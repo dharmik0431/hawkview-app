@@ -1,0 +1,61 @@
+You are building an enterprise-grade frontend for a SaaS app called HawkView.
+
+STRICT REQUIREMENTS:
+- Framework: Next.js (latest stable) with App Router (NOT Vite, NOT CRA, NOT SPA-only routing)
+- Language: TypeScript
+- Styling: Tailwind CSS
+- UI: shadcn/ui
+- State/data: TanStack React Query
+- Validation: Zod
+- Quality: ESLint + Prettier, clean folder structure, no demo shortcuts
+
+GOAL:
+Create a production-ready frontend skeleton with multi-page routing and a dashboard layout. It must run in Replit and show a working Preview.
+
+PAGES (App Router):
+- /login (public)
+- /tenants (protected placeholder)
+- /dashboard (protected placeholder)
+- /reports (protected placeholder)
+- /settings (protected placeholder)
+
+ROUTING STRUCTURE:
+- app/(public)/login/page.tsx
+- app/(protected)/layout.tsx (sidebar + topbar shell)
+- app/(protected)/tenants/page.tsx
+- app/(protected)/dashboard/page.tsx
+- app/(protected)/reports/page.tsx
+- app/(protected)/settings/page.tsx
+- app/layout.tsx (root)
+- middleware.ts (basic route protection using a placeholder session cookie)
+
+ENTERPRISE UI REQUIREMENTS:
+- Clean admin UI with sidebar navigation + top bar
+- Consistent spacing, typography, and components
+- Loading, empty, and error states on each protected page
+- Accessibility basics (ARIA labels, keyboard focus)
+- No mock business data; show empty-state messages like “No tenant selected” or “Connect Microsoft 365 to begin”
+
+API INTEGRATION PLACEHOLDERS:
+Create a small typed API client layer (no real endpoints required):
+- lib/api/client.ts (fetch wrapper)
+- lib/api/hooks.ts (useTenants, useDashboardSummary)
+Return safe empty structures when API is not wired
+
+AUTH PLACEHOLDER:
+Do NOT implement real Microsoft login yet.
+Use a temporary “Dev Sign In” button on /login that sets a cookie and redirects to /tenants.
+Also provide a “Sign out” button in the top bar that clears the cookie.
+
+PROJECT STRUCTURE:
+- components/layout/* (Sidebar, Topbar)
+- components/common/* (EmptyState, LoadingState, ErrorState)
+- lib/api/*
+- lib/utils/*
+- types/*
+
+DELIVERABLES:
+- Create all files
+- Ensure `npm run dev` works
+- Ensure Preview opens to /login
+- Add README with how routing/layout works and how to later swap in Entra ID auth
