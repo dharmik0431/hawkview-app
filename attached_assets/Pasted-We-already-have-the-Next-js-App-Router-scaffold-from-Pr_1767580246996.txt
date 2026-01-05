@@ -1,0 +1,98 @@
+We already have the Next.js App Router scaffold from Prompt 1. Now I want to focus ONLY on GUI and match the attached design screenshots (login + dashboard). Do NOT implement real auth, Microsoft Graph, or backend logic. Keep everything as static placeholder UI using components and dummy arrays inside the page components.
+
+STACK CONSTRAINTS:
+- Next.js App Router + TypeScript
+- Tailwind + shadcn/ui
+- next-themes already present: ensure all screens look good in BOTH light and dark
+- Use lucide-react icons
+- Use clean enterprise spacing, cards, subtle borders/shadows.
+
+TASK A — Login page redesign (match screenshot)
+Update: app/(public)/login/page.tsx
+Requirements:
+- Page background: light gray in light mode, near-black in dark mode
+- Centered card with subtle shadow/border
+- Top brand title: “HawkView” centered above card (blue accent like screenshot)
+- Card content:
+  - Heading: “Log in”
+  - Subtext: “Access your HawkView dashboard.”
+  - Email label + input
+  - Password label + input
+  - Row: Remember me checkbox (left) + “Forgot password?” link (right)
+  - Primary button: “Log in”
+  - Divider: “or”
+  - Secondary buttons:
+    - “Continue with Microsoft” with Microsoft-style icon placeholder (simple icon ok)
+    - “Continue with Google” with Google icon placeholder
+  - Bottom: “Sign up” link
+- Keep Dev Sign In behavior: clicking Log in can set the same placeholder session cookie and redirect to /dashboard (or /tenants if that’s your current flow). Do not add real auth.
+
+TASK B — Enterprise dashboard shell (match screenshot)
+Update: app/(protected)/layout.tsx, components/layout/Sidebar.tsx, components/layout/Topbar.tsx (or create them if missing)
+Requirements:
+- Layout like screenshot:
+  - Dark sidebar (nav) on the left with sections and icons
+  - Main content area with top bar
+- Sidebar:
+  - Brand “HawkView” at top
+  - Group headings (small uppercase): MAIN, MANAGEMENT, ADMIN, ACCOUNT
+  - Nav items with icons:
+    MAIN:
+      - Dashboard
+      - Tenants
+      - Reports
+      - Alerts & Notifications
+      - Activity Logs
+    MANAGEMENT:
+      - User Directory
+      - Licensing Overview
+      - Security Insights
+    ADMIN:
+      - Admin Settings
+      - Integrations
+    ACCOUNT:
+      - Account Settings
+      - Billing
+  - Active item highlight (blue pill highlight like screenshot)
+  - Bottom user area: avatar circle + name “Alex Greene” and role “MSP Admin”
+- Topbar:
+  - Left: page title (e.g. “Dashboard”)
+  - Right: “Changelog” link, user avatar dropdown placeholder, and “Log out” button
+  - Log out clears placeholder session cookie and returns to /login
+
+TASK C — Dashboard page content (match screenshot)
+Update: app/(protected)/dashboard/page.tsx
+Build a static dashboard UI with:
+1) KPI card row (4 cards) matching screenshot:
+   - Total Tenants (24) with users icon
+   - Microsoft 365 (12) with Microsoft badge/icon placeholder
+   - Google Workspace (12) with Google badge/icon placeholder
+   - Last Scan (2m ago) with clock icon
+2) Tenants Overview card:
+   - Title: “Tenants Overview”
+   - Subtitle: “Manage and monitor all your client tenants.”
+   - Search input (placeholder text: “Search tenants by name or domain…”)
+   - Right side: “Add Tenant” button with plus icon
+3) Tenants table (static dummy rows in the component):
+   Columns:
+   - Tenant Name (name + domain under it)
+   - Type (Microsoft 365 / Google Workspace with small icon)
+   - MFA Coverage (percentage)
+   - License Count (number)
+   - Last Sync (e.g. “3 minutes ago”)
+   - Status (badge: Healthy green, Issues red)
+Create 5 sample rows similar to screenshot.
+No real data calls. No React Query needed yet on this page.
+
+TASK D — Tenants / Reports / Settings pages
+Update these pages to be consistent with the new layout:
+- app/(protected)/tenants/page.tsx
+- app/(protected)/reports/page.tsx
+- app/(protected)/settings/page.tsx
+They can show simple placeholder cards (“Coming soon”) but must use the same page header + spacing system, and look good in light/dark.
+
+QUALITY CHECKS:
+- Ensure Preview loads /login
+- Ensure after dev login you can reach /dashboard and see the sidebar + topbar + dashboard UI
+- Ensure it looks good in both themes and the theme toggle still works
+- Do not introduce new features beyond UI structure described above.
