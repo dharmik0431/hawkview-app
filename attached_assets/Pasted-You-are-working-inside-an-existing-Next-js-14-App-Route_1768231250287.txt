@@ -1,0 +1,43 @@
+You are working inside an existing Next.js 14+ App Router project using Tailwind + shadcn/ui + lucide-react.
+
+DO NOT restructure the project.
+DO NOT add react-router-dom.
+DO NOT create new layouts, auth systems, or new route groups.
+ONLY edit or create the following two files:
+1) app/(protected)/tenants/page.tsx
+2) app/(protected)/tenants/[tenantId]/page.tsx
+
+Goal:
+Recreate the UI shown in my HawkView screenshots:
+- Tenants page = “Tenant Directory” with:
+  - Header (title + subtitle)
+  - Right aligned primary button: “Onboard New Tenant” with Plus icon
+  - Search bar (search by name/domain/id)
+  - Filter segmented control: All / Microsoft / Google
+  - Grid of tenant cards (responsive: 1 col mobile, 2 md, 3 xl)
+  - Each card shows:
+    - Tenant name + domain
+    - Status badge: Healthy / Warning / Critical
+    - Secure Score tile (percentage with color: green>=80, orange>=50, red otherwise)
+    - Licenses tile (count assigned)
+    - Footer: “Synced X ago” and a “Manage Tenant” link with chevron
+  - Clicking a card navigates to /tenants/[tenantId]
+
+- Tenant details page:
+  - Use route param tenantId
+  - Provide a “Back to Tenants” link at top
+  - Show tenant header (name, domain, type icon Microsoft/Google, status badge)
+  - Show key metric cards (secure score, licenses, last sync)
+  - Create sections/tabs (simple tabs ok):
+    Overview | Users | Licenses | Security
+  - For now: mock content in each tab (tables/cards) — keep it clean and consistent with Tenants page style.
+
+Implementation rules:
+- Use Next.js navigation: useRouter from next/navigation and Link from next/link.
+- Use shadcn/ui components where possible: Button, Input, Card, Badge, Tabs, Table.
+- Use lucide-react icons (Search, Plus, ChevronRight or similar).
+- Keep code clean, typed, and self-contained: include mock tenant data inside the files for now.
+- Keep styling close to screenshot: modern, rounded cards, subtle borders/shadows, light background, good spacing.
+- No backend work, no database work. Just UI + mock data + routing.
+
+After changes, the app should compile without any missing imports.

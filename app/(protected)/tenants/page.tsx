@@ -125,7 +125,7 @@ export default function TenantsPage() {
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {filteredTenants.map((tenant) => (
-          <Link key={tenant.id} href={`/tenants/${tenant.id}`}>
+          <Link key={tenant.id} href={`/tenants/${tenant.id}`} prefetch={false}>
             <Card className="group cursor-pointer transition-all hover:shadow-md hover:border-blue-300 dark:hover:border-blue-700">
               <CardContent className="p-5">
                 <div className="flex items-start justify-between">
