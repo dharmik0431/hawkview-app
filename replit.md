@@ -19,7 +19,7 @@ HawkView is an enterprise-grade frontend skeleton for a SaaS application built w
 │   ├── (public)/login/          # Public login page
 │   ├── (protected)/             # Protected routes with sidebar layout
 │   │   ├── tenants/
-│   │   │   └── [tenantId]/      # Tenant details with tabs (Overview, Users, Licenses, Security)
+│   │   │   └── [id]/            # Tenant details with side rail nav
 │   │   ├── dashboard/
 │   │   ├── reports/
 │   │   └── settings/
