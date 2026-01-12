@@ -1,0 +1,139 @@
+You are working inside an existing Next.js 14 App Router project using TypeScript, Tailwind CSS, and shadcn/ui.
+
+The project already has authentication middleware and a protected layout.
+Do not modify middleware, auth logic, or global layouts.
+
+Your task is to implement GUI-only pages for HawkView’s Tenant experience using static mock data only.
+
+Existing Structure (DO NOT CHANGE)
+app/
+  (protected)/
+    layout.tsx        // AppShell with sidebar + topbar
+    dashboard/page.tsx
+    tenants/
+      page.tsx        // CREATE / UPDATE
+      [id]/page.tsx  // CREATE / UPDATE
+  (public)/
+    login/page.tsx
+
+Page 1: Tenant Directory (/tenants)
+
+Build a modern SaaS-style tenant directory page.
+
+Layout
+
+Uses existing (protected)/layout.tsx
+
+Page title: Tenant Directory
+
+Subtitle: “Select a tenant environment to manage security, licenses, and users.”
+
+Primary CTA (top right): + Onboard New Tenant
+
+Controls
+
+Search input: “Search by name, domain, or ID…”
+
+Filter pills: All | Microsoft | Google
+
+Tenant Cards (grid)
+
+Each card shows:
+
+Tenant logo/avatar (Microsoft or Google)
+
+Tenant name
+
+Primary domain
+
+Status badge: Healthy | Warning | Critical
+
+Secure Score (percentage out of 100, color-coded)
+
+Licenses assigned
+
+Footer text: “Synced X minutes ago”
+
+CTA link/button: Manage Tenant →
+
+Clicking the card or CTA navigates to /tenants/[id].
+
+Page 2: Tenant Details (/tenants/[id])
+Header
+
+Tenant name
+
+Domain
+
+Provider badge (Microsoft / Google)
+
+Status pill
+
+Last synced timestamp
+
+Navigation (IMPORTANT)
+
+Use a tenant-specific left-side rail inside the page (not replacing the global sidebar):
+
+Security
+
+Licenses
+
+Users
+
+Alerts
+
+Reports
+
+Main Content (mock data)
+
+Summary cards:
+
+Secure Score
+
+MFA Coverage
+
+License Usage
+
+Table placeholders for:
+
+Users
+
+Licenses
+
+Data
+
+Use static mock data only
+
+Either inline or in lib/mock-data.ts
+
+Each tenant object should include:
+
+{
+  id: string
+  name: string
+  domain: string
+  provider: 'microsoft' | 'google'
+  secureScore: number
+  licenseCount: number
+  status: 'healthy' | 'warning' | 'critical'
+  lastSync: string
+}
+
+Technical Rules
+
+Add "use client" where required
+
+Use useRouter and useParams from next/navigation
+
+Do NOT use React Router
+
+Do NOT introduce API calls
+
+Do NOT change layouts or middleware
+
+Focus on clean UI and navigation only
+
+Goal
+
+The /tenants and /tenants/[id] pages should visually match a modern enterprise SaaS UI and be ready for future data wiring.
