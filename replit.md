@@ -19,6 +19,7 @@ HawkView is an enterprise-grade frontend skeleton for a SaaS application built w
 │   ├── (public)/login/          # Public login page
 │   ├── (protected)/             # Protected routes with sidebar layout
 │   │   ├── tenants/
+│   │   │   └── [id]/            # Tenant details with side rail nav
 │   │   ├── dashboard/
 │   │   ├── reports/
 │   │   └── settings/
@@ -28,10 +29,11 @@ HawkView is an enterprise-grade frontend skeleton for a SaaS application built w
 ├── components/
 │   ├── common/                  # EmptyState, LoadingState, ErrorState
 │   ├── layout/                  # Sidebar, Topbar
-│   ├── providers/               # React Query provider
+│   ├── providers/               # React Query, Theme providers
 │   └── ui/                      # shadcn/ui components
 ├── lib/
 │   ├── api/                     # API client and React Query hooks
+│   ├── mock-data.ts             # Static mock data for tenants, users, licenses, alerts
 │   └── utils.ts                 # Utility functions
 ├── types/                       # TypeScript types with Zod schemas
 └── middleware.ts                # Route protection
@@ -63,4 +65,7 @@ See README.md for detailed instructions.
 
 ## Recent Changes
 
+- 2026-01-12: Added Tenant Directory (/tenants) with search, filter pills, and tenant cards grid
+- 2026-01-12: Added Tenant Details (/tenants/[id]) with side rail navigation (Security, Licenses, Users, Alerts, Reports)
+- 2026-01-12: Added mock data layer (lib/mock-data.ts) with tenants, users, licenses, and alerts
 - 2026-01-05: Initial project setup with all pages, components, and routing
