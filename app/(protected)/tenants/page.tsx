@@ -1,217 +1,237 @@
 'use client'
 
-import { useState } from 'react'
+import { NeedsAttentionCell } from '@/components/tenants/needs-attention-cell'
+import { useMemo, useState } from 'react'
 import Link from 'next/link'
-import { Search, Plus, Building2, Clock, ChevronRight } from 'lucide-react'
+import { Search, Plus, Clock, ChevronRight } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
+import { TENANTS, TENANT_MOCKS } from './[id]/mock/tenants'
 
-interface Tenant {
-  id: string
-  name: string
-  domain: string
-  provider: 'microsoft' | 'google'
-  secureScore: number
-  licenseCount: number
-  status: 'healthy' | 'warning' | 'critical'
-  lastSync: string
-}
-
-const tenants: Tenant[] = [
-  {
-    id: 'contoso-ms',
-    name: 'Contoso Ltd',
-    domain: 'contoso.com',
-    provider: 'microsoft',
-    secureScore: 87,
-    licenseCount: 150,
-    status: 'healthy',
-    lastSync: '5 minutes ago',
-  },
-  {
-    id: 'northwind-ms',
-    name: 'Northwind Traders',
-    domain: 'northwind.io',
-    provider: 'microsoft',
-    secureScore: 62,
-    licenseCount: 85,
-    status: 'warning',
-    lastSync: '12 minutes ago',
-  },
-  {
-    id: 'acme-gw',
-    name: 'Acme Corp',
-    domain: 'acme.org',
-    provider: 'google',
-    secureScore: 91,
-    licenseCount: 200,
-    status: 'healthy',
-    lastSync: '2 minutes ago',
-  },
-  {
-    id: 'globex-ms',
-    name: 'Globex Industries',
-    domain: 'globex.net',
-    provider: 'microsoft',
-    secureScore: 45,
-    licenseCount: 320,
-    status: 'critical',
-    lastSync: '28 minutes ago',
-  },
-  {
-    id: 'initech-gw',
-    name: 'Initech Solutions',
-    domain: 'initech.dev',
-    provider: 'google',
-    secureScore: 78,
-    licenseCount: 45,
-    status: 'healthy',
-    lastSync: '8 minutes ago',
-  },
-  {
-    id: 'umbrella-ms',
-    name: 'Umbrella Corp',
-    domain: 'umbrella.co',
-    provider: 'microsoft',
-    secureScore: 58,
-    licenseCount: 180,
-    status: 'warning',
-    lastSync: '15 minutes ago',
-  },
-]
+type Provider = 'microsoft' | 'google'
+type TenantStatus = 'healthy' | 'warning' | 'critical'
 
 type FilterType = 'all' | 'microsoft' | 'google'
 
-function getStatusColor(status: Tenant['status']) {
+function statusBadge(status: TenantStatus) {
   switch (status) {
     case 'healthy':
-      return 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+      return 'bg-green-50 text-green-700 border border-green-200'
     case 'warning':
-      return 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400'
+      return 'bg-orange-50 text-orange-700 border border-orange-200'
     case 'critical':
-      return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+      return 'bg-red-50 text-red-700 border border-red-200'
   }
 }
 
-function getScoreColor(score: number) {
-  if (score >= 80) return 'text-green-600 dark:text-green-400'
-  if (score >= 50) return 'text-orange-500 dark:text-orange-400'
-  return 'text-red-600 dark:text-red-400'
+function scoreColor(score: number) {
+  if (score >= 80) return 'text-green-600'
+  if (score >= 50) return 'text-orange-600'
+  return 'text-red-600'
 }
 
-function getScoreBgColor(score: number) {
-  if (score >= 80) return 'bg-green-50 dark:bg-green-900/20'
-  if (score >= 50) return 'bg-orange-50 dark:bg-orange-900/20'
-  return 'bg-red-50 dark:bg-red-900/20'
+function ProviderIcon({ provider }: { provider: Provider }) {
+  return provider === 'microsoft' ? <MicrosoftMark /> : <GoogleMark />
+}
+
+function MicrosoftMark() {
+  return (
+    <div className="w-14 h-14 rounded-2xl flex items-center justify-center border shadow-sm bg-blue-50 border-blue-100">
+      <div className="grid grid-cols-2 gap-1">
+        <span className="h-3 w-3 bg-[#F25022] rounded-[3px]" />
+        <span className="h-3 w-3 bg-[#7FBA00] rounded-[3px]" />
+        <span className="h-3 w-3 bg-[#00A4EF] rounded-[3px]" />
+        <span className="h-3 w-3 bg-[#FFB900] rounded-[3px]" />
+      </div>
+    </div>
+  )
+}
+
+function GoogleMark() {
+  return (
+    <div className="w-14 h-14 rounded-2xl flex items-center justify-center border shadow-sm bg-red-50 border-red-100">
+      <svg width="28" height="28" viewBox="0 0 48 48" aria-hidden="true">
+        <path
+          fill="#FFC107"
+          d="M43.611 20.083H42V20H24v8h11.303C33.708 32.91 29.22 36 24 36c-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.971 3.029l5.657-5.657C34.046 6.053 29.272 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.651-.389-3.917z"
+        />
+        <path
+          fill="#FF3D00"
+          d="M6.306 14.691l6.571 4.819C14.655 16.108 19.009 12 24 12c3.059 0 5.842 1.154 7.971 3.029l5.657-5.657C34.046 6.053 29.272 4 24 4c-7.682 0-14.409 4.328-17.694 10.691z"
+        />
+        <path
+          fill="#4CAF50"
+          d="M24 44c5.118 0 9.786-1.969 13.314-5.186l-6.143-5.197C29.136 35.091 26.7 36 24 36c-5.199 0-9.677-3.067-11.29-7.463l-6.52 5.02C9.44 39.556 16.227 44 24 44z"
+        />
+        <path
+          fill="#1976D2"
+          d="M43.611 20.083H42V20H24v8h11.303c-.792 2.26-2.231 4.191-4.132 5.617l.002-.001 6.143 5.197C36.91 39.186 44 34 44 24c0-1.341-.138-2.651-.389-3.917z"
+        />
+      </svg>
+    </div>
+  )
 }
 
 export default function TenantsPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [filter, setFilter] = useState<FilterType>('all')
 
-  const filteredTenants = tenants.filter((tenant) => {
-    const matchesSearch =
-      tenant.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      tenant.domain.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      tenant.id.toLowerCase().includes(searchQuery.toLowerCase())
+  const filteredTenants = useMemo(() => {
+    return TENANTS.filter((tenant: any) => {
+      const q = searchQuery.toLowerCase()
+      const matchesSearch =
+        tenant.name.toLowerCase().includes(q) ||
+        tenant.domain.toLowerCase().includes(q) ||
+        tenant.id.toLowerCase().includes(q)
 
-    const matchesFilter = filter === 'all' || tenant.provider === filter
-
-    return matchesSearch && matchesFilter
-  })
+      const matchesFilter = filter === 'all' || tenant.provider === filter
+      return matchesSearch && matchesFilter
+    })
+  }, [searchQuery, filter])
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+    <div className="space-y-8 animate-in fade-in duration-300">
+      {/* Header */}
+      <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
         <div>
-          <h1 className="text-2xl font-semibold text-gray-900 dark:text-white">
+          <h1 className="text-3xl font-bold tracking-tight text-slate-900 dark:text-white">
             Tenant Directory
           </h1>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+          <p className="mt-2 text-base text-slate-500 dark:text-slate-400">
             Select a tenant environment to manage security, licenses, and users.
           </p>
         </div>
-        <Button className="gap-2">
+        <Button className="gap-2 rounded-xl">
           <Plus className="h-4 w-4" />
           Onboard New Tenant
         </Button>
       </div>
 
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+      {/* Search + Filter bar */}
+      <div className="bg-white dark:bg-slate-900 p-2 rounded-2xl border shadow-sm flex flex-col md:flex-row gap-2">
         <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+          <Search className="absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <Input
             placeholder="Search by name, domain, or ID..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-10"
+            className="pl-11 h-12 border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0"
           />
         </div>
-        <div className="inline-flex rounded-lg border bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-800">
-          {(['all', 'microsoft', 'google'] as FilterType[]).map((type) => (
-            <button
-              key={type}
-              onClick={() => setFilter(type)}
-              className={`rounded-md px-4 py-1.5 text-sm font-medium transition-colors ${
-                filter === type
-                  ? 'bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-white'
-                  : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white'
-              }`}
-            >
-              {type === 'all' ? 'All' : type === 'microsoft' ? 'Microsoft' : 'Google'}
-            </button>
-          ))}
+
+        <div className="flex items-center border-t md:border-t-0 md:border-l px-1 md:px-3">
+          <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+            {(['all', 'microsoft', 'google'] as FilterType[]).map((type) => (
+              <button
+                key={type}
+                onClick={() => setFilter(type)}
+                className={[
+                  'px-4 py-2 rounded-lg text-sm font-semibold transition-all',
+                  filter === type
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
+                    : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-white',
+                ].join(' ')}
+              >
+                {type === 'all'
+                  ? 'All'
+                  : type === 'microsoft'
+                    ? 'Microsoft'
+                    : 'Google'}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      <div className="grid gap-4 grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
-        {filteredTenants.map((tenant) => (
+      {/* Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+        {filteredTenants.map((tenant: any) => (
           <Link key={tenant.id} href={`/tenants/${tenant.id}`}>
-            <Card className="group h-full cursor-pointer rounded-xl border bg-white shadow-sm transition-all hover:shadow-md hover:border-blue-300 dark:bg-gray-900 dark:border-gray-700 dark:hover:border-blue-600">
-              <CardContent className="p-5">
-                <div className="flex items-start justify-between">
-                  <div>
-                    <h3 className="font-semibold text-gray-900 dark:text-white group-hover:text-blue-600 dark:group-hover:text-blue-400">
-                      {tenant.name}
-                    </h3>
-                    <p className="text-sm text-gray-500 dark:text-gray-400">
-                      {tenant.domain}
-                    </p>
+            <Card className="group bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-0 hover:border-blue-200 hover:shadow-xl hover:shadow-blue-500/5 transition-all duration-300 cursor-pointer relative overflow-hidden">
+              {/* accent */}
+              <div
+                className={[
+                  'absolute top-0 right-0 w-32 h-32 opacity-5 rounded-bl-full pointer-events-none -mr-8 -mt-8',
+                  tenant.provider === 'microsoft'
+                    ? 'bg-blue-500'
+                    : 'bg-red-500',
+                ].join(' ')}
+              />
+
+              <CardContent className="p-6">
+                <div className="flex items-start justify-between mb-5 relative z-10">
+                  <div className="flex items-center gap-4">
+                    <ProviderIcon provider={tenant.provider} />
+                    <div>
+                      <h3 className="text-lg font-semibold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors">
+                        {tenant.name}
+                      </h3>
+                      <p className="text-sm text-slate-500 dark:text-slate-400">
+                        {tenant.domain}
+                      </p>
+                    </div>
                   </div>
-                  <Badge className={`capitalize ${getStatusColor(tenant.status)}`}>
+
+                  {/* Keep tenant status badge (still useful), but it is no longer the "Issues" signal */}
+                  <Badge
+                    className={`uppercase tracking-wide ${statusBadge(tenant.status)}`}
+                  >
                     {tenant.status}
                   </Badge>
                 </div>
 
-                <div className="mt-4 grid grid-cols-2 gap-3">
-                  <div className={`rounded-lg p-3 ${getScoreBgColor(tenant.secureScore)}`}>
-                    <p className="text-xs font-medium text-gray-500 dark:text-gray-400">
+                {/* ✅ V1 FIX #1: explicit attention tags (visible without clicking) */}
+                <div className="mb-5 relative z-10">
+                  <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                    Needs Attention
+                  </p>
+                  {/* Ensure NeedsAttentionCell receives a tenant object with a bundle if available */}
+                  <NeedsAttentionCell
+                    tenant={{ ...tenant, bundle: TENANT_MOCKS?.[tenant.id] }}
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-4 mb-6 relative z-10">
+                  <div className="bg-slate-50 dark:bg-slate-800/60 rounded-xl p-3 border border-slate-100 dark:border-slate-800">
+                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
                       Secure Score
                     </p>
-                    <p className={`text-xl font-bold ${getScoreColor(tenant.secureScore)}`}>
-                      {tenant.secureScore}
-                    </p>
+                    <div className="flex items-end gap-1">
+                      <span
+                        className={`text-xl font-bold ${scoreColor(tenant.secureScore)}`}
+                      >
+                        {tenant.secureScore}%
+                      </span>
+                      <span className="text-xs font-semibold text-slate-400 mb-1">
+                        / 100
+                      </span>
+                    </div>
                   </div>
-                  <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-800">
-                    <p className="text-xs font-medium text-gray-500 dark:text-gray-400">
+
+                  <div className="bg-slate-50 dark:bg-slate-800/60 rounded-xl p-3 border border-slate-100 dark:border-slate-800">
+                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
                       Licenses
                     </p>
-                    <p className="text-xl font-bold text-gray-900 dark:text-white">
-                      {tenant.licenseCount}
-                    </p>
+                    <div className="flex items-end gap-1">
+                      <span className="text-xl font-bold text-slate-900 dark:text-white">
+                        {tenant.licenseCount}
+                      </span>
+                      <span className="text-xs font-semibold text-slate-400 mb-1">
+                        assigned
+                      </span>
+                    </div>
                   </div>
                 </div>
 
-                <div className="mt-4 flex items-center justify-between border-t pt-3 dark:border-gray-700">
-                  <div className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
+                <div className="flex items-center justify-between pt-4 border-t border-slate-100 dark:border-slate-800 relative z-10">
+                  <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-400">
                     <Clock className="h-3.5 w-3.5" />
-                    <span>Synced {tenant.lastSync}</span>
-                  </div>
-                  <span className="flex items-center gap-1 text-sm font-medium text-blue-600 dark:text-blue-400 group-hover:underline">
-                    Manage Tenant
-                    <ChevronRight className="h-4 w-4" />
+                    Synced {tenant.lastSync}
+                  </span>
+                  <span className="text-sm font-semibold text-blue-600 flex items-center gap-1 group-hover:underline">
+                    Manage Tenant <ChevronRight className="h-4 w-4" />
                   </span>
                 </div>
               </CardContent>
@@ -221,13 +241,12 @@ export default function TenantsPage() {
       </div>
 
       {filteredTenants.length === 0 && (
-        <div className="flex flex-col items-center justify-center py-12 text-center">
-          <Building2 className="h-12 w-12 text-gray-300 dark:text-gray-600" />
-          <h3 className="mt-4 text-lg font-medium text-gray-900 dark:text-white">
+        <div className="text-center py-20 bg-white dark:bg-slate-900 rounded-3xl border border-dashed">
+          <h3 className="text-lg font-semibold text-slate-900 dark:text-white">
             No tenants found
           </h3>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            Try adjusting your search or filter criteria.
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Try adjusting your search or filters.
           </p>
         </div>
       )}

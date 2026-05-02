@@ -1,0 +1,1 @@
+export { WhatChangedView } from './table'
