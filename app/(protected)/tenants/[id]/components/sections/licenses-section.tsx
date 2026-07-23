@@ -31,9 +31,12 @@ export default function LicensesSection({
 
         <div className="mt-6 space-y-6">
           {licenseRows.map((row) => {
-            const pct = Math.round((row.used / row.total) * 100)
+            const rawPct = row.total > 0 ? (row.used / row.total) * 100 : 0
+            const pct = Math.round(rawPct)
+            const displayPctText =
+              row.used > 0 && rawPct < 1 ? '<1% UTILIZED' : `${pct}% UTILIZED`
             return (
-              <div key={row.name}>
+              <div key={row.skuPartNumber || row.name}>
                 <div className="flex items-center justify-between gap-4">
                   <div className="text-sm font-semibold">{row.name}</div>
                   <div className="text-xs text-muted-foreground">
@@ -42,7 +45,7 @@ export default function LicensesSection({
                 </div>
                 <UtilBar value={pct} />
                 <div className="mt-2 text-right text-xs font-semibold text-muted-foreground">
-                  {pct}% UTILIZED
+                  {displayPctText}
                 </div>
               </div>
             )

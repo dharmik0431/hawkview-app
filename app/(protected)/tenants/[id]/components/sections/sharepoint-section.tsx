@@ -144,11 +144,16 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
     ),
   }
 
-  const SP_SITES = Array.isArray(sp?.sites)
-    ? sp.sites
-    : Array.isArray(rawOverview?.sites)
-      ? rawOverview.sites
-      : []
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const SP_SITES = useMemo(
+    () =>
+      Array.isArray(sp?.sites)
+        ? sp.sites
+        : Array.isArray(rawOverview?.sites)
+          ? rawOverview.sites
+          : [],
+    [bundle]
+  )
 
   const SP_DELETED_SITES = Array.isArray(sp?.deletedSites)
     ? sp.deletedSites

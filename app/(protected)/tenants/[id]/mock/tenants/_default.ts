@@ -742,6 +742,7 @@ export const tenantMock: TenantMockBundle = {
       },
       { method: 'SMS', enabled: true, users: 8, lastUpdated: '2025-10-02' },
     ],
+    namedLocations: [],
   },
 }
 

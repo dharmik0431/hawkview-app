@@ -925,6 +925,20 @@ function AuthMethodsCard({ rows }: { rows: AuthMethodRow[] }) {
   )
 }
 
+function formatSyncTimestamp(lastSyncIso?: string) {
+  if (!lastSyncIso) return 'Sync time unavailable'
+  try {
+    const d = new Date(lastSyncIso)
+    if (isNaN(d.getTime())) return 'Sync time unavailable'
+    return `Synced ${new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(d)}`
+  } catch {
+    return 'Sync time unavailable'
+  }
+}
+
 /* ===================================================================================== */
 
 export default function TenantDetailsPage() {
@@ -932,14 +946,54 @@ export default function TenantDetailsPage() {
   const router = useRouter()
   const tenantId = params?.id
 
-  const bundle = useMemo<TenantMockBundle | null>(() => {
+  const [bundle, setBundle] = useState<TenantMockBundle | null>(() => {
     if (!tenantId) return null
     return getMockTenant(tenantId)
+  })
+  const [tenantsList, setTenantsList] = useState<any[]>(TENANTS)
+
+  const fetchBundle = (refresh = false) => {
+    if (!tenantId) return
+    if (refresh) setSyncState('syncing')
+    fetch(`/api/tenants/${tenantId}${refresh ? '?refresh=true' : ''}`)
+      .then(async (res) => {
+        const data = await res.json()
+        if (data?.bundle) {
+          setBundle(data.bundle)
+          if (refresh) setSyncState('success')
+        } else if (data?.error) {
+          if (refresh) setSyncState('fail')
+        }
+      })
+      .catch(() => {
+        if (refresh) setSyncState('fail')
+      })
+      .finally(() => {
+        if (refresh) {
+          window.setTimeout(() => setSyncState('idle'), 1400)
+        }
+      })
+  }
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    fetchBundle(false)
   }, [tenantId])
 
+  useEffect(() => {
+    fetch('/api/tenants')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.tenants?.length) {
+          setTenantsList(data.tenants)
+        }
+      })
+      .catch(() => {})
+  }, [])
+
   const tenant = useMemo(
-    () => bundle?.tenant ?? TENANTS.find((t: any) => t.id === tenantId),
-    [bundle, tenantId]
+    () => bundle?.tenant ?? tenantsList.find((t: any) => t.id === tenantId),
+    [bundle, tenantsList, tenantId]
   )
 
   // ✅ JSON/TS-backed datasets (per-tenant)
@@ -1021,7 +1075,131 @@ export default function TenantDetailsPage() {
     setSelectedMailbox(null)
     setSelectedRule(null)
     setSelectedGroup(null)
-  }, [tenant?.id])
+  }, [tenant?.id, tenant?.domain, tenant?.domains])
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const filteredUsers = useMemo(() => {
+    const q = userSearch.trim().toLowerCase()
+    if (!q) return USERS
+    return USERS.filter(
+      (u) =>
+        u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
+    )
+  }, [userSearch])
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const filteredTenants = useMemo(() => {
+    const q = tenantSearch.trim().toLowerCase()
+    if (!q) return tenantsList
+    return tenantsList.filter(
+      (t: any) =>
+        t.name?.toLowerCase().includes(q) ||
+        t.domain?.toLowerCase().includes(q) ||
+        t.id?.toLowerCase().includes(q)
+    )
+  }, [tenantsList, tenantSearch])
+
+  // ✅ Entra > Security mock policies
+  const caPolicies: ConditionalAccessPolicy[] = useMemo(
+    () => [
+      {
+        id: 'ca-1',
+        name: 'Require MFA for Administrators',
+        state: 'ON',
+        origin: 'MICROSOFT_TEMPLATE',
+        targetSummary: 'Multiple Users',
+        grantSummary: 'Require multifactor authentication',
+        assignments: {
+          usersAndGroups: {
+            include: ['Directory roles: Global Administrator'],
+          },
+          cloudApps: { include: ['All Cloud Apps'] },
+        },
+        conditions: { platforms: ['Windows', 'macOS', 'iOS', 'Android'] },
+        accessControls: { grant: ['Require multifactor authentication'] },
+      },
+      {
+        id: 'ca-2',
+        name: 'Block Legacy Authentication',
+        state: 'ON',
+        origin: 'MICROSOFT_ENFORCED',
+        targetSummary: 'All Users',
+        grantSummary: 'Block access',
+        assignments: {
+          usersAndGroups: { include: ['All Users'] },
+          cloudApps: { include: ['All Cloud Apps'] },
+        },
+        accessControls: { grant: ['Block access'] },
+      },
+      {
+        id: 'ca-3',
+        name: 'Require Compliant Devices for All Users',
+        state: 'REPORT_ONLY',
+        origin: 'CUSTOM',
+        targetSummary: 'All Users',
+        grantSummary: 'Require device to be marked as compliant',
+        assignments: {
+          usersAndGroups: { include: ['All Users'], exclude: ['Guest Users'] },
+          cloudApps: { include: ['All Cloud Apps'] },
+        },
+        conditions: { platforms: ['Windows', 'macOS', 'iOS', 'Android'] },
+        accessControls: { grant: ['Require device to be marked as compliant'] },
+      },
+      {
+        id: 'ca-4',
+        name: 'Block Access from High Risk Countries',
+        state: 'ON',
+        origin: 'CUSTOM',
+        targetSummary: 'All Users',
+        grantSummary: 'Block access',
+        assignments: {
+          usersAndGroups: { include: ['All Users'] },
+          cloudApps: { include: ['All Cloud Apps'] },
+        },
+        accessControls: { grant: ['Block access'] },
+      },
+    ],
+    []
+  )
+
+  const authMethods: AuthMethodRow[] = useMemo(
+    () => [
+      {
+        id: 'am-1',
+        name: 'Microsoft Authenticator',
+        target: 'All Users',
+        status: 'ENABLED',
+      },
+      {
+        id: 'am-2',
+        name: 'FIDO2 Security Key',
+        target: 'Select Groups (IT, Execs)',
+        status: 'ENABLED',
+      },
+      { id: 'am-3', name: 'SMS', target: 'None', status: 'DISABLED' },
+      { id: 'am-4', name: 'Voice Call', target: 'None', status: 'DISABLED' },
+      {
+        id: 'am-5',
+        name: 'Temporary Access Pass',
+        target: 'All Users',
+        status: 'ENABLED',
+      },
+      {
+        id: 'am-6',
+        name: 'Passkeys (Preview)',
+        target: 'Pilot Group',
+        status: 'DISABLED',
+      },
+      { id: 'am-7', name: 'Email OTP', target: 'Guests', status: 'ENABLED' },
+      {
+        id: 'am-8',
+        name: 'Hardware OATH Tokens',
+        target: 'None',
+        status: 'DISABLED',
+      },
+    ],
+    []
+  )
 
   if (!tenantId) {
     return (
@@ -1140,18 +1318,20 @@ export default function TenantDetailsPage() {
         },
       ]
 
-  const licenseRows = isMicrosoft
-    ? [
-        { name: 'Microsoft 365 Business Premium', used: 124, total: 150 },
-        { name: 'Microsoft 365 E5 Security', used: 10, total: 20 },
-        { name: 'Microsoft Teams Phone Standard', used: 45, total: 50 },
-        { name: 'Power BI Pro', used: 5, total: 5 },
-      ]
-    : [
-        { name: 'Google Workspace Business Standard', used: 45, total: 50 },
-        { name: 'Google Workspace Enterprise Plus', used: 5, total: 10 },
-        { name: 'Cloud Identity Premium', used: 10, total: 100 },
-      ]
+  const licenseRows = bundle?.licenses?.rows?.length
+    ? bundle.licenses.rows
+    : isMicrosoft
+      ? [
+          { name: 'Microsoft 365 Business Premium', used: 124, total: 150 },
+          { name: 'Microsoft 365 E5 Security', used: 10, total: 20 },
+          { name: 'Microsoft Teams Phone Standard', used: 45, total: 50 },
+          { name: 'Power BI Pro', used: 5, total: 5 },
+        ]
+      : [
+          { name: 'Google Workspace Business Standard', used: 45, total: 50 },
+          { name: 'Google Workspace Enterprise Plus', used: 5, total: 10 },
+          { name: 'Cloud Identity Premium', used: 10, total: 100 },
+        ]
 
   const spf = bundle?.dns?.spf ?? '—'
   const dkim = bundle?.dns?.dkim ?? '—'
@@ -1159,135 +1339,8 @@ export default function TenantDetailsPage() {
 
   function runSync() {
     if (syncState === 'syncing') return
-    setSyncState('syncing')
-    window.setTimeout(() => {
-      const ok = Math.random() > 0.15
-      setSyncState(ok ? 'success' : 'fail')
-      window.setTimeout(() => setSyncState('idle'), 1400)
-    }, 900)
+    fetchBundle(true)
   }
-
-  const filteredUsers = useMemo(() => {
-    const q = userSearch.trim().toLowerCase()
-    if (!q) return USERS
-    return USERS.filter(
-      (u) =>
-        u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
-    )
-  }, [userSearch])
-
-  const filteredTenants = useMemo(() => {
-    const q = tenantSearch.trim().toLowerCase()
-    if (!q) return TENANTS
-    return TENANTS.filter(
-      (t: any) =>
-        t.name.toLowerCase().includes(q) ||
-        t.domain.toLowerCase().includes(q) ||
-        t.id.toLowerCase().includes(q)
-    )
-  }, [tenantSearch])
-
-  // ✅ Entra > Security mock policies
-  const caPolicies: ConditionalAccessPolicy[] = useMemo(
-    () => [
-      {
-        id: 'ca-1',
-        name: 'Require MFA for Administrators',
-        state: 'ON',
-        origin: 'MICROSOFT_TEMPLATE',
-        targetSummary: 'Multiple Users',
-        grantSummary: 'Require multifactor authentication',
-        assignments: {
-          usersAndGroups: {
-            include: ['Directory roles: Global Administrator'],
-          },
-          cloudApps: { include: ['All Cloud Apps'] },
-        },
-        conditions: { platforms: ['Windows', 'macOS', 'iOS', 'Android'] },
-        accessControls: { grant: ['Require multifactor authentication'] },
-      },
-      {
-        id: 'ca-2',
-        name: 'Block Legacy Authentication',
-        state: 'ON',
-        origin: 'MICROSOFT_ENFORCED',
-        targetSummary: 'All Users',
-        grantSummary: 'Block access',
-        assignments: {
-          usersAndGroups: { include: ['All Users'] },
-          cloudApps: { include: ['All Cloud Apps'] },
-        },
-        accessControls: { grant: ['Block access'] },
-      },
-      {
-        id: 'ca-3',
-        name: 'Require Compliant Devices for All Users',
-        state: 'REPORT_ONLY',
-        origin: 'CUSTOM',
-        targetSummary: 'All Users',
-        grantSummary: 'Require device to be marked as compliant',
-        assignments: {
-          usersAndGroups: { include: ['All Users'], exclude: ['Guest Users'] },
-          cloudApps: { include: ['All Cloud Apps'] },
-        },
-        conditions: { platforms: ['Windows', 'macOS', 'iOS', 'Android'] },
-        accessControls: { grant: ['Require device to be marked as compliant'] },
-      },
-      {
-        id: 'ca-4',
-        name: 'Block Access from High Risk Countries',
-        state: 'ON',
-        origin: 'CUSTOM',
-        targetSummary: 'All Users',
-        grantSummary: 'Block access',
-        assignments: {
-          usersAndGroups: { include: ['All Users'] },
-          cloudApps: { include: ['All Cloud Apps'] },
-        },
-        accessControls: { grant: ['Block access'] },
-      },
-    ],
-    []
-  )
-
-  const authMethods: AuthMethodRow[] = useMemo(
-    () => [
-      {
-        id: 'am-1',
-        name: 'Microsoft Authenticator',
-        target: 'All Users',
-        status: 'ENABLED',
-      },
-      {
-        id: 'am-2',
-        name: 'FIDO2 Security Key',
-        target: 'Select Groups (IT, Execs)',
-        status: 'ENABLED',
-      },
-      { id: 'am-3', name: 'SMS', target: 'None', status: 'DISABLED' },
-      { id: 'am-4', name: 'Voice Call', target: 'None', status: 'DISABLED' },
-      {
-        id: 'am-5',
-        name: 'Temporary Access Pass',
-        target: 'All Users',
-        status: 'ENABLED',
-      },
-      {
-        id: 'am-6',
-        name: 'Passkeys (Preview)',
-        target: 'Pilot Group',
-        status: 'DISABLED',
-      },
-      { id: 'am-7', name: 'Email OTP', target: 'Guests', status: 'ENABLED' },
-      {
-        id: 'am-8',
-        name: 'Hardware OATH Tokens',
-        target: 'None',
-        status: 'DISABLED',
-      },
-    ],
-    []
-  )
 
   function PlaceholderPage({ title }: { title: string }) {
     return (
@@ -2567,6 +2620,7 @@ export default function TenantDetailsPage() {
     useEffect(() => {
       let map: any = null
       let markers: any[] = []
+      let disposed = false
 
       const el = document.getElementById('signins-map')
       if (!el) return
@@ -2574,8 +2628,12 @@ export default function TenantDetailsPage() {
       // Prevent double-init on hot reload / strict mode
       if ((el as any).__inited) return
       ;(el as any).__inited = true
-      ;(async () => {
-        const maplibregl = (await import('maplibre-gl')).default
+      const initializeMap = async () => {
+        try {
+          const maplibregl = (await import('maplibre-gl')).default
+
+          // The component may have unmounted while the map bundle was loading.
+          if (disposed) return
 
         map = new maplibregl.Map({
           container: el,
@@ -2666,7 +2724,7 @@ export default function TenantDetailsPage() {
           if (coords.length >= 2) {
             const bounds = coords.reduce(
               (b: any, c: any) => b.extend(c),
-              new maplibregl.LngLatBounds(coords[0], coords[0])
+              new maplibregl.LngLatBounds(coords[0] as [number, number], coords[0] as [number, number])
             )
             map.fitBounds(bounds, { padding: 60, duration: 450 })
           } else if (coords.length === 1) {
@@ -2675,18 +2733,34 @@ export default function TenantDetailsPage() {
           }
         }
 
-        map.on('load', () => {
-          renderMarkers()
-          ;(el as any).__renderMarkers = renderMarkers
-        })
-      })()
+          map.on('load', () => {
+            if (disposed) return
+            renderMarkers()
+            ;(el as any).__renderMarkers = renderMarkers
+          })
+        } catch (error) {
+          // Preview chunk failures should not replace the whole page with an
+          // unhandled runtime error. A later remount can retry the map load.
+          delete (el as any).__inited
+          if (!disposed) {
+            const message =
+              error instanceof Error ? error.message : 'Unknown map load error'
+            console.error(`Unable to load the sign-ins map: ${message}`)
+          }
+        }
+      }
+
+      void initializeMap()
 
       return () => {
+        disposed = true
         try {
           for (const m of markers) m.remove()
           markers = []
           if (map) map.remove()
         } catch {}
+        delete (el as any).__renderMarkers
+        delete (el as any).__inited
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
@@ -3205,9 +3279,6 @@ export default function TenantDetailsPage() {
       if (section === 'drive') return <PlaceholderPage title="Drive" />
       if (section === 'security') return <PlaceholderPage title="Security" />
 
-      if (section === 'exchange') return <ExchangePage />
-      if (section === 'sharepoint') return <SharePointPage />
-
       return <HomePage />
     }
 
@@ -3354,8 +3425,8 @@ export default function TenantDetailsPage() {
                     {tenant.status}
                   </Badge>
                 </div>
-                <div className="px-4 pb-4 text-xs text-muted-foreground">
-                  Synced {tenant.lastSync}
+                <div className="px-4 pb-4 text-xs text-muted-foreground" title={tenant?.lastSync || ''}>
+                  {formatSyncTimestamp(tenant?.lastSync)}
                 </div>
               </div>
             </aside>
