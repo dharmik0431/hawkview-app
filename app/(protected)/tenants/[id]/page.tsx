@@ -5,7 +5,6 @@ import Link from 'next/link'
 import { useParams, useRouter } from 'next/navigation'
 
 import { TENANTS } from './mock/tenants'
-import { getMockTenant } from './mock/getMockTenant'
 
 //Importing different sections
 import DnsSection from './components/sections/dns-section'
@@ -54,6 +53,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { LoadingState } from '@/components/common/loading-state'
+import { ErrorState } from '@/components/common/error-state'
 
 type Provider = 'microsoft' | 'google'
 type TenantStatus = 'healthy' | 'warning' | 'critical'
@@ -946,33 +947,57 @@ export default function TenantDetailsPage() {
   const router = useRouter()
   const tenantId = params?.id
 
-  const [bundle, setBundle] = useState<TenantMockBundle | null>(() => {
-    if (!tenantId) return null
-    return getMockTenant(tenantId)
-  })
+  const [bundle, setBundle] = useState<TenantMockBundle | null>(null)
+  const [loadState, setLoadState] = useState<
+    'loading' | 'ready' | 'error'
+  >('loading')
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [tenantsList, setTenantsList] = useState<any[]>(TENANTS)
 
-  const fetchBundle = (refresh = false) => {
+  const fetchBundle = async (refresh = false) => {
     if (!tenantId) return
-    if (refresh) setSyncState('syncing')
-    fetch(`/api/tenants/${tenantId}${refresh ? '?refresh=true' : ''}`)
-      .then(async (res) => {
-        const data = await res.json()
-        if (data?.bundle) {
-          setBundle(data.bundle)
-          if (refresh) setSyncState('success')
-        } else if (data?.error) {
-          if (refresh) setSyncState('fail')
-        }
-      })
-      .catch(() => {
-        if (refresh) setSyncState('fail')
-      })
-      .finally(() => {
-        if (refresh) {
-          window.setTimeout(() => setSyncState('idle'), 1400)
-        }
-      })
+    if (refresh) {
+      setSyncState('syncing')
+    } else {
+      setBundle(null)
+      setLoadError(null)
+      setLoadState('loading')
+    }
+
+    try {
+      const res = await fetch(
+        `/api/tenants/${tenantId}${refresh ? '?refresh=true' : ''}`
+      )
+      const contentType = res.headers.get('content-type') || ''
+      if (!contentType.toLowerCase().includes('application/json')) {
+        throw new Error(
+          `Tenant service returned HTTP ${res.status} instead of JSON.`
+        )
+      }
+
+      const data = await res.json()
+      if (!res.ok || !data?.bundle) {
+        throw new Error(data?.error || `Unable to load tenant (${res.status}).`)
+      }
+
+      setBundle(data.bundle)
+      setLoadError(null)
+      setLoadState('ready')
+      if (refresh) setSyncState('success')
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unable to load tenant data.'
+      if (refresh) {
+        setSyncState('fail')
+      } else {
+        setLoadError(message)
+        setLoadState('error')
+      }
+    } finally {
+      if (refresh) {
+        window.setTimeout(() => setSyncState('idle'), 1400)
+      }
+    }
   }
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -991,10 +1016,7 @@ export default function TenantDetailsPage() {
       .catch(() => {})
   }, [])
 
-  const tenant = useMemo(
-    () => bundle?.tenant ?? tenantsList.find((t: any) => t.id === tenantId),
-    [bundle, tenantsList, tenantId]
-  )
+  const tenant = useMemo(() => bundle?.tenant, [bundle])
 
   // ✅ JSON/TS-backed datasets (per-tenant)
   const USERS = (bundle?.users ?? []) as TenantUser[]
@@ -1214,6 +1236,29 @@ export default function TenantDetailsPage() {
               <Link href="/tenants">Return to Tenant Directory</Link>
             </Button>
           </div>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  if (loadState === 'loading') {
+    return (
+      <Card className="rounded-2xl">
+        <CardContent className="p-8">
+          <LoadingState message="Connecting to Microsoft and loading tenant data..." />
+        </CardContent>
+      </Card>
+    )
+  }
+
+  if (loadState === 'error') {
+    return (
+      <Card className="rounded-2xl">
+        <CardContent className="p-8">
+          <ErrorState
+            message={loadError || 'Unable to load tenant data.'}
+            onRetry={() => void fetchBundle(false)}
+          />
         </CardContent>
       </Card>
     )

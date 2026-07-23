@@ -3,7 +3,9 @@ import {
   getLiveMicrosoftTenantBundle,
   sanitizeGraphError,
 } from '@/lib/microsoft-graph'
-import { getMockTenant } from '@/app/(protected)/tenants/[id]/mock/getMockTenant'
+
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 export async function GET(
   req: NextRequest,
@@ -38,6 +40,9 @@ export async function GET(
   }
 
   // Default: mock mode
+  const { getMockTenant } = await import(
+    '@/app/(protected)/tenants/[id]/mock/getMockTenant'
+  )
   const bundle = getMockTenant(id)
   return NextResponse.json({
     mode: 'mock',
