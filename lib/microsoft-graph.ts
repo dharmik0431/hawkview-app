@@ -337,6 +337,21 @@ function graphValues(result: PromiseSettledResult<any>): any[] {
     : []
 }
 
+function graphDataStatus(result: PromiseSettledResult<any>) {
+  if (result.status === 'fulfilled') {
+    return {
+      ok: true,
+      count: Array.isArray(result.value?.value)
+        ? result.value.value.length
+        : undefined,
+    }
+  }
+  return {
+    ok: false,
+    error: sanitizeGraphError(result.reason),
+  }
+}
+
 function splitCsv(text: string): string[][] {
   const rows: string[][] = []
   let row: string[] = []
@@ -595,7 +610,59 @@ function conditionalAccessTargetSummary(conditions: any): string {
   return total > 0 ? `${total} Users, Groups, or Roles` : 'Selected identities'
 }
 
-function mapConditionalAccessPolicies(rawPolicies: any[]): any[] {
+type ConditionalAccessResolvers = {
+  users: Map<string, string>
+  groups: Map<string, string>
+  roles: Map<string, string>
+  applications: Map<string, string>
+}
+
+function resolveConditionalAccessReference(
+  value: unknown,
+  kind: 'user' | 'group' | 'role' | 'application',
+  resolvers: ConditionalAccessResolvers
+): string {
+  const id = String(value || '')
+  const specialValues: Record<string, string> = {
+    All: kind === 'application' ? 'All Cloud Apps' : 'All Users',
+    GuestsOrExternalUsers: 'Guests and external users',
+    Office365: 'Office 365',
+    MicrosoftAdminPortals: 'Microsoft Admin Portals',
+    AllTrusted: 'All trusted locations',
+    None: 'None',
+  }
+  if (specialValues[id]) return specialValues[id]
+
+  const lookup =
+    kind === 'user'
+      ? resolvers.users
+      : kind === 'group'
+        ? resolvers.groups
+        : kind === 'role'
+          ? resolvers.roles
+          : resolvers.applications
+  const resolved = lookup.get(id.toLowerCase())
+  if (resolved) {
+    if (kind === 'group') return `Group: ${resolved}`
+    if (kind === 'role') return `Directory role: ${resolved}`
+    return resolved
+  }
+
+  // Never expose raw directory GUIDs in the portal. An unresolved reference
+  // usually means the object was deleted or the app cannot read that type.
+  const unavailableLabels = {
+    user: 'Deleted or unavailable user',
+    group: 'Deleted or unavailable group',
+    role: 'Unavailable directory role',
+    application: 'Unavailable cloud application',
+  }
+  return unavailableLabels[kind]
+}
+
+function mapConditionalAccessPolicies(
+  rawPolicies: any[],
+  resolvers: ConditionalAccessResolvers
+): any[] {
   return rawPolicies.map((policy) => {
     const builtInControls = Array.isArray(policy?.grantControls?.builtInControls)
       ? policy.grantControls.builtInControls
@@ -636,23 +703,40 @@ function mapConditionalAccessPolicies(rawPolicies: any[]): any[] {
       assignments: {
         usersAndGroups: {
           include: [
-            ...(policy?.conditions?.users?.includeUsers || []),
+            ...(policy?.conditions?.users?.includeUsers || []).map(
+              (id: string) =>
+                resolveConditionalAccessReference(id, 'user', resolvers)
+            ),
             ...(policy?.conditions?.users?.includeGroups || []).map(
-              (id: string) => `Group: ${id}`
+              (id: string) =>
+                resolveConditionalAccessReference(id, 'group', resolvers)
             ),
             ...(policy?.conditions?.users?.includeRoles || []).map(
-              (id: string) => `Directory role: ${id}`
+              (id: string) =>
+                resolveConditionalAccessReference(id, 'role', resolvers)
             ),
           ],
           exclude: [
-            ...(policy?.conditions?.users?.excludeUsers || []),
+            ...(policy?.conditions?.users?.excludeUsers || []).map(
+              (id: string) =>
+                resolveConditionalAccessReference(id, 'user', resolvers)
+            ),
             ...(policy?.conditions?.users?.excludeGroups || []).map(
-              (id: string) => `Group: ${id}`
+              (id: string) =>
+                resolveConditionalAccessReference(id, 'group', resolvers)
+            ),
+            ...(policy?.conditions?.users?.excludeRoles || []).map(
+              (id: string) =>
+                resolveConditionalAccessReference(id, 'role', resolvers)
             ),
           ],
         },
         cloudApps: {
-          include: policy?.conditions?.applications?.includeApplications || [],
+          include: (
+            policy?.conditions?.applications?.includeApplications || []
+          ).map((id: string) =>
+            resolveConditionalAccessReference(id, 'application', resolvers)
+          ),
         },
       },
       conditions:
@@ -731,10 +815,27 @@ export async function getLiveMicrosoftTenantBundle(
           'Users request'
         )
 
+        const signInFields =
+          'id,userId,userDisplayName,userPrincipalName,createdDateTime,ipAddress,status,appDisplayName,clientAppUsed,location'
         const signInsCall = withTimeout(
-          client.api('/auditLogs/signIns').top(50).select('id,userId,userDisplayName,userPrincipalName,createdDateTime,ipAddress,status,appDisplayName,clientAppUsed,location').get(),
-          8000,
+          client
+            .api('/auditLogs/signIns')
+            .top(100)
+            .orderby('createdDateTime desc')
+            .select(signInFields)
+            .get(),
+          15000,
           'Sign-ins request'
+        ).catch(() =>
+          withTimeout(
+            client
+              .api('/auditLogs/signIns')
+              .top(25)
+              .select(signInFields)
+              .get(),
+            8000,
+            'Sign-ins retry'
+          )
         )
 
         // These enrichments are deliberately optional. A missing permission
@@ -764,16 +865,33 @@ export async function getLiveMicrosoftTenantBundle(
           8000,
           'Directory roles request'
         )
+        const roleDefinitionsCall = withTimeout(
+          client
+            .api('/roleManagement/directory/roleDefinitions')
+            .select('id,templateId,displayName')
+            .top(999)
+            .get(),
+          8000,
+          'Directory role definitions request'
+        )
         const groupsCall = withTimeout(
           client
             .api('/groups')
-            .filter('mailEnabled eq true')
             .select('id,displayName,description,mail,mailEnabled,securityEnabled,groupTypes,membershipRule,proxyAddresses')
             .expand('members($select=id),owners($select=id,displayName,userPrincipalName)')
             .top(999)
             .get(),
           8000,
           'Groups request'
+        )
+        const servicePrincipalsCall = withTimeout(
+          client
+            .api('/servicePrincipals')
+            .select('id,appId,displayName')
+            .top(999)
+            .get(),
+          8000,
+          'Cloud applications request'
         )
         const domainsCall = withTimeout(
           client.api('/domains').get(),
@@ -811,7 +929,9 @@ export async function getLiveMicrosoftTenantBundle(
           namedLocationsResult,
           registrationDetailsResult,
           roleAssignmentsResult,
+          roleDefinitionsResult,
           groupsResult,
+          servicePrincipalsResult,
           domainsResult,
           devicesResult,
           mailboxUsageResult,
@@ -826,7 +946,9 @@ export async function getLiveMicrosoftTenantBundle(
           namedLocationsCall,
           registrationDetailsCall,
           roleAssignmentsCall,
+          roleDefinitionsCall,
           groupsCall,
+          servicePrincipalsCall,
           domainsCall,
           devicesCall,
           mailboxUsageCall,
@@ -1032,7 +1154,60 @@ export async function getLiveMicrosoftTenantBundle(
 
       // 7. Entra ID security data
       const rawCaPolicies = graphValues(caPoliciesResult)
-      const caPolicies = mapConditionalAccessPolicies(rawCaPolicies)
+      const conditionalAccessResolvers: ConditionalAccessResolvers = {
+        users: new Map(
+          rawUsers
+            .filter((user) => user?.id)
+            .map((user) => [
+              String(user.id).toLowerCase(),
+              user.displayName || user.userPrincipalName || 'User',
+            ])
+        ),
+        groups: new Map(
+          graphValues(groupsResult)
+            .filter((group) => group?.id)
+            .map((group) => [
+              String(group.id).toLowerCase(),
+              group.displayName || group.mail || 'Group',
+            ])
+        ),
+        roles: new Map(),
+        applications: new Map(),
+      }
+      for (const role of graphValues(roleDefinitionsResult)) {
+        const name = role.displayName || 'Directory role'
+        if (role.id) {
+          conditionalAccessResolvers.roles.set(
+            String(role.id).toLowerCase(),
+            name
+          )
+        }
+        if (role.templateId) {
+          conditionalAccessResolvers.roles.set(
+            String(role.templateId).toLowerCase(),
+            name
+          )
+        }
+      }
+      for (const application of graphValues(servicePrincipalsResult)) {
+        const name = application.displayName || 'Cloud application'
+        if (application.id) {
+          conditionalAccessResolvers.applications.set(
+            String(application.id).toLowerCase(),
+            name
+          )
+        }
+        if (application.appId) {
+          conditionalAccessResolvers.applications.set(
+            String(application.appId).toLowerCase(),
+            name
+          )
+        }
+      }
+      const caPolicies = mapConditionalAccessPolicies(
+        rawCaPolicies,
+        conditionalAccessResolvers
+      )
 
       const authPolicy =
         authMethodsPolicyResult.status === 'fulfilled'
@@ -1139,7 +1314,9 @@ export async function getLiveMicrosoftTenantBundle(
         isDefault: item.isDefault === true,
       }))
 
-      const exchangeGroups = graphValues(groupsResult).map((group: any) => ({
+      const exchangeGroups = graphValues(groupsResult)
+        .filter((group: any) => group.mailEnabled === true)
+        .map((group: any) => ({
         id: group.id,
         name: group.displayName || group.mail || 'Mail-enabled group',
         type: Array.isArray(group.groupTypes) &&
@@ -1157,7 +1334,7 @@ export async function getLiveMicrosoftTenantBundle(
           )
           .filter(Boolean),
         description: group.description || undefined,
-      }))
+        }))
 
       // 9. Health Calculation
       // Critical: Microsoft Graph connection fails, required endpoints unreachable, no successful sync, or last sync > 24h
@@ -1194,6 +1371,18 @@ export async function getLiveMicrosoftTenantBundle(
         },
         users,
         signIns,
+        dataStatus: {
+          users: graphDataStatus(usersResult),
+          signIns: graphDataStatus(signInsResult),
+          conditionalAccess: graphDataStatus(caPoliciesResult),
+          authenticationMethods: graphDataStatus(authMethodsPolicyResult),
+          namedLocations: graphDataStatus(namedLocationsResult),
+          directoryRoles: graphDataStatus(roleDefinitionsResult),
+          groups: graphDataStatus(groupsResult),
+          applications: graphDataStatus(servicePrincipalsResult),
+          devices: graphDataStatus(devicesResult),
+          mailboxUsage: graphDataStatus(mailboxUsageResult),
+        },
         licenses: {
           rows: licenseRows,
         },
@@ -1279,7 +1468,7 @@ export async function getLiveMicrosoftTenantBundle(
       return bundle
       }
 
-      const bundle = await withTimeout(fetchBundle(), 30000, 'Overall bundle request')
+      const bundle = await withTimeout(fetchBundle(), 40000, 'Overall bundle request')
 
       bundleCache.set(cacheKey, {
         data: bundle,

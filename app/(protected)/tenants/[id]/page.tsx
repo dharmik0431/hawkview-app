@@ -1019,8 +1019,14 @@ export default function TenantDetailsPage() {
   const tenant = useMemo(() => bundle?.tenant, [bundle])
 
   // ✅ JSON/TS-backed datasets (per-tenant)
-  const USERS = (bundle?.users ?? []) as TenantUser[]
-  const SIGNINS = (bundle?.signIns ?? []) as SignInEvent[]
+  const USERS = useMemo(
+    () => (bundle?.users ?? []) as TenantUser[],
+    [bundle?.users]
+  )
+  const SIGNINS = useMemo(
+    () => (bundle?.signIns ?? []) as SignInEvent[],
+    [bundle?.signIns]
+  )
 
   const EXCHANGE_MAILBOXES = (bundle?.exchange?.mailboxes ?? []) as Mailbox[]
   const EXCHANGE_RULES = (bundle?.exchange?.rules ?? []) as MailRule[]
@@ -1099,7 +1105,6 @@ export default function TenantDetailsPage() {
     setSelectedGroup(null)
   }, [tenant?.id, tenant?.domain, tenant?.domains])
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const filteredUsers = useMemo(() => {
     const q = userSearch.trim().toLowerCase()
     if (!q) return USERS
@@ -1107,7 +1112,7 @@ export default function TenantDetailsPage() {
       (u) =>
         u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
     )
-  }, [userSearch])
+  }, [USERS, userSearch])
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const filteredTenants = useMemo(() => {
