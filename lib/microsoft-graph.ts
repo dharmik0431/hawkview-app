@@ -386,27 +386,62 @@ function splitCsv(text: string): string[][] {
   return rows
 }
 
-function mailboxUsageByUpn(csv: unknown): Map<string, Record<string, string>> {
-  if (typeof csv !== 'string' || csv.trim().length === 0) return new Map()
-
+function csvRecords(csv: unknown): Array<Record<string, string>> {
+  if (typeof csv !== 'string' || csv.trim().length === 0) return []
   const rows = splitCsv(csv)
-  if (rows.length < 2) return new Map()
+  if (rows.length < 2) return []
 
   const headers = rows[0].map((header) =>
     header.replace(/^\uFEFF/, '').trim().toLowerCase()
   )
-  const upnIndex = headers.indexOf('user principal name')
-  if (upnIndex < 0) return new Map()
-
-  const result = new Map<string, Record<string, string>>()
-  for (const cells of rows.slice(1)) {
-    const upn = cells[upnIndex]?.trim().toLowerCase()
-    if (!upn) continue
-
+  return rows.slice(1).map((cells) => {
     const record: Record<string, string> = {}
     headers.forEach((header, index) => {
       record[header] = cells[index] ?? ''
     })
+    return record
+  })
+}
+
+function reportValue(
+  record: Record<string, string> | undefined,
+  ...keys: string[]
+): string {
+  if (!record) return ''
+  for (const key of keys) {
+    const value = record[key.toLowerCase()]
+    if (value != null && value !== '') return value
+  }
+  return ''
+}
+
+function reportNumber(
+  record: Record<string, string> | undefined,
+  ...keys: string[]
+): number {
+  const value = Number(reportValue(record, ...keys).replace(/,/g, ''))
+  return Number.isFinite(value) ? value : 0
+}
+
+function bytesToGigabytes(value: number): number {
+  return Number((Math.max(value, 0) / 1024 / 1024 / 1024).toFixed(2))
+}
+
+function nameFromWebUrl(url: string): string {
+  try {
+    const pathname = new URL(url).pathname
+    const part = pathname.split('/').filter(Boolean).pop()
+    return part ? decodeURIComponent(part).replace(/[-_]+/g, ' ') : 'Site'
+  } catch {
+    return 'Site'
+  }
+}
+
+function mailboxUsageByUpn(csv: unknown): Map<string, Record<string, string>> {
+  const result = new Map<string, Record<string, string>>()
+  for (const record of csvRecords(csv)) {
+    const upn = record['user principal name']?.trim().toLowerCase()
+    if (!upn) continue
     result.set(upn, record)
   }
   return result
@@ -558,6 +593,100 @@ async function getMailboxPurposesAndRules(
   }
 
   return { purposes, rules }
+}
+
+async function getMailGroupDetails(
+  client: Client,
+  groups: any[]
+): Promise<
+  {
+    details: Map<string, { membersCount: number; owners: string[] }>
+    ok: boolean
+    error?: string
+  }
+> {
+  const details = new Map<
+    string,
+    { membersCount: number; owners: string[] }
+  >()
+  let failedRequests = 0
+  const metadata = new Map<
+    string,
+    { groupId: string; kind: 'members' | 'owners' }
+  >()
+  const requests: any[] = []
+
+  groups.forEach((group, index) => {
+    if (!group?.id) return
+    const groupId = String(group.id)
+    details.set(groupId, { membersCount: 0, owners: [] })
+
+    const membersId = `mail-group-members-${index}`
+    const ownersId = `mail-group-owners-${index}`
+    metadata.set(membersId, { groupId, kind: 'members' })
+    metadata.set(ownersId, { groupId, kind: 'owners' })
+    requests.push(
+      {
+        id: membersId,
+        method: 'GET',
+        url: `/groups/${encodeURIComponent(groupId)}/members/$count`,
+        headers: { ConsistencyLevel: 'eventual' },
+      },
+      {
+        id: ownersId,
+        method: 'GET',
+        url: `/groups/${encodeURIComponent(groupId)}/owners?$select=id,displayName,userPrincipalName`,
+      }
+    )
+  })
+
+  for (let start = 0; start < requests.length; start += 20) {
+    try {
+      const batch = requests.slice(start, start + 20)
+      const result = await withTimeout(
+        client.api('/$batch').post({ requests: batch }),
+        12000,
+        `Mail groups batch ${start / 20 + 1}`
+      )
+
+      for (const response of result?.responses || []) {
+        if (response?.status < 200 || response?.status >= 300) {
+          failedRequests += 1
+          continue
+        }
+        const request = metadata.get(String(response.id))
+        if (!request) continue
+        const current = details.get(request.groupId) || {
+          membersCount: 0,
+          owners: [],
+        }
+
+        if (request.kind === 'members') {
+          const count = Number(response.body)
+          current.membersCount = Number.isFinite(count) ? count : 0
+        } else {
+          current.owners = (response.body?.value || [])
+            .map(
+              (owner: any) =>
+                owner.displayName || owner.userPrincipalName || undefined
+            )
+            .filter(Boolean)
+        }
+        details.set(request.groupId, current)
+      }
+    } catch {
+      failedRequests += requests.slice(start, start + 20).length
+    }
+  }
+
+  return {
+    details,
+    ok: failedRequests === 0,
+    error:
+      failedRequests > 0
+        ? 'Some group membership or owner details could not be read.'
+        : undefined,
+  }
 }
 
 function authMethodName(id: unknown): string {
@@ -877,12 +1006,21 @@ export async function getLiveMicrosoftTenantBundle(
         const groupsCall = withTimeout(
           client
             .api('/groups')
-            .select('id,displayName,description,mail,mailEnabled,securityEnabled,groupTypes,membershipRule,proxyAddresses')
-            .expand('members($select=id),owners($select=id,displayName,userPrincipalName)')
+            .select('id,displayName,description,mail,mailEnabled,securityEnabled,groupTypes,membershipRule,proxyAddresses,resourceProvisioningOptions,visibility')
             .top(999)
             .get(),
           8000,
           'Groups request'
+        )
+        const groupMembershipsCall = withTimeout(
+          client
+            .api('/groups')
+            .select('id,displayName,mail')
+            .expand('members($select=id)')
+            .top(999)
+            .get(),
+          12000,
+          'Group memberships request'
         )
         const servicePrincipalsCall = withTimeout(
           client
@@ -916,7 +1054,32 @@ export async function getLiveMicrosoftTenantBundle(
           8000,
           'Mailbox usage report request'
         )
-
+        const sharePointSitesCall = withTimeout(
+          client
+            .api('/sites')
+            .query({ search: '*' })
+            .select('id,name,displayName,webUrl,createdDateTime,siteCollection')
+            .top(999)
+            .get(),
+          12000,
+          'SharePoint sites request'
+        )
+        const sharePointUsageCall = withTimeout(
+          client
+            .api("/reports/getSharePointSiteUsageDetail(period='D30')")
+            .responseType(ResponseType.TEXT)
+            .get(),
+          12000,
+          'SharePoint usage report request'
+        )
+        const oneDriveUsageCall = withTimeout(
+          client
+            .api("/reports/getOneDriveUsageAccountDetail(period='D30')")
+            .responseType(ResponseType.TEXT)
+            .get(),
+          12000,
+          'OneDrive usage report request'
+        )
         // Execute independent Graph calls in parallel.
         const [
           orgResult,
@@ -931,10 +1094,14 @@ export async function getLiveMicrosoftTenantBundle(
           roleAssignmentsResult,
           roleDefinitionsResult,
           groupsResult,
+          groupMembershipsResult,
           servicePrincipalsResult,
           domainsResult,
           devicesResult,
           mailboxUsageResult,
+          sharePointSitesResult,
+          sharePointUsageResult,
+          oneDriveUsageResult,
         ] = await Promise.allSettled([
           orgCall,
           scoreCall,
@@ -948,10 +1115,14 @@ export async function getLiveMicrosoftTenantBundle(
           roleAssignmentsCall,
           roleDefinitionsCall,
           groupsCall,
+          groupMembershipsCall,
           servicePrincipalsCall,
           domainsCall,
           devicesCall,
           mailboxUsageCall,
+          sharePointSitesCall,
+          sharePointUsageCall,
+          oneDriveUsageCall,
         ])
 
       // 1. Organization (Required for identity)
@@ -1027,16 +1198,22 @@ export async function getLiveMicrosoftTenantBundle(
 
       // 4. Server-side live DNS check and per-mailbox Graph data.
       const rawUsers = graphValues(usersResult)
+      const rawGroups = graphValues(groupsResult)
+      const mailEnabledGroups = rawGroups.filter(
+        (group) => group?.mailEnabled === true
+      )
       const mailboxUsers = rawUsers.filter(
         (user) => user?.id && (user?.userPrincipalName || user?.mail)
       )
-      const [dnsHealth, mailboxDetailsResult] = await Promise.all([
-        checkDomainDnsHealth(domain, options?.forceRefresh),
-        getMailboxPurposesAndRules(client, mailboxUsers).catch(() => ({
-          purposes: new Map<string, string>(),
-          rules: [],
-        })),
-      ])
+      const [dnsHealth, mailboxDetailsResult, mailGroupDetails] =
+        await Promise.all([
+          checkDomainDnsHealth(domain, options?.forceRefresh),
+          getMailboxPurposesAndRules(client, mailboxUsers).catch(() => ({
+            purposes: new Map<string, string>(),
+            rules: [],
+          })),
+          getMailGroupDetails(client, mailEnabledGroups),
+        ])
 
       const registrationByUpn = new Map<string, any>()
       for (const registration of graphValues(registrationDetailsResult)) {
@@ -1059,7 +1236,7 @@ export async function getLiveMicrosoftTenantBundle(
       }
 
       const groupNamesByUserId = new Map<string, string[]>()
-      for (const group of graphValues(groupsResult)) {
+      for (const group of graphValues(groupMembershipsResult)) {
         for (const member of group.members || []) {
           const current = groupNamesByUserId.get(member.id) || []
           current.push(group.displayName || group.mail || 'Group')
@@ -1164,7 +1341,7 @@ export async function getLiveMicrosoftTenantBundle(
             ])
         ),
         groups: new Map(
-          graphValues(groupsResult)
+          rawGroups
             .filter((group) => group?.id)
             .map((group) => [
               String(group.id).toLowerCase(),
@@ -1314,29 +1491,177 @@ export async function getLiveMicrosoftTenantBundle(
         isDefault: item.isDefault === true,
       }))
 
-      const exchangeGroups = graphValues(groupsResult)
-        .filter((group: any) => group.mailEnabled === true)
+      const exchangeGroups = mailEnabledGroups
         .map((group: any) => ({
-        id: group.id,
-        name: group.displayName || group.mail || 'Mail-enabled group',
-        type: Array.isArray(group.groupTypes) &&
-          group.groupTypes.includes('Unified')
-          ? 'Microsoft365'
-          : group.securityEnabled
-            ? 'MailEnabledSecurity'
-            : 'DistributionList',
-        email: group.mail || '',
-        membersCount: Array.isArray(group.members) ? group.members.length : 0,
-        owners: (group.owners || [])
-          .map(
-            (owner: any) =>
-              owner.displayName || owner.userPrincipalName || owner.id
-          )
-          .filter(Boolean),
-        description: group.description || undefined,
+          ...(mailGroupDetails.details.get(String(group.id)) || {
+            membersCount: 0,
+            owners: [],
+          }),
+          id: group.id,
+          name: group.displayName || group.mail || 'Mail-enabled group',
+          type:
+            Array.isArray(group.groupTypes) &&
+            group.groupTypes.includes('Unified')
+              ? 'Microsoft365'
+              : group.securityEnabled
+                ? 'MailEnabledSecurity'
+                : 'DistributionList',
+          email: group.mail || '',
+          description: group.description || undefined,
         }))
 
-      // 9. Health Calculation
+      // 9. SharePoint and OneDrive inventory from Graph plus usage reports.
+      const directorySites = graphValues(sharePointSitesResult)
+      const directorySiteByUrl = new Map(
+        directorySites
+          .filter((site) => site?.webUrl)
+          .map((site) => [
+            String(site.webUrl).replace(/\/$/, '').toLowerCase(),
+            site,
+          ])
+      )
+      const sharePointUsageRecords = csvRecords(
+        sharePointUsageResult.status === 'fulfilled'
+          ? sharePointUsageResult.value
+          : ''
+      )
+      const oneDriveUsageRecords = csvRecords(
+        oneDriveUsageResult.status === 'fulfilled'
+          ? oneDriveUsageResult.value
+          : ''
+      )
+
+      const sharePointSiteMap = new Map<string, any>()
+      for (const site of directorySites) {
+        const url = String(site.webUrl || '')
+        if (!url || url.toLowerCase().includes('/personal/')) continue
+        sharePointSiteMap.set(url.replace(/\/$/, '').toLowerCase(), {
+          id: site.id || url,
+          name: site.displayName || site.name || nameFromWebUrl(url),
+          url,
+          type: 'Team site',
+          owners: 0,
+          externalSharing: null,
+          guestsCount: null,
+          storageUsedGB: 0,
+          storageQuotaGB: 0,
+          lastActivity: site.createdDateTime || '',
+          sensitivityLabel: undefined,
+        })
+      }
+
+      const sharePointUsageSites = sharePointUsageRecords
+        .filter(
+          (record) =>
+            reportValue(record, 'is deleted').toLowerCase() !== 'true'
+        )
+        .map((record) => {
+          const url = reportValue(record, 'site url')
+          const directorySite = directorySiteByUrl.get(
+            url.replace(/\/$/, '').toLowerCase()
+          )
+          const template = reportValue(record, 'root web template')
+          const owner = reportValue(
+            record,
+            'owner display name',
+            'owner principal name'
+          )
+          return {
+            id:
+              reportValue(record, 'site id') ||
+              directorySite?.id ||
+              url ||
+              crypto.randomUUID(),
+            name:
+              directorySite?.displayName ||
+              directorySite?.name ||
+              nameFromWebUrl(url),
+            url,
+            type: template.toUpperCase().includes('SITEPAGEPUBLISHING')
+              ? 'Communication site'
+              : 'Team site',
+            owners: owner ? 1 : 0,
+            externalSharing: null,
+            guestsCount: null,
+            storageUsedGB: bytesToGigabytes(
+              reportNumber(record, 'storage used (byte)', 'storage used (bytes)')
+            ),
+            storageQuotaGB: bytesToGigabytes(
+              reportNumber(
+                record,
+                'storage allocated (byte)',
+                'storage allocated (bytes)'
+              )
+            ),
+            lastActivity:
+              reportValue(record, 'last activity date') ||
+              directorySite?.createdDateTime ||
+              '',
+            sensitivityLabel: undefined,
+          }
+        })
+      for (const site of sharePointUsageSites) {
+        const key = String(site.url || '').replace(/\/$/, '').toLowerCase()
+        const existing = sharePointSiteMap.get(key)
+        sharePointSiteMap.set(key, { ...existing, ...site })
+      }
+      const sharePointSites = Array.from(sharePointSiteMap.values())
+
+      const oneDriveSites = oneDriveUsageRecords
+        .filter(
+          (record) =>
+            reportValue(record, 'is deleted').toLowerCase() !== 'true'
+        )
+        .map((record) => {
+          const url = reportValue(record, 'site url', 'url')
+          const owner = reportValue(
+            record,
+            'owner display name',
+            'owner principal name'
+          )
+          return {
+            id:
+              reportValue(record, 'site id') ||
+              reportValue(record, 'owner principal name') ||
+              url ||
+              crypto.randomUUID(),
+            name: owner || nameFromWebUrl(url),
+            url,
+            type: 'OneDrive',
+            owners: owner ? 1 : 0,
+            externalSharing: null,
+            guestsCount: null,
+            storageUsedGB: bytesToGigabytes(
+              reportNumber(record, 'storage used (byte)', 'storage used (bytes)')
+            ),
+            storageQuotaGB: bytesToGigabytes(
+              reportNumber(
+                record,
+                'storage allocated (byte)',
+                'storage allocated (bytes)'
+              )
+            ),
+            lastActivity: reportValue(record, 'last activity date'),
+            sensitivityLabel: undefined,
+          }
+        })
+
+      const allSharePointSites = [...sharePointSites, ...oneDriveSites]
+      const totalSharePointQuotaGB = Number(
+        sharePointSites
+          .reduce(
+            (total, site) => total + Number(site.storageQuotaGB || 0),
+            0
+          )
+          .toFixed(2)
+      )
+      const oneDriveStorageLimitGB = oneDriveSites.reduce(
+        (largest, site) =>
+          Math.max(largest, Number(site.storageQuotaGB || 0)),
+        0
+      )
+
+      // 10. Health Calculation
       // Critical: Microsoft Graph connection fails, required endpoints unreachable, no successful sync, or last sync > 24h
       // Warning: Graph connected & current, but Secure Score < 50%, or SPF/DKIM/DMARC warning, or SKU >= 90% utilization
       // Healthy: Connected, current, no known warning condition
@@ -1379,9 +1704,36 @@ export async function getLiveMicrosoftTenantBundle(
           namedLocations: graphDataStatus(namedLocationsResult),
           directoryRoles: graphDataStatus(roleDefinitionsResult),
           groups: graphDataStatus(groupsResult),
+          groupMemberships: graphDataStatus(groupMembershipsResult),
+          mailGroupDetails: {
+            ok: mailGroupDetails.ok,
+            count: exchangeGroups.length,
+            error: mailGroupDetails.error,
+          },
+          dynamicDistributionGroups: {
+            ok: false,
+            supported: false,
+            error:
+              'Dynamic distribution groups require an Exchange Online administrative collector.',
+          },
           applications: graphDataStatus(servicePrincipalsResult),
           devices: graphDataStatus(devicesResult),
           mailboxUsage: graphDataStatus(mailboxUsageResult),
+          sharePointSites: graphDataStatus(sharePointSitesResult),
+          sharePointUsage: {
+            ...graphDataStatus(sharePointUsageResult),
+            count: sharePointSites.length,
+          },
+          oneDriveUsage: {
+            ...graphDataStatus(oneDriveUsageResult),
+            count: oneDriveSites.length,
+          },
+          sharePointAdminSettings: {
+            ok: false,
+            supported: false,
+            error:
+              'Tenant sharing settings and deleted sites require a SharePoint Online administrative collector.',
+          },
         },
         licenses: {
           rows: licenseRows,
@@ -1405,15 +1757,22 @@ export async function getLiveMicrosoftTenantBundle(
         },
         sharepoint: {
           overview: {
-            totalSites: 0,
-            totalStorageQuotaGB: 0,
-            oneDriveStorageLimitGB: 0,
-            siteStorageLimitsMode: 'Automatic',
-            sharingSharePoint: 'ONLY_PEOPLE_IN_ORG',
-            sharingOneDrive: 'ONLY_PEOPLE_IN_ORG',
+            totalSites: allSharePointSites.length,
+            totalStorageQuotaGB: totalSharePointQuotaGB,
+            oneDriveStorageLimitGB,
+            siteStorageLimitsMode: null,
+            sharingSharePoint: null,
+            sharingOneDrive: null,
           },
-          sites: [],
+          sites: allSharePointSites,
           deletedSites: [],
+          availability: {
+            inventory: sharePointSitesResult.status === 'fulfilled',
+            usage: sharePointUsageResult.status === 'fulfilled',
+            oneDriveUsage: oneDriveUsageResult.status === 'fulfilled',
+            adminSettings: false,
+            deletedSites: false,
+          },
         },
         teams: {
           stats: {
