@@ -3151,7 +3151,7 @@ export default function TenantDetailsPage() {
                             Policies
                           </div>
                           <div className="text-2xl font-bold">
-                            {caPolicies.length}
+                            {displayedCaPolicies.length}
                           </div>
                           <div className="text-xs text-muted-foreground">
                             Conditional Access
@@ -3172,7 +3172,7 @@ export default function TenantDetailsPage() {
                             MFA Methods
                           </div>
                           <div className="text-2xl font-bold">
-                            {authMethods.length}
+                            {displayedAuthMethods.length}
                           </div>
                           <div className="text-xs text-muted-foreground">
                             Auth methods tracked
