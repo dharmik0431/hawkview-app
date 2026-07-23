@@ -24,9 +24,14 @@ export default function DnsSection({
   const [domainOpen, setDomainOpen] = useState(false)
   const [domainSelected, setDomainSelected] = useState<string>('')
 
-  const spf = dns?.spf ?? '—'
-  const dkim = dns?.dkim ?? '—'
-  const dmarc = dns?.dmarc ?? '—'
+  const spfRecord = typeof dns?.spf === 'object' ? dns.spf.record : (dns?.spf ?? '—')
+  const spfStatus = typeof dns?.spf === 'object' ? dns.spf.status : 'healthy'
+
+  const dkimRecord = typeof dns?.dkim === 'object' ? dns.dkim.record : (dns?.dkim ?? '—')
+  const dkimStatus = typeof dns?.dkim === 'object' ? dns.dkim.status : 'healthy'
+
+  const dmarcRecord = typeof dns?.dmarc === 'object' ? dns.dmarc.record : (dns?.dmarc ?? '—')
+  const dmarcStatus = typeof dns?.dmarc === 'object' ? dns.dmarc.status : (isMicrosoft ? 'warning' : 'healthy')
 
   return (
     <Card className="rounded-2xl shadow-sm">
@@ -72,11 +77,11 @@ export default function DnsSection({
 
         <div className="mt-5 rounded-2xl border bg-muted/20 p-4">
           <div className="flex items-center gap-2">
-            <ShieldCheck className="h-4 w-4 text-green-600" />
-            <div className="text-sm font-semibold">Blacklist Status: Clean</div>
+            <ShieldCheck className="h-4 w-4 text-slate-500" />
+            <div className="text-sm font-semibold">Blacklist Status: Not checked</div>
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
-            Domain is not present on any major blocklists (checked 50+ sources).
+            No live blacklist lookup service configured.
           </div>
         </div>
 
@@ -85,15 +90,21 @@ export default function DnsSection({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <div className="font-semibold text-sm">SPF</div>
-                <Badge className="bg-green-50 text-green-700 border border-green-200 uppercase">
-                  Healthy
+                <Badge
+                  className={`${
+                    spfStatus === 'healthy'
+                      ? 'bg-green-50 text-green-700 border border-green-200'
+                      : 'bg-orange-50 text-orange-700 border border-orange-200'
+                  } uppercase`}
+                >
+                  {spfStatus === 'healthy' ? 'Healthy' : 'Warning'}
                 </Badge>
               </div>
               <button className="text-xs font-medium text-blue-600 hover:underline">
                 How to fix
               </button>
             </div>
-            <CopyPill value={spf} />
+            <CopyPill value={spfRecord} />
             <div className="mt-2 text-xs text-muted-foreground">
               Sender Policy Framework prevents spoofing.
             </div>
@@ -103,15 +114,21 @@ export default function DnsSection({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <div className="font-semibold text-sm">DKIM</div>
-                <Badge className="bg-green-50 text-green-700 border border-green-200 uppercase">
-                  Healthy
+                <Badge
+                  className={`${
+                    dkimStatus === 'healthy'
+                      ? 'bg-green-50 text-green-700 border border-green-200'
+                      : 'bg-orange-50 text-orange-700 border border-orange-200'
+                  } uppercase`}
+                >
+                  {dkimStatus === 'healthy' ? 'Healthy' : 'Warning'}
                 </Badge>
               </div>
               <button className="text-xs font-medium text-blue-600 hover:underline">
                 How to fix
               </button>
             </div>
-            <CopyPill value={dkim} />
+            <CopyPill value={dkimRecord} />
             <div className="mt-2 text-xs text-muted-foreground">
               DomainKeys Identified Mail verifies message integrity.
             </div>
@@ -123,12 +140,12 @@ export default function DnsSection({
                 <div className="font-semibold text-sm">DMARC</div>
                 <Badge
                   className={`${
-                    isMicrosoft
-                      ? 'bg-orange-50 text-orange-700 border border-orange-200'
-                      : 'bg-green-50 text-green-700 border border-green-200'
+                    dmarcStatus === 'healthy'
+                      ? 'bg-green-50 text-green-700 border border-green-200'
+                      : 'bg-orange-50 text-orange-700 border border-orange-200'
                   } uppercase`}
                 >
-                  {isMicrosoft ? 'Warning' : 'Healthy'}
+                  {dmarcStatus === 'healthy' ? 'Healthy' : 'Warning'}
                 </Badge>
               </div>
               <button className="text-xs font-medium text-blue-600 hover:underline">
@@ -136,7 +153,7 @@ export default function DnsSection({
               </button>
             </div>
             <div className="mt-2 rounded-xl border bg-muted/20 px-3 py-2 text-xs font-mono break-all">
-              {spf}
+              {dmarcRecord}
             </div>
 
             <div className="mt-2 text-xs text-muted-foreground">

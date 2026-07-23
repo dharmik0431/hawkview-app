@@ -26,6 +26,10 @@ export type ChangeEvent = {
   target?: string
   source: ChangeSource
 
+  ip?: string
+  location?: { city?: string; region?: string; country?: string }
+  client?: { app?: string; device?: string }
+
   // for a simple diff view
   before?: Record<string, any>
   after?: Record<string, any>

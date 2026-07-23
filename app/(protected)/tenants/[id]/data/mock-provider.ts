@@ -4,7 +4,7 @@ import type {
   TenantSummary,
 } from './provider'
 import type { TenantMockBundle } from '../mock/types'
-import { getMockTenant } from '../mock' // adjust if your path differs
+import { getMockTenant } from '../mock/getMockTenant'
 
 export const mockProvider: TenantDataProvider = {
   async getTenantSummary(id: string): Promise<TenantSummary> {

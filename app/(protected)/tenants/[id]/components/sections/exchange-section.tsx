@@ -29,19 +29,25 @@ export default function ExchangePage({
   )
 
   // ✅ Pull from mock bundle (NOT hardcoded)
-  const EXCHANGE_MAILBOXES = Array.isArray(bundle?.exchange?.mailboxes)
-    ? bundle.exchange.mailboxes
-    : []
+  const EXCHANGE_MAILBOXES = useMemo(
+    () => (Array.isArray(bundle?.exchange?.mailboxes) ? bundle.exchange.mailboxes : []),
+    [bundle]
+  )
 
-  const EXCHANGE_RULES = Array.isArray(bundle?.exchange?.rules)
-    ? bundle.exchange.rules
-    : Array.isArray(bundle?.exchange?.transportRules)
-      ? bundle.exchange.transportRules
-      : []
+  const EXCHANGE_RULES = useMemo(
+    () =>
+      Array.isArray(bundle?.exchange?.rules)
+        ? bundle.exchange.rules
+        : Array.isArray(bundle?.exchange?.transportRules)
+          ? bundle.exchange.transportRules
+          : [],
+    [bundle]
+  )
 
-  const EXCHANGE_GROUPS = Array.isArray(bundle?.exchange?.groups)
-    ? bundle.exchange.groups
-    : []
+  const EXCHANGE_GROUPS = useMemo(
+    () => (Array.isArray(bundle?.exchange?.groups) ? bundle.exchange.groups : []),
+    [bundle]
+  )
 
   const EXCHANGE_DOMAINS = Array.isArray(bundle?.exchange?.domains)
     ? bundle.exchange.domains

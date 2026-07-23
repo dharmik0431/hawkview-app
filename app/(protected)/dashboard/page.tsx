@@ -220,7 +220,7 @@ export default function DashboardPage() {
           t.name,
           t.domain,
           t.provider,
-          ...(t.top ?? []).map((x) => x.label),
+          ...(t.top ?? []).map((x: AttentionItem) => x.label),
         ]
           .join(' ')
           .toLowerCase()
@@ -268,7 +268,7 @@ export default function DashboardPage() {
     ).length
 
     const mfaGaps = tenants.filter((t) =>
-      (t.top ?? []).some((a) => (a.label ?? '').toLowerCase().includes('mfa'))
+      (t.top ?? []).some((a: AttentionItem) => (a.label ?? '').toLowerCase().includes('mfa'))
     ).length
 
     const avgScore =
