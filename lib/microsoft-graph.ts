@@ -652,6 +652,7 @@ export async function getLiveMicrosoftTenantBundle(
         },
       }
 
+      return bundle
       }
 
       const bundle = await withTimeout(fetchBundle(), 20000, 'Overall bundle request')
