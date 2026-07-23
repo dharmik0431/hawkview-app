@@ -3,7 +3,11 @@ import {
   getLiveMicrosoftTenantSummary,
   sanitizeGraphError,
 } from '@/lib/microsoft-graph'
-import { TENANTS } from '@/app/(protected)/tenants/[id]/mock/tenants'
+
+// This route depends on runtime credentials and live Microsoft Graph data.
+// Never execute or cache it as a static build-time route.
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 export async function GET() {
   const start = performance.now()
@@ -42,6 +46,10 @@ export async function GET() {
   }
 
   // Default: mock mode
+  // Load the large mock bundle only when mock mode is actually requested.
+  const { TENANTS } = await import(
+    '@/app/(protected)/tenants/[id]/mock/tenants'
+  )
   const duration = Math.round(performance.now() - start)
   if (process.env.NODE_ENV !== 'production') {
     console.log(`[API /api/tenants] Total duration (mock): ${duration}ms`)

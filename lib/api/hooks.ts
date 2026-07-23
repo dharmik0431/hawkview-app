@@ -20,12 +20,14 @@ export function useTenants() {
         clearTimeout(timeoutId)
         if (signal) signal.removeEventListener('abort', onAbort)
 
-        let data: TenantsResponse
-        try {
-          data = await res.json()
-        } catch {
-          throw new Error('Failed to parse response from server.')
+        const contentType = res.headers.get('content-type') || ''
+        if (!contentType.toLowerCase().includes('application/json')) {
+          throw new Error(
+            `Tenant service returned HTTP ${res.status} instead of JSON.`
+          )
         }
+
+        const data = (await res.json()) as TenantsResponse
 
         if (!res.ok) {
           throw new Error(data.error || `HTTP ${res.status}: Failed to load tenant directory.`)
