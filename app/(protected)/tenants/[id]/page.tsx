@@ -1223,6 +1223,21 @@ export default function TenantDetailsPage() {
     []
   )
 
+  // Keep the existing mock presentation in mock mode. In Microsoft mode the
+  // same components receive the normalized live Graph data.
+  const displayedCaPolicies =
+    tenant?.provider === 'microsoft'
+      ? ((bundle?.entra?.caPolicies ?? []) as ConditionalAccessPolicy[])
+      : caPolicies
+  const displayedAuthMethods =
+    tenant?.provider === 'microsoft'
+      ? ((bundle?.entra?.authMethods ?? []) as AuthMethodRow[])
+      : authMethods
+  const displayedNamedLocations =
+    tenant?.provider === 'microsoft'
+      ? ((bundle?.entra?.namedLocations ?? []) as NamedLocation[])
+      : NAMED_LOCATIONS
+
   if (!tenantId) {
     return (
       <Card className="rounded-2xl">
@@ -3293,13 +3308,13 @@ export default function TenantDetailsPage() {
               {entraTab === 'security' && (
                 <div className="mt-5">
                   <EntraSection
-                    policies={caPolicies as any}
+                    policies={displayedCaPolicies as any}
                     onPolicyClick={(p) => setSelectedPolicy(p as any)}
                   />
 
                   <div className="mt-6 grid grid-cols-1 gap-6 xl:grid-cols-2">
-                    <AuthMethodsCard rows={authMethods} />
-                    <NamedLocationsCard locations={NAMED_LOCATIONS} />
+                    <AuthMethodsCard rows={displayedAuthMethods} />
+                    <NamedLocationsCard locations={displayedNamedLocations} />
                   </div>
                 </div>
               )}
@@ -3309,8 +3324,15 @@ export default function TenantDetailsPage() {
                   <CardContent className="p-6">
                     <div className="font-semibold">License Activity</div>
                     <div className="mt-2 text-sm text-muted-foreground">
-                      Mock: recent assignments, SKU usage trend, dormant
-                      accounts.
+                      {tenant?.provider === 'microsoft'
+                        ? `${bundle?.licenses?.rows?.reduce(
+                            (total: number, row: any) =>
+                              total + Number(row.used || 0),
+                            0
+                          ) || 0} assigned licenses across ${
+                            bundle?.licenses?.rows?.length || 0
+                          } subscribed products.`
+                        : 'Mock: recent assignments, SKU usage trend, dormant accounts.'}
                     </div>
                   </CardContent>
                 </Card>

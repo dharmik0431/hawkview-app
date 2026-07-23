@@ -1,5 +1,5 @@
 import { ClientSecretCredential } from '@azure/identity'
-import { Client } from '@microsoft/microsoft-graph-client'
+import { Client, ResponseType } from '@microsoft/microsoft-graph-client'
 
 export interface MicrosoftConfig {
   tenantId: string
@@ -331,6 +331,339 @@ const CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes
 import { getFriendlySkuName } from './microsoft-sku-mapper'
 import { checkDomainDnsHealth } from './dns-lookup'
 
+function graphValues(result: PromiseSettledResult<any>): any[] {
+  return result.status === 'fulfilled' && Array.isArray(result.value?.value)
+    ? result.value.value
+    : []
+}
+
+function splitCsv(text: string): string[][] {
+  const rows: string[][] = []
+  let row: string[] = []
+  let value = ''
+  let quoted = false
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    const next = text[index + 1]
+
+    if (char === '"' && quoted && next === '"') {
+      value += '"'
+      index += 1
+    } else if (char === '"') {
+      quoted = !quoted
+    } else if (char === ',' && !quoted) {
+      row.push(value)
+      value = ''
+    } else if ((char === '\n' || char === '\r') && !quoted) {
+      if (char === '\r' && next === '\n') index += 1
+      row.push(value)
+      value = ''
+      if (row.some((cell) => cell.length > 0)) rows.push(row)
+      row = []
+    } else {
+      value += char
+    }
+  }
+
+  row.push(value)
+  if (row.some((cell) => cell.length > 0)) rows.push(row)
+  return rows
+}
+
+function mailboxUsageByUpn(csv: unknown): Map<string, Record<string, string>> {
+  if (typeof csv !== 'string' || csv.trim().length === 0) return new Map()
+
+  const rows = splitCsv(csv)
+  if (rows.length < 2) return new Map()
+
+  const headers = rows[0].map((header) =>
+    header.replace(/^\uFEFF/, '').trim().toLowerCase()
+  )
+  const upnIndex = headers.indexOf('user principal name')
+  if (upnIndex < 0) return new Map()
+
+  const result = new Map<string, Record<string, string>>()
+  for (const cells of rows.slice(1)) {
+    const upn = cells[upnIndex]?.trim().toLowerCase()
+    if (!upn) continue
+
+    const record: Record<string, string> = {}
+    headers.forEach((header, index) => {
+      record[header] = cells[index] ?? ''
+    })
+    result.set(upn, record)
+  }
+  return result
+}
+
+function graphLabel(value: string): string {
+  return value
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function flattenGraphValue(value: any): string[] {
+  if (value == null || value === false || value === '') return []
+  if (value === true) return ['Yes']
+  if (typeof value === 'string' || typeof value === 'number') {
+    return [String(value)]
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => flattenGraphValue(item))
+  }
+  if (typeof value === 'object') {
+    if (value.emailAddress?.address) {
+      return [value.emailAddress.address]
+    }
+    return Object.entries(value).flatMap(([key, nested]) =>
+      flattenGraphValue(nested).map((item) => `${graphLabel(key)}: ${item}`)
+    )
+  }
+  return []
+}
+
+function summarizeRuleObject(value: any): string[] {
+  if (!value || typeof value !== 'object') return []
+
+  return Object.entries(value).flatMap(([key, nested]) => {
+    const values = flattenGraphValue(nested)
+    if (values.length === 0) return []
+    return [`${graphLabel(key)}: ${values.join(', ')}`]
+  })
+}
+
+function mailboxTypeFromPurpose(
+  purpose: unknown,
+  user: any
+): 'User' | 'Shared' | 'Room' | 'Equipment' {
+  const normalized = String(purpose || '').toLowerCase()
+  if (normalized === 'shared') return 'Shared'
+  if (normalized === 'room') return 'Room'
+  if (normalized === 'equipment') return 'Equipment'
+
+  const searchable =
+    `${user?.displayName || ''} ${user?.userPrincipalName || ''}`.toLowerCase()
+  if (searchable.includes('room')) return 'Room'
+  if (searchable.includes('equipment')) return 'Equipment'
+  if (
+    user?.accountEnabled === false &&
+    (!Array.isArray(user?.assignedLicenses) ||
+      user.assignedLicenses.length === 0)
+  ) {
+    return 'Shared'
+  }
+  return 'User'
+}
+
+async function getMailboxPurposesAndRules(
+  client: Client,
+  mailboxUsers: any[]
+): Promise<{
+  purposes: Map<string, string>
+  rules: any[]
+}> {
+  const purposes = new Map<string, string>()
+  const rules: any[] = []
+  const requestMetadata = new Map<
+    string,
+    { kind: 'purpose' | 'rules'; user: any }
+  >()
+  const requests: Array<{ id: string; method: string; url: string }> = []
+
+  mailboxUsers.forEach((user, index) => {
+    const encodedId = encodeURIComponent(user.id)
+    const purposeId = `purpose-${index}`
+    const rulesId = `rules-${index}`
+    requests.push(
+      {
+        id: purposeId,
+        method: 'GET',
+        url: `/users/${encodedId}/mailboxSettings/userPurpose`,
+      },
+      {
+        id: rulesId,
+        method: 'GET',
+        url: `/users/${encodedId}/mailFolders/inbox/messageRules?$select=id,displayName,sequence,isEnabled,conditions,actions`,
+      }
+    )
+    requestMetadata.set(purposeId, { kind: 'purpose', user })
+    requestMetadata.set(rulesId, { kind: 'rules', user })
+  })
+
+  const batches: Array<Array<{ id: string; method: string; url: string }>> = []
+  for (let index = 0; index < requests.length; index += 20) {
+    batches.push(requests.slice(index, index + 20))
+  }
+
+  const batchResults = await Promise.allSettled(
+    batches.map((batch, index) =>
+      withTimeout(
+        client.api('/$batch').post({ requests: batch }),
+        8000,
+        `Exchange mailbox batch ${index + 1}`
+      )
+    )
+  )
+
+  for (const result of batchResults) {
+    if (result.status !== 'fulfilled') continue
+
+    for (const response of result.value?.responses || []) {
+      if (response?.status < 200 || response?.status >= 300) continue
+      const metadata = requestMetadata.get(String(response.id))
+      if (!metadata) continue
+
+      if (metadata.kind === 'purpose') {
+        const value = response.body?.value
+        if (value) purposes.set(metadata.user.id, value)
+        continue
+      }
+
+      for (const rule of response.body?.value || []) {
+        const conditions = summarizeRuleObject(rule.conditions)
+        const actions = summarizeRuleObject(rule.actions)
+        rules.push({
+          id: `${metadata.user.id}:${rule.id}`,
+          name: rule.displayName || 'Inbox rule',
+          mailboxUpn:
+            metadata.user.userPrincipalName || metadata.user.mail || '',
+          enabled: rule.isEnabled !== false,
+          priority: Number(rule.sequence || 0),
+          description:
+            conditions.length || actions.length
+              ? `${conditions.join('; ')}${conditions.length && actions.length ? ' → ' : ''}${actions.join('; ')}`
+              : 'Inbox rule',
+          actions,
+          conditions,
+        })
+      }
+    }
+  }
+
+  return { purposes, rules }
+}
+
+function authMethodName(id: unknown): string {
+  const names: Record<string, string> = {
+    microsoftAuthenticator: 'Microsoft Authenticator',
+    fido2: 'FIDO2 Security Key',
+    temporaryAccessPass: 'Temporary Access Pass',
+    sms: 'SMS',
+    voice: 'Voice Call',
+    email: 'Email OTP',
+    hardwareOath: 'Hardware OATH Tokens',
+    softwareOath: 'Software OATH Tokens',
+    x509Certificate: 'Certificate-based Authentication',
+    passKeyDeviceBound: 'Passkeys',
+    qrCode: 'QR Code',
+  }
+  const key = String(id || '')
+  return names[key] || graphLabel(key || 'Authentication method')
+}
+
+function grantControlLabel(value: unknown): string {
+  const labels: Record<string, string> = {
+    block: 'Block access',
+    mfa: 'Require multifactor authentication',
+    compliantDevice: 'Require device to be marked as compliant',
+    domainJoinedDevice: 'Require Microsoft Entra hybrid joined device',
+    approvedApplication: 'Require approved client app',
+    compliantApplication: 'Require app protection policy',
+    passwordChange: 'Require password change',
+    termsOfUse: 'Require terms of use',
+  }
+  const key = String(value || '')
+  return labels[key] || graphLabel(key)
+}
+
+function conditionalAccessTargetSummary(conditions: any): string {
+  const users = conditions?.users || {}
+  const includedUsers = Array.isArray(users.includeUsers)
+    ? users.includeUsers
+    : []
+  if (includedUsers.includes('All')) return 'All Users'
+  if (includedUsers.includes('GuestsOrExternalUsers')) {
+    return 'Guests and external users'
+  }
+
+  const total =
+    includedUsers.length +
+    (Array.isArray(users.includeGroups) ? users.includeGroups.length : 0) +
+    (Array.isArray(users.includeRoles) ? users.includeRoles.length : 0)
+  return total > 0 ? `${total} Users, Groups, or Roles` : 'Selected identities'
+}
+
+function mapConditionalAccessPolicies(rawPolicies: any[]): any[] {
+  return rawPolicies.map((policy) => {
+    const builtInControls = Array.isArray(policy?.grantControls?.builtInControls)
+      ? policy.grantControls.builtInControls
+      : []
+    const grantLabels = builtInControls.map(grantControlLabel)
+    const includePlatforms = Array.isArray(
+      policy?.conditions?.platforms?.includePlatforms
+    )
+      ? policy.conditions.platforms.includePlatforms
+      : []
+    const platformNames = includePlatforms
+      .map((platform: string) => {
+        const mapping: Record<string, string> = {
+          windows: 'Windows',
+          macOS: 'macOS',
+          iOS: 'iOS',
+          android: 'Android',
+        }
+        return mapping[platform]
+      })
+      .filter(Boolean)
+
+    return {
+      id: policy.id,
+      name: policy.displayName || 'Conditional Access policy',
+      state:
+        policy.state === 'enabled'
+          ? 'ON'
+          : policy.state === 'enabledForReportingButNotEnforced'
+            ? 'REPORT_ONLY'
+            : 'OFF',
+      origin: policy.templateId ? 'MICROSOFT_TEMPLATE' : 'CUSTOM',
+      targetSummary: conditionalAccessTargetSummary(policy.conditions),
+      grantSummary:
+        grantLabels.join(
+          policy?.grantControls?.operator === 'OR' ? ' or ' : ' and '
+        ) || 'Session or authentication controls',
+      assignments: {
+        usersAndGroups: {
+          include: [
+            ...(policy?.conditions?.users?.includeUsers || []),
+            ...(policy?.conditions?.users?.includeGroups || []).map(
+              (id: string) => `Group: ${id}`
+            ),
+            ...(policy?.conditions?.users?.includeRoles || []).map(
+              (id: string) => `Directory role: ${id}`
+            ),
+          ],
+          exclude: [
+            ...(policy?.conditions?.users?.excludeUsers || []),
+            ...(policy?.conditions?.users?.excludeGroups || []).map(
+              (id: string) => `Group: ${id}`
+            ),
+          ],
+        },
+        cloudApps: {
+          include: policy?.conditions?.applications?.includeApplications || [],
+        },
+      },
+      conditions:
+        platformNames.length > 0 ? { platforms: platformNames } : undefined,
+      accessControls: {
+        grant: grantLabels,
+      },
+    }
+  })
+}
+
 export async function getLiveMicrosoftTenantBundle(
   tenantId?: string,
   options?: { forceRefresh?: boolean }
@@ -393,7 +726,7 @@ export async function getLiveMicrosoftTenantBundle(
         })
 
         const usersCall = withTimeout(
-          client.api('/users').top(999).select('id,displayName,userPrincipalName,userType,accountEnabled,createdDateTime,signInActivity').get(),
+          client.api('/users').top(500).select('id,displayName,userPrincipalName,mail,proxyAddresses,userType,accountEnabled,createdDateTime,signInActivity,assignedLicenses').get(),
           8000,
           'Users request'
         )
@@ -404,19 +737,99 @@ export async function getLiveMicrosoftTenantBundle(
           'Sign-ins request'
         )
 
-        // Execute independent Graph calls in parallel
+        // These enrichments are deliberately optional. A missing permission
+        // leaves only that section empty instead of taking down the tenant.
+        const caPoliciesCall = withTimeout(
+          client.api('/identity/conditionalAccess/policies').get(),
+          8000,
+          'Conditional Access policies request'
+        )
+        const authMethodsPolicyCall = withTimeout(
+          client.api('/policies/authenticationMethodsPolicy').get(),
+          8000,
+          'Authentication methods policy request'
+        )
+        const namedLocationsCall = withTimeout(
+          client.api('/identity/conditionalAccess/namedLocations').get(),
+          8000,
+          'Named locations request'
+        )
+        const registrationDetailsCall = withTimeout(
+          client.api('/reports/authenticationMethods/userRegistrationDetails').top(999).get(),
+          8000,
+          'Authentication registration details request'
+        )
+        const roleAssignmentsCall = withTimeout(
+          client.api('/roleManagement/directory/roleAssignments').expand('roleDefinition').top(999).get(),
+          8000,
+          'Directory roles request'
+        )
+        const groupsCall = withTimeout(
+          client
+            .api('/groups')
+            .filter('mailEnabled eq true')
+            .select('id,displayName,description,mail,mailEnabled,securityEnabled,groupTypes,membershipRule,proxyAddresses')
+            .expand('members($select=id),owners($select=id,displayName,userPrincipalName)')
+            .top(999)
+            .get(),
+          8000,
+          'Groups request'
+        )
+        const domainsCall = withTimeout(
+          client.api('/domains').get(),
+          8000,
+          'Domains request'
+        )
+        const devicesCall = withTimeout(
+          client
+            .api('/devices')
+            .select('id,displayName,operatingSystem,approximateLastSignInDateTime,accountEnabled')
+            .expand('registeredOwners($select=id)')
+            .top(999)
+            .get(),
+          8000,
+          'Devices request'
+        )
+        const mailboxUsageCall = withTimeout(
+          client
+            .api("/reports/getMailboxUsageDetail(period='D7')")
+            .responseType(ResponseType.TEXT)
+            .get(),
+          8000,
+          'Mailbox usage report request'
+        )
+
+        // Execute independent Graph calls in parallel.
         const [
           orgResult,
           scoreResult,
           skusResult,
           usersResult,
           signInsResult,
+          caPoliciesResult,
+          authMethodsPolicyResult,
+          namedLocationsResult,
+          registrationDetailsResult,
+          roleAssignmentsResult,
+          groupsResult,
+          domainsResult,
+          devicesResult,
+          mailboxUsageResult,
         ] = await Promise.allSettled([
           orgCall,
           scoreCall,
           skusCall,
           usersCall,
           signInsCall,
+          caPoliciesCall,
+          authMethodsPolicyCall,
+          namedLocationsCall,
+          registrationDetailsCall,
+          roleAssignmentsCall,
+          groupsCall,
+          domainsCall,
+          devicesCall,
+          mailboxUsageCall,
         ])
 
       // 1. Organization (Required for identity)
@@ -464,6 +877,7 @@ export async function getLiveMicrosoftTenantBundle(
         available: number
         utilization: number
       }> = []
+      const skuNamesById = new Map<string, string>()
 
       if (skusResult.status === 'fulfilled' && Array.isArray(skusResult.value?.value)) {
         for (const sku of skusResult.value.value) {
@@ -473,6 +887,9 @@ export async function getLiveMicrosoftTenantBundle(
           const utilization = total > 0 ? (used / total) * 100 : 0
           const skuPartNumber = sku.skuPartNumber || sku.skuId || 'UNKNOWN_SKU'
           const friendlyName = getFriendlySkuName(sku.skuPartNumber, sku.skuId)
+          if (sku.skuId) {
+            skuNamesById.set(String(sku.skuId).toLowerCase(), friendlyName)
+          }
 
           licenseCount += used
           licenseRows.push({
@@ -486,31 +903,109 @@ export async function getLiveMicrosoftTenantBundle(
         }
       }
 
-      // 4. Server-side live DNS check
-      const dnsHealth = await checkDomainDnsHealth(domain, options?.forceRefresh)
+      // 4. Server-side live DNS check and per-mailbox Graph data.
+      const rawUsers = graphValues(usersResult)
+      const mailboxUsers = rawUsers.filter(
+        (user) => user?.id && (user?.userPrincipalName || user?.mail)
+      )
+      const [dnsHealth, mailboxDetailsResult] = await Promise.all([
+        checkDomainDnsHealth(domain, options?.forceRefresh),
+        getMailboxPurposesAndRules(client, mailboxUsers).catch(() => ({
+          purposes: new Map<string, string>(),
+          rules: [],
+        })),
+      ])
 
-      // 5. Users
-      const users: any[] = []
-      if (usersResult.status === 'fulfilled' && Array.isArray(usersResult.value?.value)) {
-        for (const u of usersResult.value.value) {
-          users.push({
-            id: u.id,
-            name: u.displayName || u.userPrincipalName || 'User',
-            email: u.userPrincipalName || '',
-            type: u.userType === 'Guest' ? 'Guest' : 'Member',
-            role: 'User',
-            status: u.accountEnabled !== false ? 'Enabled' : 'Disabled',
-            mfa: 'Disabled',
-            lastLogin: u.signInActivity?.lastSignInDateTime || u.createdDateTime || new Date().toISOString(),
-            driveUsage: '0 GB',
-            mailUsage: '0 MB',
-            authMethods: [],
-            licenses: [],
-            groups: [],
-            devices: [],
-          })
+      const registrationByUpn = new Map<string, any>()
+      for (const registration of graphValues(registrationDetailsResult)) {
+        const key = String(registration.userPrincipalName || '').toLowerCase()
+        if (key) registrationByUpn.set(key, registration)
+      }
+
+      const roleByUserId = new Map<string, string>()
+      for (const assignment of graphValues(roleAssignmentsResult)) {
+        const principalId = String(assignment.principalId || '')
+        const roleName = String(assignment.roleDefinition?.displayName || '')
+        if (!principalId || !roleName) continue
+        if (roleName === 'Global Administrator') {
+          roleByUserId.set(principalId, 'Global Administrator')
+        } else if (roleName === 'External Identity Provider Administrator') {
+          roleByUserId.set(principalId, 'External Auditor')
+        } else if (!roleByUserId.has(principalId)) {
+          roleByUserId.set(principalId, 'User')
         }
       }
+
+      const groupNamesByUserId = new Map<string, string[]>()
+      for (const group of graphValues(groupsResult)) {
+        for (const member of group.members || []) {
+          const current = groupNamesByUserId.get(member.id) || []
+          current.push(group.displayName || group.mail || 'Group')
+          groupNamesByUserId.set(member.id, current)
+        }
+      }
+
+      const devicesByUserId = new Map<string, any[]>()
+      for (const device of graphValues(devicesResult)) {
+        for (const owner of device.registeredOwners || []) {
+          const current = devicesByUserId.get(owner.id) || []
+          current.push({
+            name: device.displayName || 'Registered device',
+            os: device.operatingSystem || 'Unknown',
+            lastSync:
+              device.approximateLastSignInDateTime || new Date(0).toISOString(),
+            status: device.accountEnabled === false ? 'Disabled' : 'Compliant',
+          })
+          devicesByUserId.set(owner.id, current)
+        }
+      }
+
+      const mailboxUsage = mailboxUsageByUpn(
+        mailboxUsageResult.status === 'fulfilled'
+          ? mailboxUsageResult.value
+          : ''
+      )
+
+      // 5. Users
+      const users: any[] = rawUsers.map((user) => {
+        const upn = String(user.userPrincipalName || user.mail || '')
+        const registration = registrationByUpn.get(upn.toLowerCase())
+        const usage = mailboxUsage.get(upn.toLowerCase())
+        const storageBytes = Number(
+          usage?.['storage used (byte)'] ||
+            usage?.['storage used (bytes)'] ||
+            0
+        )
+
+        return {
+          id: user.id,
+          name: user.displayName || upn || 'User',
+          email: upn,
+          type: user.userType === 'Guest' ? 'Guest' : 'Member',
+          role: roleByUserId.get(user.id) || 'User',
+          status: user.accountEnabled !== false ? 'Enabled' : 'Disabled',
+          mfa: registration?.isMfaRegistered ? 'Enabled' : 'Disabled',
+          lastLogin:
+            user.signInActivity?.lastSignInDateTime ||
+            user.createdDateTime ||
+            new Date().toISOString(),
+          driveUsage: '0 GB',
+          mailUsage:
+            storageBytes > 0
+              ? `${(storageBytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+              : '0 GB',
+          authMethods: Array.isArray(registration?.methodsRegistered)
+            ? registration.methodsRegistered.map(authMethodName)
+            : [],
+          licenses: (user.assignedLicenses || [])
+            .map((license: any) =>
+              skuNamesById.get(String(license.skuId || '').toLowerCase())
+            )
+            .filter(Boolean),
+          groups: groupNamesByUserId.get(user.id) || [],
+          devices: devicesByUserId.get(user.id) || [],
+        }
+      })
 
       // 6. Sign-ins
       const signIns: any[] = []
@@ -535,7 +1030,136 @@ export async function getLiveMicrosoftTenantBundle(
         }
       }
 
-      // 7. Health Calculation
+      // 7. Entra ID security data
+      const rawCaPolicies = graphValues(caPoliciesResult)
+      const caPolicies = mapConditionalAccessPolicies(rawCaPolicies)
+
+      const authPolicy =
+        authMethodsPolicyResult.status === 'fulfilled'
+          ? authMethodsPolicyResult.value
+          : null
+      const rawAuthMethods =
+        authPolicy?.authenticationMethodConfigurations ||
+        authPolicy?.configurations ||
+        []
+      const authMethods = (Array.isArray(rawAuthMethods) ? rawAuthMethods : []).map(
+        (method: any) => {
+          const includeTargets = Array.isArray(method.includeTargets)
+            ? method.includeTargets
+            : []
+          const targetsAllUsers = includeTargets.some(
+            (target: any) =>
+              target.targetType === 'group' && target.id === 'all_users'
+          )
+          return {
+            id: method.id || method['@odata.type'] || crypto.randomUUID(),
+            name: authMethodName(method.id),
+            target: targetsAllUsers
+              ? 'All users'
+              : includeTargets.length > 0
+                ? `${includeTargets.length} selected group${includeTargets.length === 1 ? '' : 's'}`
+                : 'No users',
+            status: method.state === 'enabled' ? 'ENABLED' : 'DISABLED',
+          }
+        }
+      )
+
+      const blockedLocationIds = new Set<string>()
+      for (const policy of rawCaPolicies) {
+        if (
+          policy?.grantControls?.builtInControls?.includes('block') &&
+          Array.isArray(policy?.conditions?.locations?.includeLocations)
+        ) {
+          for (const locationId of policy.conditions.locations.includeLocations) {
+            if (locationId !== 'All' && locationId !== 'AllTrusted') {
+              blockedLocationIds.add(locationId)
+            }
+          }
+        }
+      }
+
+      const namedLocations = graphValues(namedLocationsResult).map(
+        (location: any) => ({
+          id: location.id,
+          name: location.displayName || 'Named location',
+          type: blockedLocationIds.has(location.id) ? 'BLOCKED' : 'TRUSTED',
+          addresses: [
+            ...(location.ipRanges || [])
+              .map((range: any) => range.cidrAddress)
+              .filter(Boolean),
+            ...(location.countriesAndRegions || []),
+          ],
+        })
+      )
+
+      // 8. Exchange data available through Microsoft Graph.
+      const mailboxes = mailboxUsers.map((user) => {
+        const upn = String(user.userPrincipalName || user.mail || '')
+        const usage = mailboxUsage.get(upn.toLowerCase())
+        const storageBytes = Number(
+          usage?.['storage used (byte)'] ||
+            usage?.['storage used (bytes)'] ||
+            0
+        )
+        const aliases = (user.proxyAddresses || [])
+          .map((address: string) => address.replace(/^smtp:/i, ''))
+          .filter(
+            (address: string) =>
+              address && address.toLowerCase() !== upn.toLowerCase()
+          )
+
+        return {
+          id: user.id,
+          displayName: user.displayName || upn || 'Mailbox',
+          userPrincipalName: upn,
+          aliases,
+          mailboxType: mailboxTypeFromPurpose(
+            mailboxDetailsResult.purposes.get(user.id),
+            user
+          ),
+          sizeGB: Number((storageBytes / 1024 / 1024 / 1024).toFixed(2)),
+          itemCount: Number(usage?.['item count'] || 0),
+          archiveEnabled:
+            String(usage?.['has archive'] || '').toLowerCase() === 'true' ||
+            Number(usage?.['archive item count'] || 0) > 0,
+          delegation: {},
+          lastLogon:
+            usage?.['last activity date'] ||
+            user.signInActivity?.lastSignInDateTime ||
+            undefined,
+        }
+      })
+
+      const acceptedDomains = graphValues(domainsResult).map((item: any) => ({
+        id: item.id || item.domainName,
+        domain: item.id || item.domainName,
+        // Graph exposes verified Entra domains. Exchange accepted-domain relay
+        // type requires Exchange Online administration APIs.
+        type: 'Authoritative',
+        isDefault: item.isDefault === true,
+      }))
+
+      const exchangeGroups = graphValues(groupsResult).map((group: any) => ({
+        id: group.id,
+        name: group.displayName || group.mail || 'Mail-enabled group',
+        type: Array.isArray(group.groupTypes) &&
+          group.groupTypes.includes('Unified')
+          ? 'Microsoft365'
+          : group.securityEnabled
+            ? 'MailEnabledSecurity'
+            : 'DistributionList',
+        email: group.mail || '',
+        membersCount: Array.isArray(group.members) ? group.members.length : 0,
+        owners: (group.owners || [])
+          .map(
+            (owner: any) =>
+              owner.displayName || owner.userPrincipalName || owner.id
+          )
+          .filter(Boolean),
+        description: group.description || undefined,
+      }))
+
+      // 9. Health Calculation
       // Critical: Microsoft Graph connection fails, required endpoints unreachable, no successful sync, or last sync > 24h
       // Warning: Graph connected & current, but Secure Score < 50%, or SPF/DKIM/DMARC warning, or SKU >= 90% utilization
       // Healthy: Connected, current, no known warning condition
@@ -580,15 +1204,15 @@ export async function getLiveMicrosoftTenantBundle(
           blacklist: dnsHealth.blacklist,
         },
         entra: {
-          caPolicies: [],
-          authMethods: [],
-          namedLocations: [],
+          caPolicies,
+          authMethods,
+          namedLocations,
         },
         exchange: {
-          mailboxes: [],
-          rules: [],
-          acceptedDomains: [],
-          groups: [],
+          mailboxes,
+          rules: mailboxDetailsResult.rules,
+          acceptedDomains,
+          groups: exchangeGroups,
         },
         sharepoint: {
           overview: {
@@ -655,7 +1279,7 @@ export async function getLiveMicrosoftTenantBundle(
       return bundle
       }
 
-      const bundle = await withTimeout(fetchBundle(), 20000, 'Overall bundle request')
+      const bundle = await withTimeout(fetchBundle(), 30000, 'Overall bundle request')
 
       bundleCache.set(cacheKey, {
         data: bundle,
