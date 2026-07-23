@@ -323,6 +323,8 @@ interface CacheEntry {
 
 const bundleCache = new Map<string, CacheEntry>()
 const pendingBundleRequests = new Map<string, Promise<any>>()
+let summaryCache: CacheEntry | null = null
+let pendingSummaryRequest: Promise<MicrosoftTenantSummary> | null = null
 
 const CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes
 
@@ -675,6 +677,114 @@ export async function getLiveMicrosoftTenantBundle(
 export async function getLiveMicrosoftTenantSummary(options?: {
   forceRefresh?: boolean
 }): Promise<MicrosoftTenantSummary> {
-  const bundle = await getLiveMicrosoftTenantBundle('default', options)
-  return bundle.tenant
+  if (options?.forceRefresh) {
+    summaryCache = null
+  } else if (summaryCache && Date.now() < summaryCache.expiresAt) {
+    return summaryCache.data as MicrosoftTenantSummary
+  }
+
+  if (pendingSummaryRequest) {
+    return pendingSummaryRequest
+  }
+
+  pendingSummaryRequest = withTimeout(
+    (async () => {
+      const client = await getGraphClient()
+
+      // The directory card needs only these three lightweight calls. Users,
+      // sign-ins, DNS, and the full tenant bundle load after Manage Tenant.
+      const [orgResult, scoreResult, skusResult] = await Promise.allSettled([
+        withTimeout(
+          client
+            .api('/organization')
+            .select('id,displayName,verifiedDomains')
+            .get(),
+          8000,
+          'Organization summary request'
+        ),
+        withTimeout(
+          client.api('/security/secureScores').top(1).get(),
+          8000,
+          'Secure Score summary request'
+        ),
+        withTimeout(
+          client.api('/subscribedSkus').get(),
+          8000,
+          'License summary request'
+        ),
+      ])
+
+      if (orgResult.status === 'rejected') {
+        throw orgResult.reason
+      }
+
+      const org = orgResult.value?.value?.[0]
+      if (!org) {
+        throw new Error('No organization details returned from Microsoft Graph.')
+      }
+
+      const verifiedDomains = Array.isArray(org.verifiedDomains)
+        ? org.verifiedDomains
+        : []
+      const domains = verifiedDomains
+        .map((domain: any) => domain?.name)
+        .filter(Boolean)
+      const defaultDomain =
+        verifiedDomains.find((domain: any) => domain?.isDefault) ||
+        verifiedDomains.find((domain: any) => domain?.isInitial) ||
+        verifiedDomains[0]
+
+      let secureScore = 0
+      let hasWarning = scoreResult.status === 'rejected'
+      if (scoreResult.status === 'fulfilled') {
+        const score = scoreResult.value?.value?.[0]
+        if (score?.maxScore > 0) {
+          secureScore = Math.round(
+            (Number(score.currentScore || 0) / Number(score.maxScore)) * 100
+          )
+          if (secureScore < 50) hasWarning = true
+        }
+      }
+
+      let licenseCount = 0
+      if (
+        skusResult.status === 'fulfilled' &&
+        Array.isArray(skusResult.value?.value)
+      ) {
+        for (const sku of skusResult.value.value) {
+          const used = Number(sku?.consumedUnits || 0)
+          const total = Number(sku?.prepaidUnits?.enabled || 0)
+          licenseCount += used
+          if (total > 0 && used / total >= 0.9) hasWarning = true
+        }
+      } else {
+        hasWarning = true
+      }
+
+      const summary: MicrosoftTenantSummary = {
+        id: org.id || 'microsoft-tenant',
+        name: org.displayName || 'Microsoft Tenant',
+        domain: defaultDomain?.name || domains[0] || 'unknown',
+        domains,
+        provider: 'microsoft',
+        status: hasWarning ? 'warning' : 'healthy',
+        secureScore,
+        licenseCount,
+        lastSync: new Date().toISOString(),
+      }
+
+      summaryCache = {
+        data: summary,
+        expiresAt: Date.now() + CACHE_TTL_MS,
+      }
+
+      return summary
+    })(),
+    18000,
+    'Tenant directory summary request'
+  ).finally(() => {
+    pendingSummaryRequest = null
+  })
+
+  return pendingSummaryRequest
 }
