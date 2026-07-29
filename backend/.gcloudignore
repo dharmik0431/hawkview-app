@@ -1,0 +1,10 @@
+.gcloudignore
+.git
+.gitignore
+node_modules
+dist
+src/generated/prisma
+.env
+.env.*
+npm-debug.log*
+README.md

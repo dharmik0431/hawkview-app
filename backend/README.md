@@ -34,3 +34,17 @@ GET /health/database
 
 `/health/database` checks the PostgreSQL connection and returns only a safe
 availability status. It never returns credentials or database details.
+
+## Development deployment
+
+The development API is deployed separately from the Google AI Studio frontend:
+
+```text
+Cloud Run service: hawkview-api-dev
+Cloud SQL instance: hawkview-db-dev
+Region: northamerica-northeast2
+```
+
+Cloud Run receives `DATABASE_URL` from Secret Manager and connects through the
+Cloud SQL integration. Database credentials are not included in the container
+image or committed to Git.
