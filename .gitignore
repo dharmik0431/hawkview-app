@@ -79,6 +79,15 @@ web_modules/
 .env.production.local
 .env.local
 
+# Generated Prisma client
+backend/src/generated/prisma/
+
+# Local Google Cloud CLI credentials and configuration
+.gcloud/
+
+# Local development tools
+.tools/
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
