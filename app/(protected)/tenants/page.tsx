@@ -8,7 +8,6 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
-import { TENANT_MOCKS } from './[id]/mock/tenants'
 import { useTenants } from '@/lib/api/hooks'
 import { useQueryClient } from '@tanstack/react-query'
 
@@ -117,7 +116,6 @@ export default function TenantsPage() {
   }, [loading])
 
   const tenants = data?.tenants || []
-  const dataMode = data?.mode || 'mock'
   const errorMessage = error ? (error as Error).message : data?.error || null
 
   const handleRetry = () => {
@@ -153,12 +151,10 @@ export default function TenantsPage() {
             <h1 className="text-3xl font-bold tracking-tight text-slate-900 dark:text-white">
               Tenant Directory
             </h1>
-            {dataMode === 'microsoft' && (
-              <Badge className="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-3 py-1 rounded-full text-xs shadow-sm flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                Live Microsoft Data
-              </Badge>
-            )}
+            <Badge className="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-3 py-1 rounded-full text-xs shadow-sm flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-emerald-400" />
+              Database-backed API
+            </Badge>
           </div>
           <p className="mt-2 text-base text-slate-500 dark:text-slate-400">
             Select a tenant environment to manage security, licenses, and users.
@@ -299,9 +295,7 @@ export default function TenantsPage() {
                     <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">
                       Needs Attention
                     </p>
-                    <NeedsAttentionCell
-                      tenant={{ ...tenant, bundle: TENANT_MOCKS?.[tenant.id] }}
-                    />
+                    <NeedsAttentionCell tenant={tenant} />
                   </div>
 
                   <div className="grid grid-cols-2 gap-4 mb-6 relative z-10">

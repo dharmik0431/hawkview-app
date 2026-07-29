@@ -15,8 +15,7 @@ import {
   ChevronRight,
 } from 'lucide-react'
 
-import { TENANTS, TENANT_MOCKS } from '../tenants/[id]/mock/tenants'
-import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
+import { useTenants } from '@/lib/api/hooks'
 
 type Severity = 'critical' | 'high' | 'medium'
 type TabKey = 'queue' | 'matrix'
@@ -123,7 +122,12 @@ function ScrollPanel({ children }: { children: React.ReactNode }) {
   )
 }
 
-type TenantRow = (typeof TENANTS)[number] & {
+type TenantRow = {
+  id: string
+  name: string
+  domain: string
+  provider: 'microsoft' | 'google'
+  secureScore: number
   attention: AttentionItem[]
   top: AttentionItem[]
   topSeverity?: Severity
@@ -132,10 +136,9 @@ type TenantRow = (typeof TENANTS)[number] & {
   identityDetected: number
 }
 
-function buildTenants(): TenantRow[] {
-  return (TENANTS ?? []).map((t: any) => {
-    const bundle = (TENANT_MOCKS as any)?.[t.id]
-    const attention = (computeTenantAttention(bundle) ?? []) as AttentionItem[]
+function buildTenants(source: any[]): TenantRow[] {
+  return (source ?? []).map((t: any) => {
+    const attention = (t.attention ?? []) as AttentionItem[]
     const top = topAttention(attention)
 
     const topSeverity =
@@ -201,13 +204,17 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
 }
 
 export default function DashboardPage() {
+  const { data } = useTenants()
   const [tab, setTab] = React.useState<TabKey>('queue')
 
   const [tenantId, setTenantId] = React.useState<string>('all')
   const [severity, setSeverity] = React.useState<'all' | Severity>('all')
   const [search, setSearch] = React.useState('')
 
-  const tenants = React.useMemo(() => buildTenants(), [])
+  const tenants = React.useMemo(
+    () => buildTenants(data?.tenants ?? []),
+    [data?.tenants]
+  )
 
   const filteredTenants = React.useMemo(() => {
     const q = search.trim().toLowerCase()

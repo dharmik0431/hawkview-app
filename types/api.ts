@@ -10,7 +10,6 @@ export const TenantSchema = z.object({
 export type Tenant = z.infer<typeof TenantSchema>
 
 export const TenantsResponseSchema = z.object({
-  mode: z.enum(['microsoft', 'mock']).optional(),
   tenants: z.array(z.any()),
   error: z.string().optional(),
 })
