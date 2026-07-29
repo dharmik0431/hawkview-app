@@ -9,6 +9,7 @@
     "db:validate": "prisma validate",
     "db:migrate:dev": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
     "db:studio": "prisma studio",
     "db:verify": "node scripts/verify-database.mjs"
   },
@@ -22,6 +23,7 @@
     "@types/node": "^26.1.2",
     "@types/pg": "^8.20.0",
     "prisma": "^7.9.1",
+    "tsx": "^4.23.1",
     "typescript": "^7.0.2"
   }
 }
