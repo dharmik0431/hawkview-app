@@ -31,6 +31,20 @@ enum MembershipStatus {
   SUSPENDED
 }
 
+enum CustomerTenantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  DISCONNECTED
+}
+
+enum TenantConnectionStatus {
+  PENDING_CONSENT
+  CONNECTED
+  ERROR
+  REVOKED
+}
+
 model User {
   id           String       @id @default(uuid()) @db.Uuid
   email        String       @unique @db.VarChar(320)
@@ -47,13 +61,14 @@ model User {
 }
 
 model Organization {
-  id          String             @id @default(uuid()) @db.Uuid
-  name        String             @db.VarChar(200)
-  slug        String             @unique @db.VarChar(100)
-  status      OrganizationStatus @default(ACTIVE)
-  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
-  memberships Membership[]
+  id              String             @id @default(uuid()) @db.Uuid
+  name            String             @db.VarChar(200)
+  slug            String             @unique @db.VarChar(100)
+  status          OrganizationStatus @default(ACTIVE)
+  createdAt       DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+  memberships     Membership[]
+  customerTenants CustomerTenant[]
 
   @@index([status])
   @@map("organizations")
@@ -74,4 +89,39 @@ model Membership {
   @@index([organizationId, role])
   @@index([userId, status])
   @@map("memberships")
+}
+
+model CustomerTenant {
+  id                String               @id @default(uuid()) @db.Uuid
+  organizationId    String               @map("organization_id") @db.Uuid
+  microsoftTenantId String               @unique @map("microsoft_tenant_id") @db.Uuid
+  displayName       String               @map("display_name") @db.VarChar(200)
+  status            CustomerTenantStatus @default(PENDING)
+  createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization      Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  connection        TenantConnection?
+
+  @@unique([id, organizationId])
+  @@index([organizationId, status])
+  @@map("customer_tenants")
+}
+
+model TenantConnection {
+  id                   String                 @id @default(uuid()) @db.Uuid
+  organizationId       String                 @map("organization_id") @db.Uuid
+  customerTenantId     String                 @map("customer_tenant_id") @db.Uuid
+  status               TenantConnectionStatus @default(PENDING_CONSENT)
+  consentedPermissions String[]               @default([]) @map("consented_permissions")
+  consentedAt          DateTime?              @map("consented_at") @db.Timestamptz(6)
+  lastVerifiedAt       DateTime?              @map("last_verified_at") @db.Timestamptz(6)
+  lastErrorCode        String?                @map("last_error_code") @db.VarChar(100)
+  lastErrorMessage     String?                @map("last_error_message") @db.Text
+  createdAt            DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+  customerTenant       CustomerTenant         @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, organizationId])
+  @@index([organizationId, status])
+  @@map("tenant_connections")
 }
