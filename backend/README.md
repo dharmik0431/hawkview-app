@@ -1,8 +1,8 @@
 # HawkView backend
 
-This package contains the HawkView API and PostgreSQL access. Microsoft Graph
-synchronization, authentication, and server-side authorization will be added
-in later milestones.
+This package contains the HawkView API, PostgreSQL access, and Identity Platform
+token verification. Microsoft Graph synchronization and detailed server-side
+authorization will be added in later milestones.
 
 Prisma is isolated here so database credentials and generated database code are
 never included in the frontend package.
@@ -48,3 +48,29 @@ Region: northamerica-northeast2
 Cloud Run receives `DATABASE_URL` from Secret Manager and connects through the
 Cloud SQL integration. Database credentials are not included in the container
 image or committed to Git.
+
+## Authentication
+
+Google Cloud Identity Platform verifies sign-ins. Passwordless-capable email
+authentication is enabled first; Google and Microsoft will be enabled after
+their provider and redirect settings are available. HawkView remains
+responsible for its own users, memberships, roles, and tenant authorization in
+PostgreSQL.
+
+Authenticated API requests must include an Identity Platform ID token:
+
+```text
+Authorization: Bearer ID_TOKEN
+```
+
+The global authentication guard protects every endpoint unless it is explicitly
+marked public. The two health endpoints are public. After a first successful
+sign-in, the frontend calls:
+
+```text
+POST /auth/bootstrap
+```
+
+That endpoint safely links the verified Identity Platform user ID to the
+HawkView `User` record and returns the user's active MSP memberships. It never
+trusts an organization or role supplied by the browser.
