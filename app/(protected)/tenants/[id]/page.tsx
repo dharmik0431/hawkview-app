@@ -4,8 +4,6 @@ import React, { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import { useParams, useRouter } from 'next/navigation'
 
-import { TENANTS } from './mock/tenants'
-
 //Importing different sections
 import DnsSection from './components/sections/dns-section'
 import LicensesSection from './components/sections/licenses-section'
@@ -13,7 +11,8 @@ import EntraSection from './components/sections/entra-section'
 import ExchangePage from './components/sections/exchange-section'
 import SharePointPage from './components/sections/sharepoint-section'
 
-import type { TenantMockBundle } from './mock/types'
+import type { TenantBundle } from '@/types/tenant-data'
+import { apiClient } from '@/lib/api/client'
 
 import {
   ComposableMap,
@@ -947,12 +946,12 @@ export default function TenantDetailsPage() {
   const router = useRouter()
   const tenantId = params?.id
 
-  const [bundle, setBundle] = useState<TenantMockBundle | null>(null)
+  const [bundle, setBundle] = useState<TenantBundle | null>(null)
   const [loadState, setLoadState] = useState<
     'loading' | 'ready' | 'error'
   >('loading')
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [tenantsList, setTenantsList] = useState<any[]>(TENANTS)
+  const [tenantsList, setTenantsList] = useState<any[]>([])
 
   const fetchBundle = async (refresh = false) => {
     if (!tenantId) return
@@ -965,20 +964,14 @@ export default function TenantDetailsPage() {
     }
 
     try {
-      const res = await fetch(
-        `/api/tenants/${tenantId}${refresh ? '?refresh=true' : ''}`
-      )
-      const contentType = res.headers.get('content-type') || ''
-      if (!contentType.toLowerCase().includes('application/json')) {
-        throw new Error(
-          `Tenant service returned HTTP ${res.status} instead of JSON.`
-        )
-      }
-
-      const data = await res.json()
-      if (!res.ok || !data?.bundle) {
-        throw new Error(data?.error || `Unable to load tenant (${res.status}).`)
-      }
+      const data = refresh
+        ? await apiClient.post<any>(
+            `/api/tenants/${encodeURIComponent(String(tenantId))}/sync`
+          )
+        : await apiClient.get<any>(
+            `/api/tenants/${encodeURIComponent(String(tenantId))}`
+          )
+      if (!data?.bundle) throw new Error('Unable to load tenant data.')
 
       setBundle(data.bundle)
       setLoadError(null)
@@ -1006,8 +999,8 @@ export default function TenantDetailsPage() {
   }, [tenantId])
 
   useEffect(() => {
-    fetch('/api/tenants')
-      .then((res) => res.json())
+    apiClient
+      .get<any>('/api/tenants')
       .then((data) => {
         if (data?.tenants?.length) {
           setTenantsList(data.tenants)

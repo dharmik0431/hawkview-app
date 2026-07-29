@@ -1,53 +1,23 @@
 import { useQuery } from '@tanstack/react-query'
 import type { TenantsResponse, DashboardSummaryResponse } from '@/types/api'
+import { apiClient } from './client'
 
 export function useTenants() {
   return useQuery<TenantsResponse>({
     queryKey: ['tenants'],
-    queryFn: async ({ signal }) => {
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => {
-        controller.abort()
-      }, 30000)
+    queryFn: ({ signal }) =>
+      apiClient.get<TenantsResponse>('/api/tenants', { signal }),
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  })
+}
 
-      const onAbort = () => controller.abort()
-      if (signal) {
-        signal.addEventListener('abort', onAbort)
-      }
-
-      try {
-        const res = await fetch('/api/tenants', { signal: controller.signal })
-        clearTimeout(timeoutId)
-        if (signal) signal.removeEventListener('abort', onAbort)
-
-        const contentType = res.headers.get('content-type') || ''
-        if (!contentType.toLowerCase().includes('application/json')) {
-          throw new Error(
-            `Tenant service returned HTTP ${res.status} instead of JSON.`
-          )
-        }
-
-        const data = (await res.json()) as TenantsResponse
-
-        if (!res.ok) {
-          throw new Error(data.error || `HTTP ${res.status}: Failed to load tenant directory.`)
-        }
-
-        if (data.mode === 'microsoft' && data.error) {
-          throw new Error(data.error)
-        }
-
-        return data
-      } catch (err: any) {
-        clearTimeout(timeoutId)
-        if (signal) signal.removeEventListener('abort', onAbort)
-
-        if (err.name === 'AbortError') {
-          throw new Error('Tenant directory request timed out after 30 seconds.')
-        }
-        throw err
-      }
-    },
+export function useTenantBundle(tenantId?: string) {
+  return useQuery<any>({
+    queryKey: ['tenant', tenantId],
+    queryFn: ({ signal }) =>
+      apiClient.get(`/api/tenants/${encodeURIComponent(tenantId!)}`, { signal }),
+    enabled: Boolean(tenantId),
     retry: false,
     staleTime: 5 * 60 * 1000,
   })
@@ -56,16 +26,11 @@ export function useTenants() {
 export function useDashboardSummary() {
   return useQuery<DashboardSummaryResponse>({
     queryKey: ['dashboard-summary'],
-    queryFn: async () => {
-      return {
-        hasTenant: false,
-        stats: {
-          totalUsers: 0,
-          activeLicenses: 0,
-          groups: 0,
-          apps: 0,
-        },
-      }
-    },
+    queryFn: ({ signal }) =>
+      apiClient.get<DashboardSummaryResponse>('/api/dashboard/summary', {
+        signal,
+      }),
+    retry: false,
+    staleTime: 5 * 60 * 1000,
   })
 }

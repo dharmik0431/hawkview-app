@@ -1,4 +1,4 @@
-import type { TenantMockBundle } from '../mock/types'
+import type { TenantBundle } from '@/types/tenant-data'
 
 export type TenantSectionKey =
   | 'overview'
@@ -12,7 +12,7 @@ export type TenantSectionKey =
   | 'entra'
 
 export type TenantSummary = Pick<
-  TenantMockBundle['tenant'],
+  TenantBundle['tenant'],
   | 'id'
   | 'name'
   | 'domain'
@@ -25,6 +25,6 @@ export type TenantSummary = Pick<
 
 export interface TenantDataProvider {
   getTenantSummary(id: string): Promise<TenantSummary>
-  getTenantBundle(id: string): Promise<TenantMockBundle>
+  getTenantBundle(id: string): Promise<TenantBundle>
   getTenantSection(id: string, section: TenantSectionKey): Promise<any>
 }

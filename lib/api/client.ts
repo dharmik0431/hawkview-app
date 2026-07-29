@@ -1,4 +1,5 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || ''
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, '')
+const API_TIMEOUT_MS = 15_000
 
 interface FetchOptions extends RequestInit {
   params?: Record<string, string>
@@ -20,25 +21,69 @@ async function fetchApi<T>(
 ): Promise<T> {
   const { params, ...fetchOptions } = options
 
+  if (!API_BASE_URL) {
+    throw new ApiError(
+      0,
+      'HawkView API is not configured. Set NEXT_PUBLIC_API_URL.'
+    )
+  }
+
+  if (!endpoint.startsWith('/')) {
+    throw new ApiError(0, 'API endpoints must start with "/".')
+  }
+
   let url = `${API_BASE_URL}${endpoint}`
   if (params) {
     const searchParams = new URLSearchParams(params)
     url += `?${searchParams.toString()}`
   }
 
-  const response = await fetch(url, {
-    ...fetchOptions,
-    headers: {
-      'Content-Type': 'application/json',
-      ...fetchOptions.headers,
-    },
-  })
+  const timeoutController = new AbortController()
+  const timeoutId = setTimeout(() => timeoutController.abort(), API_TIMEOUT_MS)
+  const signal = fetchOptions.signal
+    ? AbortSignal.any([fetchOptions.signal, timeoutController.signal])
+    : timeoutController.signal
 
-  if (!response.ok) {
-    throw new ApiError(response.status, `API Error: ${response.statusText}`)
+  let response: Response
+  try {
+    response = await fetch(url, {
+      ...fetchOptions,
+      signal,
+      credentials: 'include',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        ...fetchOptions.headers,
+      },
+    })
+  } catch (error) {
+    if (timeoutController.signal.aborted) {
+      throw new ApiError(0, 'HawkView API request timed out.')
+    }
+    throw error
+  } finally {
+    clearTimeout(timeoutId)
   }
 
-  return response.json()
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    throw new ApiError(
+      response.status,
+      body?.error?.message ||
+        body?.message ||
+        `HawkView API returned ${response.status}.`
+    )
+  }
+
+  const contentType = response.headers.get('content-type') || ''
+  if (!contentType.toLowerCase().includes('application/json')) {
+    throw new ApiError(
+      response.status,
+      'HawkView API returned a non-JSON response.'
+    )
+  }
+
+  return response.json() as Promise<T>
 }
 
 export const apiClient = {

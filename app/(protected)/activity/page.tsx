@@ -9,6 +9,7 @@ import {
 import { SignInLogsPage } from './components/signin-logs-page'
 import { AuditLogsPage } from './components/audit-logs-page'
 import type { ActivityTab, SignInEvent } from './data/types'
+import { apiClient } from '@/lib/api/client'
 
 function parseISO(iso: string) {
   const d = new Date(iso)
@@ -60,7 +61,7 @@ export default function ActivityPage() {
   const [tenants, setTenants] = React.useState<
     Array<{ id: string; name: string }>
   >([])
-  const [tenantMocks, setTenantMocks] = React.useState<Record<string, any>>({})
+  const [selectedBundle, setSelectedBundle] = React.useState<any>(null)
 
   const [filters, setFilters] = React.useState<ActivityFiltersValue>({
     tenantId: '', // <— required now
@@ -71,27 +72,50 @@ export default function ActivityPage() {
     search: '',
   })
 
-  // Load tenant mocks client-side to avoid hydration mismatch
+  // Load the tenant directory from the HawkView backend API.
   React.useEffect(() => {
     let alive = true
-    ;(async () => {
-      const mod = await import('../tenants/[id]/mock/tenants')
-      if (!alive) return
-      setTenants(
-        (mod.TENANTS ?? []).map((t: any) => ({ id: t.id, name: t.name }))
-      )
-      setTenantMocks(mod.TENANT_MOCKS ?? {})
-      setLoaded(true)
-    })()
+    apiClient
+      .get<any>('/api/tenants')
+      .then((data) => {
+        if (!alive) return
+        setTenants(
+          (data.tenants ?? []).map((t: any) => ({ id: t.id, name: t.name }))
+        )
+        setLoaded(true)
+      })
+      .catch(() => {
+        if (alive) setLoaded(true)
+      })
     return () => {
       alive = false
     }
   }, [])
 
-  const selectedBundle = React.useMemo(() => {
-    if (!filters.tenantId) return null
-    return tenantMocks[filters.tenantId] ?? null
-  }, [tenantMocks, filters.tenantId])
+  React.useEffect(() => {
+    let alive = true
+    if (!filters.tenantId) {
+      setSelectedBundle(null)
+      return () => {
+        alive = false
+      }
+    }
+
+    apiClient
+      .get<any>(`/api/tenants/${encodeURIComponent(filters.tenantId)}`)
+      .then((data) => {
+        if (!alive) return
+        setSelectedBundle(data.bundle ?? null)
+      })
+      .catch(() => {
+        if (alive) setSelectedBundle(null)
+      })
+
+    return () => {
+      if (!alive) return
+      alive = false
+    }
+  }, [filters.tenantId])
 
   // Build user dropdown options from selected tenant log data
   const userOptions = React.useMemo(() => {

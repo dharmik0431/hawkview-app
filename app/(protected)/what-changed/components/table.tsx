@@ -5,8 +5,9 @@ import { Card, CardContent } from '@/components/ui/card'
 import { WhatChangedFilters, type WhatChangedFiltersState } from './filters'
 import { WhatChangedRow } from './row'
 import { WhatChangedDrawer } from './drawer'
-import { MOCK_CHANGES } from '../data/mock-changes'
 import type { ChangeEvent } from '../data/change-types'
+import { useQuery } from '@tanstack/react-query'
+import { apiClient } from '@/lib/api/client'
 
 function uniqTenants(events: ChangeEvent[]) {
   const map = new Map<string, { id: string; name: string }>()
@@ -35,7 +36,15 @@ function groupLabel(dayKey: string) {
 }
 
 export function WhatChangedView() {
-  const tenants = React.useMemo(() => uniqTenants(MOCK_CHANGES), [])
+  const { data } = useQuery<{ changes: ChangeEvent[] }>({
+    queryKey: ['changes'],
+    queryFn: ({ signal }) =>
+      apiClient.get('/api/changes', { signal }),
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  })
+  const changes = React.useMemo(() => data?.changes ?? [], [data?.changes])
+  const tenants = React.useMemo(() => uniqTenants(changes), [changes])
   const [selectedId, setSelectedId] = React.useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = React.useState(false)
 
@@ -49,7 +58,8 @@ export function WhatChangedView() {
   const filtered = React.useMemo(() => {
     const q = filters.search.trim().toLowerCase()
 
-    return MOCK_CHANGES.slice()
+    return changes
+      .slice()
       .sort((a, b) => +new Date(b.ts) - +new Date(a.ts))
       .filter((e) =>
         filters.tenant === 'all' ? true : e.tenantId === filters.tenant
@@ -81,7 +91,7 @@ export function WhatChangedView() {
           .toLowerCase()
         return hay.includes(q)
       })
-  }, [filters])
+  }, [changes, filters])
 
   const selected = React.useMemo(
     () => filtered.find((x) => x.id === selectedId) ?? null,

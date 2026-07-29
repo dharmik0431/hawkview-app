@@ -1,2 +1,2 @@
 export * from './provider'
-export { mockProvider } from './mock-provider'
+export { apiProvider } from './api-provider'
