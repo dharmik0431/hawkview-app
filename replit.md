@@ -42,7 +42,7 @@ HawkView is an enterprise-grade frontend skeleton for a SaaS application built w
 ## Key Features
 
 - **Route Groups**: `(public)` for unauthenticated pages, `(protected)` for authenticated
-- **Cookie-based Auth**: Placeholder using `hawkview-session` cookie
+- **Identity Platform Auth**: Email authentication with backend token verification
 - **Empty States**: Professional empty-state messages for all pages
 - **Typed API Layer**: Ready for backend integration
 
@@ -56,12 +56,9 @@ npm run lint    # Run ESLint
 
 ## Authentication
 
-Currently uses a "Dev Sign In" button that sets a session cookie. To integrate Microsoft Entra ID:
-1. Install MSAL packages
-2. Configure Azure App Registration
-3. Replace Dev Sign In with MSAL login flow
-
-See README.md for detailed instructions.
+Google Cloud Identity Platform provides email authentication. The frontend sends
+an ID token to the HawkView backend, which loads the user's roles and
+memberships from PostgreSQL. Google and Microsoft providers are planned next.
 
 ## Recent Changes
 

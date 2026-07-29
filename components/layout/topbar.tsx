@@ -4,6 +4,7 @@ import { useRouter, usePathname } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { LogOut, FileText, Moon, Sun } from 'lucide-react'
 import { useTheme } from 'next-themes'
+import { useAuth } from '@/components/providers/auth-provider'
 
 const pageTitles: Record<string, string> = {
   '/dashboard': 'Dashboard',
@@ -24,12 +25,13 @@ export function Topbar() {
   const router = useRouter()
   const pathname = usePathname()
   const { theme, setTheme } = useTheme()
+  const { session, signOut } = useAuth()
 
   const pageTitle = pageTitles[pathname] || 'Dashboard'
 
-  const handleSignOut = () => {
-    document.cookie = 'hawkview-session=; path=/; max-age=0'
-    router.push('/login')
+  const handleSignOut = async () => {
+    await signOut()
+    router.replace('/login')
   }
 
   return (
@@ -58,7 +60,12 @@ export function Topbar() {
           </Button>
 
           <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-sm font-semibold">
-            AG
+            {(session?.user.displayName || session?.user.email || 'HV')
+              .split(/\s+/)
+              .map((part) => part[0])
+              .join('')
+              .slice(0, 2)
+              .toUpperCase()}
           </div>
 
           <Button

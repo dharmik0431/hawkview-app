@@ -74,3 +74,7 @@ POST /auth/bootstrap
 That endpoint safely links the verified Identity Platform user ID to the
 HawkView `User` record and returns the user's active MSP memberships. It never
 trusts an organization or role supplied by the browser.
+
+`FRONTEND_ORIGINS` is a comma-separated allowlist of frontend origins permitted
+to call the API from a browser. Add each deployed HawkView frontend URL
+explicitly; do not use a wildcard for the authenticated API.

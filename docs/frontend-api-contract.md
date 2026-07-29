@@ -18,9 +18,10 @@ All endpoints must authenticate the user and enforce their organization
 membership and tenant assignments on the backend. The browser must not supply a
 trusted `organizationId`.
 
-Requests include browser credentials so the backend can use a secure,
-HTTP-only session cookie. The backend must allow only approved HawkView
-frontend origins through CORS.
+Authenticated requests include the current Identity Platform ID token in the
+`Authorization: Bearer ...` header. The backend verifies that short-lived token,
+loads the HawkView user and memberships from PostgreSQL, and must allow only
+approved HawkView frontend origins through CORS.
 
 The sync endpoint should return quickly after queueing work. Existing database
 data remains visible while the backend refreshes Microsoft data asynchronously.

@@ -68,7 +68,7 @@ The app will be available at http://localhost:5000
 
 | Route | Description | Auth Required |
 |-------|-------------|---------------|
-| `/login` | Login page with Dev Sign In | No |
+| `/login` | Email sign-up, sign-in, verification, and password recovery | No |
 | `/tenants` | Tenant management | Yes |
 | `/dashboard` | Overview dashboard | Yes |
 | `/reports` | Analytics and reports | Yes |
@@ -76,41 +76,15 @@ The app will be available at http://localhost:5000
 
 ## Authentication
 
-### Current Implementation (Development)
+Google Cloud Identity Platform authenticates users. Email/password is the first
+enabled method; Google and Microsoft providers will use the same Identity
+Platform account later.
 
-The app uses a simple cookie-based session for development:
-
-1. **Dev Sign In**: Sets a `hawkview-session` cookie
-2. **Middleware**: Checks for this cookie on protected routes
-3. **Sign Out**: Clears the cookie
-
-### Swapping to Microsoft Entra ID
-
-To implement real Microsoft authentication:
-
-1. Install MSAL libraries:
-   ```bash
-   npm install @azure/msal-browser @azure/msal-react
-   ```
-
-2. Create Azure App Registration in Azure Portal
-
-3. Create `lib/auth/msal-config.ts`:
-   ```typescript
-   export const msalConfig = {
-     auth: {
-       clientId: process.env.NEXT_PUBLIC_AZURE_CLIENT_ID!,
-       authority: `https://login.microsoftonline.com/${process.env.NEXT_PUBLIC_AZURE_TENANT_ID}`,
-       redirectUri: process.env.NEXT_PUBLIC_REDIRECT_URI,
-     },
-   }
-   ```
-
-4. Wrap app in MSAL Provider
-
-5. Replace the Dev Sign In button with MSAL login
-
-6. Update middleware to validate real tokens
+After sign-in, the browser sends the short-lived Identity Platform ID token to
+the HawkView backend. The backend verifies it and loads the user's memberships,
+roles, and MSP organizations from PostgreSQL. Protected pages are gated by the
+client auth provider, while all data authorization remains enforced by the
+backend.
 
 ## API Integration
 
