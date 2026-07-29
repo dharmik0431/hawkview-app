@@ -1,6 +1,13 @@
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, '')
 const API_TIMEOUT_MS = 15_000
 
+async function getIdentityToken() {
+  if (typeof window === 'undefined') return null
+
+  const { auth } = await import('@/lib/auth/firebase')
+  return auth?.currentUser?.getIdToken() ?? null
+}
+
 interface FetchOptions extends RequestInit {
   params?: Record<string, string>
 }
@@ -46,6 +53,7 @@ async function fetchApi<T>(
 
   let response: Response
   try {
+    const identityToken = await getIdentityToken()
     response = await fetch(url, {
       ...fetchOptions,
       signal,
@@ -53,6 +61,9 @@ async function fetchApi<T>(
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
+        ...(identityToken
+          ? { Authorization: `Bearer ${identityToken}` }
+          : {}),
         ...fetchOptions.headers,
       },
     })
