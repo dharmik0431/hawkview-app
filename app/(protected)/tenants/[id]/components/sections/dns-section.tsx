@@ -13,25 +13,40 @@ import CopyPill from '../shared/copy-pill'
 export default function DnsSection({
   tenant,
   domains,
-  isMicrosoft,
   dns,
 }: {
   tenant: any
   domains: any[]
-  isMicrosoft: boolean
   dns: any
 }) {
   const [domainOpen, setDomainOpen] = useState(false)
   const [domainSelected, setDomainSelected] = useState<string>('')
 
   const spfRecord = typeof dns?.spf === 'object' ? dns.spf.record : (dns?.spf ?? '—')
-  const spfStatus = typeof dns?.spf === 'object' ? dns.spf.status : 'healthy'
+  const spfStatus =
+    typeof dns?.spf === 'object' ? dns.spf.status : 'not-synced'
 
   const dkimRecord = typeof dns?.dkim === 'object' ? dns.dkim.record : (dns?.dkim ?? '—')
-  const dkimStatus = typeof dns?.dkim === 'object' ? dns.dkim.status : 'healthy'
+  const dkimStatus =
+    typeof dns?.dkim === 'object' ? dns.dkim.status : 'not-synced'
 
   const dmarcRecord = typeof dns?.dmarc === 'object' ? dns.dmarc.record : (dns?.dmarc ?? '—')
-  const dmarcStatus = typeof dns?.dmarc === 'object' ? dns.dmarc.status : (isMicrosoft ? 'warning' : 'healthy')
+  const dmarcStatus =
+    typeof dns?.dmarc === 'object' ? dns.dmarc.status : 'not-synced'
+
+  const statusClass = (status: string) =>
+    status === 'healthy'
+      ? 'bg-green-50 text-green-700 border border-green-200'
+      : status === 'not-synced'
+        ? 'bg-slate-50 text-slate-700 border border-slate-200'
+        : 'bg-orange-50 text-orange-700 border border-orange-200'
+
+  const statusLabel = (status: string) =>
+    status === 'healthy'
+      ? 'Healthy'
+      : status === 'not-synced'
+        ? 'Not synced'
+        : 'Warning'
 
   return (
     <Card className="rounded-2xl shadow-sm">
@@ -91,18 +106,16 @@ export default function DnsSection({
               <div className="flex items-center gap-2">
                 <div className="font-semibold text-sm">SPF</div>
                 <Badge
-                  className={`${
-                    spfStatus === 'healthy'
-                      ? 'bg-green-50 text-green-700 border border-green-200'
-                      : 'bg-orange-50 text-orange-700 border border-orange-200'
-                  } uppercase`}
+                  className={`${statusClass(spfStatus)} uppercase`}
                 >
-                  {spfStatus === 'healthy' ? 'Healthy' : 'Warning'}
+                  {statusLabel(spfStatus)}
                 </Badge>
               </div>
-              <button className="text-xs font-medium text-blue-600 hover:underline">
-                How to fix
-              </button>
+              {spfStatus !== 'not-synced' && (
+                <button className="text-xs font-medium text-blue-600 hover:underline">
+                  How to fix
+                </button>
+              )}
             </div>
             <CopyPill value={spfRecord} />
             <div className="mt-2 text-xs text-muted-foreground">
@@ -115,18 +128,16 @@ export default function DnsSection({
               <div className="flex items-center gap-2">
                 <div className="font-semibold text-sm">DKIM</div>
                 <Badge
-                  className={`${
-                    dkimStatus === 'healthy'
-                      ? 'bg-green-50 text-green-700 border border-green-200'
-                      : 'bg-orange-50 text-orange-700 border border-orange-200'
-                  } uppercase`}
+                  className={`${statusClass(dkimStatus)} uppercase`}
                 >
-                  {dkimStatus === 'healthy' ? 'Healthy' : 'Warning'}
+                  {statusLabel(dkimStatus)}
                 </Badge>
               </div>
-              <button className="text-xs font-medium text-blue-600 hover:underline">
-                How to fix
-              </button>
+              {dkimStatus !== 'not-synced' && (
+                <button className="text-xs font-medium text-blue-600 hover:underline">
+                  How to fix
+                </button>
+              )}
             </div>
             <CopyPill value={dkimRecord} />
             <div className="mt-2 text-xs text-muted-foreground">
@@ -139,18 +150,16 @@ export default function DnsSection({
               <div className="flex items-center gap-2">
                 <div className="font-semibold text-sm">DMARC</div>
                 <Badge
-                  className={`${
-                    dmarcStatus === 'healthy'
-                      ? 'bg-green-50 text-green-700 border border-green-200'
-                      : 'bg-orange-50 text-orange-700 border border-orange-200'
-                  } uppercase`}
+                  className={`${statusClass(dmarcStatus)} uppercase`}
                 >
-                  {dmarcStatus === 'healthy' ? 'Healthy' : 'Warning'}
+                  {statusLabel(dmarcStatus)}
                 </Badge>
               </div>
-              <button className="text-xs font-medium text-blue-600 hover:underline">
-                How to fix
-              </button>
+              {dmarcStatus !== 'not-synced' && (
+                <button className="text-xs font-medium text-blue-600 hover:underline">
+                  How to fix
+                </button>
+              )}
             </div>
             <div className="mt-2 rounded-xl border bg-muted/20 px-3 py-2 text-xs font-mono break-all">
               {dmarcRecord}

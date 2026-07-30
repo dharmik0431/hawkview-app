@@ -1260,7 +1260,7 @@ export default function TenantDetailsPage() {
     return (
       <Card className="rounded-2xl">
         <CardContent className="p-8">
-          <LoadingState message="Connecting to Microsoft and loading tenant data..." />
+          <LoadingState message="Loading saved tenant data..." />
         </CardContent>
       </Card>
     )
@@ -1285,7 +1285,7 @@ export default function TenantDetailsPage() {
         <CardContent className="p-8">
           <div className="text-lg font-semibold">Tenant not found</div>
           <div className="mt-1 text-sm text-muted-foreground">
-            The tenant id “{tenantId}” does not exist in mock data.
+            The tenant id “{tenantId}” was not found.
           </div>
           <div className="mt-4">
             <Button asChild>
@@ -1378,24 +1378,7 @@ export default function TenantDetailsPage() {
         },
       ]
 
-  const licenseRows = bundle?.licenses?.rows?.length
-    ? bundle.licenses.rows
-    : isMicrosoft
-      ? [
-          { name: 'Microsoft 365 Business Premium', used: 124, total: 150 },
-          { name: 'Microsoft 365 E5 Security', used: 10, total: 20 },
-          { name: 'Microsoft Teams Phone Standard', used: 45, total: 50 },
-          { name: 'Power BI Pro', used: 5, total: 5 },
-        ]
-      : [
-          { name: 'Google Workspace Business Standard', used: 45, total: 50 },
-          { name: 'Google Workspace Enterprise Plus', used: 5, total: 10 },
-          { name: 'Cloud Identity Premium', used: 10, total: 100 },
-        ]
-
-  const spf = bundle?.dns?.spf ?? '—'
-  const dkim = bundle?.dns?.dkim ?? '—'
-  const dmarc = bundle?.dns?.dmarc ?? '—'
+  const licenseRows = bundle?.licenses?.rows ?? []
 
   function runSync() {
     if (syncState === 'syncing') return
@@ -1408,7 +1391,7 @@ export default function TenantDetailsPage() {
         <CardContent className="p-6">
           <div className="font-semibold">{title}</div>
           <div className="mt-2 text-sm text-muted-foreground">
-            Mock page. We can build this next (tables, charts, drawers, etc).
+            This dataset has not been synchronized yet.
           </div>
         </CardContent>
       </Card>
@@ -3060,7 +3043,6 @@ export default function TenantDetailsPage() {
           <DnsSection
             tenant={tenant}
             domains={domains}
-            isMicrosoft={isMicrosoft}
             dns={bundle?.dns}
           />
         </div>
