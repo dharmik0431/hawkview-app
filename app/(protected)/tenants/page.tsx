@@ -12,17 +12,18 @@ import { useTenants } from '@/lib/api/hooks'
 import { useQueryClient } from '@tanstack/react-query'
 
 type Provider = 'microsoft' | 'google'
-type TenantStatus = 'healthy' | 'warning' | 'critical'
+type TenantStatus = 'pending' | 'active' | 'suspended' | 'disconnected'
 
 type FilterType = 'all' | 'microsoft' | 'google'
 
 function statusBadge(status: TenantStatus) {
   switch (status) {
-    case 'healthy':
+    case 'active':
       return 'bg-green-50 text-green-700 border border-green-200'
-    case 'warning':
+    case 'pending':
       return 'bg-orange-50 text-orange-700 border border-orange-200'
-    case 'critical':
+    case 'suspended':
+    case 'disconnected':
       return 'bg-red-50 text-red-700 border border-red-200'
   }
 }
@@ -33,8 +34,8 @@ function scoreColor(score: number) {
   return 'text-red-600'
 }
 
-function formatSyncTime(timeStr: string) {
-  if (!timeStr) return 'time unavailable'
+function formatSyncTime(timeStr: string | null) {
+  if (!timeStr) return 'Not synced yet'
   if (timeStr.includes('T')) {
     try {
       const d = new Date(timeStr)
@@ -140,7 +141,7 @@ export default function TenantsPage() {
   const loadingText =
     elapsedSeconds < 15
       ? `Loading tenant directory… ${elapsedSeconds}s`
-      : `Microsoft is taking longer than expected… ${elapsedSeconds}s`
+      : `HawkView API is taking longer than expected… ${elapsedSeconds}s`
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
@@ -166,13 +167,13 @@ export default function TenantsPage() {
         </Button>
       </div>
 
-      {/* Microsoft Mode Error Alert */}
+      {/* Database API Error Alert */}
       {errorMessage && !loading && (
         <Card className="border-red-200 bg-red-50/80 dark:bg-red-950/20 dark:border-red-900/50 p-4 rounded-2xl">
           <div className="flex items-start gap-3 text-red-800 dark:text-red-300">
             <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
             <div className="flex-1 text-sm">
-              <p className="font-semibold">Unable to load live Microsoft tenant data</p>
+              <p className="font-semibold">Unable to load the tenant directory</p>
               <p className="mt-1 text-red-700 dark:text-red-400">{errorMessage}</p>
             </div>
             <Button
@@ -278,7 +279,7 @@ export default function TenantsPage() {
                           {tenant.name}
                         </h3>
                         <p className="text-sm text-slate-500 dark:text-slate-400">
-                          {tenant.domain}
+                          {tenant.domain || 'Domain not synced'}
                         </p>
                       </div>
                     </div>
@@ -303,30 +304,42 @@ export default function TenantsPage() {
                       <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
                         Secure Score
                       </p>
-                      <div className="flex items-end gap-1">
-                        <span
-                          className={`text-xl font-bold ${scoreColor(tenant.secureScore)}`}
-                        >
-                          {tenant.secureScore}%
+                      {tenant.secureScore == null ? (
+                        <span className="text-sm font-semibold text-slate-500">
+                          Not synced
                         </span>
-                        <span className="text-xs font-semibold text-slate-400 mb-1">
-                          / 100
-                        </span>
-                      </div>
+                      ) : (
+                        <div className="flex items-end gap-1">
+                          <span
+                            className={`text-xl font-bold ${scoreColor(tenant.secureScore)}`}
+                          >
+                            {tenant.secureScore}%
+                          </span>
+                          <span className="text-xs font-semibold text-slate-400 mb-1">
+                            / 100
+                          </span>
+                        </div>
+                      )}
                     </div>
 
                     <div className="bg-slate-50 dark:bg-slate-800/60 rounded-xl p-3 border border-slate-100 dark:border-slate-800">
                       <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
                         Licenses
                       </p>
-                      <div className="flex items-end gap-1">
-                        <span className="text-xl font-bold text-slate-900 dark:text-white">
-                          {tenant.licenseCount}
+                      {tenant.licenseCount == null ? (
+                        <span className="text-sm font-semibold text-slate-500">
+                          Not synced
                         </span>
-                        <span className="text-xs font-semibold text-slate-400 mb-1">
-                          assigned
-                        </span>
-                      </div>
+                      ) : (
+                        <div className="flex items-end gap-1">
+                          <span className="text-xl font-bold text-slate-900 dark:text-white">
+                            {tenant.licenseCount}
+                          </span>
+                          <span className="text-xs font-semibold text-slate-400 mb-1">
+                            assigned
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -336,7 +349,9 @@ export default function TenantsPage() {
                       title={tenant.lastSync || ''}
                     >
                       <Clock className="h-3.5 w-3.5" />
-                      Synced {formatSyncTime(tenant.lastSync)}
+                      {tenant.lastSync
+                        ? `Synced ${formatSyncTime(tenant.lastSync)}`
+                        : 'Not synced yet'}
                     </span>
                     <span className="text-sm font-semibold text-blue-600 flex items-center gap-1 group-hover:underline">
                       Manage Tenant <ChevronRight className="h-4 w-4" />
