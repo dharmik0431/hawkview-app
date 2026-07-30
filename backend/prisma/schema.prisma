@@ -54,6 +54,7 @@ enum SyncResourceType {
   USERS
   LICENSES
   DOMAINS
+  GROUPS
 }
 
 enum SyncStateStatus {
@@ -80,18 +81,20 @@ model User {
 }
 
 model Organization {
-  id              String             @id @default(uuid()) @db.Uuid
-  name            String             @db.VarChar(200)
-  slug            String             @unique @db.VarChar(100)
-  status          OrganizationStatus @default(ACTIVE)
-  createdAt       DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
-  memberships     Membership[]
-  customerTenants CustomerTenant[]
-  directoryUsers  DirectoryUser[]
-  tenantLicenses  TenantLicense[]
-  tenantDomains   TenantDomain[]
-  syncStates      SyncState[]
+  id               String                     @id @default(uuid()) @db.Uuid
+  name             String                     @db.VarChar(200)
+  slug             String                     @unique @db.VarChar(100)
+  status           OrganizationStatus         @default(ACTIVE)
+  createdAt        DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  memberships      Membership[]
+  customerTenants  CustomerTenant[]
+  directoryUsers   DirectoryUser[]
+  directoryGroups  DirectoryGroup[]
+  groupMemberships DirectoryGroupMembership[]
+  tenantLicenses   TenantLicense[]
+  tenantDomains    TenantDomain[]
+  syncStates       SyncState[]
 
   @@index([status])
   @@map("organizations")
@@ -115,17 +118,19 @@ model Membership {
 }
 
 model CustomerTenant {
-  id                String               @id @default(uuid()) @db.Uuid
-  organizationId    String               @map("organization_id") @db.Uuid
-  microsoftTenantId String               @unique @map("microsoft_tenant_id") @db.Uuid
-  displayName       String?              @map("display_name") @db.VarChar(200)
-  primaryDomain     String?              @map("primary_domain") @db.VarChar(253)
-  status            CustomerTenantStatus @default(PENDING)
-  createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt         DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
-  organization      Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  id                String                     @id @default(uuid()) @db.Uuid
+  organizationId    String                     @map("organization_id") @db.Uuid
+  microsoftTenantId String                     @unique @map("microsoft_tenant_id") @db.Uuid
+  displayName       String?                    @map("display_name") @db.VarChar(200)
+  primaryDomain     String?                    @map("primary_domain") @db.VarChar(253)
+  status            CustomerTenantStatus       @default(PENDING)
+  createdAt         DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization      Organization               @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   connection        TenantConnection?
   directoryUsers    DirectoryUser[]
+  directoryGroups   DirectoryGroup[]
+  groupMemberships  DirectoryGroupMembership[]
   tenantLicenses    TenantLicense[]
   tenantDomains     TenantDomain[]
   syncStates        SyncState[]
@@ -136,28 +141,79 @@ model CustomerTenant {
 }
 
 model DirectoryUser {
-  id                    String         @id @default(uuid()) @db.Uuid
-  organizationId        String         @map("organization_id") @db.Uuid
-  customerTenantId      String         @map("customer_tenant_id") @db.Uuid
-  microsoftUserId       String         @map("microsoft_user_id") @db.Uuid
-  displayName           String         @map("display_name") @db.VarChar(256)
-  userPrincipalName     String         @map("user_principal_name") @db.VarChar(320)
-  mail                  String?        @db.VarChar(320)
-  accountEnabled        Boolean        @default(true) @map("account_enabled")
-  userType              String?        @map("user_type") @db.VarChar(50)
-  assignedLicenseSkuIds String[]       @default([]) @map("assigned_license_sku_ids")
-  firstSeenAt           DateTime       @default(now()) @map("first_seen_at") @db.Timestamptz(6)
-  lastSeenAt            DateTime       @default(now()) @map("last_seen_at") @db.Timestamptz(6)
-  deletedAt             DateTime?      @map("deleted_at") @db.Timestamptz(6)
-  createdAt             DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt             DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
-  organization          Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  customerTenant        CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  id                    String                     @id @default(uuid()) @db.Uuid
+  organizationId        String                     @map("organization_id") @db.Uuid
+  customerTenantId      String                     @map("customer_tenant_id") @db.Uuid
+  microsoftUserId       String                     @map("microsoft_user_id") @db.Uuid
+  displayName           String                     @map("display_name") @db.VarChar(256)
+  userPrincipalName     String                     @map("user_principal_name") @db.VarChar(320)
+  mail                  String?                    @db.VarChar(320)
+  accountEnabled        Boolean                    @default(true) @map("account_enabled")
+  userType              String?                    @map("user_type") @db.VarChar(50)
+  assignedLicenseSkuIds String[]                   @default([]) @map("assigned_license_sku_ids")
+  firstSeenAt           DateTime                   @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt            DateTime                   @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  deletedAt             DateTime?                  @map("deleted_at") @db.Timestamptz(6)
+  createdAt             DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization          Organization               @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant        CustomerTenant             @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  groupMemberships      DirectoryGroupMembership[]
 
   @@unique([customerTenantId, microsoftUserId])
+  @@unique([id, customerTenantId, organizationId])
   @@index([organizationId, customerTenantId, deletedAt])
   @@index([customerTenantId, userPrincipalName])
   @@map("directory_users")
+}
+
+model DirectoryGroup {
+  id               String                     @id @default(uuid()) @db.Uuid
+  organizationId   String                     @map("organization_id") @db.Uuid
+  customerTenantId String                     @map("customer_tenant_id") @db.Uuid
+  microsoftGroupId String                     @map("microsoft_group_id") @db.Uuid
+  displayName      String                     @map("display_name") @db.VarChar(256)
+  description      String?                    @db.Text
+  mail             String?                    @db.VarChar(320)
+  mailNickname     String?                    @map("mail_nickname") @db.VarChar(256)
+  mailEnabled      Boolean                    @default(false) @map("mail_enabled")
+  securityEnabled  Boolean                    @default(false) @map("security_enabled")
+  groupTypes       String[]                   @default([]) @map("group_types")
+  visibility       String?                    @db.VarChar(50)
+  firstSeenAt      DateTime                   @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt       DateTime                   @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  createdAt        DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization     Organization               @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant   CustomerTenant             @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  memberships      DirectoryGroupMembership[]
+
+  @@unique([customerTenantId, microsoftGroupId])
+  @@unique([id, customerTenantId, organizationId])
+  @@index([organizationId, customerTenantId])
+  @@index([customerTenantId, displayName])
+  @@map("directory_groups")
+}
+
+model DirectoryGroupMembership {
+  id               String         @id @default(uuid()) @db.Uuid
+  organizationId   String         @map("organization_id") @db.Uuid
+  customerTenantId String         @map("customer_tenant_id") @db.Uuid
+  directoryGroupId String         @map("directory_group_id") @db.Uuid
+  directoryUserId  String         @map("directory_user_id") @db.Uuid
+  firstSeenAt      DateTime       @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt       DateTime       @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization     Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant   CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  directoryGroup   DirectoryGroup @relation(fields: [directoryGroupId, customerTenantId, organizationId], references: [id, customerTenantId, organizationId], onDelete: Cascade)
+  directoryUser    DirectoryUser  @relation(fields: [directoryUserId, customerTenantId, organizationId], references: [id, customerTenantId, organizationId], onDelete: Cascade)
+
+  @@unique([directoryGroupId, directoryUserId])
+  @@index([organizationId, customerTenantId])
+  @@index([customerTenantId, directoryUserId])
+  @@map("directory_group_memberships")
 }
 
 model TenantLicense {
