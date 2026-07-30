@@ -3,7 +3,14 @@
 import { NeedsAttentionCell } from '@/components/tenants/needs-attention-cell'
 import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
-import { Search, Plus, Clock, ChevronRight, AlertCircle, RefreshCw } from 'lucide-react'
+import {
+  Search,
+  Plus,
+  Clock,
+  ChevronRight,
+  AlertCircle,
+  RefreshCw,
+} from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
@@ -11,7 +18,11 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { useTenants } from '@/lib/api/hooks'
 import { apiClient } from '@/lib/api/client'
-import type { CreateTenantResponse } from '@/types/api'
+import type {
+  CreateTenantResponse,
+  MicrosoftConsentResponse,
+  Tenant,
+} from '@/types/api'
 import { useQueryClient } from '@tanstack/react-query'
 
 type Provider = 'microsoft' | 'google'
@@ -103,9 +114,14 @@ export default function TenantsPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [filter, setFilter] = useState<FilterType>('all')
   const [showOnboarding, setShowOnboarding] = useState(false)
-  const [customerName, setCustomerName] = useState('')
   const [microsoftTenantId, setMicrosoftTenantId] = useState('')
   const [onboardingError, setOnboardingError] = useState<string | null>(null)
+  const [consentMessage, setConsentMessage] = useState<{
+    text: string
+    tone: 'success' | 'warning'
+  } | null>(null)
+  const [consentReview, setConsentReview] =
+    useState<MicrosoftConsentResponse | null>(null)
   const [isSavingTenant, setIsSavingTenant] = useState(false)
 
   const loading = isLoading || isFetching
@@ -124,6 +140,30 @@ export default function TenantsPage() {
     return () => clearInterval(interval)
   }, [loading])
 
+  useEffect(() => {
+    const result = new URLSearchParams(window.location.search).get(
+      'microsoftConsent'
+    )
+    if (result === 'success') {
+      setConsentMessage({
+        text: 'Microsoft 365 connection verified. HawkView is ready for the initial sync.',
+        tone: 'success',
+      })
+      queryClient.invalidateQueries({ queryKey: ['tenants'] })
+    } else if (result === 'missing-permissions') {
+      setConsentMessage({
+        text: 'Microsoft consent completed, but one or more required permissions are missing.',
+        tone: 'warning',
+      })
+      queryClient.invalidateQueries({ queryKey: ['tenants'] })
+    } else if (result === 'error') {
+      setOnboardingError(
+        'Microsoft administrator consent could not be verified. Review the tenant connection and try again.'
+      )
+      queryClient.invalidateQueries({ queryKey: ['tenants'] })
+    }
+  }, [queryClient])
+
   const tenants = data?.tenants || []
   const errorMessage = error ? (error as Error).message : data?.error || null
 
@@ -138,19 +178,45 @@ export default function TenantsPage() {
     setIsSavingTenant(true)
 
     try {
-      await apiClient.post<CreateTenantResponse>('/api/tenants', {
-        displayName: customerName,
-        microsoftTenantId,
-      })
-      setCustomerName('')
-      setMicrosoftTenantId('')
-      setShowOnboarding(false)
+      const created = await apiClient.post<CreateTenantResponse>(
+        '/api/tenants',
+        {
+          microsoftTenantId,
+        }
+      )
       await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      const consent = await apiClient.post<MicrosoftConsentResponse>(
+        `/api/tenants/${created.tenant.id}/microsoft-consent`
+      )
+      setMicrosoftTenantId('')
+      setConsentReview(consent)
     } catch (createError) {
       setOnboardingError(
         createError instanceof Error
           ? createError.message
           : 'Tenant onboarding could not be completed.'
+      )
+    } finally {
+      setIsSavingTenant(false)
+    }
+  }
+
+  const handleReviewConsent = async (tenant: Tenant) => {
+    setOnboardingError(null)
+    setIsSavingTenant(true)
+    try {
+      const consent = await apiClient.post<MicrosoftConsentResponse>(
+        `/api/tenants/${tenant.id}/microsoft-consent`
+      )
+      setConsentReview(consent)
+      setShowOnboarding(true)
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    } catch (consentError) {
+      setShowOnboarding(true)
+      setOnboardingError(
+        consentError instanceof Error
+          ? consentError.message
+          : 'Microsoft consent could not be started.'
       )
     } finally {
       setIsSavingTenant(false)
@@ -170,6 +236,12 @@ export default function TenantsPage() {
       return matchesSearch && matchesFilter
     })
   }, [data?.tenants, searchQuery, filter])
+
+  const tenantsAwaitingConsent = tenants.filter(
+    (tenant) =>
+      tenant.connectionStatus === 'pending-consent' ||
+      tenant.connectionStatus === 'error'
+  )
 
   const loadingText =
     elapsedSeconds < 15
@@ -198,6 +270,7 @@ export default function TenantsPage() {
           className="gap-2 rounded-xl"
           onClick={() => {
             setOnboardingError(null)
+            setConsentReview(null)
             setShowOnboarding((current) => !current)
           }}
         >
@@ -211,54 +284,89 @@ export default function TenantsPage() {
           <CardContent className="p-6">
             <div className="mb-5">
               <h2 className="text-lg font-semibold text-slate-900 dark:text-white">
-                Add a Microsoft 365 customer tenant
+                Connect a Microsoft 365 customer tenant
               </h2>
               <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-                This saves the tenant to HawkView as Pending. Microsoft consent
-                and data synchronization come next.
+                Enter the Microsoft tenant ID. HawkView will retrieve the real
+                organization name after administrator consent.
               </p>
             </div>
 
-            <form
-              onSubmit={handleCreateTenant}
-              className="grid gap-4 md:grid-cols-[1fr_1fr_auto] md:items-end"
-            >
-              <div className="space-y-2">
-                <Label htmlFor="customer-name">Customer name</Label>
-                <Input
-                  id="customer-name"
-                  value={customerName}
-                  onChange={(event) => setCustomerName(event.target.value)}
-                  placeholder="Example: WeCo"
-                  minLength={2}
-                  maxLength={200}
-                  required
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="microsoft-tenant-id">
-                  Microsoft tenant ID
-                </Label>
-                <Input
-                  id="microsoft-tenant-id"
-                  value={microsoftTenantId}
-                  onChange={(event) =>
-                    setMicrosoftTenantId(event.target.value)
-                  }
-                  placeholder="00000000-0000-0000-0000-000000000000"
-                  required
-                />
-              </div>
-
-              <Button
-                type="submit"
-                disabled={isSavingTenant}
-                className="rounded-xl"
+            {!consentReview ? (
+              <form
+                onSubmit={handleCreateTenant}
+                className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end"
               >
-                {isSavingTenant ? 'Saving…' : 'Save Tenant'}
-              </Button>
-            </form>
+                <div className="space-y-2">
+                  <Label htmlFor="microsoft-tenant-id">
+                    Microsoft tenant ID
+                  </Label>
+                  <Input
+                    id="microsoft-tenant-id"
+                    value={microsoftTenantId}
+                    onChange={(event) =>
+                      setMicrosoftTenantId(event.target.value)
+                    }
+                    placeholder="00000000-0000-0000-0000-000000000000"
+                    required
+                  />
+                </div>
+
+                <Button
+                  type="submit"
+                  disabled={isSavingTenant}
+                  className="rounded-xl"
+                >
+                  {isSavingTenant ? 'Preparing…' : 'Review Permissions'}
+                </Button>
+              </form>
+            ) : (
+              <div className="space-y-4">
+                <div>
+                  <h3 className="font-semibold text-slate-900 dark:text-white">
+                    Permissions requested by HawkView
+                  </h3>
+                  <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
+                    A Microsoft 365 administrator will review these permissions
+                    on Microsoft&apos;s consent screen.
+                  </p>
+                </div>
+                <div className="grid gap-3">
+                  {consentReview.requiredPermissions.map((permission) => (
+                    <div
+                      key={permission.name}
+                      className="rounded-xl border border-blue-200 bg-white p-4 dark:border-blue-900 dark:bg-slate-900"
+                    >
+                      <p className="font-semibold text-slate-900 dark:text-white">
+                        {permission.name}
+                      </p>
+                      <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
+                        {permission.description}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex flex-wrap gap-3">
+                  <Button
+                    type="button"
+                    className="rounded-xl"
+                    onClick={() =>
+                      window.location.assign(consentReview.consentUrl)
+                    }
+                  >
+                    Continue to Microsoft
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="rounded-xl"
+                    onClick={() => setConsentReview(null)}
+                  >
+                    Back
+                  </Button>
+                </div>
+              </div>
+            )}
 
             {onboardingError && (
               <p className="mt-4 text-sm font-medium text-red-700">
@@ -269,14 +377,88 @@ export default function TenantsPage() {
         </Card>
       )}
 
+      {consentMessage && (
+        <Card
+          className={
+            consentMessage.tone === 'success'
+              ? 'rounded-2xl border-emerald-200 bg-emerald-50/80 dark:border-emerald-900 dark:bg-emerald-950/20'
+              : 'rounded-2xl border-amber-200 bg-amber-50/80 dark:border-amber-900 dark:bg-amber-950/20'
+          }
+        >
+          <CardContent
+            className={
+              consentMessage.tone === 'success'
+                ? 'p-4 text-sm font-medium text-emerald-800 dark:text-emerald-300'
+                : 'p-4 text-sm font-medium text-amber-800 dark:text-amber-300'
+            }
+          >
+            {consentMessage.text}
+          </CardContent>
+        </Card>
+      )}
+
+      {onboardingError && !showOnboarding && (
+        <Card className="rounded-2xl border-red-200 bg-red-50/80 dark:border-red-900 dark:bg-red-950/20">
+          <CardContent className="p-4 text-sm font-medium text-red-800 dark:text-red-300">
+            {onboardingError}
+          </CardContent>
+        </Card>
+      )}
+
+      {!loading && tenantsAwaitingConsent.length > 0 && !showOnboarding && (
+        <Card className="rounded-2xl border-amber-200 bg-amber-50/80 dark:border-amber-900 dark:bg-amber-950/20">
+          <CardContent className="space-y-4 p-5">
+            <div>
+              <h2 className="font-semibold text-slate-900 dark:text-white">
+                Microsoft authorization required
+              </h2>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
+                These tenants are saved, but HawkView cannot synchronize them
+                until a Microsoft 365 administrator grants consent.
+              </p>
+            </div>
+            {tenantsAwaitingConsent.map((tenant) => (
+              <div
+                key={tenant.id}
+                className="flex flex-col gap-3 rounded-xl border border-amber-200 bg-white p-4 dark:border-amber-900 dark:bg-slate-900 md:flex-row md:items-center md:justify-between"
+              >
+                <div>
+                  <p className="font-semibold text-slate-900 dark:text-white">
+                    {tenant.name}
+                  </p>
+                  <p className="text-sm text-slate-500">
+                    {tenant.microsoftTenantId}
+                  </p>
+                  <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+                    Missing: {tenant.missingPermissions.join(', ')}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  className="rounded-xl"
+                  disabled={isSavingTenant}
+                  onClick={() => handleReviewConsent(tenant)}
+                >
+                  Review and Authorize
+                </Button>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
       {/* Database API Error Alert */}
       {errorMessage && !loading && (
         <Card className="border-red-200 bg-red-50/80 dark:bg-red-950/20 dark:border-red-900/50 p-4 rounded-2xl">
           <div className="flex items-start gap-3 text-red-800 dark:text-red-300">
             <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
             <div className="flex-1 text-sm">
-              <p className="font-semibold">Unable to load the tenant directory</p>
-              <p className="mt-1 text-red-700 dark:text-red-400">{errorMessage}</p>
+              <p className="font-semibold">
+                Unable to load the tenant directory
+              </p>
+              <p className="mt-1 text-red-700 dark:text-red-400">
+                {errorMessage}
+              </p>
             </div>
             <Button
               variant="outline"
@@ -337,7 +519,10 @@ export default function TenantsPage() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
             {[1, 2, 3].map((i) => (
-              <Card key={i} className="animate-pulse p-6 bg-white dark:bg-slate-900 rounded-3xl border">
+              <Card
+                key={i}
+                className="animate-pulse p-6 bg-white dark:bg-slate-900 rounded-3xl border"
+              >
                 <div className="flex items-center gap-4 mb-6">
                   <div className="w-14 h-14 bg-slate-100 dark:bg-slate-800 rounded-2xl" />
                   <div className="space-y-2 flex-1">

@@ -1,12 +1,24 @@
-import { Body, Controller, Get, Inject, Post, Req } from '@nestjs/common'
+import {
+  Body,
+  Controller,
+  Get,
+  Inject,
+  Param,
+  Post,
+  Query,
+  Req,
+  Res,
+} from '@nestjs/common'
+import type { Response } from 'express'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
+import { Public } from '../auth/public.decorator.js'
 import { TenantsService } from './tenants.service.js'
 
 @Controller('api/tenants')
 export class TenantsController {
   constructor(
     @Inject(TenantsService)
-    private readonly tenantsService: TenantsService,
+    private readonly tenantsService: TenantsService
   ) {}
 
   @Get()
@@ -15,10 +27,29 @@ export class TenantsController {
   }
 
   @Post()
-  create(
-    @Req() request: AuthenticatedRequest,
-    @Body() body: unknown,
-  ) {
+  create(@Req() request: AuthenticatedRequest, @Body() body: unknown) {
     return this.tenantsService.createForIdentity(request.auth, body)
+  }
+
+  @Post(':id/microsoft-consent')
+  createMicrosoftConsentUrl(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string
+  ) {
+    return this.tenantsService.createConsentUrlForIdentity(
+      request.auth,
+      customerTenantId
+    )
+  }
+
+  @Public()
+  @Get('microsoft/admin-consent/callback')
+  async completeMicrosoftConsent(
+    @Query() query: Record<string, unknown>,
+    @Res() response: Response
+  ) {
+    const redirectUrl =
+      await this.tenantsService.completeMicrosoftConsent(query)
+    response.redirect(303, redirectUrl)
   }
 }

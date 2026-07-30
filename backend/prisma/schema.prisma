@@ -96,7 +96,8 @@ model CustomerTenant {
   id                String               @id @default(uuid()) @db.Uuid
   organizationId    String               @map("organization_id") @db.Uuid
   microsoftTenantId String               @unique @map("microsoft_tenant_id") @db.Uuid
-  displayName       String               @map("display_name") @db.VarChar(200)
+  displayName       String?              @map("display_name") @db.VarChar(200)
+  primaryDomain     String?              @map("primary_domain") @db.VarChar(253)
   status            CustomerTenantStatus @default(PENDING)
   createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt         DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
@@ -109,18 +110,20 @@ model CustomerTenant {
 }
 
 model TenantConnection {
-  id                   String                 @id @default(uuid()) @db.Uuid
-  organizationId       String                 @map("organization_id") @db.Uuid
-  customerTenantId     String                 @map("customer_tenant_id") @db.Uuid
-  status               TenantConnectionStatus @default(PENDING_CONSENT)
-  consentedPermissions String[]               @default([]) @map("consented_permissions")
-  consentedAt          DateTime?              @map("consented_at") @db.Timestamptz(6)
-  lastVerifiedAt       DateTime?              @map("last_verified_at") @db.Timestamptz(6)
-  lastErrorCode        String?                @map("last_error_code") @db.VarChar(100)
-  lastErrorMessage     String?                @map("last_error_message") @db.Text
-  createdAt            DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt            DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
-  customerTenant       CustomerTenant         @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  id                    String                 @id @default(uuid()) @db.Uuid
+  organizationId        String                 @map("organization_id") @db.Uuid
+  customerTenantId      String                 @map("customer_tenant_id") @db.Uuid
+  status                TenantConnectionStatus @default(PENDING_CONSENT)
+  consentedPermissions  String[]               @default([]) @map("consented_permissions")
+  consentedAt           DateTime?              @map("consented_at") @db.Timestamptz(6)
+  consentStateHash      String?                @map("consent_state_hash") @db.VarChar(64)
+  consentStateExpiresAt DateTime?              @map("consent_state_expires_at") @db.Timestamptz(6)
+  lastVerifiedAt        DateTime?              @map("last_verified_at") @db.Timestamptz(6)
+  lastErrorCode         String?                @map("last_error_code") @db.VarChar(100)
+  lastErrorMessage      String?                @map("last_error_message") @db.Text
+  createdAt             DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+  customerTenant        CustomerTenant         @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
 
   @@unique([customerTenantId, organizationId])
   @@index([organizationId, status])
