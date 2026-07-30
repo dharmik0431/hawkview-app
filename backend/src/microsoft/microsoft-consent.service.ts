@@ -168,47 +168,14 @@ export class MicrosoftConsentService {
     microsoftTenantId: string,
     credentials: { clientId: string; clientSecret: string }
   ) {
-    const { clientId, clientSecret } = credentials
-    const tokenUrl = `https://login.microsoftonline.com/${microsoftTenantId}/oauth2/v2.0/token`
-    const tokenResponse = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id: clientId,
-        client_secret: clientSecret,
-        scope: 'https://graph.microsoft.com/.default',
-        grant_type: 'client_credentials',
-      }),
-      signal: AbortSignal.timeout(15_000),
-    })
-
-    if (!tokenResponse.ok) {
-      throw new BadGatewayException(
-        'Microsoft consent was granted, but HawkView could not obtain a tenant access token.'
-      )
-    }
-
-    const tokenBody = (await tokenResponse.json()) as {
-      access_token?: string
-    }
-    if (!tokenBody.access_token) {
-      throw new BadGatewayException(
-        'Microsoft did not return a tenant access token.'
-      )
-    }
-
-    const tokenClaims = decodeJwt(tokenBody.access_token)
-    const grantedPermissions = Array.isArray(tokenClaims.roles)
-      ? tokenClaims.roles.filter(
-          (permission): permission is string => typeof permission === 'string'
-        )
-      : []
+    const { accessToken, grantedPermissions } =
+      await this.requestAccessToken(microsoftTenantId, credentials)
 
     const organizationResponse = await fetch(
       'https://graph.microsoft.com/v1.0/organization?$select=id,displayName,verifiedDomains',
       {
         headers: {
-          Authorization: `Bearer ${tokenBody.access_token}`,
+          Authorization: `Bearer ${accessToken}`,
           Accept: 'application/json',
         },
         signal: AbortSignal.timeout(15_000),
@@ -253,6 +220,81 @@ export class MicrosoftConsentService {
       grantedPermissions: [...new Set(grantedPermissions)].sort(),
       missingPermissions,
     }
+  }
+
+  private async requestAccessToken(
+    microsoftTenantId: string,
+    credentials: { clientId: string; clientSecret: string }
+  ) {
+    const { clientId, clientSecret } = credentials
+    const tokenUrl = `https://login.microsoftonline.com/${microsoftTenantId}/oauth2/v2.0/token`
+    const tokenResponse = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        scope: 'https://graph.microsoft.com/.default',
+        grant_type: 'client_credentials',
+      }),
+      signal: AbortSignal.timeout(15_000),
+    })
+
+    if (!tokenResponse.ok) {
+      throw new BadGatewayException(
+        'Microsoft consent was granted, but HawkView could not obtain a tenant access token.'
+      )
+    }
+
+    const tokenBody = (await tokenResponse.json()) as {
+      access_token?: string
+    }
+    if (!tokenBody.access_token) {
+      throw new BadGatewayException(
+        'Microsoft did not return a tenant access token.'
+      )
+    }
+
+    const tokenClaims = decodeJwt(tokenBody.access_token)
+    const grantedPermissions = Array.isArray(tokenClaims.roles)
+      ? tokenClaims.roles.filter(
+          (permission): permission is string => typeof permission === 'string'
+        )
+      : []
+
+    return {
+      accessToken: tokenBody.access_token,
+      grantedPermissions,
+    }
+  }
+
+  async getTenantAccessToken(input: {
+    microsoftTenantId: string
+    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+    clientId: string | null
+    credentialReference: string | null
+  }) {
+    const credentials =
+      input.connectionMode === 'CUSTOMER_MANAGED'
+        ? {
+            clientId: input.clientId ?? '',
+            clientSecret: input.credentialReference
+              ? await this.secretStore.access(input.credentialReference)
+              : '',
+          }
+        : await this.getManagedConnector()
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new ServiceUnavailableException(
+        'The Microsoft tenant connection is incomplete.'
+      )
+    }
+
+    const result = await this.requestAccessToken(
+      input.microsoftTenantId,
+      credentials
+    )
+    return result.accessToken
   }
 
   async configureManagedConnector(input: {
