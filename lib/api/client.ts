@@ -10,6 +10,7 @@ async function getIdentityToken() {
 
 interface FetchOptions extends RequestInit {
   params?: Record<string, string>
+  timeoutMs?: number
 }
 
 class ApiError extends Error {
@@ -26,7 +27,7 @@ async function fetchApi<T>(
   endpoint: string,
   options: FetchOptions = {}
 ): Promise<T> {
-  const { params, ...fetchOptions } = options
+  const { params, timeoutMs = API_TIMEOUT_MS, ...fetchOptions } = options
 
   if (!API_BASE_URL) {
     throw new ApiError(
@@ -46,7 +47,7 @@ async function fetchApi<T>(
   }
 
   const timeoutController = new AbortController()
-  const timeoutId = setTimeout(() => timeoutController.abort(), API_TIMEOUT_MS)
+  const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs)
   const signal = fetchOptions.signal
     ? AbortSignal.any([fetchOptions.signal, timeoutController.signal])
     : timeoutController.signal

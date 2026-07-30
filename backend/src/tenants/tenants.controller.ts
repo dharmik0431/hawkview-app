@@ -14,12 +14,15 @@ import type { Response } from 'express'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { Public } from '../auth/public.decorator.js'
 import { TenantsService } from './tenants.service.js'
+import { TenantSyncService } from './tenant-sync.service.js'
 
 @Controller('api/tenants')
 export class TenantsController {
   constructor(
     @Inject(TenantsService)
-    private readonly tenantsService: TenantsService
+    private readonly tenantsService: TenantsService,
+    @Inject(TenantSyncService)
+    private readonly tenantSyncService: TenantSyncService
   ) {}
 
   @Get()
@@ -30,6 +33,28 @@ export class TenantsController {
   @Post()
   create(@Req() request: AuthenticatedRequest, @Body() body: unknown) {
     return this.tenantsService.createForIdentity(request.auth, body)
+  }
+
+  @Get(':id')
+  getTenantBundle(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string
+  ) {
+    return this.tenantSyncService.getBundleForIdentity(
+      request.auth,
+      customerTenantId
+    )
+  }
+
+  @Post(':id/sync')
+  syncTenantUsers(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string
+  ) {
+    return this.tenantSyncService.syncUsersForIdentity(
+      request.auth,
+      customerTenantId
+    )
   }
 
   @Post(':id/microsoft-consent')

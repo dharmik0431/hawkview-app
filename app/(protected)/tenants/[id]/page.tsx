@@ -91,7 +91,7 @@ type TenantUser = {
   type: 'Member' | 'Guest'
   role: 'Global Administrator' | 'User' | 'External Auditor' | 'Service Account'
   status: 'Enabled' | 'Disabled'
-  mfa: 'Enforced' | 'Enabled' | 'Disabled'
+  mfa: 'Enforced' | 'Enabled' | 'Disabled' | 'Unknown'
   lastLogin: string
   driveUsage: string
   mailUsage: string
@@ -966,7 +966,9 @@ export default function TenantDetailsPage() {
     try {
       const data = refresh
         ? await apiClient.post<any>(
-            `/api/tenants/${encodeURIComponent(String(tenantId))}/sync`
+            `/api/tenants/${encodeURIComponent(String(tenantId))}/sync`,
+            undefined,
+            { timeoutMs: 60_000 }
           )
         : await apiClient.get<any>(
             `/api/tenants/${encodeURIComponent(String(tenantId))}`
@@ -3593,7 +3595,9 @@ export default function TenantDetailsPage() {
                             ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                             : selectedUser.mfa === 'Enabled'
                               ? 'bg-blue-50 text-blue-700 border border-blue-200'
-                              : 'bg-red-50 text-red-700 border border-red-200'
+                              : selectedUser.mfa === 'Disabled'
+                                ? 'bg-red-50 text-red-700 border border-red-200'
+                                : 'bg-slate-50 text-slate-700 border border-slate-200'
                         }
                       >
                         MFA: {selectedUser.mfa}

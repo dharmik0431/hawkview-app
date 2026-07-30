@@ -50,6 +50,17 @@ enum MicrosoftConnectionMode {
   CUSTOMER_MANAGED
 }
 
+enum SyncResourceType {
+  USERS
+}
+
+enum SyncStateStatus {
+  IDLE
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
 model User {
   id                     String       @id @default(uuid()) @db.Uuid
   identityPlatformUserId String?      @unique @map("identity_platform_user_id") @db.VarChar(128)
@@ -75,6 +86,8 @@ model Organization {
   updatedAt       DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
   memberships     Membership[]
   customerTenants CustomerTenant[]
+  directoryUsers  DirectoryUser[]
+  syncStates      SyncState[]
 
   @@index([status])
   @@map("organizations")
@@ -108,10 +121,58 @@ model CustomerTenant {
   updatedAt         DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
   organization      Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   connection        TenantConnection?
+  directoryUsers    DirectoryUser[]
+  syncStates        SyncState[]
 
   @@unique([id, organizationId])
   @@index([organizationId, status])
   @@map("customer_tenants")
+}
+
+model DirectoryUser {
+  id                String         @id @default(uuid()) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  customerTenantId  String         @map("customer_tenant_id") @db.Uuid
+  microsoftUserId   String         @map("microsoft_user_id") @db.Uuid
+  displayName       String         @map("display_name") @db.VarChar(256)
+  userPrincipalName String         @map("user_principal_name") @db.VarChar(320)
+  mail              String?        @db.VarChar(320)
+  accountEnabled    Boolean        @default(true) @map("account_enabled")
+  userType          String?        @map("user_type") @db.VarChar(50)
+  firstSeenAt       DateTime       @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt        DateTime       @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  deletedAt         DateTime?      @map("deleted_at") @db.Timestamptz(6)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, microsoftUserId])
+  @@index([organizationId, customerTenantId, deletedAt])
+  @@index([customerTenantId, userPrincipalName])
+  @@map("directory_users")
+}
+
+model SyncState {
+  id                  String           @id @default(uuid()) @db.Uuid
+  organizationId      String           @map("organization_id") @db.Uuid
+  customerTenantId    String           @map("customer_tenant_id") @db.Uuid
+  resourceType        SyncResourceType @map("resource_type")
+  status              SyncStateStatus  @default(IDLE)
+  deltaLink           String?          @map("delta_link") @db.Text
+  lastAttemptAt       DateTime?        @map("last_attempt_at") @db.Timestamptz(6)
+  lastSuccessfulAt    DateTime?        @map("last_successful_at") @db.Timestamptz(6)
+  lastErrorCode       String?          @map("last_error_code") @db.VarChar(100)
+  lastErrorMessage    String?          @map("last_error_message") @db.Text
+  consecutiveFailures Int              @default(0) @map("consecutive_failures")
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization        Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant      CustomerTenant   @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, resourceType])
+  @@index([organizationId, status])
+  @@map("sync_states")
 }
 
 model TenantConnection {
