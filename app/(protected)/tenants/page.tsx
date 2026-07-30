@@ -10,6 +10,7 @@ import {
   ChevronRight,
   AlertCircle,
   RefreshCw,
+  Trash2,
 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -128,6 +129,7 @@ export default function TenantsPage() {
   const [consentReview, setConsentReview] =
     useState<MicrosoftConsentResponse | null>(null)
   const [isSavingTenant, setIsSavingTenant] = useState(false)
+  const [deletingTenantId, setDeletingTenantId] = useState<string | null>(null)
 
   const loading = isLoading || isFetching
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
@@ -242,6 +244,34 @@ export default function TenantsPage() {
       )
     } finally {
       setIsSavingTenant(false)
+    }
+  }
+
+  const handleRemovePendingTenant = async (tenant: Tenant) => {
+    const confirmed = window.confirm(
+      `Remove "${tenant.name}" from HawkView? This only removes this pending setup record.`
+    )
+    if (!confirmed) return
+
+    setOnboardingError(null)
+    setDeletingTenantId(tenant.id)
+    try {
+      await apiClient.delete<{ removed: boolean; tenantId: string }>(
+        `/api/tenants/${tenant.id}`
+      )
+      await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      setConsentMessage({
+        text: `${tenant.name} was removed from the pending tenant list.`,
+        tone: 'success',
+      })
+    } catch (deleteError) {
+      setOnboardingError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : 'The pending tenant could not be removed.'
+      )
+    } finally {
+      setDeletingTenantId(null)
     }
   }
 
@@ -528,14 +558,28 @@ export default function TenantsPage() {
                     Missing: {tenant.missingPermissions.join(', ')}
                   </p>
                 </div>
-                <Button
-                  type="button"
-                  className="rounded-xl"
-                  disabled={isSavingTenant}
-                  onClick={() => handleReviewConsent(tenant)}
-                >
-                  Review and Authorize
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    className="rounded-xl"
+                    disabled={isSavingTenant || deletingTenantId === tenant.id}
+                    onClick={() => handleReviewConsent(tenant)}
+                  >
+                    Review and Authorize
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="rounded-xl border-red-200 text-red-700 hover:bg-red-50 hover:text-red-800"
+                    disabled={isSavingTenant || deletingTenantId === tenant.id}
+                    onClick={() => handleRemovePendingTenant(tenant)}
+                  >
+                    <Trash2 className="mr-2 h-4 w-4" />
+                    {deletingTenantId === tenant.id
+                      ? 'Removing...'
+                      : 'Remove pending tenant'}
+                  </Button>
+                </div>
               </div>
             ))}
           </CardContent>

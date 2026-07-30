@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Inject,
   Param,
@@ -37,6 +38,17 @@ export class TenantsController {
     @Param('id') customerTenantId: string
   ) {
     return this.tenantsService.createConsentUrlForIdentity(
+      request.auth,
+      customerTenantId
+    )
+  }
+
+  @Delete(':id')
+  removePendingTenant(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string
+  ) {
+    return this.tenantsService.removePendingTenantForIdentity(
       request.auth,
       customerTenantId
     )
