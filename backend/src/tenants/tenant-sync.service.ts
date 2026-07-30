@@ -344,8 +344,9 @@ export class TenantSyncService {
         },
       }),
     ])
-    const lastSync =
-      syncState?.lastSuccessfulAt ?? tenant.connection?.lastVerifiedAt ?? null
+    // Connector verification only proves that credentials work. It is not a
+    // data synchronization and must never be displayed as one.
+    const lastSync = syncState?.lastSuccessfulAt ?? null
 
     return {
       bundle: {
