@@ -1,10 +1,14 @@
 import {
   BadGatewayException,
+  BadRequestException,
+  Inject,
   Injectable,
   ServiceUnavailableException,
 } from '@nestjs/common'
 import { createHash, randomBytes } from 'node:crypto'
 import { decodeJwt, jwtVerify, SignJWT } from 'jose'
+import { PrismaService } from '../prisma/prisma.service.js'
+import { SecretStoreService } from '../secrets/secret-store.service.js'
 
 const DEFAULT_REQUIRED_PERMISSIONS = [
   'Organization.Read.All',
@@ -35,25 +39,45 @@ interface MicrosoftOrganization {
 
 @Injectable()
 export class MicrosoftConsentService {
-  private getRequiredConfiguration() {
-    const clientId = process.env.MICROSOFT_CLIENT_ID?.trim()
-    const clientSecret = process.env.MICROSOFT_CLIENT_SECRET?.trim()
-    const redirectUri = process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI?.trim()
-    const stateSecret = process.env.MICROSOFT_CONSENT_STATE_SECRET?.trim()
+  constructor(
+    @Inject(PrismaService)
+    private readonly prisma: PrismaService,
+    @Inject(SecretStoreService)
+    private readonly secretStore: SecretStoreService
+  ) {}
 
-    if (!clientId || !clientSecret || !redirectUri || !stateSecret) {
+  private async getStateConfiguration() {
+    const redirectUri = process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI?.trim()
+
+    if (!redirectUri) {
       throw new ServiceUnavailableException(
         'Microsoft tenant consent is not configured yet.'
       )
     }
+    const stateSecret = await this.secretStore.accessOrCreate(
+      'hawkview-microsoft-consent-state-secret',
+      () => randomBytes(48).toString('base64url')
+    )
 
-    if (stateSecret.length < 32) {
+    return { redirectUri, stateSecret }
+  }
+
+  private async getManagedConnector() {
+    const connector =
+      await this.prisma.platformMicrosoftConnector.findUnique({
+        where: { id: 'default' },
+      })
+    if (!connector) {
       throw new ServiceUnavailableException(
-        'Microsoft consent state protection is not configured securely.'
+        'The HawkView-managed Microsoft connector has not been configured.'
       )
     }
-
-    return { clientId, clientSecret, redirectUri, stateSecret }
+    return {
+      clientId: connector.clientId,
+      clientSecret: await this.secretStore.access(
+        connector.credentialReference
+      ),
+    }
   }
 
   getRequiredPermissions() {
@@ -78,7 +102,8 @@ export class MicrosoftConsentService {
     microsoftTenantId: string,
     state: Omit<ConsentState, 'nonce'>
   ) {
-    const configuration = this.getRequiredConfiguration()
+    const configuration = await this.getStateConfiguration()
+    const connector = await this.getManagedConnector()
     const nonce = randomBytes(32).toString('base64url')
     const stateToken = await new SignJWT({ ...state, nonce })
       .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
@@ -91,7 +116,7 @@ export class MicrosoftConsentService {
     const url = new URL(
       `https://login.microsoftonline.com/${microsoftTenantId}/v2.0/adminconsent`
     )
-    url.searchParams.set('client_id', configuration.clientId)
+    url.searchParams.set('client_id', connector.clientId)
     url.searchParams.set('scope', 'https://graph.microsoft.com/.default')
     url.searchParams.set('redirect_uri', configuration.redirectUri)
     url.searchParams.set('state', stateToken)
@@ -104,7 +129,7 @@ export class MicrosoftConsentService {
   }
 
   async verifyConsentState(stateToken: string): Promise<ConsentState> {
-    const { stateSecret } = this.getRequiredConfiguration()
+    const { stateSecret } = await this.getStateConfiguration()
     const { payload } = await jwtVerify(
       stateToken,
       new TextEncoder().encode(stateSecret),
@@ -135,7 +160,15 @@ export class MicrosoftConsentService {
   }
 
   async verifyTenant(microsoftTenantId: string) {
-    const { clientId, clientSecret } = this.getRequiredConfiguration()
+    const credentials = await this.getManagedConnector()
+    return this.verifyTenantWithCredentials(microsoftTenantId, credentials)
+  }
+
+  async verifyTenantWithCredentials(
+    microsoftTenantId: string,
+    credentials: { clientId: string; clientSecret: string }
+  ) {
+    const { clientId, clientSecret } = credentials
     const tokenUrl = `https://login.microsoftonline.com/${microsoftTenantId}/oauth2/v2.0/token`
     const tokenResponse = await fetch(tokenUrl, {
       method: 'POST',
@@ -220,5 +253,80 @@ export class MicrosoftConsentService {
       grantedPermissions: [...new Set(grantedPermissions)].sort(),
       missingPermissions,
     }
+  }
+
+  async configureManagedConnector(input: {
+    clientId: string
+    homeTenantId: string
+    clientSecret: string
+    credentialExpiresAt?: Date | null
+  }) {
+    const verification = await this.verifyTenantWithCredentials(
+      input.homeTenantId,
+      {
+        clientId: input.clientId,
+        clientSecret: input.clientSecret,
+      }
+    )
+    if (verification.missingPermissions.length > 0) {
+      throw new BadRequestException(
+        `The connector is missing: ${verification.missingPermissions.join(', ')}.`
+      )
+    }
+
+    const credentialReference = await this.secretStore.store(
+      'hawkview-microsoft-connector-client-secret',
+      input.clientSecret
+    )
+    const connector = await this.prisma.platformMicrosoftConnector.upsert({
+      where: { id: 'default' },
+      create: {
+        id: 'default',
+        clientId: input.clientId,
+        homeTenantId: input.homeTenantId,
+        credentialReference,
+        credentialExpiresAt: input.credentialExpiresAt,
+      },
+      update: {
+        clientId: input.clientId,
+        homeTenantId: input.homeTenantId,
+        credentialReference,
+        credentialExpiresAt: input.credentialExpiresAt,
+        configuredAt: new Date(),
+      },
+    })
+
+    return {
+      configured: true,
+      clientId: connector.clientId,
+      homeTenantId: connector.homeTenantId,
+      credentialExpiresAt: connector.credentialExpiresAt?.toISOString() ?? null,
+      verifiedOrganization: verification.displayName,
+    }
+  }
+
+  async prepareCustomerManagedConnection(input: {
+    microsoftTenantId: string
+    clientId: string
+    clientSecret: string
+    secretId: string
+  }) {
+    const verification = await this.verifyTenantWithCredentials(
+      input.microsoftTenantId,
+      {
+        clientId: input.clientId,
+        clientSecret: input.clientSecret,
+      }
+    )
+    if (verification.missingPermissions.length > 0) {
+      throw new BadRequestException(
+        `The customer-managed application is missing: ${verification.missingPermissions.join(', ')}.`
+      )
+    }
+    const credentialReference = await this.secretStore.store(
+      input.secretId,
+      input.clientSecret
+    )
+    return { ...verification, credentialReference }
   }
 }

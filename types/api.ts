@@ -10,6 +10,7 @@ export const TenantSchema = z.object({
   connectionStatus: z
     .enum(['pending-consent', 'connected', 'error', 'revoked'])
     .nullable(),
+  connectionMode: z.enum(['hawkview-managed', 'customer-managed']),
   lastSync: z.string().nullable(),
   secureScore: z.number().nullable(),
   licenseCount: z.number().int().nullable(),
@@ -39,6 +40,7 @@ export type TenantsResponse = z.infer<typeof TenantsResponseSchema>
 
 export const CreateTenantResponseSchema = z.object({
   tenant: TenantSchema,
+  requiresConsent: z.boolean(),
 })
 
 export type CreateTenantResponse = z.infer<typeof CreateTenantResponseSchema>

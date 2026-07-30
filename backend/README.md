@@ -81,25 +81,36 @@ explicitly; do not use a wildcard for the authenticated API.
 
 ## Microsoft tenant consent
 
-HawkView uses one HawkView-owned, multitenant Microsoft Entra application.
-Customers provide only their Microsoft tenant ID. They never provide an
-application secret.
+HawkView supports two Microsoft connection modes:
+
+- `HAWKVIEW_MANAGED`: the customer provides a tenant ID and approves the
+  HawkView multitenant application.
+- `CUSTOMER_MANAGED`: the customer provides a tenant ID, application ID, and
+  credential for an application they control.
+
+Platform Admins configure the HawkView-owned connector through the protected
+HawkView Settings page. MSP Owners and Admins choose the connection mode while
+onboarding a tenant.
 
 The backend requires:
 
 ```text
-MICROSOFT_CLIENT_ID
-MICROSOFT_CLIENT_SECRET
+GOOGLE_CLOUD_PROJECT
 MICROSOFT_ADMIN_CONSENT_REDIRECT_URI
-MICROSOFT_CONSENT_STATE_SECRET
 MICROSOFT_REQUIRED_PERMISSIONS
 FRONTEND_APP_URL
 ```
 
-The client secret and consent-state secret belong in Google Secret Manager.
-They must never be exposed through a `NEXT_PUBLIC_` variable or committed to
-Git. Consent links are signed, expire after 15 minutes, and can be used only
-once.
+The backend validates submitted credentials with Microsoft before storing
+them. Google Secret Manager contains each secret; PostgreSQL contains only the
+connection mode, public client ID, status, expiration metadata, and Secret
+Manager reference. Secrets are never returned to the browser. The consent
+state signing key is created automatically in Secret Manager. Consent links
+are signed, expire after 15 minutes, and can be used only once.
+
+The Cloud Run service account needs permission to create secrets, add and
+access secret versions. Use a dedicated service account and a least-privilege
+custom role in deployed environments.
 
 The initial least-privilege permission set is:
 

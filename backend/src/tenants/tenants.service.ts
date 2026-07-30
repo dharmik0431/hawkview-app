@@ -46,6 +46,37 @@ export class TenantsService {
     return microsoftTenantId
   }
 
+  private parseCreateTenant(body: unknown) {
+    const microsoftTenantId = this.parseMicrosoftTenantId(body)
+    const candidate = body as Record<string, unknown>
+    const connectionMode =
+      candidate.connectionMode === 'CUSTOMER_MANAGED'
+        ? 'CUSTOMER_MANAGED'
+        : 'HAWKVIEW_MANAGED'
+    const clientId =
+      typeof candidate.clientId === 'string'
+        ? candidate.clientId.trim().toLowerCase()
+        : ''
+    const clientSecret =
+      typeof candidate.clientSecret === 'string'
+        ? candidate.clientSecret.trim()
+        : ''
+
+    if (connectionMode === 'CUSTOMER_MANAGED') {
+      if (!MICROSOFT_TENANT_ID_PATTERN.test(clientId)) {
+        throw new BadRequestException(
+          'Enter a valid customer-managed Microsoft application ID.'
+        )
+      }
+      if (clientSecret.length < 16 || clientSecret.length > 2048) {
+        throw new BadRequestException(
+          'Enter a valid customer-managed Microsoft client secret.'
+        )
+      }
+    }
+    return { microsoftTenantId, connectionMode, clientId, clientSecret }
+  }
+
   private async getManagedOrganizationIds(identity: AuthenticatedIdentity) {
     const user = await this.prisma.user.findUnique({
       where: { identityPlatformUserId: identity.subject },
@@ -82,6 +113,7 @@ export class TenantsService {
     status: string
     organization: { name: string; slug: string }
     connection: {
+      connectionMode: string
       status: string
       consentedPermissions: string[]
       lastVerifiedAt: Date | null
@@ -102,6 +134,10 @@ export class TenantsService {
       status: tenant.status.toLowerCase(),
       connectionStatus:
         tenant.connection?.status.toLowerCase().replaceAll('_', '-') ?? null,
+      connectionMode:
+        tenant.connection?.connectionMode === 'CUSTOMER_MANAGED'
+          ? 'customer-managed'
+          : 'hawkview-managed',
       lastSync: tenant.connection?.lastVerifiedAt?.toISOString() ?? null,
       requiredPermissions,
       consentedPermissions,
@@ -125,6 +161,7 @@ export class TenantsService {
       organization: { select: { name: true, slug: true } },
       connection: {
         select: {
+          connectionMode: true,
           status: true,
           consentedPermissions: true,
           lastVerifiedAt: true,
@@ -148,7 +185,8 @@ export class TenantsService {
   }
 
   async createForIdentity(identity: AuthenticatedIdentity, body: unknown) {
-    const microsoftTenantId = this.parseMicrosoftTenantId(body)
+    const input = this.parseCreateTenant(body)
+    const { microsoftTenantId } = input
     const organizationIds = await this.getManagedOrganizationIds(identity)
 
     if (organizationIds.length === 0) {
@@ -172,17 +210,52 @@ export class TenantsService {
       )
     }
 
+    if (input.connectionMode === 'CUSTOMER_MANAGED') {
+      const prepared =
+        await this.microsoftConsent.prepareCustomerManagedConnection({
+          microsoftTenantId,
+          clientId: input.clientId,
+          clientSecret: input.clientSecret,
+          secretId: `tenant-${microsoftTenantId}-microsoft-client-secret`,
+        })
+      const now = new Date()
+      const tenant = await this.prisma.customerTenant.create({
+        data: {
+          organizationId: organizationIds[0],
+          microsoftTenantId,
+          displayName: prepared.displayName,
+          primaryDomain: prepared.primaryDomain,
+          status: 'ACTIVE',
+          connection: {
+            create: {
+              connectionMode: 'CUSTOMER_MANAGED',
+              clientId: input.clientId,
+              credentialReference: prepared.credentialReference,
+              status: 'CONNECTED',
+              consentedPermissions: prepared.grantedPermissions,
+              consentedAt: now,
+              lastVerifiedAt: now,
+            },
+          },
+        },
+        select: this.tenantSelect(),
+      })
+      return { tenant: this.mapTenant(tenant), requiresConsent: false }
+    }
+
     const tenant = await this.prisma.customerTenant.create({
       data: {
         organizationId: organizationIds[0],
         microsoftTenantId,
         displayName: null,
-        connection: { create: {} },
+        connection: {
+          create: { connectionMode: 'HAWKVIEW_MANAGED' },
+        },
       },
       select: this.tenantSelect(),
     })
 
-    return { tenant: this.mapTenant(tenant) }
+    return { tenant: this.mapTenant(tenant), requiresConsent: true }
   }
 
   async createConsentUrlForIdentity(
@@ -199,11 +272,17 @@ export class TenantsService {
         id: true,
         organizationId: true,
         microsoftTenantId: true,
+        connection: { select: { connectionMode: true } },
       },
     })
 
     if (!tenant) {
       throw new NotFoundException('Customer tenant was not found.')
+    }
+    if (tenant.connection?.connectionMode !== 'HAWKVIEW_MANAGED') {
+      throw new BadRequestException(
+        'Customer-managed connections do not use HawkView admin consent.'
+      )
     }
 
     const consent = await this.microsoftConsent.createAdminConsentUrl(
