@@ -13,6 +13,15 @@ export const TenantSchema = z.object({
   lastSync: z.string().nullable(),
   secureScore: z.number().nullable(),
   licenseCount: z.number().int().nullable(),
+  requiredPermissions: z.array(
+    z.object({
+      name: z.string(),
+      description: z.string(),
+    })
+  ),
+  consentedPermissions: z.array(z.string()),
+  missingPermissions: z.array(z.string()),
+  connectionErrorCode: z.string().nullable(),
   organization: z.object({
     name: z.string(),
     slug: z.string(),
@@ -32,8 +41,20 @@ export const CreateTenantResponseSchema = z.object({
   tenant: TenantSchema,
 })
 
-export type CreateTenantResponse = z.infer<
-  typeof CreateTenantResponseSchema
+export type CreateTenantResponse = z.infer<typeof CreateTenantResponseSchema>
+
+export const MicrosoftConsentResponseSchema = z.object({
+  consentUrl: z.string().url(),
+  requiredPermissions: z.array(
+    z.object({
+      name: z.string(),
+      description: z.string(),
+    })
+  ),
+})
+
+export type MicrosoftConsentResponse = z.infer<
+  typeof MicrosoftConsentResponseSchema
 >
 
 export const DashboardStatsSchema = z.object({
@@ -50,4 +71,6 @@ export const DashboardSummaryResponseSchema = z.object({
   stats: DashboardStatsSchema.optional(),
 })
 
-export type DashboardSummaryResponse = z.infer<typeof DashboardSummaryResponseSchema>
+export type DashboardSummaryResponse = z.infer<
+  typeof DashboardSummaryResponseSchema
+>

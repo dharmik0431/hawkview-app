@@ -1,8 +1,8 @@
 # HawkView backend
 
-This package contains the HawkView API, PostgreSQL access, and Identity Platform
-token verification. Microsoft Graph synchronization and detailed server-side
-authorization will be added in later milestones.
+This package contains the HawkView API, PostgreSQL access, Identity Platform
+token verification, and Microsoft 365 tenant-consent handling. Microsoft Graph
+data synchronization will be added in later milestones.
 
 Prisma is isolated here so database credentials and generated database code are
 never included in the frontend package.
@@ -78,3 +78,38 @@ trusts an organization or role supplied by the browser.
 `FRONTEND_ORIGINS` is a comma-separated allowlist of frontend origins permitted
 to call the API from a browser. Add each deployed HawkView frontend URL
 explicitly; do not use a wildcard for the authenticated API.
+
+## Microsoft tenant consent
+
+HawkView uses one HawkView-owned, multitenant Microsoft Entra application.
+Customers provide only their Microsoft tenant ID. They never provide an
+application secret.
+
+The backend requires:
+
+```text
+MICROSOFT_CLIENT_ID
+MICROSOFT_CLIENT_SECRET
+MICROSOFT_ADMIN_CONSENT_REDIRECT_URI
+MICROSOFT_CONSENT_STATE_SECRET
+MICROSOFT_REQUIRED_PERMISSIONS
+FRONTEND_APP_URL
+```
+
+The client secret and consent-state secret belong in Google Secret Manager.
+They must never be exposed through a `NEXT_PUBLIC_` variable or committed to
+Git. Consent links are signed, expire after 15 minutes, and can be used only
+once.
+
+The initial least-privilege permission set is:
+
+```text
+Organization.Read.All
+User.Read.All
+```
+
+After consent, the backend obtains a tenant-specific application token, reads
+the organization from Microsoft Graph, verifies the returned tenant ID, stores
+the real organization name and primary domain, and records granted or missing
+permissions. Synchronization must not begin until every required permission is
+present.
