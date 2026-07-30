@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { cn } from '@/lib/utils'
 import { History as HistoryIcon } from 'lucide-react'
+import { useAuth } from '@/components/providers/auth-provider'
 
 import {
   LayoutDashboard,
@@ -59,6 +60,20 @@ const navigation = [
 
 export function Sidebar() {
   const pathname = usePathname()
+  const { session } = useAuth()
+  const membership = session?.user.memberships[0]
+  const displayName =
+    session?.user.displayName || session?.user.email || 'HawkView user'
+  const initials = displayName
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase()
+  const membershipRole = membership?.role
+    .replace('MSP_', '')
+    .toLowerCase()
+    .replace(/^\w/, (letter) => letter.toUpperCase())
 
   return (
     <div className="hidden lg:fixed lg:inset-y-0 lg:z-50 lg:flex lg:w-52 lg:flex-col">
@@ -136,17 +151,24 @@ export function Sidebar() {
             Contact Us
           </a>
 
-          {/* User card stays static at the bottom */}
+          {/* Signed-in user and workspace */}
           <div className="border-t border-slate-700 pt-3">
             <div className="flex items-center gap-3 px-2">
               <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-semibold">
-                AG
+                {initials || 'HV'}
               </div>
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium text-white truncate">
-                  Alex Greene
+                  {displayName}
                 </p>
-                <p className="text-xs text-slate-400 truncate">MSP Admin</p>
+                <p className="text-xs text-slate-400 truncate">
+                  {membershipRole || 'No workspace'}
+                </p>
+                {membership && (
+                  <p className="text-xs text-slate-500 truncate">
+                    {membership.organization.name}
+                  </p>
+                )}
               </div>
             </div>
           </div>
