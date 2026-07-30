@@ -28,6 +28,14 @@ export const TenantsResponseSchema = z.object({
 
 export type TenantsResponse = z.infer<typeof TenantsResponseSchema>
 
+export const CreateTenantResponseSchema = z.object({
+  tenant: TenantSchema,
+})
+
+export type CreateTenantResponse = z.infer<
+  typeof CreateTenantResponseSchema
+>
+
 export const DashboardStatsSchema = z.object({
   totalUsers: z.number(),
   activeLicenses: z.number(),

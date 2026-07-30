@@ -5,10 +5,13 @@ import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import { Search, Plus, Clock, ChevronRight, AlertCircle, RefreshCw } from 'lucide-react'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { useTenants } from '@/lib/api/hooks'
+import { apiClient } from '@/lib/api/client'
+import type { CreateTenantResponse } from '@/types/api'
 import { useQueryClient } from '@tanstack/react-query'
 
 type Provider = 'microsoft' | 'google'
@@ -99,6 +102,11 @@ export default function TenantsPage() {
 
   const [searchQuery, setSearchQuery] = useState('')
   const [filter, setFilter] = useState<FilterType>('all')
+  const [showOnboarding, setShowOnboarding] = useState(false)
+  const [customerName, setCustomerName] = useState('')
+  const [microsoftTenantId, setMicrosoftTenantId] = useState('')
+  const [onboardingError, setOnboardingError] = useState<string | null>(null)
+  const [isSavingTenant, setIsSavingTenant] = useState(false)
 
   const loading = isLoading || isFetching
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
@@ -122,6 +130,31 @@ export default function TenantsPage() {
   const handleRetry = () => {
     queryClient.invalidateQueries({ queryKey: ['tenants'] })
     refetch()
+  }
+
+  const handleCreateTenant = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setOnboardingError(null)
+    setIsSavingTenant(true)
+
+    try {
+      await apiClient.post<CreateTenantResponse>('/api/tenants', {
+        displayName: customerName,
+        microsoftTenantId,
+      })
+      setCustomerName('')
+      setMicrosoftTenantId('')
+      setShowOnboarding(false)
+      await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+    } catch (createError) {
+      setOnboardingError(
+        createError instanceof Error
+          ? createError.message
+          : 'Tenant onboarding could not be completed.'
+      )
+    } finally {
+      setIsSavingTenant(false)
+    }
   }
 
   const filteredTenants = useMemo(() => {
@@ -161,11 +194,80 @@ export default function TenantsPage() {
             Select a tenant environment to manage security, licenses, and users.
           </p>
         </div>
-        <Button className="gap-2 rounded-xl">
+        <Button
+          className="gap-2 rounded-xl"
+          onClick={() => {
+            setOnboardingError(null)
+            setShowOnboarding((current) => !current)
+          }}
+        >
           <Plus className="h-4 w-4" />
-          Onboard New Tenant
+          {showOnboarding ? 'Cancel Onboarding' : 'Onboard New Tenant'}
         </Button>
       </div>
+
+      {showOnboarding && (
+        <Card className="rounded-2xl border-blue-200 bg-blue-50/40 dark:border-blue-900/60 dark:bg-blue-950/20">
+          <CardContent className="p-6">
+            <div className="mb-5">
+              <h2 className="text-lg font-semibold text-slate-900 dark:text-white">
+                Add a Microsoft 365 customer tenant
+              </h2>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
+                This saves the tenant to HawkView as Pending. Microsoft consent
+                and data synchronization come next.
+              </p>
+            </div>
+
+            <form
+              onSubmit={handleCreateTenant}
+              className="grid gap-4 md:grid-cols-[1fr_1fr_auto] md:items-end"
+            >
+              <div className="space-y-2">
+                <Label htmlFor="customer-name">Customer name</Label>
+                <Input
+                  id="customer-name"
+                  value={customerName}
+                  onChange={(event) => setCustomerName(event.target.value)}
+                  placeholder="Example: WeCo"
+                  minLength={2}
+                  maxLength={200}
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="microsoft-tenant-id">
+                  Microsoft tenant ID
+                </Label>
+                <Input
+                  id="microsoft-tenant-id"
+                  value={microsoftTenantId}
+                  onChange={(event) =>
+                    setMicrosoftTenantId(event.target.value)
+                  }
+                  placeholder="00000000-0000-0000-0000-000000000000"
+                  required
+                />
+              </div>
+
+              <Button
+                type="submit"
+                disabled={isSavingTenant}
+                className="rounded-xl"
+              >
+                {isSavingTenant ? 'Saving…' : 'Save Tenant'}
+              </Button>
+            </form>
+
+            {onboardingError && (
+              <p className="mt-4 text-sm font-medium text-red-700">
+                {onboardingError}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Database API Error Alert */}
       {errorMessage && !loading && (
