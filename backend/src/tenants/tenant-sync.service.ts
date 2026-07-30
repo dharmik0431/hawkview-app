@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
+import { getMicrosoftSkuName } from '../microsoft/microsoft-sku-names.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 
 const TENANT_ADMIN_ROLES = ['MSP_OWNER', 'MSP_ADMIN'] as const
@@ -626,7 +627,7 @@ export class TenantSyncService {
     const licenseNameBySkuId = new Map(
       licenses.map((license) => [
         license.microsoftSkuId.toLowerCase(),
-        license.skuPartNumber,
+        getMicrosoftSkuName(license.skuPartNumber),
       ])
     )
     // Connector verification only proves that credentials work. It is not a
@@ -693,7 +694,7 @@ export class TenantSyncService {
           rows: licenses.map((license) => ({
             skuId: license.microsoftSkuId,
             skuPartNumber: license.skuPartNumber,
-            name: license.skuPartNumber,
+            name: getMicrosoftSkuName(license.skuPartNumber),
             used: license.consumedUnits,
             total: license.enabledUnits,
             warning: license.warningUnits,
