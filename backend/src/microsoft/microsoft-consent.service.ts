@@ -13,12 +13,15 @@ import { SecretStoreService } from '../secrets/secret-store.service.js'
 const DEFAULT_REQUIRED_PERMISSIONS = [
   'Organization.Read.All',
   'User.Read.All',
+  'GroupMember.Read.All',
 ] as const
 
 const PERMISSION_DESCRIPTIONS: Record<string, string> = {
   'Organization.Read.All':
     'Read the Microsoft 365 organization name, domains, and subscription details.',
   'User.Read.All': 'Read users and their basic directory profile information.',
+  'GroupMember.Read.All':
+    'Read Microsoft 365 and security groups and their user memberships.',
 }
 
 interface ConsentState {

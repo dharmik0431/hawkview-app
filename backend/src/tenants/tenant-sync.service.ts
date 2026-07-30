@@ -54,6 +54,28 @@ interface GraphOrganization {
   }>
 }
 
+interface GraphGroup {
+  id?: string
+  displayName?: string | null
+  description?: string | null
+  mail?: string | null
+  mailNickname?: string | null
+  mailEnabled?: boolean | null
+  securityEnabled?: boolean | null
+  groupTypes?: string[] | null
+  visibility?: string | null
+}
+
+interface GraphGroupsPage {
+  value?: GraphGroup[]
+  '@odata.nextLink'?: string
+}
+
+interface GraphGroupMembersPage {
+  value?: Array<{ id?: string }>
+  '@odata.nextLink'?: string
+}
+
 @Injectable()
 export class TenantSyncService {
   constructor(
@@ -262,13 +284,16 @@ export class TenantSyncService {
       this.syncLicenses(tenant, snapshotAccessToken),
       this.syncDomains(tenant, snapshotAccessToken),
     ])
+    // Groups require a separate Microsoft permission. Record an isolated
+    // GROUPS failure without hiding successfully refreshed users/licenses.
+    await this.syncGroups(tenant, snapshotAccessToken).catch(() => undefined)
 
     return this.buildBundle(tenant)
   }
 
   private async runSnapshotSync(
     tenant: { id: string; organizationId: string },
-    resourceType: 'LICENSES' | 'DOMAINS',
+    resourceType: 'LICENSES' | 'DOMAINS' | 'GROUPS',
     synchronize: () => Promise<void>
   ) {
     const lastAttemptAt = new Date()
@@ -483,6 +508,181 @@ export class TenantSyncService {
     })
   }
 
+  private async syncGroups(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'GROUPS', async () => {
+      const groups: GraphGroup[] = []
+      let groupsUrl =
+        'https://graph.microsoft.com/v1.0/groups?' +
+        '$select=id,displayName,description,mail,mailNickname,mailEnabled,' +
+        'securityEnabled,groupTypes,visibility&$top=999'
+
+      while (groupsUrl) {
+        if (!groupsUrl.startsWith('https://graph.microsoft.com/')) {
+          throw new Error('Microsoft returned an invalid groups link.')
+        }
+        const response = await fetch(groupsUrl, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(20_000),
+        })
+        if (!response.ok) {
+          throw new Error(
+            `Microsoft groups synchronization returned ${response.status}.`
+          )
+        }
+        const page = (await response.json()) as GraphGroupsPage
+        groups.push(
+          ...(page.value ?? []).filter(
+            (group) =>
+              typeof group.id === 'string' &&
+              typeof group.displayName === 'string'
+          )
+        )
+        groupsUrl = page['@odata.nextLink'] ?? ''
+      }
+
+      const memberIdsByGroupId = new Map<string, string[]>()
+      const fetchGroupMemberIds = async (groupId: string) => {
+        const memberIds: string[] = []
+        let membersUrl =
+          `https://graph.microsoft.com/v1.0/groups/${encodeURIComponent(groupId)}` +
+          '/members?$select=id&$top=999'
+        while (membersUrl) {
+          if (!membersUrl.startsWith('https://graph.microsoft.com/')) {
+            throw new Error(
+              'Microsoft returned an invalid group-members link.'
+            )
+          }
+          const response = await fetch(membersUrl, {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              Accept: 'application/json',
+            },
+            signal: AbortSignal.timeout(20_000),
+          })
+          if (!response.ok) {
+            throw new Error(
+              `Microsoft group membership synchronization returned ${response.status}.`
+            )
+          }
+          const page = (await response.json()) as GraphGroupMembersPage
+          memberIds.push(
+            ...(page.value ?? [])
+              .map((member) => member.id)
+              .filter((id): id is string => typeof id === 'string')
+          )
+          membersUrl = page['@odata.nextLink'] ?? ''
+        }
+        memberIdsByGroupId.set(groupId, [...new Set(memberIds)])
+      }
+
+      // Keep concurrency bounded to avoid overwhelming Microsoft Graph while
+      // still making the initial snapshot practical for tenants with many groups.
+      for (let index = 0; index < groups.length; index += 5) {
+        await Promise.all(
+          groups
+            .slice(index, index + 5)
+            .map((group) => fetchGroupMemberIds(group.id as string))
+        )
+      }
+
+      const directoryUsers = await this.prisma.directoryUser.findMany({
+        where: {
+          customerTenantId: tenant.id,
+          deletedAt: null,
+        },
+        select: {
+          id: true,
+          microsoftUserId: true,
+        },
+      })
+      const directoryUserIdByMicrosoftId = new Map(
+        directoryUsers.map((user) => [user.microsoftUserId, user.id])
+      )
+      const observedAt = new Date()
+
+      await this.prisma.$transaction(async (transaction) => {
+        for (const group of groups) {
+          const microsoftGroupId = group.id as string
+          const directoryGroup = await transaction.directoryGroup.upsert({
+            where: {
+              customerTenantId_microsoftGroupId: {
+                customerTenantId: tenant.id,
+                microsoftGroupId,
+              },
+            },
+            create: {
+              organizationId: tenant.organizationId,
+              customerTenantId: tenant.id,
+              microsoftGroupId,
+              displayName: group.displayName?.trim() || microsoftGroupId,
+              description: group.description?.trim() || null,
+              mail: group.mail?.trim() || null,
+              mailNickname: group.mailNickname?.trim() || null,
+              mailEnabled: group.mailEnabled === true,
+              securityEnabled: group.securityEnabled === true,
+              groupTypes: group.groupTypes ?? [],
+              visibility: group.visibility?.trim() || null,
+              lastSeenAt: observedAt,
+            },
+            update: {
+              displayName: group.displayName?.trim() || microsoftGroupId,
+              description: group.description?.trim() || null,
+              mail: group.mail?.trim() || null,
+              mailNickname: group.mailNickname?.trim() || null,
+              mailEnabled: group.mailEnabled === true,
+              securityEnabled: group.securityEnabled === true,
+              groupTypes: group.groupTypes ?? [],
+              visibility: group.visibility?.trim() || null,
+              lastSeenAt: observedAt,
+            },
+          })
+
+          await transaction.directoryGroupMembership.deleteMany({
+            where: { directoryGroupId: directoryGroup.id },
+          })
+          const memberships = (memberIdsByGroupId.get(microsoftGroupId) ?? [])
+            .map((microsoftUserId) => ({
+              directoryUserId:
+                directoryUserIdByMicrosoftId.get(microsoftUserId),
+            }))
+            .filter(
+              (
+                membership
+              ): membership is {
+                directoryUserId: string
+              } => Boolean(membership.directoryUserId)
+            )
+            .map((membership) => ({
+              organizationId: tenant.organizationId,
+              customerTenantId: tenant.id,
+              directoryGroupId: directoryGroup.id,
+              directoryUserId: membership.directoryUserId,
+              lastSeenAt: observedAt,
+            }))
+          if (memberships.length > 0) {
+            await transaction.directoryGroupMembership.createMany({
+              data: memberships,
+              skipDuplicates: true,
+            })
+          }
+        }
+
+        await transaction.directoryGroup.deleteMany({
+          where: {
+            customerTenantId: tenant.id,
+            lastSeenAt: { lt: observedAt },
+          },
+        })
+      })
+    })
+  }
+
   private async synchronizeUsers(
     tenant: {
       id: string
@@ -599,6 +799,15 @@ export class TenantSyncService {
           deletedAt: null,
         },
         orderBy: [{ displayName: 'asc' }, { userPrincipalName: 'asc' }],
+        include: {
+          groupMemberships: {
+            select: {
+              directoryGroup: {
+                select: { displayName: true },
+              },
+            },
+          },
+        },
       }),
       this.prisma.tenantLicense.findMany({
         where: {
@@ -624,6 +833,7 @@ export class TenantSyncService {
     const userSyncState = syncStateByResource.get('USERS')
     const licenseSyncState = syncStateByResource.get('LICENSES')
     const domainSyncState = syncStateByResource.get('DOMAINS')
+    const groupSyncState = syncStateByResource.get('GROUPS')
     const licenseNameBySkuId = new Map(
       licenses.map((license) => [
         license.microsoftSkuId.toLowerCase(),
@@ -678,7 +888,9 @@ export class TenantSyncService {
           licenses: user.assignedLicenseSkuIds.map(
             (skuId) => licenseNameBySkuId.get(skuId.toLowerCase()) ?? skuId
           ),
-          groups: [],
+          groups: user.groupMemberships
+            .map((membership) => membership.directoryGroup.displayName)
+            .sort((left, right) => left.localeCompare(right)),
           devices: [],
         })),
         signIns: [],
@@ -727,6 +939,12 @@ export class TenantSyncService {
             lastSuccessfulAt:
               domainSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: domainSyncState?.lastErrorMessage ?? null,
+          },
+          groups: {
+            status: groupSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt:
+              groupSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: groupSyncState?.lastErrorMessage ?? null,
           },
         },
       },

@@ -21,7 +21,7 @@ read saved data from the HawkView API and must never call Microsoft directly.
 | Organization name and primary domain | Microsoft Graph organization | `Organization.Read.All` | Live |
 | Verified domains | Microsoft Graph organization | `Organization.Read.All` | Live |
 | Purchased licenses and utilization | Microsoft Graph subscribed SKUs | `Organization.Read.All` | Live |
-| User license assignments | Microsoft Graph users delta | `User.Read.All` | In progress |
+| User license assignments | Microsoft Graph users delta | `User.Read.All` | Live |
 | SPF record | Public DNS TXT lookup | No Microsoft permission | Planned |
 | DMARC record | Public DNS TXT lookup | No Microsoft permission | Planned |
 | DKIM record and enabled state | DNS plus Exchange configuration | Exchange access may be required | Planned |
@@ -33,8 +33,8 @@ read saved data from the HawkView API and must never call Microsoft directly.
 | Frontend data | Source | Access | Status |
 | --- | --- | --- | --- |
 | Users, guests, enabled state, email | Microsoft Graph users delta | `User.Read.All` | Live |
-| Assigned user licenses | Microsoft Graph users delta | `User.Read.All` | In progress |
-| Groups and memberships | Microsoft Graph groups and membership endpoints | `Group.Read.All` | Planned |
+| Assigned user licenses | Microsoft Graph users delta | `User.Read.All` | Live |
+| Groups and memberships | Microsoft Graph groups and membership endpoints | `GroupMember.Read.All` | In progress |
 | Directory roles and administrators | Microsoft Graph role management | `RoleManagement.Read.Directory` | Planned |
 | MFA registration coverage | Microsoft Graph authentication-method reports | Additional authentication/report permission | Planned |
 | Individual authentication methods | Microsoft Graph authentication methods | Additional authentication-method permission | Planned |
