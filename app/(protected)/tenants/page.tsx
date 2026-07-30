@@ -257,7 +257,8 @@ export default function TenantsPage() {
     setDeletingTenantId(tenant.id)
     try {
       await apiClient.delete<{ removed: boolean; tenantId: string }>(
-        `/api/tenants/${tenant.id}`
+        `/api/tenants/${tenant.id}`,
+        undefined
       )
       await queryClient.invalidateQueries({ queryKey: ['tenants'] })
       setConsentMessage({
@@ -269,6 +270,46 @@ export default function TenantsPage() {
         deleteError instanceof Error
           ? deleteError.message
           : 'The pending tenant could not be removed.'
+      )
+    } finally {
+      setDeletingTenantId(null)
+    }
+  }
+
+  const handleRemoveActiveTenant = async (tenant: Tenant) => {
+    const confirmation = window.prompt(
+      `This permanently removes "${tenant.name}" from HawkView and deletes its stored customer credential.\n\nType the Microsoft tenant ID to continue:\n${tenant.microsoftTenantId}`
+    )
+    if (confirmation === null) return
+
+    if (
+      confirmation.trim().toLowerCase() !==
+      tenant.microsoftTenantId.toLowerCase()
+    ) {
+      setOnboardingError('The Microsoft tenant ID did not match.')
+      return
+    }
+
+    setOnboardingError(null)
+    setDeletingTenantId(tenant.id)
+    try {
+      await apiClient.delete<{
+        removed: boolean
+        tenantId: string
+        credentialRemoved: boolean
+      }>(`/api/tenants/${tenant.id}`, {
+        confirmMicrosoftTenantId: confirmation,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      setConsentMessage({
+        text: `${tenant.name} and its stored connection were removed from HawkView.`,
+        tone: 'success',
+      })
+    } catch (deleteError) {
+      setOnboardingError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : 'The tenant could not be removed.'
       )
     } finally {
       setDeletingTenantId(null)
@@ -683,8 +724,9 @@ export default function TenantsPage() {
       {/* Grid */}
       {!loading && (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-          {filteredTenants.map((tenant: any) => (
-            <Link key={tenant.id} href={`/tenants/${tenant.id}`}>
+          {filteredTenants.map((tenant: Tenant) => (
+            <div key={tenant.id} className="space-y-2">
+              <Link href={`/tenants/${tenant.id}`}>
               <Card className="group bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-0 hover:border-blue-200 hover:shadow-xl hover:shadow-blue-500/5 transition-all duration-300 cursor-pointer relative overflow-hidden">
                 {/* accent */}
                 <div
@@ -785,7 +827,22 @@ export default function TenantsPage() {
                   </div>
                 </CardContent>
               </Card>
-            </Link>
+              </Link>
+              {tenant.status === 'active' && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full rounded-xl border-red-200 text-red-700 hover:bg-red-50 hover:text-red-800"
+                  disabled={deletingTenantId === tenant.id}
+                  onClick={() => handleRemoveActiveTenant(tenant)}
+                >
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  {deletingTenantId === tenant.id
+                    ? 'Removing tenant...'
+                    : 'Delete active tenant'}
+                </Button>
+              )}
+            </div>
           ))}
         </div>
       )}

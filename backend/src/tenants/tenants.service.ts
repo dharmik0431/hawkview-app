@@ -319,9 +319,10 @@ export class TenantsService {
     return { tenant: this.mapTenant(tenant), requiresConsent: true }
   }
 
-  async removePendingTenantForIdentity(
+  async removeTenantForIdentity(
     identity: AuthenticatedIdentity,
-    customerTenantId: string
+    customerTenantId: string,
+    body: unknown
   ) {
     const organizationIds = await this.getManagedOrganizationIds(identity)
     const tenant = await this.prisma.customerTenant.findFirst({
@@ -331,6 +332,8 @@ export class TenantsService {
       },
       select: {
         id: true,
+        organizationId: true,
+        microsoftTenantId: true,
         status: true,
         connection: {
           select: {
@@ -344,17 +347,45 @@ export class TenantsService {
     if (!tenant) {
       throw new NotFoundException('Customer tenant was not found.')
     }
-    if (
+    const isConnected =
       tenant.status === 'ACTIVE' ||
       tenant.connection?.status === 'CONNECTED'
-    ) {
-      throw new ConflictException(
-        'Connected tenants cannot be removed from this setup screen.'
-      )
+
+    if (isConnected) {
+      const candidate =
+        body && typeof body === 'object'
+          ? (body as Record<string, unknown>)
+          : {}
+      const confirmation =
+        typeof candidate.confirmMicrosoftTenantId === 'string'
+          ? candidate.confirmMicrosoftTenantId.trim().toLowerCase()
+          : ''
+      if (confirmation !== tenant.microsoftTenantId.toLowerCase()) {
+        throw new BadRequestException(
+          'Type the Microsoft tenant ID to confirm deletion.'
+        )
+      }
+
+      await this.prisma.$transaction([
+        this.prisma.customerTenant.update({
+          where: { id: tenant.id },
+          data: { status: 'DISCONNECTED' },
+        }),
+        this.prisma.tenantConnection.update({
+          where: {
+            customerTenantId_organizationId: {
+              customerTenantId: tenant.id,
+              organizationId: tenant.organizationId,
+            },
+          },
+          data: { status: 'REVOKED' },
+        }),
+      ])
     }
+
     if (tenant.connection?.credentialReference) {
-      throw new ConflictException(
-        'A tenant with stored credentials must be disconnected through tenant settings.'
+      await this.microsoftConsent.deleteStoredCredential(
+        tenant.connection.credentialReference
       )
     }
 
@@ -362,7 +393,11 @@ export class TenantsService {
       where: { id: tenant.id },
     })
 
-    return { removed: true, tenantId: tenant.id }
+    return {
+      removed: true,
+      tenantId: tenant.id,
+      credentialRemoved: Boolean(tenant.connection?.credentialReference),
+    }
   }
 
   async createConsentUrlForIdentity(

@@ -329,4 +329,8 @@ export class MicrosoftConsentService {
     )
     return { ...verification, credentialReference }
   }
+
+  async deleteStoredCredential(reference: string) {
+    await this.secretStore.delete(reference)
+  }
 }

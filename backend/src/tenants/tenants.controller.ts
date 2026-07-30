@@ -46,11 +46,13 @@ export class TenantsController {
   @Delete(':id')
   removePendingTenant(
     @Req() request: AuthenticatedRequest,
-    @Param('id') customerTenantId: string
+    @Param('id') customerTenantId: string,
+    @Body() body: unknown
   ) {
-    return this.tenantsService.removePendingTenantForIdentity(
+    return this.tenantsService.removeTenantForIdentity(
       request.auth,
-      customerTenantId
+      customerTenantId,
+      body
     )
   }
 

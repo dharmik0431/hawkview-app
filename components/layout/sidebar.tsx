@@ -130,6 +130,20 @@ export function Sidebar() {
 
         {/* Bottom actions + user (pinned) */}
         <div className="mt-4 space-y-2">
+          {session?.user.platformRole === 'PLATFORM_ADMIN' && (
+            <Link
+              href="/settings"
+              className={cn(
+                'flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
+                pathname === '/settings'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-slate-800 text-slate-200 hover:bg-slate-700 hover:text-white'
+              )}
+            >
+              <Settings className="h-4 w-4" aria-hidden="true" />
+              Platform Settings
+            </Link>
+          )}
           <Link
             href="/help"
             className={cn(
