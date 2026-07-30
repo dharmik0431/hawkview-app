@@ -15,7 +15,10 @@ export interface HawkViewSession {
     id: string
     email: string
     displayName: string | null
-    platformRole: 'PLATFORM_ADMIN' | null
+    platformRole:
+      | 'STANDARD_USER'
+      | 'PLATFORM_SUPPORT'
+      | 'PLATFORM_ADMIN'
     memberships: HawkViewMembership[]
   }
   signInProvider?: string

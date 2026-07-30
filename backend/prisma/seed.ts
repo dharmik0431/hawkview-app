@@ -19,7 +19,7 @@ const prisma = new PrismaClient({
 })
 
 const DEVELOPMENT_OWNER = {
-  email: 'dharmik@sshtech.net',
+  email: 'dharmik0417@outlook.com',
   displayName: 'Dharmik',
   organizationName: 'SSH TECH',
   organizationSlug: 'ssh-tech',
