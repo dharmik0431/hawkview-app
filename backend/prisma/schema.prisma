@@ -45,6 +45,11 @@ enum TenantConnectionStatus {
   REVOKED
 }
 
+enum MicrosoftConnectionMode {
+  HAWKVIEW_MANAGED
+  CUSTOMER_MANAGED
+}
+
 model User {
   id                     String       @id @default(uuid()) @db.Uuid
   identityPlatformUserId String?      @unique @map("identity_platform_user_id") @db.VarChar(128)
@@ -110,22 +115,38 @@ model CustomerTenant {
 }
 
 model TenantConnection {
-  id                    String                 @id @default(uuid()) @db.Uuid
-  organizationId        String                 @map("organization_id") @db.Uuid
-  customerTenantId      String                 @map("customer_tenant_id") @db.Uuid
-  status                TenantConnectionStatus @default(PENDING_CONSENT)
-  consentedPermissions  String[]               @default([]) @map("consented_permissions")
-  consentedAt           DateTime?              @map("consented_at") @db.Timestamptz(6)
-  consentStateHash      String?                @map("consent_state_hash") @db.VarChar(64)
-  consentStateExpiresAt DateTime?              @map("consent_state_expires_at") @db.Timestamptz(6)
-  lastVerifiedAt        DateTime?              @map("last_verified_at") @db.Timestamptz(6)
-  lastErrorCode         String?                @map("last_error_code") @db.VarChar(100)
-  lastErrorMessage      String?                @map("last_error_message") @db.Text
-  createdAt             DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt             DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
-  customerTenant        CustomerTenant         @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  id                    String                  @id @default(uuid()) @db.Uuid
+  organizationId        String                  @map("organization_id") @db.Uuid
+  customerTenantId      String                  @map("customer_tenant_id") @db.Uuid
+  status                TenantConnectionStatus  @default(PENDING_CONSENT)
+  connectionMode        MicrosoftConnectionMode @default(HAWKVIEW_MANAGED) @map("connection_mode")
+  clientId              String?                 @map("client_id") @db.Uuid
+  credentialReference   String?                 @map("credential_reference") @db.VarChar(500)
+  credentialExpiresAt   DateTime?               @map("credential_expires_at") @db.Timestamptz(6)
+  consentedPermissions  String[]                @default([]) @map("consented_permissions")
+  consentedAt           DateTime?               @map("consented_at") @db.Timestamptz(6)
+  consentStateHash      String?                 @map("consent_state_hash") @db.VarChar(64)
+  consentStateExpiresAt DateTime?               @map("consent_state_expires_at") @db.Timestamptz(6)
+  lastVerifiedAt        DateTime?               @map("last_verified_at") @db.Timestamptz(6)
+  lastErrorCode         String?                 @map("last_error_code") @db.VarChar(100)
+  lastErrorMessage      String?                 @map("last_error_message") @db.Text
+  createdAt             DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  customerTenant        CustomerTenant          @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
 
   @@unique([customerTenantId, organizationId])
   @@index([organizationId, status])
   @@map("tenant_connections")
+}
+
+model PlatformMicrosoftConnector {
+  id                  String    @id @default("default") @db.VarChar(32)
+  clientId            String    @map("client_id") @db.Uuid
+  homeTenantId        String    @map("home_tenant_id") @db.Uuid
+  credentialReference String    @map("credential_reference") @db.VarChar(500)
+  credentialExpiresAt DateTime? @map("credential_expires_at") @db.Timestamptz(6)
+  configuredAt        DateTime  @default(now()) @map("configured_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("platform_microsoft_connectors")
 }

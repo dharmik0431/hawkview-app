@@ -115,6 +115,11 @@ export default function TenantsPage() {
   const [filter, setFilter] = useState<FilterType>('all')
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [microsoftTenantId, setMicrosoftTenantId] = useState('')
+  const [connectionMode, setConnectionMode] = useState<
+    'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+  >('HAWKVIEW_MANAGED')
+  const [customerClientId, setCustomerClientId] = useState('')
+  const [customerClientSecret, setCustomerClientSecret] = useState('')
   const [onboardingError, setOnboardingError] = useState<string | null>(null)
   const [consentMessage, setConsentMessage] = useState<{
     text: string
@@ -182,13 +187,30 @@ export default function TenantsPage() {
         '/api/tenants',
         {
           microsoftTenantId,
+          connectionMode,
+          ...(connectionMode === 'CUSTOMER_MANAGED'
+            ? {
+                clientId: customerClientId,
+                clientSecret: customerClientSecret,
+              }
+            : {}),
         }
       )
       await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      setMicrosoftTenantId('')
+      setCustomerClientId('')
+      setCustomerClientSecret('')
+      if (!created.requiresConsent) {
+        setShowOnboarding(false)
+        setConsentMessage({
+          text: 'Customer-managed Microsoft connection verified and stored securely. HawkView is ready for the initial sync.',
+          tone: 'success',
+        })
+        return
+      }
       const consent = await apiClient.post<MicrosoftConsentResponse>(
         `/api/tenants/${created.tenant.id}/microsoft-consent`
       )
-      setMicrosoftTenantId('')
       setConsentReview(consent)
     } catch (createError) {
       setOnboardingError(
@@ -287,16 +309,47 @@ export default function TenantsPage() {
                 Connect a Microsoft 365 customer tenant
               </h2>
               <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-                Enter the Microsoft tenant ID. HawkView will retrieve the real
-                organization name after administrator consent.
+                Choose the standard HawkView connector or an application
+                controlled by the customer.
               </p>
             </div>
 
             {!consentReview ? (
               <form
                 onSubmit={handleCreateTenant}
-                className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end"
+                className="space-y-5"
               >
+                <div className="grid gap-3 md:grid-cols-2">
+                  <button
+                    type="button"
+                    onClick={() => setConnectionMode('HAWKVIEW_MANAGED')}
+                    className={`rounded-xl border p-4 text-left ${
+                      connectionMode === 'HAWKVIEW_MANAGED'
+                        ? 'border-blue-600 bg-blue-50'
+                        : 'border-slate-200 bg-white'
+                    }`}
+                  >
+                    <span className="font-semibold">HawkView-managed</span>
+                    <span className="mt-1 block text-sm text-slate-600">
+                      Recommended. The customer approves Microsoft consent.
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConnectionMode('CUSTOMER_MANAGED')}
+                    className={`rounded-xl border p-4 text-left ${
+                      connectionMode === 'CUSTOMER_MANAGED'
+                        ? 'border-blue-600 bg-blue-50'
+                        : 'border-slate-200 bg-white'
+                    }`}
+                  >
+                    <span className="font-semibold">Customer-managed</span>
+                    <span className="mt-1 block text-sm text-slate-600">
+                      For organizations that control their own app registration.
+                    </span>
+                  </button>
+                </div>
+
                 <div className="space-y-2">
                   <Label htmlFor="microsoft-tenant-id">
                     Microsoft tenant ID
@@ -312,12 +365,54 @@ export default function TenantsPage() {
                   />
                 </div>
 
+                {connectionMode === 'CUSTOMER_MANAGED' && (
+                  <>
+                    <div className="space-y-2">
+                      <Label htmlFor="customer-client-id">
+                        Application (client) ID
+                      </Label>
+                      <Input
+                        id="customer-client-id"
+                        value={customerClientId}
+                        onChange={(event) =>
+                          setCustomerClientId(event.target.value)
+                        }
+                        placeholder="00000000-0000-0000-0000-000000000000"
+                        required
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="customer-client-secret">
+                        Client secret value
+                      </Label>
+                      <Input
+                        id="customer-client-secret"
+                        type="password"
+                        autoComplete="off"
+                        value={customerClientSecret}
+                        onChange={(event) =>
+                          setCustomerClientSecret(event.target.value)
+                        }
+                        required
+                      />
+                      <p className="text-xs text-slate-500">
+                        Sent once to the backend, stored in Secret Manager, and
+                        never returned to this browser.
+                      </p>
+                    </div>
+                  </>
+                )}
+
                 <Button
                   type="submit"
                   disabled={isSavingTenant}
                   className="rounded-xl"
                 >
-                  {isSavingTenant ? 'Preparing…' : 'Review Permissions'}
+                  {isSavingTenant
+                    ? 'Verifying…'
+                    : connectionMode === 'HAWKVIEW_MANAGED'
+                      ? 'Review Permissions'
+                      : 'Verify and Save Securely'}
                 </Button>
               </form>
             ) : (
