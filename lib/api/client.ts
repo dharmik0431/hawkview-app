@@ -115,8 +115,16 @@ export const apiClient = {
       body: data ? JSON.stringify(data) : undefined,
     }),
 
-  delete: <T>(endpoint: string, options?: FetchOptions) =>
-    fetchApi<T>(endpoint, { ...options, method: 'DELETE' }),
+  delete: <T>(
+    endpoint: string,
+    data?: unknown,
+    options?: FetchOptions
+  ) =>
+    fetchApi<T>(endpoint, {
+      ...options,
+      method: 'DELETE',
+      body: data ? JSON.stringify(data) : undefined,
+    }),
 }
 
 export { ApiError }

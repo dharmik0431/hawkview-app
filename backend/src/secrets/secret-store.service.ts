@@ -132,6 +132,24 @@ export class SecretStoreService {
     return value
   }
 
+  async delete(reference: string) {
+    const match = reference.match(
+      /^projects\/([^/]+)\/secrets\/([^/]+)\/versions\/[^/]+$/
+    )
+    if (!match || match[1] !== this.projectId) {
+      throw new ServiceUnavailableException(
+        'The stored credential reference is invalid.'
+      )
+    }
+
+    const secretName = `projects/${match[1]}/secrets/${match[2]}`
+    await this.request(
+      `https://secretmanager.googleapis.com/v1/${secretName}`,
+      { method: 'DELETE' },
+      [200, 404]
+    )
+  }
+
   async accessOrCreate(secretId: string, createValue: () => string) {
     const reference = `projects/${this.projectId}/secrets/${secretId}/versions/latest`
     try {
