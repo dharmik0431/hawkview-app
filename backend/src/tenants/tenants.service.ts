@@ -202,12 +202,73 @@ export class TenantsService {
 
     const existing = await this.prisma.customerTenant.findUnique({
       where: { microsoftTenantId },
-      select: { id: true },
+      select: {
+        id: true,
+        organizationId: true,
+        status: true,
+        connection: {
+          select: {
+            status: true,
+          },
+        },
+      },
     })
     if (existing) {
-      throw new ConflictException(
-        'This Microsoft tenant is already connected to HawkView.'
-      )
+      if (existing.organizationId !== organizationIds[0]) {
+        throw new ConflictException(
+          'This Microsoft tenant is already connected to HawkView.'
+        )
+      }
+      if (
+        existing.status === 'ACTIVE' ||
+        existing.connection?.status === 'CONNECTED'
+      ) {
+        throw new ConflictException(
+          'This Microsoft tenant is already connected to HawkView.'
+        )
+      }
+
+      if (input.connectionMode === 'CUSTOMER_MANAGED') {
+        const prepared =
+          await this.microsoftConsent.prepareCustomerManagedConnection({
+            microsoftTenantId,
+            clientId: input.clientId,
+            clientSecret: input.clientSecret,
+            secretId: `tenant-${microsoftTenantId}-microsoft-client-secret`,
+          })
+        const now = new Date()
+        const tenant = await this.prisma.customerTenant.update({
+          where: { id: existing.id },
+          data: {
+            displayName: prepared.displayName,
+            primaryDomain: prepared.primaryDomain,
+            status: 'ACTIVE',
+            connection: {
+              update: {
+                connectionMode: 'CUSTOMER_MANAGED',
+                clientId: input.clientId,
+                credentialReference: prepared.credentialReference,
+                status: 'CONNECTED',
+                consentedPermissions: prepared.grantedPermissions,
+                consentedAt: now,
+                lastVerifiedAt: now,
+                consentStateHash: null,
+                consentStateExpiresAt: null,
+                lastErrorCode: null,
+                lastErrorMessage: null,
+              },
+            },
+          },
+          select: this.tenantSelect(),
+        })
+        return { tenant: this.mapTenant(tenant), requiresConsent: false }
+      }
+
+      const tenant = await this.prisma.customerTenant.findUniqueOrThrow({
+        where: { id: existing.id },
+        select: this.tenantSelect(),
+      })
+      return { tenant: this.mapTenant(tenant), requiresConsent: true }
     }
 
     if (input.connectionMode === 'CUSTOMER_MANAGED') {
@@ -256,6 +317,52 @@ export class TenantsService {
     })
 
     return { tenant: this.mapTenant(tenant), requiresConsent: true }
+  }
+
+  async removePendingTenantForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string
+  ) {
+    const organizationIds = await this.getManagedOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: {
+        id: customerTenantId,
+        organizationId: { in: organizationIds },
+      },
+      select: {
+        id: true,
+        status: true,
+        connection: {
+          select: {
+            status: true,
+            credentialReference: true,
+          },
+        },
+      },
+    })
+
+    if (!tenant) {
+      throw new NotFoundException('Customer tenant was not found.')
+    }
+    if (
+      tenant.status === 'ACTIVE' ||
+      tenant.connection?.status === 'CONNECTED'
+    ) {
+      throw new ConflictException(
+        'Connected tenants cannot be removed from this setup screen.'
+      )
+    }
+    if (tenant.connection?.credentialReference) {
+      throw new ConflictException(
+        'A tenant with stored credentials must be disconnected through tenant settings.'
+      )
+    }
+
+    await this.prisma.customerTenant.delete({
+      where: { id: tenant.id },
+    })
+
+    return { removed: true, tenantId: tenant.id }
   }
 
   async createConsentUrlForIdentity(
