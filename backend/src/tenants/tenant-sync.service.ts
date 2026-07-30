@@ -12,7 +12,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 
 const TENANT_ADMIN_ROLES = ['MSP_OWNER', 'MSP_ADMIN'] as const
 const USER_SELECT =
-  'id,displayName,userPrincipalName,mail,accountEnabled,userType'
+  'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
 
 interface GraphUser {
   id?: string
@@ -21,6 +21,7 @@ interface GraphUser {
   mail?: string | null
   accountEnabled?: boolean | null
   userType?: string | null
+  assignedLicenses?: Array<{ skuId?: string | null }> | null
   '@removed'?: { reason?: string }
 }
 
@@ -526,6 +527,13 @@ export class TenantSyncService {
             })
           }
           const userPrincipalName = user.userPrincipalName?.trim() ?? ''
+          const assignedLicenseSkuIds = [
+            ...new Set(
+              (user.assignedLicenses ?? [])
+                .map((license) => license.skuId?.trim().toLowerCase())
+                .filter((skuId): skuId is string => Boolean(skuId))
+            ),
+          ].sort()
           return this.prisma.directoryUser.upsert({
             where: {
               customerTenantId_microsoftUserId: {
@@ -542,6 +550,7 @@ export class TenantSyncService {
               mail: user.mail?.trim() || null,
               accountEnabled: user.accountEnabled !== false,
               userType: user.userType?.trim() || null,
+              assignedLicenseSkuIds,
               lastSeenAt: observedAt,
             },
             update: {
@@ -550,6 +559,7 @@ export class TenantSyncService {
               mail: user.mail?.trim() || null,
               accountEnabled: user.accountEnabled !== false,
               userType: user.userType?.trim() || null,
+              assignedLicenseSkuIds,
               lastSeenAt: observedAt,
               deletedAt: null,
             },
@@ -613,6 +623,12 @@ export class TenantSyncService {
     const userSyncState = syncStateByResource.get('USERS')
     const licenseSyncState = syncStateByResource.get('LICENSES')
     const domainSyncState = syncStateByResource.get('DOMAINS')
+    const licenseNameBySkuId = new Map(
+      licenses.map((license) => [
+        license.microsoftSkuId.toLowerCase(),
+        license.skuPartNumber,
+      ])
+    )
     // Connector verification only proves that credentials work. It is not a
     // data synchronization and must never be displayed as one.
     const successfulDates = syncStates
@@ -658,7 +674,9 @@ export class TenantSyncService {
           driveUsage: 'Not synchronized',
           mailUsage: 'Not synchronized',
           authMethods: [],
-          licenses: [],
+          licenses: user.assignedLicenseSkuIds.map(
+            (skuId) => licenseNameBySkuId.get(skuId.toLowerCase()) ?? skuId
+          ),
           groups: [],
           devices: [],
         })),
