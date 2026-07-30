@@ -26,17 +26,30 @@ type LoginMode = 'sign-in' | 'sign-up' | 'reset'
 const authErrors: Record<string, string> = {
   'auth/email-already-in-use': 'An account already exists for this email.',
   'auth/invalid-credential': 'The email or password is incorrect.',
+  'auth/invalid-login-credentials': 'The email or password is incorrect.',
   'auth/invalid-email': 'Enter a valid email address.',
+  'auth/invalid-api-key':
+    'HawkView authentication is using an invalid Firebase API key.',
   'auth/missing-password': 'Enter your password.',
+  'auth/network-request-failed':
+    'HawkView could not reach Firebase. Check your connection and try again.',
+  'auth/operation-not-allowed':
+    'Email and password authentication is not enabled.',
   'auth/too-many-requests':
     'Too many attempts. Wait a few minutes and try again.',
+  'auth/unauthorized-domain':
+    'This HawkView web address is not authorized in Firebase.',
   'auth/user-disabled': 'This account has been disabled.',
+  'auth/user-not-found': 'The email or password is incorrect.',
   'auth/weak-password': 'Choose a stronger password with at least 8 characters.',
 }
 
 function readableAuthError(error: unknown) {
   if (error instanceof FirebaseError) {
-    return authErrors[error.code] || 'Authentication could not be completed.'
+    return (
+      authErrors[error.code] ||
+      `Authentication could not be completed (${error.code}).`
+    )
   }
   if (error instanceof Error) return error.message
   return 'Authentication could not be completed.'
