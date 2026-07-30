@@ -119,6 +119,8 @@ export class TenantsService {
       lastVerifiedAt: Date | null
       lastErrorCode: string | null
     } | null
+    tenantLicenses: Array<{ enabledUnits: number }>
+    syncStates: Array<{ lastSuccessfulAt: Date | null }>
   }) {
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
@@ -138,7 +140,12 @@ export class TenantsService {
         tenant.connection?.connectionMode === 'CUSTOMER_MANAGED'
           ? 'customer-managed'
           : 'hawkview-managed',
-      lastSync: tenant.connection?.lastVerifiedAt?.toISOString() ?? null,
+      lastSync:
+        tenant.syncStates
+          .map((state) => state.lastSuccessfulAt)
+          .filter((date): date is Date => Boolean(date))
+          .sort((a, b) => b.getTime() - a.getTime())[0]
+          ?.toISOString() ?? null,
       requiredPermissions,
       consentedPermissions,
       missingPermissions: requiredPermissions
@@ -146,7 +153,13 @@ export class TenantsService {
         .filter((permission) => !consentedPermissions.includes(permission)),
       connectionErrorCode: tenant.connection?.lastErrorCode ?? null,
       secureScore: null,
-      licenseCount: null,
+      licenseCount:
+        tenant.tenantLicenses.length > 0
+          ? tenant.tenantLicenses.reduce(
+              (total, license) => total + license.enabledUnits,
+              0
+            )
+          : null,
       organization: tenant.organization,
     }
   }
@@ -159,6 +172,8 @@ export class TenantsService {
       primaryDomain: true,
       status: true,
       organization: { select: { name: true, slug: true } },
+      tenantLicenses: { select: { enabledUnits: true } },
+      syncStates: { select: { lastSuccessfulAt: true } },
       connection: {
         select: {
           connectionMode: true,

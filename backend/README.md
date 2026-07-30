@@ -1,8 +1,10 @@
 # HawkView backend
 
 This package contains the HawkView API, PostgreSQL access, Identity Platform
-token verification, and Microsoft 365 tenant-consent handling. Microsoft Graph
-data synchronization will be added in later milestones.
+token verification, and Microsoft 365 tenant-consent handling. Microsoft
+directory users, subscribed-license totals, and verified tenant domains are
+synchronized into PostgreSQL. Additional Microsoft workloads are added as
+independent synchronization modules.
 
 Prisma is isolated here so database credentials and generated database code are
 never included in the frontend package.

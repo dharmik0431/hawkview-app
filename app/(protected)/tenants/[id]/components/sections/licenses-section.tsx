@@ -37,8 +37,8 @@ export default function LicensesSection({
               License data has not been synchronized
             </div>
             <div className="mt-1 text-xs text-muted-foreground">
-              HawkView is currently storing directory users only. License
-              synchronization comes next.
+              Use Refresh to synchronize subscribed Microsoft licenses. Until
+              then, HawkView will not display estimated or sample totals.
             </div>
           </div>
         ) : (

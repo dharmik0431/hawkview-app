@@ -30,6 +30,28 @@ interface GraphUsersPage {
   '@odata.deltaLink'?: string
 }
 
+interface GraphSubscribedSku {
+  skuId?: string
+  skuPartNumber?: string | null
+  consumedUnits?: number | null
+  capabilityStatus?: string | null
+  prepaidUnits?: {
+    enabled?: number | null
+    warning?: number | null
+    suspended?: number | null
+    lockedOut?: number | null
+  } | null
+}
+
+interface GraphOrganization {
+  displayName?: string | null
+  verifiedDomains?: Array<{
+    name?: string | null
+    isDefault?: boolean | null
+    isInitial?: boolean | null
+  }>
+}
+
 @Injectable()
 export class TenantSyncService {
   constructor(
@@ -224,7 +246,239 @@ export class TenantSyncService {
       )
     }
 
+    const snapshotAccessToken =
+      await this.microsoftConsent.getTenantAccessToken({
+        microsoftTenantId: tenant.microsoftTenantId,
+        connectionMode:
+          tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+            ? 'CUSTOMER_MANAGED'
+            : 'HAWKVIEW_MANAGED',
+        clientId: tenant.connection.clientId,
+        credentialReference: tenant.connection.credentialReference,
+      })
+    await Promise.all([
+      this.syncLicenses(tenant, snapshotAccessToken),
+      this.syncDomains(tenant, snapshotAccessToken),
+    ])
+
     return this.buildBundle(tenant)
+  }
+
+  private async runSnapshotSync(
+    tenant: { id: string; organizationId: string },
+    resourceType: 'LICENSES' | 'DOMAINS',
+    synchronize: () => Promise<void>
+  ) {
+    const lastAttemptAt = new Date()
+    await this.prisma.syncState.upsert({
+      where: {
+        customerTenantId_resourceType: {
+          customerTenantId: tenant.id,
+          resourceType,
+        },
+      },
+      create: {
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        resourceType,
+        status: 'RUNNING',
+        lastAttemptAt,
+      },
+      update: {
+        status: 'RUNNING',
+        lastAttemptAt,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+      },
+    })
+
+    try {
+      await synchronize()
+      await this.prisma.syncState.update({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType,
+          },
+        },
+        data: {
+          status: 'SUCCEEDED',
+          lastSuccessfulAt: new Date(),
+          lastErrorCode: null,
+          lastErrorMessage: null,
+          consecutiveFailures: 0,
+        },
+      })
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : `Microsoft ${resourceType.toLowerCase()} synchronization failed.`
+      await this.prisma.syncState.update({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType,
+          },
+        },
+        data: {
+          status: 'FAILED',
+          lastErrorCode: `${resourceType.toLowerCase()}-sync-failed`,
+          lastErrorMessage: message.slice(0, 2000),
+          consecutiveFailures: { increment: 1 },
+        },
+      })
+      throw new BadGatewayException(message)
+    }
+  }
+
+  private async syncLicenses(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'LICENSES', async () => {
+      const response = await fetch(
+        'https://graph.microsoft.com/v1.0/subscribedSkus',
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(20_000),
+        }
+      )
+      if (!response.ok) {
+        throw new Error(
+          `Microsoft license synchronization returned ${response.status}.`
+        )
+      }
+      const body = (await response.json()) as { value?: GraphSubscribedSku[] }
+      const observedAt = new Date()
+      const rows = (body.value ?? []).filter(
+        (sku) =>
+          typeof sku.skuId === 'string' &&
+          typeof sku.skuPartNumber === 'string'
+      )
+
+      await this.prisma.$transaction(async (transaction) => {
+        for (const sku of rows) {
+          await transaction.tenantLicense.upsert({
+            where: {
+              customerTenantId_microsoftSkuId: {
+                customerTenantId: tenant.id,
+                microsoftSkuId: sku.skuId as string,
+              },
+            },
+            create: {
+              organizationId: tenant.organizationId,
+              customerTenantId: tenant.id,
+              microsoftSkuId: sku.skuId as string,
+              skuPartNumber: (sku.skuPartNumber as string).trim(),
+              consumedUnits: Math.max(0, sku.consumedUnits ?? 0),
+              enabledUnits: Math.max(0, sku.prepaidUnits?.enabled ?? 0),
+              warningUnits: Math.max(0, sku.prepaidUnits?.warning ?? 0),
+              suspendedUnits: Math.max(0, sku.prepaidUnits?.suspended ?? 0),
+              lockedOutUnits: Math.max(0, sku.prepaidUnits?.lockedOut ?? 0),
+              capabilityStatus: sku.capabilityStatus?.trim() || null,
+              lastSeenAt: observedAt,
+            },
+            update: {
+              skuPartNumber: (sku.skuPartNumber as string).trim(),
+              consumedUnits: Math.max(0, sku.consumedUnits ?? 0),
+              enabledUnits: Math.max(0, sku.prepaidUnits?.enabled ?? 0),
+              warningUnits: Math.max(0, sku.prepaidUnits?.warning ?? 0),
+              suspendedUnits: Math.max(0, sku.prepaidUnits?.suspended ?? 0),
+              lockedOutUnits: Math.max(0, sku.prepaidUnits?.lockedOut ?? 0),
+              capabilityStatus: sku.capabilityStatus?.trim() || null,
+              lastSeenAt: observedAt,
+            },
+          })
+        }
+        await transaction.tenantLicense.deleteMany({
+          where: {
+            customerTenantId: tenant.id,
+            lastSeenAt: { lt: observedAt },
+          },
+        })
+      })
+    })
+  }
+
+  private async syncDomains(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'DOMAINS', async () => {
+      const response = await fetch(
+        'https://graph.microsoft.com/v1.0/organization?$select=displayName,verifiedDomains',
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(20_000),
+        }
+      )
+      if (!response.ok) {
+        throw new Error(
+          `Microsoft domain synchronization returned ${response.status}.`
+        )
+      }
+      const body = (await response.json()) as { value?: GraphOrganization[] }
+      const organization = body.value?.[0]
+      if (!organization) {
+        throw new Error('Microsoft did not return organization information.')
+      }
+      const observedAt = new Date()
+      const domains = (organization.verifiedDomains ?? []).filter(
+        (domain) => typeof domain.name === 'string' && domain.name.trim()
+      )
+      const primaryDomain =
+        domains.find((domain) => domain.isDefault)?.name?.trim() ??
+        domains.find((domain) => domain.isInitial)?.name?.trim() ??
+        null
+
+      await this.prisma.$transaction(async (transaction) => {
+        for (const domain of domains) {
+          const name = (domain.name as string).trim().toLowerCase()
+          await transaction.tenantDomain.upsert({
+            where: {
+              customerTenantId_name: {
+                customerTenantId: tenant.id,
+                name,
+              },
+            },
+            create: {
+              organizationId: tenant.organizationId,
+              customerTenantId: tenant.id,
+              name,
+              isDefault: domain.isDefault === true,
+              isInitial: domain.isInitial === true,
+              lastSeenAt: observedAt,
+            },
+            update: {
+              isDefault: domain.isDefault === true,
+              isInitial: domain.isInitial === true,
+              lastSeenAt: observedAt,
+            },
+          })
+        }
+        await transaction.tenantDomain.deleteMany({
+          where: {
+            customerTenantId: tenant.id,
+            lastSeenAt: { lt: observedAt },
+          },
+        })
+        await transaction.customerTenant.update({
+          where: { id: tenant.id },
+          data: {
+            displayName:
+              organization.displayName?.trim() || undefined,
+            primaryDomain,
+          },
+        })
+      })
+    })
   }
 
   private async synchronizeUsers(
@@ -326,7 +580,7 @@ export class TenantSyncService {
       lastVerifiedAt: Date | null
     } | null
   }) {
-    const [users, syncState] = await Promise.all([
+    const [users, licenses, domains, syncStates] = await Promise.all([
       this.prisma.directoryUser.findMany({
         where: {
           organizationId: tenant.organizationId,
@@ -335,18 +589,39 @@ export class TenantSyncService {
         },
         orderBy: [{ displayName: 'asc' }, { userPrincipalName: 'asc' }],
       }),
-      this.prisma.syncState.findUnique({
+      this.prisma.tenantLicense.findMany({
         where: {
-          customerTenantId_resourceType: {
-            customerTenantId: tenant.id,
-            resourceType: 'USERS',
-          },
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
         },
+        orderBy: { skuPartNumber: 'asc' },
+      }),
+      this.prisma.tenantDomain.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
+      }),
+      this.prisma.syncState.findMany({
+        where: { customerTenantId: tenant.id },
       }),
     ])
+    const syncStateByResource = new Map(
+      syncStates.map((state) => [state.resourceType, state])
+    )
+    const userSyncState = syncStateByResource.get('USERS')
+    const licenseSyncState = syncStateByResource.get('LICENSES')
+    const domainSyncState = syncStateByResource.get('DOMAINS')
     // Connector verification only proves that credentials work. It is not a
     // data synchronization and must never be displayed as one.
-    const lastSync = syncState?.lastSuccessfulAt ?? null
+    const successfulDates = syncStates
+      .map((state) => state.lastSuccessfulAt)
+      .filter((date): date is Date => Boolean(date))
+    const lastSync =
+      successfulDates.length > 0
+        ? new Date(Math.max(...successfulDates.map((date) => date.getTime())))
+        : null
 
     return {
       bundle: {
@@ -355,12 +630,18 @@ export class TenantSyncService {
           name:
             tenant.displayName ??
             `Microsoft tenant ${tenant.microsoftTenantId.slice(0, 8)}`,
-          domain: tenant.primaryDomain ?? '',
-          domains: tenant.primaryDomain ? [tenant.primaryDomain] : [],
+          domain:
+            domains.find((domain) => domain.isDefault)?.name ??
+            tenant.primaryDomain ??
+            '',
+          domains: domains.map((domain) => domain.name),
           provider: 'microsoft',
           status: tenant.status === 'ACTIVE' ? 'healthy' : 'warning',
           secureScore: 0,
-          licenseCount: 0,
+          licenseCount: licenses.reduce(
+            (total, license) => total + license.enabledUnits,
+            0
+          ),
           lastSync: lastSync?.toISOString() ?? null,
         },
         users: users.map((user) => ({
@@ -390,7 +671,19 @@ export class TenantSyncService {
         },
         sharepoint: { sites: [], deletedSites: [] },
         teams: {},
-        licenses: { rows: [] },
+        licenses: {
+          rows: licenses.map((license) => ({
+            skuId: license.microsoftSkuId,
+            skuPartNumber: license.skuPartNumber,
+            name: license.skuPartNumber,
+            used: license.consumedUnits,
+            total: license.enabledUnits,
+            warning: license.warningUnits,
+            suspended: license.suspendedUnits,
+            lockedOut: license.lockedOutUnits,
+            capabilityStatus: license.capabilityStatus,
+          })),
+        },
         entra: {
           caPolicies: [],
           authMethods: [],
@@ -399,10 +692,22 @@ export class TenantSyncService {
         syncedAt: lastSync?.toISOString() ?? null,
         sync: {
           users: {
-            status: syncState?.status.toLowerCase() ?? 'never-synced',
+            status: userSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt:
-              syncState?.lastSuccessfulAt?.toISOString() ?? null,
-            lastError: syncState?.lastErrorMessage ?? null,
+              userSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: userSyncState?.lastErrorMessage ?? null,
+          },
+          licenses: {
+            status: licenseSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt:
+              licenseSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: licenseSyncState?.lastErrorMessage ?? null,
+          },
+          domains: {
+            status: domainSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt:
+              domainSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: domainSyncState?.lastErrorMessage ?? null,
           },
         },
       },
