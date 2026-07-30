@@ -174,9 +174,7 @@ export class TenantsService {
         microsoftTenantId: input.microsoftTenantId,
         displayName: input.displayName,
         connection: {
-          create: {
-            organizationId: organizationIds[0],
-          },
+          create: {},
         },
       },
       select: {
