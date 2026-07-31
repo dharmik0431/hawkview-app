@@ -401,6 +401,32 @@ export class TenantSyncService {
       )
     })
 
+    // Run SharePoint as its own stage before the broader Entra snapshot batch.
+    // This guarantees each SharePoint module records a SyncState even when a
+    // slower Entra request (for example sign-in logs) reaches its timeout.
+    const sharePointModules: Array<Promise<unknown>> = [
+      this.syncSharePointSites(tenant, snapshotAccessToken),
+      this.syncSharePointSettings(tenant, snapshotAccessToken),
+      this.syncSharePointUsage(tenant, snapshotAccessToken),
+    ]
+    const sharePointResults = await Promise.allSettled(sharePointModules)
+    sharePointResults.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        const resource = [
+          'SHAREPOINT_SITES',
+          'SHAREPOINT_SETTINGS',
+          'SHAREPOINT_USAGE',
+        ][index]
+        this.logger.warn(
+          `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason)
+          }`
+        )
+      }
+    })
+
     const entraModules: Array<Promise<unknown>> = [
       this.syncEntraCollection(
         tenant,
@@ -452,9 +478,6 @@ export class TenantSyncService {
         'SERVICE_PRINCIPALS',
         'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,servicePrincipalType'
       ),
-      this.syncSharePointSites(tenant, snapshotAccessToken),
-      this.syncSharePointSettings(tenant, snapshotAccessToken),
-      this.syncSharePointUsage(tenant, snapshotAccessToken),
     ]
     const entraResults = await Promise.allSettled(entraModules)
     entraResults.forEach((result, index) => {
@@ -468,9 +491,6 @@ export class TenantSyncService {
           'DEVICES',
           'DIRECTORY_ROLES',
           'SERVICE_PRINCIPALS',
-          'SHAREPOINT_SITES',
-          'SHAREPOINT_SETTINGS',
-          'SHAREPOINT_USAGE',
         ][index]
         this.logger.warn(
           `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
