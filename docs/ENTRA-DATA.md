@@ -14,6 +14,8 @@ database. Opening an Entra page does not call Microsoft Graph.
 - Interactive sign-ins from the last 30 days
 - Registered devices and their registered owners
 - Direct Microsoft Entra directory role assignments
+- Enterprise applications/service principals used to resolve Conditional
+  Access application IDs into readable names
 
 Each module has an independent `SyncState`. A missing permission can therefore
 fail one module without erasing or blocking data from the others. HawkView keeps
@@ -29,6 +31,8 @@ the last successful snapshot visible and exposes the module error in the API.
 - `Policy.Read.AuthenticationMethod`
 - `Device.Read.All`
 - `RoleManagement.Read.Directory`
+- `Application.Read.All`
+- `Sites.Read.All` (used by the SharePoint site-inventory module)
 
 All are read-only application permissions and require Microsoft administrator
 consent. Customer-managed connectors need the same permissions as the shared

@@ -44,7 +44,9 @@ function summarizeAuthenticationMethodTargets(method: any) {
   const ids = targets
     .map((target: any) => target?.id)
     .filter((id: unknown): id is string => typeof id === 'string')
-  return ids.length > 0 ? `${ids.length} selected group(s)` : 'No users targeted'
+  return ids.length > 0
+    ? `${ids.length} selected group(s)`
+    : 'No users targeted'
 }
 
 interface GraphUser {
@@ -116,6 +118,8 @@ type EntraSnapshotResource =
   | 'SIGN_INS'
   | 'DEVICES'
   | 'DIRECTORY_ROLES'
+  | 'SERVICE_PRINCIPALS'
+  | 'SHAREPOINT_SITES'
 
 interface GraphCollectionPage {
   value?: unknown[]
@@ -152,7 +156,9 @@ export class TenantSyncService {
       },
     })
     if (!user || user.disabledAt) {
-      throw new ForbiddenException('This HawkView account cannot access tenants.')
+      throw new ForbiddenException(
+        'This HawkView account cannot access tenants.'
+      )
     }
 
     const organizationIds = user.memberships.map(
@@ -388,6 +394,13 @@ export class TenantSyncService {
         'DIRECTORY_ROLES',
         'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName)'
       ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'SERVICE_PRINCIPALS',
+        'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,servicePrincipalType'
+      ),
+      this.syncSharePointSites(tenant, snapshotAccessToken),
     ]
     const entraResults = await Promise.allSettled(entraModules)
     entraResults.forEach((result, index) => {
@@ -400,6 +413,8 @@ export class TenantSyncService {
           'SIGN_INS',
           'DEVICES',
           'DIRECTORY_ROLES',
+          'SERVICE_PRINCIPALS',
+          'SHAREPOINT_SITES',
         ][index]
         this.logger.warn(
           `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
@@ -506,8 +521,7 @@ export class TenantSyncService {
       const observedAt = new Date()
       const rows = (body.value ?? []).filter(
         (sku) =>
-          typeof sku.skuId === 'string' &&
-          typeof sku.skuPartNumber === 'string'
+          typeof sku.skuId === 'string' && typeof sku.skuPartNumber === 'string'
       )
 
       await this.prisma.$transaction(async (transaction) => {
@@ -622,8 +636,7 @@ export class TenantSyncService {
         await transaction.customerTenant.update({
           where: { id: tenant.id },
           data: {
-            displayName:
-              organization.displayName?.trim() || undefined,
+            displayName: organization.displayName?.trim() || undefined,
             primaryDomain,
           },
         })
@@ -677,9 +690,7 @@ export class TenantSyncService {
           '/members?$select=id&$top=999'
         while (membersUrl) {
           if (!membersUrl.startsWith('https://graph.microsoft.com/')) {
-            throw new Error(
-              'Microsoft returned an invalid group-members link.'
-            )
+            throw new Error('Microsoft returned an invalid group-members link.')
           }
           const response = await fetch(membersUrl, {
             headers: {
@@ -860,6 +871,84 @@ export class TenantSyncService {
     })
   }
 
+  private async syncSharePointSites(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'SHAREPOINT_SITES', async () => {
+      const sites: any[] = []
+      let nextUrl =
+        'https://graph.microsoft.com/v1.0/sites?search=*&$select=id,name,displayName,webUrl,createdDateTime,lastModifiedDateTime,root,siteCollection'
+      while (nextUrl) {
+        if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
+          throw new Error(
+            'Microsoft returned an invalid SharePoint sites link.'
+          )
+        }
+        const response = await fetch(nextUrl, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!response.ok) {
+          throw new Error(
+            `Microsoft SharePoint sites synchronization returned ${response.status}.`
+          )
+        }
+        const page = (await response.json()) as GraphCollectionPage
+        sites.push(...((page.value ?? []) as any[]))
+        nextUrl = page['@odata.nextLink'] ?? ''
+      }
+
+      const enrichedSites: any[] = []
+      for (let index = 0; index < sites.length; index += 8) {
+        const batch = sites.slice(index, index + 8)
+        const batchRows = await Promise.all(
+          batch.map(async (site) => {
+            if (typeof site?.id !== 'string')
+              return { ...site, driveQuota: null }
+            const driveResponse = await fetch(
+              `https://graph.microsoft.com/v1.0/sites/${encodeURIComponent(site.id)}/drive?$select=id,quota`,
+              {
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                  Accept: 'application/json',
+                },
+                signal: AbortSignal.timeout(20_000),
+              }
+            )
+            if (!driveResponse.ok) return { ...site, driveQuota: null }
+            const drive = (await driveResponse.json()) as any
+            return { ...site, driveQuota: drive?.quota ?? null }
+          })
+        )
+        enrichedSites.push(...batchRows)
+      }
+
+      await this.prisma.tenantEntraSnapshot.upsert({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType: 'SHAREPOINT_SITES',
+          },
+        },
+        create: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          resourceType: 'SHAREPOINT_SITES',
+          payload: enrichedSites as never,
+          observedAt: new Date(),
+        },
+        update: {
+          payload: enrichedSites as never,
+          observedAt: new Date(),
+        },
+      })
+    })
+  }
+
   private async synchronizeUsers(
     tenant: {
       id: string
@@ -968,54 +1057,85 @@ export class TenantSyncService {
       lastVerifiedAt: Date | null
     } | null
   }) {
-    const [users, licenses, domains, syncStates, entraSnapshots] = await Promise.all([
-      this.prisma.directoryUser.findMany({
-        where: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-          deletedAt: null,
-        },
-        orderBy: [{ displayName: 'asc' }, { userPrincipalName: 'asc' }],
-        include: {
-          groupMemberships: {
-            select: {
-              directoryGroup: {
-                select: { displayName: true },
+    const [users, licenses, domains, syncStates, entraSnapshots] =
+      await Promise.all([
+        this.prisma.directoryUser.findMany({
+          where: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+            deletedAt: null,
+          },
+          orderBy: [{ displayName: 'asc' }, { userPrincipalName: 'asc' }],
+          include: {
+            groupMemberships: {
+              select: {
+                directoryGroup: {
+                  select: { displayName: true },
+                },
               },
             },
           },
-        },
-      }),
-      this.prisma.tenantLicense.findMany({
-        where: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-        },
-        orderBy: { skuPartNumber: 'asc' },
-      }),
-      this.prisma.tenantDomain.findMany({
-        where: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-        },
-        orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
-      }),
-      this.prisma.syncState.findMany({
-        where: { customerTenantId: tenant.id },
-      }),
-      this.prisma.tenantEntraSnapshot.findMany({
-        where: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-        },
-      }),
-    ])
+        }),
+        this.prisma.tenantLicense.findMany({
+          where: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+          },
+          orderBy: { skuPartNumber: 'asc' },
+        }),
+        this.prisma.tenantDomain.findMany({
+          where: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+          },
+          orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
+        }),
+        this.prisma.syncState.findMany({
+          where: { customerTenantId: tenant.id },
+        }),
+        this.prisma.tenantEntraSnapshot.findMany({
+          where: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+          },
+        }),
+      ])
     const snapshotByResource = new Map(
       entraSnapshots.map((snapshot) => [
         snapshot.resourceType,
         Array.isArray(snapshot.payload) ? (snapshot.payload as any[]) : [],
       ])
     )
+    const servicePrincipalNameByAppId = new Map<string, string>(
+      (snapshotByResource.get('SERVICE_PRINCIPALS') ?? [])
+        .filter(
+          (principal) =>
+            typeof principal?.appId === 'string' &&
+            typeof principal?.displayName === 'string'
+        )
+        .map((principal) => [
+          principal.appId.toLowerCase(),
+          principal.displayName.trim(),
+        ])
+    )
+    const conditionalAccessTargetNames: Record<string, string> = {
+      All: 'All cloud apps',
+      Office365: 'Office 365',
+      MicrosoftAdminPortals: 'Microsoft Admin Portals',
+    }
+    const resolveApplicationTarget = (target: unknown) => {
+      if (typeof target !== 'string') return String(target ?? '')
+      return (
+        conditionalAccessTargetNames[target] ??
+        servicePrincipalNameByAppId.get(target.toLowerCase()) ??
+        target
+      )
+    }
+    const sharePointSites = snapshotByResource.get('SHAREPOINT_SITES') ?? []
+    const bytesToGb = (value: unknown) =>
+      typeof value === 'number'
+        ? Math.round((value / 1024 ** 3) * 100) / 100
+        : null
     const authRegistrations = snapshotByResource.get('AUTH_REGISTRATIONS') ?? []
     const authRegistrationByUserId = new Map(
       authRegistrations
@@ -1030,7 +1150,10 @@ export class TenantSyncService {
       if (typeof roleName !== 'string' || !roleName.trim()) continue
       const current = roleNamesByUserId.get(assignment.principalId) ?? []
       current.push(roleName.trim())
-      roleNamesByUserId.set(assignment.principalId, [...new Set(current)].sort())
+      roleNamesByUserId.set(
+        assignment.principalId,
+        [...new Set(current)].sort()
+      )
     }
     const devices = snapshotByResource.get('DEVICES') ?? []
     const devicesByUserId = new Map<
@@ -1073,7 +1196,9 @@ export class TenantSyncService {
         : []) {
         if (typeof owner?.id !== 'string') continue
         const current = devicesByUserId.get(owner.id) ?? []
-        if (!current.some((registeredDevice) => registeredDevice.name === label)) {
+        if (
+          !current.some((registeredDevice) => registeredDevice.name === label)
+        ) {
           current.push(deviceDetails)
         }
         devicesByUserId.set(
@@ -1087,7 +1212,10 @@ export class TenantSyncService {
     for (const signIn of signIns) {
       if (typeof signIn?.userId !== 'string') continue
       const current = latestSignInByUserId.get(signIn.userId)
-      if (!current || String(signIn.createdDateTime) > String(current.createdDateTime)) {
+      if (
+        !current ||
+        String(signIn.createdDateTime) > String(current.createdDateTime)
+      ) {
         latestSignInByUserId.set(signIn.userId, signIn)
       }
     }
@@ -1136,40 +1264,42 @@ export class TenantSyncService {
           lastSync: lastSync?.toISOString() ?? null,
         },
         users: users.map((user) => {
-          const registration = authRegistrationByUserId.get(user.microsoftUserId)
+          const registration = authRegistrationByUserId.get(
+            user.microsoftUserId
+          )
           const roleNames = roleNamesByUserId.get(user.microsoftUserId) ?? []
           const lastSignIn = latestSignInByUserId.get(user.microsoftUserId)
           return {
-          id: user.microsoftUserId,
-          name: user.displayName,
-          email: user.userPrincipalName || user.mail || '',
-          type: user.userType === 'Guest' ? 'Guest' : 'Member',
-          role: roleNames.length > 0 ? roleNames.join(', ') : 'User',
-          status: user.accountEnabled ? 'Enabled' : 'Disabled',
-          // MFA requires a separate Graph dataset. Never turn missing data into
-          // a security finding by reporting it as disabled.
-          mfa:
-            typeof registration?.isMfaRegistered === 'boolean'
-              ? registration.isMfaRegistered
-                ? 'Enabled'
-                : 'Disabled'
-              : 'Unknown',
-          lastLogin:
-            typeof lastSignIn?.createdDateTime === 'string'
-              ? lastSignIn.createdDateTime
-              : 'Not synchronized',
-          driveUsage: 'Not synchronized',
-          mailUsage: 'Not synchronized',
-          authMethods: Array.isArray(registration?.methodsRegistered)
-            ? registration.methodsRegistered
-            : [],
-          licenses: user.assignedLicenseSkuIds.map(
-            (skuId) => licenseNameBySkuId.get(skuId.toLowerCase()) ?? skuId
-          ),
-          groups: user.groupMemberships
-            .map((membership) => membership.directoryGroup.displayName)
-            .sort((left, right) => left.localeCompare(right)),
-          devices: devicesByUserId.get(user.microsoftUserId) ?? [],
+            id: user.microsoftUserId,
+            name: user.displayName,
+            email: user.userPrincipalName || user.mail || '',
+            type: user.userType === 'Guest' ? 'Guest' : 'Member',
+            role: roleNames.length > 0 ? roleNames.join(', ') : 'User',
+            status: user.accountEnabled ? 'Enabled' : 'Disabled',
+            // MFA requires a separate Graph dataset. Never turn missing data into
+            // a security finding by reporting it as disabled.
+            mfa:
+              typeof registration?.isMfaRegistered === 'boolean'
+                ? registration.isMfaRegistered
+                  ? 'Enabled'
+                  : 'Disabled'
+                : 'Unknown',
+            lastLogin:
+              typeof lastSignIn?.createdDateTime === 'string'
+                ? lastSignIn.createdDateTime
+                : 'Not synchronized',
+            driveUsage: 'Not synchronized',
+            mailUsage: 'Not synchronized',
+            authMethods: Array.isArray(registration?.methodsRegistered)
+              ? registration.methodsRegistered
+              : [],
+            licenses: user.assignedLicenseSkuIds.map(
+              (skuId) => licenseNameBySkuId.get(skuId.toLowerCase()) ?? skuId
+            ),
+            groups: user.groupMemberships
+              .map((membership) => membership.directoryGroup.displayName)
+              .sort((left, right) => left.localeCompare(right)),
+            devices: devicesByUserId.get(user.microsoftUserId) ?? [],
           }
         }),
         signIns: signIns.map((signIn) => ({
@@ -1197,7 +1327,36 @@ export class TenantSyncService {
           acceptedDomains: [],
           groups: [],
         },
-        sharepoint: { sites: [], deletedSites: [] },
+        sharepoint: {
+          overview: {
+            totalSites: sharePointSites.length,
+            totalStorageQuotaGB:
+              Math.round(
+                sharePointSites.reduce(
+                  (total, site) =>
+                    total + (bytesToGb(site?.driveQuota?.total) ?? 0),
+                  0
+                ) * 100
+              ) / 100,
+            oneDriveStorageLimitGB: null,
+            siteStorageLimitsMode: 'Not synchronized',
+            sharingSharePoint: null,
+            sharingOneDrive: null,
+          },
+          sites: sharePointSites.map((site) => ({
+            id: site.id,
+            name: site.displayName || site.name || 'Unnamed SharePoint site',
+            url: site.webUrl || '',
+            type: 'Team site',
+            externalSharing: null,
+            guestsCount: null,
+            owners: null,
+            storageUsedGB: bytesToGb(site?.driveQuota?.used),
+            storageQuotaGB: bytesToGb(site?.driveQuota?.total),
+            lastActivity: site.lastModifiedDateTime || 'Not synchronized',
+          })),
+          deletedSites: [],
+        },
         teams: {},
         licenses: {
           rows: licenses.map((license) => ({
@@ -1216,7 +1375,8 @@ export class TenantSyncService {
           caPolicies: (snapshotByResource.get('CONDITIONAL_ACCESS') ?? []).map(
             (policy) => {
               const includeUsers = policy?.conditions?.users?.includeUsers ?? []
-              const includeGroups = policy?.conditions?.users?.includeGroups ?? []
+              const includeGroups =
+                policy?.conditions?.users?.includeGroups ?? []
               const includeRoles = policy?.conditions?.users?.includeRoles ?? []
               const grants = policy?.grantControls?.builtInControls ?? []
               const state =
@@ -1229,20 +1389,29 @@ export class TenantSyncService {
                 id: policy.id,
                 name: policy.displayName ?? 'Unnamed policy',
                 state,
-                origin: policy.templateId
-                  ? 'MICROSOFT_TEMPLATE'
-                  : 'CUSTOM',
-                targetSummary:
-                  includeUsers.includes('All')
-                    ? 'All Users'
-                    : `${includeUsers.length + includeGroups.length + includeRoles.length} targets`,
+                origin: policy.templateId ? 'MICROSOFT_TEMPLATE' : 'CUSTOM',
+                targetSummary: includeUsers.includes('All')
+                  ? 'All Users'
+                  : `${includeUsers.length + includeGroups.length + includeRoles.length} targets`,
                 grantSummary:
                   grants.length > 0
-                    ? grants.map((grant: string) => grant === 'mfa' ? 'Require multifactor authentication' : grant === 'block' ? 'Block access' : grant).join(', ')
+                    ? grants
+                        .map((grant: string) =>
+                          grant === 'mfa'
+                            ? 'Require multifactor authentication'
+                            : grant === 'block'
+                              ? 'Block access'
+                              : grant
+                        )
+                        .join(', ')
                     : 'No grant controls',
                 assignments: {
                   usersAndGroups: {
-                    include: [...includeUsers, ...includeGroups, ...includeRoles],
+                    include: [
+                      ...includeUsers,
+                      ...includeGroups,
+                      ...includeRoles,
+                    ],
                     exclude: [
                       ...(policy?.conditions?.users?.excludeUsers ?? []),
                       ...(policy?.conditions?.users?.excludeGroups ?? []),
@@ -1250,12 +1419,19 @@ export class TenantSyncService {
                     ],
                   },
                   cloudApps: {
-                    include: policy?.conditions?.applications?.includeApplications ?? [],
-                    exclude: policy?.conditions?.applications?.excludeApplications ?? [],
+                    include: (
+                      policy?.conditions?.applications?.includeApplications ??
+                      []
+                    ).map(resolveApplicationTarget),
+                    exclude: (
+                      policy?.conditions?.applications?.excludeApplications ??
+                      []
+                    ).map(resolveApplicationTarget),
                   },
                 },
                 conditions: {
-                  platforms: policy?.conditions?.platforms?.includePlatforms ?? [],
+                  platforms:
+                    policy?.conditions?.platforms?.includePlatforms ?? [],
                 },
                 accessControls: {
                   grant: grants.map((grant: string) =>
@@ -1269,22 +1445,24 @@ export class TenantSyncService {
               }
             }
           ),
-          authMethods: (snapshotByResource.get('AUTH_METHOD_POLICIES') ?? []).map(
-            (method) => ({
-              id: method.id,
-              name: formatAuthenticationMethodName(method.id),
-              target: summarizeAuthenticationMethodTargets(method),
-              status: method.state === 'enabled' ? 'ENABLED' : 'DISABLED',
-            })
-          ),
+          authMethods: (
+            snapshotByResource.get('AUTH_METHOD_POLICIES') ?? []
+          ).map((method) => ({
+            id: method.id,
+            name: formatAuthenticationMethodName(method.id),
+            target: summarizeAuthenticationMethodTargets(method),
+            status: method.state === 'enabled' ? 'ENABLED' : 'DISABLED',
+          })),
           namedLocations: (snapshotByResource.get('NAMED_LOCATIONS') ?? []).map(
             (location) => ({
               id: location.id,
               name: location.displayName ?? 'Unnamed location',
               type: location.isTrusted === true ? 'TRUSTED' : 'OTHER',
               addresses: Array.isArray(location.ipRanges)
-                ? location.ipRanges.map((range: any) => range.cidrAddress).filter(Boolean)
-                : location.countriesAndRegions ?? [],
+                ? location.ipRanges
+                    .map((range: any) => range.cidrAddress)
+                    .filter(Boolean)
+                : (location.countriesAndRegions ?? []),
             })
           ),
         },
