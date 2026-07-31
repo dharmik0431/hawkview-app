@@ -60,8 +60,8 @@ read saved data from the HawkView API and must never call Microsoft directly.
 
 | Frontend data                                   | Source                                      | Access                                 | Status             |
 | ----------------------------------------------- | ------------------------------------------- | -------------------------------------- | ------------------ |
-| Site inventory, URLs, activity, and drive quota | Microsoft Graph sites and drives            | `Sites.Read.All`                       | Implemented        |
-| Site usage and last activity                    | Microsoft 365 usage reports                 | `Reports.Read.All`                     | Planned            |
+| Site inventory, URLs, and drive quota           | Microsoft Graph sites and drives            | `Sites.Read.All`                       | Implemented        |
+| Site usage, owner, type, and last activity       | Microsoft 365 usage reports                 | `Reports.Read.All`                     | Implemented        |
 | Primary document-library storage used/quota     | Microsoft Graph drives                      | `Sites.Read.All`                       | Implemented        |
 | Owners, guests and external sharing             | Graph sites/groups plus SharePoint settings | Additional site/group access           | Planned            |
 | OneDrive inventory and usage                    | Microsoft 365 usage reports                 | `Reports.Read.All`                     | Planned            |
