@@ -29,6 +29,10 @@ RUN apt-get update -y \
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# Prisma Client is generated in the builder from the current schema. The
+# production-only install above contains the package, but not that generated
+# schema-specific runtime, so copy it into the final image explicitly.
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/dist ./dist
 
 EXPOSE 8080

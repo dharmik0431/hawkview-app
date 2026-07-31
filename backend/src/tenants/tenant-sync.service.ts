@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
@@ -78,6 +79,8 @@ interface GraphGroupMembersPage {
 
 @Injectable()
 export class TenantSyncService {
+  private readonly logger = new Logger(TenantSyncService.name)
+
   constructor(
     @Inject(PrismaService)
     private readonly prisma: PrismaService,
@@ -286,7 +289,14 @@ export class TenantSyncService {
     ])
     // Groups require a separate Microsoft permission. Record an isolated
     // GROUPS failure without hiding successfully refreshed users/licenses.
-    await this.syncGroups(tenant, snapshotAccessToken).catch(() => undefined)
+    await this.syncGroups(tenant, snapshotAccessToken).catch((error) => {
+      const message =
+        error instanceof Error ? error.message : 'Unknown groups sync error'
+      this.logger.error(
+        `Groups synchronization failed for tenant ${tenant.id}: ${message}`,
+        error instanceof Error ? error.stack : undefined
+      )
+    })
 
     return this.buildBundle(tenant)
   }
