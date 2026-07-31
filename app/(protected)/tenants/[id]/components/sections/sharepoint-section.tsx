@@ -16,13 +16,14 @@ type SharingLevel =
   | 'ExistingGuests'
   | 'OrganizationOnly'
   | 'Off'
+  | 'Unknown'
 
 function normalizeSharingLevel(v: any): SharingLevel {
   const s = String(v ?? '')
     .trim()
     .toLowerCase()
 
-  if (!s) return 'Off'
+  if (!s || s.includes('not synchronized')) return 'Unknown'
   if (
     s === 'off' ||
     s === 'disabled' ||
@@ -57,6 +58,7 @@ function sharingRank(level: SharingLevel) {
   if (level === 'NewAndExistingGuests') return 3
   if (level === 'ExistingGuests') return 2
   if (level === 'OrganizationOnly') return 1
+  if (level === 'Unknown') return -1
   return 0
 }
 
@@ -65,6 +67,7 @@ function sharingLabel(level: SharingLevel) {
   if (level === 'NewAndExistingGuests') return 'New & existing guests'
   if (level === 'ExistingGuests') return 'Existing guests'
   if (level === 'OrganizationOnly') return 'Only people in your organization'
+  if (level === 'Unknown') return 'Not synchronized'
   return 'Off'
 }
 
@@ -113,10 +116,12 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       rawOverview.totalQuotaGB ??
       0,
     oneDriveStorageLimitGB:
-      rawOverview.oneDriveStorageLimitGB ??
-      rawOverview.onedriveStorageLimitGB ??
-      rawOverview.oneDriveLimitGB ??
-      0,
+      rawOverview.oneDriveStorageLimitGB === null
+        ? null
+        : (rawOverview.oneDriveStorageLimitGB ??
+          rawOverview.onedriveStorageLimitGB ??
+          rawOverview.oneDriveLimitGB ??
+          null),
     siteStorageLimitsMode:
       rawOverview.siteStorageLimitsMode ??
       rawOverview.storageLimitsMode ??
@@ -211,24 +216,28 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
   }) {
     const rank = sharingRank(level)
     const risk =
-      rank >= 4
-        ? 'High'
-        : rank === 3
-          ? 'Medium'
-          : rank === 2
-            ? 'Low'
-            : rank >= 1
+      rank < 0
+        ? 'Unknown'
+        : rank >= 4
+          ? 'High'
+          : rank === 3
+            ? 'Medium'
+            : rank === 2
               ? 'Low'
-              : 'Off'
+              : rank >= 1
+                ? 'Low'
+                : 'Off'
 
     const riskPill =
-      rank >= 4
-        ? 'bg-red-50 text-red-700 border border-red-200'
-        : rank === 3
-          ? 'bg-orange-50 text-orange-700 border border-orange-200'
-          : rank === 2
-            ? 'bg-blue-50 text-blue-700 border border-blue-200'
-            : 'bg-green-50 text-green-700 border border-green-200'
+      rank < 0
+        ? 'bg-slate-50 text-slate-600 border border-slate-200'
+        : rank >= 4
+          ? 'bg-red-50 text-red-700 border border-red-200'
+          : rank === 3
+            ? 'bg-orange-50 text-orange-700 border border-orange-200'
+            : rank === 2
+              ? 'bg-blue-50 text-blue-700 border border-blue-200'
+              : 'bg-green-50 text-green-700 border border-green-200'
 
     return (
       <div className="rounded-2xl border bg-white p-5">
@@ -290,7 +299,8 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
     )
     const externalOn = SP_SITES.filter((s: any) => !!s.externalSharing).length
     const orphaned = SP_SITES.filter(
-      (s: any) => (s.owners ?? 0) < 2 && s.type !== 'OneDrive'
+      (s: any) =>
+        typeof s.owners === 'number' && s.owners < 2 && s.type !== 'OneDrive'
     ).length
     return { totalUsed, externalOn, orphaned }
   }, [SP_SITES])
@@ -349,7 +359,9 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                   OneDrive Limit
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {SP_OVERVIEW.oneDriveStorageLimitGB} GB
+                  {typeof SP_OVERVIEW.oneDriveStorageLimitGB === 'number'
+                    ? `${SP_OVERVIEW.oneDriveStorageLimitGB} GB`
+                    : 'Not synchronized'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Per user
@@ -407,9 +419,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
 
           <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-3">
             <div className="rounded-2xl border bg-gradient-to-r from-blue-50 to-white p-4">
-              <div className="text-xs text-muted-foreground">
-                Total used (mock)
-              </div>
+              <div className="text-xs text-muted-foreground">Total used</div>
               <div className="text-lg font-bold text-slate-900">
                 {Math.round(totals.totalUsed)} GB
               </div>
@@ -577,19 +587,25 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                           </div>
 
                           <div className="mt-2 flex flex-wrap gap-2">
-                            {(s.owners ?? 0) < 2 && s.type !== 'OneDrive' ? (
+                            {typeof s.owners === 'number' &&
+                            s.owners < 2 &&
+                            s.type !== 'OneDrive' ? (
                               <Badge className="bg-red-50 text-red-700 border border-red-200">
                                 Owner risk
                               </Badge>
                             ) : null}
 
-                            {s.externalSharing ? (
+                            {s.externalSharing === true ? (
                               <Badge className="bg-orange-50 text-orange-700 border border-orange-200">
                                 External sharing
                               </Badge>
-                            ) : (
+                            ) : s.externalSharing === false ? (
                               <Badge className="bg-green-50 text-green-700 border border-green-200">
                                 Internal only
+                              </Badge>
+                            ) : (
+                              <Badge className="bg-slate-50 text-slate-600 border border-slate-200">
+                                Sharing not synchronized
                               </Badge>
                             )}
 
@@ -608,30 +624,42 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                         <td className="px-6 py-4">
                           <Badge
                             className={
-                              s.externalSharing
+                              s.externalSharing === true
                                 ? 'bg-orange-50 text-orange-700 border border-orange-200'
-                                : 'bg-green-50 text-green-700 border border-green-200'
+                                : s.externalSharing === false
+                                  ? 'bg-green-50 text-green-700 border border-green-200'
+                                  : 'bg-slate-50 text-slate-600 border border-slate-200'
                             }
                           >
-                            {s.externalSharing ? 'On' : 'Off'}
+                            {s.externalSharing === true
+                              ? 'On'
+                              : s.externalSharing === false
+                                ? 'Off'
+                                : 'Not synchronized'}
                           </Badge>
                         </td>
 
                         <td className="px-6 py-4">
                           <Badge
                             className={
-                              (s.guestsCount ?? 0) > 0
+                              typeof s.guestsCount === 'number' &&
+                              s.guestsCount > 0
                                 ? 'bg-purple-50 text-purple-700 border border-purple-200'
                                 : 'bg-slate-50 text-slate-600 border border-slate-200'
                             }
                           >
-                            {s.guestsCount ?? 0}
+                            {typeof s.guestsCount === 'number'
+                              ? s.guestsCount
+                              : 'Not synchronized'}
                           </Badge>
                         </td>
 
                         <td className="px-6 py-4">
                           <div className="text-xs text-muted-foreground">
-                            {s.storageUsedGB} / {s.storageQuotaGB} GB
+                            {typeof s.storageUsedGB === 'number' &&
+                            typeof s.storageQuotaGB === 'number'
+                              ? `${s.storageUsedGB} / ${s.storageQuotaGB} GB`
+                              : 'Not synchronized'}
                           </div>
                           <div className="mt-2 h-2 w-[180px] rounded-full bg-muted overflow-hidden">
                             <div
@@ -672,8 +700,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             <div>
               <div className="font-semibold">Recently deleted sites</div>
               <div className="text-sm text-muted-foreground">
-                Recoverable items (mock). Shows deletion date and days
-                remaining.
+                Recoverable items are not synchronized yet.
               </div>
             </div>
             <Badge className="bg-blue-50 text-blue-700 border border-blue-200">

@@ -19,6 +19,8 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'Policy.Read.AuthenticationMethod',
   'Device.Read.All',
   'RoleManagement.Read.Directory',
+  'Application.Read.All',
+  'Sites.Read.All',
 ] as const
 
 const PERMISSION_DESCRIPTIONS: Record<string, string> = {
@@ -29,13 +31,16 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read Microsoft 365 and security groups and their user memberships.',
   'AuditLog.Read.All':
     'Read sign-in activity and user MFA registration status.',
-  'Policy.Read.All':
-    'Read Conditional Access policies and named locations.',
+  'Policy.Read.All': 'Read Conditional Access policies and named locations.',
   'Policy.Read.AuthenticationMethod':
     'Read the tenant authentication-method policy.',
   'Device.Read.All': 'Read Microsoft Entra registered and managed devices.',
   'RoleManagement.Read.Directory':
     'Read Microsoft Entra directory role assignments.',
+  'Application.Read.All':
+    'Resolve application IDs in Conditional Access policies to readable names.',
+  'Sites.Read.All':
+    'Read SharePoint site inventory and document-library storage usage.',
 }
 
 interface ConsentState {
@@ -80,10 +85,9 @@ export class MicrosoftConsentService {
   }
 
   private async getManagedConnector() {
-    const connector =
-      await this.prisma.platformMicrosoftConnector.findUnique({
-        where: { id: 'default' },
-      })
+    const connector = await this.prisma.platformMicrosoftConnector.findUnique({
+      where: { id: 'default' },
+    })
     if (!connector) {
       throw new ServiceUnavailableException(
         'The HawkView-managed Microsoft connector has not been configured.'
@@ -185,8 +189,10 @@ export class MicrosoftConsentService {
     microsoftTenantId: string,
     credentials: { clientId: string; clientSecret: string }
   ) {
-    const { accessToken, grantedPermissions } =
-      await this.requestAccessToken(microsoftTenantId, credentials)
+    const { accessToken, grantedPermissions } = await this.requestAccessToken(
+      microsoftTenantId,
+      credentials
+    )
 
     const organizationResponse = await fetch(
       'https://graph.microsoft.com/v1.0/organization?$select=id,displayName,verifiedDomains',

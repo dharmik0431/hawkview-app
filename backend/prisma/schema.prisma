@@ -62,6 +62,8 @@ enum SyncResourceType {
   SIGN_INS
   DEVICES
   DIRECTORY_ROLES
+  SERVICE_PRINCIPALS
+  SHAREPOINT_SITES
 }
 
 enum SyncStateStatus {
