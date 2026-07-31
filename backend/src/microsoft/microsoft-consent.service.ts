@@ -21,6 +21,7 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'RoleManagement.Read.Directory',
   'Application.Read.All',
   'Sites.Read.All',
+  'SharePointTenantSettings.Read.All',
 ] as const
 
 const PERMISSION_DESCRIPTIONS: Record<string, string> = {
@@ -41,6 +42,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Resolve application IDs in Conditional Access policies to readable names.',
   'Sites.Read.All':
     'Read SharePoint site inventory and document-library storage usage.',
+  'SharePointTenantSettings.Read.All':
+    'Read tenant-level SharePoint and OneDrive storage and sharing settings.',
 }
 
 interface ConsentState {

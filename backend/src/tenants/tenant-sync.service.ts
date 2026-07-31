@@ -120,6 +120,7 @@ type EntraSnapshotResource =
   | 'DIRECTORY_ROLES'
   | 'SERVICE_PRINCIPALS'
   | 'SHAREPOINT_SITES'
+  | 'SHAREPOINT_SETTINGS'
 
 interface GraphCollectionPage {
   value?: unknown[]
@@ -401,6 +402,7 @@ export class TenantSyncService {
         'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,servicePrincipalType'
       ),
       this.syncSharePointSites(tenant, snapshotAccessToken),
+      this.syncSharePointSettings(tenant, snapshotAccessToken),
     ]
     const entraResults = await Promise.allSettled(entraModules)
     entraResults.forEach((result, index) => {
@@ -415,6 +417,7 @@ export class TenantSyncService {
           'DIRECTORY_ROLES',
           'SERVICE_PRINCIPALS',
           'SHAREPOINT_SITES',
+          'SHAREPOINT_SETTINGS',
         ][index]
         this.logger.warn(
           `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
@@ -980,6 +983,57 @@ export class TenantSyncService {
     })
   }
 
+  private async syncSharePointSettings(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'SHAREPOINT_SETTINGS', async () => {
+      const response = await fetch(
+        'https://graph.microsoft.com/v1.0/admin/sharepoint/settings',
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(30_000),
+        }
+      )
+      if (!response.ok) {
+        const graphRequestId = response.headers.get('request-id')
+        throw new Error(
+          `Microsoft SharePoint settings synchronization returned ${response.status}${
+            graphRequestId ? ` (request ${graphRequestId})` : ''
+          }.`
+        )
+      }
+      const body = (await response.json()) as any
+      // Microsoft documentation has shown both the resource directly and a
+      // single resource under `value`; normalize either response shape.
+      const settings =
+        body?.value && !Array.isArray(body.value) ? body.value : body
+
+      await this.prisma.tenantEntraSnapshot.upsert({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType: 'SHAREPOINT_SETTINGS',
+          },
+        },
+        create: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          resourceType: 'SHAREPOINT_SETTINGS',
+          payload: [settings] as never,
+          observedAt: new Date(),
+        },
+        update: {
+          payload: [settings] as never,
+          observedAt: new Date(),
+        },
+      })
+    })
+  }
+
   private async synchronizeUsers(
     tenant: {
       id: string
@@ -1163,6 +1217,9 @@ export class TenantSyncService {
       )
     }
     const sharePointSites = snapshotByResource.get('SHAREPOINT_SITES') ?? []
+    const sharePointSettings = (
+      snapshotByResource.get('SHAREPOINT_SETTINGS') ?? []
+    )[0]
     const bytesToGb = (value: unknown) =>
       typeof value === 'number'
         ? Math.round((value / 1024 ** 3) * 100) / 100
@@ -1361,17 +1418,27 @@ export class TenantSyncService {
         sharepoint: {
           overview: {
             totalSites: sharePointSites.length,
-            totalStorageQuotaGB:
-              Math.round(
-                sharePointSites.reduce(
-                  (total, site) =>
-                    total + (bytesToGb(site?.driveQuota?.total) ?? 0),
-                  0
-                ) * 100
-              ) / 100,
-            oneDriveStorageLimitGB: null,
-            siteStorageLimitsMode: 'Not synchronized',
-            sharingSharePoint: null,
+            // Graph site drive quotas are per-site limits. Summing them does
+            // not produce the tenant's licensed SharePoint storage pool.
+            totalStorageQuotaGB: null,
+            oneDriveStorageLimitGB:
+              typeof sharePointSettings?.personalSiteDefaultStorageLimitInMB ===
+              'number'
+                ? Math.round(
+                    (sharePointSettings.personalSiteDefaultStorageLimitInMB /
+                      1024) *
+                      100
+                  ) / 100
+                : null,
+            siteStorageLimitsMode:
+              typeof sharePointSettings?.isSitesStorageLimitAutomatic ===
+              'boolean'
+                ? sharePointSettings.isSitesStorageLimitAutomatic
+                  ? 'Automatic'
+                  : 'Manual'
+                : 'Not synchronized',
+            sharingSharePoint:
+              sharePointSettings?.sharingCapability ?? null,
             sharingOneDrive: null,
           },
           sites: sharePointSites.map((site) => ({
