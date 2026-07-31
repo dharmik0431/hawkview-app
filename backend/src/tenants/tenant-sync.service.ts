@@ -877,8 +877,32 @@ export class TenantSyncService {
   ) {
     return this.runSnapshotSync(tenant, 'SHAREPOINT_SITES', async () => {
       const sites: any[] = []
+      const siteFields =
+        'id,name,displayName,webUrl,createdDateTime,lastModifiedDateTime,root,siteCollection'
+
+      // Microsoft Graph site search can return an empty collection even when
+      // the tenant's root SharePoint site exists. Fetch the root explicitly so
+      // a provisioned tenant never appears as an empty SharePoint environment.
+      const rootResponse = await fetch(
+        `https://graph.microsoft.com/v1.0/sites/root?$select=${siteFields}`,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(30_000),
+        }
+      )
+      if (rootResponse.ok) {
+        sites.push((await rootResponse.json()) as any)
+      } else if (rootResponse.status !== 404) {
+        throw new Error(
+          `Microsoft SharePoint root site synchronization returned ${rootResponse.status}.`
+        )
+      }
+
       let nextUrl =
-        'https://graph.microsoft.com/v1.0/sites?search=*&$select=id,name,displayName,webUrl,createdDateTime,lastModifiedDateTime,root,siteCollection'
+        `https://graph.microsoft.com/v1.0/sites?search=*&$select=${siteFields}`
       while (nextUrl) {
         if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
           throw new Error(
@@ -902,9 +926,16 @@ export class TenantSyncService {
         nextUrl = page['@odata.nextLink'] ?? ''
       }
 
+      const uniqueSites = Array.from(
+        new Map(
+          sites
+            .filter((site) => typeof site?.id === 'string')
+            .map((site) => [site.id, site])
+        ).values()
+      )
       const enrichedSites: any[] = []
-      for (let index = 0; index < sites.length; index += 8) {
-        const batch = sites.slice(index, index + 8)
+      for (let index = 0; index < uniqueSites.length; index += 8) {
+        const batch = uniqueSites.slice(index, index + 8)
         const batchRows = await Promise.all(
           batch.map(async (site) => {
             if (typeof site?.id !== 'string')
