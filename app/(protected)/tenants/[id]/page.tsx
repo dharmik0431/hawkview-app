@@ -747,7 +747,7 @@ function PolicyDetailsView({ policy }: { policy: ConditionalAccessPolicy }) {
    ✅ Named Locations (scalable)
    ================================ */
 
-type NamedLocationType = 'TRUSTED' | 'BLOCKED'
+type NamedLocationType = 'TRUSTED' | 'OTHER'
 
 type NamedLocation = {
   id: string
@@ -778,7 +778,7 @@ const NAMED_LOCATIONS: NamedLocation[] = [
   {
     id: 'nl-4',
     name: 'Blocked Countries',
-    type: 'BLOCKED',
+    type: 'OTHER',
     addresses: ['North Korea', 'Iran', 'Russia', 'Syria'],
   },
 ]
@@ -819,11 +819,11 @@ function NamedLocationsCard({ locations }: { locations: NamedLocation[] }) {
               Trusted
             </Button>
             <Button
-              variant={filter === 'BLOCKED' ? 'default' : 'outline'}
+              variant={filter === 'OTHER' ? 'default' : 'outline'}
               size="sm"
-              onClick={() => setFilter('BLOCKED')}
+              onClick={() => setFilter('OTHER')}
             >
-              Blocked
+              Standard
             </Button>
           </div>
         </div>
@@ -850,7 +850,7 @@ function NamedLocationsCard({ locations }: { locations: NamedLocation[] }) {
                       : 'bg-red-50 text-red-700 border border-red-200'
                   }
                 >
-                  {l.type === 'TRUSTED' ? 'Trusted' : 'Blocked'}
+                  {l.type === 'TRUSTED' ? 'Trusted' : 'Standard'}
                 </Badge>
               </div>
 
