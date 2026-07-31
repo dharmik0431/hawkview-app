@@ -64,6 +64,7 @@ enum SyncResourceType {
   DIRECTORY_ROLES
   SERVICE_PRINCIPALS
   SHAREPOINT_SITES
+  SHAREPOINT_SETTINGS
 }
 
 enum SyncStateStatus {

@@ -111,10 +111,12 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       rawOverview.total ??
       0,
     totalStorageQuotaGB:
-      rawOverview.totalStorageQuotaGB ??
-      rawOverview.storageQuotaGB ??
-      rawOverview.totalQuotaGB ??
-      0,
+      rawOverview.totalStorageQuotaGB === null
+        ? null
+        : (rawOverview.totalStorageQuotaGB ??
+          rawOverview.storageQuotaGB ??
+          rawOverview.totalQuotaGB ??
+          null),
     oneDriveStorageLimitGB:
       rawOverview.oneDriveStorageLimitGB === null
         ? null
@@ -338,7 +340,9 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                   Total Storage Quota
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {SP_OVERVIEW.totalStorageQuotaGB} GB
+                  {typeof SP_OVERVIEW.totalStorageQuotaGB === 'number'
+                    ? `${SP_OVERVIEW.totalStorageQuotaGB} GB`
+                    : 'Not synchronized'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Tenant quota
@@ -382,7 +386,11 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                   External Sharing On
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {totals.externalOn}
+                  {SP_SITES.some(
+                    (site: any) => typeof site.externalSharing === 'boolean'
+                  )
+                    ? totals.externalOn
+                    : 'Not synchronized'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Sites allowing external links
@@ -433,7 +441,11 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 Orphaned sites
               </div>
               <div className="text-lg font-bold text-slate-900">
-                {totals.orphaned}
+                {SP_SITES.some(
+                  (site: any) => typeof site.owners === 'number'
+                )
+                  ? totals.orphaned
+                  : 'Not synchronized'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Less than 2 owners (governance risk)
@@ -443,7 +455,9 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             <div className="rounded-2xl border bg-gradient-to-r from-amber-50 to-white p-4">
               <div className="text-xs text-muted-foreground">Deleted sites</div>
               <div className="text-lg font-bold text-slate-900">
-                {SP_DELETED_SITES.length}
+                {sp?.deletedSitesSynchronized === true
+                  ? SP_DELETED_SITES.length
+                  : 'Not synchronized'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Recoverable items
