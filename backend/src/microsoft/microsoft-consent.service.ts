@@ -14,6 +14,11 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'Organization.Read.All',
   'User.Read.All',
   'GroupMember.Read.All',
+  'AuditLog.Read.All',
+  'Policy.Read.All',
+  'Policy.Read.AuthenticationMethod',
+  'Device.Read.All',
+  'RoleManagement.Read.Directory',
 ] as const
 
 const PERMISSION_DESCRIPTIONS: Record<string, string> = {
@@ -22,6 +27,15 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
   'User.Read.All': 'Read users and their basic directory profile information.',
   'GroupMember.Read.All':
     'Read Microsoft 365 and security groups and their user memberships.',
+  'AuditLog.Read.All':
+    'Read sign-in activity and user MFA registration status.',
+  'Policy.Read.All':
+    'Read Conditional Access policies and named locations.',
+  'Policy.Read.AuthenticationMethod':
+    'Read the tenant authentication-method policy.',
+  'Device.Read.All': 'Read Microsoft Entra registered and managed devices.',
+  'RoleManagement.Read.Directory':
+    'Read Microsoft Entra directory role assignments.',
 }
 
 interface ConsentState {

@@ -16,6 +16,37 @@ const TENANT_ADMIN_ROLES = ['MSP_OWNER', 'MSP_ADMIN'] as const
 const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
 
+const AUTH_METHOD_NAMES: Record<string, string> = {
+  fido2: 'Passkey (FIDO2)',
+  microsoftAuthenticator: 'Microsoft Authenticator',
+  sms: 'SMS',
+  temporaryAccessPass: 'Temporary Access Pass',
+  email: 'Email OTP',
+  x509Certificate: 'Certificate-based authentication',
+  voice: 'Voice call',
+  softwareOath: 'Software OATH token',
+  hardwareOath: 'Hardware OATH token',
+  qrCodePin: 'QR code PIN',
+}
+
+function formatAuthenticationMethodName(id: unknown) {
+  if (typeof id !== 'string' || !id) return 'Authentication method'
+  return AUTH_METHOD_NAMES[id] ?? id.replace(/([a-z])([A-Z])/g, '$1 $2')
+}
+
+function summarizeAuthenticationMethodTargets(method: any) {
+  const targets = Array.isArray(method?.includeTargets)
+    ? method.includeTargets
+    : []
+  if (targets.some((target: any) => target?.id === 'all_users')) {
+    return 'All users'
+  }
+  const ids = targets
+    .map((target: any) => target?.id)
+    .filter((id: unknown): id is string => typeof id === 'string')
+  return ids.length > 0 ? `${ids.length} selected group(s)` : 'No users targeted'
+}
+
 interface GraphUser {
   id?: string
   displayName?: string | null
@@ -74,6 +105,20 @@ interface GraphGroupsPage {
 
 interface GraphGroupMembersPage {
   value?: Array<{ id?: string }>
+  '@odata.nextLink'?: string
+}
+
+type EntraSnapshotResource =
+  | 'AUTH_REGISTRATIONS'
+  | 'AUTH_METHOD_POLICIES'
+  | 'CONDITIONAL_ACCESS'
+  | 'NAMED_LOCATIONS'
+  | 'SIGN_INS'
+  | 'DEVICES'
+  | 'DIRECTORY_ROLES'
+
+interface GraphCollectionPage {
+  value?: unknown[]
   '@odata.nextLink'?: string
 }
 
@@ -298,12 +343,80 @@ export class TenantSyncService {
       )
     })
 
+    const entraModules: Array<Promise<unknown>> = [
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'AUTH_REGISTRATIONS',
+        'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails'
+      ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'AUTH_METHOD_POLICIES',
+        'https://graph.microsoft.com/v1.0/policies/authenticationMethodsPolicy/authenticationMethodConfigurations'
+      ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'CONDITIONAL_ACCESS',
+        'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies'
+      ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'NAMED_LOCATIONS',
+        'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
+      ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'SIGN_INS',
+        `https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=createdDateTime ge ${encodeURIComponent(
+          new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
+        )}&$top=1000`
+      ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'DEVICES',
+        'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)'
+      ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'DIRECTORY_ROLES',
+        'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName)'
+      ),
+    ]
+    const entraResults = await Promise.allSettled(entraModules)
+    entraResults.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        const resource = [
+          'AUTH_REGISTRATIONS',
+          'AUTH_METHOD_POLICIES',
+          'CONDITIONAL_ACCESS',
+          'NAMED_LOCATIONS',
+          'SIGN_INS',
+          'DEVICES',
+          'DIRECTORY_ROLES',
+        ][index]
+        this.logger.warn(
+          `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason)
+          }`
+        )
+      }
+    })
+
     return this.buildBundle(tenant)
   }
 
   private async runSnapshotSync(
     tenant: { id: string; organizationId: string },
-    resourceType: 'LICENSES' | 'DOMAINS' | 'GROUPS',
+    resourceType: 'LICENSES' | 'DOMAINS' | 'GROUPS' | EntraSnapshotResource,
     synchronize: () => Promise<void>
   ) {
     const lastAttemptAt = new Date()
@@ -693,6 +806,60 @@ export class TenantSyncService {
     })
   }
 
+  private async syncEntraCollection(
+    tenant: { id: string; organizationId: string },
+    accessToken: string,
+    resourceType: EntraSnapshotResource,
+    initialUrl: string
+  ) {
+    return this.runSnapshotSync(tenant, resourceType, async () => {
+      const rows: unknown[] = []
+      let nextUrl = initialUrl
+      while (nextUrl) {
+        if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
+          throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
+        }
+        const response = await fetch(nextUrl, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!response.ok) {
+          const graphRequestId = response.headers.get('request-id')
+          throw new Error(
+            `Microsoft ${resourceType.toLowerCase()} synchronization returned ${response.status}${
+              graphRequestId ? ` (request ${graphRequestId})` : ''
+            }.`
+          )
+        }
+        const page = (await response.json()) as GraphCollectionPage
+        rows.push(...(page.value ?? []))
+        nextUrl = page['@odata.nextLink'] ?? ''
+      }
+      await this.prisma.tenantEntraSnapshot.upsert({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType,
+          },
+        },
+        create: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          resourceType,
+          payload: rows as never,
+          observedAt: new Date(),
+        },
+        update: {
+          payload: rows as never,
+          observedAt: new Date(),
+        },
+      })
+    })
+  }
+
   private async synchronizeUsers(
     tenant: {
       id: string
@@ -801,7 +968,7 @@ export class TenantSyncService {
       lastVerifiedAt: Date | null
     } | null
   }) {
-    const [users, licenses, domains, syncStates] = await Promise.all([
+    const [users, licenses, domains, syncStates, entraSnapshots] = await Promise.all([
       this.prisma.directoryUser.findMany({
         where: {
           organizationId: tenant.organizationId,
@@ -836,7 +1003,62 @@ export class TenantSyncService {
       this.prisma.syncState.findMany({
         where: { customerTenantId: tenant.id },
       }),
+      this.prisma.tenantEntraSnapshot.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+      }),
     ])
+    const snapshotByResource = new Map(
+      entraSnapshots.map((snapshot) => [
+        snapshot.resourceType,
+        Array.isArray(snapshot.payload) ? (snapshot.payload as any[]) : [],
+      ])
+    )
+    const authRegistrations = snapshotByResource.get('AUTH_REGISTRATIONS') ?? []
+    const authRegistrationByUserId = new Map(
+      authRegistrations
+        .filter((registration) => typeof registration?.id === 'string')
+        .map((registration) => [registration.id, registration])
+    )
+    const roleAssignments = snapshotByResource.get('DIRECTORY_ROLES') ?? []
+    const roleNamesByUserId = new Map<string, string[]>()
+    for (const assignment of roleAssignments) {
+      if (typeof assignment?.principalId !== 'string') continue
+      const roleName = assignment?.roleDefinition?.displayName
+      if (typeof roleName !== 'string' || !roleName.trim()) continue
+      const current = roleNamesByUserId.get(assignment.principalId) ?? []
+      current.push(roleName.trim())
+      roleNamesByUserId.set(assignment.principalId, [...new Set(current)].sort())
+    }
+    const devices = snapshotByResource.get('DEVICES') ?? []
+    const devicesByUserId = new Map<string, string[]>()
+    for (const device of devices) {
+      const label =
+        typeof device?.displayName === 'string' && device.displayName.trim()
+          ? device.displayName.trim()
+          : typeof device?.deviceId === 'string'
+            ? device.deviceId
+            : 'Registered device'
+      for (const owner of Array.isArray(device?.registeredOwners)
+        ? device.registeredOwners
+        : []) {
+        if (typeof owner?.id !== 'string') continue
+        const current = devicesByUserId.get(owner.id) ?? []
+        current.push(label)
+        devicesByUserId.set(owner.id, [...new Set(current)].sort())
+      }
+    }
+    const signIns = snapshotByResource.get('SIGN_INS') ?? []
+    const latestSignInByUserId = new Map<string, any>()
+    for (const signIn of signIns) {
+      if (typeof signIn?.userId !== 'string') continue
+      const current = latestSignInByUserId.get(signIn.userId)
+      if (!current || String(signIn.createdDateTime) > String(current.createdDateTime)) {
+        latestSignInByUserId.set(signIn.userId, signIn)
+      }
+    }
     const syncStateByResource = new Map(
       syncStates.map((state) => [state.resourceType, state])
     )
@@ -881,29 +1103,62 @@ export class TenantSyncService {
           ),
           lastSync: lastSync?.toISOString() ?? null,
         },
-        users: users.map((user) => ({
+        users: users.map((user) => {
+          const registration = authRegistrationByUserId.get(user.microsoftUserId)
+          const roleNames = roleNamesByUserId.get(user.microsoftUserId) ?? []
+          const lastSignIn = latestSignInByUserId.get(user.microsoftUserId)
+          return {
           id: user.microsoftUserId,
           name: user.displayName,
           email: user.userPrincipalName || user.mail || '',
           type: user.userType === 'Guest' ? 'Guest' : 'Member',
-          role: 'User',
+          role: roleNames.length > 0 ? roleNames.join(', ') : 'User',
           status: user.accountEnabled ? 'Enabled' : 'Disabled',
           // MFA requires a separate Graph dataset. Never turn missing data into
           // a security finding by reporting it as disabled.
-          mfa: 'Unknown',
-          lastLogin: 'Not synchronized',
+          mfa:
+            typeof registration?.isMfaRegistered === 'boolean'
+              ? registration.isMfaRegistered
+                ? 'Enabled'
+                : 'Disabled'
+              : 'Unknown',
+          lastLogin:
+            typeof lastSignIn?.createdDateTime === 'string'
+              ? lastSignIn.createdDateTime
+              : 'Not synchronized',
           driveUsage: 'Not synchronized',
           mailUsage: 'Not synchronized',
-          authMethods: [],
+          authMethods: Array.isArray(registration?.methodsRegistered)
+            ? registration.methodsRegistered
+            : [],
           licenses: user.assignedLicenseSkuIds.map(
             (skuId) => licenseNameBySkuId.get(skuId.toLowerCase()) ?? skuId
           ),
           groups: user.groupMemberships
             .map((membership) => membership.directoryGroup.displayName)
             .sort((left, right) => left.localeCompare(right)),
-          devices: [],
+          devices: devicesByUserId.get(user.microsoftUserId) ?? [],
+          }
+        }),
+        signIns: signIns.map((signIn) => ({
+          id: signIn.id,
+          userId: signIn.userId,
+          userDisplayName: signIn.userDisplayName ?? 'Unknown user',
+          userPrincipalName: signIn.userPrincipalName ?? '',
+          createdAt: signIn.createdDateTime,
+          ipAddress: signIn.ipAddress ?? '',
+          result:
+            Number(signIn?.status?.errorCode ?? 1) === 0
+              ? 'SUCCESS'
+              : 'FAILURE',
+          appDisplayName: signIn.appDisplayName ?? 'Unknown application',
+          clientAppUsed: signIn.clientAppUsed ?? 'Unknown',
+          country: signIn?.location?.countryOrRegion ?? 'Unknown',
+          city: signIn?.location?.city ?? undefined,
+          latitude: Number(signIn?.location?.geoCoordinates?.latitude ?? 0),
+          longitude: Number(signIn?.location?.geoCoordinates?.longitude ?? 0),
+          riskLevel: signIn.riskLevelAggregated ?? signIn.riskLevelDuringSignIn,
         })),
-        signIns: [],
         exchange: {
           mailboxes: [],
           rules: [],
@@ -926,9 +1181,80 @@ export class TenantSyncService {
           })),
         },
         entra: {
-          caPolicies: [],
-          authMethods: [],
-          namedLocations: [],
+          caPolicies: (snapshotByResource.get('CONDITIONAL_ACCESS') ?? []).map(
+            (policy) => {
+              const includeUsers = policy?.conditions?.users?.includeUsers ?? []
+              const includeGroups = policy?.conditions?.users?.includeGroups ?? []
+              const includeRoles = policy?.conditions?.users?.includeRoles ?? []
+              const grants = policy?.grantControls?.builtInControls ?? []
+              const state =
+                policy?.state === 'enabled'
+                  ? 'ON'
+                  : policy?.state === 'enabledForReportingButNotEnforced'
+                    ? 'REPORT_ONLY'
+                    : 'OFF'
+              return {
+                id: policy.id,
+                name: policy.displayName ?? 'Unnamed policy',
+                state,
+                origin: policy.templateId
+                  ? 'MICROSOFT_TEMPLATE'
+                  : 'CUSTOM',
+                targetSummary:
+                  includeUsers.includes('All')
+                    ? 'All Users'
+                    : `${includeUsers.length + includeGroups.length + includeRoles.length} targets`,
+                grantSummary:
+                  grants.length > 0
+                    ? grants.map((grant: string) => grant === 'mfa' ? 'Require multifactor authentication' : grant === 'block' ? 'Block access' : grant).join(', ')
+                    : 'No grant controls',
+                assignments: {
+                  usersAndGroups: {
+                    include: [...includeUsers, ...includeGroups, ...includeRoles],
+                    exclude: [
+                      ...(policy?.conditions?.users?.excludeUsers ?? []),
+                      ...(policy?.conditions?.users?.excludeGroups ?? []),
+                      ...(policy?.conditions?.users?.excludeRoles ?? []),
+                    ],
+                  },
+                  cloudApps: {
+                    include: policy?.conditions?.applications?.includeApplications ?? [],
+                    exclude: policy?.conditions?.applications?.excludeApplications ?? [],
+                  },
+                },
+                conditions: {
+                  platforms: policy?.conditions?.platforms?.includePlatforms ?? [],
+                },
+                accessControls: {
+                  grant: grants.map((grant: string) =>
+                    grant === 'mfa'
+                      ? 'Require multifactor authentication'
+                      : grant === 'block'
+                        ? 'Block access'
+                        : grant
+                  ),
+                },
+              }
+            }
+          ),
+          authMethods: (snapshotByResource.get('AUTH_METHOD_POLICIES') ?? []).map(
+            (method) => ({
+              id: method.id,
+              name: formatAuthenticationMethodName(method.id),
+              target: summarizeAuthenticationMethodTargets(method),
+              status: method.state === 'enabled' ? 'ENABLED' : 'DISABLED',
+            })
+          ),
+          namedLocations: (snapshotByResource.get('NAMED_LOCATIONS') ?? []).map(
+            (location) => ({
+              id: location.id,
+              name: location.displayName ?? 'Unnamed location',
+              type: location.isTrusted === true ? 'TRUSTED' : 'OTHER',
+              addresses: Array.isArray(location.ipRanges)
+                ? location.ipRanges.map((range: any) => range.cidrAddress).filter(Boolean)
+                : location.countriesAndRegions ?? [],
+            })
+          ),
         },
         syncedAt: lastSync?.toISOString() ?? null,
         sync: {
