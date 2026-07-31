@@ -1061,8 +1061,17 @@ export class TenantSyncService {
       const body = (await response.json()) as any
       // Microsoft documentation has shown both the resource directly and a
       // single resource under `value`; normalize either response shape.
-      const settings =
-        body?.value && !Array.isArray(body.value) ? body.value : body
+      const settings = Array.isArray(body?.value)
+        ? body.value[0]
+        : body?.value && typeof body.value === 'object'
+          ? body.value
+          : body
+
+      if (!settings || typeof settings !== 'object') {
+        throw new Error(
+          'Microsoft SharePoint settings synchronization returned an empty response.'
+        )
+      }
 
       await this.prisma.tenantEntraSnapshot.upsert({
         where: {
@@ -1102,7 +1111,29 @@ export class TenantSyncService {
           signal: AbortSignal.timeout(30_000),
         }
       )
-      if (reportResponse.status !== 302) {
+      let reportText: string
+      if (reportResponse.ok) {
+        // Graph normally redirects to a short-lived report URL, but some
+        // environments return the CSV directly. Both are valid responses.
+        reportText = await reportResponse.text()
+      } else if (reportResponse.status === 302) {
+        const downloadUrl = reportResponse.headers.get('location')
+        if (!downloadUrl?.startsWith('https://')) {
+          throw new Error(
+            'Microsoft returned an invalid SharePoint usage report link.'
+          )
+        }
+        const downloadResponse = await fetch(downloadUrl, {
+          headers: { Accept: 'text/csv,application/octet-stream' },
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!downloadResponse.ok) {
+          throw new Error(
+            `Microsoft SharePoint usage report download returned ${downloadResponse.status}.`
+          )
+        }
+        reportText = await downloadResponse.text()
+      } else {
         const graphRequestId = reportResponse.headers.get('request-id')
         throw new Error(
           `Microsoft SharePoint usage synchronization returned ${reportResponse.status}${
@@ -1110,22 +1141,7 @@ export class TenantSyncService {
           }.`
         )
       }
-      const downloadUrl = reportResponse.headers.get('location')
-      if (!downloadUrl?.startsWith('https://')) {
-        throw new Error(
-          'Microsoft returned an invalid SharePoint usage report link.'
-        )
-      }
-      const downloadResponse = await fetch(downloadUrl, {
-        headers: { Accept: 'text/csv,application/octet-stream' },
-        signal: AbortSignal.timeout(30_000),
-      })
-      if (!downloadResponse.ok) {
-        throw new Error(
-          `Microsoft SharePoint usage report download returned ${downloadResponse.status}.`
-        )
-      }
-      const rows = parseCsvRows(await downloadResponse.text())
+      const rows = parseCsvRows(reportText)
       await this.prisma.tenantEntraSnapshot.upsert({
         where: {
           customerTenantId_resourceType: {
@@ -1466,6 +1482,16 @@ export class TenantSyncService {
     const licenseSyncState = syncStateByResource.get('LICENSES')
     const domainSyncState = syncStateByResource.get('DOMAINS')
     const groupSyncState = syncStateByResource.get('GROUPS')
+    const sharePointSitesSyncState = syncStateByResource.get('SHAREPOINT_SITES')
+    const sharePointSettingsSyncState = syncStateByResource.get(
+      'SHAREPOINT_SETTINGS'
+    )
+    const sharePointUsageSyncState = syncStateByResource.get('SHAREPOINT_USAGE')
+    const sharePointSettingsSynchronized =
+      sharePointSettingsSyncState?.status === 'SUCCEEDED' &&
+      Boolean(sharePointSettings)
+    const sharePointUsageSynchronized =
+      sharePointUsageSyncState?.status === 'SUCCEEDED'
     const licenseNameBySkuId = new Map(
       licenses.map((license) => [
         license.microsoftSkuId.toLowerCase(),
@@ -1568,6 +1594,44 @@ export class TenantSyncService {
           groups: [],
         },
         sharepoint: {
+          sync: {
+            sites: {
+              status:
+                sharePointSitesSyncState?.status.toLowerCase() ??
+                'never-synced',
+              lastSuccessfulAt:
+                sharePointSitesSyncState?.lastSuccessfulAt?.toISOString() ??
+                null,
+              lastError:
+                sharePointSitesSyncState?.lastErrorMessage ?? null,
+            },
+            settings: {
+              status:
+                sharePointSettingsSyncState?.status.toLowerCase() ??
+                'never-synced',
+              lastSuccessfulAt:
+                sharePointSettingsSyncState?.lastSuccessfulAt?.toISOString() ??
+                null,
+              lastError:
+                sharePointSettingsSyncState?.lastErrorMessage ?? null,
+            },
+            usage: {
+              status:
+                sharePointUsageSyncState?.status.toLowerCase() ??
+                'never-synced',
+              lastSuccessfulAt:
+                sharePointUsageSyncState?.lastSuccessfulAt?.toISOString() ??
+                null,
+              lastError:
+                sharePointUsageSyncState?.lastErrorMessage ?? null,
+            },
+          },
+          capabilities: {
+            tenantSettings: sharePointSettingsSynchronized,
+            usageReport: sharePointUsageSynchronized,
+            siteOwnerCount: false,
+            deletedSites: false,
+          },
           overview: {
             totalSites: sharePointSites.length,
             // Graph site drive quotas are per-site limits. Summing them does
@@ -1589,8 +1653,16 @@ export class TenantSyncService {
                   ? 'Automatic'
                   : 'Manual'
                 : 'Not synchronized',
-            sharingSharePoint: sharePointSettings?.sharingCapability ?? null,
-            sharingOneDrive: null,
+            // Graph exposes one tenant sharing capability for the combined
+            // SharePoint and OneDrive settings resource. Until Microsoft
+            // exposes separate values, show the same authoritative tenant
+            // policy in both cards rather than pretending OneDrive failed.
+            sharingSharePoint: sharePointSettingsSynchronized
+              ? (sharePointSettings?.sharingCapability ?? null)
+              : null,
+            sharingOneDrive: sharePointSettingsSynchronized
+              ? (sharePointSettings?.sharingCapability ?? null)
+              : null,
           },
           sites: sharePointSites.map((site) => {
             const usage = getSharePointUsage(site)
@@ -1623,6 +1695,13 @@ export class TenantSyncService {
             }
           }),
           deletedSites: [],
+          deletedSitesSynchronized: false,
+          unsupported: {
+            siteOwnerCount:
+              'Microsoft Graph site inventory and usage reports do not provide a reliable owner count.',
+            deletedSites:
+              'Microsoft Graph does not provide the SharePoint recently deleted sites inventory.',
+          },
         },
         teams: {},
         licenses: {
