@@ -49,6 +49,56 @@ function summarizeAuthenticationMethodTargets(method: any) {
     : 'No users targeted'
 }
 
+function parseCsvRows(csv: string): Record<string, string>[] {
+  const rows: string[][] = []
+  let row: string[] = []
+  let field = ''
+  let quoted = false
+
+  for (let index = 0; index < csv.length; index += 1) {
+    const character = csv[index]
+    if (character === '"') {
+      if (quoted && csv[index + 1] === '"') {
+        field += '"'
+        index += 1
+      } else {
+        quoted = !quoted
+      }
+    } else if (character === ',' && !quoted) {
+      row.push(field)
+      field = ''
+    } else if ((character === '\n' || character === '\r') && !quoted) {
+      if (character === '\r' && csv[index + 1] === '\n') index += 1
+      row.push(field)
+      if (row.some((value) => value.length > 0)) rows.push(row)
+      row = []
+      field = ''
+    } else {
+      field += character
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field)
+    rows.push(row)
+  }
+
+  const [rawHeaders, ...values] = rows
+  if (!rawHeaders) return []
+  const headers = rawHeaders.map((header, index) =>
+    (index === 0 ? header.replace(/^\uFEFF/, '') : header).trim()
+  )
+  return values.map((columns) =>
+    Object.fromEntries(
+      headers.map((header, index) => [header, columns[index]?.trim() ?? ''])
+    )
+  )
+}
+
+function normalizeSharePointUrl(value: unknown) {
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/\/$/, '').toLowerCase()
+}
+
 interface GraphUser {
   id?: string
   displayName?: string | null
@@ -121,6 +171,7 @@ type EntraSnapshotResource =
   | 'SERVICE_PRINCIPALS'
   | 'SHAREPOINT_SITES'
   | 'SHAREPOINT_SETTINGS'
+  | 'SHAREPOINT_USAGE'
 
 interface GraphCollectionPage {
   value?: unknown[]
@@ -403,6 +454,7 @@ export class TenantSyncService {
       ),
       this.syncSharePointSites(tenant, snapshotAccessToken),
       this.syncSharePointSettings(tenant, snapshotAccessToken),
+      this.syncSharePointUsage(tenant, snapshotAccessToken),
     ]
     const entraResults = await Promise.allSettled(entraModules)
     entraResults.forEach((result, index) => {
@@ -418,6 +470,7 @@ export class TenantSyncService {
           'SERVICE_PRINCIPALS',
           'SHAREPOINT_SITES',
           'SHAREPOINT_SETTINGS',
+          'SHAREPOINT_USAGE',
         ][index]
         this.logger.warn(
           `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
@@ -904,8 +957,7 @@ export class TenantSyncService {
         )
       }
 
-      let nextUrl =
-        `https://graph.microsoft.com/v1.0/sites?search=*&$select=${siteFields}`
+      let nextUrl = `https://graph.microsoft.com/v1.0/sites?search=*&$select=${siteFields}`
       while (nextUrl) {
         if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
           throw new Error(
@@ -1028,6 +1080,68 @@ export class TenantSyncService {
         },
         update: {
           payload: [settings] as never,
+          observedAt: new Date(),
+        },
+      })
+    })
+  }
+
+  private async syncSharePointUsage(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'SHAREPOINT_USAGE', async () => {
+      const reportResponse = await fetch(
+        "https://graph.microsoft.com/v1.0/reports/getSharePointSiteUsageDetail(period='D30')",
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'text/csv',
+          },
+          redirect: 'manual',
+          signal: AbortSignal.timeout(30_000),
+        }
+      )
+      if (reportResponse.status !== 302) {
+        const graphRequestId = reportResponse.headers.get('request-id')
+        throw new Error(
+          `Microsoft SharePoint usage synchronization returned ${reportResponse.status}${
+            graphRequestId ? ` (request ${graphRequestId})` : ''
+          }.`
+        )
+      }
+      const downloadUrl = reportResponse.headers.get('location')
+      if (!downloadUrl?.startsWith('https://')) {
+        throw new Error(
+          'Microsoft returned an invalid SharePoint usage report link.'
+        )
+      }
+      const downloadResponse = await fetch(downloadUrl, {
+        headers: { Accept: 'text/csv,application/octet-stream' },
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!downloadResponse.ok) {
+        throw new Error(
+          `Microsoft SharePoint usage report download returned ${downloadResponse.status}.`
+        )
+      }
+      const rows = parseCsvRows(await downloadResponse.text())
+      await this.prisma.tenantEntraSnapshot.upsert({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType: 'SHAREPOINT_USAGE',
+          },
+        },
+        create: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          resourceType: 'SHAREPOINT_USAGE',
+          payload: rows as never,
+          observedAt: new Date(),
+        },
+        update: {
+          payload: rows as never,
           observedAt: new Date(),
         },
       })
@@ -1217,9 +1331,47 @@ export class TenantSyncService {
       )
     }
     const sharePointSites = snapshotByResource.get('SHAREPOINT_SITES') ?? []
-    const sharePointSettings = (
-      snapshotByResource.get('SHAREPOINT_SETTINGS') ?? []
-    )[0]
+    const sharePointSettings = (snapshotByResource.get('SHAREPOINT_SETTINGS') ??
+      [])[0]
+    const sharePointUsage = snapshotByResource.get('SHAREPOINT_USAGE') ?? []
+    const sharePointUsageByUrl = new Map(
+      sharePointUsage
+        .filter((row) => normalizeSharePointUrl(row?.['Site URL']))
+        .map((row) => [normalizeSharePointUrl(row['Site URL']), row])
+    )
+    const sharePointUsageBySiteId = new Map(
+      sharePointUsage
+        .filter(
+          (row) => typeof row?.['Site Id'] === 'string' && row['Site Id'].trim()
+        )
+        .map((row) => [row['Site Id'].trim().toLowerCase(), row])
+    )
+    const parseReportBytes = (value: unknown) => {
+      if (typeof value !== 'string' || !value.trim()) return null
+      const parsed = Number(value)
+      return Number.isFinite(parsed) ? parsed : null
+    }
+    const getSharePointUsage = (site: any) => {
+      const byUrl = sharePointUsageByUrl.get(
+        normalizeSharePointUrl(site?.webUrl)
+      )
+      if (byUrl) return byUrl
+      if (typeof site?.id !== 'string') return undefined
+      const siteIds = site.id
+        .split(',')
+        .map((value: string) => value.trim().toLowerCase())
+      return siteIds
+        .map((siteId: string) => sharePointUsageBySiteId.get(siteId))
+        .find(Boolean)
+    }
+    const getSharePointSiteType = (site: any, usage: any) => {
+      const template = String(usage?.['Root Web Template'] ?? '').toUpperCase()
+      const url = normalizeSharePointUrl(site?.webUrl)
+      if (url.includes('-my.sharepoint.com/personal/')) return 'OneDrive'
+      if (template.includes('SITEPAGEPUBLISHING')) return 'Communication site'
+      if (template.includes('GROUP')) return 'Microsoft 365 group site'
+      return template ? 'SharePoint site' : 'Not synchronized'
+    }
     const bytesToGb = (value: unknown) =>
       typeof value === 'number'
         ? Math.round((value / 1024 ** 3) * 100) / 100
@@ -1437,22 +1589,39 @@ export class TenantSyncService {
                   ? 'Automatic'
                   : 'Manual'
                 : 'Not synchronized',
-            sharingSharePoint:
-              sharePointSettings?.sharingCapability ?? null,
+            sharingSharePoint: sharePointSettings?.sharingCapability ?? null,
             sharingOneDrive: null,
           },
-          sites: sharePointSites.map((site) => ({
-            id: site.id,
-            name: site.displayName || site.name || 'Unnamed SharePoint site',
-            url: site.webUrl || '',
-            type: 'Team site',
-            externalSharing: null,
-            guestsCount: null,
-            owners: null,
-            storageUsedGB: bytesToGb(site?.driveQuota?.used),
-            storageQuotaGB: bytesToGb(site?.driveQuota?.total),
-            lastActivity: site.lastModifiedDateTime || 'Not synchronized',
-          })),
+          sites: sharePointSites.map((site) => {
+            const usage = getSharePointUsage(site)
+            const reportStorageUsed = parseReportBytes(
+              usage?.['Storage Used (Byte)']
+            )
+            const reportStorageAllocated = parseReportBytes(
+              usage?.['Storage Allocated (Byte)']
+            )
+            return {
+              id: site.id,
+              name: site.displayName || site.name || 'Unnamed SharePoint site',
+              url: site.webUrl || '',
+              type: getSharePointSiteType(site, usage),
+              externalSharing: null,
+              guestsCount: null,
+              owners: null,
+              ownerDisplayName:
+                typeof usage?.['Owner Display Name'] === 'string' &&
+                usage['Owner Display Name'].trim()
+                  ? usage['Owner Display Name'].trim()
+                  : null,
+              storageUsedGB: bytesToGb(
+                reportStorageUsed ?? site?.driveQuota?.used
+              ),
+              storageQuotaGB: bytesToGb(
+                reportStorageAllocated ?? site?.driveQuota?.total
+              ),
+              lastActivity: usage?.['Last Activity Date'] || 'Not synchronized',
+            }
+          }),
           deletedSites: [],
         },
         teams: {},

@@ -22,6 +22,7 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'Application.Read.All',
   'Sites.Read.All',
   'SharePointTenantSettings.Read.All',
+  'Reports.Read.All',
 ] as const
 
 const PERMISSION_DESCRIPTIONS: Record<string, string> = {
@@ -44,6 +45,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read SharePoint site inventory and document-library storage usage.',
   'SharePointTenantSettings.Read.All':
     'Read tenant-level SharePoint and OneDrive storage and sharing settings.',
+  'Reports.Read.All':
+    'Read SharePoint site usage, storage consumption, ownership, and last activity reports.',
 }
 
 interface ConsentState {
