@@ -50,7 +50,7 @@ function normalizeSharingLevel(v: any): SharingLevel {
   )
     return 'OrganizationOnly'
 
-  return 'Off'
+  return 'Unknown'
 }
 
 function sharingRank(level: SharingLevel) {
@@ -128,7 +128,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       rawOverview.siteStorageLimitsMode ??
       rawOverview.storageLimitsMode ??
       rawOverview.limitsMode ??
-      'Automatic',
+      'Not synchronized',
 
     sharingSharePoint: normalizeSharingLevel(
       rawOverview.sharingSharePoint ??
@@ -169,6 +169,24 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       : Array.isArray(rawOverview?.deletedSites)
         ? rawOverview.deletedSites
         : []
+
+  const sharePointSync = sp?.sync ?? {}
+  const syncFailures = [
+    ['Sites', sharePointSync?.sites],
+    ['Tenant settings', sharePointSync?.settings],
+    ['Usage report', sharePointSync?.usage],
+  ].filter(([, state]) => state?.status === 'failed') as Array<
+    [string, { status: string; lastError?: string | null }]
+  >
+  const usageSynchronized = sp?.capabilities?.usageReport === true
+  const ownerInventorySupported = sp?.capabilities?.siteOwnerCount === true
+  const deletedSitesSupported = sp?.capabilities?.deletedSites === true
+
+  const formatStorage = (value: number) => {
+    if (value === 0) return '0 GB'
+    if (value < 0.01) return '<0.01 GB'
+    return `${Math.round(value * 100) / 100} GB`
+  }
 
   function toggleSort(k: typeof sortKey) {
     if (k === sortKey) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
@@ -309,6 +327,24 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
 
   return (
     <div className="mt-6 space-y-6">
+      {syncFailures.length > 0 ? (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+          <div className="font-semibold">Some SharePoint data could not be refreshed</div>
+          <div className="mt-1 text-amber-900">
+            HawkView kept the last successful data. The details below identify
+            the exact Microsoft request that needs attention.
+          </div>
+          <ul className="mt-2 list-disc space-y-1 pl-5">
+            {syncFailures.map(([label, state]) => (
+              <li key={label}>
+                <span className="font-medium">{label}:</span>{' '}
+                {state.lastError || 'Microsoft rejected the synchronization request.'}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
       {/* Top stats */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         <Card className="rounded-2xl shadow-sm">
@@ -429,7 +465,9 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             <div className="rounded-2xl border bg-gradient-to-r from-blue-50 to-white p-4">
               <div className="text-xs text-muted-foreground">Total used</div>
               <div className="text-lg font-bold text-slate-900">
-                {Math.round(totals.totalUsed)} GB
+                {usageSynchronized
+                  ? formatStorage(totals.totalUsed)
+                  : 'Not synchronized'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Across sites + OneDrive
@@ -441,11 +479,10 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 Orphaned sites
               </div>
               <div className="text-lg font-bold text-slate-900">
-                {SP_SITES.some(
-                  (site: any) => typeof site.owners === 'number'
-                )
+                {ownerInventorySupported &&
+                SP_SITES.some((site: any) => typeof site.owners === 'number')
                   ? totals.orphaned
-                  : 'Not synchronized'}
+                  : 'Unavailable via Graph'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Less than 2 owners (governance risk)
@@ -455,9 +492,9 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             <div className="rounded-2xl border bg-gradient-to-r from-amber-50 to-white p-4">
               <div className="text-xs text-muted-foreground">Deleted sites</div>
               <div className="text-lg font-bold text-slate-900">
-                {sp?.deletedSitesSynchronized === true
+                {deletedSitesSupported && sp?.deletedSitesSynchronized === true
                   ? SP_DELETED_SITES.length
-                  : 'Not synchronized'}
+                  : 'Unavailable via Graph'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Recoverable items
@@ -714,11 +751,16 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             <div>
               <div className="font-semibold">Recently deleted sites</div>
               <div className="text-sm text-muted-foreground">
-                Recoverable items are not synchronized yet.
+                {deletedSitesSupported
+                  ? 'Recoverable SharePoint sites.'
+                  : sp?.unsupported?.deletedSites ||
+                    'Microsoft Graph does not expose this inventory.'}
               </div>
             </div>
-            <Badge className="bg-blue-50 text-blue-700 border border-blue-200">
-              {SP_DELETED_SITES.length} items
+            <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
+              {deletedSitesSupported
+                ? `${SP_DELETED_SITES.length} items`
+                : 'Not available'}
             </Badge>
           </div>
 
@@ -756,7 +798,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               </div>
             ))}
 
-            {SP_DELETED_SITES.length === 0 && (
+            {deletedSitesSupported && SP_DELETED_SITES.length === 0 && (
               <div className="text-sm text-muted-foreground text-center py-6">
                 No deleted sites found.
               </div>
