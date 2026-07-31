@@ -3681,30 +3681,49 @@ export default function TenantDetailsPage() {
                 </div>
                 <div className="mt-3 space-y-2">
                   {selectedUser.devices?.length ? (
-                    selectedUser.devices.map((d: any) => (
+                    selectedUser.devices.map((device: any, index) => {
+                      const deviceName =
+                        typeof device === 'string'
+                          ? device
+                          : device?.name || 'Registered device'
+                      const deviceOs =
+                        typeof device === 'object' && device?.os
+                          ? device.os
+                          : 'Unknown'
+                      const deviceLastSync =
+                        typeof device === 'object' && device?.lastSync
+                          ? device.lastSync
+                          : 'Not synchronized'
+                      const deviceStatus =
+                        typeof device === 'object' && device?.status
+                          ? String(device.status)
+                          : 'Unknown'
+
+                      return (
                       <div
-                        key={d.name}
+                        key={`${deviceName}-${index}`}
                         className="rounded-xl border bg-muted/20 px-4 py-3 flex items-center justify-between"
                       >
                         <div className="min-w-0">
                           <div className="text-sm font-semibold truncate">
-                            {d.name}
+                            {deviceName}
                           </div>
                           <div className="text-xs text-muted-foreground">
-                            {d.os} • Last sync {d.lastSync}
+                            {deviceOs} • Last sync {deviceLastSync}
                           </div>
                         </div>
                         <Badge
                           className={
-                            d.status.toLowerCase().includes('compliant')
+                            deviceStatus.toLowerCase() === 'compliant'
                               ? 'bg-green-50 text-green-700 border border-green-200'
                               : 'bg-orange-50 text-orange-700 border border-orange-200'
                           }
                         >
-                          {d.status}
+                          {deviceStatus}
                         </Badge>
                       </div>
-                    ))
+                      )
+                    })
                   ) : (
                     <div className="text-sm text-muted-foreground">
                       No devices.

@@ -1033,7 +1033,10 @@ export class TenantSyncService {
       roleNamesByUserId.set(assignment.principalId, [...new Set(current)].sort())
     }
     const devices = snapshotByResource.get('DEVICES') ?? []
-    const devicesByUserId = new Map<string, string[]>()
+    const devicesByUserId = new Map<
+      string,
+      Array<{ name: string; os: string; lastSync: string; status: string }>
+    >()
     for (const device of devices) {
       const label =
         typeof device?.displayName === 'string' && device.displayName.trim()
@@ -1041,13 +1044,42 @@ export class TenantSyncService {
           : typeof device?.deviceId === 'string'
             ? device.deviceId
             : 'Registered device'
+      const operatingSystem = [
+        typeof device?.operatingSystem === 'string'
+          ? device.operatingSystem.trim()
+          : '',
+        typeof device?.operatingSystemVersion === 'string'
+          ? device.operatingSystemVersion.trim()
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' ')
+      const deviceDetails = {
+        name: label,
+        os: operatingSystem || 'Unknown',
+        lastSync:
+          typeof device?.approximateLastSignInDateTime === 'string'
+            ? device.approximateLastSignInDateTime
+            : 'Not synchronized',
+        status:
+          typeof device?.isCompliant === 'boolean'
+            ? device.isCompliant
+              ? 'Compliant'
+              : 'Non-compliant'
+            : 'Unknown',
+      }
       for (const owner of Array.isArray(device?.registeredOwners)
         ? device.registeredOwners
         : []) {
         if (typeof owner?.id !== 'string') continue
         const current = devicesByUserId.get(owner.id) ?? []
-        current.push(label)
-        devicesByUserId.set(owner.id, [...new Set(current)].sort())
+        if (!current.some((registeredDevice) => registeredDevice.name === label)) {
+          current.push(deviceDetails)
+        }
+        devicesByUserId.set(
+          owner.id,
+          current.sort((left, right) => left.name.localeCompare(right.name))
+        )
       }
     }
     const signIns = snapshotByResource.get('SIGN_INS') ?? []
