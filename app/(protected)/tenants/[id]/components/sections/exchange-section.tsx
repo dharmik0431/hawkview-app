@@ -27,10 +27,20 @@ export default function ExchangePage({
   const [ruleMailboxFilter, setRuleMailboxFilter] = useState<'all' | string>(
     'all'
   )
+  const exchangeSync = bundle?.exchange?.sync ?? {}
+  const failedModules = Object.entries(exchangeSync).filter(
+    ([, value]: [string, any]) => value?.status === 'failed'
+  )
+  const hasNeverSynced = Object.values(exchangeSync).some(
+    (value: any) => value?.status === 'never-synced'
+  )
 
   // ✅ Pull from mock bundle (NOT hardcoded)
   const EXCHANGE_MAILBOXES = useMemo(
-    () => (Array.isArray(bundle?.exchange?.mailboxes) ? bundle.exchange.mailboxes : []),
+    () =>
+      Array.isArray(bundle?.exchange?.mailboxes)
+        ? bundle.exchange.mailboxes
+        : [],
     [bundle]
   )
 
@@ -45,7 +55,8 @@ export default function ExchangePage({
   )
 
   const EXCHANGE_GROUPS = useMemo(
-    () => (Array.isArray(bundle?.exchange?.groups) ? bundle.exchange.groups : []),
+    () =>
+      Array.isArray(bundle?.exchange?.groups) ? bundle.exchange.groups : [],
     [bundle]
   )
 
@@ -99,6 +110,29 @@ export default function ExchangePage({
 
   return (
     <div className="mt-6 space-y-6">
+      {(failedModules.length > 0 || hasNeverSynced) && (
+        <Card className="rounded-2xl border-amber-200 bg-amber-50/60 shadow-sm">
+          <CardContent className="p-5">
+            <div className="font-semibold">
+              Exchange synchronization needs attention
+            </div>
+            <div className="mt-1 text-sm text-muted-foreground">
+              HawkView keeps each Exchange dataset independent so available data
+              remains visible.
+            </div>
+            {failedModules.map(([name, value]: [string, any]) => (
+              <div key={name} className="mt-2 text-sm text-red-700">
+                {name}: {value?.lastError || 'Microsoft rejected this dataset.'}
+              </div>
+            ))}
+            {failedModules.length === 0 && hasNeverSynced && (
+              <div className="mt-2 text-sm text-amber-800">
+                Run tenant synchronization to collect Exchange data.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
       {/* Top stats */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         {/* Total User Mailboxes */}
@@ -189,13 +223,13 @@ export default function ExchangePage({
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Mail Flow Rules Count
+                  Inbox Rules Count
                 </div>
                 <div className="mt-1 text-2xl font-bold">
                   {EXCHANGE_RULES.length}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
-                  Inbox & transport rules
+                  User mailbox inbox rules
                 </div>
               </div>
 
@@ -454,6 +488,11 @@ export default function ExchangePage({
                     )}
                   </div>
                 ))}
+                {EXCHANGE_DOMAINS.length === 0 && (
+                  <div className="text-sm text-muted-foreground py-4">
+                    Accepted domains have not been synchronized.
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>
