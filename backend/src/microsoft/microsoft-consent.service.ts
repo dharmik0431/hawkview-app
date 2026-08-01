@@ -23,6 +23,7 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'Sites.Read.All',
   'SharePointTenantSettings.Read.All',
   'Reports.Read.All',
+  'MailboxSettings.Read',
 ] as const
 
 const PERMISSION_DESCRIPTIONS: Record<string, string> = {
@@ -47,6 +48,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read tenant-level SharePoint and OneDrive storage and sharing settings.',
   'Reports.Read.All':
     'Read SharePoint site usage, storage consumption, ownership, and last activity reports.',
+  'MailboxSettings.Read':
+    'Read mailbox inbox rules for Exchange security visibility.',
 }
 
 interface ConsentState {
@@ -112,10 +115,11 @@ export class MicrosoftConsentService {
       .map((permission) => permission.trim())
       .filter(Boolean)
 
-    const permissions =
-      configured && configured.length > 0
-        ? [...new Set(configured)]
-        : [...DEFAULT_REQUIRED_PERMISSIONS]
+    // Environment configuration may add deployment-specific permissions, but
+    // it must not silently remove permissions required by compiled modules.
+    const permissions = [
+      ...new Set([...DEFAULT_REQUIRED_PERMISSIONS, ...(configured ?? [])]),
+    ]
 
     return permissions.map((name) => ({
       name,
@@ -253,7 +257,8 @@ export class MicrosoftConsentService {
 
   private async requestAccessToken(
     microsoftTenantId: string,
-    credentials: { clientId: string; clientSecret: string }
+    credentials: { clientId: string; clientSecret: string },
+    scope = 'https://graph.microsoft.com/.default'
   ) {
     const { clientId, clientSecret } = credentials
     const tokenUrl = `https://login.microsoftonline.com/${microsoftTenantId}/oauth2/v2.0/token`
@@ -263,7 +268,7 @@ export class MicrosoftConsentService {
       body: new URLSearchParams({
         client_id: clientId,
         client_secret: clientSecret,
-        scope: 'https://graph.microsoft.com/.default',
+        scope,
         grant_type: 'client_credentials',
       }),
       signal: AbortSignal.timeout(15_000),
@@ -322,6 +327,36 @@ export class MicrosoftConsentService {
     const result = await this.requestAccessToken(
       input.microsoftTenantId,
       credentials
+    )
+    return result.accessToken
+  }
+
+  async getTenantExchangeAccessToken(input: {
+    microsoftTenantId: string
+    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+    clientId: string | null
+    credentialReference: string | null
+  }) {
+    const credentials =
+      input.connectionMode === 'CUSTOMER_MANAGED'
+        ? {
+            clientId: input.clientId ?? '',
+            clientSecret: input.credentialReference
+              ? await this.secretStore.access(input.credentialReference)
+              : '',
+          }
+        : await this.getManagedConnector()
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new ServiceUnavailableException(
+        'The Microsoft tenant connection is incomplete.'
+      )
+    }
+
+    const result = await this.requestAccessToken(
+      input.microsoftTenantId,
+      credentials,
+      'https://outlook.office365.com/.default'
     )
     return result.accessToken
   }

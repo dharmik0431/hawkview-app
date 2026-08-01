@@ -172,6 +172,10 @@ type EntraSnapshotResource =
   | 'SHAREPOINT_SITES'
   | 'SHAREPOINT_SETTINGS'
   | 'SHAREPOINT_USAGE'
+  | 'EXCHANGE_MAILBOXES'
+  | 'EXCHANGE_MAILBOX_USAGE'
+  | 'EXCHANGE_ACCEPTED_DOMAINS'
+  | 'EXCHANGE_MAILBOX_RULES'
 
 interface GraphCollectionPage {
   value?: unknown[]
@@ -419,6 +423,36 @@ export class TenantSyncService {
         resource: 'SHAREPOINT_USAGE',
         synchronize: () =>
           this.syncSharePointUsage(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'EXCHANGE_MAILBOXES',
+        synchronize: () =>
+          this.syncExchangeAdminCollection(
+            tenant,
+            'EXCHANGE_MAILBOXES',
+            'Mailbox',
+            'Get-Mailbox'
+          ),
+      },
+      {
+        resource: 'EXCHANGE_ACCEPTED_DOMAINS',
+        synchronize: () =>
+          this.syncExchangeAdminCollection(
+            tenant,
+            'EXCHANGE_ACCEPTED_DOMAINS',
+            'AcceptedDomain',
+            'Get-AcceptedDomain'
+          ),
+      },
+      {
+        resource: 'EXCHANGE_MAILBOX_USAGE',
+        synchronize: () =>
+          this.syncExchangeMailboxUsage(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'EXCHANGE_MAILBOX_RULES',
+        synchronize: () =>
+          this.syncExchangeMailboxRules(tenant, snapshotAccessToken),
       },
     ]
     const snapshotResults = await Promise.allSettled(
@@ -957,6 +991,209 @@ export class TenantSyncService {
     })
   }
 
+  private async saveSnapshot(
+    tenant: { id: string; organizationId: string },
+    resourceType: EntraSnapshotResource,
+    rows: unknown[]
+  ) {
+    await this.prisma.tenantEntraSnapshot.upsert({
+      where: {
+        customerTenantId_resourceType: {
+          customerTenantId: tenant.id,
+          resourceType,
+        },
+      },
+      create: {
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        resourceType,
+        payload: rows as never,
+        observedAt: new Date(),
+      },
+      update: { payload: rows as never, observedAt: new Date() },
+    })
+  }
+
+  private async getExchangeToken(tenant: {
+    microsoftTenantId: string
+    connection: {
+      connectionMode: string
+      clientId: string | null
+      credentialReference: string | null
+    } | null
+  }) {
+    if (!tenant.connection)
+      throw new Error('The Microsoft tenant connection is incomplete.')
+    return this.microsoftConsent.getTenantExchangeAccessToken({
+      microsoftTenantId: tenant.microsoftTenantId,
+      connectionMode:
+        tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+          ? 'CUSTOMER_MANAGED'
+          : 'HAWKVIEW_MANAGED',
+      clientId: tenant.connection.clientId,
+      credentialReference: tenant.connection.credentialReference,
+    })
+  }
+
+  private async syncExchangeAdminCollection(
+    tenant: {
+      id: string
+      organizationId: string
+      microsoftTenantId: string
+      primaryDomain: string | null
+      connection: {
+        connectionMode: string
+        clientId: string | null
+        credentialReference: string | null
+      } | null
+    },
+    resourceType: 'EXCHANGE_MAILBOXES' | 'EXCHANGE_ACCEPTED_DOMAINS',
+    endpoint: 'Mailbox' | 'AcceptedDomain',
+    cmdletName: 'Get-Mailbox' | 'Get-AcceptedDomain'
+  ) {
+    return this.runSnapshotSync(tenant, resourceType, async () => {
+      const accessToken = await this.getExchangeToken(tenant)
+      const initialDomain = await this.prisma.tenantDomain.findFirst({
+        where: { customerTenantId: tenant.id, isInitial: true },
+        select: { name: true },
+      })
+      const anchorDomain = initialDomain?.name ?? tenant.primaryDomain
+      if (!anchorDomain) {
+        throw new Error(
+          'Exchange synchronization needs the tenant initial onmicrosoft.com domain.'
+        )
+      }
+      const apiUrl = `https://outlook.office365.com/adminapi/v2.0/${tenant.microsoftTenantId}/${endpoint}`
+      const body = {
+        CmdletInput: {
+          CmdletName: cmdletName,
+          Parameters: { ResultSize: 'Unlimited' },
+        },
+      }
+      const rows: unknown[] = []
+      let nextUrl = apiUrl
+      while (nextUrl) {
+        if (!nextUrl.startsWith('https://outlook.office365.com/')) {
+          throw new Error(
+            'Microsoft returned an invalid Exchange pagination link.'
+          )
+        }
+        const response = await fetch(nextUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'X-AnchorMailbox': `APP:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@${anchorDomain}`,
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(45_000),
+        })
+        if (!response.ok) {
+          const detail = (await response.text()).slice(0, 500)
+          throw new Error(
+            `Microsoft Exchange ${endpoint} synchronization returned ${response.status}. ` +
+              `Confirm Exchange.ManageAsAppV2 and the Recipient Management/View-Only Organization Management RBAC roles. ${detail}`
+          )
+        }
+        const page = (await response.json()) as GraphCollectionPage
+        rows.push(...(page.value ?? []))
+        nextUrl = page['@odata.nextLink'] ?? ''
+      }
+      await this.saveSnapshot(tenant, resourceType, rows)
+    })
+  }
+
+  private async syncExchangeMailboxUsage(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_USAGE', async () => {
+      const response = await fetch(
+        "https://graph.microsoft.com/v1.0/reports/getMailboxUsageDetail(period='D30')",
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'text/csv',
+          },
+          redirect: 'manual',
+          signal: AbortSignal.timeout(30_000),
+        }
+      )
+      let csv = ''
+      if (response.ok) csv = await response.text()
+      else if (response.status === 302) {
+        const location = response.headers.get('location')
+        if (!location?.startsWith('https://'))
+          throw new Error(
+            'Microsoft returned an invalid mailbox usage report link.'
+          )
+        const download = await fetch(location, {
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!download.ok)
+          throw new Error(
+            `Microsoft mailbox usage report download returned ${download.status}.`
+          )
+        csv = await download.text()
+      } else {
+        throw new Error(
+          `Microsoft mailbox usage synchronization returned ${response.status}.`
+        )
+      }
+      await this.saveSnapshot(
+        tenant,
+        'EXCHANGE_MAILBOX_USAGE',
+        parseCsvRows(csv)
+      )
+    })
+  }
+
+  private async syncExchangeMailboxRules(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_RULES', async () => {
+      const users = await this.prisma.directoryUser.findMany({
+        where: { customerTenantId: tenant.id, deletedAt: null },
+        select: { microsoftUserId: true, userPrincipalName: true },
+        take: 500,
+      })
+      const rows: unknown[] = []
+      for (let index = 0; index < users.length; index += 5) {
+        const batch = users.slice(index, index + 5)
+        const results = await Promise.all(
+          batch.map(async (user) => {
+            const response = await fetch(
+              `https://graph.microsoft.com/v1.0/users/${user.microsoftUserId}/mailFolders/inbox/messageRules`,
+              {
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                  Accept: 'application/json',
+                },
+                signal: AbortSignal.timeout(20_000),
+              }
+            )
+            if (response.status === 404) return []
+            if (!response.ok) {
+              throw new Error(
+                `Microsoft inbox rules synchronization returned ${response.status}. Confirm MailboxSettings.Read application permission.`
+              )
+            }
+            const body = (await response.json()) as GraphCollectionPage
+            return (body.value ?? []).map((rule: any) => ({
+              ...rule,
+              mailboxUserId: user.microsoftUserId,
+              mailboxUpn: user.userPrincipalName,
+            }))
+          })
+        )
+        rows.push(...results.flat())
+      }
+      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', rows)
+    })
+  }
+
   private async syncSharePointSites(
     tenant: { id: string; organizationId: string },
     accessToken: string
@@ -1302,49 +1539,63 @@ export class TenantSyncService {
       lastVerifiedAt: Date | null
     } | null
   }) {
-    const [users, licenses, domains, syncStates, entraSnapshots] =
-      await Promise.all([
-        this.prisma.directoryUser.findMany({
-          where: {
-            organizationId: tenant.organizationId,
-            customerTenantId: tenant.id,
-            deletedAt: null,
-          },
-          orderBy: [{ displayName: 'asc' }, { userPrincipalName: 'asc' }],
-          include: {
-            groupMemberships: {
-              select: {
-                directoryGroup: {
-                  select: { displayName: true },
-                },
+    const [
+      users,
+      directoryGroups,
+      licenses,
+      domains,
+      syncStates,
+      entraSnapshots,
+    ] = await Promise.all([
+      this.prisma.directoryUser.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          deletedAt: null,
+        },
+        orderBy: [{ displayName: 'asc' }, { userPrincipalName: 'asc' }],
+        include: {
+          groupMemberships: {
+            select: {
+              directoryGroup: {
+                select: { displayName: true },
               },
             },
           },
-        }),
-        this.prisma.tenantLicense.findMany({
-          where: {
-            organizationId: tenant.organizationId,
-            customerTenantId: tenant.id,
-          },
-          orderBy: { skuPartNumber: 'asc' },
-        }),
-        this.prisma.tenantDomain.findMany({
-          where: {
-            organizationId: tenant.organizationId,
-            customerTenantId: tenant.id,
-          },
-          orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
-        }),
-        this.prisma.syncState.findMany({
-          where: { customerTenantId: tenant.id },
-        }),
-        this.prisma.tenantEntraSnapshot.findMany({
-          where: {
-            organizationId: tenant.organizationId,
-            customerTenantId: tenant.id,
-          },
-        }),
-      ])
+        },
+      }),
+      this.prisma.directoryGroup.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: { displayName: 'asc' },
+        include: { memberships: { select: { id: true } } },
+      }),
+      this.prisma.tenantLicense.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: { skuPartNumber: 'asc' },
+      }),
+      this.prisma.tenantDomain.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
+      }),
+      this.prisma.syncState.findMany({
+        where: { customerTenantId: tenant.id },
+      }),
+      this.prisma.tenantEntraSnapshot.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+      }),
+    ])
     const snapshotByResource = new Map(
       entraSnapshots.map((snapshot) => [
         snapshot.resourceType,
@@ -1380,6 +1631,18 @@ export class TenantSyncService {
     const sharePointSettings = (snapshotByResource.get('SHAREPOINT_SETTINGS') ??
       [])[0]
     const sharePointUsage = snapshotByResource.get('SHAREPOINT_USAGE') ?? []
+    const exchangeMailboxes = snapshotByResource.get('EXCHANGE_MAILBOXES') ?? []
+    const exchangeMailboxUsage =
+      snapshotByResource.get('EXCHANGE_MAILBOX_USAGE') ?? []
+    const exchangeAcceptedDomains =
+      snapshotByResource.get('EXCHANGE_ACCEPTED_DOMAINS') ?? []
+    const exchangeMailboxRules =
+      snapshotByResource.get('EXCHANGE_MAILBOX_RULES') ?? []
+    const exchangeUsageByUpn = new Map(
+      exchangeMailboxUsage
+        .filter((row) => typeof row?.['User Principal Name'] === 'string')
+        .map((row) => [String(row['User Principal Name']).toLowerCase(), row])
+    )
     const sharePointUsageByUrl = new Map(
       sharePointUsage
         .filter((row) => normalizeSharePointUrl(row?.['Site URL']))
@@ -1517,6 +1780,14 @@ export class TenantSyncService {
       'SHAREPOINT_SETTINGS'
     )
     const sharePointUsageSyncState = syncStateByResource.get('SHAREPOINT_USAGE')
+    const exchangeSync = (resource: EntraSnapshotResource) => {
+      const state = syncStateByResource.get(resource)
+      return {
+        status: state?.status.toLowerCase() ?? 'never-synced',
+        lastSuccessfulAt: state?.lastSuccessfulAt?.toISOString() ?? null,
+        lastError: state?.lastErrorMessage ?? null,
+      }
+    }
     const sharePointSettingsSynchronized =
       sharePointSettingsSyncState?.status === 'SUCCEEDED' &&
       Boolean(sharePointSettings)
@@ -1618,10 +1889,129 @@ export class TenantSyncService {
           riskLevel: signIn.riskLevelAggregated ?? signIn.riskLevelDuringSignIn,
         })),
         exchange: {
-          mailboxes: [],
-          rules: [],
-          acceptedDomains: [],
-          groups: [],
+          sync: {
+            mailboxes: exchangeSync('EXCHANGE_MAILBOXES'),
+            mailboxUsage: exchangeSync('EXCHANGE_MAILBOX_USAGE'),
+            acceptedDomains: exchangeSync('EXCHANGE_ACCEPTED_DOMAINS'),
+            inboxRules: exchangeSync('EXCHANGE_MAILBOX_RULES'),
+          },
+          mailboxes: exchangeMailboxes.map((mailbox: any) => {
+            const upn = String(
+              mailbox.UserPrincipalName ??
+                mailbox.PrimarySmtpAddress ??
+                mailbox.WindowsEmailAddress ??
+                ''
+            )
+            const usage = exchangeUsageByUpn.get(upn.toLowerCase())
+            const storageBytes = Number(usage?.['Storage Used (Byte)'])
+            const recipientType = String(
+              mailbox.RecipientTypeDetails ??
+                mailbox.RecipientType ??
+                'UserMailbox'
+            )
+            const mailboxType = recipientType.includes('Shared')
+              ? 'Shared'
+              : recipientType.includes('Room')
+                ? 'Room'
+                : recipientType.includes('Equipment')
+                  ? 'Equipment'
+                  : 'User'
+            const emailAddresses = Array.isArray(mailbox.EmailAddresses)
+              ? mailbox.EmailAddresses
+              : []
+            return {
+              id: String(
+                mailbox.ExternalDirectoryObjectId ??
+                  mailbox.Guid ??
+                  mailbox.Identity ??
+                  upn
+              ),
+              displayName: String(mailbox.DisplayName ?? mailbox.Name ?? upn),
+              userPrincipalName: upn,
+              aliases: emailAddresses
+                .map((address: unknown) => String(address))
+                .filter((address: string) =>
+                  address.toLowerCase().startsWith('smtp:')
+                )
+                .map((address: string) => address.slice(5)),
+              mailboxType,
+              sizeGB: Number.isFinite(storageBytes)
+                ? Math.round((storageBytes / 1024 ** 3) * 100) / 100
+                : null,
+              itemCount: Number(usage?.['Item Count']) || null,
+              archiveEnabled:
+                String(mailbox.ArchiveStatus ?? '').toLowerCase() ===
+                  'active' ||
+                Boolean(
+                  mailbox.ArchiveGuid &&
+                  !String(mailbox.ArchiveGuid).startsWith('00000000')
+                ),
+              retentionLabel:
+                mailbox.RetentionPolicy ?? mailbox.RetentionHoldEnabled ?? null,
+              delegation: {
+                fullAccess: [],
+                sendAs: [],
+                sendOnBehalf: Array.isArray(
+                  mailbox.GrantSendOnBehalfToWithDisplayNames
+                )
+                  ? mailbox.GrantSendOnBehalfToWithDisplayNames
+                  : [],
+              },
+              lastLogon: usage?.['Last Activity Date'] || null,
+            }
+          }),
+          rules: exchangeMailboxRules.map((rule: any) => ({
+            id: String(
+              rule.id ??
+                `${rule.mailboxUserId}-${rule.sequence ?? rule.displayName}`
+            ),
+            name: String(rule.displayName ?? 'Unnamed inbox rule'),
+            mailboxUpn: String(rule.mailboxUpn ?? ''),
+            enabled: rule.isEnabled !== false,
+            priority: Number(rule.sequence ?? 0),
+            description: String(rule.displayName ?? 'Inbox rule'),
+            actions: Object.entries(rule.actions ?? {})
+              .filter(
+                ([, value]) =>
+                  value !== null &&
+                  value !== false &&
+                  (!Array.isArray(value) || value.length > 0)
+              )
+              .map(([name]) => name),
+            conditions: Object.entries(rule.conditions ?? {})
+              .filter(
+                ([, value]) =>
+                  value !== null &&
+                  value !== false &&
+                  (!Array.isArray(value) || value.length > 0)
+              )
+              .map(([name]) => name),
+          })),
+          acceptedDomains: exchangeAcceptedDomains.map((domain: any) => ({
+            id: String(
+              domain.Guid ?? domain.Identity ?? domain.DomainName ?? domain.Name
+            ),
+            domain: String(
+              domain.DomainName ?? domain.Name ?? domain.Identity ?? ''
+            ),
+            type: String(domain.DomainType ?? 'Authoritative'),
+            isDefault: Boolean(domain.Default ?? domain.IsDefault),
+          })),
+          groups: directoryGroups
+            .filter((group) => group.mailEnabled)
+            .map((group) => ({
+              id: group.microsoftGroupId,
+              name: group.displayName,
+              type: group.groupTypes.includes('Unified')
+                ? 'Microsoft365'
+                : group.securityEnabled
+                  ? 'MailEnabledSecurity'
+                  : 'DistributionList',
+              email: group.mail ?? '',
+              membersCount: group.memberships.length,
+              owners: [],
+              description: group.description ?? undefined,
+            })),
         },
         sharepoint: {
           sync: {

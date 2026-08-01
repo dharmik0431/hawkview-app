@@ -26,15 +26,18 @@ export class HealthController {
   async getDatabaseHealth() {
     try {
       const [schema] = await this.prisma.$queryRaw<
-        Array<{ sharepoint_schema_current: boolean }>
+        Array<{ schema_current: boolean }>
       >`
         SELECT
           enum_range(NULL::"SyncResourceType")::text[] @>
-          ARRAY['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE']::text[]
-          AS sharepoint_schema_current
+          ARRAY[
+            'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE',
+            'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_USAGE',
+            'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'
+          ]::text[] AS schema_current
       `
 
-      if (!schema?.sharepoint_schema_current) {
+      if (!schema?.schema_current) {
         throw new Error('Database migrations are pending.')
       }
 
