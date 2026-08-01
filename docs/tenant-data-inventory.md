@@ -58,17 +58,18 @@ read saved data from the HawkView API and must never call Microsoft directly.
 
 ## SharePoint and OneDrive
 
-| Frontend data                               | Source                                      | Access                                   | Status             |
-| ------------------------------------------- | ------------------------------------------- | ---------------------------------------- | ------------------ |
-| Site inventory, URLs, and drive quota       | Microsoft Graph sites and drives            | `Sites.Read.All`                         | Implemented        |
-| Site usage, owner, type, and last activity  | Microsoft 365 usage reports                 | `Reports.Read.All`                       | Implemented        |
-| Primary document-library storage used/quota | Microsoft Graph drives                      | `Sites.Read.All`                         | Implemented        |
-| Owners, guests and external sharing         | Graph sites/groups plus SharePoint settings | Additional site/group access             | Planned            |
-| OneDrive inventory and usage                | Microsoft 365 usage reports                 | `Reports.Read.All`                       | Planned            |
-| Exchange mailboxes and accepted domains     | Exchange Online Admin API (Preview)         | `Exchange.ManageAsAppV2` + Exchange RBAC | Implemented        |
-| Exchange mailbox usage                      | Microsoft 365 usage reports                 | `Reports.Read.All`                       | Implemented        |
-| Exchange inbox rules                        | Microsoft Graph                             | `MailboxSettings.Read`                   | Implemented        |
-| Recently deleted sites                      | SharePoint admin APIs                       | SharePoint-specific application access   | Separate connector |
+| Frontend data                                         | Source                                      | Access                                                        | Status             |
+| ----------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------- | ------------------ |
+| Site inventory, URLs, and drive quota                 | Microsoft Graph sites and drives            | `Sites.Read.All`                                              | Implemented        |
+| Site usage, owner, type, and last activity            | Microsoft 365 usage reports                 | `Reports.Read.All`                                            | Implemented        |
+| Primary document-library storage used/quota           | Microsoft Graph drives                      | `Sites.Read.All`                                              | Implemented        |
+| Owners, guests and external sharing                   | Graph sites/groups plus SharePoint settings | Additional site/group access                                  | Planned            |
+| OneDrive inventory and usage                          | Microsoft 365 usage reports                 | `Reports.Read.All`                                            | Planned            |
+| Exchange mailbox directory and domains                | Microsoft Graph                             | `User.Read.All`, `Domain.Read.All`                            | Implemented        |
+| Exchange mailbox usage                                | Microsoft 365 usage reports                 | `Reports.Read.All`                                            | Implemented        |
+| Exchange inbox rules                                  | Microsoft Graph                             | `MailboxSettings.Read`                                        | Implemented        |
+| Exact recipient types and Exchange-only configuration | Exchange Online Admin API (optional)        | `Exchange.ManageAsAppV2` plus customer-approved Exchange RBAC | Deferred/optional  |
+| Recently deleted sites                                | SharePoint admin APIs                       | SharePoint-specific application access                        | Separate connector |
 
 ## Teams
 
