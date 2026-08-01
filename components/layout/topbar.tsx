@@ -2,7 +2,7 @@
 
 import { useRouter, usePathname } from 'next/navigation'
 import { Button } from '@/components/ui/button'
-import { LogOut, FileText, Moon, Sun } from 'lucide-react'
+import { LogOut, FileText, Menu, Moon, Sun } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import { useAuth } from '@/components/providers/auth-provider'
 
@@ -21,7 +21,7 @@ const pageTitles: Record<string, string> = {
   '/billing': 'Billing',
 }
 
-export function Topbar() {
+export function Topbar({ onMenuClick }: { onMenuClick?: () => void }) {
   const router = useRouter()
   const pathname = usePathname()
   const { theme, setTheme } = useTheme()
@@ -36,8 +36,17 @@ export function Topbar() {
 
   return (
     <div className="sticky top-0 z-40 flex h-16 shrink-0 items-center gap-x-4 border-b border-border bg-background px-4 shadow-sm sm:gap-x-6 sm:px-6 lg:px-8">
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={onMenuClick}
+        className="lg:hidden"
+        aria-label="Open navigation"
+      >
+        <Menu className="h-5 w-5" aria-hidden="true" />
+      </Button>
       <h1 className="text-xl font-semibold text-foreground">{pageTitle}</h1>
-      
+
       <div className="flex flex-1 justify-end gap-x-4 lg:gap-x-6">
         <div className="flex items-center gap-x-4 lg:gap-x-6">
           <Button
