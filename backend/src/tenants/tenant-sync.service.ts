@@ -427,22 +427,12 @@ export class TenantSyncService {
       {
         resource: 'EXCHANGE_MAILBOXES',
         synchronize: () =>
-          this.syncExchangeAdminCollection(
-            tenant,
-            'EXCHANGE_MAILBOXES',
-            'Mailbox',
-            'Get-Mailbox'
-          ),
+          this.syncExchangeMailboxDirectory(tenant, snapshotAccessToken),
       },
       {
         resource: 'EXCHANGE_ACCEPTED_DOMAINS',
         synchronize: () =>
-          this.syncExchangeAdminCollection(
-            tenant,
-            'EXCHANGE_ACCEPTED_DOMAINS',
-            'AcceptedDomain',
-            'Get-AcceptedDomain'
-          ),
+          this.syncExchangeAcceptedDomains(tenant, snapshotAccessToken),
       },
       {
         resource: 'EXCHANGE_MAILBOX_USAGE',
@@ -1014,94 +1004,97 @@ export class TenantSyncService {
     })
   }
 
-  private async getExchangeToken(tenant: {
-    microsoftTenantId: string
-    connection: {
-      connectionMode: string
-      clientId: string | null
-      credentialReference: string | null
-    } | null
-  }) {
-    if (!tenant.connection)
-      throw new Error('The Microsoft tenant connection is incomplete.')
-    return this.microsoftConsent.getTenantExchangeAccessToken({
-      microsoftTenantId: tenant.microsoftTenantId,
-      connectionMode:
-        tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
-          ? 'CUSTOMER_MANAGED'
-          : 'HAWKVIEW_MANAGED',
-      clientId: tenant.connection.clientId,
-      credentialReference: tenant.connection.credentialReference,
-    })
-  }
-
-  private async syncExchangeAdminCollection(
-    tenant: {
-      id: string
-      organizationId: string
-      microsoftTenantId: string
-      primaryDomain: string | null
-      connection: {
-        connectionMode: string
-        clientId: string | null
-        credentialReference: string | null
-      } | null
-    },
-    resourceType: 'EXCHANGE_MAILBOXES' | 'EXCHANGE_ACCEPTED_DOMAINS',
-    endpoint: 'Mailbox' | 'AcceptedDomain',
-    cmdletName: 'Get-Mailbox' | 'Get-AcceptedDomain'
+  private async syncExchangeMailboxDirectory(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
   ) {
-    return this.runSnapshotSync(tenant, resourceType, async () => {
-      const accessToken = await this.getExchangeToken(tenant)
-      const initialDomain = await this.prisma.tenantDomain.findFirst({
-        where: { customerTenantId: tenant.id, isInitial: true },
-        select: { name: true },
-      })
-      const anchorDomain = initialDomain?.name ?? tenant.primaryDomain
-      if (!anchorDomain) {
-        throw new Error(
-          'Exchange synchronization needs the tenant initial onmicrosoft.com domain.'
-        )
-      }
-      const apiUrl = `https://outlook.office365.com/adminapi/v2.0/${tenant.microsoftTenantId}/${endpoint}`
-      const body = {
-        CmdletInput: {
-          CmdletName: cmdletName,
-          Parameters: { ResultSize: 'Unlimited' },
-        },
-      }
+    return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOXES', async () => {
       const rows: unknown[] = []
-      let nextUrl = apiUrl
+      let nextUrl =
+        'https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,proxyAddresses,accountEnabled,assignedLicenses&$top=999'
       while (nextUrl) {
-        if (!nextUrl.startsWith('https://outlook.office365.com/')) {
+        if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
           throw new Error(
-            'Microsoft returned an invalid Exchange pagination link.'
+            'Microsoft returned an invalid users pagination link.'
           )
         }
         const response = await fetch(nextUrl, {
-          method: 'POST',
           headers: {
             Authorization: `Bearer ${accessToken}`,
             Accept: 'application/json',
-            'Content-Type': 'application/json',
-            'X-AnchorMailbox': `APP:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@${anchorDomain}`,
           },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(45_000),
+          signal: AbortSignal.timeout(30_000),
         })
         if (!response.ok) {
-          const detail = (await response.text()).slice(0, 500)
           throw new Error(
-            `Microsoft Exchange ${endpoint} synchronization returned ${response.status}. ` +
-              `Confirm Exchange.ManageAsAppV2 and the Recipient Management/View-Only Organization Management RBAC roles. ${detail}`
+            `Microsoft mailbox directory synchronization returned ${response.status}. Confirm User.Read.All application permission.`
           )
         }
         const page = (await response.json()) as GraphCollectionPage
-        rows.push(...(page.value ?? []))
+        rows.push(
+          ...(page.value ?? [])
+            .filter(
+              (user: any) =>
+                typeof user?.mail === 'string' ||
+                (Array.isArray(user?.assignedLicenses) &&
+                  user.assignedLicenses.length > 0)
+            )
+            .map((user: any) => ({
+              id: user.id,
+              displayName: user.displayName,
+              userPrincipalName: user.userPrincipalName,
+              mail: user.mail,
+              proxyAddresses: user.proxyAddresses ?? [],
+              accountEnabled: user.accountEnabled !== false,
+            }))
+        )
         nextUrl = page['@odata.nextLink'] ?? ''
       }
-      await this.saveSnapshot(tenant, resourceType, rows)
+      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOXES', rows)
     })
+  }
+
+  private async syncExchangeAcceptedDomains(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(
+      tenant,
+      'EXCHANGE_ACCEPTED_DOMAINS',
+      async () => {
+        const response = await fetch(
+          'https://graph.microsoft.com/v1.0/domains?$select=id,isDefault,isInitial,isVerified,supportedServices',
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              Accept: 'application/json',
+            },
+            signal: AbortSignal.timeout(30_000),
+          }
+        )
+        if (!response.ok) {
+          throw new Error(
+            `Microsoft accepted-domain synchronization returned ${response.status}. Confirm Domain.Read.All application permission.`
+          )
+        }
+        const page = (await response.json()) as GraphCollectionPage
+        const domains = (page.value ?? [])
+          .filter(
+            (domain: any) =>
+              domain?.isVerified !== false &&
+              (!Array.isArray(domain?.supportedServices) ||
+                domain.supportedServices.includes('Email'))
+          )
+          .map((domain: any) => ({
+            id: domain.id,
+            domain: domain.id,
+            type: 'Authoritative',
+            isDefault: Boolean(domain.isDefault),
+            isInitial: Boolean(domain.isInitial),
+          }))
+        await this.saveSnapshot(tenant, 'EXCHANGE_ACCEPTED_DOMAINS', domains)
+      }
+    )
   }
 
   private async syncExchangeMailboxUsage(
@@ -1643,6 +1636,19 @@ export class TenantSyncService {
         .filter((row) => typeof row?.['User Principal Name'] === 'string')
         .map((row) => [String(row['User Principal Name']).toLowerCase(), row])
     )
+    const exchangeMailboxInventory =
+      exchangeUsageByUpn.size > 0
+        ? exchangeMailboxes.filter((mailbox: any) => {
+            const upn = String(
+              mailbox.UserPrincipalName ??
+                mailbox.userPrincipalName ??
+                mailbox.PrimarySmtpAddress ??
+                mailbox.mail ??
+                ''
+            ).toLowerCase()
+            return exchangeUsageByUpn.has(upn)
+          })
+        : exchangeMailboxes
     const sharePointUsageByUrl = new Map(
       sharePointUsage
         .filter((row) => normalizeSharePointUrl(row?.['Site URL']))
@@ -1895,10 +1901,12 @@ export class TenantSyncService {
             acceptedDomains: exchangeSync('EXCHANGE_ACCEPTED_DOMAINS'),
             inboxRules: exchangeSync('EXCHANGE_MAILBOX_RULES'),
           },
-          mailboxes: exchangeMailboxes.map((mailbox: any) => {
+          mailboxes: exchangeMailboxInventory.map((mailbox: any) => {
             const upn = String(
               mailbox.UserPrincipalName ??
+                mailbox.userPrincipalName ??
                 mailbox.PrimarySmtpAddress ??
+                mailbox.mail ??
                 mailbox.WindowsEmailAddress ??
                 ''
             )
@@ -1922,13 +1930,24 @@ export class TenantSyncService {
             return {
               id: String(
                 mailbox.ExternalDirectoryObjectId ??
+                  mailbox.id ??
                   mailbox.Guid ??
                   mailbox.Identity ??
                   upn
               ),
-              displayName: String(mailbox.DisplayName ?? mailbox.Name ?? upn),
+              displayName: String(
+                mailbox.DisplayName ??
+                  mailbox.displayName ??
+                  mailbox.Name ??
+                  upn
+              ),
               userPrincipalName: upn,
-              aliases: emailAddresses
+              aliases: (emailAddresses.length > 0
+                ? emailAddresses
+                : Array.isArray(mailbox.proxyAddresses)
+                  ? mailbox.proxyAddresses
+                  : []
+              )
                 .map((address: unknown) => String(address))
                 .filter((address: string) =>
                   address.toLowerCase().startsWith('smtp:')
@@ -1989,13 +2008,25 @@ export class TenantSyncService {
           })),
           acceptedDomains: exchangeAcceptedDomains.map((domain: any) => ({
             id: String(
-              domain.Guid ?? domain.Identity ?? domain.DomainName ?? domain.Name
+              domain.Guid ??
+                domain.id ??
+                domain.Identity ??
+                domain.DomainName ??
+                domain.Name ??
+                domain.domain
             ),
             domain: String(
-              domain.DomainName ?? domain.Name ?? domain.Identity ?? ''
+              domain.DomainName ??
+                domain.domain ??
+                domain.Name ??
+                domain.Identity ??
+                domain.id ??
+                ''
             ),
-            type: String(domain.DomainType ?? 'Authoritative'),
-            isDefault: Boolean(domain.Default ?? domain.IsDefault),
+            type: String(domain.DomainType ?? domain.type ?? 'Authoritative'),
+            isDefault: Boolean(
+              domain.Default ?? domain.IsDefault ?? domain.isDefault
+            ),
           })),
           groups: directoryGroups
             .filter((group) => group.mailEnabled)
