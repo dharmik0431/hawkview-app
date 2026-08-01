@@ -184,6 +184,22 @@ interface GraphCollectionPage {
   '@odata.nextLink'?: string
 }
 
+interface TenantSyncTarget {
+  id: string
+  organizationId: string
+  microsoftTenantId: string
+  displayName: string | null
+  primaryDomain: string | null
+  status: string
+  connection: {
+    status: string
+    connectionMode: string
+    clientId: string | null
+    credentialReference: string | null
+    lastVerifiedAt: Date | null
+  } | null
+}
+
 @Injectable()
 export class TenantSyncService {
   private readonly logger = new Logger(TenantSyncService.name)
@@ -264,6 +280,100 @@ export class TenantSyncService {
     customerTenantId: string
   ) {
     const tenant = await this.getAuthorizedTenant(identity, customerTenantId)
+    const result = await this.syncConnectedTenant(tenant, true)
+    return result.bundle
+  }
+
+  async syncDueTenants() {
+    const staleBefore = new Date(Date.now() - 5 * 60 * 1000)
+    const limit = Math.max(
+      1,
+      Math.min(25, Number(process.env.SCHEDULED_SYNC_BATCH_SIZE ?? 10) || 10)
+    )
+    const tenants = await this.prisma.customerTenant.findMany({
+      where: {
+        status: 'ACTIVE',
+        connection: { status: 'CONNECTED' },
+        OR: [
+          { syncStates: { none: { resourceType: 'USERS' } } },
+          {
+            syncStates: {
+              some: {
+                resourceType: 'USERS',
+                OR: [
+                  { lastSuccessfulAt: null },
+                  { lastSuccessfulAt: { lt: staleBefore } },
+                  { status: 'FAILED' },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      orderBy: { updatedAt: 'asc' },
+      take: limit,
+      select: {
+        id: true,
+        organizationId: true,
+        microsoftTenantId: true,
+        displayName: true,
+        primaryDomain: true,
+        status: true,
+        connection: {
+          select: {
+            status: true,
+            connectionMode: true,
+            clientId: true,
+            credentialReference: true,
+            lastVerifiedAt: true,
+          },
+        },
+      },
+    })
+
+    const results: Array<Record<string, unknown>> = []
+    for (const tenant of tenants) {
+      try {
+        const result = await this.syncConnectedTenant(tenant, false)
+        results.push({
+          tenantId: tenant.id,
+          microsoftTenantId: tenant.microsoftTenantId,
+          status: result.status,
+          failedResources: result.failedResources,
+        })
+      } catch (error) {
+        results.push({
+          tenantId: tenant.id,
+          microsoftTenantId: tenant.microsoftTenantId,
+          status: 'FAILED',
+          error:
+            error instanceof Error
+              ? error.message.slice(0, 500)
+              : 'Tenant synchronization failed.',
+        })
+      }
+    }
+
+    const summary = {
+      checkedAt: new Date().toISOString(),
+      due: tenants.length,
+      succeeded: results.filter((result) => result.status === 'SUCCEEDED')
+        .length,
+      partial: results.filter((result) => result.status === 'PARTIAL').length,
+      failed: results.filter((result) => result.status === 'FAILED').length,
+      skipped: results.filter((result) => result.status === 'SKIPPED').length,
+      results,
+    }
+    this.logger.log(
+      `Scheduled tenant synchronization: ${JSON.stringify(summary)}`
+    )
+    return summary
+  }
+
+  private async syncConnectedTenant(
+    tenant: TenantSyncTarget,
+    throwWhenBusy: boolean
+  ) {
     if (
       tenant.status !== 'ACTIVE' ||
       tenant.connection?.status !== 'CONNECTED'
@@ -281,36 +391,59 @@ export class TenantSyncService {
         },
       },
     })
-    if (
-      existingState?.status === 'RUNNING' &&
-      existingState.lastAttemptAt &&
-      existingState.lastAttemptAt.getTime() > Date.now() - 2 * 60 * 1000
-    ) {
-      throw new ConflictException('A users synchronization is already running.')
-    }
-
     const now = new Date()
-    await this.prisma.syncState.upsert({
-      where: {
-        customerTenantId_resourceType: {
-          customerTenantId: tenant.id,
-          resourceType: 'USERS',
+    const staleLeaseBefore = new Date(now.getTime() - 15 * 60 * 1000)
+    let claimed = false
+    if (existingState) {
+      const claim = await this.prisma.syncState.updateMany({
+        where: {
+          id: existingState.id,
+          OR: [
+            { status: { not: 'RUNNING' } },
+            { lastAttemptAt: null },
+            { lastAttemptAt: { lt: staleLeaseBefore } },
+          ],
         },
-      },
-      create: {
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
-        resourceType: 'USERS',
-        status: 'RUNNING',
-        lastAttemptAt: now,
-      },
-      update: {
-        status: 'RUNNING',
-        lastAttemptAt: now,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      },
-    })
+        data: {
+          status: 'RUNNING',
+          lastAttemptAt: now,
+          lastErrorCode: null,
+          lastErrorMessage: null,
+        },
+      })
+      claimed = claim.count === 1
+    } else {
+      try {
+        await this.prisma.syncState.create({
+          data: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+            resourceType: 'USERS',
+            status: 'RUNNING',
+            lastAttemptAt: now,
+          },
+        })
+        claimed = true
+      } catch (error) {
+        const competingClaim = await this.prisma.syncState.findUnique({
+          where: {
+            customerTenantId_resourceType: {
+              customerTenantId: tenant.id,
+              resourceType: 'USERS',
+            },
+          },
+          select: { id: true },
+        })
+        if (!competingClaim) throw error
+        claimed = false
+      }
+    }
+    if (!claimed) {
+      if (throwWhenBusy) {
+        throw new ConflictException('A tenant synchronization is already running.')
+      }
+      return { bundle: null, status: 'SKIPPED', failedResources: [] as string[] }
+    }
 
     try {
       const accessToken = await this.microsoftConsent.getTenantAccessToken({
@@ -550,7 +683,21 @@ export class TenantSyncService {
       }
     })
 
-    return this.buildBundle(tenant)
+    const attemptedStates = await this.prisma.syncState.findMany({
+      where: {
+        customerTenantId: tenant.id,
+        lastAttemptAt: { gte: now },
+      },
+      select: { resourceType: true, status: true },
+    })
+    const failedResources = attemptedStates
+      .filter((state) => state.status === 'FAILED')
+      .map((state) => state.resourceType)
+    return {
+      bundle: await this.buildBundle(tenant),
+      status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
+      failedResources,
+    }
   }
 
   private async runSnapshotSync(
