@@ -15,9 +15,13 @@ export type TenantBundle = {
     }>
   }
   dns?: {
-    spf: string
-    dkim: string
-    dmarc: string
+    domain?: string
+    spf?: string | { record: string; status: 'healthy' | 'warning' }
+    dkim?: string | { record: string; status: 'healthy' | 'warning' }
+    dmarc?: string | { record: string; status: 'healthy' | 'warning' }
+    blacklist?: { record: string; status: 'not_checked' }
+    checkedAt?: string
+    byDomain?: Record<string, any>
   }
   entra?: {
     caPolicies: any[]
