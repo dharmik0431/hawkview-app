@@ -11,6 +11,7 @@ import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { getMicrosoftSkuName } from '../microsoft/microsoft-sku-names.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { resolveDomainDnsHealth } from './domain-dns-health.js'
 
 const TENANT_ADMIN_ROLES = ['MSP_OWNER', 'MSP_ADMIN'] as const
 const USER_SELECT =
@@ -176,6 +177,7 @@ type EntraSnapshotResource =
   | 'EXCHANGE_MAILBOX_USAGE'
   | 'EXCHANGE_ACCEPTED_DOMAINS'
   | 'EXCHANGE_MAILBOX_RULES'
+  | 'DOMAIN_DNS_HEALTH'
 
 interface GraphCollectionPage {
   value?: unknown[]
@@ -460,6 +462,18 @@ export class TenantSyncService {
         )
       }
     })
+
+    // Run after Microsoft domain discovery so DNS checks always use the
+    // latest database-backed domain inventory.
+    try {
+      await this.syncDomainDnsHealth(tenant)
+    } catch (error) {
+      this.logger.warn(
+        `DOMAIN_DNS_HEALTH synchronization was unavailable for tenant ${tenant.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
 
     const entraModules: Array<Promise<unknown>> = [
       this.syncEntraCollection(
@@ -751,6 +765,31 @@ export class TenantSyncService {
           },
         })
       })
+    })
+  }
+
+  private async syncDomainDnsHealth(tenant: {
+    id: string
+    organizationId: string
+  }) {
+    return this.runSnapshotSync(tenant, 'DOMAIN_DNS_HEALTH', async () => {
+      const domains = await this.prisma.tenantDomain.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
+        select: { name: true },
+      })
+      if (domains.length === 0) {
+        throw new Error(
+          'No synchronized Microsoft domains are available for DNS checks.'
+        )
+      }
+      const results = await Promise.all(
+        domains.map(({ name }) => resolveDomainDnsHealth(name))
+      )
+      await this.saveSnapshot(tenant, 'DOMAIN_DNS_HEALTH', results)
     })
   }
 
@@ -1631,6 +1670,7 @@ export class TenantSyncService {
       snapshotByResource.get('EXCHANGE_ACCEPTED_DOMAINS') ?? []
     const exchangeMailboxRules =
       snapshotByResource.get('EXCHANGE_MAILBOX_RULES') ?? []
+    const domainDnsHealth = snapshotByResource.get('DOMAIN_DNS_HEALTH') ?? []
     const exchangeUsageByUpn = new Map(
       exchangeMailboxUsage
         .filter((row) => typeof row?.['User Principal Name'] === 'string')
@@ -1828,6 +1868,21 @@ export class TenantSyncService {
           ),
           lastSync: lastSync?.toISOString() ?? null,
         },
+        dns: (() => {
+          const selectedDomain =
+            domains.find((domain) => domain.isDefault)?.name ??
+            tenant.primaryDomain ??
+            ''
+          const byDomain = Object.fromEntries(
+            domainDnsHealth
+              .filter((result) => typeof result?.domain === 'string')
+              .map((result) => [result.domain.toLowerCase(), result])
+          )
+          return {
+            ...(byDomain[selectedDomain.toLowerCase()] ?? {}),
+            byDomain,
+          }
+        })(),
         users: users.map((user) => {
           const registration = authRegistrationByUserId.get(
             user.microsoftUserId

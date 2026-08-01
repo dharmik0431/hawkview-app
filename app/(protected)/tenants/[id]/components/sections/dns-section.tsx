@@ -21,18 +21,30 @@ export default function DnsSection({
 }) {
   const [domainOpen, setDomainOpen] = useState(false)
   const [domainSelected, setDomainSelected] = useState<string>('')
+  const activeDomain = domainSelected || tenant.domain
+  const activeDns =
+    dns?.byDomain?.[String(activeDomain || '').toLowerCase()] ?? dns
 
-  const spfRecord = typeof dns?.spf === 'object' ? dns.spf.record : (dns?.spf ?? '—')
+  const spfRecord =
+    typeof activeDns?.spf === 'object'
+      ? activeDns.spf.record
+      : (activeDns?.spf ?? '—')
   const spfStatus =
-    typeof dns?.spf === 'object' ? dns.spf.status : 'not-synced'
+    typeof activeDns?.spf === 'object' ? activeDns.spf.status : 'not-synced'
 
-  const dkimRecord = typeof dns?.dkim === 'object' ? dns.dkim.record : (dns?.dkim ?? '—')
+  const dkimRecord =
+    typeof activeDns?.dkim === 'object'
+      ? activeDns.dkim.record
+      : (activeDns?.dkim ?? '—')
   const dkimStatus =
-    typeof dns?.dkim === 'object' ? dns.dkim.status : 'not-synced'
+    typeof activeDns?.dkim === 'object' ? activeDns.dkim.status : 'not-synced'
 
-  const dmarcRecord = typeof dns?.dmarc === 'object' ? dns.dmarc.record : (dns?.dmarc ?? '—')
+  const dmarcRecord =
+    typeof activeDns?.dmarc === 'object'
+      ? activeDns.dmarc.record
+      : (activeDns?.dmarc ?? '—')
   const dmarcStatus =
-    typeof dns?.dmarc === 'object' ? dns.dmarc.status : 'not-synced'
+    typeof activeDns?.dmarc === 'object' ? activeDns.dmarc.status : 'not-synced'
 
   const statusClass = (status: string) =>
     status === 'healthy'
@@ -61,7 +73,7 @@ export default function DnsSection({
               title="Select domain"
             >
               <span className="h-4 w-4 text-muted-foreground">🌐</span>
-              {domainSelected || tenant.domain}
+              {activeDomain}
               <ChevronDown className="h-4 w-4 text-muted-foreground" />
             </button>
 
