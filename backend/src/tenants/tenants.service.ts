@@ -276,6 +276,7 @@ export class TenantsService {
           },
           select: this.tenantSelect(),
         })
+        await this.markInitialSyncDue(tenant.id, organizationIds[0])
         return { tenant: this.mapTenant(tenant), requiresConsent: false }
       }
 
@@ -316,6 +317,7 @@ export class TenantsService {
         },
         select: this.tenantSelect(),
       })
+      await this.markInitialSyncDue(tenant.id, organizationIds[0])
       return { tenant: this.mapTenant(tenant), requiresConsent: false }
     }
 
@@ -600,6 +602,10 @@ export class TenantsService {
         }),
       ])
 
+      if (connected) {
+        await this.markInitialSyncDue(tenant.id, tenant.organizationId)
+      }
+
       return this.buildFrontendConsentRedirect(
         connected ? 'success' : 'missing-permissions',
         connected ? null : 'missing-permissions',
@@ -639,6 +645,27 @@ export class TenantsService {
         lastErrorCode: code.slice(0, 100),
         lastErrorMessage: message.slice(0, 2000),
       },
+    })
+  }
+
+  private async markInitialSyncDue(
+    customerTenantId: string,
+    organizationId: string
+  ) {
+    await this.prisma.syncState.upsert({
+      where: {
+        customerTenantId_resourceType: {
+          customerTenantId,
+          resourceType: 'USERS',
+        },
+      },
+      create: {
+        organizationId,
+        customerTenantId,
+        resourceType: 'USERS',
+        status: 'IDLE',
+      },
+      update: {},
     })
   }
 

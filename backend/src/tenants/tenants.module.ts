@@ -3,10 +3,12 @@ import { MicrosoftModule } from '../microsoft/microsoft.module.js'
 import { TenantsController } from './tenants.controller.js'
 import { TenantsService } from './tenants.service.js'
 import { TenantSyncService } from './tenant-sync.service.js'
+import { ScheduledSyncController } from './scheduled-sync.controller.js'
+import { SchedulerTokenVerifier } from './scheduler-token-verifier.service.js'
 
 @Module({
   imports: [MicrosoftModule],
-  controllers: [TenantsController],
-  providers: [TenantsService, TenantSyncService],
+  controllers: [TenantsController, ScheduledSyncController],
+  providers: [TenantsService, TenantSyncService, SchedulerTokenVerifier],
 })
 export class TenantsModule {}
