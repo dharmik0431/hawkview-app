@@ -13,10 +13,35 @@ async function bootstrap() {
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean)
+  const gasPreviewProjectNumber =
+    process.env.GAS_PREVIEW_PROJECT_NUMBER?.trim() ?? ''
+
+  const isAllowedOrigin = (origin?: string) => {
+    if (!origin || allowedOrigins.includes(origin)) return true
+    if (!gasPreviewProjectNumber) return false
+
+    try {
+      const url = new URL(origin)
+      const expectedSuffix = `-${gasPreviewProjectNumber}.us-east1.run.app`
+
+      return (
+        url.protocol === 'https:' &&
+        url.port === '' &&
+        url.pathname === '/' &&
+        url.hostname.startsWith('ais-dev-') &&
+        url.hostname.endsWith(expectedSuffix)
+      )
+    } catch {
+      return false
+    }
+  }
 
   app.enableShutdownHooks()
   app.enableCors({
-    origin: allowedOrigins,
+    origin: (
+      origin: string | undefined,
+      callback: (error: Error | null, allow?: boolean) => void
+    ) => callback(null, isAllowedOrigin(origin)),
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Authorization', 'Content-Type'],
     credentials: true,
