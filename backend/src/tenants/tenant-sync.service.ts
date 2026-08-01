@@ -1636,19 +1636,11 @@ export class TenantSyncService {
         .filter((row) => typeof row?.['User Principal Name'] === 'string')
         .map((row) => [String(row['User Principal Name']).toLowerCase(), row])
     )
-    const exchangeMailboxInventory =
-      exchangeUsageByUpn.size > 0
-        ? exchangeMailboxes.filter((mailbox: any) => {
-            const upn = String(
-              mailbox.UserPrincipalName ??
-                mailbox.userPrincipalName ??
-                mailbox.PrimarySmtpAddress ??
-                mailbox.mail ??
-                ''
-            ).toLowerCase()
-            return exchangeUsageByUpn.has(upn)
-          })
-        : exchangeMailboxes
+    // The mailbox usage report can anonymize user identities in Microsoft 365.
+    // It is enrichment data, not the source of truth for mailbox existence, so
+    // never remove Graph directory mailboxes merely because their UPN cannot be
+    // joined to a usage row.
+    const exchangeMailboxInventory = exchangeMailboxes
     const sharePointUsageByUrl = new Map(
       sharePointUsage
         .filter((row) => normalizeSharePointUrl(row?.['Site URL']))
