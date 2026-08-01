@@ -12,7 +12,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 export class HealthController {
   constructor(
     @Inject(PrismaService)
-    private readonly prisma: PrismaService,
+    private readonly prisma: PrismaService
   ) {}
 
   @Get()
@@ -25,16 +25,28 @@ export class HealthController {
   @Get('database')
   async getDatabaseHealth() {
     try {
-      await this.prisma.$queryRaw`SELECT 1`
+      const [schema] = await this.prisma.$queryRaw<
+        Array<{ sharepoint_schema_current: boolean }>
+      >`
+        SELECT
+          enum_range(NULL::"SyncResourceType")::text[] @>
+          ARRAY['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE']::text[]
+          AS sharepoint_schema_current
+      `
+
+      if (!schema?.sharepoint_schema_current) {
+        throw new Error('Database migrations are pending.')
+      }
 
       return {
         status: 'ok',
         database: 'connected',
+        schema: 'current',
       }
     } catch {
       throw new ServiceUnavailableException({
         status: 'error',
-        database: 'unavailable',
+        database: 'unavailable-or-outdated',
       })
     }
   }

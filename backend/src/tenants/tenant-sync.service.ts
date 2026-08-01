@@ -386,37 +386,47 @@ export class TenantSyncService {
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
       })
-    await Promise.all([
-      this.syncLicenses(tenant, snapshotAccessToken),
-      this.syncDomains(tenant, snapshotAccessToken),
-    ])
-    // Groups require a separate Microsoft permission. Record an isolated
-    // GROUPS failure without hiding successfully refreshed users/licenses.
-    await this.syncGroups(tenant, snapshotAccessToken).catch((error) => {
-      const message =
-        error instanceof Error ? error.message : 'Unknown groups sync error'
-      this.logger.error(
-        `Groups synchronization failed for tenant ${tenant.id}: ${message}`,
-        error instanceof Error ? error.stack : undefined
-      )
-    })
-
-    // Run SharePoint as its own stage before the broader Entra snapshot batch.
-    // This guarantees each SharePoint module records a SyncState even when a
-    // slower Entra request (for example sign-in logs) reaches its timeout.
-    const sharePointModules: Array<Promise<unknown>> = [
-      this.syncSharePointSites(tenant, snapshotAccessToken),
-      this.syncSharePointSettings(tenant, snapshotAccessToken),
-      this.syncSharePointUsage(tenant, snapshotAccessToken),
+    // Every secondary dataset is independent. A missing permission or timeout
+    // in one Microsoft endpoint must not prevent the remaining datasets from
+    // refreshing or recording their own diagnostic SyncState.
+    const snapshotModules: Array<{
+      resource: string
+      synchronize: () => Promise<unknown>
+    }> = [
+      {
+        resource: 'LICENSES',
+        synchronize: () => this.syncLicenses(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'DOMAINS',
+        synchronize: () => this.syncDomains(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'GROUPS',
+        synchronize: () => this.syncGroups(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'SHAREPOINT_SITES',
+        synchronize: () =>
+          this.syncSharePointSites(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'SHAREPOINT_SETTINGS',
+        synchronize: () =>
+          this.syncSharePointSettings(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'SHAREPOINT_USAGE',
+        synchronize: () =>
+          this.syncSharePointUsage(tenant, snapshotAccessToken),
+      },
     ]
-    const sharePointResults = await Promise.allSettled(sharePointModules)
-    sharePointResults.forEach((result, index) => {
+    const snapshotResults = await Promise.allSettled(
+      snapshotModules.map((module) => module.synchronize())
+    )
+    snapshotResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const resource = [
-          'SHAREPOINT_SITES',
-          'SHAREPOINT_SETTINGS',
-          'SHAREPOINT_USAGE',
-        ][index]
+        const resource = snapshotModules[index]?.resource ?? 'UNKNOWN'
         this.logger.warn(
           `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
             result.reason instanceof Error
@@ -1622,8 +1632,7 @@ export class TenantSyncService {
               lastSuccessfulAt:
                 sharePointSitesSyncState?.lastSuccessfulAt?.toISOString() ??
                 null,
-              lastError:
-                sharePointSitesSyncState?.lastErrorMessage ?? null,
+              lastError: sharePointSitesSyncState?.lastErrorMessage ?? null,
             },
             settings: {
               status:
@@ -1632,8 +1641,7 @@ export class TenantSyncService {
               lastSuccessfulAt:
                 sharePointSettingsSyncState?.lastSuccessfulAt?.toISOString() ??
                 null,
-              lastError:
-                sharePointSettingsSyncState?.lastErrorMessage ?? null,
+              lastError: sharePointSettingsSyncState?.lastErrorMessage ?? null,
             },
             usage: {
               status:
@@ -1642,8 +1650,7 @@ export class TenantSyncService {
               lastSuccessfulAt:
                 sharePointUsageSyncState?.lastSuccessfulAt?.toISOString() ??
                 null,
-              lastError:
-                sharePointUsageSyncState?.lastErrorMessage ?? null,
+              lastError: sharePointUsageSyncState?.lastErrorMessage ?? null,
             },
           },
           capabilities: {

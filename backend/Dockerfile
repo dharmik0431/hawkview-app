@@ -35,4 +35,7 @@ COPY --from=builder /app/dist ./dist
 
 EXPOSE 8080
 
-CMD ["npm", "start"]
+# Apply committed Prisma migrations before accepting requests. Cloud Run can
+# start more than one instance at a time; Prisma serializes migrations with a
+# PostgreSQL advisory lock, so concurrent starts remain safe.
+CMD ["sh", "-c", "npm run db:migrate:deploy && npm start"]
