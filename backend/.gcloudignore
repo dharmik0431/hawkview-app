@@ -2,6 +2,7 @@
 .git
 .gitignore
 node_modules
+.npm-cache
 dist
 src/generated/prisma
 .env
