@@ -365,8 +365,7 @@ export class TenantsService {
       throw new NotFoundException('Customer tenant was not found.')
     }
     const isConnected =
-      tenant.status === 'ACTIVE' ||
-      tenant.connection?.status === 'CONNECTED'
+      tenant.status === 'ACTIVE' || tenant.connection?.status === 'CONNECTED'
 
     if (isConnected) {
       const candidate =
@@ -473,6 +472,28 @@ export class TenantsService {
     }
   }
 
+  async createManagedOnboardingUrlForIdentity(identity: AuthenticatedIdentity) {
+    const organizationIds = await this.getManagedOrganizationIds(identity)
+    if (organizationIds.length === 0) {
+      throw new ForbiddenException(
+        'Only an MSP Owner or Admin can onboard a tenant.'
+      )
+    }
+    if (organizationIds.length > 1) {
+      throw new BadRequestException(
+        'Choose an MSP workspace before onboarding a tenant.'
+      )
+    }
+
+    const consent = await this.microsoftConsent.createTenantDiscoveryConsentUrl(
+      organizationIds[0]
+    )
+    return {
+      consentUrl: consent.consentUrl,
+      requiredPermissions: this.microsoftConsent.getRequiredPermissions(),
+    }
+  }
+
   async completeMicrosoftConsent(query: Record<string, unknown>) {
     const stateToken = typeof query.state === 'string' ? query.state : ''
     if (!stateToken) {
@@ -480,9 +501,10 @@ export class TenantsService {
     }
 
     let state: {
-      customerTenantId: string
+      customerTenantId?: string
       organizationId: string
       nonce: string
+      flow: 'existing-tenant' | 'discover-tenant'
     }
     try {
       state = await this.microsoftConsent.verifyConsentState(stateToken)
@@ -490,9 +512,13 @@ export class TenantsService {
       return this.buildFrontendConsentRedirect('error', 'invalid-state')
     }
 
+    if (state.flow === 'discover-tenant') {
+      return this.completeDiscoveredMicrosoftConsent(query, state)
+    }
+
     const tenant = await this.prisma.customerTenant.findFirst({
       where: {
-        id: state.customerTenantId,
+        id: state.customerTenantId!,
         organizationId: state.organizationId,
       },
       select: {
@@ -594,6 +620,124 @@ export class TenantsService {
             consentedPermissions: verification.grantedPermissions,
             consentedAt: now,
             lastVerifiedAt: now,
+            lastErrorCode: connected ? null : 'missing-permissions',
+            lastErrorMessage: connected
+              ? null
+              : `Missing permissions: ${verification.missingPermissions.join(', ')}`,
+          },
+        }),
+      ])
+
+      if (connected) {
+        await this.markInitialSyncDue(tenant.id, tenant.organizationId)
+      }
+
+      return this.buildFrontendConsentRedirect(
+        connected ? 'success' : 'missing-permissions',
+        connected ? null : 'missing-permissions',
+        tenant.id
+      )
+    } catch (error) {
+      await this.recordConnectionError(
+        tenant,
+        'verification-failed',
+        error instanceof Error
+          ? error.message
+          : 'Microsoft tenant verification failed.'
+      )
+      return this.buildFrontendConsentRedirect(
+        'error',
+        'verification-failed',
+        tenant.id
+      )
+    }
+  }
+
+  private async completeDiscoveredMicrosoftConsent(
+    query: Record<string, unknown>,
+    state: { organizationId: string; nonce: string }
+  ) {
+    const returnedTenantId =
+      typeof query.tenant === 'string' ? query.tenant.toLowerCase() : ''
+    const granted =
+      query.admin_consent === 'True' || query.admin_consent === 'true'
+    const microsoftError = typeof query.error === 'string' ? query.error : null
+
+    if (
+      microsoftError ||
+      !granted ||
+      !MICROSOFT_TENANT_ID_PATTERN.test(returnedTenantId)
+    ) {
+      return this.buildFrontendConsentRedirect(
+        'error',
+        microsoftError ?? (granted ? 'invalid-tenant' : 'consent-denied')
+      )
+    }
+
+    const existing = await this.prisma.customerTenant.findUnique({
+      where: { microsoftTenantId: returnedTenantId },
+      select: {
+        id: true,
+        organizationId: true,
+        connection: { select: { connectionMode: true } },
+      },
+    })
+    if (existing && existing.organizationId !== state.organizationId) {
+      return this.buildFrontendConsentRedirect(
+        'error',
+        'tenant-already-connected'
+      )
+    }
+    if (existing?.connection?.connectionMode === 'CUSTOMER_MANAGED') {
+      return this.buildFrontendConsentRedirect(
+        'error',
+        'customer-managed-tenant'
+      )
+    }
+
+    const tenant = existing
+      ? existing
+      : await this.prisma.customerTenant.create({
+          data: {
+            organizationId: state.organizationId,
+            microsoftTenantId: returnedTenantId,
+            connection: {
+              create: { connectionMode: 'HAWKVIEW_MANAGED' },
+            },
+          },
+          select: { id: true, organizationId: true },
+        })
+
+    try {
+      const verification =
+        await this.microsoftConsent.verifyTenant(returnedTenantId)
+      const connected = verification.missingPermissions.length === 0
+      const now = new Date()
+
+      await this.prisma.$transaction([
+        this.prisma.customerTenant.update({
+          where: { id: tenant.id },
+          data: {
+            displayName: verification.displayName,
+            primaryDomain: verification.primaryDomain,
+            status: connected ? 'ACTIVE' : 'PENDING',
+          },
+        }),
+        this.prisma.tenantConnection.update({
+          where: {
+            customerTenantId_organizationId: {
+              customerTenantId: tenant.id,
+              organizationId: tenant.organizationId,
+            },
+          },
+          data: {
+            connectionMode: 'HAWKVIEW_MANAGED',
+            status: connected ? 'CONNECTED' : 'ERROR',
+            consentedPermissions: verification.grantedPermissions,
+            consentedAt: now,
+            lastVerifiedAt: now,
+            consentStateHash: null,
+            consentStateExpiresAt: null,
             lastErrorCode: connected ? null : 'missing-permissions',
             lastErrorMessage: connected
               ? null

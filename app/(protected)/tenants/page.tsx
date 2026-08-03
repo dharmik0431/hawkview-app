@@ -439,6 +439,25 @@ export default function TenantsPage() {
     }
   }
 
+  const handleManagedOnboarding = async () => {
+    setOnboardingError(null)
+    setHawkviewPreviewMessage(null)
+    setIsSavingTenant(true)
+    try {
+      const consent = await apiClient.post<MicrosoftConsentResponse>(
+        '/api/tenants/microsoft/onboarding'
+      )
+      window.location.assign(consent.consentUrl)
+    } catch (onboardingError) {
+      setOnboardingError(
+        onboardingError instanceof Error
+          ? onboardingError.message
+          : 'Microsoft tenant onboarding could not be started.'
+      )
+      setIsSavingTenant(false)
+    }
+  }
+
   const handleReviewConsent = async (tenant: Tenant) => {
     setOnboardingError(null)
     setIsSavingTenant(true)
@@ -919,11 +938,8 @@ export default function TenantsPage() {
                   <Button
                     type="button"
                     className="gap-2.5 rounded-xl px-5 py-2.5 text-sm font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm transition-all sm:w-auto w-full"
-                    onClick={() => {
-                      setHawkviewPreviewMessage(
-                        'Microsoft administrator sign-in will be connected to the HawkView onboarding service.'
-                      )
-                    }}
+                    onClick={handleManagedOnboarding}
+                    disabled={isSavingTenant}
                   >
                     <div className="grid grid-cols-2 gap-0.5 shrink-0">
                       <span className="h-1.5 w-1.5 bg-[#F25022] rounded-[0.5px]" />
@@ -931,7 +947,9 @@ export default function TenantsPage() {
                       <span className="h-1.5 w-1.5 bg-[#00A4EF] rounded-[0.5px]" />
                       <span className="h-1.5 w-1.5 bg-[#FFB900] rounded-[0.5px]" />
                     </div>
-                    Continue with Microsoft
+                    {isSavingTenant
+                      ? 'Connecting to Microsoft...'
+                      : 'Continue with Microsoft'}
                   </Button>
                 </div>
               </div>
