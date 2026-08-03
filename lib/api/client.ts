@@ -1,4 +1,9 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, '')
+// This is a public HTTPS endpoint, not a credential. Keep the development API
+// URL in source so hosted preview environments cannot replace it with a stale
+// build-time value. Production can move this to an environment-specific build
+// when a separate production API exists.
+const API_BASE_URL =
+  'https://hawkview-api-dev-670803700763.northamerica-northeast2.run.app'
 const API_TIMEOUT_MS = 15_000
 
 async function getIdentityToken() {
