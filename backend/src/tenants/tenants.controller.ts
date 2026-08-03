@@ -35,6 +35,13 @@ export class TenantsController {
     return this.tenantsService.createForIdentity(request.auth, body)
   }
 
+  @Post('microsoft/onboarding')
+  createMicrosoftOnboardingUrl(@Req() request: AuthenticatedRequest) {
+    return this.tenantsService.createManagedOnboardingUrlForIdentity(
+      request.auth
+    )
+  }
+
   @Get(':id')
   getTenantBundle(
     @Req() request: AuthenticatedRequest,

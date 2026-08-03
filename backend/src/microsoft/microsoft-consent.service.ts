@@ -53,9 +53,10 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
 }
 
 interface ConsentState {
-  customerTenantId: string
+  customerTenantId?: string
   organizationId: string
   nonce: string
+  flow: 'existing-tenant' | 'discover-tenant'
 }
 
 interface MicrosoftOrganization {
@@ -131,6 +132,23 @@ export class MicrosoftConsentService {
 
   async createAdminConsentUrl(
     microsoftTenantId: string,
+    state: Omit<ConsentState, 'nonce' | 'flow'>
+  ) {
+    return this.createConsentUrl(microsoftTenantId, {
+      ...state,
+      flow: 'existing-tenant',
+    })
+  }
+
+  async createTenantDiscoveryConsentUrl(organizationId: string) {
+    return this.createConsentUrl('organizations', {
+      organizationId,
+      flow: 'discover-tenant',
+    })
+  }
+
+  private async createConsentUrl(
+    microsoftTenantId: string,
     state: Omit<ConsentState, 'nonce'>
   ) {
     const configuration = await this.getStateConfiguration()
@@ -171,18 +189,31 @@ export class MicrosoftConsentService {
       }
     )
 
+    const flow =
+      payload.flow === 'discover-tenant'
+        ? 'discover-tenant'
+        : typeof payload.customerTenantId === 'string'
+          ? 'existing-tenant'
+          : null
+
     if (
-      typeof payload.customerTenantId !== 'string' ||
       typeof payload.organizationId !== 'string' ||
-      typeof payload.nonce !== 'string'
+      typeof payload.nonce !== 'string' ||
+      !flow ||
+      (flow === 'existing-tenant' &&
+        typeof payload.customerTenantId !== 'string')
     ) {
       throw new Error('Microsoft consent state is invalid.')
     }
 
     return {
-      customerTenantId: payload.customerTenantId,
+      customerTenantId:
+        typeof payload.customerTenantId === 'string'
+          ? payload.customerTenantId
+          : undefined,
       organizationId: payload.organizationId,
       nonce: payload.nonce,
+      flow,
     }
   }
 
