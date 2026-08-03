@@ -15,6 +15,9 @@ export interface HawkViewSession {
     id: string
     email: string
     displayName: string | null
+    timeZone: string | null
+    dateFormat: string
+    timeFormat: '12h' | '24h'
     platformRole:
       | 'STANDARD_USER'
       | 'PLATFORM_SUPPORT'

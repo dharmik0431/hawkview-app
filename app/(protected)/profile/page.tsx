@@ -18,6 +18,8 @@ import {
   Info,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { apiClient } from '@/lib/api/client'
+import type { HawkViewSession } from '@/lib/auth/types'
 
 interface ProfileFormData {
   firstName: string
@@ -30,7 +32,7 @@ interface ProfileFormData {
 }
 
 export default function ProfilePage() {
-  const { session } = useAuth()
+  const { session, refreshSession } = useAuth()
   const { theme: activeTheme, setTheme } = useTheme()
   const { notify } = useNotifications()
 
@@ -83,9 +85,9 @@ export default function ProfilePage() {
       firstName: initialFirstName,
       lastName: initialLastName,
       displayName: rawDisplayName,
-      timeZone: detectedTimeZone,
-      dateFormat: 'MM/DD/YYYY',
-      timeFormat: '12h',
+      timeZone: session?.user.timeZone || detectedTimeZone,
+      dateFormat: session?.user.dateFormat || 'MM/DD/YYYY',
+      timeFormat: session?.user.timeFormat || '12h',
       theme: initialTheme,
     }),
     [
@@ -94,6 +96,9 @@ export default function ProfilePage() {
       rawDisplayName,
       detectedTimeZone,
       initialTheme,
+      session?.user.timeZone,
+      session?.user.dateFormat,
+      session?.user.timeFormat,
     ]
   )
 
@@ -188,9 +193,9 @@ export default function ProfilePage() {
       firstName: initialFirstName,
       lastName: initialLastName,
       displayName: rawDisplayName,
-      timeZone: detectedTimeZone,
-      dateFormat: 'MM/DD/YYYY',
-      timeFormat: '12h',
+      timeZone: session?.user.timeZone || detectedTimeZone,
+      dateFormat: session?.user.dateFormat || 'MM/DD/YYYY',
+      timeFormat: session?.user.timeFormat || '12h',
       theme: (activeTheme as 'system' | 'light' | 'dark') || 'system',
     })
   }, [
@@ -199,6 +204,9 @@ export default function ProfilePage() {
     rawDisplayName,
     detectedTimeZone,
     activeTheme,
+    session?.user.timeZone,
+    session?.user.dateFormat,
+    session?.user.timeFormat,
   ])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -212,10 +220,18 @@ export default function ProfilePage() {
         setTheme(formData.theme)
       }
 
+      await apiClient.patch<HawkViewSession>('/auth/profile', {
+        displayName: formData.displayName.trim(),
+        timeZone: formData.timeZone,
+        dateFormat: formData.dateFormat,
+        timeFormat: formData.timeFormat,
+      })
+      await refreshSession()
+
       notify({
-        title: 'Appearance preference applied.',
+        title: 'Profile settings saved',
         description:
-          'Profile persistence is not connected yet. Your theme is applied on this device.',
+          'Your name and regional preferences were saved to HawkView.',
         category: 'success',
       })
     } catch {
@@ -284,7 +300,7 @@ export default function ProfilePage() {
           </h3>
           <span className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
             <Info className="h-3.5 w-3.5 text-blue-500" />
-            <span>Preference saving coming soon</span>
+            <span>Saved to your HawkView account</span>
           </span>
         </div>
 
@@ -453,7 +469,7 @@ export default function ProfilePage() {
           </h3>
           <span className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
             <Info className="h-3.5 w-3.5 text-blue-500" />
-            <span>Preference saving coming soon</span>
+            <span>Saved to your HawkView account</span>
           </span>
         </div>
 
