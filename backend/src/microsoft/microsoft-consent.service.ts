@@ -226,6 +226,38 @@ export class MicrosoftConsentService {
     return this.verifyTenantWithCredentials(microsoftTenantId, credentials)
   }
 
+  async verifyTenantAfterConsent(microsoftTenantId: string) {
+    const retryDelaysMs = [1_000, 2_000, 3_000, 5_000, 8_000]
+    let lastVerification: Awaited<ReturnType<typeof this.verifyTenant>> | null =
+      null
+    let lastError: unknown = null
+
+    for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+      try {
+        const verification = await this.verifyTenant(microsoftTenantId)
+        lastVerification = verification
+        lastError = null
+        if (verification.missingPermissions.length === 0) {
+          return verification
+        }
+      } catch (error) {
+        lastError = error
+      }
+
+      const retryDelay = retryDelaysMs[attempt]
+      if (retryDelay) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelay))
+      }
+    }
+
+    if (lastVerification) return lastVerification
+    throw lastError instanceof Error
+      ? lastError
+      : new BadGatewayException(
+          'Microsoft tenant verification did not complete after consent.'
+        )
+  }
+
   async verifyTenantWithCredentials(
     microsoftTenantId: string,
     credentials: { clientId: string; clientSecret: string }
