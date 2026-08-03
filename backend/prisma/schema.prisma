@@ -60,6 +60,7 @@ enum SyncResourceType {
   CONDITIONAL_ACCESS
   NAMED_LOCATIONS
   SIGN_INS
+  AUDIT_LOGS
   DEVICES
   DIRECTORY_ROLES
   SERVICE_PRINCIPALS
@@ -118,21 +119,23 @@ model Notification {
 }
 
 model Organization {
-  id               String                     @id @default(uuid()) @db.Uuid
-  name             String                     @db.VarChar(200)
-  slug             String                     @unique @db.VarChar(100)
-  status           OrganizationStatus         @default(ACTIVE)
-  createdAt        DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt        DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
-  memberships      Membership[]
-  customerTenants  CustomerTenant[]
-  directoryUsers   DirectoryUser[]
-  directoryGroups  DirectoryGroup[]
-  groupMemberships DirectoryGroupMembership[]
-  tenantLicenses   TenantLicense[]
-  tenantDomains    TenantDomain[]
-  syncStates       SyncState[]
-  entraSnapshots   TenantEntraSnapshot[]
+  id                 String                     @id @default(uuid()) @db.Uuid
+  name               String                     @db.VarChar(200)
+  slug               String                     @unique @db.VarChar(100)
+  status             OrganizationStatus         @default(ACTIVE)
+  createdAt          DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  memberships        Membership[]
+  customerTenants    CustomerTenant[]
+  directoryUsers     DirectoryUser[]
+  directoryGroups    DirectoryGroup[]
+  groupMemberships   DirectoryGroupMembership[]
+  tenantLicenses     TenantLicense[]
+  tenantDomains      TenantDomain[]
+  syncStates         SyncState[]
+  entraSnapshots     TenantEntraSnapshot[]
+  signInLogs         SignInLog[]
+  directoryAuditLogs DirectoryAuditLog[]
 
   @@index([status])
   @@map("organizations")
@@ -156,23 +159,25 @@ model Membership {
 }
 
 model CustomerTenant {
-  id                String                     @id @default(uuid()) @db.Uuid
-  organizationId    String                     @map("organization_id") @db.Uuid
-  microsoftTenantId String                     @unique @map("microsoft_tenant_id") @db.Uuid
-  displayName       String?                    @map("display_name") @db.VarChar(200)
-  primaryDomain     String?                    @map("primary_domain") @db.VarChar(253)
-  status            CustomerTenantStatus       @default(PENDING)
-  createdAt         DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt         DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
-  organization      Organization               @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  connection        TenantConnection?
-  directoryUsers    DirectoryUser[]
-  directoryGroups   DirectoryGroup[]
-  groupMemberships  DirectoryGroupMembership[]
-  tenantLicenses    TenantLicense[]
-  tenantDomains     TenantDomain[]
-  syncStates        SyncState[]
-  entraSnapshots    TenantEntraSnapshot[]
+  id                 String                     @id @default(uuid()) @db.Uuid
+  organizationId     String                     @map("organization_id") @db.Uuid
+  microsoftTenantId  String                     @unique @map("microsoft_tenant_id") @db.Uuid
+  displayName        String?                    @map("display_name") @db.VarChar(200)
+  primaryDomain      String?                    @map("primary_domain") @db.VarChar(253)
+  status             CustomerTenantStatus       @default(PENDING)
+  createdAt          DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization       Organization               @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  connection         TenantConnection?
+  directoryUsers     DirectoryUser[]
+  directoryGroups    DirectoryGroup[]
+  groupMemberships   DirectoryGroupMembership[]
+  tenantLicenses     TenantLicense[]
+  tenantDomains      TenantDomain[]
+  syncStates         SyncState[]
+  entraSnapshots     TenantEntraSnapshot[]
+  signInLogs         SignInLog[]
+  directoryAuditLogs DirectoryAuditLog[]
 
   @@unique([id, organizationId])
   @@index([organizationId, status])
@@ -335,6 +340,69 @@ model TenantEntraSnapshot {
   @@unique([customerTenantId, resourceType])
   @@index([organizationId, customerTenantId])
   @@map("tenant_entra_snapshots")
+}
+
+model SignInLog {
+  id                      String         @id @default(uuid()) @db.Uuid
+  organizationId          String         @map("organization_id") @db.Uuid
+  customerTenantId        String         @map("customer_tenant_id") @db.Uuid
+  microsoftSignInId       String         @map("microsoft_sign_in_id") @db.VarChar(200)
+  eventDateTime           DateTime       @map("event_date_time") @db.Timestamptz(6)
+  userId                  String?        @map("user_id") @db.VarChar(128)
+  userDisplayName         String?        @map("user_display_name") @db.VarChar(256)
+  userPrincipalName       String?        @map("user_principal_name") @db.VarChar(320)
+  appId                   String?        @map("app_id") @db.VarChar(128)
+  appDisplayName          String?        @map("app_display_name") @db.VarChar(256)
+  resourceDisplayName     String?        @map("resource_display_name") @db.VarChar(256)
+  ipAddress               String?        @map("ip_address") @db.VarChar(64)
+  clientAppUsed           String?        @map("client_app_used") @db.VarChar(100)
+  conditionalAccessStatus String?        @map("conditional_access_status") @db.VarChar(50)
+  isInteractive           Boolean?       @map("is_interactive")
+  riskLevel               String?        @map("risk_level") @db.VarChar(50)
+  statusErrorCode         String?        @map("status_error_code") @db.VarChar(32)
+  failureReason           String?        @map("failure_reason") @db.Text
+  location                Json?          @db.JsonB
+  deviceDetail            Json?          @map("device_detail") @db.JsonB
+  raw                     Json           @db.JsonB
+  ingestedAt              DateTime       @default(now()) @map("ingested_at") @db.Timestamptz(6)
+  expiresAt               DateTime       @map("expires_at") @db.Timestamptz(6)
+  organization            Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant          CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, microsoftSignInId])
+  @@index([organizationId, customerTenantId, eventDateTime(sort: Desc)])
+  @@index([customerTenantId, userPrincipalName, eventDateTime(sort: Desc)])
+  @@index([expiresAt])
+  @@map("sign_in_logs")
+}
+
+model DirectoryAuditLog {
+  id                  String         @id @default(uuid()) @db.Uuid
+  organizationId      String         @map("organization_id") @db.Uuid
+  customerTenantId    String         @map("customer_tenant_id") @db.Uuid
+  microsoftAuditId    String         @map("microsoft_audit_id") @db.VarChar(200)
+  eventDateTime       DateTime       @map("event_date_time") @db.Timestamptz(6)
+  activityDisplayName String         @map("activity_display_name") @db.VarChar(500)
+  category            String?        @db.VarChar(100)
+  operationType       String?        @map("operation_type") @db.VarChar(100)
+  result              String?        @db.VarChar(50)
+  resultReason        String?        @map("result_reason") @db.Text
+  correlationId       String?        @map("correlation_id") @db.VarChar(128)
+  loggedByService     String?        @map("logged_by_service") @db.VarChar(100)
+  initiatedBy         Json?          @map("initiated_by") @db.JsonB
+  targetResources     Json?          @map("target_resources") @db.JsonB
+  additionalDetails   Json?          @map("additional_details") @db.JsonB
+  raw                 Json           @db.JsonB
+  ingestedAt          DateTime       @default(now()) @map("ingested_at") @db.Timestamptz(6)
+  expiresAt           DateTime       @map("expires_at") @db.Timestamptz(6)
+  organization        Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant      CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, microsoftAuditId])
+  @@index([organizationId, customerTenantId, eventDateTime(sort: Desc)])
+  @@index([customerTenantId, category, eventDateTime(sort: Desc)])
+  @@index([expiresAt])
+  @@map("directory_audit_logs")
 }
 
 model TenantConnection {
