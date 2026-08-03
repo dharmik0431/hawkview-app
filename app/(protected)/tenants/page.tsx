@@ -50,6 +50,8 @@ type SortField =
 type SortOrder = 'asc' | 'desc'
 
 const MICROSOFT_CONSENT_MESSAGE = 'hawkview:microsoft-consent-complete'
+const MICROSOFT_CONSENT_CHANNEL = 'hawkview:microsoft-consent'
+const MICROSOFT_CONSENT_POPUP_MARKER = 'hawkview:microsoft-consent-popup'
 
 type MicrosoftConsentMessage = {
   type: typeof MICROSOFT_CONSENT_MESSAGE
@@ -381,15 +383,30 @@ export default function TenantsPage() {
     const tenantId = searchParams.get('tenantId')
     if (!result) return
 
-    if (window.opener && !window.opener.closed) {
-      const message: MicrosoftConsentMessage = {
-        type: MICROSOFT_CONSENT_MESSAGE,
-        result,
-        error: consentError,
-        tenantId,
+    const message: MicrosoftConsentMessage = {
+      type: MICROSOFT_CONSENT_MESSAGE,
+      result,
+      error: consentError,
+      tenantId,
+    }
+    const hasPopupMarker =
+      window.sessionStorage.getItem(MICROSOFT_CONSENT_POPUP_MARKER) === 'true'
+    const isConsentPopup =
+      hasPopupMarker ||
+      window.name === 'hawkview-microsoft-consent' ||
+      (window.opener && !window.opener.closed)
+
+    if (isConsentPopup) {
+      window.sessionStorage.removeItem(MICROSOFT_CONSENT_POPUP_MARKER)
+      if ('BroadcastChannel' in window) {
+        const channel = new BroadcastChannel(MICROSOFT_CONSENT_CHANNEL)
+        channel.postMessage(message)
+        channel.close()
       }
-      window.opener.postMessage(message, window.location.origin)
-      window.close()
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage(message, window.location.origin)
+      }
+      window.setTimeout(() => window.close(), 100)
       return
     }
 
@@ -420,11 +437,10 @@ export default function TenantsPage() {
   }, [queryClient])
 
   useEffect(() => {
-    const handleConsentMessage = (event: MessageEvent<unknown>) => {
-      if (event.origin !== window.location.origin) return
-      if (!event.data || typeof event.data !== 'object') return
+    const handleConsentResult = (data: unknown) => {
+      if (!data || typeof data !== 'object') return
 
-      const message = event.data as Partial<MicrosoftConsentMessage>
+      const message = data as Partial<MicrosoftConsentMessage>
       if (message.type !== MICROSOFT_CONSENT_MESSAGE) return
 
       if (consentPopupMonitorRef.current) {
@@ -460,8 +476,25 @@ export default function TenantsPage() {
       setTimeout(() => onboardButtonRef.current?.focus(), 0)
     }
 
+    const handleConsentMessage = (event: MessageEvent<unknown>) => {
+      if (event.origin !== window.location.origin) return
+      handleConsentResult(event.data)
+    }
+
+    const channel =
+      'BroadcastChannel' in window
+        ? new BroadcastChannel(MICROSOFT_CONSENT_CHANNEL)
+        : null
+    if (channel) {
+      channel.onmessage = (event: MessageEvent<unknown>) =>
+        handleConsentResult(event.data)
+    }
+
     window.addEventListener('message', handleConsentMessage)
-    return () => window.removeEventListener('message', handleConsentMessage)
+    return () => {
+      window.removeEventListener('message', handleConsentMessage)
+      channel?.close()
+    }
   }, [queryClient])
 
   useEffect(
@@ -553,6 +586,7 @@ export default function TenantsPage() {
     setIsSavingTenant(true)
     try {
       popup.document.title = 'Connecting to Microsoft 365'
+      popup.sessionStorage.setItem(MICROSOFT_CONSENT_POPUP_MARKER, 'true')
       popup.document.body.innerHTML =
         '<main style="font-family:system-ui;padding:32px;color:#0f172a"><h2>Connecting to Microsoft 365...</h2><p>This window will close automatically when authorization is complete.</p></main>'
     } catch {
@@ -580,9 +614,7 @@ export default function TenantsPage() {
         }
         consentPopupRef.current = null
         setIsSavingTenant(false)
-        setOnboardingError(
-          'Microsoft authorization was not completed. You can try again when ready.'
-        )
+        queryClient.invalidateQueries({ queryKey: ['tenants'] })
       }, 500)
     } catch (error) {
       popup.close()
