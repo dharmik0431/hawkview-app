@@ -250,23 +250,25 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
 
     const riskPill =
       rank < 0
-        ? 'bg-slate-50 text-slate-600 border border-slate-200'
+        ? 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
         : rank >= 4
-          ? 'bg-red-50 text-red-700 border border-red-200'
+          ? 'bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800'
           : rank === 3
-            ? 'bg-orange-50 text-orange-700 border border-orange-200'
+            ? 'bg-orange-50 dark:bg-orange-950/60 text-orange-700 dark:text-orange-300 border border-orange-200 dark:border-orange-800'
             : rank === 2
-              ? 'bg-blue-50 text-blue-700 border border-blue-200'
-              : 'bg-green-50 text-green-700 border border-green-200'
+              ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800'
+              : 'bg-green-50 dark:bg-green-950/60 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
 
     return (
-      <div className="rounded-2xl border bg-white p-5">
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <div className="text-sm font-semibold text-slate-900">{title}</div>
+            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+              {title}
+            </div>
             <div className="mt-1 text-xs text-muted-foreground">
               Content can be shared with:{' '}
-              <span className="font-semibold text-slate-800">
+              <span className="font-semibold text-slate-800 dark:text-slate-200">
                 {sharingLabel(level)}
               </span>
             </div>
@@ -276,7 +278,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
         </div>
 
         <div className="mt-4">
-          <div className="h-2 w-full rounded-full bg-slate-100 overflow-hidden border">
+          <div className="h-2 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden border border-slate-200 dark:border-slate-700">
             <div
               className={
                 rank >= 4
@@ -287,23 +289,47 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                       ? 'h-full bg-blue-500'
                       : rank >= 1
                         ? 'h-full bg-green-500'
-                        : 'h-full bg-slate-300'
+                        : 'h-full bg-slate-300 dark:bg-slate-700'
               }
               style={{ width: `${rank === 0 ? 0 : (rank / 4) * 100}%` }}
             />
           </div>
 
           <div className="mt-3 grid grid-cols-4 gap-2 text-[11px] text-muted-foreground">
-            <div className={rank === 4 ? 'text-slate-900 font-semibold' : ''}>
+            <div
+              className={
+                rank === 4
+                  ? 'text-slate-900 dark:text-slate-100 font-semibold'
+                  : ''
+              }
+            >
               Anyone
             </div>
-            <div className={rank === 3 ? 'text-slate-900 font-semibold' : ''}>
+            <div
+              className={
+                rank === 3
+                  ? 'text-slate-900 dark:text-slate-100 font-semibold'
+                  : ''
+              }
+            >
               New+Existing
             </div>
-            <div className={rank === 2 ? 'text-slate-900 font-semibold' : ''}>
+            <div
+              className={
+                rank === 2
+                  ? 'text-slate-900 dark:text-slate-100 font-semibold'
+                  : ''
+              }
+            >
               Existing
             </div>
-            <div className={rank === 1 ? 'text-slate-900 font-semibold' : ''}>
+            <div
+              className={
+                rank === 1
+                  ? 'text-slate-900 dark:text-slate-100 font-semibold'
+                  : ''
+              }
+            >
               Org only
             </div>
           </div>
@@ -329,7 +355,9 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
     <div className="mt-6 space-y-6">
       {syncFailures.length > 0 ? (
         <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
-          <div className="font-semibold">Some SharePoint data could not be refreshed</div>
+          <div className="font-semibold">
+            Some SharePoint data could not be refreshed
+          </div>
           <div className="mt-1 text-amber-900">
             HawkView kept the last successful data. The details below identify
             the exact Microsoft request that needs attention.
@@ -338,7 +366,8 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             {syncFailures.map(([label, state]) => (
               <li key={label}>
                 <span className="font-medium">{label}:</span>{' '}
-                {state.lastError || 'Microsoft rejected the synchronization request.'}
+                {state.lastError ||
+                  'Microsoft rejected the synchronization request.'}
               </li>
             ))}
           </ul>
@@ -541,7 +570,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               <select
                 value={typeFilter}
                 onChange={(e) => setTypeFilter(e.target.value as any)}
-                className="rounded-xl border px-3 py-2 text-sm bg-white"
+                className="rounded-xl border border-slate-200 dark:border-slate-800 px-3 py-2 text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
               >
                 <option value="all">All types</option>
                 <option value="Team site">Team site</option>
@@ -552,7 +581,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               <select
                 value={sharingFilter}
                 onChange={(e) => setSharingFilter(e.target.value as any)}
-                className="rounded-xl border px-3 py-2 text-sm bg-white"
+                className="rounded-xl border border-slate-200 dark:border-slate-800 px-3 py-2 text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
               >
                 <option value="all">Sharing: All</option>
                 <option value="on">Sharing: On</option>
@@ -627,10 +656,10 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                     return (
                       <tr
                         key={s.id}
-                        className="border-b hover:bg-white hover:shadow-sm transition"
+                        className="border-b hover:bg-muted/40 transition"
                       >
                         <td className="px-6 py-4">
-                          <div className="font-semibold text-slate-900">
+                          <div className="font-semibold text-slate-900 dark:text-slate-100">
                             {s.name}
                           </div>
                           <div className="text-xs text-muted-foreground break-all">
@@ -641,27 +670,27 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                             {typeof s.owners === 'number' &&
                             s.owners < 2 &&
                             s.type !== 'OneDrive' ? (
-                              <Badge className="bg-red-50 text-red-700 border border-red-200">
+                              <Badge className="bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800">
                                 Owner risk
                               </Badge>
                             ) : null}
 
                             {s.externalSharing === true ? (
-                              <Badge className="bg-orange-50 text-orange-700 border border-orange-200">
+                              <Badge className="bg-orange-50 dark:bg-orange-950/60 text-orange-700 dark:text-orange-300 border border-orange-200 dark:border-orange-800">
                                 External sharing
                               </Badge>
                             ) : s.externalSharing === false ? (
-                              <Badge className="bg-green-50 text-green-700 border border-green-200">
+                              <Badge className="bg-green-50 dark:bg-green-950/60 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800">
                                 Internal only
                               </Badge>
                             ) : (
-                              <Badge className="bg-slate-50 text-slate-600 border border-slate-200">
+                              <Badge className="bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
                                 Sharing not synchronized
                               </Badge>
                             )}
 
                             {s.sensitivityLabel ? (
-                              <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
+                              <Badge className="bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
                                 Label: {s.sensitivityLabel}
                               </Badge>
                             ) : null}
@@ -676,10 +705,10 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                           <Badge
                             className={
                               s.externalSharing === true
-                                ? 'bg-orange-50 text-orange-700 border border-orange-200'
+                                ? 'bg-orange-50 dark:bg-orange-950/60 text-orange-700 dark:text-orange-300 border border-orange-200 dark:border-orange-800'
                                 : s.externalSharing === false
-                                  ? 'bg-green-50 text-green-700 border border-green-200'
-                                  : 'bg-slate-50 text-slate-600 border border-slate-200'
+                                  ? 'bg-green-50 dark:bg-green-950/60 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
+                                  : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
                             }
                           >
                             {s.externalSharing === true
@@ -695,8 +724,8 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                             className={
                               typeof s.guestsCount === 'number' &&
                               s.guestsCount > 0
-                                ? 'bg-purple-50 text-purple-700 border border-purple-200'
-                                : 'bg-slate-50 text-slate-600 border border-slate-200'
+                                ? 'bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800'
+                                : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
                             }
                           >
                             {typeof s.guestsCount === 'number'

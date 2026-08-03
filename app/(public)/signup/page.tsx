@@ -4,10 +4,10 @@ import React from 'react'
 import { AuthLayout } from '@/components/auth/auth-layout'
 import { AuthForm } from '@/components/auth/auth-form'
 
-export default function LoginPage() {
+export default function SignUpPage() {
   return (
     <AuthLayout>
-      <AuthForm initialMode="sign-in" />
+      <AuthForm initialMode="sign-up" />
     </AuthLayout>
   )
 }

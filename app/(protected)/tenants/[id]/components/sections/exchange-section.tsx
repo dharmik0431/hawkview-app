@@ -275,19 +275,19 @@ export default function ExchangePage({
                   return (
                     <tr
                       key={m.id}
-                      className="border-b cursor-pointer hover:bg-white hover:shadow-sm transition"
+                      className="border-b cursor-pointer hover:bg-muted/40 transition"
                       onClick={() => setSelectedMailbox(m)}
                     >
                       <td className="px-6 py-4">
                         <div className="font-semibold flex items-center gap-2">
                           {m.displayName}
                           {m.mailboxType === 'Shared' && (
-                            <Badge className="bg-indigo-50 text-indigo-700 border border-indigo-200">
+                            <Badge className="bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
                               Shared
                             </Badge>
                           )}
                           {m.archiveEnabled && (
-                            <Badge className="bg-emerald-50 text-emerald-700 border border-emerald-200">
+                            <Badge className="bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
                               Archive
                             </Badge>
                           )}
@@ -295,12 +295,12 @@ export default function ExchangePage({
 
                         <div className="mt-1 flex flex-wrap gap-2">
                           {m.delegation?.fullAccess?.length ? (
-                            <Badge className="bg-sky-50 text-sky-700 border border-sky-200">
+                            <Badge className="bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800">
                               Delegation
                             </Badge>
                           ) : null}
                           {m.retentionLabel ? (
-                            <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
+                            <Badge className="bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
                               Retention
                             </Badge>
                           ) : null}
@@ -337,8 +337,8 @@ export default function ExchangePage({
                         <Badge
                           className={
                             m.archiveEnabled
-                              ? 'bg-green-50 text-green-700 border border-green-200'
-                              : 'bg-slate-50 text-slate-600 border border-slate-200'
+                              ? 'bg-green-50 dark:bg-green-950/60 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
+                              : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
                           }
                         >
                           {m.archiveEnabled ? 'Enabled' : 'Off'}
@@ -386,7 +386,7 @@ export default function ExchangePage({
               <select
                 value={ruleMailboxFilter}
                 onChange={(e) => setRuleMailboxFilter(e.target.value)}
-                className="rounded-xl border px-3 py-2 text-sm bg-white"
+                className="rounded-xl border border-slate-200 dark:border-slate-800 px-3 py-2 text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
               >
                 <option value="all">All mailboxes</option>
                 {mailboxes.map((m: any) => (
@@ -418,7 +418,9 @@ export default function ExchangePage({
                   {/* Accent bar */}
                   <div
                     className={`w-1.5 rounded-full ${
-                      r.enabled ? 'bg-green-500' : 'bg-slate-300'
+                      r.enabled
+                        ? 'bg-green-500'
+                        : 'bg-slate-300 dark:bg-slate-700'
                     }`}
                   />
 
@@ -436,8 +438,8 @@ export default function ExchangePage({
                       <Badge
                         className={
                           r.enabled
-                            ? 'bg-green-50 text-green-700 border border-green-200 uppercase'
-                            : 'bg-slate-50 text-slate-600 border border-slate-200 uppercase'
+                            ? 'bg-green-50 dark:bg-green-950/60 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800 uppercase'
+                            : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 uppercase'
                         }
                       >
                         {r.enabled ? 'Enabled' : 'Disabled'}
@@ -478,11 +480,11 @@ export default function ExchangePage({
                       </div>
                     </div>
                     {d.isDefault ? (
-                      <Badge className="bg-blue-50 text-blue-700 border border-blue-200">
+                      <Badge className="bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
                         Default
                       </Badge>
                     ) : (
-                      <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
+                      <Badge className="bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
                         Active
                       </Badge>
                     )}
