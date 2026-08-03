@@ -108,12 +108,12 @@ function ScrollPanel({ children }: { children: React.ReactNode }) {
   return (
     <div
       className={[
-        'h-[520px] overflow-y-auto rounded-xl border bg-white',
+        'h-[520px] overflow-y-auto rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900',
         'pr-2',
         '[&::-webkit-scrollbar]:w-2',
         '[&::-webkit-scrollbar-thumb]:rounded-full',
-        '[&::-webkit-scrollbar-thumb]:bg-slate-300/70',
-        'hover:[&::-webkit-scrollbar-thumb]:bg-slate-400/80',
+        '[&::-webkit-scrollbar-thumb]:bg-slate-300/70 dark:[&::-webkit-scrollbar-thumb]:bg-slate-700/70',
+        'hover:[&::-webkit-scrollbar-thumb]:bg-slate-400/80 dark:hover:[&::-webkit-scrollbar-thumb]:bg-slate-600/80',
         '[&::-webkit-scrollbar-track]:bg-transparent',
       ].join(' ')}
     >
@@ -275,7 +275,9 @@ export default function DashboardPage() {
     ).length
 
     const mfaGaps = tenants.filter((t) =>
-      (t.top ?? []).some((a: AttentionItem) => (a.label ?? '').toLowerCase().includes('mfa'))
+      (t.top ?? []).some((a: AttentionItem) =>
+        (a.label ?? '').toLowerCase().includes('mfa')
+      )
     ).length
 
     const avgScore =
@@ -310,7 +312,7 @@ export default function DashboardPage() {
                   Risky Identities
                 </div>
                 <div className="mt-1 text-3xl font-bold">
-                  {kpis.riskyIdentities || 13}
+                  {kpis.riskyIdentities}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
                   Requires immediate attention
@@ -331,7 +333,7 @@ export default function DashboardPage() {
                   Critical Tenants
                 </div>
                 <div className="mt-1 text-3xl font-bold">
-                  {kpis.criticalTenants || 3}
+                  {kpis.criticalTenants}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
                   Security baseline failed
@@ -351,9 +353,7 @@ export default function DashboardPage() {
                 <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
                   MFA Gaps
                 </div>
-                <div className="mt-1 text-3xl font-bold">
-                  {kpis.mfaGaps || 5}
-                </div>
+                <div className="mt-1 text-3xl font-bold">{kpis.mfaGaps}</div>
                 <div className="mt-1 text-xs text-slate-500">
                   Tenants &lt; 85% coverage
                 </div>
@@ -372,9 +372,7 @@ export default function DashboardPage() {
                 <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
                   Avg Security Score
                 </div>
-                <div className="mt-1 text-3xl font-bold">
-                  {kpis.avgScore || 65}%
-                </div>
+                <div className="mt-1 text-3xl font-bold">{kpis.avgScore}%</div>
                 <div className="mt-1 text-xs text-slate-500">
                   +2% from last week
                 </div>
@@ -388,20 +386,20 @@ export default function DashboardPage() {
       </div>
 
       {/* Tabs */}
-      <div className="rounded-2xl bg-slate-100 p-1.5 border">
+      <div className="rounded-2xl bg-slate-100 dark:bg-slate-800/60 p-1.5 border border-slate-200 dark:border-slate-800">
         <div className="grid grid-cols-2 gap-1">
           <button
             onClick={() => setTab('queue')}
             className={[
               'h-11 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition-colors',
               tab === 'queue'
-                ? 'bg-white shadow-sm'
-                : 'text-slate-600 hover:text-slate-900',
+                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-sm'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200',
             ].join(' ')}
           >
             Priority Action Queue
-            <span className="inline-flex items-center justify-center h-5 min-w-[20px] px-2 rounded-full bg-red-50 text-red-700 text-xs font-bold border border-red-100">
-              {queueCount || 13}
+            <span className="inline-flex items-center justify-center h-5 min-w-[20px] px-2 rounded-full bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 text-xs font-bold border border-red-100 dark:border-red-900">
+              {queueCount}
             </span>
           </button>
 
@@ -410,27 +408,27 @@ export default function DashboardPage() {
             className={[
               'h-11 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition-colors',
               tab === 'matrix'
-                ? 'bg-white shadow-sm'
-                : 'text-slate-600 hover:text-slate-900',
+                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-sm'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200',
             ].join(' ')}
           >
             Tenant Risk Matrix
-            <span className="inline-flex items-center justify-center h-5 min-w-[20px] px-2 rounded-full bg-slate-200 text-slate-700 text-xs font-bold">
-              {matrixCount || 6}
+            <span className="inline-flex items-center justify-center h-5 min-w-[20px] px-2 rounded-full bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-bold">
+              {matrixCount}
             </span>
           </button>
         </div>
       </div>
 
       {/* Filters */}
-      <div className="rounded-2xl border bg-white p-3">
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-3">
         <div className="grid grid-cols-1 md:grid-cols-[220px_220px_1fr_110px] gap-3">
           <div className="relative">
             <label className="sr-only">Tenant</label>
             <select
               value={tenantId}
               onChange={(e) => setTenantId(e.target.value)}
-              className="h-11 w-full rounded-xl border bg-white px-3 text-sm font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+              className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-sm font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
             >
               <option value="all">All Tenants</option>
               {tenants.map((t) => (
@@ -446,7 +444,7 @@ export default function DashboardPage() {
             <select
               value={severity}
               onChange={(e) => setSeverity(e.target.value as any)}
-              className="h-11 w-full rounded-xl border bg-white px-3 text-sm font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+              className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-sm font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
             >
               <option value="all">All Severities</option>
               <option value="critical">Critical</option>
@@ -477,14 +475,14 @@ export default function DashboardPage() {
         <ScrollPanel>
           <div className="space-y-2">
             {queueItems.length === 0 ? (
-              <div className="rounded-xl border bg-slate-50 p-8 text-center text-sm text-slate-600">
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 p-8 text-center text-sm text-slate-600 dark:text-slate-400">
                 No items found. Try adjusting filters.
               </div>
             ) : (
               queueItems.map((q, idx) => (
                 <div
                   key={`${q.tenantId}-${q.item.key}-${idx}`}
-                  className="relative rounded-xl border bg-white overflow-hidden"
+                  className="relative rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden"
                 >
                   <div
                     className={`absolute left-0 top-0 bottom-0 w-1.5 ${severityStripe(
@@ -504,17 +502,17 @@ export default function DashboardPage() {
                           {severityLabel(q.item.severity)}
                         </span>
 
-                        <span className="text-xs text-slate-500">
+                        <span className="text-xs text-slate-500 dark:text-slate-400">
                           {unresolvedFor(q.detectedAt)}
                         </span>
                       </div>
 
-                      <div className="mt-1 font-semibold text-slate-900">
+                      <div className="mt-1 font-semibold text-slate-900 dark:text-slate-100">
                         {q.item.label}
                       </div>
 
                       {q.item.why ? (
-                        <div className="mt-0.5 text-sm text-slate-600 line-clamp-1">
+                        <div className="mt-0.5 text-sm text-slate-600 dark:text-slate-400 line-clamp-1">
                           {q.item.why}
                         </div>
                       ) : null}
@@ -523,10 +521,10 @@ export default function DashboardPage() {
                     <div className="flex items-center gap-3 md:justify-end">
                       {providerMark(q.provider)}
                       <div className="min-w-0">
-                        <div className="text-sm font-semibold text-slate-900 truncate">
+                        <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
                           {q.tenantName}
                         </div>
-                        <div className="text-xs text-slate-500 truncate">
+                        <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
                           ID: {q.tenantId}
                         </div>
                       </div>
@@ -537,7 +535,7 @@ export default function DashboardPage() {
                         <div className="text-[10px] font-semibold tracking-wider text-slate-400 uppercase">
                           {q.metricLabel}
                         </div>
-                        <div className="text-lg font-bold text-slate-900">
+                        <div className="text-lg font-bold text-slate-900 dark:text-slate-100">
                           {q.metricValue}
                         </div>
                       </div>
@@ -560,11 +558,11 @@ export default function DashboardPage() {
         </ScrollPanel>
       ) : (
         <ScrollPanel>
-          <div className="rounded-xl border bg-white overflow-hidden">
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
             {/* ✅ THIS fixes the overlap: horizontal scroll + minimum width */}
             <div className="overflow-x-auto">
               <div className="min-w-[980px]">
-                <div className="grid grid-cols-[320px_220px_minmax(360px,1fr)_280px_40px] gap-0 px-4 py-3 text-[11px] font-bold tracking-wider text-slate-500 uppercase border-b bg-slate-50">
+                <div className="grid grid-cols-[320px_220px_minmax(360px,1fr)_280px_40px] gap-0 px-4 py-3 text-[11px] font-bold tracking-wider text-slate-500 dark:text-slate-400 uppercase border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50">
                   <div>Tenant</div>
                   <div>Identity Risk</div>
                   <div>MFA Status</div>
@@ -572,37 +570,39 @@ export default function DashboardPage() {
                   <div />
                 </div>
 
-                <div className="divide-y">
+                <div className="divide-y divide-slate-200 dark:divide-slate-800">
                   {filteredTenants.map((t) => {
                     const covered = clamp(t.mfaCoverage, 0, 100)
                     const unprot = clamp(100 - covered, 0, 100)
 
                     const identityBadge =
                       t.identityDetected > 0 ? (
-                        <Badge className="bg-red-50 text-red-700 border border-red-200 rounded-full">
+                        <Badge className="bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800 rounded-full">
                           {t.identityDetected} Detected
                         </Badge>
                       ) : (
-                        <span className="text-sm text-slate-500">None</span>
+                        <span className="text-sm text-slate-500 dark:text-slate-400">
+                          None
+                        </span>
                       )
 
                     const score = clamp(Number(t.secureScore ?? 0), 0, 100)
                     const ringColor =
                       score >= 80
-                        ? 'border-green-500 text-green-700'
+                        ? 'border-green-500 text-green-700 dark:text-green-400'
                         : score >= 60
-                          ? 'border-amber-500 text-amber-700'
-                          : 'border-red-500 text-red-700'
+                          ? 'border-amber-500 text-amber-700 dark:text-amber-400'
+                          : 'border-red-500 text-red-700 dark:text-red-400'
 
                     return (
                       <div
                         key={t.id}
-                        className="grid grid-cols-[320px_220px_minmax(360px,1fr)_280px_40px] px-4 py-3 items-center hover:bg-slate-50 transition-colors"
+                        className="grid grid-cols-[320px_220px_minmax(360px,1fr)_280px_40px] px-4 py-3 items-center hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors"
                       >
                         <div className="flex items-center gap-3 min-w-0">
                           {providerMark(t.provider)}
                           <div className="min-w-0">
-                            <div className="font-semibold text-slate-900 truncate">
+                            <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
                               {t.name}
                             </div>
                             <div className="text-xs text-slate-500 truncate">

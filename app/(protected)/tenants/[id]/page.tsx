@@ -2,12 +2,15 @@
 
 import React, { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
-import { useParams, useRouter } from 'next/navigation'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
 
 //Importing different sections
 import DnsSection from './components/sections/dns-section'
 import LicensesSection from './components/sections/licenses-section'
+import LicenseActivitySection from './components/sections/license-activity-section'
 import EntraSection from './components/sections/entra-section'
+import EntraOverviewSection from './components/sections/entra-overview-section'
+import SignInActivitySection from './components/sections/signins-section'
 import ExchangePage from './components/sections/exchange-section'
 import SharePointPage from './components/sections/sharepoint-section'
 
@@ -27,7 +30,7 @@ import { geoCentroid } from 'd3-geo'
 import {
   ChevronLeft,
   RefreshCw,
-  Settings2,
+  Settings,
   Copy,
   ShieldCheck,
   Mail,
@@ -46,12 +49,18 @@ import {
   Plus,
   Minus,
   RotateCcw,
+  KeyRound,
+  Folder,
+  ArrowUp,
+  ArrowDown,
+  ArrowUpDown,
 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { cn } from '@/lib/utils'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
 
@@ -83,6 +92,70 @@ type TenantSection =
   | 'security'
 
 type EntraTab = 'overview' | 'identity' | 'security' | 'licenses'
+
+type UserSortField = 'name' | 'type' | 'role' | 'status' | 'mfa'
+type UserSortOrder = 'asc' | 'desc'
+type UserRoleFilter = 'all' | 'admin' | 'user' | 'unknown'
+type UserStatusFilter = 'all' | 'enabled' | 'disabled' | 'unknown'
+type UserMfaFilter = 'all' | 'enabled' | 'disabled' | 'not-synchronized'
+
+function UserSortHeader({
+  field,
+  label,
+  activeField,
+  sortOrder,
+  onSort,
+}: {
+  field: UserSortField
+  label: string
+  activeField: UserSortField
+  sortOrder: UserSortOrder
+  onSort: (field: UserSortField) => void
+}) {
+  const isActive = activeField === field
+  const ariaSort = isActive
+    ? sortOrder === 'asc'
+      ? 'ascending'
+      : 'descending'
+    : 'none'
+
+  return (
+    <th
+      scope="col"
+      aria-sort={ariaSort}
+      className="text-left px-6 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider select-none"
+    >
+      <button
+        type="button"
+        onClick={() => onSort(field)}
+        className={cn(
+          'inline-flex items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded px-1 -mx-1 py-0.5 transition-colors hover:text-foreground cursor-pointer',
+          isActive && 'text-blue-600 dark:text-blue-400 font-bold'
+        )}
+      >
+        <span>{label}</span>
+        {isActive ? (
+          sortOrder === 'asc' ? (
+            <ArrowUp
+              className="h-3.5 w-3.5 shrink-0 text-blue-600 dark:text-blue-400"
+              aria-hidden="true"
+            />
+          ) : (
+            <ArrowDown
+              className="h-3.5 w-3.5 shrink-0 text-blue-600 dark:text-blue-400"
+              aria-hidden="true"
+            />
+          )
+        ) : (
+          <ArrowUpDown
+            className="h-3.5 w-3.5 shrink-0 opacity-40 hover:opacity-75 transition-opacity"
+            aria-hidden="true"
+          />
+        )}
+      </button>
+    </th>
+  )
+}
 
 type TenantUser = {
   id: string
@@ -391,7 +464,7 @@ function SectionButton({
       onClick={onClick}
       className={`w-full flex items-center gap-3 rounded-xl px-4 py-3 text-sm font-medium transition ${
         active
-          ? 'bg-blue-50 text-blue-700 border border-blue-100'
+          ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-100 dark:border-blue-900/60 font-semibold'
           : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground'
       }`}
     >
@@ -484,15 +557,18 @@ function RightDrawer({
   if (!open) return null
   return (
     <div className="fixed inset-0 z-[80]">
-      <div className="absolute inset-0 bg-black/10" onClick={onClose} />
-      <div className="absolute right-0 top-0 h-full w-full max-w-[440px] bg-white shadow-2xl border-l rounded-l-2xl">
-        <div className="flex items-center justify-between px-6 py-4 border-b bg-white">
-          <div className="font-semibold text-[15px] text-slate-900">
+      <div
+        className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+        onClick={onClose}
+      />
+      <div className="absolute right-0 top-0 h-full w-full max-w-[440px] bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-2xl border-l border-slate-200 dark:border-slate-800 rounded-l-2xl">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
+          <div className="font-semibold text-[15px] text-slate-900 dark:text-slate-100">
             {title}
           </div>
           <button
             onClick={onClose}
-            className="h-9 w-9 rounded-lg border bg-white hover:bg-slate-50 flex items-center justify-center"
+            className="h-9 w-9 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 flex items-center justify-center transition-colors"
             title="Close"
           >
             <X className="h-4 w-4" />
@@ -944,12 +1020,70 @@ function formatSyncTimestamp(lastSyncIso?: string) {
 export default function TenantDetailsPage() {
   const params = useParams<{ id: string }>()
   const router = useRouter()
+  const searchParams = useSearchParams()
   const tenantId = params?.id
 
+  const officeTabParam = searchParams ? searchParams.get('officeTab') : null
+  const officeTab =
+    officeTabParam === 'domain-protection' ? 'domain-protection' : 'licenses'
+
+  const setOfficeTab = (tab: 'licenses' | 'domain-protection') => {
+    const p = new URLSearchParams(searchParams ? searchParams.toString() : '')
+    p.set('officeTab', tab)
+    router.replace(`?${p.toString()}`, { scroll: false })
+  }
+
+  const entraTabParam = searchParams ? searchParams.get('entraTab') : null
+  const securityViewParam = searchParams
+    ? searchParams.get('securityView')
+    : null
+  const signInViewParam = searchParams ? searchParams.get('signInView') : null
+
+  const securityView = (
+    securityViewParam &&
+    ['policies', 'sign-ins', 'auth', 'locations'].includes(securityViewParam)
+      ? securityViewParam
+      : 'policies'
+  ) as 'policies' | 'sign-ins' | 'auth' | 'locations'
+
+  const signInView = signInViewParam === 'map' ? 'map' : 'list'
+
+  const handleNavigateEntraTab = (
+    tab: EntraTab,
+    secView?: 'policies' | 'sign-ins' | 'auth' | 'locations'
+  ) => {
+    setEntraTab(tab)
+    const p = new URLSearchParams(searchParams ? searchParams.toString() : '')
+    p.set('entraTab', tab)
+    if (secView) {
+      p.set('securityView', secView)
+    } else if (tab !== 'security') {
+      p.delete('securityView')
+    }
+    router.replace(`?${p.toString()}`, { scroll: false })
+  }
+
+  const handleSecurityViewChange = (
+    secView: 'policies' | 'sign-ins' | 'auth' | 'locations'
+  ) => {
+    const p = new URLSearchParams(searchParams ? searchParams.toString() : '')
+    p.set('entraTab', 'security')
+    p.set('securityView', secView)
+    router.replace(`?${p.toString()}`, { scroll: false })
+  }
+
+  const handleSignInViewChange = (sInView: 'list' | 'map') => {
+    const p = new URLSearchParams(searchParams ? searchParams.toString() : '')
+    p.set('entraTab', 'security')
+    p.set('securityView', 'sign-ins')
+    p.set('signInView', sInView)
+    router.replace(`?${p.toString()}`, { scroll: false })
+  }
+
   const [bundle, setBundle] = useState<TenantBundle | null>(null)
-  const [loadState, setLoadState] = useState<
-    'loading' | 'ready' | 'error'
-  >('loading')
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>(
+    'loading'
+  )
   const [loadError, setLoadError] = useState<string | null>(null)
   const [tenantsList, setTenantsList] = useState<any[]>([])
 
@@ -1048,8 +1182,45 @@ export default function TenantDetailsPage() {
 
   // Entra UI state
   const [entraTab, setEntraTab] = useState<EntraTab>('overview')
+
+  useEffect(() => {
+    if (
+      entraTabParam &&
+      ['overview', 'identity', 'security', 'licenses'].includes(entraTabParam)
+    ) {
+      setEntraTab(entraTabParam as EntraTab)
+    }
+  }, [entraTabParam])
   const [userSearch, setUserSearch] = useState('')
   const [selectedUser, setSelectedUser] = useState<TenantUser | null>(null)
+  const [userSortField, setUserSortField] = useState<UserSortField>('name')
+  const [userSortOrder, setUserSortOrder] = useState<UserSortOrder>('asc')
+  const [userRoleFilter, setUserRoleFilter] = useState<UserRoleFilter>('all')
+  const [userStatusFilter, setUserStatusFilter] =
+    useState<UserStatusFilter>('all')
+  const [userMfaFilter, setUserMfaFilter] = useState<UserMfaFilter>('all')
+
+  const handleUserSort = (field: UserSortField) => {
+    if (userSortField === field) {
+      setUserSortOrder((prev) => (prev === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setUserSortField(field)
+      setUserSortOrder('asc')
+    }
+  }
+
+  const isUserFilterActive =
+    userRoleFilter !== 'all' ||
+    userStatusFilter !== 'all' ||
+    userMfaFilter !== 'all' ||
+    userSearch.trim() !== ''
+
+  const handleClearUserFilters = () => {
+    setUserRoleFilter('all')
+    setUserStatusFilter('all')
+    setUserMfaFilter('all')
+    setUserSearch('')
+  }
 
   // ✅ Exchange drawer state
   const [selectedMailbox, setSelectedMailbox] = useState<Mailbox | null>(null)
@@ -1093,6 +1264,11 @@ export default function TenantDetailsPage() {
     setSelectedUser(null)
     setSelectedPolicy(null)
     setUserSearch('')
+    setUserSortField('name')
+    setUserSortOrder('asc')
+    setUserRoleFilter('all')
+    setUserStatusFilter('all')
+    setUserMfaFilter('all')
     setEntraTab('overview')
     setSection('home')
     setSelectedMailbox(null)
@@ -1102,12 +1278,161 @@ export default function TenantDetailsPage() {
 
   const filteredUsers = useMemo(() => {
     const q = userSearch.trim().toLowerCase()
-    if (!q) return USERS
-    return USERS.filter(
-      (u) =>
-        u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
-    )
-  }, [USERS, userSearch])
+    return USERS.filter((u) => {
+      if (q) {
+        const matchName = u.name?.toLowerCase().includes(q)
+        const matchEmail = u.email?.toLowerCase().includes(q)
+        if (!matchName && !matchEmail) return false
+      }
+
+      if (userRoleFilter === 'admin') {
+        if (!u.role || !u.role.toLowerCase().includes('admin')) return false
+      } else if (userRoleFilter === 'user') {
+        if (u.role !== 'User') return false
+      } else if (userRoleFilter === 'unknown') {
+        if (
+          u.role &&
+          (u.role === 'User' || u.role.toLowerCase().includes('admin'))
+        )
+          return false
+      }
+
+      if (userStatusFilter === 'enabled') {
+        if (u.status !== 'Enabled') return false
+      } else if (userStatusFilter === 'disabled') {
+        if (u.status !== 'Disabled') return false
+      } else if (userStatusFilter === 'unknown') {
+        if (u.status === 'Enabled' || u.status === 'Disabled') return false
+      }
+
+      if (userMfaFilter === 'enabled') {
+        if (u.mfa !== 'Enabled' && u.mfa !== 'Enforced') return false
+      } else if (userMfaFilter === 'disabled') {
+        if (u.mfa !== 'Disabled') return false
+      } else if (userMfaFilter === 'not-synchronized') {
+        if (u.mfa === 'Enabled' || u.mfa === 'Enforced' || u.mfa === 'Disabled')
+          return false
+      }
+
+      return true
+    })
+  }, [USERS, userSearch, userRoleFilter, userStatusFilter, userMfaFilter])
+
+  const sortedUsers = useMemo(() => {
+    const isUnknownOrMissing = (val: string | null | undefined) => {
+      if (!val) return true
+      const norm = val.trim().toLowerCase()
+      return (
+        norm === 'unknown' || norm === 'not synchronized' || norm === 'none'
+      )
+    }
+
+    const list = [...filteredUsers]
+    return list.sort((a, b) => {
+      let cmp = 0
+      switch (userSortField) {
+        case 'name': {
+          const nameA = (a.name || '').toLowerCase()
+          const nameB = (b.name || '').toLowerCase()
+          cmp = nameA.localeCompare(nameB)
+          if (cmp === 0) {
+            const emailA = (a.email || '').toLowerCase()
+            const emailB = (b.email || '').toLowerCase()
+            cmp = emailA.localeCompare(emailB)
+          }
+          return userSortOrder === 'asc' ? cmp : -cmp
+        }
+
+        case 'type': {
+          const missingA = isUnknownOrMissing(a.type)
+          const missingB = isUnknownOrMissing(b.type)
+          if (missingA && missingB) cmp = 0
+          else if (missingA) return 1
+          else if (missingB) return -1
+          else {
+            const typeRank: Record<string, number> = { Member: 1, Guest: 2 }
+            const rankA = typeRank[a.type] || 3
+            const rankB = typeRank[b.type] || 3
+            cmp = rankA - rankB
+            if (cmp === 0) {
+              cmp = (a.type || '').localeCompare(b.type || '', undefined, {
+                sensitivity: 'base',
+              })
+            }
+          }
+          break
+        }
+
+        case 'role': {
+          const missingA = isUnknownOrMissing(a.role)
+          const missingB = isUnknownOrMissing(b.role)
+          if (missingA && missingB) cmp = 0
+          else if (missingA) return 1
+          else if (missingB) return -1
+          else {
+            const isAdminA = a.role.toLowerCase().includes('admin')
+            const isAdminB = b.role.toLowerCase().includes('admin')
+            if (isAdminA && !isAdminB) cmp = -1
+            else if (!isAdminA && isAdminB) cmp = 1
+            else {
+              cmp = a.role.localeCompare(b.role, undefined, {
+                sensitivity: 'base',
+              })
+            }
+          }
+          break
+        }
+
+        case 'status': {
+          const missingA = isUnknownOrMissing(a.status)
+          const missingB = isUnknownOrMissing(b.status)
+          if (missingA && missingB) cmp = 0
+          else if (missingA) return 1
+          else if (missingB) return -1
+          else {
+            const statusRank: Record<string, number> = {
+              Enabled: 1,
+              Disabled: 2,
+            }
+            const rankA = statusRank[a.status] || 3
+            const rankB = statusRank[b.status] || 3
+            cmp = rankA - rankB
+          }
+          break
+        }
+
+        case 'mfa': {
+          const missingA = isUnknownOrMissing(a.mfa)
+          const missingB = isUnknownOrMissing(b.mfa)
+          if (missingA && missingB) cmp = 0
+          else if (missingA) return 1
+          else if (missingB) return -1
+          else {
+            const mfaRank = (val: string) => {
+              if (val === 'Enforced' || val === 'Enabled') return 1
+              if (val === 'Disabled') return 2
+              return 3
+            }
+            cmp = mfaRank(a.mfa) - mfaRank(b.mfa)
+            if (cmp === 0) {
+              cmp = (a.mfa || '').localeCompare(b.mfa || '', undefined, {
+                sensitivity: 'base',
+              })
+            }
+          }
+          break
+        }
+      }
+
+      if (cmp !== 0) {
+        return userSortOrder === 'asc' ? cmp : -cmp
+      }
+
+      const tieA = (a.name || '').toLowerCase()
+      const tieB = (b.name || '').toLowerCase()
+      return tieA.localeCompare(tieB)
+    })
+  }, [filteredUsers, userSortField, userSortOrder])
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const filteredTenants = useMemo(() => {
@@ -1326,7 +1651,7 @@ export default function TenantDetailsPage() {
         {
           key: 'home' as const,
           label: 'Office 365',
-          icon: <ShieldCheck className="h-5 w-5" />,
+          icon: <Shield className="h-5 w-5" />,
         },
         {
           key: 'entra' as const,
@@ -1341,7 +1666,7 @@ export default function TenantDetailsPage() {
         {
           key: 'sharepoint' as const,
           label: 'SharePoint/OneDrive',
-          icon: <HardDrive className="h-5 w-5" />,
+          icon: <Folder className="h-5 w-5" />,
         },
         {
           key: 'teams' as const,
@@ -2678,103 +3003,106 @@ export default function TenantDetailsPage() {
           // The component may have unmounted while the map bundle was loading.
           if (disposed) return
 
-        map = new maplibregl.Map({
-          container: el,
-          style: {
-            version: 8,
-            sources: {
-              osm: {
-                type: 'raster',
-                tiles: [
-                  'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                  'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                  'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                ],
-                tileSize: 256,
-                attribution: '© OpenStreetMap contributors',
+          map = new maplibregl.Map({
+            container: el,
+            style: {
+              version: 8,
+              sources: {
+                osm: {
+                  type: 'raster',
+                  tiles: [
+                    'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  ],
+                  tileSize: 256,
+                  attribution: '© OpenStreetMap contributors',
+                },
               },
+              layers: [
+                {
+                  id: 'osm',
+                  type: 'raster',
+                  source: 'osm',
+                },
+              ],
             },
-            layers: [
-              {
-                id: 'osm',
-                type: 'raster',
-                source: 'osm',
-              },
-            ],
-          },
-          center: [-79.3832, 43.6532], // default center (Toronto)
-          zoom: 2.5,
-          minZoom: 1,
-          maxZoom: 18,
-          attributionControl: false,
-        })
+            center: [-79.3832, 43.6532], // default center (Toronto)
+            zoom: 2.5,
+            minZoom: 1,
+            maxZoom: 18,
+            attributionControl: false,
+          })
 
-        map.addControl(
-          new maplibregl.NavigationControl({ showCompass: true }),
-          'top-right'
-        )
+          map.addControl(
+            new maplibregl.NavigationControl({ showCompass: true }),
+            'top-right'
+          )
 
-        const renderMarkers = () => {
-          // Clear existing markers
-          for (const m of markers) m.remove()
-          markers = []
+          const renderMarkers = () => {
+            // Clear existing markers
+            for (const m of markers) m.remove()
+            markers = []
 
-          const evts = Array.isArray(filteredEvents) ? filteredEvents : []
-          for (const e of evts) {
-            if (
-              typeof e?.longitude !== 'number' ||
-              typeof e?.latitude !== 'number'
-            )
-              continue
-            if (e.longitude === 0 && e.latitude === 0) continue
+            const evts = Array.isArray(filteredEvents) ? filteredEvents : []
+            for (const e of evts) {
+              if (
+                typeof e?.longitude !== 'number' ||
+                typeof e?.latitude !== 'number'
+              )
+                continue
+              if (e.longitude === 0 && e.latitude === 0) continue
 
-            const dot = document.createElement('div')
-            dot.style.width = '10px'
-            dot.style.height = '10px'
-            dot.style.borderRadius = '999px'
-            dot.style.border = '2px solid #fff'
-            dot.style.boxShadow = '0 8px 18px rgba(0,0,0,0.18)'
-            dot.style.background =
-              e.result === 'Failure' ? '#EF4444' : '#22C55E'
-            dot.style.cursor = 'pointer'
-            dot.style.transform =
-              selectedEventId === e.id ? 'scale(1.25)' : 'scale(1)'
+              const dot = document.createElement('div')
+              dot.style.width = '10px'
+              dot.style.height = '10px'
+              dot.style.borderRadius = '999px'
+              dot.style.border = '2px solid #fff'
+              dot.style.boxShadow = '0 8px 18px rgba(0,0,0,0.18)'
+              dot.style.background =
+                e.result === 'Failure' ? '#EF4444' : '#22C55E'
+              dot.style.cursor = 'pointer'
+              dot.style.transform =
+                selectedEventId === e.id ? 'scale(1.25)' : 'scale(1)'
 
-            dot.onclick = (evt) => {
-              evt.preventDefault()
-              evt.stopPropagation()
-              setHovered(e)
-              setSelectedEventId((cur) => (cur === e.id ? null : e.id))
+              dot.onclick = (evt) => {
+                evt.preventDefault()
+                evt.stopPropagation()
+                setHovered(e)
+                setSelectedEventId((cur) => (cur === e.id ? null : e.id))
+              }
+
+              const marker = new maplibregl.Marker({ element: dot })
+                .setLngLat([e.longitude, e.latitude])
+                .addTo(map)
+
+              markers.push(marker)
             }
 
-            const marker = new maplibregl.Marker({ element: dot })
-              .setLngLat([e.longitude, e.latitude])
-              .addTo(map)
+            // Fit bounds if multiple points
+            const coords = evts
+              .filter(
+                (x: any) =>
+                  typeof x?.longitude === 'number' &&
+                  typeof x?.latitude === 'number' &&
+                  !(x.longitude === 0 && x.latitude === 0)
+              )
+              .map((x: any) => [x.longitude, x.latitude])
 
-            markers.push(marker)
+            if (coords.length >= 2) {
+              const bounds = coords.reduce(
+                (b: any, c: any) => b.extend(c),
+                new maplibregl.LngLatBounds(
+                  coords[0] as [number, number],
+                  coords[0] as [number, number]
+                )
+              )
+              map.fitBounds(bounds, { padding: 60, duration: 450 })
+            } else if (coords.length === 1) {
+              map.setCenter(coords[0])
+              map.setZoom(7)
+            }
           }
-
-          // Fit bounds if multiple points
-          const coords = evts
-            .filter(
-              (x: any) =>
-                typeof x?.longitude === 'number' &&
-                typeof x?.latitude === 'number' &&
-                !(x.longitude === 0 && x.latitude === 0)
-            )
-            .map((x: any) => [x.longitude, x.latitude])
-
-          if (coords.length >= 2) {
-            const bounds = coords.reduce(
-              (b: any, c: any) => b.extend(c),
-              new maplibregl.LngLatBounds(coords[0] as [number, number], coords[0] as [number, number])
-            )
-            map.fitBounds(bounds, { padding: 60, duration: 450 })
-          } else if (coords.length === 1) {
-            map.setCenter(coords[0])
-            map.setZoom(7)
-          }
-        }
 
           map.on('load', () => {
             if (disposed) return
@@ -3033,18 +3361,44 @@ export default function TenantDetailsPage() {
   function EntraPage({ bundle }: { bundle: any }) {
     function HomePage() {
       return (
-        <div className="mt-6 grid grid-cols-1 gap-6 xl:grid-cols-2">
-          <LicensesSection
-            isMicrosoft={isMicrosoft}
-            licenseRows={licenseRows}
-            UtilBar={UtilBar}
-          />
+        <div className="mt-5 space-y-5">
+          <div className="flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 pb-3">
+            <button
+              type="button"
+              onClick={() => setOfficeTab('licenses')}
+              className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-all ${
+                officeTab === 'licenses'
+                  ? 'bg-blue-600 text-white shadow-xs'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              <KeyRound className="h-4 w-4" />
+              <span>Licenses</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setOfficeTab('domain-protection')}
+              className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-all ${
+                officeTab === 'domain-protection'
+                  ? 'bg-blue-600 text-white shadow-xs'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              <ShieldCheck className="h-4 w-4" />
+              <span>Domain Protection</span>
+            </button>
+          </div>
 
-          <DnsSection
-            tenant={tenant}
-            domains={domains}
-            dns={bundle?.dns}
-          />
+          {officeTab === 'licenses' ? (
+            <LicensesSection
+              isMicrosoft={isMicrosoft}
+              licenseRows={licenseRows}
+              users={bundle?.users}
+              syncCompleted={Boolean(bundle?.licenses)}
+            />
+          ) : (
+            <DnsSection tenant={tenant} domains={domains} dns={bundle?.dns} />
+          )}
         </div>
       )
     }
@@ -3071,212 +3425,340 @@ export default function TenantDetailsPage() {
 
         if (section === 'entra')
           return (
-            <div className="mt-8">
-              <div className="flex flex-wrap items-center gap-2">
-                <PillTab
-                  active={entraTab === 'overview'}
-                  icon={<Layers className="h-4 w-4" />}
-                  label="Overview"
-                  onClick={() => setEntraTab('overview')}
-                />
-                <PillTab
-                  active={entraTab === 'identity'}
-                  icon={<User className="h-4 w-4" />}
-                  label="Identity"
-                  onClick={() => setEntraTab('identity')}
-                />
-                <PillTab
-                  active={entraTab === 'security'}
-                  icon={<Shield className="h-4 w-4" />}
-                  label="Security"
-                  onClick={() => setEntraTab('security')}
-                />
-                <PillTab
-                  active={entraTab === 'licenses'}
-                  icon={<Activity className="h-4 w-4" />}
-                  label="License Activity"
-                  onClick={() => setEntraTab('licenses')}
-                />
+            <div className="mt-6">
+              <div className="border-b border-slate-200 dark:border-slate-800">
+                <div className="flex items-center gap-6 overflow-x-auto no-scrollbar text-xs font-medium h-10">
+                  <button
+                    onClick={() => handleNavigateEntraTab('overview')}
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap ${
+                      entraTab === 'overview'
+                        ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                    }`}
+                  >
+                    <Layers className="h-4 w-4 shrink-0" />
+                    <span>Overview</span>
+                  </button>
+                  <button
+                    onClick={() => handleNavigateEntraTab('identity')}
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap ${
+                      entraTab === 'identity'
+                        ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                    }`}
+                  >
+                    <User className="h-4 w-4 shrink-0" />
+                    <span>Identity</span>
+                  </button>
+                  <button
+                    onClick={() => handleNavigateEntraTab('security')}
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap ${
+                      entraTab === 'security'
+                        ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                    }`}
+                  >
+                    <Shield className="h-4 w-4 shrink-0" />
+                    <span>Security</span>
+                  </button>
+                  <button
+                    onClick={() => handleNavigateEntraTab('licenses')}
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap ${
+                      entraTab === 'licenses'
+                        ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                    }`}
+                  >
+                    <Activity className="h-4 w-4 shrink-0" />
+                    <span>License Activity</span>
+                  </button>
+                </div>
               </div>
 
               {entraTab === 'overview' && (
-                <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-4">
-                  <Card className="rounded-2xl shadow-sm">
-                    <CardContent className="p-5">
-                      <div className="flex items-center gap-3">
-                        <div className="h-10 w-10 rounded-xl bg-blue-50 border flex items-center justify-center">
-                          <Users className="h-5 w-5 text-blue-700" />
-                        </div>
-                        <div>
-                          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                            Users
-                          </div>
-                          <div className="text-2xl font-bold">
-                            {USERS.length}
-                          </div>
-                          <div className="text-xs text-muted-foreground">
-                            Directory users
-                          </div>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  <Card className="rounded-2xl shadow-sm">
-                    <CardContent className="p-5">
-                      <div className="flex items-center gap-3">
-                        <div className="h-10 w-10 rounded-xl bg-purple-50 border flex items-center justify-center">
-                          <Layers className="h-5 w-5 text-purple-700" />
-                        </div>
-                        <div>
-                          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                            Policies
-                          </div>
-                          <div className="text-2xl font-bold">
-                            {displayedCaPolicies.length}
-                          </div>
-                          <div className="text-xs text-muted-foreground">
-                            Conditional Access
-                          </div>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  <Card className="rounded-2xl shadow-sm">
-                    <CardContent className="p-5">
-                      <div className="flex items-center gap-3">
-                        <div className="h-10 w-10 rounded-xl bg-slate-50 border flex items-center justify-center">
-                          <Shield className="h-5 w-5 text-slate-700" />
-                        </div>
-                        <div>
-                          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                            MFA Methods
-                          </div>
-                          <div className="text-2xl font-bold">
-                            {displayedAuthMethods.length}
-                          </div>
-                          <div className="text-xs text-muted-foreground">
-                            Auth methods tracked
-                          </div>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  <Card className="rounded-2xl shadow-sm">
-                    <CardContent className="p-5">
-                      <div className="flex items-center gap-3">
-                        <div className="h-10 w-10 rounded-xl bg-emerald-50 border flex items-center justify-center">
-                          <ShieldCheck className="h-5 w-5 text-emerald-700" />
-                        </div>
-                        <div>
-                          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                            Sign-ins
-                          </div>
-                          <div className="text-2xl font-bold">
-                            {SIGNINS.length}
-                          </div>
-                          <div className="text-xs text-muted-foreground">
-                            Activity events
-                          </div>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  <RecentSignInsPanel users={USERS} events={SIGNINS} />
-                </div>
+                <EntraOverviewSection
+                  tenant={tenant}
+                  bundle={bundle}
+                  users={USERS}
+                  signIns={SIGNINS}
+                  caPolicies={displayedCaPolicies as any}
+                  authMethods={displayedAuthMethods as any}
+                  namedLocations={displayedNamedLocations as any}
+                  onNavigateTab={(tab, secView) =>
+                    handleNavigateEntraTab(tab, secView)
+                  }
+                />
               )}
 
               {entraTab === 'identity' && (
-                <Card className="rounded-2xl mt-5 shadow-sm">
+                <Card className="rounded-2xl mt-5 shadow-sm border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
                   <CardContent className="p-0">
-                    <div className="flex items-center justify-between px-6 py-5 border-b">
-                      <div className="text-lg font-semibold">Users</div>
+                    <div className="p-5 border-b border-slate-200 dark:border-slate-800 space-y-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div>
+                          <div className="text-lg font-semibold text-slate-900 dark:text-white">
+                            Users
+                          </div>
+                          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                            Showing {sortedUsers.length} of {USERS.length} user
+                            {USERS.length === 1 ? '' : 's'}
+                          </p>
+                        </div>
 
-                      <div className="relative w-full max-w-[280px]">
-                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                        <Input
-                          value={userSearch}
-                          onChange={(e) => setUserSearch(e.target.value)}
-                          placeholder="Search users..."
-                          className="pl-10"
-                        />
+                        <div className="relative w-full sm:w-[260px]">
+                          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                          <Input
+                            value={userSearch}
+                            onChange={(e) => setUserSearch(e.target.value)}
+                            placeholder="Search users..."
+                            className="pl-9 h-9 text-xs"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Compact Filters Bar */}
+                      <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-slate-500 dark:text-slate-400 font-medium">
+                            Role:
+                          </span>
+                          <select
+                            value={userRoleFilter}
+                            onChange={(e) =>
+                              setUserRoleFilter(
+                                e.target.value as UserRoleFilter
+                              )
+                            }
+                            className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+                          >
+                            <option value="all">All roles</option>
+                            <option value="admin">Administrators</option>
+                            <option value="user">Users</option>
+                            <option value="unknown">Unknown</option>
+                          </select>
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-slate-500 dark:text-slate-400 font-medium">
+                            Status:
+                          </span>
+                          <select
+                            value={userStatusFilter}
+                            onChange={(e) =>
+                              setUserStatusFilter(
+                                e.target.value as UserStatusFilter
+                              )
+                            }
+                            className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+                          >
+                            <option value="all">All statuses</option>
+                            <option value="enabled">Enabled</option>
+                            <option value="disabled">Disabled</option>
+                            <option value="unknown">Unknown</option>
+                          </select>
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-slate-500 dark:text-slate-400 font-medium">
+                            MFA:
+                          </span>
+                          <select
+                            value={userMfaFilter}
+                            onChange={(e) =>
+                              setUserMfaFilter(e.target.value as UserMfaFilter)
+                            }
+                            className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+                          >
+                            <option value="all">All MFA states</option>
+                            <option value="enabled">Enabled</option>
+                            <option value="disabled">Disabled</option>
+                            <option value="not-synchronized">
+                              Not synchronized
+                            </option>
+                          </select>
+                        </div>
+
+                        {isUserFilterActive && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleClearUserFilters}
+                            className="h-8 px-2 text-xs text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white gap-1"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                            Clear filters
+                          </Button>
+                        )}
                       </div>
                     </div>
 
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm">
-                        <thead className="text-xs uppercase tracking-wider text-muted-foreground bg-muted/30">
+                        <thead className="bg-slate-50/80 dark:bg-slate-800/50 border-b border-slate-200 dark:border-slate-800">
                           <tr>
-                            <th className="text-left px-6 py-3">Name</th>
-                            <th className="text-left px-6 py-3">Type</th>
-                            <th className="text-left px-6 py-3">Role</th>
-                            <th className="text-left px-6 py-3">Status</th>
-                            <th className="text-left px-6 py-3">MFA</th>
-                            <th className="px-6 py-3" />
+                            <UserSortHeader
+                              field="name"
+                              label="Name"
+                              activeField={userSortField}
+                              sortOrder={userSortOrder}
+                              onSort={handleUserSort}
+                            />
+                            <UserSortHeader
+                              field="type"
+                              label="Type"
+                              activeField={userSortField}
+                              sortOrder={userSortOrder}
+                              onSort={handleUserSort}
+                            />
+                            <UserSortHeader
+                              field="role"
+                              label="Role"
+                              activeField={userSortField}
+                              sortOrder={userSortOrder}
+                              onSort={handleUserSort}
+                            />
+                            <UserSortHeader
+                              field="status"
+                              label="Status"
+                              activeField={userSortField}
+                              sortOrder={userSortOrder}
+                              onSort={handleUserSort}
+                            />
+                            <UserSortHeader
+                              field="mfa"
+                              label="MFA"
+                              activeField={userSortField}
+                              sortOrder={userSortOrder}
+                              onSort={handleUserSort}
+                            />
+                            <th scope="col" className="px-6 py-3" />
                           </tr>
                         </thead>
-                        <tbody>
-                          {filteredUsers.map((u) => (
-                            <tr
-                              key={u.id}
-                              className="border-b cursor-pointer hover:bg-white hover:shadow-sm transition"
-                              onClick={() => setSelectedUser(u)}
-                            >
-                              <td className="px-6 py-4">
-                                <div className="flex items-center gap-3">
-                                  <div className="h-9 w-9 rounded-full bg-muted flex items-center justify-center text-xs font-bold">
-                                    {u.name
-                                      .split(' ')
-                                      .map((p) => p[0])
-                                      .slice(0, 2)
-                                      .join('')}
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="font-semibold truncate">
-                                      {u.name}
-                                    </div>
-                                    <div className="text-xs text-muted-foreground truncate">
-                                      {u.email}
-                                    </div>
-                                  </div>
-                                </div>
-                              </td>
-                              <td className="px-6 py-4 text-muted-foreground">
-                                {u.type}
-                              </td>
-                              <td className="px-6 py-4 text-muted-foreground">
-                                {u.role}
-                              </td>
-                              <td className="px-6 py-4">
-                                <Badge
-                                  className={`${
-                                    u.status === 'Enabled'
-                                      ? 'bg-green-50 text-green-700 border border-green-200'
-                                      : 'bg-slate-50 text-slate-600 border border-slate-200'
-                                  }`}
-                                >
-                                  {u.status}
-                                </Badge>
-                              </td>
-                              <td className="px-6 py-4 text-muted-foreground">
-                                {u.mfa}
-                              </td>
-                              <td className="px-6 py-4 text-right">
-                                <ChevronRight className="h-4 w-4 inline-block text-muted-foreground" />
-                              </td>
-                            </tr>
-                          ))}
+                        <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                          {sortedUsers.map((u) => {
+                            const isTypeUnknown =
+                              !u.type || u.type.toLowerCase() === 'unknown'
+                            const isRoleUnknown =
+                              !u.role || u.role.toLowerCase() === 'unknown'
+                            const isMfaUnknown =
+                              !u.mfa ||
+                              (u.mfa as string) === 'Unknown' ||
+                              (u.mfa as string) === 'Not synchronized'
 
-                          {filteredUsers.length === 0 && (
+                            return (
+                              <tr
+                                key={u.id}
+                                className="border-b border-slate-100 dark:border-slate-800/60 cursor-pointer hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors group"
+                                onClick={() => setSelectedUser(u)}
+                              >
+                                <td className="px-6 py-4">
+                                  <div className="flex items-center gap-3">
+                                    <div className="h-9 w-9 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 flex items-center justify-center text-xs font-bold shrink-0">
+                                      {u.name
+                                        ? u.name
+                                            .split(' ')
+                                            .map((p) => p[0])
+                                            .slice(0, 2)
+                                            .join('')
+                                        : 'U'}
+                                    </div>
+                                    <div className="min-w-0">
+                                      <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                        {u.name || 'Not synchronized'}
+                                      </div>
+                                      <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                                        {u.email || 'Not synchronized'}
+                                      </div>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td className="px-6 py-4 text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                                  {isTypeUnknown ? (
+                                    <span className="text-slate-400 dark:text-slate-500 italic text-xs">
+                                      Not synchronized
+                                    </span>
+                                  ) : (
+                                    u.type
+                                  )}
+                                </td>
+                                <td className="px-6 py-4 text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                                  {isRoleUnknown ? (
+                                    <span className="text-slate-400 dark:text-slate-500 italic text-xs">
+                                      Not synchronized
+                                    </span>
+                                  ) : (
+                                    u.role
+                                  )}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap">
+                                  {u.status === 'Enabled' ? (
+                                    <Badge className="bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-800/60 font-medium text-xs">
+                                      Enabled
+                                    </Badge>
+                                  ) : u.status === 'Disabled' ? (
+                                    <Badge className="bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 font-medium text-xs">
+                                      Disabled
+                                    </Badge>
+                                  ) : (
+                                    <Badge className="bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-800/60 font-medium text-xs">
+                                      Not synchronized
+                                    </Badge>
+                                  )}
+                                </td>
+                                <td className="px-6 py-4 text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                                  {isMfaUnknown ? (
+                                    <span className="text-slate-400 dark:text-slate-500 italic text-xs">
+                                      Not synchronized
+                                    </span>
+                                  ) : (
+                                    u.mfa
+                                  )}
+                                </td>
+                                <td className="px-6 py-4 text-right whitespace-nowrap">
+                                  <ChevronRight className="h-4 w-4 inline-block text-slate-400 opacity-60 group-hover:opacity-100 transition-opacity" />
+                                </td>
+                              </tr>
+                            )
+                          })}
+
+                          {USERS.length === 0 && (
                             <tr>
                               <td
                                 colSpan={6}
-                                className="px-6 py-8 text-center text-muted-foreground"
+                                className="px-6 py-12 text-center text-slate-500 dark:text-slate-400"
                               >
                                 No users found.
+                              </td>
+                            </tr>
+                          )}
+
+                          {USERS.length > 0 && sortedUsers.length === 0 && (
+                            <tr>
+                              <td
+                                colSpan={6}
+                                className="px-6 py-12 text-center"
+                              >
+                                <div className="py-2 space-y-2">
+                                  <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                                    No users match the selected filters.
+                                  </p>
+                                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                                    Try adjusting your search query or filter
+                                    options.
+                                  </p>
+                                  {isUserFilterActive && (
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="sm"
+                                      onClick={handleClearUserFilters}
+                                      className="mt-2 text-xs"
+                                    >
+                                      Clear filters
+                                    </Button>
+                                  )}
+                                </div>
                               </td>
                             </tr>
                           )}
@@ -3288,36 +3770,65 @@ export default function TenantDetailsPage() {
               )}
 
               {entraTab === 'security' && (
-                <div className="mt-5">
-                  <EntraSection
-                    policies={displayedCaPolicies as any}
-                    onPolicyClick={(p) => setSelectedPolicy(p as any)}
-                  />
-
-                  <div className="mt-6 grid grid-cols-1 gap-6 xl:grid-cols-2">
-                    <AuthMethodsCard rows={displayedAuthMethods} />
-                    <NamedLocationsCard locations={displayedNamedLocations} />
+                <div className="mt-5 space-y-4">
+                  {/* Secondary Underline-Style Tab Bar */}
+                  <div className="border-b border-slate-200 dark:border-slate-800">
+                    <nav className="flex items-center gap-6 overflow-x-auto no-scrollbar text-xs font-medium h-9">
+                      {[
+                        { id: 'policies', label: 'Policies' },
+                        { id: 'sign-ins', label: 'Sign-in Activity' },
+                        { id: 'auth', label: 'Authentication' },
+                        { id: 'locations', label: 'Named Locations' },
+                      ].map((tab) => (
+                        <button
+                          key={tab.id}
+                          onClick={() =>
+                            handleSecurityViewChange(tab.id as any)
+                          }
+                          className={`h-full border-b-2 px-0.5 transition-colors whitespace-nowrap text-xs font-medium ${
+                            securityView === tab.id
+                              ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
+                              : 'border-transparent text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                          }`}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
+                    </nav>
                   </div>
+
+                  {/* Secondary Views */}
+                  {securityView === 'policies' && (
+                    <EntraSection
+                      policies={displayedCaPolicies as any}
+                      onPolicyClick={(p) => setSelectedPolicy(p as any)}
+                    />
+                  )}
+
+                  {securityView === 'sign-ins' && (
+                    <SignInActivitySection
+                      signIns={SIGNINS}
+                      signInView={signInView}
+                      onSignInViewChange={handleSignInViewChange}
+                    />
+                  )}
+
+                  {securityView === 'auth' && (
+                    <div className="mt-4">
+                      <AuthMethodsCard rows={displayedAuthMethods} />
+                    </div>
+                  )}
+
+                  {securityView === 'locations' && (
+                    <div className="mt-4">
+                      <NamedLocationsCard locations={displayedNamedLocations} />
+                    </div>
+                  )}
                 </div>
               )}
 
               {entraTab === 'licenses' && (
-                <Card className="rounded-2xl mt-5 shadow-sm">
-                  <CardContent className="p-6">
-                    <div className="font-semibold">License Activity</div>
-                    <div className="mt-2 text-sm text-muted-foreground">
-                      {tenant?.provider === 'microsoft'
-                        ? `${bundle?.licenses?.rows?.reduce(
-                            (total: number, row: any) =>
-                              total + Number(row.used || 0),
-                            0
-                          ) || 0} assigned licenses across ${
-                            bundle?.licenses?.rows?.length || 0
-                          } subscribed products.`
-                        : 'Mock: recent assignments, SKU usage trend, dormant accounts.'}
-                    </div>
-                  </CardContent>
-                </Card>
+                <LicenseActivitySection bundle={bundle} />
               )}
             </div>
           )
@@ -3341,14 +3852,14 @@ export default function TenantDetailsPage() {
           Back to Tenants
         </Link>
 
-        <div className="rounded-[28px] border bg-white overflow-hidden shadow-sm">
+        <div className="rounded-[28px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-sm">
           <div className="flex h-[calc(100vh-180px)]">
-            <aside className="hidden lg:flex w-[300px] flex-col border-r bg-white/80 sticky top-0 h-full">
-              <div className="p-4 border-b">
+            <aside className="hidden lg:flex w-[300px] flex-col border-r border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 sticky top-0 h-full">
+              <div className="p-4 border-b border-slate-200 dark:border-slate-800">
                 <div className="relative">
                   <button
                     onClick={() => setTenantPickerOpen((v) => !v)}
-                    className="w-full flex items-center justify-between gap-3 rounded-2xl border bg-white p-4 shadow-sm hover:shadow-md transition-shadow"
+                    className="w-full flex items-center justify-between gap-3 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/80 p-4 shadow-sm hover:shadow-md transition-shadow"
                     title="Switch tenant"
                   >
                     <div className="flex items-center gap-3 min-w-0">
@@ -3366,8 +3877,8 @@ export default function TenantDetailsPage() {
                   </button>
 
                   {tenantPickerOpen && (
-                    <div className="absolute z-20 mt-2 w-full rounded-2xl border bg-white shadow-lg overflow-hidden">
-                      <div className="p-3 border-b">
+                    <div className="absolute z-20 mt-2 w-full rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-lg overflow-hidden">
+                      <div className="p-3 border-b border-slate-200 dark:border-slate-800">
                         <div className="relative">
                           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                           <Input
@@ -3389,7 +3900,7 @@ export default function TenantDetailsPage() {
                             }}
                             className={`w-full text-left px-4 py-3 text-sm hover:bg-muted/30 ${
                               t.id === tenant.id
-                                ? 'bg-blue-50 text-blue-700'
+                                ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300'
                                 : ''
                             }`}
                           >
@@ -3474,13 +3985,16 @@ export default function TenantDetailsPage() {
                     {tenant.status}
                   </Badge>
                 </div>
-                <div className="px-4 pb-4 text-xs text-muted-foreground" title={tenant?.lastSync || ''}>
+                <div
+                  className="px-4 pb-4 text-xs text-muted-foreground"
+                  title={tenant?.lastSync || ''}
+                >
                   {formatSyncTimestamp(tenant?.lastSync)}
                 </div>
               </div>
             </aside>
 
-            <section className="flex-1 bg-gray-50/60 overflow-y-auto">
+            <section className="flex-1 bg-slate-50/60 dark:bg-slate-950/60 overflow-y-auto">
               <div className="p-8">
                 <div className="flex items-start justify-between">
                   <div>
@@ -3495,7 +4009,7 @@ export default function TenantDetailsPage() {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={runSync}
-                      className="h-10 w-10 rounded-xl border bg-white shadow-sm hover:shadow-md hover:bg-white transition flex items-center justify-center"
+                      className="h-10 w-10 rounded-xl border bg-white shadow-sm hover:shadow-md hover:bg-white transition flex items-center justify-center dark:bg-slate-900 dark:border-slate-800 dark:hover:bg-slate-800"
                       title={
                         syncState === 'syncing'
                           ? 'Syncing...'
@@ -3507,16 +4021,18 @@ export default function TenantDetailsPage() {
                       }
                     >
                       <RefreshCw
-                        className={`h-4 w-4 ${syncState === 'syncing' ? 'animate-spin' : ''}`}
+                        className={`h-4 w-4 text-slate-700 dark:text-slate-300 ${syncState === 'syncing' ? 'animate-spin' : ''}`}
                       />
                     </button>
 
-                    <button
-                      className="h-10 w-10 rounded-xl border bg-white shadow-sm hover:shadow-md hover:bg-white transition flex items-center justify-center"
-                      title="Settings"
+                    <Link
+                      href={`/tenants/${tenantId}/settings`}
+                      className="h-10 w-10 rounded-xl border bg-white shadow-sm hover:shadow-md hover:bg-white transition flex items-center justify-center dark:bg-slate-900 dark:border-slate-800 dark:hover:bg-slate-800"
+                      title="Tenant settings"
+                      aria-label="Open tenant settings"
                     >
-                      <Settings2 className="h-4 w-4" />
-                    </button>
+                      <Settings className="h-4 w-4 text-slate-700 dark:text-slate-300" />
+                    </Link>
                   </div>
                 </div>
 
@@ -3700,28 +4216,28 @@ export default function TenantDetailsPage() {
                           : 'Unknown'
 
                       return (
-                      <div
-                        key={`${deviceName}-${index}`}
-                        className="rounded-xl border bg-muted/20 px-4 py-3 flex items-center justify-between"
-                      >
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold truncate">
-                            {deviceName}
-                          </div>
-                          <div className="text-xs text-muted-foreground">
-                            {deviceOs} • Last sync {deviceLastSync}
-                          </div>
-                        </div>
-                        <Badge
-                          className={
-                            deviceStatus.toLowerCase() === 'compliant'
-                              ? 'bg-green-50 text-green-700 border border-green-200'
-                              : 'bg-orange-50 text-orange-700 border border-orange-200'
-                          }
+                        <div
+                          key={`${deviceName}-${index}`}
+                          className="rounded-xl border bg-muted/20 px-4 py-3 flex items-center justify-between"
                         >
-                          {deviceStatus}
-                        </Badge>
-                      </div>
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold truncate">
+                              {deviceName}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              {deviceOs} • Last sync {deviceLastSync}
+                            </div>
+                          </div>
+                          <Badge
+                            className={
+                              deviceStatus.toLowerCase() === 'compliant'
+                                ? 'bg-green-50 text-green-700 border border-green-200'
+                                : 'bg-orange-50 text-orange-700 border border-orange-200'
+                            }
+                          >
+                            {deviceStatus}
+                          </Badge>
+                        </div>
                       )
                     })
                   ) : (
@@ -3921,20 +4437,20 @@ export default function TenantDetailsPage() {
                 }`}
               />
 
-              <div className="rounded-2xl border bg-white p-4">
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/80 p-4">
                 <div className="text-sm font-semibold">Status</div>
                 <Badge
                   className={
                     selectedRule.enabled
-                      ? 'bg-green-50 text-green-700 border border-green-200'
-                      : 'bg-slate-50 text-slate-600 border border-slate-200'
+                      ? 'bg-green-50 dark:bg-green-950/60 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
+                      : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
                   }
                 >
                   {selectedRule.enabled ? 'Enabled' : 'Disabled'}
                 </Badge>
               </div>
 
-              <div className="rounded-2xl border bg-white p-4">
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/80 p-4">
                 <div className="text-sm font-semibold">Mailbox</div>
                 <div className="text-sm text-muted-foreground">
                   {selectedRule.mailboxUpn}
@@ -3953,23 +4469,23 @@ export default function TenantDetailsPage() {
             <div className="space-y-4">
               <div className="h-1 rounded-full bg-purple-500" />
 
-              <div className="rounded-2xl border bg-white p-4">
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/80 p-4">
                 <div className="text-sm font-semibold">Email</div>
                 <div className="text-sm text-muted-foreground">
                   {selectedGroup.email}
                 </div>
               </div>
 
-              <div className="rounded-2xl border bg-white p-4">
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/80 p-4">
                 <div className="text-sm font-semibold">Members</div>
-                <Badge className="bg-purple-50 text-purple-700 border border-purple-200">
+                <Badge className="bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800">
                   {selectedGroup.membersCount} members
                 </Badge>
               </div>
 
-              <div className="rounded-2xl border bg-white p-4">
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/80 p-4">
                 <div className="text-sm font-semibold">Type</div>
-                <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
+                <Badge className="bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
                   {selectedGroup.type}
                 </Badge>
               </div>

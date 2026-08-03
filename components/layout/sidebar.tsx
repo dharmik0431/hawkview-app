@@ -3,22 +3,23 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { cn } from '@/lib/utils'
-import { History as HistoryIcon } from 'lucide-react'
+import { History as HistoryIcon, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useAuth } from '@/components/providers/auth-provider'
+import { useSidebar } from '@/components/providers/sidebar-provider'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 
 import {
   LayoutDashboard,
   Building2,
   FileBarChart,
-  Bell,
   Activity,
-  Users,
-  CreditCard,
   Shield,
   Settings,
-  Puzzle,
-  UserCircle,
-  Receipt,
   Eye,
   HelpCircle,
   Mail,
@@ -30,7 +31,6 @@ const navigation = [
     items: [
       { name: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
       { name: 'Tenants', href: '/tenants', icon: Building2 },
-      //{ name: 'Alerts & Notifications', href: '/alerts', icon: Bell },
       { name: 'Activity Logs', href: '/activity', icon: Activity },
       { name: 'What Changed?', href: '/what-changed', icon: HistoryIcon },
     ],
@@ -42,179 +42,236 @@ const navigation = [
       { name: 'Reports', href: '/reports', icon: FileBarChart },
     ],
   },
-  //{
-  //  title: 'ADMIN',
-  //  items: [
-  //    { name: 'User Directory', href: '/users', icon: Users },
-  //    { name: 'Licensing Overview', href: '/licensing', icon: CreditCard },
-   //   { name: 'Admin Settings', href: '/admin', icon: Settings },
-   //   { name: 'Integrations', href: '/integrations', icon: Puzzle },
-   //   { name: 'Billing', href: '/billing', icon: Receipt },
-    //],
-  //},
-  //{
-  //  title: 'ACCOUNT',
-  //  items: [{ name: 'Account Settings', href: '/settings', icon: UserCircle }],
-  //},
 ]
 
 export function Sidebar() {
   const pathname = usePathname()
+  const { isCollapsed, toggleCollapsed } = useSidebar()
   const { session } = useAuth()
-  const membership = session?.user.memberships[0]
-  const displayName =
-    session?.user.displayName || session?.user.email || 'HawkView user'
-  const initials = displayName
-    .split(/\s+/)
-    .map((part) => part[0])
-    .join('')
-    .slice(0, 2)
-    .toUpperCase()
-  const membershipRole = membership?.role
-    .replace('MSP_', '')
-    .toLowerCase()
-    .replace(/^\w/, (letter) => letter.toUpperCase())
 
   return (
-    <div className="hidden lg:fixed lg:inset-y-0 lg:z-50 lg:flex lg:w-52 lg:flex-col">
-      {/* Make sidebar a full-height column so bottom actions stay pinned */}
-      <div className="flex h-full flex-col bg-slate-900 px-4 pb-4">
-        {/* Brand */}
-        <div className="flex h-16 shrink-0 items-center gap-2 px-2">
-          <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
-            <Eye className="w-5 h-5 text-white" aria-hidden="true" />
-          </div>
-          <span className="text-xl font-semibold text-white">HawkView</span>
-        </div>
+    <TooltipProvider delayDuration={100}>
+      <div
+        className={cn(
+          'hidden lg:fixed lg:inset-y-0 lg:z-50 lg:flex lg:flex-col transition-[width] duration-200 ease-in-out motion-reduce:transition-none',
+          isCollapsed ? 'lg:w-[72px]' : 'lg:w-52'
+        )}
+      >
+        {/* Full-height column so bottom actions stay pinned */}
+        <div className="relative flex h-full flex-col bg-slate-900 px-3 pb-4">
+          {/* Circular collapse toggle control on right edge */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={toggleCollapsed}
+                className="absolute -right-3 top-5 z-50 flex h-6 w-6 items-center justify-center rounded-full bg-slate-800 border border-slate-700 text-slate-200 hover:bg-slate-700 hover:text-white shadow-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                aria-label={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                aria-expanded={!isCollapsed}
+              >
+                {isCollapsed ? (
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right">
+              {isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            </TooltipContent>
+          </Tooltip>
 
-        {/* Main nav (scrolls if needed) */}
-        <nav
-          className="flex-1 overflow-y-auto sidebar-scroll"
-          aria-label="Main navigation"
-        >
-          <ul role="list" className="flex flex-col gap-y-6">
-            {navigation.map((group) => (
-              <li key={group.title}>
-                <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider px-2 mb-2">
-                  {group.title}
-                </div>
-                <ul role="list" className="space-y-1">
-                  {group.items.map((item) => {
-                    const isActive = pathname === item.href
-                    return (
-                      <li key={item.name}>
-                        <Link
-                          href={item.href}
-                          className={cn(
-                            'group flex gap-x-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
-                            isActive
-                              ? 'bg-blue-600 text-white'
-                              : 'text-slate-300 hover:bg-slate-800 hover:text-white'
-                          )}
-                          aria-current={isActive ? 'page' : undefined}
-                        >
-                          <item.icon
-                            className="h-5 w-5 shrink-0"
-                            aria-hidden="true"
-                          />
-                          {item.name}
-                        </Link>
-                      </li>
-                    )
-                  })}
-                </ul>
-              </li>
-            ))}
-          </ul>
-        </nav>
-
-        {/* Bottom actions + user (pinned) */}
-        <div className="mt-4 space-y-2">
-          {session?.user.platformRole === 'PLATFORM_ADMIN' && (
-            <Link
-              href="/settings"
-              className={cn(
-                'flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
-                pathname === '/settings'
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-slate-800 text-slate-200 hover:bg-slate-700 hover:text-white'
-              )}
-            >
-              <Settings className="h-4 w-4" aria-hidden="true" />
-              Platform Settings
-            </Link>
-          )}
-          <Link
-            href="/help"
+          {/* Brand */}
+          <div
             className={cn(
-              'flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
-              pathname === '/help'
-                ? 'bg-blue-600 text-white'
-                : 'bg-slate-800 text-slate-200 hover:bg-slate-700 hover:text-white'
+              'flex h-16 shrink-0 items-center gap-2 px-1',
+              isCollapsed && 'justify-center px-0'
             )}
           >
-            <HelpCircle className="h-4 w-4" aria-hidden="true" />
-            Help
-          </Link>
-
-          <a
-            href="mailto:support@hawkview.net?subject=HawkView%20Support"
-            className="flex items-center justify-center gap-2 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 transition-colors hover:bg-slate-700 hover:text-white"
-          >
-            <Mail className="h-4 w-4" aria-hidden="true" />
-            Contact Us
-          </a>
-
-          {/* Signed-in user and workspace */}
-          <div className="border-t border-slate-700 pt-3">
-            <div className="flex items-center gap-3 px-2">
-              <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-semibold">
-                {initials || 'HV'}
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-white truncate">
-                  {displayName}
-                </p>
-                <p className="text-xs text-slate-400 truncate">
-                  {membershipRole || 'No workspace'}
-                </p>
-                {membership && (
-                  <p className="text-xs text-slate-500 truncate">
-                    {membership.organization.name}
-                  </p>
-                )}
-              </div>
+            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0">
+              <Eye className="w-5 h-5 text-white" aria-hidden="true" />
             </div>
+            {!isCollapsed && (
+              <span className="text-xl font-semibold text-white whitespace-nowrap overflow-hidden">
+                HawkView
+              </span>
+            )}
           </div>
+
+          {/* Main nav (scrolls if needed) */}
+          <nav
+            className="flex-1 overflow-y-auto overflow-x-hidden sidebar-scroll"
+            aria-label="Main navigation"
+          >
+            <ul role="list" className="flex flex-col gap-y-6">
+              {navigation.map((group) => (
+                <li key={group.title}>
+                  {!isCollapsed && (
+                    <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider px-2 mb-2 whitespace-nowrap overflow-hidden">
+                      {group.title}
+                    </div>
+                  )}
+                  <ul role="list" className="space-y-1">
+                    {group.items.map((item) => {
+                      const isActive = pathname === item.href
+                      return (
+                        <li key={item.name}>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Link
+                                href={item.href}
+                                className={cn(
+                                  'group flex rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
+                                  isCollapsed
+                                    ? 'h-10 w-10 items-center justify-center mx-auto'
+                                    : 'px-3 py-2 items-center gap-x-3',
+                                  isActive
+                                    ? 'bg-blue-600 text-white'
+                                    : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                                )}
+                                aria-current={isActive ? 'page' : undefined}
+                                aria-label={item.name}
+                              >
+                                <item.icon
+                                  className="h-5 w-5 shrink-0"
+                                  aria-hidden="true"
+                                />
+                                {!isCollapsed && (
+                                  <span className="truncate">{item.name}</span>
+                                )}
+                                {isCollapsed && (
+                                  <span className="sr-only">{item.name}</span>
+                                )}
+                              </Link>
+                            </TooltipTrigger>
+                            {isCollapsed && (
+                              <TooltipContent side="right" sideOffset={12}>
+                                {item.name}
+                              </TooltipContent>
+                            )}
+                          </Tooltip>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                </li>
+              ))}
+            </ul>
+          </nav>
+
+          {/* Bottom actions + user (pinned) */}
+          <div className="mt-4 space-y-2">
+            {session?.user.platformRole === 'PLATFORM_ADMIN' && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Link
+                    href="/settings"
+                    className={cn(
+                      'flex rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
+                      isCollapsed
+                        ? 'h-10 w-10 items-center justify-center mx-auto'
+                        : 'px-3 py-2 items-center justify-center gap-2',
+                      pathname === '/settings'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-slate-800 text-slate-200 hover:bg-slate-700 hover:text-white'
+                    )}
+                    aria-label="Platform Settings"
+                  >
+                    <Settings className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    {!isCollapsed && <span>Platform Settings</span>}
+                    {isCollapsed && (
+                      <span className="sr-only">Platform Settings</span>
+                    )}
+                  </Link>
+                </TooltipTrigger>
+                {isCollapsed && (
+                  <TooltipContent side="right" sideOffset={12}>
+                    Platform Settings
+                  </TooltipContent>
+                )}
+              </Tooltip>
+            )}
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Link
+                  href="/help"
+                  className={cn(
+                    'flex rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
+                    isCollapsed
+                      ? 'h-10 w-10 items-center justify-center mx-auto'
+                      : 'px-3 py-2 items-center justify-center gap-2',
+                    pathname === '/help'
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-slate-800 text-slate-200 hover:bg-slate-700 hover:text-white'
+                  )}
+                  aria-label="Help"
+                >
+                  <HelpCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                  {!isCollapsed && <span>Help</span>}
+                  {isCollapsed && <span className="sr-only">Help</span>}
+                </Link>
+              </TooltipTrigger>
+              {isCollapsed && (
+                <TooltipContent side="right" sideOffset={12}>
+                  Help
+                </TooltipContent>
+              )}
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <a
+                  href="mailto:support@hawkview.net?subject=HawkView%20Support"
+                  className={cn(
+                    'flex rounded-lg text-sm font-medium text-slate-200 transition-colors hover:bg-slate-700 hover:text-white bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
+                    isCollapsed
+                      ? 'h-10 w-10 items-center justify-center mx-auto'
+                      : 'px-3 py-2 items-center justify-center gap-2'
+                  )}
+                  aria-label="Contact Us"
+                >
+                  <Mail className="h-4 w-4 shrink-0" aria-hidden="true" />
+                  {!isCollapsed && <span>Contact Us</span>}
+                  {isCollapsed && <span className="sr-only">Contact Us</span>}
+                </a>
+              </TooltipTrigger>
+              {isCollapsed && (
+                <TooltipContent side="right" sideOffset={12}>
+                  Contact Us
+                </TooltipContent>
+              )}
+            </Tooltip>
+          </div>
+
+          {/* Scrollbar styling */}
+          <style jsx global>{`
+            .sidebar-scroll {
+              scrollbar-width: thin;
+              scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+            }
+
+            .sidebar-scroll::-webkit-scrollbar {
+              width: 8px;
+            }
+
+            .sidebar-scroll::-webkit-scrollbar-track {
+              background: transparent;
+            }
+
+            .sidebar-scroll::-webkit-scrollbar-thumb {
+              background-color: rgba(148, 163, 184, 0.28);
+              border-radius: 999px;
+              border: 2px solid transparent;
+              background-clip: content-box;
+            }
+
+            .sidebar-scroll::-webkit-scrollbar-thumb:hover {
+              background-color: rgba(148, 163, 184, 0.45);
+            }
+          `}</style>
         </div>
-
-        {/* Scrollbar styling (local to this component, global CSS rules) */}
-        <style jsx global>{`
-          .sidebar-scroll {
-            scrollbar-width: thin; /* Firefox */
-            scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
-          }
-
-          .sidebar-scroll::-webkit-scrollbar {
-            width: 8px;
-          }
-
-          .sidebar-scroll::-webkit-scrollbar-track {
-            background: transparent;
-          }
-
-          .sidebar-scroll::-webkit-scrollbar-thumb {
-            background-color: rgba(148, 163, 184, 0.28);
-            border-radius: 999px;
-            border: 2px solid transparent;
-            background-clip: content-box;
-          }
-
-          .sidebar-scroll::-webkit-scrollbar-thumb:hover {
-            background-color: rgba(148, 163, 184, 0.45);
-          }
-        `}</style>
       </div>
-    </div>
+    </TooltipProvider>
   )
 }
