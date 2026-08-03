@@ -22,3 +22,17 @@
     userAgent?: string
     tenantName?: string
   }
+
+  export type AuditEvent = {
+    id: string
+    createdAt: string
+    activity: string
+    category?: string
+    operationType?: string
+    result?: string
+    service?: string
+    actor?: string
+    target?: string
+    resultReason?: string
+    correlationId?: string
+  }

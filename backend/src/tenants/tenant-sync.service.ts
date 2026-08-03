@@ -166,7 +166,6 @@ type EntraSnapshotResource =
   | 'AUTH_METHOD_POLICIES'
   | 'CONDITIONAL_ACCESS'
   | 'NAMED_LOCATIONS'
-  | 'SIGN_INS'
   | 'DEVICES'
   | 'DIRECTORY_ROLES'
   | 'SERVICE_PRINCIPALS'
@@ -182,6 +181,16 @@ type EntraSnapshotResource =
 interface GraphCollectionPage {
   value?: unknown[]
   '@odata.nextLink'?: string
+}
+
+const LOG_RETENTION_MONTHS = 6
+const INITIAL_LOG_LOOKBACK_DAYS = 30
+const LOG_SYNC_OVERLAP_MINUTES = 10
+
+function logExpirationDate(ingestedAt: Date) {
+  const expiresAt = new Date(ingestedAt)
+  expiresAt.setUTCMonth(expiresAt.getUTCMonth() + LOG_RETENTION_MONTHS)
+  return expiresAt
 }
 
 interface TenantSyncTarget {
@@ -633,14 +642,8 @@ export class TenantSyncService {
         'NAMED_LOCATIONS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
       ),
-      this.syncEntraCollection(
-        tenant,
-        snapshotAccessToken,
-        'SIGN_INS',
-        `https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=createdDateTime ge ${encodeURIComponent(
-          new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
-        )}&$top=1000`
-      ),
+      this.syncSignInLogs(tenant, snapshotAccessToken),
+      this.syncDirectoryAuditLogs(tenant, snapshotAccessToken),
       this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
@@ -669,6 +672,7 @@ export class TenantSyncService {
           'CONDITIONAL_ACCESS',
           'NAMED_LOCATIONS',
           'SIGN_INS',
+          'AUDIT_LOGS',
           'DEVICES',
           'DIRECTORY_ROLES',
           'SERVICE_PRINCIPALS',
@@ -702,7 +706,13 @@ export class TenantSyncService {
 
   private async runSnapshotSync(
     tenant: { id: string; organizationId: string },
-    resourceType: 'LICENSES' | 'DOMAINS' | 'GROUPS' | EntraSnapshotResource,
+    resourceType:
+      | 'LICENSES'
+      | 'DOMAINS'
+      | 'GROUPS'
+      | 'SIGN_INS'
+      | 'AUDIT_LOGS'
+      | EntraSnapshotResource,
     synchronize: () => Promise<void>
   ) {
     const lastAttemptAt = new Date()
@@ -1163,6 +1173,208 @@ export class TenantSyncService {
           payload: rows as never,
           observedAt: new Date(),
         },
+      })
+    })
+  }
+
+  private async fetchGraphCollection(
+    initialUrl: string,
+    accessToken: string,
+    resourceLabel: string
+  ) {
+    const rows: any[] = []
+    let nextUrl = initialUrl
+    while (nextUrl) {
+      if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
+        throw new Error(`Microsoft returned an invalid ${resourceLabel} link.`)
+      }
+      const response = await fetch(nextUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!response.ok) {
+        const requestId = response.headers.get('request-id')
+        throw new Error(
+          `Microsoft ${resourceLabel} synchronization returned ${response.status}${
+            requestId ? ` (request ${requestId})` : ''
+          }.`
+        )
+      }
+      const page = (await response.json()) as GraphCollectionPage
+      rows.push(...(page.value ?? []))
+      nextUrl = page['@odata.nextLink'] ?? ''
+    }
+    return rows
+  }
+
+  private async logSyncStart(
+    customerTenantId: string,
+    resourceType: 'SIGN_INS' | 'AUDIT_LOGS'
+  ) {
+    const latest =
+      resourceType === 'SIGN_INS'
+        ? await this.prisma.signInLog.findFirst({
+            where: { customerTenantId },
+            orderBy: { eventDateTime: 'desc' },
+            select: { eventDateTime: true },
+          })
+        : await this.prisma.directoryAuditLog.findFirst({
+            where: { customerTenantId },
+            orderBy: { eventDateTime: 'desc' },
+            select: { eventDateTime: true },
+          })
+    return latest
+      ? new Date(
+          latest.eventDateTime.getTime() - LOG_SYNC_OVERLAP_MINUTES * 60_000
+        )
+      : new Date(Date.now() - INITIAL_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+  }
+
+  private async syncSignInLogs(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
+      const start = await this.logSyncStart(tenant.id, 'SIGN_INS')
+      const end = new Date()
+      const filter = encodeURIComponent(
+        `createdDateTime ge ${start.toISOString()} and createdDateTime le ${end.toISOString()}`
+      )
+      const rows = await this.fetchGraphCollection(
+        `https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=${filter}&$top=1000`,
+        accessToken,
+        'sign-in logs'
+      )
+      const ingestedAt = new Date()
+      const expiresAt = logExpirationDate(ingestedAt)
+      const records = rows
+        .filter(
+          (row) =>
+            typeof row?.id === 'string' &&
+            typeof row?.createdDateTime === 'string' &&
+            Number.isFinite(new Date(row.createdDateTime).getTime())
+        )
+        .map((row) => ({
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          microsoftSignInId: row.id,
+          eventDateTime: new Date(row.createdDateTime),
+          userId: typeof row.userId === 'string' ? row.userId : null,
+          userDisplayName:
+            typeof row.userDisplayName === 'string' ? row.userDisplayName : null,
+          userPrincipalName:
+            typeof row.userPrincipalName === 'string'
+              ? row.userPrincipalName.toLowerCase()
+              : null,
+          appId: typeof row.appId === 'string' ? row.appId : null,
+          appDisplayName:
+            typeof row.appDisplayName === 'string' ? row.appDisplayName : null,
+          resourceDisplayName:
+            typeof row.resourceDisplayName === 'string'
+              ? row.resourceDisplayName
+              : null,
+          ipAddress: typeof row.ipAddress === 'string' ? row.ipAddress : null,
+          clientAppUsed:
+            typeof row.clientAppUsed === 'string' ? row.clientAppUsed : null,
+          conditionalAccessStatus:
+            typeof row.conditionalAccessStatus === 'string'
+              ? row.conditionalAccessStatus
+              : null,
+          isInteractive:
+            typeof row.isInteractive === 'boolean' ? row.isInteractive : null,
+          riskLevel:
+            typeof row.riskLevelAggregated === 'string'
+              ? row.riskLevelAggregated
+              : typeof row.riskLevelDuringSignIn === 'string'
+                ? row.riskLevelDuringSignIn
+                : null,
+          statusErrorCode:
+            row?.status?.errorCode === undefined
+              ? null
+              : String(row.status.errorCode),
+          failureReason:
+            typeof row?.status?.failureReason === 'string'
+              ? row.status.failureReason
+              : null,
+          location: row.location ?? undefined,
+          deviceDetail: row.deviceDetail ?? undefined,
+          raw: row,
+          ingestedAt,
+          expiresAt,
+        }))
+      if (records.length > 0) {
+        await this.prisma.signInLog.createMany({
+          data: records as never,
+          skipDuplicates: true,
+        })
+      }
+      await this.prisma.signInLog.deleteMany({
+        where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
+      })
+    })
+  }
+
+  private async syncDirectoryAuditLogs(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'AUDIT_LOGS', async () => {
+      const start = await this.logSyncStart(tenant.id, 'AUDIT_LOGS')
+      const end = new Date()
+      const filter = encodeURIComponent(
+        `activityDateTime ge ${start.toISOString()} and activityDateTime le ${end.toISOString()}`
+      )
+      const rows = await this.fetchGraphCollection(
+        `https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?$filter=${filter}&$top=1000`,
+        accessToken,
+        'directory audit logs'
+      )
+      const ingestedAt = new Date()
+      const expiresAt = logExpirationDate(ingestedAt)
+      const records = rows
+        .filter(
+          (row) =>
+            typeof row?.id === 'string' &&
+            typeof row?.activityDateTime === 'string' &&
+            typeof row?.activityDisplayName === 'string' &&
+            Number.isFinite(new Date(row.activityDateTime).getTime())
+        )
+        .map((row) => ({
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          microsoftAuditId: row.id,
+          eventDateTime: new Date(row.activityDateTime),
+          activityDisplayName: row.activityDisplayName,
+          category: typeof row.category === 'string' ? row.category : null,
+          operationType:
+            typeof row.operationType === 'string' ? row.operationType : null,
+          result: typeof row.result === 'string' ? row.result : null,
+          resultReason:
+            typeof row.resultReason === 'string' ? row.resultReason : null,
+          correlationId:
+            typeof row.correlationId === 'string' ? row.correlationId : null,
+          loggedByService:
+            typeof row.loggedByService === 'string'
+              ? row.loggedByService
+              : null,
+          initiatedBy: row.initiatedBy ?? undefined,
+          targetResources: row.targetResources ?? undefined,
+          additionalDetails: row.additionalDetails ?? undefined,
+          raw: row,
+          ingestedAt,
+          expiresAt,
+        }))
+      if (records.length > 0) {
+        await this.prisma.directoryAuditLog.createMany({
+          data: records as never,
+          skipDuplicates: true,
+        })
+      }
+      await this.prisma.directoryAuditLog.deleteMany({
+        where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
     })
   }
@@ -1725,6 +1937,8 @@ export class TenantSyncService {
       domains,
       syncStates,
       entraSnapshots,
+      signIns,
+      auditLogs,
     ] = await Promise.all([
       this.prisma.directoryUser.findMany({
         where: {
@@ -1773,6 +1987,22 @@ export class TenantSyncService {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
         },
+      }),
+      this.prisma.signInLog.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: { eventDateTime: 'desc' },
+        take: 5000,
+      }),
+      this.prisma.directoryAuditLog.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: { eventDateTime: 'desc' },
+        take: 5000,
       }),
     ])
     const snapshotByResource = new Map(
@@ -1941,14 +2171,13 @@ export class TenantSyncService {
         )
       }
     }
-    const signIns = snapshotByResource.get('SIGN_INS') ?? []
     const latestSignInByUserId = new Map<string, any>()
     for (const signIn of signIns) {
       if (typeof signIn?.userId !== 'string') continue
       const current = latestSignInByUserId.get(signIn.userId)
       if (
         !current ||
-        String(signIn.createdDateTime) > String(current.createdDateTime)
+        signIn.eventDateTime.getTime() > current.eventDateTime.getTime()
       ) {
         latestSignInByUserId.set(signIn.userId, signIn)
       }
@@ -2052,8 +2281,8 @@ export class TenantSyncService {
                   : 'Disabled'
                 : 'Unknown',
             lastLogin:
-              typeof lastSignIn?.createdDateTime === 'string'
-                ? lastSignIn.createdDateTime
+              lastSignIn?.eventDateTime instanceof Date
+                ? lastSignIn.eventDateTime.toISOString()
                 : 'Not synchronized',
             driveUsage: 'Not synchronized',
             mailUsage: 'Not synchronized',
@@ -2070,24 +2299,50 @@ export class TenantSyncService {
           }
         }),
         signIns: signIns.map((signIn) => ({
-          id: signIn.id,
+          id: signIn.microsoftSignInId,
           userId: signIn.userId,
           userDisplayName: signIn.userDisplayName ?? 'Unknown user',
           userPrincipalName: signIn.userPrincipalName ?? '',
-          createdAt: signIn.createdDateTime,
+          createdAt: signIn.eventDateTime.toISOString(),
           ipAddress: signIn.ipAddress ?? '',
           result:
-            Number(signIn?.status?.errorCode ?? 1) === 0
+            Number(signIn.statusErrorCode ?? 1) === 0
               ? 'SUCCESS'
               : 'FAILURE',
           appDisplayName: signIn.appDisplayName ?? 'Unknown application',
           clientAppUsed: signIn.clientAppUsed ?? 'Unknown',
-          country: signIn?.location?.countryOrRegion ?? 'Unknown',
-          city: signIn?.location?.city ?? undefined,
-          latitude: Number(signIn?.location?.geoCoordinates?.latitude ?? 0),
-          longitude: Number(signIn?.location?.geoCoordinates?.longitude ?? 0),
-          riskLevel: signIn.riskLevelAggregated ?? signIn.riskLevelDuringSignIn,
+          conditionalAccess: signIn.conditionalAccessStatus,
+          country: (signIn.location as any)?.countryOrRegion ?? 'Unknown',
+          city: (signIn.location as any)?.city ?? undefined,
+          latitude: Number(
+            (signIn.location as any)?.geoCoordinates?.latitude ?? 0
+          ),
+          longitude: Number(
+            (signIn.location as any)?.geoCoordinates?.longitude ?? 0
+          ),
+          device: (signIn.deviceDetail as any)?.displayName ?? undefined,
+          os: (signIn.deviceDetail as any)?.operatingSystem ?? undefined,
+          riskLevel: signIn.riskLevel,
+          failureReason: signIn.failureReason,
         })),
+        auditLogs: auditLogs.map((audit) => ({
+          id: audit.microsoftAuditId,
+          createdAt: audit.eventDateTime.toISOString(),
+          activity: audit.activityDisplayName,
+          category: audit.category,
+          operationType: audit.operationType,
+          result: audit.result,
+          resultReason: audit.resultReason,
+          correlationId: audit.correlationId,
+          service: audit.loggedByService,
+          initiatedBy: audit.initiatedBy,
+          targetResources: audit.targetResources,
+          additionalDetails: audit.additionalDetails,
+        })),
+        logRetention: {
+          months: LOG_RETENTION_MONTHS,
+          displayedRecordLimit: 5000,
+        },
         exchange: {
           sync: {
             mailboxes: exchangeSync('EXCHANGE_MAILBOXES'),

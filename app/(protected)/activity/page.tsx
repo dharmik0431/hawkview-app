@@ -8,7 +8,7 @@ import {
 } from './components/activity-filters'
 import { SignInLogsPage } from './components/signin-logs-page'
 import { AuditLogsPage } from './components/audit-logs-page'
-import type { ActivityTab, SignInEvent } from './data/types'
+import type { ActivityTab, AuditEvent, SignInEvent } from './data/types'
 import { apiClient } from '@/lib/api/client'
 
 function parseISO(iso: string) {
@@ -155,10 +155,16 @@ export default function ActivityPage() {
           userPrincipalName:
             s.userPrincipalName ?? s.upn ?? 'unknown@tenant.com',
           appDisplayName: s.appDisplayName ?? s.app ?? 'Unknown',
-          status: (s.status ?? s.result ?? 'Success') as 'Success' | 'Failure',
-          conditionalAccess: (s.conditionalAccess ??
-            s.condAccess ??
-            'Not Applied') as 'Applied' | 'Not Applied',
+          status:
+            String(s.status ?? s.result ?? 'Success').toLowerCase() ===
+            'success'
+              ? 'Success'
+              : 'Failure',
+          conditionalAccess: ['success', 'failure', 'applied'].includes(
+            String(s.conditionalAccess ?? s.condAccess ?? '').toLowerCase()
+          )
+            ? 'Applied'
+            : 'Not Applied',
           ipAddress: s.ipAddress ?? s.ip ?? undefined,
           location,
 
@@ -206,6 +212,68 @@ export default function ActivityPage() {
       .sort((a, b) => parseISO(b.createdAt) - parseISO(a.createdAt))
   }, [loaded, selectedBundle, filters])
 
+  const auditRows: AuditEvent[] = React.useMemo(() => {
+    if (!loaded || !selectedBundle) return []
+    const query = filters.search.trim().toLowerCase()
+    return ((selectedBundle.auditLogs ?? []) as any[])
+      .map((event) => {
+        const initiatedBy = event.initiatedBy ?? {}
+        const actor =
+          initiatedBy?.user?.userPrincipalName ??
+          initiatedBy?.user?.displayName ??
+          initiatedBy?.app?.displayName ??
+          initiatedBy?.app?.servicePrincipalName
+        const targets = Array.isArray(event.targetResources)
+          ? event.targetResources
+          : []
+        return {
+          id: String(event.id),
+          createdAt: event.createdAt,
+          activity: event.activity ?? 'Directory activity',
+          category: event.category ?? undefined,
+          operationType: event.operationType ?? undefined,
+          result: event.result ?? undefined,
+          resultReason: event.resultReason ?? undefined,
+          correlationId: event.correlationId ?? undefined,
+          service: event.service ?? undefined,
+          actor: actor ?? undefined,
+          target: targets
+            .map(
+              (target: any) =>
+                target?.displayName ?? target?.userPrincipalName ?? target?.id
+            )
+            .filter(Boolean)
+            .join(', '),
+        } as AuditEvent
+      })
+      .filter((event) =>
+        inPresetRange(
+          event.createdAt,
+          filters.datePreset,
+          filters.dateFrom,
+          filters.dateTo
+        )
+      )
+      .filter((event) => {
+        if (!query) return true
+        return [
+          event.activity,
+          event.actor,
+          event.target,
+          event.category,
+          event.result,
+          event.service,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+          .includes(query)
+      })
+      .sort(
+        (left, right) => parseISO(right.createdAt) - parseISO(left.createdAt)
+      )
+  }, [loaded, selectedBundle, filters])
+
   return (
     <div className="space-y-4">
       {/* Header */}
@@ -219,7 +287,7 @@ export default function ActivityPage() {
         </div>
 
         <Badge variant="secondary" className="h-8 px-3 rounded-full">
-          Retention: 60 days
+          Retention: 6 months
         </Badge>
       </div>
 
@@ -302,7 +370,7 @@ export default function ActivityPage() {
       ) : tab === 'signins' ? (
         <SignInLogsPage rows={signInRows} />
       ) : (
-        <AuditLogsPage />
+        <AuditLogsPage rows={auditRows} />
       )}
     </div>
   )
