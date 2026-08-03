@@ -3,11 +3,15 @@
 import { getApp, getApps, initializeApp } from 'firebase/app'
 import { getAuth } from 'firebase/auth'
 
+// Firebase web configuration identifies the public HawkView web client. These
+// values are intentionally shipped to every browser by Firebase and are not
+// credentials. Keeping them here prevents hosted preview environments from
+// silently replacing them with stale build-time environment variables.
 const firebaseConfig = {
-  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+  apiKey: 'AIzaSyDwzfLY4LzBP59I2toRUT5lC8G1UKC0lEY',
+  authDomain: 'hawkview-app.firebaseapp.com',
+  projectId: 'hawkview-app',
+  appId: '1:670803700763:web:ac7275d7cf04fe888d9cbe',
 }
 
 export const isFirebaseConfigured = Object.values(firebaseConfig).every(Boolean)
