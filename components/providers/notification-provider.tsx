@@ -9,6 +9,8 @@ import React, {
 } from 'react'
 import { CheckCircle2, Info, AlertTriangle, XCircle, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useAuth } from '@/components/providers/auth-provider'
+import { apiClient } from '@/lib/api/client'
 
 export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
 
@@ -49,56 +51,6 @@ interface NotificationContextValue {
   removeToast: (id: string) => void
 }
 
-const STORAGE_KEY = 'hawkview_notifications_v1'
-
-const DEFAULT_NOTIFICATIONS: NotificationItem[] = [
-  {
-    id: 'notif-1',
-    category: 'info',
-    title: 'Initial tenant synchronization started',
-    description: 'Sync initiated for AlphaTech Solutions and Delta Health.',
-    timestamp: '10m ago',
-    read: false,
-    actionUrl: '/tenants',
-  },
-  {
-    id: 'notif-2',
-    category: 'warning',
-    title: 'Connector credentials approaching expiration',
-    description:
-      'Microsoft Graph connector secret for Startup Labs expires in 7 days.',
-    timestamp: '1h ago',
-    read: false,
-    actionUrl: '/tenants',
-  },
-  {
-    id: 'notif-3',
-    category: 'warning',
-    title: 'Microsoft permissions are missing',
-    description:
-      'Gamma MS tenant requires consent for Directory.ReadWrite.All.',
-    timestamp: '3h ago',
-    read: false,
-    actionUrl: '/tenants',
-  },
-  {
-    id: 'notif-4',
-    category: 'success',
-    title: 'Settings saved successfully',
-    description: 'Global security policy thresholds were updated.',
-    timestamp: '1d ago',
-    read: true,
-  },
-  {
-    id: 'notif-5',
-    category: 'error',
-    title: 'Tenant synchronization failed',
-    description: 'Authentication timeout while syncing Contoso Corp.',
-    timestamp: '2d ago',
-    read: true,
-  },
-]
-
 const NotificationContext = createContext<NotificationContextValue | null>(null)
 
 export function NotificationProvider({
@@ -106,38 +58,34 @@ export function NotificationProvider({
 }: {
   children: React.ReactNode
 }) {
+  const { session } = useAuth()
+  const userId = session?.user.id
   const [notifications, setNotifications] = useState<NotificationItem[]>([])
   const [toasts, setToasts] = useState<ToastItem[]>([])
-  const [isInitialized, setIsInitialized] = useState(false)
 
-  // Initialize from localStorage
+  // Notifications belong to the signed-in HawkView user and are loaded from
+  // the API. Nothing here is seeded or persisted in the browser.
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY)
-      if (stored) {
-        const parsed = JSON.parse(stored)
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setNotifications(parsed)
-          setIsInitialized(true)
-          return
-        }
-      }
-    } catch (e) {
-      console.error('Failed to load notifications from localStorage', e)
-    }
-    setNotifications(DEFAULT_NOTIFICATIONS)
-    setIsInitialized(true)
-  }, [])
+    let cancelled = false
 
-  // Persist to localStorage
-  useEffect(() => {
-    if (!isInitialized) return
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(notifications))
-    } catch (e) {
-      console.error('Failed to save notifications to localStorage', e)
+    if (!userId) {
+      setNotifications([])
+      return
     }
-  }, [notifications, isInitialized])
+
+    apiClient
+      .get<NotificationItem[]>('/api/notifications')
+      .then((items) => {
+        if (!cancelled) setNotifications(items)
+      })
+      .catch((error) => {
+        console.error('Failed to load notifications', error)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [userId])
 
   const unreadCount = notifications.filter((n) => !n.read).length
 
@@ -161,7 +109,7 @@ export function NotificationProvider({
       actionLabel?: string
       showToast?: boolean
     }) => {
-      const newNotif: NotificationItem = {
+      const temporaryNotification: NotificationItem = {
         id: `notif-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
         category,
         title,
@@ -172,7 +120,29 @@ export function NotificationProvider({
         actionLabel,
       }
 
-      setNotifications((prev) => [newNotif, ...prev])
+      setNotifications((prev) => [temporaryNotification, ...prev])
+
+      void apiClient
+        .post<NotificationItem>('/api/notifications', {
+          title,
+          description,
+          category,
+          actionUrl,
+          actionLabel,
+        })
+        .then((saved) => {
+          setNotifications((prev) =>
+            prev.map((item) =>
+              item.id === temporaryNotification.id ? saved : item
+            )
+          )
+        })
+        .catch((error) => {
+          setNotifications((prev) =>
+            prev.filter((item) => item.id !== temporaryNotification.id)
+          )
+          console.error('Failed to save notification', error)
+        })
 
       if (showToast) {
         const toastId = `toast-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`
@@ -200,14 +170,23 @@ export function NotificationProvider({
     setNotifications((prev) =>
       prev.map((n) => (n.id === id ? { ...n, read: true } : n))
     )
+    void apiClient
+      .patch(`/api/notifications/${encodeURIComponent(id)}/read`)
+      .catch((error) => console.error('Failed to mark notification read', error))
   }, [])
 
   const markAllAsRead = useCallback(() => {
     setNotifications((prev) => prev.map((n) => ({ ...n, read: true })))
+    void apiClient
+      .post('/api/notifications/read-all')
+      .catch((error) => console.error('Failed to mark notifications read', error))
   }, [])
 
   const clearRead = useCallback(() => {
     setNotifications((prev) => prev.filter((n) => !n.read))
+    void apiClient
+      .delete('/api/notifications/read')
+      .catch((error) => console.error('Failed to clear notifications', error))
   }, [])
 
   // Listen to window custom events for decoupled notifications

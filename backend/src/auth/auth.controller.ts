@@ -1,4 +1,4 @@
-import { Controller, Inject, Post, Req } from '@nestjs/common'
+import { Body, Controller, Inject, Patch, Post, Req } from '@nestjs/common'
 import type { AuthenticatedRequest } from './auth.types.js'
 import { AuthService } from './auth.service.js'
 
@@ -12,5 +12,13 @@ export class AuthController {
   @Post('bootstrap')
   bootstrap(@Req() request: AuthenticatedRequest) {
     return this.authService.bootstrap(request.auth)
+  }
+
+  @Patch('profile')
+  updateProfile(
+    @Req() request: AuthenticatedRequest,
+    @Body() body: unknown,
+  ) {
+    return this.authService.updateProfile(request.auth, body)
   }
 }

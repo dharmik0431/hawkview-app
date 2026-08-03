@@ -81,6 +81,18 @@ export function NotificationPanel() {
 
   const hasReadNotifications = notifications.some((n) => n.read)
 
+  const formatTimestamp = (value: string) => {
+    const date = new Date(value)
+    if (Number.isNaN(date.getTime())) return value
+
+    const elapsedSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000))
+    if (elapsedSeconds < 60) return 'Just now'
+    if (elapsedSeconds < 3600) return `${Math.floor(elapsedSeconds / 60)}m ago`
+    if (elapsedSeconds < 86400) return `${Math.floor(elapsedSeconds / 3600)}h ago`
+    if (elapsedSeconds < 604800) return `${Math.floor(elapsedSeconds / 86400)}d ago`
+    return date.toLocaleDateString()
+  }
+
   const renderStatusIcon = (category: NotificationCategory) => {
     switch (category) {
       case 'success':
@@ -265,7 +277,7 @@ export function NotificationPanel() {
                           {notif.title}
                         </p>
                         <span className="text-[10px] text-muted-foreground shrink-0 whitespace-nowrap">
-                          {notif.timestamp}
+                          {formatTimestamp(notif.timestamp)}
                         </span>
                       </div>
 

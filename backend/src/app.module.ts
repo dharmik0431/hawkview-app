@@ -4,8 +4,16 @@ import { HealthModule } from './health/health.module.js'
 import { PrismaModule } from './prisma/prisma.module.js'
 import { TenantsModule } from './tenants/tenants.module.js'
 import { SecretsModule } from './secrets/secrets.module.js'
+import { NotificationsModule } from './notifications/notifications.module.js'
 
 @Module({
-  imports: [PrismaModule, SecretsModule, AuthModule, HealthModule, TenantsModule],
+  imports: [
+    PrismaModule,
+    SecretsModule,
+    AuthModule,
+    HealthModule,
+    TenantsModule,
+    NotificationsModule,
+  ],
 })
 export class AppModule {}
