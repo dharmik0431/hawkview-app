@@ -298,7 +298,10 @@ export default function TenantSettingsPage() {
     setDeleteError(null)
 
     try {
-      await apiClient.delete<{ removed: boolean }>(`/api/tenants/${tenant.id}`)
+      await apiClient.delete<{ removed: boolean }>(
+        `/api/tenants/${tenant.id}`,
+        { confirmMicrosoftTenantId: enteredId }
+      )
       await queryClient.invalidateQueries({ queryKey: ['tenants'] })
       router.push('/tenants')
     } catch (err) {
