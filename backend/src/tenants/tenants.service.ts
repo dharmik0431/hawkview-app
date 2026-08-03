@@ -593,7 +593,7 @@ export class TenantsService {
     }
 
     try {
-      const verification = await this.microsoftConsent.verifyTenant(
+      const verification = await this.microsoftConsent.verifyTenantAfterConsent(
         tenant.microsoftTenantId
       )
       const connected = verification.missingPermissions.length === 0
@@ -710,7 +710,7 @@ export class TenantsService {
 
     try {
       const verification =
-        await this.microsoftConsent.verifyTenant(returnedTenantId)
+        await this.microsoftConsent.verifyTenantAfterConsent(returnedTenantId)
       const connected = verification.missingPermissions.length === 0
       const now = new Date()
 

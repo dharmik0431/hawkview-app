@@ -49,6 +49,15 @@ type SortField =
   | 'lastSync'
 type SortOrder = 'asc' | 'desc'
 
+const MICROSOFT_CONSENT_MESSAGE = 'hawkview:microsoft-consent-complete'
+
+type MicrosoftConsentMessage = {
+  type: typeof MICROSOFT_CONSENT_MESSAGE
+  result: string
+  error: string | null
+  tenantId: string | null
+}
+
 function SortHeader({
   field,
   label,
@@ -232,6 +241,10 @@ export default function TenantsPage() {
 
   const onboardButtonRef = useRef<HTMLButtonElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
+  const consentPopupRef = useRef<Window | null>(null)
+  const consentPopupMonitorRef = useRef<ReturnType<typeof setInterval> | null>(
+    null
+  )
 
   const [searchQuery, setSearchQuery] = useState('')
   const [filter, setFilter] = useState<FilterType>('all')
@@ -287,7 +300,7 @@ export default function TenantsPage() {
 
   const handleCloseOnboarding = useCallback(
     (force = false) => {
-      if (isSavingTenant) return
+      if (isSavingTenant && !force) return
       if (!force && onboardingStep === 'manual') {
         const hasEnteredValues =
           microsoftTenantId.trim().length > 0 ||
@@ -362,9 +375,24 @@ export default function TenantsPage() {
   }, [loading])
 
   useEffect(() => {
-    const result = new URLSearchParams(window.location.search).get(
-      'microsoftConsent'
-    )
+    const searchParams = new URLSearchParams(window.location.search)
+    const result = searchParams.get('microsoftConsent')
+    const consentError = searchParams.get('error')
+    const tenantId = searchParams.get('tenantId')
+    if (!result) return
+
+    if (window.opener && !window.opener.closed) {
+      const message: MicrosoftConsentMessage = {
+        type: MICROSOFT_CONSENT_MESSAGE,
+        result,
+        error: consentError,
+        tenantId,
+      }
+      window.opener.postMessage(message, window.location.origin)
+      window.close()
+      return
+    }
+
     if (result === 'success') {
       setConsentMessage({
         text: 'Microsoft 365 connection verified. HawkView is ready for the initial sync.',
@@ -383,7 +411,68 @@ export default function TenantsPage() {
       )
       queryClient.invalidateQueries({ queryKey: ['tenants'] })
     }
+
+    const cleanUrl = new URL(window.location.href)
+    cleanUrl.searchParams.delete('microsoftConsent')
+    cleanUrl.searchParams.delete('error')
+    cleanUrl.searchParams.delete('tenantId')
+    window.history.replaceState({}, '', cleanUrl)
   }, [queryClient])
+
+  useEffect(() => {
+    const handleConsentMessage = (event: MessageEvent<unknown>) => {
+      if (event.origin !== window.location.origin) return
+      if (!event.data || typeof event.data !== 'object') return
+
+      const message = event.data as Partial<MicrosoftConsentMessage>
+      if (message.type !== MICROSOFT_CONSENT_MESSAGE) return
+
+      if (consentPopupMonitorRef.current) {
+        clearInterval(consentPopupMonitorRef.current)
+        consentPopupMonitorRef.current = null
+      }
+      consentPopupRef.current?.close()
+      consentPopupRef.current = null
+      setIsSavingTenant(false)
+      setShowOnboarding(false)
+      setConsentReview(null)
+      setOnboardingStep('select')
+
+      if (message.result === 'success') {
+        setOnboardingError(null)
+        setConsentMessage({
+          text: 'Microsoft 365 connection verified. HawkView is ready for the initial sync.',
+          tone: 'success',
+        })
+      } else if (message.result === 'missing-permissions') {
+        setOnboardingError(null)
+        setConsentMessage({
+          text: 'Microsoft consent completed, but one or more required permissions are missing.',
+          tone: 'warning',
+        })
+      } else {
+        setOnboardingError(
+          'Microsoft administrator consent could not be verified. Review the tenant connection and try again.'
+        )
+      }
+
+      queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      setTimeout(() => onboardButtonRef.current?.focus(), 0)
+    }
+
+    window.addEventListener('message', handleConsentMessage)
+    return () => window.removeEventListener('message', handleConsentMessage)
+  }, [queryClient])
+
+  useEffect(
+    () => () => {
+      if (consentPopupMonitorRef.current) {
+        clearInterval(consentPopupMonitorRef.current)
+      }
+      consentPopupRef.current?.close()
+    },
+    []
+  )
 
   const tenants = data?.tenants || []
   const errorMessage = error ? (error as Error).message : data?.error || null
@@ -439,23 +528,82 @@ export default function TenantsPage() {
     }
   }
 
-  const handleManagedOnboarding = async () => {
+  const openMicrosoftConsentPopup = async (
+    getConsent: () => Promise<MicrosoftConsentResponse>
+  ) => {
+    const width = 640
+    const height = 760
+    const left = Math.max(0, window.screenX + (window.outerWidth - width) / 2)
+    const top = Math.max(0, window.screenY + (window.outerHeight - height) / 2)
+    const popup = window.open(
+      '',
+      'hawkview-microsoft-consent',
+      `popup=yes,width=${width},height=${height},left=${Math.round(left)},top=${Math.round(top)},resizable=yes,scrollbars=yes`
+    )
+
+    if (!popup) {
+      setOnboardingError(
+        'Your browser blocked the Microsoft sign-in window. Allow pop-ups for HawkView and try again.'
+      )
+      return
+    }
+
+    consentPopupRef.current = popup
     setOnboardingError(null)
-    setHawkviewPreviewMessage(null)
     setIsSavingTenant(true)
     try {
-      const consent = await apiClient.post<MicrosoftConsentResponse>(
-        '/api/tenants/microsoft/onboarding'
-      )
-      window.location.assign(consent.consentUrl)
-    } catch (onboardingError) {
+      popup.document.title = 'Connecting to Microsoft 365'
+      popup.document.body.innerHTML =
+        '<main style="font-family:system-ui;padding:32px;color:#0f172a"><h2>Connecting to Microsoft 365...</h2><p>This window will close automatically when authorization is complete.</p></main>'
+    } catch {
+      // The temporary same-origin document is optional.
+    }
+
+    try {
+      const consent = await getConsent()
+      if (popup.closed) {
+        throw new Error(
+          'The Microsoft sign-in window was closed before authorization started.'
+        )
+      }
+      popup.location.replace(consent.consentUrl)
+      popup.focus()
+
+      if (consentPopupMonitorRef.current) {
+        clearInterval(consentPopupMonitorRef.current)
+      }
+      consentPopupMonitorRef.current = setInterval(() => {
+        if (!popup.closed) return
+        if (consentPopupMonitorRef.current) {
+          clearInterval(consentPopupMonitorRef.current)
+          consentPopupMonitorRef.current = null
+        }
+        consentPopupRef.current = null
+        setIsSavingTenant(false)
+        setOnboardingError(
+          'Microsoft authorization was not completed. You can try again when ready.'
+        )
+      }, 500)
+    } catch (error) {
+      popup.close()
+      consentPopupRef.current = null
+      setIsSavingTenant(false)
       setOnboardingError(
-        onboardingError instanceof Error
-          ? onboardingError.message
+        error instanceof Error
+          ? error.message
           : 'Microsoft tenant onboarding could not be started.'
       )
-      setIsSavingTenant(false)
     }
+  }
+
+  const handleManagedOnboarding = () => {
+    setOnboardingError(null)
+    setHawkviewPreviewMessage(null)
+    void openMicrosoftConsentPopup(() =>
+      apiClient.post<MicrosoftConsentResponse>(
+        '/api/tenants/microsoft/onboarding'
+      )
+    )
   }
 
   const handleReviewConsent = async (tenant: Tenant) => {
@@ -750,7 +898,9 @@ export default function TenantsPage() {
                     type="button"
                     className="rounded-xl"
                     onClick={() =>
-                      window.location.assign(consentReview.consentUrl)
+                      void openMicrosoftConsentPopup(() =>
+                        Promise.resolve(consentReview)
+                      )
                     }
                   >
                     Continue to Microsoft
