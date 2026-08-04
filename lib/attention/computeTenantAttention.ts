@@ -87,6 +87,31 @@ export function computeTenantAttention(bundle: any): AttentionItem[] {
   const tenantStatus = String(
     bundle?.status ?? bundle?.tenant?.status ?? ''
   ).toLowerCase()
+  const missingPermissions = normalizeArray(
+    bundle?.missingPermissions ?? bundle?.tenant?.missingPermissions
+  )
+
+  if (
+    ['pending-consent', 'pending'].includes(connectionStatus) ||
+    tenantStatus === 'pending'
+  ) {
+    items.push({
+      key: 'microsoft_authorization_required',
+      label: 'Microsoft authorization required',
+      severity: 'high',
+      why: 'Open this tenant to review and approve the required Microsoft permissions.',
+      detectedAt: getDetectedAt(bundle),
+    })
+  } else if (missingPermissions.length > 0) {
+    items.push({
+      key: 'microsoft_permissions_missing',
+      label: `Microsoft permissions missing (${missingPermissions.length})`,
+      severity: 'high',
+      why: 'Open this tenant to review the missing Microsoft permissions.',
+      detectedAt: getDetectedAt(bundle),
+    })
+  }
+
   if (
     ['error', 'revoked', 'disconnected'].includes(connectionStatus) ||
     ['suspended', 'disconnected'].includes(tenantStatus)

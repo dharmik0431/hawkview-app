@@ -12,7 +12,6 @@ import {
   ChevronRight,
   AlertCircle,
   RefreshCw,
-  Trash2,
   LayoutGrid,
   List,
   X,
@@ -273,7 +272,6 @@ export default function TenantsPage() {
   const [consentReview, setConsentReview] =
     useState<MicrosoftConsentResponse | null>(null)
   const [isSavingTenant, setIsSavingTenant] = useState(false)
-  const [deletingTenantId, setDeletingTenantId] = useState<string | null>(null)
 
   const loading = isLoading || isFetching
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
@@ -638,96 +636,6 @@ export default function TenantsPage() {
     )
   }
 
-  const handleReviewConsent = async (tenant: Tenant) => {
-    setOnboardingError(null)
-    setIsSavingTenant(true)
-    try {
-      const consent = await apiClient.post<MicrosoftConsentResponse>(
-        `/api/tenants/${tenant.id}/microsoft-consent`
-      )
-      setConsentReview(consent)
-      setShowOnboarding(true)
-    } catch (consentError) {
-      setShowOnboarding(true)
-      setOnboardingError(
-        consentError instanceof Error
-          ? consentError.message
-          : 'Microsoft consent could not be started.'
-      )
-    } finally {
-      setIsSavingTenant(false)
-    }
-  }
-
-  const handleRemovePendingTenant = async (tenant: Tenant) => {
-    const confirmed = window.confirm(
-      `Remove "${tenant.name}" from HawkView? This only removes this pending setup record.`
-    )
-    if (!confirmed) return
-
-    setOnboardingError(null)
-    setDeletingTenantId(tenant.id)
-    try {
-      await apiClient.delete<{ removed: boolean; tenantId: string }>(
-        `/api/tenants/${tenant.id}`,
-        undefined
-      )
-      await queryClient.invalidateQueries({ queryKey: ['tenants'] })
-      setConsentMessage({
-        text: `${tenant.name} was removed from the pending tenant list.`,
-        tone: 'success',
-      })
-    } catch (deleteError) {
-      setOnboardingError(
-        deleteError instanceof Error
-          ? deleteError.message
-          : 'The pending tenant could not be removed.'
-      )
-    } finally {
-      setDeletingTenantId(null)
-    }
-  }
-
-  const handleRemoveActiveTenant = async (tenant: Tenant) => {
-    const confirmation = window.prompt(
-      `This permanently removes "${tenant.name}" from HawkView and deletes its stored customer credential.\n\nType the Microsoft tenant ID to continue:\n${tenant.microsoftTenantId}`
-    )
-    if (confirmation === null) return
-
-    if (
-      confirmation.trim().toLowerCase() !==
-      tenant.microsoftTenantId.toLowerCase()
-    ) {
-      setOnboardingError('The Microsoft tenant ID did not match.')
-      return
-    }
-
-    setOnboardingError(null)
-    setDeletingTenantId(tenant.id)
-    try {
-      await apiClient.delete<{
-        removed: boolean
-        tenantId: string
-        credentialRemoved: boolean
-      }>(`/api/tenants/${tenant.id}`, {
-        confirmMicrosoftTenantId: confirmation,
-      })
-      await queryClient.invalidateQueries({ queryKey: ['tenants'] })
-      setConsentMessage({
-        text: `${tenant.name} and its stored connection were removed from HawkView.`,
-        tone: 'success',
-      })
-    } catch (deleteError) {
-      setOnboardingError(
-        deleteError instanceof Error
-          ? deleteError.message
-          : 'The tenant could not be removed.'
-      )
-    } finally {
-      setDeletingTenantId(null)
-    }
-  }
-
   const [sortField, setSortField] = useState<SortField>('name')
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc')
 
@@ -836,12 +744,6 @@ export default function TenantsPage() {
       return sortOrder === 'asc' ? cmp : -cmp
     })
   }, [filteredTenants, sortField, sortOrder])
-
-  const tenantsAwaitingConsent = tenants.filter(
-    (tenant) =>
-      tenant.connectionStatus === 'pending-consent' ||
-      tenant.connectionStatus === 'error'
-  )
 
   const loadingText =
     elapsedSeconds < 15
@@ -1267,62 +1169,6 @@ export default function TenantsPage() {
         <Card className="rounded-2xl border-red-200 bg-red-50/80 dark:border-red-900 dark:bg-red-950/20">
           <CardContent className="p-4 text-sm font-medium text-red-800 dark:text-red-300">
             {onboardingError}
-          </CardContent>
-        </Card>
-      )}
-
-      {!loading && tenantsAwaitingConsent.length > 0 && !showOnboarding && (
-        <Card className="rounded-2xl border-amber-200 bg-amber-50/80 dark:border-amber-900 dark:bg-amber-950/20">
-          <CardContent className="space-y-4 p-5">
-            <div>
-              <h2 className="font-semibold text-slate-900 dark:text-white">
-                Microsoft authorization required
-              </h2>
-              <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-                These tenants are saved, but HawkView cannot synchronize them
-                until a Microsoft 365 administrator grants consent.
-              </p>
-            </div>
-            {tenantsAwaitingConsent.map((tenant) => (
-              <div
-                key={tenant.id}
-                className="flex flex-col gap-3 rounded-xl border border-amber-200 bg-white p-4 dark:border-amber-900 dark:bg-slate-900 md:flex-row md:items-center md:justify-between"
-              >
-                <div>
-                  <p className="font-semibold text-slate-900 dark:text-white">
-                    {tenant.name}
-                  </p>
-                  <p className="text-sm text-slate-500">
-                    {tenant.microsoftTenantId}
-                  </p>
-                  <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
-                    Missing: {tenant.missingPermissions.join(', ')}
-                  </p>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    type="button"
-                    className="rounded-xl"
-                    disabled={isSavingTenant || deletingTenantId === tenant.id}
-                    onClick={() => handleReviewConsent(tenant)}
-                  >
-                    Review and Authorize
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="rounded-xl border-red-200 text-red-700 hover:bg-red-50 hover:text-red-800"
-                    disabled={isSavingTenant || deletingTenantId === tenant.id}
-                    onClick={() => handleRemovePendingTenant(tenant)}
-                  >
-                    <Trash2 className="mr-2 h-4 w-4" />
-                    {deletingTenantId === tenant.id
-                      ? 'Removing...'
-                      : 'Remove pending tenant'}
-                  </Button>
-                </div>
-              </div>
-            ))}
           </CardContent>
         </Card>
       )}

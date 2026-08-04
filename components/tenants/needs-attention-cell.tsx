@@ -15,6 +15,7 @@ export function NeedsAttentionCell({ tenant }: { tenant: any }) {
       ...(tenant?.bundle ?? {}),
       connectionStatus: tenant?.connectionStatus,
       status: tenant?.status,
+      missingPermissions: tenant?.missingPermissions,
     })
   )
 
