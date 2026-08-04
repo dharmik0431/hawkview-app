@@ -42,25 +42,40 @@ export class AuthService {
   ) {}
 
   async bootstrap(identity: AuthenticatedIdentity) {
+    const normalizedEmail = identity.email.trim().toLowerCase()
+
     const user = await this.prisma.$transaction(async (transaction) => {
-      const existingBySubject = await transaction.user.findUnique({
-        where: { authProviderUserId: identity.subject },
-      })
+      const [existingBySubject, existingByEmail] = await Promise.all([
+        transaction.user.findUnique({
+          where: { authProviderUserId: identity.subject },
+        }),
+        transaction.user.findFirst({
+          where: {
+            email: {
+              equals: normalizedEmail,
+              mode: 'insensitive',
+            },
+          },
+        }),
+      ])
 
       if (existingBySubject) {
+        if (existingByEmail && existingByEmail.id !== existingBySubject.id) {
+          throw new ForbiddenException(
+            'This identity conflicts with another HawkView account.',
+          )
+        }
+
         return transaction.user.update({
           where: { id: existingBySubject.id },
           data: {
+            email: normalizedEmail,
             displayName:
               existingBySubject.displayName ?? identity.displayName,
           },
           select: userWithMemberships,
         })
       }
-
-      const existingByEmail = await transaction.user.findUnique({
-        where: { email: identity.email },
-      })
 
       if (existingByEmail) {
         // A verified Supabase email may relink the matching HawkView profile
@@ -69,6 +84,7 @@ export class AuthService {
           where: { id: existingByEmail.id },
           data: {
             authProviderUserId: identity.subject,
+            email: normalizedEmail,
             displayName:
               existingByEmail.displayName ?? identity.displayName,
           },
@@ -79,7 +95,7 @@ export class AuthService {
       return transaction.user.create({
         data: {
           authProviderUserId: identity.subject,
-          email: identity.email,
+          email: normalizedEmail,
           displayName: identity.displayName,
         },
         select: userWithMemberships,
