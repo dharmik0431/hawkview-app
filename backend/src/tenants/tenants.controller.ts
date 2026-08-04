@@ -64,6 +64,17 @@ export class TenantsController {
     )
   }
 
+  @Post(':id/verify-connection')
+  verifyConnection(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string
+  ) {
+    return this.tenantsService.verifyConnectionForIdentity(
+      request.auth,
+      customerTenantId
+    )
+  }
+
   @Post(':id/microsoft-consent')
   createMicrosoftConsentUrl(
     @Req() request: AuthenticatedRequest,

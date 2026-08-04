@@ -81,6 +81,25 @@ export function computeTenantAttention(bundle: any): AttentionItem[] {
   const items: AttentionItem[] = []
   if (!bundle) return items
 
+  const connectionStatus = String(
+    bundle?.connectionStatus ?? bundle?.tenant?.connectionStatus ?? ''
+  ).toLowerCase()
+  const tenantStatus = String(
+    bundle?.status ?? bundle?.tenant?.status ?? ''
+  ).toLowerCase()
+  if (
+    ['error', 'revoked', 'disconnected'].includes(connectionStatus) ||
+    ['suspended', 'disconnected'].includes(tenantStatus)
+  ) {
+    items.push({
+      key: 'microsoft_connection_lost',
+      label: 'Microsoft connection lost',
+      severity: 'critical',
+      why: 'HawkView can no longer verify or synchronize this Microsoft tenant.',
+      detectedAt: getDetectedAt(bundle),
+    })
+  }
+
   // ------------------------
   // Users (array or object map)
   // ------------------------

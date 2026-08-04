@@ -499,6 +499,7 @@ export class TenantSyncService {
         }),
       ])
     } catch (error) {
+      await this.markConnectionUnavailable(tenant, error)
       await this.prisma.syncState.update({
         where: {
           customerTenantId_resourceType: {
@@ -524,8 +525,9 @@ export class TenantSyncService {
       )
     }
 
-    const snapshotAccessToken =
-      await this.microsoftConsent.getTenantAccessToken({
+    let snapshotAccessToken: string
+    try {
+      snapshotAccessToken = await this.microsoftConsent.getTenantAccessToken({
         microsoftTenantId: tenant.microsoftTenantId,
         connectionMode:
           tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
@@ -534,6 +536,12 @@ export class TenantSyncService {
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
       })
+    } catch (error) {
+      await this.markConnectionUnavailable(tenant, error)
+      throw new BadGatewayException(
+        'HawkView could not access this Microsoft tenant. Reauthorize the connection or remove the tenant.'
+      )
+    }
     // Every secondary dataset is independent. A missing permission or timeout
     // in one Microsoft endpoint must not prevent the remaining datasets from
     // refreshing or recording their own diagnostic SyncState.
@@ -702,6 +710,39 @@ export class TenantSyncService {
       status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
       failedResources,
     }
+  }
+
+  private async markConnectionUnavailable(
+    tenant: { id: string; organizationId: string },
+    error: unknown
+  ) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : 'Microsoft tenant access failed.'
+    const failedAt = new Date()
+
+    await this.prisma.$transaction([
+      this.prisma.customerTenant.update({
+        where: { id: tenant.id },
+        data: { status: 'SUSPENDED' },
+      }),
+      this.prisma.tenantConnection.update({
+        where: {
+          customerTenantId_organizationId: {
+            customerTenantId: tenant.id,
+            organizationId: tenant.organizationId,
+          },
+        },
+        data: {
+          status: 'ERROR',
+          consentedPermissions: [],
+          lastVerifiedAt: failedAt,
+          lastErrorCode: 'microsoft-access-failed',
+          lastErrorMessage: message.slice(0, 2000),
+        },
+      }),
+    ])
   }
 
   private async runSnapshotSync(
