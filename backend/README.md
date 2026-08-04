@@ -24,8 +24,8 @@ npm run build
 npm start
 ```
 
-The API listens on port `8080` by default. Cloud Run can override it through
-the `PORT` environment variable.
+The API listens on port `8080` by default. The hosting platform can override it
+through the `PORT` environment variable.
 
 ## Health endpoints
 
@@ -37,29 +37,28 @@ GET /health/database
 `/health/database` checks the PostgreSQL connection and returns only a safe
 availability status. It never returns credentials or database details.
 
-## Development deployment
+## Deployment
 
-The development API is deployed separately from the Google AI Studio frontend:
+The API is deployed separately from the Google AI Studio frontend. The
+container is hosting-neutral and can run anywhere that supports Docker and a
+public HTTPS service.
 
 ```text
-Cloud Run service: hawkview-api-dev
-Cloud SQL instance: hawkview-db-dev
-Region: northamerica-northeast2
+Frontend -> HTTPS API -> Supabase PostgreSQL
 ```
 
-Cloud Run receives `DATABASE_URL` from Secret Manager and connects through the
-Cloud SQL integration. Database credentials are not included in the container
-image or committed to Git.
+The hosting environment must provide `DATABASE_URL`, `SUPABASE_URL`, and the
+other values documented in `.env.example`. Credentials are not included in the
+container image or committed to Git.
 
 ## Authentication
 
-Google Cloud Identity Platform verifies sign-ins. Passwordless-capable email
-authentication is enabled first; Google and Microsoft will be enabled after
-their provider and redirect settings are available. HawkView remains
-responsible for its own users, memberships, roles, and tenant authorization in
-PostgreSQL.
+Supabase Auth verifies sign-ins. Email authentication is enabled first; Google
+and Microsoft can be enabled through Supabase after their provider and redirect
+settings are configured. HawkView remains responsible for its own users,
+memberships, roles, and tenant authorization in PostgreSQL.
 
-Authenticated API requests must include an Identity Platform ID token:
+Authenticated API requests must include a Supabase access token:
 
 ```text
 Authorization: Bearer ID_TOKEN
@@ -73,13 +72,28 @@ sign-in, the frontend calls:
 POST /auth/bootstrap
 ```
 
-That endpoint safely links the verified Identity Platform user ID to the
-HawkView `User` record and returns the user's active MSP memberships. It never
+That endpoint safely links the verified Supabase user ID to the HawkView `User`
+record and returns the user's active MSP memberships. It never
 trusts an organization or role supplied by the browser.
 
 `FRONTEND_ORIGINS` is a comma-separated allowlist of frontend origins permitted
 to call the API from a browser. Add each deployed HawkView frontend URL
 explicitly; do not use a wildcard for the authenticated API.
+
+## Scheduled synchronization
+
+The portable scheduler calls:
+
+```text
+POST /api/internal/sync/due-tenants
+Authorization: Bearer SCHEDULER_SHARED_SECRET
+```
+
+Use a long random `SCHEDULER_SHARED_SECRET` stored only in the backend host and
+the scheduler's encrypted secret store. During the GCP-to-portable migration,
+the endpoint also accepts the existing Google Cloud Scheduler OIDC token when
+`SCHEDULER_OIDC_AUDIENCE` and `SCHEDULER_SERVICE_ACCOUNT_EMAIL` are configured.
+Remove those two Google settings after the replacement scheduler is verified.
 
 ## Microsoft tenant consent
 
