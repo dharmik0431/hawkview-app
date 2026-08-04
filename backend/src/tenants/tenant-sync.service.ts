@@ -183,6 +183,14 @@ interface GraphCollectionPage {
   '@odata.nextLink'?: string
 }
 
+interface GraphBatchResponse {
+  responses?: Array<{
+    id?: string
+    status?: number
+    body?: { value?: Array<Record<string, unknown>>; error?: unknown }
+  }>
+}
+
 function sanitizeGraphErrorField(value: unknown, maxLength: number) {
   if (typeof value !== 'string') return null
   const sanitized = value.replace(/[\r\n\t]+/g, ' ').trim()
@@ -646,18 +654,8 @@ export class TenantSyncService {
     }
 
     const entraModules: Array<Promise<unknown>> = [
-      this.syncEntraCollection(
-        tenant,
-        snapshotAccessToken,
-        'AUTH_REGISTRATIONS',
-        'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails'
-      ),
-      this.syncEntraCollection(
-        tenant,
-        snapshotAccessToken,
-        'AUTH_METHOD_POLICIES',
-        'https://graph.microsoft.com/v1.0/policies/authenticationMethodsPolicy/authenticationMethodConfigurations'
-      ),
+      this.syncAuthenticationRegistrations(tenant, snapshotAccessToken),
+      this.syncAuthenticationMethodPolicy(tenant, snapshotAccessToken),
       this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
@@ -1236,6 +1234,164 @@ export class TenantSyncService {
           observedAt: new Date(),
         },
       })
+    })
+  }
+
+  private async saveEntraSnapshot(
+    tenant: { id: string; organizationId: string },
+    resourceType: EntraSnapshotResource,
+    rows: unknown[]
+  ) {
+    await this.prisma.tenantEntraSnapshot.upsert({
+      where: {
+        customerTenantId_resourceType: {
+          customerTenantId: tenant.id,
+          resourceType,
+        },
+      },
+      create: {
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        resourceType,
+        payload: rows as never,
+        observedAt: new Date(),
+      },
+      update: {
+        payload: rows as never,
+        observedAt: new Date(),
+      },
+    })
+  }
+
+  private async syncAuthenticationRegistrations(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    try {
+      return await this.syncEntraCollection(
+        tenant,
+        accessToken,
+        'AUTH_REGISTRATIONS',
+        'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails'
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!message.includes('Authentication_RequestFromNonPremiumTenantOrB2CTenant')) {
+        throw error
+      }
+      this.logger.log(
+        `Tenant ${tenant.id} does not have premium MFA reporting; using the per-user authentication-method fallback.`
+      )
+      return this.syncPerUserAuthenticationMethods(tenant, accessToken)
+    }
+  }
+
+  private async syncPerUserAuthenticationMethods(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'AUTH_REGISTRATIONS', async () => {
+      const users = await this.prisma.directoryUser.findMany({
+        where: { customerTenantId: tenant.id, deletedAt: null },
+        select: { microsoftUserId: true, userPrincipalName: true },
+        orderBy: { microsoftUserId: 'asc' },
+      })
+      const registrations: Array<Record<string, unknown>> = []
+      const methodLabels: Record<string, string> = {
+        '#microsoft.graph.fido2AuthenticationMethod': 'FIDO2 security key or passkey',
+        '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod': 'Microsoft Authenticator',
+        '#microsoft.graph.phoneAuthenticationMethod': 'Phone',
+        '#microsoft.graph.softwareOathAuthenticationMethod': 'Software OATH token',
+        '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod': 'Windows Hello for Business',
+        '#microsoft.graph.temporaryAccessPassAuthenticationMethod': 'Temporary Access Pass',
+        '#microsoft.graph.platformCredentialAuthenticationMethod': 'Platform credential',
+        '#microsoft.graph.hardwareOathAuthenticationMethod': 'Hardware OATH token',
+      }
+
+      for (let offset = 0; offset < users.length; offset += 20) {
+        const batchUsers = users.slice(offset, offset + 20)
+        const response = await fetch('https://graph.microsoft.com/v1.0/$batch', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            requests: batchUsers.map((user, index) => ({
+              id: String(index + 1),
+              method: 'GET',
+              url: `/users/${encodeURIComponent(user.microsoftUserId)}/authentication/methods`,
+            })),
+          }),
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!response.ok) {
+          const graphError = await describeGraphError(response)
+          throw new Error(
+            `Microsoft per-user authentication-method synchronization returned ${response.status}${graphError}.`
+          )
+        }
+        const batch = (await response.json()) as GraphBatchResponse
+        const responsesById = new Map(
+          (batch.responses ?? []).map((item) => [item.id, item])
+        )
+        batchUsers.forEach((user, index) => {
+          const item = responsesById.get(String(index + 1))
+          if (item?.status !== 200) {
+            throw new Error(
+              `Microsoft per-user authentication-method synchronization returned ${item?.status ?? 'an invalid response'}. Confirm UserAuthenticationMethod.Read.All application permission.`
+            )
+          }
+          const methods = (item.body?.value ?? [])
+            .map((method) => method['@odata.type'])
+            .filter((type): type is string => typeof type === 'string')
+          const registeredMfaMethods = [...new Set(
+            methods.map((type) => methodLabels[type]).filter(Boolean)
+          )]
+          registrations.push({
+            id: user.microsoftUserId,
+            userPrincipalName: user.userPrincipalName,
+            isMfaRegistered: registeredMfaMethods.length > 0,
+            isMfaCapable: registeredMfaMethods.length > 0,
+            methodsRegistered: registeredMfaMethods,
+            collectionSource: 'per-user-authentication-methods',
+          })
+        })
+      }
+      await this.saveEntraSnapshot(tenant, 'AUTH_REGISTRATIONS', registrations)
+    })
+  }
+
+  private async syncAuthenticationMethodPolicy(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'AUTH_METHOD_POLICIES', async () => {
+      const response = await fetch(
+        'https://graph.microsoft.com/v1.0/policies/authenticationMethodsPolicy',
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(30_000),
+        }
+      )
+      if (!response.ok) {
+        const graphError = await describeGraphError(response)
+        throw new Error(
+          `Microsoft authentication-method policy synchronization returned ${response.status}${graphError}.`
+        )
+      }
+      const policy = (await response.json()) as {
+        authenticationMethodConfigurations?: unknown[]
+      }
+      await this.saveEntraSnapshot(
+        tenant,
+        'AUTH_METHOD_POLICIES',
+        policy.authenticationMethodConfigurations ?? []
+      )
     })
   }
 
