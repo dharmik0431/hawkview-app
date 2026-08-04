@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 
@@ -105,12 +105,14 @@ function UserSortHeader({
   activeField,
   sortOrder,
   onSort,
+  className,
 }: {
   field: UserSortField
   label: string
   activeField: UserSortField
   sortOrder: UserSortOrder
   onSort: (field: UserSortField) => void
+  className?: string
 }) {
   const isActive = activeField === field
   const ariaSort = isActive
@@ -123,13 +125,16 @@ function UserSortHeader({
     <th
       scope="col"
       aria-sort={ariaSort}
-      className="text-left px-6 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider select-none"
+      className={cn(
+        'text-left px-4 py-3 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider select-none',
+        className
+      )}
     >
       <button
         type="button"
         onClick={() => onSort(field)}
         className={cn(
-          'inline-flex items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded px-1 -mx-1 py-0.5 transition-colors hover:text-foreground cursor-pointer',
+          'inline-flex items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded px-1 -mx-1 py-0.5 transition-colors hover:text-slate-900 dark:hover:text-slate-100 cursor-pointer',
           isActive && 'text-blue-600 dark:text-blue-400 font-bold'
         )}
       >
@@ -162,7 +167,8 @@ type TenantUser = {
   name: string
   email: string
   type: 'Member' | 'Guest'
-  role: 'Global Administrator' | 'User' | 'External Auditor' | 'Service Account'
+  role: string
+  roles?: string[]
   status: 'Enabled' | 'Disabled'
   mfa: 'Enforced' | 'Enabled' | 'Disabled' | 'Unknown'
   lastLogin: string
@@ -172,6 +178,119 @@ type TenantUser = {
   licenses: string[]
   groups: string[]
   devices: { name: string; os: string; lastSync: string; status: string }[]
+}
+
+function getUserRoles(u: { role?: string; roles?: string[] }): string[] {
+  if (Array.isArray(u.roles) && u.roles.length > 0) {
+    const cleaned = u.roles
+      .map((r) => (typeof r === 'string' ? r.trim() : ''))
+      .filter(Boolean)
+    if (cleaned.length > 0) return cleaned
+  }
+  if (u.role && typeof u.role === 'string') {
+    const r = u.role.trim()
+    if (
+      !r ||
+      r.toLowerCase() === 'user' ||
+      r.toLowerCase() === 'none' ||
+      r.toLowerCase() === 'unknown' ||
+      r.toLowerCase() === 'not synchronized'
+    ) {
+      return []
+    }
+    if (r.includes(',') || r.includes(';')) {
+      const parts = r
+        .split(/[,;]+/)
+        .map((p) => p.trim())
+        .filter(Boolean)
+      if (parts.length > 0) return parts
+    }
+    return [r]
+  }
+  return []
+}
+
+function UserRolesPopover({
+  user,
+  roles,
+  triggerId,
+  onClose,
+}: {
+  user: TenantUser
+  roles: string[]
+  triggerId: string
+  onClose: () => void
+}) {
+  const popoverRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const handlePointerDown = (e: MouseEvent | TouchEvent) => {
+      if (
+        popoverRef.current &&
+        !popoverRef.current.contains(e.target as Node)
+      ) {
+        onClose()
+      }
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose()
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [onClose])
+
+  return (
+    <div
+      ref={popoverRef}
+      role="dialog"
+      aria-modal="false"
+      aria-labelledby={`${triggerId}-title`}
+      onClick={(e) => e.stopPropagation()}
+      className="absolute top-full left-0 mt-1.5 w-64 p-3 bg-white dark:bg-slate-900 rounded-xl shadow-xl border border-slate-200 dark:border-slate-800 z-50 text-xs text-slate-900 dark:text-slate-100 animate-in fade-in-0 zoom-in-95"
+    >
+      <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <Shield className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+          <span
+            id={`${triggerId}-title`}
+            className="font-semibold text-slate-900 dark:text-white truncate"
+          >
+            Assigned Roles ({roles.length})
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            onClose()
+          }}
+          className="p-1 rounded-md text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+          aria-label="Close roles popover"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      <div className="mt-2.5 space-y-1.5 max-h-48 overflow-y-auto pr-0.5 no-scrollbar">
+        {roles.map((role, idx) => (
+          <div
+            key={idx}
+            className="flex items-center gap-2 py-1.5 px-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/60 text-slate-800 dark:text-slate-200 text-xs font-medium border border-slate-100 dark:border-slate-800/80"
+          >
+            <span className="h-1.5 w-1.5 rounded-full bg-blue-500 shrink-0" />
+            <span className="truncate">{role}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 // =====================
@@ -357,6 +476,20 @@ type Mailbox = {
     sendOnBehalf?: string[]
   }
   lastLogon?: string
+}
+
+function mailboxStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter(
+        (item): item is string => typeof item === 'string' && item.length > 0
+      )
+    : []
+}
+
+function mailboxNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(parsed) ? parsed : null
 }
 
 type MailRule = {
@@ -1199,6 +1332,9 @@ export default function TenantDetailsPage() {
   const [userStatusFilter, setUserStatusFilter] =
     useState<UserStatusFilter>('all')
   const [userMfaFilter, setUserMfaFilter] = useState<UserMfaFilter>('all')
+  const [openRolePopoverUserId, setOpenRolePopoverUserId] = useState<
+    string | null
+  >(null)
 
   const handleUserSort = (field: UserSortField) => {
     if (userSortField === field) {
@@ -1269,6 +1405,7 @@ export default function TenantDetailsPage() {
     setUserRoleFilter('all')
     setUserStatusFilter('all')
     setUserMfaFilter('all')
+    setOpenRolePopoverUserId(null)
     setEntraTab('overview')
     setSection('home')
     setSelectedMailbox(null)
@@ -1286,13 +1423,24 @@ export default function TenantDetailsPage() {
       }
 
       if (userRoleFilter === 'admin') {
-        if (!u.role || !u.role.toLowerCase().includes('admin')) return false
+        const roles = getUserRoles(u)
+        const isOldAdmin = Boolean(
+          u.role && u.role.toLowerCase().includes('admin')
+        )
+        if (roles.length === 0 && !isOldAdmin) return false
       } else if (userRoleFilter === 'user') {
-        if (u.role !== 'User') return false
-      } else if (userRoleFilter === 'unknown') {
+        const roles = getUserRoles(u)
         if (
-          u.role &&
-          (u.role === 'User' || u.role.toLowerCase().includes('admin'))
+          roles.length > 0 ||
+          (u.role && u.role.toLowerCase().includes('admin'))
+        )
+          return false
+      } else if (userRoleFilter === 'unknown') {
+        const roles = getUserRoles(u)
+        if (
+          roles.length > 0 ||
+          u.role === 'User' ||
+          (u.role && u.role.toLowerCase().includes('admin'))
         )
           return false
       }
@@ -1364,18 +1512,26 @@ export default function TenantDetailsPage() {
         }
 
         case 'role': {
-          const missingA = isUnknownOrMissing(a.role)
-          const missingB = isUnknownOrMissing(b.role)
+          const rolesA = getUserRoles(a)
+          const rolesB = getUserRoles(b)
+          const roleNameA = rolesA.length > 0 ? rolesA[0] : a.role || 'User'
+          const roleNameB = rolesB.length > 0 ? rolesB[0] : b.role || 'User'
+          const missingA = isUnknownOrMissing(a.role) && rolesA.length === 0
+          const missingB = isUnknownOrMissing(b.role) && rolesB.length === 0
           if (missingA && missingB) cmp = 0
           else if (missingA) return 1
           else if (missingB) return -1
           else {
-            const isAdminA = a.role.toLowerCase().includes('admin')
-            const isAdminB = b.role.toLowerCase().includes('admin')
+            const isAdminA =
+              rolesA.length > 0 ||
+              (a.role && a.role.toLowerCase().includes('admin'))
+            const isAdminB =
+              rolesB.length > 0 ||
+              (b.role && b.role.toLowerCase().includes('admin'))
             if (isAdminA && !isAdminB) cmp = -1
             else if (!isAdminA && isAdminB) cmp = 1
             else {
-              cmp = a.role.localeCompare(b.role, undefined, {
+              cmp = roleNameA.localeCompare(roleNameB, undefined, {
                 sensitivity: 'base',
               })
             }
@@ -3427,46 +3583,70 @@ export default function TenantDetailsPage() {
           return (
             <div className="mt-6">
               <div className="border-b border-slate-200 dark:border-slate-800">
-                <div className="flex items-center gap-6 overflow-x-auto no-scrollbar text-xs font-medium h-10">
+                <div
+                  role="tablist"
+                  aria-label="Entra ID navigation"
+                  className="flex items-center gap-6 overflow-x-auto no-scrollbar text-xs font-medium h-10 flex-nowrap"
+                >
                   <button
+                    type="button"
+                    role="tab"
+                    id="entra-tab-overview"
+                    aria-selected={entraTab === 'overview'}
+                    aria-controls="entra-tabpanel-overview"
                     onClick={() => handleNavigateEntraTab('overview')}
-                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap ${
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
                       entraTab === 'overview'
                         ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
-                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
                     }`}
                   >
                     <Layers className="h-4 w-4 shrink-0" />
                     <span>Overview</span>
                   </button>
                   <button
+                    type="button"
+                    role="tab"
+                    id="entra-tab-identity"
+                    aria-selected={entraTab === 'identity'}
+                    aria-controls="entra-tabpanel-identity"
                     onClick={() => handleNavigateEntraTab('identity')}
-                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap ${
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
                       entraTab === 'identity'
                         ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
-                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
                     }`}
                   >
                     <User className="h-4 w-4 shrink-0" />
                     <span>Identity</span>
                   </button>
                   <button
+                    type="button"
+                    role="tab"
+                    id="entra-tab-security"
+                    aria-selected={entraTab === 'security'}
+                    aria-controls="entra-tabpanel-security"
                     onClick={() => handleNavigateEntraTab('security')}
-                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap ${
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
                       entraTab === 'security'
                         ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
-                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
                     }`}
                   >
                     <Shield className="h-4 w-4 shrink-0" />
                     <span>Security</span>
                   </button>
                   <button
+                    type="button"
+                    role="tab"
+                    id="entra-tab-licenses"
+                    aria-selected={entraTab === 'licenses'}
+                    aria-controls="entra-tabpanel-licenses"
                     onClick={() => handleNavigateEntraTab('licenses')}
-                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap ${
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
                       entraTab === 'licenses'
                         ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
-                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
                     }`}
                   >
                     <Activity className="h-4 w-4 shrink-0" />
@@ -3476,351 +3656,478 @@ export default function TenantDetailsPage() {
               </div>
 
               {entraTab === 'overview' && (
-                <EntraOverviewSection
-                  tenant={tenant}
-                  bundle={bundle}
-                  users={USERS}
-                  signIns={SIGNINS}
-                  caPolicies={displayedCaPolicies as any}
-                  authMethods={displayedAuthMethods as any}
-                  namedLocations={displayedNamedLocations as any}
-                  onNavigateTab={(tab, secView) =>
-                    handleNavigateEntraTab(tab, secView)
-                  }
-                />
+                <div
+                  role="tabpanel"
+                  id="entra-tabpanel-overview"
+                  aria-labelledby="entra-tab-overview"
+                >
+                  <EntraOverviewSection
+                    tenant={tenant}
+                    bundle={bundle}
+                    users={USERS as any}
+                    signIns={SIGNINS}
+                    caPolicies={displayedCaPolicies as any}
+                    authMethods={displayedAuthMethods as any}
+                    namedLocations={displayedNamedLocations as any}
+                    onNavigateTab={(tab, secView) =>
+                      handleNavigateEntraTab(tab, secView)
+                    }
+                  />
+                </div>
               )}
 
               {entraTab === 'identity' && (
-                <Card className="rounded-2xl mt-5 shadow-sm border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
-                  <CardContent className="p-0">
-                    <div className="p-5 border-b border-slate-200 dark:border-slate-800 space-y-4">
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                        <div>
-                          <div className="text-lg font-semibold text-slate-900 dark:text-white">
-                            Users
+                <div
+                  role="tabpanel"
+                  id="entra-tabpanel-identity"
+                  aria-labelledby="entra-tab-identity"
+                >
+                  <Card className="rounded-2xl mt-5 shadow-sm border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
+                    <CardContent className="p-0">
+                      <div className="p-5 border-b border-slate-200 dark:border-slate-800 space-y-4">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                          <div>
+                            <div className="text-lg font-semibold text-slate-900 dark:text-white">
+                              Users
+                            </div>
+                            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                              Showing {sortedUsers.length} of {USERS.length}{' '}
+                              user
+                              {USERS.length === 1 ? '' : 's'}
+                            </p>
                           </div>
-                          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                            Showing {sortedUsers.length} of {USERS.length} user
-                            {USERS.length === 1 ? '' : 's'}
-                          </p>
+
+                          <div className="relative w-full sm:w-[260px]">
+                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                            <Input
+                              value={userSearch}
+                              onChange={(e) => setUserSearch(e.target.value)}
+                              placeholder="Search users..."
+                              className="pl-9 h-9 text-xs"
+                            />
+                          </div>
                         </div>
 
-                        <div className="relative w-full sm:w-[260px]">
-                          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
-                          <Input
-                            value={userSearch}
-                            onChange={(e) => setUserSearch(e.target.value)}
-                            placeholder="Search users..."
-                            className="pl-9 h-9 text-xs"
-                          />
+                        {/* Compact Filters Bar */}
+                        <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-slate-500 dark:text-slate-400 font-medium">
+                              Role:
+                            </span>
+                            <select
+                              value={userRoleFilter}
+                              onChange={(e) =>
+                                setUserRoleFilter(
+                                  e.target.value as UserRoleFilter
+                                )
+                              }
+                              className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+                            >
+                              <option value="all">All roles</option>
+                              <option value="admin">Administrators</option>
+                              <option value="user">Users</option>
+                              <option value="unknown">Unknown</option>
+                            </select>
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-slate-500 dark:text-slate-400 font-medium">
+                              Status:
+                            </span>
+                            <select
+                              value={userStatusFilter}
+                              onChange={(e) =>
+                                setUserStatusFilter(
+                                  e.target.value as UserStatusFilter
+                                )
+                              }
+                              className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+                            >
+                              <option value="all">All statuses</option>
+                              <option value="enabled">Enabled</option>
+                              <option value="disabled">Disabled</option>
+                              <option value="unknown">Unknown</option>
+                            </select>
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-slate-500 dark:text-slate-400 font-medium">
+                              MFA:
+                            </span>
+                            <select
+                              value={userMfaFilter}
+                              onChange={(e) =>
+                                setUserMfaFilter(
+                                  e.target.value as UserMfaFilter
+                                )
+                              }
+                              className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
+                            >
+                              <option value="all">All MFA states</option>
+                              <option value="enabled">Enabled</option>
+                              <option value="disabled">Disabled</option>
+                              <option value="not-synchronized">
+                                Not synchronized
+                              </option>
+                            </select>
+                          </div>
+
+                          {isUserFilterActive && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={handleClearUserFilters}
+                              className="h-8 px-2 text-xs text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white gap-1"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                              Clear filters
+                            </Button>
+                          )}
                         </div>
                       </div>
 
-                      {/* Compact Filters Bar */}
-                      <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-slate-500 dark:text-slate-400 font-medium">
-                            Role:
-                          </span>
-                          <select
-                            value={userRoleFilter}
-                            onChange={(e) =>
-                              setUserRoleFilter(
-                                e.target.value as UserRoleFilter
-                              )
-                            }
-                            className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
-                          >
-                            <option value="all">All roles</option>
-                            <option value="admin">Administrators</option>
-                            <option value="user">Users</option>
-                            <option value="unknown">Unknown</option>
-                          </select>
-                        </div>
+                      <div className="overflow-x-auto no-scrollbar">
+                        <table className="w-full text-sm border-collapse">
+                          <thead className="bg-slate-50/80 dark:bg-slate-800/50 border-b border-slate-200 dark:border-slate-800">
+                            <tr>
+                              <UserSortHeader
+                                field="name"
+                                label="Name"
+                                activeField={userSortField}
+                                sortOrder={userSortOrder}
+                                onSort={handleUserSort}
+                                className="min-w-[180px]"
+                              />
+                              <UserSortHeader
+                                field="type"
+                                label="Type"
+                                activeField={userSortField}
+                                sortOrder={userSortOrder}
+                                onSort={handleUserSort}
+                                className="hidden md:table-cell min-w-[90px]"
+                              />
+                              <UserSortHeader
+                                field="role"
+                                label="Role"
+                                activeField={userSortField}
+                                sortOrder={userSortOrder}
+                                onSort={handleUserSort}
+                                className="min-w-[150px]"
+                              />
+                              <UserSortHeader
+                                field="status"
+                                label="Status"
+                                activeField={userSortField}
+                                sortOrder={userSortOrder}
+                                onSort={handleUserSort}
+                                className="pr-8 min-w-[140px]"
+                              />
+                              <UserSortHeader
+                                field="mfa"
+                                label="MFA"
+                                activeField={userSortField}
+                                sortOrder={userSortOrder}
+                                onSort={handleUserSort}
+                                className="hidden md:table-cell pl-8 min-w-[160px]"
+                              />
+                              <th
+                                scope="col"
+                                className="px-4 py-3 text-right w-[48px] min-w-[48px]"
+                              />
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                            {sortedUsers.map((u) => {
+                              const isTypeUnknown =
+                                !u.type || u.type.toLowerCase() === 'unknown'
+                              const isRoleUnknown =
+                                !u.role || u.role.toLowerCase() === 'unknown'
+                              const isMfaUnknown =
+                                !u.mfa ||
+                                (u.mfa as string) === 'Unknown' ||
+                                (u.mfa as string) === 'Not synchronized'
 
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-slate-500 dark:text-slate-400 font-medium">
-                            Status:
-                          </span>
-                          <select
-                            value={userStatusFilter}
-                            onChange={(e) =>
-                              setUserStatusFilter(
-                                e.target.value as UserStatusFilter
-                              )
-                            }
-                            className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
-                          >
-                            <option value="all">All statuses</option>
-                            <option value="enabled">Enabled</option>
-                            <option value="disabled">Disabled</option>
-                            <option value="unknown">Unknown</option>
-                          </select>
-                        </div>
+                              const userRoles = getUserRoles(u)
+                              const firstRole =
+                                userRoles.length > 0 ? userRoles[0] : null
+                              const extraRoleCount = userRoles.length - 1
+                              const isPopoverOpen =
+                                openRolePopoverUserId === u.id
 
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-slate-500 dark:text-slate-400 font-medium">
-                            MFA:
-                          </span>
-                          <select
-                            value={userMfaFilter}
-                            onChange={(e) =>
-                              setUserMfaFilter(e.target.value as UserMfaFilter)
-                            }
-                            className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
-                          >
-                            <option value="all">All MFA states</option>
-                            <option value="enabled">Enabled</option>
-                            <option value="disabled">Disabled</option>
-                            <option value="not-synchronized">
-                              Not synchronized
-                            </option>
-                          </select>
-                        </div>
-
-                        {isUserFilterActive && (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onClick={handleClearUserFilters}
-                            className="h-8 px-2 text-xs text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white gap-1"
-                          >
-                            <X className="h-3.5 w-3.5" />
-                            Clear filters
-                          </Button>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead className="bg-slate-50/80 dark:bg-slate-800/50 border-b border-slate-200 dark:border-slate-800">
-                          <tr>
-                            <UserSortHeader
-                              field="name"
-                              label="Name"
-                              activeField={userSortField}
-                              sortOrder={userSortOrder}
-                              onSort={handleUserSort}
-                            />
-                            <UserSortHeader
-                              field="type"
-                              label="Type"
-                              activeField={userSortField}
-                              sortOrder={userSortOrder}
-                              onSort={handleUserSort}
-                            />
-                            <UserSortHeader
-                              field="role"
-                              label="Role"
-                              activeField={userSortField}
-                              sortOrder={userSortOrder}
-                              onSort={handleUserSort}
-                            />
-                            <UserSortHeader
-                              field="status"
-                              label="Status"
-                              activeField={userSortField}
-                              sortOrder={userSortOrder}
-                              onSort={handleUserSort}
-                            />
-                            <UserSortHeader
-                              field="mfa"
-                              label="MFA"
-                              activeField={userSortField}
-                              sortOrder={userSortOrder}
-                              onSort={handleUserSort}
-                            />
-                            <th scope="col" className="px-6 py-3" />
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                          {sortedUsers.map((u) => {
-                            const isTypeUnknown =
-                              !u.type || u.type.toLowerCase() === 'unknown'
-                            const isRoleUnknown =
-                              !u.role || u.role.toLowerCase() === 'unknown'
-                            const isMfaUnknown =
-                              !u.mfa ||
-                              (u.mfa as string) === 'Unknown' ||
-                              (u.mfa as string) === 'Not synchronized'
-
-                            return (
-                              <tr
-                                key={u.id}
-                                className="border-b border-slate-100 dark:border-slate-800/60 cursor-pointer hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors group"
-                                onClick={() => setSelectedUser(u)}
-                              >
-                                <td className="px-6 py-4">
-                                  <div className="flex items-center gap-3">
-                                    <div className="h-9 w-9 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 flex items-center justify-center text-xs font-bold shrink-0">
-                                      {u.name
-                                        ? u.name
-                                            .split(' ')
-                                            .map((p) => p[0])
-                                            .slice(0, 2)
-                                            .join('')
-                                        : 'U'}
-                                    </div>
-                                    <div className="min-w-0">
-                                      <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
-                                        {u.name || 'Not synchronized'}
+                              return (
+                                <tr
+                                  key={u.id}
+                                  className="border-b border-slate-100 dark:border-slate-800/60 cursor-pointer hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors group"
+                                  onClick={() => setSelectedUser(u)}
+                                >
+                                  <td className="px-4 py-3.5">
+                                    <div className="flex items-center gap-3 min-w-0">
+                                      <div className="h-8 w-8 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 flex items-center justify-center text-xs font-bold shrink-0 border border-slate-200/60 dark:border-slate-700/60">
+                                        {u.name
+                                          ? u.name
+                                              .split(' ')
+                                              .map((p) => p[0])
+                                              .slice(0, 2)
+                                              .join('')
+                                          : 'U'}
                                       </div>
-                                      <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                                        {u.email || 'Not synchronized'}
+                                      <div className="min-w-0 flex-1">
+                                        <div className="font-semibold text-slate-900 dark:text-slate-100 truncate text-xs sm:text-sm">
+                                          {u.name || 'Not synchronized'}
+                                        </div>
+                                        <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                                          {u.email || 'Not synchronized'}
+                                        </div>
                                       </div>
                                     </div>
-                                  </div>
-                                </td>
-                                <td className="px-6 py-4 text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                                  {isTypeUnknown ? (
-                                    <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                      Not synchronized
-                                    </span>
-                                  ) : (
-                                    u.type
-                                  )}
-                                </td>
-                                <td className="px-6 py-4 text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                                  {isRoleUnknown ? (
-                                    <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                      Not synchronized
-                                    </span>
-                                  ) : (
-                                    u.role
-                                  )}
-                                </td>
-                                <td className="px-6 py-4 whitespace-nowrap">
-                                  {u.status === 'Enabled' ? (
-                                    <Badge className="bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-800/60 font-medium text-xs">
-                                      Enabled
-                                    </Badge>
-                                  ) : u.status === 'Disabled' ? (
-                                    <Badge className="bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 font-medium text-xs">
-                                      Disabled
-                                    </Badge>
-                                  ) : (
-                                    <Badge className="bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-800/60 font-medium text-xs">
-                                      Not synchronized
-                                    </Badge>
-                                  )}
-                                </td>
-                                <td className="px-6 py-4 text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                                  {isMfaUnknown ? (
-                                    <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                      Not synchronized
-                                    </span>
-                                  ) : (
-                                    u.mfa
-                                  )}
-                                </td>
-                                <td className="px-6 py-4 text-right whitespace-nowrap">
-                                  <ChevronRight className="h-4 w-4 inline-block text-slate-400 opacity-60 group-hover:opacity-100 transition-opacity" />
+                                  </td>
+                                  <td className="px-4 py-3.5 text-slate-600 dark:text-slate-300 whitespace-nowrap hidden md:table-cell text-xs sm:text-sm">
+                                    {isTypeUnknown ? (
+                                      <span className="text-slate-400 dark:text-slate-500 italic text-xs">
+                                        Not synchronized
+                                      </span>
+                                    ) : (
+                                      u.type
+                                    )}
+                                  </td>
+                                  <td className="px-4 py-3.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300 relative">
+                                    {isRoleUnknown ? (
+                                      <span className="text-slate-400 dark:text-slate-500 italic text-xs">
+                                        Not synchronized
+                                      </span>
+                                    ) : userRoles.length === 0 ? (
+                                      <span className="text-slate-600 dark:text-slate-300 font-normal">
+                                        User
+                                      </span>
+                                    ) : userRoles.length === 1 ? (
+                                      <span
+                                        className="text-slate-700 dark:text-slate-200 truncate block font-medium"
+                                        title={userRoles[0]}
+                                      >
+                                        {userRoles[0]}
+                                      </span>
+                                    ) : (
+                                      <div className="relative inline-flex items-center gap-1.5 max-w-full">
+                                        <span
+                                          className="text-slate-700 dark:text-slate-200 truncate font-medium min-w-0"
+                                          title={firstRole!}
+                                        >
+                                          {firstRole}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          id={`user-roles-trigger-${u.id}`}
+                                          aria-label={`View all ${userRoles.length} roles for ${u.name || u.email || 'user'}`}
+                                          aria-expanded={isPopoverOpen}
+                                          aria-haspopup="dialog"
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            setOpenRolePopoverUserId(
+                                              isPopoverOpen ? null : u.id
+                                            )
+                                          }}
+                                          onKeyDown={(e) => {
+                                            if (
+                                              e.key === 'Enter' ||
+                                              e.key === ' '
+                                            ) {
+                                              e.stopPropagation()
+                                            }
+                                          }}
+                                          className="inline-flex items-center justify-center px-1.5 py-0.5 text-[11px] font-medium rounded-md bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 transition-colors shrink-0 border border-slate-200 dark:border-slate-700/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 cursor-pointer"
+                                        >
+                                          +{extraRoleCount} more
+                                        </button>
+
+                                        {isPopoverOpen && (
+                                          <UserRolesPopover
+                                            user={u}
+                                            roles={userRoles}
+                                            triggerId={`user-roles-trigger-${u.id}`}
+                                            onClose={() =>
+                                              setOpenRolePopoverUserId(null)
+                                            }
+                                          />
+                                        )}
+                                      </div>
+                                    )}
+                                  </td>
+                                  <td className="px-4 pr-8 py-3.5 whitespace-nowrap min-w-[140px]">
+                                    {u.status === 'Enabled' ? (
+                                      <Badge className="bg-emerald-50 text-emerald-700 border border-emerald-200/80 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-800/60 font-medium text-xs">
+                                        Enabled
+                                      </Badge>
+                                    ) : u.status === 'Disabled' ? (
+                                      <Badge className="bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 font-medium text-xs">
+                                        Disabled
+                                      </Badge>
+                                    ) : (
+                                      <Badge className="bg-amber-50 text-amber-700 border border-amber-200/80 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-800/60 font-medium text-xs">
+                                        Not synchronized
+                                      </Badge>
+                                    )}
+                                  </td>
+                                  <td className="px-4 pl-8 py-3.5 text-slate-600 dark:text-slate-300 whitespace-nowrap hidden md:table-cell text-xs sm:text-sm min-w-[160px]">
+                                    {isMfaUnknown ? (
+                                      <span className="text-slate-400 dark:text-slate-500 italic text-xs">
+                                        Not synchronized
+                                      </span>
+                                    ) : (
+                                      u.mfa
+                                    )}
+                                  </td>
+                                  <td className="px-4 py-3.5 text-right whitespace-nowrap w-[48px]">
+                                    <ChevronRight className="h-4 w-4 inline-block text-slate-400 opacity-60 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all" />
+                                  </td>
+                                </tr>
+                              )
+                            })}
+
+                            {USERS.length === 0 && (
+                              <tr>
+                                <td
+                                  colSpan={6}
+                                  className="px-6 py-12 text-center text-slate-500 dark:text-slate-400"
+                                >
+                                  No users found.
                                 </td>
                               </tr>
-                            )
-                          })}
+                            )}
 
-                          {USERS.length === 0 && (
-                            <tr>
-                              <td
-                                colSpan={6}
-                                className="px-6 py-12 text-center text-slate-500 dark:text-slate-400"
-                              >
-                                No users found.
-                              </td>
-                            </tr>
-                          )}
-
-                          {USERS.length > 0 && sortedUsers.length === 0 && (
-                            <tr>
-                              <td
-                                colSpan={6}
-                                className="px-6 py-12 text-center"
-                              >
-                                <div className="py-2 space-y-2">
-                                  <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
-                                    No users match the selected filters.
-                                  </p>
-                                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                                    Try adjusting your search query or filter
-                                    options.
-                                  </p>
-                                  {isUserFilterActive && (
-                                    <Button
-                                      type="button"
-                                      variant="outline"
-                                      size="sm"
-                                      onClick={handleClearUserFilters}
-                                      className="mt-2 text-xs"
-                                    >
-                                      Clear filters
-                                    </Button>
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  </CardContent>
-                </Card>
+                            {USERS.length > 0 && sortedUsers.length === 0 && (
+                              <tr>
+                                <td
+                                  colSpan={6}
+                                  className="px-6 py-12 text-center"
+                                >
+                                  <div className="py-2 space-y-2">
+                                    <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                                      No users match the selected filters.
+                                    </p>
+                                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                                      Try adjusting your search query or filter
+                                      options.
+                                    </p>
+                                    {isUserFilterActive && (
+                                      <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={handleClearUserFilters}
+                                        className="mt-2 text-xs"
+                                      >
+                                        Clear filters
+                                      </Button>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
               )}
 
               {entraTab === 'security' && (
-                <div className="mt-5 space-y-4">
-                  {/* Secondary Underline-Style Tab Bar */}
-                  <div className="border-b border-slate-200 dark:border-slate-800">
-                    <nav className="flex items-center gap-6 overflow-x-auto no-scrollbar text-xs font-medium h-9">
+                <div
+                  role="tabpanel"
+                  id="entra-tabpanel-security"
+                  aria-labelledby="entra-tab-security"
+                  className="mt-5 space-y-4"
+                >
+                  {/* Secondary Subsection Navigation Rail */}
+                  <div className="pt-1 pb-1">
+                    <nav
+                      role="tablist"
+                      aria-label="Security section navigation"
+                      className="inline-flex items-center gap-1 p-1 bg-slate-100/90 dark:bg-slate-800/70 rounded-lg border border-slate-200/70 dark:border-slate-800/80 max-w-full overflow-x-auto no-scrollbar flex-nowrap"
+                    >
                       {[
                         { id: 'policies', label: 'Policies' },
                         { id: 'sign-ins', label: 'Sign-in Activity' },
                         { id: 'auth', label: 'Authentication' },
                         { id: 'locations', label: 'Named Locations' },
-                      ].map((tab) => (
-                        <button
-                          key={tab.id}
-                          onClick={() =>
-                            handleSecurityViewChange(tab.id as any)
-                          }
-                          className={`h-full border-b-2 px-0.5 transition-colors whitespace-nowrap text-xs font-medium ${
-                            securityView === tab.id
-                              ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
-                              : 'border-transparent text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
-                          }`}
-                        >
-                          {tab.label}
-                        </button>
-                      ))}
+                      ].map((tab) => {
+                        const isActive = securityView === tab.id
+                        return (
+                          <button
+                            key={tab.id}
+                            type="button"
+                            role="tab"
+                            id={`security-tab-${tab.id}`}
+                            aria-selected={isActive}
+                            aria-controls={`security-tabpanel-${tab.id}`}
+                            onClick={(e) => {
+                              handleSecurityViewChange(tab.id as any)
+                              e.currentTarget.scrollIntoView({
+                                behavior: 'smooth',
+                                block: 'nearest',
+                                inline: 'nearest',
+                              })
+                            }}
+                            className={`px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 dark:focus-visible:ring-offset-slate-900 ${
+                              isActive
+                                ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 font-medium shadow-2xs border border-slate-200/80 dark:border-slate-600/50'
+                                : 'bg-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 hover:bg-slate-200/50 dark:hover:bg-slate-700/40 border border-transparent'
+                            }`}
+                          >
+                            {tab.label}
+                          </button>
+                        )
+                      })}
                     </nav>
                   </div>
 
                   {/* Secondary Views */}
                   {securityView === 'policies' && (
-                    <EntraSection
-                      policies={displayedCaPolicies as any}
-                      onPolicyClick={(p) => setSelectedPolicy(p as any)}
-                    />
+                    <div
+                      role="tabpanel"
+                      id="security-tabpanel-policies"
+                      aria-labelledby="security-tab-policies"
+                    >
+                      <EntraSection
+                        policies={displayedCaPolicies as any}
+                        onPolicyClick={(p) => setSelectedPolicy(p as any)}
+                      />
+                    </div>
                   )}
 
                   {securityView === 'sign-ins' && (
-                    <SignInActivitySection
-                      signIns={SIGNINS}
-                      signInView={signInView}
-                      onSignInViewChange={handleSignInViewChange}
-                    />
+                    <div
+                      role="tabpanel"
+                      id="security-tabpanel-sign-ins"
+                      aria-labelledby="security-tab-sign-ins"
+                    >
+                      <SignInActivitySection
+                        signIns={SIGNINS}
+                        signInView={signInView}
+                        onSignInViewChange={handleSignInViewChange}
+                      />
+                    </div>
                   )}
 
                   {securityView === 'auth' && (
-                    <div className="mt-4">
+                    <div
+                      role="tabpanel"
+                      id="security-tabpanel-auth"
+                      aria-labelledby="security-tab-auth"
+                      className="mt-4"
+                    >
                       <AuthMethodsCard rows={displayedAuthMethods} />
                     </div>
                   )}
 
                   {securityView === 'locations' && (
-                    <div className="mt-4">
+                    <div
+                      role="tabpanel"
+                      id="security-tabpanel-locations"
+                      aria-labelledby="security-tab-locations"
+                      className="mt-4"
+                    >
                       <NamedLocationsCard locations={displayedNamedLocations} />
                     </div>
                   )}
@@ -3828,7 +4135,13 @@ export default function TenantDetailsPage() {
               )}
 
               {entraTab === 'licenses' && (
-                <LicenseActivitySection bundle={bundle} />
+                <div
+                  role="tabpanel"
+                  id="entra-tabpanel-licenses"
+                  aria-labelledby="entra-tab-licenses"
+                >
+                  <LicenseActivitySection bundle={bundle} />
+                </div>
               )}
             </div>
           )
@@ -4322,8 +4635,8 @@ export default function TenantDetailsPage() {
                   Aliases
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  {(selectedMailbox.aliases.length
-                    ? selectedMailbox.aliases
+                  {(mailboxStringList(selectedMailbox.aliases).length
+                    ? mailboxStringList(selectedMailbox.aliases)
                     : ['—']
                   ).map((a: any) => (
                     <Badge
@@ -4343,7 +4656,9 @@ export default function TenantDetailsPage() {
                     Mailbox size
                   </div>
                   <div className="text-sm font-semibold">
-                    {selectedMailbox.sizeGB.toFixed(1)} GB
+                    {mailboxNumber(selectedMailbox.sizeGB) === null
+                      ? 'Not synchronized'
+                      : `${mailboxNumber(selectedMailbox.sizeGB)!.toFixed(1)} GB`}
                   </div>
                 </div>
 
@@ -4352,7 +4667,11 @@ export default function TenantDetailsPage() {
                     Item count
                   </div>
                   <div className="text-sm font-semibold">
-                    {selectedMailbox.itemCount.toLocaleString()}
+                    {mailboxNumber(selectedMailbox.itemCount) === null
+                      ? 'Not synchronized'
+                      : mailboxNumber(
+                          selectedMailbox.itemCount
+                        )!.toLocaleString()}
                   </div>
                 </div>
               </div>
@@ -4368,8 +4687,11 @@ export default function TenantDetailsPage() {
                     Full access
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    {(selectedMailbox.delegation?.fullAccess?.length
-                      ? selectedMailbox.delegation.fullAccess
+                    {(mailboxStringList(selectedMailbox.delegation?.fullAccess)
+                      .length
+                      ? mailboxStringList(
+                          selectedMailbox.delegation?.fullAccess
+                        )
                       : ['—']
                     ).map((x) => (
                       <Badge
@@ -4387,8 +4709,9 @@ export default function TenantDetailsPage() {
                     Send as
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    {(selectedMailbox.delegation?.sendAs?.length
-                      ? selectedMailbox.delegation.sendAs
+                    {(mailboxStringList(selectedMailbox.delegation?.sendAs)
+                      .length
+                      ? mailboxStringList(selectedMailbox.delegation?.sendAs)
                       : ['—']
                     ).map((x) => (
                       <Badge
@@ -4406,8 +4729,12 @@ export default function TenantDetailsPage() {
                     Send on behalf
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    {(selectedMailbox.delegation?.sendOnBehalf?.length
-                      ? selectedMailbox.delegation.sendOnBehalf
+                    {(mailboxStringList(
+                      selectedMailbox.delegation?.sendOnBehalf
+                    ).length
+                      ? mailboxStringList(
+                          selectedMailbox.delegation?.sendOnBehalf
+                        )
                       : ['—']
                     ).map((x) => (
                       <Badge
