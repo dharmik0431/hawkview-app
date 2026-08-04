@@ -49,7 +49,7 @@ export default function ProfilePage() {
     .toLowerCase()
     .replace(/^\w/, (l) => l.toUpperCase())
 
-  const signInProvider = session?.signInProvider || 'Firebase Auth'
+  const signInProvider = session?.signInProvider || 'Supabase Auth'
 
   // Detect user time zone
   const detectedTimeZone = useMemo(() => {

@@ -6,56 +6,48 @@ import {
 } from 'jose'
 import type { AuthenticatedIdentity } from './auth.types.js'
 
-const GOOGLE_IDENTITY_JWKS = new URL(
-  'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com',
-)
-
-interface IdentityPlatformPayload extends JWTPayload {
+interface SupabasePayload extends JWTPayload {
   email?: string
-  email_verified?: boolean
-  name?: string
-  user_id?: string
-  firebase?: {
-    sign_in_provider?: string
+  user_metadata?: {
+    display_name?: string
+    full_name?: string
   }
+  app_metadata?: { provider?: string }
 }
 
 @Injectable()
 export class IdentityTokenVerifier {
-  private readonly projectId: string
-  private readonly jwks = createRemoteJWKSet(GOOGLE_IDENTITY_JWKS)
+  private readonly issuer: string
+  private readonly jwks: ReturnType<typeof createRemoteJWKSet>
 
   constructor() {
-    const projectId =
-      process.env.IDENTITY_PLATFORM_PROJECT_ID ??
-      process.env.GOOGLE_CLOUD_PROJECT
+    const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, '')
 
-    if (!projectId) {
-      throw new Error(
-        'IDENTITY_PLATFORM_PROJECT_ID or GOOGLE_CLOUD_PROJECT is required.',
-      )
+    if (!supabaseUrl) {
+      throw new Error('SUPABASE_URL is required.')
     }
 
-    this.projectId = projectId
+    this.issuer = `${supabaseUrl}/auth/v1`
+    this.jwks = createRemoteJWKSet(
+      new URL(`${this.issuer}/.well-known/jwks.json`),
+    )
   }
 
   async verify(token: string): Promise<AuthenticatedIdentity> {
     try {
-      const { payload } = await jwtVerify<IdentityPlatformPayload>(
+      const { payload } = await jwtVerify<SupabasePayload>(
         token,
         this.jwks,
         {
-          algorithms: ['RS256'],
-          audience: this.projectId,
-          issuer: `https://securetoken.google.com/${this.projectId}`,
+          audience: 'authenticated',
+          issuer: this.issuer,
         },
       )
 
       if (
         !payload.sub ||
-        payload.user_id !== payload.sub ||
         !payload.email ||
-        payload.email_verified !== true
+        payload.role !== 'authenticated'
       ) {
         throw new UnauthorizedException('A verified email is required.')
       }
@@ -63,8 +55,11 @@ export class IdentityTokenVerifier {
       return {
         subject: payload.sub,
         email: payload.email.trim().toLowerCase(),
-        displayName: payload.name?.trim() || undefined,
-        signInProvider: payload.firebase?.sign_in_provider,
+        displayName:
+          payload.user_metadata?.display_name?.trim() ||
+          payload.user_metadata?.full_name?.trim() ||
+          undefined,
+        signInProvider: payload.app_metadata?.provider,
       }
     } catch (error) {
       if (error instanceof UnauthorizedException) {

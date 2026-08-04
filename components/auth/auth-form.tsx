@@ -3,59 +3,19 @@
 import React, { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import {
-  browserLocalPersistence,
-  browserSessionPersistence,
-  createUserWithEmailAndPassword,
-  sendEmailVerification,
-  sendPasswordResetEmail,
-  setPersistence,
-  signInWithEmailAndPassword,
-  updateProfile,
-} from 'firebase/auth'
-import { FirebaseError } from 'firebase/app'
 import { AlertCircle, CheckCircle2, Eye, EyeOff, Loader2 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Checkbox } from '@/components/ui/checkbox'
-import { auth } from '@/lib/auth/firebase'
+import { supabase } from '@/lib/auth/supabase'
 import { useAuth } from '@/components/providers/auth-provider'
 import { ProviderButtons } from '@/components/auth/provider-buttons'
 import { cn } from '@/lib/utils'
 
 export type AuthMode = 'sign-in' | 'sign-up' | 'reset'
 
-const authErrors: Record<string, string> = {
-  'auth/email-already-in-use': 'An account already exists for this email.',
-  'auth/invalid-credential': 'The email or password is incorrect.',
-  'auth/invalid-login-credentials': 'The email or password is incorrect.',
-  'auth/invalid-email': 'Enter a valid email address.',
-  'auth/invalid-api-key':
-    'HawkView authentication is using an invalid Firebase API key.',
-  'auth/missing-password': 'Enter your password.',
-  'auth/network-request-failed':
-    'HawkView could not reach Firebase. Check your connection and try again.',
-  'auth/operation-not-allowed':
-    'Email and password authentication is not enabled.',
-  'auth/too-many-requests':
-    'Too many attempts. Wait a few minutes and try again.',
-  'auth/unauthorized-domain':
-    'This HawkView web address is not authorized in Firebase.',
-  'auth/user-disabled': 'This account has been disabled.',
-  'auth/user-not-found': 'The email or password is incorrect.',
-  'auth/weak-password':
-    'Choose a stronger password with at least 8 characters.',
-}
-
 function readableAuthError(error: unknown) {
-  if (error instanceof FirebaseError) {
-    return (
-      authErrors[error.code] ||
-      `Authentication could not be completed (${error.code}).`
-    )
-  }
   if (error instanceof Error) return error.message
   return 'Authentication could not be completed.'
 }
@@ -78,7 +38,6 @@ export function AuthForm({ initialMode }: AuthFormProps) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
-  const [remember, setRemember] = useState(true)
 
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
@@ -100,7 +59,7 @@ export function AuthForm({ initialMode }: AuthFormProps) {
   }, [initialMode])
 
   useEffect(() => {
-    if (!isAuthLoading && identityUser?.emailVerified && session) {
+    if (!isAuthLoading && identityUser?.email_confirmed_at && session) {
       router.replace('/dashboard')
     }
   }, [identityUser, isAuthLoading, router, session])
@@ -167,7 +126,7 @@ export function AuthForm({ initialMode }: AuthFormProps) {
       return
     }
 
-    if (!auth) {
+    if (!supabase) {
       setError('HawkView authentication is not configured for this frontend.')
       return
     }
@@ -176,51 +135,38 @@ export function AuthForm({ initialMode }: AuthFormProps) {
 
     try {
       if (mode === 'reset') {
-        await sendPasswordResetEmail(auth, email.trim())
+        const { error: resetError } = await supabase.auth.resetPasswordForEmail(
+          email.trim(),
+          { redirectTo: `${window.location.origin}/reset-password` }
+        )
+        if (resetError) throw resetError
         setNotice(
           'If an account exists for that email, password reset instructions have been sent.'
         )
         return
       }
 
-      await setPersistence(
-        auth,
-        remember ? browserLocalPersistence : browserSessionPersistence
-      )
-
       if (mode === 'sign-up') {
-        const credential = await createUserWithEmailAndPassword(
-          auth,
-          email.trim(),
-          password
-        )
-
-        if (displayName.trim()) {
-          await updateProfile(credential.user, {
-            displayName: displayName.trim(),
-          })
-        }
-
-        await sendEmailVerification(credential.user)
+        const { error: signUpError } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+          options: {
+            data: { display_name: displayName.trim() },
+            emailRedirectTo: `${window.location.origin}/login`,
+          },
+        })
+        if (signUpError) throw signUpError
         setNotice(
           'Your account was created. Check your email and verify it before signing in.'
         )
         return
       }
 
-      const credential = await signInWithEmailAndPassword(
-        auth,
-        email.trim(),
-        password
-      )
-
-      if (!credential.user.emailVerified) {
-        await sendEmailVerification(credential.user)
-        setNotice(
-          'Verify your email before continuing. We sent you a new verification message.'
-        )
-        return
-      }
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        })
+      if (signInError) throw signInError
 
       await refreshSession()
       router.replace('/dashboard')
@@ -431,22 +377,6 @@ export function AuthForm({ initialMode }: AuthFormProps) {
                 {passwordError}
               </p>
             )}
-          </div>
-        )}
-
-        {mode !== 'reset' && (
-          <div className="flex items-center space-x-2 pt-1">
-            <Checkbox
-              id="remember"
-              checked={remember}
-              onCheckedChange={(checked) => setRemember(checked === true)}
-            />
-            <Label
-              htmlFor="remember"
-              className="cursor-pointer text-xs font-normal text-slate-600 dark:text-slate-400 select-none"
-            >
-              Remember me on this device
-            </Label>
           </div>
         )}
 

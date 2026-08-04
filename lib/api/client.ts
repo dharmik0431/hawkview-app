@@ -9,8 +9,11 @@ const API_TIMEOUT_MS = 15_000
 async function getIdentityToken() {
   if (typeof window === 'undefined') return null
 
-  const { auth } = await import('@/lib/auth/firebase')
-  return auth?.currentUser?.getIdToken() ?? null
+  const { supabase } = await import('@/lib/auth/supabase')
+  const { data } = (await supabase?.auth.getSession()) ?? {
+    data: { session: null },
+  }
+  return data.session?.access_token ?? null
 }
 
 interface FetchOptions extends RequestInit {

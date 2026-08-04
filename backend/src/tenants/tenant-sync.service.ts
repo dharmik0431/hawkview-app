@@ -253,7 +253,7 @@ export class TenantSyncService {
     customerTenantId: string
   ) {
     const user = await this.prisma.user.findUnique({
-      where: { identityPlatformUserId: identity.subject },
+      where: { authProviderUserId: identity.subject },
       select: {
         disabledAt: true,
         memberships: {

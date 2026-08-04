@@ -83,7 +83,7 @@ enum SyncStateStatus {
 
 model User {
   id                     String         @id @default(uuid()) @db.Uuid
-  identityPlatformUserId String?        @unique @map("identity_platform_user_id") @db.VarChar(128)
+  authProviderUserId     String?        @unique @map("auth_provider_user_id") @db.VarChar(128)
   email                  String         @unique @db.VarChar(320)
   displayName            String?        @map("display_name") @db.VarChar(200)
   timeZone               String?        @map("time_zone") @db.VarChar(100)

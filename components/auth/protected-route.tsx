@@ -9,7 +9,7 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { identityUser, session, isLoading, configurationError } = useAuth()
 
   useEffect(() => {
-    if (!isLoading && (!identityUser?.emailVerified || !session)) {
+    if (!isLoading && (!identityUser?.email_confirmed_at || !session)) {
       router.replace('/login')
     }
   }, [identityUser, isLoading, router, session])
@@ -22,7 +22,7 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
     )
   }
 
-  if (isLoading || !identityUser?.emailVerified || !session) {
+  if (isLoading || !identityUser?.email_confirmed_at || !session) {
     return (
       <div className="flex min-h-screen items-center justify-center">
         <p className="text-sm text-muted-foreground">
@@ -34,4 +34,3 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
   return children
 }
-

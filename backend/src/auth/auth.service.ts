@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ConflictException,
   ForbiddenException,
   Inject,
   Injectable,
@@ -45,7 +44,7 @@ export class AuthService {
   async bootstrap(identity: AuthenticatedIdentity) {
     const user = await this.prisma.$transaction(async (transaction) => {
       const existingBySubject = await transaction.user.findUnique({
-        where: { identityPlatformUserId: identity.subject },
+        where: { authProviderUserId: identity.subject },
       })
 
       if (existingBySubject) {
@@ -63,20 +62,13 @@ export class AuthService {
         where: { email: identity.email },
       })
 
-      if (
-        existingByEmail?.identityPlatformUserId &&
-        existingByEmail.identityPlatformUserId !== identity.subject
-      ) {
-        throw new ConflictException(
-          'This email is already linked to another identity.',
-        )
-      }
-
       if (existingByEmail) {
+        // A verified Supabase email may relink the matching HawkView profile
+        // during the one-time Firebase-to-Supabase migration.
         return transaction.user.update({
           where: { id: existingByEmail.id },
           data: {
-            identityPlatformUserId: identity.subject,
+            authProviderUserId: identity.subject,
             displayName:
               existingByEmail.displayName ?? identity.displayName,
           },
@@ -86,7 +78,7 @@ export class AuthService {
 
       return transaction.user.create({
         data: {
-          identityPlatformUserId: identity.subject,
+          authProviderUserId: identity.subject,
           email: identity.email,
           displayName: identity.displayName,
         },
@@ -135,7 +127,7 @@ export class AuthService {
     }
 
     const user = await this.prisma.user.update({
-      where: { identityPlatformUserId: identity.subject },
+      where: { authProviderUserId: identity.subject },
       data: { displayName, timeZone, dateFormat, timeFormat },
       select: userWithMemberships,
     })
