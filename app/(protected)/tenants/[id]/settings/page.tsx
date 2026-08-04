@@ -677,11 +677,15 @@ export default function TenantSettingsPage() {
                 >
                   {isConnectionLost
                     ? 'Reconnect Microsoft 365'
+                    : missingPermsCount > 0
+                      ? 'Microsoft permission update required'
                     : 'Complete Microsoft 365 authorization'}
                 </h2>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {isConnectionLost
                     ? 'HawkView can no longer access this tenant. Previously synchronized data remains available, but new synchronization is paused until access is restored.'
+                    : missingPermsCount > 0
+                      ? 'HawkView has added a read-only capability that this tenant has not approved yet. Existing data remains available while a Microsoft 365 administrator reviews the update.'
                     : 'This tenant is saved, but HawkView cannot complete synchronization until a Microsoft 365 administrator grants the required permissions.'}
                 </p>
               </div>
@@ -705,7 +709,7 @@ export default function TenantSettingsPage() {
                   </li>
                   <li className="flex gap-3">
                     <span className="font-semibold text-foreground">4.</span>
-                    Return here and click <strong className="text-foreground">Verify connection</strong> to confirm access and resume synchronization.
+                    Microsoft closes the authorization window, HawkView verifies the updated permissions automatically, and synchronization resumes.
                   </li>
                 </ol>
               </div>
@@ -736,6 +740,8 @@ export default function TenantSettingsPage() {
                   <ExternalLink className="h-4 w-4" />
                   {isReviewingConsent
                     ? 'Opening Microsoft...'
+                    : missingPermsCount > 0
+                      ? 'Review permission update'
                     : 'Review and authorize'}
                 </Button>
                 <Button

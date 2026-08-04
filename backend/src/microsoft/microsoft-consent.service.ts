@@ -15,6 +15,7 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'User.Read.All',
   'GroupMember.Read.All',
   'AuditLog.Read.All',
+  'UserAuthenticationMethod.Read.All',
   'Policy.Read.All',
   'Policy.Read.AuthenticationMethod',
   'Device.Read.All',
@@ -34,6 +35,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read Microsoft 365 and security groups and their user memberships.',
   'AuditLog.Read.All':
     'Read sign-in activity and user MFA registration status.',
+  'UserAuthenticationMethod.Read.All':
+    'Read which authentication method types users have registered when tenant-level MFA reporting is unavailable.',
   'Policy.Read.All': 'Read Conditional Access policies and named locations.',
   'Policy.Read.AuthenticationMethod':
     'Read the tenant authentication-method policy.',
