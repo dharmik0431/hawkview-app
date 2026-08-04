@@ -183,6 +183,26 @@ interface GraphCollectionPage {
   '@odata.nextLink'?: string
 }
 
+function sanitizeGraphErrorField(value: unknown, maxLength: number) {
+  if (typeof value !== 'string') return null
+  const sanitized = value.replace(/[\r\n\t]+/g, ' ').trim()
+  return sanitized ? sanitized.slice(0, maxLength) : null
+}
+
+async function describeGraphError(response: Response) {
+  try {
+    const body = (await response.json()) as {
+      error?: { code?: unknown; message?: unknown }
+    }
+    const code = sanitizeGraphErrorField(body?.error?.code, 160)
+    const message = sanitizeGraphErrorField(body?.error?.message, 500)
+    if (!code && !message) return ''
+    return ` [${[code, message].filter(Boolean).join(': ')}]`
+  } catch {
+    return ''
+  }
+}
+
 const LOG_RETENTION_MONTHS = 6
 const INITIAL_LOG_LOOKBACK_DAYS = 30
 const LOG_SYNC_OVERLAP_MINUTES = 10
@@ -1186,10 +1206,11 @@ export class TenantSyncService {
         })
         if (!response.ok) {
           const graphRequestId = response.headers.get('request-id')
+          const graphError = await describeGraphError(response)
           throw new Error(
             `Microsoft ${resourceType.toLowerCase()} synchronization returned ${response.status}${
               graphRequestId ? ` (request ${graphRequestId})` : ''
-            }.`
+            }${graphError}.`
           )
         }
         const page = (await response.json()) as GraphCollectionPage
