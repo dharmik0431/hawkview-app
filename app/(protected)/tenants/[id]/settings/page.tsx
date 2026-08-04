@@ -30,6 +30,7 @@ import {
   Mail,
   FileText,
   Lock,
+  Copy,
 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
@@ -209,11 +210,16 @@ export default function TenantSettingsPage() {
     }
   }, [bundle, tenantListRecord, tenantId])
 
-  // Reload the connection state already verified and stored by the backend.
+  // Ask the backend to prove current Microsoft access; do not rely on the
+  // last successful synchronization snapshot.
   const handleVerifyConnection = async () => {
     setIsVerifying(true)
     setVerifyNotice(null)
     try {
+      await apiClient.post(
+        `/api/tenants/${encodeURIComponent(String(tenantId))}/verify-connection`
+      )
+      await queryClient.invalidateQueries({ queryKey: ['tenants'] })
       await fetchTenantData()
       const timeStr = new Intl.DateTimeFormat(undefined, {
         hour: 'numeric',
@@ -221,8 +227,14 @@ export default function TenantSettingsPage() {
         second: 'numeric',
       }).format(new Date())
       setVerifyNotice(`Connection status refreshed at ${timeStr}.`)
-    } catch {
-      setVerifyNotice('Unable to refresh the connection status.')
+    } catch (error) {
+      await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      await fetchTenantData()
+      setVerifyNotice(
+        error instanceof Error
+          ? error.message
+          : 'Unable to verify the Microsoft connection.'
+      )
     } finally {
       setIsVerifying(false)
     }
@@ -372,7 +384,7 @@ export default function TenantSettingsPage() {
   }, [tenant.connectionStatus, tenant.status])
 
   const overallHealthBadge = useMemo(() => {
-    const status = tenant.status || tenant.connectionStatus
+    const status = tenant.connectionStatus || tenant.status
     if (status === 'healthy' || status === 'connected' || status === 'active') {
       return (
         <Badge className="bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 font-medium">
@@ -396,7 +408,7 @@ export default function TenantSettingsPage() {
         Critical
       </Badge>
     )
-  }, [tenant.status, tenant.connectionStatus])
+  }, [tenant.connectionStatus, tenant.status])
 
   // Module health summary
   const moduleRows = useMemo(() => {
@@ -1337,8 +1349,23 @@ export default function TenantSettingsPage() {
                 <span className="text-xs text-muted-foreground font-medium uppercase tracking-wider">
                   Microsoft Tenant ID to match
                 </span>
-                <div className="font-mono font-bold text-foreground mt-0.5 select-all">
-                  {tenant.microsoftTenantId || tenant.id}
+                <div className="mt-1 flex items-center gap-2">
+                  <div className="font-mono font-bold text-foreground select-all">
+                    {tenant.microsoftTenantId || tenant.id}
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 gap-1 px-2 text-xs"
+                    onClick={() =>
+                      navigator.clipboard.writeText(
+                        String(tenant.microsoftTenantId || tenant.id)
+                      )
+                    }
+                  >
+                    <Copy className="h-3 w-3" /> Copy
+                  </Button>
                 </div>
               </div>
             </div>

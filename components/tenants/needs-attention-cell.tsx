@@ -10,9 +10,13 @@ const severityStyles: Record<AttentionSeverity, string> = {
 }
 
 export function NeedsAttentionCell({ tenant }: { tenant: any }) {
-  // IMPORTANT: this assumes tenant.bundle exists
-  // If your row shape is different, change this line only.
-  const attention = topAttention(computeTenantAttention(tenant?.bundle))
+  const attention = topAttention(
+    computeTenantAttention({
+      ...(tenant?.bundle ?? {}),
+      connectionStatus: tenant?.connectionStatus,
+      status: tenant?.status,
+    })
+  )
 
   if (!attention.length) {
     return <span className="text-muted-foreground">—</span>

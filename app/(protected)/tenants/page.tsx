@@ -784,7 +784,13 @@ export default function TenantsPage() {
         }
         case 'needsAttention': {
           const getAttentionWeight = (t: any) => {
-            const items = topAttention(computeTenantAttention(t?.bundle))
+            const items = topAttention(
+              computeTenantAttention({
+                ...(t?.bundle ?? {}),
+                connectionStatus: t?.connectionStatus,
+                status: t?.status,
+              })
+            )
             if (!items.length) return 0
             return items.reduce((acc, item) => {
               if (item.severity === 'critical') return acc + 3

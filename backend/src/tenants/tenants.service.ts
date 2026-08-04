@@ -1,4 +1,5 @@
 import {
+  BadGatewayException,
   BadRequestException,
   ConflictException,
   ForbiddenException,
@@ -124,6 +125,13 @@ export class TenantsService {
   }) {
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
+    const connectionStatus = tenant.connection?.status ?? null
+    const effectiveStatus =
+      connectionStatus === 'ERROR' || connectionStatus === 'REVOKED'
+        ? 'disconnected'
+        : connectionStatus === 'PENDING_CONSENT'
+          ? 'pending'
+          : tenant.status.toLowerCase()
 
     return {
       id: tenant.id,
@@ -133,7 +141,7 @@ export class TenantsService {
       microsoftTenantId: tenant.microsoftTenantId,
       provider: 'microsoft' as const,
       domain: tenant.primaryDomain,
-      status: tenant.status.toLowerCase(),
+      status: effectiveStatus,
       connectionStatus:
         tenant.connection?.status.toLowerCase().replaceAll('_', '-') ?? null,
       connectionMode:
@@ -161,6 +169,112 @@ export class TenantsService {
             )
           : null,
       organization: tenant.organization,
+    }
+  }
+
+  async verifyConnectionForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string
+  ) {
+    const organizationIds = await this.getManagedOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: {
+        id: customerTenantId,
+        organizationId: { in: organizationIds },
+      },
+      select: {
+        id: true,
+        organizationId: true,
+        microsoftTenantId: true,
+        connection: {
+          select: {
+            connectionMode: true,
+            clientId: true,
+            credentialReference: true,
+          },
+        },
+      },
+    })
+
+    if (!tenant?.connection) {
+      throw new NotFoundException('Customer tenant connection was not found.')
+    }
+
+    const now = new Date()
+    try {
+      const verification = await this.microsoftConsent.verifyConnectedTenant({
+        microsoftTenantId: tenant.microsoftTenantId,
+        connectionMode:
+          tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+            ? 'CUSTOMER_MANAGED'
+            : 'HAWKVIEW_MANAGED',
+        clientId: tenant.connection.clientId,
+        credentialReference: tenant.connection.credentialReference,
+      })
+      const connected = verification.missingPermissions.length === 0
+
+      await this.prisma.$transaction([
+        this.prisma.customerTenant.update({
+          where: { id: tenant.id },
+          data: {
+            displayName: verification.displayName,
+            primaryDomain: verification.primaryDomain,
+            status: connected ? 'ACTIVE' : 'SUSPENDED',
+          },
+        }),
+        this.prisma.tenantConnection.update({
+          where: {
+            customerTenantId_organizationId: {
+              customerTenantId: tenant.id,
+              organizationId: tenant.organizationId,
+            },
+          },
+          data: {
+            status: connected ? 'CONNECTED' : 'ERROR',
+            consentedPermissions: verification.grantedPermissions,
+            lastVerifiedAt: now,
+            lastErrorCode: connected ? null : 'missing-permissions',
+            lastErrorMessage: connected
+              ? null
+              : `Missing permissions: ${verification.missingPermissions.join(', ')}`,
+          },
+        }),
+      ])
+
+      const refreshed = await this.prisma.customerTenant.findUniqueOrThrow({
+        where: { id: tenant.id },
+        select: this.tenantSelect(),
+      })
+      return { tenant: this.mapTenant(refreshed), connected }
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Microsoft tenant verification failed.'
+      await this.prisma.$transaction([
+        this.prisma.customerTenant.update({
+          where: { id: tenant.id },
+          data: { status: 'SUSPENDED' },
+        }),
+        this.prisma.tenantConnection.update({
+          where: {
+            customerTenantId_organizationId: {
+              customerTenantId: tenant.id,
+              organizationId: tenant.organizationId,
+            },
+          },
+          data: {
+            status: 'ERROR',
+            consentedPermissions: [],
+            lastVerifiedAt: now,
+            lastErrorCode: 'connection-verification-failed',
+            lastErrorMessage: message.slice(0, 2000),
+          },
+        }),
+      ])
+      throw new BadGatewayException(
+        'HawkView could not access this Microsoft tenant. Reauthorize the connection or remove the tenant.'
+      )
     }
   }
 

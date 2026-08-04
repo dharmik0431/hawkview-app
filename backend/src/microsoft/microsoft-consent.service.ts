@@ -394,6 +394,34 @@ export class MicrosoftConsentService {
     return result.accessToken
   }
 
+  async verifyConnectedTenant(input: {
+    microsoftTenantId: string
+    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+    clientId: string | null
+    credentialReference: string | null
+  }) {
+    const credentials =
+      input.connectionMode === 'CUSTOMER_MANAGED'
+        ? {
+            clientId: input.clientId ?? '',
+            clientSecret: input.credentialReference
+              ? await this.secretStore.access(input.credentialReference)
+              : '',
+          }
+        : await this.getManagedConnector()
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new ServiceUnavailableException(
+        'The Microsoft tenant connection is incomplete.'
+      )
+    }
+
+    return this.verifyTenantWithCredentials(
+      input.microsoftTenantId,
+      credentials
+    )
+  }
+
   async getTenantExchangeAccessToken(input: {
     microsoftTenantId: string
     connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
