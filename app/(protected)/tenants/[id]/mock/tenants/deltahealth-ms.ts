@@ -26,6 +26,13 @@ export const tenantMock: TenantMockBundle = {
       email: 'amit.verma@deltahealthgroup.com',
       type: 'Member',
       role: 'Global Administrator',
+      roles: [
+        'Global Administrator',
+        'Security Administrator',
+        'Exchange Administrator',
+        'Privileged Role Administrator',
+        'User Administrator',
+      ],
       status: 'Enabled',
       mfa: 'Enforced',
       lastLogin: '2026-01-19T02:22:00Z',
@@ -1007,4 +1014,3 @@ export const tenantMock: TenantMockBundle = {
     ],
   },
 }
- 
