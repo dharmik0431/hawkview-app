@@ -333,6 +333,21 @@ export default function TenantSettingsPage() {
   const missingPermsCount = Array.isArray(tenant.missingPermissions)
     ? tenant.missingPermissions.length
     : 0
+  const normalizedConnectionStatus = String(
+    tenant.connectionStatus || tenant.status || '',
+  ).toLowerCase()
+  const isConnectionLost = [
+    'error',
+    'critical',
+    'disconnected',
+    'revoked',
+  ].includes(normalizedConnectionStatus)
+  const requiresMicrosoftReconnection =
+    isConnectionLost ||
+    ['pending-consent', 'pending', 'warning'].includes(
+      normalizedConnectionStatus,
+    ) ||
+    missingPermsCount > 0
 
   const permissionStatusBadge = useMemo(() => {
     if (!hasPermissionsData) {
@@ -633,6 +648,112 @@ export default function TenantSettingsPage() {
           </div>
         )}
       </div>
+
+      {requiresMicrosoftReconnection && (
+        <section
+          className={`rounded-2xl border p-6 shadow-sm ${
+            isConnectionLost
+              ? 'border-red-300 bg-red-50/80 dark:border-red-900/70 dark:bg-red-950/25'
+              : 'border-amber-300 bg-amber-50/80 dark:border-amber-900/70 dark:bg-amber-950/25'
+          }`}
+          aria-labelledby="microsoft-reconnection-title"
+        >
+          <div className="flex items-start gap-4">
+            <div
+              className={`rounded-xl border p-2.5 ${
+                isConnectionLost
+                  ? 'border-red-200 bg-red-100 text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300'
+                  : 'border-amber-200 bg-amber-100 text-amber-700 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300'
+              }`}
+            >
+              <ShieldAlert className="h-5 w-5" />
+            </div>
+
+            <div className="min-w-0 flex-1 space-y-5">
+              <div>
+                <h2
+                  id="microsoft-reconnection-title"
+                  className="text-lg font-bold text-foreground"
+                >
+                  {isConnectionLost
+                    ? 'Reconnect Microsoft 365'
+                    : 'Complete Microsoft 365 authorization'}
+                </h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {isConnectionLost
+                    ? 'HawkView can no longer access this tenant. Previously synchronized data remains available, but new synchronization is paused until access is restored.'
+                    : 'This tenant is saved, but HawkView cannot complete synchronization until a Microsoft 365 administrator grants the required permissions.'}
+                </p>
+              </div>
+
+              <div className="rounded-xl border bg-background/80 p-4">
+                <p className="text-sm font-semibold text-foreground">
+                  How to restore the connection
+                </p>
+                <ol className="mt-3 space-y-2 text-sm text-muted-foreground">
+                  <li className="flex gap-3">
+                    <span className="font-semibold text-foreground">1.</span>
+                    Click <strong className="text-foreground">Review and authorize</strong> below.
+                  </li>
+                  <li className="flex gap-3">
+                    <span className="font-semibold text-foreground">2.</span>
+                    Sign in with a Microsoft 365 Global Administrator for <strong className="text-foreground">{tenant.name}</strong>.
+                  </li>
+                  <li className="flex gap-3">
+                    <span className="font-semibold text-foreground">3.</span>
+                    Review and approve HawkView&apos;s read-only application permissions.
+                  </li>
+                  <li className="flex gap-3">
+                    <span className="font-semibold text-foreground">4.</span>
+                    Return here and click <strong className="text-foreground">Verify connection</strong> to confirm access and resume synchronization.
+                  </li>
+                </ol>
+              </div>
+
+              {missingPermsCount > 0 && (
+                <div className="rounded-xl border border-amber-200 bg-amber-100/60 p-4 dark:border-amber-900 dark:bg-amber-950/40">
+                  <p className="text-sm font-semibold text-amber-950 dark:text-amber-100">
+                    Missing permissions ({missingPermsCount})
+                  </p>
+                  <p className="mt-1 break-words text-sm text-amber-800 dark:text-amber-200">
+                    {tenant.missingPermissions.join(', ')}
+                  </p>
+                </div>
+              )}
+
+              {consentError && (
+                <div className="rounded-xl border border-red-200 bg-red-100/70 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/50 dark:text-red-200">
+                  {consentError}
+                </div>
+              )}
+
+              <div className="flex flex-wrap gap-3">
+                <Button
+                  onClick={handleReviewPermissions}
+                  disabled={isReviewingConsent}
+                  className="gap-2 rounded-xl"
+                >
+                  <ExternalLink className="h-4 w-4" />
+                  {isReviewingConsent
+                    ? 'Opening Microsoft...'
+                    : 'Review and authorize'}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={handleVerifyConnection}
+                  disabled={isVerifying}
+                  className="gap-2 rounded-xl bg-background"
+                >
+                  <RefreshCw
+                    className={`h-4 w-4 ${isVerifying ? 'animate-spin' : ''}`}
+                  />
+                  {isVerifying ? 'Verifying...' : 'Verify connection'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* SECTION 1: Connection Overview */}
       <Card className="rounded-2xl border shadow-sm">
