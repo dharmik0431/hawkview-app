@@ -80,7 +80,7 @@ export class TenantsService {
 
   private async getManagedOrganizationIds(identity: AuthenticatedIdentity) {
     const user = await this.prisma.user.findUnique({
-      where: { identityPlatformUserId: identity.subject },
+      where: { authProviderUserId: identity.subject },
       select: {
         disabledAt: true,
         memberships: {

@@ -8,12 +8,8 @@ import {
   useMemo,
   useState,
 } from 'react'
-import {
-  onAuthStateChanged,
-  signOut as firebaseSignOut,
-  type User,
-} from 'firebase/auth'
-import { auth, isFirebaseConfigured } from '@/lib/auth/firebase'
+import type { User } from '@supabase/supabase-js'
+import { isSupabaseConfigured, supabase } from '@/lib/auth/supabase'
 import { apiClient } from '@/lib/api/client'
 import type { HawkViewSession } from '@/lib/auth/types'
 
@@ -34,7 +30,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(true)
 
   const refreshSession = useCallback(async () => {
-    if (!auth?.currentUser?.emailVerified) {
+    const { data } = (await supabase?.auth.getSession()) ?? {
+      data: { session: null },
+    }
+    if (!data.session?.user.email_confirmed_at) {
       setSession(null)
       return null
     }
@@ -45,16 +44,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   useEffect(() => {
-    if (!auth) {
+    if (!supabase) {
       setIsLoading(false)
       return
     }
 
-    return onAuthStateChanged(auth, async (user) => {
+    const { data } = supabase.auth.onAuthStateChange(async (_event, next) => {
+      const user = next?.user ?? null
       setIdentityUser(user)
 
       try {
-        if (user?.emailVerified) {
+        if (user?.email_confirmed_at) {
           await refreshSession()
         } else {
           setSession(null)
@@ -65,11 +65,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setIsLoading(false)
       }
     })
+
+    return () => data.subscription.unsubscribe()
   }, [refreshSession])
 
   const signOut = useCallback(async () => {
-    if (auth) {
-      await firebaseSignOut(auth)
+    if (supabase) {
+      await supabase.auth.signOut()
     }
     setIdentityUser(null)
     setSession(null)
@@ -80,7 +82,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       identityUser,
       session,
       isLoading,
-      configurationError: !isFirebaseConfigured,
+      configurationError: !isSupabaseConfigured,
       refreshSession,
       signOut,
     }),
@@ -99,4 +101,3 @@ export function useAuth() {
 
   return context
 }
-

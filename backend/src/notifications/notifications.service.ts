@@ -13,7 +13,7 @@ export class NotificationsService {
 
   private async userId(identity: AuthenticatedIdentity) {
     const user = await this.prisma.user.findUniqueOrThrow({
-      where: { identityPlatformUserId: identity.subject },
+      where: { authProviderUserId: identity.subject },
       select: { id: true },
     })
     return user.id

@@ -3,8 +3,7 @@
 import React, { useState, useEffect, useMemo } from 'react'
 import { useAuth } from '@/components/providers/auth-provider'
 import { useNotifications } from '@/components/providers/notification-provider'
-import { sendPasswordResetEmail } from 'firebase/auth'
-import { auth } from '@/lib/auth/firebase'
+import { supabase } from '@/lib/auth/supabase'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -25,7 +24,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-function parseFirebaseError(error: any): string {
+function parseAuthError(error: any): string {
   if (!error) return 'An unexpected error occurred.'
   const code = error.code || ''
   switch (code) {
@@ -50,7 +49,7 @@ export default function SecuritySettingsPage() {
 
   const userEmail =
     session?.user.email || identityUser?.email || 'user@hawkview.net'
-  const signInProvider = session?.signInProvider || 'Firebase Auth'
+  const signInProvider = session?.signInProvider || 'Supabase Auth'
 
   // Determine if user uses standard email/password or SSO
   const isSsoUser = useMemo(() => {
@@ -104,11 +103,14 @@ export default function SecuritySettingsPage() {
     setIsSendingReset(true)
 
     try {
-      if (!auth || !userEmail) {
+      if (!supabase || !userEmail) {
         throw new Error('HawkView authentication is not configured.')
       }
 
-      await sendPasswordResetEmail(auth, userEmail)
+      const { error } = await supabase.auth.resetPasswordForEmail(userEmail, {
+        redirectTo: `${window.location.origin}/reset-password`,
+      })
+      if (error) throw error
 
       notify({
         title: 'Password reset email sent.',
@@ -119,7 +121,7 @@ export default function SecuritySettingsPage() {
       setResetSentSuccess(true)
       setIsResetDialogOpen(false)
     } catch (err: any) {
-      const friendlyError = parseFirebaseError(err)
+      const friendlyError = parseAuthError(err)
       notify({
         title: 'Password reset failed',
         description: friendlyError,

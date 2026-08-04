@@ -26,7 +26,7 @@ export class MicrosoftConnectorController {
 
   private async requirePlatformAdmin(request: AuthenticatedRequest) {
     const user = await this.prisma.user.findUnique({
-      where: { identityPlatformUserId: request.auth.subject },
+      where: { authProviderUserId: request.auth.subject },
       select: { platformRole: true, disabledAt: true },
     })
     if (
