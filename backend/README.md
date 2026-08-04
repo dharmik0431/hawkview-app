@@ -111,11 +111,9 @@ to source control. Secrets are never returned to the browser. The consent state
 signing key is created automatically in the encrypted store. Consent links are
 signed, expire after 15 minutes, and can be used only once.
 
-During the GCP migration, `GOOGLE_CLOUD_PROJECT` may remain configured as a
-temporary read-only compatibility path. When an existing Secret Manager
-reference is first used, HawkView imports and encrypts it in PostgreSQL. Remove
-the variable and the service account's Secret Manager access only after all
-active connector credentials have been exercised or deliberately re-entered.
+Credential references created before the migration continue to resolve through
+their imported `legacyReference` mapping in PostgreSQL. The backend no longer
+calls Google Secret Manager to read, create, or delete application secrets.
 
 The initial least-privilege permission set is:
 

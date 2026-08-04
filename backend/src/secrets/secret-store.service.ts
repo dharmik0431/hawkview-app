@@ -16,10 +16,6 @@ const UUID_PATTERN =
 const LEGACY_REFERENCE_PATTERN =
   /^projects\/([^/]+)\/secrets\/([^/]+)\/versions\/[^/]+$/
 
-interface SecretAccessResponse {
-  payload?: { data?: string }
-}
-
 interface EncryptedPayload {
   ciphertext: Uint8Array<ArrayBuffer>
   initializationVector: Uint8Array<ArrayBuffer>
@@ -28,8 +24,6 @@ interface EncryptedPayload {
 
 @Injectable()
 export class SecretStoreService {
-  private cachedGoogleToken: { value: string; expiresAt: number } | null = null
-
   constructor(
     @Inject(PrismaService)
     private readonly prisma: PrismaService
@@ -47,14 +41,6 @@ export class SecretStoreService {
       )
     }
     return key
-  }
-
-  private get legacyProjectId() {
-    return (
-      process.env.GOOGLE_CLOUD_PROJECT?.trim() ??
-      process.env.GCP_PROJECT_ID?.trim() ??
-      ''
-    )
   }
 
   private encrypt(name: string, value: string): EncryptedPayload {
@@ -110,22 +96,16 @@ export class SecretStoreService {
     return `${DATABASE_REFERENCE_PREFIX}${id}`
   }
 
-  private async persist(
-    name: string,
-    value: string,
-    legacyReference?: string
-  ) {
+  private async persist(name: string, value: string) {
     const encrypted = this.encrypt(name, value)
     const secret = await this.prisma.encryptedSecret.upsert({
       where: { name },
       create: {
         name,
         ...encrypted,
-        legacyReference,
       },
       update: {
         ...encrypted,
-        ...(legacyReference ? { legacyReference } : {}),
       },
     })
     return secret
@@ -160,16 +140,14 @@ export class SecretStoreService {
     })
     if (migrated) return this.decrypt(migrated)
 
-    const match = reference.match(LEGACY_REFERENCE_PATTERN)
-    if (!match) {
+    if (!LEGACY_REFERENCE_PATTERN.test(reference)) {
       throw new ServiceUnavailableException(
         'The stored credential reference is invalid.'
       )
     }
-
-    const value = await this.accessLegacyGoogleSecret(reference)
-    const secret = await this.persist(match[2], value, reference)
-    return this.decrypt(secret)
+    throw new ServiceUnavailableException(
+      'The migrated credential is unavailable in encrypted storage.'
+    )
   }
 
   async delete(reference: string) {
@@ -184,8 +162,7 @@ export class SecretStoreService {
       return
     }
 
-    const match = reference.match(LEGACY_REFERENCE_PATTERN)
-    if (!match) {
+    if (!LEGACY_REFERENCE_PATTERN.test(reference)) {
       throw new ServiceUnavailableException(
         'The stored credential reference is invalid.'
       )
@@ -194,10 +171,6 @@ export class SecretStoreService {
     await this.prisma.encryptedSecret.deleteMany({
       where: { legacyReference: reference },
     })
-
-    if (this.legacyProjectId) {
-      await this.deleteLegacyGoogleSecret(reference)
-    }
   }
 
   async accessOrCreate(secretId: string, createValue: () => string) {
@@ -206,111 +179,8 @@ export class SecretStoreService {
     })
     if (existing) return this.decrypt(existing)
 
-    if (this.legacyProjectId) {
-      const legacyReference = `projects/${this.legacyProjectId}/secrets/${secretId}/versions/latest`
-      try {
-        return await this.access(legacyReference)
-      } catch (error) {
-        if (
-          !(error instanceof Error) ||
-          !('status' in error) ||
-          error.status !== 404
-        ) {
-          throw error
-        }
-      }
-    }
-
     const value = createValue()
     await this.persist(secretId, value)
     return value
-  }
-
-  private async getLegacyGoogleAccessToken() {
-    const configuredToken = process.env.GOOGLE_OAUTH_ACCESS_TOKEN?.trim()
-    if (configuredToken) return configuredToken
-    if (
-      this.cachedGoogleToken &&
-      this.cachedGoogleToken.expiresAt > Date.now() + 60_000
-    ) {
-      return this.cachedGoogleToken.value
-    }
-
-    const response = await fetch(
-      'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
-      {
-        headers: { 'Metadata-Flavor': 'Google' },
-        signal: AbortSignal.timeout(5_000),
-      }
-    )
-    if (!response.ok) {
-      throw new ServiceUnavailableException(
-        'HawkView could not migrate a legacy stored credential.'
-      )
-    }
-    const body = (await response.json()) as {
-      access_token?: string
-      expires_in?: number
-    }
-    if (!body.access_token) {
-      throw new ServiceUnavailableException(
-        'Google Cloud did not return a service identity token.'
-      )
-    }
-    this.cachedGoogleToken = {
-      value: body.access_token,
-      expiresAt: Date.now() + (body.expires_in ?? 300) * 1000,
-    }
-    return body.access_token
-  }
-
-  private async legacyGoogleRequest(
-    url: string,
-    init: RequestInit = {},
-    acceptedStatuses: number[] = [200]
-  ) {
-    const response = await fetch(url, {
-      ...init,
-      headers: {
-        Authorization: `Bearer ${await this.getLegacyGoogleAccessToken()}`,
-        'Content-Type': 'application/json',
-        ...init.headers,
-      },
-      signal: init.signal ?? AbortSignal.timeout(10_000),
-    })
-    if (!acceptedStatuses.includes(response.status)) {
-      const error = new Error(
-        `Legacy Secret Manager request failed with status ${response.status}.`
-      ) as Error & { status?: number }
-      error.status = response.status
-      throw error
-    }
-    return response
-  }
-
-  private async accessLegacyGoogleSecret(reference: string) {
-    const response = await this.legacyGoogleRequest(
-      `https://secretmanager.googleapis.com/v1/${reference}:access`
-    )
-    const body = (await response.json()) as SecretAccessResponse
-    const value = body.payload?.data
-      ? Buffer.from(body.payload.data, 'base64').toString('utf8').trim()
-      : ''
-    if (!value) {
-      throw new ServiceUnavailableException(
-        'The legacy stored Microsoft credential is unavailable.'
-      )
-    }
-    return value
-  }
-
-  private async deleteLegacyGoogleSecret(reference: string) {
-    const match = reference.match(LEGACY_REFERENCE_PATTERN)
-    if (!match || match[1] !== this.legacyProjectId) return
-    await this.legacyGoogleRequest(
-      `https://secretmanager.googleapis.com/v1/projects/${match[1]}/secrets/${match[2]}`,
-      { method: 'DELETE' },
-      [200, 404]
-    )
   }
 }
