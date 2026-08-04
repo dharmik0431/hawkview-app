@@ -97,22 +97,25 @@ onboarding a tenant.
 The backend requires:
 
 ```text
-GOOGLE_CLOUD_PROJECT
+SECRET_ENCRYPTION_KEY
 MICROSOFT_ADMIN_CONSENT_REDIRECT_URI
 MICROSOFT_REQUIRED_PERMISSIONS
 FRONTEND_APP_URL
 ```
 
 The backend validates submitted credentials with Microsoft before storing
-them. Google Secret Manager contains each secret; PostgreSQL contains only the
-connection mode, public client ID, status, expiration metadata, and Secret
-Manager reference. Secrets are never returned to the browser. The consent
-state signing key is created automatically in Secret Manager. Consent links
-are signed, expire after 15 minutes, and can be used only once.
+them. Each secret is encrypted with AES-256-GCM before its ciphertext is stored
+in PostgreSQL. The 32-byte `SECRET_ENCRYPTION_KEY` must be supplied by the
+backend hosting environment and must never be stored in PostgreSQL or committed
+to source control. Secrets are never returned to the browser. The consent state
+signing key is created automatically in the encrypted store. Consent links are
+signed, expire after 15 minutes, and can be used only once.
 
-The Cloud Run service account needs permission to create secrets, add and
-access secret versions. Use a dedicated service account and a least-privilege
-custom role in deployed environments.
+During the GCP migration, `GOOGLE_CLOUD_PROJECT` may remain configured as a
+temporary read-only compatibility path. When an existing Secret Manager
+reference is first used, HawkView imports and encrypts it in PostgreSQL. Remove
+the variable and the service account's Secret Manager access only after all
+active connector credentials have been exercised or deliberately re-entered.
 
 The initial least-privilege permission set is:
 

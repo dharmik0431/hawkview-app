@@ -82,19 +82,19 @@ enum SyncStateStatus {
 }
 
 model User {
-  id                     String         @id @default(uuid()) @db.Uuid
-  authProviderUserId     String?        @unique @map("auth_provider_user_id") @db.VarChar(128)
-  email                  String         @unique @db.VarChar(320)
-  displayName            String?        @map("display_name") @db.VarChar(200)
-  timeZone               String?        @map("time_zone") @db.VarChar(100)
-  dateFormat             String         @default("MM/DD/YYYY") @map("date_format") @db.VarChar(20)
-  timeFormat             String         @default("12h") @map("time_format") @db.VarChar(3)
-  platformRole           PlatformRole   @default(STANDARD_USER) @map("platform_role")
-  disabledAt             DateTime?      @map("disabled_at") @db.Timestamptz(6)
-  createdAt              DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt              DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
-  memberships            Membership[]
-  notifications          Notification[]
+  id                 String         @id @default(uuid()) @db.Uuid
+  authProviderUserId String?        @unique @map("auth_provider_user_id") @db.VarChar(128)
+  email              String         @unique @db.VarChar(320)
+  displayName        String?        @map("display_name") @db.VarChar(200)
+  timeZone           String?        @map("time_zone") @db.VarChar(100)
+  dateFormat         String         @default("MM/DD/YYYY") @map("date_format") @db.VarChar(20)
+  timeFormat         String         @default("12h") @map("time_format") @db.VarChar(3)
+  platformRole       PlatformRole   @default(STANDARD_USER) @map("platform_role")
+  disabledAt         DateTime?      @map("disabled_at") @db.Timestamptz(6)
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  memberships        Membership[]
+  notifications      Notification[]
 
   @@index([platformRole])
   @@index([disabledAt])
@@ -440,4 +440,17 @@ model PlatformMicrosoftConnector {
   updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("platform_microsoft_connectors")
+}
+
+model EncryptedSecret {
+  id                   String   @id @default(uuid()) @db.Uuid
+  name                 String   @unique @db.VarChar(200)
+  ciphertext           Bytes
+  initializationVector Bytes    @map("initialization_vector")
+  authenticationTag    Bytes    @map("authentication_tag")
+  legacyReference      String?  @unique @map("legacy_reference") @db.VarChar(500)
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("encrypted_secrets")
 }
