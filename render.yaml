@@ -33,3 +33,18 @@ services:
         sync: false
       - key: SCHEDULED_SYNC_BATCH_SIZE
         value: '10'
+
+  - type: cron
+    name: hawkview-sync-dev
+    runtime: docker
+    plan: starter
+    region: ohio
+    schedule: '*/5 * * * *'
+    dockerContext: ./backend
+    dockerfilePath: ./backend/Dockerfile
+    dockerCommand: node scripts/trigger-scheduled-sync.mjs
+    envVars:
+      - key: SCHEDULER_TARGET_URL
+        value: https://hawkview-api-dev.onrender.com/api/internal/sync/due-tenants
+      - key: SCHEDULER_SHARED_SECRET
+        sync: false
