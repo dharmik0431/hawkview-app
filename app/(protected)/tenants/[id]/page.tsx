@@ -10,6 +10,9 @@ import LicensesSection from './components/sections/licenses-section'
 import LicenseActivitySection from './components/sections/license-activity-section'
 import EntraSection from './components/sections/entra-section'
 import EntraOverviewSection from './components/sections/entra-overview-section'
+import GroupsSection from './components/sections/groups-section'
+import AppRegistrationsSection from './components/sections/app-registrations-section'
+import EnterpriseAppsSection from './components/sections/enterprise-apps-section'
 import SignInActivitySection from './components/sections/signins-section'
 import ExchangePage from './components/sections/exchange-section'
 import SharePointPage from './components/sections/sharepoint-section'
@@ -54,6 +57,8 @@ import {
   ArrowUp,
   ArrowDown,
   ArrowUpDown,
+  AppWindow,
+  Building2,
 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
@@ -91,7 +96,15 @@ type TenantSection =
   | 'drive'
   | 'security'
 
-type EntraTab = 'overview' | 'identity' | 'security' | 'licenses'
+type EntraTab =
+  | 'overview'
+  | 'users'
+  | 'groups'
+  | 'app-registrations'
+  | 'enterprise-apps'
+  | 'security'
+  | 'licenses'
+  | 'identity'
 
 type UserSortField = 'name' | 'type' | 'role' | 'status' | 'mfa'
 type UserSortOrder = 'asc' | 'desc'
@@ -1317,9 +1330,19 @@ export default function TenantDetailsPage() {
   const [entraTab, setEntraTab] = useState<EntraTab>('overview')
 
   useEffect(() => {
-    if (
-      entraTabParam &&
-      ['overview', 'identity', 'security', 'licenses'].includes(entraTabParam)
+    if (!entraTabParam) return
+    if (entraTabParam === 'identity') {
+      setEntraTab('users')
+    } else if (
+      [
+        'overview',
+        'users',
+        'groups',
+        'app-registrations',
+        'enterprise-apps',
+        'security',
+        'licenses',
+      ].includes(entraTabParam)
     ) {
       setEntraTab(entraTabParam as EntraTab)
     }
@@ -3551,6 +3574,9 @@ export default function TenantDetailsPage() {
               licenseRows={licenseRows}
               users={bundle?.users}
               syncCompleted={Boolean(bundle?.licenses)}
+              tenant={tenant}
+              bundle={bundle}
+              domains={domains}
             />
           ) : (
             <DnsSection tenant={tenant} domains={domains} dns={bundle?.dns} />
@@ -3586,7 +3612,7 @@ export default function TenantDetailsPage() {
                 <div
                   role="tablist"
                   aria-label="Entra ID navigation"
-                  className="flex items-center gap-6 overflow-x-auto no-scrollbar text-xs font-medium h-10 flex-nowrap"
+                  className="flex items-center gap-4 sm:gap-6 overflow-x-auto no-scrollbar text-xs font-medium h-10 flex-nowrap"
                 >
                   <button
                     type="button"
@@ -3607,18 +3633,66 @@ export default function TenantDetailsPage() {
                   <button
                     type="button"
                     role="tab"
-                    id="entra-tab-identity"
-                    aria-selected={entraTab === 'identity'}
-                    aria-controls="entra-tabpanel-identity"
-                    onClick={() => handleNavigateEntraTab('identity')}
+                    id="entra-tab-users"
+                    aria-selected={entraTab === 'users' || entraTab === 'identity'}
+                    aria-controls="entra-tabpanel-users"
+                    onClick={() => handleNavigateEntraTab('users')}
                     className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
-                      entraTab === 'identity'
+                      entraTab === 'users' || entraTab === 'identity'
                         ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
                         : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
                     }`}
                   >
                     <User className="h-4 w-4 shrink-0" />
-                    <span>Identity</span>
+                    <span>Users</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    id="entra-tab-groups"
+                    aria-selected={entraTab === 'groups'}
+                    aria-controls="entra-tabpanel-groups"
+                    onClick={() => handleNavigateEntraTab('groups')}
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
+                      entraTab === 'groups'
+                        ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
+                    }`}
+                  >
+                    <Users className="h-4 w-4 shrink-0" />
+                    <span>Groups</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    id="entra-tab-app-registrations"
+                    aria-selected={entraTab === 'app-registrations'}
+                    aria-controls="entra-tabpanel-app-registrations"
+                    onClick={() => handleNavigateEntraTab('app-registrations')}
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
+                      entraTab === 'app-registrations'
+                        ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
+                    }`}
+                  >
+                    <AppWindow className="h-4 w-4 shrink-0" />
+                    <span>App Registrations</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    id="entra-tab-enterprise-apps"
+                    aria-selected={entraTab === 'enterprise-apps'}
+                    aria-controls="entra-tabpanel-enterprise-apps"
+                    onClick={() => handleNavigateEntraTab('enterprise-apps')}
+                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
+                      entraTab === 'enterprise-apps'
+                        ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
+                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
+                    }`}
+                  >
+                    <Building2 className="h-4 w-4 shrink-0" />
+                    <span>Enterprise Applications</span>
                   </button>
                   <button
                     type="button"
@@ -3676,11 +3750,11 @@ export default function TenantDetailsPage() {
                 </div>
               )}
 
-              {entraTab === 'identity' && (
+              {(entraTab === 'users' || entraTab === 'identity') && (
                 <div
                   role="tabpanel"
-                  id="entra-tabpanel-identity"
-                  aria-labelledby="entra-tab-identity"
+                  id="entra-tabpanel-users"
+                  aria-labelledby="entra-tab-users"
                 >
                   <Card className="rounded-2xl mt-5 shadow-sm border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
                     <CardContent className="p-0">
@@ -4029,6 +4103,36 @@ export default function TenantDetailsPage() {
                       </div>
                     </CardContent>
                   </Card>
+                </div>
+              )}
+
+              {entraTab === 'groups' && (
+                <div
+                  role="tabpanel"
+                  id="entra-tabpanel-groups"
+                  aria-labelledby="entra-tab-groups"
+                >
+                  <GroupsSection bundle={bundle} />
+                </div>
+              )}
+
+              {entraTab === 'app-registrations' && (
+                <div
+                  role="tabpanel"
+                  id="entra-tabpanel-app-registrations"
+                  aria-labelledby="entra-tab-app-registrations"
+                >
+                  <AppRegistrationsSection bundle={bundle} />
+                </div>
+              )}
+
+              {entraTab === 'enterprise-apps' && (
+                <div
+                  role="tabpanel"
+                  id="entra-tabpanel-enterprise-apps"
+                  aria-labelledby="entra-tab-enterprise-apps"
+                >
+                  <EnterpriseAppsSection bundle={bundle} />
                 </div>
               )}
 

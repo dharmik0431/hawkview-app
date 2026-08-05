@@ -88,7 +88,15 @@ interface EntraOverviewSectionProps {
   authMethods: AuthMethodRow[]
   namedLocations: NamedLocation[]
   onNavigateTab: (
-    tab: 'overview' | 'identity' | 'security' | 'licenses',
+    tab:
+      | 'overview'
+      | 'users'
+      | 'groups'
+      | 'app-registrations'
+      | 'enterprise-apps'
+      | 'security'
+      | 'licenses'
+      | 'identity',
     securityView?: 'policies' | 'sign-ins' | 'auth' | 'locations'
   ) => void
 }

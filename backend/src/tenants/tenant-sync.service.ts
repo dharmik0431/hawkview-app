@@ -169,6 +169,8 @@ type EntraSnapshotResource =
   | 'DEVICES'
   | 'DIRECTORY_ROLES'
   | 'SERVICE_PRINCIPALS'
+  | 'APPLICATIONS'
+  | 'SECURITY_DEFAULTS'
   | 'SHAREPOINT_SITES'
   | 'SHAREPOINT_SETTINGS'
   | 'SHAREPOINT_USAGE'
@@ -686,8 +688,24 @@ export class TenantSyncService {
         tenant,
         snapshotAccessToken,
         'SERVICE_PRINCIPALS',
-        'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,servicePrincipalType'
+        'https://graph.microsoft.com/v1.0/servicePrincipals?' +
+          '$select=id,appId,displayName,description,servicePrincipalType,' +
+          'accountEnabled,appRoleAssignmentRequired,createdDateTime,homepage,' +
+          'loginUrl,publisherName,verifiedPublisher,tags,' +
+          'preferredSingleSignOnMode,notificationEmailAddresses,appRoles,' +
+          'oauth2PermissionScopes'
       ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'APPLICATIONS',
+        'https://graph.microsoft.com/v1.0/applications?' +
+          '$select=id,appId,displayName,description,createdDateTime,' +
+          'signInAudience,publisherDomain,identifierUris,web,' +
+          'passwordCredentials,keyCredentials,requiredResourceAccess&' +
+          '$expand=owners($select=id,displayName,userPrincipalName)'
+      ),
+      this.syncSecurityDefaults(tenant, snapshotAccessToken),
     ]
     const entraResults = await Promise.allSettled(entraModules)
     entraResults.forEach((result, index) => {
@@ -702,6 +720,8 @@ export class TenantSyncService {
           'DEVICES',
           'DIRECTORY_ROLES',
           'SERVICE_PRINCIPALS',
+          'APPLICATIONS',
+          'SECURITY_DEFAULTS',
         ][index]
         this.logger.warn(
           `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
@@ -1234,6 +1254,35 @@ export class TenantSyncService {
           observedAt: new Date(),
         },
       })
+    })
+  }
+
+  private async syncSecurityDefaults(
+    tenant: { id: string; organizationId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'SECURITY_DEFAULTS', async () => {
+      const response = await fetch(
+        'https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy',
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(30_000),
+        }
+      )
+      if (!response.ok) {
+        const graphRequestId = response.headers.get('request-id')
+        const graphError = await describeGraphError(response)
+        throw new Error(
+          `Microsoft security defaults synchronization returned ${response.status}${
+            graphRequestId ? ` (request ${graphRequestId})` : ''
+          }${graphError}.`
+        )
+      }
+      const policy = (await response.json()) as Record<string, unknown>
+      await this.saveEntraSnapshot(tenant, 'SECURITY_DEFAULTS', [policy])
     })
   }
 
@@ -2241,6 +2290,42 @@ export class TenantSyncService {
           principal.displayName.trim(),
         ])
     )
+    const servicePrincipals =
+      snapshotByResource.get('SERVICE_PRINCIPALS') ?? []
+    const applications = snapshotByResource.get('APPLICATIONS') ?? []
+    const resourceApiByAppId = new Map<
+      string,
+      {
+        displayName: string
+        permissionsById: Map<string, string>
+      }
+    >()
+    for (const principal of servicePrincipals) {
+      if (typeof principal?.appId !== 'string') continue
+      const permissionsById = new Map<string, string>()
+      for (const permission of [
+        ...(Array.isArray(principal.appRoles) ? principal.appRoles : []),
+        ...(Array.isArray(principal.oauth2PermissionScopes)
+          ? principal.oauth2PermissionScopes
+          : []),
+      ]) {
+        if (typeof permission?.id !== 'string') continue
+        permissionsById.set(
+          permission.id.toLowerCase(),
+          permission.value ??
+            permission.displayName ??
+            permission.adminConsentDisplayName ??
+            permission.id
+        )
+      }
+      resourceApiByAppId.set(principal.appId.toLowerCase(), {
+        displayName: principal.displayName ?? principal.appId,
+        permissionsById,
+      })
+    }
+    const securityDefaults = (
+      snapshotByResource.get('SECURITY_DEFAULTS') ?? []
+    )[0]
     const conditionalAccessTargetNames: Record<string, string> = {
       All: 'All cloud apps',
       Office365: 'Office 365',
@@ -2510,6 +2595,7 @@ export class TenantSyncService {
             licenses: user.assignedLicenseSkuIds.map(
               (skuId) => licenseNameBySkuId.get(skuId.toLowerCase()) ?? skuId
             ),
+            assignedLicenseSkuIds: user.assignedLicenseSkuIds,
             groups: user.groupMemberships
               .map((membership) => membership.directoryGroup.displayName)
               .sort((left, right) => left.localeCompare(right)),
@@ -2833,6 +2919,152 @@ export class TenantSyncService {
           })),
         },
         entra: {
+          securityDefaults:
+            typeof securityDefaults?.isEnabled === 'boolean'
+              ? {
+                  enabled: securityDefaults.isEnabled,
+                  state: securityDefaults.isEnabled ? 'ENABLED' : 'DISABLED',
+                }
+              : null,
+          groups: directoryGroups.map((group) => {
+            const isUnified = group.groupTypes.includes('Unified')
+            const isDynamic = group.groupTypes.includes('DynamicMembership')
+            const type = isUnified
+              ? isDynamic
+                ? 'Dynamic Microsoft 365'
+                : 'Microsoft 365'
+              : group.mailEnabled && group.securityEnabled
+                ? 'Mail-enabled security'
+                : group.mailEnabled
+                  ? 'Distribution list'
+                  : isDynamic
+                    ? 'Dynamic security'
+                    : 'Security'
+            return {
+              id: group.microsoftGroupId,
+              objectId: group.microsoftGroupId,
+              displayName: group.displayName,
+              description: group.description,
+              mail: group.mail,
+              type,
+              groupType: type,
+              membershipType: isDynamic ? 'Dynamic' : 'Assigned',
+              visibility: group.visibility,
+              membersCount: group.memberships.length,
+              owners: [],
+              onPremisesSyncEnabled: null,
+            }
+          }),
+          enterpriseApplications: servicePrincipals.map((principal) => ({
+            id: principal.id,
+            objectId: principal.id,
+            appId: principal.appId,
+            displayName: principal.displayName,
+            description: principal.description,
+            publisher:
+              principal.verifiedPublisher?.displayName ??
+              principal.publisherName ??
+              'Not synchronized',
+            verifiedPublisher: Boolean(
+              principal.verifiedPublisher?.verifiedPublisherId
+            ),
+            servicePrincipalType: principal.servicePrincipalType,
+            accountEnabled: principal.accountEnabled,
+            appRoleAssignmentRequired: principal.appRoleAssignmentRequired,
+            createdDateTime: principal.createdDateTime,
+            homepageUrl: principal.homepage,
+            loginUrl: principal.loginUrl,
+            preferredSingleSignOnMode: principal.preferredSingleSignOnMode,
+            assignedUsers: null,
+            assignedGroups: null,
+            assignedServicePrincipals: null,
+            delegatedGrants: [],
+            applicationPermissions: [],
+          })),
+          appRegistrations: applications.map((application) => {
+            const now = Date.now()
+            const credentials = [
+              ...(Array.isArray(application.passwordCredentials)
+                ? application.passwordCredentials.map((credential: any) => ({
+                    type: 'Secret',
+                    name: credential.displayName ?? 'Client secret',
+                    startDate: credential.startDateTime,
+                    endDate: credential.endDateTime,
+                  }))
+                : []),
+              ...(Array.isArray(application.keyCredentials)
+                ? application.keyCredentials.map((credential: any) => ({
+                    type: 'Certificate',
+                    name: credential.displayName ?? 'Certificate',
+                    startDate: credential.startDateTime,
+                    endDate: credential.endDateTime,
+                  }))
+                : []),
+            ].map((credential: any) => {
+              const expiration = Date.parse(credential.endDate ?? '')
+              const daysRemaining = Number.isFinite(expiration)
+                ? (expiration - now) / 86_400_000
+                : null
+              return {
+                ...credential,
+                status:
+                  daysRemaining === null
+                    ? 'Unknown'
+                    : daysRemaining < 0
+                      ? 'Expired'
+                      : daysRemaining <= 30
+                        ? 'Expiring'
+                        : 'Active',
+              }
+            })
+            const apiPermissions = Array.isArray(
+              application.requiredResourceAccess
+            )
+              ? application.requiredResourceAccess.flatMap((resource: any) =>
+                  Array.isArray(resource.resourceAccess)
+                    ? resource.resourceAccess.map((permission: any) => {
+                        const resourceApi = resourceApiByAppId.get(
+                          String(resource.resourceAppId ?? '').toLowerCase()
+                        )
+                        const permissionName =
+                          resourceApi?.permissionsById.get(
+                            String(permission.id ?? '').toLowerCase()
+                          ) ?? permission.id
+                        return {
+                          name: permissionName,
+                          resourceApi:
+                            resourceApi?.displayName ?? resource.resourceAppId,
+                          type:
+                            permission.type === 'Role'
+                              ? 'Application'
+                              : 'Delegated',
+                          scopeOrRole: permissionName,
+                        }
+                      })
+                    : []
+                )
+              : []
+            return {
+              id: application.id,
+              objectId: application.id,
+              appId: application.appId,
+              displayName: application.displayName,
+              description: application.description,
+              createdDateTime: application.createdDateTime,
+              publisherDomain: application.publisherDomain,
+              signInAudience: application.signInAudience,
+              homepageUrl: application.web?.homePageUrl,
+              identifierUris: application.identifierUris ?? [],
+              owners: Array.isArray(application.owners)
+                ? application.owners.map(
+                    (owner: any) =>
+                      owner.displayName ?? owner.userPrincipalName ?? owner.id
+                  )
+                : [],
+              credentials,
+              apiPermissions,
+            }
+          }),
           caPolicies: (snapshotByResource.get('CONDITIONAL_ACCESS') ?? []).map(
             (policy) => {
               const includeUsers = policy?.conditions?.users?.includeUsers ?? []
@@ -2953,6 +3185,9 @@ export class TenantSyncService {
               groupSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: groupSyncState?.lastErrorMessage ?? null,
           },
+          applications: exchangeSync('APPLICATIONS'),
+          servicePrincipals: exchangeSync('SERVICE_PRINCIPALS'),
+          securityDefaults: exchangeSync('SECURITY_DEFAULTS'),
         },
       },
     }
