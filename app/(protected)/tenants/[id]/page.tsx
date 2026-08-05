@@ -4208,6 +4208,7 @@ export default function TenantDetailsPage() {
                     >
                       <SignInActivitySection
                         signIns={SIGNINS}
+                        syncStatus={bundle?.sync?.signIns}
                         signInView={signInView}
                         onSignInViewChange={handleSignInViewChange}
                       />

@@ -16,7 +16,9 @@ import {
   XCircle,
   Globe,
   Info,
+  AlertTriangle,
 } from 'lucide-react'
+import type { TenantSyncStatus } from '@/types/tenant-data'
 
 export type SignInResult = 'Success' | 'Failure'
 
@@ -43,6 +45,7 @@ interface SignInActivitySectionProps {
   signIns: SignInEvent[]
   signInView: 'list' | 'map'
   onSignInViewChange: (view: 'list' | 'map') => void
+  syncStatus?: TenantSyncStatus
 }
 
 function formatSignInTime(dateStr: string) {
@@ -89,6 +92,7 @@ export default function SignInActivitySection({
   signIns,
   signInView,
   onSignInViewChange,
+  syncStatus,
 }: SignInActivitySectionProps) {
   const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
   const [resultFilter, setResultFilter] = useState<
@@ -286,8 +290,21 @@ export default function SignInActivitySection({
         : 'Last 30 days'
 
   return (
-    <Card className="rounded-2xl mt-4 shadow-sm bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800">
-      <CardContent className="p-0">
+    <div className="mt-4 space-y-3">
+      {syncStatus?.status === 'failed' && (
+        <div className="flex gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
+          <div>
+            <p className="text-sm font-semibold">Sign-in logs are unavailable</p>
+            <p className="mt-1 text-xs leading-5">
+              {syncStatus.lastError ||
+                'Microsoft did not return sign-in events for this tenant. Existing retained events remain available.'}
+            </p>
+          </div>
+        </div>
+      )}
+      <Card className="rounded-2xl shadow-sm bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800">
+        <CardContent className="p-0">
         {/* Header & Controls Toolbar */}
         <div className="p-5 border-b border-slate-200 dark:border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-slate-50/50 dark:bg-slate-800/40 rounded-t-2xl">
           <div>
@@ -545,7 +562,8 @@ export default function SignInActivitySection({
             </div>
           </div>
         )}
-      </CardContent>
-    </Card>
+        </CardContent>
+      </Card>
+    </div>
   )
 }

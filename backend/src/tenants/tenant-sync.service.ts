@@ -1464,10 +1464,11 @@ export class TenantSyncService {
       })
       if (!response.ok) {
         const requestId = response.headers.get('request-id')
+        const graphError = await describeGraphError(response)
         throw new Error(
           `Microsoft ${resourceLabel} synchronization returned ${response.status}${
             requestId ? ` (request ${requestId})` : ''
-          }.`
+          }${graphError}.`
         )
       }
       const page = (await response.json()) as GraphCollectionPage
@@ -2492,6 +2493,8 @@ export class TenantSyncService {
     const licenseSyncState = syncStateByResource.get('LICENSES')
     const domainSyncState = syncStateByResource.get('DOMAINS')
     const groupSyncState = syncStateByResource.get('GROUPS')
+    const signInSyncState = syncStateByResource.get('SIGN_INS')
+    const auditLogSyncState = syncStateByResource.get('AUDIT_LOGS')
     const sharePointSitesSyncState = syncStateByResource.get('SHAREPOINT_SITES')
     const sharePointSettingsSyncState = syncStateByResource.get(
       'SHAREPOINT_SETTINGS'
@@ -3184,6 +3187,18 @@ export class TenantSyncService {
             lastSuccessfulAt:
               groupSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: groupSyncState?.lastErrorMessage ?? null,
+          },
+          signIns: {
+            status: signInSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt:
+              signInSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: signInSyncState?.lastErrorMessage ?? null,
+          },
+          auditLogs: {
+            status: auditLogSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt:
+              auditLogSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: auditLogSyncState?.lastErrorMessage ?? null,
           },
           applications: exchangeSync('APPLICATIONS'),
           servicePrincipals: exchangeSync('SERVICE_PRINCIPALS'),
