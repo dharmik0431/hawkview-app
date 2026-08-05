@@ -10,8 +10,13 @@ import {
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { getMicrosoftSkuName } from '../microsoft/microsoft-sku-names.js'
+import { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { resolveDomainDnsHealth } from './domain-dns-health.js'
+import {
+  IpGeolocationService,
+  type SignInLocation,
+} from './ip-geolocation.service.js'
 
 const TENANT_ADMIN_ROLES = ['MSP_OWNER', 'MSP_ADMIN'] as const
 const USER_SELECT =
@@ -285,7 +290,9 @@ export class TenantSyncService {
     @Inject(PrismaService)
     private readonly prisma: PrismaService,
     @Inject(MicrosoftConsentService)
-    private readonly microsoftConsent: MicrosoftConsentService
+    private readonly microsoftConsent: MicrosoftConsentService,
+    @Inject(IpGeolocationService)
+    private readonly ipGeolocation: IpGeolocationService
   ) {}
 
   private async getAuthorizedTenant(
@@ -1587,6 +1594,9 @@ export class TenantSyncService {
         rows = await this.fetchLimitedLoginActivity(tenant, start, end)
         limited = true
       }
+      const inferredLocations = limited
+        ? await this.enrichLimitedSignInLocations(rows)
+        : new Map<string, SignInLocation>()
       const ingestedAt = new Date()
       const expiresAt = logExpirationDate(ingestedAt)
       const records = rows
@@ -1658,10 +1668,54 @@ export class TenantSyncService {
           skipDuplicates: true,
         })
       }
+      if (limited && inferredLocations.size > 0) {
+        await Promise.all(
+          [...inferredLocations].map(([ipAddress, location]) =>
+            this.prisma.signInLog.updateMany({
+              where: {
+                customerTenantId: tenant.id,
+                microsoftSignInId: { startsWith: 'management:' },
+                ipAddress,
+                location: { equals: Prisma.DbNull },
+              } as never,
+              data: { location } as never,
+            })
+          )
+        )
+      }
       await this.prisma.signInLog.deleteMany({
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
     })
+  }
+
+  private async enrichLimitedSignInLocations(rows: any[]) {
+    const locations = new Map<string, SignInLocation>()
+    const uniqueIps = [
+      ...new Set(
+        rows
+          .filter((row) => !row?.location)
+          .map((row) =>
+            typeof row?.ipAddress === 'string' ? row.ipAddress.trim() : ''
+          )
+          .filter(Boolean)
+      ),
+    ]
+
+    await Promise.all(
+      uniqueIps.map(async (ipAddress) => {
+        const location = await this.ipGeolocation.lookup(ipAddress)
+        if (location) locations.set(ipAddress, location)
+      })
+    )
+
+    for (const row of rows) {
+      if (row?.location || typeof row?.ipAddress !== 'string') continue
+      const location = locations.get(row.ipAddress.trim())
+      if (location) row.location = location
+    }
+
+    return locations
   }
 
   private async fetchLimitedLoginActivity(
