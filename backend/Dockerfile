@@ -33,10 +33,11 @@ COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 COPY --from=builder /app/dist ./dist
 COPY scripts/trigger-scheduled-sync.mjs ./scripts/trigger-scheduled-sync.mjs
+COPY scripts/prepare-geolite.mjs ./scripts/prepare-geolite.mjs
 
 EXPOSE 8080
 
 # Apply committed Prisma migrations before accepting requests. Container hosts
 # may start more than one instance at a time; Prisma serializes migrations with
 # a PostgreSQL advisory lock, so concurrent starts remain safe.
-CMD ["sh", "-c", "npm run db:migrate:deploy && npm start"]
+CMD ["sh", "-c", "node scripts/prepare-geolite.mjs && npm run db:migrate:deploy && npm start"]
