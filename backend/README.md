@@ -90,7 +90,13 @@ Authorization: Bearer SCHEDULER_SHARED_SECRET
 ```
 
 Use a long random `SCHEDULER_SHARED_SECRET` stored only in the backend host and
-the scheduler's encrypted secret store. During the GCP-to-portable migration,
+the scheduler's encrypted secret store. The Render Blueprint defines
+`hawkview-sync-dev`, which calls this endpoint every five minutes. Enter the
+same `SCHEDULER_SHARED_SECRET` value for both the web service and cron job; the
+cron runner exits unsuccessfully when the API cannot be reached or rejects the
+request, so failures appear in Render's run history.
+
+During the GCP-to-portable migration,
 the endpoint also accepts the existing Google Cloud Scheduler OIDC token when
 `SCHEDULER_OIDC_AUDIENCE` and `SCHEDULER_SERVICE_ACCOUNT_EMAIL` are configured.
 Remove those two Google settings after the replacement scheduler is verified.
