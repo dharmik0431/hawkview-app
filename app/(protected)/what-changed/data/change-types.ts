@@ -9,6 +9,8 @@ export type ChangeCategory =
   | 'Users'
   | 'Groups'
   | 'Devices'
+  | 'Passwords'
+  | 'Sign-ins'
 
 export type ChangeSource = 'Entra' | 'M365' | 'Unknown'
 
@@ -25,6 +27,9 @@ export type ChangeEvent = {
   actor?: string
   target?: string
   source: ChangeSource
+  eventType?: 'change' | 'sign-in'
+  correlationId?: string
+  recoveryGuidance?: string[]
 
   ip?: string
   location?: { city?: string; region?: string; country?: string }
