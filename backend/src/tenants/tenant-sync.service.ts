@@ -102,6 +102,42 @@ function normalizeSharePointUrl(value: unknown) {
   return value.trim().replace(/\/$/, '').toLowerCase()
 }
 
+function managementActivityExtendedProperty(record: any, ...names: string[]) {
+  const expected = new Set(names.map((name) => name.toLowerCase()))
+  const property = (
+    Array.isArray(record?.ExtendedProperties) ? record.ExtendedProperties : []
+  ).find(
+    (item: any) =>
+      typeof item?.Name === 'string' && expected.has(item.Name.toLowerCase())
+  )
+  return property?.Value
+}
+
+function isManagementActivityLogin(record: any) {
+  const recordType = Number(record?.RecordType)
+  if (recordType === 9 || recordType === 15) return true
+  const operation = String(record?.Operation ?? '').toLowerCase()
+  return /(login|logon|sign.?in)/.test(operation)
+}
+
+function managementActivityLoginSucceeded(record: any) {
+  const loginStatus =
+    record?.LoginStatus ??
+    managementActivityExtendedProperty(record, 'LoginStatus')
+  if (loginStatus !== undefined && loginStatus !== null && loginStatus !== '') {
+    return Number(loginStatus) === 0
+  }
+  const errorCode =
+    record?.ErrorCode ?? managementActivityExtendedProperty(record, 'ErrorCode')
+  if (errorCode !== undefined && errorCode !== null && errorCode !== '') {
+    return Number(errorCode) === 0
+  }
+  if (String(record?.Operation ?? '') === 'UserLoggedIn') return true
+  return ['success', 'succeeded'].includes(
+    String(record?.ResultStatus ?? '').toLowerCase()
+  )
+}
+
 interface GraphUser {
   id?: string
   displayName?: string | null
@@ -481,9 +517,15 @@ export class TenantSyncService {
     }
     if (!claimed) {
       if (throwWhenBusy) {
-        throw new ConflictException('A tenant synchronization is already running.')
+        throw new ConflictException(
+          'A tenant synchronization is already running.'
+        )
       }
-      return { bundle: null, status: 'SKIPPED', failedResources: [] as string[] }
+      return {
+        bundle: null,
+        status: 'SKIPPED',
+        failedResources: [] as string[],
+      }
     }
 
     try {
@@ -757,9 +799,7 @@ export class TenantSyncService {
     error: unknown
   ) {
     const message =
-      error instanceof Error
-        ? error.message
-        : 'Microsoft tenant access failed.'
+      error instanceof Error ? error.message : 'Microsoft tenant access failed.'
     const failedAt = new Date()
 
     await this.prisma.$transaction([
@@ -1327,7 +1367,11 @@ export class TenantSyncService {
       )
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      if (!message.includes('Authentication_RequestFromNonPremiumTenantOrB2CTenant')) {
+      if (
+        !message.includes(
+          'Authentication_RequestFromNonPremiumTenantOrB2CTenant'
+        )
+      ) {
         throw error
       }
       this.logger.log(
@@ -1349,34 +1393,44 @@ export class TenantSyncService {
       })
       const registrations: Array<Record<string, unknown>> = []
       const methodLabels: Record<string, string> = {
-        '#microsoft.graph.fido2AuthenticationMethod': 'FIDO2 security key or passkey',
-        '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod': 'Microsoft Authenticator',
+        '#microsoft.graph.fido2AuthenticationMethod':
+          'FIDO2 security key or passkey',
+        '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod':
+          'Microsoft Authenticator',
         '#microsoft.graph.phoneAuthenticationMethod': 'Phone',
-        '#microsoft.graph.softwareOathAuthenticationMethod': 'Software OATH token',
-        '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod': 'Windows Hello for Business',
-        '#microsoft.graph.temporaryAccessPassAuthenticationMethod': 'Temporary Access Pass',
-        '#microsoft.graph.platformCredentialAuthenticationMethod': 'Platform credential',
-        '#microsoft.graph.hardwareOathAuthenticationMethod': 'Hardware OATH token',
+        '#microsoft.graph.softwareOathAuthenticationMethod':
+          'Software OATH token',
+        '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod':
+          'Windows Hello for Business',
+        '#microsoft.graph.temporaryAccessPassAuthenticationMethod':
+          'Temporary Access Pass',
+        '#microsoft.graph.platformCredentialAuthenticationMethod':
+          'Platform credential',
+        '#microsoft.graph.hardwareOathAuthenticationMethod':
+          'Hardware OATH token',
       }
 
       for (let offset = 0; offset < users.length; offset += 20) {
         const batchUsers = users.slice(offset, offset + 20)
-        const response = await fetch('https://graph.microsoft.com/v1.0/$batch', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            requests: batchUsers.map((user, index) => ({
-              id: String(index + 1),
-              method: 'GET',
-              url: `/users/${encodeURIComponent(user.microsoftUserId)}/authentication/methods`,
-            })),
-          }),
-          signal: AbortSignal.timeout(30_000),
-        })
+        const response = await fetch(
+          'https://graph.microsoft.com/v1.0/$batch',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              Accept: 'application/json',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              requests: batchUsers.map((user, index) => ({
+                id: String(index + 1),
+                method: 'GET',
+                url: `/users/${encodeURIComponent(user.microsoftUserId)}/authentication/methods`,
+              })),
+            }),
+            signal: AbortSignal.timeout(30_000),
+          }
+        )
         if (!response.ok) {
           const graphError = await describeGraphError(response)
           throw new Error(
@@ -1397,9 +1451,11 @@ export class TenantSyncService {
           const methods = (item.body?.value ?? [])
             .map((method) => method['@odata.type'])
             .filter((type): type is string => typeof type === 'string')
-          const registeredMfaMethods = [...new Set(
-            methods.map((type) => methodLabels[type]).filter(Boolean)
-          )]
+          const registeredMfaMethods = [
+            ...new Set(
+              methods.map((type) => methodLabels[type]).filter(Boolean)
+            ),
+          ]
           registrations.push({
             id: user.microsoftUserId,
             userPrincipalName: user.userPrincipalName,
@@ -1503,10 +1559,7 @@ export class TenantSyncService {
       : new Date(Date.now() - INITIAL_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
   }
 
-  private async syncSignInLogs(
-    tenant: TenantSyncTarget,
-    accessToken: string
-  ) {
+  private async syncSignInLogs(tenant: TenantSyncTarget, accessToken: string) {
     return this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
       const start = await this.logSyncStart(tenant.id, 'SIGN_INS')
       const end = new Date()
@@ -1524,7 +1577,9 @@ export class TenantSyncService {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         if (
-          !message.includes('Authentication_RequestFromNonPremiumTenantOrB2CTenant') &&
+          !message.includes(
+            'Authentication_RequestFromNonPremiumTenantOrB2CTenant'
+          ) &&
           !message.includes("doesn't have premium license")
         ) {
           throw error
@@ -1548,7 +1603,9 @@ export class TenantSyncService {
           eventDateTime: new Date(row.createdDateTime),
           userId: typeof row.userId === 'string' ? row.userId : null,
           userDisplayName:
-            typeof row.userDisplayName === 'string' ? row.userDisplayName : null,
+            typeof row.userDisplayName === 'string'
+              ? row.userDisplayName
+              : null,
           userPrincipalName:
             typeof row.userPrincipalName === 'string'
               ? row.userPrincipalName.toLowerCase()
@@ -1626,7 +1683,10 @@ export class TenantSyncService {
         credentialReference: tenant.connection.credentialReference,
       })
     const baseUrl = `https://manage.office.com/api/v1.0/${encodeURIComponent(tenant.microsoftTenantId)}/activity/feed`
-    const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+    }
     const contentType = 'Audit.AzureActiveDirectory'
     const subscriptionIsEnabled = async () => {
       const response = await fetch(`${baseUrl}/subscriptions/list`, {
@@ -1661,6 +1721,11 @@ export class TenantSyncService {
         // subscription between our list and start requests. Verify the actual
         // state before treating that race as a sync failure.
         if (startResponse.status !== 400 || !(await subscriptionIsEnabled())) {
+          if (/tenant [^\s]+ does not exist/i.test(body)) {
+            throw new Error(
+              'Microsoft unified audit logging is not provisioned for this tenant. Turn on auditing in Microsoft Purview, wait for Microsoft to finish provisioning it, and then retry synchronization.'
+            )
+          }
           throw new Error(
             `Microsoft 365 activity subscription could not be started (HTTP ${startResponse.status})${body ? `: ${body}` : '.'}`
           )
@@ -1690,11 +1755,14 @@ export class TenantSyncService {
         }
         const items = (await response.json()) as Array<{ contentUri?: string }>
         for (const item of items) {
-          if (typeof item.contentUri === 'string') contentUris.push(item.contentUri)
+          if (typeof item.contentUri === 'string')
+            contentUris.push(item.contentUri)
         }
         pageUrl = response.headers.get('NextPageUri') ?? ''
         if (pageUrl && !pageUrl.startsWith('https://manage.office.com/')) {
-          throw new Error('Microsoft returned an invalid activity-feed page URL.')
+          throw new Error(
+            'Microsoft returned an invalid activity-feed page URL.'
+          )
         }
       }
       windowStart = new Date(windowEnd.getTime() + 1)
@@ -1713,46 +1781,71 @@ export class TenantSyncService {
     }
 
     return records
-      .filter((record) =>
-        ['UserLoggedIn', 'UserLoginFailed', 'UserLoginBlocked'].includes(
-          String(record?.Operation ?? '')
-        )
-      )
+      .filter(isManagementActivityLogin)
       .filter(
         (record) =>
           typeof record?.Id === 'string' &&
           typeof record?.CreationTime === 'string' &&
           Number.isFinite(new Date(record.CreationTime).getTime())
       )
-      .map((record) => ({
-        id: record.Id,
-        createdDateTime: record.CreationTime,
-        userId: typeof record.UserKey === 'string' ? record.UserKey : null,
-        userDisplayName: null,
-        userPrincipalName:
-          typeof record.UserId === 'string' ? record.UserId : null,
-        appId: null,
-        appDisplayName:
-          typeof record.Application === 'string'
-            ? record.Application
-            : 'Microsoft 365',
-        resourceDisplayName: record.Workload ?? null,
-        ipAddress: typeof record.ClientIP === 'string' ? record.ClientIP : null,
-        clientAppUsed: record.Application ?? null,
-        conditionalAccessStatus: null,
-        isInteractive: null,
-        riskLevelAggregated: null,
-        status: {
-          errorCode: record.Operation === 'UserLoggedIn' ? 0 : 1,
-          failureReason:
-            record.Operation === 'UserLoggedIn'
+      .map((record) => {
+        const succeeded = managementActivityLoginSucceeded(record)
+        const userPrincipalName =
+          typeof record.UserId === 'string' ? record.UserId.toLowerCase() : null
+        const countryOrRegion =
+          typeof record.Country === 'string'
+            ? record.Country
+            : typeof record.CountryOrRegion === 'string'
+              ? record.CountryOrRegion
+              : null
+        const city = typeof record.City === 'string' ? record.City : null
+        return {
+          id: record.Id,
+          createdDateTime: record.CreationTime,
+          userId:
+            typeof record.ObjectId === 'string'
+              ? record.ObjectId
+              : typeof record.UserKey === 'string'
+                ? record.UserKey
+                : null,
+          userDisplayName:
+            typeof record.UserDisplayName === 'string'
+              ? record.UserDisplayName
+              : null,
+          userPrincipalName,
+          appId: null,
+          appDisplayName:
+            typeof record.Application === 'string'
+              ? record.Application
+              : 'Microsoft 365',
+          resourceDisplayName: record.Workload ?? null,
+          ipAddress:
+            typeof record.ClientIP === 'string' ? record.ClientIP : null,
+          clientAppUsed: record.Application ?? null,
+          conditionalAccessStatus: null,
+          isInteractive: null,
+          riskLevelAggregated: null,
+          status: {
+            errorCode: succeeded
+              ? 0
+              : String(record.LoginStatus ?? record.ErrorCode ?? 1),
+            failureReason: succeeded
               ? null
-              : String(record.LogonError ?? record.Operation),
-        },
-        location: null,
-        deviceDetail: null,
-        managementActivityRecord: record,
-      }))
+              : String(
+                  record.LogonError ??
+                    managementActivityExtendedProperty(
+                      record,
+                      'LoginError',
+                      'LogonError'
+                    ) ??
+                    record.Operation
+                ),
+          },
+          location: countryOrRegion || city ? { countryOrRegion, city } : null,
+          deviceDetail: null,
+          managementActivityRecord: record,
+        }
+      })
   }
 
   private async syncDirectoryAuditLogs(
@@ -2461,8 +2554,7 @@ export class TenantSyncService {
           principal.displayName.trim(),
         ])
     )
-    const servicePrincipals =
-      snapshotByResource.get('SERVICE_PRINCIPALS') ?? []
+    const servicePrincipals = snapshotByResource.get('SERVICE_PRINCIPALS') ?? []
     const applications = snapshotByResource.get('APPLICATIONS') ?? []
     const resourceApiByAppId = new Map<
       string,
@@ -2494,9 +2586,8 @@ export class TenantSyncService {
         permissionsById,
       })
     }
-    const securityDefaults = (
-      snapshotByResource.get('SECURITY_DEFAULTS') ?? []
-    )[0]
+    const securityDefaults = (snapshotByResource.get('SECURITY_DEFAULTS') ??
+      [])[0]
     const conditionalAccessTargetNames: Record<string, string> = {
       All: 'All cloud apps',
       Office365: 'Office 365',
@@ -2656,6 +2747,21 @@ export class TenantSyncService {
         latestSignInByUserId.set(signIn.userId, signIn)
       }
     }
+    const directoryUserNameByIdentity = new Map<string, string>()
+    for (const user of users) {
+      for (const identity of [
+        user.microsoftUserId,
+        user.userPrincipalName,
+        user.mail,
+      ]) {
+        if (typeof identity === 'string' && identity.trim()) {
+          directoryUserNameByIdentity.set(
+            identity.trim().toLowerCase(),
+            user.displayName
+          )
+        }
+      }
+    }
     const syncStateByResource = new Map(
       syncStates.map((state) => [state.resourceType, state])
     )
@@ -2778,18 +2884,31 @@ export class TenantSyncService {
         signIns: signIns.map((signIn) => ({
           id: signIn.microsoftSignInId,
           userId: signIn.userId,
-          userDisplayName: signIn.userDisplayName ?? 'Unknown user',
+          userDisplayName:
+            signIn.userDisplayName ??
+            (typeof signIn.userId === 'string'
+              ? directoryUserNameByIdentity.get(signIn.userId.toLowerCase())
+              : undefined) ??
+            (typeof signIn.userPrincipalName === 'string'
+              ? directoryUserNameByIdentity.get(
+                  signIn.userPrincipalName.toLowerCase()
+                )
+              : undefined) ??
+            signIn.userPrincipalName ??
+            'Unknown user',
           userPrincipalName: signIn.userPrincipalName ?? '',
           createdAt: signIn.eventDateTime.toISOString(),
           ipAddress: signIn.ipAddress ?? '',
           result:
-            Number(signIn.statusErrorCode ?? 1) === 0
-              ? 'SUCCESS'
-              : 'FAILURE',
+            Number(signIn.statusErrorCode ?? 1) === 0 ? 'SUCCESS' : 'FAILURE',
           appDisplayName: signIn.appDisplayName ?? 'Unknown application',
           clientAppUsed: signIn.clientAppUsed ?? 'Unknown',
           conditionalAccess: signIn.conditionalAccessStatus,
-          country: (signIn.location as any)?.countryOrRegion ?? 'Unknown',
+          country:
+            (signIn.location as any)?.countryOrRegion ??
+            ((signIn.raw as any)?.hawkviewLimited
+              ? 'Not provided by Microsoft'
+              : 'Unknown'),
           city: (signIn.location as any)?.city ?? undefined,
           latitude: Number(
             (signIn.location as any)?.geoCoordinates?.latitude ?? 0
