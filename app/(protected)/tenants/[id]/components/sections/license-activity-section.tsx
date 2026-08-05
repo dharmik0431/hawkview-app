@@ -66,6 +66,7 @@ export default function LicenseActivitySection({
   const [searchQuery, setSearchQuery] = useState('')
   const [activityFilter, setActivityFilter] = useState<string>('all')
   const [dateFilter, setDateFilter] = useState<string>('all')
+  const [statusFilter, setStatusFilter] = useState<string>('all')
   const [sortField, setSortField] = useState<SortField>('date')
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc')
 
@@ -85,7 +86,7 @@ export default function LicenseActivitySection({
             minute: '2-digit',
             hour12: true,
           })
-        : 'Unknown date'
+        : 'Not synchronized'
 
       const rawAct = evt.activity || evt.action || evt.type || 'Assigned'
       let normalizedActivity = rawAct
@@ -114,32 +115,37 @@ export default function LicenseActivitySection({
         normalizedActivity === 'Product added' ||
         normalizedActivity === 'Product removed'
 
-      // Target User
-      let userName = '—'
+      // Target User info
+      let userName = 'N/A'
+      let userEmail = ''
+      let userUpn = ''
+
       if (!isTenantEvent) {
-        if (typeof evt.user === 'string') {
-          userName = evt.user
+        if (typeof evt.user === 'string' && evt.user.trim()) {
+          userName = evt.user.trim()
         } else if (evt.user && typeof evt.user === 'object') {
           userName =
-            evt.user.displayName || evt.user.email || evt.user.upn || '—'
+            evt.user.displayName || evt.user.name || evt.user.email || evt.user.upn || 'N/A'
+          userEmail = evt.user.email || ''
+          userUpn = evt.user.upn || ''
         } else if (evt.targetUser) {
           userName = evt.targetUser
         }
       }
 
       // License Name
-      let licenseName = 'Unknown license'
-      if (typeof evt.license === 'string') {
-        licenseName = evt.license
+      let licenseName = 'N/A'
+      if (typeof evt.license === 'string' && evt.license.trim()) {
+        licenseName = evt.license.trim()
       } else if (evt.license && typeof evt.license === 'object') {
         licenseName =
-          evt.license.displayName || evt.license.name || 'Unknown license'
+          evt.license.displayName || evt.license.name || 'N/A'
       } else if (evt.skuName) {
         licenseName = evt.skuName
       }
 
       // Performed By (Actor)
-      let actorName = 'Unknown actor'
+      let actorName = 'N/A'
       const rawActor = evt.performedBy || evt.actor || evt.initiatedBy
       if (typeof rawActor === 'string' && rawActor.trim()) {
         actorName = rawActor.trim()
@@ -149,7 +155,7 @@ export default function LicenseActivitySection({
           rawActor.name ||
           rawActor.upn ||
           rawActor.email ||
-          'Unknown actor'
+          'N/A'
       }
 
       // Status / Result
@@ -164,6 +170,8 @@ export default function LicenseActivitySection({
         dateDisplay: dateStr,
         activity: normalizedActivity,
         user: userName,
+        userEmail,
+        userUpn,
         license: licenseName,
         performedBy: actorName,
         status: isSuccess ? 'Successful' : String(rawStatus),
@@ -196,10 +204,21 @@ export default function LicenseActivitySection({
           return false
       }
 
-      // Search Query (Search user, administrator/performedBy, or license)
+      // Result / Status Filter
+      if (statusFilter === 'success' && !item.isSuccess) {
+        return false
+      }
+      if (statusFilter === 'failure' && item.isSuccess) {
+        return false
+      }
+
+      // Search Query (Search user, email, upn, activity, or license)
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim()
-        const matchesUser = item.user.toLowerCase().includes(q)
+        const matchesUser =
+          item.user.toLowerCase().includes(q) ||
+          item.userEmail.toLowerCase().includes(q) ||
+          item.userUpn.toLowerCase().includes(q)
         const matchesActor = item.performedBy.toLowerCase().includes(q)
         const matchesLicense = item.license.toLowerCase().includes(q)
         const matchesActivity = item.activity.toLowerCase().includes(q)
@@ -215,7 +234,7 @@ export default function LicenseActivitySection({
 
       return true
     })
-  }, [parsedEvents, activityFilter, dateFilter, searchQuery])
+  }, [parsedEvents, activityFilter, dateFilter, statusFilter, searchQuery])
 
   // Sort events
   const sortedEvents = useMemo(() => {
@@ -338,7 +357,7 @@ export default function LicenseActivitySection({
       default:
         return (
           <Badge className="text-[10px] font-semibold px-2 py-0.5 border bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border-slate-200 dark:border-slate-700 shadow-none">
-            {activity}
+            {activity || 'N/A'}
           </Badge>
         )
     }
@@ -349,9 +368,9 @@ export default function LicenseActivitySection({
       <CardContent className="p-6 space-y-4">
         {/* Filters and Search Bar */}
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pb-2 border-b border-slate-100 dark:border-slate-800/80">
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 flex-1 max-w-2xl">
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 flex-1 max-w-3xl">
             {/* Search Input */}
-            <div className="relative flex-1">
+            <div className="relative flex-1 min-w-[200px]">
               <Search
                 className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400"
                 aria-hidden="true"
@@ -387,6 +406,18 @@ export default function LicenseActivitySection({
               <option value="Unassigned">Unassigned</option>
               <option value="Product added">Product added</option>
               <option value="Product removed">Product removed</option>
+            </select>
+
+            {/* Status / Result Filter */}
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="h-9 px-3 text-xs rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/50 focus:bg-white dark:focus:bg-slate-900 text-slate-700 dark:text-slate-300 font-medium cursor-pointer shrink-0"
+              aria-label="Filter by result status"
+            >
+              <option value="all">All statuses</option>
+              <option value="success">Successful</option>
+              <option value="failure">Failed</option>
             </select>
 
             {/* Date Range Filter */}
