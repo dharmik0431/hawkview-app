@@ -327,6 +327,8 @@ type SignInEvent = {
   latitude: number
   longitude: number
   riskLevel?: 'low' | 'medium' | 'high'
+  dataSource?: 'entra-sign-in-logs' | 'microsoft-365-management-activity'
+  isLimited?: boolean
 }
 
 type TimeWindow = '24h' | '7d' | '30d'

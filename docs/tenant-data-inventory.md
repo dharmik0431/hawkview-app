@@ -41,7 +41,8 @@ read saved data from the HawkView API and must never call Microsoft directly.
 | Conditional Access policies                | Microsoft Graph Conditional Access              | `Policy.Read.All`                                  | Implemented |
 | Conditional Access cloud-app display names | Microsoft Graph service principals              | `Application.Read.All`                             | Implemented |
 | Named locations                            | Microsoft Graph Conditional Access              | `Policy.Read.All`                                  | Planned     |
-| Sign-in events and locations               | Microsoft Graph sign-in logs                    | `AuditLog.Read.All`; tenant licensing also applies | Planned     |
+| Full sign-in events and locations          | Microsoft Graph sign-in logs                    | `AuditLog.Read.All`; tenant licensing also applies | Implemented |
+| Limited login activity fallback            | Microsoft 365 unified audit feed                | Office 365 Management APIs `ActivityFeed.Read`     | Implemented |
 | Devices                                    | Microsoft Graph devices                         | `Device.Read.All`                                  | Planned     |
 | Risky users and sign-ins                   | Microsoft Graph Identity Protection             | Additional identity-risk permission and licensing  | Planned     |
 

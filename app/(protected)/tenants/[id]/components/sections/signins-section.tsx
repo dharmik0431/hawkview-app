@@ -37,6 +37,8 @@ export type SignInEvent = {
   latitude: number
   longitude: number
   riskLevel?: 'low' | 'medium' | 'high'
+  dataSource?: 'entra-sign-in-logs' | 'microsoft-365-management-activity'
+  isLimited?: boolean
 }
 
 export type TimeWindow = '24h' | '7d' | '30d'
@@ -101,6 +103,11 @@ export default function SignInActivitySection({
   const [searchQuery, setSearchQuery] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
   const pageSize = 10
+  const hasLimitedActivity = signIns.some(
+    (event) =>
+      event.isLimited ||
+      event.dataSource === 'microsoft-365-management-activity'
+  )
 
   // Filtered dataset shared between Table and Map
   const filteredSignIns = useMemo(() => {
@@ -299,6 +306,21 @@ export default function SignInActivitySection({
             <p className="mt-1 text-xs leading-5">
               {syncStatus.lastError ||
                 'Microsoft did not return sign-in events for this tenant. Existing retained events remain available.'}
+            </p>
+          </div>
+        </div>
+      )}
+      {syncStatus?.status !== 'failed' && hasLimitedActivity && (
+        <div className="flex gap-3 rounded-xl border border-blue-200 bg-blue-50 p-4 text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
+          <Info className="mt-0.5 h-5 w-5 shrink-0" />
+          <div>
+            <p className="text-sm font-semibold">Limited login activity</p>
+            <p className="mt-1 text-xs leading-5">
+              This tenant does not license full Microsoft Entra sign-in logs.
+              HawkView is retaining login events available through the
+              Microsoft 365 unified audit feed. Conditional Access, risk,
+              device, location, and authentication-step details are not
+              available in this fallback feed.
             </p>
           </div>
         </div>
