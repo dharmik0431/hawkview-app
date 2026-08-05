@@ -39,6 +39,40 @@ function actorFrom(value: unknown) {
   return text(user.userPrincipalName) ?? text(user.displayName) ?? text(app.displayName) ?? text(app.servicePrincipalName) ?? text(user.id) ?? text(app.servicePrincipalId)
 }
 
+const valueText = (value: unknown) => {
+  const parsed = parseValue(value)
+  if (Array.isArray(parsed)) return parsed.map((item) => text(item)).filter(Boolean).join(', ') || undefined
+  if (parsed && typeof parsed === 'object') return JSON.stringify(parsed)
+  return text(parsed)
+}
+
+function evidenceFrom(log: { initiatedBy: unknown; targetResources: unknown; additionalDetails: unknown; raw: unknown; result: string | null; resultReason: string | null; operationType: string | null }) {
+  const initiated = object(log.initiatedBy); const user = object(initiated.user); const app = object(initiated.app)
+  const raw = object(log.raw); const targets = array(log.targetResources).map(object)
+  const additional = new Map(array(log.additionalDetails).map(object).map((item) => [text(item.key)?.toLowerCase(), parseValue(item.value)]))
+  const properties = new Map<string, unknown>()
+  for (const target of targets) for (const item of array(target.modifiedProperties).map(object)) {
+    const name = text(item.displayName)?.toLowerCase()
+    if (name) properties.set(name, parseValue(item.newValue) ?? parseValue(item.oldValue))
+  }
+  const pick = (...names: string[]) => {
+    for (const name of names) {
+      const key = name.toLowerCase(); const direct = raw[name] ?? raw[key] ?? additional.get(key) ?? properties.get(key)
+      if (direct !== undefined && direct !== null && direct !== '') return direct
+    }
+    return undefined
+  }
+  const primary = targets[0] ?? {}; const principalName = text(user.userPrincipalName)
+  const targetName = text(primary.displayName) ?? text(primary.userPrincipalName) ?? text(primary.id) ?? 'Target not provided by Microsoft'
+  return {
+    result: log.result ?? text(raw.result), resultReason: log.resultReason ?? text(raw.resultReason), operationType: log.operationType ?? text(raw.operationType), loggedByService: text(raw.loggedByService),
+    actor: { displayName: text(user.displayName) ?? text(app.displayName) ?? text(app.servicePrincipalName), principalName, type: user.id ? 'User' : app.servicePrincipalId || app.appId ? 'Service Principal / App' : 'System', objectId: text(user.id) ?? text(app.servicePrincipalId), ipAddress: text(user.ipAddress), automatedBy: text(app.displayName) ?? text(app.servicePrincipalName) },
+    application: { displayName: valueText(pick('displayName', 'appDisplayName', 'applicationDisplayName')) ?? targetName, appId: valueText(pick('appId', 'applicationId', 'clientId')), objectId: text(primary.id) ?? valueText(pick('objectId')), servicePrincipalId: valueText(pick('servicePrincipalId')), publisher: valueText(pick('publisher', 'publisherName', 'verifiedPublisher')), appType: valueText(pick('appType', 'applicationType', 'servicePrincipalType')), signInAudience: valueText(pick('signInAudience')), description: valueText(pick('description', 'notes')), homepage: pick('homepage', 'identifierUris') },
+    permissions: { permissionName: pick('permissionName', 'permission', 'oauth2PermissionGrant'), permissionType: valueText(pick('permissionType', 'grantType')), consentType: valueText(pick('consentType')), scope: pick('scope', 'grantedScope'), resourceApi: valueText(pick('resourceApi', 'resourceDisplayName', 'resource')), appRole: valueText(pick('appRole', 'appRoleId')), assignedTo: valueText(pick('assignedTo', 'targetIdentity')) ?? text(primary.userPrincipalName), grantingAdmin: principalName, consentStatus: valueText(pick('consentStatus', 'status')) ?? log.result ?? undefined },
+    targets: targets.map((target) => ({ displayName: text(target.displayName) ?? text(target.userPrincipalName) ?? text(target.id) ?? 'Unnamed Microsoft resource', targetType: text(target.type) ?? 'Microsoft resource', objectId: text(target.id), upn: text(target.userPrincipalName) })),
+  }
+}
+
 function targetDetails(value: unknown) {
   const targets = array(value).map(object); const first = targets[0] ?? {}
   const target = text(first.userPrincipalName) ?? text(first.displayName) ?? text(first.id)
@@ -82,7 +116,7 @@ export class ChangesService {
 
     const changes = auditLogs.map((log) => {
       const kind = classify(log.activityDisplayName, log.category); const details = targetDetails(log.targetResources)
-      return { id: `audit:${log.id}`, eventType: 'change' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: 'Entra' as const, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category) }
+      return { id: `audit:${log.id}`, eventType: 'change' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: 'Entra' as const, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: evidenceFrom(log) }
     })
     const signInEvents = signIns.map((log) => {
       const location = object(log.location); const device = object(log.deviceDetail)
@@ -90,6 +124,6 @@ export class ChangesService {
       return { id: `signin:${log.id}`, eventType: 'sign-in' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: 'Sign-ins' as const, severity: risky ? 'High' as const : failed ? 'Medium' as const : 'Low' as const, title: failed ? 'Failed sign-in' : 'Successful sign-in', summary: [log.appDisplayName, log.failureReason, log.conditionalAccessStatus].filter(Boolean).join(' · ') || 'Microsoft sign-in activity', actor: log.userPrincipalName ?? log.userDisplayName ?? undefined, target: log.resourceDisplayName ?? log.appDisplayName ?? undefined, source: 'Entra' as const, ip: log.ipAddress ?? undefined, location: { city: text(location.city), region: text(location.state) ?? text(location.region), country: text(location.countryOrRegion) ?? text(location.country) }, client: { app: log.clientAppUsed ?? log.appDisplayName ?? undefined, device: text(device.displayName) ?? text(device.operatingSystem) }, before: {}, after: { result: failed ? 'Failed' : 'Success', riskLevel: log.riskLevel }, recoveryGuidance: risky || failed ? ['Confirm whether this sign-in was expected.', 'Revoke sessions and reset credentials if it was unauthorized.'] : [] }
     })
     const events = [...changes, ...signInEvents].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts))
-    return { changes: events, tenants: allTenants.map((tenant) => ({ id: tenant.id, name: names.get(tenant.id)! })), summary: { total: events.length, changes: changes.length, signIns: signInEvents.length, highRisk: events.filter((event) => event.severity === 'High').length, actors: new Set(events.map((event) => event.actor).filter(Boolean)).size }, range: { from: from.toISOString(), to: to.toISOString() } }
+    return { changes: events, tenants: allTenants.map((tenant) => ({ id: tenant.id, name: names.get(tenant.id)! })), summary: { total: events.length, changes: changes.length, signIns: signInEvents.length, highRisk: events.filter((event) => event.severity === 'High').length, actors: new Set(events.map((event) => event.actor).filter(Boolean)).size, apps: new Set(events.filter((event) => event.category === 'Apps').map((event) => event.target).filter(Boolean)).size }, range: { from: from.toISOString(), to: to.toISOString() } }
   }
 }

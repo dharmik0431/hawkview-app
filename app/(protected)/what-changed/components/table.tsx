@@ -1,229 +1,494 @@
 'use client'
 
 import * as React from 'react'
-import { Card, CardContent } from '@/components/ui/card'
-import { WhatChangedFilters, type WhatChangedFiltersState } from './filters'
-import { WhatChangedRow } from './row'
-import { WhatChangedDrawer } from './drawer'
-import type { ChangeEvent } from '../data/change-types'
+import { History, ShieldAlert, AlertCircle, RefreshCw, X } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { apiClient } from '@/lib/api/client'
+import {
+  TimeWindowValue,
+  getQuickRangeDates,
+  parseISOOrLocal,
+} from './time-window-picker'
+import { InvestigationToolbar, ToolbarFilterState } from './investigation-toolbar'
+import { SummaryStrip, SummaryCategoryKey } from './summary-strip'
+import { WhatChangedRow } from './row'
+import { WhatChangedDrawer } from './drawer'
+import { type ChangeEvent, isAppRelatedEvent } from '../data/change-types'
+import { Button } from '@/components/ui/button'
 
 type ChangesResponse = {
   changes: ChangeEvent[]
   tenants: { id: string; name: string }[]
-  summary: { total: number; changes: number; signIns: number; highRisk: number; actors: number }
-}
-
-function localDateTime(date: Date) {
-  const offset = date.getTimezoneOffset() * 60_000
-  return new Date(date.getTime() - offset).toISOString().slice(0, 16)
+  summary?: { total: number; changes: number; signIns: number; highRisk: number; apps: number }
 }
 
 function uniqTenants(events: ChangeEvent[]) {
   const map = new Map<string, { id: string; name: string }>()
-  for (const e of events)
-    map.set(e.tenantId, { id: e.tenantId, name: e.tenantName })
+  for (const e of events) {
+    if (e.tenantId) {
+      map.set(e.tenantId, { id: e.tenantId, name: e.tenantName || e.tenantId })
+    }
+  }
   return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name))
 }
 
-// UTC day buckets to avoid hydration issues
-function dayKeyUTC(ts: string) {
-  return new Date(ts).toISOString().slice(0, 10) // YYYY-MM-DD
+function dateKey(ts: string, useUtc = false) {
+  const d = new Date(ts)
+  if (isNaN(d.getTime())) return '1970-01-01'
+  if (useUtc) {
+    return d.toISOString().slice(0, 10)
+  }
+  const year = d.getFullYear()
+  const month = (d.getMonth() + 1).toString().padStart(2, '0')
+  const day = d.getDate().toString().padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
-function daysAgoUTC(dayKey: string) {
-  const nowKey = new Date().toISOString().slice(0, 10)
-  const now = new Date(nowKey + 'T00:00:00Z').getTime()
-  const day = new Date(dayKey + 'T00:00:00Z').getTime()
-  return Math.floor((now - day) / (1000 * 60 * 60 * 24))
+function formatGroupLabel(key: string, useUtc = false) {
+  const now = new Date()
+  const todayKey = dateKey(now.toISOString(), useUtc)
+
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+  const yesterdayKey = dateKey(yesterday.toISOString(), useUtc)
+
+  if (key === todayKey) return 'Today'
+  if (key === yesterdayKey) return 'Yesterday'
+
+  const parts = key.split('-')
+  if (parts.length === 3) {
+    const d = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]))
+    return new Intl.DateTimeFormat('en-US', {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    }).format(d)
+  }
+  return key
 }
 
-function groupLabel(dayKey: string) {
-  const d = daysAgoUTC(dayKey)
-  if (d === 0) return 'Today'
-  if (d === 1) return 'Yesterday'
-  return 'Earlier'
+function getCategoryHeadingLabel(key: SummaryCategoryKey): string {
+  switch (key) {
+    case 'all':
+      return 'Evidence events'
+    case 'changes':
+      return 'Directory changes'
+    case 'signIns':
+      return 'Related sign-ins'
+    case 'highRisk':
+      return 'High-risk events'
+    case 'apps':
+      return 'App-related changes'
+  }
 }
 
 export function WhatChangedView() {
-  const initialRange = React.useMemo(() => {
-    const to = new Date()
-    return { from: localDateTime(new Date(to.getTime() - 24 * 60 * 60 * 1000)), to: localDateTime(to) }
-  }, [])
-  const [filters, setFilters] = React.useState<WhatChangedFiltersState>({
-    tenant: 'all', severity: 'All', categories: [], search: '', ...initialRange,
+  // Time Window State (Default 24h)
+  const initialRange = React.useMemo(() => getQuickRangeDates('24h', false), [])
+  const [timeWindow, setTimeWindow] = React.useState<TimeWindowValue>({
+    from: initialRange.from,
+    to: initialRange.to,
+    quickRange: '24h',
+    useUtc: false,
+    is12Hour: true,
   })
-  const { data, isLoading, error } = useQuery<ChangesResponse>({
-    queryKey: ['changes', filters.tenant, filters.from, filters.to],
-    queryFn: ({ signal }) =>
-      apiClient.get('/api/changes', {
-        signal,
-        params: {
-          from: new Date(filters.from).toISOString(),
-          to: new Date(filters.to).toISOString(),
-          ...(filters.tenant !== 'all' ? { tenantId: filters.tenant } : {}),
-        },
-      }),
-    retry: false,
-    staleTime: 5 * 60 * 1000,
-    enabled: Boolean(filters.from && filters.to),
+
+  // Toolbar Filters State
+  const [toolbarFilters, setToolbarFilters] = React.useState<ToolbarFilterState>({
+    tenant: 'all',
+    search: '',
+    severity: 'All',
+    categories: [],
+    source: 'All',
+    actorFilter: '',
+    targetFilter: '',
+    locationFilter: '',
   })
-  const changes = React.useMemo(() => data?.changes ?? [], [data?.changes])
-  const tenants = React.useMemo(() => data?.tenants ?? uniqTenants(changes), [data?.tenants, changes])
+
+  // Clickable Summary Category State (Default 'all')
+  const [selectedCategory, setSelectedCategory] = React.useState<SummaryCategoryKey>('all')
+
+  // Selected event & drawer
   const [selectedId, setSelectedId] = React.useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = React.useState(false)
 
-  const filtered = React.useMemo(() => {
-    const q = filters.search.trim().toLowerCase()
+  // Validate time range
+  const isValidTimeRange = React.useMemo(() => {
+    const fromD = parseISOOrLocal(timeWindow.from)
+    const toD = parseISOOrLocal(timeWindow.to)
+    return toD.getTime() >= fromD.getTime()
+  }, [timeWindow.from, timeWindow.to])
 
-    return changes
+  // Data Query
+  const { data, isLoading, error, refetch } = useQuery<ChangesResponse>({
+    queryKey: ['changes', toolbarFilters.tenant, timeWindow.from, timeWindow.to],
+    queryFn: ({ signal }) => {
+      const fromIso = parseISOOrLocal(timeWindow.from).toISOString()
+      const toIso = parseISOOrLocal(timeWindow.to).toISOString()
+      return apiClient.get('/api/changes', {
+        signal,
+        params: {
+          from: fromIso,
+          to: toIso,
+          ...(toolbarFilters.tenant !== 'all' ? { tenantId: toolbarFilters.tenant } : {}),
+        },
+      })
+    },
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+    enabled: Boolean(timeWindow.from && timeWindow.to && isValidTimeRange),
+  })
+
+  const rawChanges = React.useMemo(() => data?.changes ?? [], [data?.changes])
+  const tenants = React.useMemo(() => data?.tenants ?? uniqTenants(rawChanges), [data?.tenants, rawChanges])
+
+  // Base client-side filtering across search, severity, source, categories, actor, target, location
+  const baseFilteredChanges = React.useMemo(() => {
+    const q = toolbarFilters.search.trim().toLowerCase()
+    const actorQ = toolbarFilters.actorFilter.trim().toLowerCase()
+    const targetQ = toolbarFilters.targetFilter.trim().toLowerCase()
+    const locQ = toolbarFilters.locationFilter.trim().toLowerCase()
+
+    return rawChanges
       .slice()
       .sort((a, b) => +new Date(b.ts) - +new Date(a.ts))
-      .filter((e) =>
-        filters.tenant === 'all' ? true : e.tenantId === filters.tenant
-      )
-      .filter((e) =>
-        filters.severity === 'All' ? true : e.severity === filters.severity
-      )
-      .filter((e) =>
-        filters.categories.length
-          ? filters.categories.includes(e.category)
-          : true
-      )
+      .filter((e) => (toolbarFilters.tenant === 'all' ? true : e.tenantId === toolbarFilters.tenant))
+      .filter((e) => (toolbarFilters.severity === 'All' ? true : e.severity === toolbarFilters.severity))
+      .filter((e) => (toolbarFilters.source === 'All' ? true : e.source === toolbarFilters.source))
+      .filter((e) => (toolbarFilters.categories.length ? toolbarFilters.categories.includes(e.category) : true))
+      .filter((e) => (!actorQ ? true : (e.actor ?? '').toLowerCase().includes(actorQ)))
+      .filter((e) => (!targetQ ? true : (e.target ?? '').toLowerCase().includes(targetQ)))
       .filter((e) => {
-        if (!q) return true
-        const hay = [
-          e.tenantName,
-          e.title,
-          e.summary,
-          e.actor ?? '',
-          e.target ?? '',
-          e.category,
-          e.source,
+        if (!locQ) return true
+        const locHay = [
           e.ip ?? '',
           e.location?.city ?? '',
           e.location?.region ?? '',
           e.location?.country ?? '',
-        ]
-          .join(' ')
-          .toLowerCase()
-        return hay.includes(q)
+        ].join(' ').toLowerCase()
+        return locHay.includes(locQ)
       })
-  }, [changes, filters])
+      .filter((e) => {
+        if (!q) return true
+        const mainHay = [
+          e.tenantName ?? '',
+          e.title ?? '',
+          e.summary ?? '',
+          e.actor ?? '',
+          e.target ?? '',
+          e.category ?? '',
+          e.source ?? '',
+          e.ip ?? '',
+          e.location?.city ?? '',
+          e.location?.region ?? '',
+          e.location?.country ?? '',
+        ].join(' ').toLowerCase()
+        return mainHay.includes(q)
+      })
+  }, [rawChanges, toolbarFilters])
 
-  const selected = React.useMemo(
-    () => filtered.find((x) => x.id === selectedId) ?? null,
-    [filtered, selectedId]
+  // Calculate summary counts dynamically from base filtered changes
+  const summaryCounts = React.useMemo(() => {
+    let total = baseFilteredChanges.length
+    let changes = 0
+    let signIns = 0
+    let highRisk = 0
+    let apps = 0
+
+    for (const e of baseFilteredChanges) {
+      const isSignIn = e.eventType === 'sign-in' || e.category === 'Sign-ins'
+      if (isSignIn) {
+        signIns++
+      } else {
+        changes++
+      }
+
+      if (e.severity === 'High') {
+        highRisk++
+      }
+
+      if (isAppRelatedEvent(e)) {
+        apps++
+      }
+    }
+
+    return { total, changes, signIns, highRisk, apps }
+  }, [baseFilteredChanges])
+
+  // Final filtering by selected summary category
+  const finalFilteredChanges = React.useMemo(() => {
+    if (selectedCategory === 'all') return baseFilteredChanges
+
+    return baseFilteredChanges.filter((e) => {
+      const isSignIn = e.eventType === 'sign-in' || e.category === 'Sign-ins'
+
+      if (selectedCategory === 'changes') {
+        return !isSignIn
+      }
+      if (selectedCategory === 'signIns') {
+        return isSignIn
+      }
+      if (selectedCategory === 'highRisk') {
+        return e.severity === 'High'
+      }
+      if (selectedCategory === 'apps') {
+        return isAppRelatedEvent(e)
+      }
+      return true
+    })
+  }, [baseFilteredChanges, selectedCategory])
+
+  // Reset all filters, time range, and category
+  const handleResetFilters = React.useCallback(() => {
+    const range24h = getQuickRangeDates('24h', false)
+    setTimeWindow({
+      from: range24h.from,
+      to: range24h.to,
+      quickRange: '24h',
+      useUtc: false,
+      is12Hour: true,
+    })
+
+    setToolbarFilters({
+      tenant: 'all',
+      search: '',
+      severity: 'All',
+      categories: [],
+      source: 'All',
+      actorFilter: '',
+      targetFilter: '',
+      locationFilter: '',
+    })
+
+    setSelectedCategory('all')
+  }, [])
+
+  // Group timeline by date
+  const groupedTimeline = React.useMemo(() => {
+    const map = new Map<string, ChangeEvent[]>()
+    for (const e of finalFilteredChanges) {
+      const key = dateKey(e.ts, timeWindow.useUtc)
+      map.set(key, [...(map.get(key) ?? []), e])
+    }
+
+    const keys = Array.from(map.keys()).sort((a, b) => (a > b ? -1 : 1)) // newest first
+
+    return keys.map((k) => ({
+      key: k,
+      label: formatGroupLabel(k, timeWindow.useUtc),
+      items: map.get(k) ?? [],
+    }))
+  }, [finalFilteredChanges, timeWindow.useUtc])
+
+  const selectedEvent = React.useMemo(
+    () => finalFilteredChanges.find((x) => x.id === selectedId) ?? null,
+    [finalFilteredChanges, selectedId]
   )
 
-  // If filters change and selected disappears, close drawer
+  // Close drawer if selected event no longer matches filters
   React.useEffect(() => {
-    if (selectedId && !filtered.some((x) => x.id === selectedId)) {
+    if (selectedId && !finalFilteredChanges.some((x) => x.id === selectedId)) {
       setDrawerOpen(false)
       setSelectedId(null)
     }
-  }, [filtered, selectedId])
+  }, [finalFilteredChanges, selectedId])
 
-  // Group timeline
-  const grouped = React.useMemo(() => {
-    const byDay = new Map<string, ChangeEvent[]>()
-    for (const e of filtered) {
-      const key = dayKeyUTC(e.ts)
-      byDay.set(key, [...(byDay.get(key) ?? []), e])
-    }
-
-    const dayKeys = Array.from(byDay.keys()).sort((a, b) => (a > b ? -1 : 1)) // newest first
-
-    return dayKeys.map((k) => ({
-      label: groupLabel(k),
-      dayKey: k,
-      items: byDay.get(k) ?? [],
-    }))
-  }, [filtered])
-
-  function openDrawerFor(id: string) {
+  const handleOpenDrawer = (id: string) => {
     setSelectedId(id)
     setDrawerOpen(true)
   }
 
-  function closeDrawer() {
+  const handleCloseDrawer = () => {
     setDrawerOpen(false)
     setSelectedId(null)
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      <div>
-        <div className="text-2xl font-semibold">What Changed?</div>
-        <div className="text-sm text-muted-foreground">
-          Investigate an incident from an exact point in time and reconstruct who changed what.
+    <div className="flex flex-col gap-5 max-w-7xl mx-auto w-full pb-8">
+      {/* Page Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-border/60 pb-4">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2.5">
+            <div className="rounded-lg bg-primary/10 p-2 text-primary">
+              <History className="h-5 w-5" />
+            </div>
+            <h1 className="text-2xl font-bold tracking-tight text-foreground">
+              What Changed?
+            </h1>
+          </div>
+          <p className="text-xs sm:text-sm text-muted-foreground">
+            Reconstruct activity around an incident and identify who changed what.
+          </p>
         </div>
       </div>
 
-      <Card>
-        <CardContent className="p-4">
-          <WhatChangedFilters
-            tenants={tenants}
-            value={filters}
-            onChange={setFilters}
-          />
-        </CardContent>
-      </Card>
+      {/* Investigation Toolbar */}
+      <InvestigationToolbar
+        tenants={tenants}
+        value={toolbarFilters}
+        onChange={setToolbarFilters}
+        timeWindow={timeWindow}
+        onChangeTimeWindow={setTimeWindow}
+        onReset={handleResetFilters}
+      />
 
-      {data?.summary ? (
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-          {[
-            ['Evidence events', data.summary.total],
-            ['Directory changes', data.summary.changes],
-            ['Related sign-ins', data.summary.signIns],
-            ['High risk', data.summary.highRisk],
-            ['Actors identified', data.summary.actors],
-          ].map(([label, value]) => (
-            <Card key={String(label)}><CardContent className="p-4"><div className="text-xs text-muted-foreground">{label}</div><div className="mt-1 text-2xl font-semibold">{value}</div></CardContent></Card>
-          ))}
+      {/* Clickable Investigation Summary Strip */}
+      {!isLoading && (
+        <SummaryStrip
+          summary={summaryCounts}
+          selectedCategory={selectedCategory}
+          onSelectCategory={setSelectedCategory}
+        />
+      )}
+
+      {/* Error state */}
+      {error && (
+        <div className="rounded-xl border border-destructive/50 bg-destructive/10 p-4 text-xs text-destructive flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span>
+              {error instanceof Error ? error.message : 'The investigation activity could not be loaded.'}
+            </span>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => refetch()}
+            className="h-7 text-xs gap-1"
+          >
+            <RefreshCw className="h-3 w-3" />
+            <span>Retry</span>
+          </Button>
         </div>
-      ) : null}
+      )}
 
-      {error ? <Card><CardContent className="p-6 text-sm text-red-600">{error instanceof Error ? error.message : 'The investigation could not be loaded.'}</CardContent></Card> : null}
+      {/* Timeline List Section */}
+      <div className="space-y-4 pt-1">
+        {/* Selected Category Heading */}
+        {!isLoading && (
+          <div className="flex items-center justify-between border-b border-border/60 pb-2">
+            <h2 className="text-sm font-bold text-foreground tracking-tight">
+              {getCategoryHeadingLabel(selectedCategory)} — {finalFilteredChanges.length}
+            </h2>
 
-      {/* Full-width timeline */}
-      <div className="space-y-4">
+            {selectedCategory !== 'all' && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => setSelectedCategory('all')}
+                className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground gap-1"
+              >
+                <X className="h-3.5 w-3.5" />
+                <span>Clear category</span>
+              </Button>
+            )}
+          </div>
+        )}
+
         {isLoading ? (
-          <Card><CardContent className="p-6 text-sm text-muted-foreground">Building the incident timeline...</CardContent></Card>
-        ) : grouped.length ? (
-          grouped.map((section, idx) => (
-            <div key={section.dayKey} className="space-y-3">
-              {(idx === 0 || section.label !== grouped[idx - 1]?.label) && (
-                <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                  {section.label}
-                </div>
-              )}
+          /* Loading State */
+          <div className="rounded-xl border border-border bg-card p-8 text-center space-y-3">
+            <div className="inline-flex items-center justify-center rounded-full bg-primary/10 p-3 text-primary animate-spin">
+              <RefreshCw className="h-5 w-5" />
+            </div>
+            <div className="text-sm font-medium text-foreground">
+              Reconstructing the selected time window…
+            </div>
+            <p className="text-xs text-muted-foreground max-w-sm mx-auto">
+              Gathering evidence logs, directory mutations, and sign-in activity.
+            </p>
+          </div>
+        ) : groupedTimeline.length ? (
+          /* Timeline Sections */
+          groupedTimeline.map((group) => (
+            <div key={group.key} className="space-y-2">
+              {/* Date Group Header */}
+              <div className="sticky top-0 z-10 bg-background/95 backdrop-blur-xs py-1.5 border-b border-border/40">
+                <span className="text-xs font-bold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-primary shrink-0" />
+                  {group.label}
+                  <span className="text-[11px] font-normal text-muted-foreground/80">
+                    ({group.items.length} {group.items.length === 1 ? 'event' : 'events'})
+                  </span>
+                </span>
+              </div>
 
-              {section.items.map((e) => (
-                <WhatChangedRow
-                  key={e.id}
-                  e={e}
-                  isActive={drawerOpen && e.id === selectedId}
-                  onClick={() => openDrawerFor(e.id)}
-                />
-              ))}
+              {/* Event Rows */}
+              <div className="pt-1">
+                {group.items.map((e) => (
+                  <WhatChangedRow
+                    key={e.id}
+                    e={e}
+                    isActive={drawerOpen && e.id === selectedId}
+                    useUtc={timeWindow.useUtc}
+                    onClick={() => handleOpenDrawer(e.id)}
+                  />
+                ))}
+              </div>
             </div>
           ))
         ) : (
-          <Card>
-            <CardContent className="p-6 text-sm text-muted-foreground">
-              No audit or sign-in evidence was stored for this time range. This does not prove that no change occurred.
-            </CardContent>
-          </Card>
+          /* Empty State */
+          <div className="rounded-xl border border-border bg-card p-8 sm:p-12 text-center space-y-3">
+            <div className="inline-flex items-center justify-center rounded-full bg-muted p-3 text-muted-foreground mx-auto">
+              <ShieldAlert className="h-6 w-6" />
+            </div>
+            <div className="text-sm font-semibold text-foreground">
+              No matching events were found.
+            </div>
+            <p className="text-xs text-muted-foreground max-w-md mx-auto">
+              Try another category, expand the time range, or clear filters.
+            </p>
+            <div className="pt-2 flex flex-wrap justify-center gap-2">
+              {selectedCategory !== 'all' && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSelectedCategory('all')}
+                  className="text-xs"
+                >
+                  View Evidence Events ({summaryCounts.total})
+                </Button>
+              )}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  const r7d = getQuickRangeDates('7d', timeWindow.useUtc)
+                  setTimeWindow((prev) => ({
+                    ...prev,
+                    quickRange: '7d',
+                    from: r7d.from,
+                    to: r7d.to,
+                  }))
+                }}
+                className="text-xs"
+              >
+                Expand to Last 7 Days
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={handleResetFilters}
+                className="text-xs"
+              >
+                Clear Filters
+              </Button>
+            </div>
+          </div>
         )}
       </div>
 
-      {/* Slide-over drawer overlay (GAS style) */}
+      {/* Details Slide-over Drawer */}
       <WhatChangedDrawer
         open={drawerOpen}
-        event={selected}
-        onClose={closeDrawer}
+        event={selectedEvent}
+        onClose={handleCloseDrawer}
       />
     </div>
   )
