@@ -25,6 +25,7 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'SharePointTenantSettings.Read.All',
   'Reports.Read.All',
   'MailboxSettings.Read',
+  'ActivityFeed.Read',
 ] as const
 
 const PERMISSION_DESCRIPTIONS: Record<string, string> = {
@@ -53,6 +54,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read SharePoint site usage, storage consumption, ownership, and last activity reports.',
   'MailboxSettings.Read':
     'Read mailbox inbox rules for Exchange security visibility.',
+  'ActivityFeed.Read':
+    'Read limited Microsoft 365 login activity when Entra sign-in logs require a premium tenant license.',
 }
 
 interface ConsentState {
@@ -265,10 +268,31 @@ export class MicrosoftConsentService {
     microsoftTenantId: string,
     credentials: { clientId: string; clientSecret: string }
   ) {
-    const { accessToken, grantedPermissions } = await this.requestAccessToken(
-      microsoftTenantId,
-      credentials
-    )
+    const { accessToken, grantedPermissions: graphPermissions } =
+      await this.requestAccessToken(
+        microsoftTenantId,
+        credentials
+      )
+
+    // Application permissions are resource-specific. ActivityFeed.Read is
+    // issued by the Office 365 Management APIs, so it never appears in a
+    // Microsoft Graph token even after the customer grants consent.
+    let managementPermissions: string[] = []
+    try {
+      const managementToken = await this.requestAccessToken(
+        microsoftTenantId,
+        credentials,
+        'https://manage.office.com/.default'
+      )
+      managementPermissions = managementToken.grantedPermissions
+    } catch {
+      // Keep tenant verification useful before the new resource permission is
+      // granted. The combined permission check below will report it as missing
+      // and drive the admin-consent update flow in the UI.
+    }
+    const grantedPermissions = [
+      ...new Set([...graphPermissions, ...managementPermissions]),
+    ]
 
     const organizationResponse = await fetch(
       'https://graph.microsoft.com/v1.0/organization?$select=id,displayName,verifiedDomains',
