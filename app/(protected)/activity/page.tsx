@@ -730,6 +730,10 @@ export default function ActivityPage() {
 
   const activeMatchingCount =
     tab === 'signins' ? signInRows.length : auditRows.length
+  const activeSyncState =
+    tab === 'signins'
+      ? selectedBundle?.sync?.signIns
+      : selectedBundle?.sync?.auditLogs
 
   return (
     <div className="space-y-4">
@@ -808,6 +812,17 @@ export default function ActivityPage() {
       </div>
 
       {/* Main Content Area */}
+      {filters.tenantId && activeSyncState?.status === 'failed' && (
+        <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <div className="font-semibold">
+            {tab === 'signins' ? 'Sign-in' : 'Directory audit'} log sync failed
+          </div>
+          <div className="mt-1 text-xs leading-5">
+            {activeSyncState.lastError ||
+              'Microsoft did not make this log dataset available. Previously retained events remain visible.'}
+          </div>
+        </div>
+      )}
       {!loaded ? (
         <div className="rounded-lg border bg-background p-6 text-sm text-muted-foreground">
           Loading…

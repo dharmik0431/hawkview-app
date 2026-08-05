@@ -28,4 +28,19 @@ export type TenantBundle = {
     authMethods: any[]
     namedLocations: any[]
   }
+  sync?: {
+    users?: TenantSyncStatus
+    licenses?: TenantSyncStatus
+    domains?: TenantSyncStatus
+    groups?: TenantSyncStatus
+    signIns?: TenantSyncStatus
+    auditLogs?: TenantSyncStatus
+    [resource: string]: TenantSyncStatus | undefined
+  }
+}
+
+export type TenantSyncStatus = {
+  status: string
+  lastSuccessfulAt: string | null
+  lastError: string | null
 }
