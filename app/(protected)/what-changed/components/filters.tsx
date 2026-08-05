@@ -15,6 +15,8 @@ const CATEGORIES: ChangeCategory[] = [
   'Users',
   'Groups',
   'Devices',
+  'Passwords',
+  'Sign-ins',
 ]
 
 const SEVERITIES: ChangeSeverity[] = ['High', 'Medium', 'Low']
@@ -24,6 +26,8 @@ export type WhatChangedFiltersState = {
   severity: 'All' | ChangeSeverity
   categories: ChangeCategory[]
   search: string
+  from: string
+  to: string
 }
 
 export function WhatChangedFilters({
@@ -74,6 +78,8 @@ export function WhatChangedFilters({
               severity: 'All',
               categories: [],
               search: '',
+              from: value.from,
+              to: value.to,
             })
           }
         >
@@ -130,6 +136,16 @@ export function WhatChangedFilters({
           </div>
         </div>
       )}
+      <div className="grid gap-3 border-t pt-3 sm:grid-cols-2">
+        <label className="space-y-1 text-xs font-medium text-muted-foreground">
+          Incident started
+          <Input type="datetime-local" value={value.from} onChange={(event) => onChange({ ...value, from: event.target.value })} />
+        </label>
+        <label className="space-y-1 text-xs font-medium text-muted-foreground">
+          Investigate through
+          <Input type="datetime-local" value={value.to} onChange={(event) => onChange({ ...value, to: event.target.value })} />
+        </label>
+      </div>
     </div>
   )
 }

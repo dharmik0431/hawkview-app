@@ -171,6 +171,15 @@ export function WhatChangedDrawer({
                     Open Audit Log
                   </Button>
                 </div>
+                {event.recoveryGuidance?.length ? (
+                  <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm dark:border-amber-900 dark:bg-amber-950/20">
+                    <div className="font-semibold">Recommended recovery review</div>
+                    <ol className="list-decimal space-y-1 pl-5">
+                      {event.recoveryGuidance.map((step) => <li key={step}>{step}</li>)}
+                    </ol>
+                    <div className="text-xs text-muted-foreground">HawkView does not automatically reverse security changes. Review the evidence and approve each recovery action.</div>
+                  </div>
+                ) : null}
               </>
             )}
           </div>

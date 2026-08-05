@@ -9,4 +9,6 @@ export const CATEGORY_DEFAULT_SEVERITY: Record<ChangeCategory, ChangeSeverity> =
   Users: 'Medium',
   Groups: 'Medium',
   Devices: 'Low',
+  Passwords: 'High',
+  'Sign-ins': 'Low',
 }
