@@ -1,9 +1,9 @@
-const targetUrl = process.env.SCHEDULER_TARGET_URL?.trim() ?? ''
-const sharedSecret = process.env.SCHEDULER_SHARED_SECRET?.trim() ?? ''
+const DEFAULT_TARGET_URL =
+  'https://hawkview-api-dev.onrender.com/api/internal/sync/due-tenants'
 
-if (!targetUrl) {
-  throw new Error('SCHEDULER_TARGET_URL is required.')
-}
+const targetUrl =
+  process.env.SCHEDULER_TARGET_URL?.trim() || DEFAULT_TARGET_URL
+const sharedSecret = process.env.SCHEDULER_SHARED_SECRET?.trim() ?? ''
 
 const parsedTarget = new URL(targetUrl)
 if (parsedTarget.protocol !== 'https:') {
