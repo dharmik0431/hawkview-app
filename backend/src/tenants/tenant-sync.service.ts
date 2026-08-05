@@ -2954,7 +2954,7 @@ export class TenantSyncService {
           createdAt: signIn.eventDateTime.toISOString(),
           ipAddress: signIn.ipAddress ?? '',
           result:
-            Number(signIn.statusErrorCode ?? 1) === 0 ? 'SUCCESS' : 'FAILURE',
+            Number(signIn.statusErrorCode ?? 1) === 0 ? 'Success' : 'Failure',
           appDisplayName: signIn.appDisplayName ?? 'Unknown application',
           clientAppUsed: signIn.clientAppUsed ?? 'Unknown',
           conditionalAccess: signIn.conditionalAccessStatus,
@@ -2964,6 +2964,7 @@ export class TenantSyncService {
               ? 'Not provided by Microsoft'
               : 'Unknown'),
           city: (signIn.location as any)?.city ?? undefined,
+          state: (signIn.location as any)?.state ?? undefined,
           latitude: Number(
             (signIn.location as any)?.geoCoordinates?.latitude ?? 0
           ),
