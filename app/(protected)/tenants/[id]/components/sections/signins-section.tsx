@@ -34,6 +34,7 @@ export type SignInEvent = {
   clientAppUsed: string
   country: string
   city?: string
+  state?: string
   latitude: number
   longitude: number
   riskLevel?: 'low' | 'medium' | 'high'
@@ -90,6 +91,20 @@ function escapeHtml(str: string) {
     .replace(/'/g, '&#039;')
 }
 
+function cleanLocationPart(value?: string | null): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim()
+  if (!normalized || /^(undefined|null|unknown)$/i.test(normalized)) return null
+  return normalized
+}
+
+function formatLocation(event: SignInEvent): string {
+  const parts = [event.city, event.state, event.country]
+    .map(cleanLocationPart)
+    .filter((part): part is string => Boolean(part))
+  return Array.from(new Set(parts)).join(', ') || 'Location unavailable'
+}
+
 export default function SignInActivitySection({
   signIns,
   signInView,
@@ -121,7 +136,7 @@ export default function SignInActivitySection({
           e.userPrincipalName?.toLowerCase().includes(q)
         const matchIp = e.ipAddress?.toLowerCase().includes(q)
         const matchApp = e.appDisplayName?.toLowerCase().includes(q)
-        const matchLoc = `${e.city || ''} ${e.country}`
+        const matchLoc = formatLocation(e)
           .toLowerCase()
           .includes(q)
         if (!matchUser && !matchIp && !matchApp && !matchLoc) return false
@@ -143,7 +158,7 @@ export default function SignInActivitySection({
   const unmappedCount = filteredSignIns.length - mappedEvents.length
 
   const uniqueLocationsCount = useMemo(() => {
-    return new Set(mappedEvents.map((e) => `${e.city || ''}-${e.country}`)).size
+    return new Set(mappedEvents.map(formatLocation)).size
   }, [mappedEvents])
 
   const mappedSuccessCount = useMemo(() => {
@@ -225,7 +240,7 @@ export default function SignInActivitySection({
                 e.result === 'Failure' ? '#ef4444' : '#22c55e'
               dot.style.cursor = 'pointer'
 
-              const cityCountry = e.city ? `${e.city}, ${e.country}` : e.country
+              const cityCountry = formatLocation(e)
               const popupDiv = document.createElement('div')
               popupDiv.className = 'p-1 text-xs font-sans text-slate-900'
               popupDiv.innerHTML = `
@@ -448,7 +463,7 @@ export default function SignInActivitySection({
                           <div className="flex items-center gap-1.5 text-slate-700 dark:text-slate-300">
                             <MapPin className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                             <span>
-                              {e.city ? `${e.city}, ${e.country}` : e.country}
+                              {formatLocation(e)}
                             </span>
                           </div>
                         </td>
