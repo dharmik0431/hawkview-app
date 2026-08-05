@@ -16,6 +16,8 @@ import { resolveDomainDnsHealth } from './domain-dns-health.js'
 const TENANT_ADMIN_ROLES = ['MSP_OWNER', 'MSP_ADMIN'] as const
 const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
+const MANAGEMENT_ACTIVITY_SOURCE = 'MICROSOFT_365_MANAGEMENT_ACTIVITY'
+const MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS = 7
 
 const AUTH_METHOD_NAMES: Record<string, string> = {
   fido2: 'Passkey (FIDO2)',
@@ -1502,7 +1504,7 @@ export class TenantSyncService {
   }
 
   private async syncSignInLogs(
-    tenant: { id: string; organizationId: string },
+    tenant: TenantSyncTarget,
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
@@ -1511,11 +1513,25 @@ export class TenantSyncService {
       const filter = encodeURIComponent(
         `createdDateTime ge ${start.toISOString()} and createdDateTime le ${end.toISOString()}`
       )
-      const rows = await this.fetchGraphCollection(
-        `https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=${filter}&$top=1000`,
-        accessToken,
-        'sign-in logs'
-      )
+      let rows: any[]
+      let limited = false
+      try {
+        rows = await this.fetchGraphCollection(
+          `https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=${filter}&$top=1000`,
+          accessToken,
+          'sign-in logs'
+        )
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (
+          !message.includes('Authentication_RequestFromNonPremiumTenantOrB2CTenant') &&
+          !message.includes("doesn't have premium license")
+        ) {
+          throw error
+        }
+        rows = await this.fetchLimitedLoginActivity(tenant, start, end)
+        limited = true
+      }
       const ingestedAt = new Date()
       const expiresAt = logExpirationDate(ingestedAt)
       const records = rows
@@ -1528,7 +1544,7 @@ export class TenantSyncService {
         .map((row) => ({
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
-          microsoftSignInId: row.id,
+          microsoftSignInId: limited ? `management:${row.id}` : row.id,
           eventDateTime: new Date(row.createdDateTime),
           userId: typeof row.userId === 'string' ? row.userId : null,
           userDisplayName:
@@ -1569,7 +1585,13 @@ export class TenantSyncService {
               : null,
           location: row.location ?? undefined,
           deviceDetail: row.deviceDetail ?? undefined,
-          raw: row,
+          raw: limited
+            ? {
+                ...row,
+                hawkviewSource: MANAGEMENT_ACTIVITY_SOURCE,
+                hawkviewLimited: true,
+              }
+            : row,
           ingestedAt,
           expiresAt,
         }))
@@ -1583,6 +1605,123 @@ export class TenantSyncService {
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
     })
+  }
+
+  private async fetchLimitedLoginActivity(
+    tenant: TenantSyncTarget,
+    requestedStart: Date,
+    end: Date
+  ) {
+    if (!tenant.connection) {
+      throw new Error('The Microsoft tenant connection is incomplete.')
+    }
+    const token =
+      await this.microsoftConsent.getTenantManagementActivityAccessToken({
+        microsoftTenantId: tenant.microsoftTenantId,
+        connectionMode:
+          tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+            ? 'CUSTOMER_MANAGED'
+            : 'HAWKVIEW_MANAGED',
+        clientId: tenant.connection.clientId,
+        credentialReference: tenant.connection.credentialReference,
+      })
+    const baseUrl = `https://manage.office.com/api/v1.0/${encodeURIComponent(tenant.microsoftTenantId)}/activity/feed`
+    const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+    const startResponse = await fetch(
+      `${baseUrl}/subscriptions/start?contentType=Audit.AzureActiveDirectory`,
+      { method: 'POST', headers, signal: AbortSignal.timeout(20_000) }
+    )
+    if (!startResponse.ok) {
+      throw new Error(
+        `Limited login activity requires the Office 365 Management APIs ActivityFeed.Read application permission (HTTP ${startResponse.status}).`
+      )
+    }
+
+    const earliest = new Date(
+      Date.now() - MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+    )
+    let windowStart = requestedStart > earliest ? requestedStart : earliest
+    const contentUris: string[] = []
+    while (windowStart < end) {
+      const windowEnd = new Date(
+        Math.min(end.getTime(), windowStart.getTime() + 23 * 60 * 60 * 1000)
+      )
+      let pageUrl = `${baseUrl}/subscriptions/content?contentType=Audit.AzureActiveDirectory&startTime=${encodeURIComponent(windowStart.toISOString())}&endTime=${encodeURIComponent(windowEnd.toISOString())}`
+      while (pageUrl) {
+        const response = await fetch(pageUrl, {
+          headers,
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!response.ok) {
+          throw new Error(
+            `Microsoft 365 limited login activity returned HTTP ${response.status}.`
+          )
+        }
+        const items = (await response.json()) as Array<{ contentUri?: string }>
+        for (const item of items) {
+          if (typeof item.contentUri === 'string') contentUris.push(item.contentUri)
+        }
+        pageUrl = response.headers.get('NextPageUri') ?? ''
+        if (pageUrl && !pageUrl.startsWith('https://manage.office.com/')) {
+          throw new Error('Microsoft returned an invalid activity-feed page URL.')
+        }
+      }
+      windowStart = new Date(windowEnd.getTime() + 1)
+    }
+
+    const records: any[] = []
+    for (const contentUri of [...new Set(contentUris)]) {
+      if (!contentUri.startsWith('https://manage.office.com/')) continue
+      const response = await fetch(contentUri, {
+        headers,
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!response.ok) continue
+      const content = (await response.json()) as any[]
+      records.push(...content)
+    }
+
+    return records
+      .filter((record) =>
+        ['UserLoggedIn', 'UserLoginFailed', 'UserLoginBlocked'].includes(
+          String(record?.Operation ?? '')
+        )
+      )
+      .filter(
+        (record) =>
+          typeof record?.Id === 'string' &&
+          typeof record?.CreationTime === 'string' &&
+          Number.isFinite(new Date(record.CreationTime).getTime())
+      )
+      .map((record) => ({
+        id: record.Id,
+        createdDateTime: record.CreationTime,
+        userId: typeof record.UserKey === 'string' ? record.UserKey : null,
+        userDisplayName: null,
+        userPrincipalName:
+          typeof record.UserId === 'string' ? record.UserId : null,
+        appId: null,
+        appDisplayName:
+          typeof record.Application === 'string'
+            ? record.Application
+            : 'Microsoft 365',
+        resourceDisplayName: record.Workload ?? null,
+        ipAddress: typeof record.ClientIP === 'string' ? record.ClientIP : null,
+        clientAppUsed: record.Application ?? null,
+        conditionalAccessStatus: null,
+        isInteractive: null,
+        riskLevelAggregated: null,
+        status: {
+          errorCode: record.Operation === 'UserLoggedIn' ? 0 : 1,
+          failureReason:
+            record.Operation === 'UserLoggedIn'
+              ? null
+              : String(record.LogonError ?? record.Operation),
+        },
+        location: null,
+        deviceDetail: null,
+        managementActivityRecord: record,
+      }))
   }
 
   private async syncDirectoryAuditLogs(
@@ -2631,6 +2770,11 @@ export class TenantSyncService {
           os: (signIn.deviceDetail as any)?.operatingSystem ?? undefined,
           riskLevel: signIn.riskLevel,
           failureReason: signIn.failureReason,
+          dataSource:
+            (signIn.raw as any)?.hawkviewSource === MANAGEMENT_ACTIVITY_SOURCE
+              ? 'microsoft-365-management-activity'
+              : 'entra-sign-in-logs',
+          isLimited: Boolean((signIn.raw as any)?.hawkviewLimited),
         })),
         auditLogs: auditLogs.map((audit) => ({
           id: audit.microsoftAuditId,
