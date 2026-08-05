@@ -1627,14 +1627,45 @@ export class TenantSyncService {
       })
     const baseUrl = `https://manage.office.com/api/v1.0/${encodeURIComponent(tenant.microsoftTenantId)}/activity/feed`
     const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' }
-    const startResponse = await fetch(
-      `${baseUrl}/subscriptions/start?contentType=Audit.AzureActiveDirectory`,
-      { method: 'POST', headers, signal: AbortSignal.timeout(20_000) }
-    )
-    if (!startResponse.ok) {
-      throw new Error(
-        `Limited login activity requires the Office 365 Management APIs ActivityFeed.Read application permission (HTTP ${startResponse.status}).`
+    const contentType = 'Audit.AzureActiveDirectory'
+    const subscriptionIsEnabled = async () => {
+      const response = await fetch(`${baseUrl}/subscriptions/list`, {
+        headers,
+        signal: AbortSignal.timeout(20_000),
+      })
+      if (!response.ok) {
+        const body = (await response.text()).slice(0, 500)
+        throw new Error(
+          `Microsoft 365 activity subscription verification returned HTTP ${response.status}${body ? `: ${body}` : '.'}`
+        )
+      }
+      const subscriptions = (await response.json()) as Array<{
+        contentType?: string
+        status?: string
+      }>
+      return subscriptions.some(
+        (subscription) =>
+          subscription.contentType === contentType &&
+          subscription.status?.toLowerCase() === 'enabled'
       )
+    }
+
+    if (!(await subscriptionIsEnabled())) {
+      const startResponse = await fetch(
+        `${baseUrl}/subscriptions/start?contentType=${encodeURIComponent(contentType)}`,
+        { method: 'POST', headers, signal: AbortSignal.timeout(20_000) }
+      )
+      if (!startResponse.ok) {
+        const body = (await startResponse.text()).slice(0, 500)
+        // Microsoft can return HTTP 400 when another worker enabled the same
+        // subscription between our list and start requests. Verify the actual
+        // state before treating that race as a sync failure.
+        if (startResponse.status !== 400 || !(await subscriptionIsEnabled())) {
+          throw new Error(
+            `Microsoft 365 activity subscription could not be started (HTTP ${startResponse.status})${body ? `: ${body}` : '.'}`
+          )
+        }
+      }
     }
 
     const earliest = new Date(
@@ -1646,7 +1677,7 @@ export class TenantSyncService {
       const windowEnd = new Date(
         Math.min(end.getTime(), windowStart.getTime() + 23 * 60 * 60 * 1000)
       )
-      let pageUrl = `${baseUrl}/subscriptions/content?contentType=Audit.AzureActiveDirectory&startTime=${encodeURIComponent(windowStart.toISOString())}&endTime=${encodeURIComponent(windowEnd.toISOString())}`
+      let pageUrl = `${baseUrl}/subscriptions/content?contentType=${encodeURIComponent(contentType)}&startTime=${encodeURIComponent(windowStart.toISOString())}&endTime=${encodeURIComponent(windowEnd.toISOString())}`
       while (pageUrl) {
         const response = await fetch(pageUrl, {
           headers,
