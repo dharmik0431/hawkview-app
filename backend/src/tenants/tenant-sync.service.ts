@@ -104,7 +104,33 @@ function parseCsvRows(csv: string): Record<string, string>[] {
 
 function normalizeSharePointUrl(value: unknown) {
   if (typeof value !== 'string') return ''
-  return value.trim().replace(/\/$/, '').toLowerCase()
+  const raw = value.trim()
+  if (!raw) return ''
+  try {
+    const url = new URL(raw)
+    url.hash = ''
+    url.search = ''
+    return decodeURIComponent(url.toString())
+      .replace(/\/$/, '')
+      .toLowerCase()
+  } catch {
+    return raw.replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase()
+  }
+}
+
+function normalizeSharePointSiteId(value: unknown) {
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/[{}]/g, '').toLowerCase()
+}
+
+function isCustomerFacingSharePointSite(site: any) {
+  const url = normalizeSharePointUrl(site?.webUrl)
+  if (!url) return true
+  return !(
+    url.includes('/contentstorage/') ||
+    url.endsWith('/sites/contenttypehub') ||
+    url.includes('/sites/contenttypehub/')
+  )
 }
 
 function managementActivityExtendedProperty(record: any, ...names: string[]) {
@@ -2837,7 +2863,9 @@ export class TenantSyncService {
         target
       )
     }
-    const sharePointSites = snapshotByResource.get('SHAREPOINT_SITES') ?? []
+    const sharePointSites = (
+      snapshotByResource.get('SHAREPOINT_SITES') ?? []
+    ).filter(isCustomerFacingSharePointSite)
     const sharePointSettings = (snapshotByResource.get('SHAREPOINT_SETTINGS') ??
       [])[0]
     const sharePointUsageSnapshot =
@@ -2926,7 +2954,7 @@ export class TenantSyncService {
             typeof row?.['Site Id'] === 'string' && row['Site Id'].trim()
         )
         .map((row: Record<string, string>) => [
-          row['Site Id'].trim().toLowerCase(),
+          normalizeSharePointSiteId(row['Site Id']),
           row,
         ])
     )
@@ -2957,11 +2985,25 @@ export class TenantSyncService {
       if (typeof site?.id !== 'string') return undefined
       const siteIds = site.id
         .split(',')
-        .map((value: string) => value.trim().toLowerCase())
+        .map(normalizeSharePointSiteId)
       return siteIds
         .map((siteId: string) => sharePointUsageBySiteId.get(siteId))
         .find(Boolean)
     }
+    const sharePointUsageRowsWithActivity = sharePointUsage.filter(
+      (row: Record<string, string>) =>
+        typeof row?.['Last Activity Date'] === 'string' &&
+        Boolean(row['Last Activity Date'].trim())
+    )
+    const matchedSharePointUsageRows = new Set(
+      sharePointSites.map(getSharePointUsage).filter(Boolean)
+    )
+    // Microsoft 365 conceals site URLs and IDs in usage reports by default in
+    // some tenants. The activity dates are still present, but there is no safe
+    // way to associate those anonymous rows with a Graph site. Never guess.
+    const sharePointUsageIdentifiersConcealed =
+      sharePointUsageRowsWithActivity.length > 0 &&
+      matchedSharePointUsageRows.size === 0
     const getSharePointSiteType = (site: any, usage: any) => {
       const template = String(usage?.['Root Web Template'] ?? '').toUpperCase()
       const url = normalizeSharePointUrl(site?.webUrl)
@@ -3597,6 +3639,18 @@ export class TenantSyncService {
               : null,
             sitesWithoutActivityData: sharePointUsageSynchronized
               ? sharePointSitesWithoutActivity
+              : null,
+            activityDataStatus: sharePointUsageIdentifiersConcealed
+              ? 'identifiers-concealed'
+              : sharePointUsageSynchronized
+                ? sharePointSitesWithoutActivity === 0
+                  ? 'available'
+                  : 'partial'
+                : 'unavailable',
+            activityReportRows: sharePointUsageRowsWithActivity.length,
+            matchedActivitySites: matchedSharePointUsageRows.size,
+            activityDataMessage: sharePointUsageIdentifiersConcealed
+              ? 'Microsoft returned SharePoint activity dates with concealed site identifiers. Turn off concealed names in Microsoft 365 Admin Center > Settings > Org settings > Services > Reports, then synchronize again.'
               : null,
             // Graph exposes one tenant sharing capability for the combined
             // SharePoint and OneDrive settings resource. Until Microsoft
