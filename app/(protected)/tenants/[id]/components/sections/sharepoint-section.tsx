@@ -30,14 +30,15 @@ function normalizeSharingLevel(v: any): SharingLevel {
     s.includes('not synced')
   )
     return 'Unknown'
-  if (
-    s === 'off' ||
-    s === 'disabled' ||
-    s === 'none' ||
-    s === 'false' ||
-    s.includes('disabled') ||
-    s.includes('off')
-  )
+
+  // Microsoft Graph sharepointSettings enum values. Handle these before the
+  // looser display-label matching below so authoritative values never fall
+  // through to "Awaiting collection".
+  if (s === 'externaluserandguestsharing') return 'Anyone'
+  if (s === 'externalusersharingonly') return 'NewAndExistingGuests'
+  if (s === 'existingexternalusersharingonly') return 'ExistingGuests'
+  if (s === 'disabled') return 'OrganizationOnly'
+  if (s === 'off' || s === 'none' || s === 'false' || s.includes('off'))
     return 'Off'
 
   if (s.includes('anyone')) return 'Anyone'
@@ -137,6 +138,10 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       rawOverview.storageLimitsMode ??
       rawOverview.limitsMode ??
       'Awaiting collection',
+    sitesMissingReportedOwner:
+      typeof rawOverview.sitesMissingReportedOwner === 'number'
+        ? rawOverview.sitesMissingReportedOwner
+        : null,
 
     sharingSharePoint: normalizeSharingLevel(
       rawOverview.sharingSharePoint ??
@@ -186,7 +191,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
     [string, { status: string; lastError?: string | null }]
   >
   const usageSynchronized = sp?.capabilities?.usageReport === true
-  const ownerInventorySupported = sp?.capabilities?.siteOwnerCount === true
+  const ownerPresenceSupported = sp?.capabilities?.siteOwnerPresence === true
   const deletedSitesSupported = sp?.capabilities?.deletedSites === true
 
   const formatStorage = (value: number) => {
@@ -351,11 +356,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       0
     )
     const externalOn = SP_SITES.filter((s: any) => !!s.externalSharing).length
-    const orphaned = SP_SITES.filter(
-      (s: any) =>
-        typeof s.owners === 'number' && s.owners < 2 && s.type !== 'OneDrive'
-    ).length
-    return { totalUsed, externalOn, orphaned }
+    return { totalUsed, externalOn }
   }, [SP_SITES])
 
   return (
@@ -518,16 +519,16 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
 
             <div className="rounded-2xl border bg-gradient-to-r from-emerald-50 to-white p-4">
               <div className="text-xs text-muted-foreground">
-                Orphaned sites
+                Sites missing owner
               </div>
               <div className="text-lg font-bold text-slate-900">
-                {ownerInventorySupported &&
-                SP_SITES.some((site: any) => typeof site.owners === 'number')
-                  ? totals.orphaned
-                  : 'Unavailable via Graph'}
+                {ownerPresenceSupported &&
+                typeof SP_OVERVIEW.sitesMissingReportedOwner === 'number'
+                  ? SP_OVERVIEW.sitesMissingReportedOwner
+                  : 'Awaiting collection'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                Less than 2 owners (governance risk)
+                No owner reported in Microsoft usage data
               </div>
             </div>
 
@@ -536,10 +537,10 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               <div className="text-lg font-bold text-slate-900">
                 {deletedSitesSupported && sp?.deletedSitesSynchronized === true
                   ? SP_DELETED_SITES.length
-                  : 'Unavailable via Graph'}
+                  : 'Awaiting collection'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                Recoverable items
+                Reported deleted in the last 30 days
               </div>
             </div>
           </div>

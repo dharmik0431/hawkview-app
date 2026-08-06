@@ -2935,6 +2935,15 @@ export class TenantSyncService {
       const parsed = Number(value)
       return Number.isFinite(parsed) ? parsed : null
     }
+    const reportBoolean = (value: unknown) =>
+      ['true', 'yes', '1'].includes(
+        String(value ?? '')
+          .trim()
+          .toLowerCase()
+      )
+    const deletedSharePointUsage = sharePointUsage.filter(
+      (row: Record<string, string>) => reportBoolean(row?.['Is Deleted'])
+    )
     const reportedSharePointAllocationBytes = sharePointUsage.reduce(
       (total: number, row: Record<string, string>) =>
         total + (parseReportBytes(row?.['Storage Allocated (Byte)']) ?? 0),
@@ -3469,8 +3478,11 @@ export class TenantSyncService {
           capabilities: {
             tenantSettings: sharePointSettingsSynchronized,
             usageReport: sharePointUsageSynchronized,
-            siteOwnerCount: false,
-            deletedSites: false,
+            // The usage report provides one reported owner, not a complete
+            // owners collection. It can still identify sites for which
+            // Microsoft reports no owner at all.
+            siteOwnerPresence: sharePointUsageSynchronized,
+            deletedSites: sharePointUsageSynchronized,
           },
           overview: {
             totalSites: sharePointSites.length,
@@ -3504,6 +3516,18 @@ export class TenantSyncService {
                   ? 'Automatic'
                   : 'Manual'
                 : 'Unavailable from Microsoft Graph',
+            sitesMissingReportedOwner: sharePointUsageSynchronized
+              ? sharePointSites.filter((site) => {
+                  const usage = getSharePointUsage(site)
+                  return ![
+                    usage?.['Owner Principal Name'],
+                    usage?.['Owner Display Name'],
+                  ].some(
+                    (owner) =>
+                      typeof owner === 'string' && Boolean(owner.trim())
+                  )
+                }).length
+              : null,
             // Graph exposes one tenant sharing capability for the combined
             // SharePoint and OneDrive settings resource. Until Microsoft
             // exposes separate values, show the same authoritative tenant
@@ -3531,6 +3555,12 @@ export class TenantSyncService {
               externalSharing: null,
               guestsCount: null,
               owners: null,
+              hasReportedOwner: [
+                usage?.['Owner Principal Name'],
+                usage?.['Owner Display Name'],
+              ].some(
+                (owner) => typeof owner === 'string' && Boolean(owner.trim())
+              ),
               ownerDisplayName:
                 typeof usage?.['Owner Display Name'] === 'string' &&
                 usage['Owner Display Name'].trim()
@@ -3546,13 +3576,30 @@ export class TenantSyncService {
                 usage?.['Last Activity Date'] || 'No activity reported',
             }
           }),
-          deletedSites: [],
-          deletedSitesSynchronized: false,
+          // This is the deleted-site signal in Microsoft's D30 usage report.
+          // It is not the SharePoint recycle bin and must not be presented as
+          // a complete list of recoverable sites.
+          deletedSites: deletedSharePointUsage.map(
+            (row: Record<string, string>, index: number) => ({
+              id: row['Site Id'] || row['Site URL'] || `deleted-site-${index}`,
+              name:
+                row['Site Name'] ||
+                row['Site URL'] ||
+                'Deleted SharePoint site',
+              url: row['Site URL'] || '',
+              ownerDisplayName: row['Owner Display Name'] || null,
+              ownerPrincipalName: row['Owner Principal Name'] || null,
+              lastActivity: row['Last Activity Date'] || null,
+              reportPeriod: 'D30',
+              source: 'microsoft-usage-report',
+            })
+          ),
+          deletedSitesSynchronized: sharePointUsageSynchronized,
           unsupported: {
             siteOwnerCount:
               'Microsoft Graph site inventory and usage reports do not provide a reliable owner count.',
-            deletedSites:
-              'Microsoft Graph does not provide the SharePoint recently deleted sites inventory.',
+            deletedSitesRecycleBin:
+              'Microsoft Graph does not provide the complete SharePoint recycle-bin inventory; HawkView shows deleted sites reported by Microsoft usage data for the last 30 days.',
           },
         },
         teams: {},
