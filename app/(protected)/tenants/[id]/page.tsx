@@ -69,7 +69,8 @@ import { cn } from '@/lib/utils'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
 import { TenantHeader } from './components/tenant-header'
-import { TenantMobileNav } from './components/tenant-nav'
+import { TenantModuleNav } from './components/tenant-nav'
+import { TenantOverview } from './components/tenant-overview'
 import { deriveTenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 
 type Provider = 'microsoft' | 'google'
@@ -88,6 +89,8 @@ type Tenant = {
 }
 
 type TenantSection =
+  | 'overview'
+  | 'settings'
   | 'home'
   | 'entra'
   | 'exchange'
@@ -1328,7 +1331,7 @@ export default function TenantDetailsPage() {
 
   const TEAMS = (bundle?.teams ?? {}) as any
 
-  const [section, setSection] = useState<TenantSection>('home')
+  const [section, setSection] = useState<TenantSection>('overview')
 
   // Entra UI state
   const [entraTab, setEntraTab] = useState<EntraTab>('overview')
@@ -1802,7 +1805,9 @@ export default function TenantDetailsPage() {
 
   const isMicrosoft = tenant.provider === 'microsoft'
   const heading =
-    isMicrosoft && section === 'entra'
+    section === 'overview'
+      ? 'Overview'
+      : isMicrosoft && section === 'entra'
       ? 'Entra ID'
       : isMicrosoft && section === 'exchange'
         ? 'Exchange'
@@ -1826,6 +1831,11 @@ export default function TenantDetailsPage() {
 
   const navItems = isMicrosoft
     ? [
+        {
+          key: 'overview' as const,
+          label: 'Overview',
+          icon: <Layers className="h-5 w-5" />,
+        },
         {
           key: 'home' as const,
           label: 'Office 365',
@@ -1851,6 +1861,11 @@ export default function TenantDetailsPage() {
           label: 'Teams',
           icon: <Users className="h-5 w-5" />,
           disabled: true,
+        },
+        {
+          key: 'settings' as const,
+          label: 'Settings',
+          icon: <Settings className="h-5 w-5" />,
         },
       ]
     : [
@@ -3568,15 +3583,18 @@ export default function TenantDetailsPage() {
           </div>
 
           {officeTab === 'licenses' ? (
-            <LicensesSection
-              isMicrosoft={isMicrosoft}
-              licenseRows={licenseRows}
-              users={bundle?.users}
-              syncCompleted={Boolean(bundle?.licenses)}
-              tenant={tenant}
-              bundle={bundle}
-              domains={domains}
-            />
+            <div className="space-y-5">
+              <LicensesSection
+                isMicrosoft={isMicrosoft}
+                licenseRows={licenseRows}
+                users={bundle?.users}
+                syncCompleted={Boolean(bundle?.licenses)}
+                tenant={tenant}
+                bundle={bundle}
+                domains={domains}
+              />
+              <LicenseActivitySection bundle={bundle} />
+            </div>
           ) : (
             <DnsSection tenant={tenant} domains={domains} dns={bundle?.dns} />
           )}
@@ -3585,6 +3603,20 @@ export default function TenantDetailsPage() {
     }
 
     function renderMainContent(bundle: any) {
+      if (section === 'overview') {
+        return (
+          <TenantOverview
+            bundle={bundle}
+            display={workspaceDisplay}
+            onOpenModule={(module) => setSection(module as TenantSection)}
+          />
+        )
+      }
+
+      if ((section as string) === 'settings') {
+        router.push(`/tenants/${tenantId}/settings`)
+        return null
+      }
       if (
         section === 'sharepoint' //||
         //section === 'sharepoint-onedrive' ||
@@ -3665,17 +3697,17 @@ export default function TenantDetailsPage() {
                     type="button"
                     role="tab"
                     id="entra-tab-app-registrations"
-                    aria-selected={entraTab === 'app-registrations'}
+                    aria-selected={entraTab === 'app-registrations' || entraTab === 'enterprise-apps'}
                     aria-controls="entra-tabpanel-app-registrations"
                     onClick={() => handleNavigateEntraTab('app-registrations')}
                     className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
-                      entraTab === 'app-registrations'
+                      entraTab === 'app-registrations' || entraTab === 'enterprise-apps'
                         ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
                         : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
                     }`}
                   >
                     <AppWindow className="h-4 w-4 shrink-0" />
-                    <span>App Registrations</span>
+                    <span>Applications</span>
                   </button>
                   <button
                     type="button"
@@ -3684,7 +3716,7 @@ export default function TenantDetailsPage() {
                     aria-selected={entraTab === 'enterprise-apps'}
                     aria-controls="entra-tabpanel-enterprise-apps"
                     onClick={() => handleNavigateEntraTab('enterprise-apps')}
-                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
+                    className={`hidden ${
                       entraTab === 'enterprise-apps'
                         ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
                         : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
@@ -3697,34 +3729,37 @@ export default function TenantDetailsPage() {
                     type="button"
                     role="tab"
                     id="entra-tab-security"
-                    aria-selected={entraTab === 'security'}
+                    aria-selected={entraTab === 'security' && securityView === 'policies'}
                     aria-controls="entra-tabpanel-security"
-                    onClick={() => handleNavigateEntraTab('security')}
+                    onClick={() => handleNavigateEntraTab('security', 'policies')}
                     className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
-                      entraTab === 'security'
+                      entraTab === 'security' && securityView === 'policies'
                         ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
                         : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
                     }`}
                   >
                     <Shield className="h-4 w-4 shrink-0" />
-                    <span>Security</span>
+                    <span>Security Policies</span>
                   </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    id="entra-tab-licenses"
-                    aria-selected={entraTab === 'licenses'}
-                    aria-controls="entra-tabpanel-licenses"
-                    onClick={() => handleNavigateEntraTab('licenses')}
-                    className={`flex items-center gap-1.5 h-full border-b-2 px-1 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 ${
-                      entraTab === 'licenses'
-                        ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 font-semibold'
-                        : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 font-medium'
-                    }`}
-                  >
-                    <Activity className="h-4 w-4 shrink-0" />
-                    <span>License Activity</span>
-                  </button>
+                  {[
+                    { id: 'sign-ins', label: 'Sign-in Activity' },
+                    { id: 'auth', label: 'Authentication' },
+                    { id: 'locations', label: 'Named Locations' },
+                  ].map((item) => {
+                    const active = entraTab === 'security' && securityView === item.id
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={active}
+                        onClick={() => handleNavigateEntraTab('security', item.id as 'sign-ins' | 'auth' | 'locations')}
+                        className={`flex h-full items-center whitespace-nowrap border-b-2 px-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${active ? 'border-blue-600 font-semibold text-blue-600 dark:border-blue-400 dark:text-blue-400' : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'}`}
+                      >
+                        {item.label}
+                      </button>
+                    )
+                  })}
                 </div>
               </div>
 
@@ -4115,23 +4150,18 @@ export default function TenantDetailsPage() {
                 </div>
               )}
 
-              {entraTab === 'app-registrations' && (
+              {(entraTab === 'app-registrations' || entraTab === 'enterprise-apps') && (
                 <div
                   role="tabpanel"
                   id="entra-tabpanel-app-registrations"
                   aria-labelledby="entra-tab-app-registrations"
+                  className="mt-5"
                 >
-                  <AppRegistrationsSection bundle={bundle} />
-                </div>
-              )}
-
-              {entraTab === 'enterprise-apps' && (
-                <div
-                  role="tabpanel"
-                  id="entra-tabpanel-enterprise-apps"
-                  aria-labelledby="entra-tab-enterprise-apps"
-                >
-                  <EnterpriseAppsSection bundle={bundle} />
+                  <div className="mb-4 inline-flex rounded-lg border border-slate-200 bg-white p-1 dark:border-slate-700 dark:bg-slate-900" role="group" aria-label="Application inventory type">
+                    <button type="button" onClick={() => handleNavigateEntraTab('app-registrations')} className={cn('rounded-md px-3 py-1.5 text-sm font-medium', entraTab === 'app-registrations' ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900' : 'text-slate-600 dark:text-slate-300')}>App Registrations</button>
+                    <button type="button" onClick={() => handleNavigateEntraTab('enterprise-apps')} className={cn('rounded-md px-3 py-1.5 text-sm font-medium', entraTab === 'enterprise-apps' ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900' : 'text-slate-600 dark:text-slate-300')}>Enterprise Applications</button>
+                  </div>
+                  {entraTab === 'app-registrations' ? <AppRegistrationsSection bundle={bundle} /> : <EnterpriseAppsSection bundle={bundle} />}
                 </div>
               )}
 
@@ -4143,7 +4173,7 @@ export default function TenantDetailsPage() {
                   className="mt-5 space-y-4"
                 >
                   {/* Secondary Subsection Navigation Rail */}
-                  <div className="pt-1 pb-1">
+                  <div className="hidden">
                     <nav
                       role="tablist"
                       aria-label="Security section navigation"
@@ -4238,15 +4268,6 @@ export default function TenantDetailsPage() {
                 </div>
               )}
 
-              {entraTab === 'licenses' && (
-                <div
-                  role="tabpanel"
-                  id="entra-tabpanel-licenses"
-                  aria-labelledby="entra-tab-licenses"
-                >
-                  <LicenseActivitySection bundle={bundle} />
-                </div>
-              )}
             </div>
           )
       }
@@ -4269,9 +4290,9 @@ export default function TenantDetailsPage() {
           Back to Tenants
         </Link>
 
-        <div className="rounded-[28px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-sm">
-          <div className="flex h-[calc(100vh-180px)]">
-            <aside className="hidden lg:flex w-[300px] flex-col border-r border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 sticky top-0 h-full">
+        <div className="min-h-[calc(100vh-150px)] border-y border-slate-200 bg-slate-50/60 dark:border-slate-800 dark:bg-slate-950/60">
+          <div className="min-h-[calc(100vh-150px)]">
+            <aside className="hidden">
               <div className="p-4 border-b border-slate-200 dark:border-slate-800">
                 <div className="relative">
                   <button
@@ -4411,28 +4432,34 @@ export default function TenantDetailsPage() {
               </div>
             </aside>
 
-            <section className="flex-1 bg-slate-50/60 dark:bg-slate-950/60 overflow-y-auto">
-              <div className="p-8">
+            <section className="min-w-0">
+              <div className="px-3 py-4 sm:px-5 xl:px-7">
                 <TenantHeader
                   tenant={tenant}
                   display={workspaceDisplay}
                   tenantId={String(tenantId)}
                   syncing={syncState === 'syncing'}
                   onRefresh={runSync}
+                  tenants={tenantsList.length ? tenantsList : [tenant]}
+                  onTenantChange={(nextTenantId) => router.push(`/tenants/${nextTenantId}`)}
                 />
 
-                <TenantMobileNav
+                <TenantModuleNav
                   items={navItems}
                   value={section}
                   onChange={(key) => {
+                    if (key === 'settings') {
+                      router.push(`/tenants/${tenantId}/settings`)
+                      return
+                    }
                     setSection(key as TenantSection)
                     if (key === 'entra') setEntraTab('overview')
                   }}
                 />
 
-                <div className="mb-4 flex items-center gap-2">
+                <div className="mb-4 flex items-baseline gap-2">
                   <h2 className="text-base font-semibold tracking-tight">{heading}</h2>
-                  <span className="text-sm text-muted-foreground">{subheading}</span>
+                  <span className="hidden text-sm text-muted-foreground sm:inline">{subheading}</span>
                 </div>
 
                 {syncState === 'fail' && (
