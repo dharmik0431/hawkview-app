@@ -160,6 +160,12 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       typeof rawOverview.sitesWithoutActivityData === 'number'
         ? rawOverview.sitesWithoutActivityData
         : null,
+    activityDataStatus:
+      rawOverview.activityDataStatus ?? rawOverview.activityStatus ?? null,
+    activityDataMessage:
+      typeof rawOverview.activityDataMessage === 'string'
+        ? rawOverview.activityDataMessage
+        : null,
 
     sharingSharePoint: normalizeSharingLevel(
       rawOverview.sharingSharePoint ??
@@ -418,6 +424,22 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               </li>
             ))}
           </ul>
+        </div>
+      ) : null}
+
+      {SP_OVERVIEW.activityDataStatus === 'identifiers-concealed' ? (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+          <div className="font-semibold">
+            SharePoint last activity needs one Microsoft report setting
+          </div>
+          <p className="mt-1 text-amber-900">
+            {SP_OVERVIEW.activityDataMessage}
+          </p>
+          <p className="mt-2 text-amber-900">
+            This lets HawkView match each Microsoft usage-report date to the
+            correct site. HawkView will never guess which anonymous activity
+            row belongs to a site.
+          </p>
         </div>
       ) : null}
 
