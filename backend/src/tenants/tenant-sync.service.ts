@@ -3104,6 +3104,41 @@ export class TenantSyncService {
       Boolean(sharePointSettings)
     const sharePointUsageSynchronized =
       sharePointUsageSyncState?.status === 'SUCCEEDED'
+    const sharePointActivityAsOf = new Date()
+    const getSharePointActivity = (site: any) => {
+      const value = getSharePointUsage(site)?.['Last Activity Date']
+      if (typeof value !== 'string' || !value.trim()) {
+        return { lastActivityAt: null, activityAgeDays: null }
+      }
+
+      const parsed = new Date(`${value.trim()}T00:00:00.000Z`)
+      if (Number.isNaN(parsed.getTime())) {
+        return { lastActivityAt: null, activityAgeDays: null }
+      }
+
+      return {
+        lastActivityAt: value.trim(),
+        activityAgeDays: Math.max(
+          0,
+          Math.floor(
+            (sharePointActivityAsOf.getTime() - parsed.getTime()) /
+              (24 * 60 * 60 * 1000)
+          )
+        ),
+      }
+    }
+    const sharePointActivity = sharePointSites.map(getSharePointActivity)
+    const inactiveSharePointSites90Days = sharePointActivity.filter(
+      ({ activityAgeDays }) =>
+        typeof activityAgeDays === 'number' && activityAgeDays >= 90
+    ).length
+    const inactiveSharePointSites180Days = sharePointActivity.filter(
+      ({ activityAgeDays }) =>
+        typeof activityAgeDays === 'number' && activityAgeDays >= 180
+    ).length
+    const sharePointSitesWithoutActivity = sharePointActivity.filter(
+      ({ activityAgeDays }) => activityAgeDays === null
+    ).length
     const licenseNameBySkuId = new Map(
       licenses.map((license) => [
         license.microsoftSkuId.toLowerCase(),
@@ -3528,6 +3563,19 @@ export class TenantSyncService {
                   )
                 }).length
               : null,
+            activityAsOf: sharePointActivityAsOf.toISOString(),
+            inactiveSites90Days: sharePointUsageSynchronized
+              ? inactiveSharePointSites90Days
+              : null,
+            inactiveSites180Days: sharePointUsageSynchronized
+              ? inactiveSharePointSites180Days
+              : null,
+            sitesWithActivityData: sharePointUsageSynchronized
+              ? sharePointSites.length - sharePointSitesWithoutActivity
+              : null,
+            sitesWithoutActivityData: sharePointUsageSynchronized
+              ? sharePointSitesWithoutActivity
+              : null,
             // Graph exposes one tenant sharing capability for the combined
             // SharePoint and OneDrive settings resource. Until Microsoft
             // exposes separate values, show the same authoritative tenant
@@ -3541,6 +3589,7 @@ export class TenantSyncService {
           },
           sites: sharePointSites.map((site) => {
             const usage = getSharePointUsage(site)
+            const activity = getSharePointActivity(site)
             const reportStorageUsed = parseReportBytes(
               usage?.['Storage Used (Byte)']
             )
@@ -3574,6 +3623,14 @@ export class TenantSyncService {
               ),
               lastActivity:
                 usage?.['Last Activity Date'] || 'No activity reported',
+              lastActivityAt: activity.lastActivityAt,
+              activityAgeDays: activity.activityAgeDays,
+              activityStatus:
+                activity.activityAgeDays === null
+                  ? 'unknown'
+                  : activity.activityAgeDays >= 90
+                    ? 'inactive'
+                    : 'active',
             }
           }),
           // This is the deleted-site signal in Microsoft's D30 usage report.
