@@ -7,7 +7,6 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 
 import { Mail, Users, Layers, Shield, Search, ChevronRight } from 'lucide-react'
-import { TenantDataState } from '../tenant-data-state'
 
 type ExchangeSectionProps = {
   bundle: any
@@ -35,12 +34,6 @@ export default function ExchangePage({
   const hasNeverSynced = Object.values(exchangeSync).some(
     (value: any) => value?.status === 'never-synced'
   )
-  const datasetCount = (key: string, value: number) => {
-    const state = exchangeSync?.[key]
-    if (state?.status === 'failed') return 'Unavailable'
-    if (state?.status === 'never-synced') return 'Awaiting first sync'
-    return value
-  }
 
   // ✅ Pull from mock bundle (NOT hardcoded)
   const EXCHANGE_MAILBOXES = useMemo(
@@ -117,8 +110,29 @@ export default function ExchangePage({
 
   return (
     <div className="mt-6 space-y-6">
-      {failedModules.length > 0 && <TenantDataState kind="partial" detail={failedModules.map(([name, value]: [string, any]) => `${name}: ${value?.lastError || 'synchronization failed'}`).join(' • ')} />}
-      {failedModules.length === 0 && hasNeverSynced && <TenantDataState kind="initial-sync" detail="Exchange datasets are awaiting their first successful synchronization." />}
+      {(failedModules.length > 0 || hasNeverSynced) && (
+        <Card className="rounded-2xl border-amber-200 bg-amber-50/60 shadow-sm">
+          <CardContent className="p-5">
+            <div className="font-semibold">
+              Exchange synchronization needs attention
+            </div>
+            <div className="mt-1 text-sm text-muted-foreground">
+              HawkView keeps each Exchange dataset independent so available data
+              remains visible.
+            </div>
+            {failedModules.map(([name, value]: [string, any]) => (
+              <div key={name} className="mt-2 text-sm text-red-700">
+                {name}: {value?.lastError || 'Microsoft rejected this dataset.'}
+              </div>
+            ))}
+            {failedModules.length === 0 && hasNeverSynced && (
+              <div className="mt-2 text-sm text-amber-800">
+                Run tenant synchronization to collect Exchange data.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
       {/* Top stats */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         {/* Total User Mailboxes */}
@@ -130,10 +144,11 @@ export default function ExchangePage({
                   Total User Mailboxes
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {datasetCount('mailboxes',
+                  {
                     EXCHANGE_MAILBOXES.filter(
                       (m: any) => m.mailboxType === 'User'
-                    ).length)}
+                    ).length
+                  }
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Active user mailboxes
@@ -156,10 +171,11 @@ export default function ExchangePage({
                   Total Shared Mailboxes
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {datasetCount('mailboxes',
+                  {
                     EXCHANGE_MAILBOXES.filter(
                       (m: any) => m.mailboxType === 'Shared'
-                    ).length)}
+                    ).length
+                  }
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Shared/support/team inboxes
@@ -182,11 +198,12 @@ export default function ExchangePage({
                   Total Distribution Groups
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {datasetCount('groups',
+                  {
                     EXCHANGE_GROUPS.filter(
                       (g: any) =>
                         g.type === 'DistributionList' || g.type === 'DynamicDL'
-                    ).length)}
+                    ).length
+                  }
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   DLs + Dynamic DLs
@@ -209,7 +226,7 @@ export default function ExchangePage({
                   Inbox Rules Count
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {datasetCount('rules', EXCHANGE_RULES.length)}
+                  {EXCHANGE_RULES.length}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   User mailbox inbox rules
@@ -341,7 +358,7 @@ export default function ExchangePage({
                       colSpan={6}
                       className="px-6 py-8 text-center text-muted-foreground"
                     >
-                      {exchangeSync?.mailboxes?.status === 'failed' ? 'Mailbox data is unavailable because synchronization failed.' : exchangeSync?.mailboxes?.status === 'never-synced' ? 'Mailboxes are awaiting their first synchronization.' : 'No mailboxes found.'}
+                      No mailboxes found.
                     </td>
                   </tr>
                 )}
@@ -438,7 +455,7 @@ export default function ExchangePage({
 
               {rules.length === 0 && (
                 <div className="text-sm text-muted-foreground text-center py-6">
-                  {exchangeSync?.rules?.status === 'failed' ? 'Mail rules are unavailable because synchronization failed.' : exchangeSync?.rules?.status === 'never-synced' ? 'Mail rules are awaiting their first synchronization.' : 'No rules found.'}
+                  No rules found.
                 </div>
               )}
             </div>
@@ -524,7 +541,7 @@ export default function ExchangePage({
 
                 {groups.length === 0 && (
                   <div className="text-sm text-muted-foreground text-center py-6">
-                    {exchangeSync?.groups?.status === 'failed' ? 'Group data is unavailable because synchronization failed.' : exchangeSync?.groups?.status === 'never-synced' ? 'Groups are awaiting their first synchronization.' : 'No groups found.'}
+                    No groups found.
                   </div>
                 )}
               </div>
