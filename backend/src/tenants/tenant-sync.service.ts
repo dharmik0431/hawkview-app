@@ -1669,18 +1669,9 @@ export class TenantSyncService {
         })
       }
       if (limited && inferredLocations.size > 0) {
-        await Promise.all(
-          [...inferredLocations].map(([ipAddress, location]) =>
-            this.prisma.signInLog.updateMany({
-              where: {
-                customerTenantId: tenant.id,
-                microsoftSignInId: { startsWith: 'management:' },
-                ipAddress,
-                location: { equals: Prisma.DbNull },
-              } as never,
-              data: { location } as never,
-            })
-          )
+        await this.backfillLimitedSignInLocations(
+          tenant.id,
+          inferredLocations
         )
       }
       await this.prisma.signInLog.deleteMany({
@@ -1694,7 +1685,7 @@ export class TenantSyncService {
     const uniqueIps = [
       ...new Set(
         rows
-          .filter((row) => !row?.location)
+          .filter((row) => !this.hasCompleteSignInLocation(row?.location))
           .map((row) =>
             typeof row?.ipAddress === 'string' ? row.ipAddress.trim() : ''
           )
@@ -1710,12 +1701,107 @@ export class TenantSyncService {
     )
 
     for (const row of rows) {
-      if (row?.location || typeof row?.ipAddress !== 'string') continue
+      if (
+        this.hasCompleteSignInLocation(row?.location) ||
+        typeof row?.ipAddress !== 'string'
+      ) {
+        continue
+      }
       const location = locations.get(row.ipAddress.trim())
-      if (location) row.location = location
+      if (location) row.location = this.mergeSignInLocations(row.location, location)
     }
 
     return locations
+  }
+
+  private hasCompleteSignInLocation(location: unknown) {
+    if (!location || typeof location !== 'object' || Array.isArray(location)) {
+      return false
+    }
+    const value = location as Record<string, unknown>
+    const coordinates = value.geoCoordinates
+    return Boolean(
+      this.locationText(value.city) &&
+        this.locationText(value.countryOrRegion ?? value.country) &&
+        coordinates &&
+        typeof coordinates === 'object' &&
+        !Array.isArray(coordinates) &&
+        typeof (coordinates as Record<string, unknown>).latitude === 'number' &&
+        typeof (coordinates as Record<string, unknown>).longitude === 'number'
+    )
+  }
+
+  private locationText(value: unknown) {
+    if (typeof value !== 'string') return null
+    const text = value.trim()
+    if (!text || ['unknown', 'undefined', 'null'].includes(text.toLowerCase())) {
+      return null
+    }
+    return text
+  }
+
+  private mergeSignInLocations(
+    microsoftLocation: unknown,
+    inferredLocation: SignInLocation
+  ): SignInLocation {
+    const microsoft =
+      microsoftLocation &&
+      typeof microsoftLocation === 'object' &&
+      !Array.isArray(microsoftLocation)
+        ? (microsoftLocation as Record<string, unknown>)
+        : {}
+    const coordinates = microsoft.geoCoordinates
+    const validCoordinates =
+      coordinates &&
+      typeof coordinates === 'object' &&
+      !Array.isArray(coordinates) &&
+      typeof (coordinates as Record<string, unknown>).latitude === 'number' &&
+      typeof (coordinates as Record<string, unknown>).longitude === 'number'
+
+    return {
+      city: this.locationText(microsoft.city) ?? inferredLocation.city,
+      state:
+        this.locationText(microsoft.state ?? microsoft.region) ??
+        inferredLocation.state,
+      countryOrRegion:
+        this.locationText(microsoft.countryOrRegion ?? microsoft.country) ??
+        inferredLocation.countryOrRegion,
+      geoCoordinates: validCoordinates
+        ? (coordinates as SignInLocation['geoCoordinates'])
+        : inferredLocation.geoCoordinates,
+      source: inferredLocation.source,
+    }
+  }
+
+  private async backfillLimitedSignInLocations(
+    customerTenantId: string,
+    inferredLocations: Map<string, SignInLocation>
+  ) {
+    const existing = await this.prisma.signInLog.findMany({
+      where: {
+        customerTenantId,
+        microsoftSignInId: { startsWith: 'management:' },
+        ipAddress: { in: [...inferredLocations.keys()] },
+      },
+      select: { id: true, ipAddress: true, location: true },
+    })
+
+    await Promise.all(
+      existing.map((record) => {
+        const inferred = record.ipAddress
+          ? inferredLocations.get(record.ipAddress.trim())
+          : undefined
+        if (!inferred || this.hasCompleteSignInLocation(record.location)) {
+          return Promise.resolve()
+        }
+        return this.prisma.signInLog.update({
+          where: { id: record.id },
+          data: {
+            location: this.mergeSignInLocations(record.location, inferred),
+          } as never,
+        })
+      })
+    )
   }
 
   private async fetchLimitedLoginActivity(
