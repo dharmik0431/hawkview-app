@@ -71,6 +71,7 @@ import { ErrorState } from '@/components/common/error-state'
 import { TenantHeader } from './components/tenant-header'
 import { TenantModuleNav } from './components/tenant-nav'
 import { TenantOverview } from './components/tenant-overview'
+import { ModuleHeader } from './components/module-header'
 import { deriveTenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 
 type Provider = 'microsoft' | 'google'
@@ -1804,31 +1805,6 @@ export default function TenantDetailsPage() {
   }
 
   const isMicrosoft = tenant.provider === 'microsoft'
-  const heading =
-    section === 'overview'
-      ? 'Overview'
-      : isMicrosoft && section === 'entra'
-      ? 'Entra ID'
-      : isMicrosoft && section === 'exchange'
-        ? 'Exchange'
-        : isMicrosoft && section === 'teams'
-          ? 'Teams'
-          : isMicrosoft && section === 'sharepoint'
-            ? 'SharePoint'
-            : isMicrosoft
-              ? 'Office 365'
-              : section === 'directory'
-                ? 'Directory'
-                : section === 'gmail'
-                  ? 'Gmail'
-                  : section === 'drive'
-                    ? 'Drive'
-                    : section === 'security'
-                      ? 'Security'
-                      : 'Workspace'
-
-  const subheading = 'Manage configuration and view reports.'
-
   const navItems = isMicrosoft
     ? [
         {
@@ -4433,7 +4409,7 @@ export default function TenantDetailsPage() {
             </aside>
 
             <section className="min-w-0">
-              <div className="px-3 py-4 sm:px-5 xl:px-7">
+              <div className="hv-tenant-workspace min-h-screen bg-[var(--hv-surface)]" data-service={section === 'home' ? 'office' : section}>
                 <TenantHeader
                   tenant={tenant}
                   display={workspaceDisplay}
@@ -4457,10 +4433,8 @@ export default function TenantDetailsPage() {
                   }}
                 />
 
-                <div className="mb-4 flex items-baseline gap-2">
-                  <h2 className="text-base font-semibold tracking-tight">{heading}</h2>
-                  <span className="hidden text-sm text-muted-foreground sm:inline">{subheading}</span>
-                </div>
+                <div className="px-3 py-4 sm:px-5 xl:px-7">
+                <ModuleHeader section={section} display={workspaceDisplay} />
 
                 {syncState === 'fail' && (
                   <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -4474,6 +4448,7 @@ export default function TenantDetailsPage() {
                 )}
 
                 {bundle && renderMainContent(bundle)}
+                </div>
               </div>
             </section>
           </div>

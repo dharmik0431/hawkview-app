@@ -24,6 +24,21 @@
     --input: 214.3 31.8% 91.4%;
     --ring: 222.2 84% 4.9%;
     --radius: 0.5rem;
+    --hv-navy-950: 222 52% 10%;
+    --hv-navy-900: 221 48% 14%;
+    --hv-slate-700: 215 25% 27%;
+    --hv-surface: 0 0% 100%;
+    --hv-surface-subtle: 214 32% 97%;
+    --hv-office: 213 94% 46%;
+    --hv-entra: 252 78% 59%;
+    --hv-exchange: 197 91% 42%;
+    --hv-sharepoint: 172 72% 32%;
+    --hv-teams: 245 58% 57%;
+    --hv-healthy: 158 64% 35%;
+    --hv-syncing: 213 94% 46%;
+    --hv-attention: 36 92% 45%;
+    --hv-critical: 0 72% 51%;
+    --hv-stale: 262 52% 55%;
   }
 
   .dark {
@@ -46,6 +61,57 @@
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
     --ring: 212.7 26.8% 83.9%;
+    --hv-surface: 222 42% 12%;
+    --hv-surface-subtle: 220 35% 15%;
+  }
+}
+
+@layer components {
+  .hv-tenant-workspace {
+    --hv-service: var(--hv-office);
+    color: hsl(var(--foreground));
+  }
+
+  .hv-tenant-workspace[data-service='entra'] { --hv-service: var(--hv-entra); }
+  .hv-tenant-workspace[data-service='exchange'] { --hv-service: var(--hv-exchange); }
+  .hv-tenant-workspace[data-service='sharepoint'] { --hv-service: var(--hv-sharepoint); }
+  .hv-tenant-workspace[data-service='teams'] { --hv-service: var(--hv-teams); }
+  .hv-tenant-workspace[data-service='overview'],
+  .hv-tenant-workspace[data-service='settings'] { --hv-service: var(--hv-office); }
+
+  .hv-service-accent { color: hsl(var(--hv-service)); }
+  .hv-service-bg { background-color: hsl(var(--hv-service) / 0.1); }
+  .hv-service-border { border-color: hsl(var(--hv-service)); }
+
+  .hv-tenant-workspace table {
+    border-collapse: separate;
+    border-spacing: 0;
+  }
+
+  .hv-tenant-workspace thead {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: hsl(var(--hv-surface-subtle));
+    box-shadow: inset 0 -1px hsl(var(--border));
+  }
+
+  .hv-tenant-workspace tbody tr {
+    transition: background-color 140ms ease, box-shadow 140ms ease;
+  }
+
+  .hv-tenant-workspace tbody tr:hover {
+    background: hsl(var(--hv-service) / 0.045);
+    box-shadow: inset 3px 0 hsl(var(--hv-service));
+  }
+
+  .hv-tenant-workspace :is(th, td) {
+    vertical-align: middle;
+  }
+
+  .hv-evidence-row {
+    border-left: 3px solid hsl(var(--hv-service));
+    background: linear-gradient(90deg, hsl(var(--hv-service) / 0.055), transparent 34%);
   }
 }
 
