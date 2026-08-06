@@ -2552,7 +2552,7 @@ export class TenantSyncService {
 
       const [sharePointReport, oneDriveReport] = await Promise.all([
         downloadReport(
-          "https://graph.microsoft.com/v1.0/reports/getSharePointSiteUsageDetail(period='D30')",
+          "https://graph.microsoft.com/v1.0/reports/getSharePointSiteUsageDetail(period='D180')",
           'SharePoint'
         ),
         downloadReport(
@@ -3106,14 +3106,34 @@ export class TenantSyncService {
       sharePointUsageSyncState?.status === 'SUCCEEDED'
     const sharePointActivityAsOf = new Date()
     const getSharePointActivity = (site: any) => {
-      const value = getSharePointUsage(site)?.['Last Activity Date']
+      const usage = getSharePointUsage(site)
+      if (!usage) {
+        return {
+          lastActivityAt: null,
+          activityAgeDays: null,
+          activitySource: 'unmatched',
+        }
+      }
+
+      const value = usage['Last Activity Date']
       if (typeof value !== 'string' || !value.trim()) {
-        return { lastActivityAt: null, activityAgeDays: null }
+        // A site present in Microsoft's D180 report with no activity date had
+        // no reported activity during the observation window. This is useful
+        // inactivity evidence, not missing data.
+        return {
+          lastActivityAt: null,
+          activityAgeDays: 180,
+          activitySource: 'microsoft-d180-no-activity',
+        }
       }
 
       const parsed = new Date(`${value.trim()}T00:00:00.000Z`)
       if (Number.isNaN(parsed.getTime())) {
-        return { lastActivityAt: null, activityAgeDays: null }
+        return {
+          lastActivityAt: null,
+          activityAgeDays: null,
+          activitySource: 'invalid-report-date',
+        }
       }
 
       return {
@@ -3125,6 +3145,7 @@ export class TenantSyncService {
               (24 * 60 * 60 * 1000)
           )
         ),
+        activitySource: 'microsoft-d180-report',
       }
     }
     const sharePointActivity = sharePointSites.map(getSharePointActivity)
@@ -3564,6 +3585,7 @@ export class TenantSyncService {
                 }).length
               : null,
             activityAsOf: sharePointActivityAsOf.toISOString(),
+            activityObservationWindowDays: 180,
             inactiveSites90Days: sharePointUsageSynchronized
               ? inactiveSharePointSites90Days
               : null,
@@ -3622,9 +3644,14 @@ export class TenantSyncService {
                 reportStorageAllocated ?? site?.driveQuota?.total
               ),
               lastActivity:
-                usage?.['Last Activity Date'] || 'No activity reported',
+                activity.activitySource === 'microsoft-d180-no-activity'
+                  ? 'No activity in the last 180 days'
+                  : activity.activitySource === 'unmatched'
+                    ? 'Activity unavailable for this site'
+                    : activity.lastActivityAt || 'Activity date unavailable',
               lastActivityAt: activity.lastActivityAt,
               activityAgeDays: activity.activityAgeDays,
+              activitySource: activity.activitySource,
               activityStatus:
                 activity.activityAgeDays === null
                   ? 'unknown'
@@ -3633,7 +3660,7 @@ export class TenantSyncService {
                     : 'active',
             }
           }),
-          // This is the deleted-site signal in Microsoft's D30 usage report.
+          // This is the deleted-site signal in Microsoft's D180 usage report.
           // It is not the SharePoint recycle bin and must not be presented as
           // a complete list of recoverable sites.
           deletedSites: deletedSharePointUsage.map(
