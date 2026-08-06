@@ -74,7 +74,7 @@ function sharingLabel(level: SharingLevel) {
   if (level === 'NewAndExistingGuests') return 'New & existing guests'
   if (level === 'ExistingGuests') return 'Existing guests'
   if (level === 'OrganizationOnly') return 'Only people in your organization'
-  if (level === 'Unknown') return 'Not available through the current Microsoft API'
+  if (level === 'Unknown') return 'Awaiting collection'
   return 'Off'
 }
 
@@ -122,7 +122,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       rawOverview.totalSites ??
       rawOverview.sitesTotal ??
       rawOverview.total ??
-      (Array.isArray(sp?.sites) ? sp.sites.length : null),
+      0,
     totalStorageQuotaGB:
       rawOverview.totalStorageQuotaGB === null
         ? null
@@ -143,7 +143,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       rawOverview.siteStorageLimitsMode ??
       rawOverview.storageLimitsMode ??
       rawOverview.limitsMode ??
-      'Not available through the current Microsoft API',
+      'Awaiting collection',
     sitesMissingReportedOwner:
       typeof rawOverview.sitesMissingReportedOwner === 'number'
         ? rawOverview.sitesMissingReportedOwner
@@ -453,7 +453,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                   Total Sites
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {typeof SP_OVERVIEW.totalSites === 'number' ? SP_OVERVIEW.totalSites : 'Unavailable'}
+                  {SP_OVERVIEW.totalSites}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Sites + OneDrive
@@ -476,7 +476,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 <div className="mt-1 text-2xl font-bold">
                   {typeof SP_OVERVIEW.totalStorageQuotaGB === 'number'
                     ? `${SP_OVERVIEW.totalStorageQuotaGB} GB`
-                    : 'Unavailable'}
+                    : 'Awaiting collection'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   {SP_OVERVIEW.storageQuotaSource ===
@@ -502,7 +502,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 <div className="mt-1 text-2xl font-bold">
                   {typeof SP_OVERVIEW.oneDriveStorageLimitGB === 'number'
                     ? `${SP_OVERVIEW.oneDriveStorageLimitGB} GB`
-                    : 'Unavailable'}
+                    : 'Awaiting collection'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Per user
@@ -571,7 +571,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               <div className="text-lg font-bold text-slate-900">
                 {usageSynchronized
                   ? formatStorage(totals.totalUsed)
-                  : 'Unavailable'}
+                  : 'Awaiting collection'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Across sites + OneDrive
@@ -628,7 +628,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                   ? inactiveThresholdDays === 90
                     ? (SP_OVERVIEW.inactiveSites90Days ?? 0)
                     : (SP_OVERVIEW.inactiveSites180Days ?? 0)
-                  : 'Unavailable'}
+                  : 'Awaiting collection'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 No reported activity for {inactiveThresholdDays}+ days · click to
@@ -641,7 +641,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               <div className="text-lg font-bold text-slate-900">
                 {deletedSitesSupported && sp?.deletedSitesSynchronized === true
                   ? SP_DELETED_SITES.length
-                  : 'Unavailable'}
+                  : 'Awaiting collection'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Reported deleted in the last 30 days
@@ -844,7 +844,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                               ? 'On'
                               : s.externalSharing === false
                                 ? 'Off'
-                                : 'Unavailable'}
+                                : 'Awaiting collection'}
                           </Badge>
                         </td>
 
@@ -859,7 +859,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                           >
                             {typeof s.guestsCount === 'number'
                               ? s.guestsCount
-                              : 'Unavailable'}
+                              : 'Awaiting collection'}
                           </Badge>
                         </td>
 
@@ -868,7 +868,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                             {typeof s.storageUsedGB === 'number' &&
                             typeof s.storageQuotaGB === 'number'
                               ? `${s.storageUsedGB} / ${s.storageQuotaGB} GB`
-                              : 'Unavailable'}
+                              : 'Awaiting collection'}
                           </div>
                           <div className="mt-2 h-2 w-[180px] rounded-full bg-muted overflow-hidden">
                             <div

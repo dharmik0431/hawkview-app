@@ -1,5 +1,8 @@
 'use client'
 
+import { NeedsAttentionCell } from '@/components/tenants/needs-attention-cell'
+import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
+import { topAttention } from '@/lib/attention/topAttention'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import {
@@ -16,11 +19,6 @@ import {
   ArrowUp,
   ArrowDown,
   ArrowUpDown,
-  AlertTriangle,
-  CheckCircle2,
-  Loader2,
-  PlugZap,
-  SlidersHorizontal,
 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -38,16 +36,10 @@ import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 
 type Provider = 'microsoft' | 'google'
+type TenantStatus = 'pending' | 'active' | 'suspended' | 'disconnected'
+
 type FilterType = 'all' | 'microsoft' | 'google'
 type ViewMode = 'tile' | 'list'
-type OperationalStatus =
-  | 'healthy'
-  | 'syncing'
-  | 'needs-attention'
-  | 'disconnected'
-  | 'pending'
-type HealthFilter = 'all' | OperationalStatus
-type ServiceFilter = 'all' | 'connection' | 'permissions'
 type SortField =
   | 'name'
   | 'status'
@@ -59,158 +51,6 @@ type SortOrder = 'asc' | 'desc'
 const MICROSOFT_CONSENT_MESSAGE = 'hawkview:microsoft-consent-complete'
 const MICROSOFT_CONSENT_CHANNEL = 'hawkview:microsoft-consent'
 const MICROSOFT_CONSENT_POPUP_MARKER = 'hawkview:microsoft-consent-popup'
-const TENANT_DIRECTORY_PREFERENCES = 'hawkview_tenant_directory_preferences'
-
-type TenantIssue = {
-  id: string
-  title: string
-  detail: string
-  service: Exclude<ServiceFilter, 'all'>
-  severity: 'critical' | 'warning'
-}
-
-type TenantOperationalView = {
-  status: OperationalStatus
-  statusLabel: string
-  connectionLabel: string
-  syncLabel: string
-  actionLabel: string
-  issues: TenantIssue[]
-}
-
-function getTenantOperationalView(tenant: Tenant): TenantOperationalView {
-  const issues: TenantIssue[] = []
-  const disconnected =
-    tenant.status === 'disconnected' ||
-    tenant.status === 'suspended' ||
-    tenant.connectionStatus === 'error' ||
-    tenant.connectionStatus === 'revoked'
-  const pending =
-    tenant.status === 'pending' || tenant.connectionStatus === 'pending-consent'
-  const missingPermissions = tenant.missingPermissions ?? []
-
-  if (disconnected) {
-    issues.push({
-      id: 'connection',
-      title: 'Microsoft connection unavailable',
-      detail:
-        tenant.connectionErrorCode ||
-        'HawkView cannot currently connect to this tenant.',
-      service: 'connection',
-      severity: 'critical',
-    })
-  }
-  if (missingPermissions.length > 0) {
-    issues.push({
-      id: 'permissions',
-      title: `${missingPermissions.length} required permission${missingPermissions.length === 1 ? '' : 's'} missing`,
-      detail: missingPermissions.join(', '),
-      service: 'permissions',
-      severity: 'warning',
-    })
-  }
-
-  if (disconnected) {
-    return {
-      status: 'disconnected',
-      statusLabel: 'Disconnected',
-      connectionLabel: 'Connection lost',
-      syncLabel: 'Sync unavailable',
-      actionLabel: 'Reconnect',
-      issues,
-    }
-  }
-  if (pending) {
-    return {
-      status: 'pending',
-      statusLabel: 'Pending',
-      connectionLabel:
-        tenant.connectionStatus === 'pending-consent'
-          ? 'Awaiting consent'
-          : 'Setup in progress',
-      syncLabel: 'Not started',
-      actionLabel: 'Complete setup',
-      issues,
-    }
-  }
-  if (issues.length > 0) {
-    return {
-      status: 'needs-attention',
-      statusLabel: 'Needs Attention',
-      connectionLabel:
-        tenant.connectionStatus === 'connected'
-          ? 'Connected'
-          : 'Connection not reported',
-      syncLabel: tenant.lastSync ? 'Completed with warnings' : 'Not completed',
-      actionLabel: 'Review issues',
-      issues,
-    }
-  }
-  if (tenant.connectionStatus === 'connected' && !tenant.lastSync) {
-    return {
-      status: 'syncing',
-      statusLabel: 'Syncing',
-      connectionLabel: 'Connected',
-      syncLabel: 'Initial synchronization',
-      actionLabel: 'View progress',
-      issues,
-    }
-  }
-  if (
-    tenant.status === 'active' &&
-    tenant.connectionStatus === 'connected' &&
-    tenant.lastSync
-  ) {
-    return {
-      status: 'healthy',
-      statusLabel: 'Healthy',
-      connectionLabel: 'Connected',
-      syncLabel: 'Completed',
-      actionLabel: 'View tenant',
-      issues,
-    }
-  }
-
-  return {
-    status: 'needs-attention',
-    statusLabel: 'Needs Attention',
-    connectionLabel: 'Connection not reported',
-    syncLabel: tenant.lastSync ? 'Last known data' : 'Unavailable',
-    actionLabel: 'Review issues',
-    issues: [
-      {
-        id: 'connection-unknown',
-        title: 'Connection health not reported',
-        detail: 'HawkView has not received a current Microsoft connection state.',
-        service: 'connection',
-        severity: 'warning',
-      },
-    ],
-  }
-}
-
-const operationalStatusOrder: Record<OperationalStatus, number> = {
-  disconnected: 0,
-  'needs-attention': 1,
-  pending: 2,
-  syncing: 3,
-  healthy: 4,
-}
-
-function operationalStatusClasses(status: OperationalStatus) {
-  switch (status) {
-    case 'healthy':
-      return 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300'
-    case 'syncing':
-      return 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300'
-    case 'pending':
-      return 'border-slate-200 bg-slate-100 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300'
-    case 'needs-attention':
-      return 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300'
-    case 'disconnected':
-      return 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300'
-  }
-}
 
 type MicrosoftConsentMessage = {
   type: typeof MICROSOFT_CONSENT_MESSAGE
@@ -284,6 +124,18 @@ function SortHeader({
       </button>
     </th>
   )
+}
+
+function statusBadge(status: TenantStatus) {
+  switch (status) {
+    case 'active':
+      return 'bg-green-50 text-green-700 border border-green-200'
+    case 'pending':
+      return 'bg-orange-50 text-orange-700 border border-orange-200'
+    case 'suspended':
+    case 'disconnected':
+      return 'bg-red-50 text-red-700 border border-red-200'
+  }
 }
 
 function scoreColor(score: number) {
@@ -390,7 +242,6 @@ export default function TenantsPage() {
 
   const onboardButtonRef = useRef<HTMLButtonElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
-  const issueDrawerCloseRef = useRef<HTMLButtonElement>(null)
   const consentPopupRef = useRef<Window | null>(null)
   const consentPopupMonitorRef = useRef<ReturnType<typeof setInterval> | null>(
     null
@@ -398,12 +249,7 @@ export default function TenantsPage() {
 
   const [searchQuery, setSearchQuery] = useState('')
   const [filter, setFilter] = useState<FilterType>('all')
-  const [healthFilter, setHealthFilter] = useState<HealthFilter>('all')
-  const [serviceFilter, setServiceFilter] = useState<ServiceFilter>('all')
   const [viewMode, setViewMode] = useState<ViewMode>('list')
-  const [selectedIssueTenantId, setSelectedIssueTenantId] = useState<
-    string | null
-  >(null)
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingStep, setOnboardingStep] = useState<
     'select' | 'hawkview' | 'manual'
@@ -437,32 +283,6 @@ export default function TenantsPage() {
       ) as ViewMode | null
       if (saved === 'tile' || saved === 'list') {
         setViewMode(saved)
-      }
-      const preferences = JSON.parse(
-        sessionStorage.getItem(TENANT_DIRECTORY_PREFERENCES) || '{}'
-      ) as Partial<{
-        searchQuery: string
-        filter: FilterType
-        healthFilter: HealthFilter
-        serviceFilter: ServiceFilter
-        sortField: SortField
-        sortOrder: SortOrder
-      }>
-      if (typeof preferences.searchQuery === 'string') {
-        setSearchQuery(preferences.searchQuery)
-      }
-      if (['all', 'microsoft', 'google'].includes(preferences.filter || '')) {
-        setFilter(preferences.filter as FilterType)
-      }
-      if (
-        ['all', 'healthy', 'syncing', 'needs-attention', 'disconnected', 'pending'].includes(
-          preferences.healthFilter || ''
-        )
-      ) {
-        setHealthFilter(preferences.healthFilter as HealthFilter)
-      }
-      if (['all', 'connection', 'permissions'].includes(preferences.serviceFilter || '')) {
-        setServiceFilter(preferences.serviceFilter as ServiceFilter)
       }
     } catch {
       // ignore
@@ -819,40 +639,6 @@ export default function TenantsPage() {
   const [sortField, setSortField] = useState<SortField>('name')
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc')
 
-  useEffect(() => {
-    try {
-      const preferences = JSON.parse(
-        sessionStorage.getItem(TENANT_DIRECTORY_PREFERENCES) || '{}'
-      ) as Partial<{ sortField: SortField; sortOrder: SortOrder }>
-      if (['name', 'status', 'needsAttention', 'secureScore', 'lastSync'].includes(preferences.sortField || '')) {
-        setSortField(preferences.sortField as SortField)
-      }
-      if (preferences.sortOrder === 'asc' || preferences.sortOrder === 'desc') {
-        setSortOrder(preferences.sortOrder)
-      }
-    } catch {
-      // Session persistence is a progressive enhancement.
-    }
-  }, [])
-
-  useEffect(() => {
-    try {
-      sessionStorage.setItem(
-        TENANT_DIRECTORY_PREFERENCES,
-        JSON.stringify({
-          searchQuery,
-          filter,
-          healthFilter,
-          serviceFilter,
-          sortField,
-          sortOrder,
-        })
-      )
-    } catch {
-      // Session persistence is a progressive enhancement.
-    }
-  }, [filter, healthFilter, searchQuery, serviceFilter, sortField, sortOrder])
-
   const handleSort = (field: SortField) => {
     if (sortField === field) {
       setSortOrder((prev) => (prev === 'asc' ? 'desc' : 'asc'))
@@ -864,24 +650,17 @@ export default function TenantsPage() {
 
   const filteredTenants = useMemo(() => {
     const list = data?.tenants || []
-    return list.filter((tenant: Tenant) => {
-      const q = searchQuery.trim().toLowerCase()
-      const operational = getTenantOperationalView(tenant)
+    return list.filter((tenant: any) => {
+      const q = searchQuery.toLowerCase()
       const matchesSearch =
         tenant.name?.toLowerCase().includes(q) ||
         tenant.domain?.toLowerCase().includes(q) ||
-        tenant.id?.toLowerCase().includes(q) ||
-        tenant.microsoftTenantId?.toLowerCase().includes(q)
+        tenant.id?.toLowerCase().includes(q)
 
       const matchesFilter = filter === 'all' || tenant.provider === filter
-      const matchesHealth =
-        healthFilter === 'all' || operational.status === healthFilter
-      const matchesService =
-        serviceFilter === 'all' ||
-        operational.issues.some((issue) => issue.service === serviceFilter)
-      return matchesSearch && matchesFilter && matchesHealth && matchesService
+      return matchesSearch && matchesFilter
     })
-  }, [data?.tenants, searchQuery, filter, healthFilter, serviceFilter])
+  }, [data?.tenants, searchQuery, filter])
 
   const sortedTenants = useMemo(() => {
     const list = [...filteredTenants]
@@ -895,8 +674,14 @@ export default function TenantsPage() {
           break
         }
         case 'status': {
-          const rankA = operationalStatusOrder[getTenantOperationalView(a).status]
-          const rankB = operationalStatusOrder[getTenantOperationalView(b).status]
+          const statusOrder: Record<string, number> = {
+            active: 1,
+            pending: 2,
+            suspended: 3,
+            disconnected: 4,
+          }
+          const rankA = statusOrder[a.status] || 99
+          const rankB = statusOrder[b.status] || 99
           cmp = rankA - rankB
           if (cmp === 0) {
             cmp = (a.name || '')
@@ -906,8 +691,24 @@ export default function TenantsPage() {
           break
         }
         case 'needsAttention': {
-          const weightA = getTenantOperationalView(a).issues.length
-          const weightB = getTenantOperationalView(b).issues.length
+          const getAttentionWeight = (t: any) => {
+            const items = topAttention(
+              computeTenantAttention({
+                ...(t?.bundle ?? {}),
+                connectionStatus: t?.connectionStatus,
+                status: t?.status,
+              })
+            )
+            if (!items.length) return 0
+            return items.reduce((acc, item) => {
+              if (item.severity === 'critical') return acc + 3
+              if (item.severity === 'high') return acc + 2
+              if (item.severity === 'medium') return acc + 1
+              return acc
+            }, 0)
+          }
+          const weightA = getAttentionWeight(a)
+          const weightB = getAttentionWeight(b)
           cmp = weightA - weightB
           if (cmp === 0) {
             cmp = (a.name || '')
@@ -948,20 +749,6 @@ export default function TenantsPage() {
     elapsedSeconds < 15
       ? `Loading tenant directory… ${elapsedSeconds}s`
       : `HawkView API is taking longer than expected… ${elapsedSeconds}s`
-
-  const selectedIssueTenant = selectedIssueTenantId
-    ? tenants.find((tenant) => tenant.id === selectedIssueTenantId) ?? null
-    : null
-
-  useEffect(() => {
-    if (!selectedIssueTenant) return
-    issueDrawerCloseRef.current?.focus()
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setSelectedIssueTenantId(null)
-    }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [selectedIssueTenant])
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
@@ -1412,88 +1199,48 @@ export default function TenantsPage() {
         </Card>
       )}
 
-      {/* Operations toolbar */}
-      <div className="bg-white dark:bg-slate-900 p-3 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-3">
-        <div className="flex flex-col xl:flex-row gap-3 xl:items-center">
-          <div className="relative flex-1 min-w-[240px]">
+      {/* Search + Filter bar */}
+      <div className="bg-white dark:bg-slate-900 p-2 rounded-2xl border shadow-sm flex flex-col md:flex-row gap-2 md:items-center">
+        <div className="relative flex-1">
           <Search className="absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <Input
-            placeholder="Search organization, domain, or Microsoft tenant ID..."
+            placeholder="Search by name, domain, or ID..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            aria-label="Search tenants"
-            className="pl-11 h-10"
+            className="pl-11 h-12 border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0"
           />
-          </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 xl:flex">
-            <select
-              value={filter}
-              onChange={(event) => setFilter(event.target.value as FilterType)}
-              aria-label="Filter by provider"
-              className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-            >
-              <option value="all">All providers</option>
-              <option value="microsoft">Microsoft</option>
-              <option value="google">Google</option>
-            </select>
-            <select
-              value={healthFilter}
-              onChange={(event) => setHealthFilter(event.target.value as HealthFilter)}
-              aria-label="Filter by tenant health"
-              className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-            >
-              <option value="all">All health states</option>
-              <option value="healthy">Healthy</option>
-              <option value="syncing">Syncing</option>
-              <option value="needs-attention">Needs Attention</option>
-              <option value="disconnected">Disconnected</option>
-              <option value="pending">Pending</option>
-            </select>
-            <select
-              value={serviceFilter}
-              onChange={(event) => setServiceFilter(event.target.value as ServiceFilter)}
-              aria-label="Filter by affected service"
-              className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-            >
-              <option value="all">All affected services</option>
-              <option value="connection">Connection</option>
-              <option value="permissions">Permissions</option>
-            </select>
-            <div className="flex">
-              <select
-                value={sortField}
-                onChange={(event) => setSortField(event.target.value as SortField)}
-                aria-label="Sort tenants by"
-                className="h-10 min-w-0 flex-1 rounded-l-lg border border-r-0 border-slate-200 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-              >
-                <option value="name">Sort: tenant name</option>
-                <option value="needsAttention">Sort: issue count</option>
-                <option value="status">Sort: status</option>
-                <option value="lastSync">Sort: last sync</option>
-                <option value="secureScore">Sort: secure score</option>
-              </select>
+        </div>
+
+        <div className="flex items-center justify-between md:justify-end gap-2 border-t md:border-t-0 md:border-l border-slate-200 dark:border-slate-800 pt-2 md:pt-0 pl-0 md:pl-3">
+          <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+            {(['all', 'microsoft', 'google'] as FilterType[]).map((type) => (
               <button
-                type="button"
-                onClick={() => setSortOrder((current) => current === 'asc' ? 'desc' : 'asc')}
-                aria-label={`Sort ${sortOrder === 'asc' ? 'descending' : 'ascending'}`}
-                className="h-10 rounded-r-lg border border-slate-200 px-3 text-slate-600 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                key={type}
+                onClick={() => setFilter(type)}
+                className={[
+                  'px-4 py-2 rounded-lg text-sm font-semibold transition-all',
+                  filter === type
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
+                    : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-white',
+                ].join(' ')}
               >
-                {sortOrder === 'asc' ? <ArrowUp className="h-4 w-4" /> : <ArrowDown className="h-4 w-4" />}
+                {type === 'all'
+                  ? 'All'
+                  : type === 'microsoft'
+                    ? 'Microsoft'
+                    : 'Google'}
               </button>
-            </div>
+            ))}
           </div>
-          <div className="flex items-center justify-between gap-2 xl:border-l xl:pl-3 dark:border-slate-800">
-            <span className="text-sm text-slate-500 dark:text-slate-400 whitespace-nowrap">
-              {sortedTenants.length} of {tenants.length}
-            </span>
-            <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-lg gap-1" role="group" aria-label="Tenant view">
+
+          <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl gap-1">
             <button
               type="button"
               onClick={() => handleViewModeChange('tile')}
               title="Tile view"
               aria-label="Tile view"
               className={[
-                'p-1.5 rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
+                'p-2 rounded-lg transition-all',
                 viewMode === 'tile'
                   ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
                   : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-white',
@@ -1507,7 +1254,7 @@ export default function TenantsPage() {
               title="List view"
               aria-label="List view"
               className={[
-                'p-1.5 rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
+                'p-2 rounded-lg transition-all',
                 viewMode === 'list'
                   ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
                   : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-white',
@@ -1515,38 +1262,9 @@ export default function TenantsPage() {
             >
               <List className="h-4 w-4" />
             </button>
-            </div>
           </div>
         </div>
-        {(searchQuery || filter !== 'all' || healthFilter !== 'all' || serviceFilter !== 'all') && (
-          <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3 text-xs dark:border-slate-800">
-            <SlidersHorizontal className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
-            <span className="text-slate-500 dark:text-slate-400">Filters active</span>
-            <button
-              type="button"
-              onClick={() => {
-                setSearchQuery('')
-                setFilter('all')
-                setHealthFilter('all')
-                setServiceFilter('all')
-              }}
-              className="font-semibold text-blue-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
-            >
-              Clear all
-            </button>
-          </div>
-        )}
       </div>
-
-      {!loading && tenants.some((tenant) => getTenantOperationalView(tenant).status === 'syncing') && (
-        <div className="flex items-start gap-3 rounded-xl border border-blue-200 bg-blue-50/70 px-4 py-3 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-200">
-          <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" aria-hidden="true" />
-          <div>
-            <p className="font-semibold">Initial synchronization is running</p>
-            <p className="mt-0.5 text-blue-700 dark:text-blue-300">Onboarding succeeded. Tenant data will appear progressively as each available service completes.</p>
-          </div>
-        </div>
-      )}
 
       {/* Loading state */}
       {loading && (
@@ -1586,11 +1304,10 @@ export default function TenantsPage() {
         (viewMode === 'tile' ? (
           /* Tile View */
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-            {sortedTenants.map((tenant: Tenant) => {
-              const operational = getTenantOperationalView(tenant)
-              return (
+            {sortedTenants.map((tenant: Tenant) => (
               <div key={tenant.id} className="space-y-2">
-                  <Card className="group bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-0 hover:border-blue-200 hover:shadow-lg hover:shadow-blue-500/5 transition-all duration-300 relative overflow-hidden">
+                <Link href={`/tenants/${tenant.id}`}>
+                  <Card className="group bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-0 hover:border-blue-200 hover:shadow-xl hover:shadow-blue-500/5 transition-all duration-300 cursor-pointer relative overflow-hidden">
                     {/* accent */}
                     <div
                       className={[
@@ -1606,7 +1323,9 @@ export default function TenantsPage() {
                         <div className="flex items-center gap-4">
                           <ProviderIcon provider={tenant.provider} />
                           <div>
-                            <Link href={`/tenants/${tenant.id}`} className="text-lg font-semibold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded">{tenant.name}</Link>
+                            <h3 className="text-lg font-semibold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors">
+                              {tenant.name}
+                            </h3>
                             <p className="text-sm text-slate-500 dark:text-slate-400">
                               {tenant.domain || 'Domain pending collection'}
                             </p>
@@ -1614,34 +1333,18 @@ export default function TenantsPage() {
                         </div>
 
                         <Badge
-                          className={`gap-1.5 border text-xs ${operationalStatusClasses(operational.status)}`}
+                          className={`uppercase tracking-wide ${statusBadge(tenant.status)}`}
                         >
-                          {operational.status === 'syncing' ? (
-                            <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
-                          ) : operational.status === 'healthy' ? (
-                            <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
-                          ) : operational.status === 'disconnected' ? (
-                            <PlugZap className="h-3 w-3" aria-hidden="true" />
-                          ) : (
-                            <AlertTriangle className="h-3 w-3" aria-hidden="true" />
-                          )}
-                          {operational.statusLabel}
+                          {tenant.status}
                         </Badge>
                       </div>
 
-                      <div className="mb-5 grid grid-cols-2 gap-3 relative z-10 text-sm">
-                        <div>
-                          <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Connection</p>
-                          <p className="mt-1 font-medium text-slate-700 dark:text-slate-200">{operational.connectionLabel}</p>
-                        </div>
-                        <div>
-                          <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Issues</p>
-                          {operational.issues.length ? (
-                            <button type="button" onClick={() => setSelectedIssueTenantId(tenant.id)} className="mt-1 font-semibold text-amber-700 hover:underline dark:text-amber-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded">
-                              {operational.issues.length} actionable
-                            </button>
-                          ) : <p className="mt-1 font-medium text-slate-700 dark:text-slate-200">None</p>}
-                        </div>
+                      {/* Needs Attention tags */}
+                      <div className="mb-5 relative z-10">
+                        <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                          Needs Attention
+                        </p>
+                        <NeedsAttentionCell tenant={tenant} />
                       </div>
 
                       <div className="grid grid-cols-2 gap-4 mb-6 relative z-10">
@@ -1651,7 +1354,7 @@ export default function TenantsPage() {
                           </p>
                           {tenant.secureScore == null ? (
                             <span className="text-sm font-semibold text-slate-500">
-                              {operational.status === 'syncing' ? 'Collecting' : 'Unavailable'}
+                              Collection pending
                             </span>
                           ) : (
                             <div className="flex items-end gap-1">
@@ -1669,9 +1372,22 @@ export default function TenantsPage() {
 
                         <div className="bg-slate-50 dark:bg-slate-800/60 rounded-xl p-3 border border-slate-100 dark:border-slate-800">
                           <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
-                            Current sync
+                            Licenses
                           </p>
-                          <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">{operational.syncLabel}</span>
+                          {tenant.licenseCount == null ? (
+                            <span className="text-sm font-semibold text-slate-500">
+                              Collection pending
+                            </span>
+                          ) : (
+                            <div className="flex items-end gap-1">
+                              <span className="text-xl font-bold text-slate-900 dark:text-white">
+                                {tenant.licenseCount}
+                              </span>
+                              <span className="text-xs font-semibold text-slate-400 mb-1">
+                                assigned
+                              </span>
+                            </div>
+                          )}
                         </div>
                       </div>
 
@@ -1683,23 +1399,17 @@ export default function TenantsPage() {
                           <Clock className="h-3.5 w-3.5" />
                           {tenant.lastSync
                             ? `Synced ${formatSyncTime(tenant.lastSync)}`
-                            : operational.status === 'syncing' ? 'First sync running' : 'Last sync unavailable'}
+                            : 'Collection pending'}
                         </span>
-                        {operational.status === 'needs-attention' ? (
-                          <button type="button" onClick={() => setSelectedIssueTenantId(tenant.id)} className="text-sm font-semibold text-blue-600 flex items-center gap-1 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded">
-                            {operational.actionLabel} <ChevronRight className="h-4 w-4" />
-                          </button>
-                        ) : (
-                          <Link href={`/tenants/${tenant.id}`} className="text-sm font-semibold text-blue-600 flex items-center gap-1 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded">
-                            {operational.actionLabel} <ChevronRight className="h-4 w-4" />
-                          </Link>
-                        )}
+                        <span className="text-sm font-semibold text-blue-600 flex items-center gap-1 group-hover:underline">
+                          Manage Tenant <ChevronRight className="h-4 w-4" />
+                        </span>
                       </div>
                     </CardContent>
                   </Card>
+                </Link>
               </div>
-              )
-            })}
+            ))}
           </div>
         ) : (
           /* List View */
@@ -1718,14 +1428,14 @@ export default function TenantsPage() {
                     />
                     <SortHeader
                       field="status"
-                      label="Health & connection"
+                      label="Status"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
                     />
                     <SortHeader
                       field="needsAttention"
-                      label="Issues / affected"
+                      label="Needs Attention"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
@@ -1739,7 +1449,7 @@ export default function TenantsPage() {
                     />
                     <SortHeader
                       field="lastSync"
-                      label="Last completed sync"
+                      label="Last Sync"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
@@ -1753,9 +1463,7 @@ export default function TenantsPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {sortedTenants.map((tenant: Tenant) => {
-                    const operational = getTenantOperationalView(tenant)
-                    return (
+                  {sortedTenants.map((tenant: Tenant) => (
                     <tr
                       key={tenant.id}
                       className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors group"
@@ -1781,38 +1489,18 @@ export default function TenantsPage() {
                       </td>
                       <td className="py-3 px-4 whitespace-nowrap">
                         <Badge
-                          className={`gap-1.5 border text-[11px] ${operationalStatusClasses(operational.status)}`}
+                          className={`uppercase tracking-wide text-[10px] ${statusBadge(tenant.status)}`}
                         >
-                          {operational.statusLabel}
+                          {tenant.status}
                         </Badge>
-                        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{operational.connectionLabel}</p>
                       </td>
                       <td className="py-3 px-4 max-w-[220px]">
-                        {operational.issues.length > 0 ? (
-                          <button
-                            type="button"
-                            onClick={() => setSelectedIssueTenantId(tenant.id)}
-                            className="inline-flex items-center gap-1.5 rounded-md text-sm font-semibold text-amber-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:text-amber-300"
-                            aria-label={`Review ${operational.issues.length} issues for ${tenant.name}`}
-                          >
-                            <AlertTriangle className="h-4 w-4" aria-hidden="true" />
-                            {operational.issues.length} issue{operational.issues.length === 1 ? '' : 's'}
-                          </button>
-                        ) : (
-                          <span className="inline-flex items-center gap-1.5 text-sm text-slate-500 dark:text-slate-400">
-                            <CheckCircle2 className="h-4 w-4 text-emerald-500" aria-hidden="true" /> None
-                          </span>
-                        )}
-                        {operational.issues.length > 0 && (
-                          <p className="mt-1 text-xs capitalize text-slate-500 dark:text-slate-400">
-                            {Array.from(new Set(operational.issues.map((issue) => issue.service))).join(', ')}
-                          </p>
-                        )}
+                        <NeedsAttentionCell tenant={tenant} />
                       </td>
                       <td className="py-3 px-4 whitespace-nowrap font-medium">
                         {tenant.secureScore == null ? (
                           <span className="text-xs text-slate-400">
-                            {operational.status === 'syncing' ? 'Collecting' : 'Unavailable'}
+                            Collection pending
                           </span>
                         ) : (
                           <span
@@ -1830,42 +1518,30 @@ export default function TenantsPage() {
                           <Clock className="h-3.5 w-3.5 shrink-0 text-slate-400" />
                           {tenant.lastSync
                             ? formatSyncTime(tenant.lastSync)
-                            : operational.status === 'syncing' ? 'First sync running' : 'Unavailable'}
+                            : 'Collection pending'}
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right whitespace-nowrap">
-                        {operational.status === 'needs-attention' ? (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setSelectedIssueTenantId(tenant.id)}
-                            className="h-8 gap-1 rounded-lg text-blue-600 hover:text-blue-700 hover:bg-blue-50 dark:hover:bg-blue-950/50 font-semibold"
-                          >
-                            {operational.actionLabel}<ChevronRight className="h-4 w-4" />
-                          </Button>
-                        ) : <Link href={`/tenants/${tenant.id}`}>
+                        <Link href={`/tenants/${tenant.id}`}>
                           <Button
                             variant="ghost"
                             size="sm"
                             className="h-8 gap-1 rounded-lg text-blue-600 hover:text-blue-700 hover:bg-blue-50 dark:hover:bg-blue-950/50 font-semibold"
                           >
-                            {operational.actionLabel}
+                            Manage
                             <ChevronRight className="h-4 w-4" />
                           </Button>
-                        </Link>}
+                        </Link>
                       </td>
                     </tr>
-                    )
-                  })}
+                  ))}
                 </tbody>
               </table>
             </div>
 
             {/* Mobile Compact Stacked Layout */}
             <div className="lg:hidden divide-y divide-slate-100 dark:divide-slate-800">
-              {sortedTenants.map((tenant: Tenant) => {
-                const operational = getTenantOperationalView(tenant)
-                return (
+              {sortedTenants.map((tenant: Tenant) => (
                 <div key={tenant.id} className="p-4 space-y-3">
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex items-center gap-3">
@@ -1883,20 +1559,17 @@ export default function TenantsPage() {
                       </div>
                     </div>
                     <Badge
-                      className={`border text-[10px] shrink-0 ${operationalStatusClasses(operational.status)}`}
+                      className={`uppercase tracking-wide text-[10px] shrink-0 ${statusBadge(tenant.status)}`}
                     >
-                      {operational.statusLabel}
+                      {tenant.status}
                     </Badge>
                   </div>
 
                   <div>
-                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Connection & issues</p>
-                    <p className="text-sm text-slate-700 dark:text-slate-200">{operational.connectionLabel}</p>
-                    {operational.issues.length > 0 && (
-                      <button type="button" onClick={() => setSelectedIssueTenantId(tenant.id)} className="mt-1 text-sm font-semibold text-amber-700 hover:underline dark:text-amber-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded">
-                        Review {operational.issues.length} issue{operational.issues.length === 1 ? '' : 's'}
-                      </button>
-                    )}
+                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
+                      Needs Attention
+                    </p>
+                    <NeedsAttentionCell tenant={tenant} />
                   </div>
 
                   <div className="pt-1">
@@ -1906,7 +1579,7 @@ export default function TenantsPage() {
                       </span>
                       {tenant.secureScore == null ? (
                         <span className="text-xs text-slate-400 font-medium">
-                          {operational.status === 'syncing' ? 'Collecting' : 'Unavailable'}
+                          Collection pending
                         </span>
                       ) : (
                         <span
@@ -1926,7 +1599,7 @@ export default function TenantsPage() {
                       <Clock className="h-3.5 w-3.5" />
                       {tenant.lastSync
                         ? formatSyncTime(tenant.lastSync)
-                        : operational.status === 'syncing' ? 'First sync running' : 'Unavailable'}
+                        : 'Collection pending'}
                     </span>
                     <Link href={`/tenants/${tenant.id}`}>
                       <Button
@@ -1934,83 +1607,24 @@ export default function TenantsPage() {
                         size="sm"
                         className="h-8 gap-1 text-xs font-semibold text-blue-600 border-blue-200 hover:bg-blue-50 dark:hover:bg-blue-950/50"
                       >
-                        {operational.actionLabel} <ChevronRight className="h-3.5 w-3.5" />
+                        Manage <ChevronRight className="h-3.5 w-3.5" />
                       </Button>
                     </Link>
                   </div>
                 </div>
-                )
-              })}
+              ))}
             </div>
           </div>
         ))}
 
       {!loading && !error && sortedTenants.length === 0 && (
-        <div className="text-center py-16 bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-300 dark:border-slate-700">
+        <div className="text-center py-20 bg-white dark:bg-slate-900 rounded-3xl border border-dashed">
           <h3 className="text-lg font-semibold text-slate-900 dark:text-white">
-            {tenants.length === 0 ? 'No tenants onboarded yet' : 'No tenants match these filters'}
+            No tenants found
           </h3>
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-            {tenants.length === 0
-              ? 'Onboard your first customer tenant to begin collecting operational data.'
-              : 'Clear or adjust the search and filters to see more tenants.'}
+            Try adjusting your search or filters.
           </p>
-        </div>
-      )}
-
-      {selectedIssueTenant && (
-        <div
-          className="fixed inset-0 z-50 flex justify-end bg-slate-950/40 backdrop-blur-[1px]"
-          role="presentation"
-          onMouseDown={(event) => {
-            if (event.currentTarget === event.target) setSelectedIssueTenantId(null)
-          }}
-        >
-          <aside
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="tenant-issues-title"
-            className="h-full w-full max-w-lg overflow-y-auto border-l border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-950"
-          >
-            {(() => {
-              const operational = getTenantOperationalView(selectedIssueTenant)
-              return (
-                <>
-                  <div className="sticky top-0 z-10 flex items-start justify-between border-b border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-950">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Tenant health</p>
-                      <h2 id="tenant-issues-title" className="mt-1 text-xl font-bold text-slate-950 dark:text-white">{selectedIssueTenant.name}</h2>
-                      <p className="text-sm text-slate-500 dark:text-slate-400">{selectedIssueTenant.domain || 'Primary domain unavailable'}</p>
-                    </div>
-                    <Button ref={issueDrawerCloseRef} variant="ghost" size="icon" onClick={() => setSelectedIssueTenantId(null)} aria-label="Close tenant issues"><X className="h-5 w-5" /></Button>
-                  </div>
-                  <div className="space-y-6 p-5">
-                    <section className="grid grid-cols-2 gap-3" aria-label="Tenant connection summary">
-                      <div className="rounded-xl border border-slate-200 p-3 dark:border-slate-800"><p className="text-xs text-slate-500">Overall status</p><Badge className={`mt-2 border ${operationalStatusClasses(operational.status)}`}>{operational.statusLabel}</Badge></div>
-                      <div className="rounded-xl border border-slate-200 p-3 dark:border-slate-800"><p className="text-xs text-slate-500">Connection</p><p className="mt-2 text-sm font-semibold text-slate-900 dark:text-white">{operational.connectionLabel}</p></div>
-                      <div className="col-span-2 rounded-xl border border-slate-200 p-3 dark:border-slate-800"><p className="text-xs text-slate-500">Microsoft tenant ID</p><p className="mt-1 break-all font-mono text-sm text-slate-800 dark:text-slate-200">{selectedIssueTenant.microsoftTenantId}</p></div>
-                    </section>
-                    <section>
-                      <h3 className="font-semibold text-slate-950 dark:text-white">Actionable issues ({operational.issues.length})</h3>
-                      <div className="mt-3 space-y-3">
-                        {operational.issues.map((issue) => (
-                          <div key={issue.id} className={cn('rounded-xl border p-4', issue.severity === 'critical' ? 'border-red-200 bg-red-50/60 dark:border-red-900 dark:bg-red-950/20' : 'border-amber-200 bg-amber-50/60 dark:border-amber-900 dark:bg-amber-950/20')}>
-                            <div className="flex gap-3"><AlertTriangle className={cn('mt-0.5 h-5 w-5 shrink-0', issue.severity === 'critical' ? 'text-red-600' : 'text-amber-600')} aria-hidden="true" /><div><p className="font-semibold text-slate-950 dark:text-white">{issue.title}</p><p className="mt-1 break-words text-sm text-slate-600 dark:text-slate-300">{issue.detail}</p><p className="mt-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Affected: {issue.service}</p></div></div>
-                          </div>
-                        ))}
-                        {operational.issues.length === 0 && <p className="text-sm text-slate-500">No actionable issues are reported.</p>}
-                      </div>
-                    </section>
-                    <section className="rounded-xl bg-slate-50 p-4 text-sm dark:bg-slate-900">
-                      <div className="flex items-center justify-between gap-4"><span className="text-slate-500">Current sync</span><strong>{operational.syncLabel}</strong></div>
-                      <div className="mt-3 flex items-center justify-between gap-4"><span className="text-slate-500">Last completed sync</span><strong className="text-right">{selectedIssueTenant.lastSync ? formatSyncTime(selectedIssueTenant.lastSync) : 'Unavailable'}</strong></div>
-                    </section>
-                    <Link href={`/tenants/${selectedIssueTenant.id}`} className="block"><Button className="w-full">{operational.actionLabel}<ChevronRight className="ml-2 h-4 w-4" /></Button></Link>
-                  </div>
-                </>
-              )
-            })()}
-          </aside>
         </div>
       )}
     </div>
