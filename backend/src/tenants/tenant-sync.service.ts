@@ -2490,6 +2490,11 @@ export class TenantSyncService {
                   sharingCapability: null,
                   collectionError: 'SharePoint access token unavailable.',
                 }
+            if (access.collectionError) {
+              this.logger.warn(
+                `SharePoint access metadata incomplete for tenant ${tenant.id}, site ${String(site.id)}: ${access.collectionError}`
+              )
+            }
             return {
               ...site,
               driveQuota: drive?.quota ?? null,
@@ -2567,34 +2572,8 @@ export class TenantSyncService {
     const errors: string[] = []
 
     try {
-      const settingsUrl = new URL('_api/site?$select=SharingCapability', siteUrl)
-      const response = await fetch(settingsUrl, {
-        headers,
-        signal: AbortSignal.timeout(20_000),
-      })
-      if (!response.ok) {
-        errors.push(`sharing capability returned ${response.status}`)
-      } else {
-        const body = (await response.json()) as any
-        sharingCapability =
-          body?.SharingCapability ?? body?.d?.SharingCapability ?? null
-        if (typeof sharingCapability === 'number') {
-          externalSharing = sharingCapability !== 0
-        } else if (typeof sharingCapability === 'string') {
-          externalSharing = !['disabled', '0'].includes(
-            sharingCapability.trim().toLowerCase()
-          )
-        }
-      }
-    } catch (error) {
-      errors.push(
-        error instanceof Error ? error.message : 'sharing capability failed'
-      )
-    }
-
-    try {
       let nextUrl = new URL(
-        '_api/web/siteusers?$select=Id,LoginName,Email,Title,PrincipalType&$top=5000',
+        '_api/web/siteusers?$select=Id,LoginName,Email,Title,PrincipalType,IsShareByEmailGuestUser&$top=5000',
         siteUrl
       ).toString()
       const guestIds = new Set<string>()
@@ -2618,13 +2597,24 @@ export class TenantSyncService {
             : []
         for (const user of users) {
           const loginName = String(user?.LoginName ?? '')
-          if (!loginName.toLowerCase().includes('#ext#')) continue
+          const normalizedLogin = loginName.toLowerCase()
+          const isGuest =
+            user?.IsShareByEmailGuestUser === true ||
+            normalizedLogin.includes('#ext#') ||
+            normalizedLogin.includes('urn:spo:guest')
+          if (!isGuest) continue
           guestIds.add(String(user?.Id ?? loginName).toLowerCase())
         }
         nextUrl =
           body?.['@odata.nextLink'] ?? body?.['odata.nextLink'] ?? body?.d?.__next ?? ''
       }
       guestsCount = guestIds.size
+      // This value describes observed external access on the site. The
+      // tenant-admin SharingCapability setting is not exposed by `_api/site`.
+      externalSharing = guestsCount > 0
+      sharingCapability = externalSharing
+        ? 'External principals present'
+        : 'No external principals present'
     } catch (error) {
       errors.push(error instanceof Error ? error.message : 'site users failed')
     }
