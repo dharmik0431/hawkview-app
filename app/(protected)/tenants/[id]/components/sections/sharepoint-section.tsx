@@ -90,6 +90,12 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
   const [sharingFilter, setSharingFilter] = useState<'all' | 'on' | 'off'>(
     'all'
   )
+  const [activityFilter, setActivityFilter] = useState<
+    'all' | 'inactive90' | 'inactive180' | 'unknown'
+  >('all')
+  const [inactiveThresholdDays, setInactiveThresholdDays] = useState<90 | 180>(
+    90
+  )
 
   const [sortKey, setSortKey] = useState<
     'name' | 'storageUsedGB' | 'lastActivity' | 'guestsCount'
@@ -142,6 +148,18 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       typeof rawOverview.sitesMissingReportedOwner === 'number'
         ? rawOverview.sitesMissingReportedOwner
         : null,
+    inactiveSites90Days:
+      typeof rawOverview.inactiveSites90Days === 'number'
+        ? rawOverview.inactiveSites90Days
+        : null,
+    inactiveSites180Days:
+      typeof rawOverview.inactiveSites180Days === 'number'
+        ? rawOverview.inactiveSites180Days
+        : null,
+    sitesWithoutActivityData:
+      typeof rawOverview.sitesWithoutActivityData === 'number'
+        ? rawOverview.sitesWithoutActivityData
+        : null,
 
     sharingSharePoint: normalizeSharingLevel(
       rawOverview.sharingSharePoint ??
@@ -191,7 +209,6 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
     [string, { status: string; lastError?: string | null }]
   >
   const usageSynchronized = sp?.capabilities?.usageReport === true
-  const ownerPresenceSupported = sp?.capabilities?.siteOwnerPresence === true
   const deletedSitesSupported = sp?.capabilities?.deletedSites === true
 
   const formatStorage = (value: number) => {
@@ -215,6 +232,18 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       if (typeFilter !== 'all' && s.type !== typeFilter) return false
       if (sharingFilter === 'on' && !s.externalSharing) return false
       if (sharingFilter === 'off' && s.externalSharing) return false
+      if (
+        activityFilter === 'inactive90' &&
+        !(typeof s.activityAgeDays === 'number' && s.activityAgeDays >= 90)
+      )
+        return false
+      if (
+        activityFilter === 'inactive180' &&
+        !(typeof s.activityAgeDays === 'number' && s.activityAgeDays >= 180)
+      )
+        return false
+      if (activityFilter === 'unknown' && s.activityAgeDays !== null)
+        return false
 
       if (!q) return true
       const hay = `${s.name} ${s.url} ${s.type}`.toLowerCase()
@@ -229,15 +258,25 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
         return ((a.storageUsedGB ?? 0) - (b.storageUsedGB ?? 0)) * dir
       if (sortKey === 'guestsCount')
         return ((a.guestsCount ?? 0) - (b.guestsCount ?? 0)) * dir
-      return (
-        (String(a.lastActivity ?? '').length -
-          String(b.lastActivity ?? '').length) *
-        dir
-      )
+      const aTime = a.lastActivityAt
+        ? new Date(a.lastActivityAt).getTime()
+        : Number.NEGATIVE_INFINITY
+      const bTime = b.lastActivityAt
+        ? new Date(b.lastActivityAt).getTime()
+        : Number.NEGATIVE_INFINITY
+      return (aTime - bTime) * dir
     })
 
     return sorted
-  }, [siteQuery, typeFilter, sharingFilter, sortKey, sortDir, SP_SITES])
+  }, [
+    siteQuery,
+    typeFilter,
+    sharingFilter,
+    activityFilter,
+    sortKey,
+    sortDir,
+    SP_SITES,
+  ])
 
   function SharingScale({
     title,
@@ -517,18 +556,61 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               </div>
             </div>
 
-            <div className="rounded-2xl border bg-gradient-to-r from-emerald-50 to-white p-4">
-              <div className="text-xs text-muted-foreground">
-                Sites missing owner
+            <div
+              role="button"
+              tabIndex={0}
+              className="rounded-2xl border bg-gradient-to-r from-emerald-50 to-white p-4 text-left transition hover:border-emerald-300"
+              onClick={() =>
+                setActivityFilter(
+                  inactiveThresholdDays === 90 ? 'inactive90' : 'inactive180'
+                )
+              }
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  setActivityFilter(
+                    inactiveThresholdDays === 90 ? 'inactive90' : 'inactive180'
+                  )
+                }
+              }}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-xs text-muted-foreground">
+                  Inactive site candidates
+                </div>
+                <div
+                  className="flex rounded-lg border bg-white p-0.5"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  {([90, 180] as const).map((days) => (
+                    <button
+                      key={days}
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setInactiveThresholdDays(days)
+                      }}
+                      className={`rounded-md px-2 py-0.5 text-xs ${
+                        inactiveThresholdDays === days
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : 'text-muted-foreground'
+                      }`}
+                    >
+                      {days}d
+                    </button>
+                  ))}
+                </div>
               </div>
               <div className="text-lg font-bold text-slate-900">
-                {ownerPresenceSupported &&
-                typeof SP_OVERVIEW.sitesMissingReportedOwner === 'number'
-                  ? SP_OVERVIEW.sitesMissingReportedOwner
+                {usageSynchronized
+                  ? inactiveThresholdDays === 90
+                    ? (SP_OVERVIEW.inactiveSites90Days ?? 0)
+                    : (SP_OVERVIEW.inactiveSites180Days ?? 0)
                   : 'Awaiting collection'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                No owner reported in Microsoft usage data
+                No reported activity for {inactiveThresholdDays}+ days · click to
+                review
               </div>
             </div>
 
@@ -590,6 +672,17 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 <option value="Team site">Team site</option>
                 <option value="Communication site">Communication site</option>
                 <option value="OneDrive">OneDrive</option>
+              </select>
+
+              <select
+                value={activityFilter}
+                onChange={(e) => setActivityFilter(e.target.value as any)}
+                className="rounded-xl border border-slate-200 dark:border-slate-800 px-3 py-2 text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
+              >
+                <option value="all">All activity</option>
+                <option value="inactive90">Inactive 90+ days</option>
+                <option value="inactive180">Inactive 180+ days</option>
+                <option value="unknown">Activity unknown</option>
               </select>
 
               <select
