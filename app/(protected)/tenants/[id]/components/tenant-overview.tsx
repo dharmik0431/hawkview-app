@@ -47,8 +47,8 @@ export function TenantOverview({ bundle, display, onOpenModule }: {
           <div><h2 id="tenant-summary-heading" className="text-base font-semibold">Tenant summary</h2><p className="text-sm text-slate-500 dark:text-slate-400">Operational inventory from the latest completed datasets.</p></div>
           <span className={cn('rounded-md border px-2 py-1 text-xs font-semibold', statusTone(display.state))}>{display.stateLabel}</span>
         </div>
-        <dl className="grid divide-y divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-white sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-4 dark:divide-slate-800 dark:border-slate-800 dark:bg-slate-900">
-          {metrics.map(([label, value]) => <div key={label} className="px-4 py-3"><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</dt><dd className="mt-1 text-xl font-semibold">{value}</dd></div>)}
+        <dl className="grid divide-y divide-slate-200 border-y border-slate-200 bg-white sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-4 dark:divide-slate-800 dark:border-slate-800 dark:bg-slate-900">
+          {metrics.map(([label, value]) => <div key={label} className="border-t-2 border-t-[var(--hv-service-color)] px-4 py-3"><dt className="text-[11px] font-semibold uppercase tracking-[.12em] text-slate-500">{label}</dt><dd className="mt-1 text-xl font-semibold tabular-nums">{value}</dd></div>)}
         </dl>
       </section>
 

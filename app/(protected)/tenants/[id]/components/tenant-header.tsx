@@ -15,7 +15,9 @@ export function TenantHeader({ tenant, display, tenantId, syncing, onRefresh, te
   onTenantChange: (tenantId: string) => void
 }) {
   return (
-    <header className="mb-1 border-b border-slate-200 pb-3 dark:border-slate-800">
+    <header className="relative overflow-hidden bg-[var(--hv-navy-950)] px-4 py-4 text-white sm:px-5">
+      <div className="pointer-events-none absolute inset-y-0 right-0 w-2/5 bg-[radial-gradient(circle_at_top_right,var(--hv-service-color),transparent_68%)] opacity-20" />
+      <div className="relative">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex min-w-0 flex-1 items-center gap-3">
           <div className="relative hidden sm:block">
@@ -24,7 +26,7 @@ export function TenantHeader({ tenant, display, tenantId, syncing, onRefresh, te
             </select>
             <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           </div>
-          <div className="min-w-0 border-l border-slate-200 pl-3 dark:border-slate-700">
+          <div className="min-w-0 border-l border-white/20 pl-3">
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="truncate text-xl font-semibold tracking-tight">{tenant?.name || 'Microsoft 365 tenant'}</h1>
               <span className={cn('inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-semibold', statusTone(display.state))}>
@@ -32,7 +34,7 @@ export function TenantHeader({ tenant, display, tenantId, syncing, onRefresh, te
                 {display.stateLabel}
               </span>
             </div>
-            <p className="mt-0.5 truncate text-sm text-slate-500 dark:text-slate-400">{tenant?.domain || 'Primary domain unavailable'}</p>
+            <p className="mt-0.5 truncate text-sm text-slate-300">{tenant?.domain || 'Primary domain unavailable'}</p>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -42,14 +44,15 @@ export function TenantHeader({ tenant, display, tenantId, syncing, onRefresh, te
           <Link href={`/tenants/${tenantId}/settings`} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium shadow-sm transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"><Settings className="h-4 w-4" /><span>Settings</span></Link>
         </div>
       </div>
-      <dl className="mt-3 grid gap-x-6 gap-y-2 border-t border-slate-100 pt-3 sm:grid-cols-2 xl:grid-cols-4 dark:border-slate-800">
+      <dl className="mt-3 grid gap-x-6 gap-y-2 border-t border-white/15 pt-3 sm:grid-cols-2 xl:grid-cols-4">
         <div className="flex items-center gap-2 text-sm"><Cloud className="h-4 w-4 text-slate-400" /><div><dt className="sr-only">Connection</dt><dd className="font-medium">{display.connectionLabel}</dd></div></div>
         <div className="flex items-center gap-2 text-sm"><Clock3 className="h-4 w-4 text-slate-400" /><div><dt className="sr-only">Last successful synchronization</dt><dd><span className="text-slate-500 dark:text-slate-400">Last success: </span>{formatTenantTimestamp(display.lastSuccessfulSync)}</dd></div></div>
         <div className="text-sm"><dt className="sr-only">Data completeness</dt><dd><span className="text-slate-500 dark:text-slate-400">Data: </span>{display.state === 'partially-synchronized' ? 'Partial' : display.isInitialSync ? 'Populating progressively' : display.isStale ? 'Last known values' : 'Current'}</dd></div>
         <div className="text-sm"><dt className="sr-only">Actionable issues</dt><dd><span className="text-slate-500 dark:text-slate-400">Actionable issues: </span><span className={display.issueCount ? 'font-semibold text-amber-700 dark:text-amber-300' : 'font-semibold'}>{display.issueCount}</span></dd></div>
       </dl>
       {display.isInitialSync && <div className="mt-3 border-l-4 border-blue-500 bg-blue-50 px-4 py-2 text-sm text-blue-900 dark:bg-blue-950/40 dark:text-blue-200"><strong>Tenant connected.</strong> Initial synchronization is running; modules will populate progressively.</div>}
-      {display.issues.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-l-4 border-amber-500 bg-amber-50 px-4 py-2 text-sm text-amber-950 dark:bg-amber-950/40 dark:text-amber-100"><strong>{display.issueCount} item{display.issueCount === 1 ? '' : 's'} require attention</strong><span>{display.issues.slice(0, 2).map((issue) => `${issue.service}: ${issue.title}`).join(' • ')}</span></div>}
+      {display.issues.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-l-4 border-amber-400 bg-amber-400/10 px-4 py-2 text-sm text-amber-100"><strong>{display.issueCount} item{display.issueCount === 1 ? '' : 's'} require attention</strong><span>{display.issues.slice(0, 2).map((issue) => `${issue.service}: ${issue.title}`).join(' • ')}</span></div>}
+      </div>
     </header>
   )
 }
