@@ -124,6 +124,8 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
           rawOverview.storageQuotaGB ??
           rawOverview.totalQuotaGB ??
           null),
+    storageQuotaSource:
+      rawOverview.storageQuotaSource ?? rawOverview.quotaSource ?? 'unavailable',
     oneDriveStorageLimitGB:
       rawOverview.oneDriveStorageLimitGB === null
         ? null
@@ -408,7 +410,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Total Storage Quota
+                  Reported Site Allocation
                 </div>
                 <div className="mt-1 text-2xl font-bold">
                   {typeof SP_OVERVIEW.totalStorageQuotaGB === 'number'
@@ -416,7 +418,10 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                     : 'Awaiting collection'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
-                  Tenant quota
+                  {SP_OVERVIEW.storageQuotaSource ===
+                  'reported-site-allocation'
+                    ? 'Reported site allocation'
+                    : 'Unavailable from Microsoft'}
                 </div>
               </div>
               <div className="h-10 w-10 rounded-2xl bg-emerald-50 border border-emerald-100 flex items-center justify-center">
@@ -454,17 +459,20 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  External Sharing On
+                  External Sharing Policy
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {SP_SITES.some(
-                    (site: any) => typeof site.externalSharing === 'boolean'
-                  )
-                    ? totals.externalOn
-                    : 'Awaiting collection'}
+                  {SP_OVERVIEW.sharingSharePoint === 'Anyone' ||
+                  SP_OVERVIEW.sharingSharePoint === 'NewAndExistingGuests'
+                    ? 'Allowed'
+                    : SP_OVERVIEW.sharingSharePoint === 'ExistingGuests' ||
+                        SP_OVERVIEW.sharingSharePoint === 'OrganizationOnly' ||
+                        SP_OVERVIEW.sharingSharePoint === 'Off'
+                      ? 'Restricted'
+                      : 'Unavailable'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
-                  Sites allowing external links
+                  Tenant-wide policy
                 </div>
               </div>
               <div className="h-10 w-10 rounded-2xl bg-amber-50 border border-amber-100 flex items-center justify-center">
