@@ -509,6 +509,47 @@ export class MicrosoftConsentService {
     return result.accessToken
   }
 
+  async getTenantSharePointAccessToken(input: {
+    microsoftTenantId: string
+    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+    clientId: string | null
+    credentialReference: string | null
+    sharePointHost: string
+  }) {
+    const sharePointHost = input.sharePointHost.trim().toLowerCase()
+    if (
+      !/^[a-z0-9.-]+\.sharepoint\.com$/.test(sharePointHost) ||
+      sharePointHost.includes('..')
+    ) {
+      throw new BadRequestException(
+        'Microsoft returned an invalid SharePoint tenant hostname.'
+      )
+    }
+
+    const credentials =
+      input.connectionMode === 'CUSTOMER_MANAGED'
+        ? {
+            clientId: input.clientId ?? '',
+            clientSecret: input.credentialReference
+              ? await this.secretStore.access(input.credentialReference)
+              : '',
+          }
+        : await this.getManagedConnector()
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new ServiceUnavailableException(
+        'The Microsoft tenant connection is incomplete.'
+      )
+    }
+
+    const result = await this.requestAccessToken(
+      input.microsoftTenantId,
+      credentials,
+      `https://${sharePointHost}/.default`
+    )
+    return result.accessToken
+  }
+
   async configureManagedConnector(input: {
     clientId: string
     homeTenantId: string
