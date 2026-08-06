@@ -27,7 +27,7 @@ export type LicenseStatus =
   | 'Near capacity'
   | 'Fully utilized'
   | 'Unavailable'
-  | 'Not synchronized'
+  | 'Awaiting collection'
 
 type SortField =
   | 'product'
@@ -39,7 +39,7 @@ type SortField =
 type SortOrder = 'asc' | 'desc'
 
 function getRowStatus(row: any, syncCompleted: boolean): LicenseStatus {
-  if (!syncCompleted) return 'Not synchronized'
+  if (!syncCompleted) return 'Awaiting collection'
   if (
     row.disabled ||
     row.status === 'bad' ||
@@ -58,14 +58,14 @@ function getRowStatus(row: any, syncCompleted: boolean): LicenseStatus {
     totalVal === undefined ||
     totalVal === null
   ) {
-    return 'Not synchronized'
+    return 'Awaiting collection'
   }
 
   const used = Number(usedVal)
   const total = Number(totalVal)
 
   if (isNaN(total) || isNaN(used) || total <= 0) {
-    return 'Not synchronized'
+    return 'Awaiting collection'
   }
 
   const pct = (used / total) * 100
@@ -120,15 +120,15 @@ export default function LicensesSection({
     return activeRows.length
   }, [rows, syncCompleted])
 
-  // (b) Security Defaults (On, Off, or Not synchronized)
-  const securityDefaultsState = useMemo<'On' | 'Off' | 'Not synchronized'>(() => {
-    if (!syncCompleted) return 'Not synchronized'
+  // (b) Security Defaults (On, Off, or Awaiting collection)
+  const securityDefaultsState = useMemo<'On' | 'Off' | 'Awaiting collection'>(() => {
+    if (!syncCompleted) return 'Awaiting collection'
     const sd =
       bundle?.securityDefaults ??
       tenant?.securityDefaults ??
       bundle?.entra?.securityDefaults ??
       bundle?.security?.securityDefaults
-    if (sd === undefined || sd === null) return 'Not synchronized'
+    if (sd === undefined || sd === null) return 'Awaiting collection'
     if (typeof sd === 'boolean') return sd ? 'On' : 'Off'
     if (typeof sd === 'string') {
       const lower = sd.trim().toLowerCase()
@@ -151,7 +151,7 @@ export default function LicensesSection({
       )
         return 'Off'
     }
-    return 'Not synchronized'
+    return 'Awaiting collection'
   }, [bundle, tenant, syncCompleted])
 
   // (c) Tenant Domains (verified count & total count)
@@ -169,7 +169,7 @@ export default function LicensesSection({
 
     if (!syncCompleted && domainList.length === 0) {
       return {
-        text: 'Not synchronized',
+        text: 'Awaiting collection',
         verified: 0,
         total: 0,
         isSynced: false,
@@ -444,11 +444,11 @@ export default function LicensesSection({
             Unavailable
           </Badge>
         )
-      case 'Not synchronized':
+      case 'Awaiting collection':
       default:
         return (
           <Badge className="text-[10px] font-semibold px-2 py-0.5 border bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 border-slate-200 dark:border-slate-700 shadow-none">
-            Not synchronized
+            Awaiting collection
           </Badge>
         )
     }
@@ -518,7 +518,7 @@ export default function LicensesSection({
           <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-slate-100">
             {subscribedProductsCount !== null
               ? String(subscribedProductsCount)
-              : 'Not synchronized'}
+              : 'Awaiting collection'}
           </div>
           <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
             {subscribedProductsCount !== null
@@ -566,7 +566,7 @@ export default function LicensesSection({
             <Globe className="h-4 w-4 text-slate-400" />
           </div>
           <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-slate-100">
-            {domainMetrics.isSynced ? domainMetrics.text : 'Not synchronized'}
+            {domainMetrics.isSynced ? domainMetrics.text : 'Awaiting collection'}
           </div>
           <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
             {domainMetrics.isSynced
@@ -636,7 +636,7 @@ export default function LicensesSection({
                 <option value="Near capacity">Near capacity</option>
                 <option value="Fully utilized">Fully utilized</option>
                 <option value="Unavailable">Unavailable</option>
-                <option value="Not synchronized">Not synchronized</option>
+                <option value="Awaiting collection">Awaiting collection</option>
               </select>
             </div>
           </div>
@@ -715,21 +715,21 @@ export default function LicensesSection({
                         <td className="py-3 px-3 text-right font-medium text-slate-800 dark:text-slate-200">
                           {isDataValid
                             ? used.toLocaleString()
-                            : 'Not synchronized'}
+                            : 'Awaiting collection'}
                         </td>
 
                         {/* Available Column */}
                         <td className="py-3 px-3 text-right font-medium text-emerald-600 dark:text-emerald-400">
                           {isDataValid
                             ? available.toLocaleString()
-                            : 'Not synchronized'}
+                            : 'Awaiting collection'}
                         </td>
 
                         {/* Total Column */}
                         <td className="py-3 px-3 text-right text-slate-500 dark:text-slate-400 font-normal">
                           {isDataValid
                             ? total.toLocaleString()
-                            : 'Not synchronized'}
+                            : 'Awaiting collection'}
                         </td>
 
                         {/* Utilization Column */}
@@ -761,7 +761,7 @@ export default function LicensesSection({
                             </div>
                           ) : (
                             <span className="text-slate-400 dark:text-slate-500">
-                              Not synchronized
+                              Awaiting collection
                             </span>
                           )}
                         </td>
@@ -866,7 +866,7 @@ export default function LicensesSection({
                           <div className="text-lg font-bold text-slate-900 dark:text-slate-100 mt-0.5">
                             {isDataValid
                               ? total.toLocaleString()
-                              : 'Not synchronized'}
+                              : 'Awaiting collection'}
                           </div>
                         </div>
 
@@ -877,7 +877,7 @@ export default function LicensesSection({
                           <div className="text-lg font-bold text-slate-900 dark:text-slate-100 mt-0.5">
                             {isDataValid
                               ? used.toLocaleString()
-                              : 'Not synchronized'}
+                              : 'Awaiting collection'}
                           </div>
                         </div>
 
@@ -888,7 +888,7 @@ export default function LicensesSection({
                           <div className="text-lg font-bold text-emerald-700 dark:text-emerald-400 mt-0.5">
                             {isDataValid
                               ? available.toLocaleString()
-                              : 'Not synchronized'}
+                              : 'Awaiting collection'}
                           </div>
                         </div>
                       </div>
@@ -1008,7 +1008,7 @@ export default function LicensesSection({
                 {/* Users List Table */}
                 {!syncCompleted ? (
                   <div className="py-6 text-center text-xs text-slate-500 dark:text-slate-400">
-                    User assignment data is not synchronized.
+                    User assignment data is awaiting collection.
                   </div>
                 ) : filteredDrawerUsers.length === 0 ? (
                   <div className="py-6 text-center text-xs text-slate-500 dark:text-slate-400">

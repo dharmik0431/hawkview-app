@@ -23,7 +23,13 @@ function normalizeSharingLevel(v: any): SharingLevel {
     .trim()
     .toLowerCase()
 
-  if (!s || s.includes('not synchronized')) return 'Unknown'
+  if (
+    !s ||
+    s.includes('awaiting collection') ||
+    s.includes('not synchronized') ||
+    s.includes('not synced')
+  )
+    return 'Unknown'
   if (
     s === 'off' ||
     s === 'disabled' ||
@@ -67,7 +73,7 @@ function sharingLabel(level: SharingLevel) {
   if (level === 'NewAndExistingGuests') return 'New & existing guests'
   if (level === 'ExistingGuests') return 'Existing guests'
   if (level === 'OrganizationOnly') return 'Only people in your organization'
-  if (level === 'Unknown') return 'Not synchronized'
+  if (level === 'Unknown') return 'Awaiting collection'
   return 'Off'
 }
 
@@ -128,7 +134,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       rawOverview.siteStorageLimitsMode ??
       rawOverview.storageLimitsMode ??
       rawOverview.limitsMode ??
-      'Not synchronized',
+      'Awaiting collection',
 
     sharingSharePoint: normalizeSharingLevel(
       rawOverview.sharingSharePoint ??
@@ -151,7 +157,6 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
     ),
   }
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const SP_SITES = useMemo(
     () =>
       Array.isArray(sp?.sites)
@@ -159,7 +164,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
         : Array.isArray(rawOverview?.sites)
           ? rawOverview.sites
           : [],
-    [bundle]
+    [sp.sites, rawOverview.sites]
   )
 
   const SP_DELETED_SITES = Array.isArray(sp?.deletedSites)
@@ -407,7 +412,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 <div className="mt-1 text-2xl font-bold">
                   {typeof SP_OVERVIEW.totalStorageQuotaGB === 'number'
                     ? `${SP_OVERVIEW.totalStorageQuotaGB} GB`
-                    : 'Not synchronized'}
+                    : 'Awaiting collection'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Tenant quota
@@ -430,7 +435,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 <div className="mt-1 text-2xl font-bold">
                   {typeof SP_OVERVIEW.oneDriveStorageLimitGB === 'number'
                     ? `${SP_OVERVIEW.oneDriveStorageLimitGB} GB`
-                    : 'Not synchronized'}
+                    : 'Awaiting collection'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Per user
@@ -455,7 +460,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                     (site: any) => typeof site.externalSharing === 'boolean'
                   )
                     ? totals.externalOn
-                    : 'Not synchronized'}
+                    : 'Awaiting collection'}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Sites allowing external links
@@ -496,7 +501,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               <div className="text-lg font-bold text-slate-900">
                 {usageSynchronized
                   ? formatStorage(totals.totalUsed)
-                  : 'Not synchronized'}
+                  : 'Awaiting collection'}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Across sites + OneDrive
@@ -685,7 +690,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                               </Badge>
                             ) : (
                               <Badge className="bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
-                                Sharing not synchronized
+                                Sharing awaiting collection
                               </Badge>
                             )}
 
@@ -715,7 +720,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                               ? 'On'
                               : s.externalSharing === false
                                 ? 'Off'
-                                : 'Not synchronized'}
+                                : 'Awaiting collection'}
                           </Badge>
                         </td>
 
@@ -730,7 +735,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                           >
                             {typeof s.guestsCount === 'number'
                               ? s.guestsCount
-                              : 'Not synchronized'}
+                              : 'Awaiting collection'}
                           </Badge>
                         </td>
 
@@ -739,7 +744,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                             {typeof s.storageUsedGB === 'number' &&
                             typeof s.storageQuotaGB === 'number'
                               ? `${s.storageUsedGB} / ${s.storageQuotaGB} GB`
-                              : 'Not synchronized'}
+                              : 'Awaiting collection'}
                           </div>
                           <div className="mt-2 h-2 w-[180px] rounded-full bg-muted overflow-hidden">
                             <div

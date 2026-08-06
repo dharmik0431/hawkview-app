@@ -97,8 +97,8 @@ export default function DnsSection({
           description,
           record: '',
           status: 'not-synced',
-          diagnosticText: 'Not synchronized',
-          resultSummary: 'Not synchronized',
+          diagnosticText: 'Awaiting collection',
+          resultSummary: 'Awaiting collection',
           howToFix: defaultFix,
         }
       }
@@ -111,7 +111,7 @@ export default function DnsSection({
           rec ||
           (st === 'healthy'
             ? 'Record configured correctly'
-            : 'Not synchronized')
+            : 'Awaiting collection')
 
         let summary = diag
         if (st === 'healthy') {
@@ -136,6 +136,7 @@ export default function DnsSection({
       if (
         !str ||
         str === '—' ||
+        str.toLowerCase() === 'awaiting collection' ||
         str.toLowerCase() === 'not synchronized' ||
         str.toLowerCase() === 'not synced'
       ) {
@@ -145,8 +146,8 @@ export default function DnsSection({
           description,
           record: '',
           status: 'not-synced',
-          diagnosticText: 'Not synchronized',
-          resultSummary: 'Not synchronized',
+          diagnosticText: 'Awaiting collection',
+          resultSummary: 'Awaiting collection',
           howToFix: defaultFix,
         }
       }
@@ -224,7 +225,7 @@ export default function DnsSection({
     const hasSync = checks.some((c) => c.status !== 'not-synced')
     if (!hasSync)
       return {
-        label: 'Not synchronized',
+        label: 'Awaiting collection',
         style:
           'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
       }
@@ -252,7 +253,7 @@ export default function DnsSection({
     if (
       lower.startsWith('no ') ||
       lower.includes('not found') ||
-      lower.includes('not synchronized') ||
+      lower.includes('awaiting collection') ||
       lower.includes('not synced') ||
       lower.includes('missing') ||
       lower.includes('check failed') ||
@@ -415,7 +416,7 @@ export default function DnsSection({
                                 ? 'Failed'
                                 : check.status === 'checking'
                                   ? 'Checking'
-                                  : 'Not Synced'}
+                                  : 'Collection pending'}
                         </Badge>
                       </div>
                     </div>
@@ -443,7 +444,7 @@ export default function DnsSection({
                               ? 'Failed'
                               : check.status === 'checking'
                                 ? 'Checking'
-                                : 'Not Synced'}
+                                : 'Collection pending'}
                       </Badge>
                     </div>
 
@@ -533,7 +534,7 @@ export default function DnsSection({
                       ? 'Warning'
                       : selectedCheck.status === 'failed'
                         ? 'Failed'
-                        : 'Not Synced'}
+                        : 'Collection pending'}
                 </Badge>
               </div>
 

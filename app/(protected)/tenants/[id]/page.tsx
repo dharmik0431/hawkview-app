@@ -207,7 +207,7 @@ function getUserRoles(u: { role?: string; roles?: string[] }): string[] {
       r.toLowerCase() === 'user' ||
       r.toLowerCase() === 'none' ||
       r.toLowerCase() === 'unknown' ||
-      r.toLowerCase() === 'not synchronized'
+      r.toLowerCase() === 'awaiting collection'
     ) {
       return []
     }
@@ -1496,7 +1496,7 @@ export default function TenantDetailsPage() {
       if (!val) return true
       const norm = val.trim().toLowerCase()
       return (
-        norm === 'unknown' || norm === 'not synchronized' || norm === 'none'
+        norm === 'unknown' || norm === 'awaiting collection' || norm === 'none'
       )
     }
 
@@ -3843,7 +3843,7 @@ export default function TenantDetailsPage() {
                               <option value="enabled">Enabled</option>
                               <option value="disabled">Disabled</option>
                               <option value="not-synchronized">
-                                Not synchronized
+                                Awaiting collection
                               </option>
                             </select>
                           </div>
@@ -3922,7 +3922,7 @@ export default function TenantDetailsPage() {
                               const isMfaUnknown =
                                 !u.mfa ||
                                 (u.mfa as string) === 'Unknown' ||
-                                (u.mfa as string) === 'Not synchronized'
+                                (u.mfa as string) === 'Awaiting collection'
 
                               const userRoles = getUserRoles(u)
                               const firstRole =
@@ -3950,10 +3950,10 @@ export default function TenantDetailsPage() {
                                       </div>
                                       <div className="min-w-0 flex-1">
                                         <div className="font-semibold text-slate-900 dark:text-slate-100 truncate text-xs sm:text-sm">
-                                          {u.name || 'Not synchronized'}
+                                          {u.name || 'Awaiting collection'}
                                         </div>
                                         <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                                          {u.email || 'Not synchronized'}
+                                          {u.email || 'Awaiting collection'}
                                         </div>
                                       </div>
                                     </div>
@@ -3961,7 +3961,7 @@ export default function TenantDetailsPage() {
                                   <td className="px-4 py-3.5 text-slate-600 dark:text-slate-300 whitespace-nowrap hidden md:table-cell text-xs sm:text-sm">
                                     {isTypeUnknown ? (
                                       <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                        Not synchronized
+                                        Awaiting collection
                                       </span>
                                     ) : (
                                       u.type
@@ -3970,7 +3970,7 @@ export default function TenantDetailsPage() {
                                   <td className="px-4 py-3.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300 relative">
                                     {isRoleUnknown ? (
                                       <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                        Not synchronized
+                                        Awaiting collection
                                       </span>
                                     ) : userRoles.length === 0 ? (
                                       <span className="text-slate-600 dark:text-slate-300 font-normal">
@@ -4040,14 +4040,14 @@ export default function TenantDetailsPage() {
                                       </Badge>
                                     ) : (
                                       <Badge className="bg-amber-50 text-amber-700 border border-amber-200/80 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-800/60 font-medium text-xs">
-                                        Not synchronized
+                                        Awaiting collection
                                       </Badge>
                                     )}
                                   </td>
                                   <td className="px-4 pl-8 py-3.5 text-slate-600 dark:text-slate-300 whitespace-nowrap hidden md:table-cell text-xs sm:text-sm min-w-[160px]">
                                     {isMfaUnknown ? (
                                       <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                        Not synchronized
+                                        Awaiting collection
                                       </span>
                                     ) : (
                                       u.mfa
@@ -4629,7 +4629,7 @@ export default function TenantDetailsPage() {
                       const deviceLastSync =
                         typeof device === 'object' && device?.lastSync
                           ? device.lastSync
-                          : 'Not synchronized'
+                          : 'Awaiting collection'
                       const deviceStatus =
                         typeof device === 'object' && device?.status
                           ? String(device.status)
@@ -4764,7 +4764,7 @@ export default function TenantDetailsPage() {
                   </div>
                   <div className="text-sm font-semibold">
                     {mailboxNumber(selectedMailbox.sizeGB) === null
-                      ? 'Not synchronized'
+                      ? 'Awaiting collection'
                       : `${mailboxNumber(selectedMailbox.sizeGB)!.toFixed(1)} GB`}
                   </div>
                 </div>
@@ -4775,7 +4775,7 @@ export default function TenantDetailsPage() {
                   </div>
                   <div className="text-sm font-semibold">
                     {mailboxNumber(selectedMailbox.itemCount) === null
-                      ? 'Not synchronized'
+                      ? 'Awaiting collection'
                       : mailboxNumber(
                           selectedMailbox.itemCount
                         )!.toLocaleString()}

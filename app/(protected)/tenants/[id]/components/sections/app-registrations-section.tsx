@@ -273,7 +273,7 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
           {!isSynchronized ? (
             <div className="p-8 text-center space-y-2">
               <Info className="mx-auto h-8 w-8 text-slate-400" />
-              <div className="text-sm font-semibold text-slate-900 dark:text-white">App Registrations Not Synchronized</div>
+              <div className="text-sm font-semibold text-slate-900 dark:text-white">App registration inventory is awaiting collection</div>
               <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
                 No App Registration objects were returned in the current tenant response. Microsoft Graph application synchronization is required for this view.
               </p>
