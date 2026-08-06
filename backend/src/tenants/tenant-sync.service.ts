@@ -225,6 +225,7 @@ type EntraSnapshotResource =
   | 'SHAREPOINT_SETTINGS'
   | 'SHAREPOINT_USAGE'
   | 'EXCHANGE_MAILBOXES'
+  | 'EXCHANGE_MAILBOX_CONFIGURATION'
   | 'EXCHANGE_MAILBOX_USAGE'
   | 'EXCHANGE_ACCEPTED_DOMAINS'
   | 'EXCHANGE_MAILBOX_RULES'
@@ -668,6 +669,10 @@ export class TenantSyncService {
         resource: 'EXCHANGE_MAILBOXES',
         synchronize: () =>
           this.syncExchangeMailboxDirectory(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'EXCHANGE_MAILBOX_CONFIGURATION',
+        synchronize: () => this.syncExchangeMailboxConfiguration(tenant),
       },
       {
         resource: 'EXCHANGE_ACCEPTED_DOMAINS',
@@ -2134,6 +2139,77 @@ export class TenantSyncService {
     })
   }
 
+  private async syncExchangeMailboxConfiguration(tenant: TenantSyncTarget) {
+    return this.runSnapshotSync(
+      tenant,
+      'EXCHANGE_MAILBOX_CONFIGURATION',
+      async () => {
+        if (!tenant.connection) {
+          throw new Error('The Microsoft tenant connection is incomplete.')
+        }
+
+        const accessToken =
+          await this.microsoftConsent.getTenantExchangeAccessToken({
+            microsoftTenantId: tenant.microsoftTenantId,
+            connectionMode: tenant.connection.connectionMode as
+              | 'HAWKVIEW_MANAGED'
+              | 'CUSTOMER_MANAGED',
+            clientId: tenant.connection.clientId,
+            credentialReference: tenant.connection.credentialReference,
+          })
+        const requestBody = {
+          CmdletInput: {
+            CmdletName: 'Get-Mailbox',
+            Parameters: {
+              ResultSize: 'Unlimited',
+              IncludeGrantSendOnBehalfTowithDisplayNames: true,
+            },
+          },
+        }
+        const rows: unknown[] = []
+        let nextUrl = `https://outlook.office365.com/adminapi/v2.0/${encodeURIComponent(tenant.microsoftTenantId)}/Mailbox`
+        const anchorMailbox = `APP:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@${tenant.microsoftTenantId}`
+
+        while (nextUrl) {
+          if (!nextUrl.startsWith('https://outlook.office365.com/')) {
+            throw new Error(
+              'Microsoft returned an invalid Exchange pagination link.'
+            )
+          }
+          const response = await fetch(nextUrl, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              Accept: 'application/json',
+              'Content-Type': 'application/json',
+              'X-AnchorMailbox': anchorMailbox,
+            },
+            body: JSON.stringify(requestBody),
+            signal: AbortSignal.timeout(60_000),
+          })
+          if (!response.ok) {
+            const details = (await response.text()).slice(0, 1_000)
+            throw new Error(
+              `Microsoft Exchange mailbox configuration synchronization returned ${response.status}. Confirm Exchange.ManageAsAppV2 and the Recipient Management Exchange RBAC role. ${details}`
+            )
+          }
+          const page = (await response.json()) as GraphCollectionPage
+          rows.push(...(Array.isArray(page.value) ? page.value : []))
+          nextUrl =
+            typeof page['@odata.nextLink'] === 'string'
+              ? page['@odata.nextLink']
+              : ''
+        }
+
+        await this.saveSnapshot(
+          tenant,
+          'EXCHANGE_MAILBOX_CONFIGURATION',
+          rows
+        )
+      }
+    )
+  }
+
   private async syncExchangeAcceptedDomains(
     tenant: { id: string; organizationId: string },
     accessToken: string
@@ -2775,6 +2851,8 @@ export class TenantSyncService {
     const sharePointUsage = combinedUsage?.sharePointSites ?? sharePointUsageSnapshot
     const oneDriveUsage = combinedUsage?.oneDriveAccounts ?? []
     const exchangeMailboxes = snapshotByResource.get('EXCHANGE_MAILBOXES') ?? []
+    const exchangeMailboxConfiguration =
+      snapshotByResource.get('EXCHANGE_MAILBOX_CONFIGURATION') ?? []
     const exchangeMailboxUsage =
       snapshotByResource.get('EXCHANGE_MAILBOX_USAGE') ?? []
     const exchangeAcceptedDomains =
@@ -2782,11 +2860,37 @@ export class TenantSyncService {
     const exchangeMailboxRules =
       snapshotByResource.get('EXCHANGE_MAILBOX_RULES') ?? []
     const domainDnsHealth = snapshotByResource.get('DOMAIN_DNS_HEALTH') ?? []
-    const exchangeUsageByUpn = new Map(
-      exchangeMailboxUsage
-        .filter((row) => typeof row?.['User Principal Name'] === 'string')
-        .map((row) => [String(row['User Principal Name']).toLowerCase(), row])
-    )
+    const exchangeUsageByUpn = new Map<string, Record<string, string>>()
+    for (const row of exchangeMailboxUsage as Array<Record<string, string>>) {
+      for (const field of [
+        'User Principal Name',
+        'User Principal Name (UPN)',
+        'Owner Principal Name',
+        'Email Address',
+      ]) {
+        const identity = row?.[field]
+        if (typeof identity === 'string' && identity.trim()) {
+          exchangeUsageByUpn.set(identity.trim().toLowerCase(), row)
+        }
+      }
+    }
+    const exchangeConfigurationByIdentity = new Map<string, any>()
+    for (const mailbox of exchangeMailboxConfiguration as any[]) {
+      for (const identity of [
+        mailbox?.ExternalDirectoryObjectId,
+        mailbox?.UserPrincipalName,
+        mailbox?.PrimarySmtpAddress,
+        mailbox?.WindowsEmailAddress,
+        mailbox?.Guid,
+      ]) {
+        if (identity != null && String(identity).trim()) {
+          exchangeConfigurationByIdentity.set(
+            String(identity).trim().toLowerCase(),
+            mailbox
+          )
+        }
+      }
+    }
     const oneDriveUsageByUpn = new Map<string, Record<string, string>>(
       oneDriveUsage
         .filter((row: any) => typeof row?.['Owner Principal Name'] === 'string')
@@ -2831,6 +2935,11 @@ export class TenantSyncService {
       const parsed = Number(value)
       return Number.isFinite(parsed) ? parsed : null
     }
+    const reportedSharePointAllocationBytes = sharePointUsage.reduce(
+      (total: number, row: Record<string, string>) =>
+        total + (parseReportBytes(row?.['Storage Allocated (Byte)']) ?? 0),
+      0
+    )
     const getSharePointUsage = (site: any) => {
       const byUrl = sharePointUsageByUrl.get(
         normalizeSharePointUrl(site?.webUrl)
@@ -3152,12 +3261,15 @@ export class TenantSyncService {
         exchange: {
           sync: {
             mailboxes: exchangeSync('EXCHANGE_MAILBOXES'),
+            mailboxConfiguration: exchangeSync(
+              'EXCHANGE_MAILBOX_CONFIGURATION'
+            ),
             mailboxUsage: exchangeSync('EXCHANGE_MAILBOX_USAGE'),
             acceptedDomains: exchangeSync('EXCHANGE_ACCEPTED_DOMAINS'),
             inboxRules: exchangeSync('EXCHANGE_MAILBOX_RULES'),
           },
           mailboxes: exchangeMailboxInventory.map((mailbox: any) => {
-            const upn = String(
+            const directoryUpn = String(
               mailbox.UserPrincipalName ??
                 mailbox.userPrincipalName ??
                 mailbox.PrimarySmtpAddress ??
@@ -3165,11 +3277,26 @@ export class TenantSyncService {
                 mailbox.WindowsEmailAddress ??
                 ''
             )
+            const configuration =
+              exchangeConfigurationByIdentity.get(
+                String(mailbox.id ?? '').toLowerCase()
+              ) ??
+              exchangeConfigurationByIdentity.get(directoryUpn.toLowerCase()) ??
+              {}
+            const enrichedMailbox = { ...mailbox, ...configuration }
+            const upn = String(
+              enrichedMailbox.UserPrincipalName ??
+                enrichedMailbox.userPrincipalName ??
+                enrichedMailbox.PrimarySmtpAddress ??
+                enrichedMailbox.mail ??
+                enrichedMailbox.WindowsEmailAddress ??
+                directoryUpn
+            )
             const usage = exchangeUsageByUpn.get(upn.toLowerCase())
             const storageBytes = Number(usage?.['Storage Used (Byte)'])
             const recipientType = String(
-              mailbox.RecipientTypeDetails ??
-                mailbox.RecipientType ??
+              enrichedMailbox.RecipientTypeDetails ??
+                enrichedMailbox.RecipientType ??
                 'UserMailbox'
             )
             const mailboxType = recipientType.includes('Shared')
@@ -3179,21 +3306,21 @@ export class TenantSyncService {
                 : recipientType.includes('Equipment')
                   ? 'Equipment'
                   : 'User'
-            const emailAddresses = Array.isArray(mailbox.EmailAddresses)
-              ? mailbox.EmailAddresses
+            const emailAddresses = Array.isArray(enrichedMailbox.EmailAddresses)
+              ? enrichedMailbox.EmailAddresses
               : []
             return {
               id: String(
-                mailbox.ExternalDirectoryObjectId ??
+                enrichedMailbox.ExternalDirectoryObjectId ??
                   mailbox.id ??
-                  mailbox.Guid ??
-                  mailbox.Identity ??
+                  enrichedMailbox.Guid ??
+                  enrichedMailbox.Identity ??
                   upn
               ),
               displayName: String(
-                mailbox.DisplayName ??
+                enrichedMailbox.DisplayName ??
                   mailbox.displayName ??
-                  mailbox.Name ??
+                  enrichedMailbox.Name ??
                   upn
               ),
               userPrincipalName: upn,
@@ -3214,21 +3341,23 @@ export class TenantSyncService {
                 : null,
               itemCount: Number(usage?.['Item Count']) || null,
               archiveEnabled:
-                String(mailbox.ArchiveStatus ?? '').toLowerCase() ===
+                String(enrichedMailbox.ArchiveStatus ?? '').toLowerCase() ===
                   'active' ||
                 Boolean(
-                  mailbox.ArchiveGuid &&
-                  !String(mailbox.ArchiveGuid).startsWith('00000000')
+                  enrichedMailbox.ArchiveGuid &&
+                  !String(enrichedMailbox.ArchiveGuid).startsWith('00000000')
                 ),
               retentionLabel:
-                mailbox.RetentionPolicy ?? mailbox.RetentionHoldEnabled ?? null,
+                enrichedMailbox.RetentionPolicy ??
+                enrichedMailbox.RetentionHoldEnabled ??
+                null,
               delegation: {
                 fullAccess: [],
                 sendAs: [],
                 sendOnBehalf: Array.isArray(
-                  mailbox.GrantSendOnBehalfToWithDisplayNames
+                  enrichedMailbox.GrantSendOnBehalfToWithDisplayNames
                 )
-                  ? mailbox.GrantSendOnBehalfToWithDisplayNames
+                  ? enrichedMailbox.GrantSendOnBehalfToWithDisplayNames
                   : [],
               },
               lastLogon: usage?.['Last Activity Date'] || null,
@@ -3345,9 +3474,20 @@ export class TenantSyncService {
           },
           overview: {
             totalSites: sharePointSites.length,
-            // Graph site drive quotas are per-site limits. Summing them does
-            // not produce the tenant's licensed SharePoint storage pool.
-            totalStorageQuotaGB: null,
+            // Microsoft Graph does not expose the licensed tenant storage
+            // pool. Its usage report does provide each reported site's
+            // allocation, so expose that useful aggregate with an explicit
+            // capability label instead of presenting it as licensed quota.
+            totalStorageQuotaGB:
+              sharePointUsageSynchronized &&
+              reportedSharePointAllocationBytes > 0
+                ? bytesToGb(reportedSharePointAllocationBytes)
+                : null,
+            storageQuotaSource:
+              sharePointUsageSynchronized &&
+              reportedSharePointAllocationBytes > 0
+                ? 'reported-site-allocation'
+                : 'unavailable',
             oneDriveStorageLimitGB:
               typeof sharePointSettings?.personalSiteDefaultStorageLimitInMB ===
               'number'
