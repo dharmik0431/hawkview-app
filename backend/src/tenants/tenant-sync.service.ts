@@ -2344,7 +2344,7 @@ export class TenantSyncService {
   }
 
   private async syncSharePointSites(
-    tenant: { id: string; organizationId: string },
+    tenant: TenantSyncTarget,
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'SHAREPOINT_SITES', async () => {
@@ -2404,13 +2404,41 @@ export class TenantSyncService {
             .map((site) => [site.id, site])
         ).values()
       )
+      const sharePointHost = uniqueSites
+        .map((site) => this.getSharePointSiteUrl(site?.webUrl)?.hostname)
+        .find((host): host is string => Boolean(host))
+      let sharePointAccessToken: string | null = null
+      if (sharePointHost && tenant.connection) {
+        try {
+          sharePointAccessToken =
+            await this.microsoftConsent.getTenantSharePointAccessToken({
+              microsoftTenantId: tenant.microsoftTenantId,
+              connectionMode:
+                tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+                  ? 'CUSTOMER_MANAGED'
+                  : 'HAWKVIEW_MANAGED',
+              clientId: tenant.connection.clientId,
+              credentialReference: tenant.connection.credentialReference,
+              sharePointHost,
+            })
+        } catch (error) {
+          this.logger.warn(
+            `SharePoint site access metadata token unavailable for tenant ${tenant.id}: ${error instanceof Error ? error.message : 'unknown error'}`
+          )
+        }
+      }
       const enrichedSites: any[] = []
       for (let index = 0; index < uniqueSites.length; index += 8) {
         const batch = uniqueSites.slice(index, index + 8)
         const batchRows = await Promise.all(
           batch.map(async (site) => {
             if (typeof site?.id !== 'string')
-              return { ...site, driveQuota: null }
+              return {
+                ...site,
+                driveQuota: null,
+                externalSharing: null,
+                guestsCount: null,
+              }
             const driveResponse = await fetch(
               `https://graph.microsoft.com/v1.0/sites/${encodeURIComponent(site.id)}/drive?$select=id,quota`,
               {
@@ -2421,9 +2449,26 @@ export class TenantSyncService {
                 signal: AbortSignal.timeout(20_000),
               }
             )
-            if (!driveResponse.ok) return { ...site, driveQuota: null }
-            const drive = (await driveResponse.json()) as any
-            return { ...site, driveQuota: drive?.quota ?? null }
+            const drive = driveResponse.ok
+              ? ((await driveResponse.json()) as any)
+              : null
+            const access = sharePointAccessToken
+              ? await this.collectSharePointSiteAccess(
+                  site.webUrl,
+                  sharePointAccessToken,
+                  sharePointHost
+                )
+              : {
+                  externalSharing: null,
+                  guestsCount: null,
+                  sharingCapability: null,
+                  collectionError: 'SharePoint access token unavailable.',
+                }
+            return {
+              ...site,
+              driveQuota: drive?.quota ?? null,
+              ...access,
+            }
           })
         )
         enrichedSites.push(...batchRows)
@@ -2449,6 +2494,121 @@ export class TenantSyncService {
         },
       })
     })
+  }
+
+  private getSharePointSiteUrl(value: unknown) {
+    if (typeof value !== 'string' || !value.trim()) return null
+    try {
+      const url = new URL(value)
+      if (
+        url.protocol !== 'https:' ||
+        !/^[a-z0-9.-]+\.sharepoint\.com$/i.test(url.hostname) ||
+        url.hostname.includes('..')
+      ) {
+        return null
+      }
+      url.search = ''
+      url.hash = ''
+      url.pathname = `${url.pathname.replace(/\/+$/, '')}/`
+      return url
+    } catch {
+      return null
+    }
+  }
+
+  private async collectSharePointSiteAccess(
+    webUrl: unknown,
+    accessToken: string,
+    expectedHost?: string
+  ) {
+    const siteUrl = this.getSharePointSiteUrl(webUrl)
+    if (!siteUrl || (expectedHost && siteUrl.hostname !== expectedHost)) {
+      return {
+        externalSharing: null,
+        guestsCount: null,
+        sharingCapability: null,
+        collectionError: 'Invalid SharePoint site URL.',
+      }
+    }
+
+    const headers = {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json;odata=nometadata',
+    }
+    let externalSharing: boolean | null = null
+    let sharingCapability: string | number | null = null
+    let guestsCount: number | null = null
+    const errors: string[] = []
+
+    try {
+      const settingsUrl = new URL('_api/site?$select=SharingCapability', siteUrl)
+      const response = await fetch(settingsUrl, {
+        headers,
+        signal: AbortSignal.timeout(20_000),
+      })
+      if (!response.ok) {
+        errors.push(`sharing capability returned ${response.status}`)
+      } else {
+        const body = (await response.json()) as any
+        sharingCapability =
+          body?.SharingCapability ?? body?.d?.SharingCapability ?? null
+        if (typeof sharingCapability === 'number') {
+          externalSharing = sharingCapability !== 0
+        } else if (typeof sharingCapability === 'string') {
+          externalSharing = !['disabled', '0'].includes(
+            sharingCapability.trim().toLowerCase()
+          )
+        }
+      }
+    } catch (error) {
+      errors.push(
+        error instanceof Error ? error.message : 'sharing capability failed'
+      )
+    }
+
+    try {
+      let nextUrl = new URL(
+        '_api/web/siteusers?$select=Id,LoginName,Email,Title,PrincipalType&$top=5000',
+        siteUrl
+      ).toString()
+      const guestIds = new Set<string>()
+      while (nextUrl) {
+        const pageUrl = new URL(nextUrl, siteUrl)
+        if (pageUrl.origin !== siteUrl.origin) {
+          throw new Error('SharePoint returned an invalid site-users link.')
+        }
+        const response = await fetch(pageUrl, {
+          headers,
+          signal: AbortSignal.timeout(20_000),
+        })
+        if (!response.ok) {
+          throw new Error(`site users returned ${response.status}`)
+        }
+        const body = (await response.json()) as any
+        const users = Array.isArray(body?.value)
+          ? body.value
+          : Array.isArray(body?.d?.results)
+            ? body.d.results
+            : []
+        for (const user of users) {
+          const loginName = String(user?.LoginName ?? '')
+          if (!loginName.toLowerCase().includes('#ext#')) continue
+          guestIds.add(String(user?.Id ?? loginName).toLowerCase())
+        }
+        nextUrl =
+          body?.['@odata.nextLink'] ?? body?.['odata.nextLink'] ?? body?.d?.__next ?? ''
+      }
+      guestsCount = guestIds.size
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : 'site users failed')
+    }
+
+    return {
+      externalSharing,
+      guestsCount,
+      sharingCapability,
+      collectionError: errors.length > 0 ? errors.join('; ') : null,
+    }
   }
 
   private async syncSharePointSettings(
@@ -3623,8 +3783,14 @@ export class TenantSyncService {
               name: site.displayName || site.name || 'Unnamed SharePoint site',
               url: site.webUrl || '',
               type: getSharePointSiteType(site, usage),
-              externalSharing: null,
-              guestsCount: null,
+              externalSharing:
+                typeof site.externalSharing === 'boolean'
+                  ? site.externalSharing
+                  : null,
+              guestsCount:
+                typeof site.guestsCount === 'number'
+                  ? site.guestsCount
+                  : null,
               owners: null,
               hasReportedOwner: [
                 usage?.['Owner Principal Name'],

@@ -427,8 +427,8 @@ type SharePointSite = {
   url: string
   type: SharePointSiteType
   owners: number
-  externalSharing: boolean
-  guestsCount: number
+  externalSharing: boolean | null
+  guestsCount: number | null
   storageUsedGB: number
   storageQuotaGB: number
   lastActivity: string
