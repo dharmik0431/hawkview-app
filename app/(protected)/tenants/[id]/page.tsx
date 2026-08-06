@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 
@@ -68,6 +68,9 @@ import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
+import { TenantHeader } from './components/tenant-header'
+import { TenantMobileNav } from './components/tenant-nav'
+import { deriveTenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 
 type Provider = 'microsoft' | 'google'
 type TenantStatus = 'healthy' | 'warning' | 'critical'
@@ -1228,6 +1231,9 @@ export default function TenantDetailsPage() {
     router.replace(`?${p.toString()}`, { scroll: false })
   }
 
+  const [syncState, setSyncState] = useState<
+    'idle' | 'syncing' | 'success' | 'fail'
+  >('idle')
   const [bundle, setBundle] = useState<TenantBundle | null>(null)
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>(
     'loading'
@@ -1235,7 +1241,7 @@ export default function TenantDetailsPage() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [tenantsList, setTenantsList] = useState<any[]>([])
 
-  const fetchBundle = async (refresh = false) => {
+  const fetchBundle = useCallback(async (refresh = false) => {
     if (!tenantId) return
     if (refresh) {
       setSyncState('syncing')
@@ -1275,12 +1281,11 @@ export default function TenantDetailsPage() {
         window.setTimeout(() => setSyncState('idle'), 1400)
       }
     }
-  }
+  }, [tenantId])
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     fetchBundle(false)
-  }, [tenantId])
+  }, [fetchBundle])
 
   useEffect(() => {
     apiClient
@@ -1294,6 +1299,10 @@ export default function TenantDetailsPage() {
   }, [])
 
   const tenant = useMemo(() => bundle?.tenant, [bundle])
+  const workspaceDisplay = useMemo(
+    () => deriveTenantWorkspaceDisplay(bundle, syncState === 'syncing'),
+    [bundle, syncState]
+  )
 
   // ✅ JSON/TS-backed datasets (per-tenant)
   const USERS = useMemo(
@@ -1312,14 +1321,7 @@ export default function TenantDetailsPage() {
   const EXCHANGE_GROUPS = (bundle?.exchange?.groups ?? []) as MailGroup[]
 
   // SharePoint (safe default so UI never crashes)
-  const SP_OVERVIEW = (bundle?.sharepoint?.overview ?? {
-    totalSites: 0,
-    totalStorageQuotaGB: 0,
-    oneDriveStorageLimitGB: 0,
-    siteStorageLimitsMode: 'Automatic',
-    sharingSharePoint: 'ONLY_PEOPLE_IN_ORG',
-    sharingOneDrive: 'ONLY_PEOPLE_IN_ORG',
-  }) as any
+  const SP_OVERVIEW = (bundle?.sharepoint?.overview ?? {}) as any
 
   const SP_SITES = (bundle?.sharepoint?.sites ?? []) as any[]
   const SP_DELETED_SITES = (bundle?.sharepoint?.deletedSites ?? []) as any[]
@@ -1395,11 +1397,6 @@ export default function TenantDetailsPage() {
   // Tenant dropdown
   const [tenantPickerOpen, setTenantPickerOpen] = useState(false)
   const [tenantSearch, setTenantSearch] = useState('')
-
-  // Refresh button state (fake)
-  const [syncState, setSyncState] = useState<
-    'idle' | 'syncing' | 'success' | 'fail'
-  >('idle')
 
   // Domain selector (per tenant)
   const domains = tenant?.domains?.length
@@ -1897,7 +1894,7 @@ export default function TenantDetailsPage() {
         <CardContent className="p-6">
           <div className="font-semibold">{title}</div>
           <div className="mt-2 text-sm text-muted-foreground">
-            This dataset has not been synchronized yet.
+            This module is not available through the current tenant data source.
           </div>
         </CardContent>
       </Card>
@@ -4401,69 +4398,51 @@ export default function TenantDetailsPage() {
               <div className="mt-auto">
                 <div className="p-4 border-t flex items-center justify-between">
                   <div className="text-xs text-muted-foreground">Health</div>
-                  <Badge className={`${statusBadge(tenant.status)} uppercase`}>
-                    {tenant.status}
+                  <Badge className={`${statusBadge(workspaceDisplay.state === 'healthy' ? 'healthy' : 'warning')} uppercase`}>
+                    {workspaceDisplay.stateLabel}
                   </Badge>
                 </div>
                 <div
                   className="px-4 pb-4 text-xs text-muted-foreground"
                   title={tenant?.lastSync || ''}
                 >
-                  {formatSyncTimestamp(tenant?.lastSync)}
+                  {formatSyncTimestamp(workspaceDisplay.lastSuccessfulSync || tenant?.lastSync)}
                 </div>
               </div>
             </aside>
 
             <section className="flex-1 bg-slate-50/60 dark:bg-slate-950/60 overflow-y-auto">
               <div className="p-8">
-                <div className="flex items-start justify-between">
-                  <div>
-                    <h1 className="text-1xl font-bold tracking-tight">
-                      {heading}
-                    </h1>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      {subheading}
-                    </p>
-                  </div>
+                <TenantHeader
+                  tenant={tenant}
+                  display={workspaceDisplay}
+                  tenantId={String(tenantId)}
+                  syncing={syncState === 'syncing'}
+                  onRefresh={runSync}
+                />
 
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={runSync}
-                      className="h-10 w-10 rounded-xl border bg-white shadow-sm hover:shadow-md hover:bg-white transition flex items-center justify-center dark:bg-slate-900 dark:border-slate-800 dark:hover:bg-slate-800"
-                      title={
-                        syncState === 'syncing'
-                          ? 'Syncing...'
-                          : syncState === 'success'
-                            ? 'Sync complete'
-                            : syncState === 'fail'
-                              ? 'Sync failed'
-                              : 'Refresh'
-                      }
-                    >
-                      <RefreshCw
-                        className={`h-4 w-4 text-slate-700 dark:text-slate-300 ${syncState === 'syncing' ? 'animate-spin' : ''}`}
-                      />
-                    </button>
+                <TenantMobileNav
+                  items={navItems}
+                  value={section}
+                  onChange={(key) => {
+                    setSection(key as TenantSection)
+                    if (key === 'entra') setEntraTab('overview')
+                  }}
+                />
 
-                    <Link
-                      href={`/tenants/${tenantId}/settings`}
-                      className="h-10 w-10 rounded-xl border bg-white shadow-sm hover:shadow-md hover:bg-white transition flex items-center justify-center dark:bg-slate-900 dark:border-slate-800 dark:hover:bg-slate-800"
-                      title="Tenant settings"
-                      aria-label="Open tenant settings"
-                    >
-                      <Settings className="h-4 w-4 text-slate-700 dark:text-slate-300" />
-                    </Link>
-                  </div>
+                <div className="mb-4 flex items-center gap-2">
+                  <h2 className="text-base font-semibold tracking-tight">{heading}</h2>
+                  <span className="text-sm text-muted-foreground">{subheading}</span>
                 </div>
 
                 {syncState === 'fail' && (
                   <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                    Sync failed. Try again.
+                    Synchronization failed. Last known data remains visible. Review tenant settings for details.
                   </div>
                 )}
                 {syncState === 'success' && (
                   <div className="mt-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
-                    Sync completed.
+                    Synchronization request completed. Module data has been refreshed.
                   </div>
                 )}
 
