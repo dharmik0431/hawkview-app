@@ -281,7 +281,7 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
           {!isSynchronized ? (
             <div className="p-8 text-center space-y-2">
               <Info className="mx-auto h-8 w-8 text-slate-400" />
-              <div className="text-sm font-semibold text-slate-900 dark:text-white">Groups Not Synchronized</div>
+              <div className="text-sm font-semibold text-slate-900 dark:text-white">Group inventory is awaiting collection</div>
               <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
                 No synchronized group records were found in the current tenant API response. Backend Microsoft Graph group synchronization is required to populate this inventory.
               </p>

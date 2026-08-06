@@ -145,7 +145,7 @@ function scoreColor(score: number) {
 }
 
 function formatSyncTime(timeStr: string | null) {
-  if (!timeStr) return 'Not synced yet'
+  if (!timeStr) return 'Collection pending'
   if (timeStr.includes('T')) {
     try {
       const d = new Date(timeStr)
@@ -1327,7 +1327,7 @@ export default function TenantsPage() {
                               {tenant.name}
                             </h3>
                             <p className="text-sm text-slate-500 dark:text-slate-400">
-                              {tenant.domain || 'Domain not synced'}
+                              {tenant.domain || 'Domain pending collection'}
                             </p>
                           </div>
                         </div>
@@ -1354,7 +1354,7 @@ export default function TenantsPage() {
                           </p>
                           {tenant.secureScore == null ? (
                             <span className="text-sm font-semibold text-slate-500">
-                              Not synced
+                              Collection pending
                             </span>
                           ) : (
                             <div className="flex items-end gap-1">
@@ -1376,7 +1376,7 @@ export default function TenantsPage() {
                           </p>
                           {tenant.licenseCount == null ? (
                             <span className="text-sm font-semibold text-slate-500">
-                              Not synced
+                              Collection pending
                             </span>
                           ) : (
                             <div className="flex items-end gap-1">
@@ -1399,7 +1399,7 @@ export default function TenantsPage() {
                           <Clock className="h-3.5 w-3.5" />
                           {tenant.lastSync
                             ? `Synced ${formatSyncTime(tenant.lastSync)}`
-                            : 'Not synced yet'}
+                            : 'Collection pending'}
                         </span>
                         <span className="text-sm font-semibold text-blue-600 flex items-center gap-1 group-hover:underline">
                           Manage Tenant <ChevronRight className="h-4 w-4" />
@@ -1482,7 +1482,7 @@ export default function TenantsPage() {
                               {tenant.name}
                             </Link>
                             <p className="text-xs text-slate-500 dark:text-slate-400">
-                              {tenant.domain || 'Domain not synced'}
+                              {tenant.domain || 'Domain pending collection'}
                             </p>
                           </div>
                         </div>
@@ -1500,7 +1500,7 @@ export default function TenantsPage() {
                       <td className="py-3 px-4 whitespace-nowrap font-medium">
                         {tenant.secureScore == null ? (
                           <span className="text-xs text-slate-400">
-                            Not synced
+                            Collection pending
                           </span>
                         ) : (
                           <span
@@ -1518,7 +1518,7 @@ export default function TenantsPage() {
                           <Clock className="h-3.5 w-3.5 shrink-0 text-slate-400" />
                           {tenant.lastSync
                             ? formatSyncTime(tenant.lastSync)
-                            : 'Not synced yet'}
+                            : 'Collection pending'}
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right whitespace-nowrap">
@@ -1554,7 +1554,7 @@ export default function TenantsPage() {
                           {tenant.name}
                         </Link>
                         <p className="text-xs text-slate-500 dark:text-slate-400">
-                          {tenant.domain || 'Domain not synced'}
+                          {tenant.domain || 'Domain pending collection'}
                         </p>
                       </div>
                     </div>
@@ -1579,7 +1579,7 @@ export default function TenantsPage() {
                       </span>
                       {tenant.secureScore == null ? (
                         <span className="text-xs text-slate-400 font-medium">
-                          Not synced
+                          Collection pending
                         </span>
                       ) : (
                         <span
@@ -1599,7 +1599,7 @@ export default function TenantsPage() {
                       <Clock className="h-3.5 w-3.5" />
                       {tenant.lastSync
                         ? formatSyncTime(tenant.lastSync)
-                        : 'Not synced'}
+                        : 'Collection pending'}
                     </span>
                     <Link href={`/tenants/${tenant.id}`}>
                       <Button

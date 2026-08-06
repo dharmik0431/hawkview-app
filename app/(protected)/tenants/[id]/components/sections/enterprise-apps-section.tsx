@@ -309,7 +309,7 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
           {!isSynchronized ? (
             <div className="p-8 text-center space-y-2">
               <Info className="mx-auto h-8 w-8 text-slate-400" />
-              <div className="text-sm font-semibold text-slate-900 dark:text-white">Enterprise Applications Not Synchronized</div>
+              <div className="text-sm font-semibold text-slate-900 dark:text-white">Enterprise application inventory is awaiting collection</div>
               <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
                 No Service Principal / Enterprise Application objects were found in the current tenant API payload. Entra ID enterprise app synchronization is required for this view.
               </p>

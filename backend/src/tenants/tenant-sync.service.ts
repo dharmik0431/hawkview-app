@@ -192,6 +192,12 @@ interface GraphGroup {
   securityEnabled?: boolean | null
   groupTypes?: string[] | null
   visibility?: string | null
+  onPremisesSyncEnabled?: boolean | null
+  owners?: Array<{
+    id?: string
+    displayName?: string | null
+    userPrincipalName?: string | null
+  }>
 }
 
 interface GraphGroupsPage {
@@ -214,6 +220,7 @@ type EntraSnapshotResource =
   | 'SERVICE_PRINCIPALS'
   | 'APPLICATIONS'
   | 'SECURITY_DEFAULTS'
+  | 'GROUPS'
   | 'SHAREPOINT_SITES'
   | 'SHAREPOINT_SETTINGS'
   | 'SHAREPOINT_USAGE'
@@ -744,7 +751,8 @@ export class TenantSyncService {
           'accountEnabled,appRoleAssignmentRequired,createdDateTime,homepage,' +
           'loginUrl,publisherName,verifiedPublisher,tags,' +
           'preferredSingleSignOnMode,notificationEmailAddresses,appRoles,' +
-          'oauth2PermissionScopes'
+          'oauth2PermissionScopes&' +
+          '$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)'
       ),
       this.syncEntraCollection(
         tenant,
@@ -1087,7 +1095,8 @@ export class TenantSyncService {
       let groupsUrl =
         'https://graph.microsoft.com/v1.0/groups?' +
         '$select=id,displayName,description,mail,mailNickname,mailEnabled,' +
-        'securityEnabled,groupTypes,visibility&$top=999'
+        'securityEnabled,groupTypes,visibility,onPremisesSyncEnabled&' +
+        '$expand=owners($select=id,displayName,userPrincipalName)&$top=999'
 
       while (groupsUrl) {
         if (!groupsUrl.startsWith('https://graph.microsoft.com/')) {
@@ -1248,6 +1257,8 @@ export class TenantSyncService {
           },
         })
       })
+
+      await this.saveSnapshot(tenant, 'GROUPS', groups)
     })
   }
 
@@ -2429,28 +2440,27 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'SHAREPOINT_USAGE', async () => {
-      const reportResponse = await fetch(
-        "https://graph.microsoft.com/v1.0/reports/getSharePointSiteUsageDetail(period='D30')",
-        {
+      const downloadReport = async (reportUrl: string, label: string) => {
+        const reportResponse = await fetch(reportUrl, {
           headers: {
             Authorization: `Bearer ${accessToken}`,
             Accept: 'text/csv',
           },
           redirect: 'manual',
           signal: AbortSignal.timeout(30_000),
+        })
+        if (reportResponse.ok) return reportResponse.text()
+        if (reportResponse.status !== 302) {
+          const graphRequestId = reportResponse.headers.get('request-id')
+          throw new Error(
+            `Microsoft ${label} usage synchronization returned ${reportResponse.status}${
+              graphRequestId ? ` (request ${graphRequestId})` : ''
+            }.`
+          )
         }
-      )
-      let reportText: string
-      if (reportResponse.ok) {
-        // Graph normally redirects to a short-lived report URL, but some
-        // environments return the CSV directly. Both are valid responses.
-        reportText = await reportResponse.text()
-      } else if (reportResponse.status === 302) {
         const downloadUrl = reportResponse.headers.get('location')
         if (!downloadUrl?.startsWith('https://')) {
-          throw new Error(
-            'Microsoft returned an invalid SharePoint usage report link.'
-          )
+          throw new Error(`Microsoft returned an invalid ${label} report link.`)
         }
         const downloadResponse = await fetch(downloadUrl, {
           headers: { Accept: 'text/csv,application/octet-stream' },
@@ -2458,19 +2468,29 @@ export class TenantSyncService {
         })
         if (!downloadResponse.ok) {
           throw new Error(
-            `Microsoft SharePoint usage report download returned ${downloadResponse.status}.`
+            `Microsoft ${label} report download returned ${downloadResponse.status}.`
           )
         }
-        reportText = await downloadResponse.text()
-      } else {
-        const graphRequestId = reportResponse.headers.get('request-id')
-        throw new Error(
-          `Microsoft SharePoint usage synchronization returned ${reportResponse.status}${
-            graphRequestId ? ` (request ${graphRequestId})` : ''
-          }.`
-        )
+        return downloadResponse.text()
       }
-      const rows = parseCsvRows(reportText)
+
+      const [sharePointReport, oneDriveReport] = await Promise.all([
+        downloadReport(
+          "https://graph.microsoft.com/v1.0/reports/getSharePointSiteUsageDetail(period='D30')",
+          'SharePoint'
+        ),
+        downloadReport(
+          "https://graph.microsoft.com/v1.0/reports/getOneDriveUsageAccountDetail(period='D30')",
+          'OneDrive'
+        ),
+      ])
+      const payload = [
+        {
+          hawkviewDataset: 'microsoft-usage-reports-v1',
+          sharePointSites: parseCsvRows(sharePointReport),
+          oneDriveAccounts: parseCsvRows(oneDriveReport),
+        },
+      ]
       await this.prisma.tenantEntraSnapshot.upsert({
         where: {
           customerTenantId_resourceType: {
@@ -2482,11 +2502,11 @@ export class TenantSyncService {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
           resourceType: 'SHAREPOINT_USAGE',
-          payload: rows as never,
+          payload: payload as never,
           observedAt: new Date(),
         },
         update: {
-          payload: rows as never,
+          payload: payload as never,
           observedAt: new Date(),
         },
       })
@@ -2744,7 +2764,16 @@ export class TenantSyncService {
     const sharePointSites = snapshotByResource.get('SHAREPOINT_SITES') ?? []
     const sharePointSettings = (snapshotByResource.get('SHAREPOINT_SETTINGS') ??
       [])[0]
-    const sharePointUsage = snapshotByResource.get('SHAREPOINT_USAGE') ?? []
+    const sharePointUsageSnapshot =
+      snapshotByResource.get('SHAREPOINT_USAGE') ?? []
+    const combinedUsage =
+      sharePointUsageSnapshot.length === 1 &&
+      sharePointUsageSnapshot[0]?.hawkviewDataset ===
+        'microsoft-usage-reports-v1'
+        ? sharePointUsageSnapshot[0]
+        : null
+    const sharePointUsage = combinedUsage?.sharePointSites ?? sharePointUsageSnapshot
+    const oneDriveUsage = combinedUsage?.oneDriveAccounts ?? []
     const exchangeMailboxes = snapshotByResource.get('EXCHANGE_MAILBOXES') ?? []
     const exchangeMailboxUsage =
       snapshotByResource.get('EXCHANGE_MAILBOX_USAGE') ?? []
@@ -2758,22 +2787,44 @@ export class TenantSyncService {
         .filter((row) => typeof row?.['User Principal Name'] === 'string')
         .map((row) => [String(row['User Principal Name']).toLowerCase(), row])
     )
+    const oneDriveUsageByUpn = new Map<string, Record<string, string>>(
+      oneDriveUsage
+        .filter((row: any) => typeof row?.['Owner Principal Name'] === 'string')
+        .map((row: any) => [
+          String(row['Owner Principal Name']).toLowerCase(),
+          row,
+        ])
+    )
+    const groupSnapshotById = new Map(
+      (snapshotByResource.get('GROUPS') ?? [])
+        .filter((group: any) => typeof group?.id === 'string')
+        .map((group: any) => [group.id, group])
+    )
     // The mailbox usage report can anonymize user identities in Microsoft 365.
     // It is enrichment data, not the source of truth for mailbox existence, so
     // never remove Graph directory mailboxes merely because their UPN cannot be
     // joined to a usage row.
     const exchangeMailboxInventory = exchangeMailboxes
-    const sharePointUsageByUrl = new Map(
+    const sharePointUsageByUrl = new Map<string, Record<string, string>>(
       sharePointUsage
-        .filter((row) => normalizeSharePointUrl(row?.['Site URL']))
-        .map((row) => [normalizeSharePointUrl(row['Site URL']), row])
+        .filter((row: Record<string, string>) =>
+          normalizeSharePointUrl(row?.['Site URL'])
+        )
+        .map((row: Record<string, string>) => [
+          normalizeSharePointUrl(row['Site URL']),
+          row,
+        ])
     )
-    const sharePointUsageBySiteId = new Map(
+    const sharePointUsageBySiteId = new Map<string, Record<string, string>>(
       sharePointUsage
         .filter(
-          (row) => typeof row?.['Site Id'] === 'string' && row['Site Id'].trim()
+          (row: Record<string, string>) =>
+            typeof row?.['Site Id'] === 'string' && row['Site Id'].trim()
         )
-        .map((row) => [row['Site Id'].trim().toLowerCase(), row])
+        .map((row: Record<string, string>) => [
+          row['Site Id'].trim().toLowerCase(),
+          row,
+        ])
     )
     const parseReportBytes = (value: unknown) => {
       if (typeof value !== 'string' || !value.trim()) return null
@@ -2799,12 +2850,18 @@ export class TenantSyncService {
       if (url.includes('-my.sharepoint.com/personal/')) return 'OneDrive'
       if (template.includes('SITEPAGEPUBLISHING')) return 'Communication site'
       if (template.includes('GROUP')) return 'Microsoft 365 group site'
-      return template ? 'SharePoint site' : 'Not synchronized'
+      return 'SharePoint site'
     }
     const bytesToGb = (value: unknown) =>
       typeof value === 'number'
         ? Math.round((value / 1024 ** 3) * 100) / 100
         : null
+    const bytesToUsageLabel = (value: unknown) => {
+      const bytes = parseReportBytes(value)
+      if (bytes === null) return 'No usage reported'
+      const gigabytes = Math.round((bytes / 1024 ** 3) * 100) / 100
+      return `${gigabytes} GB`
+    }
     const authRegistrations = snapshotByResource.get('AUTH_REGISTRATIONS') ?? []
     const authRegistrationByUserId = new Map(
       authRegistrations
@@ -2852,7 +2909,7 @@ export class TenantSyncService {
         lastSync:
           typeof device?.approximateLastSignInDateTime === 'string'
             ? device.approximateLastSignInDateTime
-            : 'Not synchronized',
+            : 'No activity reported',
         status:
           typeof device?.isCompliant === 'boolean'
             ? device.isCompliant
@@ -2987,6 +3044,9 @@ export class TenantSyncService {
           )
           const roleNames = roleNamesByUserId.get(user.microsoftUserId) ?? []
           const lastSignIn = latestSignInByUserId.get(user.microsoftUserId)
+          const normalizedUpn = user.userPrincipalName.toLowerCase()
+          const oneDrive = oneDriveUsageByUpn.get(normalizedUpn)
+          const mailboxUsage = exchangeUsageByUpn.get(normalizedUpn)
           return {
             id: user.microsoftUserId,
             name: user.displayName,
@@ -3005,9 +3065,13 @@ export class TenantSyncService {
             lastLogin:
               lastSignIn?.eventDateTime instanceof Date
                 ? lastSignIn.eventDateTime.toISOString()
-                : 'Not synchronized',
-            driveUsage: 'Not synchronized',
-            mailUsage: 'Not synchronized',
+                : 'No sign-in recorded',
+            driveUsage: oneDrive
+              ? bytesToUsageLabel(oneDrive['Storage Used (Byte)'])
+              : 'No usage reported',
+            mailUsage: mailboxUsage
+              ? bytesToUsageLabel(mailboxUsage['Storage Used (Byte)'])
+              : 'No usage reported',
             authMethods: Array.isArray(registration?.methodsRegistered)
               ? registration.methodsRegistered
               : [],
@@ -3221,19 +3285,27 @@ export class TenantSyncService {
           })),
           groups: directoryGroups
             .filter((group) => group.mailEnabled)
-            .map((group) => ({
-              id: group.microsoftGroupId,
-              name: group.displayName,
-              type: group.groupTypes.includes('Unified')
-                ? 'Microsoft365'
-                : group.securityEnabled
-                  ? 'MailEnabledSecurity'
-                  : 'DistributionList',
-              email: group.mail ?? '',
-              membersCount: group.memberships.length,
-              owners: [],
-              description: group.description ?? undefined,
-            })),
+            .map((group) => {
+              const graphGroup = groupSnapshotById.get(group.microsoftGroupId)
+              return {
+                id: group.microsoftGroupId,
+                name: group.displayName,
+                type: group.groupTypes.includes('Unified')
+                  ? 'Microsoft365'
+                  : group.securityEnabled
+                    ? 'MailEnabledSecurity'
+                    : 'DistributionList',
+                email: group.mail ?? '',
+                membersCount: group.memberships.length,
+                owners: Array.isArray(graphGroup?.owners)
+                  ? graphGroup.owners.map(
+                      (owner: any) =>
+                        owner.displayName ?? owner.userPrincipalName ?? owner.id
+                    )
+                  : [],
+                description: group.description ?? undefined,
+              }
+            }),
         },
         sharepoint: {
           sync: {
@@ -3291,7 +3363,7 @@ export class TenantSyncService {
                 ? sharePointSettings.isSitesStorageLimitAutomatic
                   ? 'Automatic'
                   : 'Manual'
-                : 'Not synchronized',
+                : 'Unavailable from Microsoft Graph',
             // Graph exposes one tenant sharing capability for the combined
             // SharePoint and OneDrive settings resource. Until Microsoft
             // exposes separate values, show the same authoritative tenant
@@ -3330,7 +3402,8 @@ export class TenantSyncService {
               storageQuotaGB: bytesToGb(
                 reportStorageAllocated ?? site?.driveQuota?.total
               ),
-              lastActivity: usage?.['Last Activity Date'] || 'Not synchronized',
+              lastActivity:
+                usage?.['Last Activity Date'] || 'No activity reported',
             }
           }),
           deletedSites: [],
@@ -3365,6 +3438,7 @@ export class TenantSyncService {
                 }
               : null,
           groups: directoryGroups.map((group) => {
+            const graphGroup = groupSnapshotById.get(group.microsoftGroupId)
             const isUnified = group.groupTypes.includes('Unified')
             const isDynamic = group.groupTypes.includes('DynamicMembership')
             const type = isUnified
@@ -3389,8 +3463,16 @@ export class TenantSyncService {
               membershipType: isDynamic ? 'Dynamic' : 'Assigned',
               visibility: group.visibility,
               membersCount: group.memberships.length,
-              owners: [],
-              onPremisesSyncEnabled: null,
+              owners: Array.isArray(graphGroup?.owners)
+                ? graphGroup.owners.map(
+                    (owner: any) =>
+                      owner.displayName ?? owner.userPrincipalName ?? owner.id
+                  )
+                : [],
+              onPremisesSyncEnabled:
+                typeof graphGroup?.onPremisesSyncEnabled === 'boolean'
+                  ? graphGroup.onPremisesSyncEnabled
+                  : false,
             }
           }),
           enterpriseApplications: servicePrincipals.map((principal) => ({
@@ -3402,7 +3484,7 @@ export class TenantSyncService {
             publisher:
               principal.verifiedPublisher?.displayName ??
               principal.publisherName ??
-              'Not synchronized',
+              'Publisher not verified',
             verifiedPublisher: Boolean(
               principal.verifiedPublisher?.verifiedPublisherId
             ),
@@ -3413,9 +3495,39 @@ export class TenantSyncService {
             homepageUrl: principal.homepage,
             loginUrl: principal.loginUrl,
             preferredSingleSignOnMode: principal.preferredSingleSignOnMode,
-            assignedUsers: null,
-            assignedGroups: null,
-            assignedServicePrincipals: null,
+            assignedUsers: Array.isArray(principal.appRoleAssignedTo)
+              ? principal.appRoleAssignedTo
+                  .filter(
+                    (assignment: any) => assignment.principalType === 'User'
+                  )
+                  .map(
+                    (assignment: any) =>
+                      assignment.principalDisplayName ?? assignment.principalId
+                  )
+              : [],
+            assignedGroups: Array.isArray(principal.appRoleAssignedTo)
+              ? principal.appRoleAssignedTo
+                  .filter(
+                    (assignment: any) => assignment.principalType === 'Group'
+                  )
+                  .map(
+                    (assignment: any) =>
+                      assignment.principalDisplayName ?? assignment.principalId
+                  )
+              : [],
+            assignedServicePrincipals: Array.isArray(
+              principal.appRoleAssignedTo
+            )
+              ? principal.appRoleAssignedTo
+                  .filter(
+                    (assignment: any) =>
+                      assignment.principalType === 'ServicePrincipal'
+                  )
+                  .map(
+                    (assignment: any) =>
+                      assignment.principalDisplayName ?? assignment.principalId
+                  )
+              : [],
             delegatedGrants: [],
             applicationPermissions: [],
           })),

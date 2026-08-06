@@ -102,16 +102,16 @@ interface EntraOverviewSectionProps {
 }
 
 function formatSyncTimestamp(lastSyncIso?: string) {
-  if (!lastSyncIso) return 'Not synchronized'
+  if (!lastSyncIso) return 'Awaiting collection'
   try {
     const d = new Date(lastSyncIso)
-    if (isNaN(d.getTime())) return 'Not synchronized'
+    if (isNaN(d.getTime())) return 'Awaiting collection'
     return new Intl.DateTimeFormat(undefined, {
       dateStyle: 'medium',
       timeStyle: 'short',
     }).format(d)
   } catch {
-    return 'Not synchronized'
+    return 'Awaiting collection'
   }
 }
 
@@ -267,7 +267,7 @@ export default function EntraOverviewSection({
         name: 'Conditional Access',
         value: caPoliciesSynchronized
           ? `${enabledCaPoliciesCount} of ${caPolicies.length} policies enabled`
-          : 'Not synchronized',
+          : 'Awaiting collection',
         detail: 'Access control and risk enforcement',
         status: !caPoliciesSynchronized
           ? 'neutral'
@@ -281,7 +281,7 @@ export default function EntraOverviewSection({
         name: 'MFA coverage',
         value: usersSynchronized
           ? `${mfaEnforcedUsersCount} of ${activeUsersCount} registered (${mfaCoveragePct}%)`
-          : 'Not synchronized',
+          : 'Awaiting collection',
         detail: 'Multi-factor authentication status',
         status: !usersSynchronized
           ? 'neutral'
@@ -295,7 +295,7 @@ export default function EntraOverviewSection({
         name: 'Authentication methods',
         value: authMethodsSynchronized
           ? `${authMethods.length} methods configured`
-          : 'Not synchronized',
+          : 'Awaiting collection',
         detail: 'FIDO2, Authenticator & SMS settings',
         status: !authMethodsSynchronized ? 'neutral' : 'healthy',
         action: authMethodsSynchronized
@@ -307,7 +307,7 @@ export default function EntraOverviewSection({
         name: 'Named locations',
         value: namedLocationsSynchronized
           ? `${namedLocations.length} locations configured`
-          : 'Not synchronized',
+          : 'Awaiting collection',
         detail: 'Trusted corporate network boundaries',
         status: !namedLocationsSynchronized ? 'neutral' : 'healthy',
         action: namedLocationsSynchronized
@@ -326,12 +326,12 @@ export default function EntraOverviewSection({
         id: 'sync',
         name: 'Synchronization health',
         value:
-          formattedSyncTime !== 'Not synchronized'
+          formattedSyncTime !== 'Awaiting collection'
             ? `Last sync: ${formattedSyncTime}`
-            : 'Not synchronized',
+            : 'Awaiting collection',
         detail: 'Directory data freshness',
         status:
-          formattedSyncTime !== 'Not synchronized' ? 'healthy' : 'neutral',
+          formattedSyncTime !== 'Awaiting collection' ? 'healthy' : 'neutral',
         action: undefined,
       },
     ]
@@ -404,7 +404,7 @@ export default function EntraOverviewSection({
                   </div>
                 ) : (
                   <div className="text-sm font-medium text-muted-foreground">
-                    Not synchronized
+                    Awaiting collection
                   </div>
                 )}
                 <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
@@ -426,7 +426,7 @@ export default function EntraOverviewSection({
                       </span>
                     ) : (
                       <span className="text-[11px] text-muted-foreground">
-                        Not synchronized
+                        Awaiting collection
                       </span>
                     )}
                   </div>
@@ -475,7 +475,7 @@ export default function EntraOverviewSection({
                       </span>
                     ) : (
                       <span className="text-[11px] text-muted-foreground">
-                        Not synchronized
+                        Awaiting collection
                       </span>
                     )}
                   </div>
@@ -536,7 +536,7 @@ export default function EntraOverviewSection({
                       </span>
                     ) : (
                       <span className="text-[11px] text-muted-foreground">
-                        Not synchronized
+                        Awaiting collection
                       </span>
                     )}
                   </div>
@@ -586,7 +586,7 @@ export default function EntraOverviewSection({
                     totalGroups
                   ) : (
                     <span className="text-xs font-normal text-muted-foreground">
-                      Not synchronized
+                      Awaiting collection
                     </span>
                   )}
                 </div>
@@ -600,7 +600,7 @@ export default function EntraOverviewSection({
                     totalDevices
                   ) : (
                     <span className="text-xs font-normal text-muted-foreground">
-                      Not synchronized
+                      Awaiting collection
                     </span>
                   )}
                 </div>
@@ -614,7 +614,7 @@ export default function EntraOverviewSection({
                     adminUsers
                   ) : (
                     <span className="text-xs font-normal text-muted-foreground">
-                      Not synchronized
+                      Awaiting collection
                     </span>
                   )}
                 </div>

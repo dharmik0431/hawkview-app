@@ -86,7 +86,7 @@ export default function LicenseActivitySection({
             minute: '2-digit',
             hour12: true,
           })
-        : 'Not synchronized'
+        : 'Awaiting collection'
 
       const rawAct = evt.activity || evt.action || evt.type || 'Assigned'
       let normalizedActivity = rawAct
