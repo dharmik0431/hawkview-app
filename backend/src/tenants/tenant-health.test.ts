@@ -88,6 +88,7 @@ test('detects a disabled Conditional Access state inside Microsoft modified prop
       category: 'Policy',
       operationType: 'Update',
       result: 'success',
+      initiatedBy: null,
       targetResources: [{
         displayName: 'Require MFA',
         modifiedProperties: [{ displayName: 'State', newValue: 'disabled' }],
