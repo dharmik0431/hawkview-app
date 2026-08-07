@@ -22,6 +22,8 @@ export const TenantSchema = z.object({
     severity: z.enum(['critical', 'high', 'medium']),
     why: z.string(),
     detectedAt: z.string().nullable(),
+    actionLabel: z.string().optional(),
+    actionUrl: z.string().optional(),
   })),
   licenseCount: z.number().int().nullable(),
   requiredPermissions: z.array(

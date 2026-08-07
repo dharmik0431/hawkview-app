@@ -1,6 +1,7 @@
 'use client'
 
 import * as React from 'react'
+import { useRouter } from 'next/navigation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -26,6 +27,8 @@ type AttentionItem = {
   severity: Severity
   why?: string
   detectedAt?: string
+  actionLabel?: string
+  actionUrl?: string
 }
 
 function topAttention(items: AttentionItem[]) {
@@ -203,6 +206,7 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
 }
 
 export default function DashboardPage() {
+  const router = useRouter()
   const { data } = useTenants()
   const [tab, setTab] = React.useState<TabKey>('queue')
 
@@ -544,9 +548,13 @@ export default function DashboardPage() {
                         className="h-9 rounded-lg"
                         onClick={(e) => {
                           e.preventDefault()
+                          router.push(
+                            q.item.actionUrl ??
+                              `/tenants/${encodeURIComponent(q.tenantId)}/settings`
+                          )
                         }}
                       >
-                        {actionLabel(q.item.severity)}
+                        {q.item.actionLabel ?? actionLabel(q.item.severity)}
                       </Button>
                     </div>
                   </div>

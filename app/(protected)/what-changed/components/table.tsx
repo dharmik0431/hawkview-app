@@ -1,6 +1,7 @@
 'use client'
 
 import * as React from 'react'
+import { useSearchParams } from 'next/navigation'
 import { History, ShieldAlert, AlertCircle, RefreshCw, X } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { apiClient } from '@/lib/api/client'
@@ -83,19 +84,29 @@ function getCategoryHeadingLabel(key: SummaryCategoryKey): string {
 }
 
 export function WhatChangedView() {
+  const searchParams = useSearchParams()
+  const linkedTenantId = searchParams.get('tenantId')
+  const linkedFrom = searchParams.get('from')
+
   // Time Window State (Default 24h)
-  const initialRange = React.useMemo(() => getQuickRangeDates('24h', false), [])
+  const initialRange = React.useMemo(() => {
+    const fallback = getQuickRangeDates('24h', false)
+    if (!linkedFrom) return fallback
+    const parsed = new Date(linkedFrom)
+    if (Number.isNaN(parsed.getTime())) return fallback
+    return { from: parsed.toISOString(), to: new Date().toISOString() }
+  }, [linkedFrom])
   const [timeWindow, setTimeWindow] = React.useState<TimeWindowValue>({
     from: initialRange.from,
     to: initialRange.to,
-    quickRange: '24h',
+    quickRange: linkedFrom ? 'custom' : '24h',
     useUtc: false,
     is12Hour: true,
   })
 
   // Toolbar Filters State
   const [toolbarFilters, setToolbarFilters] = React.useState<ToolbarFilterState>({
-    tenant: 'all',
+    tenant: linkedTenantId || 'all',
     search: '',
     severity: 'All',
     categories: [],
