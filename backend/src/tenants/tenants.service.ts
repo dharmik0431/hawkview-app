@@ -10,6 +10,7 @@ import {
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MembershipRole } from '../generated/prisma/enums.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 
 const ORGANIZATION_WIDE_TENANT_ROLES = [
@@ -26,7 +27,9 @@ export class TenantsService {
     @Inject(PrismaService)
     private readonly prisma: PrismaService,
     @Inject(MicrosoftConsentService)
-    private readonly microsoftConsent: MicrosoftConsentService
+    private readonly microsoftConsent: MicrosoftConsentService,
+    @Inject(NotificationsService)
+    private readonly notifications: NotificationsService
   ) {}
 
   private parseMicrosoftTenantId(body: unknown) {
@@ -744,6 +747,13 @@ export class TenantsService {
 
       if (connected) {
         await this.markInitialSyncDue(tenant.id, tenant.organizationId)
+        await this.notifyConnectionAuthorized(tenant.id, tenant.organizationId)
+      } else {
+        await this.notifyMissingPermissions(
+          tenant.id,
+          tenant.organizationId,
+          verification.missingPermissions
+        )
       }
 
       return this.buildFrontendConsentRedirect(
@@ -862,6 +872,13 @@ export class TenantsService {
 
       if (connected) {
         await this.markInitialSyncDue(tenant.id, tenant.organizationId)
+        await this.notifyConnectionAuthorized(tenant.id, tenant.organizationId)
+      } else {
+        await this.notifyMissingPermissions(
+          tenant.id,
+          tenant.organizationId,
+          verification.missingPermissions
+        )
       }
 
       return this.buildFrontendConsentRedirect(
@@ -903,6 +920,65 @@ export class TenantsService {
         lastErrorCode: code.slice(0, 100),
         lastErrorMessage: message.slice(0, 2000),
       },
+    })
+    await this.notifications.publishIncident({
+      organizationId: tenant.organizationId,
+      customerTenantId: tenant.id,
+      eventType: 'tenant.connection_failed',
+      category: 'error',
+      severity: 'high',
+      title: 'Microsoft 365 authorization failed',
+      description: message,
+      dedupeKey: `tenant:${tenant.id}:connection`,
+      source: 'microsoft-consent',
+      actionUrl: `/tenants/${tenant.id}/settings`,
+      actionLabel: 'Review connection',
+      metadata: { errorCode: code },
+    })
+  }
+
+  private async notifyConnectionAuthorized(
+    customerTenantId: string,
+    organizationId: string
+  ) {
+    await this.notifications.resolveIncident(
+      organizationId,
+      `tenant:${customerTenantId}:connection`
+    )
+    await this.notifications.publishIncident({
+      organizationId,
+      customerTenantId,
+      eventType: 'tenant.connection_authorized',
+      category: 'success',
+      severity: 'info',
+      title: 'Microsoft 365 connection authorized',
+      description:
+        'HawkView verified the tenant connection and queued the initial synchronization.',
+      dedupeKey: `tenant:${customerTenantId}:onboarding-authorized`,
+      source: 'microsoft-consent',
+      actionUrl: `/tenants/${customerTenantId}`,
+      actionLabel: 'View tenant',
+    })
+  }
+
+  private async notifyMissingPermissions(
+    customerTenantId: string,
+    organizationId: string,
+    missingPermissions: string[]
+  ) {
+    await this.notifications.publishIncident({
+      organizationId,
+      customerTenantId,
+      eventType: 'tenant.connection_permissions_missing',
+      category: 'warning',
+      severity: 'high',
+      title: 'Microsoft 365 permissions need attention',
+      description: `${missingPermissions.length} required permission${missingPermissions.length === 1 ? '' : 's'} must be approved before synchronization can begin.`,
+      dedupeKey: `tenant:${customerTenantId}:connection`,
+      source: 'microsoft-consent',
+      actionUrl: `/tenants/${customerTenantId}/settings`,
+      actionLabel: 'Review permissions',
+      metadata: { missingPermissions },
     })
   }
 

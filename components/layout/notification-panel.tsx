@@ -12,6 +12,7 @@ import {
   Trash2,
   ExternalLink,
   Sparkles,
+  X,
 } from 'lucide-react'
 import {
   useNotifications,
@@ -26,7 +27,7 @@ import {
 } from '@/components/ui/tooltip'
 
 export function NotificationPanel() {
-  const { notifications, unreadCount, markAsRead, markAllAsRead, clearRead } =
+  const { notifications, unreadCount, markAsRead, dismiss, markAllAsRead, clearRead } =
     useNotifications()
 
   const [isOpen, setIsOpen] = useState(false)
@@ -285,6 +286,12 @@ export function NotificationPanel() {
                         {notif.description}
                       </p>
 
+                      {(notif.occurrenceCount ?? 1) > 1 && (
+                        <p className="mt-1 text-[10px] font-medium text-muted-foreground">
+                          Occurred {notif.occurrenceCount} times
+                        </p>
+                      )}
+
                       {notif.actionUrl && (
                         <div className="mt-1.5">
                           <Link
@@ -315,6 +322,17 @@ export function NotificationPanel() {
                         className="h-2 w-2 rounded-full bg-blue-600 shrink-0 mt-1.5"
                       />
                     )}
+                    <button
+                      type="button"
+                      aria-label={`Dismiss ${notif.title}`}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        dismiss(notif.id)
+                      }}
+                      className="absolute right-2 bottom-2 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+                    >
+                      <X className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
                   </div>
                 ))
               )}

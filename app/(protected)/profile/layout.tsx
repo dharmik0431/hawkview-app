@@ -30,7 +30,6 @@ export default function ProfileLayout({
       name: 'Notifications',
       href: '/profile/notifications',
       icon: Bell,
-      badge: 'Soon',
       active: pathname === '/profile/notifications',
     },
     {
@@ -102,11 +101,6 @@ export default function ProfileLayout({
                     <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
                     <span>{item.name}</span>
                   </div>
-                  {item.badge && (
-                    <span className="text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border">
-                      {item.badge}
-                    </span>
-                  )}
                 </Link>
               )
             })}
