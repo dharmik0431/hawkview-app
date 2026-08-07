@@ -11,29 +11,13 @@ import { CheckCircle2, Info, AlertTriangle, XCircle, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/components/providers/auth-provider'
 import { apiClient } from '@/lib/api/client'
+import {
+  requestNotifications,
+  type NotificationCategory,
+  type NotificationItem,
+} from '@/lib/notifications/normalize-response'
 
-export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
-
-export interface NotificationItem {
-  id: string
-  category: NotificationCategory
-  title: string
-  description: string
-  timestamp: string
-  read: boolean
-  actionUrl?: string
-  actionLabel?: string
-  occurrenceCount?: number
-  resolved?: boolean
-}
-
-interface NotificationListResponse {
-  items: NotificationItem[]
-  total: number
-  page: number
-  pageSize: number
-  unreadCount: number
-}
+export type { NotificationCategory, NotificationItem }
 
 export interface ToastItem {
   id: string
@@ -85,12 +69,13 @@ export function NotificationProvider({
     }
 
     const load = () => {
-      void apiClient
-        .get<NotificationListResponse | NotificationItem[]>('/api/notifications')
-        .then((response) => {
-          if (!cancelled) setNotifications(Array.isArray(response) ? response : response.items)
-        })
-        .catch((error) => console.error('Failed to load notifications', error))
+      void requestNotifications(() =>
+        apiClient.get<unknown>('/api/notifications')
+      ).then((result) => {
+        if (!cancelled && result.shouldReplace) {
+          setNotifications(result.items)
+        }
+      })
     }
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') load()
