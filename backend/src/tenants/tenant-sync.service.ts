@@ -14,6 +14,7 @@ import { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { resolveDomainDnsHealth } from './domain-dns-health.js'
+import { collectGroupMemberships } from './group-membership-sync.js'
 import {
   IpGeolocationService,
   type SignInLocation,
@@ -1229,7 +1230,6 @@ export class TenantSyncService {
         groupsUrl = page['@odata.nextLink'] ?? ''
       }
 
-      const memberIdsByGroupId = new Map<string, string[]>()
       const fetchGroupMemberIds = async (groupId: string) => {
         const memberIds: string[] = []
         let membersUrl =
@@ -1247,8 +1247,13 @@ export class TenantSyncService {
             signal: AbortSignal.timeout(20_000),
           })
           if (!response.ok) {
+            const detail = await describeGraphError(response)
+            const requestId =
+              response.headers.get('request-id') ??
+              response.headers.get('client-request-id')
             throw new Error(
-              `Microsoft group membership synchronization returned ${response.status}.`
+              `Microsoft group membership synchronization returned ${response.status}${detail}` +
+                (requestId ? ` (request ${requestId})` : '')
             )
           }
           const page = (await response.json()) as GraphGroupMembersPage
@@ -1259,16 +1264,26 @@ export class TenantSyncService {
           )
           membersUrl = page['@odata.nextLink'] ?? ''
         }
-        memberIdsByGroupId.set(groupId, [...new Set(memberIds)])
+        return memberIds
       }
 
       // Keep concurrency bounded to avoid overwhelming Microsoft Graph while
       // still making the initial snapshot practical for tenants with many groups.
-      for (let index = 0; index < groups.length; index += 5) {
-        await Promise.all(
-          groups
-            .slice(index, index + 5)
-            .map((group) => fetchGroupMemberIds(group.id as string))
+      const membershipTargets = groups.map((group) => ({
+        id: group.id as string,
+        displayName: group.displayName,
+      }))
+      const { memberIdsByGroupId, failures: membershipFailures } =
+        await collectGroupMemberships(membershipTargets, (group) =>
+          fetchGroupMemberIds(group.id)
+        )
+      for (const failure of membershipFailures) {
+        const message =
+          failure.error instanceof Error
+            ? failure.error.message
+            : String(failure.error)
+        this.logger.warn(
+          `Skipped membership refresh for Microsoft group ${failure.groupName} (${failure.groupId}) in tenant ${tenant.id}: ${message}`
         )
       }
 
@@ -1323,6 +1338,10 @@ export class TenantSyncService {
               lastSeenAt: observedAt,
             },
           })
+
+          if (!memberIdsByGroupId.has(microsoftGroupId)) {
+            continue
+          }
 
           await transaction.directoryGroupMembership.deleteMany({
             where: { directoryGroupId: directoryGroup.id },
