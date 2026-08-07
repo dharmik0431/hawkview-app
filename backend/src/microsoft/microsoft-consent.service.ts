@@ -14,6 +14,7 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'Organization.Read.All',
   'User.Read.All',
   'GroupMember.Read.All',
+  'Member.Read.Hidden',
   'AuditLog.Read.All',
   'UserAuthenticationMethod.Read.All',
   'Policy.Read.All',
@@ -34,6 +35,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
   'User.Read.All': 'Read users and their basic directory profile information.',
   'GroupMember.Read.All':
     'Read Microsoft 365 and security groups and their user memberships.',
+  'Member.Read.Hidden':
+    'Read memberships for Microsoft groups whose membership list is hidden.',
   'AuditLog.Read.All':
     'Read sign-in activity and user MFA registration status.',
   'UserAuthenticationMethod.Read.All':
