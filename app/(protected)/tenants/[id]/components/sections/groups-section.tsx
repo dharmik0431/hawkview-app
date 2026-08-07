@@ -58,6 +58,28 @@ interface GroupsSectionProps {
 type GroupSortField = 'name' | 'type' | 'membership' | 'members' | 'owners' | 'mail'
 type SortOrder = 'asc' | 'desc'
 
+function normalizeLabels(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+
+  const labels: string[] = []
+  const seen = new Set<string>()
+
+  for (const candidate of value) {
+    if (typeof candidate !== 'string') continue
+
+    const label = candidate.trim()
+    if (!label) continue
+
+    const key = label.toLocaleLowerCase()
+    if (seen.has(key)) continue
+
+    seen.add(key)
+    labels.push(label)
+  }
+
+  return labels
+}
+
 export default function GroupsSection({ bundle }: GroupsSectionProps) {
   // Extract real group data from API bundle
   const rawGroups = useMemo<GroupItem[]>(() => {
@@ -101,12 +123,14 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
       }
 
       const membership = g.membershipType || (lower.includes('dynamic') ? 'Dynamic' : 'Direct')
+      const members = normalizeLabels(g.members)
+      const owners = normalizeLabels(g.owners)
       const membersCount = typeof g.membersCount === 'number'
         ? g.membersCount
-        : Array.isArray(g.members)
-        ? g.members.length
-        : 0
-      const ownersCount = Array.isArray(g.owners) ? g.owners.length : 0
+        : members
+          ? members.length
+          : undefined
+      const ownersCount = owners ? owners.length : undefined
 
       return {
         ...g,
@@ -118,6 +142,8 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
         membership,
         membersCount,
         ownersCount,
+        members,
+        owners,
       }
     })
   }, [rawGroups])
@@ -361,10 +387,10 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
                         {g.membership}
                       </td>
                       <td className="py-3 px-3 text-slate-700 dark:text-slate-300 font-medium">
-                        {g.membersCount}
+                        {g.membersCount ?? '—'}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400">
-                        {g.ownersCount}
+                        {g.ownersCount ?? '—'}
                       </td>
                       <td className="py-3 px-4 text-slate-600 dark:text-slate-400 max-w-[180px] truncate font-mono text-[11px]">
                         {g.email || '—'}
@@ -509,31 +535,37 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
                 <div className="space-y-2">
                   <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div className="text-[11px] font-semibold text-slate-900 dark:text-white mb-1">
-                      Owners ({selectedGroup.ownersCount})
+                      Owners ({selectedGroup.ownersCount ?? 'Unavailable'})
                     </div>
                     {Array.isArray(selectedGroup.owners) && selectedGroup.owners.length > 0 ? (
                       <ul className="space-y-1 font-mono text-[11px] text-slate-600 dark:text-slate-400">
-                        {selectedGroup.owners.map((owner, i) => (
-                          <li key={i} className="truncate">• {owner}</li>
+                        {selectedGroup.owners.map((owner) => (
+                          <li key={owner.toLocaleLowerCase()} className="truncate">• {owner}</li>
                         ))}
                       </ul>
+                    ) : Array.isArray(selectedGroup.owners) ? (
+                      <p className="text-[11px] text-slate-500 italic">No owners found.</p>
                     ) : (
-                      <p className="text-[11px] text-slate-500 italic">No specific owners provided in current API response.</p>
+                      <p className="text-[11px] text-slate-500 italic">Owner roster unavailable.</p>
                     )}
                   </div>
 
                   <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div className="text-[11px] font-semibold text-slate-900 dark:text-white mb-1">
-                      Members ({selectedGroup.membersCount})
+                      Members ({selectedGroup.membersCount ?? 'Unavailable'})
                     </div>
                     {Array.isArray(selectedGroup.members) && selectedGroup.members.length > 0 ? (
                       <ul className="space-y-1 font-mono text-[11px] text-slate-600 dark:text-slate-400">
-                        {selectedGroup.members.map((member, i) => (
-                          <li key={i} className="truncate">• {member}</li>
+                        {selectedGroup.members.map((member) => (
+                          <li key={member.toLocaleLowerCase()} className="truncate">• {member}</li>
                         ))}
                       </ul>
+                    ) : Array.isArray(selectedGroup.members) ? (
+                      <p className="text-[11px] text-slate-500 italic">No members found.</p>
+                    ) : typeof selectedGroup.membersCount === 'number' ? (
+                      <p className="text-[11px] text-slate-500 italic">{selectedGroup.membersCount} total members. Member roster unavailable.</p>
                     ) : (
-                      <p className="text-[11px] text-slate-500 italic">Total members count: {selectedGroup.membersCount}. Member roster not individually enumerated in current API response.</p>
+                      <p className="text-[11px] text-slate-500 italic">Member roster unavailable.</p>
                     )}
                   </div>
                 </div>

@@ -3,7 +3,21 @@ import test from 'node:test'
 import {
   collectGroupMemberships,
   collectGroupOwners,
+  uniquePrincipalLabels,
 } from './group-membership-sync.js'
+
+test('deduplicates principal labels and uses stable fallbacks', () => {
+  assert.deepEqual(
+    uniquePrincipalLabels([
+      { id: 'owner-1', displayName: 'Dharmik Pandya' },
+      { id: 'owner-2', displayName: ' dharmik pandya ' },
+      { id: 'owner-3', userPrincipalName: 'admin@example.com' },
+      { microsoftUserId: 'user-4' },
+      {},
+    ]),
+    ['Dharmik Pandya', 'admin@example.com', 'user-4']
+  )
+})
 
 test('collects successful memberships and removes duplicate user IDs', async () => {
   const result = await collectGroupMemberships(
