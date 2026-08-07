@@ -551,7 +551,7 @@ export default function TenantSettingsPage() {
   }
 
   return (
-    <div className="container mx-auto p-6 max-w-7xl space-y-6">
+    <div className="w-full space-y-4 p-1 sm:p-2">
       {/* Top Navigation */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-3">
