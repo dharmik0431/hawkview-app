@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Inject, Param, Patch, Post, Req } from '@nestjs/common'
+import { Body, Controller, Delete, Get, Inject, Param, Patch, Post, Query, Req } from '@nestjs/common'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { NotificationsService } from './notifications.service.js'
 
@@ -10,13 +10,13 @@ export class NotificationsController {
   ) {}
 
   @Get()
-  list(@Req() request: AuthenticatedRequest) {
-    return this.notifications.list(request.auth)
+  list(@Req() request: AuthenticatedRequest, @Query() query: Record<string, string | undefined>) {
+    return this.notifications.list(request.auth, query)
   }
 
-  @Post()
-  create(@Req() request: AuthenticatedRequest, @Body() body: unknown) {
-    return this.notifications.create(request.auth, body)
+  @Get('unread-count')
+  unreadCount(@Req() request: AuthenticatedRequest) {
+    return this.notifications.unreadCount(request.auth)
   }
 
   @Patch(':id/read')
@@ -33,4 +33,20 @@ export class NotificationsController {
   clearRead(@Req() request: AuthenticatedRequest) {
     return this.notifications.clearRead(request.auth)
   }
+
+  @Patch(':id/dismiss')
+  dismiss(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
+    return this.notifications.dismiss(request.auth, id)
+  }
+
+  @Get('preferences')
+  preferences(@Req() request: AuthenticatedRequest, @Query('organizationId') organizationId?: string) {
+    return this.notifications.preferences(request.auth, organizationId)
+  }
+
+  @Patch('preferences')
+  updatePreferences(@Req() request: AuthenticatedRequest, @Body() body: unknown) {
+    return this.notifications.updatePreferences(request.auth, body)
+  }
+
 }

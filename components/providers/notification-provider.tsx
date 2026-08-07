@@ -23,6 +23,16 @@ export interface NotificationItem {
   read: boolean
   actionUrl?: string
   actionLabel?: string
+  occurrenceCount?: number
+  resolved?: boolean
+}
+
+interface NotificationListResponse {
+  items: NotificationItem[]
+  total: number
+  page: number
+  pageSize: number
+  unreadCount: number
 }
 
 export interface ToastItem {
@@ -46,6 +56,7 @@ interface NotificationContextValue {
     showToast?: boolean
   }) => void
   markAsRead: (id: string) => void
+  dismiss: (id: string) => void
   markAllAsRead: () => void
   clearRead: () => void
   removeToast: (id: string) => void
@@ -73,17 +84,27 @@ export function NotificationProvider({
       return
     }
 
-    apiClient
-      .get<NotificationItem[]>('/api/notifications')
-      .then((items) => {
-        if (!cancelled) setNotifications(items)
-      })
-      .catch((error) => {
-        console.error('Failed to load notifications', error)
-      })
+    const load = () => {
+      void apiClient
+        .get<NotificationListResponse | NotificationItem[]>('/api/notifications')
+        .then((response) => {
+          if (!cancelled) setNotifications(Array.isArray(response) ? response : response.items)
+        })
+        .catch((error) => console.error('Failed to load notifications', error))
+    }
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') load()
+    }
+    load()
+    const interval = window.setInterval(load, 30_000)
+    window.addEventListener('focus', load)
+    document.addEventListener('visibilitychange', handleVisibility)
 
     return () => {
       cancelled = true
+      window.clearInterval(interval)
+      window.removeEventListener('focus', load)
+      document.removeEventListener('visibilitychange', handleVisibility)
     }
   }, [userId])
 
@@ -109,41 +130,6 @@ export function NotificationProvider({
       actionLabel?: string
       showToast?: boolean
     }) => {
-      const temporaryNotification: NotificationItem = {
-        id: `notif-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-        category,
-        title,
-        description,
-        timestamp: 'Just now',
-        read: false,
-        actionUrl,
-        actionLabel,
-      }
-
-      setNotifications((prev) => [temporaryNotification, ...prev])
-
-      void apiClient
-        .post<NotificationItem>('/api/notifications', {
-          title,
-          description,
-          category,
-          actionUrl,
-          actionLabel,
-        })
-        .then((saved) => {
-          setNotifications((prev) =>
-            prev.map((item) =>
-              item.id === temporaryNotification.id ? saved : item
-            )
-          )
-        })
-        .catch((error) => {
-          setNotifications((prev) =>
-            prev.filter((item) => item.id !== temporaryNotification.id)
-          )
-          console.error('Failed to save notification', error)
-        })
-
       if (showToast) {
         const toastId = `toast-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`
         const duration =
@@ -182,6 +168,13 @@ export function NotificationProvider({
       .catch((error) => console.error('Failed to mark notifications read', error))
   }, [])
 
+  const dismiss = useCallback((id: string) => {
+    setNotifications((prev) => prev.filter((notification) => notification.id !== id))
+    void apiClient
+      .patch(`/api/notifications/${encodeURIComponent(id)}/dismiss`)
+      .catch((error) => console.error('Failed to dismiss notification', error))
+  }, [])
+
   const clearRead = useCallback(() => {
     setNotifications((prev) => prev.filter((n) => !n.read))
     void apiClient
@@ -212,6 +205,7 @@ export function NotificationProvider({
         toasts,
         notify,
         markAsRead,
+        dismiss,
         markAllAsRead,
         clearRead,
         removeToast,

@@ -12,6 +12,7 @@ import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.
 import { getMicrosoftSkuName } from '../microsoft/microsoft-sku-names.js'
 import { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import { resolveDomainDnsHealth } from './domain-dns-health.js'
 import {
   IpGeolocationService,
@@ -326,7 +327,9 @@ export class TenantSyncService {
     @Inject(MicrosoftConsentService)
     private readonly microsoftConsent: MicrosoftConsentService,
     @Inject(IpGeolocationService)
-    private readonly ipGeolocation: IpGeolocationService
+    private readonly ipGeolocation: IpGeolocationService,
+    @Inject(NotificationsService)
+    private readonly notifications: NotificationsService
   ) {}
 
   private async getAuthorizedTenant(
@@ -833,6 +836,32 @@ export class TenantSyncService {
     const failedResources = attemptedStates
       .filter((state) => state.status === 'FAILED')
       .map((state) => state.resourceType)
+    const initialSync = !existingState?.lastSuccessfulAt
+    if (initialSync) {
+      await this.notifications.publishIncident({
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        eventType:
+          failedResources.length > 0
+            ? 'tenant.initial_sync_partial'
+            : 'tenant.initial_sync_completed',
+        category: failedResources.length > 0 ? 'warning' : 'success',
+        severity: failedResources.length > 0 ? 'medium' : 'info',
+        title:
+          failedResources.length > 0
+            ? 'Initial tenant sync completed with gaps'
+            : 'Initial tenant sync completed',
+        description:
+          failedResources.length > 0
+            ? `${failedResources.length} data source${failedResources.length === 1 ? '' : 's'} could not be collected. HawkView will retry automatically.`
+            : 'HawkView finished collecting the tenant data required for monitoring.',
+        dedupeKey: `tenant:${tenant.id}:initial-sync`,
+        source: 'tenant-sync',
+        actionUrl: `/tenants/${tenant.id}`,
+        actionLabel: 'View tenant',
+        metadata: { failedResources },
+      })
+    }
     return {
       bundle: await this.buildBundle(tenant),
       status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
@@ -869,6 +898,19 @@ export class TenantSyncService {
         },
       }),
     ])
+    await this.notifications.publishIncident({
+      organizationId: tenant.organizationId,
+      customerTenantId: tenant.id,
+      eventType: 'tenant.connection_lost',
+      category: 'error',
+      severity: 'critical',
+      title: 'Microsoft 365 connection lost',
+      description: message,
+      dedupeKey: `tenant:${tenant.id}:connection`,
+      source: 'microsoft-verification',
+      actionUrl: `/tenants/${tenant.id}/settings`,
+      actionLabel: 'Reconnect tenant',
+    })
   }
 
   private async runSnapshotSync(
@@ -922,12 +964,27 @@ export class TenantSyncService {
           consecutiveFailures: 0,
         },
       })
+      await this.notifications.resolveIncident(
+        tenant.organizationId,
+        `tenant:${tenant.id}:sync:${resourceType}`,
+        {
+          customerTenantId: tenant.id,
+          eventType: 'tenant.sync_recovered',
+          category: 'success',
+          severity: 'info',
+          title: `${resourceType.replaceAll('_', ' ')} synchronization recovered`,
+          description: 'HawkView is receiving this Microsoft 365 data again.',
+          source: 'tenant-sync',
+          actionUrl: `/tenants/${tenant.id}`,
+          actionLabel: 'View tenant',
+        }
+      )
     } catch (error) {
       const message =
         error instanceof Error
           ? error.message
           : `Microsoft ${resourceType.toLowerCase()} synchronization failed.`
-      await this.prisma.syncState.update({
+      const state = await this.prisma.syncState.update({
         where: {
           customerTenantId_resourceType: {
             customerTenantId: tenant.id,
@@ -941,6 +998,22 @@ export class TenantSyncService {
           consecutiveFailures: { increment: 1 },
         },
       })
+      if (state.consecutiveFailures >= 2) {
+        await this.notifications.publishIncident({
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          eventType: 'tenant.sync_failed',
+          category: 'warning',
+          severity: state.consecutiveFailures >= 4 ? 'high' : 'medium',
+          title: `${resourceType.replaceAll('_', ' ')} synchronization failed`,
+          description: message,
+          dedupeKey: `tenant:${tenant.id}:sync:${resourceType}`,
+          source: 'tenant-sync',
+          actionUrl: `/tenants/${tenant.id}`,
+          actionLabel: 'Review tenant',
+          metadata: { resourceType, consecutiveFailures: state.consecutiveFailures },
+        })
+      }
       throw new BadGatewayException(message)
     }
   }
@@ -2080,10 +2153,77 @@ export class TenantSyncService {
           ingestedAt,
           expiresAt,
         }))
+      const existingAuditIds =
+        records.length > 0
+          ? new Set(
+              (
+                await this.prisma.directoryAuditLog.findMany({
+                  where: {
+                    customerTenantId: tenant.id,
+                    microsoftAuditId: {
+                      in: records.map((record) => record.microsoftAuditId),
+                    },
+                  },
+                  select: { microsoftAuditId: true },
+                })
+              ).map((record) => record.microsoftAuditId)
+            )
+          : new Set<string>()
+      const newRecords = records.filter(
+        (record) => !existingAuditIds.has(record.microsoftAuditId)
+      )
       if (records.length > 0) {
         await this.prisma.directoryAuditLog.createMany({
           data: records as never,
           skipDuplicates: true,
+        })
+      }
+      for (const record of newRecords) {
+        const activity = record.activityDisplayName.toLowerCase()
+        const securityEvent =
+          activity.includes('authentication method') || activity.includes('mfa')
+            ? {
+                severity: 'critical' as const,
+                label: 'Authentication methods changed',
+              }
+            : activity.includes('password')
+              ? {
+                  severity: 'high' as const,
+                  label: 'Password-related change detected',
+                }
+              : activity.includes('application') ||
+                  activity.includes('service principal')
+                ? {
+                    severity: 'high' as const,
+                    label: 'Application registration changed',
+                  }
+                : activity.includes('role') ||
+                    activity.includes('administrator')
+                  ? {
+                      severity: 'critical' as const,
+                      label: 'Administrative role changed',
+                    }
+                  : null
+        if (!securityEvent) continue
+        await this.notifications.publishIncident({
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          eventType: 'security.directory_change',
+          category:
+            securityEvent.severity === 'critical' ? 'error' : 'warning',
+          severity: securityEvent.severity,
+          title: securityEvent.label,
+          description: record.activityDisplayName,
+          dedupeKey: `security:directory-audit:${record.microsoftAuditId}`,
+          source: 'microsoft.directoryAudit',
+          actionUrl: `/what-changed?tenantId=${encodeURIComponent(tenant.id)}&from=${encodeURIComponent(record.eventDateTime.toISOString())}`,
+          actionLabel: 'Investigate change',
+          metadata: {
+            microsoftAuditId: record.microsoftAuditId,
+            eventDateTime: record.eventDateTime.toISOString(),
+            result: record.result,
+            category: record.category,
+          },
         })
       }
       await this.prisma.directoryAuditLog.deleteMany({
