@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { collectGroupMemberships } from './group-membership-sync.js'
+import {
+  collectGroupMemberships,
+  collectGroupOwners,
+} from './group-membership-sync.js'
 
 test('collects successful memberships and removes duplicate user IDs', async () => {
   const result = await collectGroupMemberships(
@@ -50,4 +53,26 @@ test('keeps a successful empty membership result distinct from a failure', async
   assert.equal(result.memberIdsByGroupId.has('empty-group'), true)
   assert.deepEqual(result.memberIdsByGroupId.get('empty-group'), [])
   assert.deepEqual(result.failures, [])
+})
+
+test('keeps group inventory usable when an optional owner lookup is denied', async () => {
+  const result = await collectGroupOwners(
+    [
+      { id: 'visible', displayName: 'Visible group' },
+      { id: 'restricted', displayName: 'Restricted group' },
+    ],
+    async (group) => {
+      if (group.id === 'restricted') {
+        throw new Error('Microsoft Graph returned 403')
+      }
+      return [{ id: 'owner-1', displayName: 'Alex Owner' }]
+    }
+  )
+
+  assert.deepEqual(result.ownersByGroupId.get('visible'), [
+    { id: 'owner-1', displayName: 'Alex Owner' },
+  ])
+  assert.equal(result.ownersByGroupId.has('restricted'), false)
+  assert.equal(result.failures.length, 1)
+  assert.equal(result.failures[0]?.groupId, 'restricted')
 })
