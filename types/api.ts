@@ -13,6 +13,16 @@ export const TenantSchema = z.object({
   connectionMode: z.enum(['hawkview-managed', 'customer-managed']),
   lastSync: z.string().nullable(),
   secureScore: z.number().nullable(),
+  healthScore: z.number().min(0).max(100),
+  mfaCoverage: z.number().min(0).max(100).nullable(),
+  riskyIdentityCount: z.number().int().nonnegative(),
+  attention: z.array(z.object({
+    key: z.string(),
+    label: z.string(),
+    severity: z.enum(['critical', 'high', 'medium']),
+    why: z.string(),
+    detectedAt: z.string().nullable(),
+  })),
   licenseCount: z.number().int().nullable(),
   requiredPermissions: z.array(
     z.object({
