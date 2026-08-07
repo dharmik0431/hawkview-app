@@ -15,7 +15,10 @@ import {
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
-import { deriveTenantHealth } from './tenant-health.js'
+import {
+  deriveTenantHealth,
+  type TenantAuditEvent,
+} from './tenant-health.js'
 
 const ORGANIZATION_WIDE_TENANT_ROLES = [
   MembershipRole.MSP_OWNER,
@@ -138,7 +141,7 @@ export class TenantsService {
       consecutiveFailures: number
     }>
     entraSnapshots: Array<{ payload: unknown; observedAt: Date }>
-  }, riskyIdentityCount = 0) {
+  }, riskyIdentityCount = 0, auditEvents: TenantAuditEvent[] = []) {
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
     const connectionStatus = tenant.connection?.status ?? null
@@ -153,12 +156,14 @@ export class TenantsService {
       .map((permission) => permission.name)
       .filter((permission) => !consentedPermissions.includes(permission))
     const health = deriveTenantHealth({
+      tenantId: tenant.id,
       effectiveStatus,
       connectionStatus,
       missingPermissions,
       syncStates: tenant.syncStates,
       authSnapshot: tenant.entraSnapshots[0] ?? null,
       riskyIdentityCount,
+      auditEvents,
     })
 
     return {
@@ -354,21 +359,44 @@ export class TenantsService {
     })
 
     const tenantIds = tenants.map((tenant) => tenant.id)
-    const riskySignIns = await this.prisma.signInLog.findMany({
-      where: {
-        customerTenantId: { in: tenantIds },
-        eventDateTime: {
-          gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+    const [riskySignIns, auditEvents] = await Promise.all([
+      this.prisma.signInLog.findMany({
+        where: {
+          customerTenantId: { in: tenantIds },
+          eventDateTime: {
+            gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+          },
+          riskLevel: { not: null },
         },
-        riskLevel: { not: null },
-      },
-      select: {
-        customerTenantId: true,
-        userId: true,
-        userPrincipalName: true,
-        riskLevel: true,
-      },
-    })
+        select: {
+          customerTenantId: true,
+          userId: true,
+          userPrincipalName: true,
+          riskLevel: true,
+        },
+      }),
+      this.prisma.directoryAuditLog.findMany({
+        where: {
+          customerTenantId: { in: tenantIds },
+          eventDateTime: {
+            gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
+          },
+        },
+        orderBy: { eventDateTime: 'desc' },
+        take: 500,
+        select: {
+          customerTenantId: true,
+          microsoftAuditId: true,
+          eventDateTime: true,
+          activityDisplayName: true,
+          category: true,
+          operationType: true,
+          result: true,
+          initiatedBy: true,
+          targetResources: true,
+        },
+      }),
+    ])
     const riskyUsersByTenant = new Map<string, Set<string>>()
     for (const row of riskySignIns) {
       if (!['low', 'medium', 'high'].includes(row.riskLevel?.toLowerCase() ?? '')) {
@@ -381,9 +409,20 @@ export class TenantsService {
       riskyUsersByTenant.set(row.customerTenantId, users)
     }
 
+    const auditEventsByTenant = new Map<string, TenantAuditEvent[]>()
+    for (const event of auditEvents) {
+      const events = auditEventsByTenant.get(event.customerTenantId) ?? []
+      events.push(event)
+      auditEventsByTenant.set(event.customerTenantId, events)
+    }
+
     return {
       tenants: tenants.map((tenant) =>
-        this.mapTenant(tenant, riskyUsersByTenant.get(tenant.id)?.size ?? 0)
+        this.mapTenant(
+          tenant,
+          riskyUsersByTenant.get(tenant.id)?.size ?? 0,
+          auditEventsByTenant.get(tenant.id) ?? []
+        )
       ),
     }
   }
