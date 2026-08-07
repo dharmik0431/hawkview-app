@@ -14,7 +14,10 @@ import { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { resolveDomainDnsHealth } from './domain-dns-health.js'
-import { collectGroupMemberships } from './group-membership-sync.js'
+import {
+  collectGroupMemberships,
+  collectGroupOwners,
+} from './group-membership-sync.js'
 import {
   IpGeolocationService,
   type SignInLocation,
@@ -1201,7 +1204,7 @@ export class TenantSyncService {
         'https://graph.microsoft.com/v1.0/groups?' +
         '$select=id,displayName,description,mail,mailNickname,mailEnabled,' +
         'securityEnabled,groupTypes,visibility,onPremisesSyncEnabled&' +
-        '$expand=owners($select=id,displayName,userPrincipalName)&$top=999'
+        '$top=999'
 
       while (groupsUrl) {
         if (!groupsUrl.startsWith('https://graph.microsoft.com/')) {
@@ -1228,6 +1231,64 @@ export class TenantSyncService {
           )
         )
         groupsUrl = page['@odata.nextLink'] ?? ''
+      }
+
+      const groupTargets = groups.map((group) => ({
+        id: group.id as string,
+        displayName: group.displayName,
+      }))
+
+      const fetchGroupOwners = async (groupId: string) => {
+        const owners: NonNullable<GraphGroup['owners']> = []
+        let ownersUrl =
+          `https://graph.microsoft.com/v1.0/groups/${encodeURIComponent(groupId)}` +
+          '/owners?$select=id,displayName,userPrincipalName&$top=999'
+        while (ownersUrl) {
+          if (!ownersUrl.startsWith('https://graph.microsoft.com/')) {
+            throw new Error('Microsoft returned an invalid group-owners link.')
+          }
+          const response = await fetch(ownersUrl, {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              Accept: 'application/json',
+            },
+            signal: AbortSignal.timeout(20_000),
+          })
+          if (!response.ok) {
+            const detail = await describeGraphError(response)
+            const requestId =
+              response.headers.get('request-id') ??
+              response.headers.get('client-request-id')
+            throw new Error(
+              `Microsoft group owner synchronization returned ${response.status}${detail}` +
+                (requestId ? ` (request ${requestId})` : '')
+            )
+          }
+          const page = (await response.json()) as {
+            value?: NonNullable<GraphGroup['owners']>
+            '@odata.nextLink'?: string
+          }
+          owners.push(...(page.value ?? []))
+          ownersUrl = page['@odata.nextLink'] ?? ''
+        }
+        return owners
+      }
+
+      const { ownersByGroupId, failures: ownerFailures } =
+        await collectGroupOwners(groupTargets, (group) =>
+          fetchGroupOwners(group.id)
+        )
+      for (const group of groups) {
+        group.owners = ownersByGroupId.get(group.id as string) ?? []
+      }
+      for (const failure of ownerFailures) {
+        const message =
+          failure.error instanceof Error
+            ? failure.error.message
+            : String(failure.error)
+        this.logger.warn(
+          `Skipped owner refresh for Microsoft group ${failure.groupName} (${failure.groupId}) in tenant ${tenant.id}: ${message}`
+        )
       }
 
       const fetchGroupMemberIds = async (groupId: string) => {
@@ -1269,12 +1330,8 @@ export class TenantSyncService {
 
       // Keep concurrency bounded to avoid overwhelming Microsoft Graph while
       // still making the initial snapshot practical for tenants with many groups.
-      const membershipTargets = groups.map((group) => ({
-        id: group.id as string,
-        displayName: group.displayName,
-      }))
       const { memberIdsByGroupId, failures: membershipFailures } =
-        await collectGroupMemberships(membershipTargets, (group) =>
+        await collectGroupMemberships(groupTargets, (group) =>
           fetchGroupMemberIds(group.id)
         )
       for (const failure of membershipFailures) {
