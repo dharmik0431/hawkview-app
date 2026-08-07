@@ -15,6 +15,38 @@ export interface GroupOwner {
   userPrincipalName?: string | null
 }
 
+export interface GroupPrincipalLabelSource {
+  id?: string | null
+  microsoftUserId?: string | null
+  displayName?: string | null
+  userPrincipalName?: string | null
+}
+
+export function uniquePrincipalLabels(
+  principals: GroupPrincipalLabelSource[]
+): string[] {
+  const labels: string[] = []
+  const seen = new Set<string>()
+
+  for (const principal of principals) {
+    const label =
+      principal.displayName?.trim() ||
+      principal.userPrincipalName?.trim() ||
+      principal.microsoftUserId?.trim() ||
+      principal.id?.trim()
+
+    if (!label) continue
+
+    const key = label.toLocaleLowerCase()
+    if (seen.has(key)) continue
+
+    seen.add(key)
+    labels.push(label)
+  }
+
+  return labels
+}
+
 export async function collectGroupMemberships<
   T extends GroupMembershipTarget,
 >(

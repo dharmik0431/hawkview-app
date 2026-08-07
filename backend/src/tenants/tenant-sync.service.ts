@@ -17,6 +17,7 @@ import { resolveDomainDnsHealth } from './domain-dns-health.js'
 import {
   collectGroupMemberships,
   collectGroupOwners,
+  uniquePrincipalLabels,
 } from './group-membership-sync.js'
 import {
   IpGeolocationService,
@@ -3122,7 +3123,19 @@ export class TenantSyncService {
           customerTenantId: tenant.id,
         },
         orderBy: { displayName: 'asc' },
-        include: { memberships: { select: { id: true } } },
+        include: {
+          memberships: {
+            select: {
+              directoryUser: {
+                select: {
+                  microsoftUserId: true,
+                  displayName: true,
+                  userPrincipalName: true,
+                },
+              },
+            },
+          },
+        },
       }),
       this.prisma.tenantLicense.findMany({
         where: {
@@ -3899,11 +3912,13 @@ export class TenantSyncService {
                     : 'DistributionList',
                 email: group.mail ?? '',
                 membersCount: group.memberships.length,
+                members: uniquePrincipalLabels(
+                  group.memberships.map(
+                    (membership) => membership.directoryUser
+                  )
+                ),
                 owners: Array.isArray(graphGroup?.owners)
-                  ? graphGroup.owners.map(
-                      (owner: any) =>
-                        owner.displayName ?? owner.userPrincipalName ?? owner.id
-                    )
+                  ? uniquePrincipalLabels(graphGroup.owners)
                   : [],
                 description: group.description ?? undefined,
               }
@@ -4160,11 +4175,11 @@ export class TenantSyncService {
               membershipType: isDynamic ? 'Dynamic' : 'Assigned',
               visibility: group.visibility,
               membersCount: group.memberships.length,
+              members: uniquePrincipalLabels(
+                group.memberships.map((membership) => membership.directoryUser)
+              ),
               owners: Array.isArray(graphGroup?.owners)
-                ? graphGroup.owners.map(
-                    (owner: any) =>
-                      owner.displayName ?? owner.userPrincipalName ?? owner.id
-                  )
+                ? uniquePrincipalLabels(graphGroup.owners)
                 : [],
               onPremisesSyncEnabled:
                 typeof graphGroup?.onPremisesSyncEnabled === 'boolean'
