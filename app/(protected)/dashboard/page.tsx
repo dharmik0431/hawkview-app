@@ -127,7 +127,7 @@ type TenantRow = {
   name: string
   domain: string
   provider: 'microsoft' | 'google'
-  secureScore: number
+  healthScore: number
   attention: AttentionItem[]
   top: AttentionItem[]
   topSeverity?: Severity
@@ -152,12 +152,10 @@ function buildTenants(source: any[]): TenantRow[] {
       .map((a) => a.detectedAt as string)
       .sort((a, b) => parseTime(b) - parseTime(a))[0]
 
-    // placeholder until real MFA coverage exists: use secureScore
-    const mfaCoverage = clamp(Number(t.secureScore ?? 0), 0, 100)
-
-    const identityDetected = attention.filter(
-      (a) => a.severity === 'critical' || a.severity === 'high'
-    ).length
+    const healthScore = clamp(Number(t.healthScore ?? 100), 0, 100)
+    const mfaCoverage =
+      t.mfaCoverage == null ? 100 : clamp(Number(t.mfaCoverage), 0, 100)
+    const identityDetected = Math.max(0, Number(t.riskyIdentityCount ?? 0))
 
     return {
       ...t,
@@ -165,6 +163,7 @@ function buildTenants(source: any[]): TenantRow[] {
       top,
       topSeverity,
       lastCriticalAt,
+      healthScore,
       mfaCoverage,
       identityDetected,
     }
@@ -284,7 +283,7 @@ export default function DashboardPage() {
       tenants.length === 0
         ? 0
         : Math.round(
-            tenants.reduce((acc, t) => acc + (Number(t.secureScore) || 0), 0) /
+            tenants.reduce((acc, t) => acc + (Number(t.healthScore) || 0), 0) /
               tenants.length
           )
 
@@ -336,7 +335,7 @@ export default function DashboardPage() {
                   {kpis.criticalTenants}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
-                  Security baseline failed
+                  Current critical signals
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-amber-50 border border-amber-100 flex items-center justify-center">
@@ -370,11 +369,11 @@ export default function DashboardPage() {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
-                  Avg Security Score
+                  Avg Health Score
                 </div>
                 <div className="mt-1 text-3xl font-bold">{kpis.avgScore}%</div>
                 <div className="mt-1 text-xs text-slate-500">
-                  +2% from last week
+                  Derived from current signals
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-green-50 border border-green-100 flex items-center justify-center">
@@ -586,7 +585,7 @@ export default function DashboardPage() {
                         </span>
                       )
 
-                    const score = clamp(Number(t.secureScore ?? 0), 0, 100)
+                    const score = clamp(Number(t.healthScore ?? 0), 0, 100)
                     const ringColor =
                       score >= 80
                         ? 'border-green-500 text-green-700 dark:text-green-400'

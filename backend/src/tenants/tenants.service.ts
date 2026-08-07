@@ -8,10 +8,14 @@ import {
   NotFoundException,
 } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
-import { MembershipRole } from '../generated/prisma/enums.js'
+import {
+  MembershipRole,
+  SyncResourceType,
+} from '../generated/prisma/enums.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { deriveTenantHealth } from './tenant-health.js'
 
 const ORGANIZATION_WIDE_TENANT_ROLES = [
   MembershipRole.MSP_OWNER,
@@ -124,8 +128,17 @@ export class TenantsService {
       lastErrorCode: string | null
     } | null
     tenantLicenses: Array<{ enabledUnits: number }>
-    syncStates: Array<{ lastSuccessfulAt: Date | null }>
-  }) {
+    syncStates: Array<{
+      resourceType: string
+      status: string
+      lastAttemptAt: Date | null
+      lastSuccessfulAt: Date | null
+      lastErrorCode: string | null
+      lastErrorMessage: string | null
+      consecutiveFailures: number
+    }>
+    entraSnapshots: Array<{ payload: unknown; observedAt: Date }>
+  }, riskyIdentityCount = 0) {
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
     const connectionStatus = tenant.connection?.status ?? null
@@ -135,6 +148,18 @@ export class TenantsService {
         : connectionStatus === 'PENDING_CONSENT'
           ? 'pending'
           : tenant.status.toLowerCase()
+
+    const missingPermissions = requiredPermissions
+      .map((permission) => permission.name)
+      .filter((permission) => !consentedPermissions.includes(permission))
+    const health = deriveTenantHealth({
+      effectiveStatus,
+      connectionStatus,
+      missingPermissions,
+      syncStates: tenant.syncStates,
+      authSnapshot: tenant.entraSnapshots[0] ?? null,
+      riskyIdentityCount,
+    })
 
     return {
       id: tenant.id,
@@ -159,11 +184,10 @@ export class TenantsService {
           ?.toISOString() ?? null,
       requiredPermissions,
       consentedPermissions,
-      missingPermissions: requiredPermissions
-        .map((permission) => permission.name)
-        .filter((permission) => !consentedPermissions.includes(permission)),
+      missingPermissions,
       connectionErrorCode: tenant.connection?.lastErrorCode ?? null,
       secureScore: null,
+      ...health,
       licenseCount:
         tenant.tenantLicenses.length > 0
           ? tenant.tenantLicenses.reduce(
@@ -290,7 +314,23 @@ export class TenantsService {
       status: true,
       organization: { select: { name: true, slug: true } },
       tenantLicenses: { select: { enabledUnits: true } },
-      syncStates: { select: { lastSuccessfulAt: true } },
+      syncStates: {
+        select: {
+          resourceType: true,
+          status: true,
+          lastAttemptAt: true,
+          lastSuccessfulAt: true,
+          lastErrorCode: true,
+          lastErrorMessage: true,
+          consecutiveFailures: true,
+        },
+      },
+      entraSnapshots: {
+        where: { resourceType: SyncResourceType.AUTH_REGISTRATIONS },
+        orderBy: { observedAt: 'desc' as const },
+        take: 1,
+        select: { payload: true, observedAt: true },
+      },
       connection: {
         select: {
           connectionMode: true,
@@ -313,7 +353,39 @@ export class TenantsService {
       select: this.tenantSelect(),
     })
 
-    return { tenants: tenants.map((tenant) => this.mapTenant(tenant)) }
+    const tenantIds = tenants.map((tenant) => tenant.id)
+    const riskySignIns = await this.prisma.signInLog.findMany({
+      where: {
+        customerTenantId: { in: tenantIds },
+        eventDateTime: {
+          gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+        },
+        riskLevel: { not: null },
+      },
+      select: {
+        customerTenantId: true,
+        userId: true,
+        userPrincipalName: true,
+        riskLevel: true,
+      },
+    })
+    const riskyUsersByTenant = new Map<string, Set<string>>()
+    for (const row of riskySignIns) {
+      if (!['low', 'medium', 'high'].includes(row.riskLevel?.toLowerCase() ?? '')) {
+        continue
+      }
+      const identity =
+        row.userId ?? row.userPrincipalName?.toLowerCase() ?? 'unknown'
+      const users = riskyUsersByTenant.get(row.customerTenantId) ?? new Set()
+      users.add(identity)
+      riskyUsersByTenant.set(row.customerTenantId, users)
+    }
+
+    return {
+      tenants: tenants.map((tenant) =>
+        this.mapTenant(tenant, riskyUsersByTenant.get(tenant.id)?.size ?? 0)
+      ),
+    }
   }
 
   async createForIdentity(identity: AuthenticatedIdentity, body: unknown) {
