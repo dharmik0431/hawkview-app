@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 
@@ -16,6 +16,10 @@ import EnterpriseAppsSection from './components/sections/enterprise-apps-section
 import SignInActivitySection from './components/sections/signins-section'
 import ExchangePage from './components/sections/exchange-section'
 import SharePointPage from './components/sections/sharepoint-section'
+import { TenantBlade } from './components/tenant-blade'
+import { TenantOverview } from './components/tenant-overview'
+import TenantSettingsPage from './settings/page'
+import { deriveTenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 
 import type { TenantBundle } from '@/types/tenant-data'
 import { apiClient } from '@/lib/api/client'
@@ -34,6 +38,7 @@ import {
   ChevronLeft,
   RefreshCw,
   Settings,
+  Menu,
   Copy,
   ShieldCheck,
   Mail,
@@ -85,11 +90,13 @@ type Tenant = {
 }
 
 type TenantSection =
+  | 'overview'
   | 'home'
   | 'entra'
   | 'exchange'
   | 'teams'
   | 'sharepoint'
+  | 'settings'
   | 'workspace'
   | 'directory'
   | 'gmail'
@@ -1235,7 +1242,7 @@ export default function TenantDetailsPage() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [tenantsList, setTenantsList] = useState<any[]>([])
 
-  const fetchBundle = async (refresh = false) => {
+  const fetchBundle = useCallback(async (refresh = false) => {
     if (!tenantId) return
     if (refresh) {
       setSyncState('syncing')
@@ -1275,12 +1282,11 @@ export default function TenantDetailsPage() {
         window.setTimeout(() => setSyncState('idle'), 1400)
       }
     }
-  }
-
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    fetchBundle(false)
   }, [tenantId])
+
+  useEffect(() => {
+    void fetchBundle(false)
+  }, [fetchBundle])
 
   useEffect(() => {
     apiClient
@@ -1327,6 +1333,23 @@ export default function TenantDetailsPage() {
   const TEAMS = (bundle?.teams ?? {}) as any
 
   const [section, setSection] = useState<TenantSection>('home')
+  const [isMobileNavOpen, setIsMobileNavOpen] = useState(false)
+  const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('hawkview_tenant_submenu_collapsed') === 'true'
+    }
+    return false
+  })
+
+  const handleToggleCollapse = () => {
+    setIsCollapsed((prev) => {
+      const next = !prev
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('hawkview_tenant_submenu_collapsed', String(next))
+      }
+      return next
+    })
+  }
 
   // Entra UI state
   const [entraTab, setEntraTab] = useState<EntraTab>('overview')
@@ -1400,6 +1423,10 @@ export default function TenantDetailsPage() {
   const [syncState, setSyncState] = useState<
     'idle' | 'syncing' | 'success' | 'fail'
   >('idle')
+
+  const workspaceDisplay = useMemo(() => {
+    return deriveTenantWorkspaceDisplay(bundle, syncState === 'syncing')
+  }, [bundle, syncState])
 
   // Domain selector (per tenant)
   const domains = tenant?.domains?.length
@@ -1805,27 +1832,38 @@ export default function TenantDetailsPage() {
 
   const isMicrosoft = tenant.provider === 'microsoft'
   const heading =
-    isMicrosoft && section === 'entra'
-      ? 'Entra ID'
-      : isMicrosoft && section === 'exchange'
-        ? 'Exchange'
-        : isMicrosoft && section === 'teams'
-          ? 'Teams'
-          : isMicrosoft && section === 'sharepoint'
-            ? 'SharePoint'
-            : isMicrosoft
-              ? 'Office 365'
-              : section === 'directory'
-                ? 'Directory'
-                : section === 'gmail'
-                  ? 'Gmail'
-                  : section === 'drive'
-                    ? 'Drive'
-                    : section === 'security'
-                      ? 'Security'
-                      : 'Workspace'
+    section === 'overview'
+      ? 'Tenant Overview'
+      : section === 'settings'
+        ? 'Tenant Settings'
+        : isMicrosoft && section === 'entra'
+          ? 'Entra ID'
+          : isMicrosoft && section === 'exchange'
+            ? 'Exchange'
+            : isMicrosoft && section === 'teams'
+              ? 'Teams'
+              : isMicrosoft && section === 'sharepoint'
+                ? 'SharePoint'
+                : isMicrosoft && section === 'home'
+                  ? 'Office 365'
+                  : isMicrosoft
+                    ? 'Office 365'
+                    : section === 'directory'
+                      ? 'Directory'
+                      : section === 'gmail'
+                        ? 'Gmail'
+                        : section === 'drive'
+                          ? 'Drive'
+                          : section === 'security'
+                            ? 'Security'
+                            : 'Workspace'
 
-  const subheading = 'Manage configuration and view reports.'
+  const subheading =
+    section === 'overview'
+      ? 'Review Microsoft 365 connection health, synchronization status, and issues requiring action.'
+      : section === 'settings'
+        ? 'Tenant authorization, connection credentials, and Microsoft consent management.'
+        : 'Manage configuration and view reports.'
 
   const navItems = isMicrosoft
     ? [
@@ -3588,6 +3626,22 @@ export default function TenantDetailsPage() {
     }
 
     function renderMainContent(bundle: any) {
+      if (section === 'overview') {
+        return (
+          <TenantOverview
+            bundle={bundle}
+            display={workspaceDisplay}
+            onOpenModule={(m) => setSection(m as any)}
+            onSync={runSync}
+            isSyncing={syncState === 'syncing'}
+          />
+        )
+      }
+
+      if (section === 'settings') {
+        return <TenantSettingsPage />
+      }
+
       if (
         section === 'sharepoint' //||
         //section === 'sharepoint-onedrive' ||
@@ -4263,173 +4317,63 @@ export default function TenantDetailsPage() {
     }
 
     return (
-      <div className="space-y-6">
+      <div className="space-y-2.5 w-full">
         <Link
           href="/tenants"
-          className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+          className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white transition"
         >
-          <ChevronLeft className="h-4 w-4" />
+          <ChevronLeft className="h-3.5 w-3.5" />
           Back to Tenants
         </Link>
 
-        <div className="rounded-[28px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-sm">
-          <div className="flex h-[calc(100vh-180px)]">
-            <aside className="hidden lg:flex w-[300px] flex-col border-r border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 sticky top-0 h-full">
-              <div className="p-4 border-b border-slate-200 dark:border-slate-800">
-                <div className="relative">
-                  <button
-                    onClick={() => setTenantPickerOpen((v) => !v)}
-                    className="w-full flex items-center justify-between gap-3 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/80 p-4 shadow-sm hover:shadow-md transition-shadow"
-                    title="Switch tenant"
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <ProviderIcon provider={tenant.provider} />
-                      <div className="min-w-0 text-left">
-                        <div className="font-semibold truncate">
-                          {tenant.name}
-                        </div>
-                        <div className="text-xs text-muted-foreground truncate">
-                          {tenant.domain}
-                        </div>
-                      </div>
-                    </div>
-                    <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
-                  </button>
+        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-sm w-full">
+          <div className="flex h-[calc(100vh-118px)] min-h-[520px]">
+            <TenantBlade
+              tenant={tenant}
+              display={workspaceDisplay}
+              currentSection={section}
+              onSelectSection={(sec) => {
+                setSection(sec as any)
+                if (sec === 'entra') setEntraTab('overview')
+              }}
+              tenants={tenantsList}
+              onTenantChange={(id) => {
+                router.push(`/tenants/${id}`)
+              }}
+              isCollapsed={isCollapsed}
+              onToggleCollapse={handleToggleCollapse}
+              isMobileOpen={isMobileNavOpen}
+              onMobileClose={() => setIsMobileNavOpen(false)}
+            />
 
-                  {tenantPickerOpen && (
-                    <div className="absolute z-20 mt-2 w-full rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-lg overflow-hidden">
-                      <div className="p-3 border-b border-slate-200 dark:border-slate-800">
-                        <div className="relative">
-                          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                          <Input
-                            placeholder="Search tenants..."
-                            value={tenantSearch}
-                            onChange={(e) => setTenantSearch(e.target.value)}
-                            className="pl-10"
-                          />
-                        </div>
-                      </div>
-
-                      <div className="max-h-[260px] overflow-y-auto">
-                        {filteredTenants.map((t: any) => (
-                          <button
-                            key={t.id}
-                            onClick={() => {
-                              setTenantPickerOpen(false)
-                              router.push(`/tenants/${t.id}`)
-                            }}
-                            className={`w-full text-left px-4 py-3 text-sm hover:bg-muted/30 ${
-                              t.id === tenant.id
-                                ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300'
-                                : ''
-                            }`}
-                          >
-                            <div className="flex items-center gap-3">
-                              <span
-                                className={`h-2 w-2 rounded-full ${
-                                  t.id === tenant.id
-                                    ? 'bg-blue-600'
-                                    : 'bg-muted'
-                                }`}
-                              />
-                              <div className="min-w-0">
-                                <div className="font-semibold truncate">
-                                  {t.name}
-                                </div>
-                                <div className="text-xs text-muted-foreground truncate">
-                                  {t.domain}
-                                </div>
-                              </div>
-                            </div>
-                          </button>
-                        ))}
-
-                        {filteredTenants.length === 0 && (
-                          <div className="px-4 py-6 text-sm text-muted-foreground">
-                            No tenants found.
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="p-3 space-y-2 flex-1 overflow-y-auto">
-                {navItems.map((i) =>
-                  (i as any).disabled ? (
-                    <span
-                      key={i.key}
-                      title="Coming soon"
-                      className="relative block opacity-50 cursor-not-allowed group"
+            <section className="flex-1 bg-slate-50/60 dark:bg-slate-950/60 overflow-y-auto min-w-0">
+              <div className="p-4 sm:p-5 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <button
+                      type="button"
+                      onClick={() => setIsMobileNavOpen(true)}
+                      className="md:hidden inline-flex items-center justify-center p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                      aria-label="Open tenant navigation"
+                      title="Open tenant navigation"
                     >
-                      <SectionButton
-                        active={section === i.key}
-                        icon={i.icon}
-                        label={i.label}
-                        onClick={() => {
-                          // disabled: do nothing
-                        }}
-                      />
-
-                      {/* Hover stop icon */}
-                      <span className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 hidden group-hover:flex items-center justify-center">
-                        <span className="flex h-6 w-6 items-center justify-center rounded-full bg-red-100 border border-red-300">
-                          <Ban className="h-4 w-4 text-red-600" />
-                        </span>
-                      </span>
-                      {/* Instant tooltip (no overflow) */}
-                      <span className="pointer-events-none absolute right-14 top-1/2 -translate-y-1/2 hidden group-hover:block whitespace-nowrap rounded-md bg-slate-900 px-2 py-1 text-xs text-white shadow-lg">
-                        Coming Soon
-                      </span>
-                    </span>
-                  ) : (
-                    <SectionButton
-                      key={i.key}
-                      active={section === i.key}
-                      icon={i.icon}
-                      label={i.label}
-                      onClick={() => {
-                        setSection(i.key)
-                        if (i.key === 'entra') setEntraTab('overview')
-                      }}
-                    />
-                  )
-                )}
-              </div>
-
-              <div className="mt-auto">
-                <div className="p-4 border-t flex items-center justify-between">
-                  <div className="text-xs text-muted-foreground">Health</div>
-                  <Badge className={`${statusBadge(tenant.status)} uppercase`}>
-                    {tenant.status}
-                  </Badge>
-                </div>
-                <div
-                  className="px-4 pb-4 text-xs text-muted-foreground"
-                  title={tenant?.lastSync || ''}
-                >
-                  {formatSyncTimestamp(tenant?.lastSync)}
-                </div>
-              </div>
-            </aside>
-
-            <section className="flex-1 bg-slate-50/60 dark:bg-slate-950/60 overflow-y-auto">
-              <div className="p-8">
-                <div className="flex items-start justify-between">
-                  <div>
-                    <h1 className="text-1xl font-bold tracking-tight">
-                      {heading}
-                    </h1>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      {subheading}
-                    </p>
+                      <Menu className="h-4 w-4" />
+                    </button>
+                    <div>
+                      <h1 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">
+                        {heading}
+                      </h1>
+                      <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                        {subheading}
+                      </p>
+                    </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 shrink-0">
                     <button
                       onClick={runSync}
-                      className="h-10 w-10 rounded-xl border bg-white shadow-sm hover:shadow-md hover:bg-white transition flex items-center justify-center dark:bg-slate-900 dark:border-slate-800 dark:hover:bg-slate-800"
+                      type="button"
+                      className="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 shadow-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition flex items-center gap-2 cursor-pointer"
                       title={
                         syncState === 'syncing'
                           ? 'Syncing...'
@@ -4437,33 +4381,34 @@ export default function TenantDetailsPage() {
                             ? 'Sync complete'
                             : syncState === 'fail'
                               ? 'Sync failed'
-                              : 'Refresh'
+                              : 'Refresh data'
                       }
                     >
                       <RefreshCw
-                        className={`h-4 w-4 text-slate-700 dark:text-slate-300 ${syncState === 'syncing' ? 'animate-spin' : ''}`}
+                        className={cn(
+                          'h-3.5 w-3.5 text-slate-500 dark:text-slate-400',
+                          syncState === 'syncing' && 'animate-spin text-blue-600'
+                        )}
                       />
+                      <span className="hidden sm:inline">
+                        {syncState === 'syncing'
+                          ? 'Syncing'
+                          : syncState === 'success'
+                            ? 'Synced'
+                            : 'Sync Now'}
+                      </span>
                     </button>
-
-                    <Link
-                      href={`/tenants/${tenantId}/settings`}
-                      className="h-10 w-10 rounded-xl border bg-white shadow-sm hover:shadow-md hover:bg-white transition flex items-center justify-center dark:bg-slate-900 dark:border-slate-800 dark:hover:bg-slate-800"
-                      title="Tenant settings"
-                      aria-label="Open tenant settings"
-                    >
-                      <Settings className="h-4 w-4 text-slate-700 dark:text-slate-300" />
-                    </Link>
                   </div>
                 </div>
 
                 {syncState === 'fail' && (
-                  <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                    Sync failed. Try again.
+                  <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700 dark:bg-red-950/40 dark:border-red-900/50 dark:text-red-300">
+                    Sync failed. Please try again.
                   </div>
                 )}
                 {syncState === 'success' && (
-                  <div className="mt-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
-                    Sync completed.
+                  <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-xs text-green-700 dark:bg-green-950/40 dark:border-green-900/50 dark:text-green-300">
+                    Sync completed successfully.
                   </div>
                 )}
 

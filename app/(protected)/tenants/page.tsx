@@ -1,8 +1,5 @@
 'use client'
 
-import { NeedsAttentionCell } from '@/components/tenants/needs-attention-cell'
-import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
-import { topAttention } from '@/lib/attention/topAttention'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import {
@@ -19,6 +16,14 @@ import {
   ArrowUp,
   ArrowDown,
   ArrowUpDown,
+  Copy,
+  Check,
+  Shield,
+  Building2,
+  AlertTriangle,
+  CheckCircle2,
+  XCircle,
+  Filter,
 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -35,17 +40,26 @@ import type {
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 
-type Provider = 'microsoft' | 'google'
-type TenantStatus = 'pending' | 'active' | 'suspended' | 'disconnected'
+import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
+import { topAttention } from '@/lib/attention/topAttention'
+import { TenantIssueDrawer } from '@/components/tenants/tenant-issue-drawer'
+import { AffectedServices } from '@/components/tenants/affected-services'
+import {
+  TenantStatusBadge,
+  getTenantDisplayStatus,
+  type DisplayStatusKey,
+} from '@/components/tenants/tenant-status-badge'
 
-type FilterType = 'all' | 'microsoft' | 'google'
-type ViewMode = 'tile' | 'list'
-type SortField =
-  | 'name'
-  | 'status'
-  | 'needsAttention'
-  | 'secureScore'
-  | 'lastSync'
+type Provider = 'microsoft' | 'google'
+type ProviderFilter = 'all' | 'microsoft' | 'google'
+type StatusFilter =
+  | 'all'
+  | 'healthy'
+  | 'needs_attention'
+  | 'disconnected_pending'
+  | 'stale'
+type ViewMode = 'list' | 'tile'
+type SortField = 'name' | 'status' | 'needsAttention' | 'lastSync'
 type SortOrder = 'asc' | 'desc'
 
 const MICROSOFT_CONSENT_MESSAGE = 'hawkview:microsoft-consent-complete'
@@ -86,7 +100,7 @@ function SortHeader({
       scope="col"
       aria-sort={ariaSort}
       className={cn(
-        'py-3 px-4 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider select-none',
+        'py-3.5 px-4 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider select-none sticky top-0 bg-slate-50 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 z-10',
         align === 'right'
           ? 'text-right'
           : align === 'center'
@@ -126,44 +140,23 @@ function SortHeader({
   )
 }
 
-function statusBadge(status: TenantStatus) {
-  switch (status) {
-    case 'active':
-      return 'bg-green-50 text-green-700 border border-green-200'
-    case 'pending':
-      return 'bg-orange-50 text-orange-700 border border-orange-200'
-    case 'suspended':
-    case 'disconnected':
-      return 'bg-red-50 text-red-700 border border-red-200'
-  }
-}
-
-function scoreColor(score: number) {
-  if (score >= 80) return 'text-green-600'
-  if (score >= 50) return 'text-orange-600'
-  return 'text-red-600'
-}
-
 function formatSyncTime(timeStr: string | null) {
-  if (!timeStr) return 'Collection pending'
-  if (timeStr.includes('T')) {
-    try {
-      const d = new Date(timeStr)
-      if (isNaN(d.getTime())) return 'time unavailable'
-      return new Intl.DateTimeFormat(undefined, {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-      }).format(d)
-    } catch {
-      return timeStr
-    }
+  if (!timeStr) return 'Awaiting initial sync'
+  try {
+    const d = new Date(timeStr)
+    if (isNaN(d.getTime())) return timeStr
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(d)
+  } catch {
+    return timeStr
   }
-  return timeStr
 }
 
 function ProviderIcon({
   provider,
-  size = 'normal',
+  size = 'small',
 }: {
   provider: Provider
   size?: 'normal' | 'small'
@@ -175,43 +168,38 @@ function ProviderIcon({
   )
 }
 
-function MicrosoftMark({ size = 'normal' }: { size?: 'normal' | 'small' }) {
+function MicrosoftMark({ size = 'small' }: { size?: 'normal' | 'small' }) {
   const isSmall = size === 'small'
   return (
     <div
-      className={`${
-        isSmall ? 'w-10 h-10 rounded-xl' : 'w-14 h-14 rounded-2xl'
-      } flex items-center justify-center border shadow-sm bg-blue-50 border-blue-100 shrink-0`}
+      className={cn(
+        'flex items-center justify-center border shadow-sm shrink-0 rounded-lg',
+        isSmall ? 'w-8 h-8 bg-blue-50/80 border-blue-100 dark:bg-blue-950/40 dark:border-blue-900' : 'w-10 h-10 bg-blue-50 border-blue-100 dark:bg-blue-950 dark:border-blue-900'
+      )}
+      title="Microsoft 365 Tenant"
     >
-      <div className="grid grid-cols-2 gap-1">
-        <span
-          className={`${isSmall ? 'h-2 w-2' : 'h-3 w-3'} bg-[#F25022] rounded-[2px]`}
-        />
-        <span
-          className={`${isSmall ? 'h-2 w-2' : 'h-3 w-3'} bg-[#7FBA00] rounded-[2px]`}
-        />
-        <span
-          className={`${isSmall ? 'h-2 w-2' : 'h-3 w-3'} bg-[#00A4EF] rounded-[2px]`}
-        />
-        <span
-          className={`${isSmall ? 'h-2 w-2' : 'h-3 w-3'} bg-[#FFB900] rounded-[2px]`}
-        />
+      <div className="grid grid-cols-2 gap-0.5">
+        <span className={cn('bg-[#F25022] rounded-[1px]', isSmall ? 'h-1.5 w-1.5' : 'h-2 w-2')} />
+        <span className={cn('bg-[#7FBA00] rounded-[1px]', isSmall ? 'h-1.5 w-1.5' : 'h-2 w-2')} />
+        <span className={cn('bg-[#00A4EF] rounded-[1px]', isSmall ? 'h-1.5 w-1.5' : 'h-2 w-2')} />
+        <span className={cn('bg-[#FFB900] rounded-[1px]', isSmall ? 'h-1.5 w-1.5' : 'h-2 w-2')} />
       </div>
     </div>
   )
 }
 
-function GoogleMark({ size = 'normal' }: { size?: 'normal' | 'small' }) {
+function GoogleMark({ size = 'small' }: { size?: 'normal' | 'small' }) {
   const isSmall = size === 'small'
   return (
     <div
-      className={`${
-        isSmall ? 'w-10 h-10 rounded-xl' : 'w-14 h-14 rounded-2xl'
-      } flex items-center justify-center border shadow-sm bg-red-50 border-red-100 shrink-0`}
+      className={cn(
+        'flex items-center justify-center border shadow-sm shrink-0 rounded-lg',
+        isSmall ? 'w-8 h-8 bg-red-50/80 border-red-100 dark:bg-red-950/40 dark:border-red-900' : 'w-10 h-10 bg-red-50 border-red-100 dark:bg-red-950 dark:border-red-900'
+      )}
     >
       <svg
-        width={isSmall ? '20' : '28'}
-        height={isSmall ? '20' : '28'}
+        width={isSmall ? '16' : '20'}
+        height={isSmall ? '16' : '20'}
         viewBox="0 0 48 48"
         aria-hidden="true"
       >
@@ -236,6 +224,34 @@ function GoogleMark({ size = 'normal' }: { size?: 'normal' | 'small' }) {
   )
 }
 
+function TenantIdPill({ tenantId }: { tenantId: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = (e: React.MouseEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    navigator.clipboard.writeText(tenantId)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      title={`Click to copy Tenant ID: ${tenantId}`}
+      className="inline-flex items-center gap-1 text-[11px] font-mono text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 transition-colors group/copy"
+    >
+      <span className="truncate max-w-[120px]">{tenantId}</span>
+      {copied ? (
+        <Check className="h-3 w-3 text-emerald-500 shrink-0" />
+      ) : (
+        <Copy className="h-3 w-3 opacity-0 group-hover/copy:opacity-100 shrink-0 transition-opacity" />
+      )}
+    </button>
+  )
+}
+
 export default function TenantsPage() {
   const queryClient = useQueryClient()
   const { data, isLoading, isFetching, error, refetch } = useTenants()
@@ -248,8 +264,15 @@ export default function TenantsPage() {
   )
 
   const [searchQuery, setSearchQuery] = useState('')
-  const [filter, setFilter] = useState<FilterType>('all')
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>('all')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [viewMode, setViewMode] = useState<ViewMode>('list')
+  const [sortField, setSortField] = useState<SortField>('name')
+  const [sortOrder, setSortOrder] = useState<SortOrder>('asc')
+
+  const [selectedDrawerTenant, setSelectedDrawerTenant] = useState<Tenant | null>(null)
+
+  // Onboarding state
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingStep, setOnboardingStep] = useState<
     'select' | 'hawkview' | 'manual'
@@ -257,7 +280,6 @@ export default function TenantsPage() {
   const [hawkviewPreviewMessage, setHawkviewPreviewMessage] = useState<
     string | null
   >(null)
-
   const [microsoftTenantId, setMicrosoftTenantId] = useState('')
   const [connectionMode, setConnectionMode] = useState<
     'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
@@ -278,9 +300,7 @@ export default function TenantsPage() {
 
   useEffect(() => {
     try {
-      const saved = localStorage.getItem(
-        'hawkview_tenants_view_mode'
-      ) as ViewMode | null
+      const saved = localStorage.getItem('hawkview_tenants_view_mode') as ViewMode | null
       if (saved === 'tile' || saved === 'list') {
         setViewMode(saved)
       }
@@ -410,13 +430,13 @@ export default function TenantsPage() {
 
     if (result === 'success') {
       setConsentMessage({
-        text: 'Microsoft 365 connection verified. HawkView is ready for the initial sync.',
+        text: 'Microsoft 365 connection verified. HawkView is performing initial synchronization.',
         tone: 'success',
       })
       queryClient.invalidateQueries({ queryKey: ['tenants'] })
     } else if (result === 'missing-permissions') {
       setConsentMessage({
-        text: 'Microsoft consent completed, but one or more required permissions are missing.',
+        text: 'Microsoft consent completed, but required administrator permissions are missing.',
         tone: 'warning',
       })
       queryClient.invalidateQueries({ queryKey: ['tenants'] })
@@ -455,13 +475,13 @@ export default function TenantsPage() {
       if (message.result === 'success') {
         setOnboardingError(null)
         setConsentMessage({
-          text: 'Microsoft 365 connection verified. HawkView is ready for the initial sync.',
+          text: 'Microsoft 365 connection verified. HawkView is performing initial synchronization.',
           tone: 'success',
         })
       } else if (message.result === 'missing-permissions') {
         setOnboardingError(null)
         setConsentMessage({
-          text: 'Microsoft consent completed, but one or more required permissions are missing.',
+          text: 'Microsoft consent completed, but required permissions are missing.',
           tone: 'warning',
         })
       } else {
@@ -505,7 +525,7 @@ export default function TenantsPage() {
     []
   )
 
-  const tenants = data?.tenants || []
+  const tenants: Tenant[] = useMemo(() => data?.tenants || [], [data?.tenants])
   const errorMessage = error ? (error as Error).message : data?.error || null
 
   const handleRetry = () => {
@@ -539,7 +559,7 @@ export default function TenantsPage() {
       if (!created.requiresConsent) {
         handleCloseOnboarding(true)
         setConsentMessage({
-          text: 'App registration Microsoft connection verified and stored securely. HawkView is ready for the initial sync.',
+          text: 'App registration Microsoft connection verified and stored securely.',
           tone: 'success',
         })
         return
@@ -588,7 +608,7 @@ export default function TenantsPage() {
       popup.document.body.innerHTML =
         '<main style="font-family:system-ui;padding:32px;color:#0f172a"><h2>Connecting to Microsoft 365...</h2><p>This window will close automatically when authorization is complete.</p></main>'
     } catch {
-      // The temporary same-origin document is optional.
+      // temporary same-origin document
     }
 
     try {
@@ -614,13 +634,13 @@ export default function TenantsPage() {
         setIsSavingTenant(false)
         queryClient.invalidateQueries({ queryKey: ['tenants'] })
       }, 500)
-    } catch (error) {
+    } catch (err) {
       popup.close()
       consentPopupRef.current = null
       setIsSavingTenant(false)
       setOnboardingError(
-        error instanceof Error
-          ? error.message
+        err instanceof Error
+          ? err.message
           : 'Microsoft tenant onboarding could not be started.'
       )
     }
@@ -636,9 +656,6 @@ export default function TenantsPage() {
     )
   }
 
-  const [sortField, setSortField] = useState<SortField>('name')
-  const [sortOrder, setSortOrder] = useState<SortOrder>('asc')
-
   const handleSort = (field: SortField) => {
     if (sortField === field) {
       setSortOrder((prev) => (prev === 'asc' ? 'desc' : 'asc'))
@@ -648,23 +665,67 @@ export default function TenantsPage() {
     }
   }
 
+  // Calculate Truthful Counts strictly from API response
+  const counts = useMemo(() => {
+    let healthy = 0
+    let needsAttention = 0
+    let disconnectedPending = 0
+
+    tenants.forEach((t) => {
+      const displayStatus = getTenantDisplayStatus(t)
+      if (displayStatus.key === 'healthy') {
+        healthy++
+      } else if (displayStatus.key === 'needs_attention') {
+        needsAttention++
+      } else {
+        disconnectedPending++
+      }
+    })
+
+    return {
+      total: tenants.length,
+      healthy,
+      needsAttention,
+      disconnectedPending,
+    }
+  }, [tenants])
+
+  // Filter & Search logic
   const filteredTenants = useMemo(() => {
-    const list = data?.tenants || []
-    return list.filter((tenant: any) => {
-      const q = searchQuery.toLowerCase()
+    return tenants.filter((tenant) => {
+      const q = searchQuery.trim().toLowerCase()
       const matchesSearch =
+        !q ||
         tenant.name?.toLowerCase().includes(q) ||
         tenant.domain?.toLowerCase().includes(q) ||
-        tenant.id?.toLowerCase().includes(q)
+        tenant.id?.toLowerCase().includes(q) ||
+        tenant.microsoftTenantId?.toLowerCase().includes(q)
 
-      const matchesFilter = filter === 'all' || tenant.provider === filter
-      return matchesSearch && matchesFilter
+      const matchesProvider =
+        providerFilter === 'all' || tenant.provider === providerFilter
+
+      const displayStatus = getTenantDisplayStatus(tenant)
+      let matchesStatus = true
+      if (statusFilter === 'healthy') {
+        matchesStatus = displayStatus.key === 'healthy'
+      } else if (statusFilter === 'needs_attention') {
+        matchesStatus = displayStatus.key === 'needs_attention'
+      } else if (statusFilter === 'disconnected_pending') {
+        matchesStatus =
+          displayStatus.key === 'disconnected' ||
+          displayStatus.key === 'pending_setup'
+      } else if (statusFilter === 'stale') {
+        matchesStatus = displayStatus.key === 'stale'
+      }
+
+      return matchesSearch && matchesProvider && matchesStatus
     })
-  }, [data?.tenants, searchQuery, filter])
+  }, [tenants, searchQuery, providerFilter, statusFilter])
 
+  // Sorting
   const sortedTenants = useMemo(() => {
     const list = [...filteredTenants]
-    return list.sort((a: Tenant, b: Tenant) => {
+    return list.sort((a, b) => {
       let cmp = 0
       switch (sortField) {
         case 'name': {
@@ -674,70 +735,40 @@ export default function TenantsPage() {
           break
         }
         case 'status': {
-          const statusOrder: Record<string, number> = {
-            active: 1,
-            pending: 2,
-            suspended: 3,
-            disconnected: 4,
+          const statusRank: Record<DisplayStatusKey, number> = {
+            needs_attention: 1,
+            disconnected: 2,
+            pending_setup: 3,
+            stale: 4,
+            syncing: 5,
+            partially_synchronized: 6,
+            healthy: 7,
           }
-          const rankA = statusOrder[a.status] || 99
-          const rankB = statusOrder[b.status] || 99
+          const rankA = statusRank[getTenantDisplayStatus(a).key] || 99
+          const rankB = statusRank[getTenantDisplayStatus(b).key] || 99
           cmp = rankA - rankB
-          if (cmp === 0) {
-            cmp = (a.name || '')
-              .toLowerCase()
-              .localeCompare((b.name || '').toLowerCase())
-          }
           break
         }
         case 'needsAttention': {
-          const getAttentionWeight = (t: any) => {
-            const items = topAttention(
-              computeTenantAttention({
-                ...(t?.bundle ?? {}),
-                connectionStatus: t?.connectionStatus,
-                status: t?.status,
-              })
-            )
-            if (!items.length) return 0
-            return items.reduce((acc, item) => {
-              if (item.severity === 'critical') return acc + 3
-              if (item.severity === 'high') return acc + 2
-              if (item.severity === 'medium') return acc + 1
-              return acc
-            }, 0)
-          }
-          const weightA = getAttentionWeight(a)
-          const weightB = getAttentionWeight(b)
-          cmp = weightA - weightB
-          if (cmp === 0) {
-            cmp = (a.name || '')
-              .toLowerCase()
-              .localeCompare((b.name || '').toLowerCase())
-          }
-          break
-        }
-        case 'secureScore': {
-          const scoreA = a.secureScore
-          const scoreB = b.secureScore
-          if (scoreA == null && scoreB == null) cmp = 0
-          else if (scoreA == null) cmp = -1000
-          else if (scoreB == null) cmp = 1000
-          else cmp = scoreA - scoreB
+          const itemsA = computeTenantAttention({
+            ...((a as any)?.bundle ?? {}),
+            connectionStatus: a.connectionStatus,
+            status: a.status,
+            missingPermissions: a.missingPermissions,
+          })
+          const itemsB = computeTenantAttention({
+            ...((b as any)?.bundle ?? {}),
+            connectionStatus: b.connectionStatus,
+            status: b.status,
+            missingPermissions: b.missingPermissions,
+          })
+          cmp = itemsB.length - itemsA.length
           break
         }
         case 'lastSync': {
-          const getSyncTime = (ts: string | null) => {
-            if (!ts) return 0
-            const time = new Date(ts).getTime()
-            return isNaN(time) ? 0 : time
-          }
-          const timeA = getSyncTime(a.lastSync)
-          const timeB = getSyncTime(b.lastSync)
-          if (timeA === 0 && timeB === 0) cmp = 0
-          else if (timeA === 0) cmp = -100000000000000
-          else if (timeB === 0) cmp = 100000000000000
-          else cmp = timeA - timeB
+          const timeA = a.lastSync ? new Date(a.lastSync).getTime() : 0
+          const timeB = b.lastSync ? new Date(b.lastSync).getTime() : 0
+          cmp = timeA - timeB
           break
         }
       }
@@ -745,39 +776,114 @@ export default function TenantsPage() {
     })
   }, [filteredTenants, sortField, sortOrder])
 
+  const clearFilters = () => {
+    setSearchQuery('')
+    setProviderFilter('all')
+    setStatusFilter('all')
+  }
+
+  const hasActiveFilters =
+    Boolean(searchQuery.trim()) ||
+    providerFilter !== 'all' ||
+    statusFilter !== 'all'
+
   const loadingText =
     elapsedSeconds < 15
       ? `Loading tenant directory… ${elapsedSeconds}s`
       : `HawkView API is taking longer than expected… ${elapsedSeconds}s`
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-300">
-      {/* Header */}
-      <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
+      {/* 1. Page Header */}
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between border-b border-slate-200 dark:border-slate-800 pb-5">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight text-slate-900 dark:text-white">
-            Tenant Directory
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 dark:text-white flex items-center gap-2.5">
+            <Building2 className="h-7 w-7 text-blue-600 shrink-0" />
+            <span>Tenant Directory</span>
           </h1>
-          <p className="mt-2 text-base text-slate-500 dark:text-slate-400">
-            Select a tenant environment to manage security, licenses, and users.
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Monitor and manage customer environments.
           </p>
         </div>
-        <Button
-          ref={onboardButtonRef}
-          className="gap-2 rounded-xl"
-          onClick={() => {
-            setOnboardingError(null)
-            setConsentReview(null)
-            setHawkviewPreviewMessage(null)
-            setOnboardingStep('select')
-            setShowOnboarding(true)
-          }}
-        >
-          <Plus className="h-4 w-4" />
-          Onboard New Tenant
-        </Button>
+
+        <div className="flex items-center gap-3">
+          <Button
+            ref={onboardButtonRef}
+            className="gap-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold shadow-sm"
+            onClick={() => {
+              setOnboardingError(null)
+              setConsentReview(null)
+              setHawkviewPreviewMessage(null)
+              setOnboardingStep('select')
+              setShowOnboarding(true)
+            }}
+          >
+            <Plus className="h-4 w-4" />
+            <span>Onboard Tenant</span>
+          </Button>
+        </div>
       </div>
 
+      {/* 1b. Compact Summary Strip */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+          <div>
+            <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+              Total Tenants
+            </p>
+            <p className="text-2xl font-extrabold text-slate-900 dark:text-white mt-0.5">
+              {counts.total}
+            </p>
+          </div>
+          <div className="h-10 w-10 rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-600 dark:text-slate-300">
+            <Building2 className="h-5 w-5" />
+          </div>
+        </div>
+
+        <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+          <div>
+            <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 uppercase tracking-wider">
+              Healthy
+            </p>
+            <p className="text-2xl font-extrabold text-emerald-700 dark:text-emerald-400 mt-0.5">
+              {counts.healthy}
+            </p>
+          </div>
+          <div className="h-10 w-10 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-100 dark:border-emerald-900 flex items-center justify-center text-emerald-600">
+            <CheckCircle2 className="h-5 w-5" />
+          </div>
+        </div>
+
+        <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+          <div>
+            <p className="text-xs font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wider">
+              Needs Attention
+            </p>
+            <p className="text-2xl font-extrabold text-amber-700 dark:text-amber-400 mt-0.5">
+              {counts.needsAttention}
+            </p>
+          </div>
+          <div className="h-10 w-10 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-100 dark:border-amber-900 flex items-center justify-center text-amber-600">
+            <AlertTriangle className="h-5 w-5" />
+          </div>
+        </div>
+
+        <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+          <div>
+            <p className="text-xs font-semibold text-red-600 dark:text-red-400 uppercase tracking-wider">
+              Disconnected / Pending
+            </p>
+            <p className="text-2xl font-extrabold text-red-700 dark:text-red-400 mt-0.5">
+              {counts.disconnectedPending}
+            </p>
+          </div>
+          <div className="h-10 w-10 rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-100 dark:border-red-900 flex items-center justify-center text-red-600">
+            <XCircle className="h-5 w-5" />
+          </div>
+        </div>
+      </div>
+
+      {/* Onboarding Modal */}
       {showOnboarding && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm animate-in fade-in duration-200"
@@ -814,8 +920,7 @@ export default function TenantsPage() {
                     Permissions requested by HawkView
                   </h2>
                   <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-                    A Microsoft 365 administrator will review these permissions
-                    on Microsoft&apos;s consent screen.
+                    A Microsoft 365 administrator will review these permissions on Microsoft&apos;s consent screen.
                   </p>
                 </div>
                 <div className="grid gap-3 max-h-60 overflow-y-auto pr-1">
@@ -836,7 +941,7 @@ export default function TenantsPage() {
                 <div className="flex flex-wrap gap-3 pt-2">
                   <Button
                     type="button"
-                    className="rounded-xl"
+                    className="rounded-xl bg-blue-600 hover:bg-blue-700 text-white"
                     onClick={() =>
                       void openMicrosoftConsentPopup(() =>
                         Promise.resolve(consentReview)
@@ -889,8 +994,7 @@ export default function TenantsPage() {
                       </Badge>
                     </div>
                     <p className="text-sm text-slate-600 dark:text-slate-400">
-                      Sign in with a Microsoft 365 administrator account and
-                      approve the permissions requested by HawkView.
+                      Sign in with a Microsoft 365 administrator account and approve the permissions requested by HawkView.
                     </p>
                   </button>
 
@@ -909,15 +1013,13 @@ export default function TenantsPage() {
                       </span>
                     </div>
                     <p className="text-sm text-slate-600 dark:text-slate-400">
-                      Enter credentials from an application registration
-                      controlled by the customer.
+                      Enter credentials from an application registration controlled by the customer.
                     </p>
                   </button>
                 </div>
               </div>
             ) : onboardingStep === 'hawkview' ? (
               <div className="space-y-5">
-                {/* Header with small Microsoft logo inside soft-blue icon container */}
                 <div className="flex items-start gap-3.5 pr-8">
                   <div className="w-10 h-10 rounded-xl bg-blue-50 dark:bg-blue-950/60 border border-blue-100 dark:border-blue-900/50 flex items-center justify-center shrink-0">
                     <div className="grid grid-cols-2 gap-0.5">
@@ -935,13 +1037,11 @@ export default function TenantsPage() {
                       Connect with Microsoft 365
                     </h2>
                     <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-                      Authorize HawkView to securely read and monitor this
-                      tenant.
+                      Authorize HawkView to securely read and monitor this tenant.
                     </p>
                   </div>
                 </div>
 
-                {/* Compact three-step progress indicator */}
                 <div className="flex items-center justify-between text-xs border-y border-slate-100 dark:border-slate-800 py-3 my-2">
                   <div className="flex items-center gap-2 font-semibold text-blue-600 dark:text-blue-400">
                     <span className="flex h-5 w-5 items-center justify-center rounded-full bg-blue-600 dark:bg-blue-500 text-[11px] font-bold text-white shrink-0">
@@ -954,20 +1054,17 @@ export default function TenantsPage() {
                     <span className="flex h-5 w-5 items-center justify-center rounded-full border border-slate-200 dark:border-slate-800 text-[11px] shrink-0">
                       2
                     </span>
-                    <span className="hidden sm:inline">Review permissions</span>
-                    <span className="sm:hidden">Permissions</span>
+                    <span>Permissions</span>
                   </div>
                   <div className="h-px flex-1 mx-2 sm:mx-3 bg-slate-200 dark:bg-slate-800" />
                   <div className="flex items-center gap-2 text-slate-400 dark:text-slate-500 font-medium">
                     <span className="flex h-5 w-5 items-center justify-center rounded-full border border-slate-200 dark:border-slate-800 text-[11px] shrink-0">
                       3
                     </span>
-                    <span className="hidden sm:inline">Connect tenant</span>
-                    <span className="sm:hidden">Connect</span>
+                    <span>Connect</span>
                   </div>
                 </div>
 
-                {/* Informational Panel */}
                 <div className="rounded-2xl border border-blue-100 dark:border-blue-900/40 bg-blue-50/60 dark:bg-blue-950/30 p-4 space-y-3">
                   <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
                     What happens next?
@@ -975,42 +1072,32 @@ export default function TenantsPage() {
                   <ul className="space-y-2 text-xs text-slate-600 dark:text-slate-300">
                     <li className="flex items-start gap-2">
                       <span className="mt-1 h-1.5 w-1.5 rounded-full bg-blue-500 shrink-0" />
-                      <span>
-                        Sign in using a Microsoft 365 administrator account.
-                      </span>
+                      <span>Sign in using a Microsoft 365 administrator account.</span>
                     </li>
                     <li className="flex items-start gap-2">
                       <span className="mt-1 h-1.5 w-1.5 rounded-full bg-blue-500 shrink-0" />
-                      <span>
-                        Review the read-only permissions requested by HawkView.
-                      </span>
+                      <span>Review read-only permissions requested by HawkView.</span>
                     </li>
                     <li className="flex items-start gap-2">
                       <span className="mt-1 h-1.5 w-1.5 rounded-full bg-blue-500 shrink-0" />
-                      <span>
-                        Approve access and return to HawkView automatically.
-                      </span>
+                      <span>Approve access and return to HawkView automatically.</span>
                     </li>
                   </ul>
                 </div>
 
-                {/* Security Note */}
                 <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 px-1">
                   <ShieldCheck className="h-4 w-4 text-slate-400 shrink-0" />
                   <span>
-                    HawkView never receives or stores your Microsoft
-                    administrator password.
+                    HawkView never receives or stores your Microsoft administrator password.
                   </span>
                 </div>
 
-                {/* Preview state feedback */}
                 {hawkviewPreviewMessage && (
                   <div className="rounded-2xl border border-blue-200 bg-blue-50 p-3.5 text-xs font-medium text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/50 dark:text-blue-200">
                     {hawkviewPreviewMessage}
                   </div>
                 )}
 
-                {/* Footer Buttons */}
                 <div className="flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3 pt-3 border-t border-slate-100 dark:border-slate-800">
                   <Button
                     type="button"
@@ -1031,12 +1118,6 @@ export default function TenantsPage() {
                     onClick={handleManagedOnboarding}
                     disabled={isSavingTenant}
                   >
-                    <div className="grid grid-cols-2 gap-0.5 shrink-0">
-                      <span className="h-1.5 w-1.5 bg-[#F25022] rounded-[0.5px]" />
-                      <span className="h-1.5 w-1.5 bg-[#7FBA00] rounded-[0.5px]" />
-                      <span className="h-1.5 w-1.5 bg-[#00A4EF] rounded-[0.5px]" />
-                      <span className="h-1.5 w-1.5 bg-[#FFB900] rounded-[0.5px]" />
-                    </div>
                     {isSavingTenant
                       ? 'Connecting to Microsoft...'
                       : 'Continue with Microsoft'}
@@ -1044,7 +1125,6 @@ export default function TenantsPage() {
                 </div>
               </div>
             ) : (
-              /* manual step */
               <div className="space-y-6">
                 <div>
                   <h2
@@ -1054,8 +1134,7 @@ export default function TenantsPage() {
                     Manually register the app
                   </h2>
                   <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-                    Enter credentials from an application registration
-                    controlled by the customer.
+                    Enter credentials from an application registration controlled by the customer.
                   </p>
                 </div>
 
@@ -1104,17 +1183,13 @@ export default function TenantsPage() {
                       }
                       required
                     />
-                    <p className="text-xs text-slate-500 dark:text-slate-400">
-                      Sent once to the backend, stored in Secret Manager, and
-                      never returned to this browser.
-                    </p>
                   </div>
 
                   <div className="flex flex-wrap items-center gap-3 pt-2">
                     <Button
                       type="submit"
                       disabled={isSavingTenant}
-                      className="rounded-xl px-5"
+                      className="rounded-xl px-5 bg-blue-600 hover:bg-blue-700 text-white"
                     >
                       {isSavingTenant
                         ? 'Verifying…'
@@ -1145,42 +1220,28 @@ export default function TenantsPage() {
         </div>
       )}
 
+      {/* Notifications / Banners */}
       {consentMessage && (
         <Card
-          className={
+          className={cn(
+            'rounded-2xl border p-4 text-sm font-medium',
             consentMessage.tone === 'success'
-              ? 'rounded-2xl border-emerald-200 bg-emerald-50/80 dark:border-emerald-900 dark:bg-emerald-950/20'
-              : 'rounded-2xl border-amber-200 bg-amber-50/80 dark:border-amber-900 dark:bg-amber-950/20'
-          }
+              ? 'border-emerald-200 bg-emerald-50/80 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/20 dark:text-emerald-300'
+              : 'border-amber-200 bg-amber-50/80 text-amber-800 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-300'
+          )}
         >
-          <CardContent
-            className={
-              consentMessage.tone === 'success'
-                ? 'p-4 text-sm font-medium text-emerald-800 dark:text-emerald-300'
-                : 'p-4 text-sm font-medium text-amber-800 dark:text-amber-300'
-            }
-          >
-            {consentMessage.text}
-          </CardContent>
+          {consentMessage.text}
         </Card>
       )}
 
-      {onboardingError && !showOnboarding && (
-        <Card className="rounded-2xl border-red-200 bg-red-50/80 dark:border-red-900 dark:bg-red-950/20">
-          <CardContent className="p-4 text-sm font-medium text-red-800 dark:text-red-300">
-            {onboardingError}
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Database API Error Alert */}
+      {/* Backend API Error Alert */}
       {errorMessage && !loading && (
         <Card className="border-red-200 bg-red-50/80 dark:bg-red-950/20 dark:border-red-900/50 p-4 rounded-2xl">
           <div className="flex items-start gap-3 text-red-800 dark:text-red-300">
-            <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
+            <AlertCircle className="h-5 w-5 mt-0.5 shrink-0 text-red-600" />
             <div className="flex-1 text-sm">
               <p className="font-semibold">
-                Unable to load the tenant directory
+                Unable to load tenant directory
               </p>
               <p className="mt-1 text-red-700 dark:text-red-400">
                 {errorMessage}
@@ -1193,231 +1254,219 @@ export default function TenantsPage() {
               className="gap-1.5 bg-white dark:bg-slate-900 border-red-200 dark:border-red-800 text-red-800 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-950/60"
             >
               <RefreshCw className="h-3.5 w-3.5" />
-              Retry
+              <span>Retry</span>
             </Button>
           </div>
         </Card>
       )}
 
-      {/* Search + Filter bar */}
-      <div className="bg-white dark:bg-slate-900 p-2 rounded-2xl border shadow-sm flex flex-col md:flex-row gap-2 md:items-center">
+      {/* 2. Search and Control Bar */}
+      <div className="bg-white dark:bg-slate-900 p-2 sm:p-3 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-2 lg:space-y-0 lg:flex lg:items-center lg:gap-3">
+        {/* Search input */}
         <div className="relative flex-1">
-          <Search className="absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <Search className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <Input
-            placeholder="Search by name, domain, or ID..."
+            placeholder="Search by tenant name, primary domain, or tenant ID..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-11 h-12 border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0"
+            className="pl-10 h-10 border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0 text-sm placeholder:text-slate-400"
           />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
 
-        <div className="flex items-center justify-between md:justify-end gap-2 border-t md:border-t-0 md:border-l border-slate-200 dark:border-slate-800 pt-2 md:pt-0 pl-0 md:pl-3">
-          <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
-            {(['all', 'microsoft', 'google'] as FilterType[]).map((type) => (
+        {/* Filter controls group */}
+        <div className="flex flex-wrap items-center gap-2 pt-2 lg:pt-0 border-t lg:border-t-0 lg:border-l border-slate-200 dark:border-slate-800 lg:pl-3">
+          {/* Status Filter Dropdown / Selector */}
+          <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+            <span className="text-xs font-semibold text-slate-400 px-2 hidden sm:inline">
+              Status:
+            </span>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('all')}
+              className={cn(
+                'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all',
+                statusFilter === 'all'
+                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
+                  : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
+              )}
+            >
+              All
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('healthy')}
+              className={cn(
+                'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all',
+                statusFilter === 'healthy'
+                  ? 'bg-emerald-50 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 shadow-sm font-bold'
+                  : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
+              )}
+            >
+              Healthy
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('needs_attention')}
+              className={cn(
+                'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all',
+                statusFilter === 'needs_attention'
+                  ? 'bg-amber-50 text-amber-800 dark:bg-amber-950 dark:text-amber-300 shadow-sm font-bold'
+                  : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
+              )}
+            >
+              Attention
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('disconnected_pending')}
+              className={cn(
+                'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all',
+                statusFilter === 'disconnected_pending'
+                  ? 'bg-red-50 text-red-800 dark:bg-red-950 dark:text-red-300 shadow-sm font-bold'
+                  : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
+              )}
+            >
+              Offline/Pending
+            </button>
+          </div>
+
+          {/* Provider Filter */}
+          <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+            {(['all', 'microsoft', 'google'] as ProviderFilter[]).map((p) => (
               <button
-                key={type}
-                onClick={() => setFilter(type)}
-                className={[
-                  'px-4 py-2 rounded-lg text-sm font-semibold transition-all',
-                  filter === type
+                key={p}
+                type="button"
+                onClick={() => setProviderFilter(p)}
+                className={cn(
+                  'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all capitalize',
+                  providerFilter === p
                     ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
-                    : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-white',
-                ].join(' ')}
+                    : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
+                )}
               >
-                {type === 'all'
-                  ? 'All'
-                  : type === 'microsoft'
-                    ? 'Microsoft'
-                    : 'Google'}
+                {p}
               </button>
             ))}
           </div>
 
-          <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl gap-1">
-            <button
-              type="button"
-              onClick={() => handleViewModeChange('tile')}
-              title="Tile view"
-              aria-label="Tile view"
-              className={[
-                'p-2 rounded-lg transition-all',
-                viewMode === 'tile'
-                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
-                  : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-white',
-              ].join(' ')}
-            >
-              <LayoutGrid className="h-4 w-4" />
-            </button>
+          {/* View Mode Switcher */}
+          <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-xl gap-0.5 ml-auto">
             <button
               type="button"
               onClick={() => handleViewModeChange('list')}
-              title="List view"
+              title="List view (Recommended for 100+ tenants)"
               aria-label="List view"
-              className={[
-                'p-2 rounded-lg transition-all',
+              className={cn(
+                'p-1.5 rounded-lg transition-all',
                 viewMode === 'list'
-                  ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
-                  : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-white',
-              ].join(' ')}
+                  ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
+              )}
             >
               <List className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => handleViewModeChange('tile')}
+              title="Card view"
+              aria-label="Card view"
+              className={cn(
+                'p-1.5 rounded-lg transition-all',
+                viewMode === 'tile'
+                  ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
+              )}
+            >
+              <LayoutGrid className="h-4 w-4" />
             </button>
           </div>
         </div>
       </div>
 
-      {/* Loading state */}
+      {/* Active Filter Clear Bar (if active) */}
+      {hasActiveFilters && (
+        <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-slate-100/70 dark:bg-slate-800/40 border border-slate-200/60 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-semibold text-slate-500">Active Filters:</span>
+            {searchQuery && (
+              <Badge variant="outline" className="gap-1 bg-white dark:bg-slate-800">
+                Search: &quot;{searchQuery}&quot;
+              </Badge>
+            )}
+            {statusFilter !== 'all' && (
+              <Badge variant="outline" className="gap-1 bg-white dark:bg-slate-800 capitalize">
+                Status: {statusFilter.replace('_', ' ')}
+              </Badge>
+            )}
+            {providerFilter !== 'all' && (
+              <Badge variant="outline" className="gap-1 bg-white dark:bg-slate-800 capitalize">
+                Provider: {providerFilter}
+              </Badge>
+            )}
+            <span className="text-slate-400 font-medium">
+              ({sortedTenants.length} of {tenants.length} matching)
+            </span>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={clearFilters}
+            className="h-7 px-2 text-xs text-blue-600 hover:text-blue-700 font-semibold"
+          >
+            Clear Filters
+          </Button>
+        </div>
+      )}
+
+      {/* 3. Loading Skeleton */}
       {loading && (
-        <div className="space-y-4">
-          <div className="flex items-center gap-2 text-sm font-medium text-slate-500 dark:text-slate-400">
-            <RefreshCw className="h-4 w-4 animate-spin text-blue-600" />
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 dark:text-slate-400 px-1">
+            <RefreshCw className="h-3.5 w-3.5 animate-spin text-blue-600" />
             <span>{loadingText}</span>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-            {[1, 2, 3].map((i) => (
-              <Card
-                key={i}
-                className="animate-pulse p-6 bg-white dark:bg-slate-900 rounded-3xl border"
-              >
-                <div className="flex items-center gap-4 mb-6">
-                  <div className="w-14 h-14 bg-slate-100 dark:bg-slate-800 rounded-2xl" />
-                  <div className="space-y-2 flex-1">
-                    <div className="h-5 bg-slate-100 dark:bg-slate-800 rounded w-3/4" />
-                    <div className="h-4 bg-slate-100 dark:bg-slate-800 rounded w-1/2" />
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm">
+            <div className="p-4 space-y-4">
+              {[1, 2, 3, 4, 5].map((i) => (
+                <div
+                  key={i}
+                  className="flex items-center justify-between gap-4 animate-pulse pb-3 border-b border-slate-100 dark:border-slate-800 last:border-0 last:pb-0"
+                >
+                  <div className="flex items-center gap-3 w-1/3">
+                    <div className="w-8 h-8 rounded-lg bg-slate-200 dark:bg-slate-800 shrink-0" />
+                    <div className="space-y-1.5 flex-1">
+                      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-3/4" />
+                      <div className="h-3 bg-slate-100 dark:bg-slate-800/60 rounded w-1/2" />
+                    </div>
                   </div>
+                  <div className="h-6 w-24 bg-slate-200 dark:bg-slate-800 rounded-md" />
+                  <div className="h-6 w-20 bg-slate-100 dark:bg-slate-800/60 rounded-md hidden md:block" />
+                  <div className="h-8 w-24 bg-slate-200 dark:bg-slate-800 rounded-lg" />
                 </div>
-                <div className="h-16 bg-slate-50 dark:bg-slate-800/60 rounded-xl mb-4" />
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="h-14 bg-slate-50 dark:bg-slate-800/60 rounded-xl" />
-                  <div className="h-14 bg-slate-50 dark:bg-slate-800/60 rounded-xl" />
-                </div>
-              </Card>
-            ))}
+              ))}
+            </div>
           </div>
         </div>
       )}
 
-      {/* Tenants Display */}
-      {!loading &&
-        sortedTenants.length > 0 &&
-        (viewMode === 'tile' ? (
-          /* Tile View */
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-            {sortedTenants.map((tenant: Tenant) => (
-              <div key={tenant.id} className="space-y-2">
-                <Link href={`/tenants/${tenant.id}`}>
-                  <Card className="group bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 p-0 hover:border-blue-200 hover:shadow-xl hover:shadow-blue-500/5 transition-all duration-300 cursor-pointer relative overflow-hidden">
-                    {/* accent */}
-                    <div
-                      className={[
-                        'absolute top-0 right-0 w-32 h-32 opacity-5 rounded-bl-full pointer-events-none -mr-8 -mt-8',
-                        tenant.provider === 'microsoft'
-                          ? 'bg-blue-500'
-                          : 'bg-red-500',
-                      ].join(' ')}
-                    />
-
-                    <CardContent className="p-6">
-                      <div className="flex items-start justify-between mb-5 relative z-10">
-                        <div className="flex items-center gap-4">
-                          <ProviderIcon provider={tenant.provider} />
-                          <div>
-                            <h3 className="text-lg font-semibold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors">
-                              {tenant.name}
-                            </h3>
-                            <p className="text-sm text-slate-500 dark:text-slate-400">
-                              {tenant.domain || 'Domain pending collection'}
-                            </p>
-                          </div>
-                        </div>
-
-                        <Badge
-                          className={`uppercase tracking-wide ${statusBadge(tenant.status)}`}
-                        >
-                          {tenant.status}
-                        </Badge>
-                      </div>
-
-                      {/* Needs Attention tags */}
-                      <div className="mb-5 relative z-10">
-                        <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">
-                          Needs Attention
-                        </p>
-                        <NeedsAttentionCell tenant={tenant} />
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-4 mb-6 relative z-10">
-                        <div className="bg-slate-50 dark:bg-slate-800/60 rounded-xl p-3 border border-slate-100 dark:border-slate-800">
-                          <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
-                            Secure Score
-                          </p>
-                          {tenant.secureScore == null ? (
-                            <span className="text-sm font-semibold text-slate-500">
-                              Collection pending
-                            </span>
-                          ) : (
-                            <div className="flex items-end gap-1">
-                              <span
-                                className={`text-xl font-bold ${scoreColor(tenant.secureScore)}`}
-                              >
-                                {tenant.secureScore}%
-                              </span>
-                              <span className="text-xs font-semibold text-slate-400 mb-1">
-                                / 100
-                              </span>
-                            </div>
-                          )}
-                        </div>
-
-                        <div className="bg-slate-50 dark:bg-slate-800/60 rounded-xl p-3 border border-slate-100 dark:border-slate-800">
-                          <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
-                            Licenses
-                          </p>
-                          {tenant.licenseCount == null ? (
-                            <span className="text-sm font-semibold text-slate-500">
-                              Collection pending
-                            </span>
-                          ) : (
-                            <div className="flex items-end gap-1">
-                              <span className="text-xl font-bold text-slate-900 dark:text-white">
-                                {tenant.licenseCount}
-                              </span>
-                              <span className="text-xs font-semibold text-slate-400 mb-1">
-                                assigned
-                              </span>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      <div className="flex items-center justify-between pt-4 border-t border-slate-100 dark:border-slate-800 relative z-10">
-                        <span
-                          className="flex items-center gap-1.5 text-xs font-semibold text-slate-400"
-                          title={tenant.lastSync || ''}
-                        >
-                          <Clock className="h-3.5 w-3.5" />
-                          {tenant.lastSync
-                            ? `Synced ${formatSyncTime(tenant.lastSync)}`
-                            : 'Collection pending'}
-                        </span>
-                        <span className="text-sm font-semibold text-blue-600 flex items-center gap-1 group-hover:underline">
-                          Manage Tenant <ChevronRight className="h-4 w-4" />
-                        </span>
-                      </div>
-                    </CardContent>
-                  </Card>
-                </Link>
-              </div>
-            ))}
-          </div>
-        ) : (
-          /* List View */
-          <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm">
-            {/* Desktop Table Layout */}
-            <div className="hidden lg:block overflow-x-auto">
-              <table className="w-full text-left text-sm">
-                <thead className="bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+      {/* 4. Primary Tenant Directory Display */}
+      {!loading && sortedTenants.length > 0 && (
+        viewMode === 'list' ? (
+          /* List View (Default for 100+ scalability) */
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm border-collapse">
+                <thead>
                   <tr>
                     <SortHeader
                       field="name"
@@ -1428,7 +1477,7 @@ export default function TenantsPage() {
                     />
                     <SortHeader
                       field="status"
-                      label="Status"
+                      label="Overall Status"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
@@ -1440,193 +1489,305 @@ export default function TenantsPage() {
                       sortOrder={sortOrder}
                       onSort={handleSort}
                     />
-                    <SortHeader
-                      field="secureScore"
-                      label="Secure Score"
-                      activeField={sortField}
-                      sortOrder={sortOrder}
-                      onSort={handleSort}
-                    />
+                    <th
+                      scope="col"
+                      className="py-3.5 px-4 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider sticky top-0 bg-slate-50 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800"
+                    >
+                      Affected Services
+                    </th>
                     <SortHeader
                       field="lastSync"
-                      label="Last Sync"
+                      label="Last Successful Sync"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
                     />
                     <th
                       scope="col"
-                      className="py-3 px-4 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider text-right"
+                      className="py-3.5 px-4 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider text-right sticky top-0 bg-slate-50 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800"
                     >
                       Action
                     </th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {sortedTenants.map((tenant: Tenant) => (
-                    <tr
-                      key={tenant.id}
-                      className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors group"
-                    >
-                      <td className="py-3 px-4">
-                        <div className="flex items-center gap-3">
-                          <ProviderIcon
-                            provider={tenant.provider}
-                            size="small"
-                          />
-                          <div>
-                            <Link
-                              href={`/tenants/${tenant.id}`}
-                              className="font-semibold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors block"
-                            >
-                              {tenant.name}
-                            </Link>
-                            <p className="text-xs text-slate-500 dark:text-slate-400">
-                              {tenant.domain || 'Domain pending collection'}
-                            </p>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
+                  {sortedTenants.map((tenant) => {
+                    const statusInfo = getTenantDisplayStatus(tenant)
+                    const attentionItems = computeTenantAttention({
+                      ...((tenant as any)?.bundle ?? {}),
+                      connectionStatus: tenant.connectionStatus,
+                      status: tenant.status,
+                      missingPermissions: tenant.missingPermissions,
+                    })
+
+                    return (
+                      <tr
+                        key={tenant.id}
+                        className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors group"
+                      >
+                        {/* Tenant Column */}
+                        <td className="py-3.5 px-4">
+                          <div className="flex items-center gap-3">
+                            <ProviderIcon
+                              provider={tenant.provider}
+                              size="small"
+                            />
+                            <div className="min-w-0">
+                              <Link
+                                href={`/tenants/${tenant.id}`}
+                                className="font-bold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors block truncate"
+                              >
+                                {tenant.name}
+                              </Link>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <span className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                                  {tenant.domain || 'Domain collection pending'}
+                                </span>
+                                <span className="text-slate-300 dark:text-slate-700">
+                                  •
+                                </span>
+                                <TenantIdPill
+                                  tenantId={tenant.microsoftTenantId || tenant.id}
+                                />
+                              </div>
+                            </div>
                           </div>
-                        </div>
-                      </td>
-                      <td className="py-3 px-4 whitespace-nowrap">
-                        <Badge
-                          className={`uppercase tracking-wide text-[10px] ${statusBadge(tenant.status)}`}
-                        >
-                          {tenant.status}
-                        </Badge>
-                      </td>
-                      <td className="py-3 px-4 max-w-[220px]">
-                        <NeedsAttentionCell tenant={tenant} />
-                      </td>
-                      <td className="py-3 px-4 whitespace-nowrap font-medium">
-                        {tenant.secureScore == null ? (
-                          <span className="text-xs text-slate-400">
-                            Collection pending
-                          </span>
-                        ) : (
-                          <span
-                            className={`text-base font-bold ${scoreColor(tenant.secureScore)}`}
+                        </td>
+
+                        {/* Overall Status */}
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <TenantStatusBadge tenant={tenant} />
+                        </td>
+
+                        {/* Needs Attention Column */}
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          {attentionItems.length > 0 ? (
+                            <button
+                              type="button"
+                              onClick={() => setSelectedDrawerTenant(tenant)}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300 border border-amber-200 dark:border-amber-900 hover:bg-amber-100 dark:hover:bg-amber-900/60 transition-colors text-xs font-semibold text-left"
+                            >
+                              <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
+                              <span>{attentionItems.length} issue{attentionItems.length > 1 ? 's' : ''}</span>
+                              <ChevronRight className="h-3.5 w-3.5 opacity-60 ml-0.5" />
+                            </button>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-xs text-slate-400 dark:text-slate-500 font-medium">
+                              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
+                              <span>No issues</span>
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Affected Services */}
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <AffectedServices tenant={tenant} compact />
+                        </td>
+
+                        {/* Last Sync */}
+                        <td className="py-3.5 px-4 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-medium">
+                          <div
+                            className="flex items-center gap-1.5"
+                            title={tenant.lastSync || 'Awaiting initial sync'}
                           >
-                            {tenant.secureScore}%
-                          </span>
-                        )}
-                      </td>
-                      <td className="py-3 px-4 whitespace-nowrap text-xs text-slate-500 dark:text-slate-400">
-                        <span
-                          className="flex items-center gap-1.5"
-                          title={tenant.lastSync || ''}
-                        >
-                          <Clock className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                          {tenant.lastSync
-                            ? formatSyncTime(tenant.lastSync)
-                            : 'Collection pending'}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-right whitespace-nowrap">
-                        <Link href={`/tenants/${tenant.id}`}>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-8 gap-1 rounded-lg text-blue-600 hover:text-blue-700 hover:bg-blue-50 dark:hover:bg-blue-950/50 font-semibold"
-                          >
-                            Manage
-                            <ChevronRight className="h-4 w-4" />
-                          </Button>
-                        </Link>
-                      </td>
-                    </tr>
-                  ))}
+                            <Clock className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                            <span>{formatSyncTime(tenant.lastSync)}</span>
+                          </div>
+                        </td>
+
+                        {/* Context-Sensitive Primary Action */}
+                        <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                          {statusInfo.key === 'needs_attention' ? (
+                            <Button
+                              size="sm"
+                              onClick={() => setSelectedDrawerTenant(tenant)}
+                              className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white shadow-sm"
+                            >
+                              <span>{statusInfo.primaryActionLabel}</span>
+                              <ChevronRight className="h-3.5 w-3.5" />
+                            </Button>
+                          ) : (
+                            <Link href={`/tenants/${tenant.id}`}>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold text-blue-600 dark:text-blue-400 border-slate-200 dark:border-slate-800 hover:bg-blue-50 dark:hover:bg-blue-950/50"
+                              >
+                                <span>{statusInfo.primaryActionLabel}</span>
+                                <ChevronRight className="h-3.5 w-3.5" />
+                              </Button>
+                            </Link>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
+          </div>
+        ) : (
+          /* Card View */
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {sortedTenants.map((tenant) => {
+              const statusInfo = getTenantDisplayStatus(tenant)
+              const attentionItems = computeTenantAttention({
+                ...((tenant as any)?.bundle ?? {}),
+                connectionStatus: tenant.connectionStatus,
+                status: tenant.status,
+                missingPermissions: tenant.missingPermissions,
+              })
 
-            {/* Mobile Compact Stacked Layout */}
-            <div className="lg:hidden divide-y divide-slate-100 dark:divide-slate-800">
-              {sortedTenants.map((tenant: Tenant) => (
-                <div key={tenant.id} className="p-4 space-y-3">
+              return (
+                <Card
+                  key={tenant.id}
+                  className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-5 hover:border-blue-300 dark:hover:border-blue-800 hover:shadow-md transition-all space-y-4"
+                >
                   <div className="flex items-start justify-between gap-3">
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
                       <ProviderIcon provider={tenant.provider} size="small" />
-                      <div>
+                      <div className="min-w-0">
                         <Link
                           href={`/tenants/${tenant.id}`}
-                          className="font-semibold text-slate-900 dark:text-white hover:text-blue-600 transition-colors block"
+                          className="font-bold text-slate-900 dark:text-white hover:text-blue-600 transition-colors block truncate"
                         >
                           {tenant.name}
                         </Link>
-                        <p className="text-xs text-slate-500 dark:text-slate-400">
-                          {tenant.domain || 'Domain pending collection'}
+                        <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                          {tenant.domain || 'Domain collection pending'}
                         </p>
                       </div>
                     </div>
-                    <Badge
-                      className={`uppercase tracking-wide text-[10px] shrink-0 ${statusBadge(tenant.status)}`}
-                    >
-                      {tenant.status}
-                    </Badge>
+                    <TenantStatusBadge tenant={tenant} />
                   </div>
 
-                  <div>
-                    <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
-                      Needs Attention
-                    </p>
-                    <NeedsAttentionCell tenant={tenant} />
-                  </div>
-
-                  <div className="pt-1">
-                    <div className="bg-slate-50 dark:bg-slate-800/60 rounded-lg p-2 border border-slate-100 dark:border-slate-800 inline-block pr-6">
-                      <span className="text-[10px] text-slate-400 font-medium block">
-                        Secure Score
+                  <div className="grid grid-cols-2 gap-2 text-xs border-y border-slate-100 dark:border-slate-800/80 py-3">
+                    <div>
+                      <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">
+                        Issues
                       </span>
-                      {tenant.secureScore == null ? (
-                        <span className="text-xs text-slate-400 font-medium">
-                          Collection pending
-                        </span>
-                      ) : (
-                        <span
-                          className={`text-sm font-bold ${scoreColor(tenant.secureScore)}`}
+                      {attentionItems.length > 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedDrawerTenant(tenant)}
+                          className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400 font-bold hover:underline"
                         >
-                          {tenant.secureScore}%
+                          <AlertTriangle className="h-3.5 w-3.5" />
+                          <span>{attentionItems.length} Needs Review</span>
+                        </button>
+                      ) : (
+                        <span className="text-emerald-600 font-semibold flex items-center gap-1">
+                          <CheckCircle2 className="h-3.5 w-3.5" />
+                          <span>Clean</span>
                         </span>
                       )}
                     </div>
+
+                    <div>
+                      <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">
+                        Last Sync
+                      </span>
+                      <span className="text-slate-600 dark:text-slate-300 font-medium truncate block">
+                        {formatSyncTime(tenant.lastSync)}
+                      </span>
+                    </div>
                   </div>
 
-                  <div className="flex items-center justify-between pt-2 border-t border-slate-100 dark:border-slate-800 text-xs">
-                    <span
-                      className="flex items-center gap-1 text-slate-400"
-                      title={tenant.lastSync || ''}
-                    >
-                      <Clock className="h-3.5 w-3.5" />
-                      {tenant.lastSync
-                        ? formatSyncTime(tenant.lastSync)
-                        : 'Collection pending'}
+                  <div>
+                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      Affected Services
                     </span>
-                    <Link href={`/tenants/${tenant.id}`}>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-8 gap-1 text-xs font-semibold text-blue-600 border-blue-200 hover:bg-blue-50 dark:hover:bg-blue-950/50"
-                      >
-                        Manage <ChevronRight className="h-3.5 w-3.5" />
-                      </Button>
-                    </Link>
+                    <AffectedServices tenant={tenant} compact />
                   </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
 
-      {!loading && !error && sortedTenants.length === 0 && (
-        <div className="text-center py-20 bg-white dark:bg-slate-900 rounded-3xl border border-dashed">
-          <h3 className="text-lg font-semibold text-slate-900 dark:text-white">
-            No tenants found
-          </h3>
-          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-            Try adjusting your search or filters.
-          </p>
+                  <div className="pt-2 flex items-center justify-between border-t border-slate-100 dark:border-slate-800">
+                    <TenantIdPill tenantId={tenant.microsoftTenantId || tenant.id} />
+                    {statusInfo.key === 'needs_attention' ? (
+                      <Button
+                        size="sm"
+                        onClick={() => setSelectedDrawerTenant(tenant)}
+                        className="h-8 px-3 gap-1 text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white"
+                      >
+                        <span>{statusInfo.primaryActionLabel}</span>
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      </Button>
+                    ) : (
+                      <Link href={`/tenants/${tenant.id}`}>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8 px-3 gap-1 text-xs font-semibold text-blue-600 dark:text-blue-400 border-slate-200 dark:border-slate-800"
+                        >
+                          <span>{statusInfo.primaryActionLabel}</span>
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        </Button>
+                      </Link>
+                    )}
+                  </div>
+                </Card>
+              )
+            })}
+          </div>
+        )
+      )}
+
+      {/* 5. Empty State when zero tenants onboarded */}
+      {!loading && !error && tenants.length === 0 && (
+        <div className="text-center py-16 px-6 bg-white dark:bg-slate-900 rounded-3xl border border-dashed border-slate-200 dark:border-slate-800 max-w-lg mx-auto space-y-4">
+          <div className="h-12 w-12 rounded-2xl bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-400 flex items-center justify-center mx-auto">
+            <Building2 className="h-6 w-6" />
+          </div>
+          <div>
+            <h3 className="text-lg font-bold text-slate-900 dark:text-white">
+              No tenants onboarded yet
+            </h3>
+            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
+              HawkView provides unified security monitoring, licensing control, and audit trail management across your Microsoft 365 customer environments.
+            </p>
+          </div>
+          <Button
+            className="gap-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+            onClick={() => {
+              setOnboardingError(null)
+              setConsentReview(null)
+              setHawkviewPreviewMessage(null)
+              setOnboardingStep('select')
+              setShowOnboarding(true)
+            }}
+          >
+            <Plus className="h-4 w-4" />
+            <span>Onboard Your First Tenant</span>
+          </Button>
         </div>
       )}
+
+      {/* 6. No Search/Filter Results */}
+      {!loading && !error && tenants.length > 0 && sortedTenants.length === 0 && (
+        <div className="text-center py-12 px-6 bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 max-w-md mx-auto space-y-3">
+          <Filter className="h-8 w-8 text-slate-400 mx-auto" />
+          <h3 className="text-base font-bold text-slate-900 dark:text-white">
+            No matching tenants found
+          </h3>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            No customer environments match your active search terms or status filters.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={clearFilters}
+            className="text-xs font-semibold"
+          >
+            Clear Active Filters
+          </Button>
+        </div>
+      )}
+
+      {/* 7. Tenant Issue Details Drawer */}
+      <TenantIssueDrawer
+        tenant={selectedDrawerTenant}
+        isOpen={Boolean(selectedDrawerTenant)}
+        onClose={() => setSelectedDrawerTenant(null)}
+      />
     </div>
   )
 }

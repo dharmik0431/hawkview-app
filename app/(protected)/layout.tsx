@@ -25,7 +25,7 @@ function ProtectedShell({ children }: { children: React.ReactNode }) {
         )}
       >
         <Topbar />
-        <main className="py-6 px-4 sm:px-6 lg:px-8">{children}</main>
+        <main className="py-3.5 px-4 sm:px-5 lg:px-6">{children}</main>
       </div>
     </div>
   )
