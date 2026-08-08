@@ -14,11 +14,15 @@ import {
   Search,
   RotateCcw,
   ChevronRight,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
 } from 'lucide-react'
 
 import { useTenants } from '@/lib/api/hooks'
+import { AlertDetailsModal } from '@/components/dashboard/alert-details-modal'
 
-type Severity = 'critical' | 'high' | 'medium'
+export type Severity = 'critical' | 'high' | 'medium'
 type TabKey = 'queue' | 'matrix'
 
 type AttentionItem = {
@@ -44,28 +48,44 @@ function parseTime(v?: string) {
   return Number.isFinite(t) ? t : 0
 }
 
-function unresolvedFor(iso?: string) {
+function formatAge(iso?: string) {
   const t = parseTime(iso)
-  if (!t) return '—'
+  if (!t) {
+    return {
+      display: '—',
+      accessible: 'Detection time not provided',
+    }
+  }
   const diff = Date.now() - t
-  const mins = Math.round(diff / 60000)
-  if (mins < 1) return 'Unresolved for <1m'
-  if (mins < 60) return `Unresolved for ${mins}m`
+  const mins = Math.max(0, Math.round(diff / 60000))
+  if (mins < 1) {
+    return {
+      display: '<1m',
+      accessible: 'Unresolved for less than 1 minute.',
+    }
+  }
+  if (mins < 60) {
+    return {
+      display: `${mins}m`,
+      accessible: `Unresolved for ${mins} minute${mins === 1 ? '' : 's'}.`,
+    }
+  }
   const hrs = Math.round(mins / 60)
-  if (hrs < 24) return `Unresolved for ${hrs}h`
+  if (hrs < 24) {
+    return {
+      display: `${hrs}h`,
+      accessible: `Unresolved for ${hrs} hour${hrs === 1 ? '' : 's'}.`,
+    }
+  }
   const days = Math.round(hrs / 24)
-  return `Unresolved for ${days}d`
+  return {
+    display: `${days}d`,
+    accessible: `Unresolved for ${days} day${days === 1 ? '' : 's'}.`,
+  }
 }
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n))
-}
-
-function severityChip(sev: Severity) {
-  if (sev === 'critical') return 'bg-red-50 text-red-700 border border-red-200'
-  if (sev === 'high')
-    return 'bg-amber-50 text-amber-800 border border-amber-200'
-  return 'bg-blue-50 text-blue-700 border border-blue-200'
 }
 
 function severityStripe(sev: Severity) {
@@ -74,10 +94,99 @@ function severityStripe(sev: Severity) {
   return 'bg-blue-500'
 }
 
-function severityLabel(sev: Severity) {
-  if (sev === 'critical') return 'CRITICAL'
-  if (sev === 'high') return 'HIGH'
-  return 'MEDIUM'
+function SeverityBadge({ sev }: { sev: Severity }) {
+  if (sev === 'critical') {
+    return (
+      <div className="flex items-center gap-1.5 text-xs font-semibold text-red-700 dark:text-red-400">
+        <ShieldAlert className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0" />
+        <span>Critical</span>
+      </div>
+    )
+  }
+  if (sev === 'high') {
+    return (
+      <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-800 dark:text-amber-400">
+        <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
+        <span>High</span>
+      </div>
+    )
+  }
+  return (
+    <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-700 dark:text-blue-400">
+      <ShieldCheck className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" />
+      <span>Medium</span>
+    </div>
+  )
+}
+
+function getKeyResult(q: QueueItem): string {
+  const item = q.item
+  const key = (item.key ?? '').toLowerCase()
+  const label = (item.label ?? '').toLowerCase()
+  const why = item.why ?? ''
+
+  // 1. MFA Coverage
+  if (key.includes('mfa') || label.includes('mfa')) {
+    const match = item.label.match(/(\d+%)|\((\d+%)\)/) || why.match(/(\d+%)|\((\d+%)\)/)
+    const pct = match ? (match[1] || match[2]) : (q.metricValue && q.metricValue !== '—' ? q.metricValue : null)
+    return `MFA coverage: ${pct ?? 'Not provided'}`
+  }
+
+  // 2. Missing Permissions
+  if (key.includes('permission') || label.includes('permission') || why.toLowerCase().includes('missing:')) {
+    const match = why.match(/missing:\s*([^.]+)/i)
+    if (match && match[1]) {
+      return `Missing permission: ${match[1].trim()}`
+    }
+    return 'Missing permissions'
+  }
+
+  // 3. Changed application / Audit findings
+  if (label.includes('application') || why.toLowerCase().includes('application') || label.includes('app registration')) {
+    const match = why.match(/affected:\s*([^.]+)/i) || why.match(/application\s*:?\s*([^.]+)/i)
+    if (match && match[1]) {
+      return `Changed application: ${match[1].trim()}`
+    }
+    if (why.includes('HawkView Tenant Connector') || label.includes('HawkView Tenant Connector')) {
+      return 'Changed application: HawkView Tenant Connector'
+    }
+    return 'Changed application'
+  }
+
+  // 4. Affected target in why text
+  if (why.toLowerCase().includes('affected:')) {
+    const match = why.match(/affected:\s*([^.]+)/i)
+    if (match && match[1]) {
+      return `Affected: ${match[1].trim()}`
+    }
+  }
+
+  // 5. Risky Identities
+  if (key.includes('risky') || label.includes('risky')) {
+    if (q.metricValue && q.metricValue !== '—') {
+      return `Risky users: ${q.metricValue}`
+    }
+    return 'Risky users: 1'
+  }
+
+  // 6. Connection / Auth required
+  if (key.includes('connection') || label.includes('connection') || label.includes('reconnect')) {
+    return 'Connection: Disconnected'
+  }
+  if (key.includes('authorization') || label.includes('authorization')) {
+    return 'Authorization: Required'
+  }
+
+  // 7. Sync issue
+  if (key.includes('sync') || label.includes('sync')) {
+    return 'Sync status: Failed'
+  }
+
+  if (why && why.length > 0 && why.length <= 45 && !why.includes('http')) {
+    return why
+  }
+
+  return 'Not provided'
 }
 
 function actionLabel(sev: Severity) {
@@ -173,7 +282,7 @@ function buildTenants(source: any[]): TenantRow[] {
   })
 }
 
-type QueueItem = {
+export type QueueItem = {
   tenantId: string
   tenantName: string
   tenantDomain: string
@@ -210,9 +319,15 @@ export default function DashboardPage() {
   const { data } = useTenants()
   const [tab, setTab] = React.useState<TabKey>('queue')
 
+  const [selectedQueueItem, setSelectedQueueItem] = React.useState<QueueItem | null>(null)
+  const [modalOriginElement, setModalOriginElement] = React.useState<HTMLElement | null>(null)
+
   const [tenantId, setTenantId] = React.useState<string>('all')
   const [severity, setSeverity] = React.useState<'all' | Severity>('all')
   const [search, setSearch] = React.useState('')
+
+  const [sortField, setSortField] = React.useState<'severity' | 'tenant' | 'age' | null>(null)
+  const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('asc')
 
   const tenants = React.useMemo(
     () => buildTenants(data?.tenants ?? []),
@@ -267,6 +382,37 @@ export default function DashboardPage() {
       })
       .slice(0, 50)
   }, [filteredTenants, severity])
+
+  const handleSort = (field: 'severity' | 'tenant' | 'age') => {
+    if (sortField === field) {
+      if (sortDir === 'asc') setSortDir('desc')
+      else {
+        setSortField(null)
+        setSortDir('asc')
+      }
+    } else {
+      setSortField(field)
+      setSortDir('asc')
+    }
+  }
+
+  const sortedQueueItems = React.useMemo(() => {
+    if (!sortField) return queueItems
+    const items = [...queueItems]
+    items.sort((a, b) => {
+      let cmp = 0
+      if (sortField === 'severity') {
+        const order: Record<Severity, number> = { critical: 0, high: 1, medium: 2 }
+        cmp = order[a.item.severity] - order[b.item.severity]
+      } else if (sortField === 'tenant') {
+        cmp = a.tenantName.localeCompare(b.tenantName)
+      } else if (sortField === 'age') {
+        cmp = parseTime(b.detectedAt) - parseTime(a.detectedAt)
+      }
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+    return items
+  }, [queueItems, sortField, sortDir])
 
   const kpis = React.useMemo(() => {
     const riskyIdentities = queueItems.filter((q) =>
@@ -475,94 +621,267 @@ export default function DashboardPage() {
 
       {/* Content */}
       {tab === 'queue' ? (
-        <ScrollPanel>
-          <div className="space-y-2">
-            {queueItems.length === 0 ? (
-              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 p-8 text-center text-sm text-slate-600 dark:text-slate-400">
-                No items found. Try adjusting filters.
+        <div className="space-y-2.5">
+          {/* Queue Header */}
+          <div className="flex items-center justify-between px-1">
+            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100 tracking-tight">
+              Priority Action Queue
+            </h2>
+            <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+              {sortedQueueItems.length} matching {sortedQueueItems.length === 1 ? 'alert' : 'alerts'}
+            </span>
+          </div>
+
+          {/* Unified Alert Queue Surface */}
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-sm">
+            {sortedQueueItems.length === 0 ? (
+              <div className="p-8 text-center text-sm font-medium text-slate-500 dark:text-slate-400">
+                No matching alerts found. Try adjusting filters or search query.
               </div>
             ) : (
-              queueItems.map((q, idx) => (
-                <div
-                  key={`${q.tenantId}-${q.item.key}-${idx}`}
-                  className="relative rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden"
-                >
-                  <div
-                    className={`absolute left-0 top-0 bottom-0 w-1.5 ${severityStripe(
-                      q.item.severity
-                    )}`}
-                  />
+              <div>
+                {/* Desktop/Tablet Table Header */}
+                <div className="hidden md:grid grid-cols-[100px_minmax(220px,1fr)_190px_140px] lg:grid-cols-[100px_minmax(220px,1fr)_190px_80px_180px_140px] gap-3 px-4 pl-5 py-2.5 bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider items-center">
+                  <button
+                    type="button"
+                    onClick={() => handleSort('severity')}
+                    className="flex items-center gap-1.5 hover:text-slate-800 dark:hover:text-slate-200 transition-colors focus:outline-none"
+                  >
+                    Severity
+                    {sortField === 'severity' ? (
+                      sortDir === 'asc' ? <ArrowUp className="h-3 w-3 text-blue-600" /> : <ArrowDown className="h-3 w-3 text-blue-600" />
+                    ) : (
+                      <ArrowUpDown className="h-3 w-3 text-slate-400" />
+                    )}
+                  </button>
 
-                  {/* denser row */}
-                  <div className="px-4 py-3 pl-5 grid grid-cols-1 md:grid-cols-[1fr_280px_160px] gap-3 items-center">
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span
-                          className={`inline-flex items-center h-6 px-2 rounded-md text-[11px] font-bold tracking-wide ${severityChip(
+                  <div>Alert</div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleSort('tenant')}
+                    className="flex items-center gap-1.5 hover:text-slate-800 dark:hover:text-slate-200 transition-colors focus:outline-none"
+                  >
+                    Tenant
+                    {sortField === 'tenant' ? (
+                      sortDir === 'asc' ? <ArrowUp className="h-3 w-3 text-blue-600" /> : <ArrowDown className="h-3 w-3 text-blue-600" />
+                    ) : (
+                      <ArrowUpDown className="h-3 w-3 text-slate-400" />
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleSort('age')}
+                    className="hidden lg:flex items-center gap-1.5 hover:text-slate-800 dark:hover:text-slate-200 transition-colors focus:outline-none"
+                  >
+                    Age
+                    {sortField === 'age' ? (
+                      sortDir === 'asc' ? <ArrowUp className="h-3 w-3 text-blue-600" /> : <ArrowDown className="h-3 w-3 text-blue-600" />
+                    ) : (
+                      <ArrowUpDown className="h-3 w-3 text-slate-400" />
+                    )}
+                  </button>
+
+                  <div className="hidden lg:block">Key result</div>
+
+                  <div className="text-right">Action</div>
+                </div>
+
+                {/* Queue Rows */}
+                <div className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {sortedQueueItems.map((q, idx) => {
+                    const ageInfo = formatAge(q.detectedAt)
+                    const keyResult = getKeyResult(q)
+                    const destinationUrl =
+                      q.item.actionUrl ?? `/tenants/${encodeURIComponent(q.tenantId)}/settings`
+                    const buttonLabel = q.item.actionLabel ?? actionLabel(q.item.severity)
+
+                    return (
+                      <div
+                        key={`${q.tenantId}-${q.item.key}-${idx}`}
+                        role="button"
+                        tabIndex={0}
+                        aria-haspopup="dialog"
+                        aria-label={`View details for alert ${q.item.label} in ${q.tenantName}`}
+                        onClick={(e) => {
+                          setSelectedQueueItem(q)
+                          setModalOriginElement(e.currentTarget as HTMLElement)
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            setSelectedQueueItem(q)
+                            setModalOriginElement(e.currentTarget as HTMLElement)
+                          }
+                        }}
+                        className="relative bg-white dark:bg-slate-900 hover:bg-slate-50/80 dark:hover:bg-slate-800/50 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 group"
+                      >
+                        {/* Narrow severity indicator stripe at far left */}
+                        <div
+                          className={`absolute left-0 top-0 bottom-0 w-1 ${severityStripe(
                             q.item.severity
                           )}`}
-                        >
-                          {severityLabel(q.item.severity)}
-                        </span>
+                        />
 
-                        <span className="text-xs text-slate-500 dark:text-slate-400">
-                          {unresolvedFor(q.detectedAt)}
-                        </span>
+                        {/* Desktop / Tablet Grid Row */}
+                        <div className="hidden md:grid grid-cols-[100px_minmax(220px,1fr)_190px_140px] lg:grid-cols-[100px_minmax(220px,1fr)_190px_80px_180px_140px] gap-3 px-4 pl-5 py-3 items-center min-h-[68px]">
+                          {/* 1. Severity */}
+                          <div>
+                            <SeverityBadge sev={q.item.severity} />
+                          </div>
+
+                          {/* 2. Alert */}
+                          <div className="min-w-0 pr-2">
+                            <div className="text-[15px] font-semibold text-slate-900 dark:text-slate-100 leading-snug truncate group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
+                              {q.item.label}
+                            </div>
+                            {q.item.why ? (
+                              <div
+                                className="mt-0.5 text-xs lg:text-[13px] text-slate-600 dark:text-slate-400 line-clamp-2 leading-relaxed"
+                                title={q.item.why}
+                              >
+                                {q.item.why}
+                              </div>
+                            ) : null}
+                            {/* Move Age and Key Result here on Tablet (below lg) */}
+                            <div className="lg:hidden mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                              <span className="font-medium text-slate-700 dark:text-slate-300">
+                                {keyResult}
+                              </span>
+                              <span>•</span>
+                              <span title={ageInfo.accessible} aria-label={ageInfo.accessible}>
+                                {ageInfo.display}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* 3. Tenant */}
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            {providerMark(q.provider)}
+                            <div className="min-w-0 flex-1">
+                              <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                {q.tenantName}
+                              </div>
+                              {q.tenantDomain ? (
+                                <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                                  {q.tenantDomain}
+                                </div>
+                              ) : (
+                                <div className="text-xs text-slate-400 dark:text-slate-500">
+                                  Not provided
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* 4. Age (Desktop) */}
+                          <div
+                            className="hidden lg:block text-xs lg:text-[13px] font-medium text-slate-600 dark:text-slate-400 whitespace-nowrap"
+                            title={ageInfo.accessible}
+                            aria-label={ageInfo.accessible}
+                          >
+                            {ageInfo.display}
+                          </div>
+
+                          {/* 5. Key result (Desktop) */}
+                          <div
+                            className="hidden lg:block text-xs lg:text-[13px] font-medium text-slate-800 dark:text-slate-200 truncate pr-2"
+                            title={keyResult}
+                          >
+                            {keyResult}
+                          </div>
+
+                          {/* 6. Action */}
+                          <div className="flex justify-end">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 px-3 text-xs md:text-[13px] font-semibold text-slate-800 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                router.push(destinationUrl)
+                              }}
+                            >
+                              {buttonLabel}
+                            </Button>
+                          </div>
+                        </div>
+
+                        {/* Mobile Structured Row */}
+                        <div className="block md:hidden p-3.5 pl-5 space-y-2">
+                          {/* Line 1: Severity and Age */}
+                          <div className="flex items-center justify-between gap-2">
+                            <SeverityBadge sev={q.item.severity} />
+                            <span
+                              className="text-xs text-slate-500 dark:text-slate-400 font-medium"
+                              title={ageInfo.accessible}
+                              aria-label={ageInfo.accessible}
+                            >
+                              {ageInfo.display}
+                            </span>
+                          </div>
+
+                          {/* Line 2: Alert title */}
+                          <div>
+                            <div className="text-[15px] font-semibold text-slate-900 dark:text-slate-100 leading-snug">
+                              {q.item.label}
+                            </div>
+                            {q.item.why ? (
+                              <div
+                                className="mt-0.5 text-[13px] text-slate-600 dark:text-slate-400 line-clamp-2 leading-relaxed"
+                                title={q.item.why}
+                              >
+                                {q.item.why}
+                              </div>
+                            ) : null}
+                          </div>
+
+                          {/* Line 3: Tenant */}
+                          <div className="flex items-center gap-2 pt-0.5">
+                            {providerMark(q.provider)}
+                            <div className="min-w-0 flex-1">
+                              <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                {q.tenantName}
+                              </div>
+                              {q.tenantDomain ? (
+                                <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                                  {q.tenantDomain}
+                                </div>
+                              ) : (
+                                <div className="text-xs text-slate-400 dark:text-slate-500">
+                                  Not provided
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Line 4: Key result and action */}
+                          <div className="flex items-center justify-between gap-3 pt-1 border-t border-slate-100 dark:border-slate-800/60">
+                            <div className="text-xs font-medium text-slate-700 dark:text-slate-300 truncate">
+                              {keyResult}
+                            </div>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 px-3 text-xs font-semibold text-slate-800 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                router.push(destinationUrl)
+                              }}
+                            >
+                              {buttonLabel}
+                            </Button>
+                          </div>
+                        </div>
                       </div>
-
-                      <div className="mt-1 font-semibold text-slate-900 dark:text-slate-100">
-                        {q.item.label}
-                      </div>
-
-                      {q.item.why ? (
-                        <div className="mt-0.5 text-sm text-slate-600 dark:text-slate-400 line-clamp-1">
-                          {q.item.why}
-                        </div>
-                      ) : null}
-                    </div>
-
-                    <div className="flex items-center gap-3 md:justify-end">
-                      {providerMark(q.provider)}
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
-                          {q.tenantName}
-                        </div>
-                        <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                          ID: {q.tenantId}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center justify-between md:justify-end gap-3">
-                      <div className="text-right">
-                        <div className="text-[10px] font-semibold tracking-wider text-slate-400 uppercase">
-                          {q.metricLabel}
-                        </div>
-                        <div className="text-lg font-bold text-slate-900 dark:text-slate-100">
-                          {q.metricValue}
-                        </div>
-                      </div>
-
-                      <Button
-                        variant="outline"
-                        className="h-9 rounded-lg"
-                        onClick={(e) => {
-                          e.preventDefault()
-                          router.push(
-                            q.item.actionUrl ??
-                              `/tenants/${encodeURIComponent(q.tenantId)}/settings`
-                          )
-                        }}
-                      >
-                        {q.item.actionLabel ?? actionLabel(q.item.severity)}
-                      </Button>
-                    </div>
-                  </div>
+                    )
+                  })}
                 </div>
-              ))
+              </div>
             )}
           </div>
-        </ScrollPanel>
+        </div>
       ) : (
         <ScrollPanel>
           <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
@@ -679,6 +998,13 @@ export default function DashboardPage() {
           </div>
         </ScrollPanel>
       )}
+
+      <AlertDetailsModal
+        item={selectedQueueItem}
+        isOpen={Boolean(selectedQueueItem)}
+        onClose={() => setSelectedQueueItem(null)}
+        originatingElement={modalOriginElement}
+      />
     </div>
   )
 }
