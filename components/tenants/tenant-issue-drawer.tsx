@@ -22,6 +22,7 @@ import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
 import type { Tenant } from '@/types/api'
 import type { AttentionItem, AttentionSeverity } from '@/types/attention'
 import { cn } from '@/lib/utils'
+import { tenantOverviewPath } from '@/lib/tenants/navigation'
 
 interface TenantIssueDrawerProps {
   tenant: Tenant | null
@@ -296,7 +297,7 @@ export function TenantIssueDrawer({
                           <span className="text-[11px] text-slate-400 font-medium">
                             Recommended Action:
                           </span>
-                          <Link href={`/tenants/${tenant.id}`}>
+                          <Link href={tenantOverviewPath(String(tenant.id))}>
                             <span className="text-xs font-semibold text-blue-600 hover:text-blue-700 dark:text-blue-400 inline-flex items-center gap-1 hover:underline">
                               Review in Module
                               <ChevronRight className="h-3.5 w-3.5" />
@@ -370,7 +371,10 @@ export function TenantIssueDrawer({
 
           {/* Footer Action */}
           <div className="p-4 border-t border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-900/80 flex items-center gap-3">
-            <Link href={`/tenants/${tenant.id}`} className="flex-1">
+            <Link
+              href={tenantOverviewPath(String(tenant.id))}
+              className="flex-1"
+            >
               <Button className="w-full gap-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold">
                 <span>Manage Tenant Environment</span>
                 <ExternalLink className="h-4 w-4" />

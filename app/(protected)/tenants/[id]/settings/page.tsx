@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
+import { tenantOverviewPath } from '@/lib/tenants/navigation'
 import { useParams, useRouter } from 'next/navigation'
 import { useQueryClient } from '@tanstack/react-query'
 
@@ -532,7 +533,7 @@ export default function TenantSettingsPage() {
     return (
       <div className="container mx-auto p-6 max-w-7xl space-y-4">
         <Link
-          href={`/tenants/${tenantId}`}
+          href={tenantOverviewPath(String(tenantId))}
           className="inline-flex items-center text-sm font-medium text-muted-foreground hover:text-foreground transition"
         >
           <ChevronLeft className="h-4 w-4 mr-1" />
@@ -556,7 +557,7 @@ export default function TenantSettingsPage() {
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-3">
           <Link
-            href={`/tenants/${tenantId}`}
+            href={tenantOverviewPath(String(tenantId))}
             className="inline-flex items-center text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-foreground transition rounded-lg px-2 py-1 hover:bg-slate-100 dark:hover:bg-slate-800"
           >
             <ChevronLeft className="h-4 w-4 mr-1" />

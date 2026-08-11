@@ -43,6 +43,7 @@ import { cn } from '@/lib/utils'
 import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
 import { topAttention } from '@/lib/attention/topAttention'
 import { TenantIssueDrawer } from '@/components/tenants/tenant-issue-drawer'
+import { tenantOverviewPath } from '@/lib/tenants/navigation'
 import { AffectedServices } from '@/components/tenants/affected-services'
 import {
   TenantStatusBadge,
@@ -1534,7 +1535,7 @@ export default function TenantsPage() {
                             />
                             <div className="min-w-0">
                               <Link
-                                href={`/tenants/${tenant.id}`}
+                                href={tenantOverviewPath(String(tenant.id))}
                                 className="font-bold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors block truncate"
                               >
                                 {tenant.name}
@@ -1607,7 +1608,7 @@ export default function TenantsPage() {
                               <ChevronRight className="h-3.5 w-3.5" />
                             </Button>
                           ) : (
-                            <Link href={`/tenants/${tenant.id}`}>
+                            <Link href={tenantOverviewPath(String(tenant.id))}>
                               <Button
                                 variant="outline"
                                 size="sm"
@@ -1648,7 +1649,7 @@ export default function TenantsPage() {
                       <ProviderIcon provider={tenant.provider} size="small" />
                       <div className="min-w-0">
                         <Link
-                          href={`/tenants/${tenant.id}`}
+                          href={tenantOverviewPath(String(tenant.id))}
                           className="font-bold text-slate-900 dark:text-white hover:text-blue-600 transition-colors block truncate"
                         >
                           {tenant.name}
@@ -1712,7 +1713,7 @@ export default function TenantsPage() {
                         <ChevronRight className="h-3.5 w-3.5" />
                       </Button>
                     ) : (
-                      <Link href={`/tenants/${tenant.id}`}>
+                      <Link href={tenantOverviewPath(String(tenant.id))}>
                         <Button
                           variant="outline"
                           size="sm"

@@ -2,7 +2,12 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
-import { useParams, useRouter, useSearchParams } from 'next/navigation'
+import {
+  useParams,
+  usePathname,
+  useRouter,
+  useSearchParams,
+} from 'next/navigation'
 
 //Importing different sections
 import DnsSection from './components/sections/dns-section'
@@ -20,6 +25,14 @@ import { TenantBlade } from './components/tenant-blade'
 import { TenantOverview } from './components/tenant-overview'
 import TenantSettingsPage from './settings/page'
 import { deriveTenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
+import {
+  parseTenantPath,
+  tenantEntraPath,
+  tenantOfficePath,
+  tenantOverviewPath,
+  tenantSectionPath,
+  type TenantRouteSecurityView,
+} from '@/lib/tenants/navigation'
 
 import type { TenantBundle } from '@/types/tenant-data'
 import { apiClient } from '@/lib/api/client'
@@ -1174,65 +1187,85 @@ function formatSyncTimestamp(lastSyncIso?: string) {
 
 export default function TenantDetailsPage() {
   const params = useParams<{ id: string }>()
+  const pathname = usePathname()
   const router = useRouter()
   const searchParams = useSearchParams()
   const tenantId = params?.id
-
-  const officeTabParam = searchParams ? searchParams.get('officeTab') : null
-  const officeTab =
-    officeTabParam === 'domain-protection' ? 'domain-protection' : 'licenses'
+  const resolvedTenantId = String(tenantId || '')
+  const routeState = useMemo(
+    () => parseTenantPath(pathname, resolvedTenantId),
+    [pathname, resolvedTenantId]
+  )
+  const officeTab = routeState.officeTab
 
   const setOfficeTab = (tab: 'licenses' | 'domain-protection') => {
-    const p = new URLSearchParams(searchParams ? searchParams.toString() : '')
-    p.set('officeTab', tab)
-    router.replace(`?${p.toString()}`, { scroll: false })
+    router.push(tenantOfficePath(resolvedTenantId, tab), { scroll: false })
   }
 
-  const entraTabParam = searchParams ? searchParams.get('entraTab') : null
-  const securityViewParam = searchParams
-    ? searchParams.get('securityView')
-    : null
   const signInViewParam = searchParams ? searchParams.get('signInView') : null
-
-  const securityView = (
-    securityViewParam &&
-    ['policies', 'sign-ins', 'auth', 'locations'].includes(securityViewParam)
-      ? securityViewParam
-      : 'policies'
-  ) as 'policies' | 'sign-ins' | 'auth' | 'locations'
+  const securityView = routeState.securityView
 
   const signInView = signInViewParam === 'map' ? 'map' : 'list'
 
   const handleNavigateEntraTab = (
     tab: EntraTab,
-    secView?: 'policies' | 'sign-ins' | 'auth' | 'locations'
+    secView?: TenantRouteSecurityView
   ) => {
-    setEntraTab(tab)
-    const p = new URLSearchParams(searchParams ? searchParams.toString() : '')
-    p.set('entraTab', tab)
-    if (secView) {
-      p.set('securityView', secView)
-    } else if (tab !== 'security') {
-      p.delete('securityView')
-    }
-    router.replace(`?${p.toString()}`, { scroll: false })
+    const normalizedTab = tab === 'identity' ? 'users' : tab
+    router.push(
+      tenantEntraPath(
+        resolvedTenantId,
+        normalizedTab,
+        secView || routeState.securityView
+      ),
+      { scroll: false }
+    )
   }
 
-  const handleSecurityViewChange = (
-    secView: 'policies' | 'sign-ins' | 'auth' | 'locations'
-  ) => {
-    const p = new URLSearchParams(searchParams ? searchParams.toString() : '')
-    p.set('entraTab', 'security')
-    p.set('securityView', secView)
-    router.replace(`?${p.toString()}`, { scroll: false })
+  const handleSecurityViewChange = (secView: TenantRouteSecurityView) => {
+    router.push(tenantEntraPath(resolvedTenantId, 'security', secView), {
+      scroll: false,
+    })
+  }
+
+  const handleSectionNavigate = (nextSection: TenantSection) => {
+    if (!resolvedTenantId) return
+
+    switch (nextSection) {
+      case 'home':
+        router.push(tenantOfficePath(resolvedTenantId, 'licenses'), {
+          scroll: false,
+        })
+        return
+      case 'entra':
+        router.push(tenantEntraPath(resolvedTenantId, 'overview'), {
+          scroll: false,
+        })
+        return
+      case 'overview':
+      case 'exchange':
+      case 'sharepoint':
+      case 'teams':
+      case 'settings':
+        router.push(tenantSectionPath(resolvedTenantId, nextSection), {
+          scroll: false,
+        })
+        return
+      default:
+        router.push(tenantOverviewPath(resolvedTenantId), { scroll: false })
+    }
   }
 
   const handleSignInViewChange = (sInView: 'list' | 'map') => {
     const p = new URLSearchParams(searchParams ? searchParams.toString() : '')
-    p.set('entraTab', 'security')
-    p.set('securityView', 'sign-ins')
+    p.delete('entraTab')
+    p.delete('securityView')
+    p.delete('officeTab')
     p.set('signInView', sInView)
-    router.replace(`?${p.toString()}`, { scroll: false })
+    router.replace(
+      `${tenantEntraPath(resolvedTenantId, 'security', 'sign-ins')}?${p.toString()}`,
+      { scroll: false }
+    )
   }
 
   const [bundle, setBundle] = useState<TenantBundle | null>(null)
@@ -1332,7 +1365,7 @@ export default function TenantDetailsPage() {
 
   const TEAMS = (bundle?.teams ?? {}) as any
 
-  const [section, setSection] = useState<TenantSection>('home')
+  const [section, setSection] = useState<TenantSection>('overview')
   const [isMobileNavOpen, setIsMobileNavOpen] = useState(false)
   const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
@@ -1355,23 +1388,23 @@ export default function TenantDetailsPage() {
   const [entraTab, setEntraTab] = useState<EntraTab>('overview')
 
   useEffect(() => {
-    if (!entraTabParam) return
-    if (entraTabParam === 'identity') {
-      setEntraTab('users')
-    } else if (
-      [
-        'overview',
-        'users',
-        'groups',
-        'app-registrations',
-        'enterprise-apps',
-        'security',
-        'licenses',
-      ].includes(entraTabParam)
-    ) {
-      setEntraTab(entraTabParam as EntraTab)
+    setSection(routeState.section as TenantSection)
+    setEntraTab(routeState.entraTab as EntraTab)
+  }, [routeState.section, routeState.entraTab])
+
+  useEffect(() => {
+    if (!resolvedTenantId) return
+
+    const root = `/tenants/${encodeURIComponent(resolvedTenantId)}`
+    if (pathname === root || pathname === `${root}/`) {
+      router.replace(tenantOverviewPath(resolvedTenantId), { scroll: false })
+      return
     }
-  }, [entraTabParam])
+
+    if (pathname !== routeState.canonicalPath) {
+      router.replace(routeState.canonicalPath, { scroll: false })
+    }
+  }, [pathname, resolvedTenantId, routeState.canonicalPath, router])
   const [userSearch, setUserSearch] = useState('')
   const [selectedUser, setSelectedUser] = useState<TenantUser | null>(null)
   const [userSortField, setUserSortField] = useState<UserSortField>('name')
@@ -1458,8 +1491,6 @@ export default function TenantDetailsPage() {
     setUserStatusFilter('all')
     setUserMfaFilter('all')
     setOpenRolePopoverUserId(null)
-    setEntraTab('overview')
-    setSection('home')
     setSelectedMailbox(null)
     setSelectedRule(null)
     setSelectedGroup(null)
@@ -3631,7 +3662,7 @@ export default function TenantDetailsPage() {
           <TenantOverview
             bundle={bundle}
             display={workspaceDisplay}
-            onOpenModule={(m) => setSection(m as any)}
+            onOpenModule={(m) => handleSectionNavigate(m as TenantSection)}
             onSync={runSync}
             isSyncing={syncState === 'syncing'}
           />
@@ -4332,14 +4363,13 @@ export default function TenantDetailsPage() {
               tenant={tenant}
               display={workspaceDisplay}
               currentSection={section}
-              onSelectSection={(sec) => {
-                setSection(sec as any)
-                if (sec === 'entra') setEntraTab('overview')
-              }}
+              onSelectSection={(sec) =>
+                handleSectionNavigate(sec as TenantSection)
+              }
               tenants={tenantsList}
-              onTenantChange={(id) => {
-                router.push(`/tenants/${id}`)
-              }}
+              onTenantChange={(id) =>
+                router.push(tenantOverviewPath(String(id)))
+              }
               isCollapsed={isCollapsed}
               onToggleCollapse={handleToggleCollapse}
               isMobileOpen={isMobileNavOpen}
