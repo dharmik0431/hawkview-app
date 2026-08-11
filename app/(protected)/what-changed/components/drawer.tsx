@@ -21,6 +21,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { ChangeEvent, isAppRelatedEvent } from '../data/change-types'
+import { classifyEvent } from '../data/event-classifier'
 
 function pretty(obj: any) {
   return JSON.stringify(obj ?? {}, null, 2)
@@ -125,52 +126,64 @@ export function WhatChangedDrawer({
         aria-label="Event details"
       >
         {/* Drawer Header */}
-        <div className="p-4 sm:p-5 border-b border-border flex items-start justify-between gap-3 bg-muted/20 shrink-0">
-          <div className="min-w-0 flex-1 space-y-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge variant="outline" className="text-xs font-normal gap-1 bg-background">
-                <Building2 className="h-3 w-3 text-muted-foreground shrink-0" />
-                <span className="truncate max-w-[180px]">{event?.tenantName ?? 'Tenant'}</span>
-              </Badge>
+        {(() => {
+          const classification = event ? classifyEvent(event) : null
+          const CategoryIcon = classification?.category.Icon
 
-              {event?.severity && (
-                <Badge
-                  variant={event.severity === 'High' ? 'destructive' : 'secondary'}
-                  className="text-[10px] tracking-wider uppercase font-semibold shrink-0"
-                >
-                  {event.severity}
-                </Badge>
-              )}
+          return (
+            <div className="p-4 sm:p-5 border-b border-border flex items-start justify-between gap-3 bg-muted/20 shrink-0">
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  {classification && CategoryIcon && (
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider border",
+                        classification.category.containerBgClass,
+                        classification.category.iconTextClass,
+                        classification.category.containerBorderClass
+                      )}
+                    >
+                      <CategoryIcon className="h-3.5 w-3.5 shrink-0" />
+                      <span>{classification.category.label}</span>
+                    </span>
+                  )}
 
-              {isApp && (
-                <Badge variant="secondary" className="text-[10px] uppercase font-medium bg-blue-500/10 text-blue-700 dark:text-blue-300 border-blue-500/20 shrink-0">
-                  Application Event
-                </Badge>
-              )}
+                  <Badge variant="outline" className="text-xs font-normal gap-1 bg-background">
+                    <Building2 className="h-3 w-3 text-muted-foreground shrink-0" />
+                    <span className="truncate max-w-[180px]">{event?.tenantName ?? 'Tenant'}</span>
+                  </Badge>
+
+                  {event?.severity === 'High' && (
+                    <Badge variant="destructive" className="text-[10px] tracking-wider uppercase font-semibold shrink-0">
+                      HIGH RISK
+                    </Badge>
+                  )}
+                </div>
+
+                <h2 className="text-lg font-bold text-foreground leading-snug break-words">
+                  {event?.title ?? 'Event Details'}
+                </h2>
+
+                {event?.summary && (
+                  <p className="text-xs text-muted-foreground leading-normal break-words">
+                    {event.summary}
+                  </p>
+                )}
+              </div>
+
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                onClick={onClose}
+                aria-label="Close details drawer"
+                className="h-8 w-8 rounded-md shrink-0"
+              >
+                <X className="h-4 w-4" />
+              </Button>
             </div>
-
-            <h2 className="text-lg font-bold text-foreground leading-snug break-words">
-              {event?.title ?? 'Event Details'}
-            </h2>
-
-            {event?.summary && (
-              <p className="text-xs text-muted-foreground leading-normal break-words">
-                {event.summary}
-              </p>
-            )}
-          </div>
-
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            onClick={onClose}
-            aria-label="Close details drawer"
-            className="h-8 w-8 rounded-md shrink-0"
-          >
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
+          )
+        })()}
 
         {/* Drawer Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-6">

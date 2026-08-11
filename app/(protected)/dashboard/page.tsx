@@ -21,6 +21,14 @@ import {
 
 import { useTenants } from '@/lib/api/hooks'
 import { AlertDetailsModal } from '@/components/dashboard/alert-details-modal'
+import { TenantRiskMatrix } from '@/components/dashboard/tenant-risk-matrix'
+import {
+  getTenantMatrixOverallState,
+  getTenantConnectionDataInfo,
+  getTenantIdentityInfo,
+  getTenantThreatsInfo,
+} from '@/components/dashboard/tenant-risk-matrix-helpers'
+import type { Tenant } from '@/types/api'
 
 export type Severity = 'critical' | 'high' | 'medium'
 type TabKey = 'queue' | 'matrix'
@@ -234,17 +242,10 @@ function ScrollPanel({ children }: { children: React.ReactNode }) {
   )
 }
 
-type TenantRow = {
-  id: string
-  name: string
-  domain: string
-  provider: 'microsoft' | 'google'
-  healthScore: number
-  attention: AttentionItem[]
+type TenantRow = Tenant & {
   top: AttentionItem[]
   topSeverity?: Severity
   lastCriticalAt?: string
-  mfaCoverage: number
   identityDetected: number
 }
 
@@ -297,7 +298,11 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
   const label = (item.label ?? '').toLowerCase()
 
   if (label.includes('mfa')) {
-    return { metricLabel: 'COVERAGE', metricValue: `${tenant.mfaCoverage}%` }
+    const val = tenant.mfaCoverage
+    return {
+      metricLabel: 'COVERAGE',
+      metricValue: val !== null ? `${val}%` : 'Unavailable',
+    }
   }
 
   if (label.includes('risky') || label.includes('risk')) {
@@ -326,6 +331,12 @@ export default function DashboardPage() {
   const [severity, setSeverity] = React.useState<'all' | Severity>('all')
   const [search, setSearch] = React.useState('')
 
+  const [matrixScoreRange, setMatrixScoreRange] = React.useState<string>('all')
+  const [matrixHasRiskyUsers, setMatrixHasRiskyUsers] = React.useState<string>('all')
+  const [matrixHasThreats, setMatrixHasThreats] = React.useState<string>('all')
+  const [matrixDataAvailability, setMatrixDataAvailability] = React.useState<string>('all')
+  const [matrixSearch, setMatrixSearch] = React.useState<string>('')
+
   const [sortField, setSortField] = React.useState<'severity' | 'tenant' | 'age' | null>(null)
   const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('asc')
 
@@ -353,6 +364,67 @@ export default function DashboardPage() {
       })
   }, [tenants, tenantId, severity, search])
 
+  const filteredMatrixTenants = React.useMemo(() => {
+    const q = matrixSearch.trim().toLowerCase()
+    return tenants.filter((t) => {
+      if (tenantId !== 'all' && t.id !== tenantId) return false
+
+      if (q) {
+        const matchName = (t.name || '').toLowerCase().includes(q)
+        const matchDomain = (t.domain || '').toLowerCase().includes(q)
+        const matchId = (t.id || '').toLowerCase().includes(q)
+        const matchMsId = (t.microsoftTenantId || '').toLowerCase().includes(q)
+        if (!matchName && !matchDomain && !matchId && !matchMsId) return false
+      }
+
+      // 1. Secure Score Range
+      if (matrixScoreRange === 'below_50') {
+        if (t.secureScore === null || t.secureScore === undefined || t.secureScore >= 50) return false
+      } else if (matrixScoreRange === '50_74') {
+        if (t.secureScore === null || t.secureScore === undefined || t.secureScore < 50 || t.secureScore >= 75) return false
+      } else if (matrixScoreRange === '75_plus') {
+        if (t.secureScore === null || t.secureScore === undefined || t.secureScore < 75) return false
+      } else if (matrixScoreRange === 'unavailable') {
+        if (t.secureScore !== null && t.secureScore !== undefined) return false
+      }
+
+      // 2. Has Risky Users
+      if (matrixHasRiskyUsers === 'yes') {
+        if ((t.riskyIdentityCount ?? 0) <= 0) return false
+      } else if (matrixHasRiskyUsers === 'no') {
+        if ((t.riskyIdentityCount ?? 0) > 0) return false
+      }
+
+      // 3. Has Active Threats
+      const threatsInfo = getTenantThreatsInfo(t)
+      if (matrixHasThreats === 'yes') {
+        if ((threatsInfo.count ?? 0) <= 0) return false
+      } else if (matrixHasThreats === 'no') {
+        if ((threatsInfo.count ?? 0) > 0) return false
+      }
+
+      // 4. Data Availability
+      const connData = getTenantConnectionDataInfo(t)
+      if (matrixDataAvailability === 'fully_available') {
+        if (connData.connectionState !== 'connected' || connData.dataStatus !== 'current') return false
+      } else if (matrixDataAvailability === 'partial') {
+        if (connData.dataStatus !== 'partial') return false
+      } else if (matrixDataAvailability === 'unavailable') {
+        if (connData.connectionState === 'connected' && connData.dataStatus !== 'failed' && connData.dataStatus !== 'awaiting_sync') return false
+      }
+
+      return true
+    })
+  }, [
+    tenants,
+    tenantId,
+    matrixSearch,
+    matrixScoreRange,
+    matrixHasRiskyUsers,
+    matrixHasThreats,
+    matrixDataAvailability,
+  ])
+
   const queueItems = React.useMemo(() => {
     const items: QueueItem[] = []
 
@@ -363,7 +435,7 @@ export default function DashboardPage() {
         items.push({
           tenantId: t.id,
           tenantName: t.name,
-          tenantDomain: t.domain,
+          tenantDomain: t.domain ?? '',
           provider: t.provider,
           item: it,
           detectedAt: it.detectedAt ?? t.lastCriticalAt,
@@ -441,12 +513,17 @@ export default function DashboardPage() {
   }, [tenants, queueItems])
 
   const queueCount = queueItems.length
-  const matrixCount = filteredTenants.length
+  const matrixCount = tenants.length
 
   const reset = () => {
     setTenantId('all')
     setSeverity('all')
     setSearch('')
+    setMatrixScoreRange('all')
+    setMatrixHasRiskyUsers('all')
+    setMatrixHasThreats('all')
+    setMatrixDataAvailability('all')
+    setMatrixSearch('')
   }
 
   return (
@@ -571,52 +648,126 @@ export default function DashboardPage() {
 
       {/* Filters */}
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-3">
-        <div className="grid grid-cols-1 md:grid-cols-[220px_220px_1fr_110px] gap-3">
-          <div className="relative">
-            <label className="sr-only">Tenant</label>
-            <select
-              value={tenantId}
-              onChange={(e) => setTenantId(e.target.value)}
-              className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-sm font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-            >
-              <option value="all">All Tenants</option>
-              {tenants.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
-          </div>
+        {tab === 'queue' ? (
+          <div className="grid grid-cols-1 md:grid-cols-[220px_220px_1fr_110px] gap-3">
+            <div className="relative">
+              <label className="sr-only">Tenant</label>
+              <select
+                value={tenantId}
+                onChange={(e) => setTenantId(e.target.value)}
+                className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-sm font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+              >
+                <option value="all">All Tenants</option>
+                {tenants.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+            </div>
 
-          <div className="relative">
-            <label className="sr-only">Severity</label>
-            <select
-              value={severity}
-              onChange={(e) => setSeverity(e.target.value as any)}
-              className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-sm font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-            >
-              <option value="all">All Severities</option>
-              <option value="critical">Critical</option>
-              <option value="high">High</option>
-              <option value="medium">Medium</option>
-            </select>
-          </div>
+            <div className="relative">
+              <label className="sr-only">Severity</label>
+              <select
+                value={severity}
+                onChange={(e) => setSeverity(e.target.value as any)}
+                className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-sm font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+              >
+                <option value="all">All Severities</option>
+                <option value="critical">Critical</option>
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+              </select>
+            </div>
 
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-            <Input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search issues, tenants..."
-              className="h-11 pl-9 rounded-xl"
-            />
-          </div>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search issues, tenants..."
+                className="h-11 pl-9 rounded-xl"
+              />
+            </div>
 
-          <Button variant="outline" className="h-11 rounded-xl" onClick={reset}>
-            <RotateCcw className="h-4 w-4 mr-2" />
-            Reset
-          </Button>
-        </div>
+            <Button variant="outline" className="h-11 rounded-xl" onClick={reset}>
+              <RotateCcw className="h-4 w-4 mr-2" />
+              Reset
+            </Button>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
+            <div className="relative">
+              <label className="sr-only">Secure Score Range</label>
+              <select
+                value={matrixScoreRange}
+                onChange={(e) => setMatrixScoreRange(e.target.value)}
+                className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-xs font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+              >
+                <option value="all">All Secure Scores</option>
+                <option value="below_50">&lt; 50% Score</option>
+                <option value="50_74">50% – 74% Score</option>
+                <option value="75_plus">75%+ Score</option>
+                <option value="unavailable">Score Unavailable</option>
+              </select>
+            </div>
+
+            <div className="relative">
+              <label className="sr-only">Has Risky Users</label>
+              <select
+                value={matrixHasRiskyUsers}
+                onChange={(e) => setMatrixHasRiskyUsers(e.target.value)}
+                className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-xs font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+              >
+                <option value="all">All Risky User States</option>
+                <option value="yes">Has Risky Users (&gt;0)</option>
+                <option value="no">No Risky Users (0)</option>
+              </select>
+            </div>
+
+            <div className="relative">
+              <label className="sr-only">Has Active Threats</label>
+              <select
+                value={matrixHasThreats}
+                onChange={(e) => setMatrixHasThreats(e.target.value)}
+                className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-xs font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+              >
+                <option value="all">All Active Threat States</option>
+                <option value="yes">Has Active Threats (&gt;0)</option>
+                <option value="no">No Active Threats (0)</option>
+              </select>
+            </div>
+
+            <div className="relative">
+              <label className="sr-only">Data Availability</label>
+              <select
+                value={matrixDataAvailability}
+                onChange={(e) => setMatrixDataAvailability(e.target.value)}
+                className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-xs font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+              >
+                <option value="all">All Data Availability</option>
+                <option value="fully_available">Fully Available</option>
+                <option value="partial">Partial / Permission Required</option>
+                <option value="unavailable">Unavailable / Disconnected</option>
+              </select>
+            </div>
+
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <Input
+                value={matrixSearch}
+                onChange={(e) => setMatrixSearch(e.target.value)}
+                placeholder="Search tenant..."
+                className="h-11 pl-9 rounded-xl text-xs"
+              />
+            </div>
+
+            <Button variant="outline" className="h-11 rounded-xl text-xs" onClick={reset}>
+              <RotateCcw className="h-4 w-4 mr-1.5" />
+              Reset
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* Content */}
@@ -883,120 +1034,19 @@ export default function DashboardPage() {
           </div>
         </div>
       ) : (
-        <ScrollPanel>
-          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
-            {/* ✅ THIS fixes the overlap: horizontal scroll + minimum width */}
-            <div className="overflow-x-auto">
-              <div className="min-w-[980px]">
-                <div className="grid grid-cols-[320px_220px_minmax(360px,1fr)_280px_40px] gap-0 px-4 py-3 text-[11px] font-bold tracking-wider text-slate-500 dark:text-slate-400 uppercase border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50">
-                  <div>Tenant</div>
-                  <div>Identity Risk</div>
-                  <div>MFA Status</div>
-                  <div>Posture</div>
-                  <div />
-                </div>
-
-                <div className="divide-y divide-slate-200 dark:divide-slate-800">
-                  {filteredTenants.map((t) => {
-                    const covered = clamp(t.mfaCoverage, 0, 100)
-                    const unprot = clamp(100 - covered, 0, 100)
-
-                    const identityBadge =
-                      t.identityDetected > 0 ? (
-                        <Badge className="bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800 rounded-full">
-                          {t.identityDetected} Detected
-                        </Badge>
-                      ) : (
-                        <span className="text-sm text-slate-500 dark:text-slate-400">
-                          None
-                        </span>
-                      )
-
-                    const score = clamp(Number(t.healthScore ?? 0), 0, 100)
-                    const ringColor =
-                      score >= 80
-                        ? 'border-green-500 text-green-700 dark:text-green-400'
-                        : score >= 60
-                          ? 'border-amber-500 text-amber-700 dark:text-amber-400'
-                          : 'border-red-500 text-red-700 dark:text-red-400'
-
-                    return (
-                      <div
-                        key={t.id}
-                        className="grid grid-cols-[320px_220px_minmax(360px,1fr)_280px_40px] px-4 py-3 items-center hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors"
-                      >
-                        <div className="flex items-center gap-3 min-w-0">
-                          {providerMark(t.provider)}
-                          <div className="min-w-0">
-                            <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
-                              {t.name}
-                            </div>
-                            <div className="text-xs text-slate-500 truncate">
-                              {t.domain}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div>{identityBadge}</div>
-
-                        <div>
-                          <div className="flex items-center justify-between text-sm">
-                            <div className="font-semibold text-slate-900">
-                              {covered}% Covered
-                            </div>
-                            <div className="text-xs text-slate-500 hidden xl:block">
-                              {unprot}% unprotected
-                            </div>
-                          </div>
-
-                          <div className="mt-2 h-2 rounded-full bg-slate-200 overflow-hidden">
-                            <div
-                              className={[
-                                'h-2 rounded-full',
-                                covered >= 85
-                                  ? 'bg-green-500'
-                                  : covered >= 65
-                                    ? 'bg-amber-500'
-                                    : 'bg-red-500',
-                              ].join(' ')}
-                              style={{ width: `${covered}%` }}
-                            />
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div
-                            className={`h-10 w-10 rounded-full border-4 ${ringColor} flex items-center justify-center text-sm font-bold shrink-0`}
-                            title={`${score}/100`}
-                          >
-                            {score}
-                          </div>
-
-                          <div className="min-w-0">
-                            <div className="text-sm font-semibold text-slate-900 truncate">
-                              {score === 0
-                                ? 'Not yet secured'
-                                : `${score} / 100`}
-                            </div>
-                            <div className="text-xs text-slate-500 truncate">
-                              {score === 0
-                                ? 'Baseline not met'
-                                : 'Security Score'}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="flex justify-end">
-                          <ChevronRight className="h-5 w-5 text-slate-300" />
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            </div>
+        <div className="space-y-2.5">
+          <div className="flex items-center justify-between px-1">
+            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100 tracking-tight">
+              Tenant Risk Matrix
+            </h2>
+            <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+              {filteredMatrixTenants.length} matching{' '}
+              {filteredMatrixTenants.length === 1 ? 'tenant' : 'tenants'}
+            </span>
           </div>
-        </ScrollPanel>
+
+          <TenantRiskMatrix tenants={filteredMatrixTenants} />
+        </div>
       )}
 
       <AlertDetailsModal

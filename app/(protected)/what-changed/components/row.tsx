@@ -2,9 +2,20 @@
 
 import * as React from 'react'
 import { Badge } from '@/components/ui/badge'
-import { User, Shield, MapPin, Server, Building2, Target } from 'lucide-react'
+import {
+  User,
+  MapPin,
+  Server,
+  Building2,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+  Globe,
+  Network,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { ChangeEvent } from '../data/change-types'
+import { classifyEvent } from '../data/event-classifier'
 
 function fmtTime(ts: string, useUtc = false) {
   const d = new Date(ts)
@@ -18,64 +29,8 @@ function fmtTime(ts: string, useUtc = false) {
     hour12: true,
   }).format(d)
 }
-
 function safeText(v?: string) {
   return v && v.trim().length ? v : '—'
-}
-
-type EventStyleConfig = {
-  dotClass: string
-  ringClass: string
-  badgeVariant: 'destructive' | 'default' | 'secondary' | 'outline'
-  badgeText: string
-  badgeClass?: string
-}
-
-function getEventStyle(e: ChangeEvent): EventStyleConfig {
-  const isFailedSignIn = e.eventType === 'sign-in' && (
-    e.title.toLowerCase().includes('fail') ||
-    e.summary.toLowerCase().includes('fail') ||
-    e.summary.toLowerCase().includes('blocked')
-  )
-
-  if (e.severity === 'High') {
-    return {
-      dotClass: 'bg-red-500',
-      ringClass: 'ring-red-500/20',
-      badgeVariant: 'destructive',
-      badgeText: 'HIGH RISK',
-      badgeClass: 'bg-red-600 text-white font-semibold',
-    }
-  }
-
-  if (isFailedSignIn) {
-    return {
-      dotClass: 'bg-amber-500',
-      ringClass: 'ring-amber-500/20',
-      badgeVariant: 'outline',
-      badgeText: 'FAILED SIGN-IN',
-      badgeClass: 'border-amber-500/50 text-amber-700 dark:text-amber-400 bg-amber-500/10 font-medium',
-    }
-  }
-
-  if (e.eventType === 'sign-in') {
-    return {
-      dotClass: 'bg-emerald-500',
-      ringClass: 'ring-emerald-500/20',
-      badgeVariant: 'outline',
-      badgeText: 'SIGN-IN',
-      badgeClass: 'border-emerald-500/50 text-emerald-700 dark:text-emerald-400 bg-emerald-500/10 font-medium',
-    }
-  }
-
-  // Directory Change / General Change
-  return {
-    dotClass: e.severity === 'Medium' ? 'bg-amber-500' : 'bg-blue-500',
-    ringClass: e.severity === 'Medium' ? 'ring-amber-500/20' : 'ring-blue-500/20',
-    badgeVariant: 'secondary',
-    badgeText: e.severity.toUpperCase(),
-    badgeClass: e.severity === 'Medium' ? 'bg-amber-500/15 text-amber-800 dark:text-amber-300' : 'bg-blue-500/15 text-blue-800 dark:text-blue-300',
-  }
 }
 
 interface WhatChangedRowProps {
@@ -92,7 +47,8 @@ export function WhatChangedRow({
   onClick,
 }: WhatChangedRowProps) {
   const time = fmtTime(e.ts, useUtc)
-  const style = getEventStyle(e)
+  const classification = classifyEvent(e)
+  const CategoryIcon = classification.category.Icon
 
   const locationParts = [
     e.location?.city,
@@ -101,102 +57,165 @@ export function WhatChangedRow({
   ].filter(Boolean)
   const locationStr = locationParts.length ? locationParts.join(', ') : null
 
+  const isFailed = classification.result === 'failure'
+  const isSuccess = classification.result === 'success'
+  const isHighRisk = classification.isHighRisk
+
+  // Supporting text: affected resource or application summary
+  const resourceOrService = e.target && e.target !== '—' ? e.target : e.summary
+
   return (
-    <div className="group relative grid grid-cols-[70px_16px_1fr] sm:grid-cols-[90px_20px_1fr] gap-2 sm:gap-3 items-start">
+    <div className="group relative grid grid-cols-[64px_24px_1fr] sm:grid-cols-[85px_28px_1fr] gap-2 sm:gap-3 items-start">
       {/* Time rail */}
-      <div className="pt-3 text-right text-xs font-semibold text-muted-foreground tabular-nums truncate">
+      <div className="pt-3.5 text-right text-xs font-semibold text-muted-foreground tabular-nums truncate">
         {time}
       </div>
 
-      {/* Marker dot + vertical line */}
-      <div className="relative flex justify-center h-full min-h-[72px]">
+      {/* Marker + vertical line */}
+      <div
+        className="relative flex justify-center h-full min-h-[80px]"
+        aria-label={classification.accessibleLabel}
+      >
         {/* Timeline line */}
         <div className="absolute top-0 bottom-0 w-px bg-border group-last:bottom-1/2" />
-        {/* Event marker dot */}
+
+        {/* Event marker dot/icon */}
         <div
           className={cn(
-            "relative mt-3.5 h-3 w-3 rounded-full ring-4 transition-transform group-hover:scale-125 z-10 shrink-0",
-            style.dotClass,
-            style.ringClass
+            "relative mt-3 flex items-center justify-center rounded-full transition-transform group-hover:scale-110 z-10 shrink-0 text-white shadow-2xs",
+            classification.category.dotClass,
+            "w-6 h-6 sm:w-7 sm:h-7",
+            isFailed
+              ? "ring-4 ring-red-500/30 border-2 border-red-500"
+              : isHighRisk
+              ? "ring-4 ring-amber-500/30 border-2 border-amber-500"
+              : "ring-4 ring-background"
           )}
-        />
+        >
+          <CategoryIcon className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-white" aria-hidden="true" />
+        </div>
       </div>
 
-      {/* Event content row */}
+      {/* Event Card */}
       <button
         type="button"
         onClick={onClick}
         className={cn(
-          "w-full text-left rounded-lg border border-border/80 bg-card p-3 sm:p-3.5 transition-all shadow-2xs mb-2.5",
-          "hover:bg-accent/40 hover:border-border hover:shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          "w-full text-left rounded-xl border border-border/80 bg-card p-3 sm:p-4 transition-all shadow-2xs mb-3",
+          "hover:bg-accent/30 hover:border-border hover:shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
           isActive && "border-primary ring-1 ring-primary bg-accent/20 shadow-xs"
         )}
       >
-        <div className="flex flex-col gap-2">
-          {/* Top header row: Title + Badges */}
-          <div className="flex flex-wrap items-start justify-between gap-2">
-            <div className="min-w-0 flex-1">
-              <div className="font-semibold text-sm text-foreground leading-snug break-words">
-                {e.title}
+        <div className="flex flex-col gap-2.5">
+          {/* Top Marker & Badges Row */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            {/* Compact Event-Type Marker: [32-36px tinted icon container] + Category label */}
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div
+                className={cn(
+                  "w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center shrink-0 border shadow-2xs",
+                  classification.category.containerBgClass,
+                  classification.category.iconTextClass,
+                  classification.category.containerBorderClass
+                )}
+                aria-hidden="true"
+              >
+                <CategoryIcon className="w-4 h-4 sm:w-4.5 sm:h-4.5" />
               </div>
-              <div className="text-xs text-muted-foreground mt-0.5 leading-normal break-words">
-                {e.summary}
+
+              <div className="min-w-0 flex flex-col">
+                <span className={cn("text-xs font-bold uppercase tracking-wider", classification.category.iconTextClass)}>
+                  {classification.category.label}
+                </span>
               </div>
             </div>
 
-            {/* Badges */}
-            <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-              <Badge variant="outline" className="text-[11px] font-normal gap-1 bg-background/80">
+            {/* Right Status / Tenant Indicators */}
+            <div className="flex flex-wrap items-center gap-1.5 shrink-0 ml-auto">
+              {/* Tenant Badge */}
+              <Badge variant="outline" className="text-[11px] font-normal gap-1 bg-background/80 py-0.5">
                 <Building2 className="h-3 w-3 text-muted-foreground shrink-0" />
-                <span className="truncate max-w-[120px]">{e.tenantName}</span>
+                <span className="truncate max-w-[110px] sm:max-w-[140px]">{e.tenantName}</span>
               </Badge>
 
-              <Badge variant={style.badgeVariant} className={cn("text-[10px] tracking-wider px-2 py-0.5", style.badgeClass)}>
-                {style.badgeText}
-              </Badge>
+              {/* Compact Result Indicator */}
+              {isFailed ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30">
+                  <XCircle className="h-3 w-3 shrink-0 text-red-600 dark:text-red-400" />
+                  <span>Failed</span>
+                </span>
+              ) : isSuccess ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/20">
+                  <CheckCircle2 className="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                  <span>Success</span>
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-500/10 text-slate-600 dark:text-slate-400 border border-slate-500/20">
+                  <span>Completed</span>
+                </span>
+              )}
+
+              {/* Separate High-Risk Warning Indicator */}
+              {isHighRisk && (
+                <Badge variant="destructive" className="text-[10px] font-bold tracking-wider px-2 py-0.5 bg-red-600 text-white gap-1 shrink-0">
+                  <AlertTriangle className="h-3 w-3 shrink-0" />
+                  <span>HIGH RISK</span>
+                </Badge>
+              )}
             </div>
           </div>
 
-          {/* Secondary metadata compact row */}
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-1 border-t border-border/40 text-xs text-muted-foreground">
-            {/* Affected Target */}
-            <div className="flex items-center gap-1 min-w-0 max-w-full">
-              <Target className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-              <span className="font-medium text-foreground/70 shrink-0">Target:</span>
-              <span className="font-medium text-foreground truncate max-w-[200px] sm:max-w-[300px]">
-                {safeText(e.target)}
-              </span>
-            </div>
+          {/* Primary Event Title (Strongest Text) */}
+          <div className="space-y-0.5">
+            <h3 className="font-bold text-sm sm:text-base text-foreground leading-snug break-words">
+              {e.title}
+            </h3>
 
+            {/* Secondary line: Affected resource or service */}
+            <p className="text-xs font-medium text-muted-foreground leading-normal break-words">
+              {resourceOrService}
+            </p>
+          </div>
+
+          {/* Metadata line */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-2 border-t border-border/50 text-xs text-muted-foreground">
             {/* Actor */}
-            <div className="flex items-center gap-1 min-w-0 max-w-full">
+            <div className="flex items-center gap-1 min-w-0">
               <User className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
               <span className="font-medium text-foreground/70 shrink-0">Actor:</span>
-              <span className="font-medium text-foreground truncate max-w-[180px] sm:max-w-[250px]">
+              <span className="font-medium text-foreground truncate max-w-[160px] sm:max-w-[220px]" title={e.actor}>
                 {safeText(e.actor)}
               </span>
-            </div>
-
-            {/* Category */}
-            <div className="flex items-center gap-1">
-              <Shield className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-              <span className="font-medium text-foreground/70">Category:</span>
-              <span className="text-foreground/90">{e.category}</span>
             </div>
 
             {/* Source */}
             <div className="flex items-center gap-1">
               <Server className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
               <span className="font-medium text-foreground/70">Source:</span>
-              <span className="text-foreground/90">{e.source}</span>
+              <span className="text-foreground/90 font-medium">{e.source}</span>
             </div>
 
-            {/* Location & IP */}
-            {(locationStr || e.ip) && (
-              <div className="flex items-center gap-1">
+            {/* Location */}
+            {locationStr && (
+              <div className="flex items-center gap-1 min-w-0">
                 <MapPin className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                <span className="text-foreground/80">
-                  {[locationStr, e.ip].filter(Boolean).join(' · ')}
+                <span className="font-medium text-foreground/70 shrink-0">Location:</span>
+                <span className="text-foreground/90 font-medium truncate max-w-[180px]" title={locationStr}>
+                  {locationStr}
+                </span>
+              </div>
+            )}
+
+            {/* IP Address (Separated and truncated visually for IPv6/IPv4 safety) */}
+            {e.ip && (
+              <div className="flex items-center gap-1 min-w-0">
+                <Network className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                <span className="font-medium text-foreground/70 shrink-0">IP:</span>
+                <span
+                  className="font-mono text-[11px] bg-muted/60 text-foreground px-1.5 py-0.2 rounded border border-border/40 max-w-[130px] sm:max-w-[160px] truncate"
+                  title={e.ip}
+                >
+                  {e.ip}
                 </span>
               </div>
             )}
