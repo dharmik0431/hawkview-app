@@ -460,7 +460,14 @@ export class TenantSyncService {
     const results: Array<Record<string, unknown>> = []
     for (const tenant of tenants) {
       try {
-        const result = await this.syncConnectedTenant(tenant, false)
+        // Scheduled runs intentionally collect only change-oriented data. Full
+        // inventory collection is reserved for onboarding and a user-initiated
+        // sync so the five-minute job does not repeatedly download every
+        // SharePoint, Exchange, policy, and reporting dataset.
+        const result = await this.syncConnectedTenant(tenant, false, {
+          incrementalOnly: true,
+          includeBundle: false,
+        })
         results.push({
           tenantId: tenant.id,
           microsoftTenantId: tenant.microsoftTenantId,
@@ -498,8 +505,11 @@ export class TenantSyncService {
 
   private async syncConnectedTenant(
     tenant: TenantSyncTarget,
-    throwWhenBusy: boolean
+    throwWhenBusy: boolean,
+    options: { incrementalOnly?: boolean; includeBundle?: boolean } = {}
   ) {
+    const incrementalOnly = options.incrementalOnly === true
+    const includeBundle = options.includeBundle !== false
     if (
       tenant.status !== 'ACTIVE' ||
       tenant.connection?.status !== 'CONNECTED'
@@ -577,8 +587,9 @@ export class TenantSyncService {
       }
     }
 
+    let accessToken: string
     try {
-      const accessToken = await this.microsoftConsent.getTenantAccessToken({
+      accessToken = await this.microsoftConsent.getTenantAccessToken({
         microsoftTenantId: tenant.microsoftTenantId,
         connectionMode:
           tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
@@ -646,6 +657,56 @@ export class TenantSyncService {
           ? error.message
           : 'Microsoft users synchronization failed.'
       )
+    }
+
+    if (incrementalOnly) {
+      // These sources are time-window based and retain their own watermarks,
+      // so they fetch only newly available activity rather than a complete
+      // tenant inventory. Microsoft Graph user delta is completed above.
+      const incrementalModules: Array<{
+        resource: string
+        synchronize: () => Promise<unknown>
+      }> = [
+        {
+          resource: 'SIGN_INS',
+          synchronize: () => this.syncSignInLogs(tenant, accessToken),
+        },
+        {
+          resource: 'AUDIT_LOGS',
+          synchronize: () => this.syncDirectoryAuditLogs(tenant, accessToken),
+        },
+      ]
+      const incrementalResults = await Promise.allSettled(
+        incrementalModules.map((module) => module.synchronize())
+      )
+      incrementalResults.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          const resource = incrementalModules[index]?.resource ?? 'UNKNOWN'
+          this.logger.warn(
+            `${resource} incremental synchronization was unavailable for tenant ${tenant.id}: ${
+              result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason)
+            }`
+          )
+        }
+      })
+
+      const attemptedStates = await this.prisma.syncState.findMany({
+        where: {
+          customerTenantId: tenant.id,
+          lastAttemptAt: { gte: now },
+        },
+        select: { resourceType: true, status: true },
+      })
+      const failedResources = attemptedStates
+        .filter((state) => state.status === 'FAILED')
+        .map((state) => state.resourceType)
+      return {
+        bundle: includeBundle ? await this.buildBundle(tenant) : null,
+        status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
+        failedResources,
+      }
     }
 
     let snapshotAccessToken: string
@@ -868,7 +929,7 @@ export class TenantSyncService {
       })
     }
     return {
-      bundle: await this.buildBundle(tenant),
+      bundle: includeBundle ? await this.buildBundle(tenant) : null,
       status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
       failedResources,
     }
