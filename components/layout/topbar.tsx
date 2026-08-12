@@ -18,6 +18,8 @@ const pageTitles: Record<string, string> = {
   '/admin': 'Admin Settings',
   '/integrations': 'Integrations',
   '/settings': 'Account Settings',
+  '/settings/team': 'Admin Panel',
+  '/team-access': 'Admin Panel',
   '/profile': 'Profile Settings',
   '/billing': 'Billing',
 }
@@ -25,10 +27,13 @@ const pageTitles: Record<string, string> = {
 export function Topbar() {
   const pathname = usePathname()
   const pageTitle = (pathname ? pageTitles[pathname] : undefined) || 'Dashboard'
+  const isHideTitleRoute = pathname === '/settings/team' || pathname === '/admin' || pathname === '/team-access'
 
   return (
     <div className="sticky top-0 z-40 flex h-16 shrink-0 items-center gap-x-4 border-b border-border bg-background px-4 shadow-sm sm:gap-x-6 sm:px-6 lg:px-8">
-      <h1 className="text-xl font-semibold text-foreground">{pageTitle}</h1>
+      {!isHideTitleRoute && (
+        <h1 className="text-xl font-semibold text-foreground">{pageTitle}</h1>
+      )}
 
       <div className="flex flex-1 justify-end items-center gap-x-3 sm:gap-x-4">
         {/* Changelog button */}
