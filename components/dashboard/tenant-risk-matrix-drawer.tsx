@@ -148,16 +148,10 @@ export function TenantRiskMatrixDrawer({
     setTimeout(() => setCopiedId(false), 2000)
   }
 
-  // Real Score identification
-  const hasSecureScore =
+  // These scores measure different things. Never substitute HawkView's score for
+  // Microsoft's score: a missing Microsoft value must remain visibly missing.
+  const hasMicrosoftSecureScore =
     tenant.secureScore !== null && tenant.secureScore !== undefined
-  const realScore = hasSecureScore ? tenant.secureScore : tenant.healthScore
-  const scoreLabel = hasSecureScore
-    ? 'Microsoft Secure Score'
-    : 'HawkView Health Score'
-  const scoreTooltip = hasSecureScore
-    ? 'Microsoft Secure Score measures identity and device security posture directly from Entra ID.'
-    : 'HawkView Health Score evaluates overall tenant posture based on MFA coverage, administrative account protection, permission status, and sync freshness.'
 
   return (
     <TooltipProvider>
@@ -340,35 +334,60 @@ export function TenantRiskMatrixDrawer({
                 </div>
               </div>
 
-              {/* Section 4: Security Score (Real value only) */}
-              {realScore !== undefined && (
+              {/* Section 4: Separate HawkView and Microsoft scores; never use one as a fallback for the other. */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <div className="space-y-2 p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
                   <div className="flex items-center justify-between text-xs">
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <span className="font-bold text-slate-700 dark:text-slate-300 cursor-help underline decoration-dotted flex items-center gap-1.5">
                           <Info className="h-3.5 w-3.5 text-slate-400 shrink-0" />
-                          <span>{scoreLabel}</span>
+                          <span>HawkView Health Score</span>
                         </span>
                       </TooltipTrigger>
                       <TooltipContent side="top" className="max-w-xs">
-                        <span>{scoreTooltip}</span>
+                        <span>HawkView evaluates tenant posture from synchronized data such as MFA coverage, administrative account protection, permission status, and sync freshness.</span>
                       </TooltipContent>
                     </Tooltip>
 
                     <span className="font-bold text-base text-slate-900 dark:text-slate-100">
-                      {realScore} / 100
+                      {tenant.healthScore} / 100
                     </span>
                   </div>
+                </div>
 
-                  {activeIssues.count > 0 && (
-                    <div className="text-[11px] text-amber-800 dark:text-amber-300 flex items-center gap-1.5 pt-1">
-                      <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
-                      <span>
-                        Note: {activeIssues.count} active issue{activeIssues.count === 1 ? '' : 's'} require remediation regardless of score.
-                      </span>
-                    </div>
+                <div className="space-y-2 p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
+                  <div className="flex items-center justify-between text-xs gap-3">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="font-bold text-slate-700 dark:text-slate-300 cursor-help underline decoration-dotted flex items-center gap-1.5">
+                          <Info className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                          <span>Microsoft Secure Score</span>
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent side="top" className="max-w-xs">
+                        <span>This value comes directly from Microsoft when secure-score collection is available. HawkView never substitutes its own score here.</span>
+                      </TooltipContent>
+                    </Tooltip>
+
+                    <span className="font-bold text-base text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                      {hasMicrosoftSecureScore ? `${tenant.secureScore} / 100` : 'Not collected'}
+                    </span>
+                  </div>
+                  {!hasMicrosoftSecureScore && (
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Microsoft Secure Score has not been collected for this tenant yet.
+                    </p>
                   )}
+                </div>
+              </div>
+
+              {activeIssues.count > 0 && (
+                <div className="text-[11px] text-amber-800 dark:text-amber-300 flex items-center gap-1.5 px-1">
+                  <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
+                  <span>
+                    Note: {activeIssues.count} active issue{activeIssues.count === 1 ? '' : 's'} require remediation regardless of score.
+                  </span>
                 </div>
               )}
 
