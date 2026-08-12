@@ -27,6 +27,7 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'Reports.Read.All',
   'MailboxSettings.Read',
   'ActivityFeed.Read',
+  'SecurityEvents.Read.All',
 ] as const
 
 const PERMISSION_DESCRIPTIONS: Record<string, string> = {
@@ -59,6 +60,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read mailbox inbox rules for Exchange security visibility.',
   'ActivityFeed.Read':
     'Read limited Microsoft 365 login activity when Entra sign-in logs require a premium tenant license.',
+  'SecurityEvents.Read.All':
+    'Read Microsoft Secure Score snapshots and security improvement data.',
 }
 
 interface ConsentState {

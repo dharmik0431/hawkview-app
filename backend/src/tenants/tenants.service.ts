@@ -19,6 +19,7 @@ import {
   deriveTenantHealth,
   type TenantAuditEvent,
 } from './tenant-health.js'
+import { getMicrosoftSecureScore } from './secure-score.util.js'
 
 const ORGANIZATION_WIDE_TENANT_ROLES = [
   MembershipRole.MSP_OWNER,
@@ -140,7 +141,11 @@ export class TenantsService {
       lastErrorMessage: string | null
       consecutiveFailures: number
     }>
-    entraSnapshots: Array<{ payload: unknown; observedAt: Date }>
+    entraSnapshots: Array<{
+      resourceType: SyncResourceType
+      payload: unknown
+      observedAt: Date
+    }>
   }, riskyIdentityCount = 0, auditEvents: TenantAuditEvent[] = []) {
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
@@ -161,7 +166,11 @@ export class TenantsService {
       connectionStatus,
       missingPermissions,
       syncStates: tenant.syncStates,
-      authSnapshot: tenant.entraSnapshots[0] ?? null,
+      authSnapshot:
+        tenant.entraSnapshots.find(
+          (snapshot) =>
+            snapshot.resourceType === SyncResourceType.AUTH_REGISTRATIONS,
+        ) ?? null,
       riskyIdentityCount,
       auditEvents,
     })
@@ -191,7 +200,11 @@ export class TenantsService {
       consentedPermissions,
       missingPermissions,
       connectionErrorCode: tenant.connection?.lastErrorCode ?? null,
-      secureScore: null,
+      secureScore: getMicrosoftSecureScore(
+        tenant.entraSnapshots.find(
+          (snapshot) => snapshot.resourceType === SyncResourceType.SECURE_SCORES,
+        )?.payload,
+      ),
       ...health,
       licenseCount:
         tenant.tenantLicenses.length > 0
@@ -331,10 +344,16 @@ export class TenantsService {
         },
       },
       entraSnapshots: {
-        where: { resourceType: SyncResourceType.AUTH_REGISTRATIONS },
+        where: {
+          resourceType: {
+            in: [
+              SyncResourceType.AUTH_REGISTRATIONS,
+              SyncResourceType.SECURE_SCORES,
+            ] as SyncResourceType[],
+          },
+        },
         orderBy: { observedAt: 'desc' as const },
-        take: 1,
-        select: { payload: true, observedAt: true },
+        select: { resourceType: true, payload: true, observedAt: true },
       },
       connection: {
         select: {
