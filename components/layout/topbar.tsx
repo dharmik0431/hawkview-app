@@ -18,6 +18,7 @@ const pageTitles: Record<string, string> = {
   '/admin': 'Admin Settings',
   '/integrations': 'Integrations',
   '/settings': 'Account Settings',
+  '/settings/team': 'Team access',
   '/profile': 'Profile Settings',
   '/billing': 'Billing',
 }

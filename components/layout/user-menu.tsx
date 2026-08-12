@@ -14,6 +14,7 @@ import {
   ChevronRight,
   Shield,
   Sparkles,
+  Users,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import {
@@ -197,6 +198,19 @@ export function UserMenu() {
                   className="h-3.5 w-3.5 text-muted-foreground/60"
                   aria-hidden="true"
                 />
+              </Link>
+
+              <Link
+                href="/settings/team"
+                onClick={closeMenu}
+                role="menuitem"
+                className="flex items-center justify-between px-3 py-2 text-sm rounded-md text-foreground hover:bg-accent hover:text-accent-foreground transition-colors focus-visible:outline-none focus-visible:bg-accent"
+              >
+                <div className="flex items-center gap-2.5">
+                  <Users className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                  <span>Team access</span>
+                </div>
+                <ChevronRight className="h-3.5 w-3.5 text-muted-foreground/60" aria-hidden="true" />
               </Link>
 
               {/* Theme Toggle */}

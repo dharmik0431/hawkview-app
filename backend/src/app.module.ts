@@ -6,6 +6,7 @@ import { TenantsModule } from './tenants/tenants.module.js'
 import { SecretsModule } from './secrets/secrets.module.js'
 import { NotificationsModule } from './notifications/notifications.module.js'
 import { ChangesModule } from './changes/changes.module.js'
+import { WorkspaceModule } from './workspace/workspace.module.js'
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { ChangesModule } from './changes/changes.module.js'
     TenantsModule,
     NotificationsModule,
     ChangesModule,
+    WorkspaceModule,
   ],
 })
 export class AppModule {}
