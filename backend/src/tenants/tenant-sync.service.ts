@@ -23,6 +23,7 @@ import {
   IpGeolocationService,
   type SignInLocation,
 } from './ip-geolocation.service.js'
+import { getMicrosoftSecureScore } from './secure-score.util.js'
 
 const TENANT_ADMIN_ROLES = ['MSP_OWNER', 'MSP_ADMIN'] as const
 const USER_SELECT =
@@ -251,6 +252,7 @@ type EntraSnapshotResource =
   | 'DIRECTORY_ROLES'
   | 'SERVICE_PRINCIPALS'
   | 'APPLICATIONS'
+  | 'SECURE_SCORES'
   | 'SECURITY_DEFAULTS'
   | 'GROUPS'
   | 'SHAREPOINT_SITES'
@@ -864,6 +866,12 @@ export class TenantSyncService {
           'passwordCredentials,keyCredentials,requiredResourceAccess&' +
           '$expand=owners($select=id,displayName,userPrincipalName)'
       ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'SECURE_SCORES',
+        'https://graph.microsoft.com/v1.0/security/secureScores?$top=25'
+      ),
       this.syncSecurityDefaults(tenant, snapshotAccessToken),
     ]
     const entraResults = await Promise.allSettled(entraModules)
@@ -880,6 +888,7 @@ export class TenantSyncService {
           'DIRECTORY_ROLES',
           'SERVICE_PRINCIPALS',
           'APPLICATIONS',
+          'SECURE_SCORES',
           'SECURITY_DEFAULTS',
         ][index]
         this.logger.warn(
@@ -3672,7 +3681,9 @@ export class TenantSyncService {
           domains: domains.map((domain) => domain.name),
           provider: 'microsoft',
           status: tenant.status === 'ACTIVE' ? 'healthy' : 'warning',
-          secureScore: 0,
+          secureScore: getMicrosoftSecureScore(
+            snapshotByResource.get('SECURE_SCORES'),
+          ),
           licenseCount: licenses.reduce(
             (total, license) => total + license.enabledUnits,
             0
