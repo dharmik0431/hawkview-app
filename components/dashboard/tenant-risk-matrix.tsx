@@ -181,7 +181,7 @@ export function TenantRiskMatrix({
                     </button>
                   </th>
 
-                  {/* Col 2: Secure Score */}
+                  {/* Col 2: Microsoft Secure Score, with HawkView Health shown alongside below. */}
                   <th scope="col" className="py-3 px-4 min-w-[190px]">
                     <button
                       type="button"
@@ -189,7 +189,7 @@ export function TenantRiskMatrix({
                       className="group flex items-center gap-1.5 hover:text-slate-900 dark:hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded px-1 -ml-1"
                       title="Sort by Microsoft Secure Score"
                     >
-                      <span>Microsoft Secure Score</span>
+                      <span>Security Scores</span>
                       {renderSortIcon('secure_score')}
                     </button>
                   </th>
@@ -284,10 +284,15 @@ export function TenantRiskMatrix({
                         </div>
                       </td>
 
-                      {/* 2. Secure Score */}
+                      {/* 2. Microsoft Secure Score and HawkView Health Score */}
                       <td className="py-3.5 px-4 align-middle">
-                        {scoreInfo.isAvailable && scoreInfo.score !== null ? (
-                          <div className="space-y-1.5 max-w-[170px]">
+                        <div className="space-y-2 max-w-[170px]">
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold mb-1">
+                              Microsoft Secure Score
+                            </div>
+                            {scoreInfo.isAvailable && scoreInfo.score !== null ? (
+                              <div className="space-y-1.5">
                             <div className="flex items-center justify-between gap-2">
                               <span className="font-bold text-slate-900 dark:text-slate-100">
                                 {scoreInfo.score}%
@@ -312,10 +317,10 @@ export function TenantRiskMatrix({
                             <div className="text-[10px] text-slate-400 italic">
                               Points breakdown not provided
                             </div>
-                          </div>
-                        ) : (
-                          <div className="space-y-0.5">
-                            <Badge
+                              </div>
+                            ) : (
+                              <div className="space-y-0.5">
+                                <Badge
                               variant="outline"
                               className={cn(
                                 'px-2 py-0.5 text-[11px] font-semibold border rounded-md',
@@ -327,14 +332,20 @@ export function TenantRiskMatrix({
                                   ? 'border-slate-200 bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
                                   : 'border-slate-200 bg-slate-50 text-slate-600 dark:bg-slate-800/50 dark:text-slate-400'
                               )}
-                            >
-                              {scoreInfo.stateLabel}
-                            </Badge>
-                            <div className="text-[10px] text-slate-400">
-                              {scoreInfo.pointsText}
-                            </div>
+                                >
+                                  {scoreInfo.stateLabel}
+                                </Badge>
+                                <div className="text-[10px] text-slate-400">
+                                  {scoreInfo.pointsText}
+                                </div>
+                              </div>
+                            )}
                           </div>
-                        )}
+                          <div className="border-t border-slate-100 dark:border-slate-800 pt-2 flex items-center justify-between gap-2">
+                            <span className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">HawkView Health</span>
+                            <span className="font-bold text-slate-700 dark:text-slate-200">{t.healthScore}%</span>
+                          </div>
+                        </div>
                       </td>
 
                       {/* 3. Score Breakdown */}
@@ -535,7 +546,7 @@ export function TenantRiskMatrix({
 
                   {/* Compact Security Metrics Grid */}
                   <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-100 dark:border-slate-800">
-                    {/* Secure Score */}
+                    {/* Microsoft Secure Score and HawkView Health Score */}
                     <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 space-y-1">
                       <span className="text-[10px] uppercase font-bold text-slate-400 block">
                         Microsoft Secure Score
@@ -564,6 +575,10 @@ export function TenantRiskMatrix({
                           {scoreInfo.stateLabel}
                         </span>
                       )}
+                      <div className="border-t border-slate-200 dark:border-slate-700 pt-1.5 mt-1.5 flex items-center justify-between gap-2">
+                        <span className="text-[10px] uppercase font-bold text-slate-400">HawkView Health</span>
+                        <span className="font-bold text-slate-700 dark:text-slate-200">{t.healthScore}%</span>
+                      </div>
                     </div>
 
                     {/* Score Breakdown */}
