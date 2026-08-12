@@ -200,18 +200,20 @@ export function UserMenu() {
                 />
               </Link>
 
-              <Link
-                href="/settings/team"
-                onClick={closeMenu}
-                role="menuitem"
-                className="flex items-center justify-between px-3 py-2 text-sm rounded-md text-foreground hover:bg-accent hover:text-accent-foreground transition-colors focus-visible:outline-none focus-visible:bg-accent"
-              >
-                <div className="flex items-center gap-2.5">
-                  <Users className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
-                  <span>Team access</span>
-                </div>
-                <ChevronRight className="h-3.5 w-3.5 text-muted-foreground/60" aria-hidden="true" />
-              </Link>
+              {session?.user.memberships?.some((m) => m.role === 'MSP_OWNER') && (
+                <Link
+                  href="/settings/team"
+                  onClick={closeMenu}
+                  role="menuitem"
+                  className="flex items-center justify-between px-3 py-2 text-sm rounded-md text-foreground hover:bg-accent hover:text-accent-foreground transition-colors focus-visible:outline-none focus-visible:bg-accent"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <Shield className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                    <span>Admin Panel</span>
+                  </div>
+                  <ChevronRight className="h-3.5 w-3.5 text-muted-foreground/60" aria-hidden="true" />
+                </Link>
+              )}
 
               {/* Theme Toggle */}
               <div className="px-3 py-2 text-sm flex items-center justify-between rounded-md text-foreground hover:bg-accent transition-colors">

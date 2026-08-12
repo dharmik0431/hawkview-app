@@ -19,7 +19,7 @@ import {
   FileBarChart,
   Activity,
   Shield,
-  Settings,
+  ShieldCheck,
   Eye,
   HelpCircle,
   Mail,
@@ -48,6 +48,10 @@ export function Sidebar() {
   const pathname = usePathname()
   const { isCollapsed, toggleCollapsed } = useSidebar()
   const { session } = useAuth()
+
+  const isMspOwner = Boolean(
+    session?.user?.memberships?.some((m) => m.role === 'MSP_OWNER')
+  )
 
   return (
     <TooltipProvider delayDuration={100}>
@@ -161,32 +165,32 @@ export function Sidebar() {
 
           {/* Bottom actions + user (pinned) */}
           <div className="mt-4 space-y-2">
-            {session?.user.platformRole === 'PLATFORM_ADMIN' && (
+            {isMspOwner && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Link
-                    href="/settings"
+                    href="/settings/team"
                     className={cn(
                       'flex rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
                       isCollapsed
                         ? 'h-10 w-10 items-center justify-center mx-auto'
                         : 'px-3 py-2 items-center justify-center gap-2',
-                      pathname === '/settings'
+                      pathname === '/settings/team' || pathname === '/team-access'
                         ? 'bg-blue-600 text-white'
                         : 'bg-slate-800 text-slate-200 hover:bg-slate-700 hover:text-white'
                     )}
-                    aria-label="Platform Settings"
+                    aria-label="Admin Panel"
                   >
-                    <Settings className="h-4 w-4 shrink-0" aria-hidden="true" />
-                    {!isCollapsed && <span>Platform Settings</span>}
+                    <ShieldCheck className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    {!isCollapsed && <span>Admin Panel</span>}
                     {isCollapsed && (
-                      <span className="sr-only">Platform Settings</span>
+                      <span className="sr-only">Admin Panel</span>
                     )}
                   </Link>
                 </TooltipTrigger>
                 {isCollapsed && (
                   <TooltipContent side="right" sideOffset={12}>
-                    Platform Settings
+                    Admin Panel
                   </TooltipContent>
                 )}
               </Tooltip>
