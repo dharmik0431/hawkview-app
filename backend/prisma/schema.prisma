@@ -217,6 +217,23 @@ model Membership {
   @@map("memberships")
 }
 
+model WorkspaceAdminAuditLog {
+  id            String   @id @default(uuid()) @db.Uuid
+  organizationId String  @map("organization_id") @db.Uuid
+  actorUserId   String?  @map("actor_user_id") @db.Uuid
+  actorEmail    String?  @map("actor_email") @db.VarChar(320)
+  targetUserId  String?  @map("target_user_id") @db.Uuid
+  targetEmail   String?  @map("target_email") @db.VarChar(320)
+  action        String   @db.VarChar(100)
+  outcome       String   @default("SUCCEEDED") @db.VarChar(30)
+  metadata      Json?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@index([targetUserId, createdAt(sort: Desc)])
+  @@map("workspace_admin_audit_logs")
+}
+
 model CustomerTenant {
   id                 String                     @id @default(uuid()) @db.Uuid
   organizationId     String                     @map("organization_id") @db.Uuid

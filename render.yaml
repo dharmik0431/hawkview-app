@@ -17,6 +17,10 @@ services:
         sync: false
       - key: SUPABASE_URL
         sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: HAWKVIEW_AUTH_REDIRECT_URL
+        sync: false
       - key: SECRET_ENCRYPTION_KEY
         sync: false
       - key: FRONTEND_ORIGINS
