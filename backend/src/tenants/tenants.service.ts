@@ -89,6 +89,33 @@ export class TenantsService {
     return { microsoftTenantId, connectionMode, clientId, clientSecret }
   }
 
+  private async getAccessibleOrganizationIds(identity: AuthenticatedIdentity) {
+    const user = await this.prisma.user.findUnique({
+      where: { authProviderUserId: identity.subject },
+      select: {
+        disabledAt: true,
+        memberships: {
+          where: {
+            status: 'ACTIVE',
+            organization: { status: 'ACTIVE' },
+          },
+          select: { organizationId: true },
+        },
+      },
+    })
+
+    if (!user) {
+      throw new ForbiddenException(
+        'Complete HawkView account setup before accessing tenants.'
+      )
+    }
+    if (user.disabledAt) {
+      throw new ForbiddenException('This HawkView account is disabled.')
+    }
+
+    return user.memberships.map((membership) => membership.organizationId)
+  }
+
   private async getManagedOrganizationIds(identity: AuthenticatedIdentity) {
     const user = await this.prisma.user.findUnique({
       where: { authProviderUserId: identity.subject },
@@ -107,7 +134,7 @@ export class TenantsService {
 
     if (!user) {
       throw new ForbiddenException(
-        'Complete HawkView account setup before accessing tenants.'
+        'Complete HawkView account setup before managing tenants.'
       )
     }
     if (user.disabledAt) {
@@ -368,7 +395,7 @@ export class TenantsService {
   }
 
   async listForIdentity(identity: AuthenticatedIdentity) {
-    const organizationIds = await this.getManagedOrganizationIds(identity)
+    const organizationIds = await this.getAccessibleOrganizationIds(identity)
     if (organizationIds.length === 0) return { tenants: [] }
 
     const tenants = await this.prisma.customerTenant.findMany({
