@@ -72,6 +72,7 @@ export class AuthService {
             email: normalizedEmail,
             displayName:
               existingBySubject.displayName ?? identity.displayName,
+            inviteAcceptedAt: existingBySubject.inviteAcceptedAt ?? new Date(),
           },
           select: userWithMemberships,
         })
@@ -87,6 +88,7 @@ export class AuthService {
             email: normalizedEmail,
             displayName:
               existingByEmail.displayName ?? identity.displayName,
+            inviteAcceptedAt: existingByEmail.inviteAcceptedAt ?? new Date(),
           },
           select: userWithMemberships,
         })
@@ -97,6 +99,7 @@ export class AuthService {
           authProviderUserId: identity.subject,
           email: normalizedEmail,
           displayName: identity.displayName,
+          inviteAcceptedAt: new Date(),
         },
         select: userWithMemberships,
       })
