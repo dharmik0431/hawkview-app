@@ -95,6 +95,8 @@ model User {
   timeFormat         String         @default("12h") @map("time_format") @db.VarChar(3)
   platformRole       PlatformRole   @default(STANDARD_USER) @map("platform_role")
   disabledAt         DateTime?      @map("disabled_at") @db.Timestamptz(6)
+  inviteSentAt       DateTime?      @map("invite_sent_at") @db.Timestamptz(6)
+  inviteAcceptedAt   DateTime?      @map("invite_accepted_at") @db.Timestamptz(6)
   createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt          DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
   memberships        Membership[]

@@ -38,6 +38,8 @@ type MemberRecord = {
     displayName: string | null
     authProviderUserId: string | null
     disabledAt: Date | null
+    inviteSentAt: Date | null
+    inviteAcceptedAt: Date | null
     createdAt: Date
   }
 }
@@ -117,6 +119,8 @@ export class WorkspaceService {
             displayName: true,
             authProviderUserId: true,
             disabledAt: true,
+            inviteSentAt: true,
+            inviteAcceptedAt: true,
             createdAt: true,
           },
         },
@@ -181,7 +185,11 @@ export class WorkspaceService {
       role: member.role,
       status: member.status,
       joinedAt: member.user.createdAt,
-      hasHawkViewAccount: Boolean(member.user.authProviderUserId),
+      // A Supabase identity is created as soon as an invitation is sent. It
+      // does not mean the recipient has completed account setup.
+      hasHawkViewAccount: Boolean(member.user.inviteAcceptedAt),
+      invitationSentAt: member.user.inviteSentAt,
+      invitationAcceptedAt: member.user.inviteAcceptedAt,
       disabled: Boolean(member.user.disabledAt),
     }
   }
@@ -195,7 +203,7 @@ export class WorkspaceService {
         user: {
           select: {
             id: true, email: true, displayName: true, authProviderUserId: true,
-            disabledAt: true, createdAt: true,
+            disabledAt: true, inviteSentAt: true, inviteAcceptedAt: true, createdAt: true,
           },
         },
       },
@@ -263,8 +271,9 @@ export class WorkspaceService {
     if (!ROLE_VALUES.has(role)) throw new BadRequestException('Select a valid workspace role.')
 
     let user = await this.prisma.user.findUnique({ where: { email } })
-    if (!user) {
-      try {
+    let delivery: 'INVITE' | 'SETUP_LINK' = 'INVITE'
+    try {
+      if (!user || !user.authProviderUserId) {
         const invite = await this.supabaseAdminRequest('/auth/v1/invite', {
           method: 'POST',
           body: JSON.stringify({
@@ -276,22 +285,54 @@ export class WorkspaceService {
         const authProviderUserId = typeof invite?.id === 'string'
           ? invite.id
           : typeof invite?.user?.id === 'string' ? invite.user.id : null
-        user = await this.prisma.user.create({
-          data: { email, displayName, authProviderUserId },
+        if (user) {
+          user = await this.prisma.user.update({
+            where: { id: user.id },
+            data: {
+              displayName: displayName ?? user.displayName,
+              authProviderUserId,
+              inviteSentAt: new Date(),
+              inviteAcceptedAt: null,
+            },
+          })
+        } else {
+          user = await this.prisma.user.create({
+            data: { email, displayName, authProviderUserId, inviteSentAt: new Date() },
+          })
+        }
+      } else if (!user.inviteAcceptedAt) {
+        // Supabase will not issue a second invite for an existing Auth user.
+        // A recovery link lets a pending recipient securely set their password.
+        delivery = 'SETUP_LINK'
+        await this.supabaseAdminRequest('/auth/v1/recover', {
+          method: 'POST',
+          body: JSON.stringify({
+            email: user.email,
+            redirect_to: process.env.HAWKVIEW_AUTH_REDIRECT_URL?.trim() || undefined,
+          }),
         })
-      } catch (error) {
-        await this.audit(actor, 'WORKSPACE_MEMBER_INVITE', undefined, 'FAILED', { email, role })
-        throw error
+        user = await this.prisma.user.update({
+          where: { id: user.id },
+          data: { inviteSentAt: new Date() },
+        })
+      } else {
+        throw new BadRequestException(
+          'This member has already completed HawkView account setup. Use password reset instead.',
+        )
       }
+    } catch (error) {
+      await this.audit(actor, 'WORKSPACE_MEMBER_INVITE', user ?? undefined, 'FAILED', { email, role, delivery })
+      throw error
     }
+    if (!user) throw new ServiceUnavailableException('HawkView invitation could not be created.')
     const membership = await this.prisma.membership.upsert({
       where: { userId_organizationId: { userId: user.id, organizationId: actor.organizationId } },
       create: { userId: user.id, organizationId: actor.organizationId, role, status: MembershipStatus.ACTIVE },
       update: { role, status: MembershipStatus.ACTIVE },
-      include: { user: { select: { id: true, email: true, displayName: true, authProviderUserId: true, disabledAt: true, createdAt: true } } },
+      include: { user: { select: { id: true, email: true, displayName: true, authProviderUserId: true, disabledAt: true, inviteSentAt: true, inviteAcceptedAt: true, createdAt: true } } },
     })
-    await this.audit(actor, 'WORKSPACE_MEMBER_INVITED', membership.user, 'SUCCEEDED', { role })
-    return { member: this.memberView(membership) }
+    await this.audit(actor, 'WORKSPACE_MEMBER_INVITED', membership.user, 'SUCCEEDED', { role, delivery })
+    return { member: this.memberView(membership), delivery }
   }
 
   async updateMember(identity: AuthenticatedIdentity, membershipId: string, body: unknown) {
@@ -308,7 +349,7 @@ export class WorkspaceService {
     await this.protectOwner(actor, member, role, status)
     const updated = await this.prisma.membership.update({
       where: { id: member.id }, data: { role, status },
-      include: { user: { select: { id: true, email: true, displayName: true, authProviderUserId: true, disabledAt: true, createdAt: true } } },
+      include: { user: { select: { id: true, email: true, displayName: true, authProviderUserId: true, disabledAt: true, inviteSentAt: true, inviteAcceptedAt: true, createdAt: true } } },
     })
     await this.audit(actor, 'WORKSPACE_MEMBER_UPDATED', updated.user, 'SUCCEEDED', { role, status })
     return { member: this.memberView(updated) }
