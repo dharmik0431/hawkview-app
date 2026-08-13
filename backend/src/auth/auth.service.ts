@@ -4,6 +4,8 @@ import {
   Inject,
   Injectable,
 } from '@nestjs/common'
+import { MembershipRole, MembershipStatus } from '../generated/prisma/enums.js'
+import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import type { AuthenticatedIdentity } from './auth.types.js'
 
@@ -34,12 +36,72 @@ const userWithMemberships = {
   },
 } as const
 
+type BootstrapUser = {
+  id: string
+  email: string
+  displayName: string | null
+  disabledAt: Date | null
+}
+
+function workspaceName(identity: AuthenticatedIdentity, user: BootstrapUser) {
+  const fallback = user.email.split('@')[0] || 'HawkView'
+  const ownerName = (user.displayName || identity.displayName || fallback).trim()
+  return `${ownerName.slice(0, 180)}'s MSP Workspace`
+}
+
+function workspaceSlug(identity: AuthenticatedIdentity, user: BootstrapUser) {
+  const fallback = user.email.split('@')[0] || 'hawkview'
+  const base = (user.displayName || identity.displayName || fallback)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'hawkview'
+  const subjectSuffix = identity.subject.replace(/[^a-z0-9]/gi, '').slice(-10).toLowerCase()
+  return `${base.slice(0, 80)}-msp-${subjectSuffix || user.id.slice(-10)}`
+}
+
 @Injectable()
 export class AuthService {
   constructor(
     @Inject(PrismaService)
     private readonly prisma: PrismaService,
   ) {}
+
+  /**
+   * A direct HawkView sign-up has no membership yet. Create its isolated
+   * workspace and owner membership exactly once. Invited accounts already
+   * have a membership before accepting the invite, so they are never moved
+   * into a newly-created workspace.
+   */
+  private async ensureFirstWorkspace(
+    transaction: Prisma.TransactionClient,
+    identity: AuthenticatedIdentity,
+    user: BootstrapUser,
+  ) {
+    if (user.disabledAt) return
+
+    const membership = await transaction.membership.findFirst({
+      where: { userId: user.id },
+      select: { id: true },
+    })
+    if (membership) return
+
+    const organization = await transaction.organization.create({
+      data: {
+        name: workspaceName(identity, user),
+        slug: workspaceSlug(identity, user),
+      },
+      select: { id: true },
+    })
+    await transaction.membership.create({
+      data: {
+        userId: user.id,
+        organizationId: organization.id,
+        role: MembershipRole.MSP_OWNER,
+        status: MembershipStatus.ACTIVE,
+      },
+    })
+  }
 
   async bootstrap(identity: AuthenticatedIdentity) {
     const normalizedEmail = identity.email.trim().toLowerCase()
@@ -59,6 +121,8 @@ export class AuthService {
         }),
       ])
 
+      let profile: BootstrapUser
+
       if (existingBySubject) {
         if (existingByEmail && existingByEmail.id !== existingBySubject.id) {
           throw new ForbiddenException(
@@ -66,7 +130,7 @@ export class AuthService {
           )
         }
 
-        return transaction.user.update({
+        profile = await transaction.user.update({
           where: { id: existingBySubject.id },
           data: {
             email: normalizedEmail,
@@ -74,14 +138,12 @@ export class AuthService {
               existingBySubject.displayName ?? identity.displayName,
             inviteAcceptedAt: existingBySubject.inviteAcceptedAt ?? new Date(),
           },
-          select: userWithMemberships,
+          select: { id: true, email: true, displayName: true, disabledAt: true },
         })
-      }
-
-      if (existingByEmail) {
+      } else if (existingByEmail) {
         // A verified Supabase email may relink the matching HawkView profile
         // during the one-time Firebase-to-Supabase migration.
-        return transaction.user.update({
+        profile = await transaction.user.update({
           where: { id: existingByEmail.id },
           data: {
             authProviderUserId: identity.subject,
@@ -90,17 +152,23 @@ export class AuthService {
               existingByEmail.displayName ?? identity.displayName,
             inviteAcceptedAt: existingByEmail.inviteAcceptedAt ?? new Date(),
           },
-          select: userWithMemberships,
+          select: { id: true, email: true, displayName: true, disabledAt: true },
+        })
+      } else {
+        profile = await transaction.user.create({
+          data: {
+            authProviderUserId: identity.subject,
+            email: normalizedEmail,
+            displayName: identity.displayName,
+            inviteAcceptedAt: new Date(),
+          },
+          select: { id: true, email: true, displayName: true, disabledAt: true },
         })
       }
 
-      return transaction.user.create({
-        data: {
-          authProviderUserId: identity.subject,
-          email: normalizedEmail,
-          displayName: identity.displayName,
-          inviteAcceptedAt: new Date(),
-        },
+      await this.ensureFirstWorkspace(transaction, identity, profile)
+      return transaction.user.findUniqueOrThrow({
+        where: { id: profile.id },
         select: userWithMemberships,
       })
     })
