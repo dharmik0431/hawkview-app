@@ -36,6 +36,7 @@ export const TenantSchema = z.object({
   missingPermissions: z.array(z.string()),
   connectionErrorCode: z.string().nullable(),
   organization: z.object({
+    id: z.string(),
     name: z.string(),
     slug: z.string(),
   }),

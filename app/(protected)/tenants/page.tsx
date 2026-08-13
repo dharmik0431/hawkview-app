@@ -259,14 +259,20 @@ export default function TenantsPage() {
   const { session } = useAuth()
   const { data, isLoading, isFetching, error, refetch } = useTenants()
 
-  // The API remains authoritative. This only prevents roles that cannot
-  // onboard tenants from being presented with an action they cannot complete.
+  // Scope the affordance to the workspace represented by this directory.
+  // A role in another workspace must never make tenant administration actions
+  // appear here. The API remains authoritative for the operation itself.
+  const visibleOrganizationIds = new Set(
+    (data?.tenants ?? []).map((tenant) => tenant.organization.id)
+  )
   const canOnboardTenant =
+    visibleOrganizationIds.size === 1 &&
     session?.user.memberships.some(
       (membership) =>
         membership.status === 'ACTIVE' &&
+        visibleOrganizationIds.has(membership.organization.id) &&
         ['MSP_OWNER', 'MSP_ADMIN', 'MSP_TECHNICIAN'].includes(membership.role)
-    ) ?? false
+    ) === true
 
   const onboardButtonRef = useRef<HTMLButtonElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)

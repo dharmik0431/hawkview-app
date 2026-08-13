@@ -176,7 +176,7 @@ export class TenantsService {
     displayName: string | null
     primaryDomain: string | null
     status: string
-    organization: { name: string; slug: string }
+    organization: { id: string; name: string; slug: string }
     connection: {
       connectionMode: string
       status: string
@@ -383,7 +383,7 @@ export class TenantsService {
       displayName: true,
       primaryDomain: true,
       status: true,
-      organization: { select: { name: true, slug: true } },
+      organization: { select: { id: true, name: true, slug: true } },
       tenantLicenses: { select: { enabledUnits: true } },
       syncStates: {
         select: {
