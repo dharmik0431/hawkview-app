@@ -117,6 +117,8 @@ export default function SignInActivitySection({
   >('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
+  const [mapLoadError, setMapLoadError] = useState<string | null>(null)
+  const [mapRetry, setMapRetry] = useState(0)
   const pageSize = 10
   const hasLimitedActivity = signIns.some(
     (event) =>
@@ -191,9 +193,22 @@ export default function SignInActivitySection({
       const el = document.getElementById('entra-signins-map-container')
       if (!el) return
 
+      // A previous MapLibre instance leaves canvas children behind. Clearing
+      // them makes switching back to Map deterministic, including in React
+      // strict mode and after a failed dynamic import.
+      el.replaceChildren()
+      setMapLoadError(null)
+
       const initMap = async () => {
         try {
-          const maplibregl = (await import('maplibre-gl')).default
+          const maplibreModule = await import('maplibre-gl')
+          // Next can expose this ESM package either as `default` or directly,
+          // depending on the preview/build runtime. Supporting both prevents a
+          // silent blank map when the module shape differs.
+          const maplibregl = (maplibreModule.default ?? maplibreModule) as any
+          if (typeof maplibregl?.Map !== 'function') {
+            throw new Error('Map library loaded without a Map constructor.')
+          }
           if (disposed) return
 
           map = new maplibregl.Map({
@@ -283,8 +298,18 @@ export default function SignInActivitySection({
               map.setZoom(5)
             }
           })
+
+          map.on('error', (event: any) => {
+            const message = event?.error?.message
+            if (message) {
+              console.warn(`Sign-in map resource error: ${message}`)
+            }
+          })
         } catch (err) {
-          console.error('Failed to load maplibre', err)
+          const message =
+            err instanceof Error ? err.message : 'Unknown map loading error.'
+          console.error('Failed to load sign-in map', err)
+          if (!disposed) setMapLoadError(message)
         }
       }
 
@@ -302,7 +327,7 @@ export default function SignInActivitySection({
         } catch {}
       }
     }
-  }, [signInView, mappedEvents])
+  }, [signInView, mappedEvents, mapRetry])
 
   const timeWindowLabel =
     timeWindow === '24h'
@@ -584,7 +609,30 @@ export default function SignInActivitySection({
                 className="h-[420px] w-full rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-inner bg-slate-100 dark:bg-slate-950"
               />
 
-              {mappedEvents.length === 0 && (
+              {mapLoadError && mappedEvents.length > 0 && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-50/95 dark:bg-slate-900/95 rounded-xl p-6 text-center">
+                  <Globe className="h-10 w-10 text-amber-500 mb-2" />
+                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                    The sign-in map could not load
+                  </p>
+                  <p className="text-xs text-muted-foreground max-w-md mt-1">
+                    Your mapped sign-in events are still available in List view.
+                    Retry the map, or check the browser console for the loading
+                    diagnostic.
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="mt-4"
+                    onClick={() => setMapRetry((attempt) => attempt + 1)}
+                  >
+                    Retry map
+                  </Button>
+                </div>
+              )}
+
+              {!mapLoadError && mappedEvents.length === 0 && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-50/90 dark:bg-slate-900/90 rounded-xl p-6 text-center">
                   <Globe className="h-10 w-10 text-muted-foreground mb-2" />
                   <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
