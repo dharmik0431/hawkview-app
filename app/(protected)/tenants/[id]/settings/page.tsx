@@ -94,12 +94,6 @@ export default function TenantSettingsPage() {
   const queryClient = useQueryClient()
   const { session } = useAuth()
   const tenantId = params?.id
-  const canDeleteTenant =
-    session?.user.memberships.some(
-      (membership) =>
-        membership.status === 'ACTIVE' &&
-        ['MSP_OWNER', 'MSP_ADMIN'].includes(membership.role)
-    ) ?? false
 
   const [bundle, setBundle] = useState<TenantBundle | null>(null)
   const [tenantListRecord, setTenantListRecord] = useState<any | null>(null)
@@ -218,6 +212,18 @@ export default function TenantSettingsPage() {
         rawListTenant.organization || rawBundleTenant.organization || null,
     }
   }, [bundle, tenantListRecord, tenantId])
+
+  // Do not expose destructive controls until we know which workspace owns
+  // this tenant. A privileged role in another workspace is not sufficient.
+  const tenantOrganizationId = tenant.organization?.id
+  const canDeleteTenant =
+    Boolean(tenantOrganizationId) &&
+    session?.user.memberships.some(
+      (membership) =>
+        membership.status === 'ACTIVE' &&
+        membership.organization.id === tenantOrganizationId &&
+        ['MSP_OWNER', 'MSP_ADMIN'].includes(membership.role)
+    ) === true
 
   // Ask the backend to prove current Microsoft access; do not rely on the
   // last successful synchronization snapshot.
