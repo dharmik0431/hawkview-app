@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState, useEffect, useRef } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -17,10 +17,6 @@ import {
   Globe,
   Info,
   AlertTriangle,
-  Minus,
-  Plus,
-  RotateCcw,
-  X,
 } from 'lucide-react'
 import type { TenantSyncStatus } from '@/types/tenant-data'
 
@@ -47,12 +43,6 @@ export type SignInEvent = {
 }
 
 export type TimeWindow = '24h' | '7d' | '30d'
-
-type MapLocationPoint = {
-  event: SignInEvent
-  count: number
-  hasFailure: boolean
-}
 
 interface SignInActivitySectionProps {
   signIns: SignInEvent[]
@@ -115,53 +105,12 @@ function formatLocation(event: SignInEvent): string {
   return Array.from(new Set(parts)).join(', ') || 'Location unavailable'
 }
 
-function WorldMapBackdrop() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 1000 500"
-      preserveAspectRatio="none"
-      className="absolute inset-0 h-full w-full text-slate-300 dark:text-slate-700"
-    >
-      <defs>
-        <pattern id="sign-in-map-grid" width="83.333" height="83.333" patternUnits="userSpaceOnUse">
-          <path d="M 83.333 0 L 0 0 0 83.333" fill="none" stroke="currentColor" strokeWidth="1" opacity="0.55" />
-        </pattern>
-      </defs>
-      <rect width="1000" height="500" fill="url(#sign-in-map-grid)" />
-      <g fill="currentColor" opacity="0.5" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
-        <path d="M72 105 105 79 152 72 178 83 202 79 231 101 242 132 224 151 206 150 190 170 165 174 150 157 126 148 112 127 84 122Z" />
-        <path d="M215 188 239 206 253 238 247 275 264 309 252 353 232 390 214 367 210 331 193 299 195 261 184 228Z" />
-        <path d="M425 111 453 92 490 95 505 110 533 108 565 122 575 145 552 157 531 150 511 169 483 164 463 176 443 157 425 144Z" />
-        <path d="M475 181 507 188 527 215 533 249 553 281 542 329 520 369 501 394 484 369 489 334 471 300 462 262 450 224Z" />
-        <path d="M563 115 602 98 642 105 671 90 721 98 742 117 790 119 824 139 842 162 825 181 789 178 754 194 730 182 692 188 664 176 633 180 608 161 578 151Z" />
-        <path d="M737 231 764 240 779 266 765 284 742 277 726 257Z" />
-        <path d="M815 345 842 359 854 389 838 408 811 391 803 366Z" />
-        <path d="M302 327 315 337 310 353 297 348Z" />
-        <path d="M187 98 199 88 211 92 204 105Z" />
-      </g>
-      <path d="M0 250 H1000 M500 0 V500" stroke="currentColor" strokeWidth="1" opacity="0.35" />
-    </svg>
-  )
-}
-
-function fallbackMapPosition(latitude: number, longitude: number) {
-  return {
-    left: `${Math.min(99, Math.max(1, ((longitude + 180) / 360) * 100))}%`,
-    top: `${Math.min(98, Math.max(2, ((90 - latitude) / 180) * 100))}%`,
-  }
-}
-
 export default function SignInActivitySection({
   signIns,
   signInView,
   onSignInViewChange,
   syncStatus,
 }: SignInActivitySectionProps) {
-  // MapLibre/WebGL and third-party raster tiles are not reliable in embedded
-  // previews. The built-in geographic plot uses the same synchronized
-  // coordinates without any external rendering or tile dependency.
-  const useBuiltInLocationPlot = true
   const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
   const [resultFilter, setResultFilter] = useState<
     'all' | 'Success' | 'Failure'
@@ -169,17 +118,6 @@ export default function SignInActivitySection({
   const [searchQuery, setSearchQuery] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
   const [mapLoadError, setMapLoadError] = useState<string | null>(null)
-  const [mapRetry, setMapRetry] = useState(0)
-  const [mapZoom, setMapZoom] = useState(1)
-  const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
-  const [selectedMapPoint, setSelectedMapPoint] =
-    useState<MapLocationPoint | null>(null)
-  const mapDragRef = useRef<{
-    startX: number
-    startY: number
-    originX: number
-    originY: number
-  } | null>(null)
   const pageSize = 10
   const hasLimitedActivity = signIns.some(
     (event) =>
@@ -232,71 +170,6 @@ export default function SignInActivitySection({
     return mappedEvents.filter((e) => e.result === 'Failure').length
   }, [mappedEvents])
 
-  const fallbackMapPoints = useMemo(() => {
-    const points = new Map<string, MapLocationPoint>()
-
-    for (const event of mappedEvents) {
-      // Group nearby events so a busy tenant does not create hundreds of
-      // overlapping fallback markers.
-      const key = `${event.latitude.toFixed(1)}:${event.longitude.toFixed(1)}`
-      const existing = points.get(key)
-      if (existing) {
-        existing.count += 1
-        existing.hasFailure ||= event.result === 'Failure'
-      } else {
-        points.set(key, {
-          event,
-          count: 1,
-          hasFailure: event.result === 'Failure',
-        })
-      }
-    }
-
-    return Array.from(points.values())
-  }, [mappedEvents])
-
-  const resetMapView = () => {
-    setMapZoom(1)
-    setMapOffset({ x: 0, y: 0 })
-    setSelectedMapPoint(null)
-  }
-
-  const zoomMap = (direction: 'in' | 'out') => {
-    setMapZoom((current) => {
-      const next = direction === 'in' ? current + 0.5 : current - 0.5
-      return Math.min(4, Math.max(1, next))
-    })
-  }
-
-  const handleMapWheel = (deltaY: number) => {
-    setMapZoom((current) => {
-      const next = deltaY < 0 ? current + 0.25 : current - 0.25
-      return Math.min(4, Math.max(1, next))
-    })
-  }
-
-  const startMapDrag = (clientX: number, clientY: number) => {
-    mapDragRef.current = {
-      startX: clientX,
-      startY: clientY,
-      originX: mapOffset.x,
-      originY: mapOffset.y,
-    }
-  }
-
-  const moveMapDrag = (clientX: number, clientY: number) => {
-    const drag = mapDragRef.current
-    if (!drag) return
-    setMapOffset({
-      x: drag.originX + clientX - drag.startX,
-      y: drag.originY + clientY - drag.startY,
-    })
-  }
-
-  const endMapDrag = () => {
-    mapDragRef.current = null
-  }
-
   // Table pagination
   const totalPages = Math.max(1, Math.ceil(filteredSignIns.length / pageSize))
   const paginatedSignIns = useMemo(() => {
@@ -310,7 +183,7 @@ export default function SignInActivitySection({
 
   // Map initialization effect
   useEffect(() => {
-    if (signInView !== 'map' || useBuiltInLocationPlot) return
+    if (signInView !== 'map' || mappedEvents.length === 0) return
     let map: any = null
     let markers: any[] = []
     let disposed = false
@@ -341,22 +214,9 @@ export default function SignInActivitySection({
 
           map = new maplibregl.Map({
             container: el,
-            style: {
-              version: 8,
-              sources: {
-                osm: {
-                  type: 'raster',
-                  tiles: [
-                    'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                    'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                    'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                  ],
-                  tileSize: 256,
-                  attribution: '© OpenStreetMap contributors',
-                },
-              },
-              layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
-            },
+            // Hosted OpenStreetMap-based vector style; no client API key.
+            // This URL can be swapped for a self-hosted style later.
+            style: 'https://tiles.openfreemap.org/styles/liberty',
             center: [0, 20],
             zoom: 1.5,
             minZoom: 1,
@@ -471,7 +331,7 @@ export default function SignInActivitySection({
         } catch {}
       }
     }
-  }, [signInView, mappedEvents, mapRetry, useBuiltInLocationPlot])
+  }, [signInView, mappedEvents])
 
   const timeWindowLabel =
     timeWindow === '24h'
@@ -753,6 +613,8 @@ export default function SignInActivitySection({
                 className="h-[420px] w-full rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-inner bg-slate-100 dark:bg-slate-950"
               />
 
+              {/* Retained temporarily as source history while the actual map renders below. */}
+              {/*
               {mappedEvents.length > 0 && (
                 <div
                   className="absolute inset-0 overflow-hidden rounded-xl bg-slate-100 dark:bg-slate-950 cursor-grab active:cursor-grabbing touch-none"
@@ -851,6 +713,30 @@ export default function SignInActivitySection({
                       </div>
                     </div>
                   )}
+                </div>
+              )}
+              */}
+
+              {mappedEvents.length > 0 && !mapLoadError && (
+                <div className="pointer-events-none absolute left-4 top-4 z-20 max-w-sm rounded-lg border border-slate-200 bg-white/95 p-3 shadow-sm dark:border-slate-700 dark:bg-slate-900/95">
+                  <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                    Sign-in world map
+                  </p>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Drag to pan, use the map controls to zoom, and select a marker for sign-in details. Green is successful; red is failed.
+                  </p>
+                </div>
+              )}
+
+              {mapLoadError && mappedEvents.length > 0 && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50/95 p-6 text-center dark:bg-slate-900/95">
+                  <AlertTriangle className="mb-2 h-9 w-9 text-amber-500" />
+                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                    Interactive map could not be loaded
+                  </p>
+                  <p className="mt-1 max-w-md text-xs text-muted-foreground">
+                    {mapLoadError} Your sign-in events are still available in List view.
+                  </p>
                 </div>
               )}
 
