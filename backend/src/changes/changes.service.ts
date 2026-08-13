@@ -1,8 +1,25 @@
-import { BadRequestException, ForbiddenException, Inject, Injectable } from '@nestjs/common'
+import { BadRequestException, ForbiddenException, Inject, Injectable, Logger } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 
 type JsonObject = Record<string, unknown>
+type ChangeCategory = 'MFA' | 'Passwords' | 'Conditional Access' | 'Apps' | 'Roles' | 'Groups' | 'Devices' | 'Licenses' | 'Users'
+type TimelineEvent = {
+  id: string
+  eventType: 'change' | 'sign-in'
+  ts: string
+  tenantId: string
+  tenantName: string
+  provider: 'Microsoft'
+  category: string
+  severity: string
+  title: string
+  summary: string
+  actor?: string
+  target?: string
+  ip?: string
+  [key: string]: unknown
+}
 const object = (value: unknown): JsonObject =>
   value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : {}
 const array = (value: unknown): unknown[] => Array.isArray(value) ? value : []
@@ -86,6 +103,8 @@ function targetDetails(value: unknown) {
 
 @Injectable()
 export class ChangesService {
+  private readonly logger = new Logger(ChangesService.name)
+
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
   private async organizationIds(identity: AuthenticatedIdentity) {
@@ -101,7 +120,7 @@ export class ChangesService {
     const organizationIds = await this.organizationIds(identity); const now = new Date()
     const from = new Date(text(query.from) ?? now.getTime() - 86_400_000); const to = new Date(text(query.to) ?? now)
     if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from > to) throw new BadRequestException('Enter a valid investigation time range.')
-    if (to.getTime() - from.getTime() > 31 * 86_400_000) throw new BadRequestException('Investigations are limited to a 31-day window.')
+    if (to.getTime() - from.getTime() > 183 * 86_400_000) throw new BadRequestException('Investigations are limited to HawkView\'s six-month retention window.')
 
     const allTenants = await this.prisma.customerTenant.findMany({ where: { organizationId: { in: organizationIds } }, select: { id: true, displayName: true, primaryDomain: true }, orderBy: { displayName: 'asc' } })
     const requestedTenantId = text(query.tenantId)
@@ -109,21 +128,137 @@ export class ChangesService {
     const tenantIds = scopedTenants.map((tenant) => tenant.id)
     const names = new Map(allTenants.map((tenant) => [tenant.id, tenant.displayName ?? tenant.primaryDomain ?? 'Microsoft tenant']))
     const where = { organizationId: { in: organizationIds }, customerTenantId: { in: tenantIds }, eventDateTime: { gte: from, lte: to } }
-    const [auditLogs, signIns] = await Promise.all([
-      this.prisma.directoryAuditLog.findMany({ where, orderBy: { eventDateTime: 'desc' }, take: 5000 }),
-      this.prisma.signInLog.findMany({ where, orderBy: { eventDateTime: 'desc' }, take: 5000 }),
+    const [auditLogs, signIns, evidenceEvents] = await Promise.all([
+      this.prisma.directoryAuditLog
+        .findMany({ where, orderBy: { eventDateTime: 'desc' }, take: 5000 })
+        .catch((error) => {
+          this.logger.warn(`Unable to load directory audit source records: ${error instanceof Error ? error.message : String(error)}`)
+          return []
+        }),
+      this.prisma.signInLog
+        .findMany({ where, orderBy: { eventDateTime: 'desc' }, take: 5000 })
+        .catch((error) => {
+          this.logger.warn(`Unable to load sign-in source records: ${error instanceof Error ? error.message : String(error)}`)
+          return []
+        }),
+      this.prisma.changeEvidenceEvent
+        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 5000 })
+        .catch((error) => {
+          // The source logs remain the canonical fallback while a newly
+          // deployed projection table is unavailable or being backfilled.
+          this.logger.warn(`Unable to load normalized change evidence; falling back to source logs: ${error instanceof Error ? error.message : String(error)}`)
+          return []
+        }),
     ])
 
     const changes = auditLogs.map((log) => {
       const kind = classify(log.activityDisplayName, log.category); const details = targetDetails(log.targetResources)
-      return { id: `audit:${log.id}`, eventType: 'change' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: 'Entra' as const, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: evidenceFrom(log) }
+      return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: 'Entra' as const, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: evidenceFrom(log) }
     })
     const signInEvents = signIns.map((log) => {
       const location = object(log.location); const device = object(log.deviceDetail)
       const failed = Boolean(log.statusErrorCode && log.statusErrorCode !== '0'); const risky = Boolean(log.riskLevel && !['none', 'hidden', 'unknown'].includes(log.riskLevel.toLowerCase()))
-      return { id: `signin:${log.id}`, eventType: 'sign-in' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: 'Sign-ins' as const, severity: risky ? 'High' as const : failed ? 'Medium' as const : 'Low' as const, title: failed ? 'Failed sign-in' : 'Successful sign-in', summary: [log.appDisplayName, log.failureReason, log.conditionalAccessStatus].filter(Boolean).join(' · ') || 'Microsoft sign-in activity', actor: log.userPrincipalName ?? log.userDisplayName ?? undefined, target: log.resourceDisplayName ?? log.appDisplayName ?? undefined, source: 'Entra' as const, ip: log.ipAddress ?? undefined, location: { city: text(location.city), region: text(location.state) ?? text(location.region), country: text(location.countryOrRegion) ?? text(location.country) }, client: { app: log.clientAppUsed ?? log.appDisplayName ?? undefined, device: text(device.displayName) ?? text(device.operatingSystem) }, before: {}, after: { result: failed ? 'Failed' : 'Success', riskLevel: log.riskLevel }, recoveryGuidance: risky || failed ? ['Confirm whether this sign-in was expected.', 'Revoke sessions and reset credentials if it was unauthorized.'] : [] }
+      return { id: `signin:${log.microsoftSignInId}`, eventType: 'sign-in' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: 'Sign-ins' as const, severity: risky ? 'High' as const : failed ? 'Medium' as const : 'Low' as const, title: failed ? 'Failed sign-in' : 'Successful sign-in', summary: [log.appDisplayName, log.failureReason, log.conditionalAccessStatus].filter(Boolean).join(' · ') || 'Microsoft sign-in activity', actor: log.userPrincipalName ?? log.userDisplayName ?? undefined, target: log.resourceDisplayName ?? log.appDisplayName ?? undefined, source: 'Entra' as const, ip: log.ipAddress ?? undefined, location: { city: text(location.city), region: text(location.state) ?? text(location.region), country: text(location.countryOrRegion) ?? text(location.country) }, client: { app: log.clientAppUsed ?? log.appDisplayName ?? undefined, device: text(device.displayName) ?? text(device.operatingSystem) }, before: {}, after: { result: failed ? 'Failed' : 'Success', riskLevel: log.riskLevel }, recoveryGuidance: risky || failed ? ['Confirm whether this sign-in was expected.', 'Revoke sessions and reset credentials if it was unauthorized.'] : [] }
     })
-    const events = [...changes, ...signInEvents].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts))
-    return { changes: events, tenants: allTenants.map((tenant) => ({ id: tenant.id, name: names.get(tenant.id)! })), summary: { total: events.length, changes: changes.length, signIns: signInEvents.length, highRisk: events.filter((event) => event.severity === 'High').length, actors: new Set(events.map((event) => event.actor).filter(Boolean)).size, apps: new Set(events.filter((event) => event.category === 'Apps').map((event) => event.target).filter(Boolean)).size }, range: { from: from.toISOString(), to: to.toISOString() } }
+    const normalized = evidenceEvents.map((event) => {
+      const location = object(event.location)
+      const before = object(event.beforeState)
+      const after = object(event.afterState)
+      const isSignIn = event.source === 'SIGN_IN'
+      return {
+        id: `${isSignIn ? 'signin' : 'audit'}:${event.sourceEventId}`,
+        eventType: isSignIn ? 'sign-in' as const : 'change' as const,
+        ts: event.eventDateTime.toISOString(),
+        tenantId: event.customerTenantId,
+        tenantName: names.get(event.customerTenantId) ?? 'Microsoft tenant',
+        provider: 'Microsoft' as const,
+        category: event.category,
+        severity: event.severity,
+        title: event.operationName,
+        summary: event.summary,
+        actor: event.actorPrincipalName ?? event.actorDisplayName ?? undefined,
+        target: event.targetDisplayName ?? undefined,
+        source: 'Entra' as const,
+        ip: event.ipAddress ?? undefined,
+        location: {
+          city: text(location.city),
+          region: text(location.state) ?? text(location.region),
+          country: text(location.countryOrRegion) ?? text(location.country),
+        },
+        before,
+        after,
+        correlationId: event.correlationId ?? undefined,
+        recoveryGuidance: guidance(event.category),
+        evidence: {
+          normalized: true,
+          changedFields: array(event.changedFields),
+          workload: event.workload,
+          result: event.result,
+        },
+      }
+    })
+    // A projection is created during subsequent syncs. Keep previously
+    // retained raw records visible and let the normalized record replace its
+    // identical source event when both are present.
+    const bySourceEvent = new Map<string, TimelineEvent>(
+      [...changes, ...signInEvents].map((event): [string, TimelineEvent] => [event.id, event])
+    )
+    for (const event of normalized) bySourceEvent.set(event.id, event)
+    let events: TimelineEvent[] = [...bySourceEvent.values()]
+    const requestedCategory = text(query.category)
+    const requestedSeverity = text(query.severity)
+    const search = text(query.search)?.toLowerCase()
+    if (requestedCategory) events = events.filter((event) => event.category.toLowerCase() === requestedCategory.toLowerCase())
+    if (requestedSeverity) events = events.filter((event) => event.severity.toLowerCase() === requestedSeverity.toLowerCase())
+    if (search) events = events.filter((event) => [event.title, event.summary, event.actor, event.target, event.ip].filter(Boolean).join(' ').toLowerCase().includes(search))
+    events.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts) || a.id.localeCompare(b.id))
+    const requestedPage = Number(text(query.page) ?? '1')
+    const requestedPageSize = Number(text(query.pageSize) ?? '0')
+    const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1
+    const pageSize = Number.isInteger(requestedPageSize) && requestedPageSize > 0 ? Math.min(requestedPageSize, 250) : 0
+    const total = events.length
+    const summary = {
+      total,
+      changes: events.filter((event) => event.eventType === 'change').length,
+      signIns: events.filter((event) => event.eventType === 'sign-in').length,
+      highRisk: events.filter((event) => event.severity === 'High').length,
+      actors: new Set(events.map((event) => event.actor).filter(Boolean)).size,
+      apps: new Set(events.filter((event) => event.category === 'Apps').map((event) => event.target).filter(Boolean)).size,
+    }
+    if (pageSize) events = events.slice((page - 1) * pageSize, page * pageSize)
+    return { changes: events, tenants: allTenants.map((tenant) => ({ id: tenant.id, name: names.get(tenant.id)! })), summary, range: { from: from.toISOString(), to: to.toISOString() }, ...(pageSize ? { pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } } : {}) }
   }
+
+  async detail(identity: AuthenticatedIdentity, sourceId: string) {
+    const separator = sourceId.indexOf(':')
+    if (separator <= 0) throw new BadRequestException('Use a valid change event identifier.')
+    const source = sourceId.slice(0, separator) === 'signin' ? 'SIGN_IN' : 'DIRECTORY_AUDIT'
+    const sourceEventId = sourceId.slice(separator + 1)
+    const organizationIds = await this.organizationIds(identity)
+    const event = await this.prisma.changeEvidenceEvent.findFirst({
+      where: { source, sourceEventId, organizationId: { in: organizationIds } },
+    })
+    if (!event) throw new BadRequestException('This investigation event is unavailable or outside retention.')
+    const related = event.correlationId
+      ? await this.prisma.changeEvidenceEvent.findMany({
+          where: { customerTenantId: event.customerTenantId, correlationId: event.correlationId },
+          orderBy: [{ eventDateTime: 'asc' }, { id: 'asc' }],
+          take: 100,
+        })
+      : await this.prisma.changeEvidenceEvent.findMany({
+          where: {
+            customerTenantId: event.customerTenantId,
+            actorId: event.actorId ?? undefined,
+            eventDateTime: { gte: new Date(event.eventDateTime.getTime() - 15 * 60_000), lte: new Date(event.eventDateTime.getTime() + 15 * 60_000) },
+          },
+          orderBy: [{ eventDateTime: 'asc' }, { id: 'asc' }],
+          take: 100,
+        })
+    return { event, relatedEvents: related }
+  }
+}
+
+function normalizedChangeCategory(value: string): ChangeCategory {
+  const categories: ChangeCategory[] = ['MFA', 'Passwords', 'Conditional Access', 'Apps', 'Roles', 'Groups', 'Devices', 'Licenses', 'Users']
+  return categories.includes(value as ChangeCategory) ? value as ChangeCategory : 'Users'
 }

@@ -1,4 +1,4 @@
-import { Controller, Get, Inject, Query, Req } from '@nestjs/common'
+import { Controller, Get, Inject, Param, Query, Req } from '@nestjs/common'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { ChangesService } from './changes.service.js'
 
@@ -9,5 +9,10 @@ export class ChangesController {
   @Get()
   list(@Req() request: AuthenticatedRequest, @Query() query: Record<string, unknown>) {
     return this.changes.list(request.auth, query)
+  }
+
+  @Get(':id')
+  detail(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
+    return this.changes.detail(request.auth, id)
   }
 }

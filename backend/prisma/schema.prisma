@@ -195,6 +195,7 @@ model Organization {
   entraSnapshots     TenantEntraSnapshot[]
   signInLogs         SignInLog[]
   directoryAuditLogs DirectoryAuditLog[]
+  changeEvidenceEvents ChangeEvidenceEvent[]
   notifications      Notification[]
   notificationPreferences NotificationPreference[]
 
@@ -256,6 +257,7 @@ model CustomerTenant {
   entraSnapshots     TenantEntraSnapshot[]
   signInLogs         SignInLog[]
   directoryAuditLogs DirectoryAuditLog[]
+  changeEvidenceEvents ChangeEvidenceEvent[]
   notifications      Notification[]
 
   @@unique([id, organizationId])
@@ -482,6 +484,49 @@ model DirectoryAuditLog {
   @@index([customerTenantId, category, eventDateTime(sort: Desc)])
   @@index([expiresAt])
   @@map("directory_audit_logs")
+}
+
+// A normalized, investigation-friendly projection of the raw Microsoft audit
+// streams. Raw source records remain in their dedicated tables; this model is
+// deliberately keyed by tenant + source event so retries and overlapping sync
+// windows cannot duplicate an incident timeline.
+model ChangeEvidenceEvent {
+  id                String         @id @default(uuid()) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  customerTenantId  String         @map("customer_tenant_id") @db.Uuid
+  source            String         @db.VarChar(40)
+  sourceEventId     String         @map("source_event_id") @db.VarChar(200)
+  eventDateTime     DateTime       @map("event_date_time") @db.Timestamptz(6)
+  workload          String?        @db.VarChar(100)
+  category          String         @db.VarChar(100)
+  severity          String         @db.VarChar(20)
+  operationName     String         @map("operation_name") @db.VarChar(500)
+  summary           String         @db.Text
+  actorId           String?        @map("actor_id") @db.VarChar(128)
+  actorDisplayName  String?        @map("actor_display_name") @db.VarChar(256)
+  actorPrincipalName String?       @map("actor_principal_name") @db.VarChar(320)
+  targetId          String?        @map("target_id") @db.VarChar(128)
+  targetDisplayName String?        @map("target_display_name") @db.VarChar(500)
+  targetType        String?        @map("target_type") @db.VarChar(100)
+  correlationId     String?        @map("correlation_id") @db.VarChar(128)
+  result            String?        @db.VarChar(50)
+  ipAddress         String?        @map("ip_address") @db.VarChar(64)
+  location          Json?          @db.JsonB
+  beforeState       Json?          @map("before_state") @db.JsonB
+  afterState        Json?          @map("after_state") @db.JsonB
+  changedFields     Json?          @map("changed_fields") @db.JsonB
+  raw               Json           @db.JsonB
+  ingestedAt        DateTime       @default(now()) @map("ingested_at") @db.Timestamptz(6)
+  expiresAt         DateTime       @map("expires_at") @db.Timestamptz(6)
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, source, sourceEventId])
+  @@index([organizationId, customerTenantId, eventDateTime(sort: Desc)])
+  @@index([customerTenantId, category, eventDateTime(sort: Desc)])
+  @@index([customerTenantId, correlationId])
+  @@index([expiresAt])
+  @@map("change_evidence_events")
 }
 
 model TenantConnection {
