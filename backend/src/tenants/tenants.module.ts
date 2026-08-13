@@ -7,9 +7,10 @@ import { ScheduledSyncController } from './scheduled-sync.controller.js'
 import { SchedulerTokenVerifier } from './scheduler-token-verifier.service.js'
 import { IpGeolocationService } from './ip-geolocation.service.js'
 import { NotificationsModule } from '../notifications/notifications.module.js'
+import { ChangesModule } from '../changes/changes.module.js'
 
 @Module({
-  imports: [MicrosoftModule, NotificationsModule],
+  imports: [MicrosoftModule, NotificationsModule, ChangesModule],
   controllers: [TenantsController, ScheduledSyncController],
   providers: [
     TenantsService,

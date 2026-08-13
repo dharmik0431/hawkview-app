@@ -24,6 +24,7 @@ import {
   type SignInLocation,
 } from './ip-geolocation.service.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
+import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 
 const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
@@ -335,7 +336,9 @@ export class TenantSyncService {
     @Inject(IpGeolocationService)
     private readonly ipGeolocation: IpGeolocationService,
     @Inject(NotificationsService)
-    private readonly notifications: NotificationsService
+    private readonly notifications: NotificationsService,
+    @Inject(ChangeEvidenceService)
+    private readonly changeEvidence: ChangeEvidenceService
   ) {}
 
   private async getReadableTenant(
@@ -1777,27 +1780,61 @@ export class TenantSyncService {
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error(`Microsoft returned an invalid ${resourceLabel} link.`)
       }
-      const response = await fetch(nextUrl, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/json',
-        },
-        signal: AbortSignal.timeout(30_000),
-      })
-      if (!response.ok) {
-        const requestId = response.headers.get('request-id')
-        const graphError = await describeGraphError(response)
-        throw new Error(
-          `Microsoft ${resourceLabel} synchronization returned ${response.status}${
-            requestId ? ` (request ${requestId})` : ''
-          }${graphError}.`
-        )
-      }
+      const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel)
       const page = (await response.json()) as GraphCollectionPage
       rows.push(...(page.value ?? []))
       nextUrl = page['@odata.nextLink'] ?? ''
     }
     return rows
+  }
+
+  private async fetchGraphPage(
+    url: string,
+    accessToken: string,
+    resourceLabel: string
+  ) {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const response = await fetch(url, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (response.ok) return response
+
+        const retryable = [429, 500, 502, 503, 504].includes(response.status)
+        if (!retryable || attempt === 2) {
+          const requestId = response.headers.get('request-id')
+          const graphError = await describeGraphError(response)
+          throw new Error(
+            `Microsoft ${resourceLabel} synchronization returned ${response.status}${
+              requestId ? ` (request ${requestId})` : ''
+            }${graphError}.`
+          )
+        }
+        const retryAfterSeconds = Number(response.headers.get('retry-after'))
+        const delayMs = Number.isFinite(retryAfterSeconds)
+          ? Math.min(retryAfterSeconds * 1000, 10_000)
+          : (attempt + 1) * 500
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
+      } catch (error) {
+        lastError = error
+        if (
+          error instanceof Error &&
+          error.message.startsWith(`Microsoft ${resourceLabel} synchronization returned`)
+        ) {
+          throw error
+        }
+        if (attempt === 2) break
+        await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 500))
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`Microsoft ${resourceLabel} synchronization failed after retries.`)
   }
 
   private async logSyncStart(
@@ -1909,13 +1946,13 @@ export class TenantSyncService {
               : null,
           location: row.location ?? undefined,
           deviceDetail: row.deviceDetail ?? undefined,
-          raw: limited
+          raw: redactSensitiveValues(limited
             ? {
                 ...row,
                 hawkviewSource: MANAGEMENT_ACTIVITY_SOURCE,
                 hawkviewLimited: true,
               }
-            : row,
+            : row),
           ingestedAt,
           expiresAt,
         }))
@@ -1924,6 +1961,7 @@ export class TenantSyncService {
           data: records as never,
           skipDuplicates: true,
         })
+        await this.changeEvidence.projectSignIns(tenant, records)
       }
       if (limited && inferredLocations.size > 0) {
         await this.backfillLimitedSignInLocations(
@@ -1934,6 +1972,7 @@ export class TenantSyncService {
       await this.prisma.signInLog.deleteMany({
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
+      await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
     })
   }
 
@@ -2291,7 +2330,7 @@ export class TenantSyncService {
           initiatedBy: row.initiatedBy ?? undefined,
           targetResources: row.targetResources ?? undefined,
           additionalDetails: row.additionalDetails ?? undefined,
-          raw: row,
+          raw: redactSensitiveValues(row),
           ingestedAt,
           expiresAt,
         }))
@@ -2319,6 +2358,7 @@ export class TenantSyncService {
           data: records as never,
           skipDuplicates: true,
         })
+        await this.changeEvidence.projectDirectoryAudits(tenant, records)
       }
       for (const record of newRecords) {
         const activity = record.activityDisplayName.toLowerCase()
@@ -2371,6 +2411,7 @@ export class TenantSyncService {
       await this.prisma.directoryAuditLog.deleteMany({
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
+      await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
     })
   }
 

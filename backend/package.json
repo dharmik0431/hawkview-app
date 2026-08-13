@@ -16,7 +16,8 @@
     "db:studio": "prisma studio",
     "db:assign-owner": "node scripts/assign-organization-owner.mjs",
     "db:verify": "node scripts/verify-database.mjs",
-    "test:tenant-health": "tsx --test src/tenants/tenant-health.test.ts"
+    "test:tenant-health": "tsx --test src/tenants/tenant-health.test.ts",
+    "test:changes": "tsx --test src/changes/change-evidence.service.test.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.28",
