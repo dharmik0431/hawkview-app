@@ -105,6 +105,36 @@ function formatLocation(event: SignInEvent): string {
   return Array.from(new Set(parts)).join(', ') || 'Location unavailable'
 }
 
+function WorldMapBackdrop() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 1000 500"
+      preserveAspectRatio="none"
+      className="absolute inset-0 h-full w-full text-slate-300 dark:text-slate-700"
+    >
+      <defs>
+        <pattern id="sign-in-map-grid" width="83.333" height="83.333" patternUnits="userSpaceOnUse">
+          <path d="M 83.333 0 L 0 0 0 83.333" fill="none" stroke="currentColor" strokeWidth="1" opacity="0.55" />
+        </pattern>
+      </defs>
+      <rect width="1000" height="500" fill="url(#sign-in-map-grid)" />
+      <g fill="currentColor" opacity="0.5" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
+        <path d="M72 105 105 79 152 72 178 83 202 79 231 101 242 132 224 151 206 150 190 170 165 174 150 157 126 148 112 127 84 122Z" />
+        <path d="M215 188 239 206 253 238 247 275 264 309 252 353 232 390 214 367 210 331 193 299 195 261 184 228Z" />
+        <path d="M425 111 453 92 490 95 505 110 533 108 565 122 575 145 552 157 531 150 511 169 483 164 463 176 443 157 425 144Z" />
+        <path d="M475 181 507 188 527 215 533 249 553 281 542 329 520 369 501 394 484 369 489 334 471 300 462 262 450 224Z" />
+        <path d="M563 115 602 98 642 105 671 90 721 98 742 117 790 119 824 139 842 162 825 181 789 178 754 194 730 182 692 188 664 176 633 180 608 161 578 151Z" />
+        <path d="M737 231 764 240 779 266 765 284 742 277 726 257Z" />
+        <path d="M815 345 842 359 854 389 838 408 811 391 803 366Z" />
+        <path d="M302 327 315 337 310 353 297 348Z" />
+        <path d="M187 98 199 88 211 92 204 105Z" />
+      </g>
+      <path d="M0 250 H1000 M500 0 V500" stroke="currentColor" strokeWidth="1" opacity="0.35" />
+    </svg>
+  )
+}
+
 function fallbackMapPosition(latitude: number, longitude: number) {
   return {
     left: `${Math.min(99, Math.max(1, ((longitude + 180) / 360) * 100))}%`,
@@ -666,15 +696,12 @@ export default function SignInActivitySection({
 
               {mappedEvents.length > 0 && (
                 <div className="absolute inset-0 overflow-hidden rounded-xl bg-slate-100 dark:bg-slate-950">
-                  <div
-                    aria-label="Fallback geographic plot of mapped sign-in activity"
-                    className="absolute inset-0 opacity-80"
-                    style={{
-                      backgroundImage:
-                        'linear-gradient(rgba(100,116,139,.18) 1px, transparent 1px), linear-gradient(90deg, rgba(100,116,139,.18) 1px, transparent 1px), radial-gradient(ellipse at center, rgba(59,130,246,.14), transparent 65%)',
-                      backgroundSize: '100% 16.66%, 8.33% 100%, 100% 100%',
-                    }}
-                  />
+                <div
+                  aria-label="Fallback geographic plot of mapped sign-in activity"
+                  className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(59,130,246,.14),transparent_65%)]"
+                >
+                  <WorldMapBackdrop />
+                </div>
                   {fallbackMapPoints.map(({ event, count, hasFailure }) => (
                     <div
                       key={`${event.latitude}:${event.longitude}`}
@@ -695,10 +722,10 @@ export default function SignInActivitySection({
                   ))}
                   <div className="absolute left-4 top-4 z-20 max-w-sm rounded-lg border border-amber-200 bg-white/95 p-3 shadow-sm dark:border-amber-900 dark:bg-slate-900/95">
                     <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                      Sign-in location plot
+                      Sign-in world map
                     </p>
                     <p className="mt-1 text-[11px] text-muted-foreground">
-                      Uses the synchronized Microsoft location coordinates directly. Green markers are successful sign-ins; red markers include failures.
+                      Uses synchronized Microsoft location coordinates directly. Green markers are successful sign-ins; red markers include failures.
                     </p>
                   </div>
                 </div>
