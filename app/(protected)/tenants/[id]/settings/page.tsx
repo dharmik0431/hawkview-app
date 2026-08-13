@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
 import { useParams, useRouter } from 'next/navigation'
 import { useQueryClient } from '@tanstack/react-query'
+import { useAuth } from '@/components/providers/auth-provider'
 
 import { apiClient } from '@/lib/api/client'
 import type { TenantBundle } from '@/types/tenant-data'
@@ -91,7 +92,14 @@ export default function TenantSettingsPage() {
   const params = useParams<{ id: string }>()
   const router = useRouter()
   const queryClient = useQueryClient()
+  const { session } = useAuth()
   const tenantId = params?.id
+  const canDeleteTenant =
+    session?.user.memberships.some(
+      (membership) =>
+        membership.status === 'ACTIVE' &&
+        ['MSP_OWNER', 'MSP_ADMIN'].includes(membership.role)
+    ) ?? false
 
   const [bundle, setBundle] = useState<TenantBundle | null>(null)
   const [tenantListRecord, setTenantListRecord] = useState<any | null>(null)
@@ -1439,7 +1447,8 @@ export default function TenantSettingsPage() {
       </Card>
 
       {/* SECTION 6: Danger Zone */}
-      <Card className="rounded-2xl border border-red-200 dark:border-red-900/50 bg-red-50/20 dark:bg-red-950/10 shadow-sm">
+      {canDeleteTenant && (
+        <Card className="rounded-2xl border border-red-200 dark:border-red-900/50 bg-red-50/20 dark:bg-red-950/10 shadow-sm">
         <CardHeader className="pb-4">
           <div className="flex items-center gap-2 text-red-700 dark:text-red-400">
             <ShieldAlert className="h-5 w-5" />
@@ -1559,7 +1568,8 @@ export default function TenantSettingsPage() {
             </div>
           </div>
         </CardContent>
-      </Card>
+        </Card>
+      )}
     </div>
   )
 }

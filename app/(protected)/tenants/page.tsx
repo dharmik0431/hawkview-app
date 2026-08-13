@@ -32,6 +32,7 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { useTenants } from '@/lib/api/hooks'
 import { apiClient } from '@/lib/api/client'
+import { useAuth } from '@/components/providers/auth-provider'
 import type {
   CreateTenantResponse,
   MicrosoftConsentResponse,
@@ -255,7 +256,17 @@ function TenantIdPill({ tenantId }: { tenantId: string }) {
 
 export default function TenantsPage() {
   const queryClient = useQueryClient()
+  const { session } = useAuth()
   const { data, isLoading, isFetching, error, refetch } = useTenants()
+
+  // The API remains authoritative. This only prevents roles that cannot
+  // onboard tenants from being presented with an action they cannot complete.
+  const canOnboardTenant =
+    session?.user.memberships.some(
+      (membership) =>
+        membership.status === 'ACTIVE' &&
+        ['MSP_OWNER', 'MSP_ADMIN', 'MSP_TECHNICIAN'].includes(membership.role)
+    ) ?? false
 
   const onboardButtonRef = useRef<HTMLButtonElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
@@ -808,20 +819,22 @@ export default function TenantsPage() {
         </div>
 
         <div className="flex items-center gap-3">
-          <Button
-            ref={onboardButtonRef}
-            className="gap-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold shadow-sm"
-            onClick={() => {
-              setOnboardingError(null)
-              setConsentReview(null)
-              setHawkviewPreviewMessage(null)
-              setOnboardingStep('select')
-              setShowOnboarding(true)
-            }}
-          >
-            <Plus className="h-4 w-4" />
-            <span>Onboard Tenant</span>
-          </Button>
+          {canOnboardTenant && (
+            <Button
+              ref={onboardButtonRef}
+              className="gap-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold shadow-sm"
+              onClick={() => {
+                setOnboardingError(null)
+                setConsentReview(null)
+                setHawkviewPreviewMessage(null)
+                setOnboardingStep('select')
+                setShowOnboarding(true)
+              }}
+            >
+              <Plus className="h-4 w-4" />
+              <span>Onboard Tenant</span>
+            </Button>
+          )}
         </div>
       </div>
 
