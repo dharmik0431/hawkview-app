@@ -169,13 +169,13 @@ export function Sidebar() {
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Link
-                    href="/settings/team"
+                    href="/admin"
                     className={cn(
                       'flex rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
                       isCollapsed
                         ? 'h-10 w-10 items-center justify-center mx-auto'
                         : 'px-3 py-2 items-center justify-center gap-2',
-                      pathname === '/settings/team' || pathname === '/team-access'
+                      pathname === '/admin' || pathname === '/settings/team' || pathname === '/team-access'
                         ? 'bg-blue-600 text-white'
                         : 'bg-slate-800 text-slate-200 hover:bg-slate-700 hover:text-white'
                     )}

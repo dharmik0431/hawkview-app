@@ -202,7 +202,7 @@ export function UserMenu() {
 
               {session?.user.memberships?.some((m) => m.role === 'MSP_OWNER') && (
                 <Link
-                  href="/settings/team"
+                  href="/admin"
                   onClick={closeMenu}
                   role="menuitem"
                   className="flex items-center justify-between px-3 py-2 text-sm rounded-md text-foreground hover:bg-accent hover:text-accent-foreground transition-colors focus-visible:outline-none focus-visible:bg-accent"

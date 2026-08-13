@@ -1,5 +1,5 @@
-import { redirect } from 'next/navigation'
+import TeamAccessPage from '../settings/team/page'
 
-export default function AdminRedirectPage() {
-  redirect('/settings/team')
+export default function AdminPage() {
+  return <TeamAccessPage />
 }
