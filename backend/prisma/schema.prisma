@@ -192,6 +192,7 @@ model Organization {
   tenantLicenses     TenantLicense[]
   tenantDomains      TenantDomain[]
   syncStates         SyncState[]
+  collectionFieldStates TenantCollectionFieldState[]
   entraSnapshots     TenantEntraSnapshot[]
   signInLogs         SignInLog[]
   directoryAuditLogs DirectoryAuditLog[]
@@ -254,6 +255,7 @@ model CustomerTenant {
   tenantLicenses     TenantLicense[]
   tenantDomains      TenantDomain[]
   syncStates         SyncState[]
+  collectionFieldStates TenantCollectionFieldState[]
   entraSnapshots     TenantEntraSnapshot[]
   signInLogs         SignInLog[]
   directoryAuditLogs DirectoryAuditLog[]
@@ -404,6 +406,33 @@ model SyncState {
   @@unique([customerTenantId, resourceType])
   @@index([organizationId, status])
   @@map("sync_states")
+}
+
+// A sync resource can contain multiple independently collected values.  Keep
+// their collection outcome separately from the last successful snapshot so a
+// transient Microsoft failure never turns valid historical data into a blank.
+model TenantCollectionFieldState {
+  id               String   @id @default(uuid()) @db.Uuid
+  organizationId   String   @map("organization_id") @db.Uuid
+  customerTenantId String   @map("customer_tenant_id") @db.Uuid
+  fieldKey         String   @map("field_key") @db.VarChar(150)
+  state            String   @db.VarChar(40)
+  reasonCode       String?  @map("reason_code") @db.VarChar(100)
+  message          String?  @db.Text
+  source           String   @default("Microsoft Graph") @db.VarChar(100)
+  endpoint         String?  @db.Text
+  correlationId    String?  @map("correlation_id") @db.VarChar(200)
+  lastAttemptAt    DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  lastSuccessfulAt DateTime? @map("last_successful_at") @db.Timestamptz(6)
+  isStale          Boolean  @default(false) @map("is_stale")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant   CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, fieldKey])
+  @@index([organizationId, customerTenantId])
+  @@map("tenant_collection_field_states")
 }
 
 model TenantEntraSnapshot {

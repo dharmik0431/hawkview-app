@@ -25,6 +25,7 @@ import {
 } from './ip-geolocation.service.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
+import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
 
 const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
@@ -692,6 +693,7 @@ export class TenantSyncService {
         }
       })
 
+      await this.refreshCollectionFieldStates(tenant)
       const attemptedStates = await this.prisma.syncState.findMany({
         where: {
           customerTenantId: tenant.id,
@@ -899,6 +901,7 @@ export class TenantSyncService {
       }
     })
 
+    await this.refreshCollectionFieldStates(tenant)
     const attemptedStates = await this.prisma.syncState.findMany({
       where: {
         customerTenantId: tenant.id,
@@ -940,6 +943,84 @@ export class TenantSyncService {
       status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
       failedResources,
     }
+  }
+
+  /**
+   * Materialize field-level status independently from snapshot payloads. A
+   * resource failure does not remove its previous snapshot, so consumers can
+   * safely show the last value with a stale warning instead of a false zero.
+   */
+  private async refreshCollectionFieldStates(tenant: {
+    id: string
+    organizationId: string
+  }) {
+    const [syncStates, snapshots] = await Promise.all([
+      this.prisma.syncState.findMany({
+        where: { customerTenantId: tenant.id },
+      }),
+      this.prisma.tenantEntraSnapshot.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        select: { resourceType: true, payload: true },
+      }),
+    ])
+    const syncByResource = new Map(syncStates.map((state) => [state.resourceType, state]))
+    const snapshotByResource = new Map(snapshots.map((snapshot) => [snapshot.resourceType, snapshot.payload]))
+    const snapshotFor = (resource: string) =>
+      snapshotByResource.get(resource as any)
+    // A deliberately empty snapshot is still a successful, useful result. It
+    // must survive a later refresh failure as a stale zero rather than vanish.
+    const hasSnapshot = (resource: string) => snapshotByResource.has(resource as any)
+    const correlationId = (message: string | null) =>
+      message?.match(/(?:request|correlation)[^0-9a-f]*([0-9a-f]{8}-[0-9a-f-]{27,})/i)?.[1] ?? null
+    const resources: Array<{ key: string; resource: string; source: string; endpoint: string; unsupported?: boolean }> = [
+      { key: 'exchange.mailboxes.inventory', resource: 'EXCHANGE_MAILBOXES', source: 'Microsoft Graph', endpoint: '/users' },
+      { key: 'exchange.mailboxes.configuration', resource: 'EXCHANGE_MAILBOX_CONFIGURATION', source: 'Exchange Online', endpoint: '/adminapi/v2.0/Mailbox' },
+      { key: 'exchange.mailboxes.usage', resource: 'EXCHANGE_MAILBOX_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getMailboxUsageDetail' },
+      { key: 'sharepoint.sites.inventory', resource: 'SHAREPOINT_SITES', source: 'Microsoft Graph', endpoint: '/sites?search=*' },
+      { key: 'sharepoint.sites.access', resource: 'SHAREPOINT_SITES', source: 'SharePoint REST', endpoint: '/_api/web/siteusers' },
+      { key: 'sharepoint.tenant.settings', resource: 'SHAREPOINT_SETTINGS', source: 'Microsoft Graph', endpoint: '/admin/sharepoint/settings' },
+      { key: 'sharepoint.usage', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
+      { key: 'sharepoint.activity', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
+      { key: 'sharepoint.owners', resource: 'SHAREPOINT_SITES', source: 'Microsoft Graph', endpoint: '/sites', unsupported: true },
+      { key: 'sharepoint.deleted-sites', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
+      { key: 'entra.conditional-access', resource: 'CONDITIONAL_ACCESS', source: 'Microsoft Graph', endpoint: '/identity/conditionalAccess/policies' },
+    ]
+    await Promise.all(resources.map(async (definition) => {
+      const sync = syncByResource.get(definition.resource as any)
+      const conditionalAccessPayload = snapshotFor('CONDITIONAL_ACCESS')
+      const hasNoConditionalAccessPolicies =
+        definition.key === 'entra.conditional-access' &&
+        sync?.status === 'SUCCEEDED' &&
+        Array.isArray(conditionalAccessPayload) &&
+        conditionalAccessPayload.length === 0
+      const result = deriveCollectionFieldState({
+        syncStatus: sync?.status,
+        lastErrorMessage: sync?.lastErrorMessage,
+        hasPriorSnapshot: hasSnapshot(definition.resource),
+        unsupported: definition.unsupported,
+        unsupportedMessage: 'Microsoft Graph site inventory does not provide a reliable site-owner roster.',
+        notConfigured: hasNoConditionalAccessPolicies,
+      })
+      await this.prisma.tenantCollectionFieldState.upsert({
+        where: { customerTenantId_fieldKey: { customerTenantId: tenant.id, fieldKey: definition.key } },
+        create: {
+          organizationId: tenant.organizationId, customerTenantId: tenant.id, fieldKey: definition.key,
+          state: result.state, reasonCode: result.reasonCode, message: result.message,
+          source: definition.source, endpoint: definition.endpoint,
+          correlationId: correlationId(sync?.lastErrorMessage ?? null), lastAttemptAt: sync?.lastAttemptAt ?? null,
+          lastSuccessfulAt: sync?.lastSuccessfulAt ?? null, isStale: result.isStale,
+        },
+        update: {
+          state: result.state, reasonCode: result.reasonCode, message: result.message,
+          source: definition.source, endpoint: definition.endpoint,
+          correlationId: correlationId(sync?.lastErrorMessage ?? null), lastAttemptAt: sync?.lastAttemptAt ?? null,
+          lastSuccessfulAt: sync?.lastSuccessfulAt ?? null, isStale: result.isStale,
+        },
+      })
+    }))
   }
 
   private async markConnectionUnavailable(
@@ -3203,6 +3284,7 @@ export class TenantSyncService {
       domains,
       syncStates,
       entraSnapshots,
+      collectionFieldStates,
       signIns,
       auditLogs,
     ] = await Promise.all([
@@ -3265,6 +3347,13 @@ export class TenantSyncService {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
         },
+      }),
+      this.prisma.tenantCollectionFieldState.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: { fieldKey: 'asc' },
       }),
       this.prisma.signInLog.findMany({
         where: {
@@ -3462,6 +3551,11 @@ export class TenantSyncService {
         total + (parseReportBytes(row?.['Storage Allocated (Byte)']) ?? 0),
       0
     )
+    const reportedSharePointUsedBytes = sharePointUsage.reduce(
+      (total: number, row: Record<string, string>) =>
+        total + (parseReportBytes(row?.['Storage Used (Byte)']) ?? 0),
+      0
+    )
     const getSharePointUsage = (site: any) => {
       const byUrl = sharePointUsageByUrl.get(
         normalizeSharePointUrl(site?.webUrl)
@@ -3498,9 +3592,7 @@ export class TenantSyncService {
       return 'SharePoint site'
     }
     const bytesToGb = (value: unknown) =>
-      typeof value === 'number'
-        ? Math.round((value / 1024 ** 3) * 100) / 100
-        : null
+      bytesToGigabytes(typeof value === 'number' ? value : null)
     const bytesToUsageLabel = (value: unknown) => {
       const bytes = parseReportBytes(value)
       if (bytes === null) return 'No usage reported'
@@ -3607,6 +3699,37 @@ export class TenantSyncService {
     const syncStateByResource = new Map(
       syncStates.map((state) => [state.resourceType, state])
     )
+    const collectionStateByKey = new Map(
+      collectionFieldStates.map((field) => [field.fieldKey, field])
+    )
+    const collectionState = (fieldKey: string, value: unknown = null) => {
+      const field = collectionStateByKey.get(fieldKey)
+      return field
+        ? {
+            value,
+            state: field.state,
+            reasonCode: field.reasonCode,
+            message: field.message,
+            source: field.source,
+            endpoint: field.endpoint,
+            correlationId: field.correlationId,
+            lastAttemptAt: field.lastAttemptAt?.toISOString() ?? null,
+            lastSuccessfulAt: field.lastSuccessfulAt?.toISOString() ?? null,
+            isStale: field.isStale,
+          }
+        : {
+            value,
+            state: 'PENDING',
+            reasonCode: 'SYNC_NOT_STARTED',
+            message: 'Synchronization has not started for this value.',
+            source: 'Microsoft Graph',
+            endpoint: null,
+            correlationId: null,
+            lastAttemptAt: null,
+            lastSuccessfulAt: null,
+            isStale: false,
+          }
+    }
     const userSyncState = syncStateByResource.get('USERS')
     const licenseSyncState = syncStateByResource.get('LICENSES')
     const domainSyncState = syncStateByResource.get('DOMAINS')
@@ -3853,6 +3976,20 @@ export class TenantSyncService {
           displayedRecordLimit: 5000,
         },
         exchange: {
+          collection: {
+            inventory: collectionState(
+              'exchange.mailboxes.inventory',
+              exchangeMailboxInventory.length
+            ),
+            configuration: collectionState(
+              'exchange.mailboxes.configuration',
+              exchangeMailboxConfiguration.length
+            ),
+            usage: collectionState(
+              'exchange.mailboxes.usage',
+              exchangeMailboxUsage.length
+            ),
+          },
           sync: {
             mailboxes: exchangeSync('EXCHANGE_MAILBOXES'),
             mailboxConfiguration: exchangeSync(
@@ -3875,9 +4012,11 @@ export class TenantSyncService {
               exchangeConfigurationByIdentity.get(
                 String(mailbox.id ?? '').toLowerCase()
               ) ??
-              exchangeConfigurationByIdentity.get(directoryUpn.toLowerCase()) ??
-              {}
-            const enrichedMailbox = { ...mailbox, ...configuration }
+              exchangeConfigurationByIdentity.get(directoryUpn.toLowerCase())
+            const configurationCollected = Boolean(configuration)
+            const enrichedMailbox = configuration
+              ? { ...mailbox, ...configuration }
+              : mailbox
             const upn = String(
               enrichedMailbox.UserPrincipalName ??
                 enrichedMailbox.userPrincipalName ??
@@ -3888,18 +4027,20 @@ export class TenantSyncService {
             )
             const usage = exchangeUsageByUpn.get(upn.toLowerCase())
             const storageBytes = Number(usage?.['Storage Used (Byte)'])
-            const recipientType = String(
+            const recipientType =
               enrichedMailbox.RecipientTypeDetails ??
-                enrichedMailbox.RecipientType ??
-                'UserMailbox'
-            )
-            const mailboxType = recipientType.includes('Shared')
-              ? 'Shared'
-              : recipientType.includes('Room')
-                ? 'Room'
-                : recipientType.includes('Equipment')
-                  ? 'Equipment'
-                  : 'User'
+              enrichedMailbox.RecipientType ??
+              null
+            const mailboxType =
+              typeof recipientType !== 'string'
+                ? null
+                : recipientType.includes('Shared')
+                  ? 'Shared'
+                  : recipientType.includes('Room')
+                    ? 'Room'
+                    : recipientType.includes('Equipment')
+                      ? 'Equipment'
+                      : 'User'
             const emailAddresses = Array.isArray(enrichedMailbox.EmailAddresses)
               ? enrichedMailbox.EmailAddresses
               : []
@@ -3934,13 +4075,14 @@ export class TenantSyncService {
                 ? Math.round((storageBytes / 1024 ** 3) * 100) / 100
                 : null,
               itemCount: Number(usage?.['Item Count']) || null,
-              archiveEnabled:
-                String(enrichedMailbox.ArchiveStatus ?? '').toLowerCase() ===
-                  'active' ||
-                Boolean(
-                  enrichedMailbox.ArchiveGuid &&
-                  !String(enrichedMailbox.ArchiveGuid).startsWith('00000000')
-                ),
+              archiveEnabled: configurationCollected
+                ? String(enrichedMailbox.ArchiveStatus ?? '').toLowerCase() ===
+                    'active' ||
+                  Boolean(
+                    enrichedMailbox.ArchiveGuid &&
+                    !String(enrichedMailbox.ArchiveGuid).startsWith('00000000')
+                  )
+                : null,
               retentionLabel:
                 enrichedMailbox.RetentionPolicy ??
                 enrichedMailbox.RetentionHoldEnabled ??
@@ -3955,6 +4097,17 @@ export class TenantSyncService {
                   : [],
               },
               lastLogon: usage?.['Last Activity Date'] || null,
+              collection: {
+                inventory: collectionState('exchange.mailboxes.inventory', true),
+                configuration: collectionState(
+                  'exchange.mailboxes.configuration',
+                  configurationCollected
+                ),
+                usage: collectionState(
+                  'exchange.mailboxes.usage',
+                  Number.isFinite(storageBytes) ? storageBytes : null
+                ),
+              },
             }
           }),
           rules: exchangeMailboxRules.map((rule: any) => ({
@@ -4033,6 +4186,27 @@ export class TenantSyncService {
             }),
         },
         sharepoint: {
+          collection: {
+            inventory: collectionState(
+              'sharepoint.sites.inventory',
+              sharePointSites.length
+            ),
+            access: collectionState('sharepoint.sites.access', null),
+            tenantSettings: collectionState(
+              'sharepoint.tenant.settings',
+              sharePointSettings ?? null
+            ),
+            usage: collectionState(
+              'sharepoint.usage',
+              sharePointUsageSynchronized ? reportedSharePointUsedBytes : null
+            ),
+            activity: collectionState(
+              'sharepoint.activity',
+              sharePointUsageSynchronized ? sharePointActivity.length : null
+            ),
+            owners: collectionState('sharepoint.owners'),
+            deletedSites: collectionState('sharepoint.deleted-sites'),
+          },
           sync: {
             sites: {
               status:
@@ -4073,6 +4247,12 @@ export class TenantSyncService {
           },
           overview: {
             totalSites: sharePointSites.length,
+            summedSiteStorageUsedBytes: sharePointUsageSynchronized
+              ? reportedSharePointUsedBytes
+              : null,
+            summedSiteQuotaBytes: sharePointUsageSynchronized
+              ? reportedSharePointAllocationBytes
+              : null,
             // Microsoft Graph does not expose the licensed tenant storage
             // pool. Its usage report does provide each reported site's
             // allocation, so expose that useful aggregate with an explicit
@@ -4207,6 +4387,25 @@ export class TenantSyncService {
                   : activity.activityAgeDays >= 90
                     ? 'inactive'
                     : 'active',
+              collection: {
+                sharing:
+                  typeof site.externalSharing === 'boolean'
+                    ? { ...collectionState('sharepoint.sites.access'), value: site.externalSharing }
+                    : collectionState('sharepoint.sites.access'),
+                guests:
+                  typeof site.guestsCount === 'number'
+                    ? { ...collectionState('sharepoint.sites.access'), value: site.guestsCount }
+                    : collectionState('sharepoint.sites.access'),
+                storage:
+                  reportStorageUsed !== null || reportStorageAllocated !== null
+                    ? { ...collectionState('sharepoint.usage'), value: reportStorageUsed ?? reportStorageAllocated }
+                    : collectionState('sharepoint.usage'),
+                activity:
+                  activity.activityAgeDays !== null
+                    ? { ...collectionState('sharepoint.activity'), value: activity.lastActivityAt }
+                    : collectionState('sharepoint.activity'),
+                owners: collectionState('sharepoint.owners'),
+              },
             }
           }),
           // This is the deleted-site signal in Microsoft's D180 usage report.
@@ -4250,6 +4449,12 @@ export class TenantSyncService {
           })),
         },
         entra: {
+          collection: {
+            conditionalAccess: {
+              ...collectionState('entra.conditional-access'),
+              value: (snapshotByResource.get('CONDITIONAL_ACCESS') ?? []).length,
+            },
+          },
           securityDefaults:
             typeof securityDefaults?.isEnabled === 'boolean'
               ? {
