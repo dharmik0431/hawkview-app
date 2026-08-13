@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState, useEffect } from 'react'
+import { useMemo, useState, useEffect, useRef } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -17,6 +17,10 @@ import {
   Globe,
   Info,
   AlertTriangle,
+  Minus,
+  Plus,
+  RotateCcw,
+  X,
 } from 'lucide-react'
 import type { TenantSyncStatus } from '@/types/tenant-data'
 
@@ -43,6 +47,12 @@ export type SignInEvent = {
 }
 
 export type TimeWindow = '24h' | '7d' | '30d'
+
+type MapLocationPoint = {
+  event: SignInEvent
+  count: number
+  hasFailure: boolean
+}
 
 interface SignInActivitySectionProps {
   signIns: SignInEvent[]
@@ -160,6 +170,16 @@ export default function SignInActivitySection({
   const [currentPage, setCurrentPage] = useState(1)
   const [mapLoadError, setMapLoadError] = useState<string | null>(null)
   const [mapRetry, setMapRetry] = useState(0)
+  const [mapZoom, setMapZoom] = useState(1)
+  const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
+  const [selectedMapPoint, setSelectedMapPoint] =
+    useState<MapLocationPoint | null>(null)
+  const mapDragRef = useRef<{
+    startX: number
+    startY: number
+    originX: number
+    originY: number
+  } | null>(null)
   const pageSize = 10
   const hasLimitedActivity = signIns.some(
     (event) =>
@@ -213,10 +233,7 @@ export default function SignInActivitySection({
   }, [mappedEvents])
 
   const fallbackMapPoints = useMemo(() => {
-    const points = new Map<
-      string,
-      { event: SignInEvent; count: number; hasFailure: boolean }
-    >()
+    const points = new Map<string, MapLocationPoint>()
 
     for (const event of mappedEvents) {
       // Group nearby events so a busy tenant does not create hundreds of
@@ -237,6 +254,48 @@ export default function SignInActivitySection({
 
     return Array.from(points.values())
   }, [mappedEvents])
+
+  const resetMapView = () => {
+    setMapZoom(1)
+    setMapOffset({ x: 0, y: 0 })
+    setSelectedMapPoint(null)
+  }
+
+  const zoomMap = (direction: 'in' | 'out') => {
+    setMapZoom((current) => {
+      const next = direction === 'in' ? current + 0.5 : current - 0.5
+      return Math.min(4, Math.max(1, next))
+    })
+  }
+
+  const handleMapWheel = (deltaY: number) => {
+    setMapZoom((current) => {
+      const next = deltaY < 0 ? current + 0.25 : current - 0.25
+      return Math.min(4, Math.max(1, next))
+    })
+  }
+
+  const startMapDrag = (clientX: number, clientY: number) => {
+    mapDragRef.current = {
+      startX: clientX,
+      startY: clientY,
+      originX: mapOffset.x,
+      originY: mapOffset.y,
+    }
+  }
+
+  const moveMapDrag = (clientX: number, clientY: number) => {
+    const drag = mapDragRef.current
+    if (!drag) return
+    setMapOffset({
+      x: drag.originX + clientX - drag.startX,
+      y: drag.originY + clientY - drag.startY,
+    })
+  }
+
+  const endMapDrag = () => {
+    mapDragRef.current = null
+  }
 
   // Table pagination
   const totalPages = Math.max(1, Math.ceil(filteredSignIns.length / pageSize))
@@ -695,18 +754,35 @@ export default function SignInActivitySection({
               />
 
               {mappedEvents.length > 0 && (
-                <div className="absolute inset-0 overflow-hidden rounded-xl bg-slate-100 dark:bg-slate-950">
                 <div
+                  className="absolute inset-0 overflow-hidden rounded-xl bg-slate-100 dark:bg-slate-950 cursor-grab active:cursor-grabbing touch-none"
+                  onWheel={(event) => {
+                    event.preventDefault()
+                    handleMapWheel(event.deltaY)
+                  }}
+                  onMouseDown={(event) => startMapDrag(event.clientX, event.clientY)}
+                  onMouseMove={(event) => moveMapDrag(event.clientX, event.clientY)}
+                  onMouseUp={endMapDrag}
+                  onMouseLeave={endMapDrag}
+                >
+                  <div
                   aria-label="Fallback geographic plot of mapped sign-in activity"
-                  className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(59,130,246,.14),transparent_65%)]"
+                  className="absolute inset-0 origin-center bg-[radial-gradient(ellipse_at_center,rgba(59,130,246,.14),transparent_65%)] transition-transform duration-150"
+                  style={{ transform: `translate(${mapOffset.x}px, ${mapOffset.y}px) scale(${mapZoom})` }}
                 >
                   <WorldMapBackdrop />
-                </div>
                   {fallbackMapPoints.map(({ event, count, hasFailure }) => (
-                    <div
+                    <button
+                      type="button"
                       key={`${event.latitude}:${event.longitude}`}
+                      aria-label={`Show ${count} sign-in event${count === 1 ? '' : 's'} near ${formatLocation(event)}`}
+                      onMouseDown={(click) => click.stopPropagation()}
+                      onClick={(click) => {
+                        click.stopPropagation()
+                        setSelectedMapPoint({ event, count, hasFailure })
+                      }}
                       title={`${formatLocation(event)} — ${count} sign-in event${count === 1 ? '' : 's'}`}
-                      className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-md ${hasFailure ? 'bg-red-500' : 'bg-emerald-500'}`}
+                      className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-md transition-transform hover:scale-125 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${hasFailure ? 'bg-red-500' : 'bg-emerald-500'}`}
                       style={{
                         ...fallbackMapPosition(event.latitude, event.longitude),
                         width: count > 9 ? 18 : 12,
@@ -718,8 +794,9 @@ export default function SignInActivitySection({
                           {count > 99 ? '99+' : count}
                         </span>
                       )}
-                    </div>
+                    </button>
                   ))}
+                  </div>
                   <div className="absolute left-4 top-4 z-20 max-w-sm rounded-lg border border-amber-200 bg-white/95 p-3 shadow-sm dark:border-amber-900 dark:bg-slate-900/95">
                     <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
                       Sign-in world map
@@ -728,6 +805,52 @@ export default function SignInActivitySection({
                       Uses synchronized Microsoft location coordinates directly. Green markers are successful sign-ins; red markers include failures.
                     </p>
                   </div>
+                  <div
+                    className="absolute right-4 top-4 z-20 flex flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900"
+                    onMouseDown={(event) => event.stopPropagation()}
+                  >
+                    <Button variant="ghost" size="icon" className="h-9 w-9 rounded-none" onClick={() => zoomMap('in')} aria-label="Zoom in">
+                      <Plus className="h-4 w-4" />
+                    </Button>
+                    <Button variant="ghost" size="icon" className="h-9 w-9 rounded-none border-y border-slate-200 dark:border-slate-700" onClick={() => zoomMap('out')} aria-label="Zoom out">
+                      <Minus className="h-4 w-4" />
+                    </Button>
+                    <Button variant="ghost" size="icon" className="h-9 w-9 rounded-none" onClick={resetMapView} aria-label="Reset map view">
+                      <RotateCcw className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  {selectedMapPoint && (
+                    <div
+                      className="absolute bottom-4 left-4 z-30 w-[min(360px,calc(100%-2rem))] rounded-xl border border-slate-200 bg-white p-4 shadow-lg dark:border-slate-700 dark:bg-slate-900"
+                      onMouseDown={(event) => event.stopPropagation()}
+                    >
+                      <Button variant="ghost" size="icon" className="absolute right-2 top-2 h-7 w-7" onClick={() => setSelectedMapPoint(null)} aria-label="Close sign-in details">
+                        <X className="h-4 w-4" />
+                      </Button>
+                      <p className="pr-8 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        {selectedMapPoint.event.userDisplayName || 'Unknown user'}
+                      </p>
+                      <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                        {selectedMapPoint.event.userPrincipalName || 'User principal name unavailable'}
+                      </p>
+                      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
+                        <span className="text-muted-foreground">Location</span>
+                        <span className="text-right font-medium">{formatLocation(selectedMapPoint.event)}</span>
+                        <span className="text-muted-foreground">IP address</span>
+                        <span className="text-right font-medium">{selectedMapPoint.event.ipAddress || 'Unavailable'}</span>
+                        <span className="text-muted-foreground">Application</span>
+                        <span className="text-right font-medium">{selectedMapPoint.event.appDisplayName || 'Microsoft 365'}</span>
+                        <span className="text-muted-foreground">Result</span>
+                        <span className={`text-right font-medium ${selectedMapPoint.hasFailure ? 'text-red-600' : 'text-emerald-600'}`}>
+                          {selectedMapPoint.hasFailure ? 'Includes failures' : 'Successful'}
+                        </span>
+                        <span className="text-muted-foreground">Events at location</span>
+                        <span className="text-right font-medium">{selectedMapPoint.count}</span>
+                        <span className="text-muted-foreground">Latest event</span>
+                        <span className="text-right font-medium">{formatSignInTime(selectedMapPoint.event.createdAt)}</span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
