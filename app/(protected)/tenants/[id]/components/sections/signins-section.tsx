@@ -118,6 +118,10 @@ export default function SignInActivitySection({
   onSignInViewChange,
   syncStatus,
 }: SignInActivitySectionProps) {
+  // MapLibre/WebGL and third-party raster tiles are not reliable in embedded
+  // previews. The built-in geographic plot uses the same synchronized
+  // coordinates without any external rendering or tile dependency.
+  const useBuiltInLocationPlot = true
   const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
   const [resultFilter, setResultFilter] = useState<
     'all' | 'Success' | 'Failure'
@@ -217,7 +221,7 @@ export default function SignInActivitySection({
 
   // Map initialization effect
   useEffect(() => {
-    if (signInView !== 'map') return
+    if (signInView !== 'map' || useBuiltInLocationPlot) return
     let map: any = null
     let markers: any[] = []
     let disposed = false
@@ -378,7 +382,7 @@ export default function SignInActivitySection({
         } catch {}
       }
     }
-  }, [signInView, mappedEvents, mapRetry])
+  }, [signInView, mappedEvents, mapRetry, useBuiltInLocationPlot])
 
   const timeWindowLabel =
     timeWindow === '24h'
@@ -660,7 +664,7 @@ export default function SignInActivitySection({
                 className="h-[420px] w-full rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-inner bg-slate-100 dark:bg-slate-950"
               />
 
-              {mapLoadError && mappedEvents.length > 0 && (
+              {mappedEvents.length > 0 && (
                 <div className="absolute inset-0 overflow-hidden rounded-xl bg-slate-100 dark:bg-slate-950">
                   <div
                     aria-label="Fallback geographic plot of mapped sign-in activity"
@@ -691,25 +695,16 @@ export default function SignInActivitySection({
                   ))}
                   <div className="absolute left-4 top-4 z-20 max-w-sm rounded-lg border border-amber-200 bg-white/95 p-3 shadow-sm dark:border-amber-900 dark:bg-slate-900/95">
                     <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                      Interactive map unavailable — showing location plot
+                      Sign-in location plot
                     </p>
                     <p className="mt-1 text-[11px] text-muted-foreground">
-                      {mapLoadError} Green markers are successful sign-ins; red markers include failures.
+                      Uses the synchronized Microsoft location coordinates directly. Green markers are successful sign-ins; red markers include failures.
                     </p>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="mt-2 h-7 text-xs"
-                      onClick={() => setMapRetry((attempt) => attempt + 1)}
-                    >
-                      Retry interactive map
-                    </Button>
                   </div>
                 </div>
               )}
 
-              {!mapLoadError && mappedEvents.length === 0 && (
+              {mappedEvents.length === 0 && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-50/90 dark:bg-slate-900/90 rounded-xl p-6 text-center">
                   <Globe className="h-10 w-10 text-muted-foreground mb-2" />
                   <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
