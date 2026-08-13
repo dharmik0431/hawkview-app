@@ -388,56 +388,6 @@ export class TenantSyncService {
     return tenant
   }
 
-  private async getReadableTenant(
-    identity: AuthenticatedIdentity,
-    customerTenantId: string
-  ) {
-    const user = await this.prisma.user.findUnique({
-      where: { authProviderUserId: identity.subject },
-      select: {
-        disabledAt: true,
-        memberships: {
-          where: {
-            status: 'ACTIVE',
-            organization: { status: 'ACTIVE' },
-          },
-          select: { organizationId: true },
-        },
-      },
-    })
-    if (!user || user.disabledAt) {
-      throw new ForbiddenException(
-        'This HawkView account cannot access tenants.'
-      )
-    }
-
-    const tenant = await this.prisma.customerTenant.findFirst({
-      where: {
-        id: customerTenantId,
-        organizationId: { in: user.memberships.map((membership) => membership.organizationId) },
-      },
-      select: {
-        id: true,
-        organizationId: true,
-        microsoftTenantId: true,
-        displayName: true,
-        primaryDomain: true,
-        status: true,
-        connection: {
-          select: {
-            status: true,
-            connectionMode: true,
-            clientId: true,
-            credentialReference: true,
-            lastVerifiedAt: true,
-          },
-        },
-      },
-    })
-    if (!tenant) throw new NotFoundException('Customer tenant was not found.')
-    return tenant
-  }
-
   async getBundleForIdentity(
     identity: AuthenticatedIdentity,
     customerTenantId: string
