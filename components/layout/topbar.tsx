@@ -26,8 +26,11 @@ const pageTitles: Record<string, string> = {
 
 export function Topbar() {
   const pathname = usePathname()
-  const pageTitle = (pathname ? pageTitles[pathname] : undefined) || 'Dashboard'
-  const isHideTitleRoute = pathname === '/settings/team' || pathname === '/admin' || pathname === '/team-access'
+  const isAdminRoute = pathname === '/admin' || pathname?.startsWith('/admin/')
+  const pageTitle = isAdminRoute
+    ? 'Admin Panel'
+    : (pathname ? pageTitles[pathname] : undefined) || 'Dashboard'
+  const isHideTitleRoute = pathname === '/settings/team' || isAdminRoute || pathname === '/team-access'
 
   return (
     <div className="sticky top-0 z-40 flex h-16 shrink-0 items-center gap-x-4 border-b border-border bg-background px-4 shadow-sm sm:gap-x-6 sm:px-6 lg:px-8">

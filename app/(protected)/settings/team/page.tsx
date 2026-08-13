@@ -1,19 +1,27 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   Activity,
   AlertCircle,
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
   Bell,
   Building,
+  Building2,
+  Check,
   CheckCircle2,
+  CheckSquare,
   ChevronDown,
   ChevronRight,
   Clock,
+  Copy,
+  Download,
   Eye,
   FileText,
   Globe,
@@ -41,6 +49,9 @@ import { useAuth } from '@/components/providers/auth-provider'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Checkbox } from '@/components/ui/checkbox'
+import { getTenantDisplayStatus } from '@/components/tenants/tenant-status-badge'
+import type { Tenant, TenantsResponse } from '@/types/api'
 
 type MembershipRole =
   | 'MSP_OWNER'
@@ -95,7 +106,7 @@ type NotificationPref = {
   digestMode: 'off' | 'daily' | 'weekly'
 }
 
-type AdminTab =
+export type AdminTab =
   | 'overview'
   | 'users'
   | 'workspace'
@@ -103,8 +114,35 @@ type AdminTab =
   | 'notifications'
   | 'audit'
 
+export const adminTabs: AdminTab[] = [
+  'overview',
+  'users',
+  'workspace',
+  'security',
+  'notifications',
+  'audit',
+]
+
+export function isAdminTab(value: string): value is AdminTab {
+  return adminTabs.includes(value as AdminTab)
+}
+
 type SortField = 'member' | 'role' | 'status' | 'createdAt'
 type SortDirection = 'asc' | 'desc'
+
+type BulkActionType =
+  | 'ROLE_CHANGE'
+  | 'SUSPEND'
+  | 'REACTIVATE'
+  | 'RESEND_INVITE'
+  | 'PASSWORD_RESET'
+  | 'MFA_RESET'
+  | 'REMOVE'
+
+type BulkConfirmModalState = {
+  action: BulkActionType
+  targetRole?: MembershipRole
+} | null
 
 type ConfirmModal = {
   type: 'PASSWORD_RESET' | 'MFA_RESET' | 'REMOVE' | 'SUSPEND' | 'REACTIVATE' | 'ROLE_CHANGE'
@@ -152,9 +190,31 @@ function roleLabel(role: MembershipRole): string {
 }
 
 function formatActionLabel(action: string): string {
-  return action
-    .replace(/^WORKSPACE_/, '')
-    .replace(/^HAWKVIEW_/, '')
+  if (!action) return 'Unknown action'
+  const normalized = action.toUpperCase().replace(/^WORKSPACE_/, '').replace(/^HAWKVIEW_/, '')
+  const friendlyMap: Record<string, string> = {
+    MEMBER_INVITED: 'Member invited',
+    INVITE_MEMBER: 'Member invited',
+    ROLE_CHANGED: 'Role changed',
+    MEMBER_ROLE_CHANGED: 'Role changed',
+    MEMBER_ROLE_UPDATED: 'Role changed',
+    MEMBER_SUSPENDED: 'Member suspended',
+    SUSPEND_MEMBER: 'Member suspended',
+    MEMBER_RESTORED: 'Member restored',
+    MEMBER_REACTIVATED: 'Member restored',
+    REACTIVATE_MEMBER: 'Member restored',
+    PASSWORD_RESET_SENT: 'Password reset sent',
+    PASSWORD_RESET: 'Password reset sent',
+    MFA_RESET: 'MFA reset',
+    RESET_MFA: 'MFA reset',
+    MEMBER_REMOVED: 'Workspace access removed',
+    REMOVE_MEMBER: 'Workspace access removed',
+  }
+
+  if (friendlyMap[normalized]) return friendlyMap[normalized]
+  if (friendlyMap[action]) return friendlyMap[action]
+
+  return normalized
     .split('_')
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
     .join(' ')
@@ -313,9 +373,21 @@ function MemberActionMenu({
   )
 }
 
-export default function AdminPanelPage() {
+export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: AdminTab }) {
   const { session, isLoading: authLoading } = useAuth()
-  const [activeTab, setActiveTab] = useState<AdminTab>('overview')
+  const router = useRouter()
+  const [activeTab, setActiveTab] = useState<AdminTab>(initialTab)
+
+  useEffect(() => {
+    setActiveTab(initialTab)
+  }, [initialTab])
+
+  const navigateToTab = useCallback(
+    (tab: AdminTab) => {
+      router.push(`/admin/${tab}`)
+    },
+    [router],
+  )
 
   const [workspace, setWorkspace] = useState<WorkspaceResponse | null>(null)
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([])
@@ -358,6 +430,57 @@ export default function AdminPanelPage() {
   const [memberAuditMember, setMemberAuditMember] = useState<Member | null>(null)
   const [auditDrawerEntry, setAuditDrawerEntry] = useState<AuditEntry | null>(null)
 
+  // Selection & Bulk Action state
+  const [selectedMembershipIds, setSelectedMembershipIds] = useState<Set<string>>(new Set())
+  const [bulkConfirmModal, setBulkConfirmModal] = useState<BulkConfirmModalState>(null)
+
+  // Tenants state for Overview summary
+  const [tenantsData, setTenantsData] = useState<Tenant[] | null>(null)
+  const [tenantsLoading, setTenantsLoading] = useState<boolean>(true)
+
+  useEffect(() => {
+    setSelectedMembershipIds(new Set())
+  }, [activeTab])
+
+  // Workspace tab state
+  const [copySuccess, setCopySuccess] = useState(false)
+
+  // Notifications tab form state
+  const [formNotificationPrefs, setFormNotificationPrefs] = useState<NotificationPref | null>(null)
+
+  useEffect(() => {
+    if (notificationPrefs) {
+      setFormNotificationPrefs(notificationPrefs)
+    }
+  }, [notificationPrefs])
+
+  const isPrefDirty = useMemo(() => {
+    if (!notificationPrefs || !formNotificationPrefs) return false
+    return JSON.stringify(notificationPrefs) !== JSON.stringify(formNotificationPrefs)
+  }, [notificationPrefs, formNotificationPrefs])
+
+  // Audit Log Tab state
+  const [auditSortField, setAuditSortField] = useState<'createdAt' | 'action' | 'target' | 'actor' | 'outcome'>('createdAt')
+  const [auditSortDir, setAuditSortDir] = useState<'asc' | 'desc'>('desc')
+  const [auditDateRange, setAuditDateRange] = useState<'ALL' | '24H' | '7D' | '30D' | 'CUSTOM'>('ALL')
+  const [auditCustomStartDate, setAuditCustomStartDate] = useState<string>('')
+  const [auditCustomEndDate, setAuditCustomEndDate] = useState<string>('')
+
+  // Escape key listener for closing drawers/modals
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (auditDrawerEntry) setAuditDrawerEntry(null)
+        if (accountDrawerMember) setAccountDrawerMember(null)
+        if (roleChangeMember) setRoleChangeMember(null)
+        if (confirmModal) setConfirmModal(null)
+        if (inviteModalOpen) setInviteModalOpen(false)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [auditDrawerEntry, accountDrawerMember, roleChangeMember, confirmModal, inviteModalOpen])
+
   const menuContainerRef = useRef<HTMLDivElement | null>(null)
 
   const isMspOwner = Boolean(
@@ -374,21 +497,31 @@ export default function AdminPanelPage() {
   const orgStatus = activeMembership?.organization.status || 'ACTIVE'
 
   const loadAllData = useCallback(async (keepCurrent = false) => {
-    if (!keepCurrent) setLoading(true)
+    if (!keepCurrent) {
+      setLoading(true)
+      setTenantsLoading(true)
+    }
     setError(null)
     try {
-      const [membersData, auditData, prefsData] = await Promise.all([
+      const [membersData, auditData, prefsData, tenantsRes] = await Promise.all([
         apiClient.get<WorkspaceResponse>('/api/workspace/members'),
         apiClient.get<AuditResponse>('/api/workspace/audit-logs'),
         apiClient.get<NotificationPref>('/api/notifications/preferences').catch(() => null),
+        apiClient.get<TenantsResponse>('/api/tenants').catch(() => null),
       ])
       setWorkspace(membersData)
       setAuditEntries(Array.isArray(auditData?.items) ? auditData.items : [])
       if (prefsData) setNotificationPrefs(prefsData)
+      if (tenantsRes && Array.isArray(tenantsRes.tenants)) {
+        setTenantsData(tenantsRes.tenants)
+      } else {
+        setTenantsData(null)
+      }
     } catch (requestError) {
       setError(errorMessage(requestError, 'Admin Panel information could not be loaded.'))
     } finally {
       setLoading(false)
+      setTenantsLoading(false)
     }
   }, [])
 
@@ -451,6 +584,51 @@ export default function AdminPanelPage() {
   const pendingSetupCount = useMemo(() => {
     return workspace?.members.filter((m) => m.hasHawkViewAccount === false).length ?? 0
   }, [workspace?.members])
+
+  const configuredAuthCount = useMemo(() => {
+    return workspace?.members.filter((m) => m.hasHawkViewAccount === true).length ?? 0
+  }, [workspace?.members])
+
+  const activeMembers = useMemo(() => {
+    return workspace?.members.filter((m) => m.status === 'ACTIVE') ?? []
+  }, [workspace?.members])
+
+  const allActiveConfigured = useMemo(() => {
+    return activeMembers.length > 0 && activeMembers.every((m) => m.hasHawkViewAccount === true)
+  }, [activeMembers])
+
+  const securityAttentionCount = useMemo(() => {
+    return (
+      workspace?.members.filter(
+        (m) => m.status === 'SUSPENDED' || m.hasHawkViewAccount === false
+      ).length ?? 0
+    )
+  }, [workspace?.members])
+
+  const tenantMetrics = useMemo(() => {
+    if (!tenantsData) return null
+    let healthy = 0
+    let needsAttention = 0
+
+    tenantsData.forEach((t) => {
+      const displayStatus = getTenantDisplayStatus(t)
+      if (displayStatus.key === 'healthy') {
+        healthy++
+      } else if (
+        displayStatus.key === 'needs_attention' ||
+        displayStatus.key === 'disconnected' ||
+        (t.attention && t.attention.length > 0)
+      ) {
+        needsAttention++
+      }
+    })
+
+    return {
+      total: tenantsData.length,
+      healthy,
+      needsAttention,
+    }
+  }, [tenantsData])
 
   const isFinalActiveOwner = useCallback(
     (member: Member) => {
@@ -519,24 +697,344 @@ export default function AdminPanelPage() {
     }
   }
 
-  // Filter audit logs
-  const filteredAuditLogs = useMemo(() => {
-    return auditEntries.filter((entry) => {
+  // Row selection helpers
+  const toggleSelectMember = useCallback((membershipId: string) => {
+    setSelectedMembershipIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(membershipId)) {
+        next.delete(membershipId)
+      } else {
+        next.add(membershipId)
+      }
+      return next
+    })
+  }, [])
+
+  const toggleSelectAll = useCallback(() => {
+    const visibleIds = sortedMembers.map((m) => m.membershipId)
+    const allVisibleSelected =
+      visibleIds.length > 0 && visibleIds.every((id) => selectedMembershipIds.has(id))
+    setSelectedMembershipIds((prev) => {
+      const next = new Set(prev)
+      if (allVisibleSelected) {
+        visibleIds.forEach((id) => next.delete(id))
+      } else {
+        visibleIds.forEach((id) => next.add(id))
+      }
+      return next
+    })
+  }, [sortedMembers, selectedMembershipIds])
+
+  const clearSelection = useCallback(() => {
+    setSelectedMembershipIds(new Set())
+  }, [])
+
+  const selectedMembers = useMemo(() => {
+    if (!workspace?.members) return []
+    return workspace.members.filter((m) => selectedMembershipIds.has(m.membershipId))
+  }, [workspace?.members, selectedMembershipIds])
+
+  const visibleSelectedCount = useMemo(() => {
+    return sortedMembers.filter((m) => selectedMembershipIds.has(m.membershipId)).length
+  }, [sortedMembers, selectedMembershipIds])
+
+  const selectAllState: boolean | 'indeterminate' = useMemo(() => {
+    if (sortedMembers.length === 0) return false
+    if (visibleSelectedCount === sortedMembers.length) return true
+    if (visibleSelectedCount > 0) return 'indeterminate'
+    return false
+  }, [sortedMembers.length, visibleSelectedCount])
+
+  // CSV Export
+  const handleExportCsv = useCallback(() => {
+    if (sortedMembers.length === 0) return
+    try {
+      const headers = [
+        'Display name',
+        'Email address',
+        'Workspace role',
+        'Account status',
+        'Authentication status',
+        'Added date',
+        'Last activity',
+        'Current user',
+      ]
+
+      const sanitizeCsv = (val: string | null | undefined): string => {
+        if (val == null) return '""'
+        let str = String(val).trim()
+        if (/^[=+\-@]/.test(str)) {
+          str = "'" + str
+        }
+        str = str.replace(/"/g, '""')
+        return `"${str}"`
+      }
+
+      const rows = sortedMembers.map((member) => {
+        const isSelf = member.userId === currentUserId
+        return [
+          sanitizeCsv(member.displayName || ''),
+          sanitizeCsv(member.email),
+          sanitizeCsv(roleLabel(member.role)),
+          sanitizeCsv(member.status === 'ACTIVE' ? 'Active' : 'Suspended'),
+          sanitizeCsv(
+            member.hasHawkViewAccount
+              ? 'Authentication configured'
+              : 'Authentication setup required'
+          ),
+          sanitizeCsv(formatDate(member.joinedAt || member.createdAt)),
+          sanitizeCsv('Not available'),
+          sanitizeCsv(isSelf ? 'Yes' : 'No'),
+        ].join(',')
+      })
+
+      const csvContent =
+        '\uFEFF' + [headers.map(sanitizeCsv).join(','), ...rows].join('\r\n')
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      const today = new Date().toISOString().slice(0, 10)
+      link.setAttribute('href', url)
+      link.setAttribute('download', `hawkview-team-members-${today}.csv`)
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+
+      setNotice('Team members exported.')
+    } catch (err) {
+      setError('Team member export could not be created.')
+    }
+  }, [sortedMembers, currentUserId])
+
+  // Bulk action execution
+  const handleExecuteBulkAction = useCallback(async () => {
+    if (!bulkConfirmModal || selectedMembers.length === 0) return
+    const { action, targetRole } = bulkConfirmModal
+
+    const eligibleMembers = selectedMembers.filter((m) => {
+      const isSelf = m.userId === currentUserId
+      const isFinal = isFinalActiveOwner(m)
+
+      if (action === 'ROLE_CHANGE' && targetRole !== 'MSP_OWNER') {
+        if (isSelf || isFinal) return false
+      }
+      if (action === 'SUSPEND' || action === 'REMOVE') {
+        if (isSelf || isFinal) return false
+      }
+      return true
+    })
+
+    if (eligibleMembers.length === 0) {
+      setError('None of the selected members are eligible for this operation due to owner protections.')
+      setBulkConfirmModal(null)
+      return
+    }
+
+    setSubmitting(true)
+    setError(null)
+    setNotice(null)
+
+    const succeededIds: string[] = []
+    const failedItems: { email: string; reason: string }[] = []
+
+    for (const member of eligibleMembers) {
+      try {
+        if (action === 'ROLE_CHANGE' && targetRole) {
+          await apiClient.patch(
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
+            { role: targetRole }
+          )
+        } else if (action === 'SUSPEND') {
+          await apiClient.patch(
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
+            { status: 'SUSPENDED' }
+          )
+        } else if (action === 'REACTIVATE') {
+          await apiClient.patch(
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
+            { status: 'ACTIVE' }
+          )
+        } else if (action === 'RESEND_INVITE') {
+          await apiClient.post('/api/workspace/members/invite', {
+            email: member.email,
+            displayName: member.displayName || undefined,
+            role: member.role,
+          })
+        } else if (action === 'PASSWORD_RESET') {
+          await apiClient.post(
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/password-reset`
+          )
+        } else if (action === 'MFA_RESET') {
+          await apiClient.post(
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/mfa-reset`
+          )
+        } else if (action === 'REMOVE') {
+          await apiClient.delete(
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}`
+          )
+        }
+        succeededIds.push(member.membershipId)
+      } catch (err) {
+        failedItems.push({
+          email: member.email,
+          reason: errorMessage(err, 'Action failed.'),
+        })
+      }
+    }
+
+    setSelectedMembershipIds((prev) => {
+      const next = new Set(prev)
+      succeededIds.forEach((id) => next.delete(id))
+      return next
+    })
+
+    await loadAllData(true)
+    setSubmitting(false)
+    setBulkConfirmModal(null)
+
+    if (failedItems.length === 0) {
+      setNotice(`${succeededIds.length} member(s) were successfully updated.`)
+    } else if (succeededIds.length > 0) {
+      setNotice(
+        `${succeededIds.length} member(s) updated successfully. ${failedItems.length} member(s) failed: ${failedItems[0].reason}`
+      )
+    } else {
+      setError(`Bulk action failed: ${failedItems[0].reason}`)
+    }
+  }, [bulkConfirmModal, selectedMembers, currentUserId, isFinalActiveOwner, loadAllData])
+
+  // Copy Org ID handler
+  const handleCopyOrgId = async () => {
+    if (!orgId || orgId === 'N/A') return
+    try {
+      await navigator.clipboard.writeText(orgId)
+      setCopySuccess(true)
+      setTimeout(() => setCopySuccess(false), 2000)
+    } catch {
+      // ignore
+    }
+  }
+
+  // Filter and sort audit logs
+  const filteredAndSortedAuditLogs = useMemo(() => {
+    const logs = auditEntries.filter((entry) => {
       const q = auditSearch.trim().toLowerCase()
       const matchesSearch =
         !q ||
         entry.action.toLowerCase().includes(q) ||
         (entry.actorEmail && entry.actorEmail.toLowerCase().includes(q)) ||
-        (entry.targetEmail && entry.targetEmail.toLowerCase().includes(q))
+        (entry.targetEmail && entry.targetEmail.toLowerCase().includes(q)) ||
+        entry.id.toLowerCase().includes(q)
 
-      const matchesAction =
-        auditActionFilter === 'ALL' || entry.action === auditActionFilter
-      const matchesOutcome =
-        auditOutcomeFilter === 'ALL' || entry.outcome === auditOutcomeFilter
+      const matchesAction = auditActionFilter === 'ALL' || entry.action === auditActionFilter
+      const matchesOutcome = auditOutcomeFilter === 'ALL' || entry.outcome === auditOutcomeFilter
 
-      return matchesSearch && matchesAction && matchesOutcome
+      let matchesDate = true
+      const entryDate = new Date(entry.createdAt).getTime()
+      const now = Date.now()
+
+      if (auditDateRange === '24H') {
+        matchesDate = entryDate >= now - 24 * 60 * 60 * 1000
+      } else if (auditDateRange === '7D') {
+        matchesDate = entryDate >= now - 7 * 24 * 60 * 60 * 1000
+      } else if (auditDateRange === '30D') {
+        matchesDate = entryDate >= now - 30 * 24 * 60 * 60 * 1000
+      } else if (auditDateRange === 'CUSTOM') {
+        if (auditCustomStartDate) {
+          const start = new Date(auditCustomStartDate).getTime()
+          if (!isNaN(start)) matchesDate = matchesDate && entryDate >= start
+        }
+        if (auditCustomEndDate) {
+          const end = new Date(auditCustomEndDate).getTime() + 24 * 60 * 60 * 1000 - 1
+          if (!isNaN(end)) matchesDate = matchesDate && entryDate <= end
+        }
+      }
+
+      return matchesSearch && matchesAction && matchesOutcome && matchesDate
     })
-  }, [auditEntries, auditSearch, auditActionFilter, auditOutcomeFilter])
+
+    logs.sort((a, b) => {
+      let aVal: string | number = ''
+      let bVal: string | number = ''
+
+      if (auditSortField === 'createdAt') {
+        aVal = new Date(a.createdAt).getTime()
+        bVal = new Date(b.createdAt).getTime()
+      } else if (auditSortField === 'action') {
+        aVal = a.action.toLowerCase()
+        bVal = b.action.toLowerCase()
+      } else if (auditSortField === 'target') {
+        aVal = (a.targetEmail || 'workspace').toLowerCase()
+        bVal = (b.targetEmail || 'workspace').toLowerCase()
+      } else if (auditSortField === 'actor') {
+        aVal = (a.actorEmail || 'system').toLowerCase()
+        bVal = (b.actorEmail || 'system').toLowerCase()
+      } else if (auditSortField === 'outcome') {
+        aVal = a.outcome.toLowerCase()
+        bVal = b.outcome.toLowerCase()
+      }
+
+      if (aVal < bVal) return auditSortDir === 'asc' ? -1 : 1
+      if (aVal > bVal) return auditSortDir === 'asc' ? 1 : -1
+      return 0
+    })
+
+    return logs
+  }, [
+    auditEntries,
+    auditSearch,
+    auditActionFilter,
+    auditOutcomeFilter,
+    auditDateRange,
+    auditCustomStartDate,
+    auditCustomEndDate,
+    auditSortField,
+    auditSortDir,
+  ])
+
+  // CSV Export handler
+  const handleExportCSV = () => {
+    if (filteredAndSortedAuditLogs.length === 0) return
+
+    const sanitizeCSV = (str: string | null | undefined): string => {
+      if (!str) return '""'
+      let val = String(str).replace(/"/g, '""')
+      if (/^[=+\-@\t\r]/.test(val)) {
+        val = `'${val}`
+      }
+      return `"${val}"`
+    }
+
+    const headers = ['Event ID', 'Date & Time', 'Action', 'Affected Target', 'Performed By', 'Outcome', 'Reason/Message']
+    const rows = filteredAndSortedAuditLogs.map((entry) => {
+      const reason =
+        (entry.metadata?.reason as string) ||
+        (entry.metadata?.message as string) ||
+        ''
+      return [
+        sanitizeCSV(entry.id),
+        sanitizeCSV(formatDateTime(entry.createdAt)),
+        sanitizeCSV(entry.action),
+        sanitizeCSV(entry.targetEmail || 'Workspace'),
+        sanitizeCSV(entry.actorEmail || 'System'),
+        sanitizeCSV(entry.outcome),
+        sanitizeCSV(reason),
+      ].join(',')
+    })
+
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\n')
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    const dateStr = new Date().toISOString().split('T')[0]
+    link.setAttribute('download', `hawkview_audit_history_${dateStr}.csv`)
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
 
   // Action runners
   const runAction = async (action: () => Promise<unknown>, successNotice: string) => {
@@ -649,20 +1147,26 @@ export default function AdminPanelPage() {
     }
   }
 
-  const handleUpdateNotificationPref = async (field: keyof NotificationPref, value: unknown) => {
-    if (!notificationPrefs) return
+  const handleSaveNotificationPrefs = async () => {
+    if (!formNotificationPrefs) return
     setPrefSaving(true)
     setError(null)
+    setNotice(null)
     try {
-      const updated = await apiClient.patch<NotificationPref>('/api/notifications/preferences', {
-        [field]: value,
-      })
+      const updated = await apiClient.patch<NotificationPref>('/api/notifications/preferences', formNotificationPrefs)
       setNotificationPrefs(updated)
-      setNotice('Notification preferences updated successfully.')
+      setFormNotificationPrefs(updated)
+      setNotice('Notification preferences saved successfully.')
     } catch (requestError) {
-      setError(errorMessage(requestError, 'Failed to update notification preferences.'))
+      setError(errorMessage(requestError, 'Failed to save notification preferences.'))
     } finally {
       setPrefSaving(false)
+    }
+  }
+
+  const handleCancelNotificationPrefs = () => {
+    if (notificationPrefs) {
+      setFormNotificationPrefs(notificationPrefs)
     }
   }
 
@@ -709,15 +1213,18 @@ export default function AdminPanelPage() {
       {/* 1. Page Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between border-b border-border/80 pb-4">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <h1 className="text-xl font-bold tracking-tight text-foreground sm:text-2xl">
               Admin Panel
             </h1>
-            <span className="text-xs text-muted-foreground font-normal">
-              · {orgName}
-            </span>
+            <span className="text-muted-foreground font-normal text-sm">·</span>
+            <div className="flex items-center gap-1.5 bg-muted/60 px-2.5 py-0.5 rounded-md text-xs font-medium text-foreground border border-border/50">
+              <Building className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
+              <span className="font-semibold">{orgName}</span>
+              <span className="text-muted-foreground font-mono text-[11px]">({orgSlug})</span>
+            </div>
           </div>
-          <p className="mt-0.5 text-xs sm:text-sm text-muted-foreground">
+          <p className="mt-1 text-xs sm:text-sm text-muted-foreground">
             Manage your MSP workspace, team access, and HawkView security.
           </p>
           <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -791,7 +1298,7 @@ export default function AdminPanelPage() {
               <button
                 key={tab.id}
                 type="button"
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => navigateToTab(tab.id)}
                 className={`flex items-center gap-2 px-3 py-2 text-xs sm:text-sm font-medium border-b-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-t-md ${
                   isActive
                     ? 'border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400 bg-blue-50/30 dark:bg-blue-950/20'
@@ -811,184 +1318,332 @@ export default function AdminPanelPage() {
       {/* TAB 1: OVERVIEW */}
       {activeTab === 'overview' && (
         <div className="space-y-6 animate-in fade-in duration-200">
-          {/* Workspace Summary Band */}
-          <div className="rounded-lg border border-border bg-card px-4 py-3 shadow-sm">
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 divide-y sm:divide-y-0 sm:divide-x divide-border">
-              {/* Workspace */}
-              <div className="sm:pr-4 space-y-0.5">
-                <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Workspace
-                </p>
-                <p className="text-sm font-semibold text-foreground truncate">{orgName}</p>
-                <p className="text-xs text-muted-foreground">
-                  Slug: <code className="text-foreground">{orgSlug}</code>
-                </p>
+          {/* Operational Summary Grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {/* Metric 1: Managed Tenants */}
+            <Link
+              href="/tenants"
+              className="group p-4 rounded-xl border border-border bg-card hover:border-blue-500/50 hover:shadow-md transition-all text-left flex flex-col justify-between space-y-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Managed tenants
+                </span>
+                <div className="p-2 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 group-hover:scale-105 transition-transform">
+                  <Building className="h-4 w-4" aria-hidden="true" />
+                </div>
               </div>
 
-              {/* Team members */}
-              <div className="pt-3 sm:pt-0 sm:px-4 space-y-0.5">
-                <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              <div>
+                <div className="text-2xl font-bold tracking-tight text-foreground flex items-baseline gap-2">
+                  {tenantsLoading ? (
+                    <span className="text-muted-foreground text-lg">Loading…</span>
+                  ) : tenantMetrics ? (
+                    <span>{tenantMetrics.total}</span>
+                  ) : (
+                    <span className="text-muted-foreground text-base">Unavailable</span>
+                  )}
+                </div>
+                <div className="text-xs text-muted-foreground mt-1 flex items-center gap-2 flex-wrap">
+                  {tenantMetrics ? (
+                    <>
+                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                        {tenantMetrics.healthy} healthy
+                      </span>
+                      {tenantMetrics.needsAttention > 0 && (
+                        <span className="text-amber-600 dark:text-amber-400 font-medium">
+                          · {tenantMetrics.needsAttention} need attention
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    <span>Tenant summary unavailable</span>
+                  )}
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-border/60 flex items-center justify-between text-xs text-blue-600 dark:text-blue-400 font-semibold group-hover:underline">
+                <span>View all tenants</span>
+                <ChevronRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
+              </div>
+            </Link>
+
+            {/* Metric 2: Team Members */}
+            <button
+              type="button"
+              onClick={() => navigateToTab('users')}
+              className="group p-4 rounded-xl border border-border bg-card hover:border-blue-500/50 hover:shadow-md transition-all text-left flex flex-col justify-between space-y-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                   Team members
-                </p>
-                <div className="flex items-baseline gap-1.5">
-                  <span className="text-sm font-semibold text-foreground">
-                    {loading ? '…' : workspace?.members.length ?? 0} total
-                  </span>
-                  <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium">
-                    ({activeMembersCount} active)
-                  </span>
+                </span>
+                <div className="p-2 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 group-hover:scale-105 transition-transform">
+                  <Users className="h-4 w-4" aria-hidden="true" />
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  {suspendedMembersCount > 0 ? `${suspendedMembersCount} suspended` : 'No suspended accounts'}
-                </p>
               </div>
 
-              {/* Active owners */}
-              <div className="pt-3 sm:pt-0 sm:px-4 space-y-0.5">
-                <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Active owners
-                </p>
-                <div className="flex items-baseline gap-1.5">
-                  <span className="text-sm font-semibold text-foreground">
-                    {loading ? '…' : activeOwners.length} active owner{activeOwners.length === 1 ? '' : 's'}
-                  </span>
+              <div>
+                <div className="text-2xl font-bold tracking-tight text-foreground">
+                  {loading ? (
+                    <span className="text-muted-foreground text-lg">Loading…</span>
+                  ) : workspace ? (
+                    <span>{workspace.members.length}</span>
+                  ) : (
+                    <span className="text-muted-foreground text-base">Unavailable</span>
+                  )}
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  {activeOwners.length <= 1 ? 'Single owner protection' : 'Multi-owner redundancy'}
-                </p>
+                <div className="text-xs text-muted-foreground mt-1 flex items-center gap-1.5 flex-wrap">
+                  <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                    {activeMembersCount} active
+                  </span>
+                  {suspendedMembersCount > 0 && (
+                    <span className="text-amber-600 dark:text-amber-400 font-medium">
+                      · {suspendedMembersCount} suspended
+                    </span>
+                  )}
+                  {pendingSetupCount > 0 && (
+                    <span className="text-blue-600 dark:text-blue-400 font-medium">
+                      · {pendingSetupCount} setup pending
+                    </span>
+                  )}
+                </div>
               </div>
 
-              {/* Authentication */}
-              <div className="pt-3 sm:pt-0 sm:pl-4 space-y-0.5">
-                <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Authentication
-                </p>
-                <p className="text-sm font-semibold text-foreground">
-                  {session?.signInProvider ? `${session.signInProvider.toUpperCase()}` : 'Supabase Auth'}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {pendingSetupCount > 0 ? `${pendingSetupCount} awaiting setup` : 'All members configured'}
-                </p>
+              <div className="pt-2 border-t border-border/60 flex items-center justify-between text-xs text-blue-600 dark:text-blue-400 font-semibold group-hover:underline">
+                <span>Manage team members</span>
+                <ChevronRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
               </div>
-            </div>
+            </button>
+
+            {/* Metric 3: Active MSP Owners */}
+            <button
+              type="button"
+              onClick={() => navigateToTab('users')}
+              className={`group p-4 rounded-xl border transition-all text-left flex flex-col justify-between space-y-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                activeOwners.length <= 1
+                  ? 'border-amber-300 dark:border-amber-800/80 bg-amber-50/40 dark:bg-amber-950/20 hover:border-amber-400'
+                  : 'border-border bg-card hover:border-blue-500/50 hover:shadow-md'
+              }`}
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Active MSP owners
+                </span>
+                <div
+                  className={`p-2 rounded-lg ${
+                    activeOwners.length <= 1
+                      ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                      : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                  }`}
+                >
+                  {activeOwners.length <= 1 ? (
+                    <ShieldAlert className="h-4 w-4" aria-hidden="true" />
+                  ) : (
+                    <ShieldCheck className="h-4 w-4" aria-hidden="true" />
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-2xl font-bold tracking-tight text-foreground">
+                  {loading ? '…' : activeOwners.length}
+                </div>
+                {activeOwners.length <= 1 ? (
+                  <div className="mt-1 space-y-0.5">
+                    <p className="text-xs font-semibold text-amber-700 dark:text-amber-400 flex items-center gap-1">
+                      <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                      <span>Single active owner — no redundancy</span>
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Assign another active owner to prevent lockout
+                    </p>
+                  </div>
+                ) : (
+                  <div className="mt-1">
+                    <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                      <span>Multi-owner redundancy active</span>
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      {activeOwners.length} active MSP owners configured
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-2 border-t border-border/60 flex items-center justify-between text-xs text-blue-600 dark:text-blue-400 font-semibold group-hover:underline">
+                <span>Review owner access</span>
+                <ChevronRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
+              </div>
+            </button>
+
+            {/* Metric 4: Account Security */}
+            <button
+              type="button"
+              onClick={() => navigateToTab('security')}
+              className="group p-4 rounded-xl border border-border bg-card hover:border-blue-500/50 hover:shadow-md transition-all text-left flex flex-col justify-between space-y-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Account security
+                </span>
+                <div className="p-2 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 group-hover:scale-105 transition-transform">
+                  <Lock className="h-4 w-4" aria-hidden="true" />
+                </div>
+              </div>
+
+              <div>
+                <div className="text-2xl font-bold tracking-tight text-foreground">
+                  {loading ? (
+                    <span className="text-muted-foreground text-lg">Loading…</span>
+                  ) : workspace ? (
+                    <span>{configuredAuthCount} / {workspace.members.length}</span>
+                  ) : (
+                    <span className="text-muted-foreground text-base">Unavailable</span>
+                  )}
+                </div>
+                <div className="text-xs text-muted-foreground mt-1">
+                  {allActiveConfigured ? (
+                    <span className="text-emerald-600 dark:text-emerald-400 font-medium flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                      <span>All active members configured</span>
+                    </span>
+                  ) : (
+                    <span className="text-amber-600 dark:text-amber-400 font-medium flex items-center gap-1">
+                      <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                      <span>{pendingSetupCount} member{pendingSetupCount === 1 ? '' : 's'} awaiting setup</span>
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-border/60 flex items-center justify-between text-xs text-blue-600 dark:text-blue-400 font-semibold group-hover:underline">
+                <span>Security settings</span>
+                <ChevronRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
+              </div>
+            </button>
           </div>
 
-          {/* Common Tasks */}
-          <div className="space-y-2.5">
+          {/* Compact Common Tasks Bar */}
+          <div className="rounded-xl border border-border bg-card p-4 shadow-sm space-y-3">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
               Common tasks
             </h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-              <button
-                type="button"
-                onClick={() => setActiveTab('users')}
-                className="flex items-center gap-2.5 p-2.5 rounded-lg border border-border bg-card hover:bg-accent/60 transition-colors text-left group focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            <div className="flex flex-wrap items-center gap-2.5">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setInviteEmailError(null)
+                  setInviteModalOpen(true)
+                }}
+                className="h-8 text-xs font-semibold gap-1.5 hover:bg-accent/80"
               >
-                <UserPlus className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
-                <div className="min-w-0">
-                  <p className="text-xs font-semibold text-foreground group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
-                    Invite team member
-                  </p>
-                  <p className="text-[11px] text-muted-foreground truncate">Add technician or owner</p>
-                </div>
-              </button>
+                <UserPlus className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
+                <span>Invite team member</span>
+              </Button>
 
-              <button
-                type="button"
-                onClick={() => setActiveTab('users')}
-                className="flex items-center gap-2.5 p-2.5 rounded-lg border border-border bg-card hover:bg-accent/60 transition-colors text-left group focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => navigateToTab('users')}
+                className="h-8 text-xs font-semibold gap-1.5 hover:bg-accent/80"
               >
-                <Users className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
-                <div className="min-w-0">
-                  <p className="text-xs font-semibold text-foreground group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
-                    Manage team members
-                  </p>
-                  <p className="text-[11px] text-muted-foreground truncate">Roles, MFA & status</p>
-                </div>
-              </button>
+                <Users className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
+                <span>Manage team members</span>
+              </Button>
 
-              <button
-                type="button"
-                onClick={() => setActiveTab('security')}
-                className="flex items-center gap-2.5 p-2.5 rounded-lg border border-border bg-card hover:bg-accent/60 transition-colors text-left group focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => navigateToTab('security')}
+                className="h-8 text-xs font-semibold gap-1.5 hover:bg-accent/80"
               >
-                <ShieldCheck className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
-                <div className="min-w-0">
-                  <p className="text-xs font-semibold text-foreground group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
-                    Review workspace security
-                  </p>
-                  <p className="text-[11px] text-muted-foreground truncate">Auth methods & policies</p>
-                </div>
-              </button>
+                <ShieldCheck className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
+                <span>Review workspace security</span>
+              </Button>
 
-              <button
-                type="button"
-                onClick={() => setActiveTab('audit')}
-                className="flex items-center gap-2.5 p-2.5 rounded-lg border border-border bg-card hover:bg-accent/60 transition-colors text-left group focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => navigateToTab('audit')}
+                className="h-8 text-xs font-semibold gap-1.5 hover:bg-accent/80"
               >
-                <History className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
-                <div className="min-w-0">
-                  <p className="text-xs font-semibold text-foreground group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
-                    View audit history
-                  </p>
-                  <p className="text-[11px] text-muted-foreground truncate">Administrative logs</p>
-                </div>
-              </button>
+                <History className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
+                <span>View audit history</span>
+              </Button>
             </div>
           </div>
 
           {/* Recent Administrative Activity Preview */}
-          <div className="rounded-lg border border-border bg-card p-4 shadow-sm space-y-3">
-            <div className="flex items-center justify-between border-b border-border pb-2.5">
+          <div className="rounded-xl border border-border bg-card p-4 shadow-sm space-y-3">
+            <div className="flex items-center justify-between border-b border-border pb-3">
               <div className="flex items-center gap-2">
                 <History className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
-                <h3 className="text-xs font-semibold text-foreground">Recent Administrative Activity</h3>
+                <h2 className="text-sm font-bold text-foreground">Recent Administrative Activity</h2>
               </div>
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => setActiveTab('audit')}
-                className="h-6 px-2 text-xs gap-1 text-blue-600 dark:text-blue-400 hover:text-blue-700"
+                onClick={() => navigateToTab('audit')}
+                className="h-7 px-2.5 text-xs font-semibold gap-1 text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300"
               >
                 <span>View all</span>
-                <ChevronRight className="h-3 w-3" />
+                <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
               </Button>
             </div>
 
             {auditEntries.length === 0 ? (
-              <p className="text-xs text-muted-foreground py-1">
-                No administrative activity has been recorded.
-              </p>
+              <div className="py-8 text-center text-xs text-muted-foreground space-y-1">
+                <History className="h-6 w-6 mx-auto text-muted-foreground/40 mb-1" aria-hidden="true" />
+                <p className="font-medium text-foreground">No administrative activity recorded</p>
+                <p className="text-[11px] text-muted-foreground">
+                  Audit events will appear here as administrative actions occur in your workspace.
+                </p>
+              </div>
             ) : (
-              <div className="divide-y divide-border">
-                {auditEntries.slice(0, 5).map((entry) => (
-                  <div
-                    key={entry.id}
-                    className="py-2 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 text-xs"
-                  >
-                    <div>
-                      <span className="font-semibold text-foreground">
-                        {formatActionLabel(entry.action)}
-                      </span>
-                      <span className="text-muted-foreground ml-2">
-                        {entry.actorEmail || 'Unknown owner'} → {entry.targetEmail || 'Workspace'}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2.5 text-muted-foreground text-[11px]">
-                      <span
-                        className={`inline-flex items-center px-1.5 py-0.2 rounded font-medium ${
-                          entry.outcome === 'SUCCEEDED'
-                            ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                            : 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
-                        }`}
-                      >
-                        {entry.outcome}
-                      </span>
-                      <span>·</span>
-                      <span>{formatDateTime(entry.createdAt)}</span>
-                    </div>
-                  </div>
-                ))}
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead className="bg-muted/50 border-b border-border">
+                    <tr className="font-semibold text-muted-foreground text-[11px] uppercase tracking-wider">
+                      <th scope="col" className="py-2 px-3">Action</th>
+                      <th scope="col" className="py-2 px-3">Target member</th>
+                      <th scope="col" className="py-2 px-3">Actor</th>
+                      <th scope="col" className="py-2 px-3">Result</th>
+                      <th scope="col" className="py-2 px-3 text-right">Timestamp</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {auditEntries.slice(0, 5).map((entry) => (
+                      <tr key={entry.id} className="hover:bg-muted/30 transition-colors">
+                        <td className="py-2.5 px-3 font-semibold text-foreground whitespace-nowrap">
+                          {formatActionLabel(entry.action)}
+                        </td>
+                        <td className="py-2.5 px-3 text-foreground/90 max-w-[180px] truncate">
+                          {entry.targetEmail || 'Workspace'}
+                        </td>
+                        <td className="py-2.5 px-3 text-muted-foreground max-w-[180px] truncate">
+                          {entry.actorEmail || 'System'}
+                        </td>
+                        <td className="py-2.5 px-3 whitespace-nowrap">
+                          <span
+                            className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold ${
+                              entry.outcome === 'SUCCEEDED'
+                                ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40'
+                                : 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-300/40 dark:border-rose-800/40'
+                            }`}
+                          >
+                            {entry.outcome === 'SUCCEEDED' ? 'Succeeded' : entry.outcome}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 text-right text-muted-foreground whitespace-nowrap">
+                          {formatDateTime(entry.createdAt)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
@@ -1020,98 +1675,215 @@ export default function AdminPanelPage() {
                   </p>
                 </div>
 
-                <Button
-                  size="sm"
-                  onClick={() => {
-                    setInviteEmailError(null)
-                    setInviteModalOpen(true)
-                  }}
-                  className="h-8 text-xs font-semibold gap-1.5 shrink-0"
-                >
-                  <UserPlus className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>Invite member</span>
-                </Button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleExportCsv}
+                    disabled={sortedMembers.length === 0}
+                    className="h-8 text-xs font-semibold gap-1.5"
+                  >
+                    <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Export CSV</span>
+                  </Button>
+
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      setInviteEmailError(null)
+                      setInviteModalOpen(true)
+                    }}
+                    className="h-8 text-xs font-semibold gap-1.5"
+                  >
+                    <UserPlus className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Invite member</span>
+                  </Button>
+                </div>
               </div>
 
               {/* Toolbar Search & Filters */}
-              <div className="flex flex-col md:flex-row items-stretch md:items-center gap-2.5 pt-1">
-                {/* Search */}
-                <div className="relative flex-1">
-                  <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
-                  <Input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search member by name or email…"
-                    className="pl-8 h-8 text-xs"
-                  />
-                  {searchQuery && (
-                    <button
-                      type="button"
-                      onClick={() => setSearchQuery('')}
-                      className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
-                      aria-label="Clear search"
+              <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-2.5 pt-1">
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 flex-1">
+                  {/* Search */}
+                  <div className="relative flex-1">
+                    <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
+                    <Input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Search member by name or email…"
+                      className="pl-8 h-8 text-xs"
+                    />
+                    {searchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setSearchQuery('')}
+                        className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
+                        aria-label="Clear search"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Filters */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      aria-label="Filter by role"
+                      value={roleFilter}
+                      onChange={(e) => setRoleFilter(e.target.value)}
+                      className="h-8 rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                     >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  )}
+                      <option value="ALL">All roles</option>
+                      {roles.map((r) => (
+                        <option key={r.value} value={r.value}>
+                          {r.label}
+                        </option>
+                      ))}
+                    </select>
+
+                    <select
+                      aria-label="Filter by account status"
+                      value={statusFilter}
+                      onChange={(e) => setStatusFilter(e.target.value)}
+                      className="h-8 rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    >
+                      <option value="ALL">All statuses</option>
+                      <option value="ACTIVE">Active</option>
+                      <option value="SUSPENDED">Suspended</option>
+                    </select>
+
+                    <select
+                      aria-label="Filter by authentication state"
+                      value={authStatusFilter}
+                      onChange={(e) => setAuthStatusFilter(e.target.value)}
+                      className="h-8 rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    >
+                      <option value="ALL">All auth states</option>
+                      <option value="CONFIGURED">Authentication configured</option>
+                      <option value="AWAITING_SETUP">Authentication setup required</option>
+                    </select>
+
+                    {(searchQuery || roleFilter !== 'ALL' || statusFilter !== 'ALL' || authStatusFilter !== 'ALL') && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          setSearchQuery('')
+                          setRoleFilter('ALL')
+                          setStatusFilter('ALL')
+                          setAuthStatusFilter('ALL')
+                        }}
+                        className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
+                      >
+                        Reset
+                      </Button>
+                    )}
+                  </div>
                 </div>
+              </div>
 
-                {/* Filters */}
-                <div className="flex flex-wrap items-center gap-2">
-                  <select
-                    aria-label="Filter by role"
-                    value={roleFilter}
-                    onChange={(e) => setRoleFilter(e.target.value)}
-                    className="h-8 rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-                  >
-                    <option value="ALL">All roles</option>
-                    {roles.map((r) => (
-                      <option key={r.value} value={r.value}>
-                        {r.label}
-                      </option>
-                    ))}
-                  </select>
+              {/* Contextual Selection Bar */}
+              {selectedMembershipIds.size > 0 && (
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 p-2.5 rounded-lg border border-blue-200 dark:border-blue-900/60 bg-blue-50/70 dark:bg-blue-950/40 text-xs animate-in fade-in duration-150">
+                  <div className="flex items-center gap-2 font-medium text-foreground">
+                    <CheckSquare className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
+                    <span>{selectedMembershipIds.size} {selectedMembershipIds.size === 1 ? 'member' : 'members'} selected</span>
+                  </div>
 
-                  <select
-                    aria-label="Filter by account status"
-                    value={statusFilter}
-                    onChange={(e) => setStatusFilter(e.target.value)}
-                    className="h-8 rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-                  >
-                    <option value="ALL">All statuses</option>
-                    <option value="ACTIVE">Active</option>
-                    <option value="SUSPENDED">Suspended</option>
-                  </select>
+                  <div className="flex items-center gap-2">
+                    <DropdownMenu.Root>
+                      <DropdownMenu.Trigger asChild>
+                        <Button
+                          size="sm"
+                          className="h-7 px-3 text-xs font-semibold gap-1.5"
+                          disabled={submitting}
+                        >
+                          <span>Bulk actions</span>
+                          <ChevronDown className="h-3.5 w-3.5" />
+                        </Button>
+                      </DropdownMenu.Trigger>
 
-                  <select
-                    aria-label="Filter by authentication state"
-                    value={authStatusFilter}
-                    onChange={(e) => setAuthStatusFilter(e.target.value)}
-                    className="h-8 rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-                  >
-                    <option value="ALL">All auth states</option>
-                    <option value="CONFIGURED">Authentication configured</option>
-                    <option value="AWAITING_SETUP">Authentication setup required</option>
-                  </select>
+                      <DropdownMenu.Portal>
+                        <DropdownMenu.Content
+                          align="end"
+                          sideOffset={4}
+                          className="z-50 w-56 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg text-left animate-in fade-in zoom-in-95 focus:outline-none"
+                        >
+                          <DropdownMenu.Item
+                            onSelect={() => setBulkConfirmModal({ action: 'ROLE_CHANGE', targetRole: 'MSP_TECHNICIAN' })}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
+                          >
+                            <Users className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span>Change workspace role</span>
+                          </DropdownMenu.Item>
 
-                  {(searchQuery || roleFilter !== 'ALL' || statusFilter !== 'ALL' || authStatusFilter !== 'ALL') && (
+                          <DropdownMenu.Item
+                            onSelect={() => setBulkConfirmModal({ action: 'PASSWORD_RESET' })}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
+                          >
+                            <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span>Send HawkView password reset</span>
+                          </DropdownMenu.Item>
+
+                          <DropdownMenu.Item
+                            onSelect={() => setBulkConfirmModal({ action: 'MFA_RESET' })}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
+                          >
+                            <ShieldCheck className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span>Reset HawkView MFA</span>
+                          </DropdownMenu.Item>
+
+                          <DropdownMenu.Item
+                            onSelect={() => setBulkConfirmModal({ action: 'RESEND_INVITE' })}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
+                          >
+                            <Mail className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span>Resend invitations</span>
+                          </DropdownMenu.Item>
+
+                          <DropdownMenu.Separator className="h-px bg-border my-1" />
+
+                          <DropdownMenu.Item
+                            onSelect={() => setBulkConfirmModal({ action: 'SUSPEND' })}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer text-amber-600 dark:text-amber-500"
+                          >
+                            <UserX className="h-3.5 w-3.5" />
+                            <span>Suspend accounts</span>
+                          </DropdownMenu.Item>
+
+                          <DropdownMenu.Item
+                            onSelect={() => setBulkConfirmModal({ action: 'REACTIVATE' })}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer text-emerald-600 dark:text-emerald-400"
+                          >
+                            <UserCheck className="h-3.5 w-3.5" />
+                            <span>Reactivate accounts</span>
+                          </DropdownMenu.Item>
+
+                          <DropdownMenu.Separator className="h-px bg-border my-1" />
+
+                          <DropdownMenu.Item
+                            onSelect={() => setBulkConfirmModal({ action: 'REMOVE' })}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 focus:bg-rose-500/10 focus:outline-none cursor-pointer"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            <span>Remove from workspace</span>
+                          </DropdownMenu.Item>
+                        </DropdownMenu.Content>
+                      </DropdownMenu.Portal>
+                    </DropdownMenu.Root>
+
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => {
-                        setSearchQuery('')
-                        setRoleFilter('ALL')
-                        setStatusFilter('ALL')
-                        setAuthStatusFilter('ALL')
-                      }}
-                      className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
+                      onClick={clearSelection}
+                      className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
                     >
-                      Reset
+                      Clear selection
                     </Button>
-                  )}
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
 
             {/* Desktop Table View */}
@@ -1119,6 +1891,13 @@ export default function AdminPanelPage() {
               <table className="w-full text-left text-xs border-collapse">
                 <thead className="bg-muted/60 border-b border-border">
                   <tr className="font-semibold text-muted-foreground">
+                    <th scope="col" className="py-2.5 px-3 w-10 text-center">
+                      <Checkbox
+                        checked={selectAllState}
+                        onCheckedChange={toggleSelectAll}
+                        aria-label="Select all visible team members"
+                      />
+                    </th>
                     <th scope="col" className="py-2.5 px-4">
                       <button
                         type="button"
@@ -1186,13 +1965,13 @@ export default function AdminPanelPage() {
                 <tbody className="divide-y divide-border">
                   {loading && !workspace ? (
                     <tr>
-                      <td colSpan={6} className="py-8 text-center text-muted-foreground">
+                      <td colSpan={7} className="py-8 text-center text-muted-foreground">
                         Loading workspace team members…
                       </td>
                     </tr>
                   ) : sortedMembers.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-8 text-center text-muted-foreground space-y-2">
+                      <td colSpan={7} className="py-8 text-center text-muted-foreground space-y-2">
                         <p>
                           {workspace?.members.length === 0
                             ? 'No workspace members available.'
@@ -1220,12 +1999,22 @@ export default function AdminPanelPage() {
                       const isSelf = member.userId === currentUserId
                       const isFinalOwner = isFinalActiveOwner(member)
                       const initials = getInitials(member.displayName, member.email)
+                      const isSelected = selectedMembershipIds.has(member.membershipId)
 
                       return (
                         <tr
                           key={member.membershipId}
-                          className="hover:bg-muted/30 transition-colors"
+                          className={`hover:bg-muted/30 transition-colors ${isSelected ? 'bg-blue-50/40 dark:bg-blue-950/20' : ''}`}
                         >
+                          {/* Checkbox Column */}
+                          <td className="py-3 px-3 w-10 text-center">
+                            <Checkbox
+                              checked={isSelected}
+                              onCheckedChange={() => toggleSelectMember(member.membershipId)}
+                              aria-label={`Select ${member.displayName || member.email}`}
+                            />
+                          </td>
+
                           {/* Member Column */}
                           <td className="py-3 px-4 font-medium">
                             <div className="flex items-center gap-2.5">
@@ -1364,11 +2153,20 @@ export default function AdminPanelPage() {
                   const isSelf = member.userId === currentUserId
                   const isFinalOwner = isFinalActiveOwner(member)
                   const initials = getInitials(member.displayName, member.email)
+                  const isSelected = selectedMembershipIds.has(member.membershipId)
 
                   return (
-                    <div key={member.membershipId} className="p-3.5 space-y-2.5 bg-card hover:bg-muted/20 transition-colors">
+                    <div
+                      key={member.membershipId}
+                      className={`p-3.5 space-y-2.5 bg-card hover:bg-muted/20 transition-colors ${isSelected ? 'bg-blue-50/40 dark:bg-blue-950/20 border-l-2 border-l-blue-600' : ''}`}
+                    >
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex items-center gap-2.5 min-w-0">
+                          <Checkbox
+                            checked={isSelected}
+                            onCheckedChange={() => toggleSelectMember(member.membershipId)}
+                            aria-label={`Select ${member.displayName || member.email}`}
+                          />
                           <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 border border-border/80 text-foreground text-xs font-bold flex items-center justify-center shrink-0">
                             {initials}
                           </div>
@@ -1459,100 +2257,195 @@ export default function AdminPanelPage() {
       {/* TAB 3: WORKSPACE */}
       {activeTab === 'workspace' && (
         <div className="space-y-6 animate-in fade-in duration-200">
+          {/* Section 1: Workspace Identity */}
           <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-4">
             <div className="flex items-center justify-between border-b border-border pb-3">
               <div className="flex items-center gap-2">
-                <Building className="h-4 w-4 text-blue-600 dark:text-blue-400" />
-                <h2 className="text-sm font-bold text-foreground">Workspace Settings & Details</h2>
+                <Building className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                <h2 className="text-sm font-bold text-foreground">Workspace Identity</h2>
               </div>
-              <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border border-border">
-                Saving support coming later
+              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
+                {orgStatus}
               </span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
               <div className="space-y-1">
-                <Label className="text-xs font-medium text-muted-foreground">Workspace Name</Label>
-                <Input value={orgName} readOnly className="h-8 text-xs bg-muted/30" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Workspace Name
+                </span>
+                <p className="font-semibold text-foreground text-sm truncate">{orgName}</p>
               </div>
 
               <div className="space-y-1">
-                <Label className="text-xs font-medium text-muted-foreground">Organization Slug</Label>
-                <Input value={orgSlug} readOnly className="h-8 text-xs bg-muted/30" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Organization Slug
+                </span>
+                <p className="font-mono text-xs font-medium text-foreground bg-muted/50 px-2 py-1 rounded border border-border/50 truncate">
+                  {orgSlug}
+                </p>
               </div>
 
               <div className="space-y-1">
-                <Label className="text-xs font-medium text-muted-foreground">Workspace ID</Label>
-                <Input value={orgId} readOnly className="h-8 text-xs bg-muted/30 font-mono text-[11px]" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Workspace ID
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="font-mono text-[11px] text-muted-foreground bg-muted/40 px-2 py-1 rounded border border-border/50 truncate flex-1">
+                    {orgId}
+                  </span>
+                  {orgId && orgId !== 'N/A' && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleCopyOrgId}
+                      className="h-7 px-2 text-[11px] gap-1 shrink-0"
+                      title="Copy Workspace ID"
+                    >
+                      {copySuccess ? (
+                        <>
+                          <Check className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+                          <span className="text-emerald-600 dark:text-emerald-400">Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3 w-3" />
+                          <span>Copy</span>
+                        </>
+                      )}
+                    </Button>
+                  )}
+                </div>
               </div>
 
               <div className="space-y-1">
-                <Label className="text-xs font-medium text-muted-foreground">Workspace Status</Label>
-                <Input value={orgStatus} readOnly className="h-8 text-xs bg-muted/30" />
-              </div>
-
-              <div className="space-y-1">
-                <Label className="text-xs font-medium text-muted-foreground">Support Contact Email</Label>
-                <Input value="Not configured" readOnly className="h-8 text-xs bg-muted/30 text-muted-foreground" />
-              </div>
-
-              <div className="space-y-1">
-                <Label className="text-xs font-medium text-muted-foreground">Default Time Zone</Label>
-                <Input value={session?.user.timeZone || 'UTC'} readOnly className="h-8 text-xs bg-muted/30" />
-              </div>
-
-              <div className="space-y-1">
-                <Label className="text-xs font-medium text-muted-foreground">Default Date Format</Label>
-                <Input value={session?.user.dateFormat || 'YYYY-MM-DD'} readOnly className="h-8 text-xs bg-muted/30" />
-              </div>
-
-              <div className="space-y-1">
-                <Label className="text-xs font-medium text-muted-foreground">Default Time Format</Label>
-                <Input value={session?.user.timeFormat === '24h' ? '24-hour' : '12-hour'} readOnly className="h-8 text-xs bg-muted/30" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Workspace Status
+                </span>
+                <div>
+                  <span className="inline-flex items-center gap-1.5 font-medium text-foreground text-xs">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                    <span>Active Console Workspace</span>
+                  </span>
+                </div>
               </div>
             </div>
           </div>
 
-          {/* Owner-Only Danger Zone */}
-          <div className="rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/20 dark:bg-rose-950/10 p-5 shadow-sm space-y-3">
-            <div className="flex items-center gap-2 border-b border-rose-200 dark:border-rose-900/60 pb-2.5">
-              <ShieldAlert className="h-4 w-4 text-rose-600 dark:text-rose-400" />
-              <div>
-                <h3 className="text-sm font-bold text-rose-900 dark:text-rose-200">Danger Zone</h3>
-                <p className="text-xs text-rose-700 dark:text-rose-400">
-                  Critical workspace operations. These actions do not delete or modify connected Microsoft 365 tenants.
-                </p>
+          {/* Section 2: Regional Preferences */}
+          <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-4">
+            <div className="flex items-center justify-between border-b border-border pb-3">
+              <div className="flex items-center gap-2">
+                <Globe className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                <h2 className="text-sm font-bold text-foreground">Regional Preferences</h2>
               </div>
             </div>
 
-            <div className="space-y-2 pt-1">
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border bg-card">
-                <div>
-                  <p className="text-xs font-semibold text-foreground">Transfer Workspace Ownership</p>
-                  <p className="text-[11px] text-muted-foreground">Assign primary ownership to another active owner.</p>
+            {/* Subtle section-level message */}
+            <div className="p-3 rounded-lg bg-muted/40 border border-border/60 flex items-center gap-2.5 text-xs text-muted-foreground">
+              <Info className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
+              <span>Workspace preference editing is not available yet.</span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs pt-1">
+              <div className="space-y-1">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Support Contact Email
+                </span>
+                <p className="font-medium text-muted-foreground bg-muted/30 px-2.5 py-1.5 rounded border border-border/50">
+                  Not configured
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Default Time Zone
+                </span>
+                <p className="font-medium text-foreground bg-muted/30 px-2.5 py-1.5 rounded border border-border/50">
+                  {session?.user.timeZone || 'UTC'}
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Default Date Format
+                </span>
+                <p className="font-medium text-foreground bg-muted/30 px-2.5 py-1.5 rounded border border-border/50">
+                  {session?.user.dateFormat || 'YYYY-MM-DD'}
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Default Time Format
+                </span>
+                <p className="font-medium text-foreground bg-muted/30 px-2.5 py-1.5 rounded border border-border/50">
+                  {session?.user.timeFormat === '24h' ? '24-hour' : '12-hour'}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Section 3: Workspace Lifecycle */}
+          <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-4">
+            <div className="flex items-center justify-between border-b border-border pb-3">
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                <h2 className="text-sm font-bold text-foreground">Workspace Lifecycle</h2>
+              </div>
+            </div>
+
+            <div className="divide-y divide-border text-xs">
+              {/* Action 1: Transfer ownership */}
+              <div className="py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <div className="space-y-0.5">
+                  <p className="font-semibold text-foreground">Transfer Workspace Ownership</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Assign primary workspace ownership to another active MSP owner.
+                  </p>
+                  <p className="text-[11px] text-muted-foreground/80 italic">
+                    Transferring workspace ownership requires backend support.
+                  </p>
                 </div>
-                <Button size="sm" variant="outline" disabled className="h-7 text-xs">
-                  Backend support required
+                <Button size="sm" variant="outline" disabled className="h-8 text-xs shrink-0 self-start sm:self-auto">
+                  Unavailable
                 </Button>
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border bg-card">
-                <div>
-                  <p className="text-xs font-semibold text-foreground">Disable Workspace</p>
-                  <p className="text-[11px] text-muted-foreground">Suspend access to this HawkView workspace console.</p>
+              {/* Action 2: Disable workspace */}
+              <div className="py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <div className="space-y-0.5">
+                  <p className="font-semibold text-foreground">Disable Workspace</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Suspend console access to this HawkView workspace.
+                  </p>
+                  <p className="text-[11px] text-muted-foreground/80 italic">
+                    Disabling workspace console access requires backend support.
+                  </p>
                 </div>
-                <Button size="sm" variant="outline" disabled className="h-7 text-xs">
-                  Backend support required
+                <Button size="sm" variant="outline" disabled className="h-8 text-xs shrink-0 self-start sm:self-auto">
+                  Unavailable
                 </Button>
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border bg-card">
-                <div>
-                  <p className="text-xs font-semibold text-rose-600 dark:text-rose-400">Delete Workspace</p>
-                  <p className="text-[11px] text-muted-foreground">Permanently erase this HawkView workspace data.</p>
+              {/* Action 3: Delete workspace (Destructive) */}
+              <div className="py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <div className="space-y-0.5">
+                  <p className="font-semibold text-rose-600 dark:text-rose-400">Delete Workspace</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Permanently erase this HawkView workspace and all associated configuration data.
+                  </p>
+                  <p className="text-[11px] text-muted-foreground/80 italic">
+                    Deleting a workspace permanently requires backend support.
+                  </p>
                 </div>
-                <Button size="sm" variant="destructive" disabled className="h-7 text-xs">
-                  Backend support required
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled
+                  className="h-8 text-xs text-rose-600 dark:text-rose-400 border-rose-300 dark:border-rose-800/80 shrink-0 self-start sm:self-auto opacity-60"
+                >
+                  Delete workspace
                 </Button>
               </div>
             </div>
@@ -1563,97 +2456,168 @@ export default function AdminPanelPage() {
       {/* TAB 4: SECURITY */}
       {activeTab === 'security' && (
         <div className="space-y-6 animate-in fade-in duration-200">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-3">
-              <div className="flex items-center gap-2 border-b border-border pb-2.5">
-                <ShieldCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                <h2 className="text-sm font-bold text-foreground">Authentication & MFA Status</h2>
-              </div>
-              <div className="space-y-2 text-xs">
-                <div className="flex items-center justify-between py-1 border-b border-border/50">
-                  <span className="text-muted-foreground">Primary Auth Provider</span>
-                  <span className="font-semibold text-foreground">Supabase Auth (Email & OAuth)</span>
-                </div>
-                <div className="flex items-center justify-between py-1 border-b border-border/50">
-                  <span className="text-muted-foreground">Google Sign-In</span>
-                  <span className="font-semibold text-emerald-600 dark:text-emerald-400">Enabled</span>
-                </div>
-                <div className="flex items-center justify-between py-1 border-b border-border/50">
-                  <span className="text-muted-foreground">Microsoft Sign-In</span>
-                  <span className="font-semibold text-emerald-600 dark:text-emerald-400">Enabled</span>
-                </div>
-                <div className="flex items-center justify-between py-1">
-                  <span className="text-muted-foreground">HawkView MFA</span>
-                  <span className="font-semibold text-foreground">Supported (TOTP Enrollment)</span>
-                </div>
+          {/* Section 1: Authentication Status */}
+          <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-4">
+            <div className="flex items-center justify-between border-b border-border pb-3">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                <h2 className="text-sm font-bold text-foreground">Authentication Status</h2>
               </div>
             </div>
 
-            <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-3">
-              <div className="flex items-center gap-2 border-b border-border pb-2.5">
-                <Lock className="h-4 w-4 text-blue-600 dark:text-blue-400" />
-                <h2 className="text-sm font-bold text-foreground">Security Posture Metrics</h2>
+            <div className="divide-y divide-border text-xs">
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <div>
+                  <p className="font-semibold text-foreground">Primary Authentication Provider</p>
+                  <p className="text-[11px] text-muted-foreground">Supabase Identity & Authentication Engine</p>
+                </div>
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
+                  Enabled
+                </span>
               </div>
-              <div className="space-y-2 text-xs">
-                <div className="flex items-center justify-between py-1 border-b border-border/50">
-                  <span className="text-muted-foreground">Active MSP Owners</span>
-                  <span className="font-semibold text-foreground">{activeOwners.length}</span>
+
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <div>
+                  <p className="font-semibold text-foreground">Email / Password Credentials</p>
+                  <p className="text-[11px] text-muted-foreground">Standard email address and password authentication</p>
                 </div>
-                <div className="flex items-center justify-between py-1 border-b border-border/50">
-                  <span className="text-muted-foreground">Suspended Accounts</span>
-                  <span className="font-semibold text-foreground">{suspendedMembersCount}</span>
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
+                  Enabled
+                </span>
+              </div>
+
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <div>
+                  <p className="font-semibold text-foreground">Google Sign-In</p>
+                  <p className="text-[11px] text-muted-foreground">Google Workspace OAuth 2.0 single sign-on</p>
                 </div>
-                <div className="flex items-center justify-between py-1 border-b border-border/50">
-                  <span className="text-muted-foreground">Password Reset Events</span>
-                  <span className="font-semibold text-foreground">
-                    {auditEntries.filter((a) => a.action.includes('PASSWORD_RESET')).length}
-                  </span>
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
+                  Enabled
+                </span>
+              </div>
+
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <div>
+                  <p className="font-semibold text-foreground">Microsoft Sign-In</p>
+                  <p className="text-[11px] text-muted-foreground">Microsoft Entra ID / 365 OAuth single sign-on</p>
                 </div>
-                <div className="flex items-center justify-between py-1">
-                  <span className="text-muted-foreground">MFA Reset Events</span>
-                  <span className="font-semibold text-foreground">
-                    {auditEntries.filter((a) => a.action.includes('MFA_RESET')).length}
-                  </span>
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
+                  Enabled
+                </span>
+              </div>
+
+              <div className="py-2.5 flex items-center justify-between gap-2">
+                <div>
+                  <p className="font-semibold text-foreground">HawkView MFA Support</p>
+                  <p className="text-[11px] text-muted-foreground">Time-based One-Time Password (TOTP) enrollment capabilities</p>
                 </div>
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-300/40 dark:border-blue-800/40">
+                  Supported (Available, Not Enforced)
+                </span>
               </div>
             </div>
           </div>
 
+          {/* Section 2: Account Security Summary */}
           <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-4">
             <div className="flex items-center justify-between border-b border-border pb-3">
               <div className="flex items-center gap-2">
-                <Sliders className="h-4 w-4 text-muted-foreground" />
-                <h2 className="text-sm font-bold text-foreground">Workspace Security Policies</h2>
+                <Lock className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                <h2 className="text-sm font-bold text-foreground">Account Security Summary</h2>
               </div>
-              <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border border-border">
-                Configuration support coming later
-              </span>
             </div>
 
-            <div className="space-y-3 text-xs">
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border bg-muted/20">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+              <div className="p-3 rounded-lg border border-border bg-muted/20 space-y-1">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Active Owners</p>
+                <p className="text-xl font-bold text-foreground">
+                  {loading ? '…' : workspace ? activeOwners.length : 'Unavailable'}
+                </p>
+              </div>
+
+              <div className="p-3 rounded-lg border border-border bg-muted/20 space-y-1">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Active Members</p>
+                <p className="text-xl font-bold text-foreground">
+                  {loading ? '…' : workspace ? activeMembersCount : 'Unavailable'}
+                </p>
+              </div>
+
+              <div className="p-3 rounded-lg border border-border bg-muted/20 space-y-1">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Suspended</p>
+                <p className="text-xl font-bold text-foreground">
+                  {loading ? '…' : workspace ? suspendedMembersCount : 'Unavailable'}
+                </p>
+              </div>
+
+              <div className="p-3 rounded-lg border border-border bg-muted/20 space-y-1">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Awaiting Setup</p>
+                <p className="text-xl font-bold text-foreground">
+                  {loading ? '…' : workspace ? pendingSetupCount : 'Unavailable'}
+                </p>
+              </div>
+
+              <div className="p-3 rounded-lg border border-border bg-muted/20 space-y-1">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Password Resets</p>
+                <p className="text-xl font-bold text-foreground">
+                  {loading ? '…' : auditEntries ? auditEntries.filter((a) => a.action.includes('PASSWORD_RESET')).length : 'Unavailable'}
+                </p>
+              </div>
+
+              <div className="p-3 rounded-lg border border-border bg-muted/20 space-y-1">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">MFA Resets</p>
+                <p className="text-xl font-bold text-foreground">
+                  {loading ? '…' : auditEntries ? auditEntries.filter((a) => a.action.includes('MFA_RESET')).length : 'Unavailable'}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Section 3: Workspace Security Policies */}
+          <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-4">
+            <div className="flex items-center justify-between border-b border-border pb-3">
+              <div className="flex items-center gap-2">
+                <Sliders className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                <h2 className="text-sm font-bold text-foreground">Workspace Security Policies</h2>
+              </div>
+            </div>
+
+            <div className="divide-y divide-border text-xs">
+              <div className="py-3 flex items-center justify-between gap-2">
                 <div>
                   <p className="font-semibold text-foreground">Require HawkView MFA</p>
                   <p className="text-[11px] text-muted-foreground">Mandate multi-factor authentication for all workspace members.</p>
                 </div>
-                <input type="checkbox" disabled className="h-4 w-4 opacity-50" />
+                <span className="text-xs text-muted-foreground font-medium bg-muted px-2.5 py-1 rounded border border-border/60">
+                  Configuration unavailable
+                </span>
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border bg-muted/20">
+              <div className="py-3 flex items-center justify-between gap-2">
                 <div>
                   <p className="font-semibold text-foreground">Restrict Invitations by Email Domain</p>
                   <p className="text-[11px] text-muted-foreground">Allow invitations only to matching company domain addresses.</p>
                 </div>
-                <input type="checkbox" disabled className="h-4 w-4 opacity-50" />
+                <span className="text-xs text-muted-foreground font-medium bg-muted px-2.5 py-1 rounded border border-border/60">
+                  Configuration unavailable
+                </span>
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border bg-muted/20">
+              <div className="py-3 flex items-center justify-between gap-2">
                 <div>
                   <p className="font-semibold text-foreground">Session Timeout Duration</p>
-                  <p className="text-[11px] text-muted-foreground">Current session inactivity timeout setting.</p>
+                  <p className="text-[11px] text-muted-foreground">Inactivity threshold before requiring re-authentication.</p>
                 </div>
-                <span className="text-muted-foreground font-mono">24 Hours (Default)</span>
+                <span className="text-xs font-mono text-muted-foreground bg-muted px-2.5 py-1 rounded border border-border/60">
+                  24 Hours (Default)
+                </span>
               </div>
+            </div>
+
+            <div className="p-3 rounded-lg bg-muted/40 border border-border/60 text-xs text-muted-foreground flex items-center gap-2">
+              <Info className="h-4 w-4 text-muted-foreground shrink-0" aria-hidden="true" />
+              <span>
+                Note: Workspace security policies affect HawkView console access and accounts, not connected Microsoft 365 tenant identities.
+              </span>
             </div>
           </div>
         </div>
@@ -1662,112 +2626,194 @@ export default function AdminPanelPage() {
       {/* TAB 5: NOTIFICATIONS */}
       {activeTab === 'notifications' && (
         <div className="space-y-6 animate-in fade-in duration-200">
-          <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-4">
+          <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-5">
             <div className="flex items-center justify-between border-b border-border pb-3">
               <div className="flex items-center gap-2">
-                <Bell className="h-4 w-4 text-blue-600 dark:text-blue-400" />
-                <h2 className="text-sm font-bold text-foreground">Administrative Notification Preferences</h2>
+                <Bell className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                <h2 className="text-sm font-bold text-foreground">Notification Preferences</h2>
               </div>
               {prefSaving && (
-                <span className="text-xs text-muted-foreground flex items-center gap-1">
-                  <RefreshCcw className="h-3 w-3 animate-spin" />
-                  Saving…
+                <span className="text-xs text-muted-foreground flex items-center gap-1.5 font-medium">
+                  <RefreshCcw className="h-3.5 w-3.5 animate-spin text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                  Saving preferences…
                 </span>
               )}
             </div>
 
-            <p className="text-xs text-muted-foreground">
-              Configure delivery settings for workspace security alerts, team membership events, and tenant synchronization triggers.
-            </p>
+            {/* Read-only banner if notification preferences are not persisted */}
+            {!notificationPrefs && !loading && (
+              <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/60 text-xs text-amber-800 dark:text-amber-300 flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>Notification preference saving is not available yet.</span>
+              </div>
+            )}
 
-            <div className="space-y-3 pt-1">
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border">
-                <div>
-                  <p className="text-xs font-semibold text-foreground">Security Alerts</p>
-                  <p className="text-[11px] text-muted-foreground">Password resets, MFA resets, and role changes.</p>
+            <div className="space-y-6 text-xs">
+              {/* Category 1: Security */}
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground border-b border-border/50 pb-1">
+                  Security Alerts
+                </h3>
+                <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-border bg-card hover:bg-muted/20 transition-colors">
+                  <div className="space-y-0.5">
+                    <p className="font-semibold text-foreground">Password resets, MFA resets, and role changes</p>
+                    <p className="text-[11px] text-muted-foreground">Receive immediate notifications for member authentication and privilege alterations.</p>
+                  </div>
+                  <Checkbox
+                    checked={formNotificationPrefs?.securityEnabled ?? true}
+                    disabled={!notificationPrefs || prefSaving}
+                    onCheckedChange={(checked) => {
+                      if (!formNotificationPrefs) return
+                      setFormNotificationPrefs({ ...formNotificationPrefs, securityEnabled: Boolean(checked) })
+                    }}
+                    aria-label="Toggle Security Alerts"
+                  />
                 </div>
-                <input
-                  type="checkbox"
-                  checked={notificationPrefs?.securityEnabled ?? true}
-                  disabled={prefSaving || !notificationPrefs}
-                  onChange={(e) => void handleUpdateNotificationPref('securityEnabled', e.target.checked)}
-                  className="h-4 w-4 rounded border-input text-blue-600 focus:ring-blue-500"
-                />
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border">
-                <div>
-                  <p className="text-xs font-semibold text-foreground">Tenant Connection Alerts</p>
-                  <p className="text-[11px] text-muted-foreground">Microsoft 365 consent issues and connector authorization updates.</p>
+              {/* Category 2: Tenant Operations */}
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground border-b border-border/50 pb-1">
+                  Tenant Operations
+                </h3>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-border bg-card hover:bg-muted/20 transition-colors">
+                    <div className="space-y-0.5">
+                      <p className="font-semibold text-foreground">Connection or consent problems</p>
+                      <p className="text-[11px] text-muted-foreground">Alerts when Microsoft 365 tenant authorization or partner consent degrades.</p>
+                    </div>
+                    <Checkbox
+                      checked={formNotificationPrefs?.connectionEnabled ?? true}
+                      disabled={!notificationPrefs || prefSaving}
+                      onCheckedChange={(checked) => {
+                        if (!formNotificationPrefs) return
+                        setFormNotificationPrefs({ ...formNotificationPrefs, connectionEnabled: Boolean(checked) })
+                      }}
+                      aria-label="Toggle Connection or consent problems"
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-border bg-card hover:bg-muted/20 transition-colors">
+                    <div className="space-y-0.5">
+                      <p className="font-semibold text-foreground">Synchronization failures & stale tenant data</p>
+                      <p className="text-[11px] text-muted-foreground">Alerts for automated sync job failures or stale security score telemetry.</p>
+                    </div>
+                    <Checkbox
+                      checked={formNotificationPrefs?.synchronizationEnabled ?? true}
+                      disabled={!notificationPrefs || prefSaving}
+                      onCheckedChange={(checked) => {
+                        if (!formNotificationPrefs) return
+                        setFormNotificationPrefs({ ...formNotificationPrefs, synchronizationEnabled: Boolean(checked) })
+                      }}
+                      aria-label="Toggle Synchronization failures"
+                    />
+                  </div>
                 </div>
-                <input
-                  type="checkbox"
-                  checked={notificationPrefs?.connectionEnabled ?? true}
-                  disabled={prefSaving || !notificationPrefs}
-                  onChange={(e) => void handleUpdateNotificationPref('connectionEnabled', e.target.checked)}
-                  className="h-4 w-4 rounded border-input text-blue-600 focus:ring-blue-500"
-                />
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border">
-                <div>
-                  <p className="text-xs font-semibold text-foreground">Synchronization Failures</p>
-                  <p className="text-[11px] text-muted-foreground">Tenant sync errors and baseline compliance drift warnings.</p>
+              {/* Category 3: Team */}
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground border-b border-border/50 pb-1">
+                  Team Membership
+                </h3>
+                <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-border bg-card hover:bg-muted/20 transition-colors">
+                  <div className="space-y-0.5">
+                    <p className="font-semibold text-foreground">Invitations, account setup, suspensions, and removals</p>
+                    <p className="text-[11px] text-muted-foreground">Notifications when members are invited, complete setup, or get suspended.</p>
+                  </div>
+                  <Checkbox
+                    checked={formNotificationPrefs?.accountEnabled ?? true}
+                    disabled={!notificationPrefs || prefSaving}
+                    onCheckedChange={(checked) => {
+                      if (!formNotificationPrefs) return
+                      setFormNotificationPrefs({ ...formNotificationPrefs, accountEnabled: Boolean(checked) })
+                    }}
+                    aria-label="Toggle Team Membership notifications"
+                  />
                 </div>
-                <input
-                  type="checkbox"
-                  checked={notificationPrefs?.synchronizationEnabled ?? true}
-                  disabled={prefSaving || !notificationPrefs}
-                  onChange={(e) => void handleUpdateNotificationPref('synchronizationEnabled', e.target.checked)}
-                  className="h-4 w-4 rounded border-input text-blue-600 focus:ring-blue-500"
-                />
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg border border-border">
-                <div>
-                  <p className="text-xs font-semibold text-foreground">Team Member Events</p>
-                  <p className="text-[11px] text-muted-foreground">Member invitations, account setup, and suspensions.</p>
+              {/* Category 4: Delivery */}
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground border-b border-border/50 pb-1">
+                  Delivery Preferences
+                </h3>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="space-y-1.5">
+                    <Label className="text-xs font-medium text-foreground">Minimum Severity Threshold</Label>
+                    <select
+                      value={formNotificationPrefs?.minimumSeverity || 'info'}
+                      disabled={!notificationPrefs || prefSaving}
+                      onChange={(e) => {
+                        if (!formNotificationPrefs) return
+                        setFormNotificationPrefs({
+                          ...formNotificationPrefs,
+                          minimumSeverity: e.target.value as NotificationPref['minimumSeverity'],
+                        })
+                      }}
+                      className="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-50"
+                    >
+                      <option value="info">Info (All notifications)</option>
+                      <option value="low">Low severity and above</option>
+                      <option value="medium">Medium severity and above</option>
+                      <option value="high">High severity and above</option>
+                      <option value="critical">Critical only</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label className="text-xs font-medium text-foreground">Delivery Mode</Label>
+                    <select
+                      value={formNotificationPrefs?.digestMode || 'off'}
+                      disabled={!notificationPrefs || prefSaving}
+                      onChange={(e) => {
+                        if (!formNotificationPrefs) return
+                        setFormNotificationPrefs({
+                          ...formNotificationPrefs,
+                          digestMode: e.target.value as NotificationPref['digestMode'],
+                        })
+                      }}
+                      className="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-50"
+                    >
+                      <option value="off">Real-time / Instant delivery</option>
+                      <option value="daily">Daily summary digest</option>
+                      <option value="weekly">Weekly summary digest</option>
+                    </select>
+                  </div>
                 </div>
-                <input
-                  type="checkbox"
-                  checked={notificationPrefs?.accountEnabled ?? true}
-                  disabled={prefSaving || !notificationPrefs}
-                  onChange={(e) => void handleUpdateNotificationPref('accountEnabled', e.target.checked)}
-                  className="h-4 w-4 rounded border-input text-blue-600 focus:ring-blue-500"
-                />
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
-                <div className="space-y-1">
-                  <Label className="text-xs font-medium text-foreground">Minimum Severity Threshold</Label>
-                  <select
-                    value={notificationPrefs?.minimumSeverity || 'info'}
-                    disabled={prefSaving || !notificationPrefs}
-                    onChange={(e) => void handleUpdateNotificationPref('minimumSeverity', e.target.value)}
-                    className="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground"
+              {/* Actions Footer */}
+              {notificationPrefs && (
+                <div className="pt-4 border-t border-border flex items-center justify-end gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleCancelNotificationPrefs}
+                    disabled={!isPrefDirty || prefSaving}
+                    className="h-8 text-xs"
                   >
-                    <option value="info">Info (All notifications)</option>
-                    <option value="low">Low severity and above</option>
-                    <option value="medium">Medium severity and above</option>
-                    <option value="high">High severity and above</option>
-                    <option value="critical">Critical only</option>
-                  </select>
-                </div>
-
-                <div className="space-y-1">
-                  <Label className="text-xs font-medium text-foreground">Digest Delivery Mode</Label>
-                  <select
-                    value={notificationPrefs?.digestMode || 'off'}
-                    disabled={prefSaving || !notificationPrefs}
-                    onChange={(e) => void handleUpdateNotificationPref('digestMode', e.target.value)}
-                    className="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground"
+                    Cancel
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={handleSaveNotificationPrefs}
+                    disabled={!isPrefDirty || prefSaving}
+                    className="h-8 text-xs font-semibold gap-1.5"
                   >
-                    <option value="off">Real-time / Instant</option>
-                    <option value="daily">Daily Summary Digest</option>
-                    <option value="weekly">Weekly Summary Digest</option>
-                  </select>
+                    {prefSaving ? (
+                      <>
+                        <RefreshCcw className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                        <span>Saving…</span>
+                      </>
+                    ) : (
+                      <span>Save changes</span>
+                    )}
+                  </Button>
                 </div>
-              </div>
+              )}
             </div>
           </div>
         </div>
@@ -1776,123 +2822,331 @@ export default function AdminPanelPage() {
       {/* TAB 6: AUDIT HISTORY */}
       {activeTab === 'audit' && (
         <div className="space-y-6 animate-in fade-in duration-200">
-          <div className="rounded-xl border border-border bg-card shadow-sm overflow-hidden">
+          <div className="rounded-xl border border-border bg-card shadow-sm overflow-hidden space-y-0">
             {/* Toolbar */}
             <div className="p-4 border-b border-border space-y-3">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  <History className="h-4 w-4 text-muted-foreground" />
+                  <History className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
                   <h2 className="text-sm font-bold text-foreground">Administrative Activity Audit History</h2>
                 </div>
-                <span className="text-xs text-muted-foreground font-medium">
-                  {filteredAuditLogs.length} event(s)
-                </span>
+
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-muted-foreground font-medium">
+                    Showing {filteredAndSortedAuditLogs.length} of {auditEntries.length} event(s)
+                  </span>
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleExportCSV}
+                    disabled={filteredAndSortedAuditLogs.length === 0}
+                    className="h-7 text-xs font-semibold gap-1.5 hover:bg-accent/80"
+                  >
+                    <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Export CSV</span>
+                  </Button>
+                </div>
               </div>
 
-              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
-                <div className="relative flex-1">
-                  <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" />
+              {/* Filters row */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                {/* Search */}
+                <div className="relative">
+                  <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
                   <Input
                     type="text"
                     value={auditSearch}
                     onChange={(e) => setAuditSearch(e.target.value)}
-                    placeholder="Search by action, actor, or target email…"
+                    placeholder="Search action, actor, or target…"
                     className="pl-8 h-8 text-xs"
+                    aria-label="Search audit events"
                   />
                   {auditSearch && (
                     <button
                       type="button"
                       onClick={() => setAuditSearch('')}
-                      className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
+                      className="absolute right-2 top-2 text-muted-foreground hover:text-foreground p-0.5"
+                      aria-label="Clear search"
                     >
                       <X className="h-3.5 w-3.5" />
                     </button>
                   )}
                 </div>
 
-                <div className="flex items-center gap-2">
+                {/* Outcome Filter */}
+                <div>
                   <select
                     aria-label="Filter by outcome"
                     value={auditOutcomeFilter}
                     onChange={(e) => setAuditOutcomeFilter(e.target.value)}
-                    className="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    className="h-8 w-full rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                   >
                     <option value="ALL">All outcomes</option>
                     <option value="SUCCEEDED">Succeeded</option>
                     <option value="FAILED">Failed</option>
                   </select>
-
-                  {(auditSearch || auditOutcomeFilter !== 'ALL') && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => {
-                        setAuditSearch('')
-                        setAuditOutcomeFilter('ALL')
-                      }}
-                      className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
-                    >
-                      Reset
-                    </Button>
-                  )}
                 </div>
+
+                {/* Date Range Preset */}
+                <div>
+                  <select
+                    aria-label="Filter by date range"
+                    value={auditDateRange}
+                    onChange={(e) => setAuditDateRange(e.target.value as typeof auditDateRange)}
+                    className="h-8 w-full rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                  >
+                    <option value="ALL">All time</option>
+                    <option value="24H">Last 24 hours</option>
+                    <option value="7D">Last 7 days</option>
+                    <option value="30D">Last 30 days</option>
+                    <option value="CUSTOM">Custom date range</option>
+                  </select>
+                </div>
+
+                {/* Reset Filters */}
+                {(auditSearch || auditOutcomeFilter !== 'ALL' || auditDateRange !== 'ALL') && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setAuditSearch('')
+                      setAuditOutcomeFilter('ALL')
+                      setAuditDateRange('ALL')
+                      setAuditCustomStartDate('')
+                      setAuditCustomEndDate('')
+                    }}
+                    className="h-8 text-xs text-muted-foreground hover:text-foreground justify-center"
+                  >
+                    Reset all filters
+                  </Button>
+                )}
               </div>
+
+              {/* Custom Date Inputs if CUSTOM date range selected */}
+              {auditDateRange === 'CUSTOM' && (
+                <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-muted-foreground font-medium">Start:</span>
+                    <Input
+                      type="date"
+                      value={auditCustomStartDate}
+                      onChange={(e) => setAuditCustomStartDate(e.target.value)}
+                      className="h-8 text-xs w-36"
+                    />
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-muted-foreground font-medium">End:</span>
+                    <Input
+                      type="date"
+                      value={auditCustomEndDate}
+                      onChange={(e) => setAuditCustomEndDate(e.target.value)}
+                      className="h-8 text-xs w-36"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Audit Table */}
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs border-collapse">
-                <thead>
-                  <tr className="border-b border-border bg-muted/40 font-semibold text-muted-foreground">
-                    <th scope="col" className="py-2.5 px-4">Date & Time</th>
-                    <th scope="col" className="py-2.5 px-4">Action</th>
-                    <th scope="col" className="py-2.5 px-4">Affected Target</th>
-                    <th scope="col" className="py-2.5 px-4">Performed By</th>
-                    <th scope="col" className="py-2.5 px-4">Outcome</th>
+                <thead className="bg-muted/50 border-b border-border">
+                  <tr className="font-semibold text-muted-foreground text-[11px] uppercase tracking-wider">
+                    {/* Sortable Column: Date & Time */}
+                    <th scope="col" className="py-2.5 px-4">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (auditSortField === 'createdAt') {
+                            setAuditSortDir(auditSortDir === 'asc' ? 'desc' : 'asc')
+                          } else {
+                            setAuditSortField('createdAt')
+                            setAuditSortDir('desc')
+                          }
+                        }}
+                        className="flex items-center gap-1 hover:text-foreground focus-visible:outline-none"
+                      >
+                        <span>Date & Time</span>
+                        {auditSortField === 'createdAt' ? (
+                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                        ) : (
+                          <ArrowUpDown className="h-3 w-3 opacity-40" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* Sortable Column: Action */}
+                    <th scope="col" className="py-2.5 px-4">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (auditSortField === 'action') {
+                            setAuditSortDir(auditSortDir === 'asc' ? 'desc' : 'asc')
+                          } else {
+                            setAuditSortField('action')
+                            setAuditSortDir('asc')
+                          }
+                        }}
+                        className="flex items-center gap-1 hover:text-foreground focus-visible:outline-none"
+                      >
+                        <span>Action</span>
+                        {auditSortField === 'action' ? (
+                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                        ) : (
+                          <ArrowUpDown className="h-3 w-3 opacity-40" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* Sortable Column: Affected Target */}
+                    <th scope="col" className="py-2.5 px-4">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (auditSortField === 'target') {
+                            setAuditSortDir(auditSortDir === 'asc' ? 'desc' : 'asc')
+                          } else {
+                            setAuditSortField('target')
+                            setAuditSortDir('asc')
+                          }
+                        }}
+                        className="flex items-center gap-1 hover:text-foreground focus-visible:outline-none"
+                      >
+                        <span>Affected Target</span>
+                        {auditSortField === 'target' ? (
+                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                        ) : (
+                          <ArrowUpDown className="h-3 w-3 opacity-40" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* Sortable Column: Performed By */}
+                    <th scope="col" className="py-2.5 px-4">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (auditSortField === 'actor') {
+                            setAuditSortDir(auditSortDir === 'asc' ? 'desc' : 'asc')
+                          } else {
+                            setAuditSortField('actor')
+                            setAuditSortDir('asc')
+                          }
+                        }}
+                        className="flex items-center gap-1 hover:text-foreground focus-visible:outline-none"
+                      >
+                        <span>Performed By</span>
+                        {auditSortField === 'actor' ? (
+                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                        ) : (
+                          <ArrowUpDown className="h-3 w-3 opacity-40" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* Sortable Column: Outcome */}
+                    <th scope="col" className="py-2.5 px-4">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (auditSortField === 'outcome') {
+                            setAuditSortDir(auditSortDir === 'asc' ? 'desc' : 'asc')
+                          } else {
+                            setAuditSortField('outcome')
+                            setAuditSortDir('asc')
+                          }
+                        }}
+                        className="flex items-center gap-1 hover:text-foreground focus-visible:outline-none"
+                      >
+                        <span>Outcome</span>
+                        {auditSortField === 'outcome' ? (
+                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                        ) : (
+                          <ArrowUpDown className="h-3 w-3 opacity-40" />
+                        )}
+                      </button>
+                    </th>
+
                     <th scope="col" className="py-2.5 px-4 text-right">Details</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">
-                  {filteredAuditLogs.length === 0 ? (
+                  {auditEntries.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-8 text-center text-muted-foreground">
-                        No audit history entries found matching your search criteria.
+                      <td colSpan={6} className="py-12 text-center text-muted-foreground space-y-1">
+                        <History className="h-8 w-8 mx-auto text-muted-foreground/40 mb-2" aria-hidden="true" />
+                        <p className="font-medium text-foreground text-xs">No administrative activity recorded</p>
+                        <p className="text-[11px] text-muted-foreground">
+                          Audit events will automatically appear here as administrative actions occur.
+                        </p>
+                      </td>
+                    </tr>
+                  ) : filteredAndSortedAuditLogs.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-12 text-center text-muted-foreground space-y-1">
+                        <Search className="h-8 w-8 mx-auto text-muted-foreground/40 mb-2" aria-hidden="true" />
+                        <p className="font-medium text-foreground text-xs">No matching audit events found</p>
+                        <p className="text-[11px] text-muted-foreground">
+                          Try adjusting your search keywords, outcome filter, or date range.
+                        </p>
                       </td>
                     </tr>
                   ) : (
-                    filteredAuditLogs.map((entry) => (
-                      <tr key={entry.id} className="hover:bg-muted/30 transition-colors">
+                    filteredAndSortedAuditLogs.map((entry) => (
+                      <tr
+                        key={entry.id}
+                        tabIndex={0}
+                        onClick={() => setAuditDrawerEntry(entry)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            setAuditDrawerEntry(entry)
+                          }
+                        }}
+                        className="hover:bg-muted/40 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-muted/50"
+                      >
                         <td className="py-3 px-4 text-muted-foreground whitespace-nowrap">
                           {formatDateTime(entry.createdAt)}
                         </td>
-                        <td className="py-3 px-4 font-semibold text-foreground">
+                        <td className="py-3 px-4 font-semibold text-foreground whitespace-nowrap">
                           {formatActionLabel(entry.action)}
                         </td>
-                        <td className="py-3 px-4 text-muted-foreground">
+                        <td className="py-3 px-4 text-foreground/90 max-w-[180px] truncate">
                           {entry.targetEmail || 'Workspace'}
                         </td>
-                        <td className="py-3 px-4 text-muted-foreground">
-                          {entry.actorEmail || 'Unknown owner'}
+                        <td className="py-3 px-4 text-muted-foreground max-w-[180px] truncate">
+                          {entry.actorEmail || 'System'}
                         </td>
-                        <td className="py-3 px-4">
+                        <td className="py-3 px-4 whitespace-nowrap">
                           <span
-                            className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ${
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold ${
                               entry.outcome === 'SUCCEEDED'
-                                ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                                : 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
+                                ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40'
+                                : 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-300/40 dark:border-rose-800/40'
                             }`}
                           >
-                            {entry.outcome}
+                            {entry.outcome === 'SUCCEEDED' ? (
+                              <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+                            ) : (
+                              <AlertCircle className="h-3 w-3" aria-hidden="true" />
+                            )}
+                            <span>{entry.outcome === 'SUCCEEDED' ? 'Succeeded' : entry.outcome}</span>
                           </span>
                         </td>
-                        <td className="py-3 px-4 text-right">
+                        <td className="py-3 px-4 text-right whitespace-nowrap">
                           <Button
+                            type="button"
                             variant="ghost"
                             size="sm"
-                            onClick={() => setAuditDrawerEntry(entry)}
-                            className="h-7 text-xs text-blue-600 dark:text-blue-400 hover:text-blue-700"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setAuditDrawerEntry(entry)
+                            }}
+                            className="h-7 text-xs text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 font-medium"
                           >
-                            View detail
+                            View details
                           </Button>
                         </td>
                       </tr>
@@ -2015,56 +3269,72 @@ export default function AdminPanelPage() {
             <div className="flex items-center justify-between border-b border-border pb-3">
               <div>
                 <h3 id="audit-drawer-title" className="text-base font-bold text-foreground">
-                  Audit Log Details
+                  Audit Event Details
                 </h3>
                 <p className="text-xs text-muted-foreground">{formatActionLabel(auditDrawerEntry.action)}</p>
               </div>
               <button
                 type="button"
                 onClick={() => setAuditDrawerEntry(null)}
-                className="text-muted-foreground hover:text-foreground p-1"
+                className="text-muted-foreground hover:text-foreground p-1 rounded-md"
+                aria-label="Close audit log details"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            <div className="space-y-3 text-xs">
-              <div>
-                <p className="text-muted-foreground text-[11px]">Event ID</p>
-                <p className="font-mono text-[11px] text-foreground">{auditDrawerEntry.id}</p>
+            <div className="space-y-4 text-xs">
+              <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Event ID</span>
+                <p className="font-mono text-[11px] text-foreground select-all break-all">{auditDrawerEntry.id}</p>
               </div>
 
-              <div>
-                <p className="text-muted-foreground text-[11px]">Timestamp</p>
+              <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Timestamp</span>
                 <p className="font-semibold text-foreground">{formatDateTime(auditDrawerEntry.createdAt)}</p>
               </div>
 
-              <div>
-                <p className="text-muted-foreground text-[11px]">Action</p>
-                <p className="font-semibold text-foreground">{auditDrawerEntry.action}</p>
+              <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Action Code</span>
+                <p className="font-mono text-xs font-semibold text-foreground">{auditDrawerEntry.action}</p>
               </div>
 
-              <div>
-                <p className="text-muted-foreground text-[11px]">Outcome</p>
-                <p className={`font-semibold ${auditDrawerEntry.outcome === 'SUCCEEDED' ? 'text-emerald-600' : 'text-rose-600'}`}>
-                  {auditDrawerEntry.outcome}
-                </p>
-              </div>
-
-              <div>
-                <p className="text-muted-foreground text-[11px]">Performed By</p>
-                <p className="font-semibold text-foreground">{auditDrawerEntry.actorEmail || 'Unknown owner'}</p>
-              </div>
-
-              <div>
-                <p className="text-muted-foreground text-[11px]">Affected Target</p>
-                <p className="font-semibold text-foreground">{auditDrawerEntry.targetEmail || 'Workspace'}</p>
-              </div>
-
-              {auditDrawerEntry.metadata && (
+              <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Outcome</span>
                 <div>
-                  <p className="text-muted-foreground text-[11px] mb-1">Event Metadata</p>
-                  <pre className="p-3 rounded-lg bg-muted text-[11px] font-mono overflow-x-auto">
+                  <span
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold ${
+                      auditDrawerEntry.outcome === 'SUCCEEDED'
+                        ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40'
+                        : 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-300/40 dark:border-rose-800/40'
+                    }`}
+                  >
+                    {auditDrawerEntry.outcome === 'SUCCEEDED' ? (
+                      <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+                    ) : (
+                      <AlertCircle className="h-3 w-3" aria-hidden="true" />
+                    )}
+                    <span>{auditDrawerEntry.outcome}</span>
+                  </span>
+                </div>
+              </div>
+
+              <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Performed By</span>
+                <p className="font-semibold text-foreground">{auditDrawerEntry.actorEmail || 'System / Automated'}</p>
+              </div>
+
+              <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Affected Target</span>
+                <p className="font-semibold text-foreground">{auditDrawerEntry.targetEmail || 'Workspace Console'}</p>
+              </div>
+
+              {auditDrawerEntry.metadata && Object.keys(auditDrawerEntry.metadata).length > 0 && (
+                <div className="space-y-1">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Event Metadata
+                  </span>
+                  <pre className="p-3 rounded-lg bg-muted/50 border border-border text-[11px] font-mono overflow-x-auto whitespace-pre-wrap break-all text-foreground">
                     {JSON.stringify(auditDrawerEntry.metadata, null, 2)}
                   </pre>
                 </div>
@@ -2076,7 +3346,7 @@ export default function AdminPanelPage() {
                 variant="outline"
                 size="sm"
                 onClick={() => setAuditDrawerEntry(null)}
-                className="h-8 text-xs"
+                className="h-8 text-xs font-semibold"
               >
                 Close
               </Button>
@@ -2254,6 +3524,171 @@ export default function AdminPanelPage() {
                 className="h-8 text-xs font-medium"
               >
                 {submitting ? 'Updating…' : 'Confirm action'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Action Confirmation Modal */}
+      {bulkConfirmModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 animate-in fade-in">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="bulk-confirm-modal-title"
+            className="w-full max-w-lg rounded-xl border border-border bg-popover p-5 text-popover-foreground shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto"
+          >
+            <div className="flex items-center justify-between border-b border-border pb-3">
+              <div className="flex items-center gap-2.5">
+                {bulkConfirmModal.action === 'REMOVE' ? (
+                  <div className="p-2 rounded-full bg-rose-500/10 text-rose-600 dark:text-rose-400">
+                    <Trash2 className="h-5 w-5" />
+                  </div>
+                ) : bulkConfirmModal.action === 'SUSPEND' ? (
+                  <div className="p-2 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                    <UserX className="h-5 w-5" />
+                  </div>
+                ) : (
+                  <div className="p-2 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400">
+                    <Users className="h-5 w-5" />
+                  </div>
+                )}
+
+                <div>
+                  <h3 id="bulk-confirm-modal-title" className="text-sm font-bold">
+                    {bulkConfirmModal.action === 'ROLE_CHANGE'
+                      ? `Bulk change workspace role`
+                      : bulkConfirmModal.action === 'SUSPEND'
+                      ? `Bulk suspend ${selectedMembers.length} member accounts?`
+                      : bulkConfirmModal.action === 'REACTIVATE'
+                      ? `Bulk reactivate ${selectedMembers.length} member accounts?`
+                      : bulkConfirmModal.action === 'PASSWORD_RESET'
+                      ? `Send HawkView password reset to ${selectedMembers.length} members?`
+                      : bulkConfirmModal.action === 'MFA_RESET'
+                      ? `Reset HawkView MFA for ${selectedMembers.length} members?`
+                      : bulkConfirmModal.action === 'RESEND_INVITE'
+                      ? `Resend invitations to ${selectedMembers.length} members?`
+                      : `Bulk remove ${selectedMembers.length} members from workspace?`}
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    {selectedMembers.length} team member{selectedMembers.length === 1 ? '' : 's'} selected
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setBulkConfirmModal(null)}
+                className="text-muted-foreground hover:text-foreground p-1 rounded-md"
+                aria-label="Close dialog"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="text-xs text-muted-foreground bg-muted/40 p-3 rounded-lg border border-border space-y-1">
+              <p className="font-medium text-foreground">Important Note:</p>
+              <p>
+                This action affects HawkView accounts only and does not modify Microsoft 365 accounts.
+              </p>
+            </div>
+
+            {bulkConfirmModal.action === 'ROLE_CHANGE' && (
+              <div className="space-y-2">
+                <Label className="text-xs font-semibold">Select Target Role</Label>
+                <div className="space-y-1.5">
+                  {roles.map((r) => {
+                    const isSelected = bulkConfirmModal.targetRole === r.value
+                    return (
+                      <button
+                        key={r.value}
+                        type="button"
+                        onClick={() =>
+                          setBulkConfirmModal({ ...bulkConfirmModal, targetRole: r.value })
+                        }
+                        className={`w-full flex items-start justify-between p-2.5 rounded-lg border text-left text-xs transition-colors ${
+                          isSelected
+                            ? 'border-blue-600 bg-blue-50/50 dark:bg-blue-950/30'
+                            : 'border-border hover:bg-accent/60'
+                        }`}
+                      >
+                        <div>
+                          <p className="font-semibold text-foreground">{r.label}</p>
+                          <p className="text-[11px] text-muted-foreground">{r.description}</p>
+                        </div>
+                        {isSelected && (
+                          <span className="text-blue-600 dark:text-blue-400 font-semibold text-[11px]">
+                            Selected
+                          </span>
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Selected Members List with Protection Badges */}
+            <div className="space-y-2">
+              <p className="text-xs font-semibold text-foreground">Affected Members ({selectedMembers.length})</p>
+              <div className="max-h-48 overflow-y-auto divide-y divide-border border border-border rounded-lg bg-card text-xs">
+                {selectedMembers.map((m) => {
+                  const isSelf = m.userId === currentUserId
+                  const isFinal = isFinalActiveOwner(m)
+                  const isProtected =
+                    (bulkConfirmModal.action === 'ROLE_CHANGE' && bulkConfirmModal.targetRole !== 'MSP_OWNER' && (isSelf || isFinal)) ||
+                    ((bulkConfirmModal.action === 'SUSPEND' || bulkConfirmModal.action === 'REMOVE') && (isSelf || isFinal))
+
+                  return (
+                    <div key={m.membershipId} className="p-2 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="font-medium text-foreground truncate">{m.displayName || m.email}</p>
+                        <p className="text-[11px] text-muted-foreground truncate">{m.email}</p>
+                      </div>
+                      {isProtected ? (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-300 dark:border-amber-800 shrink-0">
+                          Protected — skipped
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-muted text-muted-foreground shrink-0">
+                          Will update
+                        </span>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-border">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setBulkConfirmModal(null)}
+                disabled={submitting}
+                className="h-8 text-xs"
+              >
+                Cancel
+              </Button>
+              <Button
+                variant={bulkConfirmModal.action === 'REMOVE' ? 'destructive' : 'default'}
+                size="sm"
+                onClick={() => void handleExecuteBulkAction()}
+                disabled={
+                  submitting ||
+                  (bulkConfirmModal.action === 'ROLE_CHANGE' && !bulkConfirmModal.targetRole)
+                }
+                className="h-8 text-xs font-semibold gap-1.5"
+              >
+                {submitting ? (
+                  <>
+                    <RefreshCcw className="h-3.5 w-3.5 animate-spin" />
+                    <span>Processing bulk action…</span>
+                  </>
+                ) : (
+                  <span>Confirm bulk action</span>
+                )}
               </Button>
             </div>
           </div>
@@ -2484,4 +3919,8 @@ export default function AdminPanelPage() {
       )}
     </div>
   )
+}
+
+export default function LegacyAdminPanelPage() {
+  return <AdminPanelPage />
 }
