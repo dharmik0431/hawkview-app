@@ -1183,6 +1183,36 @@ function formatSyncTimestamp(lastSyncIso?: string) {
   }
 }
 
+const TENANT_BUNDLE_CACHE_TTL_MS = 60_000
+
+type TenantBundleCacheEntry = {
+  bundle: TenantBundle
+  fetchedAt: number
+}
+
+// Route changes between tenant blades remount this page. Keep the most recent
+// saved tenant snapshot in memory so moving between Entra tabs does not blank
+// the workspace while the same data is requested again.
+const tenantBundleCache = new Map<string, TenantBundleCacheEntry>()
+
+function getCachedTenantBundle(tenantId: string) {
+  const entry = tenantBundleCache.get(tenantId)
+  if (!entry) return null
+  return Date.now() - entry.fetchedAt <= TENANT_BUNDLE_CACHE_TTL_MS
+    ? entry.bundle
+    : null
+}
+
+function formatUserDateTime(value?: string | null) {
+  if (!value || value === 'No sign-in recorded') return 'Not available'
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return value
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date)
+}
+
 /* ===================================================================================== */
 
 export default function TenantDetailsPage() {
@@ -1268,18 +1298,28 @@ export default function TenantDetailsPage() {
     )
   }
 
-  const [bundle, setBundle] = useState<TenantBundle | null>(null)
+  const [bundle, setBundle] = useState<TenantBundle | null>(() =>
+    getCachedTenantBundle(resolvedTenantId)
+  )
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>(
-    'loading'
+    () => (getCachedTenantBundle(resolvedTenantId) ? 'ready' : 'loading')
   )
   const [loadError, setLoadError] = useState<string | null>(null)
   const [tenantsList, setTenantsList] = useState<any[]>([])
 
   const fetchBundle = useCallback(async (refresh = false) => {
     if (!tenantId) return
+    const cachedBundle = getCachedTenantBundle(String(tenantId))
+
     if (refresh) {
       setSyncState('syncing')
     } else {
+      if (cachedBundle) {
+        setBundle(cachedBundle)
+        setLoadError(null)
+        setLoadState('ready')
+        return
+      }
       setBundle(null)
       setLoadError(null)
       setLoadState('loading')
@@ -1297,6 +1337,10 @@ export default function TenantDetailsPage() {
           )
       if (!data?.bundle) throw new Error('Unable to load tenant data.')
 
+      tenantBundleCache.set(String(tenantId), {
+        bundle: data.bundle as TenantBundle,
+        fetchedAt: Date.now(),
+      })
       setBundle(data.bundle)
       setLoadError(null)
       setLoadState('ready')
@@ -1306,6 +1350,13 @@ export default function TenantDetailsPage() {
         error instanceof Error ? error.message : 'Unable to load tenant data.'
       if (refresh) {
         setSyncState('fail')
+      } else if (cachedBundle) {
+        // A previously verified snapshot is safer and more useful than
+        // replacing the page with an error during a transient request failure.
+        console.warn('Unable to refresh saved tenant data; showing cached data.', error)
+        setBundle(cachedBundle)
+        setLoadError(message)
+        setLoadState('ready')
       } else {
         setLoadError(message)
         setLoadState('error')
@@ -1407,6 +1458,26 @@ export default function TenantDetailsPage() {
   }, [pathname, resolvedTenantId, routeState.canonicalPath, router])
   const [userSearch, setUserSearch] = useState('')
   const [selectedUser, setSelectedUser] = useState<TenantUser | null>(null)
+  const selectedUserSignIns = useMemo(() => {
+    if (!selectedUser) return []
+    const email = selectedUser.email.trim().toLowerCase()
+    return SIGNINS.filter((event) => {
+      const eventUserId = String(event.userId ?? '')
+      const eventEmail = String(event.userPrincipalName ?? '').toLowerCase()
+      return eventUserId === selectedUser.id || (email !== '' && eventEmail === email)
+    })
+      .sort(
+        (left, right) =>
+          new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()
+      )
+      .slice(0, 5)
+  }, [SIGNINS, selectedUser])
+  const latestSuccessfulSignIn = selectedUserSignIns.find(
+    (event) => event.result === 'Success'
+  )
+  const latestFailedSignIn = selectedUserSignIns.find(
+    (event) => event.result === 'Failure'
+  )
   const [userSortField, setUserSortField] = useState<UserSortField>('name')
   const [userSortOrder, setUserSortOrder] = useState<UserSortOrder>('asc')
   const [userRoleFilter, setUserRoleFilter] = useState<UserRoleFilter>('all')
@@ -4502,25 +4573,106 @@ export default function TenantDetailsPage() {
                     <User className="h-5 w-5 text-slate-700" />
                   </div>
                 </div>
+                <div className="mt-3">
+                  <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    User ID
+                  </div>
+                  <CopyPill value={selectedUser.id} />
+                </div>
               </div>
 
               {/* Quick stats */}
               <div className="grid grid-cols-2 gap-4">
                 <div className="rounded-xl border bg-slate-50 p-4">
                   <div className="text-xs text-muted-foreground">
-                    Last login
+                    Latest successful sign-in
                   </div>
                   <div className="text-sm font-semibold">
-                    {selectedUser.lastLogin}
+                    {formatUserDateTime(
+                      latestSuccessfulSignIn?.createdAt || selectedUser.lastLogin
+                    )}
                   </div>
                 </div>
                 <div className="rounded-xl border bg-slate-50 p-4">
                   <div className="text-xs text-muted-foreground">
-                    Auth methods
+                    Latest failed sign-in
                   </div>
                   <div className="text-sm font-semibold">
-                    {selectedUser?.authMethods?.length ?? 0}
+                    {formatUserDateTime(latestFailedSignIn?.createdAt)}
                   </div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border bg-white p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-900">
+                      Recent sign-ins
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      Saved tenant activity associated with this user.
+                    </div>
+                  </div>
+                  <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
+                    {selectedUserSignIns.length}
+                  </Badge>
+                </div>
+                <div className="mt-3 space-y-2">
+                  {selectedUserSignIns.length ? (
+                    selectedUserSignIns.map((event) => (
+                      <div
+                        key={event.id}
+                        className="rounded-xl border bg-muted/20 px-3 py-2"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0 text-sm font-medium truncate">
+                            {event.appDisplayName || 'Microsoft 365'}
+                          </div>
+                          <Badge
+                            className={
+                              event.result === 'Success'
+                                ? 'bg-green-50 text-green-700 border border-green-200'
+                                : 'bg-red-50 text-red-700 border border-red-200'
+                            }
+                          >
+                            {event.result}
+                          </Badge>
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {formatUserDateTime(event.createdAt)} · {event.ipAddress || 'IP not provided'}
+                          {event.city || event.country
+                            ? ` · ${[event.city, event.country].filter(Boolean).join(', ')}`
+                            : ''}
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-sm text-muted-foreground">
+                      No saved sign-in activity is available for this user.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border bg-white p-4">
+                <div className="text-sm font-semibold text-slate-900">
+                  Authentication methods
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {selectedUser.authMethods?.length ? (
+                    selectedUser.authMethods.map((method) => (
+                      <Badge
+                        key={method}
+                        className="bg-blue-50 text-blue-700 border border-blue-200"
+                      >
+                        {method}
+                      </Badge>
+                    ))
+                  ) : (
+                    <span className="text-sm text-muted-foreground">
+                      Authentication methods were not reported for this user.
+                    </span>
+                  )}
                 </div>
               </div>
 
