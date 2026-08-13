@@ -1,5 +1,6 @@
 import { notFound } from 'next/navigation'
-import { AdminPanelPage, isAdminTab } from '../../settings/team/page'
+import { isAdminTab } from '@/lib/admin-tabs'
+import { AdminPanelPage } from '../../settings/team/page'
 
 export default function AdminTabPage({
   params,
