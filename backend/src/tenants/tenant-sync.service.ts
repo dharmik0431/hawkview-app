@@ -25,7 +25,6 @@ import {
 } from './ip-geolocation.service.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 
-const TENANT_ADMIN_ROLES = ['MSP_OWNER', 'MSP_ADMIN'] as const
 const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
 const MANAGEMENT_ACTIVITY_SOURCE = 'MICROSOFT_365_MANAGEMENT_ACTIVITY'
@@ -339,62 +338,6 @@ export class TenantSyncService {
     private readonly notifications: NotificationsService
   ) {}
 
-  private async getAuthorizedTenant(
-    identity: AuthenticatedIdentity,
-    customerTenantId: string
-  ) {
-    const user = await this.prisma.user.findUnique({
-      where: { authProviderUserId: identity.subject },
-      select: {
-        disabledAt: true,
-        memberships: {
-          where: {
-            status: 'ACTIVE',
-            role: { in: [...TENANT_ADMIN_ROLES] },
-            organization: { status: 'ACTIVE' },
-          },
-          select: { organizationId: true },
-        },
-      },
-    })
-    if (!user || user.disabledAt) {
-      throw new ForbiddenException(
-        'This HawkView account cannot access tenants.'
-      )
-    }
-
-    const organizationIds = user.memberships.map(
-      (membership) => membership.organizationId
-    )
-    const tenant = await this.prisma.customerTenant.findFirst({
-      where: {
-        id: customerTenantId,
-        organizationId: { in: organizationIds },
-      },
-      select: {
-        id: true,
-        organizationId: true,
-        microsoftTenantId: true,
-        displayName: true,
-        primaryDomain: true,
-        status: true,
-        connection: {
-          select: {
-            status: true,
-            connectionMode: true,
-            clientId: true,
-            credentialReference: true,
-            lastVerifiedAt: true,
-          },
-        },
-      },
-    })
-    if (!tenant) {
-      throw new NotFoundException('Customer tenant was not found.')
-    }
-    return tenant
-  }
-
   private async getReadableTenant(
     identity: AuthenticatedIdentity,
     customerTenantId: string
@@ -457,7 +400,9 @@ export class TenantSyncService {
     identity: AuthenticatedIdentity,
     customerTenantId: string
   ) {
-    const tenant = await this.getAuthorizedTenant(identity, customerTenantId)
+    // Any active workspace member can refresh data for an existing tenant.
+    // Tenant creation and deletion remain restricted by TenantsService.
+    const tenant = await this.getReadableTenant(identity, customerTenantId)
     const result = await this.syncConnectedTenant(tenant, true)
     return result.bundle
   }

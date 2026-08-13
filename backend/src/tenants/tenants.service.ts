@@ -21,9 +21,15 @@ import {
 } from './tenant-health.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 
-const ORGANIZATION_WIDE_TENANT_ROLES = [
+const TENANT_DELETION_ROLES = [
   MembershipRole.MSP_OWNER,
   MembershipRole.MSP_ADMIN,
+] as const
+
+const TENANT_ONBOARDING_ROLES = [
+  MembershipRole.MSP_OWNER,
+  MembershipRole.MSP_ADMIN,
+  MembershipRole.MSP_TECHNICIAN,
 ] as const
 
 const MICROSOFT_TENANT_ID_PATTERN =
@@ -116,7 +122,11 @@ export class TenantsService {
     return user.memberships.map((membership) => membership.organizationId)
   }
 
-  private async getManagedOrganizationIds(identity: AuthenticatedIdentity) {
+  private async getOrganizationIdsForRoles(
+    identity: AuthenticatedIdentity,
+    roles: readonly MembershipRole[],
+    action: string
+  ) {
     const user = await this.prisma.user.findUnique({
       where: { authProviderUserId: identity.subject },
       select: {
@@ -124,7 +134,7 @@ export class TenantsService {
         memberships: {
           where: {
             status: 'ACTIVE',
-            role: { in: [...ORGANIZATION_WIDE_TENANT_ROLES] },
+            role: { in: [...roles] },
             organization: { status: 'ACTIVE' },
           },
           select: { organizationId: true },
@@ -134,7 +144,7 @@ export class TenantsService {
 
     if (!user) {
       throw new ForbiddenException(
-        'Complete HawkView account setup before managing tenants.'
+        `Complete HawkView account setup before ${action}.`
       )
     }
     if (user.disabledAt) {
@@ -142,6 +152,22 @@ export class TenantsService {
     }
 
     return user.memberships.map((membership) => membership.organizationId)
+  }
+
+  private getTenantDeletionOrganizationIds(identity: AuthenticatedIdentity) {
+    return this.getOrganizationIdsForRoles(
+      identity,
+      TENANT_DELETION_ROLES,
+      'removing tenants'
+    )
+  }
+
+  private getTenantOnboardingOrganizationIds(identity: AuthenticatedIdentity) {
+    return this.getOrganizationIdsForRoles(
+      identity,
+      TENANT_ONBOARDING_ROLES,
+      'onboarding tenants'
+    )
   }
 
   private mapTenant(tenant: {
@@ -248,7 +274,7 @@ export class TenantsService {
     identity: AuthenticatedIdentity,
     customerTenantId: string
   ) {
-    const organizationIds = await this.getManagedOrganizationIds(identity)
+    const organizationIds = await this.getAccessibleOrganizationIds(identity)
     const tenant = await this.prisma.customerTenant.findFirst({
       where: {
         id: customerTenantId,
@@ -476,11 +502,11 @@ export class TenantsService {
   async createForIdentity(identity: AuthenticatedIdentity, body: unknown) {
     const input = this.parseCreateTenant(body)
     const { microsoftTenantId } = input
-    const organizationIds = await this.getManagedOrganizationIds(identity)
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
 
     if (organizationIds.length === 0) {
       throw new ForbiddenException(
-        'Only an MSP Owner or Admin can onboard a tenant.'
+        'Only an MSP Owner, Admin, or Technician can onboard a tenant.'
       )
     }
     if (organizationIds.length > 1) {
@@ -615,7 +641,7 @@ export class TenantsService {
     customerTenantId: string,
     body: unknown
   ) {
-    const organizationIds = await this.getManagedOrganizationIds(identity)
+    const organizationIds = await this.getTenantDeletionOrganizationIds(identity)
     const tenant = await this.prisma.customerTenant.findFirst({
       where: {
         id: customerTenantId,
@@ -694,7 +720,7 @@ export class TenantsService {
     identity: AuthenticatedIdentity,
     customerTenantId: string
   ) {
-    const organizationIds = await this.getManagedOrganizationIds(identity)
+    const organizationIds = await this.getAccessibleOrganizationIds(identity)
     const tenant = await this.prisma.customerTenant.findFirst({
       where: {
         id: customerTenantId,
@@ -747,10 +773,10 @@ export class TenantsService {
   }
 
   async createManagedOnboardingUrlForIdentity(identity: AuthenticatedIdentity) {
-    const organizationIds = await this.getManagedOrganizationIds(identity)
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
     if (organizationIds.length === 0) {
       throw new ForbiddenException(
-        'Only an MSP Owner or Admin can onboard a tenant.'
+        'Only an MSP Owner, Admin, or Technician can onboard a tenant.'
       )
     }
     if (organizationIds.length > 1) {
