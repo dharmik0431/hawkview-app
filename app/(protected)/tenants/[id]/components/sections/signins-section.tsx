@@ -1,6 +1,7 @@
 'use client'
 
 import { useMemo, useState, useEffect } from 'react'
+import maplibregl from 'maplibre-gl'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -200,13 +201,8 @@ export default function SignInActivitySection({
       el.replaceChildren()
       setMapLoadError(null)
 
-      const initMap = async () => {
+      const initMap = () => {
         try {
-          const maplibreModule = await import('maplibre-gl')
-          // Next can expose this ESM package either as `default` or directly,
-          // depending on the preview/build runtime. Supporting both prevents a
-          // silent blank map when the module shape differs.
-          const maplibregl = (maplibreModule.default ?? maplibreModule) as any
           if (typeof maplibregl?.Map !== 'function') {
             throw new Error('Map library loaded without a Map constructor.')
           }
@@ -316,7 +312,7 @@ export default function SignInActivitySection({
         }
       }
 
-      void initMap()
+      initMap()
     }, 100)
 
     return () => {
