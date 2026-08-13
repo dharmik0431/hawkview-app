@@ -105,6 +105,13 @@ function formatLocation(event: SignInEvent): string {
   return Array.from(new Set(parts)).join(', ') || 'Location unavailable'
 }
 
+function fallbackMapPosition(latitude: number, longitude: number) {
+  return {
+    left: `${Math.min(99, Math.max(1, ((longitude + 180) / 360) * 100))}%`,
+    top: `${Math.min(98, Math.max(2, ((90 - latitude) / 180) * 100))}%`,
+  }
+}
+
 export default function SignInActivitySection({
   signIns,
   signInView,
@@ -171,6 +178,32 @@ export default function SignInActivitySection({
     return mappedEvents.filter((e) => e.result === 'Failure').length
   }, [mappedEvents])
 
+  const fallbackMapPoints = useMemo(() => {
+    const points = new Map<
+      string,
+      { event: SignInEvent; count: number; hasFailure: boolean }
+    >()
+
+    for (const event of mappedEvents) {
+      // Group nearby events so a busy tenant does not create hundreds of
+      // overlapping fallback markers.
+      const key = `${event.latitude.toFixed(1)}:${event.longitude.toFixed(1)}`
+      const existing = points.get(key)
+      if (existing) {
+        existing.count += 1
+        existing.hasFailure ||= event.result === 'Failure'
+      } else {
+        points.set(key, {
+          event,
+          count: 1,
+          hasFailure: event.result === 'Failure',
+        })
+      }
+    }
+
+    return Array.from(points.values())
+  }, [mappedEvents])
+
   // Table pagination
   const totalPages = Math.max(1, Math.ceil(filteredSignIns.length / pageSize))
   const paginatedSignIns = useMemo(() => {
@@ -188,6 +221,8 @@ export default function SignInActivitySection({
     let map: any = null
     let markers: any[] = []
     let disposed = false
+    let mapLoaded = false
+    let readinessTimer: ReturnType<typeof setTimeout> | null = null
 
     const timer = setTimeout(() => {
       const el = document.getElementById('entra-signins-map-container')
@@ -241,8 +276,23 @@ export default function SignInActivitySection({
             'top-right'
           )
 
+          // In embedded previews, WebGL can fail without throwing from the
+          // constructor. Detect that case rather than leaving a blank panel.
+          readinessTimer = setTimeout(() => {
+            if (!disposed && !mapLoaded) {
+              setMapLoadError(
+                'The interactive map renderer did not become ready in this browser.'
+              )
+              try {
+                map?.remove()
+              } catch {}
+            }
+          }, 5000)
+
           map.on('load', () => {
             if (disposed) return
+            mapLoaded = true
+            if (readinessTimer) clearTimeout(readinessTimer)
 
             mappedEvents.forEach((e) => {
               const dot = document.createElement('div')
@@ -319,6 +369,7 @@ export default function SignInActivitySection({
     return () => {
       disposed = true
       clearTimeout(timer)
+      if (readinessTimer) clearTimeout(readinessTimer)
       for (const m of markers) m.remove()
       markers = []
       if (map) {
@@ -610,25 +661,51 @@ export default function SignInActivitySection({
               />
 
               {mapLoadError && mappedEvents.length > 0 && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-50/95 dark:bg-slate-900/95 rounded-xl p-6 text-center">
-                  <Globe className="h-10 w-10 text-amber-500 mb-2" />
-                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    The sign-in map could not load
-                  </p>
-                  <p className="text-xs text-muted-foreground max-w-md mt-1">
-                    Your mapped sign-in events are still available in List view.
-                    Retry the map, or check the browser console for the loading
-                    diagnostic.
-                  </p>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="mt-4"
-                    onClick={() => setMapRetry((attempt) => attempt + 1)}
-                  >
-                    Retry map
-                  </Button>
+                <div className="absolute inset-0 overflow-hidden rounded-xl bg-slate-100 dark:bg-slate-950">
+                  <div
+                    aria-label="Fallback geographic plot of mapped sign-in activity"
+                    className="absolute inset-0 opacity-80"
+                    style={{
+                      backgroundImage:
+                        'linear-gradient(rgba(100,116,139,.18) 1px, transparent 1px), linear-gradient(90deg, rgba(100,116,139,.18) 1px, transparent 1px), radial-gradient(ellipse at center, rgba(59,130,246,.14), transparent 65%)',
+                      backgroundSize: '100% 16.66%, 8.33% 100%, 100% 100%',
+                    }}
+                  />
+                  {fallbackMapPoints.map(({ event, count, hasFailure }) => (
+                    <div
+                      key={`${event.latitude}:${event.longitude}`}
+                      title={`${formatLocation(event)} — ${count} sign-in event${count === 1 ? '' : 's'}`}
+                      className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-md ${hasFailure ? 'bg-red-500' : 'bg-emerald-500'}`}
+                      style={{
+                        ...fallbackMapPosition(event.latitude, event.longitude),
+                        width: count > 9 ? 18 : 12,
+                        height: count > 9 ? 18 : 12,
+                      }}
+                    >
+                      {count > 9 && (
+                        <span className="absolute inset-0 flex items-center justify-center text-[7px] font-bold text-white">
+                          {count > 99 ? '99+' : count}
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                  <div className="absolute left-4 top-4 z-20 max-w-sm rounded-lg border border-amber-200 bg-white/95 p-3 shadow-sm dark:border-amber-900 dark:bg-slate-900/95">
+                    <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      Interactive map unavailable — showing location plot
+                    </p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      {mapLoadError} Green markers are successful sign-ins; red markers include failures.
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="mt-2 h-7 text-xs"
+                      onClick={() => setMapRetry((attempt) => attempt + 1)}
+                    >
+                      Retry interactive map
+                    </Button>
+                  </div>
                 </div>
               )}
 
