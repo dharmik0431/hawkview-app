@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
+import { type AdminTab, adminTabs } from '@/lib/admin-tabs'
 import {
   Activity,
   AlertCircle,
@@ -104,27 +105,6 @@ type NotificationPref = {
   emailEnabled: boolean
   minimumSeverity: 'info' | 'low' | 'medium' | 'high' | 'critical'
   digestMode: 'off' | 'daily' | 'weekly'
-}
-
-export type AdminTab =
-  | 'overview'
-  | 'users'
-  | 'workspace'
-  | 'security'
-  | 'notifications'
-  | 'audit'
-
-export const adminTabs: AdminTab[] = [
-  'overview',
-  'users',
-  'workspace',
-  'security',
-  'notifications',
-  'audit',
-]
-
-export function isAdminTab(value: string): value is AdminTab {
-  return adminTabs.includes(value as AdminTab)
 }
 
 type SortField = 'member' | 'role' | 'status' | 'createdAt'
