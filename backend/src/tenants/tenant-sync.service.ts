@@ -110,6 +110,39 @@ function parseCsvRows(csv: string): Record<string, string>[] {
   )
 }
 
+/**
+ * Microsoft usage reports use human-readable CSV headers and can use a UPN,
+ * primary SMTP address, or proxy address for the same mailbox. Normalize those
+ * values once so enrichment never depends on a particular report header or
+ * address casing.
+ */
+function normalizeExchangeIdentity(value: unknown) {
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/^smtp:/i, '').toLowerCase()
+}
+
+function usageValue(row: Record<string, string> | undefined, ...names: string[]) {
+  if (!row) return undefined
+  const expected = new Set(names.map((name) => name.trim().toLowerCase()))
+  for (const [key, value] of Object.entries(row)) {
+    if (expected.has(key.trim().toLowerCase())) return value
+  }
+  return undefined
+}
+
+function parseUsageNumber(value: unknown) {
+  if (typeof value !== 'string' || !value.trim()) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function parseUsageBoolean(value: unknown) {
+  if (typeof value !== 'string') return null
+  if (/^(yes|true|active)$/i.test(value.trim())) return true
+  if (/^(no|false|inactive)$/i.test(value.trim())) return false
+  return null
+}
+
 function normalizeSharePointUrl(value: unknown) {
   if (typeof value !== 'string') return ''
   const raw = value.trim()
@@ -3462,7 +3495,7 @@ export class TenantSyncService {
     const exchangeMailboxRules =
       snapshotByResource.get('EXCHANGE_MAILBOX_RULES') ?? []
     const domainDnsHealth = snapshotByResource.get('DOMAIN_DNS_HEALTH') ?? []
-    const exchangeUsageByUpn = new Map<string, Record<string, string>>()
+    const exchangeUsageByIdentity = new Map<string, Record<string, string>>()
     for (const row of exchangeMailboxUsage as Array<Record<string, string>>) {
       for (const field of [
         'User Principal Name',
@@ -3470,10 +3503,8 @@ export class TenantSyncService {
         'Owner Principal Name',
         'Email Address',
       ]) {
-        const identity = row?.[field]
-        if (typeof identity === 'string' && identity.trim()) {
-          exchangeUsageByUpn.set(identity.trim().toLowerCase(), row)
-        }
+        const identity = normalizeExchangeIdentity(usageValue(row, field))
+        if (identity) exchangeUsageByIdentity.set(identity, row)
       }
     }
     const exchangeConfigurationByIdentity = new Map<string, any>()
@@ -3872,7 +3903,7 @@ export class TenantSyncService {
           const lastSignIn = latestSignInByUserId.get(user.microsoftUserId)
           const normalizedUpn = user.userPrincipalName.toLowerCase()
           const oneDrive = oneDriveUsageByUpn.get(normalizedUpn)
-          const mailboxUsage = exchangeUsageByUpn.get(normalizedUpn)
+          const mailboxUsage = exchangeUsageByIdentity.get(normalizedUpn)
           return {
             id: user.microsoftUserId,
             name: user.displayName,
@@ -4025,8 +4056,30 @@ export class TenantSyncService {
                 enrichedMailbox.WindowsEmailAddress ??
                 directoryUpn
             )
-            const usage = exchangeUsageByUpn.get(upn.toLowerCase())
-            const storageBytes = Number(usage?.['Storage Used (Byte)'])
+            const emailAddresses = Array.isArray(enrichedMailbox.EmailAddresses)
+              ? enrichedMailbox.EmailAddresses
+              : []
+            const mailboxIdentities = [
+              mailbox.id,
+              directoryUpn,
+              upn,
+              enrichedMailbox.PrimarySmtpAddress,
+              enrichedMailbox.WindowsEmailAddress,
+              enrichedMailbox.mail,
+              ...(Array.isArray(mailbox.proxyAddresses) ? mailbox.proxyAddresses : []),
+              ...emailAddresses,
+            ]
+              .map(normalizeExchangeIdentity)
+              .filter(Boolean)
+            const usage = mailboxIdentities
+              .map((identity) => exchangeUsageByIdentity.get(identity))
+              .find(Boolean)
+            const storageBytes = parseUsageNumber(
+              usageValue(usage, 'Storage Used (Byte)', 'Storage Used Bytes')
+            )
+            const itemCount = parseUsageNumber(
+              usageValue(usage, 'Item Count', 'Items Count')
+            )
             const recipientType =
               enrichedMailbox.RecipientTypeDetails ??
               enrichedMailbox.RecipientType ??
@@ -4041,9 +4094,6 @@ export class TenantSyncService {
                     : recipientType.includes('Equipment')
                       ? 'Equipment'
                       : 'User'
-            const emailAddresses = Array.isArray(enrichedMailbox.EmailAddresses)
-              ? enrichedMailbox.EmailAddresses
-              : []
             return {
               id: String(
                 enrichedMailbox.ExternalDirectoryObjectId ??
@@ -4071,10 +4121,10 @@ export class TenantSyncService {
                 )
                 .map((address: string) => address.slice(5)),
               mailboxType,
-              sizeGB: Number.isFinite(storageBytes)
+              sizeGB: storageBytes !== null
                 ? Math.round((storageBytes / 1024 ** 3) * 100) / 100
                 : null,
-              itemCount: Number(usage?.['Item Count']) || null,
+              itemCount,
               archiveEnabled: configurationCollected
                 ? String(enrichedMailbox.ArchiveStatus ?? '').toLowerCase() ===
                     'active' ||
@@ -4082,7 +4132,7 @@ export class TenantSyncService {
                     enrichedMailbox.ArchiveGuid &&
                     !String(enrichedMailbox.ArchiveGuid).startsWith('00000000')
                   )
-                : null,
+                : parseUsageBoolean(usageValue(usage, 'Has Archive')),
               retentionLabel:
                 enrichedMailbox.RetentionPolicy ??
                 enrichedMailbox.RetentionHoldEnabled ??
@@ -4105,7 +4155,7 @@ export class TenantSyncService {
                 ),
                 usage: collectionState(
                   'exchange.mailboxes.usage',
-                  Number.isFinite(storageBytes) ? storageBytes : null
+                  storageBytes
                 ),
               },
             }

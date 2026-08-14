@@ -13,6 +13,12 @@ export function classifyCollectionFailure(message: string | null | undefined): {
   reasonCode: string
 } {
   const text = (message ?? '').toLowerCase()
+  if (/recipient management|exchange rbac|exchange role/.test(text)) {
+    return {
+      state: 'PERMISSION_REQUIRED',
+      reasonCode: 'EXCHANGE_RBAC_ROLE_REQUIRED',
+    }
+  }
   if (/license|premium|subscription|not licensed/.test(text)) {
     return { state: 'NOT_LICENSED', reasonCode: 'MICROSOFT_LICENSE_REQUIRED' }
   }

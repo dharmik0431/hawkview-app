@@ -23,6 +23,9 @@ type CollectionState = {
 
 function collectionLabel(field?: CollectionState) {
   if (field?.isStale || field?.state === 'STALE') return 'Last value is stale'
+  if (/recipient management|exchange rbac|exchange role/i.test(field?.message ?? '')) {
+    return 'Exchange access role required'
+  }
   switch (field?.state) {
     case 'AVAILABLE': return 'Available'
     case 'PENDING': return 'Sync pending'
@@ -31,7 +34,7 @@ function collectionLabel(field?: CollectionState) {
     case 'UNSUPPORTED': return 'Not available from Microsoft'
     case 'NOT_CONFIGURED': return 'Not configured'
     case 'FAILED': return 'Collection failed'
-    default: return 'Sync pending'
+    default: return 'Unavailable'
   }
 }
 
@@ -173,7 +176,7 @@ export default function ExchangePage({
                     EXCHANGE_MAILBOXES.filter(
                       (m: any) => m.mailboxType === 'User'
                     ).length,
-                    mailboxCollection.inventory
+                    mailboxCollection.configuration
                   )}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
@@ -201,7 +204,7 @@ export default function ExchangePage({
                     EXCHANGE_MAILBOXES.filter(
                       (m: any) => m.mailboxType === 'Shared'
                     ).length,
-                    mailboxCollection.inventory
+                    mailboxCollection.configuration
                   )}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">

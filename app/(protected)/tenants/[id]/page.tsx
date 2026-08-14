@@ -4867,26 +4867,30 @@ export default function TenantDetailsPage() {
 
                     <Badge
                       className={
-                        selectedMailbox.archiveEnabled
+                        selectedMailbox.archiveEnabled === true
                           ? 'bg-green-50 text-green-700 border border-green-200'
-                          : 'bg-orange-50 text-orange-700 border border-orange-200'
+                          : selectedMailbox.archiveEnabled === false
+                            ? 'bg-orange-50 text-orange-700 border border-orange-200'
+                            : 'bg-slate-50 text-slate-600 border border-slate-200'
                       }
                     >
-                      {selectedMailbox.archiveEnabled
+                      {selectedMailbox.archiveEnabled === true
                         ? 'Archive enabled'
-                        : 'No archive'}
+                        : selectedMailbox.archiveEnabled === false
+                          ? 'No archive'
+                          : 'Archive not collected'}
                     </Badge>
 
                     <Badge
                       className={
                         selectedMailbox.retentionLabel
                           ? 'bg-blue-50 text-blue-700 border border-blue-200'
-                          : 'bg-red-50 text-red-700 border border-red-200'
+                          : 'bg-slate-50 text-slate-600 border border-slate-200'
                       }
                     >
                       {selectedMailbox.retentionLabel
                         ? 'Retention applied'
-                        : 'No retention'}
+                        : 'Retention not collected'}
                     </Badge>
                   </div>
                 </div>
@@ -4920,7 +4924,7 @@ export default function TenantDetailsPage() {
                   </div>
                   <div className="text-sm font-semibold">
                     {mailboxNumber(selectedMailbox.sizeGB) === null
-                      ? 'Awaiting collection'
+                      ? 'Not reported by Microsoft'
                       : `${mailboxNumber(selectedMailbox.sizeGB)!.toFixed(1)} GB`}
                   </div>
                 </div>
@@ -4931,7 +4935,7 @@ export default function TenantDetailsPage() {
                   </div>
                   <div className="text-sm font-semibold">
                     {mailboxNumber(selectedMailbox.itemCount) === null
-                      ? 'Awaiting collection'
+                      ? 'Not reported by Microsoft'
                       : mailboxNumber(
                           selectedMailbox.itemCount
                         )!.toLocaleString()}
