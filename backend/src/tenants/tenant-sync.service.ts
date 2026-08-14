@@ -315,8 +315,19 @@ interface GraphBatchResponse {
 
 function sanitizeGraphErrorField(value: unknown, maxLength: number) {
   if (typeof value !== 'string') return null
-  const sanitized = value.replace(/[\r\n\t]+/g, ' ').trim()
+  // Microsoft error payloads can include NUL/control characters. PostgreSQL
+  // rejects NUL bytes in text columns, so remove them before persistence.
+  const sanitized = value
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
   return sanitized ? sanitized.slice(0, maxLength) : null
+}
+
+function safeErrorMessage(error: unknown, fallback: string, maxLength = 2000) {
+  const raw = error instanceof Error ? error.message : fallback
+  return sanitizeGraphErrorField(raw, maxLength) ?? fallback
 }
 
 async function describeGraphError(response: Response) {
@@ -679,10 +690,10 @@ export class TenantSyncService {
         data: {
           status: 'FAILED',
           lastErrorCode: 'users-sync-failed',
-          lastErrorMessage:
-            error instanceof Error
-              ? error.message.slice(0, 2000)
-              : 'Microsoft users synchronization failed.',
+          lastErrorMessage: safeErrorMessage(
+            error,
+            'Microsoft users synchronization failed.'
+          ),
           consecutiveFailures: { increment: 1 },
         },
       })
@@ -1061,8 +1072,7 @@ export class TenantSyncService {
     tenant: { id: string; organizationId: string },
     error: unknown
   ) {
-    const message =
-      error instanceof Error ? error.message : 'Microsoft tenant access failed.'
+    const message = safeErrorMessage(error, 'Microsoft tenant access failed.')
     const failedAt = new Date()
 
     await this.prisma.$transaction([
@@ -1082,7 +1092,7 @@ export class TenantSyncService {
           consentedPermissions: [],
           lastVerifiedAt: failedAt,
           lastErrorCode: 'microsoft-access-failed',
-          lastErrorMessage: message.slice(0, 2000),
+          lastErrorMessage: message,
         },
       }),
     ])
@@ -1168,10 +1178,10 @@ export class TenantSyncService {
         }
       )
     } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : `Microsoft ${resourceType.toLowerCase()} synchronization failed.`
+      const message = safeErrorMessage(
+        error,
+        `Microsoft ${resourceType.toLowerCase()} synchronization failed.`
+      )
       const state = await this.prisma.syncState.update({
         where: {
           customerTenantId_resourceType: {
@@ -1182,7 +1192,7 @@ export class TenantSyncService {
         data: {
           status: 'FAILED',
           lastErrorCode: `${resourceType.toLowerCase()}-sync-failed`,
-          lastErrorMessage: message.slice(0, 2000),
+          lastErrorMessage: message,
           consecutiveFailures: { increment: 1 },
         },
       })
@@ -2633,11 +2643,29 @@ export class TenantSyncService {
         const rows: unknown[] = []
         let nextUrl = `https://outlook.office365.com/adminapi/v2.0/${encodeURIComponent(tenant.microsoftTenantId)}/Mailbox`
         const anchorMailbox = `APP:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@${tenant.microsoftTenantId}`
+        // Exchange's admin endpoint occasionally returns a continuation URL
+        // that points back to a page it has already served. Without a guard,
+        // the sync never settles and all Exchange fields remain PENDING.
+        const visitedPages = new Set<string>()
+        const deadlineAt = Date.now() + 3 * 60 * 1000
 
         while (nextUrl) {
           if (!nextUrl.startsWith('https://outlook.office365.com/')) {
             throw new Error(
               'Microsoft returned an invalid Exchange pagination link.'
+            )
+          }
+          if (visitedPages.has(nextUrl)) {
+            throw new Error(
+              'Microsoft Exchange returned a repeated mailbox configuration page. Synchronization was stopped to prevent an incomplete endless loop.'
+            )
+          }
+          visitedPages.add(nextUrl)
+
+          const remainingMs = deadlineAt - Date.now()
+          if (remainingMs <= 0) {
+            throw new Error(
+              'Microsoft Exchange mailbox configuration synchronization exceeded the three-minute safety limit.'
             )
           }
           const response = await fetch(nextUrl, {
@@ -2649,7 +2677,7 @@ export class TenantSyncService {
               'X-AnchorMailbox': anchorMailbox,
             },
             body: JSON.stringify(requestBody),
-            signal: AbortSignal.timeout(60_000),
+            signal: AbortSignal.timeout(Math.min(60_000, remainingMs)),
           })
           if (!response.ok) {
             const details = (await response.text()).slice(0, 1_000)
