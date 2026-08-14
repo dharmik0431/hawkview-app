@@ -89,10 +89,23 @@ export default function ExchangePage({
       ? bundle.exchange.acceptedDomains
       : []
   const mailboxCollection = bundle?.exchange?.collection ?? {}
-  const countOrCollection = (count: number, field?: CollectionState) =>
-    field?.state && !['AVAILABLE', 'STALE'].includes(field.state)
+  const countOrCollection = (
+    count: number,
+    field?: CollectionState,
+    hasCollectedMailboxTypes = false
+  ) => {
+    // Mailbox type is collected independently through Microsoft Graph.  Do not
+    // hide a valid Graph-derived count merely because the separate, deeper
+    // Exchange configuration dataset is unavailable.
+    if (hasCollectedMailboxTypes) return count
+    return field?.state && !['AVAILABLE', 'STALE'].includes(field.state)
       ? collectionLabel(field)
       : count
+  }
+
+  const hasCollectedMailboxTypes = EXCHANGE_MAILBOXES.some(
+    (mailbox: any) => typeof mailbox?.mailboxType === 'string'
+  )
 
   const mailboxes = useMemo(() => {
     const base = Array.isArray(EXCHANGE_MAILBOXES) ? EXCHANGE_MAILBOXES : []
@@ -176,7 +189,8 @@ export default function ExchangePage({
                     EXCHANGE_MAILBOXES.filter(
                       (m: any) => m.mailboxType === 'User'
                     ).length,
-                    mailboxCollection.configuration
+                    mailboxCollection.configuration,
+                    hasCollectedMailboxTypes
                   )}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
@@ -204,7 +218,8 @@ export default function ExchangePage({
                     EXCHANGE_MAILBOXES.filter(
                       (m: any) => m.mailboxType === 'Shared'
                     ).length,
-                    mailboxCollection.configuration
+                    mailboxCollection.configuration,
+                    hasCollectedMailboxTypes
                   )}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
