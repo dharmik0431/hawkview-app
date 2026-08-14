@@ -5,6 +5,7 @@ import { Activity, Building2, Cloud, HardDrive, KeyRound, Mail, Settings, Users 
 import { cn } from '@/lib/utils'
 import { formatTenantTimestamp, type TenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 import { getServiceTheme } from './service-theme'
+import type { ServiceSyncFreshness } from '@/types/tenant-data'
 
 const moduleMeta: Record<string, { label: string; purpose: string; icon: typeof Cloud }> = {
   overview: {
@@ -52,9 +53,11 @@ const moduleMeta: Record<string, { label: string; purpose: string; icon: typeof 
 export function ModuleHeader({
   section,
   display,
+  freshness,
 }: {
   section: string
   display: TenantWorkspaceDisplay
+  freshness?: ServiceSyncFreshness | null
 }) {
   const meta = moduleMeta[section] ?? moduleMeta.overview
   const Icon = meta.icon
@@ -67,6 +70,17 @@ export function ModuleHeader({
       : display.isStale
         ? 'Last known data'
         : 'Current dataset'
+
+  const freshnessText = (() => {
+    if (!freshness) return 'Freshness unavailable'
+    if (freshness.status === 'RUNNING') return 'Syncing'
+    if (freshness.status === 'NOT_COLLECTED' || freshness.freshnessStatus === 'NEVER_SYNCED') return 'Never synchronized'
+    if (freshness.status === 'PARTIAL') return `Partial — ${freshness.partialFailures.length} collector${freshness.partialFailures.length === 1 ? '' : 's'} need attention`
+    if (freshness.status === 'FAILED') return 'Collection failed'
+    if (freshness.status === 'STALE' || freshness.freshnessStatus === 'STALE') return 'Stale data'
+    return freshness.lastSuccessfulCollectionAt ? `Updated ${formatTenantTimestamp(freshness.lastSuccessfulCollectionAt)}` : 'Freshness unavailable'
+  })()
+  const freshnessTitle = freshness?.lastSuccessfulCollectionAt ?? undefined
 
   return (
     <div
@@ -96,11 +110,9 @@ export function ModuleHeader({
           <span className="font-semibold text-slate-800 dark:text-slate-200">{dataCoverage}</span>
         </div>
         <div className="h-3.5 w-px bg-slate-200 dark:bg-slate-800" aria-hidden="true" />
-        <div>
-          <span>Last sync: </span>
-          <span className="font-semibold text-slate-800 dark:text-slate-200">
-            {formatTenantTimestamp(display.lastSuccessfulSync)}
-          </span>
+        <div title={freshnessTitle}>
+          <span>Freshness: </span>
+          <span className="font-semibold text-slate-800 dark:text-slate-200">{freshnessText}</span>
         </div>
       </div>
     </div>

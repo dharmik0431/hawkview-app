@@ -37,6 +37,28 @@ export type TenantBundle = {
     auditLogs?: TenantSyncStatus
     [resource: string]: TenantSyncStatus | undefined
   }
+  syncFreshness?: {
+    overallLastSuccessfulAt: string | null
+    services: {
+      office365: ServiceSyncFreshness
+      entraId: ServiceSyncFreshness
+      exchange: ServiceSyncFreshness
+      sharePointOneDrive: ServiceSyncFreshness
+      signInLogs: ServiceSyncFreshness
+      auditLogs: ServiceSyncFreshness
+    }
+  }
+}
+
+export type ServiceSyncFreshness = {
+  service: string
+  status: 'SUCCESS' | 'PARTIAL' | 'RUNNING' | 'PENDING' | 'FAILED' | 'STALE' | 'NOT_COLLECTED' | 'UNKNOWN'
+  freshnessStatus: 'CURRENT' | 'AGING' | 'STALE' | 'NEVER_SYNCED' | 'UNKNOWN'
+  lastAttemptStartedAt: string | null
+  lastAttemptCompletedAt: string | null
+  lastSuccessfulCollectionAt: string | null
+  nextScheduledAttemptAt: string | null
+  partialFailures: Array<{ collector: string; status: string; message: string | null }>
 }
 
 export type TenantSyncStatus = {

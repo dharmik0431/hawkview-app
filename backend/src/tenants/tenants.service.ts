@@ -20,6 +20,10 @@ import {
   deriveTenantHealth,
   type TenantAuditEvent,
 } from './tenant-health.js'
+import {
+  deriveTenantSyncFreshness,
+  type TenantSyncFreshness,
+} from './service-sync-freshness.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 
 const TENANT_DELETION_ROLES = [
@@ -230,6 +234,7 @@ export class TenantsService {
       riskyIdentityCount,
       auditEvents,
     })
+    const syncFreshness = deriveTenantSyncFreshness(tenant.syncStates)
 
     return {
       id: tenant.id,
@@ -262,6 +267,9 @@ export class TenantsService {
         )?.payload,
       ),
       ...health,
+      // Service-level freshness is additive. The legacy lastSync remains for
+      // callers that have not yet moved to the per-service contract.
+      syncFreshness,
       // The named object is the versioned API contract.  The spread above
       // intentionally preserves legacy healthScore/mfaCoverage/attention.
       tenantHealth: health,
@@ -508,7 +516,7 @@ export class TenantsService {
     await Promise.all(mappedTenants.map(async (mapped, index) => {
       const tenant = tenants[index]
       if (!tenant) return
-      await this.persistTenantHealthSnapshot(tenant, mapped.tenantHealth)
+      await this.persistTenantHealthSnapshot(tenant, mapped.tenantHealth, mapped.syncFreshness)
     }))
 
     return { tenants: mappedTenants }
@@ -517,18 +525,26 @@ export class TenantsService {
   private async persistTenantHealthSnapshot(
     tenant: { id: string; microsoftTenantId: string; organization: { id: string } },
     health: ReturnType<typeof deriveTenantHealth>,
+    syncFreshness: TenantSyncFreshness,
   ) {
     try {
       const previous = await this.prisma.tenantHealthSnapshot.findFirst({
         where: { organizationId: tenant.organization.id, customerTenantId: tenant.id },
         orderBy: { evaluatedAt: 'desc' },
-        select: { overallStatus: true, evaluatedAt: true },
+        select: { overallStatus: true, evaluatedAt: true, payload: true },
       })
       const evaluatedAt = new Date(health.evaluatedAt)
+      const currentSignature = JSON.stringify(Object.values(syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
+      const previousPayload = previous?.payload as { syncFreshness?: TenantSyncFreshness } | null
+      const previousSignature = previousPayload?.syncFreshness
+        ? JSON.stringify(Object.values(previousPayload.syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
+        : null
       // Keep evidence history without producing a row on every tenant-list poll.
-      if (previous?.overallStatus === health.overallStatus && evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return
+      if (previous?.overallStatus === health.overallStatus && previousSignature === currentSignature && evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return
       await this.prisma.tenantHealthSnapshot.create({
-        data: { organizationId: tenant.organization.id, customerTenantId: tenant.id, healthModelVersion: health.healthModelVersion, overallStatus: health.overallStatus, payload: health, evaluatedAt },
+        // Preserve the existing health fields for snapshot consumers; freshness
+        // is additive rather than wrapping the prior payload shape.
+        data: { organizationId: tenant.organization.id, customerTenantId: tenant.id, healthModelVersion: health.healthModelVersion, overallStatus: health.overallStatus, payload: { ...health, syncFreshness }, evaluatedAt },
       })
       this.logger.debug({
         event: 'tenant_health_evaluated',
@@ -544,6 +560,12 @@ export class TenantsService {
           security: health.security.status,
           operations: health.operations.status,
         },
+        serviceSyncTransitions: Object.values(syncFreshness.services).map((service) => ({
+          service: service.service,
+          status: service.status,
+          freshnessStatus: service.freshnessStatus,
+          failedCollectors: service.failedCollectors + service.permissionRequiredCollectors,
+        })),
         evaluatedAt: health.evaluatedAt,
       })
     } catch (error) {
