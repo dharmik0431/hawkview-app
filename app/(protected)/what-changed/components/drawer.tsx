@@ -27,6 +27,20 @@ function pretty(obj: any) {
   return JSON.stringify(obj ?? {}, null, 2)
 }
 
+function hasValues(value: Record<string, unknown> | undefined) {
+  return Boolean(value && Object.keys(value).length)
+}
+
+function riskReasons(event: ChangeEvent): string[] {
+  if (event.severity !== 'High') return []
+  if (event.category === 'Passwords') return ['This is high risk because it changed the credentials for a user account. A password reset can immediately change who can access that account.']
+  if (event.category === 'MFA') return ['This is high risk because it changed authentication methods or security information, which can alter MFA protection for an account.']
+  if (event.category === 'Conditional Access') return ['This is high risk because it changed Conditional Access or a named location, which can alter security controls for many users.']
+  if (event.category === 'Apps') return ['This is high risk because it changed an application, credential, or consent, which can grant persistent tenant access.']
+  if (event.category === 'Roles') return ['This is high risk because it changed privileged role membership or administrative access.']
+  return ['This event affects a security-sensitive tenant control and should be reviewed.']
+}
+
 function fmt(ts: string) {
   const d = new Date(ts)
   if (isNaN(d.getTime())) return '—'
@@ -744,8 +758,44 @@ function NonAppEventDetails({
   copiedSection: string | null
   copyToClipboard: (text: string, label: string) => void
 }) {
+  const beforeAvailable = hasValues(event.before)
+  const afterAvailable = hasValues(event.after)
+  const riskRationale = riskReasons(event)
+  const missingEvidence = [
+    ...(!beforeAvailable ? ['Microsoft did not include a before-state payload for this audit event.'] : []),
+    ...(!afterAvailable ? ['Microsoft did not include an after-state payload for this audit event.'] : []),
+    ...(!event.ip ? ['Microsoft did not include an IP address for this audit event.'] : []),
+    ...(!event.location?.city && !event.location?.region && !event.location?.country ? ['Microsoft did not include a location for this audit event.'] : []),
+    ...(event.actor?.toLowerCase().includes('microsoft') && event.actor.toLowerCase().includes('service') ? ['The actor is a Microsoft service, not a named administrator. Use the correlation ID and nearby sign-ins to determine who initiated the action.'] : []),
+  ]
   return (
     <>
+      {(riskRationale.length > 0 || missingEvidence.length > 0) && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs space-y-3">
+          {riskRationale.length > 0 && (
+            <div>
+              <div className="flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-400">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span>Why HawkView marked this a high-risk change</span>
+              </div>
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-muted-foreground">
+                {riskRationale.map((reason) => <li key={reason} className="leading-relaxed">{reason}</li>)}
+              </ul>
+            </div>
+          )}
+          {missingEvidence.length > 0 && (
+            <div className={riskRationale.length ? 'border-t border-amber-500/20 pt-3' : ''}>
+              <div className="flex items-center gap-2 font-semibold text-foreground">
+                <Info className="h-4 w-4 shrink-0" />
+                <span>Information unavailable in this Microsoft event</span>
+              </div>
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-muted-foreground">
+                {missingEvidence.map((gap) => <li key={gap} className="leading-relaxed">{gap}</li>)}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
       {/* Event Metadata Grid */}
       <div className="rounded-xl border border-border bg-card p-4 space-y-3 shadow-xs">
         <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -823,7 +873,7 @@ function NonAppEventDetails({
           <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             State Before Change
           </h3>
-          <Button
+          {beforeAvailable && <Button
             type="button"
             variant="ghost"
             size="sm"
@@ -832,11 +882,13 @@ function NonAppEventDetails({
           >
             {copiedSection === 'before' ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
             <span>{copiedSection === 'before' ? 'Copied' : 'Copy'}</span>
-          </Button>
+          </Button>}
         </div>
-        <pre className="text-xs font-mono rounded-lg border border-border bg-muted/40 p-3 overflow-x-auto whitespace-pre-wrap break-all text-foreground max-h-60 leading-relaxed">
-          {pretty(event.before)}
-        </pre>
+        {beforeAvailable ? (
+          <pre className="text-xs font-mono rounded-lg border border-border bg-muted/40 p-3 overflow-x-auto whitespace-pre-wrap break-all text-foreground max-h-60 leading-relaxed">{pretty(event.before)}</pre>
+        ) : (
+          <div className="text-xs rounded-lg border border-dashed border-border bg-muted/20 p-3 text-muted-foreground">No before-state payload was supplied by Microsoft for this audit event.</div>
+        )}
       </div>
 
       {/* After State */}
@@ -845,7 +897,7 @@ function NonAppEventDetails({
           <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             State After Change
           </h3>
-          <Button
+          {afterAvailable && <Button
             type="button"
             variant="ghost"
             size="sm"
@@ -854,11 +906,13 @@ function NonAppEventDetails({
           >
             {copiedSection === 'after' ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
             <span>{copiedSection === 'after' ? 'Copied' : 'Copy'}</span>
-          </Button>
+          </Button>}
         </div>
-        <pre className="text-xs font-mono rounded-lg border border-border bg-muted/40 p-3 overflow-x-auto whitespace-pre-wrap break-all text-foreground max-h-60 leading-relaxed">
-          {pretty(event.after)}
-        </pre>
+        {afterAvailable ? (
+          <pre className="text-xs font-mono rounded-lg border border-border bg-muted/40 p-3 overflow-x-auto whitespace-pre-wrap break-all text-foreground max-h-60 leading-relaxed">{pretty(event.after)}</pre>
+        ) : (
+          <div className="text-xs rounded-lg border border-dashed border-border bg-muted/20 p-3 text-muted-foreground">No after-state payload was supplied by Microsoft for this audit event.</div>
+        )}
       </div>
 
       {/* Recovery Guidance if available */}
