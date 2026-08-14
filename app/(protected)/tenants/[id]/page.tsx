@@ -24,7 +24,7 @@ import SharePointPage from './components/sections/sharepoint-section'
 import { TenantBlade } from './components/tenant-blade'
 import { TenantOverview } from './components/tenant-overview'
 import TenantSettingsPage from './settings/page'
-import { deriveTenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
+import { deriveTenantWorkspaceDisplay, formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import {
   parseTenantPath,
   tenantEntraPath,
@@ -1966,6 +1966,26 @@ export default function TenantDetailsPage() {
       : section === 'settings'
         ? 'Tenant authorization, connection credentials, and Microsoft consent management.'
         : 'Manage configuration and view reports.'
+
+  const freshnessKey =
+    section === 'home' ? 'office365'
+      : section === 'entra' ? 'entraId'
+        : section === 'exchange' ? 'exchange'
+          : section === 'sharepoint' ? 'sharePointOneDrive'
+            : null
+  const serviceFreshness = freshnessKey ? bundle?.tenant?.syncFreshness?.services?.[freshnessKey] : null
+  const serviceFreshnessText = (() => {
+    if (!freshnessKey) return null
+    if (!serviceFreshness) return 'Freshness unavailable'
+    if (serviceFreshness.status === 'RUNNING') return 'Syncing'
+    if (serviceFreshness.status === 'NOT_COLLECTED' || serviceFreshness.freshnessStatus === 'NEVER_SYNCED') return 'Never synchronized'
+    if (serviceFreshness.status === 'PARTIAL') return `Partial — ${serviceFreshness.partialFailures.length} collector${serviceFreshness.partialFailures.length === 1 ? '' : 's'} need attention`
+    if (serviceFreshness.status === 'FAILED') return 'Collection failed'
+    if (serviceFreshness.status === 'STALE' || serviceFreshness.freshnessStatus === 'STALE') return 'Stale data'
+    return serviceFreshness.lastSuccessfulCollectionAt
+      ? `Updated ${formatTenantTimestamp(serviceFreshness.lastSuccessfulCollectionAt)}`
+      : 'Freshness unavailable'
+  })()
 
   const navItems = isMicrosoft
     ? [
@@ -4367,6 +4387,7 @@ export default function TenantDetailsPage() {
                       <SignInActivitySection
                         signIns={SIGNINS}
                         syncStatus={bundle?.sync?.signIns}
+                        freshness={bundle?.tenant?.syncFreshness?.services?.signInLogs}
                         signInView={signInView}
                         onSignInViewChange={handleSignInViewChange}
                       />
@@ -4467,6 +4488,14 @@ export default function TenantDetailsPage() {
                       <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
                         {subheading}
                       </p>
+                      {serviceFreshnessText && (
+                        <p
+                          className="mt-1 text-[11px] font-medium text-slate-500 dark:text-slate-400"
+                          title={serviceFreshness?.lastSuccessfulCollectionAt ?? undefined}
+                        >
+                          Freshness: {serviceFreshnessText}
+                        </p>
+                      )}
                     </div>
                   </div>
 

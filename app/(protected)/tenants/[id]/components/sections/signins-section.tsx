@@ -20,6 +20,7 @@ import {
   AlertTriangle,
 } from 'lucide-react'
 import type { TenantSyncStatus } from '@/types/tenant-data'
+import type { ServiceSyncFreshness } from '@/types/tenant-data'
 
 export type SignInResult = 'Success' | 'Failure'
 
@@ -50,6 +51,7 @@ interface SignInActivitySectionProps {
   signInView: 'list' | 'map'
   onSignInViewChange: (view: 'list' | 'map') => void
   syncStatus?: TenantSyncStatus
+  freshness?: ServiceSyncFreshness | null
 }
 
 function formatSignInTime(dateStr: string) {
@@ -111,6 +113,7 @@ export default function SignInActivitySection({
   signInView,
   onSignInViewChange,
   syncStatus,
+  freshness,
 }: SignInActivitySectionProps) {
   const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
   const [resultFilter, setResultFilter] = useState<
@@ -125,6 +128,19 @@ export default function SignInActivitySection({
       event.isLimited ||
       event.dataSource === 'microsoft-365-management-activity'
   )
+  const freshnessLabel = !freshness
+    ? 'Freshness unavailable'
+    : freshness.status === 'RUNNING'
+      ? 'Syncing'
+      : freshness.status === 'PARTIAL'
+        ? `Partial — ${freshness.partialFailures.length} collector${freshness.partialFailures.length === 1 ? '' : 's'} need attention`
+        : freshness.status === 'STALE' || freshness.freshnessStatus === 'STALE'
+          ? 'Stale'
+          : freshness.status === 'NOT_COLLECTED' || freshness.freshnessStatus === 'NEVER_SYNCED'
+            ? 'Never synchronized'
+            : freshness.lastSuccessfulCollectionAt
+              ? `Updated ${formatSignInTime(freshness.lastSuccessfulCollectionAt)}`
+              : 'Freshness unavailable'
 
   // Filtered dataset shared between Table and Map
   const filteredSignIns = useMemo(() => {
@@ -376,6 +392,9 @@ export default function SignInActivitySection({
             <p className="text-xs text-muted-foreground mt-0.5">
               Monitor real-time directory sign-in events, locations, and
               authentication outcomes.
+            </p>
+            <p className="mt-1 text-xs font-medium text-slate-600 dark:text-slate-300" title={freshness?.lastSuccessfulCollectionAt ?? undefined}>
+              {freshnessLabel}
             </p>
           </div>
 
