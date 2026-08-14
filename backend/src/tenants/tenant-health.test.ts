@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { deriveTenantHealth, type TenantAuditEvent } from './tenant-health'
+import {
+  deriveTenantHealth,
+  TENANT_HEALTH_RESOURCE_REGISTRY,
+  type TenantAuditEvent,
+} from './tenant-health'
 
 function baseInput() {
   return {
@@ -121,4 +125,81 @@ test('removed authentication methods identify the affected user', () => {
 
 test('healthy current state has no action queue findings', () => {
   assert.deepEqual(deriveTenantHealth(baseInput()).attention, [])
+})
+
+function completeCurrentStates(now = new Date('2026-08-13T12:00:00.000Z')) {
+  return TENANT_HEALTH_RESOURCE_REGISTRY.map((resource) => ({
+    resourceType: resource.resourceType,
+    status: 'SUCCEEDED',
+    lastAttemptAt: now,
+    lastSuccessfulAt: now,
+    lastErrorCode: null,
+    lastErrorMessage: null,
+    consecutiveFailures: 0,
+  }))
+}
+
+test('healthy connection, complete current data, and no findings is healthy', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const result = deriveTenantHealth({ ...baseInput(), syncStates: completeCurrentStates(now), now })
+  assert.equal(result.connection.status, 'HEALTHY')
+  assert.equal(result.data.status, 'COMPLETE')
+  assert.equal(result.overallStatus, 'HEALTHY')
+})
+
+test('security recommendations produce attention without changing the connection state', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const result = deriveTenantHealth({
+    ...baseInput(), now, syncStates: completeCurrentStates(now),
+    authSnapshot: { payload: [{ isMfaRegistered: false }, { isMfaRegistered: true }], observedAt: now },
+  })
+  assert.equal(result.connection.status, 'HEALTHY')
+  assert.equal(result.security.status, 'NEEDS_REVIEW')
+  assert.equal(result.overallStatus, 'ATTENTION')
+})
+
+test('optional incomplete collection is attention rather than a connection failure', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const states = completeCurrentStates(now).filter((state) => state.resourceType !== 'SIGN_INS')
+  const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
+  assert.equal(result.connection.status, 'HEALTHY')
+  assert.equal(result.data.status, 'PARTIAL')
+  assert.equal(result.overallStatus, 'ATTENTION')
+})
+
+test('required stale and failed collectors degrade tenant health', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const stale = completeCurrentStates(now).map((state) => state.resourceType === 'USERS' ? { ...state, lastSuccessfulAt: new Date('2026-08-13T08:00:00.000Z') } : state)
+  assert.equal(deriveTenantHealth({ ...baseInput(), now, syncStates: stale }).overallStatus, 'DEGRADED')
+  const failed = completeCurrentStates(now).map((state) => state.resourceType === 'USERS' ? { ...state, status: 'FAILED', lastErrorCode: '500', lastErrorMessage: 'upstream unavailable' } : state)
+  assert.equal(deriveTenantHealth({ ...baseInput(), now, syncStates: failed }).overallStatus, 'DEGRADED')
+})
+
+test('revoked access and critical security findings take precedence', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  assert.equal(deriveTenantHealth({ ...baseInput(), connectionStatus: 'REVOKED', now }).overallStatus, 'DISCONNECTED')
+  const critical = deriveTenantHealth({ ...baseInput(), now, syncStates: completeCurrentStates(now), auditEvents: [{ microsoftAuditId: 'critical', eventDateTime: now, activityDisplayName: 'Disable conditional access policy', category: 'Policy', operationType: 'Update', result: 'success', initiatedBy: null, targetResources: [] }] })
+  assert.equal(critical.security.status, 'CRITICAL')
+  assert.equal(critical.overallStatus, 'CRITICAL')
+})
+
+test('initial collection is pending and failed newer state overrides older success', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  assert.equal(deriveTenantHealth({ ...baseInput(), effectiveStatus: 'pending', connectionStatus: 'PENDING_CONSENT', now }).overallStatus, 'PENDING')
+  const pendingWithCriticalFinding = deriveTenantHealth({ ...baseInput(), effectiveStatus: 'pending', connectionStatus: 'PENDING_CONSENT', now, auditEvents: [{ microsoftAuditId: 'pending-critical', eventDateTime: now, activityDisplayName: 'Disable conditional access policy', category: 'Policy', operationType: 'Update', result: 'success', initiatedBy: null, targetResources: [] }] })
+  assert.equal(pendingWithCriticalFinding.overallStatus, 'CRITICAL')
+  const states = completeCurrentStates(now).map((state) => state.resourceType === 'USERS' ? { ...state, status: 'FAILED', lastAttemptAt: now, lastSuccessfulAt: new Date('2026-08-13T11:59:00.000Z'), lastErrorMessage: 'latest attempt failed' } : state)
+  const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
+  assert.equal(result.resourceHealth.find((item) => item.resourceType === 'USERS')?.classification, 'FAILED')
+  assert.equal(result.overallStatus, 'DEGRADED')
+})
+
+test('missing security collectors are unknown and empty is not failed', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const incomplete = completeCurrentStates(now).filter((state) => state.resourceType !== 'AUDIT_LOGS')
+  const result = deriveTenantHealth({ ...baseInput(), now, syncStates: incomplete })
+  assert.equal(result.security.status, 'UNKNOWN')
+  assert.notEqual(result.overallStatus, 'HEALTHY')
+  const empty = deriveTenantHealth({ ...baseInput(), now, syncStates: completeCurrentStates(now) })
+  assert.equal(empty.resourceHealth.find((item) => item.resourceType === 'USERS')?.classification, 'SUCCESS')
 })
