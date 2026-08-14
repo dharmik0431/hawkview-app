@@ -17,6 +17,7 @@
     "db:assign-owner": "node scripts/assign-organization-owner.mjs",
     "db:verify": "node scripts/verify-database.mjs",
     "test:tenant-health": "tsx --test src/tenants/tenant-health.test.ts",
+    "test:collection-field-state": "tsx --test src/tenants/collection-field-state.test.ts",
     "test:changes": "tsx --test src/changes/change-evidence.service.test.ts"
   },
   "dependencies": {

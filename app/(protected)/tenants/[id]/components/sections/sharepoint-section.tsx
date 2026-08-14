@@ -18,6 +18,26 @@ type SharingLevel =
   | 'Off'
   | 'Unknown'
 
+type CollectionState = {
+  state?: string
+  message?: string | null
+  isStale?: boolean
+}
+
+function collectionLabel(field?: CollectionState) {
+  if (field?.isStale || field?.state === 'STALE') return 'Last value is stale'
+  switch (field?.state) {
+    case 'AVAILABLE': return 'Available'
+    case 'PENDING': return 'Sync pending'
+    case 'NOT_LICENSED': return 'Requires Microsoft license'
+    case 'PERMISSION_REQUIRED': return 'Additional permission required'
+    case 'UNSUPPORTED': return 'Not available from Microsoft'
+    case 'NOT_CONFIGURED': return 'Not configured'
+    case 'FAILED': return 'Collection failed'
+    default: return 'Sync pending'
+  }
+}
+
 function normalizeSharingLevel(v: any): SharingLevel {
   const s = String(v ?? '')
     .trim()
@@ -69,12 +89,12 @@ function sharingRank(level: SharingLevel) {
   return 0
 }
 
-function sharingLabel(level: SharingLevel) {
+function sharingLabel(level: SharingLevel, field?: CollectionState) {
   if (level === 'Anyone') return 'Anyone'
   if (level === 'NewAndExistingGuests') return 'New & existing guests'
   if (level === 'ExistingGuests') return 'Existing guests'
   if (level === 'OrganizationOnly') return 'Only people in your organization'
-  if (level === 'Unknown') return 'Awaiting collection'
+  if (level === 'Unknown') return collectionLabel(field)
   return 'Off'
 }
 
@@ -143,7 +163,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
       rawOverview.siteStorageLimitsMode ??
       rawOverview.storageLimitsMode ??
       rawOverview.limitsMode ??
-      'Awaiting collection',
+      null,
     sitesMissingReportedOwner:
       typeof rawOverview.sitesMissingReportedOwner === 'number'
         ? rawOverview.sitesMissingReportedOwner
@@ -207,6 +227,12 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
         : []
 
   const sharePointSync = sp?.sync ?? {}
+  const collection = sp?.collection ?? {}
+  const totalSitesValue =
+    collection.inventory?.state &&
+    !['AVAILABLE', 'STALE'].includes(collection.inventory.state)
+      ? collectionLabel(collection.inventory)
+      : SP_OVERVIEW.totalSites
   const syncFailures = [
     ['Sites', sharePointSync?.sites],
     ['Tenant settings', sharePointSync?.settings],
@@ -287,9 +313,11 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
   function SharingScale({
     title,
     level,
+    field,
   }: {
     title: string
     level: SharingLevel
+    field?: CollectionState
   }) {
     const rank = sharingRank(level)
     const risk =
@@ -326,7 +354,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
             <div className="mt-1 text-xs text-muted-foreground">
               Content can be shared with:{' '}
               <span className="font-semibold text-slate-800 dark:text-slate-200">
-                {sharingLabel(level)}
+                {sharingLabel(level, field)}
               </span>
             </div>
           </div>
@@ -453,7 +481,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                   Total Sites
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {SP_OVERVIEW.totalSites}
+                  {totalSitesValue}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Sites + OneDrive
@@ -476,7 +504,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 <div className="mt-1 text-2xl font-bold">
                   {typeof SP_OVERVIEW.totalStorageQuotaGB === 'number'
                     ? `${SP_OVERVIEW.totalStorageQuotaGB} GB`
-                    : 'Awaiting collection'}
+                    : collectionLabel(collection.usage)}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   {SP_OVERVIEW.storageQuotaSource ===
@@ -502,7 +530,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                 <div className="mt-1 text-2xl font-bold">
                   {typeof SP_OVERVIEW.oneDriveStorageLimitGB === 'number'
                     ? `${SP_OVERVIEW.oneDriveStorageLimitGB} GB`
-                    : 'Awaiting collection'}
+                    : collectionLabel(collection.tenantSettings)}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Per user
@@ -561,7 +589,10 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                   : 'bg-purple-50 text-purple-700 border border-purple-200'
               }
             >
-              {SP_OVERVIEW.siteStorageLimitsMode}
+              {!SP_OVERVIEW.siteStorageLimitsMode ||
+              SP_OVERVIEW.siteStorageLimitsMode === 'Unavailable from Microsoft Graph'
+                ? collectionLabel(collection.tenantSettings)
+                : SP_OVERVIEW.siteStorageLimitsMode}
             </Badge>
           </div>
 
@@ -571,7 +602,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               <div className="text-lg font-bold text-slate-900">
                 {usageSynchronized
                   ? formatStorage(totals.totalUsed)
-                  : 'Awaiting collection'}
+                  : collectionLabel(collection.usage)}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Across sites + OneDrive
@@ -628,7 +659,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                   ? inactiveThresholdDays === 90
                     ? (SP_OVERVIEW.inactiveSites90Days ?? 0)
                     : (SP_OVERVIEW.inactiveSites180Days ?? 0)
-                  : 'Awaiting collection'}
+                  : collectionLabel(collection.activity)}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 No reported activity for {inactiveThresholdDays}+ days · click to
@@ -641,7 +672,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
               <div className="text-lg font-bold text-slate-900">
                 {deletedSitesSupported && sp?.deletedSitesSynchronized === true
                   ? SP_DELETED_SITES.length
-                  : 'Awaiting collection'}
+                  : collectionLabel(collection.deletedSites)}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
                 Reported deleted in the last 30 days
@@ -656,10 +687,12 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
         <SharingScale
           title="SharePoint sharing"
           level={SP_OVERVIEW.sharingSharePoint}
+          field={collection.tenantSettings}
         />
         <SharingScale
           title="OneDrive sharing"
           level={SP_OVERVIEW.sharingOneDrive}
+          field={collection.tenantSettings}
         />
       </div>
 
@@ -814,7 +847,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                               </Badge>
                             ) : (
                               <Badge className="bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
-                                Sharing awaiting collection
+                                {collectionLabel(s.collection?.sharing)}
                               </Badge>
                             )}
 
@@ -844,7 +877,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                               ? 'On'
                               : s.externalSharing === false
                                 ? 'Off'
-                                : 'Awaiting collection'}
+                                : collectionLabel(s.collection?.sharing)}
                           </Badge>
                         </td>
 
@@ -859,7 +892,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                           >
                             {typeof s.guestsCount === 'number'
                               ? s.guestsCount
-                              : 'Awaiting collection'}
+                              : collectionLabel(s.collection?.guests)}
                           </Badge>
                         </td>
 
@@ -868,7 +901,7 @@ export default function SharePointPage({ bundle }: SharePointSectionProps) {
                             {typeof s.storageUsedGB === 'number' &&
                             typeof s.storageQuotaGB === 'number'
                               ? `${s.storageUsedGB} / ${s.storageQuotaGB} GB`
-                              : 'Awaiting collection'}
+                              : collectionLabel(s.collection?.storage)}
                           </div>
                           <div className="mt-2 h-2 w-[180px] rounded-full bg-muted overflow-hidden">
                             <div

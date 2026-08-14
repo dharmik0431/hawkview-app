@@ -15,6 +15,26 @@ type ExchangeSectionProps = {
   setSelectedGroup: (g: any) => void
 }
 
+type CollectionState = {
+  state?: string
+  message?: string | null
+  isStale?: boolean
+}
+
+function collectionLabel(field?: CollectionState) {
+  if (field?.isStale || field?.state === 'STALE') return 'Last value is stale'
+  switch (field?.state) {
+    case 'AVAILABLE': return 'Available'
+    case 'PENDING': return 'Sync pending'
+    case 'NOT_LICENSED': return 'Requires Microsoft license'
+    case 'PERMISSION_REQUIRED': return 'Additional permission required'
+    case 'UNSUPPORTED': return 'Not available from Microsoft'
+    case 'NOT_CONFIGURED': return 'Not configured'
+    case 'FAILED': return 'Collection failed'
+    default: return 'Sync pending'
+  }
+}
+
 export default function ExchangePage({
   bundle,
   setSelectedMailbox,
@@ -65,6 +85,11 @@ export default function ExchangePage({
     : Array.isArray(bundle?.exchange?.acceptedDomains)
       ? bundle.exchange.acceptedDomains
       : []
+  const mailboxCollection = bundle?.exchange?.collection ?? {}
+  const countOrCollection = (count: number, field?: CollectionState) =>
+    field?.state && !['AVAILABLE', 'STALE'].includes(field.state)
+      ? collectionLabel(field)
+      : count
 
   const mailboxes = useMemo(() => {
     const base = Array.isArray(EXCHANGE_MAILBOXES) ? EXCHANGE_MAILBOXES : []
@@ -144,11 +169,12 @@ export default function ExchangePage({
                   Total User Mailboxes
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {
+                  {countOrCollection(
                     EXCHANGE_MAILBOXES.filter(
                       (m: any) => m.mailboxType === 'User'
-                    ).length
-                  }
+                    ).length,
+                    mailboxCollection.inventory
+                  )}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Active user mailboxes
@@ -171,11 +197,12 @@ export default function ExchangePage({
                   Total Shared Mailboxes
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {
+                  {countOrCollection(
                     EXCHANGE_MAILBOXES.filter(
                       (m: any) => m.mailboxType === 'Shared'
-                    ).length
-                  }
+                    ).length,
+                    mailboxCollection.inventory
+                  )}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
                   Shared/support/team inboxes
@@ -319,30 +346,35 @@ export default function ExchangePage({
                       </td>
 
                       <td className="px-6 py-4 text-muted-foreground">
-                        {m.mailboxType}
+                        {m.mailboxType ?? collectionLabel(m.collection?.configuration ?? mailboxCollection.configuration)}
                       </td>
 
                       <td className="px-6 py-4 text-muted-foreground">
                         {typeof m.sizeGB === 'number'
-                          ? m.sizeGB.toFixed(1)
-                          : '—'}{' '}
-                        GB
+                          ? `${m.sizeGB.toFixed(1)} GB`
+                          : collectionLabel(m.collection?.usage ?? mailboxCollection.usage)}
                       </td>
 
                       <td className="px-6 py-4 text-muted-foreground">
-                        {m.retentionLabel || '—'}
+                        {m.retentionLabel || collectionLabel(m.collection?.configuration ?? mailboxCollection.configuration)}
                       </td>
 
                       <td className="px-6 py-4">
-                        <Badge
-                          className={
-                            m.archiveEnabled
-                              ? 'bg-green-50 dark:bg-green-950/60 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
-                              : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
-                          }
-                        >
-                          {m.archiveEnabled ? 'Enabled' : 'Off'}
-                        </Badge>
+                        {typeof m.archiveEnabled === 'boolean' ? (
+                          <Badge
+                            className={
+                              m.archiveEnabled
+                                ? 'bg-green-50 dark:bg-green-950/60 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
+                                : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
+                            }
+                          >
+                            {m.archiveEnabled ? 'Enabled' : 'Off'}
+                          </Badge>
+                        ) : (
+                          <span className="text-muted-foreground">
+                            {collectionLabel(m.collection?.configuration ?? mailboxCollection.configuration)}
+                          </span>
+                        )}
                       </td>
 
                       <td className="px-6 py-4 text-right">
