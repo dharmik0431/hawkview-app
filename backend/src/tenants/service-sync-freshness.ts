@@ -110,10 +110,10 @@ type ServiceDefinition = {
 export const SERVICE_COLLECTOR_REGISTRY: readonly ServiceDefinition[] = [
   { service: 'OFFICE_365', key: 'office365', collectors: ['LICENSES', 'DOMAINS', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'] },
   { service: 'ENTRA_ID', key: 'entraId', collectors: ['USERS', 'GROUPS', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'DEVICES', 'DIRECTORY_ROLES', 'APPLICATIONS', 'SERVICE_PRINCIPALS'] },
-  // Exchange mailbox inventory and usage are available through Microsoft Graph.
+  // Exchange mailbox inventory, type, rules, and usage are available through Microsoft Graph.
   // Deep Exchange Admin API configuration requires a separate Exchange RBAC
   // assignment, so it is intentionally not a baseline HawkView collector.
-  { service: 'EXCHANGE', key: 'exchange', collectors: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'] },
+  { service: 'EXCHANGE', key: 'exchange', collectors: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'] },
   { service: 'SHAREPOINT_ONEDRIVE', key: 'sharePointOneDrive', collectors: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'] },
   { service: 'SIGN_IN_LOGS', key: 'signInLogs', collectors: ['SIGN_INS'] },
   { service: 'AUDIT_LOGS', key: 'auditLogs', collectors: ['AUDIT_LOGS'] },

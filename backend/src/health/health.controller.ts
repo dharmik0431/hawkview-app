@@ -32,7 +32,8 @@ export class HealthController {
           enum_range(NULL::"SyncResourceType")::text[] @>
           ARRAY[
             'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE',
-            'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_USAGE',
+            'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS',
+            'EXCHANGE_MAILBOX_USAGE',
             'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'
           ]::text[] AS schema_current
       `

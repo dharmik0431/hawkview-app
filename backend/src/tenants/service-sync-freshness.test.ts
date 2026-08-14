@@ -14,7 +14,7 @@ test('reports a fully successful service only when every expected collector succ
 })
 
 test('keeps a service partial when one Graph collector fails after other usable data succeeded', () => {
-  const data = deriveTenantSyncFreshness([success('EXCHANGE_MAILBOXES'), success('EXCHANGE_MAILBOX_USAGE'), success('EXCHANGE_ACCEPTED_DOMAINS'), failed('EXCHANGE_MAILBOX_RULES', '2026-08-13T13:45:00.000Z')], now)
+  const data = deriveTenantSyncFreshness([success('EXCHANGE_MAILBOXES'), success('EXCHANGE_MAILBOX_SETTINGS'), success('EXCHANGE_MAILBOX_USAGE'), success('EXCHANGE_ACCEPTED_DOMAINS'), failed('EXCHANGE_MAILBOX_RULES', '2026-08-13T13:45:00.000Z')], now)
   assert.equal(data.services.exchange.status, 'PARTIAL')
   assert.equal(data.services.exchange.partialFailures[0]?.collector, 'EXCHANGE_MAILBOX_RULES')
   assert.equal(data.services.exchange.partialFailures[0]?.lastSuccessfulAt, '2026-08-13T13:45:00.000Z')
@@ -23,13 +23,14 @@ test('keeps a service partial when one Graph collector fails after other usable 
 test('does not make Exchange unhealthy when the optional Exchange Admin API collector fails', () => {
   const data = deriveTenantSyncFreshness([
     success('EXCHANGE_MAILBOXES'),
+    success('EXCHANGE_MAILBOX_SETTINGS'),
     success('EXCHANGE_MAILBOX_USAGE'),
     success('EXCHANGE_ACCEPTED_DOMAINS'),
     success('EXCHANGE_MAILBOX_RULES'),
     failed('EXCHANGE_MAILBOX_CONFIGURATION', null, '403'),
   ], now)
   assert.equal(data.services.exchange.status, 'SUCCESS')
-  assert.equal(data.services.exchange.expectedCollectors, 4)
+  assert.equal(data.services.exchange.expectedCollectors, 5)
 })
 
 test('reports a complete service failure when no collector has usable data', () => {

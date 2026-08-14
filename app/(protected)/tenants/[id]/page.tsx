@@ -500,10 +500,10 @@ type Mailbox = {
   displayName: string
   userPrincipalName: string
   aliases: string[]
-  mailboxType: MailboxType
-  sizeGB: number
-  itemCount: number
-  archiveEnabled: boolean
+  mailboxType: MailboxType | null
+  sizeGB: number | null
+  itemCount: number | null
+  archiveEnabled: boolean | null
   retentionLabel?: string
   delegation?: {
     fullAccess?: string[]
@@ -4862,7 +4862,7 @@ export default function TenantDetailsPage() {
 
                   <div className="mt-3 flex flex-wrap gap-2">
                     <Badge className="bg-blue-50 text-blue-700 border border-blue-200">
-                      {selectedMailbox.mailboxType}
+                      {selectedMailbox.mailboxType ?? 'Type not reported'}
                     </Badge>
 
                     <Badge
