@@ -24,6 +24,7 @@ import {
   type SignInLocation,
 } from './ip-geolocation.service.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
+import { deriveTenantSyncFreshness } from './service-sync-freshness.js'
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
 
@@ -3733,33 +3734,67 @@ export class TenantSyncService {
     const collectionStateByKey = new Map(
       collectionFieldStates.map((field) => [field.fieldKey, field])
     )
-    const collectionState = (fieldKey: string, value: unknown = null) => {
+    const collectionState = (
+      fieldKey: string,
+      value: unknown = null,
+      resourceType?: EntraSnapshotResource
+    ) => {
       const field = collectionStateByKey.get(fieldKey)
-      return field
-        ? {
-            value,
-            state: field.state,
-            reasonCode: field.reasonCode,
-            message: field.message,
-            source: field.source,
-            endpoint: field.endpoint,
-            correlationId: field.correlationId,
-            lastAttemptAt: field.lastAttemptAt?.toISOString() ?? null,
-            lastSuccessfulAt: field.lastSuccessfulAt?.toISOString() ?? null,
-            isStale: field.isStale,
-          }
-        : {
-            value,
-            state: 'PENDING',
-            reasonCode: 'SYNC_NOT_STARTED',
-            message: 'Synchronization has not started for this value.',
-            source: 'Microsoft Graph',
-            endpoint: null,
-            correlationId: null,
-            lastAttemptAt: null,
-            lastSuccessfulAt: null,
-            isStale: false,
-          }
+      const sync = resourceType
+        ? syncStateByResource.get(resourceType)
+        : undefined
+      const pendingFieldHasCompletedCollector =
+        field?.state === 'PENDING' &&
+        Boolean(sync?.status && sync.status !== 'RUNNING' && sync.status !== 'IDLE')
+      if (field && !pendingFieldHasCompletedCollector) {
+        return {
+          value,
+          state: field.state,
+          reasonCode: field.reasonCode,
+          message: field.message,
+          source: field.source,
+          endpoint: field.endpoint,
+          correlationId: field.correlationId,
+          lastAttemptAt: field.lastAttemptAt?.toISOString() ?? null,
+          lastSuccessfulAt: field.lastSuccessfulAt?.toISOString() ?? null,
+          isStale: field.isStale,
+        }
+      }
+
+      // Older tenants can have snapshots and sync-state rows from before
+      // field-state materialization existed. Do not present those completed
+      // (or failed) collectors as permanently "pending" just because the
+      // derived field row has not been written yet.
+      const fallback = deriveCollectionFieldState({
+        syncStatus: sync?.status,
+        lastErrorMessage: sync?.lastErrorMessage,
+        hasPriorSnapshot: resourceType
+          ? snapshotByResource.has(resourceType)
+          : false,
+      })
+      const isExchangeConfiguration =
+        resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'
+      const isExchangeUsage = resourceType === 'EXCHANGE_MAILBOX_USAGE'
+      return {
+        value,
+        state: fallback.state,
+        reasonCode: fallback.reasonCode,
+        message: fallback.message,
+        source: isExchangeConfiguration
+          ? 'Exchange Online'
+          : isExchangeUsage
+            ? 'Microsoft Graph Reports'
+            : 'Microsoft Graph',
+        endpoint: isExchangeConfiguration
+          ? '/adminapi/v2.0/Mailbox'
+          : isExchangeUsage
+            ? '/reports/getMailboxUsageDetail'
+            : null,
+        correlationId: null,
+        lastAttemptAt: sync?.lastAttemptAt?.toISOString() ?? null,
+        lastSuccessfulAt: sync?.lastSuccessfulAt?.toISOString() ?? null,
+        isStale: fallback.isStale,
+      }
     }
     const userSyncState = syncStateByResource.get('USERS')
     const licenseSyncState = syncStateByResource.get('LICENSES')
@@ -3856,6 +3891,7 @@ export class TenantSyncService {
       successfulDates.length > 0
         ? new Date(Math.max(...successfulDates.map((date) => date.getTime())))
         : null
+    const syncFreshness = deriveTenantSyncFreshness(syncStates)
 
     return {
       bundle: {
@@ -3879,6 +3915,7 @@ export class TenantSyncService {
             0
           ),
           lastSync: lastSync?.toISOString() ?? null,
+          syncFreshness,
         },
         dns: (() => {
           const selectedDomain =
@@ -4010,15 +4047,18 @@ export class TenantSyncService {
           collection: {
             inventory: collectionState(
               'exchange.mailboxes.inventory',
-              exchangeMailboxInventory.length
+              exchangeMailboxInventory.length,
+              'EXCHANGE_MAILBOXES'
             ),
             configuration: collectionState(
               'exchange.mailboxes.configuration',
-              exchangeMailboxConfiguration.length
+              exchangeMailboxConfiguration.length,
+              'EXCHANGE_MAILBOX_CONFIGURATION'
             ),
             usage: collectionState(
               'exchange.mailboxes.usage',
-              exchangeMailboxUsage.length
+              exchangeMailboxUsage.length,
+              'EXCHANGE_MAILBOX_USAGE'
             ),
           },
           sync: {
@@ -4148,14 +4188,20 @@ export class TenantSyncService {
               },
               lastLogon: usage?.['Last Activity Date'] || null,
               collection: {
-                inventory: collectionState('exchange.mailboxes.inventory', true),
+                inventory: collectionState(
+                  'exchange.mailboxes.inventory',
+                  true,
+                  'EXCHANGE_MAILBOXES'
+                ),
                 configuration: collectionState(
                   'exchange.mailboxes.configuration',
-                  configurationCollected
+                  configurationCollected,
+                  'EXCHANGE_MAILBOX_CONFIGURATION'
                 ),
                 usage: collectionState(
                   'exchange.mailboxes.usage',
-                  storageBytes
+                  storageBytes,
+                  'EXCHANGE_MAILBOX_USAGE'
                 ),
               },
             }
