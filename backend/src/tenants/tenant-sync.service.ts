@@ -813,10 +813,6 @@ export class TenantSyncService {
           this.syncExchangeMailboxDirectory(tenant, snapshotAccessToken),
       },
       {
-        resource: 'EXCHANGE_MAILBOX_CONFIGURATION',
-        synchronize: () => this.syncExchangeMailboxConfiguration(tenant),
-      },
-      {
         resource: 'EXCHANGE_ACCEPTED_DOMAINS',
         synchronize: () =>
           this.syncExchangeAcceptedDomains(tenant, snapshotAccessToken),
@@ -1022,7 +1018,6 @@ export class TenantSyncService {
       message?.match(/(?:request|correlation)[^0-9a-f]*([0-9a-f]{8}-[0-9a-f-]{27,})/i)?.[1] ?? null
     const resources: Array<{ key: string; resource: string; source: string; endpoint: string; unsupported?: boolean }> = [
       { key: 'exchange.mailboxes.inventory', resource: 'EXCHANGE_MAILBOXES', source: 'Microsoft Graph', endpoint: '/users' },
-      { key: 'exchange.mailboxes.configuration', resource: 'EXCHANGE_MAILBOX_CONFIGURATION', source: 'Exchange Online', endpoint: '/adminapi/v2.0/Mailbox' },
       { key: 'exchange.mailboxes.usage', resource: 'EXCHANGE_MAILBOX_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getMailboxUsageDetail' },
       { key: 'sharepoint.sites.inventory', resource: 'SHAREPOINT_SITES', source: 'Microsoft Graph', endpoint: '/sites?search=*' },
       { key: 'sharepoint.sites.access', resource: 'SHAREPOINT_SITES', source: 'SharePoint REST', endpoint: '/_api/web/siteusers' },
@@ -3515,8 +3510,6 @@ export class TenantSyncService {
     const sharePointUsage = combinedUsage?.sharePointSites ?? sharePointUsageSnapshot
     const oneDriveUsage = combinedUsage?.oneDriveAccounts ?? []
     const exchangeMailboxes = snapshotByResource.get('EXCHANGE_MAILBOXES') ?? []
-    const exchangeMailboxConfiguration =
-      snapshotByResource.get('EXCHANGE_MAILBOX_CONFIGURATION') ?? []
     const exchangeMailboxUsage =
       snapshotByResource.get('EXCHANGE_MAILBOX_USAGE') ?? []
     const exchangeAcceptedDomains =
@@ -3534,23 +3527,6 @@ export class TenantSyncService {
       ]) {
         const identity = normalizeExchangeIdentity(usageValue(row, field))
         if (identity) exchangeUsageByIdentity.set(identity, row)
-      }
-    }
-    const exchangeConfigurationByIdentity = new Map<string, any>()
-    for (const mailbox of exchangeMailboxConfiguration as any[]) {
-      for (const identity of [
-        mailbox?.ExternalDirectoryObjectId,
-        mailbox?.UserPrincipalName,
-        mailbox?.PrimarySmtpAddress,
-        mailbox?.WindowsEmailAddress,
-        mailbox?.Guid,
-      ]) {
-        if (identity != null && String(identity).trim()) {
-          exchangeConfigurationByIdentity.set(
-            String(identity).trim().toLowerCase(),
-            mailbox
-          )
-        }
       }
     }
     const oneDriveUsageByUpn = new Map<string, Record<string, string>>(
@@ -4078,11 +4054,17 @@ export class TenantSyncService {
               exchangeMailboxInventory.length,
               'EXCHANGE_MAILBOXES'
             ),
-            configuration: collectionState(
-              'exchange.mailboxes.configuration',
-              exchangeMailboxConfiguration.length,
-              'EXCHANGE_MAILBOX_CONFIGURATION'
-            ),
+            configuration: {
+              value: null,
+              state: 'UNSUPPORTED',
+              reasonCode: 'EXCHANGE_ADMIN_API_OPTIONAL',
+              message: 'Detailed Exchange mailbox configuration is optional and is not collected through standard Microsoft Graph consent.',
+              source: 'Microsoft Graph',
+              endpoint: null,
+              lastAttemptAt: null,
+              lastSuccessfulAt: null,
+              isStale: false,
+            },
             usage: collectionState(
               'exchange.mailboxes.usage',
               exchangeMailboxUsage.length,
@@ -4091,9 +4073,6 @@ export class TenantSyncService {
           },
           sync: {
             mailboxes: exchangeSync('EXCHANGE_MAILBOXES'),
-            mailboxConfiguration: exchangeSync(
-              'EXCHANGE_MAILBOX_CONFIGURATION'
-            ),
             mailboxUsage: exchangeSync('EXCHANGE_MAILBOX_USAGE'),
             acceptedDomains: exchangeSync('EXCHANGE_ACCEPTED_DOMAINS'),
             inboxRules: exchangeSync('EXCHANGE_MAILBOX_RULES'),
@@ -4107,15 +4086,7 @@ export class TenantSyncService {
                 mailbox.WindowsEmailAddress ??
                 ''
             )
-            const configuration =
-              exchangeConfigurationByIdentity.get(
-                String(mailbox.id ?? '').toLowerCase()
-              ) ??
-              exchangeConfigurationByIdentity.get(directoryUpn.toLowerCase())
-            const configurationCollected = Boolean(configuration)
-            const enrichedMailbox = configuration
-              ? { ...mailbox, ...configuration }
-              : mailbox
+            const enrichedMailbox = mailbox
             const upn = String(
               enrichedMailbox.UserPrincipalName ??
                 enrichedMailbox.userPrincipalName ??
@@ -4193,26 +4164,12 @@ export class TenantSyncService {
                 ? Math.round((storageBytes / 1024 ** 3) * 100) / 100
                 : null,
               itemCount,
-              archiveEnabled: configurationCollected
-                ? String(enrichedMailbox.ArchiveStatus ?? '').toLowerCase() ===
-                    'active' ||
-                  Boolean(
-                    enrichedMailbox.ArchiveGuid &&
-                    !String(enrichedMailbox.ArchiveGuid).startsWith('00000000')
-                  )
-                : parseUsageBoolean(usageValue(usage, 'Has Archive')),
-              retentionLabel:
-                enrichedMailbox.RetentionPolicy ??
-                enrichedMailbox.RetentionHoldEnabled ??
-                null,
+              archiveEnabled: parseUsageBoolean(usageValue(usage, 'Has Archive')),
+              retentionLabel: null,
               delegation: {
                 fullAccess: [],
                 sendAs: [],
-                sendOnBehalf: Array.isArray(
-                  enrichedMailbox.GrantSendOnBehalfToWithDisplayNames
-                )
-                  ? enrichedMailbox.GrantSendOnBehalfToWithDisplayNames
-                  : [],
+                sendOnBehalf: [],
               },
               lastLogon: usage?.['Last Activity Date'] || null,
               collection: {
@@ -4221,11 +4178,17 @@ export class TenantSyncService {
                   true,
                   'EXCHANGE_MAILBOXES'
                 ),
-                configuration: collectionState(
-                  'exchange.mailboxes.configuration',
-                  configurationCollected,
-                  'EXCHANGE_MAILBOX_CONFIGURATION'
-                ),
+                configuration: {
+                  value: null,
+                  state: 'UNSUPPORTED',
+                  reasonCode: 'EXCHANGE_ADMIN_API_OPTIONAL',
+                  message: 'Detailed Exchange mailbox configuration requires optional Exchange admin access.',
+                  source: 'Microsoft Graph',
+                  endpoint: null,
+                  lastAttemptAt: null,
+                  lastSuccessfulAt: null,
+                  isStale: false,
+                },
                 usage: collectionState(
                   'exchange.mailboxes.usage',
                   storageBytes,
