@@ -167,6 +167,26 @@ test('optional incomplete collection is attention rather than a connection failu
   assert.equal(result.overallStatus, 'ATTENTION')
 })
 
+test('a legacy optional Exchange Admin API failure does not degrade Graph-based Exchange health', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const states = [
+    ...completeCurrentStates(now),
+    {
+      resourceType: 'EXCHANGE_MAILBOX_CONFIGURATION',
+      status: 'FAILED',
+      lastAttemptAt: now,
+      lastSuccessfulAt: null,
+      lastErrorCode: '403',
+      lastErrorMessage: 'Exchange RBAC assignment is unavailable.',
+      consecutiveFailures: 4,
+    },
+  ]
+  const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
+  assert.equal(result.operations.status, 'HEALTHY')
+  assert.equal(result.operations.failedJobs, 0)
+  assert.equal(result.operations.issues.some((issue) => issue.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), false)
+})
+
 test('required stale and failed collectors degrade tenant health', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   const stale = completeCurrentStates(now).map((state) => state.resourceType === 'USERS' ? { ...state, lastSuccessfulAt: new Date('2026-08-13T08:00:00.000Z') } : state)
