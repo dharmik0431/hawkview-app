@@ -14,6 +14,12 @@ test('derives every supported collection state without treating zero data as una
   assert.equal(deriveCollectionFieldState({ unsupported: true }).state, 'UNSUPPORTED')
   assert.equal(deriveCollectionFieldState({ syncStatus: 'FAILED', lastErrorMessage: 'premium license required' }).state, 'NOT_LICENSED')
   assert.equal(deriveCollectionFieldState({ syncStatus: 'FAILED', lastErrorMessage: '403 forbidden' }).state, 'PERMISSION_REQUIRED')
+  const exchangeRbac = deriveCollectionFieldState({
+    syncStatus: 'FAILED',
+    lastErrorMessage: 'Confirm Exchange.ManageAsAppV2 and the Recipient Management Exchange RBAC role.',
+  })
+  assert.equal(exchangeRbac.state, 'PERMISSION_REQUIRED')
+  assert.equal(exchangeRbac.reasonCode, 'EXCHANGE_RBAC_ROLE_REQUIRED')
   const notConfigured = deriveCollectionFieldState({ notConfigured: true })
   assert.equal(notConfigured.state, 'NOT_CONFIGURED')
   assert.equal(notConfigured.message, 'No Conditional Access policies configured.')
