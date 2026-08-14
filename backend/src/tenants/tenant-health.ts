@@ -28,7 +28,7 @@ export const TENANT_HEALTH_RESOURCE_REGISTRY: ReadonlyArray<{ resourceType: stri
   { resourceType: 'GROUPS', required: true }, { resourceType: 'AUTH_REGISTRATIONS', required: true }, { resourceType: 'CONDITIONAL_ACCESS', required: true },
   { resourceType: 'APPLICATIONS', required: true }, { resourceType: 'SERVICE_PRINCIPALS', required: true }, { resourceType: 'AUDIT_LOGS', required: true },
   { resourceType: 'SIGN_INS', required: false }, { resourceType: 'SECURE_SCORES', required: false }, { resourceType: 'DEVICES', required: false },
-  { resourceType: 'DIRECTORY_ROLES', required: false }, { resourceType: 'EXCHANGE_MAILBOXES', required: false }, { resourceType: 'EXCHANGE_ACCEPTED_DOMAINS', required: false },
+  { resourceType: 'DIRECTORY_ROLES', required: false }, { resourceType: 'EXCHANGE_MAILBOXES', required: false }, { resourceType: 'EXCHANGE_MAILBOX_SETTINGS', required: false }, { resourceType: 'EXCHANGE_ACCEPTED_DOMAINS', required: false },
   { resourceType: 'EXCHANGE_MAILBOX_RULES', required: false }, { resourceType: 'SHAREPOINT_SITES', required: false }, { resourceType: 'SHAREPOINT_SETTINGS', required: false },
   { resourceType: 'SHAREPOINT_USAGE', required: false },
 ]
