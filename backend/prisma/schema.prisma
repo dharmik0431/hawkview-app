@@ -197,6 +197,7 @@ model Organization {
   signInLogs         SignInLog[]
   directoryAuditLogs DirectoryAuditLog[]
   changeEvidenceEvents ChangeEvidenceEvent[]
+  healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
   notificationPreferences NotificationPreference[]
 
@@ -260,6 +261,7 @@ model CustomerTenant {
   signInLogs         SignInLog[]
   directoryAuditLogs DirectoryAuditLog[]
   changeEvidenceEvents ChangeEvidenceEvent[]
+  healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
 
   @@unique([id, organizationId])
@@ -406,6 +408,24 @@ model SyncState {
   @@unique([customerTenantId, resourceType])
   @@index([organizationId, status])
   @@map("sync_states")
+}
+
+// Immutable evaluations retain the evidence-driven health history without
+// changing the existing tenant status or sync-state contracts.
+model TenantHealthSnapshot {
+  id                 String         @id @default(uuid()) @db.Uuid
+  organizationId     String         @map("organization_id") @db.Uuid
+  customerTenantId   String         @map("customer_tenant_id") @db.Uuid
+  healthModelVersion Int            @map("health_model_version")
+  overallStatus      String         @map("overall_status") @db.VarChar(30)
+  payload            Json           @db.JsonB
+  evaluatedAt        DateTime       @map("evaluated_at") @db.Timestamptz(6)
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  organization       Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant     CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@index([organizationId, customerTenantId, evaluatedAt(sort: Desc)])
+  @@map("tenant_health_snapshots")
 }
 
 // A sync resource can contain multiple independently collected values.  Keep

@@ -5,6 +5,7 @@ import {
   ForbiddenException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
@@ -37,6 +38,7 @@ const MICROSOFT_TENANT_ID_PATTERN =
 
 @Injectable()
 export class TenantsService {
+  private readonly logger = new Logger(TenantsService.name)
   constructor(
     @Inject(PrismaService)
     private readonly prisma: PrismaService,
@@ -217,6 +219,7 @@ export class TenantsService {
       tenantId: tenant.id,
       effectiveStatus,
       connectionStatus,
+      connectionLastVerifiedAt: tenant.connection?.lastVerifiedAt ?? null,
       missingPermissions,
       syncStates: tenant.syncStates,
       authSnapshot:
@@ -259,6 +262,9 @@ export class TenantsService {
         )?.payload,
       ),
       ...health,
+      // The named object is the versioned API contract.  The spread above
+      // intentionally preserves legacy healthScore/mfaCoverage/attention.
+      tenantHealth: health,
       licenseCount:
         tenant.tenantLicenses.length > 0
           ? tenant.tenantLicenses.reduce(
@@ -488,14 +494,60 @@ export class TenantsService {
       auditEventsByTenant.set(event.customerTenantId, events)
     }
 
-    return {
-      tenants: tenants.map((tenant) =>
+    const mappedTenants = tenants.map((tenant) =>
         this.mapTenant(
           tenant,
           riskyUsersByTenant.get(tenant.id)?.size ?? 0,
           auditEventsByTenant.get(tenant.id) ?? []
         )
-      ),
+      )
+
+    // Retain auditable health history. A persistence failure must never make a
+    // tenant list unavailable, and every row is scoped to the same workspace
+    // used to load the tenant above.
+    await Promise.all(mappedTenants.map(async (mapped, index) => {
+      const tenant = tenants[index]
+      if (!tenant) return
+      await this.persistTenantHealthSnapshot(tenant, mapped.tenantHealth)
+    }))
+
+    return { tenants: mappedTenants }
+  }
+
+  private async persistTenantHealthSnapshot(
+    tenant: { id: string; microsoftTenantId: string; organization: { id: string } },
+    health: ReturnType<typeof deriveTenantHealth>,
+  ) {
+    try {
+      const previous = await this.prisma.tenantHealthSnapshot.findFirst({
+        where: { organizationId: tenant.organization.id, customerTenantId: tenant.id },
+        orderBy: { evaluatedAt: 'desc' },
+        select: { overallStatus: true, evaluatedAt: true },
+      })
+      const evaluatedAt = new Date(health.evaluatedAt)
+      // Keep evidence history without producing a row on every tenant-list poll.
+      if (previous?.overallStatus === health.overallStatus && evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return
+      await this.prisma.tenantHealthSnapshot.create({
+        data: { organizationId: tenant.organization.id, customerTenantId: tenant.id, healthModelVersion: health.healthModelVersion, overallStatus: health.overallStatus, payload: health, evaluatedAt },
+      })
+      this.logger.debug({
+        event: 'tenant_health_evaluated',
+        workspaceId: tenant.organization.id,
+        customerTenantId: tenant.id,
+        microsoftTenantId: tenant.microsoftTenantId,
+        healthModelVersion: health.healthModelVersion,
+        previousStatus: previous?.overallStatus ?? null,
+        newStatus: health.overallStatus,
+        triggeringEvidence: {
+          connection: health.connection.status,
+          data: health.data.status,
+          security: health.security.status,
+          operations: health.operations.status,
+        },
+        evaluatedAt: health.evaluatedAt,
+      })
+    } catch (error) {
+      this.logger.warn(`Tenant health snapshot persistence failed for tenant ${tenant.id}: ${error instanceof Error ? error.message : 'unknown error'}`)
     }
   }
 
