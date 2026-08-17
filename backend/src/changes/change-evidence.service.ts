@@ -1,6 +1,11 @@
 import { Inject, Injectable, Logger } from '@nestjs/common'
+import { createHash } from 'node:crypto'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { legacyCategory } from './change-classification.js'
+import {
+  SNAPSHOT_DIFFERENCE_SPECS,
+  type EvidenceOrigin,
+} from './microsoft-admin-change-catalog.js'
 
 type JsonObject = Record<string, unknown>
 const object = (value: unknown): JsonObject =>
@@ -12,6 +17,35 @@ const text = (value: unknown) =>
   typeof value === 'string' && value.trim() ? value.trim() : null
 
 const sensitiveKey = /(?:password|secret|token|authorization|credential|private.?key|client.?secret|assertion|certificate)/i
+
+export type SnapshotDifferenceEvidence = {
+  organizationId: string
+  customerTenantId: string
+  source: 'SNAPSHOT_DIFFERENCE'
+  sourceEventId: string
+  eventDateTime: Date
+  workload: string
+  category: string
+  severity: 'Low' | 'Medium' | 'High'
+  operationName: string
+  summary: string
+  actorId: null
+  actorDisplayName: null
+  actorPrincipalName: null
+  targetId: string | null
+  targetDisplayName: string | null
+  targetType: string | null
+  correlationId: null
+  result: 'detected'
+  ipAddress: null
+  location: null
+  beforeState: Record<string, unknown> | null
+  afterState: Record<string, unknown> | null
+  changedFields: string[]
+  raw: Record<string, unknown>
+  ingestedAt: Date
+  expiresAt: Date
+}
 
 // Microsoft audit payloads can contain configuration values. Retain useful
 // evidence while ensuring secrets never become searchable historical data.
@@ -75,6 +109,83 @@ function actor(initiatedBy: unknown) {
   }
 }
 
+function snapshotObjects(value: unknown): JsonObject[] {
+  return array(value).map(object).filter((item) => Object.keys(item).length > 0)
+}
+
+function identifierFor(
+  row: JsonObject,
+  fields: readonly string[],
+  compoundFields?: readonly string[]
+) {
+  if (compoundFields && compoundFields.length > 0) {
+    const values = compoundFields.map((field) => {
+      const value = row[field]
+      return typeof value === 'string' && value.trim()
+        ? value.trim()
+        : typeof value === 'number' || typeof value === 'boolean'
+          ? String(value)
+          : null
+    })
+    return values.every((value): value is string => value !== null)
+      ? values.join('::')
+      : null
+  }
+  for (const field of fields) {
+    const value = row[field]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  }
+  return null
+}
+
+const UNORDERED_ARRAY_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+  GROUPS: new Set(['groupTypes']),
+  CONDITIONAL_ACCESS: new Set([
+    'includeUsers', 'excludeUsers', 'includeGroups', 'excludeGroups',
+    'includeRoles', 'excludeRoles', 'includeApplications', 'excludeApplications',
+    'includeLocations', 'excludeLocations', 'includePlatforms', 'excludePlatforms',
+    'includeRiskLevels', 'excludeRiskLevels', 'includeClientAppTypes',
+    'builtInControls', 'termsOfUse', 'authenticationStrength',
+  ]),
+  NAMED_LOCATIONS: new Set(['countriesAndRegions', 'ipRanges']),
+  SERVICE_PRINCIPALS: new Set(['tags', 'appRoles']),
+  APPLICATIONS: new Set(['appRoles', 'requiredResourceAccess', 'resourceAccess', 'passwordCredentials', 'keyCredentials']),
+  SHAREPOINT_SETTINGS: new Set(['allowedDomainGuids', 'allowedDomainList', 'excludedFileExtensions']),
+}
+
+function canonicalize(value: unknown, resourceType: string, fieldName?: string): unknown {
+  if (Array.isArray(value)) {
+    const entries = value.map((entry) => canonicalize(entry, resourceType, fieldName))
+    if (fieldName && UNORDERED_ARRAY_FIELDS[resourceType]?.has(fieldName)) {
+      return entries.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+    }
+    return entries
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as JsonObject)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, canonicalize(child, resourceType, key)])
+    )
+  }
+  return value
+}
+
+function selectedState(row: JsonObject, fields: readonly string[], resourceType: string) {
+  const state: JsonObject = {}
+  for (const field of fields) {
+    if (row[field] !== undefined) {
+      state[field] = canonicalize(row[field], resourceType, field)
+    }
+  }
+  return state
+}
+
+function sameState(left: JsonObject, right: JsonObject) {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
 @Injectable()
 export class ChangeEvidenceService {
   private readonly logger = new Logger(ChangeEvidenceService.name)
@@ -118,7 +229,11 @@ export class ChangeEvidenceService {
         beforeState: target.before ?? undefined,
         afterState: target.after ?? undefined,
         changedFields: target.fields ?? undefined,
-        raw: redactSensitiveValues(record.raw) as never,
+        raw: {
+          ...object(redactSensitiveValues(record.raw)),
+          evidenceOrigin: 'microsoft_audit_event',
+          microsoftSource: 'Microsoft Graph /auditLogs/directoryAudits',
+        } as never,
         ingestedAt: record.ingestedAt,
         expiresAt: record.expiresAt,
       }
@@ -127,6 +242,118 @@ export class ChangeEvidenceService {
       data: data as never,
       skipDuplicates: true,
     })
+  }
+
+  /**
+   * Builds evidence only for a successful comparison of two persisted admin
+   * snapshots.  It does not write: the caller writes the evidence and the new
+   * baseline in one transaction, which prevents retry duplicates and avoids a
+   * "first collection" inventing changes.
+   */
+  buildSnapshotDifferenceEvidence(input: {
+    tenant: { id: string; organizationId: string }
+    resourceType: string
+    previousPayload: unknown
+    currentPayload: unknown
+    observedAt: Date
+    baselineObservedAt?: Date | null
+    expiresAt: Date
+  }): SnapshotDifferenceEvidence[] {
+    const spec = SNAPSHOT_DIFFERENCE_SPECS[input.resourceType]
+    if (!spec || input.previousPayload == null) return []
+
+    const previous = snapshotObjects(input.previousPayload)
+    const current = snapshotObjects(input.currentPayload)
+    const previousById = new Map(
+      previous
+        .map((row) => [identifierFor(row, spec.identifierFields, spec.compoundIdentifierFields), row] as const)
+        .filter((entry): entry is [string, JsonObject] => entry[0] !== null)
+    )
+    const currentById = new Map(
+      current
+        .map((row) => [identifierFor(row, spec.identifierFields, spec.compoundIdentifierFields), row] as const)
+        .filter((entry): entry is [string, JsonObject] => entry[0] !== null)
+    )
+    const identifiers = new Set([...previousById.keys(), ...currentById.keys()])
+    const origin: EvidenceOrigin = 'hawkview_snapshot_difference'
+    const output: SnapshotDifferenceEvidence[] = []
+
+    for (const identifier of identifiers) {
+      const beforeRow = previousById.get(identifier) ?? null
+      const afterRow = currentById.get(identifier) ?? null
+      // Compare the selected state before redaction, otherwise two credential
+      // rotations both become `[REDACTED]` and the real administrative change
+      // disappears. Only redacted representations are ever persisted. The
+      // deduplication ID below deliberately does not include those raw values.
+      const beforeComparable = beforeRow ? selectedState(beforeRow, spec.trackedFields, input.resourceType) : null
+      const afterComparable = afterRow ? selectedState(afterRow, spec.trackedFields, input.resourceType) : null
+      if (beforeComparable && afterComparable && sameState(beforeComparable, afterComparable)) continue
+
+      const changedFields = spec.trackedFields.filter((field) =>
+        JSON.stringify(beforeComparable?.[field]) !== JSON.stringify(afterComparable?.[field])
+      )
+      // An unidentifiable record is not defensible evidence.  Do not infer a
+      // target merely because a collection row moved position.
+      if (changedFields.length === 0) continue
+      const before = beforeComparable
+        ? (redactSensitiveValues(beforeComparable) as JsonObject)
+        : null
+      const after = afterComparable
+        ? (redactSensitiveValues(afterComparable) as JsonObject)
+        : null
+      // A retry of the same successful comparison must deduplicate, but this
+      // fingerprint must not become a derived store of secret material.
+      const digest = createHash('sha256')
+        .update(
+          JSON.stringify({
+            resourceType: input.resourceType,
+            identifier,
+            changedFields,
+            // A baseline version is stable across a retry, while a later
+            // A→B transition after B→A gets a new baseline version.
+            baselineObservedAt: input.baselineObservedAt?.toISOString() ?? null,
+          })
+        )
+        .digest('hex')
+        .slice(0, 24)
+      const targetName =
+        text(afterRow?.displayName) ?? text(afterRow?.name) ?? text(afterRow?.webUrl) ?? identifier
+      output.push({
+        organizationId: input.tenant.organizationId,
+        customerTenantId: input.tenant.id,
+        source: 'SNAPSHOT_DIFFERENCE',
+        sourceEventId: `${input.resourceType}:${identifier}:${digest}`.slice(0, 200),
+        eventDateTime: input.observedAt,
+        workload: spec.workload,
+        category: spec.category,
+        severity: spec.severity,
+        operationName: spec.operationName,
+        summary: 'HawkView detected a difference between successful Microsoft collections. Microsoft did not provide a confirmed actor.',
+        actorId: null,
+        actorDisplayName: null,
+        actorPrincipalName: null,
+        targetId: identifier,
+        targetDisplayName: targetName,
+        targetType: input.resourceType,
+        correlationId: null,
+        result: 'detected',
+        ipAddress: null,
+        location: null,
+        beforeState: before,
+        afterState: after,
+        changedFields,
+        raw: {
+          evidenceOrigin: origin,
+          microsoftSource: spec.microsoftSource,
+          resourceType: input.resourceType,
+          actorAvailability: 'Microsoft did not provide a confirmed actor.',
+          comparison: 'successful_snapshot_to_successful_snapshot',
+        },
+        ingestedAt: input.observedAt,
+        expiresAt: input.expiresAt,
+      })
+    }
+    return output
   }
 
   async pruneExpired(customerTenantId: string, expiresAt: Date) {

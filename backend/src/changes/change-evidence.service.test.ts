@@ -3,6 +3,22 @@ import test from 'node:test'
 import { ChangeEvidenceService, redactSensitiveValues } from './change-evidence.service.js'
 import { classifyEvidence, isPrimaryChange } from './change-classification.js'
 import { ChangesService } from './changes.service.js'
+import {
+  MICROSOFT_ADMIN_CHANGE_CATALOG,
+  SNAPSHOT_DIFFERENCE_SPECS,
+  UNIFIED_AUDIT_LOG_GAP_REPORT,
+  DOMAIN_DETAIL_COVERAGE_GAP,
+} from './microsoft-admin-change-catalog.js'
+import {
+  assertGroupRelationshipRefreshComplete,
+  authoritativeSnapshot,
+  collectMailboxDirectoryPages,
+  collectMailboxRuleUsers,
+  collectMailboxRules,
+  partialSnapshot,
+  sharePointSitesSnapshotResult,
+  TenantSyncService,
+} from '../tenants/tenant-sync.service.js'
 
 test('redacts secrets recursively while preserving investigation evidence', () => {
   const source = {
@@ -249,4 +265,368 @@ test('projects directory evidence with deduplication and redacted configuration 
   assert.equal(createManyArgs.skipDuplicates, true)
   assert.equal(createManyArgs.data[0].raw.clientSecret, '[REDACTED]')
   assert.equal(createManyArgs.data[0].afterState.clientSecret, '[REDACTED]')
+  assert.equal(createManyArgs.data[0].raw.evidenceOrigin, 'microsoft_audit_event')
+  assert.equal(createManyArgs.data[0].raw.microsoftSource, 'Microsoft Graph /auditLogs/directoryAudits')
+})
+
+test('does not create snapshot evidence for a first successful baseline', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const evidence = service.buildSnapshotDifferenceEvidence({
+    tenant: { id: 'tenant-1', organizationId: 'org-1' },
+    resourceType: 'LICENSES',
+    previousPayload: null,
+    currentPayload: [{ skuId: 'sku-1', skuPartNumber: 'M365_BUSINESS', consumedUnits: 4 }],
+    observedAt: new Date('2026-08-17T12:00:00.000Z'),
+    expiresAt: new Date('2027-02-17T12:00:00.000Z'),
+  })
+  assert.deepEqual(evidence, [])
+})
+
+test('records a redacted, actorless snapshot difference only for tracked admin state', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const observedAt = new Date('2026-08-17T12:00:00.000Z')
+  const input = {
+    tenant: { id: 'tenant-1', organizationId: 'org-1' },
+    resourceType: 'APPLICATIONS',
+    previousPayload: [{ id: 'app-object-1', displayName: 'Example app', passwordCredentials: [{ secretText: 'old-secret' }], createdDateTime: '2026-01-01T00:00:00Z' }],
+    currentPayload: [{ id: 'app-object-1', displayName: 'Example app', passwordCredentials: [{ secretText: 'new-secret' }], createdDateTime: '2026-08-17T12:00:00Z' }],
+    observedAt,
+    expiresAt: new Date('2027-02-17T12:00:00.000Z'),
+  }
+  const evidence = service.buildSnapshotDifferenceEvidence(input)
+  assert.equal(evidence.length, 1)
+  assert.equal(evidence[0]?.actorPrincipalName, null)
+  assert.equal(evidence[0]?.organizationId, 'org-1')
+  assert.equal(evidence[0]?.customerTenantId, 'tenant-1')
+  assert.match(evidence[0]?.summary ?? '', /did not provide a confirmed actor/)
+  assert.equal(evidence[0]?.raw.evidenceOrigin, 'hawkview_snapshot_difference')
+  assert.equal(evidence[0]?.raw.microsoftSource, 'Microsoft Graph /applications')
+  assert.deepEqual(evidence[0]?.changedFields, ['passwordCredentials'])
+  assert.equal(JSON.stringify(evidence[0]?.afterState).includes('new-secret'), false)
+  assert.equal(evidence[0]?.sourceEventId.includes('new-secret'), false)
+  // Identical comparisons produce the same id so retried collection is deduplicable.
+  assert.equal(service.buildSnapshotDifferenceEvidence(input)[0]?.sourceEventId, evidence[0]?.sourceEventId)
+})
+
+test('does not treat SharePoint content activity or an unidentifiable row as an admin change', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const common = {
+    tenant: { id: 'tenant-1', organizationId: 'org-1' },
+    resourceType: 'SHAREPOINT_SITES',
+    observedAt: new Date('2026-08-17T12:00:00.000Z'),
+    expiresAt: new Date('2027-02-17T12:00:00.000Z'),
+  }
+  const contentOnly = service.buildSnapshotDifferenceEvidence({
+    ...common,
+    previousPayload: [{ id: 'site-1', displayName: 'Site', lastModifiedDateTime: '2026-08-16T00:00:00Z' }],
+    currentPayload: [{ id: 'site-1', displayName: 'Site', lastModifiedDateTime: '2026-08-17T00:00:00Z' }],
+  })
+  assert.deepEqual(contentOnly, [])
+  const noIdentifier = service.buildSnapshotDifferenceEvidence({
+    ...common,
+    previousPayload: [{}],
+    currentPayload: [{ displayName: 'Cannot prove target' }],
+  })
+  assert.deepEqual(noIdentifier, [])
+  const unsupportedResource = service.buildSnapshotDifferenceEvidence({
+    ...common,
+    resourceType: 'SHAREPOINT_USAGE',
+    previousPayload: [{ id: 'report-1', usage: 1 }],
+    currentPayload: [{ id: 'report-1', usage: 2 }],
+  })
+  assert.deepEqual(unsupportedResource, [])
+})
+
+test('emits actorless, provenance-labelled differences for every supported snapshot slice', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const observedAt = new Date('2026-08-17T12:00:00.000Z')
+
+  for (const [resourceType, spec] of Object.entries(SNAPSHOT_DIFFERENCE_SPECS)) {
+    const before: Record<string, unknown> = {}
+    const after: Record<string, unknown> = {}
+    for (const identifierField of [...spec.identifierFields, ...(spec.compoundIdentifierFields ?? [])]) {
+      before[identifierField] = `${resourceType}-${identifierField}`
+      after[identifierField] = `${resourceType}-${identifierField}`
+    }
+    const changedField = spec.trackedFields.find(
+      (field) => !spec.identifierFields.includes(field)
+    )
+    assert.ok(changedField, `${resourceType} needs a non-identifier state field`)
+    before[changedField] = 'before'
+    after[changedField] = 'after'
+
+    const evidence = service.buildSnapshotDifferenceEvidence({
+      tenant: { id: 'tenant-1', organizationId: 'org-1' },
+      resourceType,
+      previousPayload: [before],
+      currentPayload: [after],
+      observedAt,
+      expiresAt: new Date('2027-02-17T12:00:00.000Z'),
+    })
+
+    assert.equal(evidence.length, 1, resourceType)
+    assert.equal(evidence[0]?.actorPrincipalName, null, resourceType)
+    assert.equal(evidence[0]?.raw.evidenceOrigin, 'hawkview_snapshot_difference', resourceType)
+    assert.equal(evidence[0]?.raw.microsoftSource, spec.microsoftSource, resourceType)
+  }
+})
+
+test('canonicalizes only documented unordered admin-state arrays', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const input = {
+    tenant: { id: 'tenant-1', organizationId: 'org-1' }, resourceType: 'APPLICATIONS',
+    previousPayload: [{ id: 'app-1', appRoles: [{ id: 'b' }, { id: 'a' }], requiredResourceAccess: [{ resourceAppId: 'b' }, { resourceAppId: 'a' }] }],
+    currentPayload: [{ id: 'app-1', appRoles: [{ id: 'a' }, { id: 'b' }], requiredResourceAccess: [{ resourceAppId: 'a' }, { resourceAppId: 'b' }] }],
+    observedAt: new Date('2026-08-17T12:00:00.000Z'), baselineObservedAt: new Date('2026-08-17T11:00:00.000Z'), expiresAt: new Date('2027-02-17T12:00:00.000Z'),
+  }
+  assert.deepEqual(service.buildSnapshotDifferenceEvidence(input), [])
+  const ordered = service.buildSnapshotDifferenceEvidence({
+    ...input, resourceType: 'EXCHANGE_MAILBOX_RULES',
+    previousPayload: [{ id: 'rule', mailboxUserId: 'user', sequence: 1, actions: [{ kind: 'a' }, { kind: 'b' }] }],
+    currentPayload: [{ id: 'rule', mailboxUserId: 'user', sequence: 1, actions: [{ kind: 'b' }, { kind: 'a' }] }],
+  })
+  assert.equal(ordered.length, 1)
+})
+
+test('does not create changes when documented unordered fields are merely reordered', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const common = { tenant: { id: 'tenant-1', organizationId: 'org-1' }, observedAt: new Date('2026-08-17T12:00:00.000Z'), baselineObservedAt: new Date('2026-08-17T11:00:00.000Z'), expiresAt: new Date('2027-02-17T12:00:00.000Z') }
+  const cases: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+    ['GROUPS', { id: 'group', groupTypes: ['Unified', 'DynamicMembership'] }, { id: 'group', groupTypes: ['DynamicMembership', 'Unified'] }],
+    ['CONDITIONAL_ACCESS', { id: 'policy', conditions: { users: { includeUsers: ['a', 'b'] }, applications: { includeApplications: ['x', 'y'] } }, grantControls: { builtInControls: ['mfa', 'compliantDevice'] } }, { id: 'policy', conditions: { applications: { includeApplications: ['y', 'x'] }, users: { includeUsers: ['b', 'a'] } }, grantControls: { builtInControls: ['compliantDevice', 'mfa'] } }],
+    ['NAMED_LOCATIONS', { id: 'location', ipRanges: ['10.0.0.0/8', '192.168.0.0/16'], countriesAndRegions: ['CA', 'US'] }, { id: 'location', ipRanges: ['192.168.0.0/16', '10.0.0.0/8'], countriesAndRegions: ['US', 'CA'] }],
+    ['SERVICE_PRINCIPALS', { id: 'sp', tags: ['tag-a', 'tag-b'] }, { id: 'sp', tags: ['tag-b', 'tag-a'] }],
+    ['APPLICATIONS', { id: 'app', appRoles: [{ id: 'a' }, { id: 'b' }], requiredResourceAccess: [{ resourceAppId: 'a' }, { resourceAppId: 'b' }] }, { id: 'app', appRoles: [{ id: 'b' }, { id: 'a' }], requiredResourceAccess: [{ resourceAppId: 'b' }, { resourceAppId: 'a' }] }],
+    ['SHAREPOINT_SETTINGS', { id: 'settings', oneDriveForBusinessRestrictions: { allowedDomainGuids: ['a', 'b'] } }, { id: 'settings', oneDriveForBusinessRestrictions: { allowedDomainGuids: ['b', 'a'] } }],
+  ]
+  for (const [resourceType, before, after] of cases) {
+    assert.deepEqual(service.buildSnapshotDifferenceEvidence({ ...common, resourceType, previousPayload: [before], currentPayload: [after] }), [], resourceType)
+  }
+})
+
+test('uses baseline version for retry-safe but transition-distinct snapshot IDs', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const make = (baseline: string) => service.buildSnapshotDifferenceEvidence({
+    tenant: { id: 'tenant-1', organizationId: 'org-1' }, resourceType: 'GROUPS',
+    previousPayload: [{ id: 'group-1', displayName: 'A' }], currentPayload: [{ id: 'group-1', displayName: 'B' }],
+    observedAt: new Date('2026-08-17T12:00:00.000Z'), baselineObservedAt: new Date(baseline), expiresAt: new Date('2027-02-17T12:00:00.000Z'),
+  })[0]?.sourceEventId
+  assert.equal(make('2026-08-17T10:00:00.000Z'), make('2026-08-17T10:00:00.000Z'))
+  assert.notEqual(make('2026-08-17T10:00:00.000Z'), make('2026-08-17T11:00:00.000Z'))
+})
+
+test('collects all mailbox users and every Graph inbox-rules page with mailbox-scoped identity', async () => {
+  const users = Array.from({ length: 501 }, (_, index) => ({ microsoftUserId: `user-${index}`, userPrincipalName: `user-${index}@example.test` }))
+  const loadedUsers = await collectMailboxRuleUsers(async (skip, take) => users.slice(skip, skip + take))
+  assert.equal(loadedUsers.length, 501)
+  const rows = await collectMailboxRules(loadedUsers.slice(0, 2), async (user, next) => next
+    ? { value: [{ id: 'same-rule' }] }
+    : { value: [{ id: 'same-rule' }], '@odata.nextLink': `https://graph.microsoft.com/next/${user.microsoftUserId}` })
+  assert.equal(rows.length, 4)
+  assert.equal((rows[0] as any).mailboxUserId, 'user-0')
+  assert.equal((rows[2] as any).mailboxUserId, 'user-1')
+})
+
+test('serializes concurrent snapshot transitions so the second comparison uses the first new baseline', async () => {
+  let snapshot: any = { payload: [{ id: 'group-1', displayName: 'A' }], observedAt: new Date('2026-08-17T10:00:00.000Z'), organizationId: 'org-1' }
+  const evidenceWrites: any[] = []
+  let queue = Promise.resolve()
+  const prisma: any = {
+    $transaction: async (callback: any) => {
+      const previous = queue
+      let release!: () => void
+      queue = new Promise<void>((resolve) => { release = resolve })
+      await previous
+      try {
+        return await callback({
+          $executeRawUnsafe: async () => 1,
+          tenantEntraSnapshot: {
+            findUnique: async () => snapshot,
+            upsert: async (args: any) => { snapshot = { ...snapshot, payload: args.update.payload, observedAt: args.update.observedAt } },
+          },
+          changeEvidenceEvent: { createMany: async (args: any) => { evidenceWrites.push(...args.data) } },
+        })
+      } finally { release() }
+    },
+  }
+  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  await Promise.all([
+    (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([{ id: 'group-1', displayName: 'B' }])),
+    (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([{ id: 'group-1', displayName: 'C' }])),
+  ])
+  assert.equal(evidenceWrites.length, 2)
+  assert.equal(evidenceWrites[0].beforeState.displayName, 'A')
+  assert.equal(evidenceWrites[1].beforeState.displayName, 'B')
+  assert.equal(snapshot.payload[0].displayName, 'C')
+})
+
+test('refuses a cross-organization snapshot baseline instead of emitting tenant evidence', async () => {
+  const service = new TenantSyncService({
+    $transaction: async (callback: any) => callback({
+      $executeRawUnsafe: async () => 1,
+      tenantEntraSnapshot: { findUnique: async () => ({ payload: [], observedAt: new Date(), organizationId: 'other-org' }) },
+      changeEvidenceEvent: { createMany: async () => undefined },
+    }),
+  } as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  await assert.rejects(
+    () => (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([])),
+    /organization mismatch/
+  )
+})
+
+test('only complete snapshot results advance baselines, including legitimate empty inventories', async () => {
+  let snapshot: any = { payload: [{ id: 'group-1', displayName: 'Old' }], observedAt: new Date('2026-08-17T10:00:00.000Z'), organizationId: 'org-1' }
+  const writes: any[] = []
+  const prisma: any = {
+    $transaction: async (callback: any) => callback({
+      $executeRawUnsafe: async () => 1,
+      tenantEntraSnapshot: {
+        findUnique: async () => snapshot,
+        upsert: async (args: any) => { snapshot = { ...snapshot, payload: args.update.payload, observedAt: args.update.observedAt } },
+      },
+      changeEvidenceEvent: { createMany: async (args: any) => { writes.push(...args.data) } },
+    }),
+  }
+  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  await assert.rejects(
+    () => (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', partialSnapshot([])),
+    /partial or unverified/
+  )
+  assert.equal(snapshot.payload.length, 1)
+  await (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([]))
+  assert.deepEqual(snapshot.payload, [])
+  assert.equal(writes.length, 1)
+})
+
+test('does not create snapshot change evidence for a first authoritative empty baseline', async () => {
+  let snapshot: any = null
+  const writes: any[] = []
+  const prisma: any = {
+    $transaction: async (callback: any) => callback({
+      $executeRawUnsafe: async () => 1,
+      tenantEntraSnapshot: {
+        findUnique: async () => snapshot,
+        upsert: async (args: any) => { snapshot = { organizationId: 'org-1', payload: args.create.payload, observedAt: args.create.observedAt } },
+      },
+      changeEvidenceEvent: { createMany: async (args: any) => { writes.push(...args.data) } },
+    }),
+  }
+  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  await (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([]))
+  assert.deepEqual(snapshot.payload, [])
+  assert.equal(writes.length, 0)
+})
+
+test('bounds mailbox inventory and rule pagination without advancing a partial baseline', async () => {
+  await assert.rejects(
+    () => collectMailboxRuleUsers(async () => [{ microsoftUserId: 'user', userPrincipalName: 'user@example.test' }], { pageSize: 1, maxPages: 2 }),
+    /2-page safety limit/
+  )
+  await assert.rejects(
+    () => collectMailboxRuleUsers(async () => [
+      { microsoftUserId: 'user-1', userPrincipalName: 'one@example.test' },
+      { microsoftUserId: 'user-2', userPrincipalName: 'two@example.test' },
+    ], { pageSize: 2, maxRecords: 1 }),
+    /1-record safety limit/
+  )
+  let page = 0
+  await assert.rejects(
+    () => collectMailboxRules(
+      [{ microsoftUserId: 'user', userPrincipalName: 'user@example.test' }],
+      async () => ({ value: [{ id: `rule-${page++}` }], '@odata.nextLink': `https://graph.microsoft.com/next/${page}` }),
+      1,
+      { maxPages: 2 }
+    ),
+    /2-page safety limit/
+  )
+  await assert.rejects(
+    () => collectMailboxRules(
+      [{ microsoftUserId: 'user', userPrincipalName: 'user@example.test' }],
+      async () => ({ value: [{ id: 'rule-1' }, { id: 'rule-2' }] }),
+      1,
+      { maxRecords: 1 }
+    ),
+    /1-record safety limit/
+  )
+})
+
+test('bounds Graph mailbox directory pagination before a baseline can advance', async () => {
+  await assert.rejects(
+    () => collectMailboxDirectoryPages(
+      'https://graph.microsoft.com/users?page=1',
+      async () => ({ value: [{ id: 'one' }], '@odata.nextLink': 'https://graph.microsoft.com/users?page=1' })
+    ),
+    /repeated mailbox directory pagination link/
+  )
+  let uniquePage = 0
+  await assert.rejects(
+    () => collectMailboxDirectoryPages(
+      'https://graph.microsoft.com/users?page=0',
+      async () => ({ value: [{ id: uniquePage }], '@odata.nextLink': `https://graph.microsoft.com/users?page=${++uniquePage}` }),
+      { maxPages: 2 }
+    ),
+    /2-page safety limit/
+  )
+  await assert.rejects(
+    () => collectMailboxDirectoryPages(
+      'https://graph.microsoft.com/users?page=0',
+      async () => ({ value: [{ id: 'one' }, { id: 'two' }] }),
+      { maxRecords: 1 }
+    ),
+    /1-record safety limit/
+  )
+})
+
+test('does not attest to a complete SharePoint baseline when administrative enrichment fails', async () => {
+  const tokenFailure = sharePointSitesSnapshotResult([{ id: 'site-1' }], false)
+  const perSiteFailure = sharePointSitesSnapshotResult([{ id: 'site-1' }], false)
+  assert.equal(tokenFailure.completeness, 'partial_or_unknown')
+  assert.equal(perSiteFailure.completeness, 'partial_or_unknown')
+
+  let writes = 0
+  const service = new TenantSyncService({
+    $transaction: async (callback: any) => callback({
+      $executeRawUnsafe: async () => 1,
+      tenantEntraSnapshot: {
+        findUnique: async () => ({ payload: [{ id: 'old-site' }], observedAt: new Date(), organizationId: 'org-1' }),
+        upsert: async () => { writes += 1 },
+      },
+      changeEvidenceEvent: { createMany: async () => { writes += 1 } },
+    }),
+  } as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  await assert.rejects(
+    () => (service as any).saveSnapshot(
+      { id: 'tenant-1', organizationId: 'org-1' },
+      'SHAREPOINT_SITES',
+      tokenFailure
+    ),
+    /partial or unverified/
+  )
+  assert.equal(writes, 0)
+})
+
+test('marks owner or membership failures as incomplete group relationship synchronization', () => {
+  assert.doesNotThrow(() => assertGroupRelationshipRefreshComplete(0, 0))
+  assert.throws(
+    () => assertGroupRelationshipRefreshComplete(1, 0),
+    /relationship refresh was incomplete/
+  )
+  assert.throws(
+    () => assertGroupRelationshipRefreshComplete(0, 1),
+    /Existing relationships were retained/
+  )
+})
+
+test('documents supported Microsoft administrative evidence and the Unified Audit gap without enabling it', () => {
+  assert.equal(MICROSOFT_ADMIN_CHANGE_CATALOG.some((entry) => entry.normalizedEventType.includes('conditional_access')), true)
+  assert.equal(MICROSOFT_ADMIN_CHANGE_CATALOG.some((entry) => entry.workload === 'Teams and tenant-wide Microsoft 365 settings' && entry.collectorStatus === 'not_collected'), true)
+  assert.equal(UNIFIED_AUDIT_LOG_GAP_REPORT.leastPrivilegeApplicationPermission, 'ActivityFeed.Read (Office 365 Management APIs, not Microsoft Graph)')
+  assert.equal(UNIFIED_AUDIT_LOG_GAP_REPORT.adminConsentRequired, true)
+  assert.equal(UNIFIED_AUDIT_LOG_GAP_REPORT.status, 'documented_not_enabled')
+  assert.match(UNIFIED_AUDIT_LOG_GAP_REPORT.subscriptions, /poll/i)
+  assert.match(UNIFIED_AUDIT_LOG_GAP_REPORT.subscriptions, /optional/i)
+  assert.match(UNIFIED_AUDIT_LOG_GAP_REPORT.currentActivityFeedUse, /already consented/i)
+  assert.equal(DOMAIN_DETAIL_COVERAGE_GAP.requiredApplicationPermission, 'Domain.Read.All')
+  assert.equal(DOMAIN_DETAIL_COVERAGE_GAP.decision, 'permission_blocked_not_implemented')
+  assert.equal(MICROSOFT_ADMIN_CHANGE_CATALOG.some((entry) => entry.microsoftSource.includes('/domains')), false)
 })
