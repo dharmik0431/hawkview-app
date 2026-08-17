@@ -58,6 +58,18 @@ test('marks previous data stale without losing its last successful timestamp', (
   assert.equal(data.services.auditLogs.lastSuccessfulCollectionAt, '2026-08-13T10:00:00.000Z')
 })
 
+test('keeps daily inventory current until its daily grace window expires', () => {
+  const data = deriveTenantSyncFreshness(
+    ['LICENSES', 'DOMAINS', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'].map((resourceType) =>
+      success(resourceType, '2026-08-12T15:00:00.000Z'),
+    ),
+    now,
+  )
+
+  assert.equal(data.services.office365.status, 'SUCCESS')
+  assert.equal(data.services.office365.freshnessStatus, 'CURRENT')
+})
+
 test('maps permission failures separately from ordinary API failures', () => {
   const data = deriveTenantSyncFreshness([failed('SIGN_INS', null, '403')], now)
   assert.equal(data.services.signInLogs.permissionRequiredCollectors, 1)

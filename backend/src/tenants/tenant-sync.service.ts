@@ -25,6 +25,10 @@ import {
 } from './ip-geolocation.service.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 import { deriveTenantSyncFreshness } from './service-sync-freshness.js'
+import {
+  deriveAuditReconciliationResources,
+  type AuditReconciliationResource,
+} from './audit-change-reconciliation.js'
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
 
@@ -32,6 +36,33 @@ const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
 const MANAGEMENT_ACTIVITY_SOURCE = 'MICROSOFT_365_MANAGEMENT_ACTIVITY'
 const MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS = 7
+/**
+ * These collectors anchor the daily full-inventory run. They are deliberately
+ * separate from the five-minute users/activity delta loop.
+ */
+const DAILY_INVENTORY_ANCHORS = ['LICENSES', 'DOMAINS'] as const
+const DAILY_INVENTORY_REFRESH_MS = 24 * 60 * 60 * 1000
+const DAILY_INVENTORY_FAILURE_RETRY_MS = 60 * 60 * 1000
+
+type DailyInventoryState = {
+  resourceType: string
+  status: string
+  lastAttemptAt: Date | null
+  lastSuccessfulAt: Date | null
+}
+
+function requiresDailyInventoryRefresh(states: DailyInventoryState[], now: Date) {
+  const byResource = new Map(states.map((state) => [state.resourceType, state]))
+  return DAILY_INVENTORY_ANCHORS.some((resourceType) => {
+    const state = byResource.get(resourceType)
+    if (!state) return true
+
+    const retryIsDue = !state.lastAttemptAt || now.getTime() - state.lastAttemptAt.getTime() >= DAILY_INVENTORY_FAILURE_RETRY_MS
+    if (state.status === 'FAILED') return retryIsDue
+    if (!state.lastSuccessfulAt) return retryIsDue
+    return now.getTime() - state.lastSuccessfulAt.getTime() >= DAILY_INVENTORY_REFRESH_MS && retryIsDue
+  })
+}
 
 const AUTH_METHOD_NAMES: Record<string, string> = {
   fido2: 'Passkey (FIDO2)',
@@ -521,24 +552,38 @@ export class TenantSyncService {
             lastVerifiedAt: true,
           },
         },
+        syncStates: {
+          where: { resourceType: { in: [...DAILY_INVENTORY_ANCHORS] } },
+          select: {
+            resourceType: true,
+            status: true,
+            lastAttemptAt: true,
+            lastSuccessfulAt: true,
+          },
+        },
       },
     })
 
     const results: Array<Record<string, unknown>> = []
     for (const tenant of tenants) {
       try {
-        // Scheduled runs intentionally collect only change-oriented data. Full
-        // inventory collection is reserved for onboarding and a user-initiated
-        // sync so the five-minute job does not repeatedly download every
-        // SharePoint, Exchange, policy, and reporting dataset.
+        // Keep the five-minute run lightweight, but run a full inventory once
+        // per day (or retry a failed daily inventory anchor after an hour).
+        // This prevents a tenant from remaining permanently stale unless an
+        // administrator manually presses Sync Now.
+        const fullInventoryDue = requiresDailyInventoryRefresh(
+          tenant.syncStates,
+          new Date()
+        )
         const result = await this.syncConnectedTenant(tenant, false, {
-          incrementalOnly: true,
+          incrementalOnly: !fullInventoryDue,
           includeBundle: false,
         })
         results.push({
           tenantId: tenant.id,
           microsoftTenantId: tenant.microsoftTenantId,
           status: result.status,
+          syncMode: fullInventoryDue ? 'FULL_INVENTORY' : 'INCREMENTAL',
           failedResources: result.failedResources,
         })
       } catch (error) {
@@ -898,7 +943,7 @@ export class TenantSyncService {
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
       ),
       this.syncSignInLogs(tenant, snapshotAccessToken),
-      this.syncDirectoryAuditLogs(tenant, snapshotAccessToken),
+      this.syncDirectoryAuditLogs(tenant, snapshotAccessToken, false),
       this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
@@ -2432,8 +2477,9 @@ export class TenantSyncService {
   }
 
   private async syncDirectoryAuditLogs(
-    tenant: { id: string; organizationId: string },
-    accessToken: string
+    tenant: TenantSyncTarget,
+    accessToken: string,
+    reconcileChanges = true
   ) {
     return this.runSnapshotSync(tenant, 'AUDIT_LOGS', async () => {
       const start = await this.logSyncStart(tenant.id, 'AUDIT_LOGS')
@@ -2507,6 +2553,13 @@ export class TenantSyncService {
         })
         await this.changeEvidence.projectDirectoryAudits(tenant, records)
       }
+      // The users delta query ran immediately before the audit collector. For
+      // every other recognized directory change, use the audit feed as a
+      // lightweight trigger for its own collection instead of waiting for the
+      // daily inventory pass or re-reading the entire tenant.
+      if (reconcileChanges) {
+        await this.reconcileDirectoryAuditChanges(tenant, accessToken, newRecords)
+      }
       for (const record of newRecords) {
         const activity = record.activityDisplayName.toLowerCase()
         const securityEvent =
@@ -2559,6 +2612,111 @@ export class TenantSyncService {
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
+    })
+  }
+
+  /**
+   * Audit records are evidence, not the canonical object representation. A
+   * group-membership event therefore refreshes Groups from Graph and rewrites
+   * only HawkView's group projection; it never tries to infer an incomplete
+   * membership delta from a human-readable audit message.
+   */
+  private async reconcileDirectoryAuditChanges(
+    tenant: TenantSyncTarget,
+    accessToken: string,
+    records: Array<{
+      activityDisplayName: string
+      category?: string | null
+      loggedByService?: string | null
+      targetResources?: unknown
+    }>
+  ) {
+    const resources = deriveAuditReconciliationResources(records)
+    if (resources.length === 0) return
+
+    const synchronizers: Record<AuditReconciliationResource, () => Promise<unknown>> = {
+      GROUPS: () => this.syncGroups(tenant, accessToken),
+      LICENSES: () => this.syncLicenses(tenant, accessToken),
+      DOMAINS: () => this.syncDomains(tenant, accessToken),
+      DOMAIN_DNS_HEALTH: () => this.syncDomainDnsHealth(tenant),
+      AUTH_REGISTRATIONS: () =>
+        this.syncAuthenticationRegistrations(tenant, accessToken),
+      AUTH_METHOD_POLICIES: () =>
+        this.syncAuthenticationMethodPolicy(tenant, accessToken),
+      CONDITIONAL_ACCESS: () =>
+        this.syncEntraCollection(
+          tenant,
+          accessToken,
+          'CONDITIONAL_ACCESS',
+          'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies'
+        ),
+      NAMED_LOCATIONS: () =>
+        this.syncEntraCollection(
+          tenant,
+          accessToken,
+          'NAMED_LOCATIONS',
+          'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
+        ),
+      DEVICES: () =>
+        this.syncEntraCollection(
+          tenant,
+          accessToken,
+          'DEVICES',
+          'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)'
+        ),
+      DIRECTORY_ROLES: () =>
+        this.syncEntraCollection(
+          tenant,
+          accessToken,
+          'DIRECTORY_ROLES',
+          'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName)'
+        ),
+      SERVICE_PRINCIPALS: () =>
+        this.syncEntraCollection(
+          tenant,
+          accessToken,
+          'SERVICE_PRINCIPALS',
+          'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,description,servicePrincipalType,accountEnabled,appRoleAssignmentRequired,createdDateTime,homepage,loginUrl,publisherName,verifiedPublisher,tags,preferredSingleSignOnMode,notificationEmailAddresses,appRoles,oauth2PermissionScopes&$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)'
+        ),
+      APPLICATIONS: () =>
+        this.syncEntraCollection(
+          tenant,
+          accessToken,
+          'APPLICATIONS',
+          'https://graph.microsoft.com/v1.0/applications?$select=id,appId,displayName,description,createdDateTime,signInAudience,publisherDomain,identifierUris,web,passwordCredentials,keyCredentials,requiredResourceAccess&$expand=owners($select=id,displayName,userPrincipalName)'
+        ),
+      SECURITY_DEFAULTS: () => this.syncSecurityDefaults(tenant, accessToken),
+      EXCHANGE_MAILBOXES: () =>
+        this.syncExchangeMailboxDirectory(tenant, accessToken),
+      EXCHANGE_MAILBOX_SETTINGS: () =>
+        this.syncExchangeMailboxSettings(tenant, accessToken),
+      EXCHANGE_MAILBOX_CONFIGURATION: () =>
+        this.syncExchangeMailboxConfiguration(tenant),
+      EXCHANGE_MAILBOX_USAGE: () =>
+        this.syncExchangeMailboxUsage(tenant, accessToken),
+      EXCHANGE_ACCEPTED_DOMAINS: () =>
+        this.syncExchangeAcceptedDomains(tenant, accessToken),
+      EXCHANGE_MAILBOX_RULES: () =>
+        this.syncExchangeMailboxRules(tenant, accessToken),
+      SHAREPOINT_SITES: () => this.syncSharePointSites(tenant, accessToken),
+      SHAREPOINT_SETTINGS: () =>
+        this.syncSharePointSettings(tenant, accessToken),
+      SHAREPOINT_USAGE: () => this.syncSharePointUsage(tenant, accessToken),
+    }
+
+    const results = await Promise.allSettled(
+      resources.map((resource) => synchronizers[resource]())
+    )
+    results.forEach((result, index) => {
+      if (result.status !== 'rejected') return
+      const resource = resources[index] ?? 'UNKNOWN'
+      const message =
+        result.reason instanceof Error
+          ? result.reason.message
+          : String(result.reason)
+      this.logger.warn(
+        `Audit-triggered ${resource} reconciliation was unavailable for tenant ${tenant.id}: ${message}`
+      )
     })
   }
 
