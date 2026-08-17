@@ -195,6 +195,35 @@ test('required stale and failed collectors degrade tenant health', () => {
   assert.equal(deriveTenantHealth({ ...baseInput(), now, syncStates: failed }).overallStatus, 'DEGRADED')
 })
 
+test('daily inventory collectors remain healthy between daily full collections', () => {
+  const collectedAt = new Date('2026-08-13T00:00:00.000Z')
+  const now = new Date('2026-08-13T23:00:00.000Z')
+  const states = completeCurrentStates(collectedAt).map((state) =>
+    ['USERS', 'SIGN_INS', 'AUDIT_LOGS'].includes(state.resourceType)
+      ? { ...state, lastAttemptAt: now, lastSuccessfulAt: now }
+      : state,
+  )
+  const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
+
+  assert.equal(result.resourceHealth.find((item) => item.resourceType === 'LICENSES')?.classification, 'SUCCESS')
+  assert.equal(result.resourceHealth.find((item) => item.resourceType === 'DOMAINS')?.classification, 'SUCCESS')
+  assert.notEqual(result.data.freshnessStatus, 'STALE')
+})
+
+test('daily inventory collectors become stale only after the daily grace window', () => {
+  const collectedAt = new Date('2026-08-13T00:00:00.000Z')
+  const now = new Date('2026-08-14T03:00:00.000Z')
+  const states = completeCurrentStates(collectedAt).map((state) =>
+    ['USERS', 'SIGN_INS', 'AUDIT_LOGS'].includes(state.resourceType)
+      ? { ...state, lastAttemptAt: now, lastSuccessfulAt: now }
+      : state,
+  )
+  const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
+
+  assert.equal(result.resourceHealth.find((item) => item.resourceType === 'LICENSES')?.classification, 'STALE')
+  assert.equal(result.resourceHealth.find((item) => item.resourceType === 'DOMAINS')?.classification, 'STALE')
+})
+
 test('revoked access and critical security findings take precedence', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   assert.equal(deriveTenantHealth({ ...baseInput(), connectionStatus: 'REVOKED', now }).overallStatus, 'DISCONNECTED')

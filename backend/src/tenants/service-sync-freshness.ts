@@ -120,9 +120,17 @@ export const SERVICE_COLLECTOR_REGISTRY: readonly ServiceDefinition[] = [
 ] as const
 
 export const SERVICE_FRESHNESS_WINDOWS = {
-  currentMs: 15 * 60 * 1000,
-  agingMs: 2 * 60 * 60 * 1000,
+  incremental: { currentMs: 15 * 60 * 1000, agingMs: 2 * 60 * 60 * 1000 },
+  dailyInventory: { currentMs: 24 * 60 * 60 * 1000, agingMs: 26 * 60 * 60 * 1000 },
 } as const
+
+const INCREMENTAL_COLLECTORS = new Set(['USERS', 'SIGN_INS', 'AUDIT_LOGS'])
+
+function freshnessWindow(collector: string) {
+  return INCREMENTAL_COLLECTORS.has(collector)
+    ? SERVICE_FRESHNESS_WINDOWS.incremental
+    : SERVICE_FRESHNESS_WINDOWS.dailyInventory
+}
 
 const RENDER_CRON_SCHEDULE = '*/5 * * * *'
 const RENDER_CRON_INTERVAL_MINUTES = 5
@@ -135,13 +143,13 @@ function authFailure(state: PersistedSyncState) {
   return state.lastErrorCode === '401' || state.lastErrorCode === '403' || /unauthorized|forbidden|permission|consent/i.test(state.lastErrorMessage ?? '')
 }
 
-function collectorStatus(state: PersistedSyncState | undefined, now: Date): CollectorSyncStatus {
+function collectorStatus(resourceType: string, state: PersistedSyncState | undefined, now: Date): CollectorSyncStatus {
   if (!state) return 'NOT_CONFIGURED'
   if (state.status === 'RUNNING') return 'RUNNING'
   if (state.status === 'FAILED') return authFailure(state) ? 'PERMISSION_REQUIRED' : 'FAILED'
   if (state.status === 'IDLE' && !state.lastAttemptAt && !state.lastSuccessfulAt) return 'PENDING'
   if (!state.lastSuccessfulAt) return 'PENDING'
-  return now.getTime() - state.lastSuccessfulAt.getTime() > SERVICE_FRESHNESS_WINDOWS.agingMs
+  return now.getTime() - state.lastSuccessfulAt.getTime() > freshnessWindow(resourceType).agingMs
     ? 'STALE'
     : 'SUCCESS'
 }
@@ -166,7 +174,7 @@ function oldestIso(dates: Array<Date | null | undefined>) {
 
 function buildService(definition: ServiceDefinition, states: Map<string, PersistedSyncState>, now: Date): ServiceSyncFreshness {
   const rows = definition.collectors.map((collector) => ({ collector, state: states.get(collector) }))
-  const classifications = rows.map(({ state }) => collectorStatus(state, now))
+  const classifications = rows.map(({ collector, state }) => collectorStatus(collector, state, now))
   const successfulCollectors = classifications.filter((status) => status === 'SUCCESS' || status === 'EMPTY').length
   // A failed collector can still have usable data from an earlier successful
   // collection. Keep that distinction so a service is PARTIAL, not FAILED.
@@ -185,8 +193,13 @@ function buildService(definition: ServiceDefinition, states: Map<string, Persist
   let freshnessStatus: ServiceFreshnessStatus = 'UNKNOWN'
   if (!lastSuccessfulCollectionAt) freshnessStatus = expectedCollectors > 0 ? 'NEVER_SYNCED' : 'UNKNOWN'
   else if (oldestSuccessful) {
-    const age = now.getTime() - new Date(oldestSuccessful).getTime()
-    freshnessStatus = age <= SERVICE_FRESHNESS_WINDOWS.currentMs ? 'CURRENT' : age <= SERVICE_FRESHNESS_WINDOWS.agingMs ? 'AGING' : 'STALE'
+    const collectorFreshness = rows.map(({ collector, state }) => {
+      if (!state?.lastSuccessfulAt) return 'STALE' as const
+      const age = now.getTime() - state.lastSuccessfulAt.getTime()
+      const window = freshnessWindow(collector)
+      return age <= window.currentMs ? 'CURRENT' as const : age <= window.agingMs ? 'AGING' as const : 'STALE' as const
+    })
+    freshnessStatus = collectorFreshness.includes('STALE') ? 'STALE' : collectorFreshness.includes('AGING') ? 'AGING' : 'CURRENT'
   }
 
   let status: ServiceSyncStatus

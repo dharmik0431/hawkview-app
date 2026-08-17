@@ -41,7 +41,24 @@ export const TENANT_HEALTH_RESOURCE_REGISTRY: ReadonlyArray<{ resourceType: stri
  */
 const OPTIONAL_ADMIN_COLLECTORS = new Set(['EXCHANGE_MAILBOX_CONFIGURATION'])
 
-export const TENANT_HEALTH_FRESHNESS = { currentMs: 15 * 60 * 1000, agingMs: 2 * 60 * 60 * 1000 } as const
+/**
+ * HawkView receives lightweight delta/activity updates every five minutes, but
+ * full inventory collectors run once per day.  Treating every collector as
+ * stale after two hours created false health alerts for otherwise successful
+ * daily inventory synchronization.
+ */
+export const TENANT_HEALTH_FRESHNESS = {
+  incremental: { currentMs: 15 * 60 * 1000, agingMs: 2 * 60 * 60 * 1000 },
+  dailyInventory: { currentMs: 24 * 60 * 60 * 1000, agingMs: 26 * 60 * 60 * 1000 },
+} as const
+
+const INCREMENTAL_RESOURCE_TYPES = new Set(['USERS', 'SIGN_INS', 'AUDIT_LOGS'])
+
+function freshnessWindow(resourceType: string) {
+  return INCREMENTAL_RESOURCE_TYPES.has(resourceType)
+    ? TENANT_HEALTH_FRESHNESS.incremental
+    : TENANT_HEALTH_FRESHNESS.dailyInventory
+}
 
 function mfaCoverage(payload: unknown) { if (!Array.isArray(payload)) return null; const rows = payload.filter((row): row is { isMfaRegistered: boolean } => typeof row === 'object' && row !== null && typeof (row as { isMfaRegistered?: unknown }).isMfaRegistered === 'boolean'); return rows.length ? Math.round((rows.filter((row) => row.isMfaRegistered).length / rows.length) * 100) : null }
 function latestDate(dates: Array<Date | null>) { return dates.filter((d): d is Date => Boolean(d)).sort((a, b) => b.getTime() - a.getTime())[0]?.toISOString() ?? null }
@@ -73,17 +90,21 @@ function classify(state: SyncState | undefined, now: Date): Omit<ResourceHealth,
   if (state.status === 'RUNNING') return { ...base, classification: 'PENDING', reasonCode: 'collector-running', message: 'Collection is in progress.' }
   if (!state.lastSuccessfulAt) return { ...base, classification: 'NOT_CONFIGURED', reasonCode: 'never-succeeded', message: 'The collector has not completed successfully.' }
   const age = now.getTime() - state.lastSuccessfulAt.getTime()
-  if (age > TENANT_HEALTH_FRESHNESS.agingMs) return { ...base, classification: 'STALE', reasonCode: 'stale-success', message: 'The last successful collection is outside the acceptable window.' }
+  if (age > freshnessWindow(state.resourceType).agingMs) return { ...base, classification: 'STALE', reasonCode: 'stale-success', message: 'The last successful collection is outside its scheduled freshness window.' }
   return { ...base, classification: 'SUCCESS', reasonCode: null, message: null }
 }
 
 function freshness(resources: ResourceHealth[], now: Date): FreshnessStatus {
   const applicable = resources.filter((r) => r.classification !== 'UNSUPPORTED' && r.classification !== 'NOT_LICENSED')
-  const dates = applicable.map((r) => r.lastSuccessfulAt ? new Date(r.lastSuccessfulAt) : null).filter((d): d is Date => Boolean(d))
-  if (!dates.length) return applicable.length ? 'NEVER_SYNCED' : 'UNKNOWN'
-  const oldest = Math.min(...dates.map((d) => d.getTime())); const age = now.getTime() - oldest
-  if (age <= TENANT_HEALTH_FRESHNESS.currentMs) return 'CURRENT'
-  return age <= TENANT_HEALTH_FRESHNESS.agingMs ? 'AGING' : 'STALE'
+  const collected = applicable.filter((resource) => Boolean(resource.lastSuccessfulAt))
+  if (!collected.length) return applicable.length ? 'NEVER_SYNCED' : 'UNKNOWN'
+  const statuses = collected.map((resource) => {
+    const age = now.getTime() - new Date(resource.lastSuccessfulAt!).getTime()
+    const window = freshnessWindow(resource.resourceType)
+    return age <= window.currentMs ? 'CURRENT' as const : age <= window.agingMs ? 'AGING' as const : 'STALE' as const
+  })
+  if (statuses.includes('STALE')) return 'STALE'
+  return statuses.includes('AGING') ? 'AGING' : 'CURRENT'
 }
 
 export function deriveTenantHealth(input: HealthInput) {
