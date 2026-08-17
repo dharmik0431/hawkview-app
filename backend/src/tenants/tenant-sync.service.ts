@@ -31,6 +31,11 @@ import {
 } from './audit-change-reconciliation.js'
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
+import {
+  DAILY_INVENTORY_ANCHORS,
+  requiresDailyInventoryRefresh,
+  scheduledSyncTenantWhere,
+} from './scheduled-sync-selection.js'
 
 const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
@@ -40,30 +45,6 @@ const MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS = 7
  * These collectors anchor the daily full-inventory run. They are deliberately
  * separate from the five-minute users/activity delta loop.
  */
-const DAILY_INVENTORY_ANCHORS = ['LICENSES', 'DOMAINS'] as const
-const DAILY_INVENTORY_REFRESH_MS = 24 * 60 * 60 * 1000
-const DAILY_INVENTORY_FAILURE_RETRY_MS = 60 * 60 * 1000
-
-type DailyInventoryState = {
-  resourceType: string
-  status: string
-  lastAttemptAt: Date | null
-  lastSuccessfulAt: Date | null
-}
-
-function requiresDailyInventoryRefresh(states: DailyInventoryState[], now: Date) {
-  const byResource = new Map(states.map((state) => [state.resourceType, state]))
-  return DAILY_INVENTORY_ANCHORS.some((resourceType) => {
-    const state = byResource.get(resourceType)
-    if (!state) return true
-
-    const retryIsDue = !state.lastAttemptAt || now.getTime() - state.lastAttemptAt.getTime() >= DAILY_INVENTORY_FAILURE_RETRY_MS
-    if (state.status === 'FAILED') return retryIsDue
-    if (!state.lastSuccessfulAt) return retryIsDue
-    return now.getTime() - state.lastSuccessfulAt.getTime() >= DAILY_INVENTORY_REFRESH_MS && retryIsDue
-  })
-}
-
 const AUTH_METHOD_NAMES: Record<string, string> = {
   fido2: 'Passkey (FIDO2)',
   microsoftAuthenticator: 'Microsoft Authenticator',
@@ -509,31 +490,13 @@ export class TenantSyncService {
   }
 
   async syncDueTenants() {
-    const staleBefore = new Date(Date.now() - 5 * 60 * 1000)
+    const now = new Date()
     const limit = Math.max(
       1,
       Math.min(25, Number(process.env.SCHEDULED_SYNC_BATCH_SIZE ?? 10) || 10)
     )
     const tenants = await this.prisma.customerTenant.findMany({
-      where: {
-        status: 'ACTIVE',
-        connection: { status: 'CONNECTED' },
-        OR: [
-          { syncStates: { none: { resourceType: 'USERS' } } },
-          {
-            syncStates: {
-              some: {
-                resourceType: 'USERS',
-                OR: [
-                  { lastSuccessfulAt: null },
-                  { lastSuccessfulAt: { lt: staleBefore } },
-                  { status: 'FAILED' },
-                ],
-              },
-            },
-          },
-        ],
-      },
+      where: scheduledSyncTenantWhere(now),
       orderBy: { updatedAt: 'asc' },
       take: limit,
       select: {
@@ -573,7 +536,7 @@ export class TenantSyncService {
         // administrator manually presses Sync Now.
         const fullInventoryDue = requiresDailyInventoryRefresh(
           tenant.syncStates,
-          new Date()
+          now
         )
         const result = await this.syncConnectedTenant(tenant, false, {
           incrementalOnly: !fullInventoryDue,

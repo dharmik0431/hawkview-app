@@ -109,7 +109,17 @@ function getKeyResultText(q: QueueItem): string {
   }
 
   if (key.includes('sync') || label.includes('sync')) {
-    return 'Sync status: Failed'
+    const normalizedWhy = why.toLowerCase()
+    if (normalizedWhy.includes('outside the acceptable window') || normalizedWhy.includes('outside the service freshness window')) {
+      return 'Collection overdue'
+    }
+    if (normalizedWhy.includes('awaiting execution') || normalizedWhy.includes('in progress')) {
+      return 'Sync in progress'
+    }
+    if (normalizedWhy.includes('permission') || normalizedWhy.includes('forbidden') || normalizedWhy.includes('unauthorized')) {
+      return 'Permission required'
+    }
+    return 'Sync needs attention'
   }
 
   if (why && why.length > 0 && why.length <= 45 && !why.includes('http')) {
