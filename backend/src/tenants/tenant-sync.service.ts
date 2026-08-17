@@ -282,6 +282,184 @@ interface GraphOrganization {
   }>
 }
 
+type MailboxRuleUser = { microsoftUserId: string; userPrincipalName: string }
+
+/**
+ * A snapshot baseline may only advance after a collector can attest that its
+ * response is complete. This avoids treating an interrupted or bounded read
+ * as a destructive inventory deletion.
+ */
+export type SnapshotCollectionResult = {
+  rows: unknown[]
+  completeness: 'authoritative_complete' | 'partial_or_unknown'
+}
+
+export const authoritativeSnapshot = (rows: unknown[]): SnapshotCollectionResult => ({
+  rows,
+  completeness: 'authoritative_complete',
+})
+
+export const partialSnapshot = (rows: unknown[]): SnapshotCollectionResult => ({
+  rows,
+  completeness: 'partial_or_unknown',
+})
+
+/**
+ * Site access metadata is part of the compared SHAREPOINT_SITES state.  A
+ * Graph inventory page by itself is therefore not enough to attest to a
+ * complete site snapshot when its SharePoint administrative enrichment did
+ * not finish.  Callers must retain the previous baseline in that case.
+ */
+export function sharePointSitesSnapshotResult(
+  rows: unknown[],
+  administrativeEnrichmentComplete: boolean
+): SnapshotCollectionResult {
+  return administrativeEnrichmentComplete
+    ? authoritativeSnapshot(rows)
+    : partialSnapshot(rows)
+}
+
+/**
+ * Group definitions and their owner/member relationship refreshes have
+ * different authority boundaries. Definitions may be safely snapshotted from
+ * /groups, but any failed relationship collection must still surface as a
+ * partial GROUPS synchronization rather than a successful one.
+ */
+export function assertGroupRelationshipRefreshComplete(
+  ownerFailures: number,
+  membershipFailures: number
+) {
+  if (ownerFailures > 0 || membershipFailures > 0) {
+    throw new Error(
+      `Microsoft group definitions synchronized, but relationship refresh was incomplete (${ownerFailures} owner and ${membershipFailures} membership failure(s)). Existing relationships were retained for failed groups.`
+    )
+  }
+}
+
+export type MailboxPaginationBounds = {
+  pageSize?: number
+  maxPages?: number
+  maxRecords?: number
+}
+
+const DEFAULT_MAILBOX_USER_PAGE_SIZE = 250
+const DEFAULT_MAX_MAILBOX_USER_PAGES = 1_000
+const DEFAULT_MAX_MAILBOX_USERS = 100_000
+const DEFAULT_MAX_RULE_PAGES_PER_MAILBOX = 100
+const DEFAULT_MAX_RULES_PER_MAILBOX = 10_000
+
+/**
+ * Follows a Graph collection cursor with explicit termination bounds.  This
+ * is intentionally separate from the local-directory paginator above: Graph
+ * next links are opaque and a unique, never-ending link chain is still an
+ * incomplete collection rather than a reason to advance a destructive
+ * baseline.
+ */
+export async function collectMailboxDirectoryPages(
+  initialUrl: string,
+  loadPage: (nextUrl: string) => Promise<GraphCollectionPage>,
+  bounds: MailboxPaginationBounds = {}
+) {
+  const maxPages = bounds.maxPages ?? DEFAULT_MAX_MAILBOX_USER_PAGES
+  const maxRecords = bounds.maxRecords ?? DEFAULT_MAX_MAILBOX_USERS
+  const rows: unknown[] = []
+  const seen = new Set<string>()
+  let nextUrl: string | null = initialUrl
+  let pageNumber = 0
+
+  while (nextUrl) {
+    if (pageNumber >= maxPages) {
+      throw new Error(
+        `Mailbox directory exceeded the ${maxPages}-page safety limit; baseline was not advanced.`
+      )
+    }
+    if (seen.has(nextUrl)) {
+      throw new Error(
+        'Microsoft returned a repeated mailbox directory pagination link; baseline was not advanced.'
+      )
+    }
+    seen.add(nextUrl)
+    const page = await loadPage(nextUrl)
+    pageNumber += 1
+    rows.push(...(page.value ?? []))
+    if (rows.length > maxRecords) {
+      throw new Error(
+        `Mailbox directory exceeded the ${maxRecords}-record safety limit; baseline was not advanced.`
+      )
+    }
+    nextUrl =
+      typeof page['@odata.nextLink'] === 'string'
+        ? page['@odata.nextLink']
+        : null
+  }
+
+  return rows
+}
+
+/** Paginates the local recipient inventory; no tenant is silently capped. */
+export async function collectMailboxRuleUsers(
+  loadPage: (skip: number, take: number) => Promise<MailboxRuleUser[]>,
+  bounds: MailboxPaginationBounds = {}
+) {
+  const pageSize = bounds.pageSize ?? DEFAULT_MAILBOX_USER_PAGE_SIZE
+  const maxPages = bounds.maxPages ?? DEFAULT_MAX_MAILBOX_USER_PAGES
+  const maxRecords = bounds.maxRecords ?? DEFAULT_MAX_MAILBOX_USERS
+  const users: MailboxRuleUser[] = []
+  for (let pageNumber = 0, skip = 0; ; pageNumber += 1, skip += pageSize) {
+    if (pageNumber >= maxPages) {
+      throw new Error(`Mailbox recipient inventory exceeded the ${maxPages}-page safety limit; baseline was not advanced.`)
+    }
+    const page = await loadPage(skip, pageSize)
+    users.push(...page)
+    if (users.length > maxRecords) {
+      throw new Error(`Mailbox recipient inventory exceeded the ${maxRecords}-record safety limit; baseline was not advanced.`)
+    }
+    if (page.length < pageSize) return users
+  }
+}
+
+/** Follows Graph next links and retains the mailbox part of each rule identity. */
+export async function collectMailboxRules(
+  users: MailboxRuleUser[],
+  loadPage: (user: MailboxRuleUser, nextUrl: string | null) => Promise<GraphCollectionPage>,
+  batchSize = 5,
+  bounds: MailboxPaginationBounds = {}
+) {
+  const maxPages = bounds.maxPages ?? DEFAULT_MAX_RULE_PAGES_PER_MAILBOX
+  const maxRecords = bounds.maxRecords ?? DEFAULT_MAX_RULES_PER_MAILBOX
+  const rows: unknown[] = []
+  for (let index = 0; index < users.length; index += batchSize) {
+    const results = await Promise.all(users.slice(index, index + batchSize).map(async (user) => {
+      const mailboxRows: unknown[] = []
+      let nextUrl: string | null = null
+      const seen = new Set<string>()
+      let pageNumber = 0
+      do {
+        if (pageNumber >= maxPages) {
+          throw new Error(`Inbox rules for ${user.userPrincipalName} exceeded the ${maxPages}-page safety limit; baseline was not advanced.`)
+        }
+        const page = await loadPage(user, nextUrl)
+        pageNumber += 1
+        mailboxRows.push(...(page.value ?? []).map((rule: any) => ({
+          ...rule,
+          mailboxUserId: user.microsoftUserId,
+          mailboxUpn: user.userPrincipalName,
+        })))
+        if (mailboxRows.length > maxRecords) {
+          throw new Error(`Inbox rules for ${user.userPrincipalName} exceeded the ${maxRecords}-record safety limit; baseline was not advanced.`)
+        }
+        const candidate = typeof page['@odata.nextLink'] === 'string' ? page['@odata.nextLink'] : null
+        if (candidate && seen.has(candidate)) throw new Error('Microsoft returned a repeated inbox-rules pagination link.')
+        if (candidate) seen.add(candidate)
+        nextUrl = candidate
+      } while (nextUrl)
+      return mailboxRows
+    }))
+    rows.push(...results.flat())
+  }
+  return rows
+}
+
 interface GraphGroup {
   id?: string
   displayName?: string | null
@@ -311,6 +489,8 @@ interface GraphGroupMembersPage {
 }
 
 type EntraSnapshotResource =
+  | 'LICENSES'
+  | 'DOMAINS'
   | 'AUTH_REGISTRATIONS'
   | 'AUTH_METHOD_POLICIES'
   | 'CONDITIONAL_ACCESS'
@@ -1314,6 +1494,7 @@ export class TenantSyncService {
           },
         })
       })
+      await this.saveSnapshot(tenant, 'LICENSES', authoritativeSnapshot(rows))
     })
   }
 
@@ -1390,6 +1571,7 @@ export class TenantSyncService {
           },
         })
       })
+      await this.saveSnapshot(tenant, 'DOMAINS', authoritativeSnapshot(domains))
     })
   }
 
@@ -1414,7 +1596,7 @@ export class TenantSyncService {
       const results = await Promise.all(
         domains.map(({ name }) => resolveDomainDnsHealth(name))
       )
-      await this.saveSnapshot(tenant, 'DOMAIN_DNS_HEALTH', results)
+      await this.saveSnapshot(tenant, 'DOMAIN_DNS_HEALTH', authoritativeSnapshot(results))
     })
   }
 
@@ -1461,6 +1643,59 @@ export class TenantSyncService {
         id: group.id as string,
         displayName: group.displayName,
       }))
+      const observedAt = new Date()
+
+      // A group definition is an independently authoritative Graph /groups
+      // collection.  Persist and snapshot that definition before attempting
+      // the optional relationship subcollections below.  Owners/members are
+      // not fields in the GROUPS comparison contract, so a relationship 403
+      // must not turn a valid group definition into a false removal.
+      await this.prisma.$transaction(async (transaction) => {
+        for (const group of groups) {
+          const microsoftGroupId = group.id as string
+          await transaction.directoryGroup.upsert({
+            where: {
+              customerTenantId_microsoftGroupId: {
+                customerTenantId: tenant.id,
+                microsoftGroupId,
+              },
+            },
+            create: {
+              organizationId: tenant.organizationId,
+              customerTenantId: tenant.id,
+              microsoftGroupId,
+              displayName: group.displayName?.trim() || microsoftGroupId,
+              description: group.description?.trim() || null,
+              mail: group.mail?.trim() || null,
+              mailNickname: group.mailNickname?.trim() || null,
+              mailEnabled: group.mailEnabled === true,
+              securityEnabled: group.securityEnabled === true,
+              groupTypes: group.groupTypes ?? [],
+              visibility: group.visibility?.trim() || null,
+              lastSeenAt: observedAt,
+            },
+            update: {
+              displayName: group.displayName?.trim() || microsoftGroupId,
+              description: group.description?.trim() || null,
+              mail: group.mail?.trim() || null,
+              mailNickname: group.mailNickname?.trim() || null,
+              mailEnabled: group.mailEnabled === true,
+              securityEnabled: group.securityEnabled === true,
+              groupTypes: group.groupTypes ?? [],
+              visibility: group.visibility?.trim() || null,
+              lastSeenAt: observedAt,
+            },
+          })
+        }
+        await transaction.directoryGroup.deleteMany({
+          where: {
+            customerTenantId: tenant.id,
+            lastSeenAt: { lt: observedAt },
+          },
+        })
+      })
+
+      await this.saveSnapshot(tenant, 'GROUPS', authoritativeSnapshot(groups))
 
       const fetchGroupOwners = async (groupId: string) => {
         const owners: NonNullable<GraphGroup['owners']> = []
@@ -1568,7 +1803,8 @@ export class TenantSyncService {
         )
       }
 
-      const directoryUsers = await this.prisma.directoryUser.findMany({
+      const [directoryUsers, directoryGroups] = await Promise.all([
+        this.prisma.directoryUser.findMany({
         where: {
           customerTenantId: tenant.id,
           deletedAt: null,
@@ -1577,55 +1813,29 @@ export class TenantSyncService {
           id: true,
           microsoftUserId: true,
         },
-      })
+        }),
+        this.prisma.directoryGroup.findMany({
+          where: { customerTenantId: tenant.id },
+          select: { id: true, microsoftGroupId: true },
+        }),
+      ])
       const directoryUserIdByMicrosoftId = new Map(
         directoryUsers.map((user) => [user.microsoftUserId, user.id])
       )
-      const observedAt = new Date()
+      const directoryGroupIdByMicrosoftId = new Map(
+        directoryGroups.map((group) => [group.microsoftGroupId, group.id])
+      )
 
       await this.prisma.$transaction(async (transaction) => {
         for (const group of groups) {
           const microsoftGroupId = group.id as string
-          const directoryGroup = await transaction.directoryGroup.upsert({
-            where: {
-              customerTenantId_microsoftGroupId: {
-                customerTenantId: tenant.id,
-                microsoftGroupId,
-              },
-            },
-            create: {
-              organizationId: tenant.organizationId,
-              customerTenantId: tenant.id,
-              microsoftGroupId,
-              displayName: group.displayName?.trim() || microsoftGroupId,
-              description: group.description?.trim() || null,
-              mail: group.mail?.trim() || null,
-              mailNickname: group.mailNickname?.trim() || null,
-              mailEnabled: group.mailEnabled === true,
-              securityEnabled: group.securityEnabled === true,
-              groupTypes: group.groupTypes ?? [],
-              visibility: group.visibility?.trim() || null,
-              lastSeenAt: observedAt,
-            },
-            update: {
-              displayName: group.displayName?.trim() || microsoftGroupId,
-              description: group.description?.trim() || null,
-              mail: group.mail?.trim() || null,
-              mailNickname: group.mailNickname?.trim() || null,
-              mailEnabled: group.mailEnabled === true,
-              securityEnabled: group.securityEnabled === true,
-              groupTypes: group.groupTypes ?? [],
-              visibility: group.visibility?.trim() || null,
-              lastSeenAt: observedAt,
-            },
-          })
-
-          if (!memberIdsByGroupId.has(microsoftGroupId)) {
+          const directoryGroupId = directoryGroupIdByMicrosoftId.get(microsoftGroupId)
+          if (!directoryGroupId || !memberIdsByGroupId.has(microsoftGroupId)) {
             continue
           }
 
           await transaction.directoryGroupMembership.deleteMany({
-            where: { directoryGroupId: directoryGroup.id },
+            where: { directoryGroupId },
           })
           const memberships = (memberIdsByGroupId.get(microsoftGroupId) ?? [])
             .map((microsoftUserId) => ({
@@ -1642,7 +1852,7 @@ export class TenantSyncService {
             .map((membership) => ({
               organizationId: tenant.organizationId,
               customerTenantId: tenant.id,
-              directoryGroupId: directoryGroup.id,
+              directoryGroupId,
               directoryUserId: membership.directoryUserId,
               lastSeenAt: observedAt,
             }))
@@ -1654,15 +1864,12 @@ export class TenantSyncService {
           }
         }
 
-        await transaction.directoryGroup.deleteMany({
-          where: {
-            customerTenantId: tenant.id,
-            lastSeenAt: { lt: observedAt },
-          },
-        })
       })
 
-      await this.saveSnapshot(tenant, 'GROUPS', groups)
+      assertGroupRelationshipRefreshComplete(
+        ownerFailures.length,
+        membershipFailures.length
+      )
     })
   }
 
@@ -1699,25 +1906,7 @@ export class TenantSyncService {
         rows.push(...(page.value ?? []))
         nextUrl = page['@odata.nextLink'] ?? ''
       }
-      await this.prisma.tenantEntraSnapshot.upsert({
-        where: {
-          customerTenantId_resourceType: {
-            customerTenantId: tenant.id,
-            resourceType,
-          },
-        },
-        create: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-          resourceType,
-          payload: rows as never,
-          observedAt: new Date(),
-        },
-        update: {
-          payload: rows as never,
-          observedAt: new Date(),
-        },
-      })
+      await this.saveSnapshot(tenant, resourceType, authoritativeSnapshot(rows))
     })
   }
 
@@ -1755,25 +1944,7 @@ export class TenantSyncService {
     resourceType: EntraSnapshotResource,
     rows: unknown[]
   ) {
-    await this.prisma.tenantEntraSnapshot.upsert({
-      where: {
-        customerTenantId_resourceType: {
-          customerTenantId: tenant.id,
-          resourceType,
-        },
-      },
-      create: {
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
-        resourceType,
-        payload: rows as never,
-        observedAt: new Date(),
-      },
-      update: {
-        payload: rows as never,
-        observedAt: new Date(),
-      },
-    })
+    await this.saveSnapshot(tenant, resourceType, authoritativeSnapshot(rows))
   }
 
   private async syncAuthenticationRegistrations(
@@ -2685,23 +2856,62 @@ export class TenantSyncService {
   private async saveSnapshot(
     tenant: { id: string; organizationId: string },
     resourceType: EntraSnapshotResource,
-    rows: unknown[]
+    result: SnapshotCollectionResult
   ) {
-    await this.prisma.tenantEntraSnapshot.upsert({
-      where: {
-        customerTenantId_resourceType: {
+    if (result.completeness !== 'authoritative_complete') {
+      throw new Error(
+        `Refusing to advance ${resourceType} snapshot baseline from a partial or unverified collection.`
+      )
+    }
+    const rows = result.rows
+    const observedAt = new Date()
+    // A baseline and its evidence must move together.  The first snapshot has
+    // no prior successful collection and intentionally creates no change. A
+    // PostgreSQL transaction advisory lock serializes this resource across
+    // concurrent workers so they cannot compare against one stale baseline.
+    await this.prisma.$transaction(async (transaction) => {
+      await transaction.$executeRawUnsafe(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        `hawkview:snapshot:${tenant.id}:${resourceType}`
+      )
+      const existing = await transaction.tenantEntraSnapshot.findUnique({
+        where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType } },
+        select: { payload: true, observedAt: true, organizationId: true },
+      })
+      if (existing && existing.organizationId !== tenant.organizationId) {
+        throw new Error('Snapshot organization mismatch; refusing cross-organization comparison.')
+      }
+      const previousRows = Array.isArray(existing?.payload) ? existing.payload : []
+      // This method only accepts a collector result that explicitly attests
+      // to complete pagination. A legitimate empty inventory can therefore
+      // remove prior objects, while failed or partial reads cannot advance
+      // the baseline or create mass-removal evidence.
+      const evidence = this.changeEvidence.buildSnapshotDifferenceEvidence({
+        tenant, resourceType, previousPayload: existing?.payload, currentPayload: rows,
+        observedAt, baselineObservedAt: existing?.observedAt, expiresAt: logExpirationDate(observedAt),
+      })
+      if (evidence.length > 0) {
+        await transaction.changeEvidenceEvent.createMany({
+          data: evidence as never,
+          skipDuplicates: true,
+        })
+      }
+      await transaction.tenantEntraSnapshot.upsert({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType,
+          },
+        },
+        create: {
+          organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
           resourceType,
+          payload: rows as never,
+          observedAt,
         },
-      },
-      create: {
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
-        resourceType,
-        payload: rows as never,
-        observedAt: new Date(),
-      },
-      update: { payload: rows as never, observedAt: new Date() },
+        update: { payload: rows as never, observedAt },
+      })
     })
   }
 
@@ -2710,10 +2920,11 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOXES', async () => {
-      const rows: unknown[] = []
-      let nextUrl =
+      const initialUrl =
         'https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,proxyAddresses,accountEnabled,assignedLicenses&$top=999'
-      while (nextUrl) {
+      const directoryUsers = await collectMailboxDirectoryPages(
+        initialUrl,
+        async (nextUrl) => {
         if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
           throw new Error(
             'Microsoft returned an invalid users pagination link.'
@@ -2731,27 +2942,25 @@ export class TenantSyncService {
             `Microsoft mailbox directory synchronization returned ${response.status}. Confirm User.Read.All application permission.`
           )
         }
-        const page = (await response.json()) as GraphCollectionPage
-        rows.push(
-          ...(page.value ?? [])
-            .filter(
-              (user: any) =>
-                typeof user?.mail === 'string' ||
-                (Array.isArray(user?.assignedLicenses) &&
-                  user.assignedLicenses.length > 0)
-            )
-            .map((user: any) => ({
-              id: user.id,
-              displayName: user.displayName,
-              userPrincipalName: user.userPrincipalName,
-              mail: user.mail,
-              proxyAddresses: user.proxyAddresses ?? [],
-              accountEnabled: user.accountEnabled !== false,
-            }))
+          return (await response.json()) as GraphCollectionPage
+        }
+      )
+      const rows = directoryUsers
+        .filter(
+          (user: any) =>
+            typeof user?.mail === 'string' ||
+            (Array.isArray(user?.assignedLicenses) &&
+              user.assignedLicenses.length > 0)
         )
-        nextUrl = page['@odata.nextLink'] ?? ''
-      }
-      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOXES', rows)
+        .map((user: any) => ({
+          id: user.id,
+          displayName: user.displayName,
+          userPrincipalName: user.userPrincipalName,
+          mail: user.mail,
+          proxyAddresses: user.proxyAddresses ?? [],
+          accountEnabled: user.accountEnabled !== false,
+        }))
+      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOXES', authoritativeSnapshot(rows))
     })
   }
 
@@ -2766,11 +2975,15 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_SETTINGS', async () => {
-      const users = await this.prisma.directoryUser.findMany({
-        where: { customerTenantId: tenant.id, deletedAt: null },
-        select: { microsoftUserId: true, userPrincipalName: true },
-        take: 500,
-      })
+      const users = await collectMailboxRuleUsers((skip, take) =>
+        this.prisma.directoryUser.findMany({
+          where: { customerTenantId: tenant.id, deletedAt: null },
+          select: { microsoftUserId: true, userPrincipalName: true },
+          orderBy: { microsoftUserId: 'asc' },
+          skip,
+          take,
+        })
+      )
       const rows: unknown[] = []
       for (let index = 0; index < users.length; index += 5) {
         const batch = users.slice(index, index + 5)
@@ -2804,7 +3017,7 @@ export class TenantSyncService {
         )
         rows.push(...results.filter((row) => row !== null))
       }
-      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_SETTINGS', rows)
+      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_SETTINGS', authoritativeSnapshot(rows))
     })
   }
 
@@ -2891,7 +3104,7 @@ export class TenantSyncService {
         await this.saveSnapshot(
           tenant,
           'EXCHANGE_MAILBOX_CONFIGURATION',
-          rows
+          authoritativeSnapshot(rows)
         )
       }
     )
@@ -2906,7 +3119,7 @@ export class TenantSyncService {
       'EXCHANGE_ACCEPTED_DOMAINS',
       async () => {
         const response = await fetch(
-          'https://graph.microsoft.com/v1.0/domains?$select=id,isDefault,isInitial,isVerified,supportedServices',
+          'https://graph.microsoft.com/v1.0/organization?$select=verifiedDomains',
           {
             headers: {
               Authorization: `Bearer ${accessToken}`,
@@ -2917,25 +3130,25 @@ export class TenantSyncService {
         )
         if (!response.ok) {
           throw new Error(
-            `Microsoft accepted-domain synchronization returned ${response.status}. Confirm Domain.Read.All application permission.`
+            `Microsoft accepted-domain synchronization returned ${response.status}. Confirm Organization.Read.All application permission.`
           )
         }
-        const page = (await response.json()) as GraphCollectionPage
-        const domains = (page.value ?? [])
+        const page = (await response.json()) as { value?: GraphOrganization[] }
+        // Deliberately limited to the Organization.Read.All shape.  Full
+        // accepted-domain attributes (isVerified/supportedServices) require
+        // Domain.Read.All and are not claimed or requested in Phase 1.
+        const domains = (page.value?.[0]?.verifiedDomains ?? [])
           .filter(
-            (domain: any) =>
-              domain?.isVerified !== false &&
-              (!Array.isArray(domain?.supportedServices) ||
-                domain.supportedServices.includes('Email'))
+            (domain: any) => typeof domain?.name === 'string' && domain.name.trim()
           )
           .map((domain: any) => ({
-            id: domain.id,
-            domain: domain.id,
+            id: domain.name,
+            domain: domain.name,
             type: 'Authoritative',
             isDefault: Boolean(domain.isDefault),
             isInitial: Boolean(domain.isInitial),
           }))
-        await this.saveSnapshot(tenant, 'EXCHANGE_ACCEPTED_DOMAINS', domains)
+        await this.saveSnapshot(tenant, 'EXCHANGE_ACCEPTED_DOMAINS', authoritativeSnapshot(domains))
       }
     )
   }
@@ -2980,7 +3193,7 @@ export class TenantSyncService {
       await this.saveSnapshot(
         tenant,
         'EXCHANGE_MAILBOX_USAGE',
-        parseCsvRows(csv)
+        authoritativeSnapshot(parseCsvRows(csv))
       )
     })
   }
@@ -2990,43 +3203,19 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_RULES', async () => {
-      const users = await this.prisma.directoryUser.findMany({
+      const users = await collectMailboxRuleUsers((skip, take) => this.prisma.directoryUser.findMany({
         where: { customerTenantId: tenant.id, deletedAt: null },
-        select: { microsoftUserId: true, userPrincipalName: true },
-        take: 500,
+        select: { microsoftUserId: true, userPrincipalName: true }, orderBy: { microsoftUserId: 'asc' }, skip, take,
+      }))
+      const rows = await collectMailboxRules(users, async (user, continuation) => {
+        const url = continuation ?? `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.microsoftUserId)}/mailFolders/inbox/messageRules?$top=100`
+        if (!url.startsWith('https://graph.microsoft.com/')) throw new Error('Microsoft returned an invalid inbox-rules pagination link.')
+        const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' }, signal: AbortSignal.timeout(20_000) })
+        if (response.status === 404) return { value: [] }
+        if (!response.ok) throw new Error(`Microsoft inbox rules synchronization returned ${response.status}. Confirm MailboxSettings.Read application permission.`)
+        return (await response.json()) as GraphCollectionPage
       })
-      const rows: unknown[] = []
-      for (let index = 0; index < users.length; index += 5) {
-        const batch = users.slice(index, index + 5)
-        const results = await Promise.all(
-          batch.map(async (user) => {
-            const response = await fetch(
-              `https://graph.microsoft.com/v1.0/users/${user.microsoftUserId}/mailFolders/inbox/messageRules`,
-              {
-                headers: {
-                  Authorization: `Bearer ${accessToken}`,
-                  Accept: 'application/json',
-                },
-                signal: AbortSignal.timeout(20_000),
-              }
-            )
-            if (response.status === 404) return []
-            if (!response.ok) {
-              throw new Error(
-                `Microsoft inbox rules synchronization returned ${response.status}. Confirm MailboxSettings.Read application permission.`
-              )
-            }
-            const body = (await response.json()) as GraphCollectionPage
-            return (body.value ?? []).map((rule: any) => ({
-              ...rule,
-              mailboxUserId: user.microsoftUserId,
-              mailboxUpn: user.userPrincipalName,
-            }))
-          })
-        )
-        rows.push(...results.flat())
-      }
-      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', rows)
+      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows))
     })
   }
 
@@ -3115,6 +3304,7 @@ export class TenantSyncService {
         }
       }
       const enrichedSites: any[] = []
+      let administrativeEnrichmentComplete = Boolean(sharePointAccessToken)
       for (let index = 0; index < uniqueSites.length; index += 8) {
         const batch = uniqueSites.slice(index, index + 8)
         const batchRows = await Promise.all(
@@ -3152,6 +3342,7 @@ export class TenantSyncService {
                   collectionError: 'SharePoint access token unavailable.',
                 }
             if (access.collectionError) {
+              administrativeEnrichmentComplete = false
               this.logger.warn(
                 `SharePoint access metadata incomplete for tenant ${tenant.id}, site ${String(site.id)}: ${access.collectionError}`
               )
@@ -3166,25 +3357,14 @@ export class TenantSyncService {
         enrichedSites.push(...batchRows)
       }
 
-      await this.prisma.tenantEntraSnapshot.upsert({
-        where: {
-          customerTenantId_resourceType: {
-            customerTenantId: tenant.id,
-            resourceType: 'SHAREPOINT_SITES',
-          },
-        },
-        create: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-          resourceType: 'SHAREPOINT_SITES',
-          payload: enrichedSites as never,
-          observedAt: new Date(),
-        },
-        update: {
-          payload: enrichedSites as never,
-          observedAt: new Date(),
-        },
-      })
+      await this.saveSnapshot(
+        tenant,
+        'SHAREPOINT_SITES',
+        sharePointSitesSnapshotResult(
+          enrichedSites,
+          administrativeEnrichmentComplete
+        )
+      )
     })
   }
 
@@ -3326,25 +3506,7 @@ export class TenantSyncService {
         )
       }
 
-      await this.prisma.tenantEntraSnapshot.upsert({
-        where: {
-          customerTenantId_resourceType: {
-            customerTenantId: tenant.id,
-            resourceType: 'SHAREPOINT_SETTINGS',
-          },
-        },
-        create: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-          resourceType: 'SHAREPOINT_SETTINGS',
-          payload: [settings] as never,
-          observedAt: new Date(),
-        },
-        update: {
-          payload: [settings] as never,
-          observedAt: new Date(),
-        },
-      })
+      await this.saveSnapshot(tenant, 'SHAREPOINT_SETTINGS', authoritativeSnapshot([settings]))
     })
   }
 
@@ -3404,25 +3566,7 @@ export class TenantSyncService {
           oneDriveAccounts: parseCsvRows(oneDriveReport),
         },
       ]
-      await this.prisma.tenantEntraSnapshot.upsert({
-        where: {
-          customerTenantId_resourceType: {
-            customerTenantId: tenant.id,
-            resourceType: 'SHAREPOINT_USAGE',
-          },
-        },
-        create: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-          resourceType: 'SHAREPOINT_USAGE',
-          payload: payload as never,
-          observedAt: new Date(),
-        },
-        update: {
-          payload: payload as never,
-          observedAt: new Date(),
-        },
-      })
+      await this.saveSnapshot(tenant, 'SHAREPOINT_USAGE', authoritativeSnapshot(payload))
     })
   }
 
