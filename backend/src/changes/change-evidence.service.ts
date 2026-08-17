@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { legacyCategory } from './change-classification.js'
 
 type JsonObject = Record<string, unknown>
 const object = (value: unknown): JsonObject =>
@@ -35,19 +36,6 @@ function parseValue(value: unknown): unknown {
   } catch {
     return value
   }
-}
-
-function classify(activity: string, category?: string | null) {
-  const value = `${activity} ${category ?? ''}`.toLowerCase()
-  if (/authentication method|security info|mfa|strong authentication/.test(value)) return { category: 'MFA', severity: 'High' }
-  if (/password/.test(value)) return { category: 'Passwords', severity: 'High' }
-  if (/conditional access|named location/.test(value)) return { category: 'Conditional Access', severity: 'High' }
-  if (/service principal|application|app registration|credential|oauth/.test(value)) return { category: 'Apps', severity: 'High' }
-  if (/role|eligible assignment|member to role/.test(value)) return { category: 'Roles', severity: 'High' }
-  if (/group/.test(value)) return { category: 'Groups', severity: 'Medium' }
-  if (/device/.test(value)) return { category: 'Devices', severity: 'Medium' }
-  if (/license/.test(value)) return { category: 'Licenses', severity: 'Medium' }
-  return { category: 'Users', severity: 'Low' }
 }
 
 function targetState(targetResources: unknown) {
@@ -99,7 +87,7 @@ export class ChangeEvidenceService {
   ) {
     if (records.length === 0) return
     const data = records.map((record) => {
-      const kind = classify(record.activityDisplayName, record.category)
+      const kind = legacyCategory(record.activityDisplayName, record.category)
       const target = targetState(record.targetResources)
       const initiatedBy = actor(record.initiatedBy)
       const initiated = object(record.initiatedBy)
@@ -130,53 +118,6 @@ export class ChangeEvidenceService {
         beforeState: target.before ?? undefined,
         afterState: target.after ?? undefined,
         changedFields: target.fields ?? undefined,
-        raw: redactSensitiveValues(record.raw) as never,
-        ingestedAt: record.ingestedAt,
-        expiresAt: record.expiresAt,
-      }
-    })
-    await this.prisma.changeEvidenceEvent.createMany({
-      data: data as never,
-      skipDuplicates: true,
-    })
-  }
-
-  async projectSignIns(
-    tenant: { id: string; organizationId: string },
-    records: Array<Record<string, any>>
-  ) {
-    if (records.length === 0) return
-    const data = records.map((record) => {
-      const failed = Boolean(record.statusErrorCode && record.statusErrorCode !== '0')
-      const risky = Boolean(
-        record.riskLevel && !['none', 'hidden', 'unknown'].includes(String(record.riskLevel).toLowerCase())
-      )
-      return {
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
-        source: 'SIGN_IN',
-        sourceEventId: record.microsoftSignInId,
-        eventDateTime: record.eventDateTime,
-        workload: 'Microsoft Entra ID',
-        category: 'Sign-ins',
-        severity: risky ? 'High' : failed ? 'Medium' : 'Low',
-        operationName: failed ? 'Failed sign-in' : 'Successful sign-in',
-        summary: [record.appDisplayName, record.failureReason, record.conditionalAccessStatus]
-          .filter(Boolean)
-          .join(' · ') || 'Microsoft sign-in activity',
-        actorId: record.userId ?? null,
-        actorDisplayName: record.userDisplayName ?? null,
-        actorPrincipalName: record.userPrincipalName ?? null,
-        targetId: record.appId ?? null,
-        targetDisplayName: record.resourceDisplayName ?? record.appDisplayName ?? null,
-        targetType: 'Application',
-        correlationId: null,
-        result: failed ? 'Failure' : 'Success',
-        ipAddress: record.ipAddress ?? null,
-        location: record.location ? redactSensitiveValues(record.location) as never : undefined,
-        beforeState: undefined,
-        afterState: { result: failed ? 'Failed' : 'Success', riskLevel: record.riskLevel ?? null } as never,
-        changedFields: undefined,
         raw: redactSensitiveValues(record.raw) as never,
         ingestedAt: record.ingestedAt,
         expiresAt: record.expiresAt,

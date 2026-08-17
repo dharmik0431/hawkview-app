@@ -2116,7 +2116,6 @@ export class TenantSyncService {
           data: records as never,
           skipDuplicates: true,
         })
-        await this.changeEvidence.projectSignIns(tenant, records)
       }
       if (limited && inferredLocations.size > 0) {
         await this.backfillLimitedSignInLocations(

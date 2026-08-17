@@ -1,12 +1,20 @@
 import { BadRequestException, ForbiddenException, Inject, Injectable, Logger } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { redactSensitiveValues } from './change-evidence.service.js'
+import {
+  classifyEvidence,
+  isPrimaryChange,
+  legacyCategory,
+  PRIMARY_CHANGE_CLASSIFICATIONS,
+  type ChangeClassification,
+} from './change-classification.js'
 
 type JsonObject = Record<string, unknown>
-type ChangeCategory = 'MFA' | 'Passwords' | 'Conditional Access' | 'Apps' | 'Roles' | 'Groups' | 'Devices' | 'Licenses' | 'Users'
 type TimelineEvent = {
   id: string
-  eventType: 'change' | 'sign-in'
+  eventType: 'change'
+  classification: ChangeClassification
   ts: string
   tenantId: string
   tenantName: string
@@ -27,19 +35,6 @@ const text = (value: unknown) => typeof value === 'string' && value.trim() ? val
 const parseValue = (value: unknown) => {
   if (typeof value !== 'string') return value
   try { return JSON.parse(value) } catch { return value }
-}
-
-function classify(activity: string, category?: string | null) {
-  const value = `${activity} ${category ?? ''}`.toLowerCase()
-  if (/authentication method|security info|mfa|strong authentication/.test(value)) return { category: 'MFA', severity: 'High' } as const
-  if (/password/.test(value)) return { category: 'Passwords', severity: 'High' } as const
-  if (/conditional access|named location/.test(value)) return { category: 'Conditional Access', severity: 'High' } as const
-  if (/service principal|application|app registration|credential/.test(value)) return { category: 'Apps', severity: 'High' } as const
-  if (/role|eligible assignment|member to role/.test(value)) return { category: 'Roles', severity: 'High' } as const
-  if (/group/.test(value)) return { category: 'Groups', severity: 'Medium' } as const
-  if (/device/.test(value)) return { category: 'Devices', severity: 'Medium' } as const
-  if (/license/.test(value)) return { category: 'Licenses', severity: 'Medium' } as const
-  return { category: 'Users', severity: 'Low' } as const
 }
 
 function guidance(category: string): string[] {
@@ -96,9 +91,19 @@ function targetDetails(value: unknown) {
   const before: JsonObject = {}; const after: JsonObject = {}
   for (const resource of targets) for (const item of array(resource.modifiedProperties).map(object)) {
     const name = text(item.displayName) ?? 'value'
-    before[name] = parseValue(item.oldValue); after[name] = parseValue(item.newValue)
+    before[name] = redactSensitiveValues(parseValue(item.oldValue), name)
+    after[name] = redactSensitiveValues(parseValue(item.newValue), name)
   }
   return { target, before, after }
+}
+
+function correlationIdFromRaw(value: unknown) {
+  const raw = object(value)
+  return text(raw.correlationId) ?? text(raw.correlation_id)
+}
+
+function targetResourceTypes(value: unknown) {
+  return array(value).map(object).map((target) => text(target.type)).filter((type): type is string => Boolean(type))
 }
 
 @Injectable()
@@ -116,6 +121,20 @@ export class ChangesService {
     return user.memberships.map((membership) => membership.organizationId)
   }
 
+  /** The six-month range is bounded, but records inside it are never silently capped. */
+  private async loadAllPages<T extends { id: string }>(loadPage: (cursor?: string) => Promise<T[]>) {
+    const records: T[] = []
+    let cursor: string | undefined
+    for (;;) {
+      const page = await loadPage(cursor)
+      records.push(...page)
+      if (page.length < 1000) return records
+      const nextCursor = page.at(-1)?.id
+      if (!nextCursor || nextCursor === cursor) throw new Error('Change investigation pagination could not advance safely.')
+      cursor = nextCursor
+    }
+  }
+
   async list(identity: AuthenticatedIdentity, query: Record<string, unknown>) {
     const organizationIds = await this.organizationIds(identity); const now = new Date()
     const from = new Date(text(query.from) ?? now.getTime() - 86_400_000); const to = new Date(text(query.to) ?? now)
@@ -128,21 +147,15 @@ export class ChangesService {
     const tenantIds = scopedTenants.map((tenant) => tenant.id)
     const names = new Map(allTenants.map((tenant) => [tenant.id, tenant.displayName ?? tenant.primaryDomain ?? 'Microsoft tenant']))
     const where = { organizationId: { in: organizationIds }, customerTenantId: { in: tenantIds }, eventDateTime: { gte: from, lte: to } }
-    const [auditLogs, signIns, evidenceEvents] = await Promise.all([
-      this.prisma.directoryAuditLog
-        .findMany({ where, orderBy: { eventDateTime: 'desc' }, take: 5000 })
+    const [auditLogs, evidenceEvents] = await Promise.all([
+      this.loadAllPages((cursor) => this.prisma.directoryAuditLog
+        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) }))
         .catch((error) => {
           this.logger.warn(`Unable to load directory audit source records: ${error instanceof Error ? error.message : String(error)}`)
           return []
         }),
-      this.prisma.signInLog
-        .findMany({ where, orderBy: { eventDateTime: 'desc' }, take: 5000 })
-        .catch((error) => {
-          this.logger.warn(`Unable to load sign-in source records: ${error instanceof Error ? error.message : String(error)}`)
-          return []
-        }),
-      this.prisma.changeEvidenceEvent
-        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 5000 })
+      this.loadAllPages((cursor) => this.prisma.changeEvidenceEvent
+        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) }))
         .catch((error) => {
           // The source logs remain the canonical fallback while a newly
           // deployed projection table is unavailable or being backfilled.
@@ -151,23 +164,22 @@ export class ChangesService {
         }),
     ])
 
-    const changes = auditLogs.map((log) => {
-      const kind = classify(log.activityDisplayName, log.category); const details = targetDetails(log.targetResources)
-      return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: 'Entra' as const, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: evidenceFrom(log) }
-    })
-    const signInEvents = signIns.map((log) => {
-      const location = object(log.location); const device = object(log.deviceDetail)
-      const failed = Boolean(log.statusErrorCode && log.statusErrorCode !== '0'); const risky = Boolean(log.riskLevel && !['none', 'hidden', 'unknown'].includes(log.riskLevel.toLowerCase()))
-      return { id: `signin:${log.microsoftSignInId}`, eventType: 'sign-in' as const, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: 'Sign-ins' as const, severity: risky ? 'High' as const : failed ? 'Medium' as const : 'Low' as const, title: failed ? 'Failed sign-in' : 'Successful sign-in', summary: [log.appDisplayName, log.failureReason, log.conditionalAccessStatus].filter(Boolean).join(' · ') || 'Microsoft sign-in activity', actor: log.userPrincipalName ?? log.userDisplayName ?? undefined, target: log.resourceDisplayName ?? log.appDisplayName ?? undefined, source: 'Entra' as const, ip: log.ipAddress ?? undefined, location: { city: text(location.city), region: text(location.state) ?? text(location.region), country: text(location.countryOrRegion) ?? text(location.country) }, client: { app: log.clientAppUsed ?? log.appDisplayName ?? undefined, device: text(device.displayName) ?? text(device.operatingSystem) }, before: {}, after: { result: failed ? 'Failed' : 'Success', riskLevel: log.riskLevel }, recoveryGuidance: risky || failed ? ['Confirm whether this sign-in was expected.', 'Revoke sessions and reset credentials if it was unauthorized.'] : [] }
-    })
+    const changes = auditLogs
+      .filter((log) => isPrimaryChange({ source: 'DIRECTORY_AUDIT', activity: log.activityDisplayName, category: log.category, operationType: log.operationType, targetResourceTypes: targetResourceTypes(log.targetResources) }))
+      .map((log) => {
+        const kind = legacyCategory(log.activityDisplayName, log.category); const details = targetDetails(log.targetResources)
+        const classification = classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: log.activityDisplayName, category: log.category, operationType: log.operationType, targetResourceTypes: targetResourceTypes(log.targetResources) })
+        return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, classification, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: 'Entra' as const, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: { ...evidenceFrom(log), provenance: 'Microsoft Graph directoryAudit' } }
+      })
     const normalized = evidenceEvents.map((event) => {
       const location = object(event.location)
       const before = object(event.beforeState)
       const after = object(event.afterState)
-      const isSignIn = event.source === 'SIGN_IN'
+      const classification = classifyEvidence({ source: event.source, activity: event.operationName, category: event.category })
       return {
-        id: `${isSignIn ? 'signin' : 'audit'}:${event.sourceEventId}`,
-        eventType: isSignIn ? 'sign-in' as const : 'change' as const,
+        id: `audit:${event.sourceEventId}`,
+        eventType: 'change' as const,
+        classification,
         ts: event.eventDateTime.toISOString(),
         tenantId: event.customerTenantId,
         tenantName: names.get(event.customerTenantId) ?? 'Microsoft tenant',
@@ -194,14 +206,15 @@ export class ChangesService {
           changedFields: array(event.changedFields),
           workload: event.workload,
           result: event.result,
+          provenance: event.source === 'DIRECTORY_AUDIT' ? 'Microsoft Graph directoryAudit' : event.source,
         },
       }
-    })
+    }).filter((event) => PRIMARY_CHANGE_CLASSIFICATIONS.has(event.classification))
     // A projection is created during subsequent syncs. Keep previously
     // retained raw records visible and let the normalized record replace its
     // identical source event when both are present.
     const bySourceEvent = new Map<string, TimelineEvent>(
-      [...changes, ...signInEvents].map((event): [string, TimelineEvent] => [event.id, event])
+      changes.map((event): [string, TimelineEvent] => [event.id, event])
     )
     for (const event of normalized) bySourceEvent.set(event.id, event)
     let events: TimelineEvent[] = [...bySourceEvent.values()]
@@ -219,8 +232,12 @@ export class ChangesService {
     const total = events.length
     const summary = {
       total,
-      changes: events.filter((event) => event.eventType === 'change').length,
-      signIns: events.filter((event) => event.eventType === 'sign-in').length,
+      changes: total,
+      // Retained sign-in telemetry is intentionally excluded from the
+      // primary change timeline and only returned as labelled supporting
+      // evidence on a correlated change detail response.
+      signIns: 0,
+      supportingSignIns: 0,
       highRisk: events.filter((event) => event.severity === 'High').length,
       actors: new Set(events.map((event) => event.actor).filter(Boolean)).size,
       apps: new Set(events.filter((event) => event.category === 'Apps').map((event) => event.target).filter(Boolean)).size,
@@ -232,33 +249,92 @@ export class ChangesService {
   async detail(identity: AuthenticatedIdentity, sourceId: string) {
     const separator = sourceId.indexOf(':')
     if (separator <= 0) throw new BadRequestException('Use a valid change event identifier.')
-    const source = sourceId.slice(0, separator) === 'signin' ? 'SIGN_IN' : 'DIRECTORY_AUDIT'
+    if (sourceId.slice(0, separator) === 'signin') {
+      throw new BadRequestException('Sign-ins are available only as correlated supporting evidence for a recorded change.')
+    }
+    const source = 'DIRECTORY_AUDIT'
     const sourceEventId = sourceId.slice(separator + 1)
     const organizationIds = await this.organizationIds(identity)
-    const event = await this.prisma.changeEvidenceEvent.findFirst({
+    const projectedEvent = await this.prisma.changeEvidenceEvent.findFirst({
       where: { source, sourceEventId, organizationId: { in: organizationIds } },
     })
-    if (!event) throw new BadRequestException('This investigation event is unavailable or outside retention.')
+    const fallbackAudit = projectedEvent ? null : await this.prisma.directoryAuditLog.findFirst({
+      where: { microsoftAuditId: sourceEventId, organizationId: { in: organizationIds } },
+    })
+    if (!projectedEvent && !fallbackAudit) throw new BadRequestException('This investigation event is unavailable or outside retention.')
+
+    const fallbackKind = fallbackAudit ? legacyCategory(fallbackAudit.activityDisplayName, fallbackAudit.category) : null
+    const fallbackDetails = fallbackAudit ? targetDetails(fallbackAudit.targetResources) : null
+    const classification = projectedEvent
+      ? classifyEvidence({ source: projectedEvent.source, activity: projectedEvent.operationName, category: projectedEvent.category })
+      : classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: fallbackAudit!.activityDisplayName, category: fallbackAudit!.category, operationType: fallbackAudit!.operationType, targetResourceTypes: targetResourceTypes(fallbackAudit!.targetResources) })
+    if (!PRIMARY_CHANGE_CLASSIFICATIONS.has(classification)) {
+      throw new BadRequestException('This record is telemetry rather than a tenant change investigation event.')
+    }
+    const event = projectedEvent ?? {
+      id: fallbackAudit!.id,
+      source: 'DIRECTORY_AUDIT',
+      sourceEventId: fallbackAudit!.microsoftAuditId,
+      eventDateTime: fallbackAudit!.eventDateTime,
+      customerTenantId: fallbackAudit!.customerTenantId,
+      organizationId: fallbackAudit!.organizationId,
+      category: fallbackKind!.category,
+      severity: fallbackKind!.severity,
+      operationName: fallbackAudit!.activityDisplayName,
+      summary: [fallbackAudit!.operationType, fallbackAudit!.result, fallbackAudit!.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change',
+      actorPrincipalName: actorFrom(fallbackAudit!.initiatedBy) ?? null,
+      actorDisplayName: null,
+      targetDisplayName: fallbackDetails!.target ?? null,
+      correlationId: fallbackAudit!.correlationId,
+      changedFields: Object.keys({ ...fallbackDetails!.before, ...fallbackDetails!.after }),
+      workload: evidenceFrom(fallbackAudit!).loggedByService ?? 'Microsoft Entra ID',
+      result: fallbackAudit!.result,
+      location: null,
+      beforeState: fallbackDetails!.before,
+      afterState: fallbackDetails!.after,
+      raw: redactSensitiveValues(fallbackAudit!.raw),
+    }
     const related = event.correlationId
       ? await this.prisma.changeEvidenceEvent.findMany({
-          where: { customerTenantId: event.customerTenantId, correlationId: event.correlationId },
+          where: { organizationId: { in: organizationIds }, customerTenantId: event.customerTenantId, correlationId: event.correlationId },
           orderBy: [{ eventDateTime: 'asc' }, { id: 'asc' }],
           take: 100,
         })
-      : await this.prisma.changeEvidenceEvent.findMany({
+      : []
+    const correlatedSignIns = event.correlationId
+      ? await this.prisma.signInLog.findMany({
           where: {
+            organizationId: { in: organizationIds },
             customerTenantId: event.customerTenantId,
-            actorId: event.actorId ?? undefined,
-            eventDateTime: { gte: new Date(event.eventDateTime.getTime() - 15 * 60_000), lte: new Date(event.eventDateTime.getTime() + 15 * 60_000) },
+            OR: [
+              { raw: { path: ['correlationId'], equals: event.correlationId } },
+              { raw: { path: ['correlation_id'], equals: event.correlationId } },
+            ],
           },
-          orderBy: [{ eventDateTime: 'asc' }, { id: 'asc' }],
-          take: 100,
+          orderBy: { eventDateTime: 'asc' },
         })
-    return { event, relatedEvents: related }
+      : []
+    const relatedSignIns = correlatedSignIns
+      .filter((signIn) => correlationIdFromRaw(signIn.raw) === event.correlationId)
+      .map((signIn) => {
+        const failed = Boolean(signIn.statusErrorCode && signIn.statusErrorCode !== '0')
+        return {
+          id: signIn.microsoftSignInId,
+          eventDateTime: signIn.eventDateTime,
+          actor: signIn.userPrincipalName ?? signIn.userDisplayName ?? undefined,
+          application: signIn.resourceDisplayName ?? signIn.appDisplayName ?? undefined,
+          result: failed ? 'Failure' : 'Success',
+          ipAddress: signIn.ipAddress ?? undefined,
+          source: 'Microsoft Graph auditLogs/signIns',
+          provenance: 'Microsoft Graph auditLogs/signIns',
+          relationship: 'Shares Microsoft correlation ID; this is supporting evidence and does not establish causation.',
+        }
+      })
+    return {
+      event,
+      classification,
+      relatedEvents: related.filter((candidate) => candidate.id !== event.id && candidate.source !== 'SIGN_IN'),
+      relatedSignIns,
+    }
   }
-}
-
-function normalizedChangeCategory(value: string): ChangeCategory {
-  const categories: ChangeCategory[] = ['MFA', 'Passwords', 'Conditional Access', 'Apps', 'Roles', 'Groups', 'Devices', 'Licenses', 'Users']
-  return categories.includes(value as ChangeCategory) ? value as ChangeCategory : 'Users'
 }
