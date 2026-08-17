@@ -36,6 +36,12 @@ import {
   requiresDailyInventoryRefresh,
   scheduledSyncTenantWhere,
 } from './scheduled-sync-selection.js'
+import {
+  M365ManagementActivityService,
+  m365AuditUsageDate,
+  m365AuditUsageLimits,
+  validateManagementUrl,
+} from './m365-management-activity.service.js'
 
 const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
@@ -597,7 +603,9 @@ export class TenantSyncService {
     @Inject(NotificationsService)
     private readonly notifications: NotificationsService,
     @Inject(ChangeEvidenceService)
-    private readonly changeEvidence: ChangeEvidenceService
+    private readonly changeEvidence: ChangeEvidenceService,
+    @Inject(M365ManagementActivityService)
+    private readonly m365ManagementActivity: M365ManagementActivityService
   ) {}
 
   private async getReadableTenant(
@@ -843,6 +851,7 @@ export class TenantSyncService {
     }
 
     let accessToken: string
+    let graphTokenAcquired = false
     try {
       accessToken = await this.microsoftConsent.getTenantAccessToken({
         microsoftTenantId: tenant.microsoftTenantId,
@@ -853,6 +862,7 @@ export class TenantSyncService {
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
       })
+      graphTokenAcquired = true
       const result = await this.synchronizeUsers(
         tenant,
         accessToken,
@@ -906,6 +916,18 @@ export class TenantSyncService {
           consecutiveFailures: { increment: 1 },
         },
       })
+      if (graphTokenAcquired) {
+        try {
+          // The Management Activity API is a separate Microsoft resource.
+          // A transient Graph users failure must not create an audit blind
+          // spot; ingest evidence now and reconcile current state later.
+          await this.m365ManagementActivity.syncTenant(tenant)
+        } catch (auditError) {
+          this.logger.warn(
+            `Independent Microsoft 365 audit synchronization also failed for tenant ${tenant.id}: ${safeErrorMessage(auditError, 'Microsoft 365 audit synchronization failed.')}`
+          )
+        }
+      }
       if (error instanceof ConflictException) throw error
       throw new BadGatewayException(
         error instanceof Error
@@ -929,6 +951,10 @@ export class TenantSyncService {
         {
           resource: 'AUDIT_LOGS',
           synchronize: () => this.syncDirectoryAuditLogs(tenant, accessToken),
+        },
+        {
+          resource: 'M365_AUDIT',
+          synchronize: () => this.syncM365AuditActivity(tenant, accessToken),
         },
       ]
       const incrementalResults = await Promise.allSettled(
@@ -1087,6 +1113,7 @@ export class TenantSyncService {
       ),
       this.syncSignInLogs(tenant, snapshotAccessToken),
       this.syncDirectoryAuditLogs(tenant, snapshotAccessToken, false),
+      this.syncM365AuditActivity(tenant, snapshotAccessToken),
       this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
@@ -1139,6 +1166,7 @@ export class TenantSyncService {
           'NAMED_LOCATIONS',
           'SIGN_INS',
           'AUDIT_LOGS',
+          'M365_AUDIT',
           'DEVICES',
           'DIRECTORY_ROLES',
           'SERVICE_PRINCIPALS',
@@ -2433,8 +2461,8 @@ export class TenantSyncService {
     if (!tenant.connection) {
       throw new Error('The Microsoft tenant connection is incomplete.')
     }
-    const token =
-      await this.microsoftConsent.getTenantManagementActivityAccessToken({
+    const { accessToken: token, publisherIdentifier } =
+      await this.microsoftConsent.getTenantManagementActivityContext({
         microsoftTenantId: tenant.microsoftTenantId,
         connectionMode:
           tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
@@ -2444,13 +2472,18 @@ export class TenantSyncService {
         credentialReference: tenant.connection.credentialReference,
       })
     const baseUrl = `https://manage.office.com/api/v1.0/${encodeURIComponent(tenant.microsoftTenantId)}/activity/feed`
+    const activityUrl = (url: string) => {
+      const parsed = validateManagementUrl(url, tenant.microsoftTenantId)
+      parsed.searchParams.set('PublisherIdentifier', publisherIdentifier)
+      return parsed.toString()
+    }
     const headers = {
       Authorization: `Bearer ${token}`,
       Accept: 'application/json',
     }
     const contentType = 'Audit.AzureActiveDirectory'
     const subscriptionIsEnabled = async () => {
-      const response = await fetch(`${baseUrl}/subscriptions/list`, {
+      const response = await fetch(activityUrl(`${baseUrl}/subscriptions/list`), {
         headers,
         signal: AbortSignal.timeout(20_000),
       })
@@ -2472,26 +2505,12 @@ export class TenantSyncService {
     }
 
     if (!(await subscriptionIsEnabled())) {
-      const startResponse = await fetch(
-        `${baseUrl}/subscriptions/start?contentType=${encodeURIComponent(contentType)}`,
-        { method: 'POST', headers, signal: AbortSignal.timeout(20_000) }
+      // Subscription lifecycle has one owner: M365ManagementActivityService.
+      // It persists Microsoft's mandatory 15-minute start cooldown. The
+      // limited-license sign-in fallback must never race it with another POST.
+      throw new Error(
+        'Microsoft 365 audit subscription activation is pending. HawkView will retry sign-in collection after the audit collector enables it.'
       )
-      if (!startResponse.ok) {
-        const body = (await startResponse.text()).slice(0, 500)
-        // Microsoft can return HTTP 400 when another worker enabled the same
-        // subscription between our list and start requests. Verify the actual
-        // state before treating that race as a sync failure.
-        if (startResponse.status !== 400 || !(await subscriptionIsEnabled())) {
-          if (/tenant [^\s]+ does not exist/i.test(body)) {
-            throw new Error(
-              'Microsoft unified audit logging is not provisioned for this tenant. Turn on auditing in Microsoft Purview, wait for Microsoft to finish provisioning it, and then retry synchronization.'
-            )
-          }
-          throw new Error(
-            `Microsoft 365 activity subscription could not be started (HTTP ${startResponse.status})${body ? `: ${body}` : '.'}`
-          )
-        }
-      }
     }
 
     const earliest = new Date(
@@ -2505,7 +2524,7 @@ export class TenantSyncService {
       )
       let pageUrl = `${baseUrl}/subscriptions/content?contentType=${encodeURIComponent(contentType)}&startTime=${encodeURIComponent(windowStart.toISOString())}&endTime=${encodeURIComponent(windowEnd.toISOString())}`
       while (pageUrl) {
-        const response = await fetch(pageUrl, {
+        const response = await fetch(activityUrl(pageUrl), {
           headers,
           signal: AbortSignal.timeout(30_000),
         })
@@ -2520,19 +2539,14 @@ export class TenantSyncService {
             contentUris.push(item.contentUri)
         }
         pageUrl = response.headers.get('NextPageUri') ?? ''
-        if (pageUrl && !pageUrl.startsWith('https://manage.office.com/')) {
-          throw new Error(
-            'Microsoft returned an invalid activity-feed page URL.'
-          )
-        }
+        if (pageUrl) validateManagementUrl(pageUrl, tenant.microsoftTenantId)
       }
       windowStart = new Date(windowEnd.getTime() + 1)
     }
 
     const records: any[] = []
     for (const contentUri of [...new Set(contentUris)]) {
-      if (!contentUri.startsWith('https://manage.office.com/')) continue
-      const response = await fetch(contentUri, {
+      const response = await fetch(activityUrl(contentUri), {
         headers,
         signal: AbortSignal.timeout(30_000),
       })
@@ -2746,6 +2760,23 @@ export class TenantSyncService {
       })
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
     })
+  }
+
+  private async syncM365AuditActivity(
+    tenant: TenantSyncTarget,
+    graphAccessToken: string
+  ) {
+    const changes = await this.m365ManagementActivity.syncTenant(tenant)
+    if (changes.length > 0) {
+      // The activity feed is evidence. Coalesce all records in this polling
+      // run into the smallest set of authoritative current-state refreshes.
+      await this.reconcileDirectoryAuditChanges(
+        tenant,
+        graphAccessToken,
+        changes
+      )
+    }
+    return { collectedChanges: changes.length }
   }
 
   /**
@@ -3678,6 +3709,12 @@ export class TenantSyncService {
       lastVerifiedAt: Date | null
     } | null
   }) {
+    const m365AuditToday = m365AuditUsageDate()
+    const m365AuditMonthStart = new Date(Date.UTC(
+      m365AuditToday.getUTCFullYear(),
+      m365AuditToday.getUTCMonth(),
+      1
+    ))
     const [
       users,
       directoryGroups,
@@ -3688,6 +3725,11 @@ export class TenantSyncService {
       collectionFieldStates,
       signIns,
       auditLogs,
+      m365AuditSubscriptions,
+      m365AuditContentCounts,
+      oldestM365AuditBacklog,
+      m365AuditUsage,
+      m365AuditMonthlyUsage,
     ] = await Promise.all([
       this.prisma.directoryUser.findMany({
         where: {
@@ -3771,6 +3813,49 @@ export class TenantSyncService {
         },
         orderBy: { eventDateTime: 'desc' },
         take: 5000,
+      }),
+      this.prisma.m365ActivitySubscription.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        orderBy: { contentType: 'asc' },
+      }),
+      this.prisma.m365ActivityContent.groupBy({
+        by: ['status'],
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        _count: { _all: true },
+      }),
+      this.prisma.m365ActivityContent.findFirst({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          status: { in: ['PENDING', 'PROCESSING', 'RETRY', 'FAILED'] },
+        },
+        orderBy: [{ contentCreatedAt: 'asc' }, { discoveredAt: 'asc' }],
+        select: { contentCreatedAt: true, discoveredAt: true },
+      }),
+      this.prisma.m365AuditDailyUsage.findUnique({
+        where: {
+          customerTenantId_usageDate: {
+            customerTenantId: tenant.id,
+            usageDate: m365AuditToday,
+          },
+        },
+      }),
+      this.prisma.m365AuditDailyUsage.aggregate({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          usageDate: {
+            gte: m365AuditMonthStart,
+            lte: m365AuditToday,
+          },
+        },
+        _sum: { downloadedBytes: true, recordsStored: true, blobsProcessed: true },
       }),
     ])
     const snapshotByResource = new Map(
@@ -4159,6 +4244,11 @@ export class TenantSyncService {
     const groupSyncState = syncStateByResource.get('GROUPS')
     const signInSyncState = syncStateByResource.get('SIGN_INS')
     const auditLogSyncState = syncStateByResource.get('AUDIT_LOGS')
+    const m365AuditSyncState = syncStateByResource.get('M365_AUDIT')
+    const m365AuditCounts = Object.fromEntries(
+      m365AuditContentCounts.map((row) => [row.status, row._count._all])
+    )
+    const m365AuditLimits = m365AuditUsageLimits()
     const sharePointSitesSyncState = syncStateByResource.get('SHAREPOINT_SITES')
     const sharePointSettingsSyncState = syncStateByResource.get(
       'SHAREPOINT_SETTINGS'
@@ -5226,6 +5316,61 @@ export class TenantSyncService {
             lastSuccessfulAt:
               auditLogSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: auditLogSyncState?.lastErrorMessage ?? null,
+          },
+          m365Audit: {
+            status: m365AuditSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt:
+              m365AuditSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: m365AuditSyncState?.lastErrorMessage ?? null,
+            source: 'Office 365 Management Activity API',
+            pollingIsAuthoritative: true,
+            subscriptions: m365AuditSubscriptions.map((subscription) => ({
+              contentType: subscription.contentType,
+              status: subscription.status.toLowerCase(),
+              lastStartRequestedAt:
+                subscription.lastStartRequestedAt?.toISOString() ?? null,
+              lastVerifiedAt: subscription.lastVerifiedAt?.toISOString() ?? null,
+              lastSuccessfulPollAt:
+                subscription.lastSuccessfulPollAt?.toISOString() ?? null,
+              discoveryWindowStart:
+                subscription.discoveryWindowStart?.toISOString() ?? null,
+              discoveryWindowEnd:
+                subscription.discoveryWindowEnd?.toISOString() ?? null,
+              discoveryHasContinuation: Boolean(subscription.discoveryNextPageUri),
+              lastError: subscription.lastError,
+            })),
+            backlog: {
+              pending: m365AuditCounts.PENDING ?? 0,
+              processing: m365AuditCounts.PROCESSING ?? 0,
+              retrying: m365AuditCounts.RETRY ?? 0,
+              failed: m365AuditCounts.FAILED ?? 0,
+              oldestAt:
+                (oldestM365AuditBacklog?.contentCreatedAt ??
+                  oldestM365AuditBacklog?.discoveredAt)?.toISOString() ?? null,
+            },
+            costBudget: {
+              usageDate: m365AuditToday.toISOString().slice(0, 10),
+              downloadedBytes: Number(m365AuditUsage?.downloadedBytes ?? 0n),
+              recordsStored: m365AuditUsage?.recordsStored ?? 0,
+              blobsProcessed: m365AuditUsage?.blobsProcessed ?? 0,
+              monthDownloadedBytes: Number(m365AuditMonthlyUsage._sum.downloadedBytes ?? 0n),
+              monthRecordsStored: m365AuditMonthlyUsage._sum.recordsStored ?? 0,
+              monthBlobsProcessed: m365AuditMonthlyUsage._sum.blobsProcessed ?? 0,
+              tenantDailyDownloadLimitBytes: Number(m365AuditLimits.tenantBytes),
+              deploymentDailyDownloadLimitBytes: Number(m365AuditLimits.deploymentBytes),
+              tenantMonthlyDownloadLimitBytes: Number(m365AuditLimits.tenantMonthlyBytes),
+              deploymentMonthlyDownloadLimitBytes: Number(m365AuditLimits.deploymentMonthlyBytes),
+              tenantDailyRecordLimit: m365AuditLimits.tenantRecords,
+              deploymentDailyRecordLimit: m365AuditLimits.deploymentRecords,
+              tenantMonthlyRecordLimit: m365AuditLimits.tenantMonthlyRecords,
+              deploymentMonthlyRecordLimit: m365AuditLimits.deploymentMonthlyRecords,
+              dailyResetsAt: new Date(m365AuditToday.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+              monthlyResetsAt: new Date(Date.UTC(
+                m365AuditToday.getUTCFullYear(),
+                m365AuditToday.getUTCMonth() + 1,
+                1
+              )).toISOString(),
+            },
           },
           applications: exchangeSync('APPLICATIONS'),
           servicePrincipals: exchangeSync('SERVICE_PRINCIPALS'),

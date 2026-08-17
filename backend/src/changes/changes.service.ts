@@ -177,7 +177,9 @@ export class ChangesService {
       const after = object(event.afterState)
       const classification = classifyEvidence({ source: event.source, activity: event.operationName, category: event.category })
       return {
-        id: `audit:${event.sourceEventId}`,
+        id: event.source === 'DIRECTORY_AUDIT'
+          ? `audit:${event.sourceEventId}`
+          : `evidence:${event.source}:${event.sourceEventId}`,
         eventType: 'change' as const,
         classification,
         ts: event.eventDateTime.toISOString(),
@@ -190,7 +192,9 @@ export class ChangesService {
         summary: event.summary,
         actor: event.actorPrincipalName ?? event.actorDisplayName ?? undefined,
         target: event.targetDisplayName ?? undefined,
-        source: 'Entra' as const,
+        source: event.source === 'M365_UNIFIED_AUDIT'
+          ? (event.workload ?? 'Microsoft 365')
+          : 'Entra',
         ip: event.ipAddress ?? undefined,
         location: {
           city: text(location.city),
@@ -216,7 +220,18 @@ export class ChangesService {
     const bySourceEvent = new Map<string, TimelineEvent>(
       changes.map((event): [string, TimelineEvent] => [event.id, event])
     )
-    for (const event of normalized) bySourceEvent.set(event.id, event)
+    for (const event of normalized) {
+      // Microsoft can surface the same Entra record through Graph and the
+      // Management Activity API. Exact source IDs are safe to collapse; if
+      // Microsoft supplies only an uncertain similarity, retain both records.
+      const sourceEventId = String(event.id).split(':').at(-1)
+      if (
+        String(event.id).startsWith('evidence:M365_UNIFIED_AUDIT:') &&
+        sourceEventId &&
+        bySourceEvent.has(`audit:${sourceEventId}`)
+      ) continue
+      bySourceEvent.set(event.id, event)
+    }
     let events: TimelineEvent[] = [...bySourceEvent.values()]
     const requestedCategory = text(query.category)
     const requestedSeverity = text(query.severity)
@@ -252,15 +267,26 @@ export class ChangesService {
     if (sourceId.slice(0, separator) === 'signin') {
       throw new BadRequestException('Sign-ins are available only as correlated supporting evidence for a recorded change.')
     }
-    const source = 'DIRECTORY_AUDIT'
-    const sourceEventId = sourceId.slice(separator + 1)
+    const prefix = sourceId.slice(0, separator)
+    let source = 'DIRECTORY_AUDIT'
+    let sourceEventId = sourceId.slice(separator + 1)
+    if (prefix === 'evidence') {
+      const sourceSeparator = sourceEventId.indexOf(':')
+      if (sourceSeparator <= 0) throw new BadRequestException('Use a valid evidence event identifier.')
+      source = sourceEventId.slice(0, sourceSeparator)
+      sourceEventId = sourceEventId.slice(sourceSeparator + 1)
+    } else if (prefix !== 'audit') {
+      throw new BadRequestException('Use a valid change event identifier.')
+    }
     const organizationIds = await this.organizationIds(identity)
     const projectedEvent = await this.prisma.changeEvidenceEvent.findFirst({
       where: { source, sourceEventId, organizationId: { in: organizationIds } },
     })
-    const fallbackAudit = projectedEvent ? null : await this.prisma.directoryAuditLog.findFirst({
-      where: { microsoftAuditId: sourceEventId, organizationId: { in: organizationIds } },
-    })
+    const fallbackAudit = projectedEvent || source !== 'DIRECTORY_AUDIT'
+      ? null
+      : await this.prisma.directoryAuditLog.findFirst({
+          where: { microsoftAuditId: sourceEventId, organizationId: { in: organizationIds } },
+        })
     if (!projectedEvent && !fallbackAudit) throw new BadRequestException('This investigation event is unavailable or outside retention.')
 
     const fallbackKind = fallbackAudit ? legacyCategory(fallbackAudit.activityDisplayName, fallbackAudit.category) : null

@@ -199,7 +199,7 @@ test('daily inventory collectors remain healthy between daily full collections',
   const collectedAt = new Date('2026-08-13T00:00:00.000Z')
   const now = new Date('2026-08-13T23:00:00.000Z')
   const states = completeCurrentStates(collectedAt).map((state) =>
-    ['USERS', 'SIGN_INS', 'AUDIT_LOGS'].includes(state.resourceType)
+    ['USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'].includes(state.resourceType)
       ? { ...state, lastAttemptAt: now, lastSuccessfulAt: now }
       : state,
   )
@@ -214,7 +214,7 @@ test('daily inventory collectors become stale only after the daily grace window'
   const collectedAt = new Date('2026-08-13T00:00:00.000Z')
   const now = new Date('2026-08-14T03:00:00.000Z')
   const states = completeCurrentStates(collectedAt).map((state) =>
-    ['USERS', 'SIGN_INS', 'AUDIT_LOGS'].includes(state.resourceType)
+    ['USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'].includes(state.resourceType)
       ? { ...state, lastAttemptAt: now, lastSuccessfulAt: now }
       : state,
   )

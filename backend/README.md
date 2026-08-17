@@ -96,6 +96,48 @@ same `SCHEDULER_SHARED_SECRET` value for both the web service and cron job; the
 cron runner exits unsuccessfully when the API cannot be reached or rejects the
 request, so failures appear in Render's run history.
 
+The Microsoft 365 Management Activity collector uses that same five-minute
+heartbeat but polls Microsoft every 15 minutes once caught up. If durable
+content is pending or due for retry, each cron run processes the next bounded
+batch immediately. `M365_AUDIT_POLL_INTERVAL_MINUTES` (default `15`, maximum
+`60`) and `M365_AUDIT_MAX_BLOBS_PER_RUN` (default `12`, maximum `100`) are cost
+and memory guardrails. `M365_AUDIT_MAX_DOWNLOAD_MB_PER_RUN` defaults to `12`,
+which caps content-body bandwidth per tenant invocation even when many blobs
+are queued. HawkView stores only compact, redacted administrative
+events; ordinary file access and sign-ins are not duplicated into this store.
+Blob processing also stops after `M365_AUDIT_MAX_RUNTIME_SECONDS` (default
+`45`) so one busy tenant cannot monopolize the request-based Render scheduler.
+Daily UTC budgets put a hard ceiling on this collector across repeated cron
+runs: 50 MB and 1,000 retained administrative records per tenant, plus 100 MB
+and 2,000 records across the deployment by default. Monthly ceilings are 1 GB
+and 20,000 records per tenant, and 2 GB and 40,000 records deployment-wide.
+Configure these with
+`M365_AUDIT_TENANT_DAILY_DOWNLOAD_MB`,
+`M365_AUDIT_DEPLOYMENT_DAILY_DOWNLOAD_MB`,
+`M365_AUDIT_TENANT_MONTHLY_DOWNLOAD_MB`,
+`M365_AUDIT_DEPLOYMENT_MONTHLY_DOWNLOAD_MB`,
+`M365_AUDIT_TENANT_DAILY_RECORDS`, and
+`M365_AUDIT_DEPLOYMENT_DAILY_RECORDS`, plus the corresponding
+`M365_AUDIT_TENANT_MONTHLY_RECORDS` and
+`M365_AUDIT_DEPLOYMENT_MONTHLY_RECORDS`. Reaching a limit leaves the collector
+honestly backlogged and retries after the corresponding UTC day or month
+boundary; it never advances past known
+unprocessed content. The tenant bundle exposes current usage, limits, backlog,
+and discovery checkpoints for alerting. These limits bound only the Management
+Activity collector, not unrelated Graph or application traffic.
+
+Polling covers `Audit.AzureActiveDirectory`, `Audit.Exchange`,
+`Audit.SharePoint`, and `Audit.General`. The collector exposes subscription,
+last-poll, retry, failed-blob, and oldest-backlog state in the tenant bundle at
+`sync.m365Audit`. A successful Graph sync never masks a failed Microsoft 365
+audit collector.
+
+Microsoft requires a 15-minute interval between subscription-start requests,
+so first-time setup enables at most one missing content type per interval. The
+collector persists that cooldown and never automatically replays an ambiguous
+start POST. All production requests include HawkView's publisher tenant ID to
+use Microsoft's dedicated publisher quota.
+
 During the GCP-to-portable migration,
 the endpoint also accepts the existing Google Cloud Scheduler OIDC token when
 `SCHEDULER_OIDC_AUDIENCE` and `SCHEDULER_SERVICE_ACCOUNT_EMAIL` are configured.

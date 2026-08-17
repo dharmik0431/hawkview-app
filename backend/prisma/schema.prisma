@@ -61,6 +61,7 @@ enum SyncResourceType {
   NAMED_LOCATIONS
   SIGN_INS
   AUDIT_LOGS
+  M365_AUDIT
   DEVICES
   DIRECTORY_ROLES
   SERVICE_PRINCIPALS
@@ -197,6 +198,10 @@ model Organization {
   entraSnapshots     TenantEntraSnapshot[]
   signInLogs         SignInLog[]
   directoryAuditLogs DirectoryAuditLog[]
+  m365ActivitySubscriptions M365ActivitySubscription[]
+  m365ActivityContents M365ActivityContent[]
+  m365AuditRecords M365AuditRecord[]
+  m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
@@ -261,6 +266,10 @@ model CustomerTenant {
   entraSnapshots     TenantEntraSnapshot[]
   signInLogs         SignInLog[]
   directoryAuditLogs DirectoryAuditLog[]
+  m365ActivitySubscriptions M365ActivitySubscription[]
+  m365ActivityContents M365ActivityContent[]
+  m365AuditRecords M365AuditRecord[]
+  m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
@@ -534,6 +543,112 @@ model DirectoryAuditLog {
   @@index([customerTenantId, category, eventDateTime(sort: Desc)])
   @@index([expiresAt])
   @@map("directory_audit_logs")
+}
+
+// Per-workload subscription health for the Microsoft 365 Management Activity
+// API. Polling remains authoritative; webhooks are only a future accelerator.
+model M365ActivitySubscription {
+  id                   String         @id @default(uuid()) @db.Uuid
+  organizationId       String         @map("organization_id") @db.Uuid
+  customerTenantId     String         @map("customer_tenant_id") @db.Uuid
+  contentType          String         @map("content_type") @db.VarChar(80)
+  status               String         @default("UNKNOWN") @db.VarChar(30)
+  lastStartRequestedAt DateTime?      @map("last_start_requested_at") @db.Timestamptz(6)
+  lastVerifiedAt       DateTime?      @map("last_verified_at") @db.Timestamptz(6)
+  lastContentPollAt    DateTime?      @map("last_content_poll_at") @db.Timestamptz(6)
+  lastSuccessfulPollAt DateTime?      @map("last_successful_poll_at") @db.Timestamptz(6)
+  discoveryWindowStart DateTime?      @map("discovery_window_start") @db.Timestamptz(6)
+  discoveryWindowEnd   DateTime?      @map("discovery_window_end") @db.Timestamptz(6)
+  discoveryNextPageUri String?        @map("discovery_next_page_uri") @db.Text
+  lastError            String?        @map("last_error") @db.Text
+  createdAt            DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization         Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant       CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, contentType])
+  @@index([organizationId, customerTenantId, status])
+  @@map("m365_activity_subscriptions")
+}
+
+// A durable at-least-once ledger. The unique Microsoft content ID is the
+// checkpoint; event CreationTime is intentionally not used as a cursor because
+// Microsoft documents that blobs and records can arrive out of order.
+model M365ActivityContent {
+  id                 String         @id @default(uuid()) @db.Uuid
+  organizationId     String         @map("organization_id") @db.Uuid
+  customerTenantId   String         @map("customer_tenant_id") @db.Uuid
+  contentType        String         @map("content_type") @db.VarChar(80)
+  microsoftContentId String         @map("microsoft_content_id") @db.VarChar(500)
+  contentUri         String         @map("content_uri") @db.Text
+  contentCreatedAt   DateTime?      @map("content_created_at") @db.Timestamptz(6)
+  contentExpiresAt   DateTime?      @map("content_expires_at") @db.Timestamptz(6)
+  status             String         @default("PENDING") @db.VarChar(30)
+  attemptCount       Int            @default(0) @map("attempt_count")
+  nextRetryAt        DateTime?      @map("next_retry_at") @db.Timestamptz(6)
+  lastError          String?        @map("last_error") @db.Text
+  discoveredAt       DateTime       @default(now()) @map("discovered_at") @db.Timestamptz(6)
+  processedAt        DateTime?      @map("processed_at") @db.Timestamptz(6)
+  ledgerExpiresAt    DateTime       @map("ledger_expires_at") @db.Timestamptz(6)
+  updatedAt          DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization       Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant     CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, microsoftContentId])
+  @@index([organizationId, customerTenantId, status, nextRetryAt])
+  @@index([ledgerExpiresAt])
+  @@map("m365_activity_contents")
+}
+
+// Retain only genuine administrative/security/configuration events, not the
+// high-volume routine file access and sign-in stream. The redacted source
+// payload supports investigations while keeping Supabase growth bounded.
+model M365AuditRecord {
+  id                String         @id @default(uuid()) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  customerTenantId  String         @map("customer_tenant_id") @db.Uuid
+  contentType       String         @map("content_type") @db.VarChar(80)
+  microsoftRecordId String         @map("microsoft_record_id") @db.VarChar(500)
+  eventDateTime     DateTime       @map("event_date_time") @db.Timestamptz(6)
+  workload          String?        @db.VarChar(100)
+  operation         String         @db.VarChar(500)
+  actorId           String?        @map("actor_id") @db.VarChar(320)
+  actorType         String?        @map("actor_type") @db.VarChar(80)
+  objectId          String?        @map("object_id") @db.Text
+  result            String?        @db.VarChar(100)
+  clientIp          String?        @map("client_ip") @db.VarChar(128)
+  correlationId     String?        @map("correlation_id") @db.VarChar(200)
+  raw               Json           @db.JsonB
+  ingestedAt        DateTime       @default(now()) @map("ingested_at") @db.Timestamptz(6)
+  expiresAt         DateTime       @map("expires_at") @db.Timestamptz(6)
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, microsoftRecordId])
+  @@index([organizationId, customerTenantId, eventDateTime(sort: Desc)])
+  @@index([customerTenantId, correlationId])
+  @@index([expiresAt])
+  @@map("m365_audit_records")
+}
+
+// Enforced cost accounting for downloads and retained administrative events.
+// UTC day keys make quotas deterministic across Render workers and tenants.
+model M365AuditDailyUsage {
+  id                String         @id @default(uuid()) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  customerTenantId  String         @map("customer_tenant_id") @db.Uuid
+  usageDate         DateTime       @map("usage_date") @db.Date
+  downloadedBytes   BigInt         @default(0) @map("downloaded_bytes")
+  recordsStored     Int            @default(0) @map("records_stored")
+  blobsProcessed    Int            @default(0) @map("blobs_processed")
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([customerTenantId, usageDate])
+  @@index([usageDate])
+  @@index([organizationId, customerTenantId, usageDate])
+  @@map("m365_audit_daily_usage")
 }
 
 // A normalized, investigation-friendly projection of the raw Microsoft audit

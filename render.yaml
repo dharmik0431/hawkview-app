@@ -37,6 +37,33 @@ services:
         sync: false
       - key: SCHEDULED_SYNC_BATCH_SIZE
         value: '10'
+      # The five-minute cron remains the recovery heartbeat. The audit feed
+      # polls every 15 minutes when caught up, but drains an existing backlog
+      # on each cron run. These ceilings bound Render bandwidth and memory.
+      - key: M365_AUDIT_POLL_INTERVAL_MINUTES
+        value: '15'
+      - key: M365_AUDIT_MAX_BLOBS_PER_RUN
+        value: '12'
+      - key: M365_AUDIT_MAX_DOWNLOAD_MB_PER_RUN
+        value: '12'
+      - key: M365_AUDIT_MAX_RUNTIME_SECONDS
+        value: '45'
+      - key: M365_AUDIT_TENANT_DAILY_DOWNLOAD_MB
+        value: '50'
+      - key: M365_AUDIT_DEPLOYMENT_DAILY_DOWNLOAD_MB
+        value: '100'
+      - key: M365_AUDIT_TENANT_MONTHLY_DOWNLOAD_MB
+        value: '1000'
+      - key: M365_AUDIT_DEPLOYMENT_MONTHLY_DOWNLOAD_MB
+        value: '2000'
+      - key: M365_AUDIT_TENANT_DAILY_RECORDS
+        value: '1000'
+      - key: M365_AUDIT_DEPLOYMENT_DAILY_RECORDS
+        value: '2000'
+      - key: M365_AUDIT_TENANT_MONTHLY_RECORDS
+        value: '20000'
+      - key: M365_AUDIT_DEPLOYMENT_MONTHLY_RECORDS
+        value: '40000'
       - key: MAXMIND_LICENSE_KEY
         sync: false
       - key: GEOIP_CITY_DATABASE_PATH
