@@ -9,7 +9,7 @@ import { useAuth } from '@/components/providers/auth-provider'
 
 import { apiClient } from '@/lib/api/client'
 import { auditSyncFocusTarget, isM365AuditSyncDeepLink, m365AuditSyncHealth } from '@/lib/tenants/audit-sync-health'
-import { normalizeCollectionReadiness, readinessLabel } from '@/lib/tenants/collection-readiness'
+import { normalizeCollectionReadiness, readinessDiagnostic, readinessLabel, readinessRemediation, synchronizationReadinessSummary } from '@/lib/tenants/collection-readiness'
 import type { TenantBundle } from '@/types/tenant-data'
 
 import {
@@ -551,6 +551,10 @@ export default function TenantSettingsPage() {
     () => normalizeCollectionReadiness(tenantListRecord?.collectionReadiness),
     [tenantListRecord],
   )
+  const synchronizationSummary = useMemo(
+    () => synchronizationReadinessSummary(collectionReadiness),
+    [collectionReadiness],
+  )
 
   if (loadState === 'loading') {
     return (
@@ -981,7 +985,7 @@ export default function TenantSettingsPage() {
                       <div><dt className="text-muted-foreground">Freshness</dt><dd className="font-medium text-foreground">{readinessLabel(workload.freshness)}</dd></div>
                       {workload.lastVerifiedAt && <div><dt className="text-muted-foreground">Subscription verified</dt><dd className="font-medium text-foreground">{formatDate(workload.lastVerifiedAt)}</dd></div>}
                     </dl>
-                    {workload.reason && <p className="mt-3 break-words text-sm text-amber-800 dark:text-amber-200">{workload.reason}</p>}
+                    {readinessDiagnostic(workload.reasonCode, workload.reason) && <p className="mt-3 break-words text-sm text-amber-800 dark:text-amber-200">{readinessDiagnostic(workload.reasonCode, workload.reason)}</p>}
                     {workload.exchangeRbac && <p className="mt-3 text-sm text-muted-foreground">Exchange Admin API RBAC: <span className="font-medium text-foreground">{readinessLabel(workload.exchangeRbac.status)}</span> — {workload.exchangeRbac.reason}</p>}
                     {workload.components.length > 0 && (
                       <details className="mt-3 text-sm">
@@ -991,14 +995,15 @@ export default function TenantSettingsPage() {
                             <li key={component.key}>
                               <span>{component.label}: </span>
                               <span className="font-medium text-foreground">{readinessLabel(component.state)}</span>
-                              {component.reason ? ` — ${component.reason}` : ''}
+                              {readinessDiagnostic(component.reasonCode, component.reason) ? ` — ${readinessDiagnostic(component.reasonCode, component.reason)}` : ''}
+                              {component.reasonCode ? <span className="ml-2 text-xs">Diagnostic: {component.reasonCode}</span> : null}
                               {component.lastVerifiedAt ? <span className="ml-2 text-xs">Subscription verified: {formatDate(component.lastVerifiedAt)}</span> : null}
                             </li>
                           ))}
                         </ul>
                       </details>
                     )}
-                    <p className="mt-3 text-sm text-muted-foreground">{workload.remediation}</p>
+                    <p className="mt-3 text-sm text-muted-foreground">{readinessRemediation(workload.state, workload.remediation)}</p>
                   </section>
                 ))}
               </div>
@@ -1244,7 +1249,9 @@ export default function TenantSettingsPage() {
                 Overall Sync Status
               </span>
               <div className="font-semibold text-foreground capitalize">
-                {tenant.status || tenant.connectionStatus || 'Not available'}
+                {synchronizationSummary
+                  ? readinessLabel(synchronizationSummary.overallState)
+                  : 'Not available'}
               </div>
             </div>
 
@@ -1253,8 +1260,10 @@ export default function TenantSettingsPage() {
                 Current Sync Progress
               </span>
               <div className="font-semibold text-foreground">
-                {tenant.status === 'active' || tenant.status === 'healthy'
-                  ? '100% (Completed)'
+                {synchronizationSummary
+                  ? synchronizationSummary.applicableWorkloads === 0
+                    ? 'Not applicable'
+                    : `${synchronizationSummary.currentWorkloads} / ${synchronizationSummary.applicableWorkloads} current`
                   : 'Not available'}
               </div>
             </div>
@@ -1264,7 +1273,7 @@ export default function TenantSettingsPage() {
                 Last Full Sync
               </span>
               <div className="font-semibold text-foreground">
-                {formatDate(tenant.lastSync)}
+                {formatDate(synchronizationSummary?.primaryLastSuccessfulAt)}
               </div>
             </div>
 
@@ -1280,8 +1289,8 @@ export default function TenantSettingsPage() {
                 Successful Modules
               </span>
               <div className="font-semibold text-foreground">
-                {bundle
-                  ? `${successfulModulesCount} / ${moduleRows.length}`
+                {synchronizationSummary
+                  ? `${synchronizationSummary.currentWorkloads} / ${synchronizationSummary.applicableWorkloads}`
                   : 'Not available'}
               </div>
             </div>
@@ -1291,7 +1300,9 @@ export default function TenantSettingsPage() {
                 Failed Modules
               </span>
               <div className="font-semibold text-foreground">
-                {bundle ? '0' : 'Not available'}
+                {synchronizationSummary
+                  ? String(synchronizationSummary.failedWorkloads)
+                  : 'Not available'}
               </div>
             </div>
 
@@ -1300,7 +1311,9 @@ export default function TenantSettingsPage() {
                 Data Freshness
               </span>
               <div className="font-semibold text-foreground">
-                {calculateFreshness(tenant.lastSync)}
+                {synchronizationSummary
+                  ? calculateFreshness(synchronizationSummary.primaryLastSuccessfulAt)
+                  : 'Not available'}
               </div>
             </div>
 
@@ -1309,10 +1322,16 @@ export default function TenantSettingsPage() {
                 Recent Sync Errors
               </span>
               <div className="font-semibold text-foreground">
-                {tenant.connectionErrorCode || 'None'}
+                {synchronizationSummary?.primaryReasonCode || 'None'}
               </div>
             </div>
           </div>
+
+          {synchronizationSummary?.primaryReason && synchronizationSummary.overallState !== 'READY' && (
+            <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
+              {readinessDiagnostic(synchronizationSummary.primaryReasonCode, synchronizationSummary.primaryReason)}
+            </p>
+          )}
 
           <div className="space-y-3">
             <h3 className="text-sm font-semibold text-foreground">

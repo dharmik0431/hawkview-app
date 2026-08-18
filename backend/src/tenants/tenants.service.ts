@@ -191,7 +191,7 @@ export class TenantsService {
       lastVerifiedAt: Date | null
       lastErrorCode: string | null
     } | null
-    tenantLicenses: Array<{ enabledUnits: number }>
+    tenantLicenses: Array<{ enabledUnits: number; servicePlans?: unknown }>
     syncStates: Array<{
       resourceType: string
       status: string
@@ -228,6 +228,24 @@ export class TenantsService {
     const missingPermissions = requiredPermissions
       .map((permission) => permission.name)
       .filter((permission) => !consentedPermissions.includes(permission))
+    const collectionReadiness = deriveCollectionReadiness({
+      connectionStatus,
+      connectionVerifiedAt: tenant.connection?.lastVerifiedAt,
+      consentedPermissions,
+      syncStates: tenant.syncStates,
+      subscriptions: tenant.m365ActivitySubscriptions,
+      // Existing rows deliberately remain null until a successful authoritative
+      // LICENSES collection writes service plans.  Do not turn that absence
+      // into a deceptive authoritative empty inventory.
+      licenseServicePlans: tenant.tenantLicenses.some((license) => !Array.isArray(license.servicePlans))
+        ? null
+        : tenant.tenantLicenses.flatMap((license) => license.servicePlans as Array<{ servicePlanId?: string; servicePlanName: string; provisioningStatus: string }>),
+    })
+    const notApplicableResourceTypes = collectionReadiness.workloads
+      .filter((workload) => workload.state === 'NOT_LICENSED' || workload.state === 'UNSUPPORTED')
+      .flatMap((workload) => workload.components?.map((component) => component.key) ?? [])
+      .filter((key) => !['LICENSE_APPLICABILITY', 'PERMISSION_GRANT'].includes(key))
+    const syncFreshness = deriveTenantSyncFreshness(tenant.syncStates, new Date(), notApplicableResourceTypes)
     const health = deriveTenantHealth({
       tenantId: tenant.id,
       effectiveStatus,
@@ -235,21 +253,10 @@ export class TenantsService {
       connectionLastVerifiedAt: tenant.connection?.lastVerifiedAt ?? null,
       missingPermissions,
       syncStates: tenant.syncStates,
-      authSnapshot:
-        tenant.entraSnapshots.find(
-          (snapshot) =>
-            snapshot.resourceType === SyncResourceType.AUTH_REGISTRATIONS,
-        ) ?? null,
+      authSnapshot: tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.AUTH_REGISTRATIONS) ?? null,
       riskyIdentityCount,
       auditEvents,
-    })
-    const syncFreshness = deriveTenantSyncFreshness(tenant.syncStates)
-    const collectionReadiness = deriveCollectionReadiness({
-      connectionStatus,
-      connectionVerifiedAt: tenant.connection?.lastVerifiedAt,
-      consentedPermissions,
-      syncStates: tenant.syncStates,
-      subscriptions: tenant.m365ActivitySubscriptions,
+      notApplicableResourceTypes,
     })
 
     return {
@@ -418,7 +425,7 @@ export class TenantsService {
       primaryDomain: true,
       status: true,
       organization: { select: { id: true, name: true, slug: true } },
-      tenantLicenses: { select: { enabledUnits: true } },
+      tenantLicenses: { select: { enabledUnits: true, servicePlans: true } },
       syncStates: {
         select: {
           resourceType: true,

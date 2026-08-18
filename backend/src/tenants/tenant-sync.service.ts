@@ -31,10 +31,15 @@ import {
 } from './audit-change-reconciliation.js'
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
+import { sanitizeHealthMessage } from './sanitize-health-message.js'
 import {
   DAILY_INVENTORY_ANCHORS,
   requiresDailyInventoryRefresh,
   scheduledSyncTenantWhere,
+  selectScheduledTenantWork,
+  shouldRunTargetedTransientRetry,
+  TARGETED_TRANSIENT_RETRY_RESOURCES,
+  TENANT_SYNC_LEASE_MS,
 } from './scheduled-sync-selection.js'
 import {
   M365ManagementActivityService,
@@ -49,6 +54,60 @@ const MANAGEMENT_ACTIVITY_SOURCE = 'MICROSOFT_365_MANAGEMENT_ACTIVITY'
 const MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS = 7
 const DEFAULT_FAST_MAILBOX_RULE_REFRESH_MINUTES = 15
 const DEFAULT_FAST_MAILBOX_RULE_MAX_USERS = 250
+/** Hard ceilings keep a targeted SharePoint retry below the 15 minute USERS lease. */
+export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
+  sitePages: 50,
+  sites: 10_000,
+  siteUserPages: 20,
+  siteUserRecords: 50_000,
+  responseBytes: 5 * 1024 * 1024,
+  requestTimeoutMs: 20_000,
+  collectorDeadlineMs: 10 * 60_000,
+})
+
+/**
+ * The only durable tenant-wide lease used by the scheduler and manual sync.
+ * Keeping this compare-and-set in one helper makes a test exercise the exact
+ * updateMany/create race used by syncConnectedTenant rather than a parallel
+ * in-memory lock model.
+ */
+export async function claimTenantUsersLease(
+  prisma: any,
+  tenant: { id: string; organizationId: string },
+  now = new Date(),
+) {
+  const existingState = await prisma.syncState.findUnique({
+    where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'USERS' } },
+  })
+  const staleLeaseBefore = new Date(now.getTime() - TENANT_SYNC_LEASE_MS)
+  if (existingState) {
+    const claim = await prisma.syncState.updateMany({
+      where: {
+        id: existingState.id,
+        OR: [
+          { status: { not: 'RUNNING' } },
+          { lastAttemptAt: null },
+          { lastAttemptAt: { lt: staleLeaseBefore } },
+        ],
+      },
+      data: { status: 'RUNNING', lastAttemptAt: now, lastErrorCode: null, lastErrorMessage: null },
+    })
+    return { claimed: claim.count === 1, existingState }
+  }
+  try {
+    await prisma.syncState.create({
+      data: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'USERS', status: 'RUNNING', lastAttemptAt: now },
+    })
+    return { claimed: true, existingState: null }
+  } catch (error) {
+    const competingClaim = await prisma.syncState.findUnique({
+      where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'USERS' } },
+      select: { id: true },
+    })
+    if (!competingClaim) throw error
+    return { claimed: false, existingState: null }
+  }
+}
 /**
  * These collectors anchor the daily full-inventory run. They are deliberately
  * separate from the five-minute users/activity delta loop.
@@ -320,6 +379,25 @@ interface GraphSubscribedSku {
     suspended?: number | null
     lockedOut?: number | null
   } | null
+  servicePlans?: Array<{
+    servicePlanId?: string | null
+    servicePlanName?: string | null
+    provisioningStatus?: string | null
+    appliesTo?: string | null
+  }> | null
+}
+
+function boundedServicePlans(value: GraphSubscribedSku['servicePlans']) {
+  if (!Array.isArray(value)) return null
+  const plans = value.slice(0, 128).flatMap((plan) => {
+    if (!plan || typeof plan !== 'object') return []
+    const servicePlanId = typeof plan.servicePlanId === 'string' ? plan.servicePlanId.trim().slice(0, 80) : ''
+    const servicePlanName = typeof plan.servicePlanName === 'string' ? plan.servicePlanName.trim().slice(0, 120) : ''
+    const provisioningStatus = typeof plan.provisioningStatus === 'string' ? plan.provisioningStatus.trim().slice(0, 50) : ''
+    const appliesTo = typeof plan.appliesTo === 'string' ? plan.appliesTo.trim().slice(0, 50) : ''
+    return servicePlanId && servicePlanName && provisioningStatus ? [{ servicePlanId, servicePlanName, provisioningStatus, ...(appliesTo ? { appliesTo } : {}) }] : []
+  })
+  return plans.sort((left, right) => `${left.servicePlanId}:${left.servicePlanName}`.localeCompare(`${right.servicePlanId}:${right.servicePlanName}`))
 }
 
 interface GraphOrganization {
@@ -368,6 +446,80 @@ export function sharePointSitesSnapshotResult(
   return administrativeEnrichmentComplete
     ? authoritativeSnapshot(rows)
     : partialSnapshot(rows)
+}
+
+/**
+ * The compared SharePoint site state includes administrative access metadata.
+ * Do not advance the baseline when that metadata is incomplete, but do retain
+ * an actionable, sanitized reason instead of exposing the generic snapshot
+ * safety assertion to a tenant administrator.
+ */
+export function sharePointAdministrativeEnrichmentFailureMessage(
+  failure: unknown
+) {
+  const diagnostic = sanitizeGraphErrorField(
+    typeof failure === 'string' ? failure : '',
+    160
+  )
+  const status = diagnostic?.match(/\b(401|403)\b/)?.[1]
+  if (status) {
+    return `Microsoft SharePoint site access metadata returned HTTP ${status}. Confirm the SharePoint application permission required for site-user metadata. HawkView retained the previous site inventory and will retry during a bounded scheduled collection.`
+  }
+  if (/token|credential|acquire/i.test(diagnostic ?? '')) {
+    return 'HawkView could not acquire the SharePoint administrative access token required for site-user metadata. HawkView retained the previous site inventory and will retry during a bounded scheduled collection.'
+  }
+  if (/invalid sharepoint site url|tenant host|initial microsoft tenant domain/i.test(diagnostic ?? '')) {
+    return 'HawkView could not verify the tenant SharePoint host needed for administrative metadata collection. HawkView retained the previous site inventory and will retry after verified tenant domain information is available.'
+  }
+  return 'Microsoft SharePoint site access metadata could not be collected completely. HawkView retained the previous site inventory and will retry during a bounded scheduled collection.'
+}
+
+/** Only the root SharePoint tenant host and its paired personal-site host are
+ * valid token audiences for a tenant. Graph site URLs must never make us mint
+ * a token for an arbitrary hostname. */
+export function sharePointTenantHostFamilyFromInitialDomain(initialDomain: unknown) {
+  // This is intentionally derived from HawkView's persisted, verified tenant
+  // domain state. A Graph site webUrl is inventory data, not an authority to
+  // mint a SharePoint token for its hostname.
+  if (typeof initialDomain !== 'string' || initialDomain !== initialDomain.trim()) return [] as string[]
+  const match = /^([a-z0-9-]+)\.onmicrosoft\.com$/.exec(initialDomain)
+  if (!match || !match[1] || match[1].includes('--')) return [] as string[]
+  const tenantPrefix = match[1]
+  return [`${tenantPrefix}.sharepoint.com`, `${tenantPrefix}-my.sharepoint.com`]
+}
+
+/**
+ * Validate a Graph-returned site URL only after the token audience family has
+ * been established from the persisted initial onmicrosoft.com domain. The
+ * strict raw form rejects browser/URL parser ambiguities (case folding,
+ * ports, credentials, encoded separators, query/fragment, and host suffixes).
+ */
+export function trustedSharePointSiteUrl(
+  value: unknown,
+  allowedHosts: ReadonlySet<string>,
+) {
+  if (typeof value !== 'string' || value !== value.trim() || value.length > 2_048) return null
+  if (/[\\\\\u0000-\u001f\u007f]|%(?:2f|5c)/i.test(value)) return null
+  const rawMatch = /^https:\/\/([a-z0-9-]+\.sharepoint\.com)(?:\/|$)/.exec(value)
+  if (!rawMatch || !allowedHosts.has(rawMatch[1])) return null
+  try {
+    const url = new URL(value)
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname !== rawMatch[1] ||
+      url.host !== rawMatch[1] ||
+      url.username ||
+      url.password ||
+      url.port ||
+      url.search ||
+      url.hash ||
+      !allowedHosts.has(url.hostname)
+    ) return null
+    url.pathname = `${url.pathname.replace(/\/+$/, '')}/`
+    return url
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -592,21 +744,85 @@ function sanitizeGraphErrorField(value: unknown, maxLength: number) {
 
 function safeErrorMessage(error: unknown, fallback: string, maxLength = 2000) {
   const raw = error instanceof Error ? error.message : fallback
-  return sanitizeGraphErrorField(raw, maxLength) ?? fallback
+  // Operational failures are persisted and logged. Apply the same strict
+  // allowlisted diagnostic projection used by tenant-health before either
+  // sink receives a message; truncation/control stripping alone leaks tokens.
+  const sanitized = sanitizeHealthMessage(raw, fallback)
+  return sanitizeGraphErrorField(sanitized, maxLength) ?? fallback
+}
+
+function httpStatusFromSafeMessage(message: string) {
+  const match = /\b(?:HTTP\s*)?(401|403)\b/i.exec(message)
+  return match?.[1] ?? null
+}
+
+function boundedCollectionFailure(message: string) {
+  return /bounded collection|record limit|page limit|response-size|wall-clock deadline|capacity/i.test(message)
 }
 
 async function describeGraphError(response: Response) {
   try {
-    const body = (await response.json()) as {
-      error?: { code?: unknown; message?: unknown }
-    }
-    const code = sanitizeGraphErrorField(body?.error?.code, 160)
-    const message = sanitizeGraphErrorField(body?.error?.message, 500)
-    if (!code && !message) return ''
-    return ` [${[code, message].filter(Boolean).join(': ')}]`
+    // Project before the error is thrown, logged, or persisted.  Microsoft
+    // error bodies can echo a request URL or credential-shaped diagnostic.
+    const body = await response.text()
+    const safe = sanitizeHealthMessage(body, '')
+    return safe ? ` [${safe}]` : ''
   } catch {
     return ''
   }
+}
+
+export function assertSharePointResponseSize(
+  response: Response,
+  maximumBytes = SHAREPOINT_COLLECTION_LIMITS.responseBytes,
+) {
+  const contentLength = Number(response.headers.get('content-length') ?? '0')
+  if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
+    throw new Error('SharePoint response exceeded the bounded collection response-size limit.')
+  }
+}
+
+/**
+ * Content-Length is only an early rejection hint.  Count the streamed body so
+ * a missing or dishonest header cannot bypass the SharePoint collector cap.
+ */
+export async function readBoundedSharePointJson(
+  response: Response,
+  maximumBytes = SHAREPOINT_COLLECTION_LIMITS.responseBytes,
+): Promise<unknown> {
+  assertSharePointResponseSize(response, maximumBytes)
+  if (!response.body) return response.json()
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > maximumBytes) {
+        await reader.cancel('SharePoint response exceeded bounded limit')
+        throw new Error('SharePoint response exceeded the bounded collection response-size limit.')
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+  return JSON.parse(new TextDecoder().decode(bytes))
+}
+
+function sharePointRequestTimeout(
+  deadlineAt: number,
+  requestTimeoutMs = SHAREPOINT_COLLECTION_LIMITS.requestTimeoutMs,
+) {
+  const remaining = deadlineAt - Date.now()
+  if (remaining <= 0) throw new Error('SharePoint collection exceeded its bounded wall-clock deadline before completion.')
+  return Math.min(requestTimeoutMs, remaining)
 }
 
 const LOG_RETENTION_MONTHS = 6
@@ -761,10 +977,14 @@ export class TenantSyncService {
       1,
       Math.min(25, Number(process.env.SCHEDULED_SYNC_BATCH_SIZE ?? 10) || 10)
     )
-    const tenants = await this.prisma.customerTenant.findMany({
+    // Read a bounded fair-candidate window, then rank it by the due resource
+    // state below.  `updatedAt` is intentionally not a scheduling signal:
+    // a noisy tenant must not starve 1,000 other due tenants.
+    const candidateLimit = Math.max(limit, Math.min(1_000, Number(process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT ?? 1_000) || 1_000))
+    const candidateTenants = await this.prisma.customerTenant.findMany({
       where: scheduledSyncTenantWhere(now),
-      orderBy: { updatedAt: 'asc' },
-      take: limit,
+      orderBy: { id: 'asc' },
+      take: candidateLimit,
       select: {
         id: true,
         organizationId: true,
@@ -782,28 +1002,49 @@ export class TenantSyncService {
           },
         },
         syncStates: {
-          where: { resourceType: { in: [...DAILY_INVENTORY_ANCHORS] } },
+          where: {
+            resourceType: {
+              in: [
+                'USERS',
+                ...DAILY_INVENTORY_ANCHORS,
+                ...TARGETED_TRANSIENT_RETRY_RESOURCES,
+              ],
+            },
+          },
           select: {
             resourceType: true,
             status: true,
             lastAttemptAt: true,
             lastSuccessfulAt: true,
+            lastErrorCode: true,
+            lastErrorMessage: true,
+            consecutiveFailures: true,
           },
         },
       },
     })
 
+    const selectedWork = selectScheduledTenantWork(candidateTenants, now, candidateLimit)
+    const selectedById = new Map(selectedWork.map((work) => [work.tenantId, work]))
+    const tenants = candidateTenants
+      .filter((tenant) => selectedById.has(tenant.id))
+      .sort((left, right) => {
+        const leftWork = selectedById.get(left.id)!
+        const rightWork = selectedById.get(right.id)!
+        return leftWork.dueAt.getTime() - rightWork.dueAt.getTime() || left.id.localeCompare(right.id)
+      })
+
     const results: Array<Record<string, unknown>> = []
+    // A lock loser is not useful work. Continue through the fair candidate
+    // window so another due tenant can use this run's bounded capacity.
     for (const tenant of tenants) {
+      if (results.filter((result) => result.status !== 'SKIPPED').length >= limit) break
       try {
         // Keep the five-minute run lightweight, but run a full inventory once
         // per day (or retry a failed daily inventory anchor after an hour).
         // This prevents a tenant from remaining permanently stale unless an
         // administrator manually presses Sync Now.
-        const fullInventoryDue = requiresDailyInventoryRefresh(
-          tenant.syncStates,
-          now
-        )
+        const fullInventoryDue = selectedById.get(tenant.id)?.fullInventoryDue ?? requiresDailyInventoryRefresh(tenant.syncStates, now)
         const result = await this.syncConnectedTenant(tenant, false, {
           incrementalOnly: !fullInventoryDue,
           includeBundle: false,
@@ -860,61 +1101,8 @@ export class TenantSyncService {
       )
     }
 
-    const existingState = await this.prisma.syncState.findUnique({
-      where: {
-        customerTenantId_resourceType: {
-          customerTenantId: tenant.id,
-          resourceType: 'USERS',
-        },
-      },
-    })
     const now = new Date()
-    const staleLeaseBefore = new Date(now.getTime() - 15 * 60 * 1000)
-    let claimed = false
-    if (existingState) {
-      const claim = await this.prisma.syncState.updateMany({
-        where: {
-          id: existingState.id,
-          OR: [
-            { status: { not: 'RUNNING' } },
-            { lastAttemptAt: null },
-            { lastAttemptAt: { lt: staleLeaseBefore } },
-          ],
-        },
-        data: {
-          status: 'RUNNING',
-          lastAttemptAt: now,
-          lastErrorCode: null,
-          lastErrorMessage: null,
-        },
-      })
-      claimed = claim.count === 1
-    } else {
-      try {
-        await this.prisma.syncState.create({
-          data: {
-            organizationId: tenant.organizationId,
-            customerTenantId: tenant.id,
-            resourceType: 'USERS',
-            status: 'RUNNING',
-            lastAttemptAt: now,
-          },
-        })
-        claimed = true
-      } catch (error) {
-        const competingClaim = await this.prisma.syncState.findUnique({
-          where: {
-            customerTenantId_resourceType: {
-              customerTenantId: tenant.id,
-              resourceType: 'USERS',
-            },
-          },
-          select: { id: true },
-        })
-        if (!competingClaim) throw error
-        claimed = false
-      }
-    }
+    const { claimed, existingState } = await claimTenantUsersLease(this.prisma, tenant, now)
     if (!claimed) {
       if (throwWhenBusy) {
         throw new ConflictException(
@@ -1035,53 +1223,37 @@ export class TenantSyncService {
           synchronize: () => this.syncM365AuditActivity(tenant, accessToken),
         },
       ]
-      const mailboxRuleRefreshMinutes = boundedPositiveInteger(
-        process.env.EXCHANGE_MAILBOX_RULE_FAST_REFRESH_MINUTES,
-        DEFAULT_FAST_MAILBOX_RULE_REFRESH_MINUTES,
-        24 * 60
-      )
-      const mailboxRuleMaximumUsers = boundedPositiveInteger(
-        process.env.EXCHANGE_MAILBOX_RULE_FAST_MAX_USERS,
-        DEFAULT_FAST_MAILBOX_RULE_MAX_USERS,
-        5_000
-      )
-      const mailboxRuleState = await this.prisma.syncState.findUnique({
+      // Retry only explicitly safe, non-per-user inventory resources between
+      // daily full collections. The USERS row claim above serializes this with
+      // other tenant syncs. Permission failures never enter this path.
+      const targetedRetryStates = await this.prisma.syncState.findMany({
         where: {
-          customerTenantId_resourceType: {
-            customerTenantId: tenant.id,
-            resourceType: 'EXCHANGE_MAILBOX_RULES',
-          },
+          customerTenantId: tenant.id,
+          resourceType: { in: [...TARGETED_TRANSIENT_RETRY_RESOURCES] },
         },
         select: {
+          resourceType: true,
           status: true,
           lastAttemptAt: true,
           lastSuccessfulAt: true,
+          lastErrorCode: true,
+          lastErrorMessage: true,
+          consecutiveFailures: true,
         },
       })
-      const mailboxRuleReference = mailboxRuleState?.status === 'FAILED'
-        ? mailboxRuleState.lastAttemptAt
-        : mailboxRuleState?.lastSuccessfulAt
-      const mailboxRuleRefreshDue = !mailboxRuleReference ||
-        now.getTime() - mailboxRuleReference.getTime() >=
-          mailboxRuleRefreshMinutes * 60_000
-      if (mailboxRuleRefreshDue) {
-        const activeMailboxUsers = await this.prisma.directoryUser.count({
-          where: { customerTenantId: tenant.id, deletedAt: null },
-        })
-        if (shouldRunFastMailboxRuleRefresh({
-          state: mailboxRuleState,
-          activeMailboxUsers,
-          now,
-          intervalMinutes: mailboxRuleRefreshMinutes,
-          maximumUsers: mailboxRuleMaximumUsers,
-        })) {
+      for (const state of targetedRetryStates) {
+        if (!shouldRunTargetedTransientRetry(state, now)) continue
+        if (state.resourceType === 'SHAREPOINT_SITES') {
           incrementalModules.push({
-            resource: 'EXCHANGE_MAILBOX_RULES',
-            synchronize: () =>
-              this.syncExchangeMailboxRules(tenant, accessToken),
+            resource: 'SHAREPOINT_SITES',
+            synchronize: () => this.syncSharePointSites(tenant, accessToken),
           })
         }
       }
+      // Mailbox-rule inventory is intentionally daily-only. A broad Graph
+      // per-mailbox scan must never become an unconditional five-minute poll;
+      // future audit-triggered reconciliation needs an exact, bounded event
+      // predicate before it can opt this resource back into incremental work.
       const incrementalResults = await Promise.allSettled(
         incrementalModules.map((module) => module.synchronize())
       )
@@ -1180,6 +1352,14 @@ export class TenantSyncService {
         resource: 'EXCHANGE_MAILBOX_SETTINGS',
         synchronize: () =>
           this.syncExchangeMailboxSettings(tenant, snapshotAccessToken),
+      },
+      {
+        // This is the existing app-only Exchange Admin API probe used to
+        // verify Recipient Management RBAC. Include it in the daily
+        // authoritative inventory so an unverified state can converge on a
+        // normal scheduler run without adding a faster or per-mailbox probe.
+        resource: 'EXCHANGE_MAILBOX_CONFIGURATION',
+        synchronize: () => this.syncExchangeMailboxConfiguration(tenant),
       },
       {
         resource: 'EXCHANGE_ACCEPTED_DOMAINS',
@@ -1558,7 +1738,15 @@ export class TenantSyncService {
         },
         data: {
           status: 'FAILED',
-          lastErrorCode: `${resourceType.toLowerCase()}-sync-failed`,
+          // Retain a permission-shaped HTTP code when Microsoft supplied one:
+          // readiness and the scheduler use it to avoid retrying a permanent
+          // authorization failure every five minutes.
+          lastErrorCode:
+            httpStatusFromSafeMessage(message) ??
+            (boundedCollectionFailure(message)
+              ? `${resourceType.toLowerCase()}-capacity`
+              : null) ??
+            `${resourceType.toLowerCase()}-sync-failed`,
           lastErrorMessage: message,
           consecutiveFailures: { increment: 1 },
         },
@@ -1610,7 +1798,7 @@ export class TenantSyncService {
           typeof sku.skuId === 'string' && typeof sku.skuPartNumber === 'string'
       )
 
-      await this.prisma.$transaction(async (transaction) => {
+      await this.saveSnapshot(tenant, 'LICENSES', authoritativeSnapshot(rows), async (transaction) => {
         for (const sku of rows) {
           await transaction.tenantLicense.upsert({
             where: {
@@ -1630,6 +1818,7 @@ export class TenantSyncService {
               suspendedUnits: Math.max(0, sku.prepaidUnits?.suspended ?? 0),
               lockedOutUnits: Math.max(0, sku.prepaidUnits?.lockedOut ?? 0),
               capabilityStatus: sku.capabilityStatus?.trim() || null,
+              servicePlans: boundedServicePlans(sku.servicePlans) ?? Prisma.JsonNull,
               lastSeenAt: observedAt,
             },
             update: {
@@ -1640,6 +1829,7 @@ export class TenantSyncService {
               suspendedUnits: Math.max(0, sku.prepaidUnits?.suspended ?? 0),
               lockedOutUnits: Math.max(0, sku.prepaidUnits?.lockedOut ?? 0),
               capabilityStatus: sku.capabilityStatus?.trim() || null,
+              servicePlans: boundedServicePlans(sku.servicePlans) ?? Prisma.JsonNull,
               lastSeenAt: observedAt,
             },
           })
@@ -1651,7 +1841,6 @@ export class TenantSyncService {
           },
         })
       })
-      await this.saveSnapshot(tenant, 'LICENSES', authoritativeSnapshot(rows))
     })
   }
 
@@ -3045,7 +3234,9 @@ export class TenantSyncService {
   private async saveSnapshot(
     tenant: { id: string; organizationId: string },
     resourceType: EntraSnapshotResource,
-    result: SnapshotCollectionResult
+    result: SnapshotCollectionResult,
+    /** Resource inventory writes which must become visible with this baseline. */
+    persistWithSnapshot?: (transaction: Prisma.TransactionClient) => Promise<void>,
   ) {
     if (result.completeness !== 'authoritative_complete') {
       throw new Error(
@@ -3085,6 +3276,7 @@ export class TenantSyncService {
           skipDuplicates: true,
         })
       }
+      if (persistWithSnapshot) await persistWithSnapshot(transaction)
       await transaction.tenantEntraSnapshot.upsert({
         where: {
           customerTenantId_resourceType: {
@@ -3277,9 +3469,9 @@ export class TenantSyncService {
             signal: AbortSignal.timeout(Math.min(60_000, remainingMs)),
           })
           if (!response.ok) {
-            const details = (await response.text()).slice(0, 1_000)
+            const details = await describeGraphError(response)
             throw new Error(
-              `Microsoft Exchange mailbox configuration synchronization returned ${response.status}. Confirm Exchange.ManageAsAppV2 and the Recipient Management Exchange RBAC role. ${details}`
+              `Microsoft Exchange mailbox configuration synchronization returned ${response.status}. Confirm Exchange.ManageAsAppV2 and the Recipient Management Exchange RBAC role.${details}`
             )
           }
           const page = (await response.json()) as GraphCollectionPage
@@ -3410,9 +3602,13 @@ export class TenantSyncService {
 
   private async syncSharePointSites(
     tenant: TenantSyncTarget,
-    accessToken: string
+    accessToken: string,
+    limits: typeof SHAREPOINT_COLLECTION_LIMITS = SHAREPOINT_COLLECTION_LIMITS,
   ) {
     return this.runSnapshotSync(tenant, 'SHAREPOINT_SITES', async () => {
+      const deadlineAt = Date.now() + limits.collectorDeadlineMs // safely below the 15-minute tenant lease
+      const maxSitePages = limits.sitePages
+      const maxSites = limits.sites
       const sites: any[] = []
       const siteFields =
         'id,name,displayName,webUrl,createdDateTime,lastModifiedDateTime,root,siteCollection'
@@ -3427,11 +3623,11 @@ export class TenantSyncService {
             Authorization: `Bearer ${accessToken}`,
             Accept: 'application/json',
           },
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs)),
         }
       )
       if (rootResponse.ok) {
-        sites.push((await rootResponse.json()) as any)
+        sites.push((await readBoundedSharePointJson(rootResponse, limits.responseBytes)) as any)
       } else if (rootResponse.status !== 404) {
         throw new Error(
           `Microsoft SharePoint root site synchronization returned ${rootResponse.status}.`
@@ -3439,26 +3635,34 @@ export class TenantSyncService {
       }
 
       let nextUrl = `https://graph.microsoft.com/v1.0/sites?search=*&$select=${siteFields}`
+      let sitePages = 0
+      const seenSitePages = new Set<string>()
       while (nextUrl) {
+        if (++sitePages > maxSitePages || Date.now() >= deadlineAt) throw new Error('SharePoint site inventory reached a bounded collection limit before completion.')
         if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
           throw new Error(
             'Microsoft returned an invalid SharePoint sites link.'
           )
         }
+        if (seenSitePages.has(nextUrl)) {
+          throw new Error('SharePoint site inventory returned a repeated pagination link.')
+        }
+        seenSitePages.add(nextUrl)
         const response = await fetch(nextUrl, {
           headers: {
             Authorization: `Bearer ${accessToken}`,
             Accept: 'application/json',
           },
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs)),
         })
         if (!response.ok) {
           throw new Error(
             `Microsoft SharePoint sites synchronization returned ${response.status}.`
           )
         }
-        const page = (await response.json()) as GraphCollectionPage
+        const page = (await readBoundedSharePointJson(response, limits.responseBytes)) as GraphCollectionPage
         sites.push(...((page.value ?? []) as any[]))
+        if (sites.length > maxSites) throw new Error('SharePoint site inventory reached a bounded record limit before completion.')
         nextUrl = page['@odata.nextLink'] ?? ''
       }
 
@@ -3469,32 +3673,55 @@ export class TenantSyncService {
             .map((site) => [site.id, site])
         ).values()
       )
-      const sharePointHost = uniqueSites
-        .map((site) => this.getSharePointSiteUrl(site?.webUrl)?.hostname)
-        .find((host): host is string => Boolean(host))
-      let sharePointAccessToken: string | null = null
-      if (sharePointHost && tenant.connection) {
-        try {
-          sharePointAccessToken =
-            await this.microsoftConsent.getTenantSharePointAccessToken({
-              microsoftTenantId: tenant.microsoftTenantId,
-              connectionMode:
-                tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
-                  ? 'CUSTOMER_MANAGED'
-                  : 'HAWKVIEW_MANAGED',
-              clientId: tenant.connection.clientId,
-              credentialReference: tenant.connection.credentialReference,
-              sharePointHost,
-            })
-        } catch (error) {
-          this.logger.warn(
-            `SharePoint site access metadata token unavailable for tenant ${tenant.id}: ${error instanceof Error ? error.message : 'unknown error'}`
-          )
+      // Never derive an OAuth audience from site inventory. The initial
+      // onmicrosoft.com domain is recorded from the tenant's verified domain
+      // configuration and is the only source used to establish this public
+      // cloud SharePoint host pair.
+      const initialDomain = await this.prisma.tenantDomain.findFirst({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          isInitial: true,
+        },
+        select: { name: true },
+      })
+      const allowedSharePointHosts = new Set(
+        sharePointTenantHostFamilyFromInitialDomain(initialDomain?.name),
+      )
+      const sharePointTokens = new Map<string, Promise<string>>()
+      let administrativeEnrichmentFailure: string | null = null
+      if (!tenant.connection || !allowedSharePointHosts.size) {
+        administrativeEnrichmentFailure =
+          'HawkView has not recorded a verified initial Microsoft tenant domain for SharePoint administrative access.'
+      }
+      const accessTokenForSite = async (webUrl: unknown) => {
+        const siteUrl = trustedSharePointSiteUrl(webUrl, allowedSharePointHosts)
+        const siteHost = siteUrl?.hostname ?? null
+        if (!siteHost || !allowedSharePointHosts.has(siteHost) || !tenant.connection) {
+          throw new Error('Invalid SharePoint site URL.')
         }
+        let token = sharePointTokens.get(siteHost)
+        if (!token) {
+          token = this.microsoftConsent.getTenantSharePointAccessToken({
+            microsoftTenantId: tenant.microsoftTenantId,
+            connectionMode:
+              tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+                ? 'CUSTOMER_MANAGED'
+                : 'HAWKVIEW_MANAGED',
+            clientId: tenant.connection.clientId,
+            credentialReference: tenant.connection.credentialReference,
+            sharePointHost: siteHost,
+          })
+          sharePointTokens.set(siteHost, token)
+        }
+        return token
       }
       const enrichedSites: any[] = []
-      let administrativeEnrichmentComplete = Boolean(sharePointAccessToken)
+      let administrativeEnrichmentComplete = !administrativeEnrichmentFailure
       for (let index = 0; index < uniqueSites.length; index += 8) {
+        if (Date.now() >= deadlineAt) {
+          throw new Error('SharePoint site inventory reached a bounded collection limit before completion.')
+        }
         const batch = uniqueSites.slice(index, index + 8)
         const batchRows = await Promise.all(
           batch.map(async (site) => {
@@ -3512,26 +3739,41 @@ export class TenantSyncService {
                   Authorization: `Bearer ${accessToken}`,
                   Accept: 'application/json',
                 },
-                signal: AbortSignal.timeout(20_000),
+                signal: AbortSignal.timeout(sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs)),
               }
             )
             const drive = driveResponse.ok
-              ? ((await driveResponse.json()) as any)
+              ? ((await readBoundedSharePointJson(driveResponse, limits.responseBytes)) as any)
               : null
-            const access = sharePointAccessToken
-              ? await this.collectSharePointSiteAccess(
-                  site.webUrl,
-                  sharePointAccessToken,
-                  sharePointHost
-                )
-              : {
-                  externalSharing: null,
-                  guestsCount: null,
-                  sharingCapability: null,
-                  collectionError: 'SharePoint access token unavailable.',
-                }
+            let access: {
+              externalSharing: boolean | null
+              guestsCount: number | null
+              sharingCapability: string | number | null
+              collectionError?: string | null
+            }
+            try {
+              const sharePointAccessToken = await accessTokenForSite(site.webUrl)
+              access = await this.collectSharePointSiteAccess(
+                site.webUrl,
+                sharePointAccessToken,
+                allowedSharePointHosts,
+                deadlineAt,
+                limits,
+              )
+            } catch (error) {
+              access = {
+                externalSharing: null,
+                guestsCount: null,
+                sharingCapability: null,
+                collectionError: safeErrorMessage(
+                  error,
+                  'SharePoint administrative access token unavailable.',
+                ),
+              }
+            }
             if (access.collectionError) {
               administrativeEnrichmentComplete = false
+              administrativeEnrichmentFailure ??= access.collectionError
               this.logger.warn(
                 `SharePoint access metadata incomplete for tenant ${tenant.id}, site ${String(site.id)}: ${access.collectionError}`
               )
@@ -3546,44 +3788,31 @@ export class TenantSyncService {
         enrichedSites.push(...batchRows)
       }
 
+      if (!administrativeEnrichmentComplete) {
+        throw new Error(
+          sharePointAdministrativeEnrichmentFailureMessage(
+            administrativeEnrichmentFailure
+          )
+        )
+      }
+
       await this.saveSnapshot(
         tenant,
         'SHAREPOINT_SITES',
-        sharePointSitesSnapshotResult(
-          enrichedSites,
-          administrativeEnrichmentComplete
-        )
+        authoritativeSnapshot(enrichedSites)
       )
     })
-  }
-
-  private getSharePointSiteUrl(value: unknown) {
-    if (typeof value !== 'string' || !value.trim()) return null
-    try {
-      const url = new URL(value)
-      if (
-        url.protocol !== 'https:' ||
-        !/^[a-z0-9.-]+\.sharepoint\.com$/i.test(url.hostname) ||
-        url.hostname.includes('..')
-      ) {
-        return null
-      }
-      url.search = ''
-      url.hash = ''
-      url.pathname = `${url.pathname.replace(/\/+$/, '')}/`
-      return url
-    } catch {
-      return null
-    }
   }
 
   private async collectSharePointSiteAccess(
     webUrl: unknown,
     accessToken: string,
-    expectedHost?: string
+    allowedHosts: ReadonlySet<string>,
+    deadlineAt: number,
+    limits: typeof SHAREPOINT_COLLECTION_LIMITS = SHAREPOINT_COLLECTION_LIMITS,
   ) {
-    const siteUrl = this.getSharePointSiteUrl(webUrl)
-    if (!siteUrl || (expectedHost && siteUrl.hostname !== expectedHost)) {
+    const siteUrl = trustedSharePointSiteUrl(webUrl, allowedHosts)
+    if (!siteUrl) {
       return {
         externalSharing: null,
         guestsCount: null,
@@ -3607,24 +3836,32 @@ export class TenantSyncService {
         siteUrl
       ).toString()
       const guestIds = new Set<string>()
+      const seenPages = new Set<string>()
+      let pageCount = 0
+      let recordCount = 0
       while (nextUrl) {
+        if (++pageCount > limits.siteUserPages || Date.now() >= deadlineAt) throw new Error('SharePoint site-user metadata reached a bounded collection limit before completion.')
         const pageUrl = new URL(nextUrl, siteUrl)
         if (pageUrl.origin !== siteUrl.origin) {
           throw new Error('SharePoint returned an invalid site-users link.')
         }
+        if (seenPages.has(pageUrl.toString())) throw new Error('SharePoint returned a repeated site-users page.')
+        seenPages.add(pageUrl.toString())
         const response = await fetch(pageUrl, {
           headers,
-          signal: AbortSignal.timeout(20_000),
+          signal: AbortSignal.timeout(sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs)),
         })
         if (!response.ok) {
           throw new Error(`site users returned ${response.status}`)
         }
-        const body = (await response.json()) as any
+        const body = (await readBoundedSharePointJson(response, limits.responseBytes)) as any
         const users = Array.isArray(body?.value)
           ? body.value
           : Array.isArray(body?.d?.results)
             ? body.d.results
             : []
+        recordCount += users.length
+        if (recordCount > limits.siteUserRecords) throw new Error('SharePoint site-user metadata reached a bounded record limit before completion.')
         for (const user of users) {
           const loginName = String(user?.LoginName ?? '')
           const normalizedLogin = loginName.toLowerCase()
@@ -3634,6 +3871,7 @@ export class TenantSyncService {
             normalizedLogin.includes('urn:spo:guest')
           if (!isGuest) continue
           guestIds.add(String(user?.Id ?? loginName).toLowerCase())
+          if (guestIds.size > limits.siteUserRecords) throw new Error('SharePoint site-user metadata reached a bounded record limit before completion.')
         }
         nextUrl =
           body?.['@odata.nextLink'] ?? body?.['odata.nextLink'] ?? body?.d?.__next ?? ''
@@ -4412,6 +4650,9 @@ export class TenantSyncService {
       'SHAREPOINT_SETTINGS'
     )
     const sharePointUsageSyncState = syncStateByResource.get('SHAREPOINT_USAGE')
+    const exchangeConfigurationSyncState = syncStateByResource.get(
+      'EXCHANGE_MAILBOX_CONFIGURATION'
+    )
     const exchangeSync = (resource: EntraSnapshotResource) => {
       const state = syncStateByResource.get(resource)
       return {
@@ -5529,6 +5770,26 @@ export class TenantSyncService {
                 1
               )).toISOString(),
             },
+          },
+          sharePointSites: {
+            status: sharePointSitesSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt: sharePointSitesSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: sharePointSitesSyncState?.lastErrorMessage ?? null,
+          },
+          sharePointSettings: {
+            status: sharePointSettingsSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt: sharePointSettingsSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: sharePointSettingsSyncState?.lastErrorMessage ?? null,
+          },
+          sharePointUsage: {
+            status: sharePointUsageSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt: sharePointUsageSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: sharePointUsageSyncState?.lastErrorMessage ?? null,
+          },
+          exchangeAdminRbac: {
+            status: exchangeConfigurationSyncState?.status.toLowerCase() ?? 'never-synced',
+            lastSuccessfulAt: exchangeConfigurationSyncState?.lastSuccessfulAt?.toISOString() ?? null,
+            lastError: exchangeConfigurationSyncState?.lastErrorMessage ?? null,
           },
           applications: exchangeSync('APPLICATIONS'),
           servicePrincipals: exchangeSync('SERVICE_PRINCIPALS'),

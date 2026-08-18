@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { normalizeCollectionReadiness, readinessLabel } from './collection-readiness.ts'
+import { normalizeCollectionReadiness, readinessDiagnostic, readinessLabel, readinessRemediation, synchronizationReadinessSummary } from './collection-readiness.ts'
 
 const valid = {
   version: 1,
@@ -83,4 +83,48 @@ test('recomputes parent and overall state from the worst nested component and ke
   assert.equal(blocked?.overallState, 'BLOCKED_PERMISSION')
   assert.equal(blocked?.reason, 'MailboxSettings.Read is missing.')
   assert.equal(blocked?.workloads[0]?.components.some((component) => component.key === 'invalid_component_data'), true)
+})
+
+test('uses safe administrator-facing readiness copy for completed workloads and legacy snapshot safety assertions', () => {
+  assert.equal(
+    readinessRemediation('READY', 'Confirm a permission.'),
+    'No action required. HawkView will continue normal scheduled collection.',
+  )
+  assert.equal(
+    readinessDiagnostic(
+      'sharepoint_sites-sync-failed',
+      'Refusing to advance SHAREPOINT_SITES snapshot baseline from a partial or unverified collection.',
+    ),
+    'SharePoint site access metadata could not be verified completely. HawkView retained the prior site inventory and will retry at the next eligible scheduled collection.',
+  )
+})
+
+test('drives legacy synchronization summary from required readiness rather than a successful scheduler heartbeat', () => {
+  const readiness = normalizeCollectionReadiness({
+    ...valid,
+    overallState: 'READY',
+    workloads: [
+      { ...valid.workloads[0], key: 'sharepoint', workload: 'SharePoint and OneDrive', state: 'FAILED_TRANSIENT', reasonCode: 'HTTP_401', reason: 'SharePoint administrative access was denied.', lastAttemptAt: '2026-08-18T12:00:00.000Z', lastSuccessfulAt: '2026-08-17T12:00:00.000Z' },
+      { ...valid.workloads[0], key: 'exchange', workload: 'Exchange', state: 'NEVER_SUCCEEDED', reasonCode: 'EXCHANGE_RBAC_UNVERIFIED', reason: 'Exchange Admin RBAC has not succeeded.', lastAttemptAt: '2026-08-18T11:00:00.000Z', lastSuccessfulAt: null },
+      { ...valid.workloads[0], key: 'optional_license', workload: 'Optional licensed data', state: 'NOT_LICENSED', reason: 'Not licensed.', lastAttemptAt: null, lastSuccessfulAt: null },
+    ],
+  })
+  const summary = synchronizationReadinessSummary(readiness)
+  assert.equal(summary?.overallState, 'FAILED_TRANSIENT')
+  assert.equal(summary?.applicableWorkloads, 2)
+  assert.equal(summary?.currentWorkloads, 0)
+  assert.equal(summary?.failedWorkloads, 2)
+  assert.equal(summary?.primaryReasonCode, 'HTTP_401')
+  assert.equal(summary?.primaryLastAttemptAt, '2026-08-18T12:00:00.000Z')
+})
+
+test('treats an all-unlicensed matrix as not applicable instead of falsely successful', () => {
+  const readiness = normalizeCollectionReadiness({
+    ...valid,
+    workloads: [{ ...valid.workloads[0], state: 'NOT_LICENSED', reason: 'Not licensed.', lastAttemptAt: null, lastSuccessfulAt: null }],
+  })
+  const summary = synchronizationReadinessSummary(readiness)
+  assert.equal(summary?.overallState, 'NOT_LICENSED')
+  assert.equal(summary?.applicableWorkloads, 0)
+  assert.equal(summary?.failedWorkloads, 0)
 })

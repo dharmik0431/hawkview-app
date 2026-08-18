@@ -282,7 +282,7 @@ test('optional incomplete collection is attention rather than a connection failu
   assert.equal(result.overallStatus, 'ATTENTION')
 })
 
-test('a legacy optional Exchange Admin API failure does not degrade Graph-based Exchange health', () => {
+test('a required Exchange Admin API failure cannot leave tenant health healthy', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   const states = [
     ...completeCurrentStates(now),
@@ -297,9 +297,21 @@ test('a legacy optional Exchange Admin API failure does not degrade Graph-based 
     },
   ]
   const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
-  assert.equal(result.operations.status, 'HEALTHY')
-  assert.equal(result.operations.failedJobs, 0)
-  assert.equal(result.operations.issues.some((issue) => issue.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), false)
+  assert.equal(result.operations.status, 'DEGRADED')
+  assert.equal(result.operations.failedJobs, 1)
+  assert.equal(result.overallStatus, 'DEGRADED')
+  assert.equal(result.operations.issues.some((issue) => issue.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), true)
+})
+
+test('a failed required SharePoint inventory cannot leave tenant health healthy', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const states = completeCurrentStates(now).map((state) => state.resourceType === 'SHAREPOINT_SITES'
+    ? { ...state, status: 'FAILED', lastErrorCode: '401', lastErrorMessage: 'SharePoint site users returned 401.' }
+    : state)
+  const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
+  assert.equal(result.overallStatus, 'DEGRADED')
+  assert.equal(result.legacyHealthStatus, 'attention')
+  assert.equal(result.healthScore < 100, true)
 })
 
 test('required stale and failed collectors degrade tenant health', () => {

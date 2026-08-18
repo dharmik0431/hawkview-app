@@ -16,12 +16,127 @@ export const DAILY_INVENTORY_ANCHORS = [
 export const DAILY_INVENTORY_REFRESH_MS = 24 * 60 * 60 * 1000
 export const DAILY_INVENTORY_FAILURE_RETRY_MS = 60 * 60 * 1000
 export const USER_INCREMENTAL_REFRESH_MS = 5 * 60 * 1000
+/** The durable USERS RUNNING row is the tenant-wide scheduler lease. */
+export const TENANT_SYNC_LEASE_MS = 15 * 60 * 1000
+/**
+ * A small, explicitly bounded set of inventory resources may retry on the
+ * normal scheduler between daily full inventories. These are never per-user
+ * collectors. Permission-shaped failures are deliberately excluded.
+ */
+export const TARGETED_TRANSIENT_RETRY_RESOURCES = [
+  SyncResourceType.SHAREPOINT_SITES,
+] as const
+export const TARGETED_TRANSIENT_RETRY_BASE_MS = 30 * 60 * 1000
+export const TARGETED_TRANSIENT_RETRY_MAX_MS = 6 * 60 * 60 * 1000
 
 export type DailyInventoryState = {
   resourceType: string
   status: string
   lastAttemptAt: Date | null
   lastSuccessfulAt: Date | null
+  lastErrorCode?: string | null
+  lastErrorMessage?: string | null
+  consecutiveFailures?: number
+}
+
+export type ScheduledTenantCandidate = {
+  id: string
+  syncStates: DailyInventoryState[]
+}
+
+export type ScheduledTenantWork = {
+  tenantId: string
+  /**
+   * The resource work timestamp, not CustomerTenant.updatedAt.  Every
+   * collection attempt advances this durable state, so repeatedly attempted
+   * tenants naturally yield to other due tenants on the next scheduler run.
+   */
+  dueAt: Date
+  fullInventoryDue: boolean
+}
+
+function authorizationFailure(state: DailyInventoryState) {
+  return state.lastErrorCode === '401' || state.lastErrorCode === '403' ||
+    /\b(?:401|403)\b|unauthorized|forbidden|permission|consent/i.test(
+      state.lastErrorMessage ?? '',
+    )
+}
+
+function boundedCapacityFailure(state: DailyInventoryState) {
+  return /bounded collection|record limit|page limit|response-size|wall-clock deadline|capacity/i.test(
+    `${state.lastErrorCode ?? ''} ${state.lastErrorMessage ?? ''}`,
+  )
+}
+
+export function targetedTransientRetryDelayMs(state: DailyInventoryState) {
+  const failures = Math.max(1, Math.min(8, state.consecutiveFailures ?? 1))
+  return Math.min(
+    TARGETED_TRANSIENT_RETRY_MAX_MS,
+    TARGETED_TRANSIENT_RETRY_BASE_MS * 2 ** (failures - 1),
+  )
+}
+
+export function shouldRunTargetedTransientRetry(
+  state: DailyInventoryState | undefined,
+  now: Date,
+) {
+  if (!state || state.status !== SyncStateStatus.FAILED) return false
+  if (!(TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(state.resourceType)) return false
+  // A permanent authorization failure or capacity guard must wait for a
+  // normal inventory/reconfiguration signal, never a five-minute hot loop.
+  if (authorizationFailure(state) || boundedCapacityFailure(state) || !state.lastAttemptAt) return false
+  return now.getTime() - state.lastAttemptAt.getTime() >= targetedTransientRetryDelayMs(state)
+}
+
+function validPastTime(value: Date | null | undefined, now: Date) {
+  return value instanceof Date && Number.isFinite(value.getTime()) && value <= now
+}
+
+function earliestDue(values: Array<Date | null | undefined>, now: Date) {
+  const valid = values.filter((value): value is Date => validPastTime(value, now))
+  return valid.sort((left, right) => left.getTime() - right.getTime())[0] ?? new Date(0)
+}
+
+/**
+ * Produces one durable due-work record per tenant and orders it fairly.  This
+ * stays pure so the DB query can be broad enough to find due tenants while the
+ * scheduler uses the resource timestamps that actually govern eligibility.
+ */
+export function selectScheduledTenantWork(
+  candidates: ScheduledTenantCandidate[],
+  now: Date,
+  limit: number,
+) {
+  const work = candidates.flatMap((candidate): ScheduledTenantWork[] => {
+    const byResource = new Map(candidate.syncStates.map((state) => [state.resourceType, state]))
+    const fullInventoryDue = requiresDailyInventoryRefresh(candidate.syncStates, now)
+    const users = byResource.get(SyncResourceType.USERS)
+    // A future/invalid durable timestamp is not an immediate retry signal:
+    // attempting it ahead of every other tenant would create starvation. The
+    // readiness layer reports that anomaly honestly until a normal repair.
+    const userDue = !users || users.lastSuccessfulAt === null ||
+      (validPastTime(users.lastSuccessfulAt, now) && (
+        users.status === SyncStateStatus.FAILED ||
+        now.getTime() - users.lastSuccessfulAt.getTime() >= USER_INCREMENTAL_REFRESH_MS
+      ))
+    const targetedDue = candidate.syncStates.some((state) => shouldRunTargetedTransientRetry(state, now))
+
+    if (!fullInventoryDue && !userDue && !targetedDue) return []
+    const dueStates = candidate.syncStates.filter((state) => {
+      if (DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])) return fullInventoryDue
+      if (state.resourceType === SyncResourceType.USERS) return userDue
+      return shouldRunTargetedTransientRetry(state, now)
+    })
+    return [{
+      tenantId: candidate.id,
+      fullInventoryDue,
+      dueAt: earliestDue(dueStates.flatMap((state) => [state.lastAttemptAt, state.lastSuccessfulAt]), now),
+    }]
+  })
+
+  return work
+    .sort((left, right) => left.dueAt.getTime() - right.dueAt.getTime() || left.tenantId.localeCompare(right.tenantId))
+    .slice(0, Math.max(1, limit))
 }
 
 export function requiresDailyInventoryRefresh(
@@ -61,6 +176,7 @@ export function requiresDailyInventoryRefresh(
 export function scheduledSyncTenantWhere(
   now: Date,
 ): Prisma.CustomerTenantWhereInput {
+  const activeLeaseAfter = new Date(now.getTime() - TENANT_SYNC_LEASE_MS)
   const usersStaleBefore = new Date(
     now.getTime() - USER_INCREMENTAL_REFRESH_MS,
   )
@@ -74,11 +190,25 @@ export function scheduledSyncTenantWhere(
     { lastAttemptAt: null },
     { lastAttemptAt: { lt: dailyRetryBefore } },
   ]
+  const targetedRetryBefore = new Date(
+    now.getTime() - TARGETED_TRANSIENT_RETRY_BASE_MS,
+  )
 
   return {
     status: 'ACTIVE' as const,
     connection: { status: 'CONNECTED' as const },
-    OR: [
+    // Exclude active tenant leases before the candidate cap. Otherwise the
+    // first 1,000 rows can all be lock losers and starve eligible tenants.
+    AND: [{
+      syncStates: {
+        none: {
+          resourceType: SyncResourceType.USERS,
+          status: SyncStateStatus.RUNNING,
+          lastAttemptAt: { gt: activeLeaseAfter },
+        },
+      },
+    }, {
+      OR: [
       { syncStates: { none: { resourceType: 'USERS' } } },
       {
         syncStates: {
@@ -108,6 +238,17 @@ export function scheduledSyncTenantWhere(
           },
         },
       ]),
-    ],
+      {
+        syncStates: {
+          some: {
+            resourceType: { in: [...TARGETED_TRANSIENT_RETRY_RESOURCES] },
+            status: SyncStateStatus.FAILED,
+            lastErrorCode: { notIn: ['401', '403', 'sharepoint_sites-capacity'] },
+            lastAttemptAt: { lt: targetedRetryBefore },
+          },
+        },
+      },
+      ],
+    }],
   }
 }
