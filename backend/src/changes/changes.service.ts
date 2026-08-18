@@ -35,6 +35,42 @@ const object = (value: unknown): JsonObject =>
   value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : {}
 const array = (value: unknown): unknown[] => Array.isArray(value) ? value : []
 const text = (value: unknown) => typeof value === 'string' && value.trim() ? value.trim() : undefined
+
+type EvidenceSourcePresentation = {
+  source: string
+  provenance: string
+  microsoftSource?: string
+}
+
+const SANITIZED_MICROSOFT_SOURCES: Record<string, string> = {
+  'Microsoft Graph /users/{id}/mailFolders/inbox/messageRules': 'Microsoft Graph mailbox rules',
+  'Microsoft Graph directoryAudit': 'Microsoft Graph directory audit',
+  'Office 365 Management Activity API': 'Office 365 Management Activity API',
+}
+
+/**
+ * Stored evidence is immutable source material. This maps only the API DTO to
+ * a stable, friendly and non-sensitive display source for both list and detail
+ * responses.
+ */
+function sourcePresentation(event: { source: string; workload?: string | null; raw?: unknown }): EvidenceSourcePresentation {
+  if (event.source === 'DIRECTORY_AUDIT') {
+    return { source: 'Entra', provenance: 'Microsoft Graph directoryAudit', microsoftSource: 'Microsoft Graph directory audit' }
+  }
+  if (event.source === 'M365_UNIFIED_AUDIT') {
+    return { source: text(event.workload) ?? 'Microsoft 365', provenance: 'Microsoft 365 Unified Audit', microsoftSource: 'Office 365 Management Activity API' }
+  }
+  if (event.source === 'SNAPSHOT_DIFFERENCE') {
+    const raw = object(event.raw)
+    const microsoftSource = SANITIZED_MICROSOFT_SOURCES[text(raw.microsoftSource) ?? '']
+    return {
+      source: text(event.workload) ?? 'Microsoft 365',
+      provenance: 'HawkView snapshot comparison',
+      ...(microsoftSource ? { microsoftSource } : {}),
+    }
+  }
+  return { source: text(event.workload) ?? 'Microsoft 365', provenance: 'Microsoft evidence' }
+}
 const parseValue = (value: unknown) => {
   if (typeof value !== 'string') return value
   try { return JSON.parse(value) } catch { return value }
@@ -244,7 +280,8 @@ export class ChangesService {
       .map((log) => {
         const kind = legacyCategory(log.activityDisplayName, log.category); const details = targetDetails(log.targetResources)
         const classification = classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: log.activityDisplayName, category: log.category, operationType: log.operationType, targetResourceTypes: targetResourceTypes(log.targetResources) })
-        return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, classification, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: 'Entra' as const, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: { ...evidenceFrom(log), provenance: 'Microsoft Graph directoryAudit' } }
+        const presentation = sourcePresentation({ source: 'DIRECTORY_AUDIT' })
+        return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, classification, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: presentation.source, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: { ...evidenceFrom(log), ...presentation } }
       })
     const authoritativeCandidates = [
       ...evidenceEvents,
@@ -268,6 +305,7 @@ export class ChangesService {
       const before = object(event.beforeState)
       const after = object(event.afterState)
       const classification = normalizedEvidenceClassification(event)
+      const presentation = sourcePresentation(event)
       return {
         id: event.source === 'DIRECTORY_AUDIT'
           ? `audit:${event.sourceEventId}`
@@ -284,9 +322,7 @@ export class ChangesService {
         summary: event.summary,
         actor: event.actorPrincipalName ?? event.actorDisplayName ?? undefined,
         target: event.targetDisplayName ?? undefined,
-        source: event.source === 'M365_UNIFIED_AUDIT'
-          ? (event.workload ?? 'Microsoft 365')
-          : 'Entra',
+        source: presentation.source,
         ip: event.ipAddress ?? undefined,
         location: {
           city: text(location.city),
@@ -302,7 +338,7 @@ export class ChangesService {
           changedFields: array(event.changedFields),
           workload: event.workload,
           result: event.result,
-          provenance: event.source === 'DIRECTORY_AUDIT' ? 'Microsoft Graph directoryAudit' : event.source,
+          ...presentation,
         },
       }
     }).filter((event) => PRIMARY_CHANGE_CLASSIFICATIONS.has(event.classification))
@@ -603,8 +639,13 @@ export class ChangesService {
         source: candidate.source,
         relationship: 'Shares an exact actor or target within the one-hour investigation window; this association does not establish causation.',
       }))
+    const presentation = sourcePresentation(event)
     return {
-      event,
+      event: {
+        ...event,
+        source: presentation.source,
+        evidence: presentation,
+      },
       classification,
       relatedEvents: related.filter((candidate) => candidate.id !== event.id && candidate.source !== 'SIGN_IN'),
       relatedSignIns,

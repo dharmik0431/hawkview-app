@@ -5,6 +5,7 @@ import {
   TENANT_HEALTH_RESOURCE_REGISTRY,
   type TenantAuditEvent,
 } from './tenant-health'
+import { sanitizeHealthMessage } from './sanitize-health-message'
 
 function baseInput() {
   return {
@@ -40,6 +41,120 @@ test('missing permissions link directly to permission settings', () => {
   assert.equal(result.attention[0]?.label, 'Required Microsoft permissions are missing')
   assert.equal(result.attention[0]?.actionLabel, 'Review permissions')
   assert.equal(result.attention[0]?.actionUrl, '/tenants/tenant-1/settings')
+})
+
+test('M365 audit collection findings open the audit synchronization health panel', () => {
+  const result = deriveTenantHealth({
+    ...baseInput(),
+    syncStates: [{ resourceType: 'M365_AUDIT', status: 'FAILED', lastAttemptAt: new Date('2026-08-07T12:00:00.000Z'), lastSuccessfulAt: null, lastErrorCode: '403', lastErrorMessage: 'Microsoft rejected the request.', consecutiveFailures: 1 }],
+  })
+  const finding = result.attention.find((item) => item.key === 'sync-m365_audit')
+  assert.equal(finding?.actionLabel, 'Review audit synchronization')
+  assert.equal(finding?.actionUrl, '/tenants/tenant-1/settings?section=sync&resource=M365_AUDIT')
+  assert.equal(finding?.actionUrl.includes('what-changed'), false)
+})
+
+test('redacts credential-shaped collector failures before tenant health is returned', () => {
+  const result = deriveTenantHealth({
+    ...baseInput(),
+    syncStates: [{ resourceType: 'M365_AUDIT', status: 'FAILED', lastAttemptAt: new Date(), lastSuccessfulAt: null, lastErrorCode: '403', lastErrorMessage: 'HTTP 403 Bearer secret-token refresh_token=hidden https://graph.microsoft.com/v1.0/auditLogs?sig=signed', consecutiveFailures: 1 }],
+  })
+  const resource = result.resourceHealth.find((item) => item.resourceType === 'M365_AUDIT')
+  assert.match(resource?.message ?? '', /HTTP 403/)
+  assert.doesNotMatch(resource?.message ?? '', /secret-token|hidden|signed/)
+  assert.match(result.operations.issues[0]?.message ?? '', /\[REDACTED\]/)
+})
+
+test('does not render arbitrary fields from structured collector failures', () => {
+  const result = sanitizeHealthMessage({
+    status: 429,
+    message: 'Too many requests; access_token=hidden https://graph.microsoft.com/v1.0/auditLogs?sig=signed',
+    rawPayload: 'must never be rendered',
+  })
+  assert.match(result, /HTTP 429/)
+  assert.doesNotMatch(result, /hidden|signed|must never be rendered/)
+})
+
+test('redacts quoted and encoded secrets in structured failure messages', () => {
+  const result = sanitizeHealthMessage('HTTP 429 Correlation ID corr-1 {"client_secret":"JSONSECRET","refresh_token":"REFRESH"} api_key: "two word secret" Refresh_Token%253DENCODEDSECRET Bearer%2520ENCODEDTOKEN')
+  assert.match(result, /HTTP 429 Correlation ID corr-1/)
+  assert.doesNotMatch(result, /JSONSECRET|\bREFRESH\b|two word secret|ENCODEDSECRET|ENCODEDTOKEN/i)
+  assert.match(result, /\[REDACTED\]/)
+})
+
+test('fails closed on malformed percent encoding while retaining HTTP status', () => {
+  const result = sanitizeHealthMessage('HTTP 400 malformed %ZZ refresh_token=must-not-render')
+  assert.equal(result, 'HTTP 400: [REDACTED ENCODED ERROR]')
+  assert.doesNotMatch(result, /must-not-render/)
+})
+
+test('sanitizes compound free-text and recursive structured credentials while retaining safe error codes', () => {
+  const structured = sanitizeHealthMessage(JSON.stringify({
+    error: { code: 'RequestDenied', message: 'Microsoft denied this operation.' },
+    client_secret: 'alpha beta gamma',
+    access_token: ['ARRAYSECRET1', 'ARRAYSECRET2'],
+    password: { primary: 'NESTEDSECRET' },
+    nested: [{ refresh_token: 'REFRESH VALUE' }],
+  }))
+  assert.match(structured, /RequestDenied/)
+  assert.match(structured, /Microsoft denied this operation/)
+  assert.doesNotMatch(structured, /alpha beta gamma|ARRAYSECRET1|ARRAYSECRET2|NESTEDSECRET|REFRESH VALUE/i)
+
+  for (const value of [
+    'password=top secret phrase',
+    'client_secret: alpha beta gamma',
+    'password={"primary":"NESTEDSECRET"}',
+    'refresh_token%3DENCODEDSECRET',
+    'Bearer%20ENCODEDTOKEN',
+    'Bearer%2520DOUBLEENCODEDTOKEN',
+    'CLIENT_SECRET: "escaped \\"secret\\" value"',
+  ]) {
+    const result = sanitizeHealthMessage(value)
+    assert.match(result, /\[REDACTED\]/)
+    assert.doesNotMatch(result, /top secret phrase|alpha beta gamma|NESTEDSECRET|ENCODEDSECRET|ENCODEDTOKEN|DOUBLEENCODEDTOKEN|escaped|secret value/i)
+  }
+})
+
+test('projects structured diagnostics through a strict allowlist', () => {
+  const probe = JSON.stringify({
+    error: { code: 'RequestDenied', message: 'Microsoft rejected the request.' }, correlationId: 'corr-1', tenantId: 'tenant-1',
+    arbitrary: 'ARBITRARYSECRET', nested: { debug: 'DEBUGSECRET' }, access_token: ['ARRAYSECRET1', 'ARRAYSECRET2'],
+    password: { primary: 'NESTEDSECRET' }, __proto__: { debug: 'PROTOTYPESECRET' }, constructor: 'CONSTRUCTORSECRET',
+  })
+  for (const value of [probe, `prefix ${probe}`]) {
+    const result = sanitizeHealthMessage(value)
+    assert.match(result, /RequestDenied|REDACTED STRUCTURED ERROR/)
+    assert.match(result, /corr-1|REDACTED STRUCTURED ERROR/)
+    assert.doesNotMatch(result, /ARBITRARYSECRET|DEBUGSECRET|ARRAYSECRET1|ARRAYSECRET2|NESTEDSECRET|PROTOTYPESECRET|CONSTRUCTORSECRET/i)
+    assert.doesNotMatch(result, /"arbitrary"|"nested"|"access_token"|"password"/i)
+  }
+  assert.equal(sanitizeHealthMessage('{"untrusted":["NOPE"],"other":{"debug":"NOPE2"}}'), '{"diagnostic":"[REDACTED STRUCTURED ERROR]"}')
+})
+
+test('uses case-insensitive strict projection for direct collector error objects', () => {
+  const result = sanitizeHealthMessage({
+    STATUS: 403, Error: { CODE: 'RequestDenied', MESSAGE: 'Safe Microsoft message' }, CLIENTREQUESTID: 'req-1', Organization_ID: 'org-1',
+    URL: 'https://user:pass@graph.microsoft.com/v1.0/auditLogs?sig=SECRET#fragment', PASSWORD: 'NESTEDSECRET',
+    arbitrary: ['ARBITRARYSECRET'], nested: { debug: 'DEBUGSECRET' }, constructor: 'CONSTRUCTORSECRET',
+  })
+  assert.match(result, /HTTP 403.*RequestDenied.*Safe Microsoft message.*req-1.*org-1.*https:\/\/graph\.microsoft\.com\/v1\.0\/auditLogs/i)
+  assert.doesNotMatch(result, /user:pass|sig=|fragment|NESTEDSECRET|ARBITRARYSECRET|DEBUGSECRET|CONSTRUCTORSECRET/i)
+  assert.equal(sanitizeHealthMessage({ status: ['not primitive'], message: { no: 'object' }, __proto__: { secret: 'NOPE' } }), 'The latest collection failed.')
+})
+
+test('normalizes approved direct-object aliases without preserving collisions or unknown values', () => {
+  const result = sanitizeHealthMessage({
+    STATUS_CODE: 401,
+    'REQUEST-ID': 'request-first',
+    request_id: 'request-second',
+    'ORGANIZATION-ID': 'org-hyphen',
+    URI: 'https://graph.microsoft.com/v1.0/users?api_key=SECRET',
+    MESSAGE: { unsafe: 'OBJECTSECRET' },
+    unknown: { nested: 'UNKNOWNSECRET' },
+    __proto__: { poison: 'PROTOTYPESECRET' },
+  })
+  assert.match(result, /HTTP 401.*request-first.*org-hyphen.*https:\/\/graph\.microsoft\.com\/v1\.0\/users/i)
+  assert.doesNotMatch(result, /request-second|SECRET|OBJECTSECRET|UNKNOWNSECRET|PROTOTYPESECRET/i)
 })
 
 test('MFA coverage produces an actionable organization finding', () => {

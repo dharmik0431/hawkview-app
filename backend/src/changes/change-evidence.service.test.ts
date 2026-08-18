@@ -135,6 +135,50 @@ test('exposes M365 workload evidence with a source-specific stable identifier', 
   assert.equal(result.changes[0]?.id, 'evidence:M365_UNIFIED_AUDIT:exchange-record-1')
   assert.equal(result.changes[0]?.source, 'Exchange')
   assert.equal(result.changes[0]?.classification, 'configuration_change')
+  assert.equal((result.changes[0]?.evidence as { provenance?: string }).provenance, 'Microsoft 365 Unified Audit')
+})
+
+test('presents Exchange mailbox-rule snapshot evidence consistently in list and detail', async () => {
+  const event = {
+    id: 'snapshot-rule-1', source: 'SNAPSHOT_DIFFERENCE', sourceEventId: 'exchange-rule:mailbox@example.test:rule-1',
+    eventDateTime: new Date('2026-08-01T13:00:00.000Z'), customerTenantId: 'tenant-1', organizationId: 'org-1',
+    category: 'Exchange', severity: 'High', operationName: 'Exchange inbox rule changed', summary: 'A mailbox rule changed.',
+    actorId: null, actorPrincipalName: null, actorDisplayName: null, targetId: 'mailbox@example.test', targetDisplayName: 'mailbox@example.test',
+    ipAddress: null, location: null, beforeState: { forwardTo: [] }, afterState: { forwardTo: ['external@example.test'] },
+    correlationId: null, changedFields: ['forwardTo'], workload: 'Exchange Online', result: 'Detected',
+    raw: { evidenceOrigin: 'hawkview_snapshot_difference', microsoftSource: 'Microsoft Graph /users/{id}/mailFolders/inbox/messageRules' },
+  }
+  const service = new ChangesService(changesPrisma({
+    changeEvidenceEvent: { findMany: async () => [event], findFirst: async () => event },
+  }) as never)
+  const list = await service.list(identity, range)
+  const row = list.changes[0] as { source?: string; evidence?: { provenance?: string; microsoftSource?: string } }
+  assert.equal(row.source, 'Exchange Online')
+  assert.deepEqual(row.evidence, {
+    normalized: true, changedFields: ['forwardTo'], workload: 'Exchange Online', result: 'Detected',
+    source: 'Exchange Online', provenance: 'HawkView snapshot comparison', microsoftSource: 'Microsoft Graph mailbox rules',
+  })
+  const detail = await service.detail(identity, 'evidence:SNAPSHOT_DIFFERENCE:exchange-rule:mailbox@example.test:rule-1')
+  assert.equal(detail.event.source, 'Exchange Online')
+  assert.deepEqual((detail.event.evidence as { provenance?: string; microsoftSource?: string }), {
+    source: 'Exchange Online', provenance: 'HawkView snapshot comparison', microsoftSource: 'Microsoft Graph mailbox rules',
+  })
+  assert.equal(detail.event.actorPrincipalName, null)
+})
+
+test('keeps directory audit display source as Entra in list and detail', async () => {
+  const event = {
+    id: 'directory-1', source: 'DIRECTORY_AUDIT', sourceEventId: 'directory-1', eventDateTime: new Date('2026-08-01T13:00:00.000Z'),
+    customerTenantId: 'tenant-1', organizationId: 'org-1', category: 'Apps', severity: 'High', operationName: 'Update application', summary: 'Updated',
+    actorId: null, actorPrincipalName: null, actorDisplayName: null, targetId: null, targetDisplayName: 'App', ipAddress: null, location: null,
+    beforeState: null, afterState: null, correlationId: null, changedFields: [], workload: 'Microsoft Entra ID', result: 'Succeeded', raw: {},
+  }
+  const service = new ChangesService(changesPrisma({ changeEvidenceEvent: { findMany: async () => [event], findFirst: async () => event } }) as never)
+  const list = await service.list(identity, range)
+  assert.equal(list.changes[0]?.source, 'Entra')
+  const detail = await service.detail(identity, 'audit:directory-1')
+  assert.equal(detail.event.source, 'Entra')
+  assert.equal((detail.event.evidence as { provenance?: string }).provenance, 'Microsoft Graph directoryAudit')
 })
 
 test('keeps routine Exchange mailbox actions out of What Changed while retaining real inbox-rule changes', async () => {

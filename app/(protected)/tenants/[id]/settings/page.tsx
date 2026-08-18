@@ -1,13 +1,14 @@
 'use client'
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
-import { useParams, useRouter } from 'next/navigation'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '@/components/providers/auth-provider'
 
 import { apiClient } from '@/lib/api/client'
+import { auditSyncFocusTarget, isM365AuditSyncDeepLink, m365AuditSyncHealth } from '@/lib/tenants/audit-sync-health'
 import type { TenantBundle } from '@/types/tenant-data'
 
 import {
@@ -90,10 +91,14 @@ function maskClientId(clientId?: string) {
 
 export default function TenantSettingsPage() {
   const params = useParams<{ id: string }>()
+  const searchParams = useSearchParams()
   const router = useRouter()
   const queryClient = useQueryClient()
   const { session } = useAuth()
   const tenantId = params?.id
+  const auditSyncDeepLink = isM365AuditSyncDeepLink(searchParams.get('section'), searchParams.get('resource'))
+  const auditSyncFocusId = auditSyncFocusTarget(searchParams.get('section'), searchParams.get('resource'))
+  const auditSyncPanelRef = useRef<HTMLDivElement>(null)
 
   const [bundle, setBundle] = useState<TenantBundle | null>(null)
   const [tenantListRecord, setTenantListRecord] = useState<any | null>(null)
@@ -101,6 +106,13 @@ export default function TenantSettingsPage() {
     'loading'
   )
   const [loadError, setLoadError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (auditSyncFocusId && loadState !== 'loading') {
+      auditSyncPanelRef.current?.scrollIntoView({ block: 'start' })
+      auditSyncPanelRef.current?.focus({ preventScroll: true })
+    }
+  }, [auditSyncFocusId, loadState])
 
   // Action states
   const [isVerifying, setIsVerifying] = useState(false)
@@ -530,6 +542,10 @@ export default function TenantSettingsPage() {
     () => moduleRows.filter((m) => m.available).length,
     [moduleRows]
   )
+  const auditSync = useMemo(
+    () => m365AuditSyncHealth(tenantListRecord?.tenantHealth?.resourceHealth ?? tenantListRecord?.resourceHealth),
+    [tenantListRecord],
+  )
 
   if (loadState === 'loading') {
     return (
@@ -951,6 +967,19 @@ export default function TenantSettingsPage() {
           </div>
         </CardHeader>
         <CardContent className="space-y-6">
+          {auditSyncDeepLink && (
+            <div ref={auditSyncPanelRef} id="sync-health" tabIndex={-1} role="region" aria-labelledby="sync-health-heading" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-600 focus-visible:ring-offset-2 dark:border-amber-900 dark:bg-amber-950/30">
+              <h3 id="sync-health-heading" className="font-semibold text-foreground">Microsoft 365 audit synchronization</h3>
+              {auditSync ? (
+                <dl className="mt-3 grid gap-2 sm:grid-cols-2">
+                  <div><dt className="text-muted-foreground">State</dt><dd className="font-medium">{auditSync.classification}</dd></div>
+                  <div><dt className="text-muted-foreground">Last attempt</dt><dd className="font-medium">{formatDate(auditSync.lastAttemptAt)}</dd></div>
+                  <div><dt className="text-muted-foreground">Last success</dt><dd className="font-medium">{formatDate(auditSync.lastSuccessfulAt)}</dd></div>
+                  <div><dt className="text-muted-foreground">Current reason</dt><dd className="font-medium break-words">{auditSync.message}</dd></div>
+                </dl>
+              ) : <p className="mt-2 text-muted-foreground">No M365 Audit collector state has been recorded for this tenant.</p>}
+            </div>
+          )}
           {consentError && (
             <div className="rounded-xl border border-red-200 bg-red-50 dark:bg-red-950/30 dark:border-red-900/50 p-3 text-sm text-red-700 dark:text-red-300">
               {consentError}
