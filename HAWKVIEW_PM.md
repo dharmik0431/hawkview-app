@@ -69,7 +69,7 @@ P0-4 mailbox-rule detection repair in progress:
 - A content-type HTTP 400 is persisted for that subscription without blocking polling of already-enabled workloads. Any failed subscription makes `M365_AUDIT` failed/partial instead of healthy.
 - Incremental tenant runs independently refresh inbox-rule Graph snapshots every 15 minutes for tenants with at most 250 active directory users. Both interval and cap are environment-configurable; larger tenants retain the daily full-inventory fallback until a scalable sharded/risk-based scanner is implemented.
 - Validation so far: Management Activity 23/23, What Changed/snapshot 36/36, tenant health 17/17, service freshness 13/13, collection field state 2/2; TypeScript, Prisma validation, production build, and diff check pass.
-- Not committed, pushed, merged, or deployed yet. Live acceptance must be repeated after deployment; leave `HAWKVIEW-P04-TEST` enabled so the new snapshot path can detect it.
+- Repair committed and pushed on `codex/p0-4-mailbox-rule-detection`; draft PR #151 is open. It is not merged or deployed. Live acceptance must be repeated after deployment; leave `HAWKVIEW-P04-TEST` enabled so the new snapshot path can detect it.
 
 Problem observed in production:
 
