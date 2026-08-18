@@ -1,8 +1,10 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-17
+Last updated: 2026-08-17 after P0-4 production deployment
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
+
+Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
 
 ## Product objective
 
@@ -50,7 +52,7 @@ Initial market: United States and Canada. Pricing and 1,000-tenant scale work ar
 
 ### P0-4 — Security signal quality and compromise reconstruction
 
-Status: backend implementation complete and validated on `codex/p0-4-security-signal-quality`; awaiting publish/review/deploy approval.
+Status: backend implementation merged and deployed. Live end-to-end acceptance testing is still pending.
 
 Problem observed in production:
 
@@ -78,7 +80,7 @@ Implemented behavior:
 - Change detail returns grouped `relatedMailboxActivity` plus actor/target-associated primary changes within one hour. Every association is labelled non-causal unless Microsoft supplies an exact correlation ID—and even exact correlation is not claimed as causation.
 - Historical Exchange noise that was already projected is hidden dynamically without a destructive database backfill.
 - An actorless snapshot is suppressed when Microsoft audit evidence for the same tenant/category/target exists within 45 minutes.
-- No frontend, consent, schema, migration, or live-state change was made.
+- No frontend, consent, schema, or migration change was required.
 
 Validation completed:
 
@@ -89,6 +91,15 @@ Validation completed:
 - Collection field state: 2/2 passed.
 - TypeScript, Prisma schema validation, production backend build, and `git diff --check` passed.
 
+Publish and deployment:
+
+- Source commit: `96851ea` (`Improve M365 security signal quality`).
+- Merged to `main` in PR #149.
+- Merge commit: `c81bddaec74f891479b47ceb6f37ac83211b7096`.
+- The live Render `hawkview-api-dev` service is linked to `dharmik0431/hawkview-app`, branch `main`, and marked the `c81bdda` deployment live after `New commit via Auto-Deploy`.
+- The Render `hawkview-sync-dev` cron is also linked to `main`; its build for `c81bdda` succeeded through Auto-Deploy. A successful build is not the same as a successful tenant sync run.
+- Final live acceptance still required: create or change an inbox rule, generate controlled mailbox move/delete activity, then confirm HawkView shows the rule as a primary change and groups the mailbox operations only as supporting evidence.
+
 ## Known live issues
 
 - Exchange mailbox configuration can return HTTP 403 when Exchange RBAC `Recipient Management` is absent even when `Exchange.ManageAsAppV2` API consent is present.
@@ -98,10 +109,11 @@ Validation completed:
 
 ## Next milestones after P0-4
 
-1. Connection and collection health: actionable permission/RBAC/unsupported-tenant states.
-2. Retention and investigations: prove six-month access, export, restore testing, and archival decision.
-3. Beta readiness: security/isolation review, MSP roles, onboarding/offboarding, monitoring, support workflow, and a controlled 3–5 MSP pilot.
-4. Scale foundation after prototype validation: durable job queue, separate workers, fair scheduling, delta sources where supported, partitioning, cold storage, and load gates at 25/100/250/1,000 tenants.
+1. Complete the controlled live P0-4 acceptance scenario and record event delay, grouping, provenance, and any false positives.
+2. Connection and collection health: actionable permission/RBAC/unsupported-tenant states.
+3. Retention and investigations: prove six-month access, export, restore testing, and archival decision.
+4. Beta readiness: security/isolation review, MSP roles, onboarding/offboarding, monitoring, support workflow, and a controlled 3–5 MSP pilot.
+5. Scale foundation after prototype validation: durable job queue, separate workers, fair scheduling, delta sources where supported, partitioning, cold storage, and load gates at 25/100/250/1,000 tenants.
 
 ## Update checklist
 
