@@ -95,6 +95,23 @@ test('reports audit coverage as partial when the M365 workload collector has nev
   assert.equal(data.services.auditLogs.partialFailures[0]?.collector, 'M365_AUDIT')
 })
 
+test('does not report audit coverage healthy after a newer M365 subscription failure', () => {
+  const data = deriveTenantSyncFreshness([
+    success('AUDIT_LOGS'),
+    failed(
+      'M365_AUDIT',
+      '2026-08-13T13:50:00.000Z',
+      'm365-audit-subscription-incomplete',
+    ),
+  ], now)
+  assert.equal(data.services.auditLogs.status, 'PARTIAL')
+  assert.equal(data.services.auditLogs.failedCollectors, 1)
+  assert.equal(
+    data.services.auditLogs.partialFailures[0]?.reasonCode,
+    'm365-audit-subscription-incomplete',
+  )
+})
+
 test('uses the configured Render cron schedule as the next scheduled attempt source', () => {
   const data = deriveTenantSyncFreshness([success('AUDIT_LOGS')], now)
   assert.equal(data.services.auditLogs.scheduleSource, '*/5 * * * *')

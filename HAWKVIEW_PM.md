@@ -1,6 +1,6 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-17 after P0-4 production deployment
+Last updated: 2026-08-17 during P0-4 live inbox-rule acceptance repair
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
@@ -54,6 +54,23 @@ Initial market: United States and Canada. Pricing and 1,000-tenant scale work ar
 
 Status: backend implementation merged and deployed. Live end-to-end acceptance testing is still pending.
 
+Live OWA inbox-rule acceptance finding:
+
+- Dharmik created and enabled `HAWKVIEW-P04-TEST` in tenant `MSFT` for `dharmik0417@szlk.onmicrosoft.com` after 22:49 America/Toronto.
+- HawkView customer tenant `6facb85e-7a71-472f-b5ea-2938ee25fe3b` maps to Microsoft tenant `320721eb-d16f-4cab-acdd-f7d5578d7a60` (`MSFT`, `szlk.onmicrosoft.com`).
+- The rule was absent from What Changed during the acceptance window. Render showed this exact tenant's `M365_AUDIT` collector failing at 22:25, 22:40, 23:00, and 23:15 with Microsoft's HTTP 400 `Tenant ... does not exist` response while starting `Audit.AzureActiveDirectory`.
+- Because subscription activation always selected the first missing content type, the failing Entra workload could prevent `Audit.Exchange` from ever being activated. A cooldown run could then appear successful even though subscriptions were missing. The independent Graph mailbox-rule snapshot was only part of the daily full inventory.
+
+P0-4 mailbox-rule detection repair in progress:
+
+- Branch/worktree: `codex/p0-4-mailbox-rule-detection` / `hawkview-p041`, based on `origin/main` at `e56eef1`.
+- Backend only; no frontend, tenant, consent, Render, or live configuration changes.
+- Exchange subscription activation is attempted first. Missing workloads rotate by oldest/never-attempted state rather than retrying one content type forever.
+- A content-type HTTP 400 is persisted for that subscription without blocking polling of already-enabled workloads. Any failed subscription makes `M365_AUDIT` failed/partial instead of healthy.
+- Incremental tenant runs independently refresh inbox-rule Graph snapshots every 15 minutes for tenants with at most 250 active directory users. Both interval and cap are environment-configurable; larger tenants retain the daily full-inventory fallback until a scalable sharded/risk-based scanner is implemented.
+- Validation so far: Management Activity 23/23, What Changed/snapshot 36/36, tenant health 17/17, service freshness 13/13, collection field state 2/2; TypeScript, Prisma validation, production build, and diff check pass.
+- Repair committed and pushed on `codex/p0-4-mailbox-rule-detection`; draft PR #151 is open. It is not merged or deployed. Live acceptance must be repeated after deployment; leave `HAWKVIEW-P04-TEST` enabled so the new snapshot path can detect it.
+
 Problem observed in production:
 
 - Routine Exchange mailbox-item operations such as `Create`, `MoveToDeletedItems`, and `SoftDelete` are presented as independent tenant changes.
@@ -102,8 +119,9 @@ Publish and deployment:
 
 ## Known live issues
 
+- MSFT currently has no reliable Unified Audit coverage: Microsoft rejects subscription activation with `Tenant ... does not exist`. This affects the exact tenant used for the live inbox-rule test and must be shown as incomplete audit coverage, not healthy.
+- Inbox-rule Graph snapshots were daily-only in the deployed build. The P0-4 repair adds a bounded 15-minute small-tenant safety scan, but tenants above the configured user cap still need a sharded/risk-based fast scanner before broad beta.
 - Exchange mailbox configuration can return HTTP 403 when Exchange RBAC `Recipient Management` is absent even when `Exchange.ManageAsAppV2` API consent is present.
-- At least one connected tenant intermittently reports that the Management Activity tenant does not exist; tenant eligibility/staleness needs a later connection-health repair.
 - Render service-initiated bandwidth is the current infrastructure cost warning. Scale architecture is deferred, but per-tenant cost and lag instrumentation is required before a broad beta.
 - Current retention is approximately six calendar months. Immutability, tamper resistance, restore drills, and legal-grade archival are not complete.
 
