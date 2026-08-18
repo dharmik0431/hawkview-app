@@ -38,10 +38,14 @@ const CATEGORIES: ChangeCategory[] = [
   'Devices',
   'Passwords',
   'Sign-ins',
+  'Organization',
+  'Domains',
+  'Exchange',
+  'SharePoint',
 ]
 
 const SEVERITIES: ChangeSeverity[] = ['High', 'Medium', 'Low']
-const SOURCES: ChangeSource[] = ['Entra', 'M365', 'Unknown']
+const SOURCES: ChangeSource[] = ['Entra', 'Microsoft 365', 'Exchange Online', 'SharePoint and OneDrive', 'Teams', 'Unknown']
 
 export type ToolbarFilterState = {
   tenant: string // "all" or tenantId

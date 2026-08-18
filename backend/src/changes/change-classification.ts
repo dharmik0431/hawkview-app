@@ -83,7 +83,7 @@ export function classifyEvidence(input: {
   if (/role assignment|directory role|administrator|eligible assignment|password reset|reset password|reset.*password|disable user|delete user/.test(value)) return 'administrative_action'
   if (/synchroni[sz]/.test(value)) return 'configuration_change'
   if (/group|member|user|device/.test(value)) return 'identity_change'
-  if (/license|domain|exchange|mailbox|sharepoint|onedrive|site|setting|configuration|policy/.test(value)) return 'configuration_change'
+  if (/license|subscription|domain|organization|tenant identity|exchange|mailbox|sharepoint|onedrive|site|setting|configuration|policy/.test(value)) return 'configuration_change'
 
   // Preserve unknown source evidence in storage, but do not present it as an
   // administrative change until a narrow mapping has been reviewed.

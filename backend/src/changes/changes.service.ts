@@ -12,6 +12,7 @@ import {
 import {
   managementActivityRoleFromEvidence,
 } from './m365-activity-classification.js'
+import { productGuidanceForSnapshot } from './microsoft-admin-change-catalog.js'
 
 type JsonObject = Record<string, unknown>
 type TimelineEvent = {
@@ -70,6 +71,22 @@ function sourcePresentation(event: { source: string; workload?: string | null; r
     }
   }
   return { source: text(event.workload) ?? 'Microsoft 365', provenance: 'Microsoft evidence' }
+}
+
+function potentialImpactFor(event: {
+  source: string
+  targetType?: string | null
+  workload?: string | null
+  category?: string | null
+  operationName?: string | null
+}) {
+  return productGuidanceForSnapshot({
+    source: event.source,
+    resourceType: event.targetType,
+    workload: event.workload,
+    category: event.category,
+    operationName: event.operationName,
+  })
 }
 const parseValue = (value: unknown) => {
   if (typeof value !== 'string') return value
@@ -306,6 +323,7 @@ export class ChangesService {
       const after = object(event.afterState)
       const classification = normalizedEvidenceClassification(event)
       const presentation = sourcePresentation(event)
+      const potentialImpact = potentialImpactFor(event)
       return {
         id: event.source === 'DIRECTORY_AUDIT'
           ? `audit:${event.sourceEventId}`
@@ -339,6 +357,7 @@ export class ChangesService {
           workload: event.workload,
           result: event.result,
           ...presentation,
+          ...(potentialImpact ? { potentialImpact } : {}),
         },
       }
     }).filter((event) => PRIMARY_CHANGE_CLASSIFICATIONS.has(event.classification))
@@ -640,11 +659,15 @@ export class ChangesService {
         relationship: 'Shares an exact actor or target within the one-hour investigation window; this association does not establish causation.',
       }))
     const presentation = sourcePresentation(event)
+    const potentialImpact = potentialImpactFor(event)
     return {
       event: {
         ...event,
         source: presentation.source,
-        evidence: presentation,
+        evidence: {
+          ...presentation,
+          ...(potentialImpact ? { potentialImpact } : {}),
+        },
       },
       classification,
       relatedEvents: related.filter((candidate) => candidate.id !== event.id && candidate.source !== 'SIGN_IN'),

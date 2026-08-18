@@ -218,6 +218,15 @@ function determineCategoryKey(e: ChangeEvent): EventCategoryKey {
   if (e.category === 'Licenses') {
     return 'license'
   }
+  if (e.category === 'Domains') {
+    return 'dns-domain'
+  }
+  if (e.category === 'Exchange') {
+    return 'exchange'
+  }
+  if (e.category === 'SharePoint') {
+    return 'sharepoint'
+  }
   if (e.category === 'Users' || e.category === 'Passwords') {
     return 'user'
   }

@@ -11,4 +11,9 @@ export const CATEGORY_DEFAULT_SEVERITY: Record<ChangeCategory, ChangeSeverity> =
   Devices: 'Low',
   Passwords: 'High',
   'Sign-ins': 'Low',
+  Organization: 'Medium',
+  Domains: 'Medium',
+  Exchange: 'Medium',
+  SharePoint: 'Medium',
+  Unknown: 'Low',
 }

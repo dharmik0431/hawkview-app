@@ -17,6 +17,10 @@ const CATEGORIES: ChangeCategory[] = [
   'Devices',
   'Passwords',
   'Sign-ins',
+  'Organization',
+  'Domains',
+  'Exchange',
+  'SharePoint',
 ]
 
 const SEVERITIES: ChangeSeverity[] = ['High', 'Medium', 'Low']

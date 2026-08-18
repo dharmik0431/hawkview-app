@@ -323,6 +323,8 @@ interface GraphSubscribedSku {
 }
 
 interface GraphOrganization {
+  id?: string | null
+  tenantId?: string | null
   displayName?: string | null
   verifiedDomains?: Array<{
     name?: string | null
@@ -539,6 +541,7 @@ interface GraphGroupMembersPage {
 
 type EntraSnapshotResource =
   | 'LICENSES'
+  | 'ORGANIZATION_CONFIGURATION'
   | 'DOMAINS'
   | 'AUTH_REGISTRATIONS'
   | 'AUTH_METHOD_POLICIES'
@@ -630,6 +633,38 @@ interface TenantSyncTarget {
     credentialReference: string | null
     lastVerifiedAt: Date | null
   } | null
+}
+
+type GraphOrganizationConfigurationResponse = {
+  value?: Array<{ id?: unknown; displayName?: unknown }>
+}
+
+/**
+ * Graph's /organization result is an authority boundary.  A token issued for
+ * the wrong customer tenant must never establish or replace this tenant's
+ * snapshot baseline, even if Graph returned an otherwise valid organization.
+ */
+export function organizationConfigurationSnapshotForTenant(
+  expectedMicrosoftTenantId: string,
+  body: GraphOrganizationConfigurationResponse | null | undefined,
+) {
+  const expectedId = expectedMicrosoftTenantId.trim().toLowerCase()
+  const organizations = Array.isArray(body?.value) ? body.value : []
+  if (!expectedId || organizations.length !== 1) {
+    throw new Error('Microsoft did not return one authoritative organization record.')
+  }
+  const organization = organizations[0]
+  const returnedId = typeof organization?.id === 'string' ? organization.id.trim() : ''
+  if (!returnedId || returnedId.toLowerCase() !== expectedId) {
+    throw new Error('Microsoft organization identifier does not match the connected tenant.')
+  }
+  return {
+    id: expectedMicrosoftTenantId,
+    tenantId: expectedMicrosoftTenantId,
+    displayName: typeof organization.displayName === 'string' && organization.displayName.trim()
+      ? organization.displayName.trim()
+      : null,
+  }
 }
 
 @Injectable()
@@ -1108,6 +1143,10 @@ export class TenantSyncService {
       {
         resource: 'LICENSES',
         synchronize: () => this.syncLicenses(tenant, snapshotAccessToken),
+      },
+      {
+        resource: 'ORGANIZATION_CONFIGURATION',
+        synchronize: () => this.syncOrganizationConfiguration(tenant, snapshotAccessToken),
       },
       {
         resource: 'DOMAINS',
@@ -1690,6 +1729,33 @@ export class TenantSyncService {
         })
       })
       await this.saveSnapshot(tenant, 'DOMAINS', authoritativeSnapshot(domains))
+    })
+  }
+
+  /**
+   * A separate authoritative organization baseline keeps a display-name change
+   * from being confused with domain inventory.  The initial collection is a
+   * baseline only; saveSnapshot emits evidence only after two successful
+   * collections and keeps the prior state on a failed/partial request.
+   */
+  private async syncOrganizationConfiguration(
+    tenant: { id: string; organizationId: string; microsoftTenantId: string },
+    accessToken: string
+  ) {
+    return this.runSnapshotSync(tenant, 'ORGANIZATION_CONFIGURATION', async () => {
+      const response = await fetch(
+        'https://graph.microsoft.com/v1.0/organization?$select=id,displayName',
+        {
+          headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+          signal: AbortSignal.timeout(20_000),
+        }
+      )
+      if (!response.ok) {
+        throw new Error(`Microsoft organization configuration synchronization returned ${response.status}.`)
+      }
+      const body = (await response.json()) as GraphOrganizationConfigurationResponse
+      const organization = organizationConfigurationSnapshotForTenant(tenant.microsoftTenantId, body)
+      await this.saveSnapshot(tenant, 'ORGANIZATION_CONFIGURATION', authoritativeSnapshot([organization]))
     })
   }
 
@@ -2889,6 +2955,8 @@ export class TenantSyncService {
     if (resources.length === 0) return
 
     const synchronizers: Record<AuditReconciliationResource, () => Promise<unknown>> = {
+      ORGANIZATION_CONFIGURATION: () =>
+        this.syncOrganizationConfiguration(tenant, accessToken),
       GROUPS: () => this.syncGroups(tenant, accessToken),
       LICENSES: () => this.syncLicenses(tenant, accessToken),
       DOMAINS: () => this.syncDomains(tenant, accessToken),

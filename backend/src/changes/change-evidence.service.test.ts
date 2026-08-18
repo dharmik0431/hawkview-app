@@ -8,6 +8,8 @@ import {
   SNAPSHOT_DIFFERENCE_SPECS,
   UNIFIED_AUDIT_LOG_GAP_REPORT,
   DOMAIN_DETAIL_COVERAGE_GAP,
+  describeExchangeOrganizationCustomization,
+  describeUnifiedAuditIngestion,
 } from './microsoft-admin-change-catalog.js'
 import {
   assertGroupRelationshipRefreshComplete,
@@ -76,6 +78,7 @@ test('classifies evidence and keeps authentication telemetry out of the primary 
   assert.equal(classifyEvidence({ source: 'SIGN_IN', activity: 'Successful sign-in' }), 'authentication_evidence')
   assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Update conditional access policy' }), 'security_control_change')
   assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Add app role assignment' }), 'permission_change')
+  assert.equal(classifyEvidence({ source: 'SNAPSHOT_DIFFERENCE', activity: 'Microsoft 365 organization identity changed', category: 'Organization' }), 'configuration_change')
   assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Add member to group' }), 'identity_change')
   assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Update license assignment' }), 'configuration_change')
   assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Reset user password' }), 'administrative_action')
@@ -146,13 +149,14 @@ test('presents Exchange mailbox-rule snapshot evidence consistently in list and 
     actorId: null, actorPrincipalName: null, actorDisplayName: null, targetId: 'mailbox@example.test', targetDisplayName: 'mailbox@example.test',
     ipAddress: null, location: null, beforeState: { forwardTo: [] }, afterState: { forwardTo: ['external@example.test'] },
     correlationId: null, changedFields: ['forwardTo'], workload: 'Exchange Online', result: 'Detected',
-    raw: { evidenceOrigin: 'hawkview_snapshot_difference', microsoftSource: 'Microsoft Graph /users/{id}/mailFolders/inbox/messageRules' },
+    targetType: 'EXCHANGE_MAILBOX_RULES',
+    raw: { evidenceOrigin: 'hawkview_snapshot_difference', microsoftSource: 'Microsoft Graph /users/{id}/mailFolders/inbox/messageRules', impact: { guidance: 'attacker-supplied impact' } },
   }
   const service = new ChangesService(changesPrisma({
     changeEvidenceEvent: { findMany: async () => [event], findFirst: async () => event },
   }) as never)
   const list = await service.list(identity, range)
-  const row = list.changes[0] as { source?: string; evidence?: { provenance?: string; microsoftSource?: string } }
+  const row = list.changes[0] as { source?: string; evidence?: { provenance?: string; microsoftSource?: string; potentialImpact?: { kind?: string; guidance?: string } } }
   assert.equal(row.source, 'Exchange Online')
   assert.deepEqual(row.evidence, {
     normalized: true, changedFields: ['forwardTo'], workload: 'Exchange Online', result: 'Detected',
@@ -429,6 +433,104 @@ test('does not create snapshot evidence for a first successful baseline', () => 
     expiresAt: new Date('2027-02-17T12:00:00.000Z'),
   })
   assert.deepEqual(evidence, [])
+})
+
+test('records an actorless organization rename with identity impact guidance', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const evidence = service.buildSnapshotDifferenceEvidence({
+    tenant: { id: 'tenant-1', organizationId: 'org-1' },
+    resourceType: 'ORGANIZATION_CONFIGURATION',
+    previousPayload: [{ id: 'microsoft-tenant-1', tenantId: 'microsoft-tenant-1', displayName: 'Contoso MSP' }],
+    currentPayload: [{ id: 'microsoft-tenant-1', tenantId: 'microsoft-tenant-1', displayName: 'Contoso Security' }],
+    observedAt: new Date('2026-08-18T12:00:00.000Z'), baselineObservedAt: new Date('2026-08-18T11:00:00.000Z'), expiresAt: new Date('2027-02-18T12:00:00.000Z'),
+  })
+  assert.equal(evidence.length, 1)
+  assert.equal(evidence[0]?.operationName, 'Microsoft 365 organization identity changed')
+  assert.deepEqual(evidence[0]?.changedFields, ['displayName'])
+  assert.equal(evidence[0]?.actorDisplayName, null)
+  assert.equal((evidence[0]?.raw as any)?.impact, undefined)
+})
+
+test('derives product guidance only from the trusted snapshot catalog, never stored raw impact', async () => {
+  const event = {
+    id: 'organization-guidance-1', source: 'SNAPSHOT_DIFFERENCE', sourceEventId: 'organization:displayName',
+    eventDateTime: new Date('2026-08-18T13:00:00.000Z'), customerTenantId: 'tenant-1', organizationId: 'org-1',
+    targetType: 'ORGANIZATION_CONFIGURATION', category: 'Organization', severity: 'Medium',
+    operationName: 'Microsoft 365 organization identity changed', summary: 'The organization identity changed.',
+    actorPrincipalName: null, actorDisplayName: null, targetDisplayName: 'Contoso Security',
+    ipAddress: null, location: null, beforeState: { displayName: 'Contoso MSP' }, afterState: { displayName: 'Contoso Security' },
+    correlationId: null, changedFields: ['displayName'], workload: 'Microsoft 365 organization', result: 'Detected',
+    raw: { impact: { guidance: 'ATTACKER-CONTROLLED-GUIDANCE', isProductGuidance: true } },
+  }
+  const service = new ChangesService(changesPrisma({
+    changeEvidenceEvent: { findMany: async () => [event], findFirst: async () => event },
+  }) as never)
+  const list = await service.list(identity, range)
+  const listImpact = (list.changes[0]?.evidence as { potentialImpact?: unknown }).potentialImpact
+  const detail = await service.detail(identity, 'evidence:SNAPSHOT_DIFFERENCE:organization:displayName')
+  const detailImpact = (detail.event.evidence as { potentialImpact?: unknown }).potentialImpact
+  assert.deepEqual(listImpact, {
+    kind: 'product_guidance', impactId: 'organization.identity_changed',
+  })
+  assert.deepEqual(detailImpact, listImpact)
+  assert.doesNotMatch(JSON.stringify({ listImpact, detailImpact }), /ATTACKER-CONTROLLED-GUIDANCE/)
+})
+
+test('does not derive product guidance for unrecognized or Microsoft-audit evidence', async () => {
+  const event = {
+    id: 'audit-no-guidance-1', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'audit-no-guidance-1',
+    eventDateTime: new Date('2026-08-18T13:00:00.000Z'), customerTenantId: 'tenant-1', organizationId: 'org-1',
+    targetType: 'ORGANIZATION_CONFIGURATION', category: 'Organization', severity: 'Medium', operationName: 'Update organization',
+    summary: 'Microsoft reported an organization update.', actorPrincipalName: 'admin@example.test', actorDisplayName: null,
+    targetDisplayName: 'Contoso Security', ipAddress: null, location: null, beforeState: null, afterState: null,
+    correlationId: null, changedFields: [], workload: 'Microsoft 365 organization', result: 'Succeeded',
+    raw: { impact: { guidance: 'ATTACKER-CONTROLLED-GUIDANCE' } },
+  }
+  const service = new ChangesService(changesPrisma({ changeEvidenceEvent: { findMany: async () => [event] } }) as never)
+  const list = await service.list(identity, range)
+  assert.equal((list.changes[0]?.evidence as { potentialImpact?: unknown }).potentialImpact, undefined)
+})
+
+test('records domain additions, removals, and default transitions with domain guidance', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const common = { tenant: { id: 'tenant-1', organizationId: 'org-1' }, resourceType: 'DOMAINS', observedAt: new Date('2026-08-18T12:00:00.000Z'), baselineObservedAt: new Date('2026-08-18T11:00:00.000Z'), expiresAt: new Date('2027-02-18T12:00:00.000Z') }
+  const added = service.buildSnapshotDifferenceEvidence({ ...common, previousPayload: [{ name: 'old.example', isDefault: true, isInitial: true }], currentPayload: [{ name: 'old.example', isDefault: false, isInitial: true }, { name: 'new.example', isDefault: true, isInitial: false }] })
+  assert.equal(added.length, 2)
+  assert.equal((added[0]?.raw as any)?.impact, undefined)
+  const removed = service.buildSnapshotDifferenceEvidence({ ...common, previousPayload: [{ name: 'old.example', isDefault: true, isInitial: true }], currentPayload: [] })
+  assert.equal(removed.length, 1)
+  assert.deepEqual(removed[0]?.afterState, null)
+})
+
+test('records SKU capacity and capability differences as guidance, not a billing or per-user assignment claim', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const evidence = service.buildSnapshotDifferenceEvidence({
+    tenant: { id: 'tenant-1', organizationId: 'org-1' }, resourceType: 'LICENSES',
+    previousPayload: [{ skuId: 'sku-1', skuPartNumber: 'M365_BASIC', consumedUnits: 2, prepaidUnits: { enabled: 10 }, capabilityStatus: 'Enabled' }],
+    currentPayload: [{ skuId: 'sku-1', skuPartNumber: 'M365_BASIC', consumedUnits: 3, prepaidUnits: { enabled: 12 }, capabilityStatus: 'Suspended' }],
+    observedAt: new Date('2026-08-18T12:00:00.000Z'), baselineObservedAt: new Date('2026-08-18T11:00:00.000Z'), expiresAt: new Date('2027-02-18T12:00:00.000Z'),
+  })
+  assert.equal(evidence.length, 1)
+  assert.deepEqual(evidence[0]?.changedFields, ['prepaidUnits', 'capabilityStatus'])
+  assert.equal((evidence[0]?.raw as any)?.impact, undefined)
+})
+
+test('does not emit subscription evidence for consumed-license utilization alone', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const evidence = service.buildSnapshotDifferenceEvidence({
+    tenant: { id: 'tenant-1', organizationId: 'org-1' }, resourceType: 'LICENSES',
+    previousPayload: [{ skuId: 'sku-1', skuPartNumber: 'M365_BASIC', consumedUnits: 2, prepaidUnits: { enabled: 10 }, capabilityStatus: 'Enabled' }],
+    currentPayload: [{ skuId: 'sku-1', skuPartNumber: 'M365_BASIC', consumedUnits: 3, prepaidUnits: { enabled: 10 }, capabilityStatus: 'Enabled' }],
+    observedAt: new Date('2026-08-18T12:00:00.000Z'), baselineObservedAt: new Date('2026-08-18T11:00:00.000Z'), expiresAt: new Date('2027-02-18T12:00:00.000Z'),
+  })
+  assert.deepEqual(evidence, [])
+})
+
+test('keeps Exchange customization and Unified Audit semantic inversions explicit for a verified future collector', () => {
+  assert.equal(describeExchangeOrganizationCustomization(true).operationName, 'Exchange organization customization disabled')
+  assert.equal(describeExchangeOrganizationCustomization(false).operationName, 'Exchange organization customization enabled')
+  assert.match(describeUnifiedAuditIngestion(true).impactGuidance, /does not establish that historic audit data was recovered/i)
+  assert.match(describeUnifiedAuditIngestion(false).impactGuidance, /may be unavailable or delayed/i)
 })
 
 test('records a redacted, actorless snapshot difference only for tracked admin state', () => {
