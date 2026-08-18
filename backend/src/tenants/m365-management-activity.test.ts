@@ -5,6 +5,7 @@ import {
   M365AuditBudgetError,
   M365_ACTIVITY_CONTENT_TYPES,
   compactManagementEvidence,
+  classifyManagementActivity,
   isPrimaryManagementActivity,
   managementContentWindows,
   readBoundedJson,
@@ -85,6 +86,17 @@ test('keeps genuine M365 administration changes and excludes routine user activi
     assert.equal(isPrimaryManagementActivity(record({ Operation: operation })), false, operation)
   }
   assert.equal(isPrimaryManagementActivity(record({ ResultStatus: 'Failed' })), false)
+  for (const operation of ['Move', 'Delete', 'MoveToDeletedItems', 'SoftDelete', 'HardDelete']) {
+    assert.equal(
+      classifyManagementActivity(record({ Operation: operation })),
+      'security_supporting_activity',
+      operation,
+    )
+  }
+  assert.equal(classifyManagementActivity(record({ Operation: 'Set-InboxRule' })), 'primary_change')
+  assert.equal(classifyManagementActivity(record({ Operation: 'Create' })), 'routine_activity')
+  assert.equal(classifyManagementActivity(record({ Operation: 'Update' })), 'routine_activity')
+  assert.equal(classifyManagementActivity(record({ Operation: 'FileAccessed' })), 'routine_activity')
 })
 
 test('retains investigation fields while redacting secrets named inside Microsoft parameter arrays', () => {
@@ -315,8 +327,8 @@ test('writes raw and normalized evidence and completes a content ledger in one t
         aggregate: async () => ({ _sum: { downloadedBytes: 0n, recordsStored: 0 } }),
         upsert: async (args: any) => { usageWrites.push(args) },
       },
-      m365AuditRecord: { createMany: async ({ data }: any) => { rawWrites.push(data[0]); return { count: 1 } } },
-      changeEvidenceEvent: { createMany: async ({ data }: any) => evidenceWrites.push(data[0]) },
+      m365AuditRecord: { createMany: async ({ data }: any) => { rawWrites.push(...data); return { count: data.length } } },
+      changeEvidenceEvent: { createMany: async ({ data }: any) => evidenceWrites.push(...data) },
       m365ActivityContent: { update: async ({ data }: any) => ledgerWrites.push(data) },
     }),
   }
@@ -330,17 +342,25 @@ test('writes raw and normalized evidence and completes a content ledger in one t
       record(),
       record(),
       record({ Id: 'record-already-accepted-concurrently' }),
+      record({ Id: 'supporting-record', Operation: 'MoveToDeletedItems', ObjectId: 'message-1', MailboxOwnerUPN: 'victim@example.test' }),
+      record({ Id: 'supporting-record-2', Operation: 'MoveToDeletedItems', ObjectId: 'message-2', MailboxOwnerUPN: 'victim@example.test', CreationTime: '2026-08-17T12:31:00.000Z' }),
+      record({ Id: 'routine-record', Operation: 'FileAccessed' }),
     ]))
   }
   try {
     const changes = await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content)
     assert.equal(changes.length, 2)
-    assert.equal(rawWrites.length, 1)
-    assert.equal(evidenceWrites.length, 1)
+    assert.equal(rawWrites.length, 3)
+    assert.equal(evidenceWrites.length, 2)
     assert.equal(evidenceWrites[0].source, 'M365_UNIFIED_AUDIT')
     assert.equal(evidenceWrites[0].raw.evidenceOrigin, 'microsoft_audit_event')
+    const supportingSummary = rawWrites.find((entry) => entry.raw.hawkviewEvidenceRole === 'security_supporting_activity')
+    assert.equal(supportingSummary?.raw.hawkviewSupportingActivityCount, 2)
+    assert.deepEqual(supportingSummary?.raw.hawkviewSupportingSampleRecordIds, ['supporting-record', 'supporting-record-2'])
+    assert.match(supportingSummary?.microsoftRecordId, /^support:blob-1:/)
+    assert.equal(rawWrites.some((entry) => entry.microsoftRecordId === 'routine-record'), false)
     assert.equal(ledgerWrites[0].status, 'COMPLETED')
-    assert.equal(usageWrites.some((entry) => entry.create.recordsStored === 1), true)
+    assert.equal(usageWrites.some((entry) => entry.create.recordsStored === 3), true)
   } finally {
     globalThis.fetch = originalFetch
   }

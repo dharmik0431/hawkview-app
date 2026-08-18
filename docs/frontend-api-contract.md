@@ -13,6 +13,13 @@ Microsoft application secrets, or tenant-wide Microsoft access tokens.
 | `POST` | `/api/tenants/:tenantId/sync` | Queue an asynchronous tenant refresh |
 | `GET` | `/api/dashboard/summary` | Prepared organization dashboard totals |
 | `GET` | `/api/changes` | Stored cross-tenant change timeline |
+| `GET` | `/api/changes/:id` | Investigation detail and related supporting evidence |
+
+`GET /api/changes/:id` can also return `relatedMailboxActivity` and
+`associatedChanges`. These are explicitly labelled investigation associations:
+an exact shared Microsoft correlation ID is strongest, while a shared actor or
+target inside the one-hour window does not establish causation. Routine mailbox
+traffic is not returned as a primary change.
 
 All endpoints must authenticate the user and enforce their organization
 membership and tenant assignments on the backend. The browser must not supply a

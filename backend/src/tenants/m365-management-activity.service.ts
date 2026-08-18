@@ -3,7 +3,13 @@ import { createHash } from 'node:crypto'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { redactSensitiveValues } from '../changes/change-evidence.service.js'
+import {
+  classifyManagementActivity,
+  type ManagementActivityRole,
+} from '../changes/m365-activity-classification.js'
 import type { Prisma } from '../generated/prisma/client.js'
+
+export { classifyManagementActivity } from '../changes/m365-activity-classification.js'
 
 export const M365_ACTIVITY_CONTENT_TYPES = [
   'Audit.AzureActiveDirectory',
@@ -186,24 +192,13 @@ export function managementContentWindows(start: Date, end: Date) {
   return windows
 }
 
-const routineOperation =
-  /(?:userloggedin|userloginfailed|signin|logon|file(?:accessed|previewed|downloaded|modified|uploaded|synced|deleted|moved|renamed|copied|recycled|restored)|folder(?:accessed|modified|created|deleted|moved|renamed)|pageviewed|searchquery|searchsession|messageaccessed|mailitemsaccessed|usage(?:report)?|report(?:downloaded|exported|viewed))/i
-const changeOperation =
-  /(?:^|[-_. ])(?:new|set|add|added|remove|removed|update|updated|create|created|delete|deleted|enable|enabled|disable|disabled|grant|granted|revoke|revoked|assign|assigned|unassign|unassigned|change|changed|modify|modified|restore|restored|reset|install|installed|uninstall|uninstalled|activate|activated|deactivate|deactivated)(?:[-_. ]|$)|(?:policy|permission|consent|role|administrator|admin|sharing|anonymouslink|companylink|securelink|inboxrule|transportrule|forwarding|delegation|domain|license|mailbox|sitecollection|teamsetting|channelsetting)/i
-
 /**
  * The Management Activity API carries high-volume usage telemetry. HawkView's
  * primary timeline is intentionally limited to genuine administrative,
  * configuration, security, permission, and sharing changes.
  */
 export function isPrimaryManagementActivity(record: unknown) {
-  const value = object(record)
-  const operation = text(value.Operation) ?? ''
-  const normalizedOperation = operation.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-  const result = (text(value.ResultStatus) ?? '').toLowerCase()
-  if (!operation || /^(failed|failure|false)$/i.test(result)) return false
-  if (routineOperation.test(operation)) return false
-  return changeOperation.test(normalizedOperation)
+  return classifyManagementActivity(record) === 'primary_change'
 }
 
 function limitEvidence(value: unknown, depth = 0): unknown {
@@ -228,6 +223,8 @@ const retainedEvidenceKeys = new Set([
   'ClientRequestId', 'CorrelationId', 'ActorIpAddress', 'EventSource', 'ItemType',
   'ExternalAccess', 'SiteUrl', 'SourceFileName', 'SourceRelativeUrl',
   'TargetUserOrGroupName', 'TargetUserOrGroupType', 'MailboxOwnerUPN',
+  'hawkviewSupportingActivityCount', 'hawkviewSupportingFirstSeenAt',
+  'hawkviewSupportingLastSeenAt', 'hawkviewSupportingSampleRecordIds',
   'Parameters', 'ModifiedProperties', 'ExtendedProperties', 'Members',
 ])
 
@@ -1032,13 +1029,59 @@ export class M365ManagementActivityService {
           throw new Error('Microsoft 365 activity content did not prove an exact connected-tenant match.')
         }
       }
-      const primaryById = new Map<string, JsonObject>()
-      for (const record of allRecords.filter(isPrimaryManagementActivity)) {
+      const retainedById = new Map<string, { record: JsonObject; role: ManagementActivityRole }>()
+      const supportingGroups = new Map<string, JsonObject[]>()
+      for (const record of allRecords) {
+        const role = classifyManagementActivity(record)
+        if (role === 'routine_activity') continue
         const id = text(record.Id)
-        if (id && !primaryById.has(id)) primaryById.set(id, record)
+        if (!id) continue
+        if (role === 'primary_change') {
+          if (!retainedById.has(id)) retainedById.set(id, { record, role })
+          continue
+        }
+        const eventTime = validDate(record.CreationTime)
+        if (!eventTime) continue
+        // Supporting mailbox activity can be very high volume. Preserve a
+        // deterministic 15-minute actor/mailbox/operation summary per source
+        // blob instead of duplicating every message event in PostgreSQL.
+        const bucket = Math.floor(eventTime.getTime() / (15 * 60 * 1000))
+        const groupingKey = [
+          text(record.Workload) ?? '',
+          text(record.Operation) ?? '',
+          text(record.UserId) ?? text(record.UserKey) ?? '',
+          text(record.MailboxOwnerUPN) ?? text(record.TargetUserOrGroupName) ?? '',
+          text(record.CorrelationId) ?? text(record.ClientRequestId) ?? '',
+          String(bucket),
+        ].join('\u0000').toLowerCase()
+        const group = supportingGroups.get(groupingKey) ?? []
+        if (!group.some((candidate) => text(candidate.Id) === id)) group.push(record)
+        supportingGroups.set(groupingKey, group)
       }
-      const primary = [...primaryById.values()]
-      const ids = primary.map((record) => text(record.Id)).filter((value): value is string => Boolean(value))
+      for (const [groupingKey, records] of supportingGroups) {
+        records.sort((left, right) => validDate(left.CreationTime)!.getTime() - validDate(right.CreationTime)!.getTime())
+        const first = records[0]!
+        const last = records.at(-1)!
+        const digest = createHash('sha256')
+          .update(`${content.microsoftContentId}\u0000${groupingKey}`)
+          .digest('hex')
+          .slice(0, 40)
+        const summaryId = `support:${content.microsoftContentId}:${digest}`
+        retainedById.set(summaryId, {
+          role: 'security_supporting_activity',
+          record: {
+            ...first,
+            Id: summaryId,
+            ObjectId: text(first.MailboxOwnerUPN) ?? text(first.TargetUserOrGroupName) ?? text(first.ObjectId),
+            hawkviewSupportingActivityCount: records.length,
+            hawkviewSupportingFirstSeenAt: text(first.CreationTime),
+            hawkviewSupportingLastSeenAt: text(last.CreationTime),
+            hawkviewSupportingSampleRecordIds: records.slice(0, 10).map((record) => text(record.Id)).filter(Boolean),
+          },
+        })
+      }
+      const retained = [...retainedById.values()]
+      const ids = retained.map(({ record }) => text(record.Id)).filter((value): value is string => Boolean(value))
       const storedIds = ids.map(boundedSourceEventId)
       const existing = new Set<string>()
       for (let offset = 0; offset < storedIds.length; offset += 500) {
@@ -1052,16 +1095,19 @@ export class M365ManagementActivityService {
         })
         for (const entry of stored) existing.add(entry.microsoftRecordId)
       }
-      const newRecords = primary.filter((record) => {
+      const newRecords = retained.filter(({ record }) => {
         const id = text(record.Id)
         return Boolean(id && validDate(record.CreationTime) && text(record.Operation) && !existing.has(boundedSourceEventId(id)))
       })
+      const primaryRecords = newRecords
+        .filter(({ role }) => role === 'primary_change')
+        .map(({ record }) => record)
       const directoryDuplicates = content.contentType === 'Audit.AzureActiveDirectory'
-        ? await this.existingDirectoryDuplicates(tenant, newRecords)
+        ? await this.existingDirectoryDuplicates(tenant, primaryRecords)
         : new Set<string>()
       const ingestedAt = new Date()
       const expiresAt = evidenceExpiration(ingestedAt)
-      const rawRows = newRecords.map((record) => ({
+      const rawRows = newRecords.map(({ record, role }) => ({
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         contentType: content.contentType,
@@ -1075,11 +1121,14 @@ export class M365ManagementActivityService {
         result: boundedText(record.ResultStatus, 100),
         clientIp: boundedText(record.ClientIP, 128) ?? boundedText(record.ActorIpAddress, 128),
         correlationId: boundedText(record.CorrelationId, 200) ?? boundedText(record.ClientRequestId, 200),
-        raw: compactManagementEvidence(record),
+        raw: {
+          ...compactManagementEvidence(record),
+          hawkviewEvidenceRole: role,
+        },
         ingestedAt,
         expiresAt,
       }))
-      const evidenceRows = newRecords
+      const evidenceRows = primaryRecords
         .filter((record) => !directoryDuplicates.has(text(record.Id)!))
         .map((record) => {
           const operation = text(record.Operation)!
@@ -1112,6 +1161,7 @@ export class M365ManagementActivityService {
             changedFields: state.fields,
             raw: {
               ...compactManagementEvidence(record),
+              hawkviewEvidenceRole: 'primary_change',
               evidenceOrigin: 'microsoft_audit_event',
               microsoftSource: `Office 365 Management Activity API / ${content.contentType}`,
             },
@@ -1150,7 +1200,7 @@ export class M365ManagementActivityService {
         })
       })
 
-      return newRecords.map((record) => ({
+      return primaryRecords.map((record) => ({
         activityDisplayName: text(record.Operation)!,
         category: text(record.RecordType),
         loggedByService: text(record.Workload),

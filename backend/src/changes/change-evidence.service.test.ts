@@ -59,6 +59,7 @@ function changesPrisma(overrides: Record<string, unknown> = {}) {
     },
     directoryAuditLog: { findMany: async () => [], findFirst: async () => null },
     signInLog: { findMany: async () => [] },
+    m365AuditRecord: { findMany: async () => [] },
     changeEvidenceEvent: { findMany: async () => [] },
     ...overrides,
   }
@@ -133,6 +134,50 @@ test('exposes M365 workload evidence with a source-specific stable identifier', 
   assert.equal(result.changes[0]?.id, 'evidence:M365_UNIFIED_AUDIT:exchange-record-1')
   assert.equal(result.changes[0]?.source, 'Exchange')
   assert.equal(result.changes[0]?.classification, 'configuration_change')
+})
+
+test('keeps routine Exchange mailbox actions out of What Changed while retaining real inbox-rule changes', async () => {
+  const base = {
+    eventDateTime: new Date('2026-08-01T13:00:00.000Z'), customerTenantId: 'tenant-1', category: 'Exchange', severity: 'High',
+    actorPrincipalName: 'compromised@example.test', actorDisplayName: null, targetDisplayName: 'compromised@example.test',
+    ipAddress: null, location: null, beforeState: null, afterState: null, correlationId: null, changedFields: [], workload: 'Exchange', result: 'Succeeded',
+  }
+  const events = [
+    { ...base, id: 'noise-1', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'noise-1', operationName: 'MoveToDeletedItems', summary: 'Mailbox item moved.', raw: { Operation: 'MoveToDeletedItems', Workload: 'Exchange' } },
+    { ...base, id: 'noise-2', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'noise-2', operationName: 'Create', summary: 'Mailbox item created.', raw: { Operation: 'Create', Workload: 'Exchange' } },
+    { ...base, id: 'rule-1', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'rule-1', operationName: 'Set-InboxRule', summary: 'Inbox rule changed.', raw: { Operation: 'Set-InboxRule', Workload: 'Exchange' } },
+  ]
+  const service = new ChangesService(changesPrisma({
+    changeEvidenceEvent: { findMany: async () => events },
+  }) as never)
+  const result = await service.list(identity, range)
+  assert.deepEqual(result.changes.map((event) => event.title), ['Set-InboxRule'])
+})
+
+test('suppresses an actorless snapshot when authoritative Microsoft audit evidence covers the same target', async () => {
+  const base = {
+    customerTenantId: 'tenant-1', category: 'Groups', severity: 'Medium', actorDisplayName: null, ipAddress: null,
+    location: null, beforeState: null, afterState: null, correlationId: null, changedFields: [], workload: 'Microsoft Entra ID', result: 'Succeeded', raw: {},
+  }
+  const events = [
+    {
+      ...base, id: 'audit-row', source: 'DIRECTORY_AUDIT', sourceEventId: 'audit-group', eventDateTime: new Date('2026-08-01T12:00:00.000Z'),
+      operationName: 'Add group', summary: 'Microsoft recorded the group.', actorId: 'actor-1', actorPrincipalName: 'admin@example.test',
+      targetId: 'group-1', targetDisplayName: 'Incident Group',
+    },
+    {
+      ...base, id: 'snapshot-row', source: 'SNAPSHOT_DIFFERENCE', sourceEventId: 'GROUPS:group-1:diff', eventDateTime: new Date('2026-08-01T12:10:00.000Z'),
+      operationName: 'Group configuration changed', summary: 'HawkView observed a difference.', actorId: null, actorPrincipalName: null,
+      targetId: 'group-1', targetDisplayName: 'Incident Group', raw: { evidenceOrigin: 'hawkview_snapshot_difference' },
+    },
+  ]
+  const service = new ChangesService(changesPrisma({
+    changeEvidenceEvent: { findMany: async () => events },
+  }) as never)
+  const result = await service.list(identity, range)
+  assert.equal(result.changes.length, 1)
+  assert.equal(result.changes[0]?.id, 'audit:audit-group')
+  assert.equal(result.changes[0]?.actor, 'admin@example.test')
 })
 
 test('keeps source timeline available when normalized evidence is malformed or unavailable', async () => {
@@ -212,6 +257,51 @@ test('does not attach nearby sign-ins when Microsoft did not provide a correlati
   const result = await service.detail(identity, 'audit:audit-no-correlation')
   assert.deepEqual(result.relatedSignIns, [])
   assert.equal(signInQueryCount, 0)
+})
+
+test('groups destructive mailbox activity as non-causal evidence around a compromised actor', async () => {
+  const event = {
+    id: 'app-event', source: 'DIRECTORY_AUDIT', sourceEventId: 'app-registration', eventDateTime: new Date('2026-08-01T12:00:00.000Z'),
+    customerTenantId: 'tenant-1', organizationId: 'org-1', category: 'Apps', severity: 'High', operationName: 'Add application',
+    summary: 'Application registered', actorId: 'actor-1', actorPrincipalName: 'compromised@example.test', actorDisplayName: null,
+    targetId: 'app-1', targetDisplayName: 'Data theft app', correlationId: null, changedFields: [], workload: 'Microsoft Entra ID',
+    result: 'success', location: null, beforeState: null, afterState: null, raw: {},
+  }
+  const inboxRule = {
+    ...event,
+    id: 'rule-event', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'rule-record', eventDateTime: new Date('2026-08-01T12:05:00.000Z'),
+    category: 'Exchange', operationName: 'Set-InboxRule', summary: 'Inbox rule changed', targetId: 'victim@example.test',
+    targetDisplayName: 'victim@example.test', workload: 'Exchange', raw: { Operation: 'Set-InboxRule', Workload: 'Exchange' },
+  }
+  const supporting = (id: string, operation: string, actorId = 'compromised@example.test') => ({
+    id, microsoftRecordId: id, eventDateTime: new Date(`2026-08-01T12:${id === 'mail-1' ? '10' : '11'}:00.000Z`),
+    operation, workload: 'Exchange', actorId, objectId: `message-${id}`, correlationId: null,
+    raw: { Operation: operation, Workload: 'Exchange', UserId: actorId, MailboxOwnerUPN: 'victim@example.test', hawkviewEvidenceRole: 'security_supporting_activity' },
+  })
+  const summarizedSupporting = supporting('mail-1', 'MoveToDeletedItems')
+  summarizedSupporting.raw = {
+    ...summarizedSupporting.raw,
+    hawkviewSupportingActivityCount: 3,
+    hawkviewSupportingFirstSeenAt: '2026-08-01T12:08:00.000Z',
+    hawkviewSupportingLastSeenAt: '2026-08-01T12:10:00.000Z',
+    hawkviewSupportingSampleRecordIds: ['source-mail-1', 'source-mail-2', 'source-mail-3'],
+  } as typeof summarizedSupporting.raw
+  const service = new ChangesService(changesPrisma({
+    changeEvidenceEvent: { findFirst: async () => event, findMany: async () => [event, inboxRule] },
+    m365AuditRecord: { findMany: async () => [
+      summarizedSupporting,
+      supporting('mail-2', 'MoveToDeletedItems'),
+      supporting('mail-unrelated', 'SoftDelete', 'other@example.test'),
+    ] },
+  }) as never)
+  const result = await service.detail(identity, 'audit:app-registration')
+  assert.equal(result.relatedMailboxActivity.length, 1)
+  assert.equal(result.relatedMailboxActivity[0]?.operation, 'MoveToDeletedItems')
+  assert.equal(result.relatedMailboxActivity[0]?.count, 4)
+  assert.equal(result.relatedMailboxActivity[0]?.mailboxOrObject, 'victim@example.test')
+  assert.match(String(result.relatedMailboxActivity[0]?.relationship), /does not establish causation/)
+  assert.deepEqual(result.associatedChanges.map((change) => change.operationName), ['Set-InboxRule'])
+  assert.equal(result.relatedMailboxActivityTruncated, false)
 })
 
 test('does not expose a standalone sign-in through the change detail endpoint', async () => {
