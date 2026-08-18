@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 
 import { useTenants } from '@/lib/api/hooks'
+import { investigateDestination } from '@/lib/tenants/investigate-navigation'
 import { AlertDetailsModal } from '@/components/dashboard/alert-details-modal'
 import { TenantRiskMatrix } from '@/components/dashboard/tenant-risk-matrix'
 import {
@@ -854,8 +855,10 @@ export default function DashboardPage() {
                   {sortedQueueItems.map((q, idx) => {
                     const ageInfo = formatAge(q.detectedAt)
                     const keyResult = getKeyResult(q)
-                    const destinationUrl =
-                      q.item.actionUrl ?? `/tenants/${encodeURIComponent(q.tenantId)}/settings`
+                    const destinationUrl = investigateDestination(
+                      q.item.actionUrl,
+                      `/tenants/${encodeURIComponent(q.tenantId)}/settings`,
+                    )
                     const buttonLabel = q.item.actionLabel ?? actionLabel(q.item.severity)
 
                     return (

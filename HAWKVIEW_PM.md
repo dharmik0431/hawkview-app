@@ -142,3 +142,17 @@ When changing this file, record:
 - Branch, PR, merge commit, and deployment status.
 - Validation performed and anything that could not be validated.
 - Remaining limitations and the next concrete task.
+
+## Scoped repair — What Changed provenance and audit-sync investigation
+
+Status: implemented locally on `codex/fix-change-source-audit-investigate`; QA-approved and ready for commit/PR, but not committed, published, deployed, or applied to a live tenant.
+
+- The What Changed API now derives a sanitized presentation DTO from immutable stored evidence. Directory Audit remains `Entra`; Unified Audit retains its declared workload; snapshot evidence now retains its workload, so Exchange mailbox-rule differences display `Exchange Online` with `HawkView snapshot comparison` provenance and a sanitized `Microsoft Graph mailbox rules` source.
+- M365 Audit health findings now point to `/tenants/{id}/settings?section=sync&resource=M365_AUDIT`. The settings page recognizes that deep link, scrolls to synchronization health, and displays read-only state, last attempt, last success, and a redacted current reason. It adds no retry or permission behavior.
+- Dashboard and alert modal navigation preserve backend-provided same-origin action URLs.
+
+QA status: final independent QA passed (P0=0, P1=0). The work is safe to publish but remains local and unpublished.
+
+Validation: frontend sanitizer/navigation 15/15; tenant health 26/26; changes 38/38; root and backend TypeScript checks; Prisma validation with a non-production placeholder `DATABASE_URL`; and `git diff --check` pass. Both full production builds passed in the immediately preceding independent QA environment; no build configuration changed. Direct objects now use the identical case-insensitive, underscore/hyphen-tolerant safe-field projection as parsed JSON; only bounded primitive status/error-code/message/correlation/tenant/URL fields survive, and URLs retain origin plus pathname only. Arbitrary/nested/prototype-like data and secret-like keys remain dropped.
+
+Limitations: this changes only response presentation and collection-failure navigation. It does not create evidence for failed audit collection, change RBAC, update historic stored records, or make Microsoft audit ingestion realtime. P2: a credential expression inside an otherwise approved message can consume later safe correlation, tenant, or URL context, reducing diagnostic usefulness; frontend and backend handle it equivalently and do not leak credentials.

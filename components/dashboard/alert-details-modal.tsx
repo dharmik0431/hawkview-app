@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { investigateDestination } from '@/lib/tenants/investigate-navigation'
 import type { QueueItem } from '@/app/(protected)/dashboard/page'
 
 interface AlertDetailsModalProps {
@@ -222,7 +223,10 @@ export function AlertDetailsModal({
   const isPermission = keyLower.includes('permission') || labelLower.includes('permission') || whyLower.includes('missing:')
   const isAppChange = labelLower.includes('application') || whyLower.includes('application') || labelLower.includes('app registration') || keyLower.includes('app')
 
-  const destinationUrl = item.item.actionUrl ?? `/tenants/${encodeURIComponent(item.tenantId)}/settings`
+  const destinationUrl = investigateDestination(
+    item.item.actionUrl,
+    `/tenants/${encodeURIComponent(item.tenantId)}/settings`,
+  )
 
   let primaryActionText = 'Go fix it'
   if (isAppChange || keyLower.includes('investigate') || labelLower.includes('investigate') || (item.item.actionLabel ?? '').toLowerCase().includes('investigate')) {
