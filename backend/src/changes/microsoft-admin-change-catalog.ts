@@ -102,10 +102,9 @@ export const SNAPSHOT_DIFFERENCE_SPECS: Readonly<Record<string, SnapshotDifferen
   EXCHANGE_MAILBOX_RULES: { workload: 'Exchange Online', category: 'Exchange', severity: 'High', operationName: 'Exchange inbox rule changed', microsoftSource: 'Microsoft Graph /users/{id}/mailFolders/inbox/messageRules', identifierFields: ['id'], compoundIdentifierFields: ['mailboxUserId', 'id'], trackedFields: ['displayName', 'sequence', 'isEnabled', 'conditions', 'actions', 'exceptions'] },
 } as const
 
-/**
- * Not implemented by this change.  This is the explicit decision record for
- * the Office 365 Management Activity API / Unified Audit Log expansion.
- */
+/** Implementation and remaining-limit record for the Office 365 Management
+ * Activity API. Polling is authoritative; optional webhooks are not required
+ * for correctness. */
 export const UNIFIED_AUDIT_LOG_GAP_REPORT = {
   source: 'Office 365 Management Activity API / Microsoft Purview Unified Audit Log',
   leastPrivilegeApplicationPermission: 'ActivityFeed.Read (Office 365 Management APIs, not Microsoft Graph)',
@@ -113,11 +112,12 @@ export const UNIFIED_AUDIT_LOG_GAP_REPORT = {
   licensing: 'Audit retention and some advanced audit events depend on Microsoft 365 / Purview licensing and tenant configuration.',
   subscriptions: 'Requires per-content-type audit subscriptions. HawkView can create subscriptions, poll their content endpoints, then retrieve content URIs with durable checkpoints; this polling flow is independent of webhook delivery. Webhooks are optional and have their own callback validation and renewal lifecycle, which must not be conflated with polling-subscription lifecycle.',
   latency: 'Microsoft audit content is asynchronous and can arrive with service-dependent delay; it is not a real-time causal feed.',
-  throttling: 'Implement tenant-scoped polling checkpoints, idempotent content-URI handling, exponential backoff, and bounded retries before enabling.',
-  retention: 'The API only returns content within Microsoft\'s tenant retention window; HawkView can retain collected, redacted evidence longer subject to its retention policy.',
-  workloadsUnlocked: ['Exchange admin and mailbox activity', 'SharePoint/OneDrive sharing and file activity', 'Teams administration/activity', 'Microsoft 365 admin activity', 'some application consent and security events'],
-  currentActivityFeedUse: 'ActivityFeed.Read is already consented and token-capable for HawkView\'s limited existing activity-feed use. Comprehensive Unified Audit administrative ingestion, subscription creation, content checkpointing, and retry processing are not implemented.',
-  status: 'documented_not_enabled',
+  throttling: 'Implemented with tenant-scoped content-ID checkpoints, retry-after handling, exponential backoff, response/page/record ceilings, and a bounded per-run blob budget.',
+  retention: 'The content API exposes at most the previous seven days. HawkView retains collected, redacted administrative evidence for six calendar months under its current policy.',
+  workloadsUnlocked: ['Exchange administration and mailbox configuration activity', 'SharePoint/OneDrive sharing and administration activity', 'Teams administration activity', 'Microsoft 365 administration activity', 'some application consent and security events'],
+  currentActivityFeedUse: 'ActivityFeed.Read is already consented. HawkView now creates and verifies the four core audit subscriptions, polls content with a durable at-least-once ledger, and stores only genuine administrative/security/configuration evidence. Routine file access and sign-in activity remain deliberately excluded from What Changed.',
+  remainingLimitations: 'Microsoft can delay or omit content depending on unified-auditing configuration and licensing. First content can take hours, events can arrive out of order, and Microsoft provides no real-time delivery guarantee. DLP.All and optional webhooks are not enabled.',
+  status: 'implemented_polling',
 } as const
 
 /**

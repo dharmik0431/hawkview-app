@@ -52,7 +52,10 @@ test('reports an active collector as running', () => {
 })
 
 test('marks previous data stale without losing its last successful timestamp', () => {
-  const data = deriveTenantSyncFreshness([success('AUDIT_LOGS', '2026-08-13T10:00:00.000Z')], now)
+  const data = deriveTenantSyncFreshness([
+    success('AUDIT_LOGS', '2026-08-13T10:00:00.000Z'),
+    success('M365_AUDIT', '2026-08-13T10:00:00.000Z'),
+  ], now)
   assert.equal(data.services.auditLogs.status, 'STALE')
   assert.equal(data.services.auditLogs.freshnessStatus, 'STALE')
   assert.equal(data.services.auditLogs.lastSuccessfulCollectionAt, '2026-08-13T10:00:00.000Z')
@@ -77,9 +80,19 @@ test('maps permission failures separately from ordinary API failures', () => {
 })
 
 test('keeps freshness independent across services', () => {
-  const data = deriveTenantSyncFreshness([success('AUDIT_LOGS'), success('SIGN_INS', '2026-08-13T10:00:00.000Z')], now)
+  const data = deriveTenantSyncFreshness([
+    success('AUDIT_LOGS'),
+    success('M365_AUDIT'),
+    success('SIGN_INS', '2026-08-13T10:00:00.000Z'),
+  ], now)
   assert.equal(data.services.auditLogs.freshnessStatus, 'CURRENT')
   assert.equal(data.services.signInLogs.freshnessStatus, 'STALE')
+})
+
+test('reports audit coverage as partial when the M365 workload collector has never run', () => {
+  const data = deriveTenantSyncFreshness([success('AUDIT_LOGS')], now)
+  assert.equal(data.services.auditLogs.status, 'PARTIAL')
+  assert.equal(data.services.auditLogs.partialFailures[0]?.collector, 'M365_AUDIT')
 })
 
 test('uses the configured Render cron schedule as the next scheduled attempt source', () => {

@@ -19,7 +19,8 @@
     "test:tenant-health": "tsx --test src/tenants/tenant-health.test.ts",
     "test:service-sync-freshness": "tsx --test src/tenants/service-sync-freshness.test.ts",
     "test:collection-field-state": "tsx --test src/tenants/collection-field-state.test.ts",
-    "test:changes": "tsx --test src/changes/change-evidence.service.test.ts"
+    "test:changes": "tsx --test src/changes/change-evidence.service.test.ts",
+    "test:m365-audit": "tsx --test src/tenants/m365-management-activity.test.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.28",

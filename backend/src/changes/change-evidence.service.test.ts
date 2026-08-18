@@ -121,6 +121,20 @@ test('returns a stable paginated change-only timeline from normalized evidence',
   assert.equal(result.summary.signIns, 0)
 })
 
+test('exposes M365 workload evidence with a source-specific stable identifier', async () => {
+  const event = {
+    id: 'm365-evidence-1', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'exchange-record-1', eventDateTime: new Date('2026-08-01T13:00:00.000Z'), customerTenantId: 'tenant-1', category: 'Exchange', severity: 'High', operationName: 'Set-Mailbox', summary: 'Exchange reported Set-Mailbox.', actorPrincipalName: 'admin@example.test', actorDisplayName: null, targetDisplayName: 'mailbox@example.test', ipAddress: null, location: null, beforeState: null, afterState: { ForwardingAddress: 'review@example.test' }, correlationId: 'corr-m365', changedFields: ['ForwardingAddress'], workload: 'Exchange', result: 'Succeeded',
+  }
+  const service = new ChangesService(changesPrisma({
+    changeEvidenceEvent: { findMany: async () => [event] },
+  }) as never)
+  const result = await service.list(identity, range)
+  assert.equal(result.changes.length, 1)
+  assert.equal(result.changes[0]?.id, 'evidence:M365_UNIFIED_AUDIT:exchange-record-1')
+  assert.equal(result.changes[0]?.source, 'Exchange')
+  assert.equal(result.changes[0]?.classification, 'configuration_change')
+})
+
 test('keeps source timeline available when normalized evidence is malformed or unavailable', async () => {
   const sourceAudit = {
     id: 'raw-1', microsoftAuditId: 'audit-raw-1', activityDisplayName: 'Reset user password', category: 'UserManagement', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), customerTenantId: 'tenant-1', operationType: null, result: 'success', resultReason: null, initiatedBy: null, targetResources: null, additionalDetails: null, raw: {}, correlationId: null,
@@ -449,7 +463,7 @@ test('serializes concurrent snapshot transitions so the second comparison uses t
       } finally { release() }
     },
   }
-  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
   await Promise.all([
     (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([{ id: 'group-1', displayName: 'B' }])),
     (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([{ id: 'group-1', displayName: 'C' }])),
@@ -467,7 +481,7 @@ test('refuses a cross-organization snapshot baseline instead of emitting tenant 
       tenantEntraSnapshot: { findUnique: async () => ({ payload: [], observedAt: new Date(), organizationId: 'other-org' }) },
       changeEvidenceEvent: { createMany: async () => undefined },
     }),
-  } as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  } as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
   await assert.rejects(
     () => (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([])),
     /organization mismatch/
@@ -487,7 +501,7 @@ test('only complete snapshot results advance baselines, including legitimate emp
       changeEvidenceEvent: { createMany: async (args: any) => { writes.push(...args.data) } },
     }),
   }
-  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
   await assert.rejects(
     () => (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', partialSnapshot([])),
     /partial or unverified/
@@ -511,7 +525,7 @@ test('does not create snapshot change evidence for a first authoritative empty b
       changeEvidenceEvent: { createMany: async (args: any) => { writes.push(...args.data) } },
     }),
   }
-  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
   await (service as any).saveSnapshot({ id: 'tenant-1', organizationId: 'org-1' }, 'GROUPS', authoritativeSnapshot([]))
   assert.deepEqual(snapshot.payload, [])
   assert.equal(writes.length, 0)
@@ -593,7 +607,7 @@ test('does not attest to a complete SharePoint baseline when administrative enri
       },
       changeEvidenceEvent: { createMany: async () => { writes += 1 } },
     }),
-  } as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never))
+  } as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
   await assert.rejects(
     () => (service as any).saveSnapshot(
       { id: 'tenant-1', organizationId: 'org-1' },
@@ -617,15 +631,16 @@ test('marks owner or membership failures as incomplete group relationship synchr
   )
 })
 
-test('documents supported Microsoft administrative evidence and the Unified Audit gap without enabling it', () => {
+test('documents supported Microsoft administrative evidence and the implemented Unified Audit boundary', () => {
   assert.equal(MICROSOFT_ADMIN_CHANGE_CATALOG.some((entry) => entry.normalizedEventType.includes('conditional_access')), true)
   assert.equal(MICROSOFT_ADMIN_CHANGE_CATALOG.some((entry) => entry.workload === 'Teams and tenant-wide Microsoft 365 settings' && entry.collectorStatus === 'not_collected'), true)
   assert.equal(UNIFIED_AUDIT_LOG_GAP_REPORT.leastPrivilegeApplicationPermission, 'ActivityFeed.Read (Office 365 Management APIs, not Microsoft Graph)')
   assert.equal(UNIFIED_AUDIT_LOG_GAP_REPORT.adminConsentRequired, true)
-  assert.equal(UNIFIED_AUDIT_LOG_GAP_REPORT.status, 'documented_not_enabled')
+  assert.equal(UNIFIED_AUDIT_LOG_GAP_REPORT.status, 'implemented_polling')
   assert.match(UNIFIED_AUDIT_LOG_GAP_REPORT.subscriptions, /poll/i)
   assert.match(UNIFIED_AUDIT_LOG_GAP_REPORT.subscriptions, /optional/i)
   assert.match(UNIFIED_AUDIT_LOG_GAP_REPORT.currentActivityFeedUse, /already consented/i)
+  assert.match(UNIFIED_AUDIT_LOG_GAP_REPORT.currentActivityFeedUse, /durable at-least-once ledger/i)
   assert.equal(DOMAIN_DETAIL_COVERAGE_GAP.requiredApplicationPermission, 'Domain.Read.All')
   assert.equal(DOMAIN_DETAIL_COVERAGE_GAP.decision, 'permission_blocked_not_implemented')
   assert.equal(MICROSOFT_ADMIN_CHANGE_CATALOG.some((entry) => entry.microsoftSource.includes('/domains')), false)

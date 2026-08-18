@@ -59,7 +59,7 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
   'MailboxSettings.Read':
     'Read mailbox inbox rules for Exchange security visibility.',
   'ActivityFeed.Read':
-    'Read limited Microsoft 365 login activity when Entra sign-in logs require a premium tenant license.',
+    'Read Microsoft 365 unified audit activity for Exchange, SharePoint, Teams, Entra, and tenant administration; also supports limited-license login evidence.',
   'SecurityEvents.Read.All':
     'Read Microsoft Secure Score snapshots and security improvement data.',
 }
@@ -117,6 +117,7 @@ export class MicrosoftConsentService {
     }
     return {
       clientId: connector.clientId,
+      homeTenantId: connector.homeTenantId,
       clientSecret: await this.secretStore.access(
         connector.credentialReference
       ),
@@ -491,10 +492,24 @@ export class MicrosoftConsentService {
     clientId: string | null
     credentialReference: string | null
   }) {
+    const context = await this.getTenantManagementActivityContext(input)
+    return context.accessToken
+  }
+
+  async getTenantManagementActivityContext(input: {
+    microsoftTenantId: string
+    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+    clientId: string | null
+    credentialReference: string | null
+  }) {
     const credentials =
       input.connectionMode === 'CUSTOMER_MANAGED'
         ? {
             clientId: input.clientId ?? '',
+            // Customer-managed connectors are currently tenant-local. If
+            // HawkView later supports a customer-owned multi-tenant ISV app,
+            // its publisher tenant must become an explicit stored field.
+            homeTenantId: input.microsoftTenantId,
             clientSecret: input.credentialReference
               ? await this.secretStore.access(input.credentialReference)
               : '',
@@ -512,7 +527,10 @@ export class MicrosoftConsentService {
       credentials,
       'https://manage.office.com/.default'
     )
-    return result.accessToken
+    return {
+      accessToken: result.accessToken,
+      publisherIdentifier: credentials.homeTenantId,
+    }
   }
 
   async getTenantSharePointAccessToken(input: {

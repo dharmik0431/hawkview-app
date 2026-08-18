@@ -116,7 +116,7 @@ export const SERVICE_COLLECTOR_REGISTRY: readonly ServiceDefinition[] = [
   { service: 'EXCHANGE', key: 'exchange', collectors: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'] },
   { service: 'SHAREPOINT_ONEDRIVE', key: 'sharePointOneDrive', collectors: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'] },
   { service: 'SIGN_IN_LOGS', key: 'signInLogs', collectors: ['SIGN_INS'] },
-  { service: 'AUDIT_LOGS', key: 'auditLogs', collectors: ['AUDIT_LOGS'] },
+  { service: 'AUDIT_LOGS', key: 'auditLogs', collectors: ['AUDIT_LOGS', 'M365_AUDIT'] },
 ] as const
 
 export const SERVICE_FRESHNESS_WINDOWS = {
@@ -124,7 +124,7 @@ export const SERVICE_FRESHNESS_WINDOWS = {
   dailyInventory: { currentMs: 24 * 60 * 60 * 1000, agingMs: 26 * 60 * 60 * 1000 },
 } as const
 
-const INCREMENTAL_COLLECTORS = new Set(['USERS', 'SIGN_INS', 'AUDIT_LOGS'])
+const INCREMENTAL_COLLECTORS = new Set(['USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'])
 
 function freshnessWindow(collector: string) {
   return INCREMENTAL_COLLECTORS.has(collector)
