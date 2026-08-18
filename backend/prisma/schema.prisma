@@ -53,6 +53,7 @@ enum MicrosoftConnectionMode {
 enum SyncResourceType {
   USERS
   LICENSES
+  ORGANIZATION_CONFIGURATION
   DOMAINS
   GROUPS
   AUTH_REGISTRATIONS

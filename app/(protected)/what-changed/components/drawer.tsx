@@ -20,7 +20,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import { ChangeEvent, isAppRelatedEvent } from '../data/change-types'
+import { ChangeEvent, isAppRelatedEvent, productGuidanceForImpactId } from '../data/change-types'
 import { classifyEvent } from '../data/event-classifier'
 
 function pretty(obj: any) {
@@ -760,6 +760,9 @@ function NonAppEventDetails({
 }) {
   const beforeAvailable = hasValues(event.before)
   const afterAvailable = hasValues(event.after)
+  const productGuidance = event.evidence?.potentialImpact
+    ? productGuidanceForImpactId(event.evidence.potentialImpact.impactId)
+    : undefined
   const riskRationale = riskReasons(event)
   const missingEvidence = [
     ...(!beforeAvailable ? ['Microsoft did not include a before-state payload for this audit event.'] : []),
@@ -914,6 +917,17 @@ function NonAppEventDetails({
           <div className="text-xs rounded-lg border border-dashed border-border bg-muted/20 p-3 text-muted-foreground">No after-state payload was supplied by Microsoft for this audit event.</div>
         )}
       </div>
+
+      {/* Recovery Guidance if available */}
+      {productGuidance ? (
+        <div className="space-y-1 rounded-xl border border-blue-500/25 bg-blue-500/10 p-4 text-xs text-foreground">
+          <div className="font-semibold text-blue-800 dark:text-blue-300">
+            {productGuidance.label}
+          </div>
+          <p className="leading-relaxed text-muted-foreground">{productGuidance.guidance}</p>
+          <p className="text-[11px] italic text-muted-foreground">Product guidance, not proof that an incident occurred.</p>
+        </div>
+      ) : null}
 
       {/* Recovery Guidance if available */}
       {event.recoveryGuidance?.length ? (

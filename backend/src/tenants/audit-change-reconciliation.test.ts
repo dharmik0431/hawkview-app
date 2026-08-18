@@ -43,3 +43,28 @@ test('does not guess a collector for unrecognized audit activity', () => {
     []
   )
 })
+
+test('routes an explicit organization identity change to only the organization snapshot', () => {
+  assert.deepEqual(
+    deriveAuditReconciliationResourcesForChange({
+      activityDisplayName: 'Update organization name',
+      category: 'OrganizationManagement',
+    }),
+    ['ORGANIZATION_CONFIGURATION']
+  )
+})
+
+test('does not refresh organization identity for unrelated tenant or organization operations', () => {
+  for (const activityDisplayName of [
+    'Update tenant policy',
+    'Update organization settings',
+    'Update tenant subscription',
+    'Synchronize organization',
+  ]) {
+    assert.equal(
+      deriveAuditReconciliationResourcesForChange({ activityDisplayName }).includes('ORGANIZATION_CONFIGURATION'),
+      false,
+      activityDisplayName,
+    )
+  }
+})

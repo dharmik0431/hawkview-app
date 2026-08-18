@@ -14,7 +14,7 @@ import { InvestigationToolbar, ToolbarFilterState } from './investigation-toolba
 import { SummaryStrip, SummaryCategoryKey } from './summary-strip'
 import { WhatChangedRow } from './row'
 import { WhatChangedDrawer } from './drawer'
-import { type ChangeEvent, isAppRelatedEvent } from '../data/change-types'
+import { type ChangeEvent, isAppRelatedEvent, normalizeChangesResponse } from '../data/change-types'
 import { Button } from '@/components/ui/button'
 
 type ChangesResponse = {
@@ -133,10 +133,10 @@ export function WhatChangedView() {
   // Data Query
   const { data, isLoading, error, refetch } = useQuery<ChangesResponse>({
     queryKey: ['changes', toolbarFilters.tenant, timeWindow.from, timeWindow.to],
-    queryFn: ({ signal }) => {
+    queryFn: async ({ signal }) => {
       const fromIso = parseISOOrLocal(timeWindow.from).toISOString()
       const toIso = parseISOOrLocal(timeWindow.to).toISOString()
-      return apiClient.get('/api/changes', {
+      const response = await apiClient.get('/api/changes', {
         signal,
         params: {
           from: fromIso,
@@ -144,6 +144,7 @@ export function WhatChangedView() {
           ...(toolbarFilters.tenant !== 'all' ? { tenantId: toolbarFilters.tenant } : {}),
         },
       })
+      return normalizeChangesResponse(response)
     },
     retry: false,
     staleTime: 5 * 60 * 1000,

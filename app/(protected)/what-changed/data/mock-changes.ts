@@ -77,7 +77,7 @@ export const MOCK_CHANGES: ChangeEvent[] = [
     summary: 'Business Premium assigned to a user.',
     actor: 'License Admin',
     target: 'alex@alphatech.com',
-    source: 'M365',
+    source: 'Microsoft 365',
     before: { licenses: ['Exchange Online (Plan 1)'] },
     after: { licenses: ['Exchange Online (Plan 1)', 'Microsoft 365 Business Premium'] },
   },

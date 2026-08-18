@@ -5,6 +5,7 @@
  * What Changed, but do not cause an unrelated inventory refresh.
  */
 export const AUDIT_RECONCILIATION_RESOURCES = [
+  'ORGANIZATION_CONFIGURATION',
   'GROUPS',
   'LICENSES',
   'DOMAINS',
@@ -60,6 +61,21 @@ function normalizedAuditText(change: DirectoryAuditChange) {
     .toLowerCase()
 }
 
+// Only these documented organization display-name/profile operations may
+// refresh the organization-identity snapshot.  Do not infer an identity
+// update from targets, categories, or broad "update tenant" text: those can
+// describe unrelated policy, subscription, or service operations.
+const ORGANIZATION_CONFIGURATION_ACTIVITY_NAMES = new Set([
+  'update organization',
+  'update organization name',
+  'update organization profile',
+  'update tenant name',
+])
+
+function normalizedActivityDisplayName(change: DirectoryAuditChange) {
+  return change.activityDisplayName.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
 /**
  * Return the collection-level refreshes warranted by one audit event. Multiple
  * events in a poll are de-duplicated by `deriveAuditReconciliationResources`.
@@ -72,6 +88,12 @@ export function deriveAuditReconciliationResourcesForChange(
 
   if (/group|membership|member|owner/.test(text)) resources.add('GROUPS')
   if (/license|licence|subscription|sku/.test(text)) resources.add('LICENSES')
+  // Organization identity is a separate, lightweight snapshot. Keep it
+  // distinct from domain inventory so an administrator rename does not imply
+  // a verified-domain change.
+  if (ORGANIZATION_CONFIGURATION_ACTIVITY_NAMES.has(normalizedActivityDisplayName(change))) {
+    resources.add('ORGANIZATION_CONFIGURATION')
+  }
   if (/domain|dns|verified domain/.test(text)) {
     resources.add('DOMAINS')
     resources.add('DOMAIN_DNS_HEALTH')
