@@ -308,6 +308,77 @@ test('serializes concurrent subscription starts so only one POST occurs', async 
   }
 })
 
+test('starts Exchange first and rotates past a failed workload without blocking enabled coverage', async () => {
+  const subscriptions: any[] = []
+  const starts: string[] = []
+  const subscriptionStore = {
+    findMany: async () => subscriptions,
+    upsert: async (args: any) => {
+      const contentType = args.where.customerTenantId_contentType.contentType
+      const index = subscriptions.findIndex((entry) => entry.contentType === contentType)
+      const next = index >= 0
+        ? { ...subscriptions[index], ...args.update, contentType }
+        : { ...args.create, contentType }
+      if (index >= 0) subscriptions[index] = next
+      else subscriptions.push(next)
+      return next
+    },
+  }
+  const prisma: any = {
+    m365ActivitySubscription: subscriptionStore,
+    $transaction: async (callback: any) => callback({
+      $executeRawUnsafe: async () => undefined,
+      m365ActivitySubscription: subscriptionStore,
+    }),
+  }
+  const service = new M365ManagementActivityService(prisma, {} as never)
+  ;(service as any).readMeteredJson = async (_tenant: unknown, response: Response) =>
+    response.json()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input))
+    if (init?.method === 'POST') {
+      const contentType = url.searchParams.get('contentType') ?? ''
+      starts.push(contentType)
+      if (contentType === 'Audit.Exchange') {
+        return new Response(JSON.stringify({ error: { message: 'Tenant does not exist.' } }), {
+          status: 400,
+        })
+      }
+      return new Response('{}')
+    }
+    return new Response('[]')
+  }
+  try {
+    const first = await (service as any).ensureSubscriptions(
+      tenant,
+      'token',
+      publisherIdentifier,
+      new Date('2026-08-17T12:00:00.000Z'),
+    )
+    assert.equal(first.size, 0)
+    assert.equal(
+      subscriptions.find((entry) => entry.contentType === 'Audit.Exchange')?.status,
+      'FAILED',
+    )
+
+    const second = await (service as any).ensureSubscriptions(
+      tenant,
+      'token',
+      publisherIdentifier,
+      new Date('2026-08-17T12:16:00.000Z'),
+    )
+    assert.deepEqual(starts, ['Audit.Exchange', 'Audit.AzureActiveDirectory'])
+    assert.equal(second.has('Audit.AzureActiveDirectory'), true)
+    assert.equal(
+      subscriptions.find((entry) => entry.contentType === 'Audit.Exchange')?.status,
+      'FAILED',
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('writes raw and normalized evidence and completes a content ledger in one transaction', async () => {
   const rawWrites: any[] = []
   const evidenceWrites: any[] = []
@@ -874,6 +945,7 @@ test('reports a backlog after blob-count, byte-budget, and runtime bounds instea
           ),
           deleteMany: async () => ({ count: 0 }),
         },
+        m365ActivitySubscription: { findMany: async () => [] },
         m365AuditRecord: { deleteMany: async () => ({ count: 0 }) },
         m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
         $transaction: async (operations: any) => Promise.all(operations),
@@ -918,6 +990,60 @@ test('reports a backlog after blob-count, byte-budget, and runtime bounds instea
     if (originalBlobs === undefined) delete process.env.M365_AUDIT_MAX_BLOBS_PER_RUN
     else process.env.M365_AUDIT_MAX_BLOBS_PER_RUN = originalBlobs
   }
+})
+
+test('reports incomplete subscription coverage as a collector failure while polling enabled workloads', async () => {
+  const syncUpdates: any[] = []
+  let discovered: string[] = []
+  const prisma: any = {
+    syncState: {
+      findUnique: async () => null,
+      upsert: async () => undefined,
+      update: async ({ data }: any) => { syncUpdates.push(data); return data },
+    },
+    m365ActivityContent: {
+      count: async () => 0,
+      updateMany: async () => ({ count: 0 }),
+      findMany: async () => [],
+      deleteMany: async () => ({ count: 0 }),
+    },
+    m365ActivitySubscription: {
+      findMany: async () => [{
+        contentType: 'Audit.AzureActiveDirectory',
+        status: 'FAILED',
+        lastError: 'Tenant does not exist.',
+      }],
+    },
+    m365AuditRecord: { deleteMany: async () => ({ count: 0 }) },
+    m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
+    $transaction: async (operations: any) => Promise.all(operations),
+  }
+  const consent: any = {
+    getTenantManagementActivityContext: async () => ({
+      accessToken: 'token',
+      publisherIdentifier,
+    }),
+  }
+  const service = new M365ManagementActivityService(prisma, consent)
+  ;(service as any).ensureSubscriptions = async () => new Set(['Audit.Exchange'])
+  ;(service as any).discoverContent = async (
+    _tenant: unknown,
+    _token: string,
+    _publisher: string,
+    enabled: Set<string>,
+  ) => {
+    discovered = [...enabled]
+    return false
+  }
+
+  await service.syncTenant(tenant)
+  assert.deepEqual(discovered, ['Audit.Exchange'])
+  assert.equal(syncUpdates.at(-1).status, 'FAILED')
+  assert.equal(
+    syncUpdates.at(-1).lastErrorCode,
+    'm365-audit-subscription-incomplete',
+  )
+  assert.match(syncUpdates.at(-1).lastErrorMessage, /Audit\.AzureActiveDirectory/)
 })
 
 test('treats a daily/monthly budget stop as recoverable backpressure, not a collector failure', async () => {

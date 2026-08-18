@@ -12,8 +12,8 @@ import type { Prisma } from '../generated/prisma/client.js'
 export { classifyManagementActivity } from '../changes/m365-activity-classification.js'
 
 export const M365_ACTIVITY_CONTENT_TYPES = [
-  'Audit.AzureActiveDirectory',
   'Audit.Exchange',
+  'Audit.AzureActiveDirectory',
   'Audit.SharePoint',
   'Audit.General',
 ] as const
@@ -498,9 +498,25 @@ export class M365ManagementActivityService {
         now.getTime() - lastStartRequestedAt.getTime() <
           SUBSCRIPTION_START_COOLDOWN_MS
       ) return null
-      const contentType = M365_ACTIVITY_CONTENT_TYPES.find(
-        (candidate) => !enabled.has(candidate)
+      const storedByContentType = new Map(
+        stored.map((entry) => [entry.contentType, entry])
       )
+      const contentType = M365_ACTIVITY_CONTENT_TYPES
+        .filter((candidate) => !enabled.has(candidate))
+        .sort((left, right) => {
+          const leftAttempt = storedByContentType.get(left)?.lastStartRequestedAt
+          const rightAttempt = storedByContentType.get(right)?.lastStartRequestedAt
+          if (!leftAttempt && rightAttempt) return -1
+          if (leftAttempt && !rightAttempt) return 1
+          if (leftAttempt && rightAttempt) {
+            const difference = leftAttempt.getTime() - rightAttempt.getTime()
+            if (difference !== 0) return difference
+          }
+          return (
+            M365_ACTIVITY_CONTENT_TYPES.indexOf(left) -
+            M365_ACTIVITY_CONTENT_TYPES.indexOf(right)
+          )
+        })[0]
       if (!contentType) return null
       await transaction.m365ActivitySubscription.upsert({
         where: {
@@ -577,6 +593,7 @@ export class M365ManagementActivityService {
       enabled,
       now
     )
+    const startFailures = new Map<string, string>()
 
     if (contentTypeToStart) {
       try {
@@ -608,13 +625,28 @@ export class M365ManagementActivityService {
             entry.contentType === contentTypeToStart &&
             entry.status?.toLowerCase() === 'enabled'
         )
-        if (!isEnabled) throw error
-        enabled.add(contentTypeToStart)
+        if (isEnabled) {
+          enabled.add(contentTypeToStart)
+        } else {
+          // One workload can be unavailable or not provisioned while another
+          // remains usable. Persist the exact content-type failure and keep
+          // polling already-enabled workloads instead of turning it into an
+          // all-or-nothing tenant outage.
+          startFailures.set(contentTypeToStart, safeMessage(error))
+        }
       }
     }
 
+    const storedByContentType = new Map(
+      stored.map((entry) => [entry.contentType, entry])
+    )
     for (const contentType of M365_ACTIVITY_CONTENT_TYPES) {
       const isEnabled = enabled.has(contentType)
+      const startFailure = startFailures.get(contentType)
+      const previousFailure = storedByContentType.get(contentType)?.status === 'FAILED'
+        ? storedByContentType.get(contentType)?.lastError
+        : null
+      const failure = startFailure ?? previousFailure
       await this.prisma.m365ActivitySubscription.upsert({
         where: {
           customerTenantId_contentType: {
@@ -626,15 +658,18 @@ export class M365ManagementActivityService {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
           contentType,
-          status: isEnabled ? 'ENABLED' : 'PENDING',
-          lastVerifiedAt: now,
-        },
-        update: {
-          status: isEnabled ? 'ENABLED' : 'PENDING',
+          status: isEnabled ? 'ENABLED' : failure ? 'FAILED' : 'PENDING',
           lastVerifiedAt: now,
           lastError: isEnabled
             ? null
-            : 'Subscription activation is pending Microsoft verification.',
+            : failure ?? 'Subscription activation is pending Microsoft verification.',
+        },
+        update: {
+          status: isEnabled ? 'ENABLED' : failure ? 'FAILED' : 'PENDING',
+          lastVerifiedAt: now,
+          lastError: isEnabled
+            ? null
+            : failure ?? 'Subscription activation is pending Microsoft verification.',
         },
       })
     }
@@ -1313,6 +1348,16 @@ export class M365ManagementActivityService {
         publisherIdentifier,
         now
       )
+      const subscriptionStates = await this.prisma.m365ActivitySubscription.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        select: { contentType: true, status: true, lastError: true },
+      })
+      const failedSubscriptions = subscriptionStates.filter(
+        (subscription) => subscription.status === 'FAILED'
+      )
       const downloadBudget = {
         remainingBytes: maxDownloadMegabytes * 1024 * 1024,
       }
@@ -1406,11 +1451,15 @@ export class M365ManagementActivityService {
           where: {
             customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
           },
-          data: failedBacklog > 0
+          data: failedBacklog > 0 || failedSubscriptions.length > 0
             ? {
                 status: 'FAILED',
-                lastErrorCode: 'm365-audit-content-unavailable',
-                lastErrorMessage: `${failedBacklog} Microsoft audit content blob(s) are permanently unavailable; pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}.`,
+                lastErrorCode: failedSubscriptions.length > 0
+                  ? 'm365-audit-subscription-incomplete'
+                  : 'm365-audit-content-unavailable',
+                lastErrorMessage: failedSubscriptions.length > 0
+                  ? `${failedSubscriptions.length} Microsoft audit subscription(s) failed: ${failedSubscriptions.map((subscription) => `${subscription.contentType}: ${subscription.lastError ?? 'activation failed'}`).join('; ')}. Enabled=${enabledContentTypes.size}/${M365_ACTIVITY_CONTENT_TYPES.length}; content pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}, permanently unavailable=${failedBacklog}.`.slice(0, 1_000)
+                  : `${failedBacklog} Microsoft audit content blob(s) are permanently unavailable; pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}.`,
                 consecutiveFailures: { increment: 1 },
               }
             : blocked > 0

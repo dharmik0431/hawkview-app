@@ -17,6 +17,7 @@ import {
   collectMailboxRules,
   partialSnapshot,
   sharePointSitesSnapshotResult,
+  shouldRunFastMailboxRuleRefresh,
   TenantSyncService,
 } from '../tenants/tenant-sync.service.js'
 
@@ -529,6 +530,57 @@ test('collects all mailbox users and every Graph inbox-rules page with mailbox-s
   assert.equal(rows.length, 4)
   assert.equal((rows[0] as any).mailboxUserId, 'user-0')
   assert.equal((rows[2] as any).mailboxUserId, 'user-1')
+})
+
+test('runs the independent mailbox-rule safety scan only when due and within its cost cap', () => {
+  const now = new Date('2026-08-17T12:30:00.000Z')
+  const recent = {
+    status: 'SUCCEEDED',
+    lastAttemptAt: new Date('2026-08-17T12:20:00.000Z'),
+    lastSuccessfulAt: new Date('2026-08-17T12:20:00.000Z'),
+  }
+  const stale = {
+    ...recent,
+    lastAttemptAt: new Date('2026-08-17T12:00:00.000Z'),
+    lastSuccessfulAt: new Date('2026-08-17T12:00:00.000Z'),
+  }
+  assert.equal(shouldRunFastMailboxRuleRefresh({
+    state: null,
+    activeMailboxUsers: 20,
+    now,
+  }), true)
+  assert.equal(shouldRunFastMailboxRuleRefresh({
+    state: recent,
+    activeMailboxUsers: 20,
+    now,
+    intervalMinutes: 15,
+  }), false)
+  assert.equal(shouldRunFastMailboxRuleRefresh({
+    state: stale,
+    activeMailboxUsers: 20,
+    now,
+    intervalMinutes: 15,
+  }), true)
+  assert.equal(shouldRunFastMailboxRuleRefresh({
+    state: stale,
+    activeMailboxUsers: 251,
+    now,
+    maximumUsers: 250,
+  }), false)
+})
+
+test('backs off a failed mailbox-rule safety scan from its last attempt', () => {
+  const now = new Date('2026-08-17T12:30:00.000Z')
+  assert.equal(shouldRunFastMailboxRuleRefresh({
+    state: {
+      status: 'FAILED',
+      lastAttemptAt: new Date('2026-08-17T12:25:00.000Z'),
+      lastSuccessfulAt: new Date('2026-08-16T12:00:00.000Z'),
+    },
+    activeMailboxUsers: 20,
+    now,
+    intervalMinutes: 15,
+  }), false)
 })
 
 test('serializes concurrent snapshot transitions so the second comparison uses the first new baseline', async () => {

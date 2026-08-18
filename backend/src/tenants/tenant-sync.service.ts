@@ -47,6 +47,8 @@ const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
 const MANAGEMENT_ACTIVITY_SOURCE = 'MICROSOFT_365_MANAGEMENT_ACTIVITY'
 const MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS = 7
+const DEFAULT_FAST_MAILBOX_RULE_REFRESH_MINUTES = 15
+const DEFAULT_FAST_MAILBOX_RULE_MAX_USERS = 250
 /**
  * These collectors anchor the daily full-inventory run. They are deliberately
  * separate from the five-minute users/activity delta loop.
@@ -62,6 +64,47 @@ const AUTH_METHOD_NAMES: Record<string, string> = {
   softwareOath: 'Software OATH token',
   hardwareOath: 'Hardware OATH token',
   qrCodePin: 'QR code PIN',
+}
+
+function boundedPositiveInteger(
+  value: string | undefined,
+  fallback: number,
+  maximum: number
+) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0
+    ? Math.min(parsed, maximum)
+    : fallback
+}
+
+export type MailboxRuleRefreshState = {
+  status: string
+  lastAttemptAt: Date | null
+  lastSuccessfulAt: Date | null
+} | null
+
+export function shouldRunFastMailboxRuleRefresh(input: {
+  state: MailboxRuleRefreshState
+  activeMailboxUsers: number
+  now: Date
+  intervalMinutes?: number
+  maximumUsers?: number
+}) {
+  const intervalMinutes = Math.max(
+    1,
+    input.intervalMinutes ?? DEFAULT_FAST_MAILBOX_RULE_REFRESH_MINUTES
+  )
+  const maximumUsers = Math.max(
+    1,
+    input.maximumUsers ?? DEFAULT_FAST_MAILBOX_RULE_MAX_USERS
+  )
+  if (input.activeMailboxUsers > maximumUsers) return false
+
+  const reference = input.state?.status === 'FAILED'
+    ? input.state.lastAttemptAt
+    : input.state?.lastSuccessfulAt
+  return !reference ||
+    input.now.getTime() - reference.getTime() >= intervalMinutes * 60_000
 }
 
 function formatAuthenticationMethodName(id: unknown) {
@@ -957,6 +1000,53 @@ export class TenantSyncService {
           synchronize: () => this.syncM365AuditActivity(tenant, accessToken),
         },
       ]
+      const mailboxRuleRefreshMinutes = boundedPositiveInteger(
+        process.env.EXCHANGE_MAILBOX_RULE_FAST_REFRESH_MINUTES,
+        DEFAULT_FAST_MAILBOX_RULE_REFRESH_MINUTES,
+        24 * 60
+      )
+      const mailboxRuleMaximumUsers = boundedPositiveInteger(
+        process.env.EXCHANGE_MAILBOX_RULE_FAST_MAX_USERS,
+        DEFAULT_FAST_MAILBOX_RULE_MAX_USERS,
+        5_000
+      )
+      const mailboxRuleState = await this.prisma.syncState.findUnique({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType: 'EXCHANGE_MAILBOX_RULES',
+          },
+        },
+        select: {
+          status: true,
+          lastAttemptAt: true,
+          lastSuccessfulAt: true,
+        },
+      })
+      const mailboxRuleReference = mailboxRuleState?.status === 'FAILED'
+        ? mailboxRuleState.lastAttemptAt
+        : mailboxRuleState?.lastSuccessfulAt
+      const mailboxRuleRefreshDue = !mailboxRuleReference ||
+        now.getTime() - mailboxRuleReference.getTime() >=
+          mailboxRuleRefreshMinutes * 60_000
+      if (mailboxRuleRefreshDue) {
+        const activeMailboxUsers = await this.prisma.directoryUser.count({
+          where: { customerTenantId: tenant.id, deletedAt: null },
+        })
+        if (shouldRunFastMailboxRuleRefresh({
+          state: mailboxRuleState,
+          activeMailboxUsers,
+          now,
+          intervalMinutes: mailboxRuleRefreshMinutes,
+          maximumUsers: mailboxRuleMaximumUsers,
+        })) {
+          incrementalModules.push({
+            resource: 'EXCHANGE_MAILBOX_RULES',
+            synchronize: () =>
+              this.syncExchangeMailboxRules(tenant, accessToken),
+          })
+        }
+      }
       const incrementalResults = await Promise.allSettled(
         incrementalModules.map((module) => module.synchronize())
       )
