@@ -1,6 +1,6 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-17 during P0-4 live inbox-rule acceptance repair
+Last updated: 2026-08-18 during P0-6 collection-readiness implementation
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
@@ -52,7 +52,7 @@ Initial market: United States and Canada. Pricing and 1,000-tenant scale work ar
 
 ### P0-4 — Security signal quality and compromise reconstruction
 
-Status: backend implementation merged and deployed. Live end-to-end acceptance testing is still pending.
+Status: merged and deployed. The mailbox-rule source/provenance and audit-investigation repair is also merged; remaining live acceptance is product validation, not an unpublished code state.
 
 Live OWA inbox-rule acceptance finding:
 
@@ -145,13 +145,13 @@ When changing this file, record:
 
 ## Scoped repair — What Changed provenance and audit-sync investigation
 
-Status: implemented locally on `codex/fix-change-source-audit-investigate`; QA-approved and ready for commit/PR, but not committed, published, deployed, or applied to a live tenant.
+Status: merged to `main` and deployed as part of the current baseline. It remains a response-presentation and operational-navigation repair; it does not make Management Activity ingestion realtime.
 
 - The What Changed API now derives a sanitized presentation DTO from immutable stored evidence. Directory Audit remains `Entra`; Unified Audit retains its declared workload; snapshot evidence now retains its workload, so Exchange mailbox-rule differences display `Exchange Online` with `HawkView snapshot comparison` provenance and a sanitized `Microsoft Graph mailbox rules` source.
 - M365 Audit health findings now point to `/tenants/{id}/settings?section=sync&resource=M365_AUDIT`. The settings page recognizes that deep link, scrolls to synchronization health, and displays read-only state, last attempt, last success, and a redacted current reason. It adds no retry or permission behavior.
 - Dashboard and alert modal navigation preserve backend-provided same-origin action URLs.
 
-QA status: final independent QA passed (P0=0, P1=0). The work is safe to publish but remains local and unpublished.
+QA status: final independent QA passed (P0=0, P1=0) before publish.
 
 Validation: frontend sanitizer/navigation 15/15; tenant health 26/26; changes 38/38; root and backend TypeScript checks; Prisma validation with a non-production placeholder `DATABASE_URL`; and `git diff --check` pass. Both full production builds passed in the immediately preceding independent QA environment; no build configuration changed. Direct objects now use the identical case-insensitive, underscore/hyphen-tolerant safe-field projection as parsed JSON; only bounded primitive status/error-code/message/correlation/tenant/URL fields survive, and URLs retain origin plus pathname only. Arbitrary/nested/prototype-like data and secret-like keys remain dropped.
 
@@ -159,7 +159,7 @@ Limitations: this changes only response presentation and collection-failure navi
 
 ## Scoped implementation — P0-5 tenant configuration history
 
-Status: final independent QA passed (P0=0, P1=0); this local P0-5 implementation is safe to publish from `codex/p0-5-config-history` based on `origin/main` merge `620005eb2825d5396db16e1e89819d41f0070337`. It remains uncommitted, unpublished, and not deployed. No tenant, Microsoft consent, or live configuration was changed.
+Status: merged in PR #153 and deployed from `main` at `e542a860b7be22d3c86ea472f7f5dc1880c0396d`. The matching database migration was part of the deployed release. No Microsoft consent or tenant configuration was changed by this release.
 
 - Added a transactional `ORGANIZATION_CONFIGURATION` snapshot resource backed by Microsoft Graph `/organization` under the existing `Organization.Read.All` permission. It tracks organization display name and stable tenant identity, with first-baseline protection, tenant/resource advisory locking, provenance, before/after values, and actor-honest snapshot evidence. The repair now rejects missing, partial, multi-record, or mismatched Graph organization IDs before any snapshot/baseline write.
 - Existing verified-domain and subscribed-SKU snapshots now have explicit product-guidance impact metadata in What Changed list/detail. Supported differences include domain add/remove/default-state transitions and subscription SKU add/remove/purchased-capacity/capability/status transitions. Consumed-seat utilization is deliberately excluded from the primary subscription snapshot to avoid treating ordinary per-user assignment changes as tenant configuration events. Guidance intentionally does not claim external DNS, a billing event, or a per-user/group license assignment.
@@ -171,6 +171,22 @@ Live UAL incident note: the P0-4 subscription-start failure/root-cause and the u
 
 Validation after repair: final focused frontend What Changed tests 7/7; backend What Changed tests 45/45; root and backend TypeScript; Prisma validation with a placeholder non-production `DATABASE_URL`; and `git diff --check` all pass. Both full production builds passed during the implementation repair; no build configuration changed.
 
-Deployment note: the new `OrganizationConfigurationSnapshot` database migration must be applied before deploying the matching backend. Publishing this work alone does not deploy it, run migrations, modify a tenant, change Microsoft consent, or alter GAS.
+Deployment note: `OrganizationConfigurationSnapshot` migration must precede matching backend deployments. It was included in the P0-5 deployment; future environment rebuilds must preserve that ordering.
 
 Cadence/cost: organization/domain/SKU configuration snapshots are lightweight Graph collection suitable for the existing daily authoritative inventory plus exact-audit-triggered reconciliation. They must not introduce mailbox- or per-user-scale polling. Exchange organization/audit setting collection is deferred until its read API/RBAC behavior is verified. Remaining gaps include direct Exchange configuration evidence, SharePoint/OneDrive and Teams administrative settings outside the existing catalog, external DNS changes, and any unsupported Microsoft audit workload.
+
+## Active milestone — P0-6 onboarding and collection readiness
+
+Status: final independent QA PASS (`P0=0`, `P1=0`); the local work in `codex/p0-6-onboarding-readiness` is safe to publish but remains uncommitted, unpublished, undeployed, and unapplied to any live tenant.
+
+- Adds a read-only, versioned collection-readiness contract derived exclusively from durable per-resource sync states, verified consent records, and the four existing Management Activity subscription rows. It makes no Microsoft request while listing a tenant and never equates OAuth verification or a successful cron process with workload readiness.
+- Readiness rows cover Entra directory audit, sign-ins, Graph configuration snapshots, SharePoint/OneDrive, Exchange mailbox/configuration, and Microsoft 365 Unified Audit. States distinguish READY, INITIALIZING, PARTIAL, BLOCKED_PERMISSION, BLOCKED_TENANT_CONFIGURATION, UNSUPPORTED, STALE, BACKLOGGED, FAILED_TRANSIENT, and NEVER_SUCCEEDED.
+- Management Activity exposes `Audit.Exchange`, `Audit.AzureActiveDirectory`, `Audit.SharePoint`, and `Audit.General` independently. Provisioning is not presented as a permanent failure; a bounded backlog is distinct from a completed collector. Existing normal scheduler checks continue after Microsoft/admin remediation.
+- Exchange Graph permission readiness and Exchange Admin API RBAC are shown separately. A successful Admin API collection can confirm RBAC, a recognized RBAC/Recipient Management failure is blocked, and all other cases remain explicitly unverified; an unverified promised Exchange Admin capability prevents Exchange from reporting READY. No new Exchange command, RBAC role, consent, or PowerShell execution was added.
+- Minimal tenant Settings UI renders the safe normalized matrix with state, permission/capability status, last attempt/success, current sanitized reason, remediation, M365 components, and Exchange RBAC. It adds no retry action and operational health remains outside What Changed.
+
+Cost/cadence: readiness is derived from data already persisted during onboarding, relevant sync outcomes, reconnect/permission failures, and the existing bounded scheduler cadence (15-minute M365 catch-up and daily inventory). It adds no per-user, per-mailbox, or per-site readiness probe and is suitable for a 1,000-tenant scheduler design with existing jitter/backoff.
+
+Final QA validation: independent verification passed frontend readiness tests (6/6), backend readiness tests (15/15), adjacent backend tests (107/107), root and backend TypeScript, Prisma validation, both production builds, and diff/scope checks. The matrix includes the current Secure Score, devices, directory-role, authentication-method policy, named-location, Security Defaults, Exchange usage/accepted-domain/admin-RBAC, and tenant configuration collectors with their actual required grants, including `SecurityEvents.Read.All` and `Member.Read.Hidden`. Licensing failures are distinct from tenant configuration; an absent permission-verification record is UNVERIFIED rather than missing; revoked/failed connection evidence overrides historical readiness without deleting prior-success timestamps; invalid/future Exchange Admin timestamps cannot confirm RBAC; and Graph mailbox permission blockers survive Exchange RBAC aggregation. Unknown, oversized, duplicate, and malformed client readiness data becomes visibly unsupported rather than silently disappearing, and a worst nested component deterministically drives its parent/global readiness diagnostics. Management Activity verification time is displayed separately from first successful polling. A scheduler heartbeat is no longer presented as a per-resource retry promise.
+
+Known limits: the current contract cannot prove a permission grant when no verification record exists; it says UNVERIFIED/MISSING rather than guessing. `Exchange.ManageAsAppV2` and Exchange RBAC are not represented as Graph consent and require a successful existing Admin API collection to confirm. The existing Management Activity collector remains subject to Microsoft provisioning/latency and does not guarantee every admin event. Nonblocking P2 follow-up: harden the legacy retry-time contract, version the permission manifest, and use stricter date parsing.

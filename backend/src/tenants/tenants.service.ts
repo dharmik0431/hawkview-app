@@ -20,6 +20,7 @@ import {
   deriveTenantHealth,
   type TenantAuditEvent,
 } from './tenant-health.js'
+import { deriveCollectionReadiness } from './collection-readiness.js'
 import {
   deriveTenantSyncFreshness,
   type TenantSyncFreshness,
@@ -205,6 +206,14 @@ export class TenantsService {
       payload: unknown
       observedAt: Date
     }>
+    m365ActivitySubscriptions: Array<{
+      contentType: string
+      status: string
+      lastStartRequestedAt: Date | null
+      lastVerifiedAt: Date | null
+      lastSuccessfulPollAt: Date | null
+      lastError: string | null
+    }>
   }, riskyIdentityCount = 0, auditEvents: TenantAuditEvent[] = []) {
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
@@ -235,6 +244,13 @@ export class TenantsService {
       auditEvents,
     })
     const syncFreshness = deriveTenantSyncFreshness(tenant.syncStates)
+    const collectionReadiness = deriveCollectionReadiness({
+      connectionStatus,
+      connectionVerifiedAt: tenant.connection?.lastVerifiedAt,
+      consentedPermissions,
+      syncStates: tenant.syncStates,
+      subscriptions: tenant.m365ActivitySubscriptions,
+    })
 
     return {
       id: tenant.id,
@@ -270,6 +286,10 @@ export class TenantsService {
       // Service-level freshness is additive. The legacy lastSync remains for
       // callers that have not yet moved to the per-service contract.
       syncFreshness,
+      // Readiness is deliberately derived from durable per-resource outcomes.
+      // It is not an OAuth or scheduler-success proxy and makes no Microsoft
+      // request while listing tenants.
+      collectionReadiness,
       // The named object is the versioned API contract.  The spread above
       // intentionally preserves legacy healthScore/mfaCoverage/attention.
       tenantHealth: health,
@@ -429,6 +449,16 @@ export class TenantsService {
           consentedPermissions: true,
           lastVerifiedAt: true,
           lastErrorCode: true,
+        },
+      },
+      m365ActivitySubscriptions: {
+        select: {
+          contentType: true,
+          status: true,
+          lastStartRequestedAt: true,
+          lastVerifiedAt: true,
+          lastSuccessfulPollAt: true,
+          lastError: true,
         },
       },
     } as const

@@ -9,6 +9,7 @@ import { useAuth } from '@/components/providers/auth-provider'
 
 import { apiClient } from '@/lib/api/client'
 import { auditSyncFocusTarget, isM365AuditSyncDeepLink, m365AuditSyncHealth } from '@/lib/tenants/audit-sync-health'
+import { normalizeCollectionReadiness, readinessLabel } from '@/lib/tenants/collection-readiness'
 import type { TenantBundle } from '@/types/tenant-data'
 
 import {
@@ -546,6 +547,10 @@ export default function TenantSettingsPage() {
     () => m365AuditSyncHealth(tenantListRecord?.tenantHealth?.resourceHealth ?? tenantListRecord?.resourceHealth),
     [tenantListRecord],
   )
+  const collectionReadiness = useMemo(
+    () => normalizeCollectionReadiness(tenantListRecord?.collectionReadiness),
+    [tenantListRecord],
+  )
 
   if (loadState === 'loading') {
     return (
@@ -936,6 +941,69 @@ export default function TenantSettingsPage() {
               </div>
             </div>
           </div>
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl border shadow-sm" aria-labelledby="collection-readiness-heading">
+        <CardHeader className="pb-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle id="collection-readiness-heading" className="text-lg font-bold flex items-center gap-2">
+                <Activity className="h-5 w-5 text-primary" />
+                Collection readiness
+              </CardTitle>
+              <CardDescription>
+                Readiness is tracked per Microsoft workload. A connected authorization or successful scheduler run alone does not mean the data is current.
+              </CardDescription>
+            </div>
+            {collectionReadiness && <Badge variant="outline" className="shrink-0">{readinessLabel(collectionReadiness.overallState)}</Badge>}
+          </div>
+        </CardHeader>
+        <CardContent>
+          {!collectionReadiness ? (
+            <p className="text-sm text-muted-foreground">No workload readiness has been recorded yet. HawkView will evaluate this after onboarding and each relevant collection result.</p>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-xs text-muted-foreground">Last evaluated: {formatDate(collectionReadiness.evaluatedAt)}</p>
+              <div className="grid gap-3 lg:grid-cols-2">
+                {collectionReadiness.workloads.map((workload) => (
+                  <section key={workload.key} className="rounded-xl border bg-muted/10 p-4" aria-label={`${workload.workload} readiness`}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <h3 className="font-semibold text-foreground">{workload.workload}</h3>
+                        <p className="mt-1 text-xs text-muted-foreground">Capability: {readinessLabel(workload.configuredCapability)} · Permission: {readinessLabel(workload.permissionStatus)}</p>
+                      </div>
+                      <Badge variant="outline">{readinessLabel(workload.state)}</Badge>
+                    </div>
+                    <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                      <div><dt className="text-muted-foreground">Last attempt</dt><dd className="font-medium text-foreground">{formatDate(workload.lastAttemptAt)}</dd></div>
+                      <div><dt className="text-muted-foreground">Last success</dt><dd className="font-medium text-foreground">{formatDate(workload.lastSuccessfulAt)}</dd></div>
+                      <div><dt className="text-muted-foreground">Freshness</dt><dd className="font-medium text-foreground">{readinessLabel(workload.freshness)}</dd></div>
+                      {workload.lastVerifiedAt && <div><dt className="text-muted-foreground">Subscription verified</dt><dd className="font-medium text-foreground">{formatDate(workload.lastVerifiedAt)}</dd></div>}
+                    </dl>
+                    {workload.reason && <p className="mt-3 break-words text-sm text-amber-800 dark:text-amber-200">{workload.reason}</p>}
+                    {workload.exchangeRbac && <p className="mt-3 text-sm text-muted-foreground">Exchange Admin API RBAC: <span className="font-medium text-foreground">{readinessLabel(workload.exchangeRbac.status)}</span> — {workload.exchangeRbac.reason}</p>}
+                    {workload.components.length > 0 && (
+                      <details className="mt-3 text-sm">
+                        <summary className="cursor-pointer font-medium text-foreground">Component status ({workload.components.length})</summary>
+                        <ul className="mt-2 space-y-2 text-muted-foreground">
+                          {workload.components.map((component) => (
+                            <li key={component.key}>
+                              <span>{component.label}: </span>
+                              <span className="font-medium text-foreground">{readinessLabel(component.state)}</span>
+                              {component.reason ? ` — ${component.reason}` : ''}
+                              {component.lastVerifiedAt ? <span className="ml-2 text-xs">Subscription verified: {formatDate(component.lastVerifiedAt)}</span> : null}
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                    <p className="mt-3 text-sm text-muted-foreground">{workload.remediation}</p>
+                  </section>
+                ))}
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
