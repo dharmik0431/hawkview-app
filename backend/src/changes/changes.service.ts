@@ -9,6 +9,9 @@ import {
   PRIMARY_CHANGE_CLASSIFICATIONS,
   type ChangeClassification,
 } from './change-classification.js'
+import {
+  managementActivityRoleFromEvidence,
+} from './m365-activity-classification.js'
 
 type JsonObject = Record<string, unknown>
 type TimelineEvent = {
@@ -106,6 +109,78 @@ function targetResourceTypes(value: unknown) {
   return array(value).map(object).map((target) => text(target.type)).filter((type): type is string => Boolean(type))
 }
 
+function normalizedEvidenceClassification(event: {
+  source: string
+  operationName: string
+  category?: string | null
+  workload?: string | null
+  raw?: unknown
+}): ChangeClassification {
+  if (event.source === 'M365_UNIFIED_AUDIT') {
+    const role = managementActivityRoleFromEvidence(event)
+    if (role === 'security_supporting_activity') return 'security_supporting_activity'
+    if (role === 'routine_activity') return 'system_or_collection_event'
+  }
+  return classifyEvidence({ source: event.source, activity: event.operationName, category: event.category })
+}
+
+function evidenceTargetKeys(event: {
+  customerTenantId: string
+  category: string
+  targetId?: string | null
+  targetDisplayName?: string | null
+}) {
+  const prefix = `${event.customerTenantId}\u0000${event.category.toLowerCase()}\u0000`
+  const id = text(event.targetId)?.toLowerCase()
+  const name = text(event.targetDisplayName)?.toLowerCase()
+  return [id ? `${prefix}id:${id}` : null, name ? `${prefix}name:${name}` : null]
+    .filter((value): value is string => Boolean(value))
+}
+
+function authoritativeEvidenceIndex(
+  candidates: Array<{
+    source: string
+    customerTenantId: string
+    eventDateTime: Date
+    category: string
+    targetId?: string | null
+    targetDisplayName?: string | null
+  }>,
+) {
+  const index = new Map<string, number[]>()
+  for (const candidate of candidates) {
+    if (candidate.source === 'SNAPSHOT_DIFFERENCE' || candidate.source === 'SIGN_IN') continue
+    for (const key of evidenceTargetKeys(candidate)) {
+      const timestamps = index.get(key) ?? []
+      timestamps.push(candidate.eventDateTime.getTime())
+      index.set(key, timestamps)
+    }
+  }
+  return index
+}
+
+function isSupersededSnapshot(
+  snapshot: {
+    source: string
+    customerTenantId: string
+    eventDateTime: Date
+    category: string
+    targetId?: string | null
+    targetDisplayName?: string | null
+  },
+  index: Map<string, number[]>,
+) {
+  if (snapshot.source !== 'SNAPSHOT_DIFFERENCE') return false
+  const snapshotTime = snapshot.eventDateTime.getTime()
+  return evidenceTargetKeys(snapshot).some((key) =>
+    (index.get(key) ?? []).some((candidateTime) => Math.abs(candidateTime - snapshotTime) <= 45 * 60 * 1000)
+  )
+}
+
+function investigationIdentityValues(...values: Array<unknown>) {
+  return new Set(values.map((value) => text(value)?.toLowerCase()).filter((value): value is string => Boolean(value)))
+}
+
 @Injectable()
 export class ChangesService {
   private readonly logger = new Logger(ChangesService.name)
@@ -171,11 +246,28 @@ export class ChangesService {
         const classification = classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: log.activityDisplayName, category: log.category, operationType: log.operationType, targetResourceTypes: targetResourceTypes(log.targetResources) })
         return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, classification, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: 'Entra' as const, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: { ...evidenceFrom(log), provenance: 'Microsoft Graph directoryAudit' } }
       })
-    const normalized = evidenceEvents.map((event) => {
+    const authoritativeCandidates = [
+      ...evidenceEvents,
+      ...auditLogs.map((log) => {
+        const primaryTarget = object(array(log.targetResources)[0])
+        return {
+          source: 'DIRECTORY_AUDIT',
+          customerTenantId: log.customerTenantId,
+          eventDateTime: log.eventDateTime,
+          category: legacyCategory(log.activityDisplayName, log.category).category,
+          targetId: text(primaryTarget.id) ?? null,
+          targetDisplayName: text(primaryTarget.userPrincipalName) ?? text(primaryTarget.displayName) ?? text(primaryTarget.id) ?? null,
+        }
+      }),
+    ]
+    const authoritativeIndex = authoritativeEvidenceIndex(authoritativeCandidates)
+    const normalized = evidenceEvents
+      .filter((event) => !isSupersededSnapshot(event, authoritativeIndex))
+      .map((event) => {
       const location = object(event.location)
       const before = object(event.beforeState)
       const after = object(event.afterState)
-      const classification = classifyEvidence({ source: event.source, activity: event.operationName, category: event.category })
+      const classification = normalizedEvidenceClassification(event)
       return {
         id: event.source === 'DIRECTORY_AUDIT'
           ? `audit:${event.sourceEventId}`
@@ -292,7 +384,7 @@ export class ChangesService {
     const fallbackKind = fallbackAudit ? legacyCategory(fallbackAudit.activityDisplayName, fallbackAudit.category) : null
     const fallbackDetails = fallbackAudit ? targetDetails(fallbackAudit.targetResources) : null
     const classification = projectedEvent
-      ? classifyEvidence({ source: projectedEvent.source, activity: projectedEvent.operationName, category: projectedEvent.category })
+      ? normalizedEvidenceClassification(projectedEvent)
       : classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: fallbackAudit!.activityDisplayName, category: fallbackAudit!.category, operationType: fallbackAudit!.operationType, targetResourceTypes: targetResourceTypes(fallbackAudit!.targetResources) })
     if (!PRIMARY_CHANGE_CLASSIFICATIONS.has(classification)) {
       throw new BadRequestException('This record is telemetry rather than a tenant change investigation event.')
@@ -308,8 +400,10 @@ export class ChangesService {
       severity: fallbackKind!.severity,
       operationName: fallbackAudit!.activityDisplayName,
       summary: [fallbackAudit!.operationType, fallbackAudit!.result, fallbackAudit!.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change',
+      actorId: null,
       actorPrincipalName: actorFrom(fallbackAudit!.initiatedBy) ?? null,
       actorDisplayName: null,
+      targetId: null,
       targetDisplayName: fallbackDetails!.target ?? null,
       correlationId: fallbackAudit!.correlationId,
       changedFields: Object.keys({ ...fallbackDetails!.before, ...fallbackDetails!.after }),
@@ -356,11 +450,168 @@ export class ChangesService {
           relationship: 'Shares Microsoft correlation ID; this is supporting evidence and does not establish causation.',
         }
       })
+    const incidentStart = new Date(event.eventDateTime.getTime() - 60 * 60 * 1000)
+    const incidentEnd = new Date(event.eventDateTime.getTime() + 60 * 60 * 1000)
+    const actorIdentities = investigationIdentityValues(event.actorId, event.actorPrincipalName, event.actorDisplayName)
+    const targetIdentities = investigationIdentityValues(event.targetId, event.targetDisplayName)
+    const canAssociate = actorIdentities.size > 0 || targetIdentities.size > 0
+    const originalActorIdentities = [event.actorId, event.actorPrincipalName, event.actorDisplayName].map(text).filter((value): value is string => Boolean(value))
+    const originalTargetIdentities = [event.targetId, event.targetDisplayName].map(text).filter((value): value is string => Boolean(value))
+    const auditAssociationPredicates = [
+      ...originalActorIdentities.map((value) => ({ actorId: { equals: value, mode: 'insensitive' as const } })),
+      ...originalTargetIdentities.map((value) => ({ objectId: { equals: value, mode: 'insensitive' as const } })),
+      ...originalActorIdentities.flatMap((value) => [
+        { raw: { path: ['UserId'], equals: value } },
+        { raw: { path: ['UserKey'], equals: value } },
+      ]),
+      ...originalTargetIdentities.flatMap((value) => [
+        { raw: { path: ['MailboxOwnerUPN'], equals: value } },
+        { raw: { path: ['TargetUserOrGroupName'], equals: value } },
+      ]),
+    ]
+    const changeAssociationPredicates = [
+      ...originalActorIdentities.flatMap((value) => [
+        { actorId: { equals: value, mode: 'insensitive' as const } },
+        { actorPrincipalName: { equals: value, mode: 'insensitive' as const } },
+        { actorDisplayName: { equals: value, mode: 'insensitive' as const } },
+      ]),
+      ...originalTargetIdentities.flatMap((value) => [
+        { targetId: { equals: value, mode: 'insensitive' as const } },
+        { targetDisplayName: { equals: value, mode: 'insensitive' as const } },
+      ]),
+    ]
+    const [mailboxCandidates, nearbyChangeCandidates] = canAssociate
+      ? await Promise.all([
+          this.prisma.m365AuditRecord.findMany({
+            where: {
+              organizationId: { in: organizationIds },
+              customerTenantId: event.customerTenantId,
+              eventDateTime: { gte: incidentStart, lte: incidentEnd },
+              OR: auditAssociationPredicates,
+            },
+            orderBy: [{ eventDateTime: 'asc' }, { id: 'asc' }],
+            take: 2001,
+          }),
+          this.prisma.changeEvidenceEvent.findMany({
+            where: {
+              organizationId: { in: organizationIds },
+              customerTenantId: event.customerTenantId,
+              eventDateTime: { gte: incidentStart, lte: incidentEnd },
+              OR: changeAssociationPredicates,
+            },
+            orderBy: [{ eventDateTime: 'asc' }, { id: 'asc' }],
+            take: 201,
+          }),
+        ])
+      : [[], []]
+    const supportingRows = mailboxCandidates.slice(0, 2000).filter((candidate) => {
+      if (managementActivityRoleFromEvidence({
+        operationName: candidate.operation,
+        workload: candidate.workload,
+        raw: candidate.raw,
+      }) !== 'security_supporting_activity') return false
+      const raw = object(candidate.raw)
+      const candidateActors = investigationIdentityValues(candidate.actorId, raw.UserId, raw.UserKey)
+      const candidateTargets = investigationIdentityValues(
+        candidate.objectId,
+        raw.MailboxOwnerUPN,
+        raw.TargetUserOrGroupName,
+      )
+      return [...candidateActors].some((value) => actorIdentities.has(value))
+        || [...candidateTargets].some((value) => targetIdentities.has(value))
+    })
+    const groupedMailboxActivity = new Map<string, {
+      operation: string
+      workload: string
+      actor?: string
+      mailboxOrObject?: string
+      count: number
+      firstSeenAt: Date
+      lastSeenAt: Date
+      sampleMicrosoftRecordIds: string[]
+      exactCorrelationMatch: boolean
+    }>()
+    for (const candidate of supportingRows) {
+      const raw = object(candidate.raw)
+      const actor = candidate.actorId ?? text(raw.UserId) ?? text(raw.UserKey)
+      const mailboxOrObject = text(raw.MailboxOwnerUPN) ?? candidate.objectId ?? undefined
+      const key = [candidate.workload ?? 'Exchange', candidate.operation, actor ?? '', mailboxOrObject ?? ''].join('\u0000').toLowerCase()
+      const existingGroup = groupedMailboxActivity.get(key)
+      const exactCorrelationMatch = Boolean(event.correlationId && candidate.correlationId === event.correlationId)
+      const recordedCount = typeof raw.hawkviewSupportingActivityCount === 'number' && raw.hawkviewSupportingActivityCount > 0
+        ? Math.floor(raw.hawkviewSupportingActivityCount)
+        : 1
+      const recordedFirstSeenAt = text(raw.hawkviewSupportingFirstSeenAt)
+      const recordedLastSeenAt = text(raw.hawkviewSupportingLastSeenAt)
+      const firstSeenAt = recordedFirstSeenAt && Number.isFinite(Date.parse(recordedFirstSeenAt))
+        ? new Date(recordedFirstSeenAt)
+        : candidate.eventDateTime
+      const lastSeenAt = recordedLastSeenAt && Number.isFinite(Date.parse(recordedLastSeenAt))
+        ? new Date(recordedLastSeenAt)
+        : candidate.eventDateTime
+      const recordedSamples = array(raw.hawkviewSupportingSampleRecordIds).map(text).filter((value): value is string => Boolean(value))
+      const sampleRecordIds = recordedSamples.length ? recordedSamples : [candidate.microsoftRecordId]
+      if (existingGroup) {
+        existingGroup.count += recordedCount
+        if (firstSeenAt < existingGroup.firstSeenAt) existingGroup.firstSeenAt = firstSeenAt
+        if (lastSeenAt > existingGroup.lastSeenAt) existingGroup.lastSeenAt = lastSeenAt
+        existingGroup.exactCorrelationMatch ||= exactCorrelationMatch
+        for (const sampleId of sampleRecordIds) {
+          if (existingGroup.sampleMicrosoftRecordIds.length >= 10) break
+          if (!existingGroup.sampleMicrosoftRecordIds.includes(sampleId)) existingGroup.sampleMicrosoftRecordIds.push(sampleId)
+        }
+      } else {
+        groupedMailboxActivity.set(key, {
+          operation: candidate.operation,
+          workload: candidate.workload ?? 'Exchange',
+          actor: actor ?? undefined,
+          mailboxOrObject,
+          count: recordedCount,
+          firstSeenAt,
+          lastSeenAt,
+          sampleMicrosoftRecordIds: sampleRecordIds.slice(0, 10),
+          exactCorrelationMatch,
+        })
+      }
+    }
+    const relatedMailboxActivity = [...groupedMailboxActivity.values()].map(({ exactCorrelationMatch, ...group }) => ({
+      ...group,
+      source: 'Office 365 Management Activity API',
+      provenance: 'Microsoft Purview unified audit supporting activity',
+      relationship: exactCorrelationMatch
+        ? 'Shares a Microsoft correlation ID; this is supporting evidence and does not establish causation.'
+        : 'Shares an exact actor or target within the one-hour investigation window; this is supporting evidence and does not establish causation.',
+    }))
+    const associatedChanges = nearbyChangeCandidates
+      .slice(0, 200)
+      .filter((candidate) => candidate.id !== event.id && PRIMARY_CHANGE_CLASSIFICATIONS.has(normalizedEvidenceClassification(candidate)))
+      .filter((candidate) => {
+        const candidateActors = investigationIdentityValues(candidate.actorId, candidate.actorPrincipalName, candidate.actorDisplayName)
+        const candidateTargets = investigationIdentityValues(candidate.targetId, candidate.targetDisplayName)
+        return [...candidateActors].some((value) => actorIdentities.has(value))
+          || [...candidateTargets].some((value) => targetIdentities.has(value))
+      })
+      .map((candidate) => ({
+        id: candidate.source === 'DIRECTORY_AUDIT'
+          ? `audit:${candidate.sourceEventId}`
+          : `evidence:${candidate.source}:${candidate.sourceEventId}`,
+        eventDateTime: candidate.eventDateTime,
+        operationName: candidate.operationName,
+        category: candidate.category,
+        actor: candidate.actorPrincipalName ?? candidate.actorDisplayName ?? undefined,
+        target: candidate.targetDisplayName ?? undefined,
+        source: candidate.source,
+        relationship: 'Shares an exact actor or target within the one-hour investigation window; this association does not establish causation.',
+      }))
     return {
       event,
       classification,
       relatedEvents: related.filter((candidate) => candidate.id !== event.id && candidate.source !== 'SIGN_IN'),
       relatedSignIns,
+      relatedMailboxActivity,
+      relatedMailboxActivityTruncated: mailboxCandidates.length > 2000,
+      associatedChanges,
+      associatedChangesTruncated: nearbyChangeCandidates.length > 200,
     }
   }
 }

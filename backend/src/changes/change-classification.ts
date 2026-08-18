@@ -13,6 +13,7 @@ export type ChangeClassification =
   | 'security_control_change'
   | 'administrative_action'
   | 'authentication_evidence'
+  | 'security_supporting_activity'
   | 'system_or_collection_event'
 
 export const PRIMARY_CHANGE_CLASSIFICATIONS = new Set<ChangeClassification>([
