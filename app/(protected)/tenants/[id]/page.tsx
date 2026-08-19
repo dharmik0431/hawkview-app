@@ -23,6 +23,7 @@ import ExchangePage from './components/sections/exchange-section'
 import SharePointPage from './components/sections/sharepoint-section'
 import { TenantBlade } from './components/tenant-blade'
 import { TenantOverview } from './components/tenant-overview'
+import TenantBreadcrumb from './components/tenant-breadcrumb'
 import TenantSettingsPage from './settings/page'
 import { deriveTenantWorkspaceDisplay, formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import {
@@ -3769,7 +3770,15 @@ export default function TenantDetailsPage() {
         //section === 'sharepoint-onedrive' ||
         //section === 'onedrive'
       ) {
-        return <SharePointPage bundle={bundle} />
+        return (
+          <SharePointPage
+            bundle={bundle}
+            onSync={runSync}
+            syncState={syncState}
+            serviceFreshnessText={serviceFreshnessText}
+            onOpenMobileNav={() => setIsMobileNavOpen(true)}
+          />
+        )
       }
 
       if (isMicrosoft) {
@@ -3780,6 +3789,9 @@ export default function TenantDetailsPage() {
               setSelectedMailbox={setSelectedMailbox}
               setSelectedRule={setSelectedRule}
               setSelectedGroup={setSelectedGroup}
+              onSync={runSync}
+              syncState={syncState}
+              onOpenMobileNav={() => setIsMobileNavOpen(true)}
             />
           )
 
@@ -4441,14 +4453,6 @@ export default function TenantDetailsPage() {
 
     return (
       <div className="space-y-2.5 w-full">
-        <Link
-          href="/tenants"
-          className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white transition"
-        >
-          <ChevronLeft className="h-3.5 w-3.5" />
-          Back to Tenants
-        </Link>
-
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-sm w-full">
           <div className="flex h-[calc(100vh-118px)] min-h-[520px]">
             <TenantBlade
@@ -4469,77 +4473,89 @@ export default function TenantDetailsPage() {
             />
 
             <section className="flex-1 bg-slate-50/60 dark:bg-slate-950/60 overflow-y-auto min-w-0">
-              <div className="p-4 sm:p-5 space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-3">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <button
-                      type="button"
-                      onClick={() => setIsMobileNavOpen(true)}
-                      className="md:hidden inline-flex items-center justify-center p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
-                      aria-label="Open tenant navigation"
-                      title="Open tenant navigation"
-                    >
-                      <Menu className="h-4 w-4" />
-                    </button>
-                    <div>
-                      <h1 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">
-                        {heading}
-                      </h1>
-                      <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                        {subheading}
-                      </p>
-                      {serviceFreshnessText && (
-                        <p
-                          className="mt-1 text-[11px] font-medium text-slate-500 dark:text-slate-400"
-                          title={serviceFreshness?.lastSuccessfulCollectionAt ?? undefined}
+              <div className="p-4 sm:p-5 space-y-3.5">
+                {/* Reusable Shared Workspace Breadcrumb Header */}
+                <TenantBreadcrumb
+                  tenantId={String(tenantId)}
+                  tenantName={tenant.name}
+                  section={section}
+                  heading={heading}
+                />
+
+                {section !== 'exchange' && section !== 'sharepoint' && (
+                  <>
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-3">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <button
+                          type="button"
+                          onClick={() => setIsMobileNavOpen(true)}
+                          className="md:hidden inline-flex items-center justify-center p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                          aria-label="Open tenant navigation"
+                          title="Open tenant navigation"
                         >
-                          Freshness: {serviceFreshnessText}
-                        </p>
-                      )}
+                          <Menu className="h-4 w-4" />
+                        </button>
+                        <div>
+                          <h1 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">
+                            {heading}
+                          </h1>
+                          <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                            {subheading}
+                          </p>
+                          {serviceFreshnessText && (
+                            <p
+                              className="mt-1 text-[11px] font-medium text-slate-500 dark:text-slate-400"
+                              title={serviceFreshness?.lastSuccessfulCollectionAt ?? undefined}
+                            >
+                              Freshness: {serviceFreshnessText}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={runSync}
+                          type="button"
+                          className="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 shadow-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition flex items-center gap-2 cursor-pointer"
+                          title={
+                            syncState === 'syncing'
+                              ? 'Syncing...'
+                              : syncState === 'success'
+                                ? 'Sync complete'
+                                : syncState === 'fail'
+                                  ? 'Sync failed'
+                                  : 'Refresh data'
+                          }
+                        >
+                          <RefreshCw
+                            className={cn(
+                              'h-3.5 w-3.5 text-slate-500 dark:text-slate-400',
+                              syncState === 'syncing' && 'animate-spin text-blue-600'
+                            )}
+                          />
+                          <span className="hidden sm:inline">
+                            {syncState === 'syncing'
+                              ? 'Syncing'
+                              : syncState === 'success'
+                                ? 'Synced'
+                                : 'Sync Now'}
+                          </span>
+                        </button>
+                      </div>
                     </div>
-                  </div>
 
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      onClick={runSync}
-                      type="button"
-                      className="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 shadow-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition flex items-center gap-2 cursor-pointer"
-                      title={
-                        syncState === 'syncing'
-                          ? 'Syncing...'
-                          : syncState === 'success'
-                            ? 'Sync complete'
-                            : syncState === 'fail'
-                              ? 'Sync failed'
-                              : 'Refresh data'
-                      }
-                    >
-                      <RefreshCw
-                        className={cn(
-                          'h-3.5 w-3.5 text-slate-500 dark:text-slate-400',
-                          syncState === 'syncing' && 'animate-spin text-blue-600'
-                        )}
-                      />
-                      <span className="hidden sm:inline">
-                        {syncState === 'syncing'
-                          ? 'Syncing'
-                          : syncState === 'success'
-                            ? 'Synced'
-                            : 'Sync Now'}
-                      </span>
-                    </button>
-                  </div>
-                </div>
-
-                {syncState === 'fail' && (
-                  <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700 dark:bg-red-950/40 dark:border-red-900/50 dark:text-red-300">
-                    Sync failed. Please try again.
-                  </div>
-                )}
-                {syncState === 'success' && (
-                  <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-xs text-green-700 dark:bg-green-950/40 dark:border-green-900/50 dark:text-green-300">
-                    Sync completed successfully.
-                  </div>
+                    {syncState === 'fail' && (
+                      <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700 dark:bg-red-950/40 dark:border-red-900/50 dark:text-red-300">
+                        Sync failed. Please try again.
+                      </div>
+                    )}
+                    {syncState === 'success' && (
+                      <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-xs text-green-700 dark:bg-green-950/40 dark:border-green-900/50 dark:text-green-300">
+                        Sync completed successfully.
+                      </div>
+                    )}
+                  </>
                 )}
 
                 {bundle && renderMainContent(bundle)}
