@@ -125,21 +125,14 @@ test('uses authoritative service-plan semantics without treating pending plans a
   assert.equal(row(staleLicenses, 'exchange').state, 'UNVERIFIED')
 })
 
-test('maps an explicit SharePoint administrative access denial to a permission blocker', () => {
-  const states = allResources.map((resource) => sync(resource))
-  states.splice(
-    states.findIndex((state) => state.resourceType === 'SHAREPOINT_SITES'),
-    1,
-    sync('SHAREPOINT_SITES', {
-      status: 'FAILED',
-      lastErrorCode: 'sharepoint_sites-sync-failed',
-      lastErrorMessage: 'Microsoft SharePoint site access metadata returned HTTP 403. Confirm the SharePoint application permission required for site-user metadata. HawkView retained the previous site inventory and will retry during a bounded scheduled collection.',
-    }),
-  )
-  const result = deriveCollectionReadiness(input({ syncStates: states }))
+test('keeps standard SharePoint Graph inventory ready while explicitly declaring access metadata uncollected', () => {
+  const result = deriveCollectionReadiness(input({
+    licenseServicePlans: [{ servicePlanName: 'SHAREPOINTENTERPRISE', provisioningStatus: 'Success' }],
+  }))
   const sharePoint = row(result, 'sharepoint_onedrive')
-  assert.equal(sharePoint.state, 'BLOCKED_PERMISSION')
-  assert.match(sharePoint.reason ?? '', /retained the previous site inventory/i)
+  assert.equal(sharePoint.state, 'READY')
+  assert.equal(sharePoint.capabilities?.[0]?.state, 'NOT_COLLECTED_LEAST_PRIVILEGE')
+  assert.equal(sharePoint.capabilities?.[0]?.reasonCode, 'NOT_COLLECTED_LEAST_PRIVILEGE')
 })
 
 test('missing consent and an unavailable Microsoft connection remain explicit without inventing next retry', () => {

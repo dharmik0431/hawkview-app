@@ -19,10 +19,6 @@ import {
   collectMailboxRules,
   partialSnapshot,
   readBoundedSharePointJson,
-  sharePointAdministrativeEnrichmentFailureMessage,
-  sharePointTenantHostFamilyFromInitialDomain,
-  trustedSharePointSiteUrl,
-  sharePointSitesSnapshotResult,
   SHAREPOINT_COLLECTION_LIMITS,
   shouldRunFastMailboxRuleRefresh,
   claimTenantUsersLease,
@@ -885,75 +881,6 @@ test('bounds Graph mailbox directory pagination before a baseline can advance', 
   )
 })
 
-test('does not attest to a complete SharePoint baseline when administrative enrichment fails', async () => {
-  const tokenFailure = sharePointSitesSnapshotResult([{ id: 'site-1' }], false)
-  const perSiteFailure = sharePointSitesSnapshotResult([{ id: 'site-1' }], false)
-  assert.equal(tokenFailure.completeness, 'partial_or_unknown')
-  assert.equal(perSiteFailure.completeness, 'partial_or_unknown')
-
-  let writes = 0
-  const service = new TenantSyncService({
-    $transaction: async (callback: any) => callback({
-      $executeRawUnsafe: async () => 1,
-      tenantEntraSnapshot: {
-        findUnique: async () => ({ payload: [{ id: 'old-site' }], observedAt: new Date(), organizationId: 'org-1' }),
-        upsert: async () => { writes += 1 },
-      },
-      changeEvidenceEvent: { createMany: async () => { writes += 1 } },
-    }),
-  } as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
-  await assert.rejects(
-    () => (service as any).saveSnapshot(
-      { id: 'tenant-1', organizationId: 'org-1' },
-      'SHAREPOINT_SITES',
-      tokenFailure
-    ),
-    /partial or unverified/
-  )
-  assert.equal(writes, 0)
-})
-
-test('converts SharePoint administrative-enrichment failures into bounded readiness diagnostics', () => {
-  assert.match(
-    sharePointAdministrativeEnrichmentFailureMessage('site users returned 403; access_token=do-not-show'),
-    /HTTP 403.*application permission.*retained the previous site inventory.*bounded scheduled/i,
-  )
-  assert.doesNotMatch(
-    sharePointAdministrativeEnrichmentFailureMessage('site users returned 403; access_token=do-not-show'),
-    /do-not-show/i,
-  )
-  assert.match(
-    sharePointAdministrativeEnrichmentFailureMessage('token acquisition failed'),
-    /administrative access token/i,
-  )
-})
-
-test('derives SharePoint token audiences only from the persisted initial tenant domain', () => {
-  assert.deepEqual(sharePointTenantHostFamilyFromInitialDomain('contoso.onmicrosoft.com'), [
-    'contoso.sharepoint.com', 'contoso-my.sharepoint.com',
-  ])
-  assert.deepEqual(sharePointTenantHostFamilyFromInitialDomain('CONTOSO.onmicrosoft.com'), [])
-  assert.deepEqual(sharePointTenantHostFamilyFromInitialDomain('evil.example.com'), [])
-  assert.deepEqual(sharePointTenantHostFamilyFromInitialDomain('contoso.sharepoint.com'), [])
-})
-
-test('rejects untrusted or ambiguous Graph site URLs before any SharePoint token is acquired', () => {
-  const allowedHosts = new Set(sharePointTenantHostFamilyFromInitialDomain('contoso.onmicrosoft.com'))
-  assert.equal(trustedSharePointSiteUrl('https://contoso.sharepoint.com/sites/finance', allowedHosts)?.hostname, 'contoso.sharepoint.com')
-  assert.equal(trustedSharePointSiteUrl('https://contoso-my.sharepoint.com/personal/alice', allowedHosts)?.hostname, 'contoso-my.sharepoint.com')
-  for (const hostile of [
-    'https://evil.sharepoint.com/sites/finance',
-    'https://contoso.sharepoint.com.evil.example/sites/finance',
-    'https://CONTOSO.sharepoint.com/sites/finance',
-    'https://contoso.sharepoint.com.:443/sites/finance',
-    'https://user:pass@contoso.sharepoint.com/sites/finance',
-    'http://contoso.sharepoint.com/sites/finance',
-    'https://contoso.sharepoint.com/%2fadmin',
-    'https://contoso.sharepoint.com/%5Cadmin',
-    'https://contoso.sharepoint.com\\@evil.example/sites/finance',
-  ]) assert.equal(trustedSharePointSiteUrl(hostile, allowedHosts), null)
-})
-
 test('enforces the SharePoint response byte ceiling from the actual stream, not Content-Length', async () => {
   const encoder = new TextEncoder()
   const streamResponse = (chunks: string[], contentLength?: string) => {
@@ -983,7 +910,7 @@ test('enforces the SharePoint response byte ceiling from the actual stream, not 
   await assert.rejects(() => readBoundedSharePointJson(declaredTooLarge.response, 12), /response-size limit/)
 })
 
-test('runs the real bounded SharePoint orchestration with isolated root and personal-site tokens', async () => {
+test('runs the real bounded SharePoint orchestration without SharePoint-resource tokens or site-user REST calls', async () => {
   const tokenHosts: string[] = []
   const saved: any[] = []
   const service = new TenantSyncService({
@@ -1011,7 +938,7 @@ test('runs the real bounded SharePoint orchestration with isolated root and pers
       connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' },
     }, 'graph-token', { ...SHAREPOINT_COLLECTION_LIMITS, sitePages: 1, sites: 5, siteUserPages: 1, siteUserRecords: 5, responseBytes: 1024 })
   } finally { globalThis.fetch = originalFetch }
-  assert.deepEqual(tokenHosts.sort(), ['contoso-my.sharepoint.com', 'contoso.sharepoint.com'])
+  assert.deepEqual(tokenHosts, [])
   assert.equal(saved.length, 1)
   assert.equal(saved[0]?.[1], 'SHAREPOINT_SITES')
 })
@@ -1039,7 +966,7 @@ test('real SharePoint pagination aborts before a snapshot baseline can advance',
   assert.equal(saved, false)
 })
 
-test('real syncSharePointSites enforces injected Graph, site, REST-page, and REST-record limits before save', async () => {
+test.skip('legacy REST site-user limit coverage is superseded by standard least-privilege mode', async () => {
   assert.deepEqual(SHAREPOINT_COLLECTION_LIMITS, {
     sitePages: 50, sites: 10_000, siteUserPages: 20, siteUserRecords: 50_000,
     responseBytes: 5 * 1024 * 1024, requestTimeoutMs: 20_000, collectorDeadlineMs: 10 * 60_000,
@@ -1122,7 +1049,7 @@ test('real syncSharePointSites streams root responses with byte limits and never
   assert.deepEqual(understatedOverflow, { cancelled: true, saves: 0 })
 })
 
-test('real syncSharePointSites aborts a timed-out request and preserves the prior baseline on token or REST failure', async () => {
+test.skip('legacy SharePoint-resource token failure coverage is superseded by standard least-privilege mode', async () => {
   const tenant: any = { id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1', connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' } }
   async function make(mode: 'timeout' | 'token' | 'rest') {
     let transactions = 0; const logs: string[] = []; const tokenHosts: string[] = []; let sawAbort = false
@@ -1193,6 +1120,87 @@ test('real syncSharePointSites aborts a timed-out request and preserves the prio
   assert.deepEqual(rest.persisted.evidence, [{ id: 'old-evidence' }])
   assert.deepEqual(rest.persisted.siteRelationships, [{ siteId: 'old-site', userId: 'old-user' }])
   for (const output of [rest.logs.join(' '), rest.failure]) assert.doesNotMatch(output, /never|sig=|Bearer\s+jwt/i)
+})
+
+test('a complete Graph SharePoint inventory advances after a historic REST-access 401 without any REST or SharePoint-token call', async () => {
+  const saves: any[] = []
+  const calls: string[] = []
+  const service = new TenantSyncService({} as never, {
+    getTenantSharePointAccessToken: async () => { throw new Error('must not request a SharePoint resource token') },
+  } as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+  ;(service as any).runSnapshotSync = async (_tenant: any, _resource: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async (...args: any[]) => { saves.push(args) }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input); calls.push(url)
+    if (url.includes('/sites/root')) return new Response(JSON.stringify({ id: 'root', displayName: 'Root', webUrl: 'https://contoso.sharepoint.com' }))
+    if (url.includes('/v1.0/sites?')) return new Response(JSON.stringify({ value: [] }))
+    if (url.includes('/drive?')) return new Response(JSON.stringify({ quota: { used: 1 } }))
+    throw new Error(`unexpected request ${url}`)
+  }) as typeof fetch
+  try {
+    await (service as any).syncSharePointSites({ id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1' }, 'graph-token', { ...SHAREPOINT_COLLECTION_LIMITS, sitePages: 1, sites: 2, responseBytes: 1024 })
+  } finally { globalThis.fetch = originalFetch }
+  assert.equal(saves.length, 1)
+  assert.equal(saves[0]?.[2]?.completeness, 'authoritative_complete')
+  assert.equal(saves[0]?.[2]?.rows?.[0]?.siteAccessMetadataState, 'NOT_COLLECTED_LEAST_PRIVILEGE')
+  assert.equal(saves[0]?.[2]?.rows?.[0]?.externalSharing, null)
+  assert.equal(calls.some((url) => /_api\/web\/siteusers|\.sharepoint\.com\/\.default/i.test(url)), false)
+})
+
+test('retires historic privileged SharePoint access fields without fabricating evidence, while preserving real site changes', async () => {
+  let snapshot: any = {
+    organizationId: 'org-1',
+    observedAt: new Date('2026-08-18T08:00:00.000Z'),
+    payload: [{
+      id: 'site-1', webUrl: 'https://contoso.sharepoint.com/sites/one', displayName: 'One',
+      externalSharing: true, guestsCount: 4, sharingCapability: 'ExternalUserSharingOnly',
+      owners: [{ id: 'old-owner' }], siteCollectionAdministrator: 'old-admin', accessMetadata: { privileged: true },
+    }],
+  }
+  const evidenceStore: any[] = [{
+    id: 'historic-evidence', source: 'SNAPSHOT_DIFFERENCE', customerTenantId: 'tenant-1',
+    beforeState: { externalSharing: true }, afterState: { externalSharing: false },
+  }]
+  const historicEvidence = structuredClone(evidenceStore)
+  const prisma: any = {
+    $transaction: async (work: any) => work({
+      $executeRawUnsafe: async () => undefined,
+      tenantEntraSnapshot: {
+        findUnique: async () => snapshot,
+        upsert: async (input: any) => {
+          snapshot = {
+            organizationId: 'org-1',
+            observedAt: input.update.observedAt,
+            payload: input.update.payload,
+          }
+        },
+      },
+      changeEvidenceEvent: {
+        createMany: async (input: any) => evidenceStore.push(...input.data),
+        findMany: async () => structuredClone(evidenceStore),
+      },
+    }),
+  }
+  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+  const tenant = { id: 'tenant-1', organizationId: 'org-1' }
+  const graphOnlyRow = {
+    id: 'site-1', webUrl: 'https://contoso.sharepoint.com/sites/one', displayName: 'One',
+    externalSharing: null, guestsCount: null, sharingCapability: null,
+    owners: null, siteCollectionAdministrator: null, accessMetadata: null,
+    siteAccessMetadataState: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+  }
+
+  await (service as any).saveSnapshot(tenant, 'SHAREPOINT_SITES', authoritativeSnapshot([graphOnlyRow]))
+  assert.deepEqual(await (prisma.$transaction as any)(async (tx: any) => tx.changeEvidenceEvent.findMany()), historicEvidence, 'existing evidence remains byte/record-identical')
+  assert.equal(snapshot.payload[0].externalSharing, null)
+  assert.equal(snapshot.payload[0].guestsCount, null)
+  assert.equal(snapshot.payload[0].owners, null)
+  assert.equal(snapshot.payload[0].accessMetadata, null)
+
+  await (service as any).saveSnapshot(tenant, 'SHAREPOINT_SITES', authoritativeSnapshot([{ ...graphOnlyRow, displayName: 'Renamed site' }]))
+  assert.equal(evidenceStore.length, 2, 'supported Graph site changes remain evidence')
+  assert.deepEqual(evidenceStore[1]?.changedFields, ['displayName'])
 })
 
 test('real Exchange Admin collector projects secret-bearing non-2xx bodies before throwing', async () => {

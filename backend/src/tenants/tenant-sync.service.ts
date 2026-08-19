@@ -434,93 +434,10 @@ export const partialSnapshot = (rows: unknown[]): SnapshotCollectionResult => ({
 })
 
 /**
- * Site access metadata is part of the compared SHAREPOINT_SITES state.  A
- * Graph inventory page by itself is therefore not enough to attest to a
- * complete site snapshot when its SharePoint administrative enrichment did
- * not finish.  Callers must retain the previous baseline in that case.
+ * Standard HawkView SharePoint collection is Graph-only.  Site-user and SCA
+ * metadata would require a SharePoint resource token and broad site control,
+ * so it is deliberately not part of the authoritative inventory contract.
  */
-export function sharePointSitesSnapshotResult(
-  rows: unknown[],
-  administrativeEnrichmentComplete: boolean
-): SnapshotCollectionResult {
-  return administrativeEnrichmentComplete
-    ? authoritativeSnapshot(rows)
-    : partialSnapshot(rows)
-}
-
-/**
- * The compared SharePoint site state includes administrative access metadata.
- * Do not advance the baseline when that metadata is incomplete, but do retain
- * an actionable, sanitized reason instead of exposing the generic snapshot
- * safety assertion to a tenant administrator.
- */
-export function sharePointAdministrativeEnrichmentFailureMessage(
-  failure: unknown
-) {
-  const diagnostic = sanitizeGraphErrorField(
-    typeof failure === 'string' ? failure : '',
-    160
-  )
-  const status = diagnostic?.match(/\b(401|403)\b/)?.[1]
-  if (status) {
-    return `Microsoft SharePoint site access metadata returned HTTP ${status}. Confirm the SharePoint application permission required for site-user metadata. HawkView retained the previous site inventory and will retry during a bounded scheduled collection.`
-  }
-  if (/token|credential|acquire/i.test(diagnostic ?? '')) {
-    return 'HawkView could not acquire the SharePoint administrative access token required for site-user metadata. HawkView retained the previous site inventory and will retry during a bounded scheduled collection.'
-  }
-  if (/invalid sharepoint site url|tenant host|initial microsoft tenant domain/i.test(diagnostic ?? '')) {
-    return 'HawkView could not verify the tenant SharePoint host needed for administrative metadata collection. HawkView retained the previous site inventory and will retry after verified tenant domain information is available.'
-  }
-  return 'Microsoft SharePoint site access metadata could not be collected completely. HawkView retained the previous site inventory and will retry during a bounded scheduled collection.'
-}
-
-/** Only the root SharePoint tenant host and its paired personal-site host are
- * valid token audiences for a tenant. Graph site URLs must never make us mint
- * a token for an arbitrary hostname. */
-export function sharePointTenantHostFamilyFromInitialDomain(initialDomain: unknown) {
-  // This is intentionally derived from HawkView's persisted, verified tenant
-  // domain state. A Graph site webUrl is inventory data, not an authority to
-  // mint a SharePoint token for its hostname.
-  if (typeof initialDomain !== 'string' || initialDomain !== initialDomain.trim()) return [] as string[]
-  const match = /^([a-z0-9-]+)\.onmicrosoft\.com$/.exec(initialDomain)
-  if (!match || !match[1] || match[1].includes('--')) return [] as string[]
-  const tenantPrefix = match[1]
-  return [`${tenantPrefix}.sharepoint.com`, `${tenantPrefix}-my.sharepoint.com`]
-}
-
-/**
- * Validate a Graph-returned site URL only after the token audience family has
- * been established from the persisted initial onmicrosoft.com domain. The
- * strict raw form rejects browser/URL parser ambiguities (case folding,
- * ports, credentials, encoded separators, query/fragment, and host suffixes).
- */
-export function trustedSharePointSiteUrl(
-  value: unknown,
-  allowedHosts: ReadonlySet<string>,
-) {
-  if (typeof value !== 'string' || value !== value.trim() || value.length > 2_048) return null
-  if (/[\\\\\u0000-\u001f\u007f]|%(?:2f|5c)/i.test(value)) return null
-  const rawMatch = /^https:\/\/([a-z0-9-]+\.sharepoint\.com)(?:\/|$)/.exec(value)
-  if (!rawMatch || !allowedHosts.has(rawMatch[1])) return null
-  try {
-    const url = new URL(value)
-    if (
-      url.protocol !== 'https:' ||
-      url.hostname !== rawMatch[1] ||
-      url.host !== rawMatch[1] ||
-      url.username ||
-      url.password ||
-      url.port ||
-      url.search ||
-      url.hash ||
-      !allowedHosts.has(url.hostname)
-    ) return null
-    url.pathname = `${url.pathname.replace(/\/+$/, '')}/`
-    return url
-  } catch {
-    return null
-  }
-}
 
 /**
  * Group definitions and their owner/member relationship refreshes have
@@ -1567,12 +1484,12 @@ export class TenantSyncService {
     const hasSnapshot = (resource: string) => snapshotByResource.has(resource as any)
     const correlationId = (message: string | null) =>
       message?.match(/(?:request|correlation)[^0-9a-f]*([0-9a-f]{8}-[0-9a-f-]{27,})/i)?.[1] ?? null
-    const resources: Array<{ key: string; resource: string; source: string; endpoint: string; unsupported?: boolean }> = [
+    const resources: Array<{ key: string; resource: string; source: string; endpoint: string; unsupported?: boolean; capability?: 'NOT_COLLECTED_LEAST_PRIVILEGE' }> = [
       { key: 'exchange.mailboxes.inventory', resource: 'EXCHANGE_MAILBOXES', source: 'Microsoft Graph', endpoint: '/users' },
       { key: 'exchange.mailboxes.settings', resource: 'EXCHANGE_MAILBOX_SETTINGS', source: 'Microsoft Graph', endpoint: '/users/{id}/mailboxSettings' },
       { key: 'exchange.mailboxes.usage', resource: 'EXCHANGE_MAILBOX_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getMailboxUsageDetail' },
       { key: 'sharepoint.sites.inventory', resource: 'SHAREPOINT_SITES', source: 'Microsoft Graph', endpoint: '/sites?search=*' },
-      { key: 'sharepoint.sites.access', resource: 'SHAREPOINT_SITES', source: 'SharePoint REST', endpoint: '/_api/web/siteusers' },
+      { key: 'sharepoint.sites.access', resource: 'SHAREPOINT_SITES', source: 'HawkView standard least-privilege mode', endpoint: 'not-collected-in-standard-mode', capability: 'NOT_COLLECTED_LEAST_PRIVILEGE' },
       { key: 'sharepoint.tenant.settings', resource: 'SHAREPOINT_SETTINGS', source: 'Microsoft Graph', endpoint: '/admin/sharepoint/settings' },
       { key: 'sharepoint.usage', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
       { key: 'sharepoint.activity', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
@@ -3673,51 +3590,7 @@ export class TenantSyncService {
             .map((site) => [site.id, site])
         ).values()
       )
-      // Never derive an OAuth audience from site inventory. The initial
-      // onmicrosoft.com domain is recorded from the tenant's verified domain
-      // configuration and is the only source used to establish this public
-      // cloud SharePoint host pair.
-      const initialDomain = await this.prisma.tenantDomain.findFirst({
-        where: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-          isInitial: true,
-        },
-        select: { name: true },
-      })
-      const allowedSharePointHosts = new Set(
-        sharePointTenantHostFamilyFromInitialDomain(initialDomain?.name),
-      )
-      const sharePointTokens = new Map<string, Promise<string>>()
-      let administrativeEnrichmentFailure: string | null = null
-      if (!tenant.connection || !allowedSharePointHosts.size) {
-        administrativeEnrichmentFailure =
-          'HawkView has not recorded a verified initial Microsoft tenant domain for SharePoint administrative access.'
-      }
-      const accessTokenForSite = async (webUrl: unknown) => {
-        const siteUrl = trustedSharePointSiteUrl(webUrl, allowedSharePointHosts)
-        const siteHost = siteUrl?.hostname ?? null
-        if (!siteHost || !allowedSharePointHosts.has(siteHost) || !tenant.connection) {
-          throw new Error('Invalid SharePoint site URL.')
-        }
-        let token = sharePointTokens.get(siteHost)
-        if (!token) {
-          token = this.microsoftConsent.getTenantSharePointAccessToken({
-            microsoftTenantId: tenant.microsoftTenantId,
-            connectionMode:
-              tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
-                ? 'CUSTOMER_MANAGED'
-                : 'HAWKVIEW_MANAGED',
-            clientId: tenant.connection.clientId,
-            credentialReference: tenant.connection.credentialReference,
-            sharePointHost: siteHost,
-          })
-          sharePointTokens.set(siteHost, token)
-        }
-        return token
-      }
       const enrichedSites: any[] = []
-      let administrativeEnrichmentComplete = !administrativeEnrichmentFailure
       for (let index = 0; index < uniqueSites.length; index += 8) {
         if (Date.now() >= deadlineAt) {
           throw new Error('SharePoint site inventory reached a bounded collection limit before completion.')
@@ -3745,55 +3618,20 @@ export class TenantSyncService {
             const drive = driveResponse.ok
               ? ((await readBoundedSharePointJson(driveResponse, limits.responseBytes)) as any)
               : null
-            let access: {
-              externalSharing: boolean | null
-              guestsCount: number | null
-              sharingCapability: string | number | null
-              collectionError?: string | null
-            }
-            try {
-              const sharePointAccessToken = await accessTokenForSite(site.webUrl)
-              access = await this.collectSharePointSiteAccess(
-                site.webUrl,
-                sharePointAccessToken,
-                allowedSharePointHosts,
-                deadlineAt,
-                limits,
-              )
-            } catch (error) {
-              access = {
-                externalSharing: null,
-                guestsCount: null,
-                sharingCapability: null,
-                collectionError: safeErrorMessage(
-                  error,
-                  'SharePoint administrative access token unavailable.',
-                ),
-              }
-            }
-            if (access.collectionError) {
-              administrativeEnrichmentComplete = false
-              administrativeEnrichmentFailure ??= access.collectionError
-              this.logger.warn(
-                `SharePoint access metadata incomplete for tenant ${tenant.id}, site ${String(site.id)}: ${access.collectionError}`
-              )
-            }
             return {
               ...site,
               driveQuota: drive?.quota ?? null,
-              ...access,
+              // Standard mode intentionally avoids SharePoint-resource
+              // access enrichment. Never carry old privileged access
+              // observations forward as current.
+              externalSharing: null,
+              guestsCount: null,
+              sharingCapability: null,
+              siteAccessMetadataState: 'NOT_COLLECTED_LEAST_PRIVILEGE',
             }
           })
         )
         enrichedSites.push(...batchRows)
-      }
-
-      if (!administrativeEnrichmentComplete) {
-        throw new Error(
-          sharePointAdministrativeEnrichmentFailureMessage(
-            administrativeEnrichmentFailure
-          )
-        )
       }
 
       await this.saveSnapshot(
@@ -3802,97 +3640,6 @@ export class TenantSyncService {
         authoritativeSnapshot(enrichedSites)
       )
     })
-  }
-
-  private async collectSharePointSiteAccess(
-    webUrl: unknown,
-    accessToken: string,
-    allowedHosts: ReadonlySet<string>,
-    deadlineAt: number,
-    limits: typeof SHAREPOINT_COLLECTION_LIMITS = SHAREPOINT_COLLECTION_LIMITS,
-  ) {
-    const siteUrl = trustedSharePointSiteUrl(webUrl, allowedHosts)
-    if (!siteUrl) {
-      return {
-        externalSharing: null,
-        guestsCount: null,
-        sharingCapability: null,
-        collectionError: 'Invalid SharePoint site URL.',
-      }
-    }
-
-    const headers = {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json;odata=nometadata',
-    }
-    let externalSharing: boolean | null = null
-    let sharingCapability: string | number | null = null
-    let guestsCount: number | null = null
-    const errors: string[] = []
-
-    try {
-      let nextUrl = new URL(
-        '_api/web/siteusers?$select=Id,LoginName,Email,Title,PrincipalType,IsShareByEmailGuestUser&$top=5000',
-        siteUrl
-      ).toString()
-      const guestIds = new Set<string>()
-      const seenPages = new Set<string>()
-      let pageCount = 0
-      let recordCount = 0
-      while (nextUrl) {
-        if (++pageCount > limits.siteUserPages || Date.now() >= deadlineAt) throw new Error('SharePoint site-user metadata reached a bounded collection limit before completion.')
-        const pageUrl = new URL(nextUrl, siteUrl)
-        if (pageUrl.origin !== siteUrl.origin) {
-          throw new Error('SharePoint returned an invalid site-users link.')
-        }
-        if (seenPages.has(pageUrl.toString())) throw new Error('SharePoint returned a repeated site-users page.')
-        seenPages.add(pageUrl.toString())
-        const response = await fetch(pageUrl, {
-          headers,
-          signal: AbortSignal.timeout(sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs)),
-        })
-        if (!response.ok) {
-          throw new Error(`site users returned ${response.status}`)
-        }
-        const body = (await readBoundedSharePointJson(response, limits.responseBytes)) as any
-        const users = Array.isArray(body?.value)
-          ? body.value
-          : Array.isArray(body?.d?.results)
-            ? body.d.results
-            : []
-        recordCount += users.length
-        if (recordCount > limits.siteUserRecords) throw new Error('SharePoint site-user metadata reached a bounded record limit before completion.')
-        for (const user of users) {
-          const loginName = String(user?.LoginName ?? '')
-          const normalizedLogin = loginName.toLowerCase()
-          const isGuest =
-            user?.IsShareByEmailGuestUser === true ||
-            normalizedLogin.includes('#ext#') ||
-            normalizedLogin.includes('urn:spo:guest')
-          if (!isGuest) continue
-          guestIds.add(String(user?.Id ?? loginName).toLowerCase())
-          if (guestIds.size > limits.siteUserRecords) throw new Error('SharePoint site-user metadata reached a bounded record limit before completion.')
-        }
-        nextUrl =
-          body?.['@odata.nextLink'] ?? body?.['odata.nextLink'] ?? body?.d?.__next ?? ''
-      }
-      guestsCount = guestIds.size
-      // This value describes observed external access on the site. The
-      // tenant-admin SharingCapability setting is not exposed by `_api/site`.
-      externalSharing = guestsCount > 0
-      sharingCapability = externalSharing
-        ? 'External principals present'
-        : 'No external principals present'
-    } catch (error) {
-      errors.push(error instanceof Error ? error.message : 'site users failed')
-    }
-
-    return {
-      externalSharing,
-      guestsCount,
-      sharingCapability,
-      collectionError: errors.length > 0 ? errors.join('; ') : null,
-    }
   }
 
   private async syncSharePointSettings(
@@ -4634,6 +4381,17 @@ export class TenantSyncService {
         isStale: fallback.isStale,
       }
     }
+    const siteAccessNotCollected = (value: unknown = null) => ({
+      ...collectionState('sharepoint.sites.access', value),
+      state: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+      reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+      message:
+        'Standard least-privilege mode does not collect current site-user, site collection administrator, sharing-member, or per-site permission metadata.',
+      source: 'HawkView standard least-privilege mode',
+      endpoint: null,
+      correlationId: null,
+      isStale: false,
+    })
     const userSyncState = syncStateByResource.get('USERS')
     const licenseSyncState = syncStateByResource.get('LICENSES')
     const domainSyncState = syncStateByResource.get('DOMAINS')
@@ -5135,7 +4893,7 @@ export class TenantSyncService {
               'sharepoint.sites.inventory',
               sharePointSites.length
             ),
-            access: collectionState('sharepoint.sites.access', null),
+            access: siteAccessNotCollected(),
             tenantSettings: collectionState(
               'sharepoint.tenant.settings',
               sharePointSettings ?? null
@@ -5290,14 +5048,10 @@ export class TenantSyncService {
               name: site.displayName || site.name || 'Unnamed SharePoint site',
               url: site.webUrl || '',
               type: getSharePointSiteType(site, usage),
-              externalSharing:
-                typeof site.externalSharing === 'boolean'
-                  ? site.externalSharing
-                  : null,
-              guestsCount:
-                typeof site.guestsCount === 'number'
-                  ? site.guestsCount
-                  : null,
+              // Historical full-control enrichment remains historical only.
+              // Never present it as current in standard least-privilege mode.
+              externalSharing: null,
+              guestsCount: null,
               owners: null,
               hasReportedOwner: [
                 usage?.['Owner Principal Name'],
@@ -5332,14 +5086,8 @@ export class TenantSyncService {
                     ? 'inactive'
                     : 'active',
               collection: {
-                sharing:
-                  typeof site.externalSharing === 'boolean'
-                    ? { ...collectionState('sharepoint.sites.access'), value: site.externalSharing }
-                    : collectionState('sharepoint.sites.access'),
-                guests:
-                  typeof site.guestsCount === 'number'
-                    ? { ...collectionState('sharepoint.sites.access'), value: site.guestsCount }
-                    : collectionState('sharepoint.sites.access'),
+                sharing: siteAccessNotCollected(),
+                guests: siteAccessNotCollected(),
                 storage:
                   reportStorageUsed !== null || reportStorageAllocated !== null
                     ? { ...collectionState('sharepoint.usage'), value: reportStorageUsed ?? reportStorageAllocated }

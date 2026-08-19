@@ -987,6 +987,13 @@ export default function TenantSettingsPage() {
                     </dl>
                     {readinessDiagnostic(workload.reasonCode, workload.reason) && <p className="mt-3 break-words text-sm text-amber-800 dark:text-amber-200">{readinessDiagnostic(workload.reasonCode, workload.reason)}</p>}
                     {workload.exchangeRbac && <p className="mt-3 text-sm text-muted-foreground">Exchange Admin API RBAC: <span className="font-medium text-foreground">{readinessLabel(workload.exchangeRbac.status)}</span> — {workload.exchangeRbac.reason}</p>}
+                    {workload.capabilities.length > 0 && (
+                      <div className="mt-3 rounded-lg border border-sky-200 bg-sky-50 p-3 text-sm text-sky-950 dark:border-sky-900 dark:bg-sky-950/30 dark:text-sky-100">
+                        {workload.capabilities.map((capability) => (
+                          <p key={capability.key}><span className="font-medium">{capability.label}:</span> {capability.message}</p>
+                        ))}
+                      </div>
+                    )}
                     {workload.components.length > 0 && (
                       <details className="mt-3 text-sm">
                         <summary className="cursor-pointer font-medium text-foreground">Component status ({workload.components.length})</summary>

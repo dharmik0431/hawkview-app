@@ -113,7 +113,7 @@ export const SNAPSHOT_DIFFERENCE_SPECS: Readonly<Record<string, SnapshotDifferen
   SECURITY_DEFAULTS: { workload: 'Microsoft Entra ID', category: 'Conditional Access', severity: 'High', operationName: 'Security Defaults changed', microsoftSource: 'Microsoft Graph /policies/identitySecurityDefaultsEnforcementPolicy', identifierFields: ['id'], trackedFields: ['isEnabled'] },
   // `lastModifiedDateTime` is content activity, not an administrative change.
   // It must not turn an ordinary document edit into a What Changed event.
-  SHAREPOINT_SITES: { workload: 'SharePoint and OneDrive', category: 'SharePoint', severity: 'Medium', operationName: 'SharePoint site configuration changed', microsoftSource: 'Microsoft Graph /sites', identifierFields: ['id', 'webUrl'], trackedFields: ['displayName', 'webUrl', 'createdDateTime', 'siteCollection', 'externalSharing', 'guestsCount', 'sharingCapability'] },
+  SHAREPOINT_SITES: { workload: 'SharePoint and OneDrive', category: 'SharePoint', severity: 'Medium', operationName: 'SharePoint site configuration changed', microsoftSource: 'Microsoft Graph /sites', identifierFields: ['id', 'webUrl'], trackedFields: ['displayName', 'webUrl', 'createdDateTime', 'siteCollection'] },
   SHAREPOINT_SETTINGS: { workload: 'SharePoint and OneDrive', category: 'SharePoint', severity: 'High', operationName: 'SharePoint tenant sharing setting changed', microsoftSource: 'Microsoft Graph /admin/sharepoint/settings', identifierFields: ['id'], trackedFields: ['isLegacyAuthProtocolsEnabled', 'isUnmanagedSyncAppForTenantRestricted', 'sharingCapability', 'oneDriveForBusinessRestrictions'] },
   // The current verifiedDomains collector deliberately retains only the
   // Organization.Read.All shape. Full domain attributes are a separately
