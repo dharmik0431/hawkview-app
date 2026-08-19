@@ -65,6 +65,59 @@ export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
   collectorDeadlineMs: 10 * 60_000,
 })
 
+export const NON_PREMIUM_AUTH_REGISTRATION_ERROR_CODE =
+  'Authentication_RequestFromNonPremiumTenantOrB2CTenant'
+
+export type AuthRegistrationFallbackLimits = {
+  batchSize: number
+  maxUserPages: number
+  maxUsers: number
+  maxBatches: number
+  responseBytes: number
+  requestTimeoutMs: number
+  collectorDeadlineMs: number
+}
+
+/**
+ * The non-premium fallback is intentionally bounded below the tenant-wide
+ * scheduler lease. Microsoft Graph JSON batches accept at most 20 requests,
+ * so 20,000 users is a hard 1,000-request ceiling rather than an unbounded
+ * per-user loop.
+ */
+export const AUTH_REGISTRATION_FALLBACK_LIMITS: Readonly<AuthRegistrationFallbackLimits> = Object.freeze({
+  batchSize: 20,
+  maxUserPages: 50,
+  maxUsers: 20_000,
+  maxBatches: 1_000,
+  responseBytes: 2 * 1024 * 1024,
+  requestTimeoutMs: 30_000,
+  collectorDeadlineMs: 10 * 60_000,
+})
+
+function assertAuthRegistrationFallbackLimits(
+  limits: Readonly<AuthRegistrationFallbackLimits>,
+) {
+  const positiveIntegers = [
+    limits.batchSize,
+    limits.maxUserPages,
+    limits.maxUsers,
+    limits.maxBatches,
+    limits.responseBytes,
+    limits.requestTimeoutMs,
+    limits.collectorDeadlineMs,
+  ]
+  if (
+    positiveIntegers.some(
+      (value) => !Number.isSafeInteger(value) || value <= 0,
+    ) ||
+    limits.batchSize > 20
+  ) {
+    throw new Error(
+      'Microsoft per-user authentication-method synchronization has an invalid bounded collection configuration.',
+    )
+  }
+}
+
 /**
  * The only durable tenant-wide lease used by the scheduler and manual sync.
  * Keeping this compare-and-set in one helper makes a test exercise the exact
@@ -677,16 +730,104 @@ function boundedCollectionFailure(message: string) {
   return /bounded collection|record limit|page limit|response-size|wall-clock deadline|capacity/i.test(message)
 }
 
-async function describeGraphError(response: Response) {
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+export function graphErrorCodeFromBody(body: string) {
+  if (!body || body.length > 32 * 1024) return null
   try {
-    // Project before the error is thrown, logged, or persisted.  Microsoft
-    // error bodies can echo a request URL or credential-shaped diagnostic.
-    const body = await response.text()
-    const safe = sanitizeHealthMessage(body, '')
-    return safe ? ` [${safe}]` : ''
+    const parsed = JSON.parse(body) as unknown
+    if (!plainRecord(parsed) || !plainRecord(parsed.error)) return null
+    const code = parsed.error.code
+    if (typeof code !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(code)) {
+      return null
+    }
+    return code
   } catch {
-    return ''
+    return null
   }
+}
+
+async function readBoundedResponseText(
+  response: Response,
+  maximumBytes: number,
+) {
+  const declaredLength = Number(response.headers.get('content-length') ?? '0')
+  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
+    throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
+  }
+  if (!response.body) {
+    const text = await response.text()
+    if (new TextEncoder().encode(text).byteLength > maximumBytes) {
+      throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
+    }
+    return text
+  }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > maximumBytes) {
+        await reader.cancel('Microsoft Graph error response exceeded bounded limit')
+        throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return new TextDecoder().decode(bytes)
+}
+
+export async function readGraphOperationalError(
+  response: Response,
+  maximumBytes = 32 * 1024,
+) {
+  try {
+    const body = await readBoundedResponseText(response, maximumBytes)
+    const code = graphErrorCodeFromBody(body)
+    const projected = sanitizeHealthMessage(body, '')
+    const safe = code && (!projected || projected.includes('[REDACTED STRUCTURED ERROR]'))
+      ? JSON.stringify({ code })
+      : projected
+    return { code, suffix: safe ? ` [${safe}]` : '' }
+  } catch (error) {
+    const safe = safeErrorMessage(
+      error,
+      'Microsoft Graph returned an unreadable error response.',
+      300,
+    )
+    return { code: null, suffix: safe ? ` [${safe}]` : '' }
+  }
+}
+
+export class MicrosoftGraphCollectionError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly graphErrorCode: string | null,
+  ) {
+    super(message)
+    this.name = 'MicrosoftGraphCollectionError'
+  }
+}
+
+async function describeGraphError(response: Response) {
+  return (await readGraphOperationalError(response)).suffix
 }
 
 export function assertSharePointResponseSize(
@@ -2170,34 +2311,49 @@ export class TenantSyncService {
     initialUrl: string
   ) {
     return this.runSnapshotSync(tenant, resourceType, async () => {
-      const rows: unknown[] = []
-      let nextUrl = initialUrl
-      while (nextUrl) {
-        if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
-          throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
-        }
-        const response = await fetch(nextUrl, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(30_000),
-        })
-        if (!response.ok) {
-          const graphRequestId = response.headers.get('request-id')
-          const graphError = await describeGraphError(response)
-          throw new Error(
-            `Microsoft ${resourceType.toLowerCase()} synchronization returned ${response.status}${
-              graphRequestId ? ` (request ${graphRequestId})` : ''
-            }${graphError}.`
-          )
-        }
-        const page = (await response.json()) as GraphCollectionPage
-        rows.push(...(page.value ?? []))
-        nextUrl = page['@odata.nextLink'] ?? ''
-      }
+      const rows = await this.collectEntraCollection(
+        accessToken,
+        resourceType,
+        initialUrl,
+      )
       await this.saveSnapshot(tenant, resourceType, authoritativeSnapshot(rows))
     })
+  }
+
+  private async collectEntraCollection(
+    accessToken: string,
+    resourceType: EntraSnapshotResource,
+    initialUrl: string,
+  ) {
+    const rows: unknown[] = []
+    let nextUrl = initialUrl
+    while (nextUrl) {
+      if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
+        throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
+      }
+      const response = await fetch(nextUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!response.ok) {
+        const graphRequestId = response.headers.get('request-id')
+        const graphError = await readGraphOperationalError(response)
+        throw new MicrosoftGraphCollectionError(
+          `Microsoft ${resourceType.toLowerCase()} synchronization returned ${response.status}${
+            graphRequestId ? ` (request ${graphRequestId})` : ''
+          }${graphError.suffix}.`,
+          response.status,
+          graphError.code,
+        )
+      }
+      const page = (await response.json()) as GraphCollectionPage
+      rows.push(...(page.value ?? []))
+      nextUrl = page['@odata.nextLink'] ?? ''
+    }
+    return rows
   }
 
   private async syncSecurityDefaults(
@@ -2241,116 +2397,257 @@ export class TenantSyncService {
     tenant: { id: string; organizationId: string },
     accessToken: string
   ) {
-    try {
-      return await this.syncEntraCollection(
-        tenant,
-        accessToken,
-        'AUTH_REGISTRATIONS',
-        'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails'
-      )
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      if (
-        !message.includes(
-          'Authentication_RequestFromNonPremiumTenantOrB2CTenant'
-        )
-      ) {
-        throw error
-      }
-      this.logger.log(
-        `Tenant ${tenant.id} does not have premium MFA reporting; using the per-user authentication-method fallback.`
-      )
-      return this.syncPerUserAuthenticationMethods(tenant, accessToken)
-    }
-  }
-
-  private async syncPerUserAuthenticationMethods(
-    tenant: { id: string; organizationId: string },
-    accessToken: string
-  ) {
     return this.runSnapshotSync(tenant, 'AUTH_REGISTRATIONS', async () => {
-      const users = await this.prisma.directoryUser.findMany({
-        where: { customerTenantId: tenant.id, deletedAt: null },
-        select: { microsoftUserId: true, userPrincipalName: true },
-        orderBy: { microsoftUserId: 'asc' },
-      })
-      const registrations: Array<Record<string, unknown>> = []
-      const methodLabels: Record<string, string> = {
-        '#microsoft.graph.fido2AuthenticationMethod':
-          'FIDO2 security key or passkey',
-        '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod':
-          'Microsoft Authenticator',
-        '#microsoft.graph.phoneAuthenticationMethod': 'Phone',
-        '#microsoft.graph.softwareOathAuthenticationMethod':
-          'Software OATH token',
-        '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod':
-          'Windows Hello for Business',
-        '#microsoft.graph.temporaryAccessPassAuthenticationMethod':
-          'Temporary Access Pass',
-        '#microsoft.graph.platformCredentialAuthenticationMethod':
-          'Platform credential',
-        '#microsoft.graph.hardwareOathAuthenticationMethod':
-          'Hardware OATH token',
-      }
-
-      for (let offset = 0; offset < users.length; offset += 20) {
-        const batchUsers = users.slice(offset, offset + 20)
-        const response = await fetch(
-          'https://graph.microsoft.com/v1.0/$batch',
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              Accept: 'application/json',
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              requests: batchUsers.map((user, index) => ({
-                id: String(index + 1),
-                method: 'GET',
-                url: `/users/${encodeURIComponent(user.microsoftUserId)}/authentication/methods`,
-              })),
-            }),
-            signal: AbortSignal.timeout(30_000),
-          }
+      let registrations: unknown[]
+      try {
+        registrations = await this.collectEntraCollection(
+          accessToken,
+          'AUTH_REGISTRATIONS',
+          'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails',
         )
-        if (!response.ok) {
-          const graphError = await describeGraphError(response)
-          throw new Error(
-            `Microsoft per-user authentication-method synchronization returned ${response.status}${graphError}.`
-          )
+      } catch (error) {
+        if (
+          !(error instanceof MicrosoftGraphCollectionError) ||
+          error.graphErrorCode !== NON_PREMIUM_AUTH_REGISTRATION_ERROR_CODE
+        ) {
+          throw error
         }
-        const batch = (await response.json()) as GraphBatchResponse
-        const responsesById = new Map(
-          (batch.responses ?? []).map((item) => [item.id, item])
+        this.logger.log(
+          `Tenant ${tenant.id} does not have premium MFA reporting; using the per-user authentication-method fallback.`,
         )
-        batchUsers.forEach((user, index) => {
-          const item = responsesById.get(String(index + 1))
-          if (item?.status !== 200) {
-            throw new Error(
-              `Microsoft per-user authentication-method synchronization returned ${item?.status ?? 'an invalid response'}. Confirm UserAuthenticationMethod.Read.All application permission.`
-            )
-          }
-          const methods = (item.body?.value ?? [])
-            .map((method) => method['@odata.type'])
-            .filter((type): type is string => typeof type === 'string')
-          const registeredMfaMethods = [
-            ...new Set(
-              methods.map((type) => methodLabels[type]).filter(Boolean)
-            ),
-          ]
-          registrations.push({
-            id: user.microsoftUserId,
-            userPrincipalName: user.userPrincipalName,
-            isMfaRegistered: registeredMfaMethods.length > 0,
-            isMfaCapable: registeredMfaMethods.length > 0,
-            methodsRegistered: registeredMfaMethods,
-            collectionSource: 'per-user-authentication-methods',
-          })
-        })
+        registrations = await this.collectPerUserAuthenticationMethods(
+          accessToken,
+        )
       }
       await this.saveEntraSnapshot(tenant, 'AUTH_REGISTRATIONS', registrations)
     })
+  }
+
+  private async collectPerUserAuthenticationMethods(
+    accessToken: string,
+    limits: Readonly<AuthRegistrationFallbackLimits> =
+      AUTH_REGISTRATION_FALLBACK_LIMITS,
+  ) {
+    assertAuthRegistrationFallbackLimits(limits)
+    const deadline = Date.now() + limits.collectorDeadlineMs
+    const users = await this.collectAuthenticationFallbackUsers(
+      accessToken,
+      limits,
+      deadline,
+    )
+    const requiredBatches = Math.ceil(users.length / limits.batchSize)
+    if (requiredBatches > limits.maxBatches) {
+      throw new Error(
+        `Microsoft per-user authentication-method synchronization exceeded the bounded ${limits.maxBatches}-batch limit; baseline was not advanced.`,
+      )
+    }
+    const registrations: Array<Record<string, unknown>> = []
+    const methodLabels: Record<string, string> = {
+      '#microsoft.graph.fido2AuthenticationMethod':
+        'FIDO2 security key or passkey',
+      '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod':
+        'Microsoft Authenticator',
+      '#microsoft.graph.phoneAuthenticationMethod': 'Phone',
+      '#microsoft.graph.softwareOathAuthenticationMethod':
+        'Software OATH token',
+      '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod':
+        'Windows Hello for Business',
+      '#microsoft.graph.temporaryAccessPassAuthenticationMethod':
+        'Temporary Access Pass',
+      '#microsoft.graph.platformCredentialAuthenticationMethod':
+        'Platform credential',
+      '#microsoft.graph.hardwareOathAuthenticationMethod':
+        'Hardware OATH token',
+    }
+
+    for (let offset = 0; offset < users.length; offset += limits.batchSize) {
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) {
+        throw new Error(
+          'Microsoft per-user authentication-method synchronization reached its bounded wall-clock deadline; baseline was not advanced.',
+        )
+      }
+      const batchUsers = users.slice(offset, offset + limits.batchSize)
+      const response = await fetch(
+        'https://graph.microsoft.com/v1.0/$batch',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            requests: batchUsers.map((user, index) => ({
+              id: String(index + 1),
+              method: 'GET',
+              url: `/users/${encodeURIComponent(user.microsoftUserId)}/authentication/methods`,
+            })),
+          }),
+          signal: AbortSignal.timeout(
+            Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
+          ),
+        }
+      )
+      if (!response.ok) {
+        const graphError = await describeGraphError(response)
+        throw new Error(
+          `Microsoft per-user authentication-method synchronization returned ${response.status}${graphError}.`
+        )
+      }
+      const batch = JSON.parse(
+        await readBoundedResponseText(response, limits.responseBytes),
+      ) as unknown
+      if (!plainRecord(batch) || !Array.isArray(batch.responses)) {
+        throw new Error(
+          'Microsoft per-user authentication-method synchronization returned an invalid batch response; baseline was not advanced.',
+        )
+      }
+      const responsesById = new Map<string, NonNullable<GraphBatchResponse['responses']>[number]>()
+      for (const item of batch.responses) {
+        if (
+          !plainRecord(item) ||
+          typeof item.id !== 'string' ||
+          responsesById.has(item.id)
+        ) {
+          throw new Error(
+            'Microsoft per-user authentication-method synchronization returned an invalid batch response; baseline was not advanced.',
+          )
+        }
+        responsesById.set(
+          item.id,
+          item as NonNullable<GraphBatchResponse['responses']>[number],
+        )
+      }
+      if (responsesById.size !== batchUsers.length) {
+        throw new Error(
+          'Microsoft per-user authentication-method synchronization returned an incomplete batch response; baseline was not advanced.',
+        )
+      }
+      batchUsers.forEach((user, index) => {
+        const item = responsesById.get(String(index + 1))
+        if (item?.status !== 200) {
+          throw new Error(
+            `Microsoft per-user authentication-method synchronization returned ${item?.status ?? 'an invalid response'}. Confirm UserAuthenticationMethod.Read.All application permission.`
+          )
+        }
+        if (!plainRecord(item.body) || !Array.isArray(item.body.value)) {
+          throw new Error(
+            'Microsoft per-user authentication-method synchronization returned an invalid user-method response; baseline was not advanced.',
+          )
+        }
+        const methods = item.body.value
+          .map((method) => method['@odata.type'])
+          .filter((type): type is string => typeof type === 'string')
+        const registeredMfaMethods = [
+          ...new Set(
+            methods.map((type) => methodLabels[type]).filter(Boolean)
+          ),
+        ]
+        registrations.push({
+          id: user.microsoftUserId,
+          userPrincipalName: user.userPrincipalName,
+          isMfaRegistered: registeredMfaMethods.length > 0,
+          isMfaCapable: registeredMfaMethods.length > 0,
+          methodsRegistered: registeredMfaMethods,
+          collectionSource: 'per-user-authentication-methods',
+        })
+      })
+    }
+    return registrations
+  }
+
+  private async collectAuthenticationFallbackUsers(
+    accessToken: string,
+    limits: Readonly<AuthRegistrationFallbackLimits>,
+    deadline: number,
+  ) {
+    const users: Array<{
+      microsoftUserId: string
+      userPrincipalName: string
+    }> = []
+    const visited = new Set<string>()
+    let pageCount = 0
+    let nextUrl =
+      'https://graph.microsoft.com/v1.0/users?$select=id,userPrincipalName&$top=999'
+    while (nextUrl) {
+      if (
+        !nextUrl.startsWith('https://graph.microsoft.com/') ||
+        visited.has(nextUrl)
+      ) {
+        throw new Error(
+          'Microsoft returned an invalid or repeated users pagination link; authentication-registration baseline was not advanced.',
+        )
+      }
+      visited.add(nextUrl)
+      pageCount += 1
+      if (pageCount > limits.maxUserPages) {
+        throw new Error(
+          `Microsoft authentication-registration user discovery exceeded the bounded ${limits.maxUserPages}-page limit; baseline was not advanced.`,
+        )
+      }
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) {
+        throw new Error(
+          'Microsoft per-user authentication-method synchronization reached its bounded wall-clock deadline; baseline was not advanced.',
+        )
+      }
+      const response = await fetch(nextUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(
+          Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
+        ),
+      })
+      if (!response.ok) {
+        const graphError = await describeGraphError(response)
+        throw new Error(
+          `Microsoft authentication-registration user discovery returned ${response.status}${graphError}.`,
+        )
+      }
+      const parsed = JSON.parse(
+        await readBoundedResponseText(response, limits.responseBytes),
+      ) as unknown
+      if (!plainRecord(parsed) || !Array.isArray(parsed.value)) {
+        throw new Error(
+          'Microsoft authentication-registration user discovery returned an invalid response; baseline was not advanced.',
+        )
+      }
+      for (const row of parsed.value) {
+        if (
+          !plainRecord(row) ||
+          typeof row.id !== 'string' ||
+          !row.id ||
+          typeof row.userPrincipalName !== 'string'
+        ) {
+          throw new Error(
+            'Microsoft authentication-registration user discovery returned an invalid user; baseline was not advanced.',
+          )
+        }
+        users.push({
+          microsoftUserId: row.id,
+          userPrincipalName: row.userPrincipalName,
+        })
+        if (users.length > limits.maxUsers) {
+          throw new Error(
+            `Microsoft per-user authentication-method synchronization exceeded the bounded ${limits.maxUsers}-user limit; baseline was not advanced.`,
+          )
+        }
+      }
+      const nextLink = parsed['@odata.nextLink']
+      if (nextLink !== undefined && typeof nextLink !== 'string') {
+        throw new Error(
+          'Microsoft authentication-registration user discovery returned an invalid pagination link; baseline was not advanced.',
+        )
+      }
+      nextUrl = nextLink ?? ''
+    }
+    users.sort((left, right) =>
+      left.microsoftUserId.localeCompare(right.microsoftUserId),
+    )
+    return users
   }
 
   private async syncAuthenticationMethodPolicy(
