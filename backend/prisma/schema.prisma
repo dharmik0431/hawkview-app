@@ -368,6 +368,7 @@ model TenantLicense {
   suspendedUnits   Int            @default(0) @map("suspended_units")
   lockedOutUnits   Int            @default(0) @map("locked_out_units")
   capabilityStatus String?        @map("capability_status") @db.VarChar(50)
+  servicePlans     Json?          @map("service_plans")
   firstSeenAt      DateTime       @default(now()) @map("first_seen_at") @db.Timestamptz(6)
   lastSeenAt       DateTime       @default(now()) @map("last_seen_at") @db.Timestamptz(6)
   createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)

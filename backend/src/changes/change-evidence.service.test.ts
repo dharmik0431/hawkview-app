@@ -18,8 +18,14 @@ import {
   collectMailboxRuleUsers,
   collectMailboxRules,
   partialSnapshot,
+  readBoundedSharePointJson,
+  sharePointAdministrativeEnrichmentFailureMessage,
+  sharePointTenantHostFamilyFromInitialDomain,
+  trustedSharePointSiteUrl,
   sharePointSitesSnapshotResult,
+  SHAREPOINT_COLLECTION_LIMITS,
   shouldRunFastMailboxRuleRefresh,
+  claimTenantUsersLease,
   TenantSyncService,
 } from '../tenants/tenant-sync.service.js'
 
@@ -905,6 +911,497 @@ test('does not attest to a complete SharePoint baseline when administrative enri
     /partial or unverified/
   )
   assert.equal(writes, 0)
+})
+
+test('converts SharePoint administrative-enrichment failures into bounded readiness diagnostics', () => {
+  assert.match(
+    sharePointAdministrativeEnrichmentFailureMessage('site users returned 403; access_token=do-not-show'),
+    /HTTP 403.*application permission.*retained the previous site inventory.*bounded scheduled/i,
+  )
+  assert.doesNotMatch(
+    sharePointAdministrativeEnrichmentFailureMessage('site users returned 403; access_token=do-not-show'),
+    /do-not-show/i,
+  )
+  assert.match(
+    sharePointAdministrativeEnrichmentFailureMessage('token acquisition failed'),
+    /administrative access token/i,
+  )
+})
+
+test('derives SharePoint token audiences only from the persisted initial tenant domain', () => {
+  assert.deepEqual(sharePointTenantHostFamilyFromInitialDomain('contoso.onmicrosoft.com'), [
+    'contoso.sharepoint.com', 'contoso-my.sharepoint.com',
+  ])
+  assert.deepEqual(sharePointTenantHostFamilyFromInitialDomain('CONTOSO.onmicrosoft.com'), [])
+  assert.deepEqual(sharePointTenantHostFamilyFromInitialDomain('evil.example.com'), [])
+  assert.deepEqual(sharePointTenantHostFamilyFromInitialDomain('contoso.sharepoint.com'), [])
+})
+
+test('rejects untrusted or ambiguous Graph site URLs before any SharePoint token is acquired', () => {
+  const allowedHosts = new Set(sharePointTenantHostFamilyFromInitialDomain('contoso.onmicrosoft.com'))
+  assert.equal(trustedSharePointSiteUrl('https://contoso.sharepoint.com/sites/finance', allowedHosts)?.hostname, 'contoso.sharepoint.com')
+  assert.equal(trustedSharePointSiteUrl('https://contoso-my.sharepoint.com/personal/alice', allowedHosts)?.hostname, 'contoso-my.sharepoint.com')
+  for (const hostile of [
+    'https://evil.sharepoint.com/sites/finance',
+    'https://contoso.sharepoint.com.evil.example/sites/finance',
+    'https://CONTOSO.sharepoint.com/sites/finance',
+    'https://contoso.sharepoint.com.:443/sites/finance',
+    'https://user:pass@contoso.sharepoint.com/sites/finance',
+    'http://contoso.sharepoint.com/sites/finance',
+    'https://contoso.sharepoint.com/%2fadmin',
+    'https://contoso.sharepoint.com/%5Cadmin',
+    'https://contoso.sharepoint.com\\@evil.example/sites/finance',
+  ]) assert.equal(trustedSharePointSiteUrl(hostile, allowedHosts), null)
+})
+
+test('enforces the SharePoint response byte ceiling from the actual stream, not Content-Length', async () => {
+  const encoder = new TextEncoder()
+  const streamResponse = (chunks: string[], contentLength?: string) => {
+    let index = 0
+    let cancelled = false
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const next = chunks[index++]
+        if (next === undefined) return controller.close()
+        controller.enqueue(encoder.encode(next))
+      },
+      cancel() { cancelled = true },
+    })
+    return {
+      response: new Response(stream, { headers: contentLength ? { 'content-length': contentLength } : undefined }),
+      cancelled: () => cancelled,
+    }
+  }
+  const exact = streamResponse(['{"x":', '"1234"}'])
+  assert.deepEqual(await readBoundedSharePointJson(exact.response, 12), { x: '1234' })
+  const missingHeader = streamResponse(['{"x":', '"12345"}'])
+  await assert.rejects(() => readBoundedSharePointJson(missingHeader.response, 12), /response-size limit/)
+  assert.equal(missingHeader.cancelled(), true)
+  const understatedHeader = streamResponse(['{"x":', '"12345"}'], '1')
+  await assert.rejects(() => readBoundedSharePointJson(understatedHeader.response, 12), /response-size limit/)
+  const declaredTooLarge = streamResponse(['{}'], '99')
+  await assert.rejects(() => readBoundedSharePointJson(declaredTooLarge.response, 12), /response-size limit/)
+})
+
+test('runs the real bounded SharePoint orchestration with isolated root and personal-site tokens', async () => {
+  const tokenHosts: string[] = []
+  const saved: any[] = []
+  const service = new TenantSyncService({
+    tenantDomain: { findFirst: async () => ({ name: 'contoso.onmicrosoft.com' }) },
+  } as never, {
+    getTenantSharePointAccessToken: async (input: any) => { tokenHosts.push(input.sharePointHost); return `token-${input.sharePointHost}` },
+  } as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+  ;(service as any).runSnapshotSync = async (_tenant: any, _resource: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async (...args: any[]) => { saved.push(args) }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/sites/root')) return new Response(JSON.stringify({ id: 'root', webUrl: 'https://contoso.sharepoint.com' }))
+    if (url.includes('/v1.0/sites?')) return new Response(JSON.stringify({ value: [
+      { id: 'root', webUrl: 'https://contoso.sharepoint.com' },
+      { id: 'my', webUrl: 'https://contoso-my.sharepoint.com/personal/a' },
+    ] }))
+    if (url.includes('/drive?')) return new Response(JSON.stringify({ quota: {} }))
+    if (url.includes('/_api/web/siteusers')) return new Response(JSON.stringify({ value: [] }))
+    throw new Error(`unexpected request ${url}`)
+  }) as typeof fetch
+  try {
+    await (service as any).syncSharePointSites({
+      id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1',
+      connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' },
+    }, 'graph-token', { ...SHAREPOINT_COLLECTION_LIMITS, sitePages: 1, sites: 5, siteUserPages: 1, siteUserRecords: 5, responseBytes: 1024 })
+  } finally { globalThis.fetch = originalFetch }
+  assert.deepEqual(tokenHosts.sort(), ['contoso-my.sharepoint.com', 'contoso.sharepoint.com'])
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0]?.[1], 'SHAREPOINT_SITES')
+})
+
+test('real SharePoint pagination aborts before a snapshot baseline can advance', async () => {
+  let saved = false
+  const service = new TenantSyncService({
+    tenantDomain: { findFirst: async () => ({ name: 'contoso.onmicrosoft.com' }) },
+  } as never, { getTenantSharePointAccessToken: async () => 'site-token' } as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+  ;(service as any).runSnapshotSync = async (_tenant: any, _resource: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async () => { saved = true }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/sites/root')) return new Response(JSON.stringify({ id: 'root', webUrl: 'https://contoso.sharepoint.com' }))
+    if (url.includes('/v1.0/sites?')) return new Response(JSON.stringify({ value: [], '@odata.nextLink': url }))
+    throw new Error(`unexpected request ${url}`)
+  }) as typeof fetch
+  try {
+    await assert.rejects(() => (service as any).syncSharePointSites({
+      id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1',
+      connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' },
+    }, 'graph-token', { ...SHAREPOINT_COLLECTION_LIMITS, sitePages: 2, sites: 5, siteUserPages: 1, siteUserRecords: 5, responseBytes: 1024 }), /repeated pagination link/)
+  } finally { globalThis.fetch = originalFetch }
+  assert.equal(saved, false)
+})
+
+test('real syncSharePointSites enforces injected Graph, site, REST-page, and REST-record limits before save', async () => {
+  assert.deepEqual(SHAREPOINT_COLLECTION_LIMITS, {
+    sitePages: 50, sites: 10_000, siteUserPages: 20, siteUserRecords: 50_000,
+    responseBytes: 5 * 1024 * 1024, requestTimeoutMs: 20_000, collectorDeadlineMs: 10 * 60_000,
+  })
+  const tenant: any = { id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1', connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' } }
+  async function run(input: { limits: any; graphPages?: any[]; restPages?: any[] }) {
+    let saved = 0; let graphPage = 0; let restPage = 0
+    const service = new TenantSyncService({ tenantDomain: { findFirst: async () => ({ name: 'contoso.onmicrosoft.com' }) } } as never, { getTenantSharePointAccessToken: async () => 'site-token' } as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+    ;(service as any).runSnapshotSync = async (_t: any, _r: string, work: any) => work()
+    ;(service as any).saveSnapshot = async () => { saved += 1 }
+    const original = globalThis.fetch
+    globalThis.fetch = (async (request: any) => {
+      const url = String(request)
+      if (url.includes('/sites/root')) return new Response(JSON.stringify({ id: 'root', webUrl: 'https://contoso.sharepoint.com/sites/root' }))
+      if (url.includes('/v1.0/sites?')) return new Response(JSON.stringify(input.graphPages?.[graphPage++] ?? { value: [] }))
+      if (url.includes('/drive?')) return new Response(JSON.stringify({ quota: {} }))
+      if (url.includes('/_api/web/siteusers')) {
+        const page = input.restPages?.[restPage++] ?? { value: [] }
+        return new Response(JSON.stringify(page?.__repeat ? { value: page.value ?? [], '@odata.nextLink': url } : page))
+      }
+      throw new Error(`unexpected ${url}`)
+    }) as typeof fetch
+    try { await (service as any).syncSharePointSites(tenant, 'graph-token', input.limits) } finally { globalThis.fetch = original }
+    return saved
+  }
+  const limits = { ...SHAREPOINT_COLLECTION_LIMITS, sitePages: 1, sites: 2, siteUserPages: 1, siteUserRecords: 1, responseBytes: 1024 }
+  assert.equal(await run({ limits, graphPages: [{ value: [{ id: 'other', webUrl: 'https://contoso.sharepoint.com/sites/other' }] }], restPages: [{ value: [{ Id: 1 }] }] }), 1, 'exactly two raw sites and one site-user record at the configured limits save once')
+  await assert.rejects(() => run({ limits, graphPages: [{ value: [], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/sites?next=2' }, { value: [] }] }), /bounded collection limit/)
+  await assert.rejects(() => run({ limits: { ...limits, sites: 1 }, graphPages: [{ value: [{ id: 'other', webUrl: 'https://contoso.sharepoint.com/sites/other' }] }] }), /bounded record limit/)
+  await assert.rejects(() => run({ limits: { ...limits, collectorDeadlineMs: 0 }, graphPages: [{ value: [] }] }), /bounded wall-clock deadline/)
+  await assert.rejects(() => run({ limits, graphPages: [{ value: [{ id: 'other', webUrl: 'https://contoso.sharepoint.com/sites/other' }] }], restPages: [{ value: [], '@odata.nextLink': 'https://contoso.sharepoint.com/sites/other/_api/web/siteusers?next=2' }] }), /could not be collected completely/)
+  await assert.rejects(() => run({ limits, graphPages: [{ value: [{ id: 'other', webUrl: 'https://contoso.sharepoint.com/sites/other' }] }], restPages: [{ value: [{ Id: 1 }, { Id: 2 }] }] }), /could not be collected completely/)
+  await assert.rejects(() => run({ limits: { ...limits, siteUserPages: 2 }, graphPages: [{ value: [{ id: 'other', webUrl: 'https://contoso.sharepoint.com/sites/other' }] }], restPages: [{ value: [], __repeat: true }] }), /could not be collected completely/)
+})
+
+test('real syncSharePointSites streams root responses with byte limits and never advances a snapshot on overflow', async () => {
+  const encoder = new TextEncoder()
+  const tenant: any = { id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1', connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' } }
+  async function runRoot(chunks: string[], contentLength?: string, observed: { cancelled?: boolean; saves?: number } = {}) {
+    let cancelled = false; let saves = 0
+    const service = new TenantSyncService({ tenantDomain: { findFirst: async () => ({ name: 'contoso.onmicrosoft.com' }) } } as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+    ;(service as any).runSnapshotSync = async (_t: any, _r: string, work: any) => work()
+    ;(service as any).saveSnapshot = async () => { saves += 1 }
+    const original = globalThis.fetch
+    globalThis.fetch = (async (url: any) => {
+      if (String(url).includes('/sites/root')) {
+        let index = 0
+        // A minimal response body records the reader cancellation invoked by
+        // the production collector.  This avoids relying on Undici's stream
+        // wrapper to forward its internal cancel callback in the test runner.
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(contentLength ? { 'content-length': contentLength } : undefined),
+          body: { getReader: () => ({
+            read: async () => { const chunk = chunks[index++]; return chunk === undefined ? { done: true, value: undefined } : { done: false, value: encoder.encode(chunk) } },
+            cancel: async () => { cancelled = true; observed.cancelled = true },
+            releaseLock: () => undefined,
+          }) },
+        } as Response
+      }
+      return new Response('[]')
+    }) as typeof fetch
+    try {
+      await (service as any).syncSharePointSites(tenant, 'graph', { ...SHAREPOINT_COLLECTION_LIMITS, responseBytes: 2, sitePages: 1, sites: 1, siteUserPages: 1, siteUserRecords: 1 })
+    } finally {
+      observed.saves = saves
+      observed.cancelled = cancelled || observed.cancelled
+      globalThis.fetch = original
+    }
+    return { cancelled, saves }
+  }
+  assert.deepEqual(await runRoot(['{}']), { cancelled: false, saves: 1 }, 'exact byte limit succeeds')
+  const chunkedOverflow: { cancelled?: boolean; saves?: number } = {}
+  await assert.rejects(() => runRoot(['{', '}', 'x'], undefined, chunkedOverflow), /response-size limit/)
+  assert.deepEqual(chunkedOverflow, { cancelled: true, saves: 0 }, 'the actual collector cancels an overflowing chunked response before saving')
+  await assert.rejects(() => runRoot(['{}'], '999'), /response-size limit/)
+  const understatedOverflow: { cancelled?: boolean; saves?: number } = {}
+  await assert.rejects(() => runRoot(['{', '}', 'x'], '1', understatedOverflow), /response-size limit/)
+  assert.deepEqual(understatedOverflow, { cancelled: true, saves: 0 })
+})
+
+test('real syncSharePointSites aborts a timed-out request and preserves the prior baseline on token or REST failure', async () => {
+  const tenant: any = { id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1', connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' } }
+  async function make(mode: 'timeout' | 'token' | 'rest') {
+    let transactions = 0; const logs: string[] = []; const tokenHosts: string[] = []; let sawAbort = false
+    // This journal is deliberately wired through the real saveSnapshot
+    // transaction contract.  Collection failures must happen before the
+    // transaction and leave the seeded baseline/evidence untouched.
+    const persisted = {
+      snapshot: { organizationId: 'org-1', payload: [{ id: 'old-site' }], observedAt: new Date('2026-08-01T00:00:00.000Z') },
+      evidence: [{ id: 'old-evidence' }],
+      siteRelationships: [{ siteId: 'old-site', userId: 'old-user' }],
+    }
+    const prisma = {
+      tenantDomain: { findFirst: async () => ({ name: 'contoso.onmicrosoft.com' }) },
+      $transaction: async (work: (transaction: any) => Promise<unknown>) => {
+        transactions += 1
+        const before = structuredClone(persisted)
+        try {
+          return await work({
+            $executeRawUnsafe: async () => undefined,
+            tenantEntraSnapshot: {
+              findUnique: async () => persisted.snapshot,
+              upsert: async (input: any) => { persisted.snapshot = { organizationId: 'org-1', payload: input.update.payload, observedAt: input.update.observedAt } },
+            },
+            changeEvidenceEvent: { createMany: async (input: any) => { persisted.evidence.push(...input.data) } },
+          })
+        } catch (error) {
+          persisted.snapshot = before.snapshot
+          persisted.evidence = before.evidence
+          persisted.siteRelationships = before.siteRelationships
+          throw error
+        }
+      },
+    }
+    const service = new TenantSyncService(prisma as never, {
+      getTenantSharePointAccessToken: async (input: any) => { tokenHosts.push(input.sharePointHost); if (mode === 'token' && input.sharePointHost === 'contoso-my.sharepoint.com') throw new Error('HTTP 403 RequestDenied correlationId=corr-1 access_token=never password=never Bearer jwt.secret client_secret=never https://user:pass@host/path?sig=never'); return `token-${input.sharePointHost}` },
+    } as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+    ;(service as any).runSnapshotSync = async (_t: any, _r: string, work: any) => work()
+    ;(service as any).logger = { warn: (message: unknown) => logs.push(String(message)), log: () => undefined, error: () => undefined }
+    const original = globalThis.fetch
+    globalThis.fetch = (async (url: any, init: any) => {
+      const value = String(url)
+      if (mode === 'timeout' && value.includes('/sites/root')) return await new Promise<Response>((_resolve, reject) => init.signal.addEventListener('abort', () => { sawAbort = true; reject(new Error('request timeout')) }, { once: true }))
+      if (value.includes('/sites/root')) return new Response(JSON.stringify({ id: 'root', webUrl: 'https://contoso.sharepoint.com/sites/root' }))
+      if (value.includes('/v1.0/sites?')) return new Response(JSON.stringify({ value: [{ id: 'root', webUrl: 'https://contoso.sharepoint.com/sites/root' }, { id: 'my', webUrl: 'https://contoso-my.sharepoint.com/personal/a' }] }))
+      if (value.includes('/drive?')) return new Response(JSON.stringify({ quota: {} }))
+      if (value.includes('/_api/web/siteusers')) return mode === 'rest' ? new Response('denied access_token=never&sig=never', { status: 401, headers: { 'x-correlation-id': 'corr-1' } }) : new Response(JSON.stringify({ value: [] }))
+      throw new Error(`unexpected ${value}`)
+    }) as typeof fetch
+    let failure = ''
+    try {
+      await assert.rejects(() => (service as any).syncSharePointSites(tenant, 'graph', { ...SHAREPOINT_COLLECTION_LIMITS, requestTimeoutMs: mode === 'timeout' ? 1 : 20, sitePages: 1, sites: 5, siteUserPages: 1, siteUserRecords: 5, responseBytes: 1024 }), (error: Error) => { failure = error.message; return true })
+    } finally { globalThis.fetch = original }
+    return { transactions, logs, tokenHosts, sawAbort, failure, persisted }
+  }
+  const timeout = await make('timeout')
+  assert.equal(timeout.sawAbort, true); assert.equal(timeout.transactions, 0)
+  const token = await make('token')
+  assert.equal(token.transactions, 0); assert.deepEqual(token.tokenHosts.sort(), ['contoso-my.sharepoint.com', 'contoso.sharepoint.com'])
+  assert.equal(token.logs.length, 1)
+  assert.match(token.logs[0] ?? '', /403|RequestDenied|correlationId/i)
+  for (const output of [token.logs.join(' '), token.failure]) assert.doesNotMatch(output, /never|jwt\.secret|user:pass|sig=|Bearer\s+jwt/i)
+  assert.deepEqual(token.persisted.snapshot.payload, [{ id: 'old-site' }])
+  assert.deepEqual(token.persisted.evidence, [{ id: 'old-evidence' }])
+  assert.deepEqual(token.persisted.siteRelationships, [{ siteId: 'old-site', userId: 'old-user' }])
+  const rest = await make('rest')
+  assert.equal(rest.transactions, 0)
+  assert.deepEqual(rest.persisted.snapshot.payload, [{ id: 'old-site' }])
+  assert.deepEqual(rest.persisted.evidence, [{ id: 'old-evidence' }])
+  assert.deepEqual(rest.persisted.siteRelationships, [{ siteId: 'old-site', userId: 'old-user' }])
+  for (const output of [rest.logs.join(' '), rest.failure]) assert.doesNotMatch(output, /never|sig=|Bearer\s+jwt/i)
+})
+
+test('real Exchange Admin collector projects secret-bearing non-2xx bodies before throwing', async () => {
+  const service = new TenantSyncService({} as never, {
+    getTenantExchangeAccessToken: async () => 'exchange-token',
+  } as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+  ;(service as any).runSnapshotSync = async (_tenant: any, _resource: string, work: () => Promise<void>) => work()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    error: { code: 'RequestDenied', message: 'Recipient role is required.' },
+    access_token: 'DO-NOT-LEAK', password: 'DO-NOT-LEAK',
+    url: 'https://user:pass@outlook.office365.com/adminapi?sig=DO-NOT-LEAK',
+  }), { status: 403 })) as typeof fetch
+  try {
+    await assert.rejects(
+      () => (service as any).syncExchangeMailboxConfiguration({
+        id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1',
+        connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' },
+      }),
+      (error: Error) => {
+        assert.match(error.message, /403/)
+        assert.match(error.message, /RequestDenied/)
+        assert.doesNotMatch(error.message, /DO-NOT-LEAK|user:pass|sig=/)
+        return true
+      },
+    )
+  } finally { globalThis.fetch = originalFetch }
+})
+
+function scheduledTenant(id: number) {
+  return {
+    id: `tenant-${String(id).padStart(4, '0')}`,
+    organizationId: 'org-1',
+    microsoftTenantId: `microsoft-${id}`,
+    displayName: `Tenant ${id}`,
+    primaryDomain: `tenant-${id}.example.test`,
+    status: 'ACTIVE',
+    connection: { status: 'CONNECTED' },
+    syncStates: [{
+      resourceType: 'USERS', status: 'SUCCEEDED',
+      lastAttemptAt: new Date('2026-08-15T00:00:00.000Z'),
+      lastSuccessfulAt: new Date('2026-08-15T00:00:00.000Z'),
+      lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
+    }],
+  }
+}
+
+test('actual scheduled service excludes active leases before its 1,000-candidate window and rotates productive work after lock losses', async () => {
+  const candidates = Array.from({ length: 1_000 }, (_, index) => scheduledTenant(index + 1))
+  const queries: any[] = []
+  const prisma = {
+    customerTenant: { findMany: async (query: any) => { queries.push(query); return candidates } },
+  }
+  const service = new TenantSyncService(prisma as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+  const attempted: string[] = []
+  ;(service as any).syncConnectedTenant = async (tenant: any) => {
+    attempted.push(tenant.id)
+    return { status: tenant.id === 'tenant-0001' ? 'SKIPPED' : 'SUCCEEDED', failedResources: [] }
+  }
+  const oldBatch = process.env.SCHEDULED_SYNC_BATCH_SIZE
+  const oldScan = process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT
+  process.env.SCHEDULED_SYNC_BATCH_SIZE = '25'
+  process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT = '1000'
+  try {
+    const summary = await service.syncDueTenants()
+    assert.equal(summary.succeeded, 25)
+    assert.equal(summary.skipped, 1)
+    assert.equal(attempted.length, 26, 'a lock loser must not consume a productive slot')
+    assert.equal(attempted.at(-1), 'tenant-0026')
+    const leaseClause = queries[0]?.where?.AND?.[0]?.syncStates?.none
+    assert.equal(leaseClause?.resourceType, 'USERS')
+    assert.equal(leaseClause?.status, 'RUNNING')
+    assert.ok(leaseClause?.lastAttemptAt?.gt instanceof Date, 'active USERS leases are filtered by the database query before take:1000')
+    assert.equal(queries[0]?.take, 1000)
+  } finally {
+    if (oldBatch === undefined) delete process.env.SCHEDULED_SYNC_BATCH_SIZE
+    else process.env.SCHEDULED_SYNC_BATCH_SIZE = oldBatch
+    if (oldScan === undefined) delete process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT
+    else process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT = oldScan
+  }
+})
+
+test('two actual scheduled service runs share leases without duplicate productive tenants and advance beyond the first batch', async () => {
+  const candidates = Array.from({ length: 1_000 }, (_, index) => scheduledTenant(index + 1))
+  const prisma = { customerTenant: { findMany: async () => candidates } }
+  const active = new Set<string>()
+  const completed = new Set<string>()
+  const executed: string[] = []
+  const makeService = () => {
+    const service = new TenantSyncService(prisma as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+    ;(service as any).syncConnectedTenant = async (tenant: any) => {
+      if (active.has(tenant.id) || completed.has(tenant.id)) return { status: 'SKIPPED', failedResources: [] }
+      active.add(tenant.id)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      active.delete(tenant.id)
+      completed.add(tenant.id)
+      executed.push(tenant.id)
+      return { status: 'SUCCEEDED', failedResources: [] }
+    }
+    return service
+  }
+  const oldBatch = process.env.SCHEDULED_SYNC_BATCH_SIZE
+  process.env.SCHEDULED_SYNC_BATCH_SIZE = '25'
+  try {
+    const [left, right] = await Promise.all([makeService().syncDueTenants(), makeService().syncDueTenants()])
+    assert.equal(new Set(executed).size, executed.length, 'a tenant executes productively at most once across concurrent workers')
+    assert.equal(executed.length, 50)
+    assert.equal(left.succeeded + right.succeeded, 50)
+    assert.ok(executed.some((id) => id === 'tenant-0050'), 'later eligible tenants are reached after races')
+  } finally {
+    if (oldBatch === undefined) delete process.env.SCHEDULED_SYNC_BATCH_SIZE
+    else process.env.SCHEDULED_SYNC_BATCH_SIZE = oldBatch
+  }
+})
+
+test('production USERS lease compare-and-set permits one concurrent claimant, rejects active state, and takes over stale state', async () => {
+  const now = new Date('2026-08-18T12:00:00.000Z')
+  let row: any = { id: 'users-state', status: 'SUCCEEDED', lastAttemptAt: new Date('2026-08-18T11:00:00.000Z') }
+  const prisma: any = {
+    syncState: {
+      findUnique: async () => row,
+      updateMany: async (args: any) => {
+        const allowed = row && (row.status !== 'RUNNING' || !row.lastAttemptAt || row.lastAttemptAt < args.where.OR[2].lastAttemptAt.lt)
+        if (!allowed) return { count: 0 }
+        row = { ...row, ...args.data }
+        return { count: 1 }
+      },
+      create: async (args: any) => { if (row) throw new Error('unique'); row = { id: 'new-users-state', ...args.data } },
+    },
+  }
+  const tenant = { id: 'tenant-1', organizationId: 'org-1' }
+  const [left, right] = await Promise.all([claimTenantUsersLease(prisma, tenant, now), claimTenantUsersLease(prisma, tenant, now)])
+  assert.deepEqual([left.claimed, right.claimed].sort(), [false, true])
+  assert.equal(row.status, 'RUNNING')
+  const active = await claimTenantUsersLease(prisma, tenant, new Date(now.getTime() + 1_000))
+  assert.equal(active.claimed, false)
+  row.lastAttemptAt = new Date(now.getTime() - 16 * 60_000)
+  const stale = await claimTenantUsersLease(prisma, tenant, now)
+  assert.equal(stale.claimed, true)
+  row = null
+  const [created, createRace] = await Promise.all([claimTenantUsersLease(prisma, tenant, now), claimTenantUsersLease(prisma, tenant, now)])
+  assert.deepEqual([created.claimed, createRace.claimed].sort(), [false, true], 'unique create race produces one durable lease')
+})
+
+test('actual license snapshot transaction rolls back inventory, evidence, and baseline together before a retry commits once', async () => {
+  const committed: { licenses: any[]; evidence: any[]; snapshot: any } = { licenses: [], evidence: [], snapshot: null }
+  let failPoint: 'baseline' | 'evidence' | null = 'baseline'
+  const prisma: any = {
+    $transaction: async (callback: any) => {
+      const draft = { licenses: structuredClone(committed.licenses), evidence: structuredClone(committed.evidence), snapshot: structuredClone(committed.snapshot) }
+      const transaction = {
+        $executeRawUnsafe: async () => 1,
+        tenantLicense: {
+          upsert: async (args: any) => {
+            const key = args.where.customerTenantId_microsoftSkuId
+            const index = draft.licenses.findIndex((row) => row.customerTenantId === key.customerTenantId && row.microsoftSkuId === key.microsoftSkuId)
+            const row = { ...(index < 0 ? args.create : draft.licenses[index]), ...(index < 0 ? {} : args.update) }
+            if (index < 0) draft.licenses.push(row); else draft.licenses[index] = row
+          },
+          deleteMany: async () => undefined,
+        },
+        tenantEntraSnapshot: {
+          findUnique: async () => draft.snapshot,
+          upsert: async (args: any) => {
+            if (failPoint === 'baseline') throw new Error('forced baseline write failure')
+            draft.snapshot = { organizationId: 'org-1', payload: args.create.payload, observedAt: args.create.observedAt }
+          },
+        },
+        changeEvidenceEvent: {
+          createMany: async (args: any) => {
+            if (failPoint === 'evidence') throw new Error('forced evidence write failure')
+            draft.evidence.push(...args.data)
+          },
+        },
+      }
+      const value = await callback(transaction)
+      committed.licenses = draft.licenses
+      committed.evidence = draft.evidence
+      committed.snapshot = draft.snapshot
+      return value
+    },
+  }
+  const service = new TenantSyncService(prisma, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+  ;(service as any).runSnapshotSync = async (_tenant: any, _resource: string, work: () => Promise<void>) => work()
+  const originalFetch = globalThis.fetch
+  let capabilityStatus = 'Enabled'
+  globalThis.fetch = (async () => new Response(JSON.stringify({ value: [{
+    skuId: 'sku-1', skuPartNumber: 'EXAMPLE', consumedUnits: 0,
+    prepaidUnits: { enabled: 5 }, capabilityStatus,
+    servicePlans: [{ servicePlanId: 'plan-1', servicePlanName: 'EXCHANGE_S_STANDARD', provisioningStatus: 'Success', appliesTo: 'User' }],
+  }] }))) as typeof fetch
+  try {
+    await assert.rejects(() => (service as any).syncLicenses({ id: 'tenant-1', organizationId: 'org-1' }, 'token'), /forced baseline/)
+    assert.deepEqual(committed, { licenses: [], evidence: [], snapshot: null })
+    failPoint = null
+    await (service as any).syncLicenses({ id: 'tenant-1', organizationId: 'org-1' }, 'token')
+    assert.equal(committed.licenses.length, 1)
+    assert.equal((committed as any).snapshot?.payload?.length, 1)
+    const committedSnapshot = structuredClone(committed.snapshot)
+    capabilityStatus = 'Suspended'
+    failPoint = 'evidence'
+    await assert.rejects(() => (service as any).syncLicenses({ id: 'tenant-1', organizationId: 'org-1' }, 'token'), /forced evidence/)
+    assert.equal((committed as any).licenses[0]?.capabilityStatus, 'Enabled', 'evidence failure rolls back the pending license update')
+    assert.deepEqual(committed.snapshot, committedSnapshot, 'evidence failure rolls back the pending baseline update')
+    failPoint = null
+    await (service as any).syncLicenses({ id: 'tenant-1', organizationId: 'org-1' }, 'token')
+    assert.equal(committed.licenses.length, 1, 'retry is idempotent for the same SKU')
+    assert.equal(committed.evidence.length, 1, 'the successful changed-state retry creates one evidence record')
+  } finally { globalThis.fetch = originalFetch }
 })
 
 test('marks owner or membership failures as incomplete group relationship synchronization', () => {

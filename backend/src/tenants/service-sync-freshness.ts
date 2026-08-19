@@ -110,10 +110,7 @@ type ServiceDefinition = {
 export const SERVICE_COLLECTOR_REGISTRY: readonly ServiceDefinition[] = [
   { service: 'OFFICE_365', key: 'office365', collectors: ['LICENSES', 'DOMAINS', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'] },
   { service: 'ENTRA_ID', key: 'entraId', collectors: ['USERS', 'GROUPS', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'DEVICES', 'DIRECTORY_ROLES', 'APPLICATIONS', 'SERVICE_PRINCIPALS'] },
-  // Exchange mailbox inventory, type, rules, and usage are available through Microsoft Graph.
-  // Deep Exchange Admin API configuration requires a separate Exchange RBAC
-  // assignment, so it is intentionally not a baseline HawkView collector.
-  { service: 'EXCHANGE', key: 'exchange', collectors: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'] },
+  { service: 'EXCHANGE', key: 'exchange', collectors: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOX_CONFIGURATION'] },
   { service: 'SHAREPOINT_ONEDRIVE', key: 'sharePointOneDrive', collectors: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'] },
   { service: 'SIGN_IN_LOGS', key: 'signInLogs', collectors: ['SIGN_INS'] },
   { service: 'AUDIT_LOGS', key: 'auditLogs', collectors: ['AUDIT_LOGS', 'M365_AUDIT'] },
@@ -132,8 +129,6 @@ function freshnessWindow(collector: string) {
     : SERVICE_FRESHNESS_WINDOWS.dailyInventory
 }
 
-const RENDER_CRON_SCHEDULE = '*/5 * * * *'
-const RENDER_CRON_INTERVAL_MINUTES = 5
 
 function iso(date: Date | null | undefined) {
   return date?.toISOString() ?? null
@@ -154,13 +149,6 @@ function collectorStatus(resourceType: string, state: PersistedSyncState | undef
     : 'SUCCESS'
 }
 
-function nextRenderCronAt(now: Date) {
-  const next = new Date(now)
-  next.setUTCSeconds(0, 0)
-  const minute = next.getUTCMinutes()
-  next.setUTCMinutes(minute - (minute % RENDER_CRON_INTERVAL_MINUTES) + RENDER_CRON_INTERVAL_MINUTES)
-  return next.toISOString()
-}
 
 function latestIso(dates: Array<Date | null | undefined>) {
   const latest = dates.filter((date): date is Date => Boolean(date)).sort((a, b) => b.getTime() - a.getTime())[0]
@@ -213,7 +201,11 @@ function buildService(definition: ServiceDefinition, states: Map<string, Persist
   else if (successfulCollectors > 0 || failedCollectors || permissionRequiredCollectors || pendingCollectors || staleCollectors) status = 'PARTIAL'
   else status = 'UNKNOWN'
 
-  const nextScheduledAttemptAt = nextRenderCronAt(now)
+  // A Render heartbeat is not a promise that this specific resource will run:
+  // due-state, locks, backoff, and tenant caps decide that later. Keep this
+  // compatibility field null rather than presenting the global cron as an
+  // exact per-resource retry time.
+  const nextScheduledAttemptAt = null
   const partialFailures = rows.flatMap(({ collector, state }, index): ServiceCollectorFailure[] => {
     const collectorState = classifications[index]
     if (!['FAILED', 'PERMISSION_REQUIRED', 'PENDING', 'RUNNING', 'STALE', 'NOT_CONFIGURED'].includes(collectorState)) return []
@@ -225,7 +217,7 @@ function buildService(definition: ServiceDefinition, states: Map<string, Persist
       lastAttemptAt: iso(state?.lastAttemptAt),
       lastSuccessfulAt: iso(state?.lastSuccessfulAt),
       retryable: collectorState === 'FAILED' || collectorState === 'PERMISSION_REQUIRED' || collectorState === 'STALE',
-      nextRetryAt: collectorState === 'FAILED' || collectorState === 'PERMISSION_REQUIRED' || collectorState === 'STALE' ? nextScheduledAttemptAt : null,
+      nextRetryAt: null,
       correlationId: null,
     }]
   })
@@ -238,7 +230,7 @@ function buildService(definition: ServiceDefinition, states: Map<string, Persist
     lastAttemptCompletedAt: lastSuccessfulCollectionAt,
     lastSuccessfulCollectionAt,
     nextScheduledAttemptAt,
-    scheduleSource: RENDER_CRON_SCHEDULE,
+    scheduleSource: 'scheduler cadence; resource eligibility unknown',
     successfulCollectors,
     expectedCollectors,
     failedCollectors,
@@ -251,9 +243,10 @@ function buildService(definition: ServiceDefinition, states: Map<string, Persist
   }
 }
 
-export function deriveTenantSyncFreshness(syncStates: PersistedSyncState[], now = new Date()): TenantSyncFreshness {
+export function deriveTenantSyncFreshness(syncStates: PersistedSyncState[], now = new Date(), excludedCollectors: readonly string[] = []): TenantSyncFreshness {
   const states = new Map(syncStates.map((state) => [state.resourceType, state]))
-  const serviceEntries = SERVICE_COLLECTOR_REGISTRY.map((definition) => [definition.key, buildService(definition, states, now)] as const)
+  const excluded = new Set(excludedCollectors)
+  const serviceEntries = SERVICE_COLLECTOR_REGISTRY.map((definition) => [definition.key, buildService({ ...definition, collectors: definition.collectors.filter((collector) => !excluded.has(collector)) }, states, now)] as const)
   const services = Object.fromEntries(serviceEntries) as TenantSyncFreshness['services']
   return {
     modelVersion: SERVICE_SYNC_FRESHNESS_VERSION,

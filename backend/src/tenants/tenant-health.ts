@@ -21,7 +21,7 @@ type SyncState = { resourceType: string; status: string; lastAttemptAt: Date | n
 export type TenantAuditEvent = { microsoftAuditId: string; eventDateTime: Date; activityDisplayName: string; category: string | null; operationType: string | null; result: string | null; initiatedBy: unknown; targetResources: unknown }
 
 export type ResourceHealth = { resourceType: string; required: boolean; classification: ResourceClassification; reasonCode: string | null; message: string | null; lastAttemptAt: string | null; lastSuccessfulAt: string | null }
-type HealthInput = { tenantId: string; effectiveStatus: string; connectionStatus: string | null; connectionLastVerifiedAt?: Date | null; missingPermissions: string[]; syncStates: SyncState[]; authSnapshot: { payload: unknown; observedAt: Date } | null; riskyIdentityCount: number; auditEvents?: TenantAuditEvent[]; now?: Date }
+type HealthInput = { tenantId: string; effectiveStatus: string; connectionStatus: string | null; connectionLastVerifiedAt?: Date | null; missingPermissions: string[]; syncStates: SyncState[]; authSnapshot: { payload: unknown; observedAt: Date } | null; riskyIdentityCount: number; auditEvents?: TenantAuditEvent[]; /** Only collector components backed by an authoritative NOT_LICENSED/UNSUPPORTED readiness row. */ notApplicableResourceTypes?: string[]; now?: Date }
 
 /** Central policy.  Optional collectors affect completeness but are never used
  * to claim that a tenant is disconnected or that required telemetry succeeded. */
@@ -31,17 +31,9 @@ export const TENANT_HEALTH_RESOURCE_REGISTRY: ReadonlyArray<{ resourceType: stri
   { resourceType: 'APPLICATIONS', required: true }, { resourceType: 'SERVICE_PRINCIPALS', required: true }, { resourceType: 'AUDIT_LOGS', required: true }, { resourceType: 'M365_AUDIT', required: true },
   { resourceType: 'SIGN_INS', required: false }, { resourceType: 'SECURE_SCORES', required: false }, { resourceType: 'DEVICES', required: false },
   { resourceType: 'DIRECTORY_ROLES', required: false }, { resourceType: 'EXCHANGE_MAILBOXES', required: false }, { resourceType: 'EXCHANGE_MAILBOX_SETTINGS', required: false }, { resourceType: 'EXCHANGE_ACCEPTED_DOMAINS', required: false },
-  { resourceType: 'EXCHANGE_MAILBOX_RULES', required: false }, { resourceType: 'SHAREPOINT_SITES', required: false }, { resourceType: 'SHAREPOINT_SETTINGS', required: false },
+  { resourceType: 'EXCHANGE_MAILBOX_RULES', required: false }, { resourceType: 'EXCHANGE_MAILBOX_CONFIGURATION', required: true }, { resourceType: 'SHAREPOINT_SITES', required: true }, { resourceType: 'SHAREPOINT_SETTINGS', required: false },
   { resourceType: 'SHAREPOINT_USAGE', required: false },
 ]
-
-/**
- * These legacy collectors need privileged service-specific administration and
- * are deliberately outside the normal Microsoft Graph consent experience.
- * Their historic SyncState rows must not keep an otherwise Graph-connected
- * tenant in an operationally failed state.
- */
-const OPTIONAL_ADMIN_COLLECTORS = new Set(['EXCHANGE_MAILBOX_CONFIGURATION'])
 
 /**
  * HawkView receives lightweight delta/activity updates every five minutes, but
@@ -115,7 +107,9 @@ export function deriveTenantHealth(input: HealthInput) {
   if (connection.status === 'DISCONNECTED') attention.push({ key: 'connection-unavailable', label: 'Tenant is no longer connected to HawkView', severity: 'critical', why: connection.message, detectedAt: latestDate(input.syncStates.map((s) => s.lastAttemptAt)), actionLabel: 'Reconnect tenant', actionUrl: settingsUrl })
   else if (connection.status === 'PENDING' || input.missingPermissions.length > 0) attention.push({ key: 'authorization-required', label: input.missingPermissions.length ? 'Required Microsoft permissions are missing' : 'Microsoft authorization is required', severity: 'high', why: input.missingPermissions.length ? `Missing: ${input.missingPermissions.join(', ')}.` : connection.message, detectedAt: latestDate(input.syncStates.map((s) => s.lastAttemptAt)), actionLabel: 'Review permissions', actionUrl: settingsUrl })
 
-  const states = new Map(input.syncStates.map((state) => [state.resourceType, state])); const resources: ResourceHealth[] = TENANT_HEALTH_RESOURCE_REGISTRY.map((item) => ({ resourceType: item.resourceType, required: item.required, ...classify(states.get(item.resourceType), now) }))
+  const states = new Map(input.syncStates.map((state) => [state.resourceType, state])); const notApplicable = new Set(input.notApplicableResourceTypes ?? []); const resources: ResourceHealth[] = TENANT_HEALTH_RESOURCE_REGISTRY.map((item) => notApplicable.has(item.resourceType)
+    ? { resourceType: item.resourceType, required: item.required, classification: 'NOT_LICENSED' as const, reasonCode: 'SERVICE_PLAN_NOT_ENABLED', message: 'Authoritative subscription inventory shows this workload is not enabled.', lastAttemptAt: null, lastSuccessfulAt: null }
+    : ({ resourceType: item.resourceType, required: item.required, ...classify(states.get(item.resourceType), now) }))
   const applicable = resources.filter((r) => r.classification !== 'UNSUPPORTED' && r.classification !== 'NOT_LICENSED'); const successful = applicable.filter((r) => r.classification === 'SUCCESS' || r.classification === 'EMPTY'); const failed = applicable.filter((r) => r.classification === 'FAILED' || r.classification === 'PERMISSION_REQUIRED'); const pending = applicable.filter((r) => r.classification === 'PENDING' || r.classification === 'NOT_CONFIGURED'); const stale = applicable.filter((r) => r.classification === 'STALE'); const unsupported = resources.filter((r) => r.classification === 'UNSUPPORTED' || r.classification === 'NOT_LICENSED'); const requiredProblems = resources.filter((r) => r.required && ['FAILED', 'PERMISSION_REQUIRED', 'STALE'].includes(r.classification))
   for (const resource of requiredProblems.slice(0, 3)) { const state = states.get(resource.resourceType); const action = syncAction(input.tenantId, resource.resourceType); attention.push({ key: `sync-${resource.resourceType.toLowerCase()}`, label: `${resource.resourceType.replaceAll('_', ' ').toLowerCase()} synchronization needs attention`, severity: state?.consecutiveFailures && state.consecutiveFailures >= 3 ? 'critical' : 'high', why: resource.message ?? 'Required collection is not current.', detectedAt: resource.lastAttemptAt, actionLabel: action.label, actionUrl: action.url }) }
   const currentFreshness = freshness(resources, now); const completenessPercent = applicable.length ? Math.round((successful.length / applicable.length) * 100) : null
@@ -126,7 +120,14 @@ export function deriveTenantHealth(input: HealthInput) {
   for (const event of input.auditEvents ?? []) { const finding = auditFinding(input.tenantId, event); if (finding && !attention.some((item) => item.label === finding.label)) attention.push(finding); if (attention.filter((item) => item.key.startsWith('audit-')).length >= 3) break }
   const securityCollectorStates = ['AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUDIT_LOGS', 'M365_AUDIT'].map((name) => resources.find((r) => r.resourceType === name)).filter((r): r is ResourceHealth => Boolean(r)); const securityIncomplete = securityCollectorStates.some((r) => r.classification !== 'SUCCESS' && r.classification !== 'EMPTY'); const criticalFindings = attention.filter((a) => a.severity === 'critical' && !a.key.startsWith('connection') && !a.key.startsWith('sync-')).length; const highFindings = attention.filter((a) => a.severity === 'high' && !a.key.startsWith('connection') && !a.key.startsWith('sync-')).length; const mediumFindings = attention.filter((a) => a.severity === 'medium').length; const lowFindings = attention.filter((a) => a.severity === 'low').length
   const security = { status: criticalFindings > 0 ? 'CRITICAL' as SecurityStatus : highFindings > 0 ? 'AT_RISK' as SecurityStatus : securityIncomplete ? 'UNKNOWN' as SecurityStatus : mediumFindings + lowFindings > 0 ? 'NEEDS_REVIEW' as SecurityStatus : 'HEALTHY' as SecurityStatus, criticalFindings, highFindings, mediumFindings, lowFindings, recommendationCount: mediumFindings + lowFindings, lastEvaluatedAt: latestDate([input.authSnapshot?.observedAt ?? null, ...input.syncStates.filter((s) => ['AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUDIT_LOGS', 'M365_AUDIT'].includes(s.resourceType)).map((s) => s.lastSuccessfulAt)]) }
-  const operationalStates = input.syncStates.filter((state) => !OPTIONAL_ADMIN_COLLECTORS.has(state.resourceType))
+  // A successful OAuth connection is not an operational-health attestation.
+  // Required workload collectors, including SharePoint and Exchange Admin,
+  // participate in this summary so legacy tenant-directory health cannot say
+  // "Healthy" while readiness reports a real collection failure.
+  // The same authoritative applicability exclusion drives data and operations.
+  // Historic failures for a currently not-licensed workload are evidence, but
+  // not a current operational outage.
+  const operationalStates = input.syncStates.filter((state) => !notApplicable.has(state.resourceType))
   const failedJobs = operationalStates.filter((s) => s.status === 'FAILED').length; const pendingJobs = operationalStates.filter((s) => s.status === 'RUNNING').length; const partialJobs = operationalStates.filter((s) => s.status === 'FAILED' && s.lastSuccessfulAt !== null).length; const operations = { status: failedJobs >= 3 ? 'FAILED' as OperationsStatus : failedJobs > 0 ? 'DEGRADED' as OperationsStatus : pendingJobs > 0 ? 'SYNCING' as OperationsStatus : operationalStates.length ? 'HEALTHY' as OperationsStatus : 'UNKNOWN' as OperationsStatus, activeIssues: failedJobs + requiredProblems.length, failedJobs, partialJobs, pendingJobs, lastSuccessfulJobAt: latestDate(operationalStates.map((s) => s.lastSuccessfulAt)), issues: operationalStates.filter((s) => s.status === 'FAILED').map((s) => ({ resourceType: s.resourceType, reasonCode: s.lastErrorCode, message: sanitizeHealthMessage(s.lastErrorMessage), consecutiveFailures: s.consecutiveFailures })) }
   // Apply the published precedence in order. Pending consent is informative,
   // but must never hide a critical finding or a failed synchronization job.

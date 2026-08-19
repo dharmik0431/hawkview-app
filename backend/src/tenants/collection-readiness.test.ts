@@ -29,6 +29,10 @@ function input(overrides: Record<string, unknown> = {}) {
     connectionVerifiedAt: current,
     consentedPermissions: permissions,
     syncStates: allResources.map((resource) => sync(resource)),
+    licenseServicePlans: [
+      { servicePlanName: 'SHAREPOINTENTERPRISE', provisioningStatus: 'Success' },
+      { servicePlanName: 'EXCHANGE_S_ENTERPRISE', provisioningStatus: 'Success' },
+    ],
     subscriptions: M365_ACTIVITY_CONTENT_TYPES.map((contentType) => ({ contentType, status: 'ENABLED', lastStartRequestedAt: current, lastVerifiedAt: current, lastSuccessfulPollAt: current, lastError: null })),
     now,
     ...overrides,
@@ -89,6 +93,53 @@ test('does not equate Exchange Graph consent with Exchange RBAC and keeps messag
   assert.equal(exchange.exchangeRbac?.status, 'MISSING')
   assert.equal(exchange.exchangeRbac?.state, 'BLOCKED_PERMISSION')
   assert.doesNotMatch(JSON.stringify(result), /do-not-show/)
+})
+
+test('converges Exchange readiness after the daily Exchange Admin configuration collector succeeds', () => {
+  const before = deriveCollectionReadiness(input({
+    syncStates: allResources
+      .filter((resource) => resource !== 'EXCHANGE_MAILBOX_CONFIGURATION')
+      .map((resource) => sync(resource)),
+  }))
+  assert.equal(row(before, 'exchange').state, 'UNVERIFIED')
+
+  const after = deriveCollectionReadiness(input())
+  assert.equal(row(after, 'exchange').state, 'READY')
+  assert.equal(row(after, 'exchange').exchangeRbac?.status, 'CONFIRMED')
+})
+
+test('uses authoritative service-plan semantics without treating pending plans as unlicensed', () => {
+  const disabled = deriveCollectionReadiness(input({
+    licenseServicePlans: [{ servicePlanName: 'EXCHANGE_S_ENTERPRISE', provisioningStatus: 'Disabled' }],
+  }))
+  assert.equal(row(disabled, 'exchange').state, 'NOT_LICENSED')
+
+  const pending = deriveCollectionReadiness(input({
+    licenseServicePlans: [{ servicePlanName: 'EXCHANGE_S_ENTERPRISE', provisioningStatus: 'PendingActivation' }],
+  }))
+  assert.equal(row(pending, 'exchange').state, 'UNVERIFIED')
+
+  const staleLicenses = deriveCollectionReadiness(input({
+    syncStates: allResources.map((resource) => sync(resource, resource === 'LICENSES' ? { lastSuccessfulAt: new Date('2026-08-16T00:00:00.000Z') } : {})),
+  }))
+  assert.equal(row(staleLicenses, 'exchange').state, 'UNVERIFIED')
+})
+
+test('maps an explicit SharePoint administrative access denial to a permission blocker', () => {
+  const states = allResources.map((resource) => sync(resource))
+  states.splice(
+    states.findIndex((state) => state.resourceType === 'SHAREPOINT_SITES'),
+    1,
+    sync('SHAREPOINT_SITES', {
+      status: 'FAILED',
+      lastErrorCode: 'sharepoint_sites-sync-failed',
+      lastErrorMessage: 'Microsoft SharePoint site access metadata returned HTTP 403. Confirm the SharePoint application permission required for site-user metadata. HawkView retained the previous site inventory and will retry during a bounded scheduled collection.',
+    }),
+  )
+  const result = deriveCollectionReadiness(input({ syncStates: states }))
+  const sharePoint = row(result, 'sharepoint_onedrive')
+  assert.equal(sharePoint.state, 'BLOCKED_PERMISSION')
+  assert.match(sharePoint.reason ?? '', /retained the previous site inventory/i)
 })
 
 test('missing consent and an unavailable Microsoft connection remain explicit without inventing next retry', () => {

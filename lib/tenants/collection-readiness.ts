@@ -208,3 +208,64 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
 export function readinessLabel(value: string) {
   return value.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
+
+/**
+ * Old persisted sync rows can contain an internal snapshot-safety assertion.
+ * Never surface that implementation detail as an administrator instruction.
+ */
+export function readinessDiagnostic(reasonCode: string | null, reason: string | null) {
+  if (/^Refusing to advance SHAREPOINT_SITES snapshot baseline from a partial or unverified collection\.?$/i.test(reason ?? '')) {
+    return 'SharePoint site access metadata could not be verified completely. HawkView retained the prior site inventory and will retry at the next eligible scheduled collection.'
+  }
+  if (reasonCode === 'sharepoint_sites-sync-failed' && /site access metadata/i.test(reason ?? '')) {
+    return reason
+  }
+  return reason
+}
+
+export function readinessRemediation(state: ReadinessState, remediation: string) {
+  if (state === 'READY') {
+    return 'No action required. HawkView will continue normal scheduled collection.'
+  }
+  return remediation
+}
+
+/**
+ * The legacy synchronization card is a summary of required collection
+ * readiness, never a report that a scheduler invocation happened to finish.
+ * NOT_LICENSED is intentionally shown as not applicable rather than counted
+ * as a failed required workload. Every other non-READY workload keeps the
+ * summary non-healthy and contributes its own observed status.
+ */
+export type SynchronizationReadinessSummary = {
+  overallState: ReadinessState
+  applicableWorkloads: number
+  currentWorkloads: number
+  failedWorkloads: number
+  primaryReason: string | null
+  primaryReasonCode: string | null
+  primaryLastAttemptAt: string | null
+  primaryLastSuccessfulAt: string | null
+}
+
+export function synchronizationReadinessSummary(
+  readiness: CollectionReadinessView | null,
+): SynchronizationReadinessSummary | null {
+  if (!readiness) return null
+  const applicable = readiness.workloads.filter((workload) => workload.state !== 'NOT_LICENSED')
+  const pool = applicable.length ? applicable : readiness.workloads
+  const selected = pool.reduce<CollectionReadinessView['workloads'][number] | null>((worst, workload) => {
+    return !worst || READINESS_ORDER[workload.state] < READINESS_ORDER[worst.state] ? workload : worst
+  }, null)
+  if (!selected) return null
+  return {
+    overallState: selected.state,
+    applicableWorkloads: applicable.length,
+    currentWorkloads: applicable.filter((workload) => workload.state === 'READY').length,
+    failedWorkloads: applicable.filter((workload) => workload.state !== 'READY').length,
+    primaryReason: selected.reason,
+    primaryReasonCode: selected.reasonCode,
+    primaryLastAttemptAt: selected.lastAttemptAt,
+    primaryLastSuccessfulAt: selected.lastSuccessfulAt,
+  }
+}

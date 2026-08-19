@@ -91,7 +91,26 @@ type ReadinessInput = {
   consentedPermissions: string[]
   syncStates: ReadinessSyncState[]
   subscriptions?: M365ActivitySubscriptionState[]
+  /** null means the durable license inventory is absent, stale, or not authoritative. */
+  licenseServicePlans?: Array<{ servicePlanId?: string; servicePlanName: string; provisioningStatus: string }> | null
   now?: Date
+}
+
+const SERVICE_PLAN_APPLICABILITY = {
+  sharepoint: new Set(['SHAREPOINTENTERPRISE', 'SHAREPOINTSTANDARD', 'ONEDRIVESTANDARD', 'ONEDRIVEENTERPRISE']),
+  exchange: new Set(['EXCHANGE_S_ENTERPRISE', 'EXCHANGE_S_STANDARD', 'EXCHANGE_S_DESKLESS', 'EXCHANGEARCHIVE']),
+}
+
+function servicePlanApplicability(plans: ReadinessInput['licenseServicePlans'], workload: keyof typeof SERVICE_PLAN_APPLICABILITY) {
+  if (!plans) return 'UNVERIFIED' as const
+  const recognized = plans.filter((plan) => typeof plan.servicePlanName === 'string' && SERVICE_PLAN_APPLICABILITY[workload].has(plan.servicePlanName.toUpperCase()))
+  if (!recognized.length) return 'UNVERIFIED' as const
+  // Microsoft documents SUCCESS as provisioned.  Pending/unknown states are
+  // neither proof of entitlement nor proof that the workload is unlicensed.
+  if (recognized.some((plan) => plan.provisioningStatus.toUpperCase() === 'SUCCESS')) return 'APPLICABLE' as const
+  return recognized.every((plan) => plan.provisioningStatus.toUpperCase() === 'DISABLED')
+    ? 'NOT_LICENSED' as const
+    : 'UNVERIFIED' as const
 }
 
 const CURRENT_MS = 15 * 60 * 1000
@@ -322,6 +341,12 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   const consented = new Set(input.consentedPermissions.map((permission) => permission.toLowerCase()))
   const verificationKnown = Boolean(validDate(input.connectionVerifiedAt))
   const connectionUnavailable = ['ERROR', 'REVOKED', 'PENDING_CONSENT', 'EXPIRED', 'INVALID'].includes(input.connectionStatus?.toUpperCase() ?? '')
+  // Entitlement is authoritative only when the matching LICENSES collector is
+  // currently successful.  An old/null inventory must not turn a collector
+  // failure into a licensing assertion.
+  const licensesCurrent = fromSyncState(states.get('LICENSES'), now, 'daily').state === 'READY'
+  const sharePointApplicability = licensesCurrent ? servicePlanApplicability(input.licenseServicePlans, 'sharepoint') : 'UNVERIFIED'
+  const exchangeApplicability = licensesCurrent ? servicePlanApplicability(input.licenseServicePlans, 'exchange') : 'UNVERIFIED'
   const rows = [
     workload({ key: 'entra_directory_audit', workload: 'Entra directory audit', resourceTypes: ['AUDIT_LOGS'], requiredPermissions: ['AuditLog.Read.All'], cadence: 'incremental', remediation: 'Confirm AuditLog.Read.All has tenant-wide admin consent, then allow the scheduled collector to recheck.' }, states, consented, verificationKnown, now),
     workload({ key: 'sign_ins', workload: 'Entra sign-ins', resourceTypes: ['SIGN_INS'], requiredPermissions: ['AuditLog.Read.All'], cadence: 'incremental', remediation: 'Confirm AuditLog.Read.All and the tenant’s sign-in log entitlement. HawkView will recheck during normal collection.' }, states, consented, verificationKnown, now),
@@ -331,6 +356,19 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     workload({ key: 'sharepoint_onedrive', workload: 'SharePoint and OneDrive', resourceTypes: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'], requiredPermissions: ['Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All'], cadence: 'daily', remediation: 'Confirm the listed SharePoint and Reports permissions, then wait for the next scheduled inventory collection.' }, states, consented, verificationKnown, now),
     workload({ key: 'exchange', workload: 'Exchange mailbox and configuration', resourceTypes: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'], requiredPermissions: ['User.Read.All', 'MailboxSettings.Read', 'Reports.Read.All', 'Organization.Read.All'], cadence: 'daily', remediation: 'Graph mailbox data requires the listed Graph permissions. Exchange Admin configuration also requires Exchange.ManageAsAppV2 and a Recipient Management RBAC role; HawkView does not infer that RBAC is granted.' }, states, consented, verificationKnown, now),
   ]
+
+  const applyApplicability = (key: 'sharepoint_onedrive' | 'exchange', applicability: 'APPLICABLE' | 'NOT_LICENSED' | 'UNVERIFIED') => {
+    const row = rows.find((candidate) => candidate.key === key)!
+    if (applicability === 'NOT_LICENSED') {
+      row.state = 'NOT_LICENSED'; row.configuredCapability = 'NOT_CONFIGURED'; row.reasonCode = 'SERVICE_PLAN_NOT_ENABLED'; row.reason = 'The collected subscription plans explicitly show this workload is not enabled.'
+    } else if (applicability === 'UNVERIFIED') {
+      row.components = [...(row.components ?? []), { key: 'LICENSE_APPLICABILITY', label: 'Subscription applicability', state: 'UNVERIFIED', lastAttemptAt: null, lastSuccessfulAt: null, freshness: 'UNKNOWN', reasonCode: 'SERVICE_PLAN_UNVERIFIED', reason: 'Collected subscription plans do not authoritatively establish this workload entitlement.' }]
+      const selected = selectedWorst(row.components)!; row.state = selected.state; row.reasonCode = selected.reasonCode; row.reason = selected.reason
+    }
+  }
+  // SharePoint has no second admin-RBAC aggregation below. Exchange is applied
+  // after that aggregation so it cannot accidentally overwrite licensing truth.
+  applyApplicability('sharepoint_onedrive', sharePointApplicability)
 
   const exchange = rows.find((row) => row.key === 'exchange')!
   const exchangeAdmin = fromSyncState(states.get('EXCHANGE_MAILBOX_CONFIGURATION'), now, 'daily')
@@ -356,6 +394,7 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   exchange.freshness = selectedExchange.freshness
   exchange.reasonCode = selectedExchange.reasonCode
   exchange.reason = selectedExchange.reason
+  applyApplicability('exchange', exchangeApplicability)
 
   const subscriptionByType = new Map((input.subscriptions ?? []).map((subscription) => [subscription.contentType, subscription]))
   const subscriptionComponents = M365_ACTIVITY_CONTENT_TYPES.map((contentType) => ({
