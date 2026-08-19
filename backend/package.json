@@ -21,7 +21,8 @@
     "test:collection-field-state": "tsx --test src/tenants/collection-field-state.test.ts",
     "test:changes": "tsx --test src/changes/change-evidence.service.test.ts",
     "test:m365-audit": "tsx --test src/tenants/m365-management-activity.test.ts",
-    "test:auth-registrations": "tsx --test src/tenants/auth-registration-sync.test.ts"
+    "test:auth-registrations": "tsx --test src/tenants/auth-registration-sync.test.ts",
+    "test:sharepoint-contract": "tsx --test src/tenants/sharepoint-data-contract.test.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.28",

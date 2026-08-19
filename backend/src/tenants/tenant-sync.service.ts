@@ -32,6 +32,7 @@ import {
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import { buildSharePointDataContract } from './sharepoint-data-contract.js'
 import {
   DAILY_INVENTORY_ANCHORS,
   requiresDailyInventoryRefresh,
@@ -4451,15 +4452,6 @@ export class TenantSyncService {
       const parsed = Number(value)
       return Number.isFinite(parsed) ? parsed : null
     }
-    const reportBoolean = (value: unknown) =>
-      ['true', 'yes', '1'].includes(
-        String(value ?? '')
-          .trim()
-          .toLowerCase()
-      )
-    const deletedSharePointUsage = sharePointUsage.filter(
-      (row: Record<string, string>) => reportBoolean(row?.['Is Deleted'])
-    )
     const reportedSharePointAllocationBytes = sharePointUsage.reduce(
       (total: number, row: Record<string, string>) =>
         total + (parseReportBytes(row?.['Storage Allocated (Byte)']) ?? 0),
@@ -4721,7 +4713,41 @@ export class TenantSyncService {
       Boolean(sharePointSettings)
     const sharePointUsageSynchronized =
       sharePointUsageSyncState?.status === 'SUCCEEDED'
-    const sharePointActivityAsOf = new Date()
+    const latestSharePointReportRefreshDate = sharePointUsage
+      .map((row: Record<string, string>) => row?.['Report Refresh Date']?.trim())
+      .filter((value: string | undefined): value is string => Boolean(value))
+      .sort()
+      .at(-1)
+    const parseReportCalendarDate = (value: unknown, notAfter?: Date) => {
+      if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null
+      const [year, month, day] = value.split('-').map(Number)
+      const parsed = new Date(Date.UTC(year, month - 1, day))
+      if (
+        parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 ||
+        parsed.getUTCDate() !== day || (notAfter && parsed.getTime() > notAfter.getTime())
+      ) return null
+      return parsed
+    }
+    const parsedSharePointActivityAsOf = parseReportCalendarDate(
+      latestSharePointReportRefreshDate,
+      new Date()
+    )
+    // Inactivity is measured as of Microsoft's report refresh, not the time
+    // this API response happened to be assembled.
+    const sharePointActivityAsOf =
+      parsedSharePointActivityAsOf &&
+      !Number.isNaN(parsedSharePointActivityAsOf.getTime())
+        ? parsedSharePointActivityAsOf
+        : new Date()
+    const sharePointDataContract = buildSharePointDataContract({
+      sites: sharePointSites,
+      settings: sharePointSettings,
+      sharePointUsage,
+      oneDriveUsage,
+      settingsSynchronized: sharePointSettingsSynchronized,
+      usageSynchronized: sharePointUsageSynchronized,
+      activityAsOf: sharePointActivityAsOf,
+    })
     const getSharePointActivity = (site: any) => {
       const usage = getSharePointUsage(site)
       if (!usage) {
@@ -4732,20 +4758,31 @@ export class TenantSyncService {
         }
       }
 
-      const value = usage['Last Activity Date']
-      if (typeof value !== 'string' || !value.trim()) {
-        // A site present in Microsoft's D180 report with no activity date had
-        // no reported activity during the observation window. This is useful
-        // inactivity evidence, not missing data.
+      const reportRefreshDate = parseReportCalendarDate(
+        usage['Report Refresh Date'],
+        new Date()
+      )
+      if (!reportRefreshDate) {
         return {
           lastActivityAt: null,
-          activityAgeDays: 180,
-          activitySource: 'microsoft-d180-no-activity',
+          activityAgeDays: null,
+          activitySource: 'microsoft-report-refresh-unavailable',
         }
       }
 
-      const parsed = new Date(`${value.trim()}T00:00:00.000Z`)
-      if (Number.isNaN(parsed.getTime())) {
+      const value = usage['Last Activity Date']
+      if (typeof value !== 'string' || !value.trim()) {
+        // Microsoft omitted the activity date. Do not turn an omitted report
+        // value into a claim that the site was inactive for the full window.
+        return {
+          lastActivityAt: null,
+          activityAgeDays: null,
+          activitySource: 'microsoft-d180-activity-not-reported',
+        }
+      }
+
+      const parsed = parseReportCalendarDate(value.trim(), reportRefreshDate)
+      if (!parsed) {
         return {
           lastActivityAt: null,
           activityAgeDays: null,
@@ -4755,12 +4792,8 @@ export class TenantSyncService {
 
       return {
         lastActivityAt: value.trim(),
-        activityAgeDays: Math.max(
-          0,
-          Math.floor(
-            (sharePointActivityAsOf.getTime() - parsed.getTime()) /
-              (24 * 60 * 60 * 1000)
-          )
+        activityAgeDays: Math.floor(
+          (reportRefreshDate.getTime() - parsed.getTime()) / (24 * 60 * 60 * 1000)
         ),
         activitySource: 'microsoft-d180-report',
       }
@@ -5185,6 +5218,10 @@ export class TenantSyncService {
             }),
         },
         sharepoint: {
+          // Versioned additive contract for the current SharePoint/OneDrive UI.
+          // The legacy fields below remain temporarily for compatibility, but
+          // new clients should consume this closed, source-labelled projection.
+          dataContract: sharePointDataContract,
           collection: {
             inventory: collectionState(
               'sharepoint.sites.inventory',
@@ -5320,16 +5357,20 @@ export class TenantSyncService {
             activityDataMessage: sharePointUsageIdentifiersConcealed
               ? 'Microsoft returned SharePoint activity dates with concealed site identifiers. Turn off concealed names in Microsoft 365 Admin Center > Settings > Org settings > Services > Reports, then synchronize again.'
               : null,
-            // Graph exposes one tenant sharing capability for the combined
-            // SharePoint and OneDrive settings resource. Until Microsoft
-            // exposes separate values, show the same authoritative tenant
-            // policy in both cards rather than pretending OneDrive failed.
-            sharingSharePoint: sharePointSettingsSynchronized
-              ? (sharePointSettings?.sharingCapability ?? null)
-              : null,
-            sharingOneDrive: sharePointSettingsSynchronized
-              ? (sharePointSettings?.sharingCapability ?? null)
-              : null,
+            // Canonical combined tenant policy. The aliases are a temporary
+            // compatibility bridge for the deployed frontend; they always
+            // equal this canonical value and are not independent observations.
+            tenantSharingCapability:
+              sharePointDataContract.tenantSettings.externalSharing.capability,
+            sharingSharePoint:
+              sharePointDataContract.tenantSettings.externalSharing.capability,
+            sharingOneDrive:
+              sharePointDataContract.tenantSettings.externalSharing.capability,
+            sharingCompatibility: {
+              canonicalField: 'tenantSharingCapability',
+              deprecatedAliases: ['sharingSharePoint', 'sharingOneDrive'],
+              aliasesRepresentSameCombinedTenantPolicy: true,
+            },
           },
           sites: sharePointSites.map((site) => {
             const usage = getSharePointUsage(site)
@@ -5368,8 +5409,8 @@ export class TenantSyncService {
                 reportStorageAllocated ?? site?.driveQuota?.total
               ),
               lastActivity:
-                activity.activitySource === 'microsoft-d180-no-activity'
-                  ? 'No activity in the last 180 days'
+                activity.activitySource === 'microsoft-d180-activity-not-reported'
+                  ? 'Activity not reported by Microsoft'
                   : activity.activitySource === 'unmatched'
                     ? 'Activity unavailable for this site'
                     : activity.lastActivityAt || 'Activity date unavailable',
@@ -5400,27 +5441,13 @@ export class TenantSyncService {
           // This is the deleted-site signal in Microsoft's D180 usage report.
           // It is not the SharePoint recycle bin and must not be presented as
           // a complete list of recoverable sites.
-          deletedSites: deletedSharePointUsage.map(
-            (row: Record<string, string>, index: number) => ({
-              id: row['Site Id'] || row['Site URL'] || `deleted-site-${index}`,
-              name:
-                row['Site Name'] ||
-                row['Site URL'] ||
-                'Deleted SharePoint site',
-              url: row['Site URL'] || '',
-              ownerDisplayName: row['Owner Display Name'] || null,
-              ownerPrincipalName: row['Owner Principal Name'] || null,
-              lastActivity: row['Last Activity Date'] || null,
-              reportPeriod: 'D30',
-              source: 'microsoft-usage-report',
-            })
-          ),
+          deletedSites: sharePointDataContract.reportedDeletedSites,
           deletedSitesSynchronized: sharePointUsageSynchronized,
           unsupported: {
             siteOwnerCount:
               'Microsoft Graph site inventory and usage reports do not provide a reliable owner count.',
             deletedSitesRecycleBin:
-              'Microsoft Graph does not provide the complete SharePoint recycle-bin inventory; HawkView shows deleted sites reported by Microsoft usage data for the last 30 days.',
+              'Microsoft Graph does not provide the complete SharePoint recycle-bin inventory; HawkView shows only the deleted flag in the D180 SharePoint usage report. That flag does not establish recoverability or deletion time.',
           },
         },
         teams: {},

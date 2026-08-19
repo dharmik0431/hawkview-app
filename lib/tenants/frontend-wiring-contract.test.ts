@@ -1,0 +1,49 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import test from 'node:test'
+
+function source(relativePath: string): string {
+  return readFileSync(new URL(`../../${relativePath}`, import.meta.url), 'utf8')
+}
+
+test('SharePoint page is wired through the canonical adapter without wall-clock inactivity', () => {
+  const component = source('app/(protected)/tenants/[id]/components/sections/sharepoint-section.tsx')
+  assert.match(component, /buildSharePointViewModel\(sp\)/)
+  assert.match(component, /sharePointRetentionDaysLabel/)
+  assert.doesNotMatch(component, /Date\.now\s*\(/)
+})
+
+test('Exchange badges use resource sync aliases and the strict status helper', () => {
+  const component = source('app/(protected)/tenants/[id]/components/sections/exchange-section.tsx')
+  assert.match(component, /exchangeSync\?\.mailboxes/)
+  assert.match(component, /exchangeSync\?\.inboxRules/)
+  assert.match(component, /exchangeSync\?\.acceptedDomains/)
+  assert.match(component, /exchangeSync\?\.groups/)
+  assert.match(component, /exchangeDatasetStatus\(mailboxesSyncStatus, EXCHANGE_MAILBOXES\.length\)/)
+  assert.doesNotMatch(component, /EXCHANGE_RULES\.length > 0 \? 'Synchronized'/)
+})
+
+test('Settings consumes readiness, preserves the audit deep link, and has no healthy fallback', () => {
+  const component = source('app/(protected)/tenants/[id]/settings/page.tsx')
+  const compact = component.replace(/\s+/g, ' ')
+  assert.match(component, /normalizeCollectionReadiness\(tenantListRecord\?\.collectionReadiness\)/)
+  assert.match(component, /row-m365_unified_audit/)
+  assert.match(component, /settingsConnectionHealth/)
+  assert.match(component, /isM365AuditSyncDeepLink\(sectionParam, resourceParam\)/)
+  assert.match(component, /auditSyncFocusTarget\(sectionParam, resourceParam\)/)
+  assert.match(component, /m365AuditSyncHealth\(tenantListRecord\?\.tenantHealth\?\.resourceHealth \?\? tenantListRecord\?\.resourceHealth\)/)
+  assert.match(component, /auditSync\.classification/)
+  assert.match(component, /auditSync\.message/)
+  assert.match(component, /auditSync\.lastAttemptAt/)
+  assert.match(component, /auditSync\.lastSuccessfulAt/)
+  assert.match(component, /Exchange Admin API RBAC/)
+  assert.match(component, /readinessLabel\(w\.exchangeRbac\.state\)/)
+  assert.match(component, /w\.exchangeRbac\.status/)
+  assert.match(component, /w\.exchangeRbac\.reason/)
+  assert.match(component, /apiClient\.delete<\{ removed: boolean \}>/)
+  assert.match(component, /confirmMicrosoftTenantId:\s*enteredId/)
+  assert.match(compact, /if \(enteredId !== requiredId\)/)
+  assert.match(compact, /if \(!ackChecked\)/)
+  assert.match(compact, /disabled=\{ isDeleting \|\| !ackChecked \|\| confirmTenantId\.trim\(\)\.toLowerCase\(\) !== String\(tenant\.microsoftTenantId \|\| tenant\.id\)\.trim\(\)\.toLowerCase\(\) \}/)
+  assert.doesNotMatch(component, /status:\s*rawListTenant\.status[^\n]+\|\|\s*'healthy'/)
+})
