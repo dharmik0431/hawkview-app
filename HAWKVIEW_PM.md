@@ -1,10 +1,22 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-18 during P0-6.1 local reliability repair
+Last updated: 2026-08-19 after P0-6.2 final independent QA
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P0-6.2 — standard least-privilege SharePoint mode (local, unpublished; QA-approved)
+
+- Standard Phase 1 no longer requests or uses the SharePoint-resource `Sites.FullControl.All` path. The SharePoint collector keeps Graph site inventory, tenant settings, and usage/report collection with the existing read-only Graph permissions; it does not acquire a SharePoint-host token or call `/_api/web/siteusers`.
+- A complete Graph site inventory is authoritative even when current site-user, site collection administrator, sharing-member, or per-site permission metadata is unavailable. The API and Settings readiness view expose that boundary as `NOT_COLLECTED_LEAST_PRIVILEGE`; it does not degrade otherwise-supported SharePoint readiness.
+- Transition behavior needs no schema migration: historic full-control-derived evidence remains historical, while the current tenant payload suppresses historic access observations and the snapshot comparison catalog no longer treats those access fields as current configuration changes. Unified Audit SharePoint/OneDrive evidence remains independent of current-state inventory.
+- Final independent QA passed: **P0=0, P1=0, P2=0**. Validation confirmed 176 backend tests passed with two intentional legacy REST skips; frontend tests passed 10/10; root and backend TypeScript, Prisma validation, and `git diff --check` passed.
+- Exact local scope is 11 files: `HAWKVIEW_PM.md`, the Tenant Settings readiness view, SharePoint readiness helpers/tests, tenant sync/readiness code/tests, the Microsoft consent service/tests, and the Microsoft admin-change catalog/evidence regression.
+- No migration is required. This work remains local and unpublished, is safe to publish, and has not changed any live permission, tenant, consent, deployment, or GAS state.
+- Build limitation recorded honestly: backend TypeScript passed, but the backend esbuild production bundle was blocked by Windows filesystem access to linked dependencies. The root Next build reached compilation and then stalled without a source error; clean-runner completion remains unverified.
+- Deployment sequence: merge and deploy the code first; verify normal Graph-only SharePoint collection succeeds and recovers from the prior REST 401. Only then remove `Sites.FullControl.All` from the live app registration and revoke existing tenant grants. GAS Settings copy remains user-managed.
+- The least-privilege decision follows Microsoft’s distinction between full-control `Sites.FullControl.All` and per-site assigned `Sites.Selected`; an enhanced mode is future work and is not automated here.
 
 ## Product objective
 
@@ -187,11 +199,11 @@ Final QA validation: independent verification passed frontend readiness tests (6
 
 Known limits: the current contract cannot prove a permission grant when no verification record exists; it says UNVERIFIED/MISSING rather than guessing. `Exchange.ManageAsAppV2` and Exchange RBAC are not represented as Graph consent and require a successful existing Admin API collection to confirm. The existing Management Activity collector remains subject to Microsoft provisioning/latency and does not guarantee every admin event. Nonblocking P2 follow-up: harden the legacy retry-time contract, version the permission manifest, and use stricter date parsing.
 
-## Active local follow-up — P0-6.1 collection reliability cleanup
+## Historical follow-up — P0-6.1 collection reliability cleanup
 
-Status: final independent QA PASS (P0=0, P1=0, P2=0); local/unpublished and safe to publish on `codex/p0-6-1-collection-reliability`, based on `origin/main` after PR #154. No manual sync, permission/RBAC, consent, migration, deployment, tenant configuration, commit, push, or PR action has been taken.
+Status: PR #155 was subsequently merged. The REST site-access approach below is historical context only; P0-6.2 replaces it with standard least-privilege Graph-only SharePoint inventory.
 
-- Baseline QA found the live SharePoint path reaches Graph inventory successfully but fails on SharePoint REST `/_api/web/siteusers` with HTTP 401. The first local repair incorrectly derived the token-host family from Graph inventory. QA rejected that trust boundary. The current local repair derives the exact public-cloud root and paired personal-site host only from HawkView's persisted verified initial `*.onmicrosoft.com` tenant-domain state, rejects every other Graph URL before a token request, retains distinct per-host token caching, and preserves the authoritative-baseline refusal on any token/per-site failure. If the trusted initial domain is absent, collection fails closed with a safe configuration diagnostic. This remains local and pending re-QA.
+- Baseline QA found the historical live SharePoint path reached Graph inventory successfully but failed on SharePoint REST `/_api/web/siteusers` with HTTP 401. P0-6.1 hardened that resource-token trust boundary; P0-6.2 removes the broad REST enrichment requirement from standard mode instead.
 - Code-path diagnosis also found that the existing Exchange Admin API mailbox/configuration collector was invoked by audit-driven reconciliation but omitted from the normal daily full-inventory module list. Its RBAC status could therefore remain UNVERIFIED/NEVER_SUCCEEDED forever without an audit event. This follow-up adds that existing daily collector without increasing cron frequency or adding per-user readiness probes. A future 401/403 will surface as the existing explicit Exchange Admin/RBAC blocker rather than READY.
 - The normal five-minute scheduler now performs a targeted `SHAREPOINT_SITES` retry only after a 30-minute exponential-backoff eligibility window (capped at six hours), within the existing per-tenant lock and scheduler batch cap. It never hot-loops HTTP 401/403 authorization-shaped failures, does not add calls on page reads, and does not run per-user/per-mailbox work. A successful resource clears the retry state through existing `runSnapshotSync` semantics. Exchange mailbox/configuration remains a daily collector only; its existing HTTP 401/403 readiness mapping remains an explicit Exchange Admin/RBAC blocker rather than a Graph permission assertion.
 - Tenant health now treats the promised SharePoint site inventory and Exchange Admin configuration collections as required operational evidence. A failed/stale/never-succeeded required workload cannot leave the legacy tenant health/status at Healthy or 100%; this does not create What Changed evidence.

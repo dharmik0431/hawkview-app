@@ -3,6 +3,7 @@ import {
   BadRequestException,
   Inject,
   Injectable,
+  Logger,
   ServiceUnavailableException,
 } from '@nestjs/common'
 import { createHash, randomBytes } from 'node:crypto'
@@ -64,6 +65,90 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read Microsoft Secure Score snapshots and security improvement data.',
 }
 
+const GRAPH_RESOURCE_HOST = 'graph.microsoft.com'
+const MANAGEMENT_RESOURCE_HOST = 'manage.office.com'
+const SHAREPOINT_RESOURCE_APP_ID = '00000003-0000-0ff1-ce00-000000000000'
+const DEPRECATED_SHAREPOINT_FULL_CONTROL = 'sites.fullcontrol.all'
+
+type ConfiguredPermissionOverride = {
+  name: string
+  rejected?: string
+}
+
+/**
+ * Environment overrides historically used bare Microsoft Graph permission
+ * names. It now accepts only code-owned canonical names, so an unknown bare
+ * value is never silently reinterpreted as Graph. Resource-qualified
+ * SharePoint values are rejected so standard mode can never request or report
+ * the deprecated SharePoint full-control grant.
+ */
+function decodeBoundedPermissionOverride(raw: string): string | null {
+  if (raw.length === 0 || raw.length > 256 || /[\u0000-\u001f\u007f\\]/.test(raw)) return null
+  let value = raw
+  for (let layer = 0; layer < 2 && value.includes('%'); layer += 1) {
+    try {
+      const decoded = decodeURIComponent(value)
+      if (decoded === value) break
+      value = decoded
+    } catch {
+      return null
+    }
+  }
+  // An undecoded percent marker is ambiguous configuration, not a scope.
+  return value.includes('%') || /[\u0000-\u001f\u007f\\]/.test(value) ? null : value
+}
+
+function canonicalPermissionName(value: string): string | null {
+  const normalized = value.replace(/\s+/g, '').toLowerCase()
+  return DEFAULT_REQUIRED_PERMISSIONS.find(
+    (permission) => permission.toLowerCase() === normalized
+  ) ?? null
+}
+
+/** Strictly accept only code-owned Graph names and the Office 365 Management
+ * ActivityFeed.Read resource representation. Values are environment input,
+ * so a resource-like or encoded unknown value is never treated as Graph. */
+export function normalizeConfiguredRequiredPermissions(value: string | undefined): {
+  permissions: string[]
+  rejected: string[]
+} {
+  const parsed: ConfiguredPermissionOverride[] = (value ?? '')
+    .split(',')
+    .map((raw) => raw.trim())
+    .filter(Boolean)
+    .map((raw) => {
+      const decoded = decodeBoundedPermissionOverride(raw)
+      if (!decoded) return { name: raw, rejected: 'malformed or ambiguous permission override' }
+      const compact = decoded.replace(/\s+/g, '')
+      const canonicalBare = canonicalPermissionName(compact)
+      if (canonicalBare) return { name: canonicalBare }
+
+      const qualified = /^(https?):\/\/([^/?#:]+)(?::\d+)?\/([^/?#]+)$/i.exec(compact)
+      const labelled = /^([a-z0-9.-]+)[:/]([^:/?#]+)$/i.exec(compact)
+      const resource = (qualified?.[2] ?? labelled?.[1] ?? '').toLowerCase().replace(/\.$/, '')
+      const permission = qualified?.[3] ?? labelled?.[2] ?? ''
+      const canonical = canonicalPermissionName(permission)
+      const normalizedPermission = permission.toLowerCase()
+      const sharePointResource = resource === SHAREPOINT_RESOURCE_APP_ID || resource === 'sharepoint' || resource === 'office365sharepointonline' || resource === 'sharepoint.com' || resource.endsWith('.sharepoint.com')
+      if (sharePointResource) {
+        return { name: raw, rejected: normalizedPermission === DEPRECATED_SHAREPOINT_FULL_CONTROL ? 'deprecated SharePoint Sites.FullControl.All' : 'SharePoint-resource permissions are not used in standard mode' }
+      }
+      if (!canonical) return { name: raw, rejected: 'unknown permission override' }
+      if ((resource === GRAPH_RESOURCE_HOST || resource === 'graph' || resource === 'microsoftgraph') && canonical !== 'ActivityFeed.Read') {
+        return { name: canonical }
+      }
+      if ((resource === MANAGEMENT_RESOURCE_HOST || resource === 'office365management' || resource === 'management') && canonical === 'ActivityFeed.Read') {
+        return { name: canonical }
+      }
+      return { name: raw, rejected: 'unrecognized or mismatched permission resource' }
+    })
+
+  return {
+    permissions: [...new Set(parsed.filter((entry) => !entry.rejected).map((entry) => entry.name))],
+    rejected: parsed.filter((entry) => entry.rejected).map((entry) => `${entry.name}: ${entry.rejected}`),
+  }
+}
+
 interface ConsentState {
   customerTenantId?: string
   organizationId: string
@@ -83,6 +168,8 @@ interface MicrosoftOrganization {
 
 @Injectable()
 export class MicrosoftConsentService {
+  private readonly logger = new Logger(MicrosoftConsentService.name)
+  private rejectedPermissionOverrideWarning?: string
   constructor(
     @Inject(PrismaService)
     private readonly prisma: PrismaService,
@@ -125,14 +212,22 @@ export class MicrosoftConsentService {
   }
 
   getRequiredPermissions() {
-    const configured = process.env.MICROSOFT_REQUIRED_PERMISSIONS?.split(',')
-      .map((permission) => permission.trim())
-      .filter(Boolean)
+    const configured = normalizeConfiguredRequiredPermissions(
+      process.env.MICROSOFT_REQUIRED_PERMISSIONS
+    )
+
+    if (configured.rejected.length) {
+      const warning = `Ignored unsafe Microsoft permission override(s): ${configured.rejected.join('; ')}`
+      if (warning !== this.rejectedPermissionOverrideWarning) {
+        this.rejectedPermissionOverrideWarning = warning
+        this.logger.warn(warning)
+      }
+    }
 
     // Environment configuration may add deployment-specific permissions, but
     // it must not silently remove permissions required by compiled modules.
     const permissions = [
-      ...new Set([...DEFAULT_REQUIRED_PERMISSIONS, ...(configured ?? [])]),
+      ...new Set([...DEFAULT_REQUIRED_PERMISSIONS, ...configured.permissions]),
     ]
 
     return permissions.map((name) => ({
@@ -531,47 +626,6 @@ export class MicrosoftConsentService {
       accessToken: result.accessToken,
       publisherIdentifier: credentials.homeTenantId,
     }
-  }
-
-  async getTenantSharePointAccessToken(input: {
-    microsoftTenantId: string
-    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
-    clientId: string | null
-    credentialReference: string | null
-    sharePointHost: string
-  }) {
-    const sharePointHost = input.sharePointHost.trim().toLowerCase()
-    if (
-      !/^[a-z0-9.-]+\.sharepoint\.com$/.test(sharePointHost) ||
-      sharePointHost.includes('..')
-    ) {
-      throw new BadRequestException(
-        'Microsoft returned an invalid SharePoint tenant hostname.'
-      )
-    }
-
-    const credentials =
-      input.connectionMode === 'CUSTOMER_MANAGED'
-        ? {
-            clientId: input.clientId ?? '',
-            clientSecret: input.credentialReference
-              ? await this.secretStore.access(input.credentialReference)
-              : '',
-          }
-        : await this.getManagedConnector()
-
-    if (!credentials.clientId || !credentials.clientSecret) {
-      throw new ServiceUnavailableException(
-        'The Microsoft tenant connection is incomplete.'
-      )
-    }
-
-    const result = await this.requestAccessToken(
-      input.microsoftTenantId,
-      credentials,
-      `https://${sharePointHost}/.default`
-    )
-    return result.accessToken
   }
 
   async configureManagedConnector(input: {

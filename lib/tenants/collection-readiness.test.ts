@@ -22,6 +22,28 @@ test('normalizes a bounded readiness response and preserves useful M365 subscrip
   assert.equal(readinessLabel('BLOCKED_TENANT_CONFIGURATION'), 'Blocked Tenant Configuration')
 })
 
+test('preserves the explicit standard least-privilege SharePoint capability boundary without degrading readiness', () => {
+  const result = normalizeCollectionReadiness({
+    ...valid,
+    workloads: [{
+      ...valid.workloads[0],
+      key: 'sharepoint_onedrive',
+      workload: 'SharePoint and OneDrive',
+      state: 'READY',
+      capabilities: [{
+        key: 'sharepoint_site_access_metadata',
+        label: 'Site access metadata',
+        state: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+        reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+        source: 'HawkView standard least-privilege mode',
+        message: 'Standard mode does not collect current site-user metadata.',
+      }],
+    }],
+  })
+  assert.equal(result?.overallState, 'READY')
+  assert.equal(result?.workloads[0]?.capabilities[0]?.state, 'NOT_COLLECTED_LEAST_PRIVILEGE')
+})
+
 test('drops malformed, unsafe, and unexpected readiness values instead of rendering them', () => {
   const hostile = {
     ...valid,

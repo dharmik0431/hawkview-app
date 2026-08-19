@@ -45,6 +45,14 @@ export type CollectionReadinessView = {
     reason: string | null
     lastVerifiedAt: string | null
     remediation: string
+    capabilities: Array<{
+      key: string
+      label: string
+      state: 'NOT_COLLECTED_LEAST_PRIVILEGE'
+      reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE'
+      source: string
+      message: string
+    }>
     components: Array<{
       key: string
       label: string
@@ -102,6 +110,18 @@ function component(value: unknown) {
   }
 }
 
+function capability(value: unknown) {
+  const candidate = record(value)
+  if (!candidate || candidate.state !== 'NOT_COLLECTED_LEAST_PRIVILEGE' || candidate.reasonCode !== 'NOT_COLLECTED_LEAST_PRIVILEGE') return null
+  const key = text(candidate.key, 80)
+  const label = text(candidate.label, 120)
+  const source = text(candidate.source, 160)
+  const message = text(candidate.message, 500)
+  return key && label && source && message
+    ? { key, label, state: 'NOT_COLLECTED_LEAST_PRIVILEGE' as const, reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE' as const, source, message }
+    : null
+}
+
 export function normalizeCollectionReadiness(value: unknown): CollectionReadinessView | null {
   const candidate = record(value)
   if (!candidate || !Array.isArray(candidate.workloads)) return null
@@ -129,12 +149,15 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
         key: `invalid_readiness_row_${index}`, workload: 'Readiness data validation', state: 'UNSUPPORTED',
         configuredCapability: 'UNVERIFIED', permissionStatus: 'UNVERIFIED', requiredPermissions: [],
         lastAttemptAt: null, lastSuccessfulAt: null, freshness: 'UNKNOWN', reasonCode: 'MALFORMED_READINESS_ROW', reason: 'HawkView received a malformed readiness row.', lastVerifiedAt: null,
-        remediation: 'Refresh the tenant data after the service reports a valid readiness response.', components: [], exchangeRbac: null,
+        remediation: 'Refresh the tenant data after the service reports a valid readiness response.', capabilities: [], components: [], exchangeRbac: null,
       })
       continue
     }
     const requiredPermissions = Array.isArray(row.requiredPermissions)
       ? row.requiredPermissions.slice(0, 16).map((permission) => text(permission, 160)).filter((permission): permission is string => Boolean(permission))
+      : []
+    const capabilities = Array.isArray(row.capabilities)
+      ? row.capabilities.slice(0, 8).map(capability).filter((item): item is NonNullable<ReturnType<typeof capability>> => Boolean(item))
       : []
     const rawComponents = Array.isArray(row.components) ? row.components : []
     const oversizedComponents = rawComponents.length > 16
@@ -182,6 +205,7 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
       remediation: selectedComponent
         ? `Review ${selectedComponent.label}: ${selectedComponent.reason ?? 'this component could not be safely verified.'}`
         : remediation,
+      capabilities,
       components,
       exchangeRbac: rbacState && rbacStatus && rbacReason ? { status: rbacStatus, state: rbacState, reason: rbacReason } : null,
     })
@@ -191,7 +215,7 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
       key: 'invalid_readiness_data', workload: 'Readiness data validation', state: 'UNSUPPORTED',
       configuredCapability: 'UNVERIFIED', permissionStatus: 'UNVERIFIED', requiredPermissions: [],
       lastAttemptAt: null, lastSuccessfulAt: null, freshness: 'UNKNOWN', reasonCode: 'READINESS_ROW_LIMIT_EXCEEDED', reason: 'HawkView received more readiness rows than this bounded contract permits.', lastVerifiedAt: null,
-      remediation: 'Refresh the tenant data after the service reports a valid readiness response.', components: [], exchangeRbac: null,
+      remediation: 'Refresh the tenant data after the service reports a valid readiness response.', capabilities: [], components: [], exchangeRbac: null,
     })
   }
   if (!workloads.length) return null

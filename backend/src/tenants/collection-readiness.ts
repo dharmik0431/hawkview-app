@@ -55,6 +55,15 @@ export type CollectionReadinessRow = {
   reason: string | null
   lastVerifiedAt?: string | null
   remediation: string
+  /** Informational capability boundaries do not degrade supported workload readiness. */
+  capabilities?: Array<{
+    key: string
+    label: string
+    state: 'NOT_COLLECTED_LEAST_PRIVILEGE'
+    reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE'
+    source: string
+    message: string
+  }>
   components?: Array<{
     key: string
     label: string
@@ -266,6 +275,7 @@ function workload(
     requiredPermissions: string[]
     cadence: 'incremental' | 'daily'
     remediation: string
+    capabilities?: CollectionReadinessRow['capabilities']
   },
   states: Map<string, ReadinessSyncState>,
   consented: Set<string>,
@@ -297,6 +307,7 @@ function workload(
     reasonCode: primary.reasonCode,
     reason: primary.reason,
     remediation: input.remediation,
+    capabilities: input.capabilities,
     components: permissionComponent ? [permissionComponent, ...components] : components,
   }
 }
@@ -353,7 +364,7 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     workload({ key: 'entra_directory', workload: 'Entra directory inventory', resourceTypes: ['USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES'], requiredPermissions: ['User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory'], cadence: 'daily', remediation: 'Confirm the required directory, hidden-membership, device, and role-management application permissions. HawkView rechecks during normal collection.' }, states, consented, verificationKnown, now),
     workload({ key: 'entra_security_configuration', workload: 'Entra security configuration', resourceTypes: ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES'], requiredPermissions: ['UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'SecurityEvents.Read.All'], cadence: 'daily', remediation: 'Confirm the required authentication-method, policy, application, and Secure Score permissions. A successful OAuth connection alone does not verify every collector.' }, states, consented, verificationKnown, now),
     workload({ key: 'office_365_tenant_configuration', workload: 'Microsoft 365 tenant configuration', resourceTypes: ['ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH'], requiredPermissions: ['Organization.Read.All'], cadence: 'daily', remediation: 'Confirm Organization.Read.All and review the exact collector result. Domain DNS readiness is collected independently and does not imply a tenant setting change.' }, states, consented, verificationKnown, now),
-    workload({ key: 'sharepoint_onedrive', workload: 'SharePoint and OneDrive', resourceTypes: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'], requiredPermissions: ['Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All'], cadence: 'daily', remediation: 'Confirm the listed SharePoint and Reports permissions, then wait for the next scheduled inventory collection.' }, states, consented, verificationKnown, now),
+    workload({ key: 'sharepoint_onedrive', workload: 'SharePoint and OneDrive', resourceTypes: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'], requiredPermissions: ['Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All'], cadence: 'daily', remediation: 'Confirm the listed SharePoint and Reports permissions, then wait for the next scheduled inventory collection.', capabilities: [{ key: 'sharepoint_site_access_metadata', label: 'Site access metadata', state: 'NOT_COLLECTED_LEAST_PRIVILEGE', reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE', source: 'HawkView standard least-privilege mode', message: 'Standard mode does not collect current site-user, site collection administrator, sharing-member, or per-site permission metadata. SharePoint and OneDrive administrative events remain available when Microsoft audit evidence is available.' }] }, states, consented, verificationKnown, now),
     workload({ key: 'exchange', workload: 'Exchange mailbox and configuration', resourceTypes: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'], requiredPermissions: ['User.Read.All', 'MailboxSettings.Read', 'Reports.Read.All', 'Organization.Read.All'], cadence: 'daily', remediation: 'Graph mailbox data requires the listed Graph permissions. Exchange Admin configuration also requires Exchange.ManageAsAppV2 and a Recipient Management RBAC role; HawkView does not infer that RBAC is granted.' }, states, consented, verificationKnown, now),
   ]
 
