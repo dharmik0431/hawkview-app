@@ -8,6 +8,8 @@ import { NotificationPanel } from '@/components/layout/notification-panel'
 import { UserMenu } from '@/components/layout/user-menu'
 import { apiClient } from '@/lib/api/client'
 import { tenantNameFromBundleResponse } from '@/lib/tenants/tenant-api-view'
+import { useAuth } from '@/components/providers/auth-provider'
+import { IdentityScopedMemoryCache } from '@/lib/auth/data-isolation'
 
 const pageTitles: Record<string, string> = {
   '/dashboard': 'Dashboard',
@@ -28,9 +30,10 @@ const pageTitles: Record<string, string> = {
 }
 
 // Module-level in-memory cache for tenant names to ensure instant transitions
-const tenantNameCache = new Map<string, string>()
+const tenantNameCache = new IdentityScopedMemoryCache<string>()
 
 export function Topbar() {
+  const { cacheScope } = useAuth()
   const pathname = usePathname() || ''
 
   // Parse path segments to check for tenant routes (/tenants/[tenantId] or /tenants/[tenantId]/[module])
@@ -38,20 +41,36 @@ export function Topbar() {
   const isTenantRoute = segments[0] === 'tenants' && segments.length >= 2
   const tenantId = isTenantRoute ? segments[1] : null
 
-  const [tenantName, setTenantName] = useState<string | null>(() => {
-    return tenantId ? tenantNameCache.get(tenantId) || null : null
+  const [tenantNameState, setTenantNameState] = useState<{
+    scope: string
+    tenantId: string | null
+    name: string | null
+  }>(() => {
+    return {
+      scope: cacheScope,
+      tenantId,
+      name: tenantId ? tenantNameCache.get(cacheScope, tenantId) : null,
+    }
   })
+  const tenantName =
+    tenantNameState.scope === cacheScope &&
+    tenantNameState.tenantId === tenantId
+      ? tenantNameState.name
+      : null
 
   useEffect(() => {
     if (!tenantId) {
-      setTenantName(null)
+      setTenantNameState({ scope: cacheScope, tenantId: null, name: null })
       return
     }
 
-    if (tenantNameCache.has(tenantId)) {
-      setTenantName(tenantNameCache.get(tenantId)!)
+    const cachedName = tenantNameCache.get(cacheScope, tenantId)
+    if (cachedName) {
+      setTenantNameState({ scope: cacheScope, tenantId, name: cachedName })
       return
     }
+
+    setTenantNameState({ scope: cacheScope, tenantId, name: null })
 
     let isMounted = true
 
@@ -62,9 +81,14 @@ export function Topbar() {
         if (!isMounted) return
         const tenants = data?.tenants || []
         tenants.forEach((t: any) => {
-          if (t.id && t.name) tenantNameCache.set(String(t.id), t.name)
+          if (t.id && t.name)
+            tenantNameCache.set(cacheScope, String(t.id), t.name)
           if (t.microsoftTenantId && t.name)
-            tenantNameCache.set(String(t.microsoftTenantId), t.name)
+            tenantNameCache.set(
+              cacheScope,
+              String(t.microsoftTenantId),
+              t.name
+            )
         })
 
         const matched = tenants.find(
@@ -73,7 +97,7 @@ export function Topbar() {
         )
 
         if (matched?.name) {
-          setTenantName(matched.name)
+          setTenantNameState({ scope: cacheScope, tenantId, name: matched.name })
         } else {
           // Fallback to specific bundle endpoint if not in list
           apiClient
@@ -81,8 +105,8 @@ export function Topbar() {
             .then((response) => {
               const name = tenantNameFromBundleResponse(response)
               if (isMounted && name) {
-                tenantNameCache.set(tenantId, name)
-                setTenantName(name)
+                tenantNameCache.set(cacheScope, tenantId, name)
+                setTenantNameState({ scope: cacheScope, tenantId, name })
               }
             })
             .catch(() => {})
@@ -93,7 +117,7 @@ export function Topbar() {
     return () => {
       isMounted = false
     }
-  }, [tenantId])
+  }, [cacheScope, tenantId])
 
   const isAdminRoute = pathname === '/admin' || pathname.startsWith('/admin/')
   const isHideTitleRoute =

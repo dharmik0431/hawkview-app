@@ -515,7 +515,7 @@ test('serializes the tenant bundle with organization isolation and a legacy shar
     tenantDomain: { findMany: async ({ where }: any) => (scoped(where), []) },
     syncState: {
       findMany: async ({ where }: any) => {
-        assert.equal(where.customerTenantId, expectedScope.customerTenantId)
+        scoped(where)
         return syncStates
       },
     },
@@ -529,10 +529,7 @@ test('serializes the tenant bundle with organization isolation and a legacy shar
       findFirst: async ({ where }: any) => (scoped(where), null),
     },
     m365AuditDailyUsage: {
-      findUnique: async ({ where }: any) => {
-        assert.equal(where.customerTenantId_usageDate.customerTenantId, expectedScope.customerTenantId)
-        return null
-      },
+      findFirst: async ({ where }: any) => (scoped(where), null),
       aggregate: async ({ where }: any) => (
         scoped(where), { _sum: { downloadedBytes: null, recordsStored: null, blobsProcessed: null } }
       ),

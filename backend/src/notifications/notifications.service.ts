@@ -50,13 +50,23 @@ export class NotificationsService {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
   private async context(identity: AuthenticatedIdentity) {
-    const user = await this.prisma.user.findUniqueOrThrow({
+    const user = await this.prisma.user.findUnique({
       where: { authProviderUserId: identity.subject },
       select: {
         id: true,
-        memberships: { where: { status: 'ACTIVE' }, select: { organizationId: true } },
+        disabledAt: true,
+        memberships: {
+          where: {
+            status: 'ACTIVE',
+            organization: { status: 'ACTIVE' },
+          },
+          select: { organizationId: true },
+        },
       },
     })
+    if (!user || user.disabledAt) {
+      throw new ForbiddenException('This HawkView account cannot access notifications.')
+    }
     return { userId: user.id, organizationIds: user.memberships.map((item) => item.organizationId) }
   }
 

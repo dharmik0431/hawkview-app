@@ -87,6 +87,8 @@ import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
+import { useAuth } from '@/components/providers/auth-provider'
+import { IdentityScopedMemoryCache } from '@/lib/auth/data-isolation'
 
 type Provider = 'microsoft' | 'google'
 type TenantStatus = 'healthy' | 'warning' | 'critical'
@@ -1186,22 +1188,14 @@ function formatSyncTimestamp(lastSyncIso?: string) {
 
 const TENANT_BUNDLE_CACHE_TTL_MS = 60_000
 
-type TenantBundleCacheEntry = {
-  bundle: TenantBundle
-  fetchedAt: number
-}
-
 // Route changes between tenant blades remount this page. Keep the most recent
 // saved tenant snapshot in memory so moving between Entra tabs does not blank
-// the workspace while the same data is requested again.
-const tenantBundleCache = new Map<string, TenantBundleCacheEntry>()
+// the workspace while the same data is requested again. Identity scope is
+// mandatory: a tenant id alone is never an authorization boundary.
+const tenantBundleCache = new IdentityScopedMemoryCache<TenantBundle>()
 
-function getCachedTenantBundle(tenantId: string) {
-  const entry = tenantBundleCache.get(tenantId)
-  if (!entry) return null
-  return Date.now() - entry.fetchedAt <= TENANT_BUNDLE_CACHE_TTL_MS
-    ? entry.bundle
-    : null
+function getCachedTenantBundle(cacheScope: string, tenantId: string) {
+  return tenantBundleCache.get(cacheScope, tenantId, TENANT_BUNDLE_CACHE_TTL_MS)
 }
 
 function formatUserDateTime(value?: string | null) {
@@ -1217,6 +1211,7 @@ function formatUserDateTime(value?: string | null) {
 /* ===================================================================================== */
 
 export default function TenantDetailsPage() {
+  const { cacheScope } = useAuth()
   const params = useParams<{ id: string }>()
   const pathname = usePathname()
   const router = useRouter()
@@ -1300,17 +1295,18 @@ export default function TenantDetailsPage() {
   }
 
   const [bundle, setBundle] = useState<TenantBundle | null>(() =>
-    getCachedTenantBundle(resolvedTenantId)
+    getCachedTenantBundle(cacheScope, resolvedTenantId)
   )
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>(
-    () => (getCachedTenantBundle(resolvedTenantId) ? 'ready' : 'loading')
+    () =>
+      getCachedTenantBundle(cacheScope, resolvedTenantId) ? 'ready' : 'loading'
   )
   const [loadError, setLoadError] = useState<string | null>(null)
   const [tenantsList, setTenantsList] = useState<any[]>([])
 
   const fetchBundle = useCallback(async (refresh = false) => {
     if (!tenantId) return
-    const cachedBundle = getCachedTenantBundle(String(tenantId))
+    const cachedBundle = getCachedTenantBundle(cacheScope, String(tenantId))
 
     if (refresh) {
       setSyncState('syncing')
@@ -1338,10 +1334,11 @@ export default function TenantDetailsPage() {
           )
       if (!data?.bundle) throw new Error('Unable to load tenant data.')
 
-      tenantBundleCache.set(String(tenantId), {
-        bundle: data.bundle as TenantBundle,
-        fetchedAt: Date.now(),
-      })
+      tenantBundleCache.set(
+        cacheScope,
+        String(tenantId),
+        data.bundle as TenantBundle
+      )
       setBundle(data.bundle)
       setLoadError(null)
       setLoadState('ready')
@@ -1367,13 +1364,14 @@ export default function TenantDetailsPage() {
         window.setTimeout(() => setSyncState('idle'), 1400)
       }
     }
-  }, [tenantId])
+  }, [cacheScope, tenantId])
 
   useEffect(() => {
     void fetchBundle(false)
   }, [fetchBundle])
 
   useEffect(() => {
+    setTenantsList([])
     apiClient
       .get<any>('/api/tenants')
       .then((data) => {
@@ -1382,7 +1380,7 @@ export default function TenantDetailsPage() {
         }
       })
       .catch(() => {})
-  }, [])
+  }, [cacheScope])
 
   const tenant = useMemo(() => bundle?.tenant, [bundle])
 

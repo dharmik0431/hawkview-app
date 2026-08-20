@@ -64,6 +64,9 @@ async function fetchApi<T>(
     response = await fetch(url, {
       ...fetchOptions,
       signal,
+      // Authenticated tenant responses must never be reused by the browser's
+      // HTTP cache after an account switch.
+      cache: 'no-store',
       credentials: 'include',
       headers: {
         Accept: 'application/json',

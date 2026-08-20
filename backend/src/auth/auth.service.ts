@@ -43,6 +43,40 @@ type BootstrapUser = {
   disabledAt: Date | null
 }
 
+type IdentityLookupUser = BootstrapUser & {
+  authProviderUserId: string | null
+  inviteSentAt: Date | null
+  inviteAcceptedAt: Date | null
+  memberships: Array<{ id: string }>
+}
+
+const identityLookupSelect = {
+  id: true,
+  email: true,
+  displayName: true,
+  authProviderUserId: true,
+  inviteSentAt: true,
+  inviteAcceptedAt: true,
+  disabledAt: true,
+  memberships: {
+    where: {
+      status: 'ACTIVE' as const,
+      organization: { status: 'ACTIVE' as const },
+    },
+    select: { id: true },
+  },
+} as const
+
+function isPendingInvitation(user: IdentityLookupUser) {
+  return (
+    user.disabledAt === null &&
+    user.authProviderUserId === null &&
+    user.inviteSentAt !== null &&
+    user.inviteAcceptedAt === null &&
+    user.memberships.length > 0
+  )
+}
+
 function workspaceName(identity: AuthenticatedIdentity, user: BootstrapUser) {
   const fallback = user.email.split('@')[0] || 'HawkView'
   const ownerName = (user.displayName || identity.displayName || fallback).trim()
@@ -110,6 +144,7 @@ export class AuthService {
       const [existingBySubject, existingByEmail] = await Promise.all([
         transaction.user.findUnique({
           where: { authProviderUserId: identity.subject },
+          select: identityLookupSelect,
         }),
         transaction.user.findFirst({
           where: {
@@ -118,8 +153,13 @@ export class AuthService {
               mode: 'insensitive',
             },
           },
+          select: identityLookupSelect,
         }),
       ])
+
+      if (existingBySubject?.disabledAt) {
+        throw new ForbiddenException('This HawkView account is disabled.')
+      }
 
       let profile: BootstrapUser
 
@@ -141,8 +181,16 @@ export class AuthService {
           select: { id: true, email: true, displayName: true, disabledAt: true },
         })
       } else if (existingByEmail) {
-        // A verified Supabase email may relink the matching HawkView profile
-        // during the one-time Firebase-to-Supabase migration.
+        // Email equality alone is not an identity-linking authority. The only
+        // supported email-based claim is an explicit, still-pending workspace
+        // invitation whose provider subject was not recorded when it was sent.
+        // Accepted accounts and legacy profiles must use their original
+        // provider identity or an audited administrative recovery flow.
+        if (!isPendingInvitation(existingByEmail)) {
+          throw new ForbiddenException(
+            'This email is already associated with another HawkView identity. Sign in with the original account or contact support.',
+          )
+        }
         profile = await transaction.user.update({
           where: { id: existingByEmail.id },
           data: {

@@ -70,18 +70,18 @@ export class WorkspaceService {
     identity: AuthenticatedIdentity,
     requestedOrganizationId?: string,
   ): Promise<OwnerContext> {
-    const actor = await this.prisma.user.findFirst({
-      where: {
-        OR: [
-          { authProviderUserId: identity.subject },
-          { email: identity.email.toLowerCase() },
-        ],
-      },
+    const actor = await this.prisma.user.findUnique({
+      where: { authProviderUserId: identity.subject },
       select: {
         id: true,
         email: true,
+        disabledAt: true,
         memberships: {
-          where: { role: MembershipRole.MSP_OWNER, status: MembershipStatus.ACTIVE },
+          where: {
+            role: MembershipRole.MSP_OWNER,
+            status: MembershipStatus.ACTIVE,
+            organization: { status: 'ACTIVE' },
+          },
           select: {
             organization: { select: { id: true, name: true } },
           },
@@ -90,6 +90,9 @@ export class WorkspaceService {
     })
 
     if (!actor) throw new ForbiddenException('HawkView user account was not found.')
+    if (actor.disabledAt) {
+      throw new ForbiddenException('This HawkView account is disabled.')
+    }
     const memberships = actor.memberships.filter(
       ({ organization }) => !requestedOrganizationId || organization.id === requestedOrganizationId,
     )
@@ -273,6 +276,20 @@ export class WorkspaceService {
     let user = await this.prisma.user.findUnique({ where: { email } })
     let delivery: 'INVITE' | 'SETUP_LINK' = 'INVITE'
     try {
+      if (user?.disabledAt) {
+        throw new BadRequestException(
+          'This HawkView account is disabled and cannot be invited.',
+        )
+      }
+      if (
+        user &&
+        !user.authProviderUserId &&
+        (!user.inviteSentAt || user.inviteAcceptedAt)
+      ) {
+        throw new BadRequestException(
+          'This email is associated with an existing HawkView profile that cannot be relinked by invitation. Contact a platform administrator.',
+        )
+      }
       if (!user || !user.authProviderUserId) {
         const invite = await this.supabaseAdminRequest('/auth/v1/invite', {
           method: 'POST',

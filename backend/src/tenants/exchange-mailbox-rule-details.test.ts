@@ -221,8 +221,9 @@ test('tenant bundle scopes the rule snapshot by organization and tenant and emit
       findFirst: async ({ where }: any) => (scoped(where), null),
     },
     m365AuditDailyUsage: {
-      findUnique: async ({ where }: any) => {
-        assert.equal(where.customerTenantId_usageDate.customerTenantId, expectedScope.customerTenantId)
+      findFirst: async ({ where }: any) => {
+        scoped(where)
+        assert.ok(where.usageDate instanceof Date)
         return null
       },
       aggregate: async ({ where }: any) => (scoped(where), { _sum: { downloadedBytes: null, recordsStored: null, blobsProcessed: null } }),

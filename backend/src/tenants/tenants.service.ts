@@ -485,6 +485,7 @@ export class TenantsService {
     const [riskySignIns, auditEvents] = await Promise.all([
       this.prisma.signInLog.findMany({
         where: {
+          organizationId: { in: organizationIds },
           customerTenantId: { in: tenantIds },
           eventDateTime: {
             gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
@@ -500,6 +501,7 @@ export class TenantsService {
       }),
       this.prisma.directoryAuditLog.findMany({
         where: {
+          organizationId: { in: organizationIds },
           customerTenantId: { in: tenantIds },
           eventDateTime: {
             gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
