@@ -35,6 +35,15 @@ import {
   exchangeDatasetStatus,
   type ExchangeDatasetStatus,
 } from '@/lib/tenants/exchange-dataset-status'
+import {
+  classifyExchangeRule,
+  compareExchangeRulePriority,
+  exchangeRuleEnabledState,
+  exchangeRulePriority,
+  normalizeExchangeRuleDrawer,
+  type ExchangeRuleDrawerFact,
+  type ExchangeRuleCategory as RuleCategory,
+} from '@/lib/tenants/exchange-rule-drawer'
 
 export type ExchangeSectionProps = {
   bundle: any
@@ -48,7 +57,6 @@ export type ExchangeSectionProps = {
 
 type TabKey = 'overview' | 'mailboxes' | 'rules' | 'domains-groups'
 type DomainGroupSubtab = 'domains' | 'groups'
-type RuleCategory = 'Forward' | 'Redirect' | 'Delete' | 'Move' | 'Other'
 
 function datasetBadgeClass(status: ExchangeDatasetStatus): string {
   if (status.tone === 'success') {
@@ -61,6 +69,39 @@ function datasetBadgeClass(status: ExchangeDatasetStatus): string {
     return 'bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800'
   }
   return 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+}
+
+function RuleFactList({ facts, emptyText }: { facts: ExchangeRuleDrawerFact[]; emptyText: string }) {
+  if (!facts.length) return <p className="text-slate-500 italic">{emptyText}</p>
+  return (
+    <ul className="space-y-2" role="list">
+      {facts.map((fact) => (
+        <li
+          key={fact.key}
+          className={cn(
+            'rounded-lg border p-3 space-y-1',
+            fact.emphasis === 'destination' && 'border-amber-200 bg-amber-50/70 dark:border-amber-900/70 dark:bg-amber-950/30',
+            fact.emphasis === 'destructive' && 'border-red-200 bg-red-50/70 dark:border-red-900/70 dark:bg-red-950/30',
+            fact.emphasis === 'standard' && 'border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900',
+          )}
+        >
+          <div className="font-semibold text-slate-900 dark:text-slate-100">{fact.label}</div>
+          {fact.values.length > 0 && (
+            <ul className="space-y-1" aria-label={`${fact.label} values`}>
+              {fact.values.map((value, index) => (
+                <li key={`${fact.key}-${index}`} className="font-mono text-[11px] break-all text-slate-700 dark:text-slate-300">
+                  {value}
+                </li>
+              ))}
+            </ul>
+          )}
+          {fact.truncated && (
+            <p className="text-[10px] text-slate-500">Additional Microsoft-provided values were omitted by HawkView&apos;s display limit.</p>
+          )}
+        </li>
+      ))}
+    </ul>
+  )
 }
 
 export default function ExchangePage({
@@ -95,9 +136,15 @@ export default function ExchangePage({
   const [inspectingMailbox, setInspectingMailbox] = useState<any | null>(null)
   const [inspectingRule, setInspectingRule] = useState<any | null>(null)
   const [inspectingGroup, setInspectingGroup] = useState<any | null>(null)
+  const ruleInvestigation = useMemo(
+    () => inspectingRule ? normalizeExchangeRuleDrawer(inspectingRule) : null,
+    [inspectingRule],
+  )
 
   // Focus Return Reference
   const lastTriggerRef = useRef<HTMLElement | null>(null)
+  const ruleDrawerRef = useRef<HTMLDivElement | null>(null)
+  const ruleCloseButtonRef = useRef<HTMLButtonElement | null>(null)
 
   // Handle drawer closing & restoring focus
   const closeDrawers = React.useCallback(() => {
@@ -122,6 +169,38 @@ export default function ExchangePage({
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [inspectingMailbox, inspectingRule, inspectingGroup, closeDrawers])
+
+  // Put keyboard focus inside the rule dialog and keep Tab navigation contained until it closes.
+  useEffect(() => {
+    if (!inspectingRule || !ruleInvestigation) return
+    const drawer = ruleDrawerRef.current
+    const closeButton = ruleCloseButtonRef.current
+    closeButton?.focus()
+
+    const trapFocus = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab' || !drawer) return
+      const focusable = Array.from(drawer.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )).filter((element) => !element.hasAttribute('hidden'))
+      if (!focusable.length) {
+        event.preventDefault()
+        drawer.focus()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    drawer?.addEventListener('keydown', trapFocus)
+    return () => drawer?.removeEventListener('keydown', trapFocus)
+  }, [inspectingRule, ruleInvestigation])
 
   // Tenant Info
   const tenant = bundle?.tenant ?? {}
@@ -233,20 +312,6 @@ export default function ExchangePage({
     return Array.from(set)
   }, [EXCHANGE_MAILBOXES])
 
-  // Rule Categorization Logic (Client-side classification based on rule text & actions)
-  const getRuleCategory = (r: any): RuleCategory => {
-    const actionsArr = Array.isArray(r?.actions) ? r.actions.join(' ') : String(r?.actions || '')
-    const desc = String(r?.description || '')
-    const name = String(r?.name || '')
-    const text = `${actionsArr} ${desc} ${name}`.toLowerCase()
-
-    if (text.includes('forward') || text.includes('auto-forward')) return 'Forward'
-    if (text.includes('redirect')) return 'Redirect'
-    if (text.includes('delete') || text.includes('reject') || text.includes('remove')) return 'Delete'
-    if (text.includes('move') || text.includes('junk')) return 'Move'
-    return 'Other'
-  }
-
   // Filtered & Sorted Mailboxes
   const mailboxes = useMemo(() => {
     let list = [...EXCHANGE_MAILBOXES]
@@ -298,12 +363,11 @@ export default function ExchangePage({
     }
 
     if (ruleEnabledFilter !== 'all') {
-      const isEnabled = ruleEnabledFilter === 'enabled'
-      list = list.filter((r: any) => Boolean(r.enabled) === isEnabled)
+      list = list.filter((r: any) => exchangeRuleEnabledState(r) === ruleEnabledFilter)
     }
 
     if (ruleCategoryFilter !== 'all') {
-      list = list.filter((r: any) => getRuleCategory(r) === ruleCategoryFilter)
+      list = list.filter((r: any) => classifyExchangeRule(r) === ruleCategoryFilter)
     }
 
     if (q) {
@@ -315,7 +379,7 @@ export default function ExchangePage({
       })
     }
 
-    list.sort((a: any, b: any) => (a.priority ?? 0) - (b.priority ?? 0))
+    list.sort(compareExchangeRulePriority)
     return list
   }, [EXCHANGE_RULES, ruleQuery, ruleMailboxFilter, ruleEnabledFilter, ruleCategoryFilter])
 
@@ -343,7 +407,7 @@ export default function ExchangePage({
     }> = []
 
     // 1. Forwarding / Redirect Rules
-    const forwardingRules = EXCHANGE_RULES.filter((r: any) => r.enabled && (getRuleCategory(r) === 'Forward' || getRuleCategory(r) === 'Redirect'))
+    const forwardingRules = EXCHANGE_RULES.filter((r: any) => r.enabled === true && (classifyExchangeRule(r) === 'Forward' || classifyExchangeRule(r) === 'Redirect'))
     if (forwardingRules.length > 0) {
       findings.push({
         id: 'finding-fwd-rules',
@@ -360,7 +424,7 @@ export default function ExchangePage({
     }
 
     // 2. Delete / Move Rules
-    const deleteMoveRules = EXCHANGE_RULES.filter((r: any) => r.enabled && (getRuleCategory(r) === 'Delete' || getRuleCategory(r) === 'Move'))
+    const deleteMoveRules = EXCHANGE_RULES.filter((r: any) => r.enabled === true && (classifyExchangeRule(r) === 'Delete' || classifyExchangeRule(r) === 'Move'))
     if (deleteMoveRules.length > 0) {
       findings.push({
         id: 'finding-del-rules',
@@ -1080,6 +1144,7 @@ export default function ExchangePage({
                 <option value="all">All Statuses</option>
                 <option value="enabled">Enabled Only</option>
                 <option value="disabled">Disabled Only</option>
+                <option value="unknown">Not Provided</option>
               </select>
 
               {/* Clear Filters */}
@@ -1117,7 +1182,9 @@ export default function ExchangePage({
                 </thead>
                 <tbody className="divide-y divide-slate-200 dark:divide-slate-800/80">
                   {rules.map((r: any) => {
-                    const category = getRuleCategory(r)
+                    const category = classifyExchangeRule(r)
+                    const enabledState = exchangeRuleEnabledState(r)
+                    const priority = exchangeRulePriority(r)
                     return (
                       <tr
                         key={r.id}
@@ -1157,14 +1224,14 @@ export default function ExchangePage({
 
                         {/* Status */}
                         <td className="px-4 py-3">
-                          <Badge className={r.enabled ? "bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700"}>
-                            {r.enabled ? 'Enabled' : 'Disabled'}
+                          <Badge className={enabledState === 'enabled' ? "bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700"}>
+                            {enabledState === 'enabled' ? 'Enabled' : enabledState === 'disabled' ? 'Disabled' : 'Not provided'}
                           </Badge>
                         </td>
 
                         {/* Priority */}
                         <td className="px-4 py-3 text-slate-600 dark:text-slate-400 font-medium">
-                          Priority {r.priority ?? '1'}
+                          {priority === null ? 'Not provided' : `Priority ${priority}`}
                         </td>
 
                         {/* Summary */}
@@ -1500,23 +1567,24 @@ export default function ExchangePage({
       )}
 
       {/* ================= RULE DETAIL DRAWER ================= */}
-      {inspectingRule && (
+      {inspectingRule && ruleInvestigation && (
         <div className="fixed inset-0 z-[100] flex justify-end" role="dialog" aria-modal="true" aria-labelledby="rule-drawer-title">
           <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs transition-opacity" onClick={closeDrawers} aria-hidden="true" />
-          <div className="relative z-10 w-full max-w-[640px] h-full bg-white dark:bg-slate-900 shadow-2xl border-l border-slate-200 dark:border-slate-800 flex flex-col focus-visible:outline-none">
+          <div ref={ruleDrawerRef} tabIndex={-1} className="relative z-10 w-full max-w-[640px] h-full bg-white dark:bg-slate-900 shadow-2xl border-l border-slate-200 dark:border-slate-800 flex flex-col focus-visible:outline-none">
             <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between shrink-0 bg-slate-50/50 dark:bg-slate-800/40">
               <div className="flex items-center gap-2.5 min-w-0">
                 <Shield className="h-5 w-5 text-amber-600 dark:text-amber-400 shrink-0" aria-hidden="true" />
                 <div className="min-w-0">
                   <h2 id="rule-drawer-title" className="text-sm font-bold text-slate-900 dark:text-white truncate">
-                    {inspectingRule.name}
+                    {ruleInvestigation.name}
                   </h2>
                   <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                    {inspectingRule.mailboxUpn}
+                    {ruleInvestigation.mailboxUpn || 'Mailbox not provided by Microsoft'}
                   </p>
                 </div>
               </div>
               <button
+                ref={ruleCloseButtonRef}
                 type="button"
                 onClick={closeDrawers}
                 className="h-8 w-8 rounded-lg border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
@@ -1530,49 +1598,53 @@ export default function ExchangePage({
               <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="font-semibold text-slate-900 dark:text-slate-100">Rule Status</span>
-                  <Badge className={inspectingRule.enabled ? "bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700"}>
-                    {inspectingRule.enabled ? 'Enabled' : 'Disabled'}
+                  <Badge className={ruleInvestigation.enabled === true ? "bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700"}>
+                    {ruleInvestigation.enabled === null ? 'Not provided' : ruleInvestigation.enabled ? 'Enabled' : 'Disabled'}
                   </Badge>
                 </div>
-                <div>
-                  <span className="text-slate-500 block text-[11px]">Mailbox Owner</span>
-                  <span className="font-mono text-slate-800 dark:text-slate-200">{inspectingRule.mailboxUpn}</span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <span className="text-slate-500 block text-[11px]">Mailbox</span>
+                    <span className="font-mono text-slate-800 dark:text-slate-200 break-all">{ruleInvestigation.mailboxUpn || 'Not provided by Microsoft'}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block text-[11px]">Priority</span>
+                    <span className="font-semibold text-slate-800 dark:text-slate-200">
+                      {ruleInvestigation.priority === null ? 'Not provided by Microsoft' : ruleInvestigation.priority}
+                    </span>
+                  </div>
                 </div>
               </div>
 
               <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
                 <h3 className="font-semibold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider text-slate-500">
-                  Rule Conditions
+                  What triggers this rule
                 </h3>
-                {Array.isArray(inspectingRule.conditions) && inspectingRule.conditions.length > 0 ? (
-                  <ul className="list-disc list-inside space-y-1 text-slate-700 dark:text-slate-300">
-                    {inspectingRule.conditions.map((cond: string, idx: number) => (
-                      <li key={idx}>{cond}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-slate-500 italic">No specific conditions provided by Microsoft.</p>
+                <RuleFactList
+                  facts={ruleInvestigation.conditions}
+                  emptyText="Microsoft did not provide condition values for this rule."
+                />
+                {ruleInvestigation.exceptions.length > 0 && (
+                  <div className="pt-2 space-y-2">
+                    <h4 className="font-semibold text-slate-700 dark:text-slate-300">Exceptions reported by Microsoft</h4>
+                    <RuleFactList facts={ruleInvestigation.exceptions} emptyText="" />
+                  </div>
                 )}
               </div>
 
               <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
                 <h3 className="font-semibold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider text-slate-500">
-                  Rule Actions
+                  What this rule does
                 </h3>
-                {Array.isArray(inspectingRule.actions) && inspectingRule.actions.length > 0 ? (
-                  <ul className="list-disc list-inside space-y-1 text-slate-700 dark:text-slate-300">
-                    {inspectingRule.actions.map((act: string, idx: number) => (
-                      <li key={idx}>{act}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-slate-500 italic">No specific actions provided by Microsoft.</p>
-                )}
+                <RuleFactList
+                  facts={ruleInvestigation.actions}
+                  emptyText="Microsoft did not provide action values for this rule."
+                />
               </div>
 
               <div className="p-3.5 rounded-xl border border-blue-200 dark:border-blue-900/60 bg-blue-50/50 dark:bg-blue-950/30 text-blue-800 dark:text-blue-300 flex items-start gap-2">
                 <Info className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400 mt-0.5" />
-                <span>This rule may affect message delivery. Review its conditions, actions, and destination carefully.</span>
+                <span>These are mailbox-rule settings reported by Microsoft. HawkView does not infer who created the rule, why it was created, or whether the rule indicates compromise.</span>
               </div>
             </div>
           </div>

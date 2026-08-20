@@ -34,6 +34,12 @@ import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
 import { buildSharePointDataContract } from './sharepoint-data-contract.js'
 import {
+  exchangeMailboxRuleCompoundId,
+  projectExchangeMailboxRuleDetails,
+  safeExchangeMailboxRuleText,
+  summarizeExchangeMailboxRuleActions,
+} from './exchange-mailbox-rule-details.js'
+import {
   DAILY_INVENTORY_ANCHORS,
   requiresDailyInventoryRefresh,
   scheduledSyncTenantWhere,
@@ -5173,33 +5179,28 @@ export class TenantSyncService {
               },
             }
           }),
-          rules: exchangeMailboxRules.map((rule: any) => ({
-            id: String(
-              rule.id ??
-                `${rule.mailboxUserId}-${rule.sequence ?? rule.displayName}`
-            ),
-            name: String(rule.displayName ?? 'Unnamed inbox rule'),
-            mailboxUpn: String(rule.mailboxUpn ?? ''),
-            enabled: rule.isEnabled !== false,
-            priority: Number(rule.sequence ?? 0),
-            description: String(rule.displayName ?? 'Inbox rule'),
-            actions: Object.entries(rule.actions ?? {})
-              .filter(
-                ([, value]) =>
-                  value !== null &&
-                  value !== false &&
-                  (!Array.isArray(value) || value.length > 0)
-              )
-              .map(([name]) => name),
-            conditions: Object.entries(rule.conditions ?? {})
-              .filter(
-                ([, value]) =>
-                  value !== null &&
-                  value !== false &&
-                  (!Array.isArray(value) || value.length > 0)
-              )
-              .map(([name]) => name),
-          })),
+          rules: exchangeMailboxRules.map((rule: any, index: number) => {
+            const details = projectExchangeMailboxRuleDetails(rule)
+            const mailboxUserId = safeExchangeMailboxRuleText(rule.mailboxUserId)
+            const microsoftRuleId = safeExchangeMailboxRuleText(rule.id)
+            return {
+              id: exchangeMailboxRuleCompoundId(rule) ??
+                `${mailboxUserId ?? 'mailbox'}::unidentified-rule-${index + 1}`,
+              microsoftRuleId,
+              mailboxUserId,
+              name: safeExchangeMailboxRuleText(rule.displayName) ?? 'Unnamed inbox rule',
+              mailboxUpn: safeExchangeMailboxRuleText(rule.mailboxUpn) ?? '',
+              enabled: typeof rule.isEnabled === 'boolean' ? rule.isEnabled : null,
+              priority: typeof rule.sequence === 'number' && Number.isSafeInteger(rule.sequence) && rule.sequence >= 0
+                ? rule.sequence
+                : null,
+              description: summarizeExchangeMailboxRuleActions(details),
+              actions: details.actions.map((fact) => fact.key),
+              conditions: details.conditions.map((fact) => fact.key),
+              exceptions: details.exceptions.map((fact) => fact.key),
+              details,
+            }
+          }),
           acceptedDomains: exchangeAcceptedDomains.map((domain: any) => ({
             id: String(
               domain.Guid ??
