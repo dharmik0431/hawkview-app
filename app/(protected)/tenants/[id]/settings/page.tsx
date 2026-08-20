@@ -12,6 +12,8 @@ import { normalizeCollectionReadiness, readinessDiagnostic, readinessLabel, read
 import {
   settingsConnectionHealth,
   settingsOverallHealth,
+  settingsSynchronizationAttention,
+  settingsSynchronizationStateLabel,
   settingsSynchronizationRows,
 } from '@/lib/tenants/settings-readiness-view'
 import type { TenantBundle } from '@/types/tenant-data'
@@ -716,6 +718,11 @@ export default function TenantSettingsPage() {
     })
   }, [collectionReadiness])
 
+  const synchronizationAttention = useMemo(
+    () => settingsSynchronizationAttention(moduleRows),
+    [moduleRows],
+  )
+
   const filteredSyncModules = useMemo(() => {
     let list = [...moduleRows]
     if (syncSearch.trim()) {
@@ -919,7 +926,7 @@ export default function TenantSettingsPage() {
           </TabsTrigger>
           <TabsTrigger value="synchronization" className="rounded-lg text-xs font-semibold px-4 py-2 cursor-pointer flex items-center gap-1.5">
             <span>Synchronization</span>
-            {synchronizationSummary && synchronizationSummary.failedWorkloads > 0 && (
+            {synchronizationSummary && synchronizationSummary.attentionWorkloads > 0 && (
               <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" />
             )}
           </TabsTrigger>
@@ -1587,40 +1594,40 @@ export default function TenantSettingsPage() {
           {/* Summary Ribbon */}
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Overall Sync Status</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Overall Collection Status</span>
               <div className="font-semibold text-xs text-slate-900 dark:text-white capitalize pt-0.5">
-                {synchronizationSummary ? readinessLabel(synchronizationSummary.overallState) : 'Not available'}
+                {synchronizationSummary ? settingsSynchronizationStateLabel(synchronizationSummary.overallState) : 'Not available'}
               </div>
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Modules Current</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Workloads Ready</span>
               <div className="font-semibold text-xs text-slate-900 dark:text-white pt-0.5">
                 {synchronizationSummary ? `${synchronizationSummary.currentWorkloads} / ${synchronizationSummary.applicableWorkloads}` : 'Not available'}
               </div>
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Last Full Sync</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Status Evaluated</span>
               <div className="font-semibold text-xs text-slate-900 dark:text-white pt-0.5 truncate">
-                {formatDate(synchronizationSummary?.primaryLastSuccessfulAt)}
+                {formatDate(collectionReadiness?.evaluatedAt)}
               </div>
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Data Freshness</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Affected Data Last Success</span>
               <div className="font-semibold text-xs text-slate-900 dark:text-white pt-0.5">
                 {synchronizationSummary ? calculateFreshness(synchronizationSummary.primaryLastSuccessfulAt) : 'Not available'}
               </div>
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs col-span-2 sm:col-span-1">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Failed Modules</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Needs Attention</span>
               <div className="font-semibold text-xs pt-0.5">
-                {synchronizationSummary && synchronizationSummary.failedWorkloads > 0 ? (
-                  <span className="text-amber-600 dark:text-amber-400">{synchronizationSummary.failedWorkloads} failing</span>
+                {synchronizationAttention.total > 0 ? (
+                  <span className="text-amber-600 dark:text-amber-400">{synchronizationAttention.label}</span>
                 ) : (
-                  <span className="text-emerald-600 dark:text-emerald-400">0 failing</span>
+                  <span className="text-emerald-600 dark:text-emerald-400">None</span>
                 )}
               </div>
             </div>
@@ -1695,7 +1702,7 @@ export default function TenantSettingsPage() {
                               variant={m.status === 'READY' ? 'success' : ['BLOCKED_PERMISSION', 'FAILED_TRANSIENT'].includes(m.status) ? 'destructive' : 'secondary'}
                               className="text-[11px] px-2 py-0"
                             >
-                              {readinessLabel(m.status)}
+                              {settingsSynchronizationStateLabel(m.status)}
                             </Badge>
                           </td>
                           <td className="px-3 py-3 text-slate-500 dark:text-slate-400">{formatDate(m.lastAttempt)}</td>
