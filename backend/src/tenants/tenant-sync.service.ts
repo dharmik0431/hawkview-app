@@ -1379,6 +1379,7 @@ export class TenantSyncService {
       // other tenant syncs. Permission failures never enter this path.
       const targetedRetryStates = await this.prisma.syncState.findMany({
         where: {
+          organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
           resourceType: { in: [...TARGETED_TRANSIENT_RETRY_RESOURCES] },
         },
@@ -1424,6 +1425,7 @@ export class TenantSyncService {
       await this.refreshCollectionFieldStates(tenant)
       const attemptedStates = await this.prisma.syncState.findMany({
         where: {
+          organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
           lastAttemptAt: { gte: now },
         },
@@ -1647,6 +1649,7 @@ export class TenantSyncService {
     await this.refreshCollectionFieldStates(tenant)
     const attemptedStates = await this.prisma.syncState.findMany({
       where: {
+        organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         lastAttemptAt: { gte: now },
       },
@@ -1699,7 +1702,10 @@ export class TenantSyncService {
   }) {
     const [syncStates, snapshots] = await Promise.all([
       this.prisma.syncState.findMany({
-        where: { customerTenantId: tenant.id },
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
       }),
       this.prisma.tenantEntraSnapshot.findMany({
         where: {
@@ -4316,7 +4322,10 @@ export class TenantSyncService {
         orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
       }),
       this.prisma.syncState.findMany({
-        where: { customerTenantId: tenant.id },
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
       }),
       this.prisma.tenantEntraSnapshot.findMany({
         where: {
@@ -4371,12 +4380,11 @@ export class TenantSyncService {
         orderBy: [{ contentCreatedAt: 'asc' }, { discoveredAt: 'asc' }],
         select: { contentCreatedAt: true, discoveredAt: true },
       }),
-      this.prisma.m365AuditDailyUsage.findUnique({
+      this.prisma.m365AuditDailyUsage.findFirst({
         where: {
-          customerTenantId_usageDate: {
-            customerTenantId: tenant.id,
-            usageDate: m365AuditToday,
-          },
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          usageDate: m365AuditToday,
         },
       }),
       this.prisma.m365AuditDailyUsage.aggregate({

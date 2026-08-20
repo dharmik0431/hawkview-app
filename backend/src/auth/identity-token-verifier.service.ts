@@ -8,11 +8,54 @@ import type { AuthenticatedIdentity } from './auth.types.js'
 
 interface SupabasePayload extends JWTPayload {
   email?: string
+  aal?: string
+  session_id?: string
+  is_anonymous?: boolean
   user_metadata?: {
     display_name?: string
     full_name?: string
   }
   app_metadata?: { provider?: string }
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+/**
+ * Supabase does not include an authoritative `email_confirmed` claim in its
+ * access-token contract. Instead, Confirm Email prevents a session from being
+ * issued before confirmation; when the setting is disabled, Supabase treats
+ * the email as implicitly confirmed. Validate the signed permanent-session
+ * boundary here and never trust user_metadata as confirmation evidence.
+ */
+export function authenticatedIdentityFromSupabasePayload(
+  payload: SupabasePayload,
+): AuthenticatedIdentity {
+  const email = typeof payload.email === 'string' ? payload.email.trim() : ''
+  if (
+    typeof payload.sub !== 'string' ||
+    !UUID_PATTERN.test(payload.sub) ||
+    !email ||
+    payload.role !== 'authenticated' ||
+    payload.is_anonymous !== false ||
+    (payload.aal !== 'aal1' && payload.aal !== 'aal2') ||
+    typeof payload.session_id !== 'string' ||
+    !UUID_PATTERN.test(payload.session_id)
+  ) {
+    throw new UnauthorizedException(
+      'A confirmed, non-anonymous Supabase session is required.',
+    )
+  }
+
+  return {
+    subject: payload.sub,
+    email: email.toLowerCase(),
+    displayName:
+      payload.user_metadata?.display_name?.trim() ||
+      payload.user_metadata?.full_name?.trim() ||
+      undefined,
+    signInProvider: payload.app_metadata?.provider,
+  }
 }
 
 @Injectable()
@@ -44,23 +87,7 @@ export class IdentityTokenVerifier {
         },
       )
 
-      if (
-        !payload.sub ||
-        !payload.email ||
-        payload.role !== 'authenticated'
-      ) {
-        throw new UnauthorizedException('A verified email is required.')
-      }
-
-      return {
-        subject: payload.sub,
-        email: payload.email.trim().toLowerCase(),
-        displayName:
-          payload.user_metadata?.display_name?.trim() ||
-          payload.user_metadata?.full_name?.trim() ||
-          undefined,
-        signInProvider: payload.app_metadata?.provider,
-      }
+      return authenticatedIdentityFromSupabasePayload(payload)
     } catch (error) {
       if (error instanceof UnauthorizedException) {
         throw error
