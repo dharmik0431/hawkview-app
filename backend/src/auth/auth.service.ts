@@ -8,6 +8,7 @@ import { MembershipRole, MembershipStatus } from '../generated/prisma/enums.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import type { AuthenticatedIdentity } from './auth.types.js'
+import { workspaceOnboardingView } from '../workspace/organization-onboarding.js'
 
 const userWithMemberships = {
   id: true,
@@ -19,7 +20,10 @@ const userWithMemberships = {
   platformRole: true,
   disabledAt: true,
   memberships: {
-    where: { status: 'ACTIVE' as const },
+    where: {
+      status: 'ACTIVE' as const,
+      organization: { status: 'ACTIVE' as const },
+    },
     select: {
       id: true,
       role: true,
@@ -30,6 +34,10 @@ const userWithMemberships = {
           name: true,
           slug: true,
           status: true,
+          businessDomain: true,
+          timeZone: true,
+          onboardingCompletedAt: true,
+          createdByUserId: true,
         },
       },
     },
@@ -124,6 +132,7 @@ export class AuthService {
       data: {
         name: workspaceName(identity, user),
         slug: workspaceSlug(identity, user),
+        createdByUserId: user.id,
       },
       select: { id: true },
     })
@@ -140,7 +149,18 @@ export class AuthService {
   async bootstrap(identity: AuthenticatedIdentity) {
     const normalizedEmail = identity.email.trim().toLowerCase()
 
-    const user = await this.prisma.$transaction(async (transaction) => {
+    const bootstrapOnce = () => this.prisma.$transaction(async (transaction) => {
+      const lockKeys = [
+        `hawkview:auth-bootstrap:email:${normalizedEmail}`,
+        `hawkview:auth-bootstrap:subject:${identity.subject}`,
+      ].sort()
+      for (const lockKey of lockKeys) {
+        await transaction.$executeRawUnsafe(
+          'SELECT pg_advisory_xact_lock(hashtext($1))',
+          lockKey,
+        )
+      }
+
       const [existingBySubject, existingByEmail] = await Promise.all([
         transaction.user.findUnique({
           where: { authProviderUserId: identity.subject },
@@ -221,15 +241,60 @@ export class AuthService {
       })
     })
 
+    let user
+    try {
+      user = await bootstrapOnce()
+    } catch (error) {
+      // A rolling deployment or legacy writer can race before every process
+      // uses the advisory lock. Retry one entire locked transaction so the
+      // committed provider subject/email is reread rather than duplicated.
+      if (!isUniqueConstraintError(error)) throw error
+      user = await bootstrapOnce()
+    }
+
     if (user.disabledAt) {
       throw new ForbiddenException('This HawkView account is disabled.')
     }
 
-    const { disabledAt: _disabledAt, ...safeUser } = user
+    const founderMemberships = user.memberships
+      .filter(
+        ({ role, organization }) =>
+          role === MembershipRole.MSP_OWNER &&
+          organization.createdByUserId === user.id,
+      )
+      .sort((left, right) => {
+        const leftIncomplete = left.organization.onboardingCompletedAt === null ? 0 : 1
+        const rightIncomplete = right.organization.onboardingCompletedAt === null ? 0 : 1
+        return leftIncomplete - rightIncomplete ||
+          left.organization.id.localeCompare(right.organization.id)
+      })
+    const onboardingOrganization = founderMemberships[0]?.organization ?? null
+
+    const { disabledAt: _disabledAt, ...userWithoutDisabledAt } = user
+    const safeUser = {
+      ...userWithoutDisabledAt,
+      memberships: userWithoutDisabledAt.memberships.map(({ organization, ...membership }) => {
+        const { createdByUserId: _createdByUserId, ...safeOrganization } = organization
+        return { ...membership, organization: safeOrganization }
+      }),
+    }
 
     return {
       user: safeUser,
       signInProvider: identity.signInProvider,
+      workspaceOnboarding: onboardingOrganization
+        ? workspaceOnboardingView({
+            ...onboardingOrganization,
+            timeZone: onboardingOrganization.timeZone ?? user.timeZone,
+          })
+        : {
+            required: false,
+            organizationId: null,
+            organizationName: null,
+            businessDomain: null,
+            businessDomainVerification: 'UNVERIFIED_INFORMATIONAL' as const,
+            timeZone: user.timeZone,
+          },
     }
   }
 
@@ -267,7 +332,26 @@ export class AuthService {
       select: userWithMemberships,
     })
 
-    const { disabledAt: _disabledAt, ...safeUser } = user
+    const { disabledAt: _disabledAt, ...userWithoutDisabledAt } = user
+    const safeUser = {
+      ...userWithoutDisabledAt,
+      memberships: userWithoutDisabledAt.memberships.map(
+        ({ organization, ...membership }) => {
+          const { createdByUserId: _createdByUserId, ...safeOrganization } =
+            organization
+          return { ...membership, organization: safeOrganization }
+        },
+      ),
+    }
     return { user: safeUser, signInProvider: identity.signInProvider }
   }
+}
+
+function isUniqueConstraintError(error: unknown) {
+  return Boolean(
+    error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: unknown }).code === 'P2002',
+  )
 }

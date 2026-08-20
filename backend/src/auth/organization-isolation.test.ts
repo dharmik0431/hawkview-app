@@ -11,6 +11,7 @@ const identity: AuthenticatedIdentity = {
   subject: '11111111-2222-3333-4444-555555555555',
   email: 'owner@example.com',
 }
+const WORKSPACE_ORGANIZATION_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
 test('workspace administration resolves its actor only by provider subject', async () => {
   let memberQueries = 0
@@ -30,7 +31,11 @@ test('workspace administration resolves its actor only by provider subject', asy
   } as unknown as PrismaService
 
   await assert.rejects(
-    () => new WorkspaceService(prisma).listMembers(identity),
+    () =>
+      new WorkspaceService(prisma).listMembers(
+        identity,
+        WORKSPACE_ORGANIZATION_ID,
+      ),
     /HawkView user account was not found/,
   )
   assert.equal(memberQueries, 0)
@@ -46,7 +51,7 @@ test('workspace administration retains a subject-linked active owner', async () 
         memberships: [
           {
             organization: {
-              id: 'organization-a',
+              id: WORKSPACE_ORGANIZATION_ID,
               name: 'Organization A',
             },
           },
@@ -61,9 +66,140 @@ test('workspace administration retains a subject-linked active owner', async () 
     },
   } as unknown as PrismaService
 
-  const result = await new WorkspaceService(prisma).listMembers(identity)
-  assert.deepEqual(memberWhere, { organizationId: 'organization-a' })
-  assert.equal(result.organization.id, 'organization-a')
+  const result = await new WorkspaceService(prisma).listMembers(
+    identity,
+    WORKSPACE_ORGANIZATION_ID,
+  )
+  assert.deepEqual(memberWhere, { organizationId: WORKSPACE_ORGANIZATION_ID })
+  assert.equal(result.organization.id, WORKSPACE_ORGANIZATION_ID)
+})
+
+test('workspace administration uses the explicit organization context regardless of membership order', async () => {
+  const otherOrganizationId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+  let memberWhere: unknown
+  const prisma = {
+    user: {
+      findUnique: async () => ({
+        id: 'owner-user',
+        email: identity.email,
+        disabledAt: null,
+        memberships: [
+          {
+            organization: {
+              id: otherOrganizationId,
+              name: 'Organization B',
+              businessDomain: 'organization-b.example',
+              timeZone: 'America/Vancouver',
+              onboardingCompletedAt: new Date('2026-08-18T00:00:00.000Z'),
+            },
+          },
+          {
+            organization: {
+              id: WORKSPACE_ORGANIZATION_ID,
+              name: 'Organization A',
+              businessDomain: 'organization-a.example',
+              timeZone: 'America/Toronto',
+              onboardingCompletedAt: new Date('2026-08-19T00:00:00.000Z'),
+            },
+          },
+        ],
+      }),
+    },
+    membership: {
+      findMany: async ({ where }: { where: unknown }) => {
+        memberWhere = where
+        return []
+      },
+    },
+  } as unknown as PrismaService
+
+  const result = await new WorkspaceService(prisma).listMembers(
+    identity,
+    WORKSPACE_ORGANIZATION_ID,
+  )
+  assert.deepEqual(result.organization, {
+    id: WORKSPACE_ORGANIZATION_ID,
+    name: 'Organization A',
+    businessDomain: 'organization-a.example',
+    businessDomainVerification: 'UNVERIFIED_INFORMATIONAL',
+    timeZone: 'America/Toronto',
+    onboardingCompletedAt: new Date('2026-08-19T00:00:00.000Z'),
+  })
+  assert.equal(result.canEditOrganization, true)
+  assert.deepEqual(memberWhere, { organizationId: WORKSPACE_ORGANIZATION_ID })
+})
+
+test('workspace organization profile edit capability is false until selected organization setup completes', async () => {
+  const prisma = {
+    user: {
+      findUnique: async () => ({
+        id: 'owner-user',
+        email: identity.email,
+        disabledAt: null,
+        memberships: [
+          {
+            organization: {
+              id: WORKSPACE_ORGANIZATION_ID,
+              name: 'Organization A',
+              businessDomain: null,
+              timeZone: null,
+              onboardingCompletedAt: null,
+            },
+          },
+        ],
+      }),
+    },
+    membership: { findMany: async () => [] },
+  } as unknown as PrismaService
+
+  const result = await new WorkspaceService(prisma).listMembers(
+    identity,
+    WORKSPACE_ORGANIZATION_ID,
+  )
+  assert.equal(result.canManage, true)
+  assert.equal(result.canEditOrganization, false)
+  assert.equal(result.organization.onboardingCompletedAt, null)
+})
+
+test('workspace administration rejects a missing explicit organization context before lookup', async () => {
+  let userQueries = 0
+  const prisma = {
+    user: {
+      findUnique: async () => {
+        userQueries += 1
+        return null
+      },
+    },
+  } as unknown as PrismaService
+  await assert.rejects(
+    () => new WorkspaceService(prisma).listMembers(identity),
+    /valid HawkView organization/,
+  )
+  assert.equal(userQueries, 0)
+})
+
+test('every workspace team mutation rejects a missing explicit organization context', async () => {
+  let userQueries = 0
+  const prisma = {
+    user: {
+      findUnique: async () => {
+        userQueries += 1
+        return null
+      },
+    },
+  } as unknown as PrismaService
+  const service = new WorkspaceService(prisma)
+  const calls = [
+    () => service.inviteMember(identity, { email: 'member@example.com', role: 'MSP_VIEWER' }),
+    () => service.updateMember(identity, 'membership', { role: 'MSP_VIEWER' }),
+    () => service.removeMember(identity, 'membership'),
+    () => service.sendPasswordReset(identity, 'membership', {}),
+    () => service.resetHawkViewMfa(identity, 'membership', {}),
+  ]
+  for (const call of calls) {
+    await assert.rejects(call, /valid HawkView organization/)
+  }
+  assert.equal(userQueries, 0)
 })
 
 test('disabled subject-linked owner cannot read team or audit data or perform admin mutations', async () => {
@@ -77,7 +213,7 @@ test('disabled subject-linked owner cannot read team or audit data or perform ad
         memberships: [
           {
             organization: {
-              id: 'organization-a',
+              id: WORKSPACE_ORGANIZATION_ID,
               name: 'Organization A',
             },
           },
@@ -103,11 +239,18 @@ test('disabled subject-linked owner cannot read team or audit data or perform ad
   } as unknown as PrismaService
   const service = new WorkspaceService(prisma)
 
-  await assert.rejects(() => service.listMembers(identity), /account is disabled/)
-  await assert.rejects(() => service.listAuditLogs(identity), /account is disabled/)
+  await assert.rejects(
+    () => service.listMembers(identity, WORKSPACE_ORGANIZATION_ID),
+    /account is disabled/,
+  )
+  await assert.rejects(
+    () => service.listAuditLogs(identity, WORKSPACE_ORGANIZATION_ID),
+    /account is disabled/,
+  )
   await assert.rejects(
     () =>
       service.inviteMember(identity, {
+        organizationId: WORKSPACE_ORGANIZATION_ID,
         email: 'new.member@example.com',
         role: 'MSP_VIEWER',
       }),
@@ -129,7 +272,7 @@ for (const profileState of ['legacy', 'accepted'] as const) {
               memberships: [
                 {
                   organization: {
-                    id: 'organization-a',
+                    id: WORKSPACE_ORGANIZATION_ID,
                     name: 'Organization A',
                   },
                 },
@@ -165,6 +308,7 @@ for (const profileState of ['legacy', 'accepted'] as const) {
     await assert.rejects(
       () =>
         new WorkspaceService(prisma).inviteMember(identity, {
+          organizationId: WORKSPACE_ORGANIZATION_ID,
           email: 'existing@example.com',
           role: 'MSP_VIEWER',
         }),

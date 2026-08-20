@@ -132,7 +132,8 @@ export class TenantsService {
   private async getOrganizationIdsForRoles(
     identity: AuthenticatedIdentity,
     roles: readonly MembershipRole[],
-    action: string
+    action: string,
+    requireCompletedOrganizationOnboarding = false,
   ) {
     const user = await this.prisma.user.findUnique({
       where: { authProviderUserId: identity.subject },
@@ -144,7 +145,10 @@ export class TenantsService {
             role: { in: [...roles] },
             organization: { status: 'ACTIVE' },
           },
-          select: { organizationId: true },
+          select: {
+            organizationId: true,
+            organization: { select: { onboardingCompletedAt: true } },
+          },
         },
       },
     })
@@ -158,7 +162,21 @@ export class TenantsService {
       throw new ForbiddenException('This HawkView account is disabled.')
     }
 
-    return user.memberships.map((membership) => membership.organizationId)
+    const eligibleMemberships = requireCompletedOrganizationOnboarding
+      ? user.memberships.filter(
+          (membership) => membership.organization.onboardingCompletedAt !== null,
+        )
+      : user.memberships
+    if (
+      requireCompletedOrganizationOnboarding &&
+      user.memberships.length > 0 &&
+      eligibleMemberships.length === 0
+    ) {
+      throw new ForbiddenException(
+        'Complete MSP organization setup before onboarding tenants.',
+      )
+    }
+    return eligibleMemberships.map((membership) => membership.organizationId)
   }
 
   private getTenantDeletionOrganizationIds(identity: AuthenticatedIdentity) {
@@ -173,7 +191,8 @@ export class TenantsService {
     return this.getOrganizationIdsForRoles(
       identity,
       TENANT_ONBOARDING_ROLES,
-      'onboarding tenants'
+      'onboarding tenants',
+      true,
     )
   }
 

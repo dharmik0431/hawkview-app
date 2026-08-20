@@ -3,6 +3,11 @@
 import { useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/components/providers/auth-provider'
+import {
+  WorkspaceOnboardingGate,
+  WorkspaceOnboardingUnavailable,
+} from '@/components/auth/workspace-onboarding'
+import { workspaceOnboardingState } from '@/lib/auth/workspace-onboarding'
 
 export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const router = useRouter()
@@ -30,6 +35,15 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
         </p>
       </div>
     )
+  }
+
+  const onboardingState = workspaceOnboardingState(session)
+  if (onboardingState.state !== 'ready') {
+    return <WorkspaceOnboardingUnavailable />
+  }
+
+  if (onboardingState.onboarding.required) {
+    return <WorkspaceOnboardingGate onboarding={onboardingState.onboarding} />
   }
 
   return children

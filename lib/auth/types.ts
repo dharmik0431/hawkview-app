@@ -7,7 +7,19 @@ export interface HawkViewMembership {
     name: string
     slug: string
     status: string
+    businessDomain?: string | null
+    timeZone?: string | null
+    onboardingCompletedAt?: string | null
   }
+}
+
+export interface HawkViewWorkspaceOnboarding {
+  required: boolean
+  organizationId: string | null
+  organizationName: string | null
+  businessDomain: string | null
+  businessDomainVerification: 'UNVERIFIED_INFORMATIONAL'
+  timeZone: string | null
 }
 
 export interface HawkViewSession {
@@ -25,5 +37,10 @@ export interface HawkViewSession {
     memberships: HawkViewMembership[]
   }
   signInProvider?: string
+  /**
+   * Present on onboarding-aware backends. Its absence is represented in the
+   * type for defensive parsing, but the protected route fails closed until
+   * the backend supplies it. Never infer it from a generated workspace name.
+   */
+  workspaceOnboarding?: HawkViewWorkspaceOnboarding
 }
-
