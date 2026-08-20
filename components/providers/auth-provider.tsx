@@ -19,6 +19,12 @@ import {
   clearIdentityBoundCaches,
   type AuthTransitionTicket,
 } from '@/lib/auth/data-isolation'
+import {
+  PassiveWorkspaceRefreshLimiter,
+  WorkspaceBootstrapRefreshQueue,
+  WorkspaceChangeSignalGuard,
+  subscribeWorkspaceChanges,
+} from '@/lib/auth/workspace-onboarding-sync'
 
 interface AuthContextValue {
   identityUser: User | null
@@ -37,6 +43,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<HawkViewSession | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const transitionGuard = useRef(new AuthTransitionGuard())
+  const workspaceSignalGuard = useRef(new WorkspaceChangeSignalGuard())
+  const passiveRefreshLimiter = useRef(new PassiveWorkspaceRefreshLimiter())
+  const workspaceBootstrapRefreshQueue = useRef(
+    new WorkspaceBootstrapRefreshQueue()
+  )
   const sessionRef = useRef<HawkViewSession | null>(null)
   const bootstrapInFlight = useRef<{
     ticket: AuthTransitionTicket
@@ -176,6 +187,50 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     return () => data.subscription.unsubscribe()
   }, [beginIdentityTransition, bootstrapIdentity, commitSession])
+
+  useEffect(() => {
+    const refreshCurrentIdentity = () => {
+      if (!identityUser?.email_confirmed_at) return
+      const ticket = transitionGuard.current.current()
+      if (ticket.subject !== identityUser.id) return
+      void bootstrapIdentity(identityUser, ticket)
+    }
+
+    const unsubscribe = subscribeWorkspaceChanges((value) => {
+      const accepted = workspaceSignalGuard.current.accept(
+        value,
+        identityUser?.id,
+        sessionRef.current
+      )
+      if (!accepted) return
+      clearIdentityBoundCaches()
+      const staleRequest = bootstrapInFlight.current?.promise ?? null
+      void workspaceBootstrapRefreshQueue.current.request(
+        staleRequest,
+        async () => {
+          const ticket = transitionGuard.current.current()
+          if (ticket.subject !== identityUser?.id || !identityUser) return null
+          return bootstrapIdentity(identityUser, ticket)
+        }
+      )
+    })
+
+    const passiveRefresh = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        passiveRefreshLimiter.current.allow()
+      ) {
+        refreshCurrentIdentity()
+      }
+    }
+    window.addEventListener('focus', passiveRefresh)
+    document.addEventListener('visibilitychange', passiveRefresh)
+    return () => {
+      unsubscribe()
+      window.removeEventListener('focus', passiveRefresh)
+      document.removeEventListener('visibilitychange', passiveRefresh)
+    }
+  }, [bootstrapIdentity, identityUser])
 
   const signOut = useCallback(async () => {
     beginIdentityTransition(null)

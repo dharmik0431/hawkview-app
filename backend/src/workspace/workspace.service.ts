@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Inject,
   Injectable,
@@ -13,6 +14,12 @@ import {
 } from '../generated/prisma/enums.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import {
+  parseOrganizationSettings,
+  parseOrganizationId,
+  sameOrganizationSettings,
+  workspaceOnboardingView,
+} from './organization-onboarding.js'
 
 const ROLE_VALUES = new Set(Object.values(MembershipRole))
 const STATUS_VALUES = new Set(Object.values(MembershipStatus))
@@ -22,6 +29,9 @@ type OwnerContext = {
   email: string
   organizationId: string
   organizationName: string
+  businessDomain: string | null
+  timeZone: string | null
+  onboardingCompletedAt: Date | null
 }
 
 type AuditMetadata = Record<string, string | number | boolean | null>
@@ -51,10 +61,12 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
-function optionalOrganizationId(body: unknown): string | undefined {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined
-  const value = (body as Record<string, unknown>).organizationId
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+function requiredOrganizationId(body: unknown): string {
+  const payload = record(body)
+  const value = Object.prototype.hasOwnProperty.call(payload, 'organizationId')
+    ? payload.organizationId
+    : undefined
+  return parseOrganizationId(value)
 }
 
 function stringValue(body: Record<string, unknown>, name: string): string {
@@ -83,7 +95,15 @@ export class WorkspaceService {
             organization: { status: 'ACTIVE' },
           },
           select: {
-            organization: { select: { id: true, name: true } },
+            organization: {
+              select: {
+                id: true,
+                name: true,
+                businessDomain: true,
+                timeZone: true,
+                onboardingCompletedAt: true,
+              },
+            },
           },
         },
       },
@@ -105,6 +125,9 @@ export class WorkspaceService {
       email: actor.email,
       organizationId: organization.id,
       organizationName: organization.name,
+      businessDomain: organization.businessDomain,
+      timeZone: organization.timeZone,
+      onboardingCompletedAt: organization.onboardingCompletedAt,
     }
   }
 
@@ -150,6 +173,18 @@ export class WorkspaceService {
       member.status === MembershipStatus.ACTIVE &&
       (nextRole !== MembershipRole.MSP_OWNER || nextStatus !== MembershipStatus.ACTIVE)
     if (!removesOwner) return
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: actor.organizationId },
+      select: { createdByUserId: true, onboardingCompletedAt: true },
+    })
+    if (
+      organization?.onboardingCompletedAt === null &&
+      organization.createdByUserId === member.userId
+    ) {
+      throw new BadRequestException(
+        'The founding MSP owner cannot be removed or demoted until organization setup is complete.',
+      )
+    }
     if (member.userId === actor.userId) {
       throw new BadRequestException('You cannot remove, suspend, or demote your own MSP owner access.')
     }
@@ -179,6 +214,217 @@ export class WorkspaceService {
     })
   }
 
+  private organizationSettingsView(organization: {
+    id: string
+    name: string
+    businessDomain: string | null
+    timeZone: string | null
+    onboardingCompletedAt: Date | null
+  }) {
+    return {
+      organization: {
+        id: organization.id,
+        name: organization.name,
+        businessDomain: organization.businessDomain,
+        businessDomainVerification: 'UNVERIFIED_INFORMATIONAL' as const,
+        timeZone: organization.timeZone,
+        onboardingCompletedAt: organization.onboardingCompletedAt,
+      },
+      workspaceOnboarding: workspaceOnboardingView(organization),
+    }
+  }
+
+  private activeOwnerWhere(actor: OwnerContext, requireFounder = false) {
+    return {
+      id: actor.organizationId,
+      status: 'ACTIVE' as const,
+      ...(requireFounder ? { createdByUserId: actor.userId } : {}),
+      memberships: {
+        some: {
+          userId: actor.userId,
+          role: MembershipRole.MSP_OWNER,
+          status: MembershipStatus.ACTIVE,
+        },
+      },
+    }
+  }
+
+  private async assertOrganizationAuthority(
+    transaction: Prisma.TransactionClient,
+    actor: OwnerContext,
+    requireFounder: boolean,
+  ) {
+    const activeOrganization = await transaction.organization.findFirst({
+      where: {
+        id: actor.organizationId,
+        status: 'ACTIVE',
+        memberships: {
+          some: {
+            userId: actor.userId,
+            role: MembershipRole.MSP_OWNER,
+            status: MembershipStatus.ACTIVE,
+          },
+        },
+      },
+      select: {
+        id: true,
+        name: true,
+        businessDomain: true,
+        timeZone: true,
+        onboardingCompletedAt: true,
+        createdByUserId: true,
+        updatedAt: true,
+      },
+    })
+    if (!activeOrganization) {
+      throw new ForbiddenException('Only an active MSP owner can manage this organization.')
+    }
+    if (requireFounder && activeOrganization.createdByUserId !== actor.userId) {
+      throw new ForbiddenException(
+        'Only the founding MSP owner can manage this organization identity.',
+      )
+    }
+    return activeOrganization
+  }
+
+  async completeOrganizationOnboarding(
+    identity: AuthenticatedIdentity,
+    body: unknown,
+  ) {
+    const input = parseOrganizationSettings(body)
+    const actor = await this.ownerContext(identity, input.organizationId)
+    const completedAt = new Date()
+
+    return this.prisma.$transaction(async (transaction) => {
+      const result = await transaction.organization.updateMany({
+        where: {
+          ...this.activeOwnerWhere(actor, true),
+          onboardingCompletedAt: null,
+        },
+        data: {
+          name: input.organizationName,
+          businessDomain: input.businessDomain,
+          timeZone: input.timeZone,
+          onboardingCompletedAt: completedAt,
+        },
+      })
+
+      if (result.count === 0) {
+        const organization = await this.assertOrganizationAuthority(
+          transaction,
+          actor,
+          true,
+        )
+        if (
+          organization.onboardingCompletedAt &&
+          sameOrganizationSettings(organization, input)
+        ) {
+          return this.organizationSettingsView(organization)
+        }
+        if (organization.onboardingCompletedAt) {
+          throw new ConflictException(
+            'Organization setup is already complete. Use organization settings to make changes.',
+          )
+        }
+        throw new ConflictException(
+          'Organization setup changed while this request was being processed. Refresh and try again.',
+        )
+      }
+
+      const organization = await transaction.organization.findUniqueOrThrow({
+        where: { id: actor.organizationId },
+        select: {
+          id: true,
+          name: true,
+          businessDomain: true,
+          timeZone: true,
+          onboardingCompletedAt: true,
+        },
+      })
+      await transaction.workspaceAdminAuditLog.create({
+        data: {
+          organizationId: actor.organizationId,
+          actorUserId: actor.userId,
+          actorEmail: actor.email,
+          action: 'ORGANIZATION_ONBOARDING_COMPLETED',
+          outcome: 'SUCCEEDED',
+          metadata: {
+            organizationName: input.organizationName,
+            businessDomain: input.businessDomain,
+            timeZone: input.timeZone,
+          },
+        },
+      })
+      return this.organizationSettingsView(organization)
+    })
+  }
+
+  async updateOrganization(identity: AuthenticatedIdentity, body: unknown) {
+    const input = parseOrganizationSettings(body)
+    const actor = await this.ownerContext(identity, input.organizationId)
+
+    return this.prisma.$transaction(async (transaction) => {
+      const current = await this.assertOrganizationAuthority(
+        transaction,
+        actor,
+        false,
+      )
+      if (!current.onboardingCompletedAt) {
+        throw new ConflictException(
+          'Complete organization setup before changing organization settings.',
+        )
+      }
+      if (sameOrganizationSettings(current, input)) {
+        return this.organizationSettingsView(current)
+      }
+
+      const result = await transaction.organization.updateMany({
+        where: {
+          ...this.activeOwnerWhere(actor),
+          onboardingCompletedAt: { not: null },
+          updatedAt: current.updatedAt,
+        },
+        data: {
+          name: input.organizationName,
+          businessDomain: input.businessDomain,
+          timeZone: input.timeZone,
+        },
+      })
+      if (result.count !== 1) {
+        throw new ConflictException(
+          'Organization settings changed while this request was being processed. Refresh and try again.',
+        )
+      }
+      const organization = await transaction.organization.findUniqueOrThrow({
+        where: { id: actor.organizationId },
+        select: {
+          id: true,
+          name: true,
+          businessDomain: true,
+          timeZone: true,
+          onboardingCompletedAt: true,
+        },
+      })
+      const changedFields: string[] = []
+      if (current.name !== organization.name) changedFields.push('name')
+      if (current.businessDomain !== organization.businessDomain) {
+        changedFields.push('businessDomain')
+      }
+      if (current.timeZone !== organization.timeZone) changedFields.push('timeZone')
+      await transaction.workspaceAdminAuditLog.create({
+        data: {
+          organizationId: actor.organizationId,
+          actorUserId: actor.userId,
+          actorEmail: actor.email,
+          action: 'ORGANIZATION_SETTINGS_UPDATED',
+          outcome: 'SUCCEEDED',
+          metadata: { changedFields },
+        },
+      })
+      return this.organizationSettingsView(organization)
+    })
+  }
+
   private memberView(member: MemberRecord) {
     return {
       membershipId: member.id,
@@ -198,7 +444,7 @@ export class WorkspaceService {
   }
 
   async listMembers(identity: AuthenticatedIdentity, organizationId?: string) {
-    const actor = await this.ownerContext(identity, organizationId)
+    const actor = await this.ownerContext(identity, parseOrganizationId(organizationId))
     const members = await this.prisma.membership.findMany({
       where: { organizationId: actor.organizationId },
       orderBy: [{ role: 'asc' }, { user: { email: 'asc' } }],
@@ -212,14 +458,22 @@ export class WorkspaceService {
       },
     })
     return {
-      organization: { id: actor.organizationId, name: actor.organizationName },
+      organization: {
+        id: actor.organizationId,
+        name: actor.organizationName,
+        businessDomain: actor.businessDomain,
+        businessDomainVerification: 'UNVERIFIED_INFORMATIONAL' as const,
+        timeZone: actor.timeZone,
+        onboardingCompletedAt: actor.onboardingCompletedAt,
+      },
       canManage: true,
+      canEditOrganization: actor.onboardingCompletedAt !== null,
       members: members.map((member) => this.memberView(member)),
     }
   }
 
   async listAuditLogs(identity: AuthenticatedIdentity, organizationId?: string) {
-    const actor = await this.ownerContext(identity, organizationId)
+    const actor = await this.ownerContext(identity, parseOrganizationId(organizationId))
     const items = await this.prisma.workspaceAdminAuditLog.findMany({
       where: { organizationId: actor.organizationId },
       orderBy: { createdAt: 'desc' },
@@ -266,7 +520,7 @@ export class WorkspaceService {
 
   async inviteMember(identity: AuthenticatedIdentity, body: unknown) {
     const candidate = record(body)
-    const actor = await this.ownerContext(identity, optionalOrganizationId(body))
+    const actor = await this.ownerContext(identity, requiredOrganizationId(body))
     const email = stringValue(candidate, 'email').toLowerCase()
     const displayName = stringValue(candidate, 'displayName') || null
     const role = stringValue(candidate, 'role') as MembershipRole
@@ -354,7 +608,7 @@ export class WorkspaceService {
 
   async updateMember(identity: AuthenticatedIdentity, membershipId: string, body: unknown) {
     const candidate = record(body)
-    const actor = await this.ownerContext(identity, optionalOrganizationId(body))
+    const actor = await this.ownerContext(identity, requiredOrganizationId(body))
     const member = await this.memberForOwner(actor.organizationId, membershipId)
     const roleValue = stringValue(candidate, 'role')
     const statusValue = stringValue(candidate, 'status')
@@ -373,7 +627,10 @@ export class WorkspaceService {
   }
 
   async removeMember(identity: AuthenticatedIdentity, membershipId: string, organizationId?: string) {
-    const actor = await this.ownerContext(identity, organizationId)
+    const actor = await this.ownerContext(
+      identity,
+      parseOrganizationId(organizationId),
+    )
     const member = await this.memberForOwner(actor.organizationId, membershipId)
     await this.protectOwner(actor, member, MembershipRole.MSP_VIEWER, MembershipStatus.SUSPENDED)
     await this.prisma.membership.delete({ where: { id: member.id } })
@@ -382,7 +639,7 @@ export class WorkspaceService {
   }
 
   async sendPasswordReset(identity: AuthenticatedIdentity, membershipId: string, body: unknown) {
-    const actor = await this.ownerContext(identity, optionalOrganizationId(body))
+    const actor = await this.ownerContext(identity, requiredOrganizationId(body))
     const member = await this.memberForOwner(actor.organizationId, membershipId)
     try {
       await this.supabaseAdminRequest('/auth/v1/recover', {
@@ -398,7 +655,7 @@ export class WorkspaceService {
   }
 
   async resetHawkViewMfa(identity: AuthenticatedIdentity, membershipId: string, body: unknown) {
-    const actor = await this.ownerContext(identity, optionalOrganizationId(body))
+    const actor = await this.ownerContext(identity, requiredOrganizationId(body))
     const member = await this.memberForOwner(actor.organizationId, membershipId)
     if (!member.user.authProviderUserId) {
       throw new BadRequestException('This invited member has not completed HawkView account setup yet.')

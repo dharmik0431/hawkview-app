@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { AuthService } from './auth.service.js'
+import type { AuthenticatedIdentity } from './auth.types.js'
 import type { PrismaService } from '../prisma/prisma.service.js'
 
 type StoredUser = {
@@ -21,6 +22,7 @@ type ExistingState =
   | 'accepted-email'
   | 'legacy-email'
   | 'subject'
+  | 'subject-no-membership'
 
 function authServiceFixture(options: { existing?: ExistingState } = {}) {
   const existing = options.existing
@@ -30,7 +32,9 @@ function authServiceFixture(options: { existing?: ExistingState } = {}) {
         email: 'member@example.com',
         displayName: 'Existing member',
         authProviderUserId:
-          existing === 'subject' || existing === 'disabled-subject'
+          existing === 'subject' ||
+          existing === 'subject-no-membership' ||
+          existing === 'disabled-subject'
             ? '11111111-2222-3333-4444-555555555555'
             : null,
         inviteSentAt:
@@ -50,10 +54,20 @@ function authServiceFixture(options: { existing?: ExistingState } = {}) {
             : null,
       }
     : null
-  const organizations: Array<{ id: string; name: string; slug: string }> = []
-  const memberships: Array<{ userId: string; organizationId: string; role: string; status: string }> = existing && existing !== 'pending-without-membership'
+  const organizations: Array<{
+    id: string
+    name: string
+    slug: string
+    status: string
+    businessDomain: string | null
+    timeZone: string | null
+    onboardingCompletedAt: Date | null
+    createdByUserId: string | null
+  }> = []
+  const memberships: Array<{ userId: string; organizationId: string; role: string; status: string }> = existing && existing !== 'pending-without-membership' && existing !== 'subject-no-membership'
     ? [{ userId: 'existing-user', organizationId: 'existing-workspace', role: 'MSP_VIEWER', status: 'ACTIVE' }]
     : []
+  const bootstrapLockKeys: string[] = []
 
   const identityView = () =>
     user
@@ -70,6 +84,11 @@ function authServiceFixture(options: { existing?: ExistingState } = {}) {
       : null
 
   const transaction = {
+    $executeRawUnsafe: async (sql: string, lockKey: string) => {
+      assert.equal(sql, 'SELECT pg_advisory_xact_lock(hashtext($1))')
+      bootstrapLockKeys.push(lockKey)
+      return 1
+    },
     user: {
       findUnique: async ({ where }: { where: { authProviderUserId?: string } }) =>
         where.authProviderUserId && user?.authProviderUserId === where.authProviderUserId
@@ -112,6 +131,10 @@ function authServiceFixture(options: { existing?: ExistingState } = {}) {
                 name: 'Existing workspace',
                 slug: 'existing-workspace',
                 status: 'ACTIVE',
+                businessDomain: null,
+                timeZone: 'America/Toronto',
+                onboardingCompletedAt: new Date('2026-01-01T00:00:00.000Z'),
+                createdByUserId: null,
               },
             })),
         }
@@ -126,8 +149,15 @@ function authServiceFixture(options: { existing?: ExistingState } = {}) {
       },
     },
     organization: {
-      create: async ({ data }: { data: { name: string; slug: string } }) => {
-        const organization = { id: `workspace-${organizations.length + 1}`, ...data }
+      create: async ({ data }: { data: { name: string; slug: string; createdByUserId: string } }) => {
+        const organization = {
+          id: `workspace-${organizations.length + 1}`,
+          status: 'ACTIVE',
+          businessDomain: null,
+          timeZone: null,
+          onboardingCompletedAt: null,
+          ...data,
+        }
         organizations.push(organization)
         return organization
       },
@@ -143,6 +173,7 @@ function authServiceFixture(options: { existing?: ExistingState } = {}) {
     organizations,
     memberships,
     user: () => user,
+    bootstrapLockKeys,
   }
 }
 
@@ -164,6 +195,21 @@ test('direct sign-up receives an isolated owner workspace', async () => {
     status: 'ACTIVE',
   })
   assert.equal(result.user.memberships[0]?.organization.id, 'workspace-1')
+  assert.deepEqual(result.workspaceOnboarding, {
+    required: true,
+    organizationId: 'workspace-1',
+    organizationName: "New Owner's MSP Workspace",
+    businessDomain: null,
+    businessDomainVerification: 'UNVERIFIED_INFORMATIONAL',
+    timeZone: null,
+  })
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      result.user.memberships[0]?.organization ?? {},
+      'createdByUserId',
+    ),
+    false,
+  )
 })
 
 test('explicit pending invite keeps the user in the inviter workspace', async () => {
@@ -182,6 +228,7 @@ test('explicit pending invite keeps the user in the inviter workspace', async ()
     fixture.user()?.authProviderUserId,
     '11111111-2222-3333-4444-555555555555',
   )
+  assert.equal(result.workspaceOnboarding.required, false)
 })
 
 for (const existing of [
@@ -235,6 +282,7 @@ test('a subject and email collision never reassigns either identity', async () =
   }
   let updates = 0
   const transaction = {
+    $executeRawUnsafe: async () => 1,
     user: {
       findUnique: async () => subjectUser,
       findFirst: async () => emailUser,
@@ -272,6 +320,152 @@ test('provider subject remains authoritative for its existing workspace', async 
 
   assert.equal(fixture.organizations.length, 0)
   assert.equal(result.user.memberships[0]?.organization.id, 'existing-workspace')
+})
+
+for (const existing of [undefined, 'subject-no-membership'] as const) {
+  test(`concurrent bootstrap creates one workspace for ${existing ?? 'a new user'}`, async () => {
+    const fixture = authServiceFixture({ existing })
+    // Model PostgreSQL transaction advisory-lock serialization. Both calls
+    // start before either completes, but only one transaction can read/write
+    // the subject/email identity at a time.
+    const servicePrisma = (fixture.service as unknown as {
+      prisma: { $transaction: Function }
+    }).prisma
+    const originalTransaction = servicePrisma.$transaction.bind(servicePrisma)
+    let queue = Promise.resolve()
+    servicePrisma.$transaction = <T>(callback: unknown) => {
+      const run = queue.then(() => originalTransaction(callback)) as Promise<T>
+      queue = run.then(() => undefined, () => undefined)
+      return run
+    }
+
+    const request: AuthenticatedIdentity = {
+      subject: '11111111-2222-3333-4444-555555555555',
+      email: 'member@example.com',
+      displayName: 'Concurrent Owner',
+    }
+    const [first, second] = await Promise.all([
+      fixture.service.bootstrap(request),
+      fixture.service.bootstrap(request),
+    ])
+
+    assert.equal(fixture.organizations.length, 1)
+    assert.equal(fixture.memberships.length, 1)
+    assert.equal(
+      first.user.memberships[0]?.organization.id,
+      second.user.memberships[0]?.organization.id,
+    )
+    assert.deepEqual(first.workspaceOnboarding, second.workspaceOnboarding)
+    assert.equal(fixture.bootstrapLockKeys.length, 4)
+    assert.equal(
+      new Set(fixture.bootstrapLockKeys).size,
+      2,
+    )
+  })
+}
+
+test('bootstrap retries one unique race and rereads the durable workspace', async () => {
+  const fixture = authServiceFixture()
+  const servicePrisma = (fixture.service as unknown as {
+    prisma: { $transaction: Function }
+  }).prisma
+  const originalTransaction = servicePrisma.$transaction.bind(servicePrisma)
+  let transactions = 0
+  servicePrisma.$transaction = async <T>(callback: unknown) => {
+    transactions += 1
+    const result = await originalTransaction(callback) as T
+    if (transactions === 1) throw { code: 'P2002' }
+    return result
+  }
+
+  const result = await fixture.service.bootstrap({
+    subject: '11111111-2222-3333-4444-555555555555',
+    email: 'new.owner@example.com',
+    displayName: 'New Owner',
+  })
+  assert.equal(transactions, 2)
+  assert.equal(fixture.organizations.length, 1)
+  assert.equal(fixture.memberships.length, 1)
+  assert.equal(result.user.memberships[0]?.organization.id, 'workspace-1')
+})
+
+test('bootstrap excludes inactive organizations from session and onboarding candidates', async () => {
+  const profile = {
+    id: 'owner-user',
+    email: 'owner@example.com',
+    displayName: 'Owner',
+    authProviderUserId: '11111111-2222-3333-4444-555555555555',
+    inviteSentAt: null,
+    inviteAcceptedAt: new Date('2026-01-01T00:00:00.000Z'),
+    disabledAt: null,
+  }
+  const inactiveOrganization = {
+    id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    name: 'Inactive founder workspace',
+    slug: 'inactive-founder',
+    status: 'SUSPENDED',
+    businessDomain: null,
+    timeZone: null,
+    onboardingCompletedAt: null,
+    createdByUserId: profile.id,
+  }
+  const activeOrganization = {
+    id: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+    name: 'Active invited workspace',
+    slug: 'active-invited',
+    status: 'ACTIVE',
+    businessDomain: null,
+    timeZone: 'America/Toronto',
+    onboardingCompletedAt: new Date('2026-01-01T00:00:00.000Z'),
+    createdByUserId: 'another-owner',
+  }
+  const transaction = {
+    $executeRawUnsafe: async () => 1,
+    user: {
+      findUnique: async () => ({ ...profile, memberships: [{ id: 'active' }] }),
+      findFirst: async () => ({ ...profile, memberships: [{ id: 'active' }] }),
+      update: async () => profile,
+      findUniqueOrThrow: async ({ select }: { select: Record<string, any> }) => {
+        assert.deepEqual(select.memberships.where, {
+          status: 'ACTIVE',
+          organization: { status: 'ACTIVE' },
+        })
+        return {
+          ...profile,
+          timeZone: null,
+          dateFormat: 'MM/DD/YYYY',
+          timeFormat: '12h',
+          platformRole: 'STANDARD_USER',
+          memberships: [
+            {
+              id: 'active',
+              role: 'MSP_VIEWER',
+              status: 'ACTIVE',
+              organization: activeOrganization,
+            },
+          ],
+        }
+      },
+    },
+    membership: { findFirst: async () => ({ id: 'active' }) },
+  }
+  const prisma = {
+    $transaction: async <T>(callback: (client: typeof transaction) => Promise<T>) =>
+      callback(transaction),
+  } as unknown as PrismaService
+
+  const result = await new AuthService(prisma).bootstrap({
+    subject: profile.authProviderUserId,
+    email: profile.email,
+  })
+  assert.equal(result.user.memberships.length, 1)
+  assert.equal(result.user.memberships[0]?.organization.id, activeOrganization.id)
+  assert.equal(result.workspaceOnboarding.required, false)
+  assert.equal(result.workspaceOnboarding.organizationId, null)
+  assert.notEqual(
+    result.workspaceOnboarding.organizationId,
+    inactiveOrganization.id,
+  )
 })
 
 test('disabled subject-linked account is rejected before any profile mutation', async () => {

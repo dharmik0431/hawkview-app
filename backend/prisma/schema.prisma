@@ -105,6 +105,7 @@ model User {
   memberships        Membership[]
   notificationStates NotificationUserState[]
   notificationPreferences NotificationPreference[]
+  foundedOrganizations Organization[] @relation("OrganizationFounder")
 
   @@index([platformRole])
   @@index([disabledAt])
@@ -184,6 +185,10 @@ model Organization {
   id                 String                     @id @default(uuid()) @db.Uuid
   name               String                     @db.VarChar(200)
   slug               String                     @unique @db.VarChar(100)
+  businessDomain     String?                    @map("business_domain") @db.VarChar(253)
+  timeZone           String?                    @map("time_zone") @db.VarChar(100)
+  onboardingCompletedAt DateTime?               @map("onboarding_completed_at") @db.Timestamptz(6)
+  createdByUserId    String?                    @map("created_by_user_id") @db.Uuid
   status             OrganizationStatus         @default(ACTIVE)
   createdAt          DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt          DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
@@ -207,8 +212,11 @@ model Organization {
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
   notificationPreferences NotificationPreference[]
+  createdBy          User?                      @relation("OrganizationFounder", fields: [createdByUserId], references: [id], onDelete: SetNull)
 
   @@index([status])
+  @@index([createdByUserId])
+  @@index([onboardingCompletedAt])
   @@map("organizations")
 }
 

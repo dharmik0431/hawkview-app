@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { type AdminTab, adminTabs } from '@/lib/admin-tabs'
 import {
@@ -47,12 +47,26 @@ import {
 } from 'lucide-react'
 import { apiClient } from '@/lib/api/client'
 import { useAuth } from '@/components/providers/auth-provider'
+import { OrganizationProfileEditor } from '@/components/admin/organization-profile-editor'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
 import { getTenantDisplayStatus } from '@/components/tenants/tenant-status-badge'
 import type { Tenant, TenantsResponse } from '@/types/api'
+import {
+  organizationProfileFromWorkspace,
+  workspaceOnboardingState,
+} from '@/lib/auth/workspace-onboarding'
+import {
+  WorkspaceOrganizationLoadGuard,
+  workspaceOrganizationContext,
+} from '@/lib/auth/workspace-organization-context'
+import {
+  PassiveWorkspaceRefreshLimiter,
+  WorkspaceChangeSignalGuard,
+  subscribeWorkspaceChanges,
+} from '@/lib/auth/workspace-onboarding-sync'
 
 type MembershipRole =
   | 'MSP_OWNER'
@@ -87,8 +101,16 @@ type AuditEntry = {
 }
 
 type WorkspaceResponse = {
-  organization: { id: string; name: string }
+  organization: {
+    id: string
+    name: string
+    businessDomain?: string | null
+    businessDomainVerification?: string
+    timeZone?: string | null
+    onboardingCompletedAt?: string | null
+  }
   canManage?: boolean
+  canEditOrganization?: boolean
   members: Member[]
 }
 
@@ -354,8 +376,9 @@ function MemberActionMenu({
 }
 
 export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: AdminTab }) {
-  const { session, isLoading: authLoading } = useAuth()
+  const { identityUser, session, isLoading: authLoading } = useAuth()
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [activeTab, setActiveTab] = useState<AdminTab>(initialTab)
 
   useEffect(() => {
@@ -364,13 +387,23 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
   const navigateToTab = useCallback(
     (tab: AdminTab) => {
-      router.push(`/admin/${tab}`)
+      const organizationId = searchParams.get('organizationId')
+      router.push(
+        organizationId
+          ? `/admin/${tab}?organizationId=${encodeURIComponent(organizationId)}`
+          : `/admin/${tab}`
+      )
     },
-    [router],
+    [router, searchParams],
   )
 
-  const [workspace, setWorkspace] = useState<WorkspaceResponse | null>(null)
-  const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([])
+  const [workspaceResponse, setWorkspace] = useState<WorkspaceResponse | null>(null)
+  const adminLoadGuard = useRef(new WorkspaceOrganizationLoadGuard())
+  const adminWorkspaceSignalGuard = useRef(new WorkspaceChangeSignalGuard())
+  const adminPassiveRefreshLimiter = useRef(
+    new PassiveWorkspaceRefreshLimiter()
+  )
+  const [auditEntriesResponse, setAuditEntries] = useState<AuditEntry[]>([])
   const [notificationPrefs, setNotificationPrefs] = useState<NotificationPref | null>(null)
 
   const [loading, setLoading] = useState(true)
@@ -415,7 +448,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
   const [bulkConfirmModal, setBulkConfirmModal] = useState<BulkConfirmModalState>(null)
 
   // Tenants state for Overview summary
-  const [tenantsData, setTenantsData] = useState<Tenant[] | null>(null)
+  const [tenantsResponse, setTenantsData] = useState<Tenant[] | null>(null)
   const [tenantsLoading, setTenantsLoading] = useState<boolean>(true)
 
   useEffect(() => {
@@ -463,20 +496,101 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
   const menuContainerRef = useRef<HTMLDivElement | null>(null)
 
-  const isMspOwner = Boolean(
-    session?.user?.memberships?.some((m) => m.role === 'MSP_OWNER')
+  const organizationContext = workspaceOrganizationContext(
+    session,
+    searchParams.get('organizationId')
+  )
+  const isMspOwner = organizationContext.organizations.length > 0
+  const selectedOrganizationId =
+    organizationContext.state === 'selected'
+      ? organizationContext.selected.id
+      : null
+
+  useEffect(() => {
+    adminLoadGuard.current.invalidate()
+    setActiveMenuId(null)
+    setConfirmModal(null)
+    setRoleChangeMember(null)
+    setAccountDrawerMember(null)
+    setMemberAuditMember(null)
+    setAuditDrawerEntry(null)
+    setSelectedMembershipIds(new Set())
+    setBulkConfirmModal(null)
+    setInviteModalOpen(false)
+  }, [selectedOrganizationId])
+
+  const workspace =
+    workspaceResponse?.organization.id === selectedOrganizationId
+      ? workspaceResponse
+      : null
+  const auditEntries = useMemo(
+    () =>
+      selectedOrganizationId
+        ? auditEntriesResponse.filter(
+            (entry) => entry.organizationId === selectedOrganizationId
+          )
+        : [],
+    [auditEntriesResponse, selectedOrganizationId]
+  )
+  const tenantsData = useMemo(
+    () =>
+      selectedOrganizationId
+        ? tenantsResponse?.filter(
+            (tenant) => tenant.organization.id === selectedOrganizationId
+          ) ?? null
+        : null,
+    [selectedOrganizationId, tenantsResponse]
   )
 
   const currentUserId = session?.user?.id
 
   // Primary workspace organization info from session or loaded workspace
-  const activeMembership = session?.user?.memberships?.find((m) => m.role === 'MSP_OWNER') || session?.user?.memberships?.[0]
-  const orgName = workspace?.organization.name || activeMembership?.organization.name || 'HawkView Workspace'
-  const orgSlug = activeMembership?.organization.slug || 'N/A'
+  const activeMembership = selectedOrganizationId
+    ? session?.user?.memberships?.find(
+        (membership) =>
+          membership.role === 'MSP_OWNER' &&
+          membership.status === 'ACTIVE' &&
+          membership.organization.status === 'ACTIVE' &&
+          membership.organization.id.toLowerCase() === selectedOrganizationId
+      )
+    : undefined
+  const onboardingState = workspaceOnboardingState(session)
+  const bootstrapOrganizationProfile =
+    onboardingState.state === 'ready' &&
+    onboardingState.onboarding.organizationId === selectedOrganizationId
+      ? onboardingState.onboarding
+      : null
+  const selectedOrganizationProfile = organizationProfileFromWorkspace(
+    workspace?.organization
+  )
+  const organizationProfile =
+    selectedOrganizationProfile ?? bootstrapOrganizationProfile
+  const orgName =
+    organizationProfile?.organizationName ||
+    workspace?.organization.name ||
+    activeMembership?.organization.name ||
+    'HawkView Workspace'
   const orgId = workspace?.organization.id || activeMembership?.organization.id || 'N/A'
   const orgStatus = activeMembership?.organization.status || 'ACTIVE'
+  const businessDomain =
+    organizationProfile?.businessDomain ||
+    activeMembership?.organization.businessDomain ||
+    'Not configured'
+  const organizationTimeZone =
+    organizationProfile?.timeZone ||
+    activeMembership?.organization.timeZone ||
+    'Not configured'
 
   const loadAllData = useCallback(async (keepCurrent = false) => {
+    if (!selectedOrganizationId) {
+      setWorkspace(null)
+      setAuditEntries([])
+      setTenantsData(null)
+      setLoading(false)
+      setTenantsLoading(false)
+      return
+    }
+    const ticket = adminLoadGuard.current.begin(selectedOrganizationId)
     if (!keepCurrent) {
       setLoading(true)
       setTenantsLoading(true)
@@ -484,11 +598,16 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
     setError(null)
     try {
       const [membersData, auditData, prefsData, tenantsRes] = await Promise.all([
-        apiClient.get<WorkspaceResponse>('/api/workspace/members'),
-        apiClient.get<AuditResponse>('/api/workspace/audit-logs'),
+        apiClient.get<WorkspaceResponse>('/api/workspace/members', {
+          params: { organizationId: selectedOrganizationId },
+        }),
+        apiClient.get<AuditResponse>('/api/workspace/audit-logs', {
+          params: { organizationId: selectedOrganizationId },
+        }),
         apiClient.get<NotificationPref>('/api/notifications/preferences').catch(() => null),
         apiClient.get<TenantsResponse>('/api/tenants').catch(() => null),
       ])
+      if (!adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId)) return
       setWorkspace(membersData)
       setAuditEntries(Array.isArray(auditData?.items) ? auditData.items : [])
       if (prefsData) setNotificationPrefs(prefsData)
@@ -498,20 +617,56 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
         setTenantsData(null)
       }
     } catch (requestError) {
+      if (!adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId)) return
       setError(errorMessage(requestError, 'Admin Panel information could not be loaded.'))
     } finally {
-      setLoading(false)
-      setTenantsLoading(false)
+      if (adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId)) {
+        setLoading(false)
+        setTenantsLoading(false)
+      }
     }
-  }, [])
+  }, [selectedOrganizationId])
 
   useEffect(() => {
-    if (isMspOwner) {
+    if (isMspOwner && selectedOrganizationId) {
       void loadAllData()
     } else {
       setLoading(false)
+      setTenantsLoading(false)
     }
-  }, [isMspOwner, loadAllData])
+  }, [isMspOwner, loadAllData, selectedOrganizationId])
+
+  useEffect(() => {
+    if (!selectedOrganizationId) return
+    const refreshSelectedOrganization = () => {
+      void loadAllData(true)
+    }
+    const unsubscribe = subscribeWorkspaceChanges((value) => {
+      const accepted = adminWorkspaceSignalGuard.current.accept(
+        value,
+        identityUser?.id,
+        session
+      )
+      if (accepted?.organizationId === selectedOrganizationId) {
+        refreshSelectedOrganization()
+      }
+    })
+    const passiveRefresh = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        adminPassiveRefreshLimiter.current.allow()
+      ) {
+        refreshSelectedOrganization()
+      }
+    }
+    window.addEventListener('focus', passiveRefresh)
+    document.addEventListener('visibilitychange', passiveRefresh)
+    return () => {
+      unsubscribe()
+      window.removeEventListener('focus', passiveRefresh)
+      document.removeEventListener('visibilitychange', passiveRefresh)
+    }
+  }, [identityUser?.id, loadAllData, selectedOrganizationId, session])
 
   // Close menus & drawers on Esc or outside click
   useEffect(() => {
@@ -789,7 +944,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
   // Bulk action execution
   const handleExecuteBulkAction = useCallback(async () => {
-    if (!bulkConfirmModal || selectedMembers.length === 0) return
+    if (!bulkConfirmModal || selectedMembers.length === 0 || !selectedOrganizationId) return
     const { action, targetRole } = bulkConfirmModal
 
     const eligibleMembers = selectedMembers.filter((m) => {
@@ -823,35 +978,40 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
         if (action === 'ROLE_CHANGE' && targetRole) {
           await apiClient.patch(
             `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
-            { role: targetRole }
+            { organizationId: selectedOrganizationId, role: targetRole }
           )
         } else if (action === 'SUSPEND') {
           await apiClient.patch(
             `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
-            { status: 'SUSPENDED' }
+            { organizationId: selectedOrganizationId, status: 'SUSPENDED' }
           )
         } else if (action === 'REACTIVATE') {
           await apiClient.patch(
             `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
-            { status: 'ACTIVE' }
+            { organizationId: selectedOrganizationId, status: 'ACTIVE' }
           )
         } else if (action === 'RESEND_INVITE') {
           await apiClient.post('/api/workspace/members/invite', {
+            organizationId: selectedOrganizationId,
             email: member.email,
             displayName: member.displayName || undefined,
             role: member.role,
           })
         } else if (action === 'PASSWORD_RESET') {
           await apiClient.post(
-            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/password-reset`
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/password-reset`,
+            { organizationId: selectedOrganizationId }
           )
         } else if (action === 'MFA_RESET') {
           await apiClient.post(
-            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/mfa-reset`
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/mfa-reset`,
+            { organizationId: selectedOrganizationId }
           )
         } else if (action === 'REMOVE') {
           await apiClient.delete(
-            `/api/workspace/members/${encodeURIComponent(member.membershipId)}`
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
+            undefined,
+            { params: { organizationId: selectedOrganizationId } }
           )
         }
         succeededIds.push(member.membershipId)
@@ -882,7 +1042,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
     } else {
       setError(`Bulk action failed: ${failedItems[0].reason}`)
     }
-  }, [bulkConfirmModal, selectedMembers, currentUserId, isFinalActiveOwner, loadAllData])
+  }, [bulkConfirmModal, selectedMembers, currentUserId, isFinalActiveOwner, loadAllData, selectedOrganizationId])
 
   // Copy Org ID handler
   const handleCopyOrgId = async () => {
@@ -1037,6 +1197,10 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
   const invite = async (event: FormEvent) => {
     event.preventDefault()
+    if (!selectedOrganizationId) {
+      setInviteEmailError('Select an MSP workspace before inviting a member.')
+      return
+    }
     setInviteEmailError(null)
 
     const trimmedEmail = inviteEmail.trim()
@@ -1052,6 +1216,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
     await runAction(
       () =>
         apiClient.post('/api/workspace/members/invite', {
+          organizationId: selectedOrganizationId,
           email: trimmedEmail,
           displayName: inviteName.trim() || undefined,
           role: inviteRole,
@@ -1066,9 +1231,11 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
   }
 
   const handleResendInvitation = async (member: Member) => {
+    if (!selectedOrganizationId) return
     await runAction(
       () =>
         apiClient.post('/api/workspace/members/invite', {
+          organizationId: selectedOrganizationId,
           email: member.email,
           displayName: member.displayName || undefined,
           role: member.role,
@@ -1078,7 +1245,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
   }
 
   const handleExecuteModalAction = async () => {
-    if (!confirmModal) return
+    if (!confirmModal || !selectedOrganizationId) return
     const { type, member, targetRole } = confirmModal
 
     if (type === 'ROLE_CHANGE' && targetRole) {
@@ -1086,7 +1253,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
         () =>
           apiClient.patch(
             `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
-            { role: targetRole }
+            { organizationId: selectedOrganizationId, role: targetRole }
           ),
         `Role updated to ${roleLabel(targetRole)} for ${member.email}.`
       )
@@ -1096,7 +1263,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
         () =>
           apiClient.patch(
             `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
-            { status: nextStatus }
+            { organizationId: selectedOrganizationId, status: nextStatus }
           ),
         `${member.email} is now ${nextStatus === 'ACTIVE' ? 'active' : 'suspended'}.`
       )
@@ -1104,7 +1271,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
       await runAction(
         () =>
           apiClient.post(
-            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/password-reset`
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/password-reset`,
+            { organizationId: selectedOrganizationId }
           ),
         `A HawkView account password-reset email was sent to ${member.email}.`
       )
@@ -1112,7 +1280,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
       await runAction(
         () =>
           apiClient.post(
-            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/mfa-reset`
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/mfa-reset`,
+            { organizationId: selectedOrganizationId }
           ),
         `HawkView MFA was reset for ${member.email}.`
       )
@@ -1120,7 +1289,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
       await runAction(
         () =>
           apiClient.delete(
-            `/api/workspace/members/${encodeURIComponent(member.membershipId)}`
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}`,
+            undefined,
+            { params: { organizationId: selectedOrganizationId } }
           ),
         `${member.email} was removed from this HawkView workspace.`
       )
@@ -1179,6 +1350,41 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
     )
   }
 
+  if (organizationContext.state === 'selection-required') {
+    return (
+      <div className="mx-auto max-w-xl px-4 py-12">
+        <div className="space-y-4 rounded-xl border border-border bg-card p-6 shadow-sm">
+          <div className="flex items-center gap-2.5">
+            <Building className="h-5 w-5 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+            <h1 className="text-lg font-semibold text-foreground">Choose a workspace</h1>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Select the MSP organization you want to administer. HawkView keeps team, audit, and profile operations scoped to this choice.
+          </p>
+          <Label htmlFor="admin-workspace-selector">MSP workspace</Label>
+          <select
+            id="admin-workspace-selector"
+            defaultValue=""
+            onChange={(event) => {
+              if (!event.target.value) return
+              router.replace(
+                `/admin/${activeTab}?organizationId=${encodeURIComponent(event.target.value)}`
+              )
+            }}
+            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <option value="" disabled>Select a workspace…</option>
+            {organizationContext.organizations.map((organization) => (
+              <option value={organization.id} key={organization.id}>
+                {organization.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+    )
+  }
+
   const tabs: Array<{ id: AdminTab; label: string; icon: typeof Activity }> = [
     { id: 'overview', label: 'Overview', icon: Activity },
     { id: 'users', label: 'User Management', icon: Users },
@@ -1201,7 +1407,6 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
             <div className="flex items-center gap-1.5 bg-muted/60 px-2.5 py-0.5 rounded-md text-xs font-medium text-foreground border border-border/50">
               <Building className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
               <span className="font-semibold">{orgName}</span>
-              <span className="text-muted-foreground font-mono text-[11px]">({orgSlug})</span>
             </div>
           </div>
           <p className="mt-1 text-xs sm:text-sm text-muted-foreground">
@@ -1212,19 +1417,46 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
             <span>Controls in this area affect HawkView accounts only, not Microsoft 365 identities or credentials.</span>
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void loadAllData(true)}
-          disabled={loading || submitting}
-          className="h-8 text-xs gap-1.5 shrink-0 self-start sm:self-auto"
-        >
-          <RefreshCcw
-            className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`}
-            aria-hidden="true"
-          />
-          <span>Refresh</span>
-        </Button>
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+          {organizationContext.organizations.length > 1 && (
+            <Label className="sr-only" htmlFor="admin-workspace-switcher">MSP workspace</Label>
+          )}
+          {organizationContext.organizations.length > 1 && (
+            <select
+              id="admin-workspace-switcher"
+              value={selectedOrganizationId ?? ''}
+              onChange={(event) => {
+                setWorkspace(null)
+                setAuditEntries([])
+                setTenantsData(null)
+                clearSelection()
+                router.replace(
+                  `/admin/${activeTab}?organizationId=${encodeURIComponent(event.target.value)}`
+                )
+              }}
+              className="h-8 max-w-56 rounded-md border border-input bg-background px-2 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {organizationContext.organizations.map((organization) => (
+                <option value={organization.id} key={organization.id}>
+                  {organization.name}
+                </option>
+              ))}
+            </select>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void loadAllData(true)}
+            disabled={loading || submitting}
+            className="h-8 text-xs gap-1.5 shrink-0"
+          >
+            <RefreshCcw
+              className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`}
+              aria-hidden="true"
+            />
+            <span>Refresh</span>
+          </Button>
+        </div>
       </div>
 
       {/* Global Alerts / Toasts */}
@@ -2259,10 +2491,13 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
               <div className="space-y-1">
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  Organization Slug
+                  Business Domain
                 </span>
-                <p className="font-mono text-xs font-medium text-foreground bg-muted/50 px-2 py-1 rounded border border-border/50 truncate">
-                  {orgSlug}
+                <p className="text-xs font-medium text-foreground bg-muted/50 px-2 py-1 rounded border border-border/50 truncate">
+                  {businessDomain}
+                </p>
+                <p className="text-[10px] text-muted-foreground">
+                  Informational; ownership is not verified
                 </p>
               </div>
 
@@ -2310,6 +2545,13 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                 </div>
               </div>
             </div>
+
+            {organizationProfile && workspace?.canEditOrganization === true && (
+              <OrganizationProfileEditor
+                onboarding={organizationProfile}
+                onSaved={() => loadAllData(true)}
+              />
+            )}
           </div>
 
           {/* Section 2: Regional Preferences */}
@@ -2319,12 +2561,6 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                 <Globe className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
                 <h2 className="text-sm font-bold text-foreground">Regional Preferences</h2>
               </div>
-            </div>
-
-            {/* Subtle section-level message */}
-            <div className="p-3 rounded-lg bg-muted/40 border border-border/60 flex items-center gap-2.5 text-xs text-muted-foreground">
-              <Info className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
-              <span>Workspace preference editing is not available yet.</span>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs pt-1">
@@ -2342,7 +2578,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                   Default Time Zone
                 </span>
                 <p className="font-medium text-foreground bg-muted/30 px-2.5 py-1.5 rounded border border-border/50">
-                  {session?.user.timeZone || 'UTC'}
+                  {organizationTimeZone}
                 </p>
               </div>
 

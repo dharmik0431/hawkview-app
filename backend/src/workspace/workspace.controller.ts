@@ -20,6 +20,22 @@ export class WorkspaceController {
     private readonly workspaceService: WorkspaceService,
   ) {}
 
+  @Post('onboarding')
+  completeOrganizationOnboarding(
+    @Req() request: AuthenticatedRequest,
+    @Body() body: unknown,
+  ) {
+    return this.workspaceService.completeOrganizationOnboarding(request.auth, body)
+  }
+
+  @Patch('organization')
+  updateOrganization(
+    @Req() request: AuthenticatedRequest,
+    @Body() body: unknown,
+  ) {
+    return this.workspaceService.updateOrganization(request.auth, body)
+  }
+
   @Get('members')
   listMembers(
     @Req() request: AuthenticatedRequest,
