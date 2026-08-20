@@ -12,6 +12,7 @@ import {
 test('normalizes internal and external forwarding plus multiple conditions and destinations', () => {
   const rule = normalizeExchangeRuleDrawer({
     name: 'Forward invoices', mailboxUpn: 'user@contoso.com', enabled: true, priority: 2,
+    hasError: false, isReadOnly: true, configurationCollectedAt: '2026-08-19T12:00:00.000Z',
     details: {
       conditions: [
         { key: 'subjectContains', label: 'untrusted', values: ['Invoice', 'Urgent'], truncated: false },
@@ -30,10 +31,13 @@ test('normalizes internal and external forwarding plus multiple conditions and d
         { key: 'delete', values: [] },
       ],
     },
-  })
+  }, new Date('2026-08-20T12:00:00.000Z'))
 
   assert.equal(rule?.name, 'Forward invoices')
   assert.equal(rule?.mailboxUpn, 'user@contoso.com')
+  assert.equal(rule?.hasError, false)
+  assert.equal(rule?.isReadOnly, true)
+  assert.equal(rule?.configurationCollectedAt, '2026-08-19T12:00:00.000Z')
   assert.deepEqual(rule?.conditions.map(({ key, label, values }) => ({ key, label, values })), [
     { key: 'subjectContains', label: 'Subject contains', values: ['Invoice', 'Urgent'] },
     { key: 'fromAddresses', label: 'From', values: ['Accounts <billing@contoso.com>'] },
@@ -48,6 +52,34 @@ test('normalizes internal and external forwarding plus multiple conditions and d
   assert.equal(rule?.actions[0]?.emphasis, 'destination')
   assert.equal(rule?.actions[1]?.label, 'Move to folder ID')
   assert.equal(rule?.actions[2]?.emphasis, 'destructive')
+  assert.deepEqual(rule?.destinations.map(({ key, kind, values }) => ({ key, kind, values })), [
+    { key: 'forwardTo', kind: 'recipient', values: ['review@contoso.com', 'archive@example.net'] },
+    { key: 'moveToFolder', kind: 'folder', values: ['Archive'] },
+    { key: 'delete', kind: 'deleted-items', values: ['Deleted Items'] },
+  ])
+  assert.deepEqual(rule?.otherActions, [])
+})
+
+test('fails closed for invalid, future and hostile collection metadata while supporting old bundles', () => {
+  const now = new Date('2026-08-20T12:00:00.000Z')
+  for (const value of [
+    '2026-08-20T12:00:00.001Z', 'not-a-date', '2026-08-19T12:00:00Z',
+    '2026-08-19T12:00:00.000Z\u0000', 'x'.repeat(41),
+  ]) {
+    const rule = normalizeExchangeRuleDrawer({
+      name: 'Rule', hasError: 'false', isReadOnly: 1, configurationCollectedAt: value,
+    }, now)
+    assert.equal(rule?.configurationCollectedAt, null, value)
+    assert.equal(rule?.hasError, null)
+    assert.equal(rule?.isReadOnly, null)
+  }
+
+  const legacy = normalizeExchangeRuleDrawer({ name: 'Legacy rule', enabled: true, actions: ['forwardTo'] }, now)
+  assert.equal(legacy?.configurationCollectedAt, null)
+  assert.equal(legacy?.hasError, null)
+  assert.equal(legacy?.isReadOnly, null)
+  assert.deepEqual(legacy?.destinations, [])
+  assert.deepEqual(legacy?.otherActions, [])
 })
 
 test('frontend safe-string policy matches backend rejection while preserving useful identifiers', () => {
@@ -147,7 +179,16 @@ test('Exchange rule drawer uses the strict contract and evidence-only investigat
   )
   assert.match(source, /normalizeExchangeRuleDrawer\(inspectingRule\)/)
   assert.match(source, /What triggers this rule/)
-  assert.match(source, /What this rule does/)
+  assert.match(source, /Destinations/)
+  assert.match(source, /Folder display name: Not collected with current permission/)
+  assert.match(source, /Other actions/)
+  assert.match(source, /Microsoft object history/)
+  assert.match(source, /Created<\/dt><dd[^>]*>Not provided by Microsoft Graph/)
+  assert.match(source, /Last modified<\/dt><dd[^>]*>Not provided by Microsoft Graph/)
+  assert.match(source, /Actor<\/dt><dd[^>]*>Not provided by Microsoft Graph/)
+  assert.match(source, /Configuration collected by HawkView/)
+  assert.match(source, /does not correlate those events to this object or use them as its creation time or actor/)
+  assert.doesNotMatch(source, /inspectingRule\.(?:createdAt|lastModifiedAt|actor)/)
   assert.match(source, /Microsoft did not provide condition values for this rule/)
   assert.match(source, /does not infer who created the rule/)
   assert.match(source, /exchangeRuleEnabledState\(r\) === ruleEnabledFilter/)

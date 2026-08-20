@@ -1597,7 +1597,7 @@ export default function ExchangePage({
             <div className="p-5 overflow-y-auto space-y-4 text-xs">
               <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="font-semibold text-slate-900 dark:text-slate-100">Rule Status</span>
+                  <span className="font-semibold text-slate-900 dark:text-slate-100">Current rule state</span>
                   <Badge className={ruleInvestigation.enabled === true ? "bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700"}>
                     {ruleInvestigation.enabled === null ? 'Not provided' : ruleInvestigation.enabled ? 'Enabled' : 'Disabled'}
                   </Badge>
@@ -1608,12 +1608,58 @@ export default function ExchangePage({
                     <span className="font-mono text-slate-800 dark:text-slate-200 break-all">{ruleInvestigation.mailboxUpn || 'Not provided by Microsoft'}</span>
                   </div>
                   <div>
-                    <span className="text-slate-500 block text-[11px]">Priority</span>
+                    <span className="text-slate-500 block text-[11px]">Priority / sequence</span>
                     <span className="font-semibold text-slate-800 dark:text-slate-200">
                       {ruleInvestigation.priority === null ? 'Not provided by Microsoft' : ruleInvestigation.priority}
                     </span>
                   </div>
+                  <div>
+                    <span className="text-slate-500 block text-[11px]">Read-only rule</span>
+                    <span className="font-semibold text-slate-800 dark:text-slate-200">
+                      {ruleInvestigation.isReadOnly === null ? 'Not provided by Microsoft' : ruleInvestigation.isReadOnly ? 'Yes' : 'No'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block text-[11px]">Microsoft error state</span>
+                    <span className={cn(
+                      'font-semibold',
+                      ruleInvestigation.hasError === true ? 'text-red-700 dark:text-red-300' : 'text-slate-800 dark:text-slate-200',
+                    )}>
+                      {ruleInvestigation.hasError === null ? 'Not provided by Microsoft' : ruleInvestigation.hasError ? 'Rule has an error' : 'No error reported'}
+                    </span>
+                  </div>
                 </div>
+              </div>
+
+              <div className="p-3.5 rounded-xl border border-amber-200 dark:border-amber-900/70 bg-amber-50/60 dark:bg-amber-950/20 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Mail className="h-4 w-4 text-amber-700 dark:text-amber-400" aria-hidden="true" />
+                  <h3 className="font-semibold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider">
+                    Destinations
+                  </h3>
+                </div>
+                {ruleInvestigation.destinations.length === 0 ? (
+                  <p className="text-slate-600 dark:text-slate-400 italic">Microsoft did not provide a destination action for this rule.</p>
+                ) : (
+                  <ul className="space-y-2" role="list">
+                    {ruleInvestigation.destinations.map((destination) => (
+                      <li key={destination.key} className="rounded-lg border border-amber-200/80 dark:border-amber-900/70 bg-white/80 dark:bg-slate-900/60 p-3 space-y-1.5">
+                        <div className="font-semibold text-slate-900 dark:text-slate-100">{destination.label}</div>
+                        <ul className="space-y-1" aria-label={`${destination.label} values`}>
+                          {destination.values.map((value, index) => (
+                            <li key={`${destination.key}-${index}`} className="font-mono text-[11px] break-all text-slate-800 dark:text-slate-200">{value}</li>
+                          ))}
+                        </ul>
+                        {destination.kind === 'folder' && (
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400">Folder display name: Not collected with current permission</p>
+                        )}
+                        {destination.truncated && (
+                          <p className="text-[10px] text-slate-500">Additional Microsoft-provided destinations were omitted by HawkView&apos;s display limit.</p>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
 
               <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
@@ -1632,14 +1678,32 @@ export default function ExchangePage({
                 )}
               </div>
 
+              {ruleInvestigation.otherActions.length > 0 && (
               <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
                 <h3 className="font-semibold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider text-slate-500">
-                  What this rule does
+                  Other actions
                 </h3>
                 <RuleFactList
-                  facts={ruleInvestigation.actions}
+                  facts={ruleInvestigation.otherActions}
                   emptyText="Microsoft did not provide action values for this rule."
                 />
+              </div>
+              )}
+
+              <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Archive className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                  <h3 className="font-semibold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider text-slate-500">
+                    Microsoft object history
+                  </h3>
+                </div>
+                <dl className="divide-y divide-slate-200 dark:divide-slate-800">
+                  <div className="py-2 flex items-start justify-between gap-4"><dt className="text-slate-500">Created</dt><dd className="font-medium text-right text-slate-800 dark:text-slate-200">Not provided by Microsoft Graph</dd></div>
+                  <div className="py-2 flex items-start justify-between gap-4"><dt className="text-slate-500">Last modified</dt><dd className="font-medium text-right text-slate-800 dark:text-slate-200">Not provided by Microsoft Graph</dd></div>
+                  <div className="py-2 flex items-start justify-between gap-4"><dt className="text-slate-500">Actor</dt><dd className="font-medium text-right text-slate-800 dark:text-slate-200">Not provided by Microsoft Graph</dd></div>
+                  <div className="py-2 flex items-start justify-between gap-4"><dt className="text-slate-500">Configuration collected by HawkView</dt><dd className="font-medium text-right text-slate-800 dark:text-slate-200">{ruleInvestigation.configurationCollectedAt ? formatTenantTimestamp(ruleInvestigation.configurationCollectedAt) : 'Not available'}</dd></div>
+                </dl>
+                <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">Microsoft Unified Audit may contain separate mailbox-rule change events. HawkView does not correlate those events to this object or use them as its creation time or actor.</p>
               </div>
 
               <div className="p-3.5 rounded-xl border border-blue-200 dark:border-blue-900/60 bg-blue-50/50 dark:bg-blue-950/30 text-blue-800 dark:text-blue-300 flex items-start gap-2">

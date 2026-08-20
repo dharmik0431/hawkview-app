@@ -13,10 +13,23 @@ export type ExchangeRuleDrawerModel = {
   name: string
   mailboxUpn: string | null
   enabled: boolean | null
+  hasError: boolean | null
+  isReadOnly: boolean | null
   priority: number | null
+  configurationCollectedAt: string | null
   conditions: ExchangeRuleDrawerFact[]
   exceptions: ExchangeRuleDrawerFact[]
   actions: ExchangeRuleDrawerFact[]
+  destinations: ExchangeRuleDestination[]
+  otherActions: ExchangeRuleDrawerFact[]
+}
+
+export type ExchangeRuleDestination = {
+  key: 'copyToFolder' | 'delete' | 'forwardAsAttachmentTo' | 'forwardTo' | 'moveToFolder' | 'redirectTo'
+  label: string
+  values: string[]
+  kind: 'folder' | 'recipient' | 'deleted-items'
+  truncated: boolean
 }
 
 export type ExchangeRuleCategory = 'Forward' | 'Redirect' | 'Delete' | 'Move' | 'Other'
@@ -110,6 +123,14 @@ function text(value: unknown): string | null {
   return normalized
 }
 
+function collectedAt(value: unknown, now: Date): string | null {
+  if (typeof value !== 'string' || value.length > 40) return null
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return null
+  const parsed = new Date(value)
+  if (!Number.isFinite(parsed.getTime()) || parsed.getTime() > now.getTime()) return null
+  return parsed.toISOString() === value ? value : null
+}
+
 export function exchangeRuleEnabledState(value: unknown): ExchangeRuleEnabledState {
   const rule = record(value)
   const enabled = rule ? own(rule, 'enabled') : undefined
@@ -192,20 +213,57 @@ function normalizeFacts(
   return facts
 }
 
-export function normalizeExchangeRuleDrawer(value: unknown): ExchangeRuleDrawerModel | null {
+function projectDestinations(actions: ExchangeRuleDrawerFact[]): ExchangeRuleDestination[] {
+  const destinations: ExchangeRuleDestination[] = []
+  for (const action of actions) {
+    if (action.key === 'delete') {
+      destinations.push({
+        key: 'delete', label: 'Move to Deleted Items', values: ['Deleted Items'],
+        kind: 'deleted-items', truncated: false,
+      })
+      continue
+    }
+    if (action.key === 'moveToFolder' || action.key === 'copyToFolder') {
+      destinations.push({
+        key: action.key, label: action.label, values: action.values,
+        kind: 'folder', truncated: action.truncated,
+      })
+      continue
+    }
+    if (action.key === 'forwardTo' || action.key === 'redirectTo' || action.key === 'forwardAsAttachmentTo') {
+      destinations.push({
+        key: action.key, label: action.label, values: action.values,
+        kind: 'recipient', truncated: action.truncated,
+      })
+    }
+  }
+  return destinations
+}
+
+const DESTINATION_ACTION_KEYS = new Set([
+  'copyToFolder', 'delete', 'forwardAsAttachmentTo', 'forwardTo', 'moveToFolder', 'redirectTo',
+])
+
+export function normalizeExchangeRuleDrawer(value: unknown, now = new Date()): ExchangeRuleDrawerModel | null {
   const rule = record(value)
   if (!rule) return null
   const details = record(own(rule, 'details'))
   const rawPriority = own(rule, 'priority')
+  const actions = normalizeFacts(details ? own(details, 'actions') : null, ACTIONS, true)
   return {
     name: text(own(rule, 'name')) ?? 'Unnamed inbox rule',
     mailboxUpn: text(own(rule, 'mailboxUpn')),
     enabled: typeof own(rule, 'enabled') === 'boolean' ? own(rule, 'enabled') as boolean : null,
+    hasError: typeof own(rule, 'hasError') === 'boolean' ? own(rule, 'hasError') as boolean : null,
+    isReadOnly: typeof own(rule, 'isReadOnly') === 'boolean' ? own(rule, 'isReadOnly') as boolean : null,
     priority: typeof rawPriority === 'number' && Number.isSafeInteger(rawPriority) && rawPriority >= 0 && rawPriority <= 1_000_000
       ? rawPriority
       : null,
+    configurationCollectedAt: collectedAt(own(rule, 'configurationCollectedAt'), now),
     conditions: normalizeFacts(details ? own(details, 'conditions') : null, CONDITION_LABELS, false),
     exceptions: normalizeFacts(details ? own(details, 'exceptions') : null, CONDITION_LABELS, false),
-    actions: normalizeFacts(details ? own(details, 'actions') : null, ACTIONS, true),
+    actions,
+    destinations: projectDestinations(actions),
+    otherActions: actions.filter((action) => !DESTINATION_ACTION_KEYS.has(action.key)),
   }
 }

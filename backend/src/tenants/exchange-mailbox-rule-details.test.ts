@@ -4,6 +4,7 @@ import { TenantSyncService } from './tenant-sync.service.js'
 import {
   exchangeMailboxRuleCompoundId,
   projectExchangeMailboxRuleDetails,
+  safeExchangeMailboxRuleCollectedAt,
   safeExchangeMailboxRuleText,
   summarizeExchangeMailboxRuleActions,
 } from './exchange-mailbox-rule-details.js'
@@ -96,6 +97,21 @@ test('backend safe-string policy rejects unsafe and encoded URL secrets while pr
   }
 })
 
+test('accepts only valid non-future snapshot observation timestamps', () => {
+  const now = new Date('2026-08-20T12:00:00.000Z')
+  assert.equal(
+    safeExchangeMailboxRuleCollectedAt(new Date('2026-08-20T11:45:00.000Z'), now),
+    '2026-08-20T11:45:00.000Z',
+  )
+  assert.equal(safeExchangeMailboxRuleCollectedAt('2026-08-20T11:45:00.000Z', now), '2026-08-20T11:45:00.000Z')
+  assert.equal(safeExchangeMailboxRuleCollectedAt('2026-08-20T12:00:00.001Z', now), null)
+  assert.equal(safeExchangeMailboxRuleCollectedAt('not-a-date', now), null)
+  assert.equal(safeExchangeMailboxRuleCollectedAt('August 20, 2026 11:45 UTC', now), null)
+  assert.equal(safeExchangeMailboxRuleCollectedAt('2026-08-20T11:45:00Z', now), null)
+  assert.equal(safeExchangeMailboxRuleCollectedAt('2026-08-20T11:45:00.000Z\u0000', now), null)
+  assert.equal(safeExchangeMailboxRuleCollectedAt({ toISOString: () => '2026-08-20T11:45:00.000Z' }, now), null)
+})
+
 test('returns an explicit empty detail contract when Microsoft did not provide usable values', () => {
   assert.deepEqual(projectExchangeMailboxRuleDetails(null), { conditions: [], exceptions: [], actions: [] })
   assert.deepEqual(projectExchangeMailboxRuleDetails({
@@ -153,11 +169,13 @@ test('tenant bundle scopes the rule snapshot by organization and tenant and emit
     assert.equal(where.organizationId, expectedScope.organizationId)
     assert.equal(where.customerTenantId, expectedScope.customerTenantId)
   }
+  const successfulAt = new Date('2026-08-19T12:00:00.000Z')
   const snapshots = [{
     resourceType: 'EXCHANGE_MAILBOX_RULES',
+    observedAt: successfulAt,
     payload: [{
       id: 'rule-1', mailboxUserId: 'mailbox-1', mailboxUpn: 'user@contoso.com',
-      displayName: 'Forward invoices', sequence: 2, isEnabled: true,
+      displayName: 'Forward invoices', sequence: 2, isEnabled: true, hasError: false, isReadOnly: true,
       conditions: {
         recipientContains: ['@contoso.com'],
         subjectContains: ['Invoice'],
@@ -175,7 +193,6 @@ test('tenant bundle scopes the rule snapshot by organization and tenant and emit
       displayName: 'Microsoft omitted state', conditions: {}, actions: {},
     }],
   }]
-  const successfulAt = new Date('2026-08-20T12:00:00.000Z')
   const prisma = {
     directoryUser: { findMany: async ({ where }: any) => (scoped(where), []) },
     directoryGroup: { findMany: async ({ where }: any) => (scoped(where), []) },
@@ -217,6 +234,9 @@ test('tenant bundle scopes the rule snapshot by organization and tenant and emit
   assert.equal(rule.id, 'mailbox-1::rule-1')
   assert.equal(rule.mailboxUserId, 'mailbox-1')
   assert.equal(rule.description, 'Forward to: audit@example.net')
+  assert.equal(rule.configurationCollectedAt, '2026-08-19T12:00:00.000Z')
+  assert.equal(rule.hasError, false)
+  assert.equal(rule.isReadOnly, true)
   assert.deepEqual(rule.conditions, ['recipientContains', 'subjectContains', 'withinSizeRange'])
   assert.deepEqual(rule.exceptions, ['recipientContains', 'withinSizeRange'])
   assert.deepEqual(rule.actions, ['forwardTo'])
@@ -229,5 +249,8 @@ test('tenant bundle scopes the rule snapshot by organization and tenant and emit
   assert.equal(result.bundle.exchange.rules[1].enabled, null)
   assert.equal(result.bundle.exchange.rules[1].priority, null)
   assert.equal(result.bundle.exchange.rules[1].description, null)
+  assert.equal(result.bundle.exchange.rules[1].hasError, null)
+  assert.equal(result.bundle.exchange.rules[1].isReadOnly, null)
+  assert.equal(result.bundle.exchange.rules[1].configurationCollectedAt, '2026-08-19T12:00:00.000Z')
   assert.deepEqual(result.bundle.exchange.rules[1].details, { conditions: [], exceptions: [], actions: [] })
 })

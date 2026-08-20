@@ -125,6 +125,22 @@ export function safeExchangeMailboxRuleText(value: unknown): string | null {
   return safeText(value)
 }
 
+export function safeExchangeMailboxRuleCollectedAt(
+  value: unknown,
+  now = new Date(),
+): string | null {
+  if (!(value instanceof Date) && typeof value !== 'string') return null
+  if (
+    typeof value === 'string' &&
+    (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(value))
+  ) return null
+  const collectedAt = value instanceof Date ? value : new Date(value)
+  if (!Number.isFinite(collectedAt.getTime()) || collectedAt.getTime() > now.getTime()) return null
+  const iso = collectedAt.toISOString()
+  return iso.length <= 40 && (typeof value !== 'string' || value === iso) ? iso : null
+}
+
 function safeArray(value: unknown, projector: (item: unknown) => string | null) {
   if (!Array.isArray(value)) return { values: [] as string[], truncated: false }
   const projected: string[] = []

@@ -36,6 +36,7 @@ import { buildSharePointDataContract } from './sharepoint-data-contract.js'
 import {
   exchangeMailboxRuleCompoundId,
   projectExchangeMailboxRuleDetails,
+  safeExchangeMailboxRuleCollectedAt,
   safeExchangeMailboxRuleText,
   summarizeExchangeMailboxRuleActions,
 } from './exchange-mailbox-rule-details.js'
@@ -4342,6 +4343,9 @@ export class TenantSyncService {
         Array.isArray(snapshot.payload) ? (snapshot.payload as any[]) : [],
       ])
     )
+    const snapshotObservedAtByResource = new Map(
+      entraSnapshots.map((snapshot) => [snapshot.resourceType, snapshot.observedAt])
+    )
     const servicePrincipalNameByAppId = new Map<string, string>(
       (snapshotByResource.get('SERVICE_PRINCIPALS') ?? [])
         .filter(
@@ -5183,6 +5187,9 @@ export class TenantSyncService {
             const details = projectExchangeMailboxRuleDetails(rule)
             const mailboxUserId = safeExchangeMailboxRuleText(rule.mailboxUserId)
             const microsoftRuleId = safeExchangeMailboxRuleText(rule.id)
+            const configurationCollectedAt = safeExchangeMailboxRuleCollectedAt(
+              snapshotObservedAtByResource.get('EXCHANGE_MAILBOX_RULES')
+            )
             return {
               id: exchangeMailboxRuleCompoundId(rule) ??
                 `${mailboxUserId ?? 'mailbox'}::unidentified-rule-${index + 1}`,
@@ -5191,9 +5198,12 @@ export class TenantSyncService {
               name: safeExchangeMailboxRuleText(rule.displayName) ?? 'Unnamed inbox rule',
               mailboxUpn: safeExchangeMailboxRuleText(rule.mailboxUpn) ?? '',
               enabled: typeof rule.isEnabled === 'boolean' ? rule.isEnabled : null,
+              hasError: typeof rule.hasError === 'boolean' ? rule.hasError : null,
+              isReadOnly: typeof rule.isReadOnly === 'boolean' ? rule.isReadOnly : null,
               priority: typeof rule.sequence === 'number' && Number.isSafeInteger(rule.sequence) && rule.sequence >= 0
                 ? rule.sequence
                 : null,
+              configurationCollectedAt,
               description: summarizeExchangeMailboxRuleActions(details),
               actions: details.actions.map((fact) => fact.key),
               conditions: details.conditions.map((fact) => fact.key),
