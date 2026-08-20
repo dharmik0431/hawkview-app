@@ -82,6 +82,41 @@ test('fails closed for invalid, future and hostile collection metadata while sup
   assert.deepEqual(legacy?.otherActions, [])
 })
 
+test('supports old and current backend rule shapes without inventing missing investigation details', () => {
+  const now = new Date('2026-08-20T12:00:00.000Z')
+  const legacy = normalizeExchangeRuleDrawer({
+    name: 'Legacy move rule',
+    mailboxUpn: 'legacy@contoso.com',
+    enabled: true,
+    priority: 4,
+    actions: ['moveToFolder'],
+  }, now)
+  assert.equal(legacy?.mailboxUpn, 'legacy@contoso.com')
+  assert.equal(legacy?.enabled, true)
+  assert.equal(legacy?.priority, 4)
+  assert.deepEqual(legacy?.destinations, [])
+  assert.equal(legacy?.configurationCollectedAt, null)
+
+  const current = normalizeExchangeRuleDrawer({
+    name: 'Current move rule',
+    mailboxUpn: 'current@contoso.com',
+    enabled: true,
+    priority: 2,
+    configurationCollectedAt: '2026-08-20T11:30:00.000Z',
+    details: {
+      conditions: [{ key: 'subjectContains', values: ['Invoice'] }],
+      actions: [{ key: 'moveToFolder', values: ['AQMkFolderId'] }],
+    },
+  }, now)
+  assert.deepEqual(current?.conditions.map(({ key, values }) => ({ key, values })), [
+    { key: 'subjectContains', values: ['Invoice'] },
+  ])
+  assert.deepEqual(current?.destinations.map(({ key, values }) => ({ key, values })), [
+    { key: 'moveToFolder', values: ['AQMkFolderId'] },
+  ])
+  assert.equal(current?.configurationCollectedAt, '2026-08-20T11:30:00.000Z')
+})
+
 test('frontend safe-string policy matches backend rejection while preserving useful identifiers', () => {
   const values = [
     'safe@example.net',
@@ -221,4 +256,32 @@ test('rule dialog owns its focus refs and keyboard containment instead of the ma
   assert.match(source, /!event\.shiftKey && document\.activeElement === last/)
   assert.match(source, /e\.key === 'Escape'[\s\S]*?closeDrawers\(\)/)
   assert.match(source, /lastTriggerRef\.current\.focus\(\)/)
+})
+
+test('rule drawer selection stays local so opening and closing it cannot remount the Exchange tab state', () => {
+  const componentSource = readFileSync(
+    new URL('../../app/(protected)/tenants/[id]/components/sections/exchange-section.tsx', import.meta.url),
+    'utf8',
+  )
+  const pageSource = readFileSync(
+    new URL('../../app/(protected)/tenants/[id]/page.tsx', import.meta.url),
+    'utf8',
+  )
+  const openStart = componentSource.indexOf('const openRuleDrawer')
+  const openEnd = componentSource.indexOf('// Open Group Drawer', openStart)
+  const closeStart = componentSource.indexOf('const closeDrawers')
+  const closeEnd = componentSource.indexOf('// Global Escape key listener', closeStart)
+  assert.ok(openStart >= 0 && openEnd > openStart && closeStart >= 0 && closeEnd > closeStart)
+
+  const openRuleDrawer = componentSource.slice(openStart, openEnd)
+  const closeDrawers = componentSource.slice(closeStart, closeEnd)
+  assert.match(openRuleDrawer, /setInspectingRule\(r\)/)
+  assert.doesNotMatch(openRuleDrawer, /setSelectedRule|setActiveTab/)
+  assert.match(closeDrawers, /setInspectingRule\(null\)/)
+  assert.doesNotMatch(closeDrawers, /setSelectedRule|setActiveTab/)
+
+  const exchangeUsageStart = pageSource.indexOf('<ExchangePage')
+  const exchangeUsageEnd = pageSource.indexOf('/>', exchangeUsageStart)
+  assert.ok(exchangeUsageStart >= 0 && exchangeUsageEnd > exchangeUsageStart)
+  assert.doesNotMatch(pageSource.slice(exchangeUsageStart, exchangeUsageEnd), /setSelectedRule/)
 })
