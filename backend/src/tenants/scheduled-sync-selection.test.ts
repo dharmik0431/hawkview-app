@@ -69,14 +69,16 @@ test('excludes a non-expired durable USERS lease before scheduler candidate limi
   assert.match(where, /2026-08-17T15:45:00.000Z/)
 })
 
-test('retries only bounded transient SharePoint failures before the daily inventory', () => {
+test('retries only explicitly bounded transient resources before the daily inventory', () => {
   const transient = {
     ...state('SHAREPOINT_SITES', 'FAILED', null, new Date('2026-08-17T15:29:00.000Z')),
     lastErrorCode: '500', lastErrorMessage: 'upstream unavailable', consecutiveFailures: 1,
   }
   assert.equal(shouldRunTargetedTransientRetry(transient, now), true)
+  assert.equal(shouldRunTargetedTransientRetry({ ...transient, resourceType: 'NAMED_LOCATIONS' }, now), true)
   assert.equal(targetedTransientRetryDelayMs(transient), 30 * 60 * 1000)
   assert.equal(shouldRunTargetedTransientRetry({ ...transient, lastErrorCode: '401', lastErrorMessage: 'Unauthorized' }, now), false)
+  assert.equal(shouldRunTargetedTransientRetry({ ...transient, resourceType: 'NAMED_LOCATIONS', lastErrorCode: '403', lastErrorMessage: 'Forbidden' }, now), false)
   assert.equal(shouldRunTargetedTransientRetry({ ...transient, resourceType: 'USERS' }, now), false)
 })
 
@@ -89,8 +91,30 @@ test('targeted retry backs off and the scheduler query excludes known authorizat
   assert.equal(shouldRunTargetedTransientRetry(laterFailure, now), false)
   const where = JSON.stringify(scheduledSyncTenantWhere(now))
   assert.match(where, /SHAREPOINT_SITES/)
+  assert.match(where, /NAMED_LOCATIONS/)
   assert.match(where, /401/)
   assert.match(where, /403/)
+})
+
+test('selects a tenant for an eligible Named Locations retry without forcing full inventory', () => {
+  const selected = selectScheduledTenantWork([{
+    id: 'named-locations-retry',
+    syncStates: [
+      state('USERS', 'SUCCEEDED', now, now),
+      state('LICENSES'),
+      state('DOMAINS'),
+      {
+        ...state('NAMED_LOCATIONS', 'FAILED', new Date('2026-08-17T10:00:00.000Z'), new Date('2026-08-17T15:29:00.000Z')),
+        lastErrorCode: '500',
+        lastErrorMessage: 'Microsoft named locations synchronization returned 500.',
+        consecutiveFailures: 1,
+      },
+    ],
+  }], now, 25)
+
+  assert.equal(selected.length, 1)
+  assert.equal(selected[0]?.tenantId, 'named-locations-retry')
+  assert.equal(selected[0]?.fullInventoryDue, false)
 })
 
 test('never hot-loops bounded SharePoint capacity failures or invalid retry timestamps', () => {

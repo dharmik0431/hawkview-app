@@ -1283,6 +1283,41 @@ test('actual scheduled service excludes active leases before its 1,000-candidate
   }
 })
 
+test('targeted retry maps Named Locations to its exact tenant-level Graph collector only', async () => {
+  const service = new TenantSyncService({} as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
+  const calls: Array<{ resource: string; endpoint: string; token: string }> = []
+  ;(service as any).syncEntraCollection = async (
+    _tenant: unknown,
+    token: string,
+    resource: string,
+    endpoint: string,
+  ) => { calls.push({ resource, endpoint, token }) }
+  ;(service as any).syncSharePointSites = async () => {
+    throw new Error('SharePoint must not run for a Named Locations retry.')
+  }
+  const tenant = {
+    id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1',
+    status: 'ACTIVE', connection: { status: 'CONNECTED' },
+  }
+
+  const module = (service as any).targetedTransientRetryModule(
+    tenant,
+    'graph-token',
+    'NAMED_LOCATIONS',
+  )
+  assert.equal(module?.resource, 'NAMED_LOCATIONS')
+  await module?.synchronize()
+  assert.deepEqual(calls, [{
+    resource: 'NAMED_LOCATIONS',
+    endpoint: 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations',
+    token: 'graph-token',
+  }])
+  assert.equal(
+    (service as any).targetedTransientRetryModule(tenant, 'graph-token', 'USERS'),
+    null,
+  )
+})
+
 test('two actual scheduled service runs share leases without duplicate productive tenants and advance beyond the first batch', async () => {
   const candidates = Array.from({ length: 1_000 }, (_, index) => scheduledTenant(index + 1))
   const prisma = { customerTenant: { findMany: async () => candidates } }

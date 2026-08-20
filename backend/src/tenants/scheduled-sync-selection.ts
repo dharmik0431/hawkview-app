@@ -25,6 +25,7 @@ export const TENANT_SYNC_LEASE_MS = 15 * 60 * 1000
  */
 export const TARGETED_TRANSIENT_RETRY_RESOURCES = [
   SyncResourceType.SHAREPOINT_SITES,
+  SyncResourceType.NAMED_LOCATIONS,
 ] as const
 export const TARGETED_TRANSIENT_RETRY_BASE_MS = 30 * 60 * 1000
 export const TARGETED_TRANSIENT_RETRY_MAX_MS = 6 * 60 * 60 * 1000
