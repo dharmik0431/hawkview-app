@@ -1144,6 +1144,37 @@ export class TenantSyncService {
     return summary
   }
 
+  /**
+   * Keep between-inventory retries explicit and cheap. Every entry here is a
+   * tenant-level collection protected by the existing USERS lease and the
+   * scheduler's exponential backoff; adding a resource to the selection list
+   * without an execution mapping must never silently run unrelated work.
+   */
+  private targetedTransientRetryModule(
+    tenant: TenantSyncTarget,
+    accessToken: string,
+    resourceType: string,
+  ): { resource: string; synchronize: () => Promise<unknown> } | null {
+    if (resourceType === 'SHAREPOINT_SITES') {
+      return {
+        resource: 'SHAREPOINT_SITES',
+        synchronize: () => this.syncSharePointSites(tenant, accessToken),
+      }
+    }
+    if (resourceType === 'NAMED_LOCATIONS') {
+      return {
+        resource: 'NAMED_LOCATIONS',
+        synchronize: () => this.syncEntraCollection(
+          tenant,
+          accessToken,
+          'NAMED_LOCATIONS',
+          'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations',
+        ),
+      }
+    }
+    return null
+  }
+
   private async syncConnectedTenant(
     tenant: TenantSyncTarget,
     throwWhenBusy: boolean,
@@ -1302,12 +1333,12 @@ export class TenantSyncService {
       })
       for (const state of targetedRetryStates) {
         if (!shouldRunTargetedTransientRetry(state, now)) continue
-        if (state.resourceType === 'SHAREPOINT_SITES') {
-          incrementalModules.push({
-            resource: 'SHAREPOINT_SITES',
-            synchronize: () => this.syncSharePointSites(tenant, accessToken),
-          })
-        }
+        const module = this.targetedTransientRetryModule(
+          tenant,
+          accessToken,
+          state.resourceType,
+        )
+        if (module) incrementalModules.push(module)
       }
       // Mailbox-rule inventory is intentionally daily-only. A broad Graph
       // per-mailbox scan must never become an unconditional five-minute poll;
