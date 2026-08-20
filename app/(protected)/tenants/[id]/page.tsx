@@ -3787,7 +3787,6 @@ export default function TenantDetailsPage() {
             <ExchangePage
               bundle={bundle}
               setSelectedMailbox={setSelectedMailbox}
-              setSelectedRule={setSelectedRule}
               setSelectedGroup={setSelectedGroup}
               onSync={runSync}
               syncState={syncState}

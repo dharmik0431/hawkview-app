@@ -48,7 +48,6 @@ import {
 export type ExchangeSectionProps = {
   bundle: any
   setSelectedMailbox?: (m: any) => void
-  setSelectedRule?: (r: any) => void
   setSelectedGroup?: (g: any) => void
   onSync?: () => void
   syncState?: 'idle' | 'syncing' | 'success' | 'fail'
@@ -107,7 +106,6 @@ function RuleFactList({ facts, emptyText }: { facts: ExchangeRuleDrawerFact[]; e
 export default function ExchangePage({
   bundle,
   setSelectedMailbox,
-  setSelectedRule,
   setSelectedGroup,
   onSync,
   syncState = 'idle',
@@ -152,12 +150,11 @@ export default function ExchangePage({
     setInspectingRule(null)
     setInspectingGroup(null)
     if (setSelectedMailbox) setSelectedMailbox(null)
-    if (setSelectedRule) setSelectedRule(null)
     if (setSelectedGroup) setSelectedGroup(null)
     if (lastTriggerRef.current) {
       lastTriggerRef.current.focus()
     }
-  }, [setSelectedMailbox, setSelectedRule, setSelectedGroup])
+  }, [setSelectedMailbox, setSelectedGroup])
 
   // Global Escape key listener for active drawers
   useEffect(() => {
@@ -483,7 +480,6 @@ export default function ExchangePage({
   const openRuleDrawer = (r: any, e: React.MouseEvent | React.KeyboardEvent) => {
     lastTriggerRef.current = e.currentTarget as HTMLElement
     setInspectingRule(r)
-    if (setSelectedRule) setSelectedRule(r)
   }
 
   // Open Group Drawer
