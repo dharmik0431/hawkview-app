@@ -251,3 +251,14 @@ The first independent integration QA failed with **P0=0, P1=4, P2=3**, and the n
 - Tenant Settings consumes the normalized persisted `collectionReadiness` workloads and never fabricates READY modules. Missing connection status is Unknown, not Healthy. The M365 audit deep link, RBAC distinction, diagnostic sanitization, and deletion authorization/confirmation behavior remain unchanged.
 
 Final validation includes 42 frontend helper/source tests, 142 backend tests with two intentional legacy REST skips, root and backend TypeScript, root lint, Prisma validation with a non-production placeholder URL, both production builds, and `git diff --check`. Final independent QA also replayed the hostile URL, truncation, retention, Exchange resource-status, missing-connection, M365 deep-link, RBAC, sanitization, and deletion-safety cases. No Git publish, Render/GAS deployment, database migration application, Microsoft consent, manual synchronization, or live tenant action has occurred for this combined release yet.
+
+## Local follow-up — P0-7.1 synchronization status wording
+
+Status: implemented and validated on `codex/p0-7-1-sync-status-wording`; approved for Git publication, not merged, and not deployed. No Microsoft tenant, scheduler, permission, Render, Supabase, or GAS state was changed.
+
+- The observed Entra security-configuration incident was an HTTP 500 from Microsoft Graph's Conditional Access named-locations endpoint during the 1:26 PM full collection. Permission was confirmed and previously collected data remained current, so this is a temporary collection failure rather than a permission failure or proof that cached data is stale. The later 5:40 PM incremental run did not include Named Locations, so it did not clear or retry that resource state.
+- Microsoft 365 Unified Audit was separately `BACKLOGGED`: known content remained queued for bounded processing. It was not a second failed module.
+- Tenant Settings now labels these conditions independently. `Failed Modules: 2 failing` becomes `Needs Attention: 1 temporary failure · 1 processing backlog`; `Failed Transient` becomes `Temporary Collection Failure`; and `Backlogged` becomes `Processing Backlog`.
+- The summary no longer labels the selected workload's last-success timestamp as `Last Full Sync`. It shows the contract's readiness evaluation time as `Status Evaluated` and labels the selected affected workload's successful-data age explicitly.
+
+Validation: focused readiness/Settings tests 16/16 passed; root TypeScript passed; root lint passed with zero warnings/errors; and `git diff --check` passed. Follow-up reliability work remains separate: a Named Locations-only transient failure currently waits for a future full inventory/manual full sync rather than receiving a dedicated fast retry.

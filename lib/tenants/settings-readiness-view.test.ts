@@ -4,6 +4,8 @@ import { normalizeCollectionReadiness, synchronizationReadinessSummary } from '.
 import {
   settingsConnectionHealth,
   settingsOverallHealth,
+  settingsSynchronizationAttention,
+  settingsSynchronizationStateLabel,
   settingsSynchronizationRows,
 } from './settings-readiness-view.ts'
 
@@ -57,6 +59,37 @@ test('uses the backend readiness keys and states without synthetic READY rows', 
   assert.deepEqual(rows.map((row) => row.key), ['sharepoint_onedrive', 'm365_unified_audit'])
   assert.equal(rows[0]?.status, 'FAILED_TRANSIENT')
   assert.equal(rows.some((row) => row.key === 'SHAREPOINT_SITES'), false)
+})
+
+test('distinguishes a transient failure from a processing backlog', () => {
+  const readiness = normalizeCollectionReadiness({
+    ...readinessPayload,
+    workloads: [
+      readinessPayload.workloads[0],
+      {
+        ...readinessPayload.workloads[1],
+        state: 'BACKLOGGED',
+        reasonCode: 'COLLECTION_BACKLOGGED',
+        reason: 'Known audit content remains queued for bounded processing.',
+      },
+    ],
+  })
+  const attention = settingsSynchronizationAttention(settingsSynchronizationRows(readiness))
+  assert.deepEqual(attention, {
+    total: 2,
+    failed: 1,
+    blocked: 0,
+    backlogged: 1,
+    stale: 0,
+    other: 0,
+    label: '1 temporary failure · 1 processing backlog',
+  })
+})
+
+test('uses user-facing synchronization state labels without changing state truth', () => {
+  assert.equal(settingsSynchronizationStateLabel('FAILED_TRANSIENT'), 'Temporary Collection Failure')
+  assert.equal(settingsSynchronizationStateLabel('BACKLOGGED'), 'Processing Backlog')
+  assert.equal(settingsSynchronizationStateLabel('BLOCKED_PERMISSION'), 'Permission Blocked')
 })
 
 test('fails closed when readiness data is absent', () => {

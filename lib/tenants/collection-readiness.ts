@@ -265,7 +265,7 @@ export type SynchronizationReadinessSummary = {
   overallState: ReadinessState
   applicableWorkloads: number
   currentWorkloads: number
-  failedWorkloads: number
+  attentionWorkloads: number
   primaryReason: string | null
   primaryReasonCode: string | null
   primaryLastAttemptAt: string | null
@@ -286,7 +286,7 @@ export function synchronizationReadinessSummary(
     overallState: selected.state,
     applicableWorkloads: applicable.length,
     currentWorkloads: applicable.filter((workload) => workload.state === 'READY').length,
-    failedWorkloads: applicable.filter((workload) => workload.state !== 'READY').length,
+    attentionWorkloads: applicable.filter((workload) => workload.state !== 'READY').length,
     primaryReason: selected.reason,
     primaryReasonCode: selected.reasonCode,
     primaryLastAttemptAt: selected.lastAttemptAt,
