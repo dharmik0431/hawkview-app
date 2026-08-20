@@ -53,6 +53,21 @@ export class TenantsController {
     )
   }
 
+  @Get(':id/exchange/rules/related-audit')
+  getRelatedExchangeRuleAudit(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+    @Query('mailboxUpn') mailboxUpn: string | undefined,
+    @Query('ruleName') ruleName: string | undefined,
+  ) {
+    return this.tenantSyncService.getRelatedExchangeRuleAuditForIdentity(
+      request.auth,
+      customerTenantId,
+      mailboxUpn,
+      ruleName,
+    )
+  }
+
   @Post(':id/sync')
   syncTenantUsers(
     @Req() request: AuthenticatedRequest,

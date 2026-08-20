@@ -191,6 +191,15 @@ test('tenant bundle scopes the rule snapshot by organization and tenant and emit
     }, {
       id: 'rule-2', mailboxUserId: 'mailbox-1', mailboxUpn: 'user@contoso.com',
       displayName: 'Microsoft omitted state', conditions: {}, actions: {},
+    }, {
+      id: 'rule-3', mailboxUserId: 'mailbox-1', mailboxUpn: 'user@contoso.com',
+      conditions: {}, actions: {},
+    }, {
+      id: 'rule-4', mailboxUserId: 'mailbox-1', mailboxUpn: 'user@contoso.com',
+      displayName: 'password=hunter2', conditions: {}, actions: {},
+    }, {
+      id: 'rule-5', mailboxUserId: 'mailbox-1', mailboxUpn: 'user@contoso.com',
+      displayName: 'Unnamed inbox rule', conditions: {}, actions: {},
     }],
   }]
   const prisma = {
@@ -233,6 +242,8 @@ test('tenant bundle scopes the rule snapshot by organization and tenant and emit
 
   assert.equal(rule.id, 'mailbox-1::rule-1')
   assert.equal(rule.mailboxUserId, 'mailbox-1')
+  assert.equal(rule.name, 'Forward invoices')
+  assert.equal(rule.microsoftRuleName, 'Forward invoices')
   assert.equal(rule.description, 'Forward to: audit@example.net')
   assert.equal(rule.configurationCollectedAt, '2026-08-19T12:00:00.000Z')
   assert.equal(rule.hasError, false)
@@ -253,4 +264,11 @@ test('tenant bundle scopes the rule snapshot by organization and tenant and emit
   assert.equal(result.bundle.exchange.rules[1].isReadOnly, null)
   assert.equal(result.bundle.exchange.rules[1].configurationCollectedAt, '2026-08-19T12:00:00.000Z')
   assert.deepEqual(result.bundle.exchange.rules[1].details, { conditions: [], exceptions: [], actions: [] })
+  assert.equal(result.bundle.exchange.rules[2].name, 'Unnamed inbox rule')
+  assert.equal(result.bundle.exchange.rules[2].microsoftRuleName, null)
+  assert.equal(result.bundle.exchange.rules[3].name, 'Unnamed inbox rule')
+  assert.equal(result.bundle.exchange.rules[3].microsoftRuleName, null)
+  assert.doesNotMatch(JSON.stringify(result.bundle.exchange.rules[3]), /hunter2|password=/)
+  assert.equal(result.bundle.exchange.rules[4].name, 'Unnamed inbox rule')
+  assert.equal(result.bundle.exchange.rules[4].microsoftRuleName, 'Unnamed inbox rule')
 })
