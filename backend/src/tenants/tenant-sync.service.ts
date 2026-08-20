@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   BadGatewayException,
   ConflictException,
   ForbiddenException,
@@ -40,6 +41,13 @@ import {
   safeExchangeMailboxRuleText,
   summarizeExchangeMailboxRuleActions,
 } from './exchange-mailbox-rule-details.js'
+import {
+  buildRelatedExchangeRuleAuditResponse,
+  normalizeRelatedExchangeRuleAuditRequest,
+  RELATED_EXCHANGE_RULE_AUDIT_CANDIDATE_LIMIT,
+  RELATED_EXCHANGE_RULE_AUDIT_OPERATIONS,
+  RELATED_EXCHANGE_RULE_AUDIT_WINDOW_DAYS,
+} from './exchange-rule-related-audit.js'
 import {
   DAILY_INVENTORY_ANCHORS,
   requiresDailyInventoryRefresh,
@@ -1024,6 +1032,52 @@ export class TenantSyncService {
   ) {
     const tenant = await this.getReadableTenant(identity, customerTenantId)
     return this.buildBundle(tenant)
+  }
+
+  async getRelatedExchangeRuleAuditForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string,
+    mailboxUpn: unknown,
+    ruleName: unknown,
+  ) {
+    const tenant = await this.getReadableTenant(identity, customerTenantId)
+    const request = normalizeRelatedExchangeRuleAuditRequest(mailboxUpn, ruleName)
+    if (!request) {
+      throw new BadRequestException('A valid mailbox UPN and optional rule name are required.')
+    }
+
+    const now = new Date()
+    const windowStart = new Date(
+      now.getTime() - RELATED_EXCHANGE_RULE_AUDIT_WINDOW_DAYS * 24 * 60 * 60 * 1_000
+    )
+    const rows = await this.prisma.m365AuditRecord.findMany({
+      where: {
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        eventDateTime: { gte: windowStart, lte: now },
+        expiresAt: { gt: now },
+        operation: { in: [...RELATED_EXCHANGE_RULE_AUDIT_OPERATIONS] },
+      },
+      orderBy: { eventDateTime: 'desc' },
+      take: RELATED_EXCHANGE_RULE_AUDIT_CANDIDATE_LIMIT + 1,
+      select: {
+        microsoftRecordId: true,
+        eventDateTime: true,
+        operation: true,
+        actorId: true,
+        objectId: true,
+        result: true,
+        raw: true,
+      },
+    })
+    return buildRelatedExchangeRuleAuditResponse(
+      rows.slice(0, RELATED_EXCHANGE_RULE_AUDIT_CANDIDATE_LIMIT),
+      request,
+      {
+        now,
+        candidateScanTruncated: rows.length > RELATED_EXCHANGE_RULE_AUDIT_CANDIDATE_LIMIT,
+      },
+    )
   }
 
   async syncUsersForIdentity(
@@ -5187,6 +5241,10 @@ export class TenantSyncService {
             const details = projectExchangeMailboxRuleDetails(rule)
             const mailboxUserId = safeExchangeMailboxRuleText(rule.mailboxUserId)
             const microsoftRuleId = safeExchangeMailboxRuleText(rule.id)
+            const microsoftRuleName = rule && typeof rule === 'object' && !Array.isArray(rule) &&
+              Object.prototype.hasOwnProperty.call(rule, 'displayName')
+              ? safeExchangeMailboxRuleText(rule.displayName)
+              : null
             const configurationCollectedAt = safeExchangeMailboxRuleCollectedAt(
               snapshotObservedAtByResource.get('EXCHANGE_MAILBOX_RULES')
             )
@@ -5194,8 +5252,9 @@ export class TenantSyncService {
               id: exchangeMailboxRuleCompoundId(rule) ??
                 `${mailboxUserId ?? 'mailbox'}::unidentified-rule-${index + 1}`,
               microsoftRuleId,
+              microsoftRuleName,
               mailboxUserId,
-              name: safeExchangeMailboxRuleText(rule.displayName) ?? 'Unnamed inbox rule',
+              name: microsoftRuleName ?? 'Unnamed inbox rule',
               mailboxUpn: safeExchangeMailboxRuleText(rule.mailboxUpn) ?? '',
               enabled: typeof rule.isEnabled === 'boolean' ? rule.isEnabled : null,
               hasError: typeof rule.hasError === 'boolean' ? rule.hasError : null,

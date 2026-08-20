@@ -11,6 +11,7 @@ export type ExchangeRuleDrawerFact = {
 
 export type ExchangeRuleDrawerModel = {
   name: string
+  microsoftRuleName: string | null
   mailboxUpn: string | null
   enabled: boolean | null
   hasError: boolean | null
@@ -34,6 +35,33 @@ export type ExchangeRuleDestination = {
 
 export type ExchangeRuleCategory = 'Forward' | 'Redirect' | 'Delete' | 'Move' | 'Other'
 export type ExchangeRuleEnabledState = 'enabled' | 'disabled' | 'unknown'
+
+export type ExchangeRuleRelatedAuditEvent = {
+  kind: 'possible_related_microsoft_audit_event'
+  id: string
+  operation: 'New-InboxRule' | 'Set-InboxRule' | 'Remove-InboxRule' | 'UpdateInboxRules'
+  microsoftEventTime: string
+  microsoftReportedActor: string | null
+  result: string | null
+  source: 'Microsoft 365 Unified Audit'
+  matchBasis: 'exact_mailbox' | 'exact_mailbox_and_rule_name'
+}
+
+export type ExchangeRuleRelatedAuditResponse = {
+  version: 1
+  windowDays: 90
+  events: ExchangeRuleRelatedAuditEvent[]
+  truncated: boolean
+  disclaimer: 'Possible related events do not prove that an event belongs to this exact current rule.'
+}
+
+const RELATED_AUDIT_OPERATIONS = new Set([
+  'New-InboxRule', 'Set-InboxRule', 'Remove-InboxRule', 'UpdateInboxRules',
+])
+const RELATED_AUDIT_MATCH_BASES = new Set([
+  'exact_mailbox', 'exact_mailbox_and_rule_name',
+])
+const RELATED_AUDIT_RESULT_LIMIT = 8
 
 const CONDITION_LABELS = Object.freeze({
   bodyContains: 'Message body contains', bodyOrSubjectContains: 'Body or subject contains',
@@ -249,9 +277,12 @@ export function normalizeExchangeRuleDrawer(value: unknown, now = new Date()): E
   if (!rule) return null
   const details = record(own(rule, 'details'))
   const rawPriority = own(rule, 'priority')
+  const microsoftRuleName = text(own(rule, 'microsoftRuleName'))
+  const displayName = text(own(rule, 'name'))
   const actions = normalizeFacts(details ? own(details, 'actions') : null, ACTIONS, true)
   return {
-    name: text(own(rule, 'name')) ?? 'Unnamed inbox rule',
+    name: displayName ?? microsoftRuleName ?? 'Unnamed inbox rule',
+    microsoftRuleName,
     mailboxUpn: text(own(rule, 'mailboxUpn')),
     enabled: typeof own(rule, 'enabled') === 'boolean' ? own(rule, 'enabled') as boolean : null,
     hasError: typeof own(rule, 'hasError') === 'boolean' ? own(rule, 'hasError') as boolean : null,
@@ -265,5 +296,63 @@ export function normalizeExchangeRuleDrawer(value: unknown, now = new Date()): E
     actions,
     destinations: projectDestinations(actions),
     otherActions: actions.filter((action) => !DESTINATION_ACTION_KEYS.has(action.key)),
+  }
+}
+
+export function exchangeRuleRelatedAuditParams(
+  rule: ExchangeRuleDrawerModel | null,
+): Record<string, string> | null {
+  if (!rule?.mailboxUpn) return null
+  return rule.microsoftRuleName
+    ? { mailboxUpn: rule.mailboxUpn, ruleName: rule.microsoftRuleName }
+    : { mailboxUpn: rule.mailboxUpn }
+}
+
+export function normalizeExchangeRuleRelatedAuditResponse(
+  value: unknown,
+  now = new Date(),
+): ExchangeRuleRelatedAuditResponse | null {
+  const response = record(value)
+  if (!response || own(response, 'version') !== 1 || own(response, 'windowDays') !== 90) return null
+  const rawEvents = own(response, 'events')
+  if (!Array.isArray(rawEvents) || rawEvents.length > RELATED_AUDIT_RESULT_LIMIT) return null
+
+  const events: ExchangeRuleRelatedAuditEvent[] = []
+  const seen = new Set<string>()
+  for (const candidate of rawEvents) {
+    const event = record(candidate)
+    const id = event ? text(own(event, 'id')) : null
+    const operation = event ? text(own(event, 'operation')) : null
+    const microsoftEventTime = event ? collectedAt(own(event, 'microsoftEventTime'), now) : null
+    const source = event ? own(event, 'source') : null
+    const matchBasis = event ? text(own(event, 'matchBasis')) : null
+    if (
+      !event ||
+      own(event, 'kind') !== 'possible_related_microsoft_audit_event' ||
+      !id || seen.has(id) ||
+      !operation || !RELATED_AUDIT_OPERATIONS.has(operation) ||
+      !microsoftEventTime ||
+      source !== 'Microsoft 365 Unified Audit' ||
+      !matchBasis || !RELATED_AUDIT_MATCH_BASES.has(matchBasis)
+    ) continue
+    seen.add(id)
+    events.push({
+      kind: 'possible_related_microsoft_audit_event',
+      id,
+      operation: operation as ExchangeRuleRelatedAuditEvent['operation'],
+      microsoftEventTime,
+      microsoftReportedActor: text(own(event, 'microsoftReportedActor')),
+      result: text(own(event, 'result')),
+      source: 'Microsoft 365 Unified Audit',
+      matchBasis: matchBasis as ExchangeRuleRelatedAuditEvent['matchBasis'],
+    })
+  }
+
+  return {
+    version: 1,
+    windowDays: 90,
+    events,
+    truncated: own(response, 'truncated') === true,
+    disclaimer: 'Possible related events do not prove that an event belongs to this exact current rule.',
   }
 }

@@ -29,6 +29,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { apiClient } from '@/lib/api/client'
 import { cn } from '@/lib/utils'
 import { formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import {
@@ -38,10 +39,13 @@ import {
 import {
   classifyExchangeRule,
   compareExchangeRulePriority,
+  exchangeRuleRelatedAuditParams,
   exchangeRuleEnabledState,
   exchangeRulePriority,
   normalizeExchangeRuleDrawer,
+  normalizeExchangeRuleRelatedAuditResponse,
   type ExchangeRuleDrawerFact,
+  type ExchangeRuleRelatedAuditResponse,
   type ExchangeRuleCategory as RuleCategory,
 } from '@/lib/tenants/exchange-rule-drawer'
 
@@ -138,6 +142,10 @@ export default function ExchangePage({
     () => inspectingRule ? normalizeExchangeRuleDrawer(inspectingRule) : null,
     [inspectingRule],
   )
+  const [relatedRuleAudit, setRelatedRuleAudit] = useState<
+    | { state: 'idle' | 'loading' | 'unavailable' | 'error' }
+    | { state: 'ready'; data: ExchangeRuleRelatedAuditResponse }
+  >({ state: 'idle' })
 
   // Focus Return Reference
   const lastTriggerRef = useRef<HTMLElement | null>(null)
@@ -203,6 +211,38 @@ export default function ExchangePage({
   const tenant = bundle?.tenant ?? {}
   const tenantName = tenant.name || 'Tenant'
   const primaryDomain = tenant.domain || ''
+
+  // Audit evidence is intentionally lazy: opening a rule drawer issues one
+  // bounded, tenant-scoped lookup without delaying the Exchange page bundle.
+  useEffect(() => {
+    if (!inspectingRule || !ruleInvestigation) {
+      setRelatedRuleAudit({ state: 'idle' })
+      return
+    }
+    const tenantId = typeof tenant.id === 'string' ? tenant.id.trim() : ''
+    const params = exchangeRuleRelatedAuditParams(ruleInvestigation)
+    if (!tenantId || !params) {
+      setRelatedRuleAudit({ state: 'unavailable' })
+      return
+    }
+
+    const controller = new AbortController()
+    setRelatedRuleAudit({ state: 'loading' })
+    void apiClient.get<unknown>(
+      `/api/tenants/${encodeURIComponent(tenantId)}/exchange/rules/related-audit`,
+      {
+        signal: controller.signal,
+        params,
+      },
+    ).then((response) => {
+      if (controller.signal.aborted) return
+      const normalized = normalizeExchangeRuleRelatedAuditResponse(response)
+      setRelatedRuleAudit(normalized ? { state: 'ready', data: normalized } : { state: 'error' })
+    }).catch(() => {
+      if (!controller.signal.aborted) setRelatedRuleAudit({ state: 'error' })
+    })
+    return () => controller.abort()
+  }, [inspectingRule, ruleInvestigation, tenant.id])
 
   // Raw Exchange Datasets
   const EXCHANGE_MAILBOXES = useMemo(() => {
@@ -479,6 +519,7 @@ export default function ExchangePage({
   // Open Rule Drawer
   const openRuleDrawer = (r: any, e: React.MouseEvent | React.KeyboardEvent) => {
     lastTriggerRef.current = e.currentTarget as HTMLElement
+    setRelatedRuleAudit({ state: 'loading' })
     setInspectingRule(r)
   }
 
@@ -1690,16 +1731,57 @@ export default function ExchangePage({
                 <div className="flex items-center gap-2">
                   <Archive className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
                   <h3 className="font-semibold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider text-slate-500">
-                    Microsoft object history
+                    Configuration evidence
                   </h3>
                 </div>
                 <dl className="divide-y divide-slate-200 dark:divide-slate-800">
-                  <div className="py-2 flex items-start justify-between gap-4"><dt className="text-slate-500">Created</dt><dd className="font-medium text-right text-slate-800 dark:text-slate-200">Not provided by Microsoft Graph</dd></div>
-                  <div className="py-2 flex items-start justify-between gap-4"><dt className="text-slate-500">Last modified</dt><dd className="font-medium text-right text-slate-800 dark:text-slate-200">Not provided by Microsoft Graph</dd></div>
-                  <div className="py-2 flex items-start justify-between gap-4"><dt className="text-slate-500">Actor</dt><dd className="font-medium text-right text-slate-800 dark:text-slate-200">Not provided by Microsoft Graph</dd></div>
                   <div className="py-2 flex items-start justify-between gap-4"><dt className="text-slate-500">Configuration collected by HawkView</dt><dd className="font-medium text-right text-slate-800 dark:text-slate-200">{ruleInvestigation.configurationCollectedAt ? formatTenantTimestamp(ruleInvestigation.configurationCollectedAt) : 'Not available'}</dd></div>
                 </dl>
-                <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">Microsoft Unified Audit may contain separate mailbox-rule change events. HawkView does not correlate those events to this object or use them as its creation time or actor.</p>
+                <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">Microsoft Graph messageRule does not provide object creation or modification timestamps, or an actor.</p>
+              </div>
+
+              <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Shield className="h-4 w-4 text-violet-600 dark:text-violet-400" aria-hidden="true" />
+                  <h3 className="font-semibold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider text-slate-500">
+                    Related Microsoft audit activity
+                  </h3>
+                </div>
+                {relatedRuleAudit.state === 'loading' && (
+                  <p className="text-slate-500" role="status">Checking a bounded 90-day window for possible related inbox-rule audit events…</p>
+                )}
+                {relatedRuleAudit.state === 'unavailable' && (
+                  <p className="text-slate-500">Related audit activity is unavailable because Microsoft did not provide the mailbox scope needed for a safe lookup.</p>
+                )}
+                {relatedRuleAudit.state === 'error' && (
+                  <p className="text-slate-500" role="status">Related audit activity could not be loaded. Current rule details remain available above.</p>
+                )}
+                {relatedRuleAudit.state === 'ready' && relatedRuleAudit.data.events.length === 0 && (
+                  <p className="text-slate-500">No possible related inbox-rule audit events were found in the bounded 90-day window. This does not prove that no change occurred.</p>
+                )}
+                {relatedRuleAudit.state === 'ready' && relatedRuleAudit.data.events.length > 0 && (
+                  <div className="space-y-3">
+                    <ul className="space-y-2" role="list">
+                      {relatedRuleAudit.data.events.map((event) => (
+                        <li key={event.id} className="rounded-lg border border-violet-200/80 dark:border-violet-900/70 bg-violet-50/50 dark:bg-violet-950/20 p-3 space-y-2">
+                          <div className="font-semibold text-slate-900 dark:text-slate-100">Possible related Microsoft audit event</div>
+                          <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2">
+                            <div><dt className="text-slate-500">Operation</dt><dd className="font-medium text-slate-800 dark:text-slate-200">{event.operation}</dd></div>
+                            <div><dt className="text-slate-500">Microsoft event time</dt><dd className="font-medium text-slate-800 dark:text-slate-200">{formatTenantTimestamp(event.microsoftEventTime)}</dd></div>
+                            <div><dt className="text-slate-500">Microsoft-reported actor</dt><dd className="font-medium break-all text-slate-800 dark:text-slate-200">{event.microsoftReportedActor || 'Not provided by Microsoft'}</dd></div>
+                            <div><dt className="text-slate-500">Result</dt><dd className="font-medium text-slate-800 dark:text-slate-200">{event.result || 'Not provided by Microsoft'}</dd></div>
+                            <div><dt className="text-slate-500">Source</dt><dd className="font-medium text-slate-800 dark:text-slate-200">{event.source}</dd></div>
+                            <div><dt className="text-slate-500">Match basis</dt><dd className="font-medium text-slate-800 dark:text-slate-200">{event.matchBasis === 'exact_mailbox_and_rule_name' ? 'Exact mailbox owner and rule-name match' : 'Exact mailbox owner match'}</dd></div>
+                          </dl>
+                        </li>
+                      ))}
+                    </ul>
+                    {relatedRuleAudit.data.truncated && (
+                      <p className="text-[11px] text-slate-500">Additional candidates were omitted by HawkView&apos;s bounded result limit.</p>
+                    )}
+                    <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">{relatedRuleAudit.data.disclaimer}</p>
+                  </div>
+                )}
               </div>
 
               <div className="p-3.5 rounded-xl border border-blue-200 dark:border-blue-900/60 bg-blue-50/50 dark:bg-blue-950/30 text-blue-800 dark:text-blue-300 flex items-start gap-2">
