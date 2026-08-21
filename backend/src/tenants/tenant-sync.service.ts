@@ -84,6 +84,20 @@ export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
 export const NON_PREMIUM_AUTH_REGISTRATION_ERROR_CODE =
   'Authentication_RequestFromNonPremiumTenantOrB2CTenant'
 
+/**
+ * An upstream dependency is still being provisioned. This is an expected,
+ * retryable lifecycle state, not a failed collection attempt.
+ */
+export class CollectionInitializingError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'CollectionInitializingError'
+  }
+}
+
 export type AuthRegistrationFallbackLimits = {
   batchSize: number
   maxUserPages: number
@@ -1937,6 +1951,30 @@ export class TenantSyncService {
         error,
         `Microsoft ${resourceType.toLowerCase()} synchronization failed.`
       )
+      if (error instanceof CollectionInitializingError) {
+        await this.prisma.syncState.update({
+          where: {
+            customerTenantId_resourceType: {
+              customerTenantId: tenant.id,
+              resourceType,
+            },
+          },
+          data: {
+            status: 'RUNNING',
+            lastErrorCode: error.code,
+            lastErrorMessage: message,
+            consecutiveFailures: 0,
+          },
+        })
+        // A previous deployment could have published an incident for this
+        // normal provisioning state. Retire it without claiming collection
+        // success; readiness will continue to report INITIALIZING.
+        await this.notifications.resolveIncident(
+          tenant.organizationId,
+          `tenant:${tenant.id}:sync:${resourceType}`,
+        )
+        return
+      }
       const state = await this.prisma.syncState.update({
         where: {
           customerTenantId_resourceType: {
@@ -3355,8 +3393,9 @@ export class TenantSyncService {
       // Subscription lifecycle has one owner: M365ManagementActivityService.
       // It persists Microsoft's mandatory 15-minute start cooldown. The
       // limited-license sign-in fallback must never race it with another POST.
-      throw new Error(
-        'Microsoft 365 audit subscription activation is pending. HawkView will retry sign-in collection after the audit collector enables it.'
+      throw new CollectionInitializingError(
+        'sign-ins-audit-subscription-initializing',
+        'Microsoft is activating the audit subscription used for limited-license sign-in collection. HawkView will retry automatically during scheduled collection.'
       )
     }
 
