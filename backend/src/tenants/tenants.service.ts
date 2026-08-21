@@ -26,7 +26,6 @@ import {
   type TenantSyncFreshness,
 } from './service-sync-freshness.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
-import { buildExchangeRbacSetup } from './exchange-rbac-setup.js'
 
 const TENANT_DELETION_ROLES = [
   MembershipRole.MSP_OWNER,
@@ -901,43 +900,8 @@ export class TenantsService {
 
     return {
       consentUrl: consent.consentUrl,
-      requiredPermissions: this.microsoftConsent.getOnboardingPermissions(),
+      requiredPermissions: this.microsoftConsent.getRequiredPermissions(),
     }
-  }
-
-  async getExchangeRbacSetupForIdentity(
-    identity: AuthenticatedIdentity,
-    customerTenantId: string,
-  ) {
-    const organizationIds = await this.getAccessibleOrganizationIds(identity)
-    const tenant = await this.prisma.customerTenant.findFirst({
-      where: {
-        id: customerTenantId,
-        organizationId: { in: organizationIds },
-      },
-      select: {
-        connection: {
-          select: {
-            connectionMode: true,
-            clientId: true,
-          },
-        },
-      },
-    })
-    if (!tenant?.connection) {
-      throw new NotFoundException('Customer tenant was not found.')
-    }
-
-    const applicationId =
-      tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
-        ? tenant.connection.clientId
-        : await this.microsoftConsent.getManagedConnectorApplicationId()
-    if (!applicationId) {
-      throw new BadRequestException(
-        'The Microsoft application ID required for Exchange setup is unavailable.',
-      )
-    }
-    return buildExchangeRbacSetup(applicationId)
   }
 
   async createManagedOnboardingUrlForIdentity(identity: AuthenticatedIdentity) {
@@ -958,7 +922,7 @@ export class TenantsService {
     )
     return {
       consentUrl: consent.consentUrl,
-      requiredPermissions: this.microsoftConsent.getOnboardingPermissions(),
+      requiredPermissions: this.microsoftConsent.getRequiredPermissions(),
     }
   }
 

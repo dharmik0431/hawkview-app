@@ -82,6 +82,42 @@ test('retries only explicitly bounded transient resources before the daily inven
   assert.equal(shouldRunTargetedTransientRetry({ ...transient, resourceType: 'USERS' }, now), false)
 })
 
+test('a retired Exchange Admin collector can never schedule targeted work', () => {
+  const historicalFailure = {
+    ...state(
+      'EXCHANGE_MAILBOX_CONFIGURATION',
+      'FAILED',
+      null,
+      new Date('2026-08-17T10:00:00.000Z'),
+    ),
+    lastErrorCode: '403',
+    lastErrorMessage: 'Historical Exchange Admin API authorization failure.',
+    consecutiveFailures: 20,
+  }
+
+  assert.equal(shouldRunTargetedTransientRetry(historicalFailure, now), false)
+  assert.doesNotMatch(
+    JSON.stringify(scheduledSyncTenantWhere(now)),
+    /EXCHANGE_MAILBOX_CONFIGURATION/,
+  )
+  assert.deepEqual(
+    selectScheduledTenantWork(
+      [{
+        id: 'retired-exchange-admin-state',
+        syncStates: [
+          state('USERS', 'SUCCEEDED', now, now),
+          state('LICENSES'),
+          state('DOMAINS'),
+          historicalFailure,
+        ],
+      }],
+      now,
+      25,
+    ),
+    [],
+  )
+})
+
 test('targeted retry backs off and the scheduler query excludes known authorization failures', () => {
   const laterFailure = {
     ...state('SHAREPOINT_SITES', 'FAILED', null, new Date('2026-08-17T15:00:00.000Z')),

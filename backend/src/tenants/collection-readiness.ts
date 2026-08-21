@@ -419,7 +419,11 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     workload({ key: 'entra_security_configuration', workload: 'Entra security configuration', resourceTypes: ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES'], requiredPermissions: ['UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'SecurityEvents.Read.All'], cadence: 'daily', remediation: 'Confirm the required authentication-method, policy, application, and Secure Score permissions. A successful OAuth connection alone does not verify every collector.' }, states, consented, verificationKnown, now),
     workload({ key: 'office_365_tenant_configuration', workload: 'Microsoft 365 tenant configuration', resourceTypes: ['ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH'], requiredPermissions: ['Organization.Read.All'], cadence: 'daily', remediation: 'Confirm Organization.Read.All and review the exact collector result. Domain DNS readiness is collected independently and does not imply a tenant setting change.' }, states, consented, verificationKnown, now),
     workload({ key: 'sharepoint_onedrive', workload: 'SharePoint and OneDrive', resourceTypes: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'], requiredPermissions: ['Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All'], cadence: 'daily', remediation: 'Confirm the listed SharePoint and Reports permissions, then wait for the next scheduled inventory collection.', capabilities: [{ key: 'sharepoint_site_access_metadata', label: 'Site access metadata', state: 'NOT_COLLECTED_LEAST_PRIVILEGE', reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE', source: 'HawkView standard least-privilege mode', message: 'Standard mode does not collect current site-user, site collection administrator, sharing-member, or per-site permission metadata. SharePoint and OneDrive administrative events remain available when Microsoft audit evidence is available.' }] }, states, consented, verificationKnown, now),
-    workload({ key: 'exchange', workload: 'Exchange mailbox and configuration', resourceTypes: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'], requiredPermissions: ['User.Read.All', 'MailboxSettings.Read', 'Reports.Read.All', 'Organization.Read.All'], cadence: 'daily', remediation: 'Graph mailbox data requires the listed Graph permissions. Exchange Admin configuration also requires Exchange.ManageAsAppV2 and HawkView Exchange Read Only, a custom Exchange role containing Get-Mailbox only. Do not assign Recipient Management, Exchange Administrator, or Global Administrator to the HawkView application.' }, states, consented, verificationKnown, now),
+    workload({ key: 'exchange', workload: 'Exchange mailbox visibility', resourceTypes: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'], requiredPermissions: ['User.Read.All', 'MailboxSettings.Read', 'Reports.Read.All', 'Organization.Read.All'], cadence: 'daily', remediation: 'Confirm the listed Microsoft Graph application permissions, then allow the next scheduled collection to verify mailbox inventory, usage, rules, and tenant-associated domains.', capabilities: [
+      { key: 'exchange_mailbox_delegation', label: 'Mailbox delegation', state: 'NOT_COLLECTED_LEAST_PRIVILEGE', reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE', source: 'HawkView standard least-privilege mode', message: 'Microsoft Graph does not expose tenant-wide Full Access, Send As, or Send on Behalf mailbox assignments. HawkView does not request Exchange administrator access for this unsupported field.' },
+      { key: 'exchange_mailbox_retention_assignment', label: 'Mailbox retention-policy assignment', state: 'NOT_COLLECTED_LEAST_PRIVILEGE', reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE', source: 'HawkView standard least-privilege mode', message: 'Microsoft Graph does not expose tenant-wide mailbox retention-policy assignments in the current standard collector.' },
+      { key: 'exchange_accepted_domain_type', label: 'Exchange accepted-domain type', state: 'NOT_COLLECTED_LEAST_PRIVILEGE', reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE', source: 'Microsoft Graph organization verifiedDomains', message: 'HawkView reports tenant-associated Microsoft 365 domains. Microsoft Graph organization data does not establish Exchange Authoritative or Internal Relay accepted-domain type.' },
+    ] }, states, consented, verificationKnown, now),
   ]
 
   const applyApplicability = (key: 'sharepoint_onedrive' | 'exchange', applicability: 'APPLICABLE' | 'NOT_LICENSED' | 'UNVERIFIED') => {
@@ -431,34 +435,7 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
       const selected = selectedWorst(row.components)!; row.state = selected.state; row.reasonCode = selected.reasonCode; row.reason = selected.reason
     }
   }
-  // SharePoint has no second admin-RBAC aggregation below. Exchange is applied
-  // after that aggregation so it cannot accidentally overwrite licensing truth.
   applyApplicability('sharepoint_onedrive', sharePointApplicability)
-
-  const exchange = rows.find((row) => row.key === 'exchange')!
-  const exchangeAdmin = fromSyncState(states.get('EXCHANGE_MAILBOX_CONFIGURATION'), now, 'daily')
-  const exchangeAdminSuccessfulAt = validDate(states.get('EXCHANGE_MAILBOX_CONFIGURATION')?.lastSuccessfulAt)
-  const exchangeAdminHasProvenSuccess = Boolean(exchangeAdminSuccessfulAt && exchangeAdminSuccessfulAt.getTime() <= now.getTime())
-  const exchangeAdminComponent: NonNullable<CollectionReadinessRow['exchangeRbac']> = exchangeAdmin.state === 'BLOCKED_PERMISSION'
-    ? { status: 'MISSING' as const, state: exchangeAdmin.state, reason: 'Exchange.ManageAsAppV2 or the HawkView Get-Mailbox-only Exchange RBAC role is missing.' }
-    : exchangeAdminHasProvenSuccess
-      ? { status: 'CONFIRMED' as const, state: exchangeAdmin.state, reason: exchangeAdmin.state === 'STALE' ? 'Exchange Admin API access was previously confirmed, but the last successful collection is stale.' : exchangeAdmin.state === 'FAILED_TRANSIENT' ? 'Exchange Admin API access was previously confirmed, but the latest collection failed transiently.' : 'A successful Exchange Admin API collection confirmed the configured access.' }
-      : { status: 'UNVERIFIED' as const, state: 'UNVERIFIED' as const, reason: 'HawkView has no successful Exchange Admin API collection that can verify RBAC.' }
-  exchange.exchangeRbac = exchangeAdminComponent
-  const adminComponent = { key: 'EXCHANGE_MAILBOX_CONFIGURATION', label: 'Exchange Admin RBAC', state: exchangeAdminComponent.state, lastAttemptAt: exchangeAdmin.lastAttemptAt, lastSuccessfulAt: exchangeAdminHasProvenSuccess ? iso(exchangeAdminSuccessfulAt) : null, freshness: exchangeAdmin.freshness, reasonCode: exchangeAdmin.reasonCode ?? (exchangeAdminComponent.state === 'READY' ? null : 'EXCHANGE_ADMIN_RBAC_UNVERIFIED'), reason: exchangeAdminComponent.state === 'READY' ? null : exchangeAdminComponent.reason }
-  exchange.components = [...(exchange.components ?? []), adminComponent]
-  const selectedExchange = selectedWorst(exchange.components)!
-  exchange.state = selectedExchange.state
-  exchange.configuredCapability = exchange.permissionStatus === 'MISSING' || exchangeAdminComponent.status === 'MISSING'
-    ? 'NOT_CONFIGURED'
-    : exchange.permissionStatus === 'UNVERIFIED' || exchangeAdminComponent.status === 'UNVERIFIED'
-      ? 'UNVERIFIED'
-      : 'CONFIGURED'
-  exchange.lastAttemptAt = selectedExchange.lastAttemptAt
-  exchange.lastSuccessfulAt = selectedExchange.lastSuccessfulAt
-  exchange.freshness = selectedExchange.freshness
-  exchange.reasonCode = selectedExchange.reasonCode
-  exchange.reason = selectedExchange.reason
   applyApplicability('exchange', exchangeApplicability)
 
   const subscriptionByType = new Map((input.subscriptions ?? []).map((subscription) => [subscription.contentType, subscription]))

@@ -72,26 +72,6 @@ export type MicrosoftConsentResponse = z.infer<
   typeof MicrosoftConsentResponseSchema
 >
 
-export const ExchangeRbacSetupResponseSchema = z.object({
-  contractVersion: z.literal(1),
-  applicationId: z.string().uuid(),
-  permission: z.literal('Exchange.ManageAsAppV2'),
-  access: z.literal('READ_ONLY'),
-  scope: z.literal('ALL_EXCHANGE_RECIPIENTS'),
-  parentRoleName: z.literal('View-Only Recipients'),
-  managementRoleName: z.literal('HawkView Get-Mailbox Read Only'),
-  roleGroupName: z.literal('HawkView Exchange Read Only'),
-  allowedCmdlets: z.tuple([z.literal('Get-Mailbox')]),
-  setupScript: z.string().min(1).max(20_000),
-  docsUrl: z.literal(
-    'https://learn.microsoft.com/en-us/exchange/reference/admin-api-authentication'
-  ),
-})
-
-export type ExchangeRbacSetupResponse = z.infer<
-  typeof ExchangeRbacSetupResponseSchema
->
-
 export const DashboardStatsSchema = z.object({
   totalUsers: z.number(),
   activeLicenses: z.number(),

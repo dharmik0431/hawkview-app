@@ -584,7 +584,8 @@ type MailRule = {
 type AcceptedDomain = {
   id: string
   domain: string
-  type: 'Authoritative' | 'InternalRelay' | 'ExternalRelay'
+  associationType?: string | null
+  capabilities?: string | null
   isDefault?: boolean
 }
 

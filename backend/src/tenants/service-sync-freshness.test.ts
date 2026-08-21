@@ -20,21 +20,16 @@ test('keeps a service partial when one Graph collector fails after other usable 
   assert.equal(data.services.exchange.partialFailures[0]?.lastSuccessfulAt, '2026-08-13T13:45:00.000Z')
 })
 
-test('treats Exchange Admin configuration as required when Exchange is applicable, but excludes it when not licensed', () => {
+test('treats the five Graph Exchange collectors as the complete standard service', () => {
   const data = deriveTenantSyncFreshness([
     success('EXCHANGE_MAILBOXES'),
     success('EXCHANGE_MAILBOX_SETTINGS'),
     success('EXCHANGE_MAILBOX_USAGE'),
     success('EXCHANGE_ACCEPTED_DOMAINS'),
     success('EXCHANGE_MAILBOX_RULES'),
-    failed('EXCHANGE_MAILBOX_CONFIGURATION', null, '403'),
   ], now)
-  assert.equal(data.services.exchange.status, 'PARTIAL')
-  assert.equal(data.services.exchange.expectedCollectors, 6)
-  const notLicensed = deriveTenantSyncFreshness([
-    success('EXCHANGE_MAILBOXES'), success('EXCHANGE_MAILBOX_SETTINGS'), success('EXCHANGE_MAILBOX_USAGE'), success('EXCHANGE_ACCEPTED_DOMAINS'), success('EXCHANGE_MAILBOX_RULES'), failed('EXCHANGE_MAILBOX_CONFIGURATION', null, '403'),
-  ], now, ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOX_CONFIGURATION'])
-  assert.equal(notLicensed.services.exchange.status, 'UNKNOWN')
+  assert.equal(data.services.exchange.status, 'SUCCESS')
+  assert.equal(data.services.exchange.expectedCollectors, 5)
 })
 
 test('reports a complete service failure when no collector has usable data', () => {

@@ -98,42 +98,12 @@ test('never reports a deprecated SharePoint full-control override as required co
   }
 })
 
-test('exposes only the managed connector application ID for tenant RBAC setup', async () => {
-  let secretReads = 0
-  const service = new MicrosoftConsentService({
-    platformMicrosoftConnector: {
-      findUnique: async ({ select }: { select: unknown }) => {
-        assert.deepEqual(select, { clientId: true })
-        return { clientId: '11111111-2222-4333-8444-555555555555' }
-      },
-    },
-  } as never, {
-    access: async () => {
-      secretReads += 1
-      return 'must-not-be-read'
-    },
-  } as never)
-
-  assert.equal(
-    await service.getManagedConnectorApplicationId(),
-    '11111111-2222-4333-8444-555555555555',
-  )
-  assert.equal(secretReads, 0)
-})
-
-test('onboarding discloses Exchange API consent without treating it as a Graph token role', () => {
+test('standard onboarding requests only the compiled least-privilege permissions', () => {
   const service = new MicrosoftConsentService({} as never, {} as never)
   const required = service.getRequiredPermissions().map((item) => item.name)
-  const onboarding = service.getOnboardingPermissions()
   assert.equal(required.includes('Exchange.ManageAsAppV2'), false)
-  assert.equal(
-    onboarding.filter((item) => item.name === 'Exchange.ManageAsAppV2').length,
-    1,
-  )
-  assert.match(
-    onboarding.find((item) => item.name === 'Exchange.ManageAsAppV2')?.description ?? '',
-    /Get-Mailbox-only custom Exchange RBAC role/i,
-  )
+  assert.equal(required.includes('MailboxSettings.Read'), true)
+  assert.equal(required.includes('Reports.Read.All'), true)
 })
 
 test('managed and customer verification paths do not make a deprecated override missing', async () => {

@@ -1264,33 +1264,6 @@ test('retires historic privileged SharePoint access fields without fabricating e
   assert.deepEqual(evidenceStore[1]?.changedFields, ['displayName'])
 })
 
-test('real Exchange Admin collector projects secret-bearing non-2xx bodies before throwing', async () => {
-  const service = new TenantSyncService({} as never, {
-    getTenantExchangeAccessToken: async () => 'exchange-token',
-  } as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
-  ;(service as any).runSnapshotSync = async (_tenant: any, _resource: string, work: () => Promise<void>) => work()
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = (async () => new Response(JSON.stringify({
-    error: { code: 'RequestDenied', message: 'Recipient role is required.' },
-    access_token: 'DO-NOT-LEAK', password: 'DO-NOT-LEAK',
-    url: 'https://user:pass@outlook.office365.com/adminapi?sig=DO-NOT-LEAK',
-  }), { status: 403 })) as typeof fetch
-  try {
-    await assert.rejects(
-      () => (service as any).syncExchangeMailboxConfiguration({
-        id: 'tenant-1', organizationId: 'org-1', microsoftTenantId: 'microsoft-1',
-        connection: { connectionMode: 'CUSTOMER_MANAGED', clientId: 'client', credentialReference: 'reference' },
-      }),
-      (error: Error) => {
-        assert.match(error.message, /403/)
-        assert.match(error.message, /RequestDenied/)
-        assert.doesNotMatch(error.message, /DO-NOT-LEAK|user:pass|sig=/)
-        return true
-      },
-    )
-  } finally { globalThis.fetch = originalFetch }
-})
-
 function scheduledTenant(id: number) {
   return {
     id: `tenant-${String(id).padStart(4, '0')}`,
