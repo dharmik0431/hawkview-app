@@ -68,6 +68,17 @@ export class TenantsController {
     )
   }
 
+  @Get(':id/exchange-rbac-setup')
+  getExchangeRbacSetup(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    return this.tenantsService.getExchangeRbacSetupForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
   @Post(':id/sync')
   syncTenantUsers(
     @Req() request: AuthenticatedRequest,

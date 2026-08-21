@@ -72,6 +72,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read Microsoft 365 unified audit activity for Exchange, SharePoint, Teams, Entra, and tenant administration; also supports limited-license login evidence.',
   'SecurityEvents.Read.All':
     'Read Microsoft Secure Score snapshots and security improvement data.',
+  'Exchange.ManageAsAppV2':
+    'Authorize the HawkView application to call the Exchange Admin API. Effective access is separately limited by the Get-Mailbox-only custom Exchange RBAC role.',
 }
 
 const GRAPH_RESOURCE_HOST = 'graph.microsoft.com'
@@ -220,6 +222,19 @@ export class MicrosoftConsentService {
     }
   }
 
+  async getManagedConnectorApplicationId() {
+    const connector = await this.prisma.platformMicrosoftConnector.findUnique({
+      where: { id: 'default' },
+      select: { clientId: true },
+    })
+    if (!connector) {
+      throw new ServiceUnavailableException(
+        'The HawkView-managed Microsoft connector has not been configured.'
+      )
+    }
+    return connector.clientId
+  }
+
   getRequiredPermissions() {
     const configured = normalizeConfiguredRequiredPermissions(
       process.env.MICROSOFT_REQUIRED_PERMISSIONS
@@ -245,6 +260,16 @@ export class MicrosoftConsentService {
         PERMISSION_DESCRIPTIONS[name] ??
         'Required by a configured HawkView Microsoft synchronization module.',
     }))
+  }
+
+  getOnboardingPermissions() {
+    return [
+      ...this.getRequiredPermissions(),
+      {
+        name: 'Exchange.ManageAsAppV2',
+        description: PERMISSION_DESCRIPTIONS['Exchange.ManageAsAppV2'],
+      },
+    ]
   }
 
   async createAdminConsentUrl(

@@ -1620,7 +1620,7 @@ export class TenantSyncService {
       },
       {
         // This is the existing app-only Exchange Admin API probe used to
-        // verify Recipient Management RBAC. Include it in the daily
+        // verify HawkView's Get-Mailbox-only custom Exchange RBAC. Include it in the daily
         // authoritative inventory so an unverified state can converge on a
         // normal scheduler run without adding a faster or per-mailbox probe.
         resource: 'EXCHANGE_MAILBOX_CONFIGURATION',
