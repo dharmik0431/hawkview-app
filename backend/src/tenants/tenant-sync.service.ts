@@ -10,6 +10,12 @@ import {
 } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
+import {
+  classifyMicrosoftFailure,
+  customerCollectionFailureMessage,
+  fetchMicrosoftWithRetry,
+  MicrosoftRequestError,
+} from '../microsoft/microsoft-request.js'
 import { getMicrosoftSkuName } from '../microsoft/microsoft-sku-names.js'
 import { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
@@ -821,15 +827,6 @@ function safeErrorMessage(error: unknown, fallback: string, maxLength = 2000) {
   return sanitizeGraphErrorField(sanitized, maxLength) ?? fallback
 }
 
-function httpStatusFromSafeMessage(message: string) {
-  const match = /\b(?:HTTP\s*)?(401|403)\b/i.exec(message)
-  return match?.[1] ?? null
-}
-
-function boundedCollectionFailure(message: string) {
-  return /bounded collection|record limit|page limit|response-size|wall-clock deadline|capacity/i.test(message)
-}
-
 function plainRecord(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const prototype = Object.getPrototypeOf(value)
@@ -915,19 +912,16 @@ export async function readGraphOperationalError(
   }
 }
 
-export class MicrosoftGraphCollectionError extends Error {
+export class MicrosoftGraphCollectionError extends MicrosoftRequestError {
   constructor(
     message: string,
     readonly status: number,
     readonly graphErrorCode: string | null,
+    requestId: string | null = null,
   ) {
-    super(message)
+    super(message, status, graphErrorCode, requestId)
     this.name = 'MicrosoftGraphCollectionError'
   }
-}
-
-async function describeGraphError(response: Response) {
-  return (await readGraphOperationalError(response)).suffix
 }
 
 export function assertSharePointResponseSize(
@@ -1300,24 +1294,42 @@ export class TenantSyncService {
     accessToken: string,
     resourceType: string,
   ): { resource: string; synchronize: () => Promise<unknown> } | null {
-    if (resourceType === 'SHAREPOINT_SITES') {
-      return {
-        resource: 'SHAREPOINT_SITES',
-        synchronize: () => this.syncSharePointSites(tenant, accessToken),
-      }
+    const synchronizers: Partial<Record<string, () => Promise<unknown>>> = {
+      LICENSES: () => this.syncLicenses(tenant, accessToken),
+      ORGANIZATION_CONFIGURATION: () => this.syncOrganizationConfiguration(tenant, accessToken),
+      DOMAINS: () => this.syncDomains(tenant, accessToken),
+      GROUPS: () => this.syncGroups(tenant, accessToken),
+      AUTH_METHOD_POLICIES: () => this.syncAuthenticationMethodPolicy(tenant, accessToken),
+      CONDITIONAL_ACCESS: () => this.syncEntraCollection(
+        tenant, accessToken, 'CONDITIONAL_ACCESS',
+        'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies',
+      ),
+      NAMED_LOCATIONS: () => this.syncEntraCollection(
+        tenant, accessToken, 'NAMED_LOCATIONS',
+        'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations',
+      ),
+      DEVICES: () => this.syncEntraCollection(
+        tenant, accessToken, 'DEVICES',
+        'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)',
+      ),
+      DIRECTORY_ROLES: () => this.syncEntraCollection(
+        tenant, accessToken, 'DIRECTORY_ROLES',
+        'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName)',
+      ),
+      SERVICE_PRINCIPALS: () => this.syncEntraCollection(
+        tenant, accessToken, 'SERVICE_PRINCIPALS',
+        'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,description,servicePrincipalType,accountEnabled,appRoleAssignmentRequired,createdDateTime,homepage,loginUrl,publisherName,verifiedPublisher,tags,preferredSingleSignOnMode,notificationEmailAddresses,appRoles,oauth2PermissionScopes&$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)',
+      ),
+      APPLICATIONS: () => this.syncEntraCollection(
+        tenant, accessToken, 'APPLICATIONS',
+        'https://graph.microsoft.com/v1.0/applications?$select=id,appId,displayName,description,createdDateTime,signInAudience,publisherDomain,identifierUris,web,passwordCredentials,keyCredentials,requiredResourceAccess&$expand=owners($select=id,displayName,userPrincipalName)',
+      ),
+      SECURITY_DEFAULTS: () => this.syncSecurityDefaults(tenant, accessToken),
+      SHAREPOINT_SITES: () => this.syncSharePointSites(tenant, accessToken),
+      SHAREPOINT_SETTINGS: () => this.syncSharePointSettings(tenant, accessToken),
     }
-    if (resourceType === 'NAMED_LOCATIONS') {
-      return {
-        resource: 'NAMED_LOCATIONS',
-        synchronize: () => this.syncEntraCollection(
-          tenant,
-          accessToken,
-          'NAMED_LOCATIONS',
-          'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations',
-        ),
-      }
-    }
-    return null
+    const synchronize = synchronizers[resourceType]
+    return synchronize ? { resource: resourceType, synchronize } : null
   }
 
   private async syncConnectedTenant(
@@ -1399,7 +1411,22 @@ export class TenantSyncService {
         }),
       ])
     } catch (error) {
-      await this.markConnectionUnavailable(tenant, error)
+      const technicalMessage = safeErrorMessage(
+        error,
+        'Microsoft users synchronization failed.',
+      )
+      const failure = classifyMicrosoftFailure(error, technicalMessage)
+      // A successful token acquisition proves the tenant connection itself is
+      // still usable. Collection failures (including a Graph 401/403) belong
+      // to the resource and must never suspend the whole customer tenant.
+      if (!graphTokenAcquired && failure.failureClass === 'AUTHENTICATION_REQUIRED') {
+        await this.markConnectionUnavailable(tenant, error)
+      }
+      const message = customerCollectionFailureMessage(
+        'user directory',
+        failure,
+        Boolean(existingState?.lastSuccessfulAt),
+      )
       await this.prisma.syncState.update({
         where: {
           customerTenantId_resourceType: {
@@ -1409,11 +1436,8 @@ export class TenantSyncService {
         },
         data: {
           status: 'FAILED',
-          lastErrorCode: 'users-sync-failed',
-          lastErrorMessage: safeErrorMessage(
-            error,
-            'Microsoft users synchronization failed.'
-          ),
+          lastErrorCode: failure.reasonCode,
+          lastErrorMessage: message,
           consecutiveFailures: { increment: 1 },
         },
       })
@@ -1537,9 +1561,13 @@ export class TenantSyncService {
         credentialReference: tenant.connection.credentialReference,
       })
     } catch (error) {
-      await this.markConnectionUnavailable(tenant, error)
+      const technicalMessage = safeErrorMessage(error, 'Microsoft token acquisition failed.')
+      const failure = classifyMicrosoftFailure(error, technicalMessage)
+      if (failure.failureClass === 'AUTHENTICATION_REQUIRED') {
+        await this.markConnectionUnavailable(tenant, error)
+      }
       throw new BadGatewayException(
-        'HawkView could not access this Microsoft tenant. Reauthorize the connection or remove the tenant.'
+        customerCollectionFailureMessage('Microsoft 365', failure, true),
       )
     }
     // Every secondary dataset is independent. A missing permission or timeout
@@ -1877,9 +1905,8 @@ export class TenantSyncService {
         },
         data: {
           status: 'ERROR',
-          consentedPermissions: [],
           lastVerifiedAt: failedAt,
-          lastErrorCode: 'microsoft-access-failed',
+          lastErrorCode: 'MICROSOFT_AUTHENTICATION_REQUIRED',
           lastErrorMessage: message,
         },
       }),
@@ -1911,7 +1938,7 @@ export class TenantSyncService {
     synchronize: () => Promise<void>
   ) {
     const lastAttemptAt = new Date()
-    await this.prisma.syncState.upsert({
+    const previousState = await this.prisma.syncState.upsert({
       where: {
         customerTenantId_resourceType: {
           customerTenantId: tenant.id,
@@ -1966,7 +1993,7 @@ export class TenantSyncService {
         }
       )
     } catch (error) {
-      const message = safeErrorMessage(
+      const technicalMessage = safeErrorMessage(
         error,
         `Microsoft ${resourceType.toLowerCase()} synchronization failed.`
       )
@@ -1981,7 +2008,7 @@ export class TenantSyncService {
           data: {
             status: 'RUNNING',
             lastErrorCode: error.code,
-            lastErrorMessage: message,
+            lastErrorMessage: technicalMessage,
             consecutiveFailures: 0,
           },
         })
@@ -2006,7 +2033,7 @@ export class TenantSyncService {
             status: 'RUNNING',
             lastSuccessfulAt: new Date(),
             lastErrorCode: error.code,
-            lastErrorMessage: message,
+            lastErrorMessage: technicalMessage,
             consecutiveFailures: 0,
           },
         })
@@ -2016,6 +2043,23 @@ export class TenantSyncService {
         )
         return
       }
+      const failure = classifyMicrosoftFailure(error, technicalMessage)
+      const message = customerCollectionFailureMessage(
+        resourceType.replaceAll('_', ' ').toLowerCase(),
+        failure,
+        Boolean(previousState?.lastSuccessfulAt),
+      )
+      this.logger.warn(JSON.stringify({
+        event: 'microsoft_collection_failed',
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        resourceType,
+        failureClass: failure.failureClass,
+        reasonCode: failure.reasonCode,
+        status: failure.status,
+        microsoftCode: failure.microsoftCode,
+        requestId: failure.requestId,
+      }))
       const state = await this.prisma.syncState.update({
         where: {
           customerTenantId_resourceType: {
@@ -2025,33 +2069,45 @@ export class TenantSyncService {
         },
         data: {
           status: 'FAILED',
-          // Retain a permission-shaped HTTP code when Microsoft supplied one:
-          // readiness and the scheduler use it to avoid retrying a permanent
-          // authorization failure every five minutes.
-          lastErrorCode:
-            httpStatusFromSafeMessage(message) ??
-            (boundedCollectionFailure(message)
-              ? `${resourceType.toLowerCase()}-capacity`
-              : null) ??
-            `${resourceType.toLowerCase()}-sync-failed`,
+          lastErrorCode: failure.reasonCode,
           lastErrorMessage: message,
           consecutiveFailures: { increment: 1 },
         },
       })
-      if (state.consecutiveFailures >= 2) {
+      const shouldNotify = failure.retryable
+        ? state.consecutiveFailures >= 3
+        : state.consecutiveFailures >= 1
+      if (shouldNotify) {
+        const permissionRequired = failure.customerAction === 'REVIEW_PERMISSIONS'
+        const reconnectRequired = failure.customerAction === 'RECONNECT'
         await this.notifications.publishIncident({
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
           eventType: 'tenant.sync_failed',
           category: 'warning',
-          severity: state.consecutiveFailures >= 4 ? 'high' : 'medium',
-          title: `${resourceType.replaceAll('_', ' ')} synchronization failed`,
+          severity: permissionRequired || reconnectRequired || state.consecutiveFailures >= 6
+            ? 'high'
+            : 'medium',
+          title: failure.retryable
+            ? `${resourceType.replaceAll('_', ' ')} refresh delayed`
+            : `${resourceType.replaceAll('_', ' ')} requires attention`,
           description: message,
           dedupeKey: `tenant:${tenant.id}:sync:${resourceType}`,
           source: 'tenant-sync',
-          actionUrl: `/tenants/${tenant.id}`,
-          actionLabel: 'Review tenant',
-          metadata: { resourceType, consecutiveFailures: state.consecutiveFailures },
+          actionUrl: permissionRequired || reconnectRequired
+            ? `/tenants/${tenant.id}/settings`
+            : `/tenants/${tenant.id}`,
+          actionLabel: permissionRequired
+            ? 'Review permissions'
+            : reconnectRequired
+              ? 'Reconnect tenant'
+              : 'View synchronization',
+          metadata: {
+            resourceType,
+            consecutiveFailures: state.consecutiveFailures,
+            failureClass: failure.failureClass,
+            reasonCode: failure.reasonCode,
+          },
         })
       }
       throw new BadGatewayException(message)
@@ -2063,21 +2119,10 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'LICENSES', async () => {
-      const response = await fetch(
-        'https://graph.microsoft.com/v1.0/subscribedSkus',
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(20_000),
-        }
+      const response = await this.fetchGraphPage(
+        'https://graph.microsoft.com/v1.0/subscribedSkus', accessToken, 'license',
+        { timeoutMs: 20_000 },
       )
-      if (!response.ok) {
-        throw new Error(
-          `Microsoft license synchronization returned ${response.status}.`
-        )
-      }
       const body = (await response.json()) as { value?: GraphSubscribedSku[] }
       const observedAt = new Date()
       const rows = (body.value ?? []).filter(
@@ -2136,21 +2181,12 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'DOMAINS', async () => {
-      const response = await fetch(
+      const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/organization?$select=displayName,verifiedDomains',
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(20_000),
-        }
+        accessToken,
+        'domain',
+        { timeoutMs: 20_000 },
       )
-      if (!response.ok) {
-        throw new Error(
-          `Microsoft domain synchronization returned ${response.status}.`
-        )
-      }
       const body = (await response.json()) as { value?: GraphOrganization[] }
       const organization = body.value?.[0]
       if (!organization) {
@@ -2219,16 +2255,12 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'ORGANIZATION_CONFIGURATION', async () => {
-      const response = await fetch(
+      const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/organization?$select=id,displayName',
-        {
-          headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
-          signal: AbortSignal.timeout(20_000),
-        }
+        accessToken,
+        'organization configuration',
+        { timeoutMs: 20_000 },
       )
-      if (!response.ok) {
-        throw new Error(`Microsoft organization configuration synchronization returned ${response.status}.`)
-      }
       const body = (await response.json()) as GraphOrganizationConfigurationResponse
       const organization = organizationConfigurationSnapshotForTenant(tenant.microsoftTenantId, body)
       await this.saveSnapshot(tenant, 'ORGANIZATION_CONFIGURATION', authoritativeSnapshot([organization]))
@@ -2276,18 +2308,9 @@ export class TenantSyncService {
         if (!groupsUrl.startsWith('https://graph.microsoft.com/')) {
           throw new Error('Microsoft returned an invalid groups link.')
         }
-        const response = await fetch(groupsUrl, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(20_000),
-        })
-        if (!response.ok) {
-          throw new Error(
-            `Microsoft groups synchronization returned ${response.status}.`
-          )
-        }
+        const response = await this.fetchGraphPage(
+          groupsUrl, accessToken, 'groups', { timeoutMs: 20_000 },
+        )
         const page = (await response.json()) as GraphGroupsPage
         groups.push(
           ...(page.value ?? []).filter(
@@ -2366,23 +2389,9 @@ export class TenantSyncService {
           if (!ownersUrl.startsWith('https://graph.microsoft.com/')) {
             throw new Error('Microsoft returned an invalid group-owners link.')
           }
-          const response = await fetch(ownersUrl, {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              Accept: 'application/json',
-            },
-            signal: AbortSignal.timeout(20_000),
-          })
-          if (!response.ok) {
-            const detail = await describeGraphError(response)
-            const requestId =
-              response.headers.get('request-id') ??
-              response.headers.get('client-request-id')
-            throw new Error(
-              `Microsoft group owner synchronization returned ${response.status}${detail}` +
-                (requestId ? ` (request ${requestId})` : '')
-            )
-          }
+          const response = await this.fetchGraphPage(
+            ownersUrl, accessToken, 'group owner', { timeoutMs: 20_000 },
+          )
           const page = (await response.json()) as {
             value?: NonNullable<GraphGroup['owners']>
             '@odata.nextLink'?: string
@@ -2419,23 +2428,9 @@ export class TenantSyncService {
           if (!membersUrl.startsWith('https://graph.microsoft.com/')) {
             throw new Error('Microsoft returned an invalid group-members link.')
           }
-          const response = await fetch(membersUrl, {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              Accept: 'application/json',
-            },
-            signal: AbortSignal.timeout(20_000),
-          })
-          if (!response.ok) {
-            const detail = await describeGraphError(response)
-            const requestId =
-              response.headers.get('request-id') ??
-              response.headers.get('client-request-id')
-            throw new Error(
-              `Microsoft group membership synchronization returned ${response.status}${detail}` +
-                (requestId ? ` (request ${requestId})` : '')
-            )
-          }
+          const response = await this.fetchGraphPage(
+            membersUrl, accessToken, 'group membership', { timeoutMs: 20_000 },
+          )
           const page = (await response.json()) as GraphGroupMembersPage
           memberIds.push(
             ...(page.value ?? [])
@@ -2560,24 +2555,11 @@ export class TenantSyncService {
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
       }
-      const response = await fetch(nextUrl, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/json',
-        },
-        signal: AbortSignal.timeout(30_000),
-      })
-      if (!response.ok) {
-        const graphRequestId = response.headers.get('request-id')
-        const graphError = await readGraphOperationalError(response)
-        throw new MicrosoftGraphCollectionError(
-          `Microsoft ${resourceType.toLowerCase()} synchronization returned ${response.status}${
-            graphRequestId ? ` (request ${graphRequestId})` : ''
-          }${graphError.suffix}.`,
-          response.status,
-          graphError.code,
-        )
-      }
+      const response = await this.fetchGraphPage(
+        nextUrl,
+        accessToken,
+        resourceType.toLowerCase(),
+      )
       const page = (await response.json()) as GraphCollectionPage
       rows.push(...(page.value ?? []))
       nextUrl = page['@odata.nextLink'] ?? ''
@@ -2590,25 +2572,11 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'SECURITY_DEFAULTS', async () => {
-      const response = await fetch(
+      const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy',
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(30_000),
-        }
+        accessToken,
+        'security defaults',
       )
-      if (!response.ok) {
-        const graphRequestId = response.headers.get('request-id')
-        const graphError = await describeGraphError(response)
-        throw new Error(
-          `Microsoft security defaults synchronization returned ${response.status}${
-            graphRequestId ? ` (request ${graphRequestId})` : ''
-          }${graphError}.`
-        )
-      }
       const policy = (await response.json()) as Record<string, unknown>
       await this.saveEntraSnapshot(tenant, 'SECURITY_DEFAULTS', [policy])
     })
@@ -2709,30 +2677,27 @@ export class TenantSyncService {
           )
         }
         const batchIds = ids.slice(offset, offset + limits.batchSize)
-        const response = await fetch('https://graph.microsoft.com/beta/$batch', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
+        const response = await this.fetchGraphPage(
+          'https://graph.microsoft.com/beta/$batch',
+          accessToken,
+          'per-user MFA-state',
+          {
+            retryUnsafeMethod: true,
+            timeoutMs: Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
+            deadlineAt: deadline,
+            init: {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                requests: batchIds.map((userId, index) => ({
+                  id: String(index + 1),
+                  method: 'GET',
+                  url: `/users/${encodeURIComponent(userId)}/authentication/requirements`,
+                })),
+              }),
+            },
           },
-          body: JSON.stringify({
-            requests: batchIds.map((userId, index) => ({
-              id: String(index + 1),
-              method: 'GET',
-              url: `/users/${encodeURIComponent(userId)}/authentication/requirements`,
-            })),
-          }),
-          signal: AbortSignal.timeout(
-            Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
-          ),
-        })
-        if (!response.ok) {
-          const graphError = await describeGraphError(response)
-          throw new Error(
-            `Microsoft per-user MFA-state synchronization returned ${response.status}${graphError}.`,
-          )
-        }
+        )
         const parsed = JSON.parse(
           await readBoundedResponseText(response, limits.responseBytes),
         ) as unknown
@@ -2835,13 +2800,17 @@ export class TenantSyncService {
         )
       }
       const batchUsers = users.slice(offset, offset + limits.batchSize)
-      const response = await fetch(
+      const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/$batch',
+        accessToken,
+        'per-user authentication-method',
         {
+          retryUnsafeMethod: true,
+          timeoutMs: Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
+          deadlineAt: deadline,
+          init: {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
@@ -2851,17 +2820,9 @@ export class TenantSyncService {
               url: `/users/${encodeURIComponent(user.microsoftUserId)}/authentication/methods`,
             })),
           }),
-          signal: AbortSignal.timeout(
-            Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
-          ),
-        }
+          },
+        },
       )
-      if (!response.ok) {
-        const graphError = await describeGraphError(response)
-        throw new Error(
-          `Microsoft per-user authentication-method synchronization returned ${response.status}${graphError}.`
-        )
-      }
       const batch = JSON.parse(
         await readBoundedResponseText(response, limits.responseBytes),
       ) as unknown
@@ -2959,21 +2920,15 @@ export class TenantSyncService {
           'Microsoft per-user authentication-method synchronization reached its bounded wall-clock deadline; baseline was not advanced.',
         )
       }
-      const response = await fetch(nextUrl, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/json',
+      const response = await this.fetchGraphPage(
+        nextUrl,
+        accessToken,
+        'authentication-registration user discovery',
+        {
+          timeoutMs: Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
+          deadlineAt: deadline,
         },
-        signal: AbortSignal.timeout(
-          Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
-        ),
-      })
-      if (!response.ok) {
-        const graphError = await describeGraphError(response)
-        throw new Error(
-          `Microsoft authentication-registration user discovery returned ${response.status}${graphError}.`,
-        )
-      }
+      )
       const parsed = JSON.parse(
         await readBoundedResponseText(response, limits.responseBytes),
       ) as unknown
@@ -3022,22 +2977,11 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'AUTH_METHOD_POLICIES', async () => {
-      const response = await fetch(
+      const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/policies/authenticationMethodsPolicy',
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(30_000),
-        }
+        accessToken,
+        'authentication-method policy',
       )
-      if (!response.ok) {
-        const graphError = await describeGraphError(response)
-        throw new Error(
-          `Microsoft authentication-method policy synchronization returned ${response.status}${graphError}.`
-        )
-      }
       const policy = (await response.json()) as {
         authenticationMethodConfigurations?: unknown[]
       }
@@ -3071,50 +3015,40 @@ export class TenantSyncService {
   private async fetchGraphPage(
     url: string,
     accessToken: string,
-    resourceLabel: string
+    resourceLabel: string,
+    options: {
+      timeoutMs?: number
+      deadlineAt?: number
+      acceptedStatuses?: number[]
+      init?: RequestInit
+      retryUnsafeMethod?: boolean
+    } = {},
   ) {
-    let lastError: unknown
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        const response = await fetch(url, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(30_000),
-        })
-        if (response.ok) return response
+    const headers = new Headers(options.init?.headers)
+    if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${accessToken}`)
+    if (!headers.has('Accept')) headers.set('Accept', 'application/json')
+    const response = await fetchMicrosoftWithRetry(
+      url,
+      { ...options.init, headers },
+      {
+        label: `Microsoft ${resourceLabel} synchronization`,
+        timeoutMs: options.timeoutMs ?? 30_000,
+        deadlineAt: options.deadlineAt,
+        retryUnsafeMethod: options.retryUnsafeMethod,
+      },
+    )
+    if (response.ok || options.acceptedStatuses?.includes(response.status)) return response
 
-        const retryable = [429, 500, 502, 503, 504].includes(response.status)
-        if (!retryable || attempt === 2) {
-          const requestId = response.headers.get('request-id')
-          const graphError = await describeGraphError(response)
-          throw new Error(
-            `Microsoft ${resourceLabel} synchronization returned ${response.status}${
-              requestId ? ` (request ${requestId})` : ''
-            }${graphError}.`
-          )
-        }
-        const retryAfterSeconds = Number(response.headers.get('retry-after'))
-        const delayMs = Number.isFinite(retryAfterSeconds)
-          ? Math.min(retryAfterSeconds * 1000, 10_000)
-          : (attempt + 1) * 500
-        await new Promise((resolve) => setTimeout(resolve, delayMs))
-      } catch (error) {
-        lastError = error
-        if (
-          error instanceof Error &&
-          error.message.startsWith(`Microsoft ${resourceLabel} synchronization returned`)
-        ) {
-          throw error
-        }
-        if (attempt === 2) break
-        await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 500))
-      }
-    }
-    throw lastError instanceof Error
-      ? lastError
-      : new Error(`Microsoft ${resourceLabel} synchronization failed after retries.`)
+    const requestId = response.headers.get('request-id')
+    const graphError = await readGraphOperationalError(response)
+    throw new MicrosoftGraphCollectionError(
+      `Microsoft ${resourceLabel} synchronization returned ${response.status}${
+        requestId ? ` (request ${requestId})` : ''
+      }${graphError.suffix}.`,
+      response.status,
+      graphError.code,
+      requestId,
+    )
   }
 
   private async logSyncStart(
@@ -3455,16 +3389,12 @@ export class TenantSyncService {
     }
     const contentType = 'Audit.AzureActiveDirectory'
     const subscriptionIsEnabled = async () => {
-      const response = await fetch(activityUrl(`${baseUrl}/subscriptions/list`), {
-        headers,
-        signal: AbortSignal.timeout(20_000),
-      })
-      if (!response.ok) {
-        const body = (await response.text()).slice(0, 500)
-        throw new Error(
-          `Microsoft 365 activity subscription verification returned HTTP ${response.status}${body ? `: ${body}` : '.'}`
-        )
-      }
+      const response = await this.fetchGraphPage(
+        activityUrl(`${baseUrl}/subscriptions/list`),
+        token,
+        '365 activity subscription verification',
+        { timeoutMs: 20_000, init: { headers } },
+      )
       const subscriptions = (await response.json()) as Array<{
         contentType?: string
         status?: string
@@ -3497,15 +3427,12 @@ export class TenantSyncService {
       )
       let pageUrl = `${baseUrl}/subscriptions/content?contentType=${encodeURIComponent(contentType)}&startTime=${encodeURIComponent(windowStart.toISOString())}&endTime=${encodeURIComponent(windowEnd.toISOString())}`
       while (pageUrl) {
-        const response = await fetch(activityUrl(pageUrl), {
-          headers,
-          signal: AbortSignal.timeout(30_000),
-        })
-        if (!response.ok) {
-          throw new Error(
-            `Microsoft 365 limited login activity returned HTTP ${response.status}.`
-          )
-        }
+        const response = await this.fetchGraphPage(
+          activityUrl(pageUrl),
+          token,
+          '365 limited login activity',
+          { timeoutMs: 30_000, init: { headers } },
+        )
         const items = (await response.json()) as Array<{ contentUri?: string }>
         for (const item of items) {
           if (typeof item.contentUri === 'string')
@@ -3519,11 +3446,12 @@ export class TenantSyncService {
 
     const records: any[] = []
     for (const contentUri of [...new Set(contentUris)]) {
-      const response = await fetch(activityUrl(contentUri), {
-        headers,
-        signal: AbortSignal.timeout(30_000),
-      })
-      if (!response.ok) continue
+      const response = await this.fetchGraphPage(
+        activityUrl(contentUri),
+        token,
+        '365 limited login activity content',
+        { timeoutMs: 30_000, init: { headers } },
+      )
       const content = (await response.json()) as any[]
       records.push(...content)
     }
@@ -3939,18 +3867,12 @@ export class TenantSyncService {
             'Microsoft returned an invalid users pagination link.'
           )
         }
-        const response = await fetch(nextUrl, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(30_000),
-        })
-        if (!response.ok) {
-          throw new Error(
-            `Microsoft mailbox directory synchronization returned ${response.status}. Confirm User.Read.All application permission.`
-          )
-        }
+        const response = await this.fetchGraphPage(
+          nextUrl,
+          accessToken,
+          'mailbox directory',
+          { timeoutMs: 30_000 },
+        )
           return (await response.json()) as GraphCollectionPage
         }
       )
@@ -3998,15 +3920,11 @@ export class TenantSyncService {
         const batch = users.slice(index, index + 5)
         const results = await Promise.all(
           batch.map(async (user) => {
-            const response = await fetch(
+            const response = await this.fetchGraphPage(
               `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.microsoftUserId)}/mailboxSettings?$select=userPurpose,timeZone`,
-              {
-                headers: {
-                  Authorization: `Bearer ${accessToken}`,
-                  Accept: 'application/json',
-                },
-                signal: AbortSignal.timeout(20_000),
-              }
+              accessToken,
+              'mailbox settings',
+              { timeoutMs: 20_000, acceptedStatuses: [404] },
             )
             // Not every directory user has an Exchange mailbox.  That is a
             // valid empty result rather than an Exchange synchronization error.
@@ -4085,23 +4003,25 @@ export class TenantSyncService {
               'Microsoft Exchange mailbox configuration synchronization exceeded the three-minute safety limit.'
             )
           }
-          const response = await fetch(nextUrl, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              Accept: 'application/json',
-              'Content-Type': 'application/json',
-              'X-AnchorMailbox': anchorMailbox,
+          const response = await this.fetchGraphPage(
+            nextUrl,
+            accessToken,
+            'Exchange mailbox configuration',
+            {
+              timeoutMs: Math.min(60_000, remainingMs),
+              deadlineAt,
+              retryUnsafeMethod: true,
+              init: {
+                method: 'POST',
+                headers: {
+                  Accept: 'application/json',
+                  'Content-Type': 'application/json',
+                  'X-AnchorMailbox': anchorMailbox,
+                },
+                body: JSON.stringify(requestBody),
+              },
             },
-            body: JSON.stringify(requestBody),
-            signal: AbortSignal.timeout(Math.min(60_000, remainingMs)),
-          })
-          if (!response.ok) {
-            const details = await describeGraphError(response)
-            throw new Error(
-              `Microsoft Exchange mailbox configuration synchronization returned ${response.status}. Confirm Exchange.ManageAsAppV2 and the Recipient Management Exchange RBAC role.${details}`
-            )
-          }
+          )
           const page = (await response.json()) as GraphCollectionPage
           rows.push(...(Array.isArray(page.value) ? page.value : []))
           nextUrl =
@@ -4127,21 +4047,12 @@ export class TenantSyncService {
       tenant,
       'EXCHANGE_ACCEPTED_DOMAINS',
       async () => {
-        const response = await fetch(
+        const response = await this.fetchGraphPage(
           'https://graph.microsoft.com/v1.0/organization?$select=verifiedDomains',
-          {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              Accept: 'application/json',
-            },
-            signal: AbortSignal.timeout(30_000),
-          }
+          accessToken,
+          'accepted-domain',
+          { timeoutMs: 30_000 },
         )
-        if (!response.ok) {
-          throw new Error(
-            `Microsoft accepted-domain synchronization returned ${response.status}. Confirm Organization.Read.All application permission.`
-          )
-        }
         const page = (await response.json()) as { value?: GraphOrganization[] }
         // Deliberately limited to the Organization.Read.All shape.  Full
         // accepted-domain attributes (isVerified/supportedServices) require
@@ -4167,16 +4078,15 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_USAGE', async () => {
-      const response = await fetch(
+      const response = await this.fetchGraphPage(
         "https://graph.microsoft.com/v1.0/reports/getMailboxUsageDetail(period='D30')",
+        accessToken,
+        'mailbox usage',
         {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'text/csv',
-          },
-          redirect: 'manual',
-          signal: AbortSignal.timeout(30_000),
-        }
+          timeoutMs: 30_000,
+          acceptedStatuses: [302],
+          init: { headers: { Accept: 'text/csv' }, redirect: 'manual' },
+        },
       )
       let csv = ''
       if (response.ok) csv = await response.text()
@@ -4186,9 +4096,11 @@ export class TenantSyncService {
           throw new Error(
             'Microsoft returned an invalid mailbox usage report link.'
           )
-        const download = await fetch(location, {
-          signal: AbortSignal.timeout(30_000),
-        })
+        const download = await fetchMicrosoftWithRetry(
+          location,
+          { headers: { Accept: 'text/csv,application/octet-stream' } },
+          { label: 'Microsoft mailbox usage report download', timeoutMs: 30_000 },
+        )
         if (!download.ok)
           throw new Error(
             `Microsoft mailbox usage report download returned ${download.status}.`
@@ -4219,9 +4131,10 @@ export class TenantSyncService {
       const rows = await collectMailboxRules(users, async (user, continuation) => {
         const url = continuation ?? `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.microsoftUserId)}/mailFolders/inbox/messageRules?$top=100`
         if (!url.startsWith('https://graph.microsoft.com/')) throw new Error('Microsoft returned an invalid inbox-rules pagination link.')
-        const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' }, signal: AbortSignal.timeout(20_000) })
+        const response = await this.fetchGraphPage(
+          url, accessToken, 'inbox rules', { timeoutMs: 20_000, acceptedStatuses: [404] },
+        )
         if (response.status === 404) return { value: [] }
-        if (!response.ok) throw new Error(`Microsoft inbox rules synchronization returned ${response.status}. Confirm MailboxSettings.Read application permission.`)
         return (await response.json()) as GraphCollectionPage
       })
       await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows))
@@ -4244,15 +4157,15 @@ export class TenantSyncService {
       // Microsoft Graph site search can return an empty collection even when
       // the tenant's root SharePoint site exists. Fetch the root explicitly so
       // a provisioned tenant never appears as an empty SharePoint environment.
-      const rootResponse = await fetch(
+      const rootResponse = await this.fetchGraphPage(
         `https://graph.microsoft.com/v1.0/sites/root?$select=${siteFields}`,
+        accessToken,
+        'SharePoint root site',
         {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs)),
-        }
+          timeoutMs: sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs),
+          deadlineAt,
+          acceptedStatuses: [404],
+        },
       )
       if (rootResponse.ok) {
         sites.push((await readBoundedSharePointJson(rootResponse, limits.responseBytes)) as any)
@@ -4276,18 +4189,12 @@ export class TenantSyncService {
           throw new Error('SharePoint site inventory returned a repeated pagination link.')
         }
         seenSitePages.add(nextUrl)
-        const response = await fetch(nextUrl, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs)),
-        })
-        if (!response.ok) {
-          throw new Error(
-            `Microsoft SharePoint sites synchronization returned ${response.status}.`
-          )
-        }
+        const response = await this.fetchGraphPage(
+          nextUrl,
+          accessToken,
+          'SharePoint sites',
+          { timeoutMs: sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs), deadlineAt },
+        )
         const page = (await readBoundedSharePointJson(response, limits.responseBytes)) as GraphCollectionPage
         sites.push(...((page.value ?? []) as any[]))
         if (sites.length > maxSites) throw new Error('SharePoint site inventory reached a bounded record limit before completion.')
@@ -4316,15 +4223,15 @@ export class TenantSyncService {
                 externalSharing: null,
                 guestsCount: null,
               }
-            const driveResponse = await fetch(
+            const driveResponse = await this.fetchGraphPage(
               `https://graph.microsoft.com/v1.0/sites/${encodeURIComponent(site.id)}/drive?$select=id,quota`,
+              accessToken,
+              'SharePoint drive quota',
               {
-                headers: {
-                  Authorization: `Bearer ${accessToken}`,
-                  Accept: 'application/json',
-                },
-                signal: AbortSignal.timeout(sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs)),
-              }
+                timeoutMs: sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs),
+                deadlineAt,
+                acceptedStatuses: [404],
+              },
             )
             const drive = driveResponse.ok
               ? ((await readBoundedSharePointJson(driveResponse, limits.responseBytes)) as any)
@@ -4358,24 +4265,11 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'SHAREPOINT_SETTINGS', async () => {
-      const response = await fetch(
+      const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/admin/sharepoint/settings',
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-          signal: AbortSignal.timeout(30_000),
-        }
+        accessToken,
+        'SharePoint settings',
       )
-      if (!response.ok) {
-        const graphRequestId = response.headers.get('request-id')
-        throw new Error(
-          `Microsoft SharePoint settings synchronization returned ${response.status}${
-            graphRequestId ? ` (request ${graphRequestId})` : ''
-          }.`
-        )
-      }
       const body = (await response.json()) as any
       // Microsoft documentation has shown both the resource directly and a
       // single resource under `value`; normalize either response shape.
@@ -4401,14 +4295,16 @@ export class TenantSyncService {
   ) {
     return this.runSnapshotSync(tenant, 'SHAREPOINT_USAGE', async () => {
       const downloadReport = async (reportUrl: string, label: string) => {
-        const reportResponse = await fetch(reportUrl, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'text/csv',
+        const reportResponse = await this.fetchGraphPage(
+          reportUrl,
+          accessToken,
+          `${label} usage`,
+          {
+            timeoutMs: 30_000,
+            acceptedStatuses: [302],
+            init: { headers: { Accept: 'text/csv' }, redirect: 'manual' },
           },
-          redirect: 'manual',
-          signal: AbortSignal.timeout(30_000),
-        })
+        )
         if (reportResponse.ok) return reportResponse.text()
         if (reportResponse.status !== 302) {
           const graphRequestId = reportResponse.headers.get('request-id')
@@ -4422,10 +4318,11 @@ export class TenantSyncService {
         if (!downloadUrl?.startsWith('https://')) {
           throw new Error(`Microsoft returned an invalid ${label} report link.`)
         }
-        const downloadResponse = await fetch(downloadUrl, {
-          headers: { Accept: 'text/csv,application/octet-stream' },
-          signal: AbortSignal.timeout(30_000),
-        })
+        const downloadResponse = await fetchMicrosoftWithRetry(
+          downloadUrl,
+          { headers: { Accept: 'text/csv,application/octet-stream' } },
+          { label: `Microsoft ${label} usage report download`, timeoutMs: 30_000 },
+        )
         if (!downloadResponse.ok) {
           throw new Error(
             `Microsoft ${label} report download returned ${downloadResponse.status}.`
@@ -4461,8 +4358,10 @@ export class TenantSyncService {
       organizationId: string
     },
     accessToken: string,
-    deltaLink: string | null
-  ) {
+    deltaLink: string | null,
+    allowDeltaReset = true,
+  ): Promise<{ deltaLink: string }> {
+    const fullSyncStartedAt = deltaLink ? null : new Date()
     let nextUrl =
       deltaLink ??
       `https://graph.microsoft.com/v1.0/users/delta?$select=${USER_SELECT}`
@@ -4472,16 +4371,23 @@ export class TenantSyncService {
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error('Microsoft returned an invalid synchronization link.')
       }
-      const response = await fetch(nextUrl, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/json',
-        },
-        signal: AbortSignal.timeout(20_000),
+      const response = await this.fetchGraphPage(nextUrl, accessToken, 'users', {
+        timeoutMs: 20_000,
+        acceptedStatuses: [410],
       })
-      if (!response.ok) {
-        throw new Error(
-          `Microsoft users synchronization returned ${response.status}.`
+      if (response.status === 410) {
+        const metadata = await readGraphOperationalError(response)
+        if (deltaLink && allowDeltaReset) {
+          this.logger.warn(
+            `Microsoft invalidated the users delta checkpoint for tenant ${tenant.id}; rebuilding the users baseline.`,
+          )
+          return this.synchronizeUsers(tenant, accessToken, null, false)
+        }
+        throw new MicrosoftGraphCollectionError(
+          `Microsoft users synchronization returned 410${metadata.suffix}.`,
+          410,
+          metadata.code,
+          response.headers.get('request-id'),
         )
       }
       const page = (await response.json()) as GraphUsersPage
@@ -4548,6 +4454,17 @@ export class TenantSyncService {
 
     if (!finalDeltaLink) {
       throw new Error('Microsoft did not return a users delta checkpoint.')
+    }
+    if (fullSyncStartedAt) {
+      await this.prisma.directoryUser.updateMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          deletedAt: null,
+          lastSeenAt: { lt: fullSyncStartedAt },
+        },
+        data: { deletedAt: new Date() },
+      })
     }
     return { deltaLink: finalDeltaLink }
   }

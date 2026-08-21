@@ -96,6 +96,33 @@ test('targeted retry backs off and the scheduler query excludes known authorizat
   assert.match(where, /403/)
 })
 
+test('uses stable failure codes and cost-aware retry windows', () => {
+  const lightTransient = {
+    ...state('NAMED_LOCATIONS', 'FAILED', null, new Date('2026-08-17T15:44:00.000Z')),
+    lastErrorCode: 'MICROSOFT_TRANSIENT',
+    lastErrorMessage: 'Microsoft temporarily could not provide Named Locations data.',
+    consecutiveFailures: 1,
+  }
+  const heavyTransient = {
+    ...lightTransient,
+    resourceType: 'SHAREPOINT_SITES',
+    lastAttemptAt: new Date('2026-08-17T15:31:00.000Z'),
+  }
+
+  assert.equal(targetedTransientRetryDelayMs(lightTransient), 15 * 60 * 1000)
+  assert.equal(targetedTransientRetryDelayMs(heavyTransient), 30 * 60 * 1000)
+  assert.equal(shouldRunTargetedTransientRetry(lightTransient, now), true)
+  assert.equal(shouldRunTargetedTransientRetry(heavyTransient, now), false)
+  assert.equal(shouldRunTargetedTransientRetry({
+    ...lightTransient,
+    lastErrorCode: 'MICROSOFT_PERMISSION_REQUIRED',
+  }, now), false)
+  assert.equal(shouldRunTargetedTransientRetry({
+    ...lightTransient,
+    lastErrorCode: 'MICROSOFT_AUTHENTICATION_REQUIRED',
+  }, now), false)
+})
+
 test('selects a tenant for an eligible Named Locations retry without forcing full inventory', () => {
   const selected = selectScheduledTenantWork([{
     id: 'named-locations-retry',

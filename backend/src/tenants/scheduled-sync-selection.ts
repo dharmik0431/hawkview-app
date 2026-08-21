@@ -24,11 +24,30 @@ export const TENANT_SYNC_LEASE_MS = 15 * 60 * 1000
  * collectors. Permission-shaped failures are deliberately excluded.
  */
 export const TARGETED_TRANSIENT_RETRY_RESOURCES = [
+  SyncResourceType.LICENSES,
+  SyncResourceType.ORGANIZATION_CONFIGURATION,
+  SyncResourceType.DOMAINS,
+  SyncResourceType.GROUPS,
+  SyncResourceType.AUTH_METHOD_POLICIES,
+  SyncResourceType.CONDITIONAL_ACCESS,
   SyncResourceType.SHAREPOINT_SITES,
   SyncResourceType.NAMED_LOCATIONS,
+  SyncResourceType.DEVICES,
+  SyncResourceType.DIRECTORY_ROLES,
+  SyncResourceType.SERVICE_PRINCIPALS,
+  SyncResourceType.APPLICATIONS,
+  SyncResourceType.SECURITY_DEFAULTS,
+  SyncResourceType.SHAREPOINT_SETTINGS,
 ] as const
 export const TARGETED_TRANSIENT_RETRY_BASE_MS = 30 * 60 * 1000
 export const TARGETED_TRANSIENT_RETRY_MAX_MS = 6 * 60 * 60 * 1000
+const HEAVIER_RETRY_RESOURCES = new Set<string>([
+  SyncResourceType.GROUPS,
+  SyncResourceType.DEVICES,
+  SyncResourceType.SERVICE_PRINCIPALS,
+  SyncResourceType.APPLICATIONS,
+  SyncResourceType.SHAREPOINT_SITES,
+])
 
 export type DailyInventoryState = {
   resourceType: string
@@ -58,22 +77,41 @@ export type ScheduledTenantWork = {
 
 function authorizationFailure(state: DailyInventoryState) {
   return state.lastErrorCode === '401' || state.lastErrorCode === '403' ||
+    state.lastErrorCode === 'MICROSOFT_AUTHENTICATION_REQUIRED' ||
+    state.lastErrorCode === 'MICROSOFT_PERMISSION_REQUIRED' ||
     /\b(?:401|403)\b|unauthorized|forbidden|permission|consent/i.test(
       state.lastErrorMessage ?? '',
     )
 }
 
 function boundedCapacityFailure(state: DailyInventoryState) {
-  return /bounded collection|record limit|page limit|response-size|wall-clock deadline|capacity/i.test(
-    `${state.lastErrorCode ?? ''} ${state.lastErrorMessage ?? ''}`,
-  )
+  return state.lastErrorCode === 'HAWKVIEW_CAPACITY_GUARD' ||
+    /bounded collection|record limit|page limit|response-size|wall-clock deadline|capacity/i.test(
+      `${state.lastErrorCode ?? ''} ${state.lastErrorMessage ?? ''}`,
+    )
+}
+
+function retryableFailure(state: DailyInventoryState) {
+  if (authorizationFailure(state) || boundedCapacityFailure(state)) return false
+  if (state.lastErrorCode?.startsWith('MICROSOFT_')) {
+    return [
+      'MICROSOFT_TRANSIENT',
+      'MICROSOFT_THROTTLED',
+      'MICROSOFT_NETWORK_TIMEOUT',
+      'MICROSOFT_DELTA_RESET_REQUIRED',
+    ].includes(state.lastErrorCode)
+  }
+  return true
 }
 
 export function targetedTransientRetryDelayMs(state: DailyInventoryState) {
   const failures = Math.max(1, Math.min(8, state.consecutiveFailures ?? 1))
+  const base = HEAVIER_RETRY_RESOURCES.has(state.resourceType)
+    ? TARGETED_TRANSIENT_RETRY_BASE_MS
+    : TARGETED_TRANSIENT_RETRY_BASE_MS / 2
   return Math.min(
     TARGETED_TRANSIENT_RETRY_MAX_MS,
-    TARGETED_TRANSIENT_RETRY_BASE_MS * 2 ** (failures - 1),
+    base * 2 ** (failures - 1),
   )
 }
 
@@ -85,7 +123,7 @@ export function shouldRunTargetedTransientRetry(
   if (!(TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(state.resourceType)) return false
   // A permanent authorization failure or capacity guard must wait for a
   // normal inventory/reconfiguration signal, never a five-minute hot loop.
-  if (authorizationFailure(state) || boundedCapacityFailure(state) || !state.lastAttemptAt) return false
+  if (!retryableFailure(state) || !state.lastAttemptAt) return false
   return now.getTime() - state.lastAttemptAt.getTime() >= targetedTransientRetryDelayMs(state)
 }
 
@@ -244,7 +282,18 @@ export function scheduledSyncTenantWhere(
           some: {
             resourceType: { in: [...TARGETED_TRANSIENT_RETRY_RESOURCES] },
             status: SyncStateStatus.FAILED,
-            lastErrorCode: { notIn: ['401', '403', 'sharepoint_sites-capacity'] },
+            lastErrorCode: {
+              notIn: [
+                '401',
+                '403',
+                'sharepoint_sites-capacity',
+                'MICROSOFT_AUTHENTICATION_REQUIRED',
+                'MICROSOFT_PERMISSION_REQUIRED',
+                'HAWKVIEW_CAPACITY_GUARD',
+                'MICROSOFT_INVALID_RESPONSE',
+                'HAWKVIEW_INTERNAL_FAILURE',
+              ],
+            },
             lastAttemptAt: { lt: targetedRetryBefore },
           },
         },
