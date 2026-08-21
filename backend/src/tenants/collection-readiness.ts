@@ -1,4 +1,5 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import { deriveSignInEntitlement } from './sign-in-entitlement.js'
 
 /**
  * A customer-facing view of persisted collection evidence.  It deliberately
@@ -209,6 +210,7 @@ function fromSyncState(
   state: ReadinessSyncState | undefined,
   now: Date,
   cadence: 'incremental' | 'daily',
+  licensingFailureDisposition?: 'NOT_LICENSED' | 'FAILED_TRANSIENT' | 'UNVERIFIED',
 ): Pick<CollectionReadinessRow, 'state' | 'lastAttemptAt' | 'lastSuccessfulAt' | 'freshness' | 'reasonCode' | 'reason'> {
   if (!state) {
     return {
@@ -231,7 +233,36 @@ function fromSyncState(
 
   if (state.status === 'FAILED') {
     if (isPermissionFailure(state)) return { ...base, state: 'BLOCKED_PERMISSION' }
-    if (isLicensingFailure(state)) return { ...base, state: 'NOT_LICENSED' }
+    if (isLicensingFailure(state)) {
+      if (licensingFailureDisposition === 'FAILED_TRANSIENT') {
+        return {
+          ...base,
+          state: 'FAILED_TRANSIENT',
+          reasonCode: 'SIGN_IN_LICENSE_RESPONSE_CONTRADICTED',
+          reason:
+            'Microsoft Graph rejected full sign-in access, but HawkView’s current service-plan evidence confirms Microsoft Entra ID P1/P2.',
+        }
+      }
+      if (licensingFailureDisposition === 'UNVERIFIED') {
+        return {
+          ...base,
+          state: 'UNVERIFIED',
+          reasonCode: 'SIGN_IN_ENTITLEMENT_UNVERIFIED',
+          reason:
+            'Microsoft Graph rejected full sign-in access, but HawkView does not yet have current service-plan evidence to verify the tenant entitlement.',
+        }
+      }
+      if (licensingFailureDisposition === 'NOT_LICENSED') {
+        return {
+          ...base,
+          state: 'NOT_LICENSED',
+          reasonCode: 'SIGN_IN_ENTITLEMENT_NOT_LICENSED',
+          reason:
+            'HawkView’s current service-plan evidence does not include Microsoft Entra ID P1/P2, so full Microsoft Graph sign-in details are unavailable.',
+        }
+      }
+      return { ...base, state: 'NOT_LICENSED' }
+    }
     if (isTenantConfigurationFailure(state)) return { ...base, state: 'BLOCKED_TENANT_CONFIGURATION' }
     if (isUnsupportedFailure(state)) return { ...base, state: 'UNSUPPORTED' }
     return { ...base, state: 'FAILED_TRANSIENT' }
@@ -276,6 +307,7 @@ function workload(
     cadence: 'incremental' | 'daily'
     remediation: string
     capabilities?: CollectionReadinessRow['capabilities']
+    licensingFailureDisposition?: 'NOT_LICENSED' | 'FAILED_TRANSIENT' | 'UNVERIFIED'
   },
   states: Map<string, ReadinessSyncState>,
   consented: Set<string>,
@@ -283,7 +315,12 @@ function workload(
   now: Date,
 ): CollectionReadinessRow {
   const components = input.resourceTypes.map((resourceType) => {
-    const status = fromSyncState(states.get(resourceType), now, input.cadence)
+    const status = fromSyncState(
+      states.get(resourceType),
+      now,
+      input.cadence,
+      input.licensingFailureDisposition,
+    )
     return { key: resourceType, label: resourceType.replaceAll('_', ' ').toLowerCase(), ...status }
   })
   const grants = permissionStatus(input.requiredPermissions, consented, verificationKnown)
@@ -358,9 +395,26 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   const licensesCurrent = fromSyncState(states.get('LICENSES'), now, 'daily').state === 'READY'
   const sharePointApplicability = licensesCurrent ? servicePlanApplicability(input.licenseServicePlans, 'sharepoint') : 'UNVERIFIED'
   const exchangeApplicability = licensesCurrent ? servicePlanApplicability(input.licenseServicePlans, 'exchange') : 'UNVERIFIED'
+  const signInEntitlement = deriveSignInEntitlement({
+    licenses: [{ servicePlans: input.licenseServicePlans }],
+    licenseSync: states.get('LICENSES'),
+    now,
+  })
+  const signInPermissions =
+    signInEntitlement === 'PREMIUM'
+      ? ['AuditLog.Read.All', 'Directory.Read.All']
+      : signInEntitlement === 'NON_PREMIUM'
+        ? ['ActivityFeed.Read']
+        : ['AuditLog.Read.All', 'Directory.Read.All', 'ActivityFeed.Read']
+  const signInRemediation =
+    signInEntitlement === 'PREMIUM'
+      ? 'Confirm AuditLog.Read.All and Directory.Read.All have tenant-wide admin consent. HawkView will use the full Microsoft Graph sign-in source.'
+      : signInEntitlement === 'NON_PREMIUM'
+        ? 'Confirm ActivityFeed.Read has tenant-wide admin consent. HawkView will use the limited Microsoft 365 audit-feed source because the collected service plans do not include Entra ID P1/P2.'
+        : 'Confirm AuditLog.Read.All, Directory.Read.All, and ActivityFeed.Read while HawkView verifies the tenant entitlement and selects the best available sign-in source.'
   const rows = [
     workload({ key: 'entra_directory_audit', workload: 'Entra directory audit', resourceTypes: ['AUDIT_LOGS'], requiredPermissions: ['AuditLog.Read.All'], cadence: 'incremental', remediation: 'Confirm AuditLog.Read.All has tenant-wide admin consent, then allow the scheduled collector to recheck.' }, states, consented, verificationKnown, now),
-    workload({ key: 'sign_ins', workload: 'Entra sign-ins', resourceTypes: ['SIGN_INS'], requiredPermissions: ['AuditLog.Read.All'], cadence: 'incremental', remediation: 'Confirm AuditLog.Read.All and the tenant’s sign-in log entitlement. HawkView will recheck during normal collection.' }, states, consented, verificationKnown, now),
+    workload({ key: 'sign_ins', workload: 'Entra sign-ins', resourceTypes: ['SIGN_INS'], requiredPermissions: signInPermissions, cadence: 'incremental', remediation: signInRemediation, licensingFailureDisposition: signInEntitlement === 'PREMIUM' ? 'FAILED_TRANSIENT' : signInEntitlement === 'NON_PREMIUM' ? 'NOT_LICENSED' : 'UNVERIFIED' }, states, consented, verificationKnown, now),
     workload({ key: 'entra_directory', workload: 'Entra directory inventory', resourceTypes: ['USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES'], requiredPermissions: ['User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory'], cadence: 'daily', remediation: 'Confirm the required directory, hidden-membership, device, and role-management application permissions. HawkView rechecks during normal collection.' }, states, consented, verificationKnown, now),
     workload({ key: 'entra_security_configuration', workload: 'Entra security configuration', resourceTypes: ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES'], requiredPermissions: ['UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'SecurityEvents.Read.All'], cadence: 'daily', remediation: 'Confirm the required authentication-method, policy, application, and Secure Score permissions. A successful OAuth connection alone does not verify every collector.' }, states, consented, verificationKnown, now),
     workload({ key: 'office_365_tenant_configuration', workload: 'Microsoft 365 tenant configuration', resourceTypes: ['ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH'], requiredPermissions: ['Organization.Read.All'], cadence: 'daily', remediation: 'Confirm Organization.Read.All and review the exact collector result. Domain DNS readiness is collected independently and does not imply a tenant setting change.' }, states, consented, verificationKnown, now),

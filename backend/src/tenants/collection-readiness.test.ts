@@ -21,7 +21,7 @@ const allResources = [
   'AUDIT_LOGS', 'SIGN_INS', 'USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES', 'ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE', 'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOX_CONFIGURATION', 'M365_AUDIT',
 ]
 
-const permissions = ['Organization.Read.All', 'User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory', 'UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'AuditLog.Read.All', 'Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All', 'MailboxSettings.Read', 'ActivityFeed.Read', 'SecurityEvents.Read.All']
+const permissions = ['Organization.Read.All', 'User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory', 'UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'AuditLog.Read.All', 'Directory.Read.All', 'Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All', 'MailboxSettings.Read', 'ActivityFeed.Read', 'SecurityEvents.Read.All']
 
 function input(overrides: Record<string, unknown> = {}) {
   return {
@@ -32,6 +32,7 @@ function input(overrides: Record<string, unknown> = {}) {
     licenseServicePlans: [
       { servicePlanName: 'SHAREPOINTENTERPRISE', provisioningStatus: 'Success' },
       { servicePlanName: 'EXCHANGE_S_ENTERPRISE', provisioningStatus: 'Success' },
+      { servicePlanName: 'AAD_PREMIUM', servicePlanId: '41781fb2-bc02-4b7c-bd55-b576c07bb09d', provisioningStatus: 'Success' },
     ],
     subscriptions: M365_ACTIVITY_CONTENT_TYPES.map((contentType) => ({ contentType, status: 'ENABLED', lastStartRequestedAt: current, lastVerifiedAt: current, lastSuccessfulPollAt: current, lastError: null })),
     now,
@@ -60,7 +61,11 @@ test('surfaces permission, tenant configuration, stale, and transient failures d
   states.splice(states.findIndex((state) => state.resourceType === 'EXCHANGE_MAILBOXES'), 1, sync('EXCHANGE_MAILBOXES', { status: 'FAILED', lastErrorCode: '500', lastErrorMessage: 'Gateway temporarily unavailable' }))
   const result = deriveCollectionReadiness(input({ syncStates: states }))
   assert.equal(row(result, 'entra_directory_audit').state, 'BLOCKED_PERMISSION')
-  assert.equal(row(result, 'sign_ins').state, 'NOT_LICENSED')
+  const signIns = row(result, 'sign_ins')
+  assert.equal(signIns.state, 'FAILED_TRANSIENT')
+  assert.equal(signIns.reasonCode, 'SIGN_IN_LICENSE_RESPONSE_CONTRADICTED')
+  assert.match(signIns.reason ?? '', /current service-plan evidence confirms/i)
+  assert.doesNotMatch(signIns.reason ?? '', /does not have a premium license/i)
   assert.equal(row(result, 'sharepoint_onedrive').state, 'STALE')
   assert.equal(row(result, 'exchange').state, 'FAILED_TRANSIENT')
 })
@@ -123,6 +128,119 @@ test('uses authoritative service-plan semantics without treating pending plans a
     syncStates: allResources.map((resource) => sync(resource, resource === 'LICENSES' ? { lastSuccessfulAt: new Date('2026-08-16T00:00:00.000Z') } : {})),
   }))
   assert.equal(row(staleLicenses, 'exchange').state, 'UNVERIFIED')
+})
+
+test('selects sign-in permissions from current authoritative Entra entitlement evidence', () => {
+  const premium = row(deriveCollectionReadiness(input()), 'sign_ins')
+  assert.deepEqual(premium.requiredPermissions, [
+    'AuditLog.Read.All',
+    'Directory.Read.All',
+  ])
+  assert.equal(premium.permissionStatus, 'CONFIRMED')
+
+  const premiumMissingDirectory = row(
+    deriveCollectionReadiness(
+      input({
+        consentedPermissions: permissions.filter(
+          (permission) => permission !== 'Directory.Read.All',
+        ),
+      }),
+    ),
+    'sign_ins',
+  )
+  assert.equal(premiumMissingDirectory.state, 'BLOCKED_PERMISSION')
+  assert.match(premiumMissingDirectory.reason ?? '', /Directory\.Read\.All/)
+
+  const nonPremium = row(
+    deriveCollectionReadiness(
+      input({
+        licenseServicePlans: [
+          {
+            servicePlanName: 'EXCHANGE_S_STANDARD',
+            servicePlanId: 'plan-1',
+            provisioningStatus: 'Success',
+          },
+        ],
+        consentedPermissions: ['ActivityFeed.Read'],
+      }),
+    ),
+    'sign_ins',
+  )
+  assert.deepEqual(nonPremium.requiredPermissions, ['ActivityFeed.Read'])
+  assert.equal(nonPremium.permissionStatus, 'CONFIRMED')
+
+  const historicalLicenseFailure = allResources.map((resource) =>
+    sync(
+      resource,
+      resource === 'SIGN_INS'
+        ? {
+            status: 'FAILED',
+            lastErrorCode: 'sign-in-license',
+            lastErrorMessage: 'Tenant does not have a premium license',
+          }
+        : {},
+    ),
+  )
+  const nonPremiumFailure = row(
+    deriveCollectionReadiness(
+      input({
+        syncStates: historicalLicenseFailure,
+        licenseServicePlans: [
+          {
+            servicePlanName: 'EXCHANGE_S_STANDARD',
+            servicePlanId: 'plan-1',
+            provisioningStatus: 'Success',
+          },
+        ],
+      }),
+    ),
+    'sign_ins',
+  )
+  assert.equal(nonPremiumFailure.state, 'NOT_LICENSED')
+  assert.equal(
+    nonPremiumFailure.reasonCode,
+    'SIGN_IN_ENTITLEMENT_NOT_LICENSED',
+  )
+  assert.match(nonPremiumFailure.reason ?? '', /service-plan evidence does not include/i)
+
+  const unknown = row(
+    deriveCollectionReadiness(
+      input({
+        syncStates: allResources.map((resource) =>
+          sync(
+            resource,
+            resource === 'LICENSES'
+              ? { lastSuccessfulAt: new Date('2026-08-16T00:00:00.000Z') }
+              : {},
+          ),
+        ),
+      }),
+    ),
+    'sign_ins',
+  )
+  assert.deepEqual(unknown.requiredPermissions, [
+    'AuditLog.Read.All',
+    'Directory.Read.All',
+    'ActivityFeed.Read',
+  ])
+
+  const unknownFailure = row(
+    deriveCollectionReadiness(
+      input({
+        syncStates: historicalLicenseFailure.map((state) =>
+          state.resourceType === 'LICENSES'
+            ? { ...state, lastSuccessfulAt: new Date('2026-08-16T00:00:00.000Z') }
+            : state,
+        ),
+      }),
+    ),
+    'sign_ins',
+  )
+  assert.equal(unknownFailure.state, 'UNVERIFIED')
+  assert.equal(
+    unknownFailure.reasonCode,
+    'SIGN_IN_ENTITLEMENT_UNVERIFIED',
+  )
 })
 
 test('keeps standard SharePoint Graph inventory ready while explicitly declaring access metadata uncollected', () => {
