@@ -712,8 +712,59 @@ interface GraphBatchResponse {
   responses?: Array<{
     id?: string
     status?: number
-    body?: { value?: Array<Record<string, unknown>>; error?: unknown }
+    body?: Record<string, unknown>
   }>
+}
+
+type PerUserMfaState = 'disabled' | 'enabled' | 'enforced'
+
+export function normalizePerUserMfaState(value: unknown): PerUserMfaState | null {
+  return value === 'disabled' || value === 'enabled' || value === 'enforced'
+    ? value
+    : null
+}
+
+export function projectMfaTruth(registration: unknown) {
+  const row = plainRecord(registration) ? registration : null
+  const isRegistered =
+    typeof row?.isMfaRegistered === 'boolean'
+      ? row.isMfaRegistered
+      : null
+  const perUserState = normalizePerUserMfaState(row?.perUserMfaState)
+  return {
+    // Deprecated compatibility alias. This has always represented method
+    // registration, not MFA enforcement or the legacy per-user requirement.
+    mfa:
+      isRegistered === null
+        ? 'Unknown'
+        : isRegistered
+          ? 'Enabled'
+          : 'Disabled',
+    mfaRegistration:
+      isRegistered === null
+        ? 'Unknown'
+        : isRegistered
+          ? 'Registered'
+          : 'Not registered',
+    perUserMfaState:
+      perUserState === 'enabled'
+        ? 'Enabled'
+        : perUserState === 'enforced'
+          ? 'Enforced'
+          : perUserState === 'disabled'
+            ? 'Disabled'
+            : 'Unknown',
+    mfaRegistrationSource:
+      isRegistered === null
+        ? null
+        : row?.collectionSource === 'per-user-authentication-methods'
+          ? 'microsoft-graph-authentication-methods'
+          : 'microsoft-graph-user-registration-details',
+    perUserMfaStateSource:
+      perUserState === null
+        ? null
+        : 'microsoft-graph-beta-authentication-requirements',
+  }
 }
 
 function sanitizeGraphErrorField(value: unknown, maxLength: number) {
@@ -2518,7 +2569,145 @@ export class TenantSyncService {
           accessToken,
         )
       }
+      registrations = await this.enrichAuthenticationRegistrationsWithPerUserMfaState(
+        accessToken,
+        registrations,
+      )
       await this.saveEntraSnapshot(tenant, 'AUTH_REGISTRATIONS', registrations)
+    })
+  }
+
+  private async enrichAuthenticationRegistrationsWithPerUserMfaState(
+    accessToken: string,
+    registrations: unknown[],
+    limits: Readonly<AuthRegistrationFallbackLimits> =
+      AUTH_REGISTRATION_FALLBACK_LIMITS,
+  ) {
+    assertAuthRegistrationFallbackLimits(limits)
+    const rows = registrations.filter(plainRecord)
+    const ids = [
+      ...new Set(
+        rows
+          .map((row) => row.id)
+          .filter(
+            (id): id is string =>
+              typeof id === 'string' && id.length > 0 && id.length <= 128,
+          ),
+      ),
+    ].sort((left, right) => left.localeCompare(right))
+
+    const withoutRequirement = () =>
+      registrations.map((row) =>
+        plainRecord(row)
+          ? {
+              ...row,
+              perUserMfaState: null,
+              perUserMfaStateSource:
+                'microsoft-graph-beta-authentication-requirements',
+            }
+          : row,
+      )
+
+    if (ids.length === 0) return withoutRequirement()
+    if (
+      ids.length > limits.maxUsers ||
+      Math.ceil(ids.length / limits.batchSize) > limits.maxBatches
+    ) {
+      this.logger.warn(
+        `Microsoft per-user MFA-state synchronization exceeded its bounded ${limits.maxUsers}-user or ${limits.maxBatches}-batch limit. Registration data remains available; per-user MFA state is unavailable.`,
+      )
+      return withoutRequirement()
+    }
+
+    const deadline = Date.now() + limits.collectorDeadlineMs
+    const states = new Map<string, PerUserMfaState>()
+    try {
+      for (let offset = 0; offset < ids.length; offset += limits.batchSize) {
+        const remainingMs = deadline - Date.now()
+        if (remainingMs <= 0) {
+          throw new Error(
+            'Microsoft per-user MFA-state synchronization reached its bounded wall-clock deadline.',
+          )
+        }
+        const batchIds = ids.slice(offset, offset + limits.batchSize)
+        const response = await fetch('https://graph.microsoft.com/beta/$batch', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            requests: batchIds.map((userId, index) => ({
+              id: String(index + 1),
+              method: 'GET',
+              url: `/users/${encodeURIComponent(userId)}/authentication/requirements`,
+            })),
+          }),
+          signal: AbortSignal.timeout(
+            Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
+          ),
+        })
+        if (!response.ok) {
+          const graphError = await describeGraphError(response)
+          throw new Error(
+            `Microsoft per-user MFA-state synchronization returned ${response.status}${graphError}.`,
+          )
+        }
+        const parsed = JSON.parse(
+          await readBoundedResponseText(response, limits.responseBytes),
+        ) as unknown
+        if (!plainRecord(parsed) || !Array.isArray(parsed.responses)) {
+          throw new Error(
+            'Microsoft per-user MFA-state synchronization returned an invalid batch response.',
+          )
+        }
+        const responses = new Map<string, NonNullable<GraphBatchResponse['responses']>[number]>()
+        for (const item of parsed.responses) {
+          if (
+            !plainRecord(item) ||
+            typeof item.id !== 'string' ||
+            responses.has(item.id)
+          ) {
+            throw new Error(
+              'Microsoft per-user MFA-state synchronization returned an invalid batch item.',
+            )
+          }
+          responses.set(
+            item.id,
+            item as NonNullable<GraphBatchResponse['responses']>[number],
+          )
+        }
+        if (responses.size !== batchIds.length) {
+          throw new Error(
+            'Microsoft per-user MFA-state synchronization returned an incomplete batch response.',
+          )
+        }
+        batchIds.forEach((userId, index) => {
+          const item = responses.get(String(index + 1))
+          if (item?.status !== 200 || !plainRecord(item.body)) return
+          const state = normalizePerUserMfaState(item.body.perUserMfaState)
+          if (state) states.set(userId, state)
+        })
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Per-user MFA state is unavailable. Registration data remains available. ${safeErrorMessage(
+          error,
+          'Microsoft did not return the per-user MFA requirement state.',
+        )}`,
+      )
+      return withoutRequirement()
+    }
+
+    return registrations.map((row) => {
+      if (!plainRecord(row) || typeof row.id !== 'string') return row
+      return {
+        ...row,
+        perUserMfaState: states.get(row.id) ?? null,
+        perUserMfaStateSource:
+          'microsoft-graph-beta-authentication-requirements',
+      }
     })
   }
 
@@ -4985,14 +5174,7 @@ export class TenantSyncService {
             type: user.userType === 'Guest' ? 'Guest' : 'Member',
             role: roleNames.length > 0 ? roleNames.join(', ') : 'User',
             status: user.accountEnabled ? 'Enabled' : 'Disabled',
-            // MFA requires a separate Graph dataset. Never turn missing data into
-            // a security finding by reporting it as disabled.
-            mfa:
-              typeof registration?.isMfaRegistered === 'boolean'
-                ? registration.isMfaRegistered
-                  ? 'Enabled'
-                  : 'Disabled'
-                : 'Unknown',
+            ...projectMfaTruth(registration),
             lastLogin:
               lastSignIn?.eventDateTime instanceof Date
                 ? lastSignIn.eventDateTime.toISOString()

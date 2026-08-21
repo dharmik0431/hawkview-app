@@ -138,7 +138,7 @@ function getKeyResult(q: QueueItem): string {
   if (key.includes('mfa') || label.includes('mfa')) {
     const match = item.label.match(/(\d+%)|\((\d+%)\)/) || why.match(/(\d+%)|\((\d+%)\)/)
     const pct = match ? (match[1] || match[2]) : (q.metricValue && q.metricValue !== '—' ? q.metricValue : null)
-    return `MFA coverage: ${pct ?? 'Not provided'}`
+    return `MFA registration coverage: ${pct ?? 'Not provided'}`
   }
 
   // 2. Missing Permissions
@@ -278,7 +278,7 @@ function buildTenants(source: any[]): TenantRow[] {
 
     const healthScore = clamp(Number(t.healthScore ?? 100), 0, 100)
     const mfaCoverage =
-      t.mfaCoverage == null ? 100 : clamp(Number(t.mfaCoverage), 0, 100)
+      t.mfaCoverage == null ? null : clamp(Number(t.mfaCoverage), 0, 100)
     const identityDetected = Math.max(0, Number(t.riskyIdentityCount ?? 0))
 
     return {
@@ -588,7 +588,7 @@ export default function DashboardPage() {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
-                  MFA Gaps
+                  MFA Registration Gaps
                 </div>
                 <div className="mt-1 text-3xl font-bold">{kpis.mfaGaps}</div>
                 <div className="mt-1 text-xs text-slate-500">

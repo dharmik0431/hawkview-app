@@ -89,6 +89,10 @@ import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
 import { useAuth } from '@/components/providers/auth-provider'
 import { IdentityScopedMemoryCache } from '@/lib/auth/data-isolation'
+import {
+  tenantUserMfaRegistration,
+  tenantUserPerUserMfaState,
+} from '@/lib/tenants/mfa-status'
 
 type Provider = 'microsoft' | 'google'
 type TenantStatus = 'healthy' | 'warning' | 'critical'
@@ -133,7 +137,7 @@ type UserSortField = 'name' | 'type' | 'role' | 'status' | 'mfa'
 type UserSortOrder = 'asc' | 'desc'
 type UserRoleFilter = 'all' | 'admin' | 'user' | 'unknown'
 type UserStatusFilter = 'all' | 'enabled' | 'disabled' | 'unknown'
-type UserMfaFilter = 'all' | 'enabled' | 'disabled' | 'not-synchronized'
+type UserMfaFilter = 'all' | 'registered' | 'not-registered' | 'not-reported'
 
 function UserSortHeader({
   field,
@@ -207,6 +211,8 @@ type TenantUser = {
   roles?: string[]
   status: 'Enabled' | 'Disabled'
   mfa: 'Enforced' | 'Enabled' | 'Disabled' | 'Unknown'
+  mfaRegistration?: 'Registered' | 'Not registered' | 'Unknown'
+  perUserMfaState?: 'Enabled' | 'Enforced' | 'Disabled' | 'Unknown'
   lastLogin: string
   driveUsage: string
   mailUsage: string
@@ -1606,13 +1612,13 @@ export default function TenantDetailsPage() {
         if (u.status === 'Enabled' || u.status === 'Disabled') return false
       }
 
-      if (userMfaFilter === 'enabled') {
-        if (u.mfa !== 'Enabled' && u.mfa !== 'Enforced') return false
-      } else if (userMfaFilter === 'disabled') {
-        if (u.mfa !== 'Disabled') return false
-      } else if (userMfaFilter === 'not-synchronized') {
-        if (u.mfa === 'Enabled' || u.mfa === 'Enforced' || u.mfa === 'Disabled')
-          return false
+      const registration = tenantUserMfaRegistration(u)
+      if (userMfaFilter === 'registered') {
+        if (registration !== 'Registered') return false
+      } else if (userMfaFilter === 'not-registered') {
+        if (registration !== 'Not registered') return false
+      } else if (userMfaFilter === 'not-reported') {
+        if (registration !== 'Unknown') return false
       }
 
       return true
@@ -1711,20 +1717,22 @@ export default function TenantDetailsPage() {
         }
 
         case 'mfa': {
-          const missingA = isUnknownOrMissing(a.mfa)
-          const missingB = isUnknownOrMissing(b.mfa)
+          const registrationA = tenantUserMfaRegistration(a)
+          const registrationB = tenantUserMfaRegistration(b)
+          const missingA = registrationA === 'Unknown'
+          const missingB = registrationB === 'Unknown'
           if (missingA && missingB) cmp = 0
           else if (missingA) return 1
           else if (missingB) return -1
           else {
             const mfaRank = (val: string) => {
-              if (val === 'Enforced' || val === 'Enabled') return 1
-              if (val === 'Disabled') return 2
+              if (val === 'Registered') return 1
+              if (val === 'Not registered') return 2
               return 3
             }
-            cmp = mfaRank(a.mfa) - mfaRank(b.mfa)
+            cmp = mfaRank(registrationA) - mfaRank(registrationB)
             if (cmp === 0) {
-              cmp = (a.mfa || '').localeCompare(b.mfa || '', undefined, {
+              cmp = registrationA.localeCompare(registrationB, undefined, {
                 sensitivity: 'base',
               })
             }
@@ -4013,7 +4021,7 @@ export default function TenantDetailsPage() {
 
                           <div className="flex items-center gap-1.5">
                             <span className="text-slate-500 dark:text-slate-400 font-medium">
-                              MFA:
+                              MFA registration:
                             </span>
                             <select
                               value={userMfaFilter}
@@ -4024,11 +4032,11 @@ export default function TenantDetailsPage() {
                               }
                               className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
                             >
-                              <option value="all">All MFA states</option>
-                              <option value="enabled">Enabled</option>
-                              <option value="disabled">Disabled</option>
-                              <option value="not-synchronized">
-                                Awaiting collection
+                              <option value="all">All registration states</option>
+                              <option value="registered">Registered</option>
+                              <option value="not-registered">Not registered</option>
+                              <option value="not-reported">
+                                Not reported
                               </option>
                             </select>
                           </div>
@@ -4045,8 +4053,12 @@ export default function TenantDetailsPage() {
                               Clear filters
                             </Button>
                           )}
+                          </div>
                         </div>
-                      </div>
+
+                        <div className="border-b border-slate-200 bg-blue-50/60 px-4 py-2 text-xs text-blue-900 dark:border-slate-800 dark:bg-blue-950/20 dark:text-blue-200">
+                          MFA registration shows whether Microsoft reports a registered MFA method. Per-user MFA is the separate legacy Enabled, Enforced, or Disabled requirement and is read from Microsoft Graph beta when available. Conditional Access and security defaults are evaluated separately.
+                        </div>
 
                       <div className="overflow-x-auto no-scrollbar">
                         <table className="w-full text-sm border-collapse">
@@ -4086,12 +4098,18 @@ export default function TenantDetailsPage() {
                               />
                               <UserSortHeader
                                 field="mfa"
-                                label="MFA"
+                                label="MFA registration"
                                 activeField={userSortField}
                                 sortOrder={userSortOrder}
                                 onSort={handleUserSort}
                                 className="hidden md:table-cell pl-8 min-w-[160px]"
                               />
+                              <th
+                                scope="col"
+                                className="hidden lg:table-cell px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 min-w-[145px]"
+                              >
+                                Per-user MFA
+                              </th>
                               <th
                                 scope="col"
                                 className="px-4 py-3 text-right w-[48px] min-w-[48px]"
@@ -4104,10 +4122,11 @@ export default function TenantDetailsPage() {
                                 !u.type || u.type.toLowerCase() === 'unknown'
                               const isRoleUnknown =
                                 !u.role || u.role.toLowerCase() === 'unknown'
-                              const isMfaUnknown =
-                                !u.mfa ||
-                                (u.mfa as string) === 'Unknown' ||
-                                (u.mfa as string) === 'Awaiting collection'
+                              const mfaRegistration =
+                                tenantUserMfaRegistration(u)
+                              const perUserMfaState =
+                                tenantUserPerUserMfaState(u)
+                              const isMfaUnknown = mfaRegistration === 'Unknown'
 
                               const userRoles = getUserRoles(u)
                               const firstRole =
@@ -4235,7 +4254,16 @@ export default function TenantDetailsPage() {
                                         Awaiting collection
                                       </span>
                                     ) : (
-                                      u.mfa
+                                      mfaRegistration
+                                    )}
+                                  </td>
+                                  <td className="hidden lg:table-cell px-4 py-3.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                                    {perUserMfaState === 'Unknown' ? (
+                                      <span className="text-slate-400 dark:text-slate-500 italic text-xs">
+                                        Not reported
+                                      </span>
+                                    ) : (
+                                      perUserMfaState
                                     )}
                                   </td>
                                   <td className="px-4 py-3.5 text-right whitespace-nowrap w-[48px]">
@@ -4248,7 +4276,7 @@ export default function TenantDetailsPage() {
                             {USERS.length === 0 && (
                               <tr>
                                 <td
-                                  colSpan={6}
+                                  colSpan={7}
                                   className="px-6 py-12 text-center text-slate-500 dark:text-slate-400"
                                 >
                                   No users found.
@@ -4259,7 +4287,7 @@ export default function TenantDetailsPage() {
                             {USERS.length > 0 && sortedUsers.length === 0 && (
                               <tr>
                                 <td
-                                  colSpan={6}
+                                  colSpan={7}
                                   className="px-6 py-12 text-center"
                                 >
                                   <div className="py-2 space-y-2">
@@ -4595,18 +4623,17 @@ export default function TenantDetailsPage() {
                       >
                         {selectedUser.status}
                       </Badge>
-                      <Badge
-                        className={
-                          selectedUser.mfa === 'Enforced'
-                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                            : selectedUser.mfa === 'Enabled'
-                              ? 'bg-blue-50 text-blue-700 border border-blue-200'
-                              : selectedUser.mfa === 'Disabled'
-                                ? 'bg-red-50 text-red-700 border border-red-200'
-                                : 'bg-slate-50 text-slate-700 border border-slate-200'
-                        }
-                      >
-                        MFA: {selectedUser.mfa}
+                      <Badge className="bg-blue-50 text-blue-700 border border-blue-200">
+                        MFA registration:{' '}
+                        {tenantUserMfaRegistration(selectedUser) === 'Unknown'
+                          ? 'Not reported'
+                          : tenantUserMfaRegistration(selectedUser)}
+                      </Badge>
+                      <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
+                        Per-user MFA:{' '}
+                        {tenantUserPerUserMfaState(selectedUser) === 'Unknown'
+                          ? 'Not reported'
+                          : tenantUserPerUserMfaState(selectedUser)}
                       </Badge>
                     </div>
                   </div>

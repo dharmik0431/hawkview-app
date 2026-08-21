@@ -248,7 +248,7 @@ export function TenantRiskMatrixDrawer({
                   {overallState.key === 'critical'
                     ? 'Critical security signals or lost tenant connector connectivity require urgent administrator investigation.'
                     : overallState.key === 'needs_attention'
-                    ? 'Security gaps, missing API permissions, or incomplete MFA coverage require administrative action.'
+                    ? 'Security gaps, missing API permissions, or incomplete MFA registration coverage require administrative action.'
                     : overallState.key === 'disconnected'
                     ? 'The Microsoft 365 consent or connection was revoked or disconnected. Re-authentication is required.'
                     : overallState.key === 'stale'
@@ -346,7 +346,7 @@ export function TenantRiskMatrixDrawer({
                         </span>
                       </TooltipTrigger>
                       <TooltipContent side="top" className="max-w-xs">
-                        <span>HawkView evaluates tenant posture from synchronized data such as MFA coverage, administrative account protection, permission status, and sync freshness.</span>
+                        <span>HawkView evaluates tenant posture from synchronized data such as MFA registration coverage, administrative account protection, permission status, and sync freshness. Registration does not prove MFA enforcement.</span>
                       </TooltipContent>
                     </Tooltip>
 

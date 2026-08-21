@@ -196,7 +196,7 @@ export function getTenantActiveIssuesInfo(tenant: Tenant) {
     tenant.mfaCoverage !== undefined &&
     tenant.mfaCoverage < 85
   ) {
-    summaryParts.push(`MFA: ${tenant.mfaCoverage}% covered`)
+    summaryParts.push(`MFA registration: ${tenant.mfaCoverage}% covered`)
   }
   if (tenant.riskyIdentityCount > 0) {
     summaryParts.push(`${tenant.riskyIdentityCount} risky identities`)
@@ -229,20 +229,20 @@ export function getTenantIdentityInfo(tenant: Tenant) {
     tenant.status === 'pending'
 
   // MFA
-  let mfaText = 'MFA: Unavailable'
+  let mfaText = 'MFA registration: Unavailable'
   let mfaValue = tenant.mfaCoverage
   let mfaStatus: 'good' | 'warning' | 'critical' | 'unavailable' = 'unavailable'
 
   if (tenant.mfaCoverage !== null && tenant.mfaCoverage !== undefined) {
     mfaValue = tenant.mfaCoverage
-    mfaText = `MFA: ${mfaValue}% covered`
+    mfaText = `MFA registration: ${mfaValue}% covered`
     if (mfaValue >= 85) mfaStatus = 'good'
     else if (mfaValue >= 50) mfaStatus = 'warning'
     else mfaStatus = 'critical'
   } else if (isPending) {
-    mfaText = 'MFA: Awaiting sync'
+    mfaText = 'MFA registration: Awaiting sync'
   } else if (isDisconnected) {
-    mfaText = 'MFA: Connection lost'
+    mfaText = 'MFA registration: Connection lost'
   }
 
   // Risky Identities
@@ -431,7 +431,7 @@ export function getTenantRecommendedAction(tenant: Tenant) {
     return {
       label: 'Review security posture',
       destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`,
-      description: 'Address permission gaps or sub-baseline MFA coverage.',
+      description: 'Address permission gaps or sub-baseline MFA registration coverage.',
     }
   }
 
@@ -665,8 +665,8 @@ export function getPrimaryConcern(tenant: Tenant) {
     tenant.mfaCoverage < 85
   ) {
     return {
-      title: 'Low MFA Coverage',
-      detail: `Directory MFA coverage is at ${tenant.mfaCoverage}%, below 85% baseline.`,
+      title: 'Low MFA Registration Coverage',
+      detail: `Directory MFA registration coverage is at ${tenant.mfaCoverage}%, below 85% baseline. This does not establish MFA enforcement.`,
       severity: 'warning' as const,
       icon: AlertTriangle,
     }
