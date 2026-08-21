@@ -107,6 +107,30 @@ test('uses structured audit metadata without hiding real policy or synchronizati
   assert.equal(isPrimaryChange({ source: 'DIRECTORY_AUDIT', activity: 'Unmapped Microsoft operation', category: 'Unknown' }), false)
 })
 
+test('keeps narrow Microsoft portal and service maintenance noise out of change investigations', () => {
+  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Features_GetFeaturesAsync', category: 'Groups', operationType: 'Update' }), 'system_or_collection_event')
+  assert.equal(classifyEvidence({
+    source: 'DIRECTORY_AUDIT', activity: 'Set Company Information', category: 'Users', operationType: 'Update',
+    actor: 'Microsoft Office 365 Portal', beforeState: { 'Included Updated Properties': null }, afterState: { 'Included Updated Properties': '' },
+  }), 'system_or_collection_event')
+  assert.equal(classifyEvidence({
+    source: 'DIRECTORY_AUDIT', activity: 'Set Company Information', category: 'Users', operationType: 'Update',
+    actor: 'Microsoft Office 365 Portal', beforeState: { displayName: 'Old Co' }, afterState: { displayName: 'New Co' },
+  }), 'identity_change')
+  assert.equal(classifyEvidence({
+    source: 'DIRECTORY_AUDIT', activity: 'Update service principal', category: 'Applications', operationType: 'Update',
+    actor: 'Microsoft Azure AD Internal - Jit Provisioning',
+  }), 'system_or_collection_event')
+  assert.equal(classifyEvidence({
+    source: 'M365_UNIFIED_AUDIT', activity: 'Set-Mailbox', category: 'Exchange',
+    actor: 'NT SERVICE\\MSExchangeAdminApiNetCore (Microsoft.Exchange.AdminApi.NetCore)', afterState: { Arbitration: 'True' },
+  }), 'system_or_collection_event')
+  assert.equal(classifyEvidence({
+    source: 'M365_UNIFIED_AUDIT', activity: 'Set-Mailbox', category: 'Exchange',
+    actor: 'admin@example.test', afterState: { ForwardingAddress: 'review@example.test' },
+  }), 'configuration_change')
+})
+
 test('returns a stable paginated change-only timeline from normalized evidence', async () => {
   const events = [
     {
@@ -141,6 +165,43 @@ test('exposes M365 workload evidence with a source-specific stable identifier', 
   assert.equal(result.changes[0]?.source, 'Exchange')
   assert.equal(result.changes[0]?.classification, 'configuration_change')
   assert.equal((result.changes[0]?.evidence as { provenance?: string }).provenance, 'Microsoft 365 Unified Audit')
+})
+
+test('suppresses Microsoft system-mailbox maintenance while retaining ordinary mailbox changes', async () => {
+  const base = {
+    eventDateTime: new Date('2026-08-01T13:00:00.000Z'), customerTenantId: 'tenant-1', category: 'Exchange', severity: 'High',
+    actorDisplayName: null, targetDisplayName: 'mailbox', ipAddress: null, location: null, beforeState: null,
+    correlationId: null, changedFields: [], workload: 'Exchange', result: 'Succeeded', raw: {},
+  }
+  const events = [
+    {
+      ...base, id: 'system-mailbox', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'system-mailbox', operationName: 'Set-Mailbox',
+      summary: 'Exchange reported Set-Mailbox.', actorPrincipalName: 'NT SERVICE\\MSExchangeAdminApiNetCore (Microsoft.Exchange.AdminApi.NetCore)',
+      afterState: { Identity: 'Microsoft Exchange Hosted Organizations\\example.test\\Migration.8f3e7716', Arbitration: 'True' },
+    },
+    {
+      ...base, id: 'user-mailbox', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'user-mailbox', operationName: 'Set-Mailbox',
+      summary: 'Exchange reported Set-Mailbox.', actorPrincipalName: 'admin@example.test', afterState: { ForwardingAddress: 'review@example.test' },
+    },
+  ]
+  const service = new ChangesService(changesPrisma({ changeEvidenceEvent: { findMany: async () => events } }) as never)
+  const result = await service.list(identity, range)
+  assert.deepEqual(result.changes.map((event) => event.id), ['evidence:M365_UNIFIED_AUDIT:user-mailbox'])
+  assert.equal(result.changes[0]?.guidanceKind, 'recovery')
+})
+
+test('labels missing-state advice as review guidance rather than rollback guidance', async () => {
+  const event = {
+    id: 'missing-state', source: 'DIRECTORY_AUDIT', sourceEventId: 'missing-state', eventDateTime: new Date('2026-08-01T13:00:00.000Z'),
+    customerTenantId: 'tenant-1', category: 'Groups', severity: 'Medium', operationName: 'Update group', summary: 'Microsoft reported an update.',
+    actorPrincipalName: 'admin@example.test', actorDisplayName: null, targetDisplayName: 'Support', ipAddress: null, location: null,
+    beforeState: null, afterState: null, correlationId: 'corr-1', changedFields: [], workload: 'Microsoft Entra ID', result: 'Succeeded', raw: {},
+  }
+  const service = new ChangesService(changesPrisma({ changeEvidenceEvent: { findMany: async () => [event] } }) as never)
+  const result = await service.list(identity, range)
+  assert.equal(result.changes[0]?.guidanceKind, 'review')
+  assert.match(String((result.changes[0]?.recoveryGuidance as string[] | undefined)?.at(-1)), /did not provide enough state evidence/i)
+  assert.doesNotMatch((result.changes[0]?.recoveryGuidance as string[] | undefined)?.join(' ') ?? '', /restore the last approved configuration/i)
 })
 
 test('presents Exchange mailbox-rule snapshot evidence consistently in list and detail', async () => {

@@ -35,6 +35,70 @@ export type LegacyChangeCategory =
   | 'Licenses'
   | 'Users'
 
+type EvidenceClassificationInput = {
+  source?: string | null
+  activity: string
+  category?: string | null
+  operationType?: string | null
+  targetResourceTypes?: Array<string | null | undefined>
+  actor?: string | null
+  target?: string | null
+  beforeState?: unknown
+  afterState?: unknown
+  raw?: unknown
+}
+
+function meaningfulStateValue(value: unknown): boolean {
+  if (value === null || value === undefined || value === '') return false
+  if (Array.isArray(value)) return value.some(meaningfulStateValue)
+  if (typeof value === 'object') return Object.values(value as Record<string, unknown>).some(meaningfulStateValue)
+  return true
+}
+
+function stateBoolean(value: unknown, key: string): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const candidate = Object.entries(value as Record<string, unknown>)
+    .find(([name]) => name.toLowerCase() === key.toLowerCase())?.[1]
+  return candidate === true || (typeof candidate === 'string' && candidate.toLowerCase() === 'true')
+}
+
+/**
+ * Narrow Microsoft-owned operations that must not be presented as customer
+ * configuration changes. The evidence remains retained; this only controls
+ * the primary investigation/action surfaces.
+ */
+export function isKnownMicrosoftSystemEvent(input: EvidenceClassificationInput): boolean {
+  const activity = input.activity.trim().toLowerCase()
+  const actor = input.actor?.trim().toLowerCase() ?? ''
+
+  // Portal feature discovery is a lookup operation despite Microsoft marking
+  // the directory-audit operation type as "Update".
+  if (/^features[_\s-]*getfeaturesasync$/.test(activity)) return true
+
+  // Microsoft can emit this Office portal bookkeeping record with no actual
+  // company-information values. A real populated company update remains visible.
+  if (
+    activity === 'set company information'
+    && !meaningfulStateValue(input.beforeState)
+    && !meaningfulStateValue(input.afterState)
+  ) return true
+
+  // Microsoft documents this exact actor as its asynchronous service-principal
+  // provisioning process, rather than a named tenant administrator.
+  if (actor === 'microsoft azure ad internal - jit provisioning') return true
+
+  // Exchange Online uses this service identity for Admin API work. Suppress
+  // only the system/arbitration-mailbox shape; ordinary Set-Mailbox changes
+  // initiated through the same service remain visible.
+  if (
+    activity === 'set-mailbox'
+    && actor.startsWith('nt service\\msexchangeadminapinetcore')
+    && stateBoolean(input.afterState, 'Arbitration')
+  ) return true
+
+  return false
+}
+
 export function legacyCategory(activity: string, category?: string | null): {
   category: LegacyChangeCategory
   severity: 'Low' | 'Medium' | 'High'
@@ -51,13 +115,7 @@ export function legacyCategory(activity: string, category?: string | null): {
   return { category: 'Users', severity: 'Low' }
 }
 
-export function classifyEvidence(input: {
-  source?: string | null
-  activity: string
-  category?: string | null
-  operationType?: string | null
-  targetResourceTypes?: Array<string | null | undefined>
-}): ChangeClassification {
+export function classifyEvidence(input: EvidenceClassificationInput): ChangeClassification {
   const source = input.source?.toUpperCase() ?? ''
   const activity = input.activity.toLowerCase()
   const category = input.category?.toLowerCase() ?? ''
@@ -68,6 +126,8 @@ export function classifyEvidence(input: {
   // A sign-in is authentication telemetry, not proof that a configuration or
   // administrative change occurred.
   if (source === 'SIGN_IN') return 'authentication_evidence'
+
+  if (isKnownMicrosoftSystemEvent(input)) return 'system_or_collection_event'
 
   // Directory audits contain read/report/health operations as well as changes.
   // Evaluate their structured operation first, so a report *about* a policy or
@@ -90,12 +150,6 @@ export function classifyEvidence(input: {
   return 'system_or_collection_event'
 }
 
-export function isPrimaryChange(input: {
-  source?: string | null
-  activity: string
-  category?: string | null
-  operationType?: string | null
-  targetResourceTypes?: Array<string | null | undefined>
-}) {
+export function isPrimaryChange(input: EvidenceClassificationInput) {
   return PRIMARY_CHANGE_CLASSIFICATIONS.has(classifyEvidence(input))
 }

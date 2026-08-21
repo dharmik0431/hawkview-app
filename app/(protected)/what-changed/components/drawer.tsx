@@ -931,10 +931,14 @@ function NonAppEventDetails({
 
       {/* Recovery Guidance if available */}
       {event.recoveryGuidance?.length ? (
-        <div className="space-y-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-foreground">
-          <div className="flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-400">
-            <AlertTriangle className="h-4 w-4 shrink-0" />
-            <span>Recommended Recovery Steps</span>
+        <div className={event.guidanceKind === 'review'
+          ? 'space-y-2 rounded-xl border border-blue-500/25 bg-blue-500/10 p-4 text-xs text-foreground'
+          : 'space-y-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-foreground'}>
+          <div className={event.guidanceKind === 'review'
+            ? 'flex items-center gap-2 font-semibold text-blue-800 dark:text-blue-300'
+            : 'flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-400'}>
+            {event.guidanceKind === 'review' ? <Info className="h-4 w-4 shrink-0" /> : <AlertTriangle className="h-4 w-4 shrink-0" />}
+            <span>{event.guidanceKind === 'review' ? 'Suggested Review Steps' : 'Recommended Recovery Steps'}</span>
           </div>
           <ol className="list-decimal space-y-1.5 pl-5 text-muted-foreground">
             {event.recoveryGuidance.map((step, idx) => (
@@ -943,8 +947,12 @@ function NonAppEventDetails({
               </li>
             ))}
           </ol>
-          <div className="pt-2 text-[11px] text-muted-foreground italic border-t border-amber-500/20">
-            HawkView does not automatically revert security policies. Review evidence before approving actions.
+          <div className={event.guidanceKind === 'review'
+            ? 'pt-2 text-[11px] text-muted-foreground italic border-t border-blue-500/20'
+            : 'pt-2 text-[11px] text-muted-foreground italic border-t border-amber-500/20'}>
+            {event.guidanceKind === 'review'
+              ? 'Review guidance is not evidence that a security incident or customer-initiated change occurred.'
+              : 'HawkView does not automatically revert security policies. Review evidence before approving actions.'}
           </div>
         </div>
       ) : null}
