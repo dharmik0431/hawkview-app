@@ -36,12 +36,7 @@ export function getTenantDisplayStatus(tenant: Tenant): DisplayStatusInfo {
   const tenantStatus = String(tenant.status || '').toLowerCase()
   const missingPerms = tenant.missingPermissions || []
 
-  const attentionItems = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const attentionItems = computeTenantAttention(tenant)
 
   // 1. Disconnected
   if (

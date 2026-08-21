@@ -134,12 +134,7 @@ export function TenantRiskMatrixDrawer({
   const syncInfo = getTenantSyncTimeInfo(tenant.lastSync)
   const recAction = getTenantRecommendedAction(tenant)
 
-  const attentionItems = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const attentionItems = computeTenantAttention(tenant)
 
   const copyTenantId = () => {
     const idToCopy = tenant.microsoftTenantId || tenant.id

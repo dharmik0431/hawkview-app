@@ -104,12 +104,7 @@ export function TenantIssueDrawer({
 
   if (!isOpen || !tenant) return null
 
-  const attentionItems: AttentionItem[] = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const attentionItems: AttentionItem[] = computeTenantAttention(tenant)
 
   const copyTenantId = () => {
     const idToCopy = tenant.microsoftTenantId || tenant.id

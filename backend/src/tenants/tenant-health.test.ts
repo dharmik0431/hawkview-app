@@ -315,6 +315,24 @@ test('optional incomplete collection is attention rather than a connection failu
   assert.equal(result.overallStatus, 'ATTENTION')
 })
 
+test('an optional failed collector is exposed as an operational attention item', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const states = completeCurrentStates(now).map((state) => state.resourceType === 'SIGN_INS'
+    ? {
+        ...state,
+        status: 'FAILED',
+        lastErrorCode: '500',
+        lastErrorMessage: 'Microsoft sign-in collection returned 500.',
+        consecutiveFailures: 1,
+      }
+    : state)
+  const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
+  assert.equal(result.overallStatus, 'DEGRADED')
+  assert.equal(result.operations.activeIssues, 1)
+  assert.equal(result.attention.some((item) => item.key === 'sync-sign_ins'), true)
+  assert.match(result.attention.find((item) => item.key === 'sync-sign_ins')?.label ?? '', /Sign-ins data/)
+})
+
 test('a required Exchange Admin API failure cannot leave tenant health healthy', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   const states = [
@@ -332,6 +350,7 @@ test('a required Exchange Admin API failure cannot leave tenant health healthy',
   const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
   assert.equal(result.operations.status, 'DEGRADED')
   assert.equal(result.operations.failedJobs, 1)
+  assert.equal(result.operations.activeIssues, 1)
   assert.equal(result.overallStatus, 'DEGRADED')
   assert.equal(result.operations.issues.some((issue) => issue.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), true)
 })

@@ -768,18 +768,8 @@ export default function TenantsPage() {
           break
         }
         case 'needsAttention': {
-          const itemsA = computeTenantAttention({
-            ...((a as any)?.bundle ?? {}),
-            connectionStatus: a.connectionStatus,
-            status: a.status,
-            missingPermissions: a.missingPermissions,
-          })
-          const itemsB = computeTenantAttention({
-            ...((b as any)?.bundle ?? {}),
-            connectionStatus: b.connectionStatus,
-            status: b.status,
-            missingPermissions: b.missingPermissions,
-          })
+          const itemsA = computeTenantAttention(a)
+          const itemsB = computeTenantAttention(b)
           cmp = itemsB.length - itemsA.length
           break
         }
@@ -1533,12 +1523,7 @@ export default function TenantsPage() {
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
                   {sortedTenants.map((tenant) => {
                     const statusInfo = getTenantDisplayStatus(tenant)
-                    const attentionItems = computeTenantAttention({
-                      ...((tenant as any)?.bundle ?? {}),
-                      connectionStatus: tenant.connectionStatus,
-                      status: tenant.status,
-                      missingPermissions: tenant.missingPermissions,
-                    })
+                    const attentionItems = computeTenantAttention(tenant)
 
                     return (
                       <tr
@@ -1651,12 +1636,7 @@ export default function TenantsPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {sortedTenants.map((tenant) => {
               const statusInfo = getTenantDisplayStatus(tenant)
-              const attentionItems = computeTenantAttention({
-                ...((tenant as any)?.bundle ?? {}),
-                connectionStatus: tenant.connectionStatus,
-                status: tenant.status,
-                missingPermissions: tenant.missingPermissions,
-              })
+              const attentionItems = computeTenantAttention(tenant)
 
               return (
                 <Card

@@ -1,10 +1,18 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-21 during MFA truthfulness repair
+Last updated: 2026-08-21 during tenant-directory health consistency repair
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P0 — tenant-directory operational health consistency (local, unpublished)
+
+- A live demo exposed a trust defect: the Tenant Directory labelled a newly connected tenant `Healthy` with `No issues`, while that tenant's action center correctly showed failed Sign-ins, Microsoft 365 Audit, and Exchange collection. The directory was recomputing health from connection state and missing permissions because list rows have no full tenant bundle; it ignored the backend's existing `attention` contract. A working OAuth connection was therefore being presented as operational health.
+- The shared frontend attention normalizer now treats a present backend `attention` array, including an explicitly empty array, as authoritative. Tenant Directory totals, status filters, sorting, list/tile issue counts, status badges, issue drawer, affected-service indicators, and dashboard risk-matrix consumers now pass the complete tenant-list response instead of rebuilding an incomplete connection-only object. The normalizer uses a closed severity/text projection and drops malformed rows.
+- Backend health now emits an attention item for every real failed collector, including optional collectors such as `SIGN_INS`, while still using required-resource policy for completeness and stale-resource decisions. Operational `activeIssues` no longer double-counts a required failed collector. Common Sign-ins, Microsoft 365 Audit, Exchange configuration, and SharePoint failures receive readable labels. This response is derived from already-persisted sync state, so no new Microsoft call, permission, consent, schema, migration, or manual sync is required.
+- Affected-service chips now recognize Sign-ins/directory failures as Entra, Microsoft 365 Audit as M365, Exchange collectors as EXO, and SharePoint collectors as SPO. An unaffected chip says only that no issue was reported in this tenant summary; it no longer claims the whole service is healthy.
+- Local validation passes the complete frontend helper/source suite (112/112), the complete backend suite (267 passed with two intentional legacy SharePoint REST skips), focused health tests 30/30, root and backend TypeScript, root lint with no warnings/errors, and `git diff --check`. The local Prisma generator was blocked by Windows cache permissions, so backend TypeScript used an existing generated client from an identical schema in a prior isolated worktree; no generated output is tracked. The repair remains local and unpublished pending final review.
 
 ## P0 — truthful MFA registration and per-user requirement state (merged; presentation refinement local)
 
