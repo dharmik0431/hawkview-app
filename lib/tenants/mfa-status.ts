@@ -9,6 +9,13 @@ export type PerUserMfaState =
   | 'Disabled'
   | 'Unknown'
 
+export type MfaBadgeTone = 'positive' | 'caution' | 'info' | 'neutral'
+
+export type MfaBadgePresentation = {
+  label: string
+  tone: MfaBadgeTone
+}
+
 type RecordLike = Record<string, unknown>
 
 function plainRecord(value: unknown): value is RecordLike {
@@ -42,4 +49,23 @@ export function tenantUserPerUserMfaState(value: unknown): PerUserMfaState {
   return state === 'Enabled' || state === 'Enforced' || state === 'Disabled'
     ? state
     : 'Unknown'
+}
+
+export function mfaRegistrationPresentation(
+  value: unknown,
+): MfaBadgePresentation {
+  const state = tenantUserMfaRegistration(value)
+  if (state === 'Registered') return { label: state, tone: 'positive' }
+  if (state === 'Not registered') return { label: state, tone: 'caution' }
+  return { label: 'Not reported', tone: 'neutral' }
+}
+
+export function perUserMfaPresentation(
+  value: unknown,
+): MfaBadgePresentation {
+  const state = tenantUserPerUserMfaState(value)
+  if (state === 'Enforced') return { label: state, tone: 'positive' }
+  if (state === 'Enabled') return { label: state, tone: 'info' }
+  if (state === 'Disabled') return { label: state, tone: 'neutral' }
+  return { label: 'Not reported', tone: 'neutral' }
 }

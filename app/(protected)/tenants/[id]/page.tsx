@@ -90,8 +90,10 @@ import { ErrorState } from '@/components/common/error-state'
 import { useAuth } from '@/components/providers/auth-provider'
 import { IdentityScopedMemoryCache } from '@/lib/auth/data-isolation'
 import {
+  mfaRegistrationPresentation,
+  perUserMfaPresentation,
   tenantUserMfaRegistration,
-  tenantUserPerUserMfaState,
+  type MfaBadgeTone,
 } from '@/lib/tenants/mfa-status'
 
 type Provider = 'microsoft' | 'google'
@@ -199,6 +201,38 @@ function UserSortHeader({
         )}
       </button>
     </th>
+  )
+}
+
+const mfaBadgeStyles: Record<MfaBadgeTone, string> = {
+  positive:
+    'bg-emerald-50 text-emerald-700 border-emerald-200/80 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800/60',
+  caution:
+    'bg-amber-50 text-amber-800 border-amber-200/90 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800/60',
+  info:
+    'bg-blue-50 text-blue-700 border-blue-200/90 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800/60',
+  neutral:
+    'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
+}
+
+function MfaFactBadge({
+  label,
+  tone,
+  prefix,
+}: {
+  label: string
+  tone: MfaBadgeTone
+  prefix?: string
+}) {
+  return (
+    <Badge
+      className={cn(
+        'border font-medium text-xs whitespace-nowrap',
+        mfaBadgeStyles[tone],
+      )}
+    >
+      {prefix ? `${prefix}: ${label}` : label}
+    </Badge>
   )
 }
 
@@ -4073,13 +4107,27 @@ export default function TenantDetailsPage() {
                                 className="min-w-[180px]"
                               />
                               <UserSortHeader
-                                field="type"
-                                label="Type"
+                                field="status"
+                                label="Status"
                                 activeField={userSortField}
                                 sortOrder={userSortOrder}
                                 onSort={handleUserSort}
-                                className="hidden md:table-cell min-w-[90px]"
+                                className="min-w-[120px]"
                               />
+                              <UserSortHeader
+                                field="mfa"
+                                label="MFA registration"
+                                activeField={userSortField}
+                                sortOrder={userSortOrder}
+                                onSort={handleUserSort}
+                                className="hidden md:table-cell min-w-[160px]"
+                              />
+                              <th
+                                scope="col"
+                                className="hidden lg:table-cell px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 min-w-[150px]"
+                              >
+                                Per-user MFA
+                              </th>
                               <UserSortHeader
                                 field="role"
                                 label="Role"
@@ -4089,27 +4137,13 @@ export default function TenantDetailsPage() {
                                 className="min-w-[150px]"
                               />
                               <UserSortHeader
-                                field="status"
-                                label="Status"
+                                field="type"
+                                label="Type"
                                 activeField={userSortField}
                                 sortOrder={userSortOrder}
                                 onSort={handleUserSort}
-                                className="pr-8 min-w-[140px]"
+                                className="hidden md:table-cell min-w-[90px]"
                               />
-                              <UserSortHeader
-                                field="mfa"
-                                label="MFA registration"
-                                activeField={userSortField}
-                                sortOrder={userSortOrder}
-                                onSort={handleUserSort}
-                                className="hidden md:table-cell pl-8 min-w-[160px]"
-                              />
-                              <th
-                                scope="col"
-                                className="hidden lg:table-cell px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 min-w-[145px]"
-                              >
-                                Per-user MFA
-                              </th>
                               <th
                                 scope="col"
                                 className="px-4 py-3 text-right w-[48px] min-w-[48px]"
@@ -4122,11 +4156,10 @@ export default function TenantDetailsPage() {
                                 !u.type || u.type.toLowerCase() === 'unknown'
                               const isRoleUnknown =
                                 !u.role || u.role.toLowerCase() === 'unknown'
-                              const mfaRegistration =
-                                tenantUserMfaRegistration(u)
-                              const perUserMfaState =
-                                tenantUserPerUserMfaState(u)
-                              const isMfaUnknown = mfaRegistration === 'Unknown'
+                              const mfaRegistrationBadge =
+                                mfaRegistrationPresentation(u)
+                              const perUserMfaBadge =
+                                perUserMfaPresentation(u)
 
                               const userRoles = getUserRoles(u)
                               const firstRole =
@@ -4162,16 +4195,28 @@ export default function TenantDetailsPage() {
                                       </div>
                                     </div>
                                   </td>
-                                  <td className="px-4 py-3.5 text-slate-600 dark:text-slate-300 whitespace-nowrap hidden md:table-cell text-xs sm:text-sm">
-                                    {isTypeUnknown ? (
-                                      <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                        Awaiting collection
-                                      </span>
+                                  <td className="px-4 py-3.5 whitespace-nowrap min-w-[120px]">
+                                    {u.status === 'Enabled' ? (
+                                      <Badge className="bg-emerald-50 text-emerald-700 border border-emerald-200/80 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-800/60 font-medium text-xs">
+                                        Enabled
+                                      </Badge>
+                                    ) : u.status === 'Disabled' ? (
+                                      <Badge className="bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 font-medium text-xs">
+                                        Disabled
+                                      </Badge>
                                     ) : (
-                                      u.type
+                                      <Badge className="bg-amber-50 text-amber-700 border border-amber-200/80 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-800/60 font-medium text-xs">
+                                        Awaiting collection
+                                      </Badge>
                                     )}
                                   </td>
-                                  <td className="px-4 py-3.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300 relative">
+                                  <td className="hidden md:table-cell px-4 py-3.5 min-w-[160px]">
+                                    <MfaFactBadge {...mfaRegistrationBadge} />
+                                  </td>
+                                  <td className="hidden lg:table-cell px-4 py-3.5 min-w-[150px]">
+                                    <MfaFactBadge {...perUserMfaBadge} />
+                                  </td>
+                                  <td className="px-4 py-3.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300 relative min-w-[150px]">
                                     {isRoleUnknown ? (
                                       <span className="text-slate-400 dark:text-slate-500 italic text-xs">
                                         Awaiting collection
@@ -4233,37 +4278,13 @@ export default function TenantDetailsPage() {
                                       </div>
                                     )}
                                   </td>
-                                  <td className="px-4 pr-8 py-3.5 whitespace-nowrap min-w-[140px]">
-                                    {u.status === 'Enabled' ? (
-                                      <Badge className="bg-emerald-50 text-emerald-700 border border-emerald-200/80 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-800/60 font-medium text-xs">
-                                        Enabled
-                                      </Badge>
-                                    ) : u.status === 'Disabled' ? (
-                                      <Badge className="bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 font-medium text-xs">
-                                        Disabled
-                                      </Badge>
-                                    ) : (
-                                      <Badge className="bg-amber-50 text-amber-700 border border-amber-200/80 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-800/60 font-medium text-xs">
-                                        Awaiting collection
-                                      </Badge>
-                                    )}
-                                  </td>
-                                  <td className="px-4 pl-8 py-3.5 text-slate-600 dark:text-slate-300 whitespace-nowrap hidden md:table-cell text-xs sm:text-sm min-w-[160px]">
-                                    {isMfaUnknown ? (
+                                  <td className="px-4 py-3.5 text-slate-600 dark:text-slate-300 whitespace-nowrap hidden md:table-cell text-xs sm:text-sm min-w-[90px]">
+                                    {isTypeUnknown ? (
                                       <span className="text-slate-400 dark:text-slate-500 italic text-xs">
                                         Awaiting collection
                                       </span>
                                     ) : (
-                                      mfaRegistration
-                                    )}
-                                  </td>
-                                  <td className="hidden lg:table-cell px-4 py-3.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                                    {perUserMfaState === 'Unknown' ? (
-                                      <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                        Not reported
-                                      </span>
-                                    ) : (
-                                      perUserMfaState
+                                      u.type
                                     )}
                                   </td>
                                   <td className="px-4 py-3.5 text-right whitespace-nowrap w-[48px]">
@@ -4623,18 +4644,14 @@ export default function TenantDetailsPage() {
                       >
                         {selectedUser.status}
                       </Badge>
-                      <Badge className="bg-blue-50 text-blue-700 border border-blue-200">
-                        MFA registration:{' '}
-                        {tenantUserMfaRegistration(selectedUser) === 'Unknown'
-                          ? 'Not reported'
-                          : tenantUserMfaRegistration(selectedUser)}
-                      </Badge>
-                      <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
-                        Per-user MFA:{' '}
-                        {tenantUserPerUserMfaState(selectedUser) === 'Unknown'
-                          ? 'Not reported'
-                          : tenantUserPerUserMfaState(selectedUser)}
-                      </Badge>
+                      <MfaFactBadge
+                        prefix="MFA registration"
+                        {...mfaRegistrationPresentation(selectedUser)}
+                      />
+                      <MfaFactBadge
+                        prefix="Per-user MFA"
+                        {...perUserMfaPresentation(selectedUser)}
+                      />
                     </div>
                   </div>
 
