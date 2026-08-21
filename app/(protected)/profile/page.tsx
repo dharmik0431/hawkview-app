@@ -176,6 +176,12 @@ export default function ProfilePage() {
   const isValid = Object.keys(errors).length === 0
 
   const handleFieldChange = (field: keyof ProfileFormData, value: any) => {
+    if (
+      field === 'theme' &&
+      (value === 'system' || value === 'light' || value === 'dark')
+    ) {
+      setTheme(value)
+    }
     setFormData((prev) => {
       const updated = { ...prev, [field]: value }
       if (field === 'firstName' || field === 'lastName') {

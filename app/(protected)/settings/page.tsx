@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { useAuth } from '@/components/providers/auth-provider'
 
 interface ConnectorStatus {
   configured: boolean
@@ -25,6 +26,8 @@ interface ConnectorStatus {
 }
 
 export default function SettingsPage() {
+  const { session } = useAuth()
+  const isPlatformAdmin = session?.user.platformRole === 'PLATFORM_ADMIN'
   const [status, setStatus] = useState<ConnectorStatus | null>(null)
   const [clientId, setClientId] = useState('')
   const [homeTenantId, setHomeTenantId] = useState('')
@@ -35,6 +38,7 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
+    if (!isPlatformAdmin) return
     apiClient
       .get<ConnectorStatus>('/api/platform/microsoft-connector')
       .then((result) => {
@@ -51,7 +55,7 @@ export default function SettingsPage() {
             : 'Connector settings could not be loaded.'
         )
       )
-  }, [])
+  }, [isPlatformAdmin])
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -87,6 +91,19 @@ export default function SettingsPage() {
     } finally {
       setSaving(false)
     }
+  }
+
+  if (!isPlatformAdmin) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Platform administration only</CardTitle>
+          <CardDescription>
+            The Microsoft Connector is managed by HawkView platform administrators. Use Account &amp; Security from your profile menu for personal account settings.
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    )
   }
 
   return (

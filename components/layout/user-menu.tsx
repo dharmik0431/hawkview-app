@@ -110,6 +110,7 @@ export function UserMenu() {
         <Tooltip>
           <TooltipTrigger asChild>
             <button
+              id="user-menu-button"
               ref={buttonRef}
               type="button"
               onClick={toggleMenu}
@@ -182,7 +183,7 @@ export function UserMenu() {
 
               {/* Account Settings */}
               <Link
-                href="/settings"
+                href="/profile/security"
                 onClick={closeMenu}
                 role="menuitem"
                 className="flex items-center justify-between px-3 py-2 text-sm rounded-md text-foreground hover:bg-accent hover:text-accent-foreground transition-colors focus-visible:outline-none focus-visible:bg-accent"
@@ -192,7 +193,7 @@ export function UserMenu() {
                     className="h-4 w-4 text-muted-foreground"
                     aria-hidden="true"
                   />
-                  <span>Account Settings</span>
+                  <span>Account &amp; Security</span>
                 </div>
                 <ChevronRight
                   className="h-3.5 w-3.5 text-muted-foreground/60"
