@@ -4,7 +4,6 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { redactSensitiveValues } from './change-evidence.service.js'
 import {
   classifyEvidence,
-  isPrimaryChange,
   legacyCategory,
   PRIMARY_CHANGE_CLASSIFICATIONS,
   type ChangeClassification,
@@ -102,6 +101,29 @@ function guidance(category: string): string[] {
   return ['Validate the change with the resource owner.', 'Use the evidence to restore the last approved configuration.']
 }
 
+function reviewGuidance(): string[] {
+  return [
+    'Confirm the event with the listed actor or resource owner.',
+    'Use the timestamp and correlation ID to review Microsoft audit records and nearby sign-ins.',
+    'Microsoft did not provide enough state evidence for HawkView to recommend a configuration rollback.',
+  ]
+}
+
+function hasMaterialState(value: unknown): boolean {
+  if (value === null || value === undefined || value === '') return false
+  if (Array.isArray(value)) return value.some(hasMaterialState)
+  if (typeof value === 'object') return Object.values(value as Record<string, unknown>).some(hasMaterialState)
+  return true
+}
+
+function eventGuidance(category: string, before: unknown, after: unknown) {
+  const recovery = hasMaterialState(before) || hasMaterialState(after)
+  return {
+    guidanceKind: recovery ? 'recovery' as const : 'review' as const,
+    recoveryGuidance: recovery ? guidance(category) : reviewGuidance(),
+  }
+}
+
 function actorFrom(value: unknown) {
   const initiated = object(value); const user = object(initiated.user); const app = object(initiated.app)
   return text(user.userPrincipalName) ?? text(user.displayName) ?? text(app.displayName) ?? text(app.servicePrincipalName) ?? text(user.id) ?? text(app.servicePrincipalId)
@@ -168,13 +190,49 @@ function normalizedEvidenceClassification(event: {
   category?: string | null
   workload?: string | null
   raw?: unknown
+  actorPrincipalName?: string | null
+  actorDisplayName?: string | null
+  targetDisplayName?: string | null
+  beforeState?: unknown
+  afterState?: unknown
 }): ChangeClassification {
   if (event.source === 'M365_UNIFIED_AUDIT') {
     const role = managementActivityRoleFromEvidence(event)
     if (role === 'security_supporting_activity') return 'security_supporting_activity'
     if (role === 'routine_activity') return 'system_or_collection_event'
   }
-  return classifyEvidence({ source: event.source, activity: event.operationName, category: event.category })
+  return classifyEvidence({
+    source: event.source,
+    activity: event.operationName,
+    category: event.category,
+    actor: event.actorPrincipalName ?? event.actorDisplayName,
+    target: event.targetDisplayName,
+    beforeState: event.beforeState,
+    afterState: event.afterState,
+    raw: event.raw,
+  })
+}
+
+function directoryAuditProjection(log: {
+  activityDisplayName: string
+  category: string | null
+  operationType: string | null
+  targetResources: unknown
+  initiatedBy: unknown
+}) {
+  const details = targetDetails(log.targetResources)
+  const classification = classifyEvidence({
+    source: 'DIRECTORY_AUDIT',
+    activity: log.activityDisplayName,
+    category: log.category,
+    operationType: log.operationType,
+    targetResourceTypes: targetResourceTypes(log.targetResources),
+    actor: actorFrom(log.initiatedBy),
+    target: details.target,
+    beforeState: details.before,
+    afterState: details.after,
+  })
+  return { details, classification }
 }
 
 function evidenceTargetKeys(event: {
@@ -293,12 +351,12 @@ export class ChangesService {
     ])
 
     const changes = auditLogs
-      .filter((log) => isPrimaryChange({ source: 'DIRECTORY_AUDIT', activity: log.activityDisplayName, category: log.category, operationType: log.operationType, targetResourceTypes: targetResourceTypes(log.targetResources) }))
-      .map((log) => {
-        const kind = legacyCategory(log.activityDisplayName, log.category); const details = targetDetails(log.targetResources)
-        const classification = classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: log.activityDisplayName, category: log.category, operationType: log.operationType, targetResourceTypes: targetResourceTypes(log.targetResources) })
+      .map((log) => ({ log, ...directoryAuditProjection(log) }))
+      .filter(({ classification }) => PRIMARY_CHANGE_CLASSIFICATIONS.has(classification))
+      .map(({ log, details, classification }) => {
+        const kind = legacyCategory(log.activityDisplayName, log.category)
         const presentation = sourcePresentation({ source: 'DIRECTORY_AUDIT' })
-        return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, classification, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: presentation.source, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, recoveryGuidance: guidance(kind.category), evidence: { ...evidenceFrom(log), ...presentation } }
+        return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, classification, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: presentation.source, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, ...eventGuidance(kind.category, details.before, details.after), evidence: { ...evidenceFrom(log), ...presentation } }
       })
     const authoritativeCandidates = [
       ...evidenceEvents,
@@ -350,7 +408,7 @@ export class ChangesService {
         before,
         after,
         correlationId: event.correlationId ?? undefined,
-        recoveryGuidance: guidance(event.category),
+        ...eventGuidance(event.category, before, after),
         evidence: {
           normalized: true,
           changedFields: array(event.changedFields),
@@ -440,7 +498,7 @@ export class ChangesService {
     const fallbackDetails = fallbackAudit ? targetDetails(fallbackAudit.targetResources) : null
     const classification = projectedEvent
       ? normalizedEvidenceClassification(projectedEvent)
-      : classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: fallbackAudit!.activityDisplayName, category: fallbackAudit!.category, operationType: fallbackAudit!.operationType, targetResourceTypes: targetResourceTypes(fallbackAudit!.targetResources) })
+      : directoryAuditProjection(fallbackAudit!).classification
     if (!PRIMARY_CHANGE_CLASSIFICATIONS.has(classification)) {
       throw new BadRequestException('This record is telemetry rather than a tenant change investigation event.')
     }

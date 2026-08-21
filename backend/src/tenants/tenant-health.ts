@@ -1,4 +1,5 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import { isKnownMicrosoftSystemEvent } from '../changes/change-classification.js'
 
 /**
  * Backend-owned tenant health model.  This deliberately keeps connection,
@@ -68,6 +69,7 @@ function auditFinding(tenantId: string, event: TenantAuditEvent): TenantAttentio
   if (event.result && !['success', 'succeeded'].includes(event.result.toLowerCase())) return null
   const text = `${event.activityDisplayName} ${event.category ?? ''} ${event.operationType ?? ''}`.toLowerCase(); const payloadText = auditPayloadText(event.targetResources)
   const destructive = /disable|disabled|delete|deleted|remove|removed|turn off/.test(`${text} ${payloadText}`); const actor = auditActor(event.initiatedBy); const target = auditTarget(event.targetResources)
+  if (isKnownMicrosoftSystemEvent({ source: 'DIRECTORY_AUDIT', activity: event.activityDisplayName, category: event.category, operationType: event.operationType, actor, target })) return null
   const context = [actor ? `By ${actor}.` : null, target ? `Affected: ${target}.` : null].filter(Boolean).join(' '); const base = { detectedAt: event.eventDateTime.toISOString(), actionLabel: 'Investigate change', actionUrl: `/what-changed?tenantId=${encodeURIComponent(tenantId)}&from=${encodeURIComponent(event.eventDateTime.toISOString())}` }
   if (/conditional access|named location/.test(text)) return { ...base, key: `audit-ca-${event.microsoftAuditId}`, label: destructive ? 'Conditional Access policy was disabled or removed' : 'Conditional Access policy changed', severity: destructive ? 'critical' : 'high', why: context || event.activityDisplayName }
   if (/authentication method|security info|strong authentication|mfa/.test(text)) return { ...base, key: `audit-auth-${event.microsoftAuditId}`, label: destructive ? `MFA or authentication method was removed${target ? ` for ${target}` : ''}` : `Authentication methods changed${target ? ` for ${target}` : ''}`, severity: destructive ? 'critical' : 'high', why: context || event.activityDisplayName }

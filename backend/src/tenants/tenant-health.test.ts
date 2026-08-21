@@ -245,6 +245,32 @@ test('removed authentication methods identify the affected user', () => {
   assert.equal(result.attention[0]?.severity, 'critical')
 })
 
+test('does not turn Microsoft JIT service-principal provisioning into a customer security alert', () => {
+  const result = deriveTenantHealth({
+    ...baseInput(),
+    auditEvents: [{
+      microsoftAuditId: 'audit-jit', eventDateTime: new Date('2026-08-07T12:00:00.000Z'),
+      activityDisplayName: 'Update service principal', category: 'ApplicationManagement', operationType: 'Update', result: 'success',
+      initiatedBy: { app: { displayName: 'Microsoft Azure AD Internal - Jit Provisioning' } },
+      targetResources: [{ displayName: 'Workload Identity Control Plane' }],
+    }],
+  })
+  assert.deepEqual(result.attention, [])
+})
+
+test('retains a named-administrator application change as an actionable alert', () => {
+  const result = deriveTenantHealth({
+    ...baseInput(),
+    auditEvents: [{
+      microsoftAuditId: 'audit-app', eventDateTime: new Date('2026-08-07T12:00:00.000Z'),
+      activityDisplayName: 'Update application', category: 'ApplicationManagement', operationType: 'Update', result: 'success',
+      initiatedBy: { user: { userPrincipalName: 'admin@example.test' } }, targetResources: [{ displayName: 'Customer Integration' }],
+    }],
+  })
+  assert.equal(result.attention[0]?.label, 'Application access changed')
+  assert.match(result.attention[0]?.why ?? '', /admin@example\.test/)
+})
+
 test('healthy current state has no action queue findings', () => {
   assert.deepEqual(deriveTenantHealth(baseInput()).attention, [])
 })

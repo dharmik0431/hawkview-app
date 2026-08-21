@@ -48,6 +48,12 @@ test('uses Unknown fallbacks for unrecognized or malicious category/source value
   assert.equal(event?.source, 'Unknown')
 })
 
+test('normalizes only the closed review and recovery guidance labels', () => {
+  assert.equal(normalizeChangeEvent({ ...baseEvent, guidanceKind: 'review' })?.guidanceKind, 'review')
+  assert.equal(normalizeChangeEvent({ ...baseEvent, guidanceKind: 'recovery' })?.guidanceKind, 'recovery')
+  assert.equal(normalizeChangeEvent({ ...baseEvent, guidanceKind: 'attacker-label' })?.guidanceKind, undefined)
+})
+
 test('normalizes list and detail-shaped events consistently and drops malformed records', () => {
   const list = normalizeChangesResponse({
     changes: [

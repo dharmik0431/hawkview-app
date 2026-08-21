@@ -130,6 +130,7 @@ export type ChangeEvent = {
   eventType?: 'change' | 'sign-in'
   correlationId?: string
   recoveryGuidance?: string[]
+  guidanceKind?: 'review' | 'recovery'
   evidence?: ChangeEvidence
 
   ip?: string
@@ -386,6 +387,7 @@ export function normalizeChangeEvent(value: unknown): ChangeEvent | null {
     recoveryGuidance: Array.isArray(input.recoveryGuidance)
       ? input.recoveryGuidance.map((step) => boundedText(step, '', 500)).filter(Boolean).slice(0, 20)
       : undefined,
+    guidanceKind: input.guidanceKind === 'recovery' ? 'recovery' : input.guidanceKind === 'review' ? 'review' : undefined,
     ip: boundedText(input.ip, '', 100) || undefined,
     location: compact({
       ...(boundedText(record(input.location)?.city, '', 200) ? { city: boundedText(record(input.location)?.city, '', 200) } : {}),
