@@ -91,6 +91,7 @@ test('never reports a deprecated SharePoint full-control override as required co
     assert.equal(names.some((name) => /sharepoint.*fullcontrol/i.test(name)), false)
     assert.ok(names.includes('Sites.Read.All'))
     assert.ok(names.includes('ActivityFeed.Read'))
+    assert.ok(names.includes('Directory.Read.All'))
   } finally {
     if (prior === undefined) delete process.env.MICROSOFT_REQUIRED_PERMISSIONS
     else process.env.MICROSOFT_REQUIRED_PERMISSIONS = prior
@@ -122,7 +123,7 @@ test('managed and customer verification paths do not make a deprecated override 
           ? ['ActivityFeed.Read']
           : [
               'Organization.Read.All', 'User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden',
-              'AuditLog.Read.All', 'UserAuthenticationMethod.Read.All', 'Policy.Read.All',
+              'AuditLog.Read.All', 'Directory.Read.All', 'UserAuthenticationMethod.Read.All', 'Policy.Read.All',
               'Policy.Read.AuthenticationMethod', 'Device.Read.All', 'RoleManagement.Read.Directory',
               'Application.Read.All', 'Sites.Read.All', 'SharePointTenantSettings.Read.All',
               'Reports.Read.All', 'MailboxSettings.Read', 'SecurityEvents.Read.All',

@@ -17,6 +17,7 @@ const DEFAULT_REQUIRED_PERMISSIONS = [
   'GroupMember.Read.All',
   'Member.Read.Hidden',
   'AuditLog.Read.All',
+  'Directory.Read.All',
   'UserAuthenticationMethod.Read.All',
   'Policy.Read.All',
   'Policy.Read.AuthenticationMethod',
@@ -41,6 +42,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read memberships for Microsoft groups whose membership list is hidden.',
   'AuditLog.Read.All':
     'Read sign-in activity and user MFA registration status.',
+  'Directory.Read.All':
+    'Allow Microsoft Graph to evaluate tenant licensing reliably when HawkView reads sign-in activity.',
   'UserAuthenticationMethod.Read.All':
     'Read which authentication method types users have registered when tenant-level MFA reporting is unavailable.',
   'Policy.Read.All':

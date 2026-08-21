@@ -33,6 +33,10 @@ import {
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import {
+  deriveSignInEntitlement,
+  type SignInEntitlement,
+} from './sign-in-entitlement.js'
 import { buildSharePointDataContract } from './sharepoint-data-contract.js'
 import {
   exchangeMailboxRuleCompoundId,
@@ -95,6 +99,21 @@ export class CollectionInitializingError extends Error {
   ) {
     super(message)
     this.name = 'CollectionInitializingError'
+  }
+}
+
+/**
+ * A bounded secondary source completed successfully, but it is not equivalent
+ * to the workload's preferred authoritative source. Persist fresh evidence
+ * while keeping readiness explicitly partial.
+ */
+export class CollectionPartialError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'CollectionPartialError'
   }
 }
 
@@ -1975,6 +1994,28 @@ export class TenantSyncService {
         )
         return
       }
+      if (error instanceof CollectionPartialError) {
+        await this.prisma.syncState.update({
+          where: {
+            customerTenantId_resourceType: {
+              customerTenantId: tenant.id,
+              resourceType,
+            },
+          },
+          data: {
+            status: 'RUNNING',
+            lastSuccessfulAt: new Date(),
+            lastErrorCode: error.code,
+            lastErrorMessage: message,
+            consecutiveFailures: 0,
+          },
+        })
+        await this.notifications.resolveIncident(
+          tenant.organizationId,
+          `tenant:${tenant.id}:sync:${resourceType}`,
+        )
+        return
+      }
       const state = await this.prisma.syncState.update({
         where: {
           customerTenantId_resourceType: {
@@ -3103,11 +3144,13 @@ export class TenantSyncService {
     return this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
       const start = await this.logSyncStart(tenant.id, 'SIGN_INS')
       const end = new Date()
+      const entitlement = await this.signInEntitlement(tenant)
       const filter = encodeURIComponent(
         `createdDateTime ge ${start.toISOString()} and createdDateTime le ${end.toISOString()}`
       )
       let rows: any[]
       let limited = false
+      let limitedReason: CollectionPartialError | null = null
       try {
         rows = await this.fetchGraphCollection(
           `https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=${filter}&$top=1000`,
@@ -3126,6 +3169,7 @@ export class TenantSyncService {
         }
         rows = await this.fetchLimitedLoginActivity(tenant, start, end)
         limited = true
+        limitedReason = this.signInFallbackReason(entitlement)
       }
       const inferredLocations = limited
         ? await this.enrichLimitedSignInLocations(rows)
@@ -3211,7 +3255,50 @@ export class TenantSyncService {
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
+      if (limitedReason) throw limitedReason
     })
+  }
+
+  private async signInEntitlement(
+    tenant: Pick<TenantSyncTarget, 'id' | 'organizationId'>,
+  ): Promise<SignInEntitlement> {
+    const [licenseSync, licenses] = await Promise.all([
+      this.prisma.syncState.findFirst({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+          resourceType: 'LICENSES',
+        },
+        select: { status: true, lastSuccessfulAt: true },
+      }),
+      this.prisma.tenantLicense.findMany({
+        where: {
+          organizationId: tenant.organizationId,
+          customerTenantId: tenant.id,
+        },
+        select: { servicePlans: true },
+      }),
+    ])
+    return deriveSignInEntitlement({ licenses, licenseSync })
+  }
+
+  private signInFallbackReason(entitlement: SignInEntitlement) {
+    if (entitlement === 'PREMIUM') {
+      return new CollectionPartialError(
+        'sign-ins-premium-graph-fallback-active',
+        'HawkView collected limited Microsoft 365 audit-feed login evidence because Microsoft Graph rejected full sign-in access even though current service plans confirm Entra ID P1/P2. Confirm AuditLog.Read.All and Directory.Read.All admin consent; HawkView will retry the full source automatically.',
+      )
+    }
+    if (entitlement === 'NON_PREMIUM') {
+      return new CollectionPartialError(
+        'sign-ins-non-premium-fallback-active',
+        'HawkView collected limited Microsoft 365 audit-feed login evidence because the current service plans do not include Entra ID P1/P2. Full Microsoft Graph sign-in details require Entra ID P1/P2.',
+      )
+    }
+    return new CollectionPartialError(
+      'sign-ins-entitlement-unverified-fallback-active',
+      'HawkView collected limited Microsoft 365 audit-feed login evidence while the tenant sign-in entitlement remains unverified. HawkView will retry the full Microsoft Graph source automatically.',
+    )
   }
 
   private async enrichLimitedSignInLocations(rows: any[]) {
@@ -3395,7 +3482,7 @@ export class TenantSyncService {
       // limited-license sign-in fallback must never race it with another POST.
       throw new CollectionInitializingError(
         'sign-ins-audit-subscription-initializing',
-        'Microsoft is activating the audit subscription used for limited-license sign-in collection. HawkView will retry automatically during scheduled collection.'
+        'Microsoft is activating the audit subscription used for fallback sign-in collection. HawkView will retry automatically during scheduled collection.'
       )
     }
 
