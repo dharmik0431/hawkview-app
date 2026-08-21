@@ -308,7 +308,7 @@ test('serializes concurrent subscription starts so only one POST occurs', async 
   }
 })
 
-test('starts Exchange first and rotates past a failed workload without blocking enabled coverage', async () => {
+test('starts Azure AD audit first for the limited-license sign-in fallback and rotates past a failed workload', async () => {
   const subscriptions: any[] = []
   const starts: string[] = []
   const subscriptionStore = {
@@ -340,7 +340,7 @@ test('starts Exchange first and rotates past a failed workload without blocking 
     if (init?.method === 'POST') {
       const contentType = url.searchParams.get('contentType') ?? ''
       starts.push(contentType)
-      if (contentType === 'Audit.Exchange') {
+      if (contentType === 'Audit.AzureActiveDirectory') {
         return new Response(JSON.stringify({ error: { message: 'Tenant does not exist.' } }), {
           status: 400,
         })
@@ -358,7 +358,7 @@ test('starts Exchange first and rotates past a failed workload without blocking 
     )
     assert.equal(first.size, 0)
     assert.equal(
-      subscriptions.find((entry) => entry.contentType === 'Audit.Exchange')?.status,
+      subscriptions.find((entry) => entry.contentType === 'Audit.AzureActiveDirectory')?.status,
       'FAILED',
     )
 
@@ -368,10 +368,10 @@ test('starts Exchange first and rotates past a failed workload without blocking 
       publisherIdentifier,
       new Date('2026-08-17T12:16:00.000Z'),
     )
-    assert.deepEqual(starts, ['Audit.Exchange', 'Audit.AzureActiveDirectory'])
-    assert.equal(second.has('Audit.AzureActiveDirectory'), true)
+    assert.deepEqual(starts, ['Audit.AzureActiveDirectory', 'Audit.Exchange'])
+    assert.equal(second.has('Audit.Exchange'), true)
     assert.equal(
-      subscriptions.find((entry) => entry.contentType === 'Audit.Exchange')?.status,
+      subscriptions.find((entry) => entry.contentType === 'Audit.AzureActiveDirectory')?.status,
       'FAILED',
     )
   } finally {

@@ -12,8 +12,8 @@ import type { Prisma } from '../generated/prisma/client.js'
 export { classifyManagementActivity } from '../changes/m365-activity-classification.js'
 
 export const M365_ACTIVITY_CONTENT_TYPES = [
-  'Audit.Exchange',
   'Audit.AzureActiveDirectory',
+  'Audit.Exchange',
   'Audit.SharePoint',
   'Audit.General',
 ] as const
