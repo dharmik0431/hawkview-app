@@ -67,7 +67,6 @@ import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
-import { ExchangeRbacSetup } from '@/components/tenants/exchange-rbac-setup'
 import { cn } from '@/lib/utils'
 
 function formatDate(isoString?: string | null) {
@@ -228,7 +227,6 @@ export default function TenantSettingsPage() {
 
   // Copy feedback state
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
-  const [showExchangeRbacSetup, setShowExchangeRbacSetup] = useState(false)
 
   // Tab 2 (Collection) filters
   const [collectionSearch, setCollectionSearch] = useState('')
@@ -1430,39 +1428,6 @@ export default function TenantSettingsPage() {
                                         </div>
                                       ))}
                                     </div>
-                                  </div>
-                                )}
-
-                                {/* Exchange Admin API access is distinct from Graph consent. */}
-                                {w.exchangeRbac && (
-                                  <div className="rounded-lg border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3 text-xs space-y-2">
-                                    <div className="flex items-center justify-between gap-3">
-                                      <span className="font-semibold text-slate-800 dark:text-slate-200">Exchange read-only RBAC</span>
-                                      <Badge variant="outline" className="text-[10px] shrink-0">
-                                        {readinessLabel(w.exchangeRbac.state)}
-                                      </Badge>
-                                    </div>
-                                    <div className="text-slate-600 dark:text-slate-400">
-                                      <span className="font-medium text-slate-700 dark:text-slate-300">{w.exchangeRbac.status}</span>
-                                      {' — '}{w.exchangeRbac.reason}
-                                    </div>
-                                    {w.exchangeRbac.status !== 'CONFIRMED' && (
-                                      <Button
-                                        type="button"
-                                        size="sm"
-                                        variant="outline"
-                                        className="h-8"
-                                        onClick={() => setShowExchangeRbacSetup((value) => !value)}
-                                      >
-                                        {showExchangeRbacSetup ? 'Hide setup' : 'Configure read-only Exchange access'}
-                                      </Button>
-                                    )}
-                                    {showExchangeRbacSetup && w.exchangeRbac.status !== 'CONFIRMED' && tenantId && (
-                                      <ExchangeRbacSetup
-                                        tenantId={String(tenantId)}
-                                        className="mt-3 border-t border-slate-200 pt-4 dark:border-slate-800"
-                                      />
-                                    )}
                                   </div>
                                 )}
 

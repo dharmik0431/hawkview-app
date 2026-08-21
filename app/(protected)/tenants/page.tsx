@@ -44,7 +44,6 @@ import { cn } from '@/lib/utils'
 import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
 import { topAttention } from '@/lib/attention/topAttention'
 import { TenantIssueDrawer } from '@/components/tenants/tenant-issue-drawer'
-import { ExchangeRbacSetup } from '@/components/tenants/exchange-rbac-setup'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
 import { AffectedServices } from '@/components/tenants/affected-services'
 import {
@@ -294,9 +293,8 @@ export default function TenantsPage() {
   // Onboarding state
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingStep, setOnboardingStep] = useState<
-    'select' | 'hawkview' | 'manual' | 'exchange'
+    'select' | 'hawkview' | 'manual'
   >('select')
-  const [exchangeSetupTenantId, setExchangeSetupTenantId] = useState<string | null>(null)
   const [hawkviewPreviewMessage, setHawkviewPreviewMessage] = useState<
     string | null
   >(null)
@@ -358,7 +356,6 @@ export default function TenantsPage() {
       setConsentReview(null)
       setHawkviewPreviewMessage(null)
       setOnboardingStep('select')
-      setExchangeSetupTenantId(null)
       setCustomerClientSecret('')
       setTimeout(() => {
         onboardButtonRef.current?.focus()
@@ -451,14 +448,10 @@ export default function TenantsPage() {
 
     if (result === 'success') {
       setConsentMessage({
-        text: 'Microsoft 365 consent is verified. Complete the read-only Exchange setup to enable mailbox configuration collection.',
+        text: 'Microsoft 365 consent is verified. HawkView will begin read-only scheduled collection through Microsoft Graph.',
         tone: 'success',
       })
-      if (tenantId) {
-        setExchangeSetupTenantId(tenantId)
-        setOnboardingStep('exchange')
-        setShowOnboarding(true)
-      }
+      setShowOnboarding(false)
       queryClient.invalidateQueries({ queryKey: ['tenants'] })
     } else if (result === 'missing-permissions') {
       setConsentMessage({
@@ -499,17 +492,11 @@ export default function TenantsPage() {
       if (message.result === 'success') {
         setOnboardingError(null)
         setConsentMessage({
-          text: 'Microsoft 365 consent is verified. Complete the read-only Exchange setup to enable mailbox configuration collection.',
+          text: 'Microsoft 365 consent is verified. HawkView will begin read-only scheduled collection through Microsoft Graph.',
           tone: 'success',
         })
-        if (message.tenantId) {
-          setExchangeSetupTenantId(message.tenantId)
-          setOnboardingStep('exchange')
-          setShowOnboarding(true)
-        } else {
-          setShowOnboarding(false)
-          setOnboardingStep('select')
-        }
+        setShowOnboarding(false)
+        setOnboardingStep('select')
       } else if (message.result === 'missing-permissions') {
         setShowOnboarding(false)
         setOnboardingStep('select')
@@ -593,11 +580,11 @@ export default function TenantsPage() {
       setCustomerClientId('')
       setCustomerClientSecret('')
       if (!created.requiresConsent) {
-        setExchangeSetupTenantId(created.tenant.id)
-        setOnboardingStep('exchange')
+        setShowOnboarding(false)
+        setOnboardingStep('select')
         setConsentReview(null)
         setConsentMessage({
-          text: 'App registration verified. Complete the read-only Exchange setup to enable mailbox configuration collection.',
+          text: 'App registration verified. HawkView will begin read-only scheduled collection through Microsoft Graph.',
           tone: 'success',
         })
         return
@@ -1154,11 +1141,6 @@ export default function TenantsPage() {
                   </Button>
                 </div>
               </div>
-            ) : onboardingStep === 'exchange' && exchangeSetupTenantId ? (
-              <ExchangeRbacSetup
-                tenantId={exchangeSetupTenantId}
-                onDone={() => handleCloseOnboarding(true)}
-              />
             ) : (
               <div className="space-y-6">
                 <div>

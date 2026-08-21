@@ -360,7 +360,7 @@ test('temporary Microsoft failures stay in automatic-retry state before becoming
   assert.doesNotMatch(issue?.label ?? '', /review policies|permission/i)
 })
 
-test('a required Exchange Admin API failure cannot leave tenant health healthy', () => {
+test('a retired historical Exchange Admin API failure no longer degrades tenant health', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   const states = [
     ...completeCurrentStates(now),
@@ -375,11 +375,7 @@ test('a required Exchange Admin API failure cannot leave tenant health healthy',
     },
   ]
   const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
-  assert.equal(result.operations.status, 'DEGRADED')
-  assert.equal(result.operations.failedJobs, 1)
-  assert.equal(result.operations.activeIssues, 1)
-  assert.equal(result.overallStatus, 'DEGRADED')
-  assert.equal(result.operations.issues.some((issue) => issue.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), true)
+  assert.equal(result.operations.issues.some((issue) => issue.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), false)
 })
 
 test('a failed required SharePoint inventory cannot leave tenant health healthy', () => {

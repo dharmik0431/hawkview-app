@@ -21,7 +21,6 @@ export const AUDIT_RECONCILIATION_RESOURCES = [
   'SECURITY_DEFAULTS',
   'EXCHANGE_MAILBOXES',
   'EXCHANGE_MAILBOX_SETTINGS',
-  'EXCHANGE_MAILBOX_CONFIGURATION',
   'EXCHANGE_MAILBOX_USAGE',
   'EXCHANGE_ACCEPTED_DOMAINS',
   'EXCHANGE_MAILBOX_RULES',
@@ -118,7 +117,6 @@ export function deriveAuditReconciliationResourcesForChange(
   if (/mailbox|inbox rule|mail flow|exchange/.test(text)) {
     resources.add('EXCHANGE_MAILBOXES')
     resources.add('EXCHANGE_MAILBOX_SETTINGS')
-    resources.add('EXCHANGE_MAILBOX_CONFIGURATION')
     resources.add('EXCHANGE_MAILBOX_USAGE')
     resources.add('EXCHANGE_MAILBOX_RULES')
     resources.add('EXCHANGE_ACCEPTED_DOMAINS')

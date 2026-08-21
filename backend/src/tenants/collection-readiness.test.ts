@@ -18,7 +18,7 @@ function sync(resourceType: string, overrides: Record<string, unknown> = {}) {
 }
 
 const allResources = [
-  'AUDIT_LOGS', 'SIGN_INS', 'USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES', 'ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE', 'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOX_CONFIGURATION', 'M365_AUDIT',
+  'AUDIT_LOGS', 'SIGN_INS', 'USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES', 'ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE', 'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES', 'M365_AUDIT',
 ]
 
 const permissions = ['Organization.Read.All', 'User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory', 'UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'AuditLog.Read.All', 'Directory.Read.All', 'Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All', 'MailboxSettings.Read', 'ActivityFeed.Read', 'SecurityEvents.Read.All']
@@ -89,28 +89,15 @@ test('reports all four Management Activity subscriptions independently and disti
   assert.equal(audit.components?.find((component) => component.key === 'Audit.AzureActiveDirectory')?.state, 'BLOCKED_TENANT_CONFIGURATION')
 })
 
-test('does not equate Exchange Graph consent with Exchange RBAC and keeps messages sanitized', () => {
-  const states = allResources.map((resource) => sync(resource))
-  states.splice(states.findIndex((state) => state.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), 1, sync('EXCHANGE_MAILBOX_CONFIGURATION', { status: 'FAILED', lastErrorMessage: 'HawkView Get-Mailbox Exchange RBAC role required; client_secret=do-not-show' }))
-  const result = deriveCollectionReadiness(input({ syncStates: states }))
-  const exchange = row(result, 'exchange')
-  assert.equal(exchange.permissionStatus, 'CONFIRMED')
-  assert.equal(exchange.exchangeRbac?.status, 'MISSING')
-  assert.equal(exchange.exchangeRbac?.state, 'BLOCKED_PERMISSION')
-  assert.doesNotMatch(JSON.stringify(result), /do-not-show/)
-})
-
-test('converges Exchange readiness after the daily Exchange Admin configuration collector succeeds', () => {
-  const before = deriveCollectionReadiness(input({
-    syncStates: allResources
-      .filter((resource) => resource !== 'EXCHANGE_MAILBOX_CONFIGURATION')
-      .map((resource) => sync(resource)),
-  }))
-  assert.equal(row(before, 'exchange').state, 'UNVERIFIED')
-
-  const after = deriveCollectionReadiness(input())
-  assert.equal(row(after, 'exchange').state, 'READY')
-  assert.equal(row(after, 'exchange').exchangeRbac?.status, 'CONFIRMED')
+test('reports unsupported Exchange administrative facts as non-degrading capability boundaries', () => {
+  const exchange = row(deriveCollectionReadiness(input()), 'exchange')
+  assert.equal(exchange.state, 'READY')
+  assert.deepEqual(exchange.capabilities?.map((capability) => capability.key), [
+    'exchange_mailbox_delegation',
+    'exchange_mailbox_retention_assignment',
+    'exchange_accepted_domain_type',
+  ])
+  assert.equal(exchange.capabilities?.every((capability) => capability.state === 'NOT_COLLECTED_LEAST_PRIVILEGE'), true)
 })
 
 test('uses authoritative service-plan semantics without treating pending plans as unlicensed', () => {
@@ -261,15 +248,9 @@ test('missing consent and an unavailable Microsoft connection remain explicit wi
   assert.match(audit.reason ?? '', /Microsoft connection consent/i)
 })
 
-test('fails closed when an included collector is missing or Exchange RBAC is unverified', () => {
+test('fails closed when an included collector is missing', () => {
   const omitted = deriveCollectionReadiness(input({ syncStates: allResources.filter((resource) => resource !== 'DEVICES').map((resource) => sync(resource)) }))
   assert.notEqual(row(omitted, 'entra_directory').state, 'READY')
-
-  const noExchangeAdmin = deriveCollectionReadiness(input({ syncStates: allResources.filter((resource) => resource !== 'EXCHANGE_MAILBOX_CONFIGURATION').map((resource) => sync(resource)) }))
-  const exchange = row(noExchangeAdmin, 'exchange')
-  assert.equal(exchange.state, 'UNVERIFIED')
-  assert.equal(exchange.exchangeRbac?.status, 'UNVERIFIED')
-  assert.notEqual(noExchangeAdmin.overallState, 'READY')
 })
 
 test('keeps subscription verification separate from successful polling and selects matching diagnostics', () => {
@@ -282,58 +263,15 @@ test('keeps subscription verification separate from successful polling and selec
   assert.equal(result.reason, row(result, result.workloads.find((item) => item.state === result.overallState)?.key ?? '').reason)
 })
 
-test('preserves prior Exchange Admin success while accurately reporting stale and later failures', () => {
-  const old = new Date('2026-08-14T12:00:00.000Z')
-  const states = allResources.map((resource) => sync(resource))
-  const replace = (value: Record<string, unknown>) => states.splice(states.findIndex((item) => item.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), 1, sync('EXCHANGE_MAILBOX_CONFIGURATION', value))
-  replace({ lastAttemptAt: old, lastSuccessfulAt: old })
-  let result = deriveCollectionReadiness(input({ syncStates: states }))
-  let exchange = row(result, 'exchange')
-  assert.equal(exchange.state, 'STALE')
-  assert.equal(exchange.lastSuccessfulAt, old.toISOString())
-
-  replace({ status: 'FAILED', lastAttemptAt: current, lastSuccessfulAt: old, lastErrorCode: '403', lastErrorMessage: 'HawkView Get-Mailbox Exchange RBAC role required' })
-  result = deriveCollectionReadiness(input({ syncStates: states }))
-  exchange = row(result, 'exchange')
-  assert.equal(exchange.state, 'BLOCKED_PERMISSION')
-  assert.equal(exchange.lastSuccessfulAt, old.toISOString())
-
-  replace({ status: 'FAILED', lastAttemptAt: current, lastSuccessfulAt: old, lastErrorCode: '500', lastErrorMessage: 'Temporary failure' })
-  result = deriveCollectionReadiness(input({ syncStates: states }))
-  exchange = row(result, 'exchange')
-  assert.equal(exchange.state, 'FAILED_TRANSIENT')
-  assert.equal(exchange.lastSuccessfulAt, old.toISOString())
-
-  replace({ lastAttemptAt: current, lastSuccessfulAt: new Date('invalid') })
-  result = deriveCollectionReadiness(input({ syncStates: states }))
-  assert.equal(row(result, 'exchange').state, 'UNVERIFIED')
-
-  replace({ lastAttemptAt: current, lastSuccessfulAt: new Date('2026-08-19T12:00:00.000Z') })
-  result = deriveCollectionReadiness(input({ syncStates: states }))
-  exchange = row(result, 'exchange')
-  assert.equal(exchange.state, 'UNVERIFIED')
-  assert.equal(exchange.exchangeRbac?.status, 'UNVERIFIED')
-  assert.equal(exchange.components?.find((component) => component.key === 'EXCHANGE_MAILBOX_CONFIGURATION')?.lastSuccessfulAt, null)
-})
-
-test('keeps missing Graph mailbox permission authoritative across confirmed, unverified, and failed Exchange RBAC', () => {
+test('keeps a missing Graph mailbox permission authoritative', () => {
   const withoutMailboxSettings = permissions.filter((permission) => permission !== 'MailboxSettings.Read')
-  const variants: Array<Record<string, unknown>> = [
-    {},
-    { lastSuccessfulAt: current },
-    { status: 'FAILED', lastErrorCode: '403', lastErrorMessage: 'HawkView Get-Mailbox Exchange RBAC role required' },
-  ]
-  for (const exchangeAdmin of variants) {
-    const states = allResources.map((resource) => sync(resource))
-    states.splice(states.findIndex((state) => state.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), 1, sync('EXCHANGE_MAILBOX_CONFIGURATION', exchangeAdmin))
-    const result = deriveCollectionReadiness(input({ consentedPermissions: withoutMailboxSettings, syncStates: states }))
-    const exchange = row(result, 'exchange')
-    assert.equal(exchange.permissionStatus, 'MISSING')
-    assert.equal(exchange.state, 'BLOCKED_PERMISSION')
-    assert.equal(exchange.reasonCode, 'MICROSOFT_PERMISSION_NOT_CONFIRMED')
-    assert.match(exchange.reason ?? '', /MailboxSettings\.Read/)
-    assert.equal(result.overallState, 'BLOCKED_PERMISSION')
-  }
+  const result = deriveCollectionReadiness(input({ consentedPermissions: withoutMailboxSettings }))
+  const exchange = row(result, 'exchange')
+  assert.equal(exchange.permissionStatus, 'MISSING')
+  assert.equal(exchange.state, 'BLOCKED_PERMISSION')
+  assert.equal(exchange.reasonCode, 'MICROSOFT_PERMISSION_NOT_CONFIRMED')
+  assert.match(exchange.reason ?? '', /MailboxSettings\.Read/)
+  assert.equal(result.overallState, 'BLOCKED_PERMISSION')
 })
 
 test('marks absent verification as unverified, revoked connection as blocked, and secure score failure as visible', () => {

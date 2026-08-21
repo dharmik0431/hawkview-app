@@ -123,7 +123,6 @@ export default function ExchangePage({
   const [mbxQuery, setMbxQuery] = useState('')
   const [mbxTypeFilter, setMbxTypeFilter] = useState('all')
   const [mbxArchiveFilter, setMbxArchiveFilter] = useState('all')
-  const [mbxRetentionFilter, setMbxRetentionFilter] = useState('all')
   const [mbxSortField, setMbxSortField] = useState<'displayName' | 'mailboxType' | 'sizeGB'>('displayName')
   const [mbxSortOrder, setMbxSortOrder] = useState<'asc' | 'desc'>('asc')
 
@@ -371,11 +370,6 @@ export default function ExchangePage({
       if (mbxArchiveFilter === 'disabled') list = list.filter((m: any) => m.archiveEnabled === false)
     }
 
-    if (mbxRetentionFilter !== 'all') {
-      if (mbxRetentionFilter === 'applied') list = list.filter((m: any) => Boolean(m.retentionLabel))
-      if (mbxRetentionFilter === 'none') list = list.filter((m: any) => !m.retentionLabel)
-    }
-
     list.sort((a: any, b: any) => {
       let valA = a[mbxSortField] ?? ''
       let valB = b[mbxSortField] ?? ''
@@ -388,7 +382,7 @@ export default function ExchangePage({
     })
 
     return list
-  }, [EXCHANGE_MAILBOXES, mbxQuery, mbxTypeFilter, mbxArchiveFilter, mbxRetentionFilter, mbxSortField, mbxSortOrder])
+  }, [EXCHANGE_MAILBOXES, mbxQuery, mbxTypeFilter, mbxArchiveFilter, mbxSortField, mbxSortOrder])
 
   // Filtered Rules
   const rules = useMemo(() => {
@@ -491,14 +485,14 @@ export default function ExchangePage({
       })
     }
 
-    // 4. Accepted Domains State
+    // 4. Tenant-associated Microsoft 365 domains state
     if (EXCHANGE_DOMAINS.length === 0 && !isSyncing) {
       findings.push({
         id: 'finding-domains-empty',
         type: 'domain',
-        title: 'Accepted domains dataset unavailable',
-        target: 'Accepted Domains Collection',
-        reason: 'No accepted domains have been synchronized for this tenant.',
+        title: 'Microsoft 365 domains dataset unavailable',
+        target: 'Tenant-associated domains collection',
+        reason: 'No tenant-associated Microsoft 365 domains have been synchronized for this tenant.',
         onAction: () => {
           setActiveTab('domains-groups')
           setDomainGroupSubtab('domains')
@@ -535,7 +529,6 @@ export default function ExchangePage({
     setMbxQuery('')
     setMbxTypeFilter('all')
     setMbxArchiveFilter('all')
-    setMbxRetentionFilter('all')
   }
 
   // Clear Rule Filters
@@ -879,10 +872,10 @@ export default function ExchangePage({
                 </div>
               </div>
 
-              {/* Accepted Domains dataset */}
+              {/* Tenant-associated Microsoft 365 domains dataset */}
               <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/30 dark:bg-slate-800/20">
                 <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center justify-between">
-                  <span>Accepted Domains</span>
+                  <span>Microsoft 365 Domains</span>
                   <Badge className={datasetBadgeClass(domainDatasetStatus)}>
                     {domainDatasetStatus.label}
                   </Badge>
@@ -953,20 +946,8 @@ export default function ExchangePage({
                 <option value="disabled">Archive Off</option>
               </select>
 
-              {/* Retention Filter */}
-              <select
-                value={mbxRetentionFilter}
-                onChange={(e) => setMbxRetentionFilter(e.target.value)}
-                className="h-8 rounded-md border border-slate-200 dark:border-slate-700 px-2.5 text-xs bg-slate-50 dark:bg-slate-800/60 text-slate-800 dark:text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
-                aria-label="Filter by retention label"
-              >
-                <option value="all">All Retention</option>
-                <option value="applied">Retention Applied</option>
-                <option value="none">No Retention Policy</option>
-              </select>
-
               {/* Clear Filters Button */}
-              {(mbxQuery || mbxTypeFilter !== 'all' || mbxArchiveFilter !== 'all' || mbxRetentionFilter !== 'all') && (
+              {(mbxQuery || mbxTypeFilter !== 'all' || mbxArchiveFilter !== 'all') && (
                 <button
                   type="button"
                   onClick={clearMbxFilters}
@@ -1029,7 +1010,6 @@ export default function ExchangePage({
                         <ArrowUpDown className="h-3 w-3 text-slate-400" />
                       </button>
                     </th>
-                    <th scope="col" className="px-4 py-3">Retention</th>
                     <th scope="col" className="px-4 py-3">Archive</th>
                     <th scope="col" className="px-4 py-3 text-right">Action</th>
                   </tr>
@@ -1080,17 +1060,6 @@ export default function ExchangePage({
                           {typeof m.sizeGB === 'number' ? `${m.sizeGB.toFixed(1)} GB` : 'Not collected by HawkView'}
                         </td>
 
-                        {/* Retention */}
-                        <td className="px-4 py-3 text-slate-600 dark:text-slate-400">
-                          {m.retentionLabel ? (
-                            <span className="font-medium text-slate-800 dark:text-slate-200 truncate max-w-[160px] inline-block" title={m.retentionLabel}>
-                              {m.retentionLabel}
-                            </span>
-                          ) : (
-                            <span className="text-slate-400 italic">No retention label</span>
-                          )}
-                        </td>
-
                         {/* Archive */}
                         <td className="px-4 py-3">
                           {typeof m.archiveEnabled === 'boolean' ? (
@@ -1112,7 +1081,7 @@ export default function ExchangePage({
 
                   {mailboxes.length === 0 && (
                     <tr>
-                      <td colSpan={6} className="px-4 py-8 text-center text-slate-500 dark:text-slate-400">
+                      <td colSpan={5} className="px-4 py-8 text-center text-slate-500 dark:text-slate-400">
                         {EXCHANGE_MAILBOXES.length === 0 ? 'Awaiting first synchronization or no mailbox records found.' : 'No mailboxes match active filters.'}
                       </td>
                     </tr>
@@ -1315,7 +1284,7 @@ export default function ExchangePage({
                   : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
               )}
             >
-              Accepted Domains ({EXCHANGE_DOMAINS.length})
+              Microsoft 365 Domains ({EXCHANGE_DOMAINS.length})
             </button>
             <button
               type="button"
@@ -1331,18 +1300,18 @@ export default function ExchangePage({
             </button>
           </div>
 
-          {/* SUBVIEW 1: ACCEPTED DOMAINS */}
+          {/* SUBVIEW 1: TENANT-ASSOCIATED MICROSOFT 365 DOMAINS */}
           {domainGroupSubtab === 'domains' && (
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-2xs">
               <div className="p-3 border-b border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-300">
-                Accepted Domains Inventory
+                Tenant-associated Microsoft 365 domains
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs text-left border-collapse">
                   <thead className="bg-slate-50 dark:bg-slate-800/80 text-slate-600 dark:text-slate-300 font-semibold uppercase tracking-wider border-b border-slate-200 dark:border-slate-800">
                     <tr>
                       <th scope="col" className="px-4 py-3">Domain Name</th>
-                      <th scope="col" className="px-4 py-3">Domain Type</th>
+                      <th scope="col" className="px-4 py-3">Association</th>
                       <th scope="col" className="px-4 py-3">Status</th>
                     </tr>
                   </thead>
@@ -1354,16 +1323,16 @@ export default function ExchangePage({
                           <span>{d.domain}</span>
                         </td>
                         <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-medium">
-                          {d.type || 'Authoritative'}
+                          {d.associationType || 'Associated domain'}
                         </td>
                         <td className="px-4 py-3">
                           {d.isDefault ? (
                             <Badge className="bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800">
-                              Default Domain
+                              Default tenant domain
                             </Badge>
                           ) : (
                             <Badge className="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700">
-                              Active
+                              Associated
                             </Badge>
                           )}
                         </td>
@@ -1373,7 +1342,7 @@ export default function ExchangePage({
                     {EXCHANGE_DOMAINS.length === 0 && (
                       <tr>
                         <td colSpan={3} className="px-4 py-8 text-center text-slate-500 dark:text-slate-400">
-                          Accepted domains data is not collected or awaiting first synchronization.
+                          Tenant-associated domain data is awaiting first synchronization.
                         </td>
                       </tr>
                     )}
@@ -1545,9 +1514,9 @@ export default function ExchangePage({
                     </Badge>
                   </div>
                   <div>
-                    <span className="text-slate-500 dark:text-slate-400 block text-[11px]">Retention Policy</span>
+                    <span className="text-slate-500 dark:text-slate-400 block text-[11px]">Mailbox retention-policy assignment</span>
                     <span className="font-medium text-slate-800 dark:text-slate-200">
-                      {inspectingMailbox.retentionLabel || 'Not provided by Microsoft'}
+                      Not collected in standard mode
                     </span>
                   </div>
                 </div>

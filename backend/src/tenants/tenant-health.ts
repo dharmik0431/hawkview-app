@@ -32,7 +32,7 @@ export const TENANT_HEALTH_RESOURCE_REGISTRY: ReadonlyArray<{ resourceType: stri
   { resourceType: 'APPLICATIONS', required: true }, { resourceType: 'SERVICE_PRINCIPALS', required: true }, { resourceType: 'AUDIT_LOGS', required: true }, { resourceType: 'M365_AUDIT', required: true },
   { resourceType: 'SIGN_INS', required: false }, { resourceType: 'SECURE_SCORES', required: false }, { resourceType: 'DEVICES', required: false },
   { resourceType: 'DIRECTORY_ROLES', required: false }, { resourceType: 'EXCHANGE_MAILBOXES', required: false }, { resourceType: 'EXCHANGE_MAILBOX_SETTINGS', required: false }, { resourceType: 'EXCHANGE_ACCEPTED_DOMAINS', required: false },
-  { resourceType: 'EXCHANGE_MAILBOX_RULES', required: false }, { resourceType: 'EXCHANGE_MAILBOX_CONFIGURATION', required: true }, { resourceType: 'SHAREPOINT_SITES', required: true }, { resourceType: 'SHAREPOINT_SETTINGS', required: false },
+  { resourceType: 'EXCHANGE_MAILBOX_RULES', required: false }, { resourceType: 'SHAREPOINT_SITES', required: true }, { resourceType: 'SHAREPOINT_SETTINGS', required: false },
   { resourceType: 'SHAREPOINT_USAGE', required: false },
 ]
 
@@ -109,7 +109,6 @@ function syncIssueLabel(resourceType: string) {
   const labels: Record<string, string> = {
     SIGN_INS: 'Sign-ins data could not be synchronized',
     M365_AUDIT: 'Microsoft 365 audit data could not be synchronized',
-    EXCHANGE_MAILBOX_CONFIGURATION: 'Exchange mailbox and configuration data could not be synchronized',
     SHAREPOINT_SITES: 'SharePoint and OneDrive data could not be synchronized',
   }
   return labels[resourceType] ?? `${resourceType.replaceAll('_', ' ').toLowerCase()} synchronization needs attention`
@@ -145,13 +144,14 @@ export function deriveTenantHealth(input: HealthInput) {
   const securityCollectorStates = ['AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUDIT_LOGS', 'M365_AUDIT'].map((name) => resources.find((r) => r.resourceType === name)).filter((r): r is ResourceHealth => Boolean(r)); const securityIncomplete = securityCollectorStates.some((r) => r.classification !== 'SUCCESS' && r.classification !== 'EMPTY'); const criticalFindings = attention.filter((a) => a.severity === 'critical' && !a.key.startsWith('connection') && !a.key.startsWith('sync-')).length; const highFindings = attention.filter((a) => a.severity === 'high' && !a.key.startsWith('connection') && !a.key.startsWith('sync-')).length; const mediumFindings = attention.filter((a) => a.severity === 'medium').length; const lowFindings = attention.filter((a) => a.severity === 'low').length
   const security = { status: criticalFindings > 0 ? 'CRITICAL' as SecurityStatus : highFindings > 0 ? 'AT_RISK' as SecurityStatus : securityIncomplete ? 'UNKNOWN' as SecurityStatus : mediumFindings + lowFindings > 0 ? 'NEEDS_REVIEW' as SecurityStatus : 'HEALTHY' as SecurityStatus, criticalFindings, highFindings, mediumFindings, lowFindings, recommendationCount: mediumFindings + lowFindings, lastEvaluatedAt: latestDate([input.authSnapshot?.observedAt ?? null, ...input.syncStates.filter((s) => ['AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUDIT_LOGS', 'M365_AUDIT'].includes(s.resourceType)).map((s) => s.lastSuccessfulAt)]) }
   // A successful OAuth connection is not an operational-health attestation.
-  // Required workload collectors, including SharePoint and Exchange Admin,
+  // Required workload collectors, including SharePoint,
   // participate in this summary so legacy tenant-directory health cannot say
   // "Healthy" while readiness reports a real collection failure.
   // The same authoritative applicability exclusion drives data and operations.
   // Historic failures for a currently not-licensed workload are evidence, but
   // not a current operational outage.
-  const operationalStates = input.syncStates.filter((state) => !notApplicable.has(state.resourceType) && !(retryableSyncState(state) && state.consecutiveFailures < 3))
+  const activeResourceTypes = new Set(TENANT_HEALTH_RESOURCE_REGISTRY.map((resource) => resource.resourceType))
+  const operationalStates = input.syncStates.filter((state) => activeResourceTypes.has(state.resourceType) && !notApplicable.has(state.resourceType) && !(retryableSyncState(state) && state.consecutiveFailures < 3))
   const failedJobs = operationalStates.filter((s) => s.status === 'FAILED').length; const pendingJobs = operationalStates.filter((s) => s.status === 'RUNNING').length; const partialJobs = operationalStates.filter((s) => s.status === 'FAILED' && s.lastSuccessfulAt !== null).length; const requiredStaleJobs = requiredProblems.filter((resource) => resource.classification === 'STALE').length; const operations = { status: failedJobs >= 3 ? 'FAILED' as OperationsStatus : failedJobs > 0 ? 'DEGRADED' as OperationsStatus : pendingJobs > 0 ? 'SYNCING' as OperationsStatus : operationalStates.length ? 'HEALTHY' as OperationsStatus : 'UNKNOWN' as OperationsStatus, activeIssues: failedJobs + requiredStaleJobs, failedJobs, partialJobs, pendingJobs, lastSuccessfulJobAt: latestDate(operationalStates.map((s) => s.lastSuccessfulAt)), issues: operationalStates.filter((s) => s.status === 'FAILED').map((s) => ({ resourceType: s.resourceType, reasonCode: s.lastErrorCode, message: sanitizeHealthMessage(s.lastErrorMessage), consecutiveFailures: s.consecutiveFailures })) }
   // Apply the published precedence in order. Pending consent is informative,
   // but must never hide a critical finding or a failed synchronization job.

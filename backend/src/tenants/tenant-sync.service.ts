@@ -516,6 +516,8 @@ interface GraphOrganization {
     name?: string | null
     isDefault?: boolean | null
     isInitial?: boolean | null
+    capabilities?: string | null
+    type?: string | null
   }>
 }
 
@@ -1617,14 +1619,6 @@ export class TenantSyncService {
         resource: 'EXCHANGE_MAILBOX_SETTINGS',
         synchronize: () =>
           this.syncExchangeMailboxSettings(tenant, snapshotAccessToken),
-      },
-      {
-        // This is the existing app-only Exchange Admin API probe used to
-        // verify HawkView's Get-Mailbox-only custom Exchange RBAC. Include it in the daily
-        // authoritative inventory so an unverified state can converge on a
-        // normal scheduler run without adding a faster or per-mailbox probe.
-        resource: 'EXCHANGE_MAILBOX_CONFIGURATION',
-        synchronize: () => this.syncExchangeMailboxConfiguration(tenant),
       },
       {
         resource: 'EXCHANGE_ACCEPTED_DOMAINS',
@@ -3757,8 +3751,6 @@ export class TenantSyncService {
         this.syncExchangeMailboxDirectory(tenant, accessToken),
       EXCHANGE_MAILBOX_SETTINGS: () =>
         this.syncExchangeMailboxSettings(tenant, accessToken),
-      EXCHANGE_MAILBOX_CONFIGURATION: () =>
-        this.syncExchangeMailboxConfiguration(tenant),
       EXCHANGE_MAILBOX_USAGE: () =>
         this.syncExchangeMailboxUsage(tenant, accessToken),
       EXCHANGE_ACCEPTED_DOMAINS: () =>
@@ -3948,97 +3940,6 @@ export class TenantSyncService {
     })
   }
 
-  private async syncExchangeMailboxConfiguration(tenant: TenantSyncTarget) {
-    return this.runSnapshotSync(
-      tenant,
-      'EXCHANGE_MAILBOX_CONFIGURATION',
-      async () => {
-        if (!tenant.connection) {
-          throw new Error('The Microsoft tenant connection is incomplete.')
-        }
-
-        const accessToken =
-          await this.microsoftConsent.getTenantExchangeAccessToken({
-            microsoftTenantId: tenant.microsoftTenantId,
-            connectionMode: tenant.connection.connectionMode as
-              | 'HAWKVIEW_MANAGED'
-              | 'CUSTOMER_MANAGED',
-            clientId: tenant.connection.clientId,
-            credentialReference: tenant.connection.credentialReference,
-          })
-        const requestBody = {
-          CmdletInput: {
-            CmdletName: 'Get-Mailbox',
-            Parameters: {
-              ResultSize: 'Unlimited',
-              IncludeGrantSendOnBehalfTowithDisplayNames: true,
-            },
-          },
-        }
-        const rows: unknown[] = []
-        let nextUrl = `https://outlook.office365.com/adminapi/v2.0/${encodeURIComponent(tenant.microsoftTenantId)}/Mailbox`
-        const anchorMailbox = `APP:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@${tenant.microsoftTenantId}`
-        // Exchange's admin endpoint occasionally returns a continuation URL
-        // that points back to a page it has already served. Without a guard,
-        // the sync never settles and all Exchange fields remain PENDING.
-        const visitedPages = new Set<string>()
-        const deadlineAt = Date.now() + 3 * 60 * 1000
-
-        while (nextUrl) {
-          if (!nextUrl.startsWith('https://outlook.office365.com/')) {
-            throw new Error(
-              'Microsoft returned an invalid Exchange pagination link.'
-            )
-          }
-          if (visitedPages.has(nextUrl)) {
-            throw new Error(
-              'Microsoft Exchange returned a repeated mailbox configuration page. Synchronization was stopped to prevent an incomplete endless loop.'
-            )
-          }
-          visitedPages.add(nextUrl)
-
-          const remainingMs = deadlineAt - Date.now()
-          if (remainingMs <= 0) {
-            throw new Error(
-              'Microsoft Exchange mailbox configuration synchronization exceeded the three-minute safety limit.'
-            )
-          }
-          const response = await this.fetchGraphPage(
-            nextUrl,
-            accessToken,
-            'Exchange mailbox configuration',
-            {
-              timeoutMs: Math.min(60_000, remainingMs),
-              deadlineAt,
-              retryUnsafeMethod: true,
-              init: {
-                method: 'POST',
-                headers: {
-                  Accept: 'application/json',
-                  'Content-Type': 'application/json',
-                  'X-AnchorMailbox': anchorMailbox,
-                },
-                body: JSON.stringify(requestBody),
-              },
-            },
-          )
-          const page = (await response.json()) as GraphCollectionPage
-          rows.push(...(Array.isArray(page.value) ? page.value : []))
-          nextUrl =
-            typeof page['@odata.nextLink'] === 'string'
-              ? page['@odata.nextLink']
-              : ''
-        }
-
-        await this.saveSnapshot(
-          tenant,
-          'EXCHANGE_MAILBOX_CONFIGURATION',
-          authoritativeSnapshot(rows)
-        )
-      }
-    )
-  }
-
   private async syncExchangeAcceptedDomains(
     tenant: { id: string; organizationId: string },
     accessToken: string
@@ -4054,9 +3955,10 @@ export class TenantSyncService {
           { timeoutMs: 30_000 },
         )
         const page = (await response.json()) as { value?: GraphOrganization[] }
-        // Deliberately limited to the Organization.Read.All shape.  Full
-        // accepted-domain attributes (isVerified/supportedServices) require
-        // Domain.Read.All and are not claimed or requested in Phase 1.
+        // Organization.Read.All returns tenant-associated verifiedDomains.
+        // These are not Exchange accepted-domain objects, so do not invent an
+        // Authoritative/InternalRelay type. Preserve only the fields Graph
+        // actually returned and label the customer contract accordingly.
         const domains = (page.value?.[0]?.verifiedDomains ?? [])
           .filter(
             (domain: any) => typeof domain?.name === 'string' && domain.name.trim()
@@ -4064,7 +3966,14 @@ export class TenantSyncService {
           .map((domain: any) => ({
             id: domain.name,
             domain: domain.name,
-            type: 'Authoritative',
+            associationType:
+              typeof domain.type === 'string' && domain.type.trim()
+                ? domain.type.trim()
+                : null,
+            capabilities:
+              typeof domain.capabilities === 'string' && domain.capabilities.trim()
+                ? domain.capabilities.trim()
+                : null,
             isDefault: Boolean(domain.isDefault),
             isInitial: Boolean(domain.isInitial),
           }))
@@ -4981,22 +4890,16 @@ export class TenantSyncService {
           ? snapshotByResource.has(resourceType)
           : false,
       })
-      const isExchangeConfiguration =
-        resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'
       const isExchangeUsage = resourceType === 'EXCHANGE_MAILBOX_USAGE'
       return {
         value,
         state: fallback.state,
         reasonCode: fallback.reasonCode,
         message: fallback.message,
-        source: isExchangeConfiguration
-          ? 'Exchange Online'
-          : isExchangeUsage
+        source: isExchangeUsage
             ? 'Microsoft Graph Reports'
             : 'Microsoft Graph',
-        endpoint: isExchangeConfiguration
-          ? '/adminapi/v2.0/Mailbox'
-          : isExchangeUsage
+        endpoint: isExchangeUsage
             ? '/reports/getMailboxUsageDetail'
             : null,
         correlationId: null,
@@ -5032,9 +4935,6 @@ export class TenantSyncService {
       'SHAREPOINT_SETTINGS'
     )
     const sharePointUsageSyncState = syncStateByResource.get('SHAREPOINT_USAGE')
-    const exchangeConfigurationSyncState = syncStateByResource.get(
-      'EXCHANGE_MAILBOX_CONFIGURATION'
-    )
     const exchangeSync = (resource: EntraSnapshotResource) => {
       const state = syncStateByResource.get(resource)
       return {
@@ -5319,11 +5219,11 @@ export class TenantSyncService {
             ),
             configuration: {
               value: null,
-              state: 'UNSUPPORTED',
-              reasonCode: 'EXCHANGE_ADMIN_API_OPTIONAL',
-              message: 'Detailed Exchange mailbox configuration requires optional Exchange Online admin access and is not collected through standard Microsoft Graph consent.',
-              source: 'Exchange Online Admin API',
-              endpoint: '/adminapi/v2.0/Mailbox',
+              state: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+              reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+              message: 'Standard mode does not collect mailbox delegation or mailbox retention-policy assignments because Microsoft Graph does not expose those tenant-wide administrative facts.',
+              source: 'HawkView standard least-privilege mode',
+              endpoint: null,
               lastAttemptAt: null,
               lastSuccessfulAt: null,
               isStale: false,
@@ -5453,11 +5353,11 @@ export class TenantSyncService {
                 ),
                 configuration: {
                   value: null,
-                  state: 'UNSUPPORTED',
-                  reasonCode: 'EXCHANGE_ADMIN_API_OPTIONAL',
-                  message: 'Detailed Exchange mailbox configuration requires optional Exchange admin access.',
-                  source: 'Exchange Online Admin API',
-                  endpoint: '/adminapi/v2.0/Mailbox',
+                  state: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+                  reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+                  message: 'Mailbox delegation and mailbox retention-policy assignments are not collected in HawkView standard mode.',
+                  source: 'HawkView standard least-privilege mode',
+                  endpoint: null,
                   lastAttemptAt: null,
                   lastSuccessfulAt: null,
                   isStale: false,
@@ -5520,7 +5420,9 @@ export class TenantSyncService {
                 domain.id ??
                 ''
             ),
-            type: String(domain.DomainType ?? domain.type ?? 'Authoritative'),
+            associationType:
+              domain.associationType ?? domain.type ?? null,
+            capabilities: domain.capabilities ?? null,
             isDefault: Boolean(
               domain.Default ?? domain.IsDefault ?? domain.isDefault
             ),
@@ -6191,11 +6093,6 @@ export class TenantSyncService {
             status: sharePointUsageSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt: sharePointUsageSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: sharePointUsageSyncState?.lastErrorMessage ?? null,
-          },
-          exchangeAdminRbac: {
-            status: exchangeConfigurationSyncState?.status.toLowerCase() ?? 'never-synced',
-            lastSuccessfulAt: exchangeConfigurationSyncState?.lastSuccessfulAt?.toISOString() ?? null,
-            lastError: exchangeConfigurationSyncState?.lastErrorMessage ?? null,
           },
           applications: exchangeSync('APPLICATIONS'),
           servicePrincipals: exchangeSync('SERVICE_PRINCIPALS'),
