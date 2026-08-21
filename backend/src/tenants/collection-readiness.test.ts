@@ -91,7 +91,7 @@ test('reports all four Management Activity subscriptions independently and disti
 
 test('does not equate Exchange Graph consent with Exchange RBAC and keeps messages sanitized', () => {
   const states = allResources.map((resource) => sync(resource))
-  states.splice(states.findIndex((state) => state.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), 1, sync('EXCHANGE_MAILBOX_CONFIGURATION', { status: 'FAILED', lastErrorMessage: 'Recipient Management Exchange RBAC role required; client_secret=do-not-show' }))
+  states.splice(states.findIndex((state) => state.resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'), 1, sync('EXCHANGE_MAILBOX_CONFIGURATION', { status: 'FAILED', lastErrorMessage: 'HawkView Get-Mailbox Exchange RBAC role required; client_secret=do-not-show' }))
   const result = deriveCollectionReadiness(input({ syncStates: states }))
   const exchange = row(result, 'exchange')
   assert.equal(exchange.permissionStatus, 'CONFIRMED')
@@ -292,7 +292,7 @@ test('preserves prior Exchange Admin success while accurately reporting stale an
   assert.equal(exchange.state, 'STALE')
   assert.equal(exchange.lastSuccessfulAt, old.toISOString())
 
-  replace({ status: 'FAILED', lastAttemptAt: current, lastSuccessfulAt: old, lastErrorCode: '403', lastErrorMessage: 'Recipient Management role required' })
+  replace({ status: 'FAILED', lastAttemptAt: current, lastSuccessfulAt: old, lastErrorCode: '403', lastErrorMessage: 'HawkView Get-Mailbox Exchange RBAC role required' })
   result = deriveCollectionReadiness(input({ syncStates: states }))
   exchange = row(result, 'exchange')
   assert.equal(exchange.state, 'BLOCKED_PERMISSION')
@@ -321,7 +321,7 @@ test('keeps missing Graph mailbox permission authoritative across confirmed, unv
   const variants: Array<Record<string, unknown>> = [
     {},
     { lastSuccessfulAt: current },
-    { status: 'FAILED', lastErrorCode: '403', lastErrorMessage: 'Recipient Management role required' },
+    { status: 'FAILED', lastErrorCode: '403', lastErrorMessage: 'HawkView Get-Mailbox Exchange RBAC role required' },
   ]
   for (const exchangeAdmin of variants) {
     const states = allResources.map((resource) => sync(resource))

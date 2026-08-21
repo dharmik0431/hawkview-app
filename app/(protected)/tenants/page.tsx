@@ -44,6 +44,7 @@ import { cn } from '@/lib/utils'
 import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
 import { topAttention } from '@/lib/attention/topAttention'
 import { TenantIssueDrawer } from '@/components/tenants/tenant-issue-drawer'
+import { ExchangeRbacSetup } from '@/components/tenants/exchange-rbac-setup'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
 import { AffectedServices } from '@/components/tenants/affected-services'
 import {
@@ -293,8 +294,9 @@ export default function TenantsPage() {
   // Onboarding state
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingStep, setOnboardingStep] = useState<
-    'select' | 'hawkview' | 'manual'
+    'select' | 'hawkview' | 'manual' | 'exchange'
   >('select')
+  const [exchangeSetupTenantId, setExchangeSetupTenantId] = useState<string | null>(null)
   const [hawkviewPreviewMessage, setHawkviewPreviewMessage] = useState<
     string | null
   >(null)
@@ -356,6 +358,7 @@ export default function TenantsPage() {
       setConsentReview(null)
       setHawkviewPreviewMessage(null)
       setOnboardingStep('select')
+      setExchangeSetupTenantId(null)
       setCustomerClientSecret('')
       setTimeout(() => {
         onboardButtonRef.current?.focus()
@@ -448,9 +451,14 @@ export default function TenantsPage() {
 
     if (result === 'success') {
       setConsentMessage({
-        text: 'Microsoft 365 connection verified. HawkView is performing initial synchronization.',
+        text: 'Microsoft 365 consent is verified. Complete the read-only Exchange setup to enable mailbox configuration collection.',
         tone: 'success',
       })
+      if (tenantId) {
+        setExchangeSetupTenantId(tenantId)
+        setOnboardingStep('exchange')
+        setShowOnboarding(true)
+      }
       queryClient.invalidateQueries({ queryKey: ['tenants'] })
     } else if (result === 'missing-permissions') {
       setConsentMessage({
@@ -486,23 +494,33 @@ export default function TenantsPage() {
       consentPopupRef.current?.close()
       consentPopupRef.current = null
       setIsSavingTenant(false)
-      setShowOnboarding(false)
       setConsentReview(null)
-      setOnboardingStep('select')
 
       if (message.result === 'success') {
         setOnboardingError(null)
         setConsentMessage({
-          text: 'Microsoft 365 connection verified. HawkView is performing initial synchronization.',
+          text: 'Microsoft 365 consent is verified. Complete the read-only Exchange setup to enable mailbox configuration collection.',
           tone: 'success',
         })
+        if (message.tenantId) {
+          setExchangeSetupTenantId(message.tenantId)
+          setOnboardingStep('exchange')
+          setShowOnboarding(true)
+        } else {
+          setShowOnboarding(false)
+          setOnboardingStep('select')
+        }
       } else if (message.result === 'missing-permissions') {
+        setShowOnboarding(false)
+        setOnboardingStep('select')
         setOnboardingError(null)
         setConsentMessage({
           text: 'Microsoft consent completed, but required permissions are missing.',
           tone: 'warning',
         })
       } else {
+        setShowOnboarding(false)
+        setOnboardingStep('select')
         setOnboardingError(
           'Microsoft administrator consent could not be verified. Review the tenant connection and try again.'
         )
@@ -575,9 +593,11 @@ export default function TenantsPage() {
       setCustomerClientId('')
       setCustomerClientSecret('')
       if (!created.requiresConsent) {
-        handleCloseOnboarding(true)
+        setExchangeSetupTenantId(created.tenant.id)
+        setOnboardingStep('exchange')
+        setConsentReview(null)
         setConsentMessage({
-          text: 'App registration Microsoft connection verified and stored securely.',
+          text: 'App registration verified. Complete the read-only Exchange setup to enable mailbox configuration collection.',
           tone: 'success',
         })
         return
@@ -1134,6 +1154,11 @@ export default function TenantsPage() {
                   </Button>
                 </div>
               </div>
+            ) : onboardingStep === 'exchange' && exchangeSetupTenantId ? (
+              <ExchangeRbacSetup
+                tenantId={exchangeSetupTenantId}
+                onDone={() => handleCloseOnboarding(true)}
+              />
             ) : (
               <div className="space-y-6">
                 <div>

@@ -50,12 +50,12 @@ read saved data from the HawkView API and must never call Microsoft directly.
 
 | Frontend data                                    | Source                                                                          | Access                                      | Status             |
 | ------------------------------------------------ | ------------------------------------------------------------------------------- | ------------------------------------------- | ------------------ |
-| User/shared/room/equipment mailboxes             | Exchange Online                                                                 | Exchange application access and scoped RBAC | Separate connector |
+| User/shared/room/equipment mailboxes             | Exchange Online Admin API `Get-Mailbox`                                         | `Exchange.ManageAsAppV2` + HawkView custom Get-Mailbox-only role | Implemented |
 | Mailbox size, item count, archive and last logon | Exchange Online                                                                 | Exchange application access and scoped RBAC | Separate connector |
 | Inbox and transport rules                        | Microsoft Graph for limited mailbox rules; Exchange Online for tenant mail flow | Additional mailbox or Exchange access       | Separate connector |
 | Accepted domains                                 | Exchange Online                                                                 | Exchange application access and scoped RBAC | Separate connector |
 | Distribution and dynamic groups                  | Exchange Online / Microsoft Graph groups                                        | Group and/or Exchange access                | Planned            |
-| Delegation and forwarding                        | Exchange Online                                                                 | Exchange application access and scoped RBAC | Separate connector |
+| Delegation and forwarding                        | Exchange Online                                                                 | Current Graph evidence where supported; no broad Exchange write role | Partial |
 
 ## SharePoint and OneDrive
 

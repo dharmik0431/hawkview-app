@@ -16,7 +16,7 @@ test('derives every supported collection state without treating zero data as una
   assert.equal(deriveCollectionFieldState({ syncStatus: 'FAILED', lastErrorMessage: '403 forbidden' }).state, 'PERMISSION_REQUIRED')
   const exchangeRbac = deriveCollectionFieldState({
     syncStatus: 'FAILED',
-    lastErrorMessage: 'Confirm Exchange.ManageAsAppV2 and the Recipient Management Exchange RBAC role.',
+    lastErrorMessage: 'Confirm Exchange.ManageAsAppV2 and the HawkView Get-Mailbox Exchange RBAC role.',
   })
   assert.equal(exchangeRbac.state, 'PERMISSION_REQUIRED')
   assert.equal(exchangeRbac.reasonCode, 'EXCHANGE_RBAC_ROLE_REQUIRED')
