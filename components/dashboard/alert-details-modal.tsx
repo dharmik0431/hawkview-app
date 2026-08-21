@@ -66,7 +66,7 @@ function getKeyResultText(q: QueueItem): string {
   if (key.includes('mfa') || label.includes('mfa')) {
     const match = item.label.match(/(\d+%)|\((\d+%)\)/) || why.match(/(\d+%)|\((\d+%)\)/)
     const pct = match ? (match[1] || match[2]) : (q.metricValue && q.metricValue !== '—' ? q.metricValue : null)
-    return `MFA coverage: ${pct ?? 'Not provided'}`
+    return `MFA registration coverage: ${pct ?? 'Not provided'}`
   }
 
   if (key.includes('permission') || label.includes('permission') || why.toLowerCase().includes('missing:')) {
@@ -391,7 +391,7 @@ export function AlertDetailsModal({
                   >
                     {item.metricValue && item.metricValue !== '—' ? item.metricValue : 'below safety standards'}
                   </span>
-                  . Users without enforced MFA leave directory accounts exposed to unauthorized access.
+                  . Users without a registered MFA method may be unable to satisfy an MFA challenge. This signal does not prove whether MFA is required by Conditional Access, security defaults, or per-user MFA.
                 </>
               ) : isPermission ? (
                 <>
@@ -435,7 +435,7 @@ export function AlertDetailsModal({
               )}
             >
               {isMfa
-                ? 'Accounts without MFA registration significantly increase account-takeover risk and weaken organizational access controls against password spraying and credential stuffing attacks.'
+                ? 'Accounts without a registered MFA method may be unable to satisfy an MFA challenge. Review registration and enforcement policy as separate controls.'
                 : isPermission
                 ? 'Without the full required permission manifest, HawkView cannot accurately perform security posture evaluations, identity risk assessments, or directory monitoring.'
                 : isAppChange
@@ -511,7 +511,7 @@ export function AlertDetailsModal({
             <div className="border-l-3 border-blue-600 dark:border-blue-500 pl-3.5 py-0.5">
               <p className="text-sm sm:text-[15px] leading-relaxed text-slate-700 dark:text-slate-300">
                 {isMfa
-                  ? 'Review tenant security settings or Conditional Access policies to enforce MFA registration across all active users.'
+                ? 'Review MFA registration, Conditional Access, security defaults, and per-user MFA as separate controls.'
                   : isPermission
                   ? 'Re-authenticate the tenant connector in HawkView and grant administrator consent for the required Entra ID API permissions.'
                   : isAppChange

@@ -5,6 +5,7 @@ import {
   graphErrorCodeFromBody,
   MicrosoftGraphCollectionError,
   NON_PREMIUM_AUTH_REGISTRATION_ERROR_CODE,
+  projectMfaTruth,
   readGraphOperationalError,
   TenantSyncService,
   type AuthRegistrationFallbackLimits,
@@ -32,6 +33,11 @@ type InternalAuthSync = {
   collectEntraCollection: (...args: unknown[]) => Promise<unknown[]>
   collectPerUserAuthenticationMethods: (
     accessToken: string,
+    limits?: Readonly<AuthRegistrationFallbackLimits>,
+  ) => Promise<unknown[]>
+  enrichAuthenticationRegistrationsWithPerUserMfaState: (
+    accessToken: string,
+    registrations: unknown[],
     limits?: Readonly<AuthRegistrationFallbackLimits>,
   ) => Promise<unknown[]>
   runSnapshotSync: (
@@ -119,6 +125,7 @@ test('falls back only for the exact non-premium report error', async () => {
     fallbackCalls += 1
     return [{ id: 'fallback-user' }]
   }
+  subject.enrichAuthenticationRegistrationsWithPerUserMfaState = async (_token, rows) => rows
   subject.collectEntraCollection = async () => {
     throw new MicrosoftGraphCollectionError(
       'Microsoft auth registrations synchronization returned 403.',
@@ -161,6 +168,7 @@ test('uses the actual Graph response path to classify non-premium and permission
     fallbackCalls += 1
     return [{ id: 'fallback-user' }]
   }
+  subject.enrichAuthenticationRegistrationsWithPerUserMfaState = async (_token, rows) => rows
   const originalFetch = globalThis.fetch
   globalThis.fetch = async () => new Response(JSON.stringify({
     error: {
@@ -199,6 +207,89 @@ test('uses the actual Graph response path to classify non-premium and permission
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test('collects the separate legacy per-user MFA requirement without changing registration truth', async () => {
+  const subject = internal(serviceWithPrisma({}))
+  const originalFetch = globalThis.fetch
+  const requestedUrls: string[] = []
+  globalThis.fetch = async (input, init) => {
+    assert.equal(String(input), 'https://graph.microsoft.com/beta/$batch')
+    const payload = JSON.parse(String(init?.body)) as {
+      requests: Array<{ id: string; url: string }>
+    }
+    requestedUrls.push(...payload.requests.map((request) => request.url))
+    return new Response(JSON.stringify({
+      responses: [
+        { id: '1', status: 200, body: { perUserMfaState: 'disabled' } },
+        { id: '2', status: 200, body: { perUserMfaState: 'enforced' } },
+        { id: '3', status: 200, body: { perUserMfaState: 'unexpected' } },
+      ],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const result = await subject.enrichAuthenticationRegistrationsWithPerUserMfaState(
+      'graph-token',
+      [
+        { id: 'user-a', isMfaRegistered: true },
+        { id: 'user-b', isMfaRegistered: false },
+        { id: 'user-c', isMfaRegistered: true },
+      ],
+    ) as Array<Record<string, unknown>>
+    assert.deepEqual(requestedUrls, [
+      '/users/user-a/authentication/requirements',
+      '/users/user-b/authentication/requirements',
+      '/users/user-c/authentication/requirements',
+    ])
+    assert.equal(result[0]?.isMfaRegistered, true)
+    assert.equal(result[0]?.perUserMfaState, 'disabled')
+    assert.equal(result[1]?.isMfaRegistered, false)
+    assert.equal(result[1]?.perUserMfaState, 'enforced')
+    assert.equal(result[2]?.perUserMfaState, null)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('retains registration data when the optional per-user MFA lookup fails', async () => {
+  const subject = internal(serviceWithPrisma({}))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    error: { code: 'Authorization_RequestDenied', client_secret: 'must-not-leak' },
+  }), { status: 403, headers: { 'content-type': 'application/json' } })
+  try {
+    const result = await subject.enrichAuthenticationRegistrationsWithPerUserMfaState(
+      'graph-token',
+      [{ id: 'user-a', isMfaRegistered: true, methodsRegistered: ['Passkey'] }],
+    ) as Array<Record<string, unknown>>
+    assert.equal(result[0]?.isMfaRegistered, true)
+    assert.deepEqual(result[0]?.methodsRegistered, ['Passkey'])
+    assert.equal(result[0]?.perUserMfaState, null)
+    assert.doesNotMatch(JSON.stringify(result), /must-not-leak/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('projects registration and per-user MFA as independent facts', () => {
+  assert.deepEqual(projectMfaTruth({
+    isMfaRegistered: true,
+    perUserMfaState: 'disabled',
+    collectionSource: 'per-user-authentication-methods',
+  }), {
+    mfa: 'Enabled',
+    mfaRegistration: 'Registered',
+    perUserMfaState: 'Disabled',
+    mfaRegistrationSource: 'microsoft-graph-authentication-methods',
+    perUserMfaStateSource: 'microsoft-graph-beta-authentication-requirements',
+  })
+  assert.deepEqual(projectMfaTruth(null), {
+    mfa: 'Unknown',
+    mfaRegistration: 'Unknown',
+    perUserMfaState: 'Unknown',
+    mfaRegistrationSource: null,
+    perUserMfaStateSource: null,
+  })
 })
 
 test('uses bounded 20-user Graph batches and returns one complete fallback collection', async () => {

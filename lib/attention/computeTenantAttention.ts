@@ -15,24 +15,34 @@ function isAdminRole(role: unknown) {
   )
 }
 
-function isMfaGood(mfa: unknown): boolean {
+function mfaRegistrationFact(user: any): boolean | null {
+  const explicit = user?.mfaRegistration
+  if (explicit === 'Registered') return true
+  if (explicit === 'Not registered') return false
+  if (explicit === 'Unknown') return null
+
+  const mfa = user?.mfa ?? user?.mfaState ?? user?.auth?.mfa
   if (mfa === true) return true
   if (mfa === false) return false
 
   if (typeof mfa === 'string') {
     const v = mfa.toLowerCase()
-    return (
+    if (
       v === 'enabled' ||
       v === 'enforced' ||
       v === 'true' ||
       v === 'yes' ||
       v === 'on'
-    )
+    ) return true
+    if (v === 'disabled' || v === 'false' || v === 'no' || v === 'off') {
+      return false
+    }
+    return null
   }
 
   if (typeof mfa === 'number') {
     // common: 1 = enabled, 0 = disabled
-    return mfa === 1
+    return mfa === 1 ? true : mfa === 0 ? false : null
   }
 
   if (typeof mfa === 'object' && mfa !== null) {
@@ -48,16 +58,18 @@ function isMfaGood(mfa: unknown): boolean {
 
     if (typeof anyMfa.state === 'string') {
       const s = anyMfa.state.toLowerCase()
-      return ['enabled', 'enforced', 'true', 'yes', 'on'].includes(s)
+      if (['enabled', 'enforced', 'true', 'yes', 'on'].includes(s)) return true
+      if (['disabled', 'false', 'no', 'off'].includes(s)) return false
     }
 
     if (typeof anyMfa.mfa === 'string') {
       const s = anyMfa.mfa.toLowerCase()
-      return ['enabled', 'enforced', 'true', 'yes', 'on'].includes(s)
+      if (['enabled', 'enforced', 'true', 'yes', 'on'].includes(s)) return true
+      if (['disabled', 'false', 'no', 'off'].includes(s)) return false
     }
   }
 
-  return false
+  return null
 }
 
 function normalizeArray(value: unknown): any[] {
@@ -131,7 +143,8 @@ export function computeTenantAttention(bundle: any): AttentionItem[] {
   const users = normalizeArray(bundle?.users)
 
   // ---------
-  // CRITICAL: Admin without MFA
+  // CRITICAL: Admin without a registered MFA method. This is registration
+  // evidence only; it does not claim whether MFA is required by policy.
   // ---------
   const adminWithoutMfa = users.filter((u: any) => {
     // admin role could be in role, roles[], isAdmin, admin flag, etc.
@@ -144,35 +157,37 @@ export function computeTenantAttention(bundle: any): AttentionItem[] {
       isAdminRole(roleStr) ||
       rolesArr.some((r) => isAdminRole(r))
 
-    return isAdmin && !isMfaGood(u?.mfa ?? u?.mfaState ?? u?.auth?.mfa)
+    return isAdmin && mfaRegistrationFact(u) === false
   })
 
   if (adminWithoutMfa.length > 0) {
     items.push({
       key: 'admin_without_mfa',
-      label: `Admin without MFA (${adminWithoutMfa.length})`,
+      label: `Admin without a registered MFA method (${adminWithoutMfa.length})`,
       severity: 'critical',
-      why: 'Admins without MFA are the most common breach entry point.',
+      why: 'Microsoft reports no registered MFA method for these administrators. This does not establish whether a policy requires MFA.',
       detectedAt: getDetectedAt(bundle),
     })
   }
 
   // ---------
-  // MEDIUM: MFA gap (users)
+  // MEDIUM: MFA registration gap (users)
   // ---------
   if (users.length > 0) {
-    const mfaGoodCount = users.filter((u: any) =>
-      isMfaGood(u?.mfa ?? u?.mfaState ?? u?.auth?.mfa)
-    ).length
+    const knownRegistrations = users
+      .map((user: any) => mfaRegistrationFact(user))
+      .filter((value): value is boolean => value !== null)
+    const mfaGoodCount = knownRegistrations.filter(Boolean).length
+    const pct = knownRegistrations.length > 0
+      ? Math.round((mfaGoodCount / knownRegistrations.length) * 100)
+      : null
 
-    const pct = Math.round((mfaGoodCount / users.length) * 100)
-
-    if (pct < 100) {
+    if (pct !== null && pct < 100) {
       items.push({
         key: 'user_mfa_gap',
-        label: `MFA gap (users) (${pct}%)`,
+        label: `MFA registration gap (users) (${pct}%)`,
         severity: 'medium',
-        why: 'Users without MFA increase account takeover risk.',
+        why: 'Microsoft reports that some synchronized users do not have an MFA method registered. Registration does not prove MFA enforcement.',
         detectedAt: getDetectedAt(bundle),
       })
     }

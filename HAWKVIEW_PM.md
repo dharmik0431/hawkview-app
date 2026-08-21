@@ -1,10 +1,19 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-20 during combined MSP organization onboarding integration
+Last updated: 2026-08-21 during MFA truthfulness repair
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P0 — truthful MFA registration and per-user requirement state (branch published; PR pending)
+
+- A live comparison exposed a product truthfulness defect: HawkView labelled Microsoft Graph `isMfaRegistered` as `MFA Enabled`, while the Microsoft Entra per-user MFA page displays the separate legacy `disabled`, `enabled`, or `enforced` requirement. A registered method does not establish legacy per-user MFA, Conditional Access enforcement, or security-defaults enforcement.
+- The tenant user contract and UI now expose two independent facts: `MFA registration` (`Registered`, `Not registered`, `Not reported`) and `Per-user MFA` (`Disabled`, `Enabled`, `Enforced`, `Not reported`). The deprecated `mfa` field remains only for old client compatibility and continues to mean method registration; new UI and findings do not use it as enforcement evidence.
+- The existing authentication-registration collection is enriched through the bounded Microsoft Graph beta `/users/{id}/authentication/requirements` batch path. It uses the already-required `Policy.Read.All` application permission and adds no consent. The optional lookup has the existing 20-user batch, 20,000-user, 1,000-batch, 2 MiB response, 30-second request, and ten-minute collection bounds. A lookup failure preserves registration evidence and reports the per-user requirement as unavailable rather than failing or falsifying the registration baseline.
+- Dashboard, tenant health, attention findings, user filters/table/drawer, and Entra overview copy now say `MFA registration coverage`. They explicitly avoid claiming that registration proves enforcement. Conditional Access and security defaults remain separate evidence sources.
+- Scope is published on branch `codex/p0-mfa-truthful-state` in commit `8c1017b`: backend collector/projection/tests and permission purpose copy; directly connected tenant/dashboard frontend semantics and strict helper/source tests; this PM record. No schema, migration, new permission, consent, Microsoft/live tenant call, manual sync, Render, GAS, merge, deployment, or other live-state action has occurred. Draft PR creation remains pending because the local GitHub CLI token expired and the connected GitHub integration returned a write-access 403.
+- Validation passes: the complete backend suite has 261 tests passed with two intentional legacy SharePoint REST skips; the complete frontend helper/source suite passes 106/106; the focused MFA frontend contract passes 6/6; root and backend TypeScript, root lint, Prisma validation with a non-production placeholder URL, both production builds, and `git diff --check` pass. The backend build required running esbuild outside the Windows sandbox after its TypeScript phase passed because sandbox ancestor traversal was denied. No source/build configuration workaround was added. The branch should receive independent review before merge.
 
 ## P0 — backend bootstrap identity isolation (local, unpublished)
 

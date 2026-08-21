@@ -157,7 +157,7 @@ test('normalizes approved direct-object aliases without preserving collisions or
   assert.doesNotMatch(result, /request-second|SECRET|OBJECTSECRET|UNKNOWNSECRET|PROTOTYPESECRET/i)
 })
 
-test('MFA coverage produces an actionable organization finding', () => {
+test('MFA registration coverage produces an actionable organization finding', () => {
   const result = deriveTenantHealth({
     ...baseInput(),
     authSnapshot: {
@@ -173,7 +173,14 @@ test('MFA coverage produces an actionable organization finding', () => {
   })
 
   assert.equal(result.mfaCoverage, 20)
-  assert.equal(result.attention[0]?.label, 'This organization has 20% MFA coverage')
+  assert.equal(
+    result.attention[0]?.label,
+    'This organization has 20% MFA registration coverage',
+  )
+  assert.match(
+    result.attention[0]?.why ?? '',
+    /does not establish whether MFA is required/,
+  )
   assert.equal(result.attention[0]?.actionUrl, '/tenants/tenant-1?entraTab=security&securityView=auth')
 })
 

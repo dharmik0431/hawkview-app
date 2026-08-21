@@ -3,6 +3,7 @@
 import { useMemo } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { tenantUserMfaRegistration } from '@/lib/tenants/mfa-status'
 import {
   ChevronRight,
   Clock,
@@ -20,6 +21,8 @@ export type TenantUser = {
   role: 'Global Administrator' | 'User' | 'External Auditor' | 'Service Account'
   status: 'Enabled' | 'Disabled'
   mfa: 'Enforced' | 'Enabled' | 'Disabled' | 'Unknown'
+  mfaRegistration?: 'Registered' | 'Not registered' | 'Unknown'
+  perUserMfaState?: 'Enabled' | 'Enforced' | 'Disabled' | 'Unknown'
   lastLogin?: string
   authMethods?: string[]
   licenses?: string[]
@@ -197,16 +200,16 @@ export default function EntraOverviewSection({
     Array.isArray(bundle?.entra?.namedLocations) || namedLocations.length > 0
 
   const activeUsersCount = enabledUsers ?? 0
-  const mfaEnforcedUsersCount = usersSynchronized
+  const mfaRegisteredUsersCount = usersSynchronized
     ? users.filter(
         (u) =>
           u.status === 'Enabled' &&
-          (u.mfa === 'Enforced' || u.mfa === 'Enabled')
+          tenantUserMfaRegistration(u) === 'Registered'
       ).length
     : 0
-  const mfaCoveragePct =
+  const mfaRegistrationCoveragePct =
     activeUsersCount > 0
-      ? Math.round((mfaEnforcedUsersCount / activeUsersCount) * 100)
+      ? Math.round((mfaRegisteredUsersCount / activeUsersCount) * 100)
       : 0
 
   const formattedSyncTime = formatSyncTimestamp(tenant?.lastSync)
@@ -243,7 +246,7 @@ export default function EntraOverviewSection({
       if (
         failedSignInsCount > 0 ||
         (caPoliciesSynchronized && enabledCaPoliciesCount === 0) ||
-        (usersSynchronized && mfaCoveragePct < 80) ||
+        (usersSynchronized && mfaRegistrationCoveragePct < 80) ||
         (bundle?.entra?.riskyUsers?.length || 0) > 0
       ) {
         return 'Needs attention'
@@ -255,7 +258,7 @@ export default function EntraOverviewSection({
       authMethodsSynchronized,
       failedSignInsCount,
       enabledCaPoliciesCount,
-      mfaCoveragePct,
+      mfaRegistrationCoveragePct,
       bundle?.entra?.riskyUsers,
     ])
 
@@ -278,14 +281,14 @@ export default function EntraOverviewSection({
       },
       {
         id: 'mfa',
-        name: 'MFA coverage',
+        name: 'MFA registration coverage',
         value: usersSynchronized
-          ? `${mfaEnforcedUsersCount} of ${activeUsersCount} registered (${mfaCoveragePct}%)`
+          ? `${mfaRegisteredUsersCount} of ${activeUsersCount} registered (${mfaRegistrationCoveragePct}%)`
           : 'Awaiting collection',
-        detail: 'Multi-factor authentication status',
+        detail: 'Registered methods; not enforcement state',
         status: !usersSynchronized
           ? 'neutral'
-          : mfaCoveragePct >= 80
+          : mfaRegistrationCoveragePct >= 80
             ? 'healthy'
             : 'warning',
         action: () => onNavigateTab('identity'),
@@ -340,9 +343,9 @@ export default function EntraOverviewSection({
     enabledCaPoliciesCount,
     caPolicies.length,
     usersSynchronized,
-    mfaEnforcedUsersCount,
+    mfaRegisteredUsersCount,
     activeUsersCount,
-    mfaCoveragePct,
+    mfaRegistrationCoveragePct,
     authMethodsSynchronized,
     authMethods.length,
     namedLocationsSynchronized,
@@ -635,7 +638,7 @@ export default function EntraOverviewSection({
                     {caPoliciesSynchronized
                       ? `${enabledCaPoliciesCount} of ${caPolicies.length} Conditional Access policies enabled`
                       : usersSynchronized
-                        ? `MFA coverage at ${mfaCoveragePct}% across ${activeUsersCount} active users`
+                        ? `MFA registration coverage at ${mfaRegistrationCoveragePct}% across ${activeUsersCount} active users`
                         : 'Directory identity security posture'}
                   </div>
                 </div>
