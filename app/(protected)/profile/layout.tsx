@@ -44,15 +44,15 @@ export default function ProfileLayout({
     switch (pathname) {
       case '/profile/security':
         return {
-          title: 'Security',
+          title: 'Account & Security',
           subtitle:
-            'Manage your password, authentication methods, and active account security.',
+            'Review your sign-in method, reset your password, and inspect this browser session.',
         }
       case '/profile/notifications':
         return {
           title: 'Notifications',
           subtitle:
-            'Configure email digests and push alerts for tenant synchronization status.',
+            'Configure in-app alerts and future email-delivery preferences.',
         }
       case '/profile/appearance':
         return {

@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { apiClient } from '@/lib/api/client'
 import { useNotifications } from '@/components/providers/notification-provider'
 
@@ -26,12 +26,25 @@ export default function NotificationPreferencesPage() {
   const { notify } = useNotifications()
   const [preferences, setPreferences] = useState<Preferences | null>(null)
   const [saving, setSaving] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(false)
+
+  const loadPreferences = useCallback(async () => {
+    setLoading(true)
+    setLoadError(false)
+    try {
+      setPreferences(await apiClient.get<Preferences>('/api/notifications/preferences'))
+    } catch {
+      setLoadError(true)
+      notify({ title: 'Unable to load preferences', description: 'Try refreshing this page.', category: 'error' })
+    } finally {
+      setLoading(false)
+    }
+  }, [notify])
 
   useEffect(() => {
-    void apiClient.get<Preferences>('/api/notifications/preferences').then(setPreferences).catch(() => {
-      notify({ title: 'Unable to load preferences', description: 'Try refreshing this page.', category: 'error' })
-    })
-  }, [notify])
+    void loadPreferences()
+  }, [loadPreferences])
 
   const save = async () => {
     if (!preferences) return
@@ -47,7 +60,21 @@ export default function NotificationPreferencesPage() {
     }
   }
 
-  if (!preferences) return <div className="rounded-xl border border-border bg-card p-6 text-sm text-muted-foreground">Loading notification preferences...</div>
+  if (loading && !preferences) return <div className="rounded-xl border border-border bg-card p-6 text-sm text-muted-foreground">Loading notification preferences...</div>
+
+  if (loadError && !preferences) {
+    return (
+      <div role="alert" className="rounded-xl border border-border bg-card p-6">
+        <p className="text-sm font-semibold text-foreground">Notification preferences could not be loaded.</p>
+        <p className="mt-1 text-xs text-muted-foreground">Your existing preferences were not changed.</p>
+        <button type="button" onClick={() => void loadPreferences()} className="mt-4 rounded-md border border-border px-3 py-2 text-sm font-semibold hover:bg-muted">
+          Retry
+        </button>
+      </div>
+    )
+  }
+
+  if (!preferences) return null
 
   return (
     <div className="space-y-5">

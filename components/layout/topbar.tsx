@@ -22,10 +22,13 @@ const pageTitles: Record<string, string> = {
   '/security': 'Security Insights',
   '/admin': 'Admin Settings',
   '/integrations': 'Integrations',
-  '/settings': 'Account Settings',
+  '/settings': 'Microsoft Connector',
   '/settings/team': 'Admin Panel',
   '/team-access': 'Admin Panel',
   '/profile': 'Profile Settings',
+  '/profile/security': 'Account & Security',
+  '/profile/notifications': 'Notification Settings',
+  '/profile/appearance': 'Appearance',
   '/billing': 'Billing',
 }
 

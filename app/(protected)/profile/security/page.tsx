@@ -11,19 +11,12 @@ import {
   ShieldCheck,
   Laptop,
   Lock,
-  Mail,
   Loader2,
   CheckCircle2,
   Info,
-  AlertCircle,
   Shield,
-  Smartphone,
   Globe,
-  Clock,
-  ExternalLink,
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
-
 function parseAuthError(error: any): string {
   if (!error) return 'An unexpected error occurred.'
   const code = error.code || ''
@@ -65,7 +58,6 @@ export default function SecuritySettingsPage() {
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false)
   const [isSendingReset, setIsSendingReset] = useState(false)
   const [resetSentSuccess, setResetSentSuccess] = useState(false)
-  const [is2FaModalOpen, setIs2FaModalOpen] = useState(false)
 
   // System environment info
   const [userAgentInfo, setUserAgentInfo] = useState<{
@@ -82,10 +74,10 @@ export default function SecuritySettingsPage() {
       let browser = 'Web Browser'
       let os = 'Desktop'
 
-      if (ua.includes('Chrome')) browser = 'Google Chrome'
+      if (ua.includes('Edg')) browser = 'Microsoft Edge'
+      else if (ua.includes('Chrome')) browser = 'Google Chrome'
       else if (ua.includes('Safari')) browser = 'Apple Safari'
       else if (ua.includes('Firefox')) browser = 'Mozilla Firefox'
-      else if (ua.includes('Edg')) browser = 'Microsoft Edge'
 
       if (ua.includes('Macintosh') || ua.includes('Mac OS')) os = 'macOS'
       else if (ua.includes('Windows')) os = 'Windows'
@@ -239,7 +231,7 @@ export default function SecuritySettingsPage() {
         )}
       </div>
 
-      {/* SECTION 2: TWO-FACTOR AUTHENTICATION (2FA) */}
+      {/* SECTION 2: MULTI-FACTOR AUTHENTICATION */}
       <div className="rounded-xl border border-border bg-card p-6 text-card-foreground shadow-sm">
         <div className="flex items-center justify-between border-b border-border pb-4 mb-5">
           <div className="flex items-center gap-3">
@@ -248,44 +240,33 @@ export default function SecuritySettingsPage() {
             </div>
             <div>
               <h2 className="text-base font-semibold text-foreground">
-                Two-Factor Authentication (2FA)
+                Multi-Factor Authentication
               </h2>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Multi-factor security controls protecting your account sessions.
+                Authentication information available to HawkView.
               </p>
             </div>
           </div>
 
-          <span className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-600 dark:text-emerald-400 ring-1 ring-inset ring-emerald-500/20">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            <span>Enrolled</span>
+          <span className="inline-flex items-center rounded-md bg-muted px-2.5 py-1 text-xs font-semibold text-muted-foreground ring-1 ring-inset ring-border">
+            Not reported
           </span>
         </div>
 
         <p className="text-xs text-muted-foreground leading-relaxed mb-4">
-          Two-Factor Authentication is active for your HawkView account.
-          Verification tokens are synchronized with your tenant security policy
-          to prevent unauthorized access.
+          HawkView does not currently receive a reliable enrollment status for
+          your own HawkView sign-in. Configure or reset MFA through the account
+          provider shown above. This is separate from the Microsoft 365 tenant
+          MFA data HawkView monitors for customers.
         </p>
 
-        <div className="flex items-center justify-between pt-4 border-t border-border">
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Shield className="h-4 w-4 text-blue-500 shrink-0" />
-            <span>Enforced via tenant identity policies.</span>
-          </div>
-
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => setIs2FaModalOpen(true)}
-            className="text-xs"
-          >
-            Reset 2FA
-          </Button>
+        <div className="flex items-center gap-2 pt-4 border-t border-border text-xs text-muted-foreground">
+          <Shield className="h-4 w-4 text-blue-500 shrink-0" aria-hidden="true" />
+          <span>No enrollment or recovery action is inferred by HawkView.</span>
         </div>
       </div>
 
-      {/* SECTION 3: ACTIVE SESSIONS & ACCOUNT SECURITY */}
+      {/* SECTION 3: CURRENT SESSION */}
       <div className="rounded-xl border border-border bg-card p-6 text-card-foreground shadow-sm">
         <div className="flex items-center gap-3 border-b border-border pb-4 mb-5">
           <div className="p-2 rounded-lg bg-purple-500/10 text-purple-600 dark:text-purple-400">
@@ -293,10 +274,10 @@ export default function SecuritySettingsPage() {
           </div>
           <div>
             <h2 className="text-base font-semibold text-foreground">
-              Active Sessions & Security
+              Current Browser Session
             </h2>
             <p className="text-xs text-muted-foreground mt-0.5">
-              Review current browser sessions and security status.
+              Details about the browser currently signed in to HawkView.
             </p>
           </div>
         </div>
@@ -317,16 +298,16 @@ export default function SecuritySettingsPage() {
                 </span>
               </div>
               <p className="text-[11px] text-muted-foreground mt-1">
-                Current browser session &bull; Authenticated via{' '}
+                Current browser only &bull; Authenticated via{' '}
                 {signInProvider}
               </p>
             </div>
           </div>
 
           <div className="text-right text-xs text-muted-foreground">
-            <p className="font-medium text-foreground">Token Verified</p>
+            <p className="font-medium text-foreground">Signed in</p>
             <p className="text-[11px] text-muted-foreground">
-              Auto-renews with activity
+              Other active sessions are not listed
             </p>
           </div>
         </div>
@@ -386,44 +367,6 @@ export default function SecuritySettingsPage() {
         </div>
       )}
 
-      {/* 2FA INFORMATIONAL MODAL */}
-      {is2FaModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs animate-in fade-in">
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="2fa-dialog-title"
-            className="w-full max-w-md rounded-xl border border-border bg-popover p-6 text-popover-foreground shadow-xl space-y-4"
-          >
-            <div className="flex items-center gap-3 text-foreground">
-              <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-                <ShieldCheck className="h-5 w-5" />
-              </div>
-              <h3 id="2fa-dialog-title" className="text-base font-bold">
-                Reset Two-Factor Authentication
-              </h3>
-            </div>
-
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              Two-Factor Authentication configuration is managed by your
-              organization&apos;s identity provider. To reset or re-enroll your
-              2FA authenticator device, please contact your MSP system
-              administrator.
-            </p>
-
-            <div className="pt-3 flex items-center justify-end">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setIs2FaModalOpen(false)}
-                className="text-xs"
-              >
-                Close
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
