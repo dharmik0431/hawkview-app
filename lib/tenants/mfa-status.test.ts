@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  mfaRegistrationPresentation,
+  perUserMfaPresentation,
   tenantUserMfaRegistration,
   tenantUserPerUserMfaState,
 } from './mfa-status.ts'
@@ -37,4 +39,36 @@ test('fails closed for inherited, malformed, and future values', () => {
     assert.equal(tenantUserMfaRegistration(value), 'Unknown')
     assert.equal(tenantUserPerUserMfaState(value), 'Unknown')
   }
+})
+
+test('assigns distinct, non-deceptive badge tones to every MFA state', () => {
+  assert.deepEqual(
+    mfaRegistrationPresentation({ mfaRegistration: 'Registered' }),
+    { label: 'Registered', tone: 'positive' },
+  )
+  assert.deepEqual(
+    mfaRegistrationPresentation({ mfaRegistration: 'Not registered' }),
+    { label: 'Not registered', tone: 'caution' },
+  )
+  assert.deepEqual(mfaRegistrationPresentation({}), {
+    label: 'Not reported',
+    tone: 'neutral',
+  })
+
+  assert.deepEqual(perUserMfaPresentation({ perUserMfaState: 'Enforced' }), {
+    label: 'Enforced',
+    tone: 'positive',
+  })
+  assert.deepEqual(perUserMfaPresentation({ perUserMfaState: 'Enabled' }), {
+    label: 'Enabled',
+    tone: 'info',
+  })
+  assert.deepEqual(perUserMfaPresentation({ perUserMfaState: 'Disabled' }), {
+    label: 'Disabled',
+    tone: 'neutral',
+  })
+  assert.deepEqual(perUserMfaPresentation({}), {
+    label: 'Not reported',
+    tone: 'neutral',
+  })
 })

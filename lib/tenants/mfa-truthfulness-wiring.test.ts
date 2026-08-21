@@ -12,8 +12,31 @@ test('tenant users render registration and legacy per-user MFA as separate Micro
   assert.match(page, /Per-user MFA/)
   assert.match(page, /Microsoft Graph beta when available/)
   assert.match(page, /Conditional Access and security defaults are evaluated separately/)
-  assert.match(page, /tenantUserMfaRegistration\(u\)/)
-  assert.match(page, /tenantUserPerUserMfaState\(u\)/)
+  assert.match(page, /mfaRegistrationPresentation\(u\)/)
+  assert.match(page, /perUserMfaPresentation\(u\)/)
+  assert.match(page, /<MfaFactBadge \{\.\.\.mfaRegistrationBadge\} \/>/)
+  assert.match(page, /<MfaFactBadge \{\.\.\.perUserMfaBadge\} \/>/)
+})
+
+test('user security facts precede role and type in the table', () => {
+  const page = source('app/(protected)/tenants/[id]/page.tsx')
+  const banner = page.indexOf('MFA registration shows whether')
+  const start = page.indexOf('<thead', banner)
+  const end = page.indexOf('{USERS.length === 0', start)
+  const table = page.slice(start, end)
+  const order = [
+    'label="Status"',
+    'label="MFA registration"',
+    'Per-user MFA',
+    'label="Role"',
+    'label="Type"',
+  ].map((label) => table.indexOf(label))
+  assert.equal(order.every((position) => position >= 0), true)
+  assert.deepEqual(order, [...order].sort((left, right) => left - right))
+  assert.match(page, /positive:[\s\S]*emerald/)
+  assert.match(page, /caution:[\s\S]*amber/)
+  assert.match(page, /info:[\s\S]*blue/)
+  assert.match(page, /neutral:[\s\S]*slate/)
 })
 
 test('dashboard and health language never claim registration proves enforcement', () => {
