@@ -27,12 +27,7 @@ const SERVICES: ServiceInfo[] = [
 ]
 
 export function AffectedServices({ tenant, compact = true }: AffectedServicesProps) {
-  const items = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const items = computeTenantAttention(tenant)
 
   // Map attention items to services
   const affectedMap: Record<ServiceKey, boolean> = {
@@ -48,14 +43,17 @@ export function AffectedServices({ tenant, compact = true }: AffectedServicesPro
       item.key.includes('mfa') ||
       item.key.includes('microsoft_') ||
       item.key.includes('permission') ||
-      item.key.includes('auth')
+      item.key.includes('auth') ||
+      item.key.includes('sign_in') ||
+      item.key.includes('conditional_access') ||
+      item.key.includes('directory')
     ) {
       affectedMap.entra = true
     }
     if (item.key.includes('sharing') || item.key.includes('sharepoint')) {
       affectedMap.sharepoint = true
     }
-    if (item.key.includes('license')) {
+    if (item.key.includes('license') || item.key.includes('m365_audit') || item.key.includes('audit_log')) {
       affectedMap.o365 = true
     }
     if (item.key.includes('exchange') || item.key.includes('mail')) {
@@ -75,7 +73,7 @@ export function AffectedServices({ tenant, compact = true }: AffectedServicesPro
           return (
             <div
               key={srv.key}
-              title={`${srv.name}: ${isAffected ? 'Needs attention' : 'Healthy'}`}
+              title={`${srv.name}: ${isAffected ? 'Needs attention' : 'No issue reported in this tenant summary'}`}
               className={cn(
                 'inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium transition-colors',
                 isAffected

@@ -38,12 +38,7 @@ export function getTenantMatrixOverallState(
   const tenantStatus = String(tenant.status || '').toLowerCase()
   const missingPerms = tenant.missingPermissions || []
 
-  const attentionItems = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const attentionItems = computeTenantAttention(tenant)
 
   const isDisconnected =
     ['error', 'revoked', 'disconnected'].includes(connectionStatus) ||
@@ -146,12 +141,7 @@ export function getTenantMatrixOverallState(
 }
 
 export function getTenantActiveIssuesInfo(tenant: Tenant) {
-  const attentionItems = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const attentionItems = computeTenantAttention(tenant)
 
   const missingPerms = tenant.missingPermissions || []
   const isDisconnected =
@@ -380,12 +370,7 @@ export function getTenantRecommendedAction(tenant: Tenant) {
   const isPending = ['pending-consent', 'pending'].includes(connectionStatus)
   const missingPerms = tenant.missingPermissions || []
 
-  const attentionItems = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const attentionItems = computeTenantAttention(tenant)
 
   if (isDisconnected) {
     return {
@@ -585,12 +570,7 @@ export function getTenantThreatsInfo(tenant: Tenant) {
     }
   }
 
-  const attentionItems = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const attentionItems = computeTenantAttention(tenant)
 
   const count = attentionItems.length
   return {
@@ -632,12 +612,7 @@ export function getPrimaryConcern(tenant: Tenant) {
     }
   }
 
-  const attentionItems = computeTenantAttention({
-    ...((tenant as any)?.bundle ?? {}),
-    connectionStatus: tenant.connectionStatus,
-    status: tenant.status,
-    missingPermissions: tenant.missingPermissions,
-  })
+  const attentionItems = computeTenantAttention(tenant)
 
   const criticalItem = attentionItems.find((i) => i.severity === 'critical')
   if (criticalItem) {

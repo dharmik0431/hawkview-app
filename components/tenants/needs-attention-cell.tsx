@@ -11,12 +11,7 @@ const severityStyles: Record<AttentionSeverity, string> = {
 
 export function NeedsAttentionCell({ tenant }: { tenant: any }) {
   const attention = topAttention(
-    computeTenantAttention({
-      ...(tenant?.bundle ?? {}),
-      connectionStatus: tenant?.connectionStatus,
-      status: tenant?.status,
-      missingPermissions: tenant?.missingPermissions,
-    })
+    computeTenantAttention(tenant)
   )
 
   if (!attention.length) {

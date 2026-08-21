@@ -1,5 +1,68 @@
 import type { AttentionItem } from '@/types/attention'
 
+const ATTENTION_SEVERITIES = new Set(['critical', 'high', 'medium'])
+
+function own(value: object, key: string) {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+function safeAttentionText(value: unknown, maxLength: number): string | null {
+  if (typeof value !== 'string') return null
+  const text = value.trim()
+  if (!text || text.length > maxLength || /[\u0000-\u001f\u007f]/.test(text)) {
+    return null
+  }
+  return text
+}
+
+/**
+ * Tenant-list responses already contain the backend-owned health findings.
+ * Their presence (including an empty array) is authoritative: recomputing
+ * health from connection state alone is what previously let the directory say
+ * Healthy while the tenant workspace showed failed collectors.
+ */
+function authoritativeAttention(value: unknown): AttentionItem[] | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const nestedHealth = own(record, 'tenantHealth') && record.tenantHealth &&
+    typeof record.tenantHealth === 'object' && !Array.isArray(record.tenantHealth)
+      ? record.tenantHealth as Record<string, unknown>
+      : null
+  const nestedTenant = own(record, 'tenant') && record.tenant &&
+    typeof record.tenant === 'object' && !Array.isArray(record.tenant)
+      ? record.tenant as Record<string, unknown>
+      : null
+  const source = own(record, 'attention')
+    ? record.attention
+    : nestedHealth && own(nestedHealth, 'attention')
+      ? nestedHealth.attention
+      : nestedTenant && own(nestedTenant, 'attention')
+        ? nestedTenant.attention
+        : undefined
+
+  if (!Array.isArray(source)) return null
+
+  return source.slice(0, 100).flatMap((item): AttentionItem[] => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const row = item as Record<string, unknown>
+    const key = safeAttentionText(row.key, 160)
+    const label = safeAttentionText(row.label, 240)
+    const why = safeAttentionText(row.why, 1000)
+    const severity = row.severity
+    if (!key || !label || !why || typeof severity !== 'string' || !ATTENTION_SEVERITIES.has(severity)) {
+      return []
+    }
+    const detectedAt = safeAttentionText(row.detectedAt, 80) ?? undefined
+    return [{
+      key,
+      label,
+      why,
+      severity: severity as AttentionItem['severity'],
+      ...(detectedAt ? { detectedAt } : {}),
+    }]
+  })
+}
+
 function isAdminRole(role: unknown) {
   if (typeof role !== 'string') return false
   const r = role.toLowerCase()
@@ -92,6 +155,9 @@ function getDetectedAt(bundle: any): string | undefined {
 export function computeTenantAttention(bundle: any): AttentionItem[] {
   const items: AttentionItem[] = []
   if (!bundle) return items
+
+  const backendFindings = authoritativeAttention(bundle)
+  if (backendFindings !== null) return backendFindings
 
   const connectionStatus = String(
     bundle?.connectionStatus ?? bundle?.tenant?.connectionStatus ?? ''
