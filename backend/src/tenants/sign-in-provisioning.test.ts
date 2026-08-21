@@ -4,6 +4,7 @@ import { BadGatewayException } from '@nestjs/common'
 import {
   CollectionInitializingError,
   CollectionPartialError,
+  MicrosoftGraphCollectionError,
   TenantSyncService,
 } from './tenant-sync.service.js'
 
@@ -79,7 +80,8 @@ test('does not hide a genuine sign-in collector failure as provisioning', async 
   )
 
   assert.equal(updates.at(-1)?.status, 'FAILED')
-  assert.equal(updates.at(-1)?.lastErrorCode, 'sign_ins-sync-failed')
+  assert.equal(updates.at(-1)?.lastErrorCode, 'MICROSOFT_TRANSIENT')
+  assert.match(String(updates.at(-1)?.lastErrorMessage), /retry automatically/i)
 })
 
 test('records successful bounded fallback evidence as partial without publishing a failure', async () => {
@@ -286,4 +288,67 @@ test('the limited-license fallback reports a disabled audit subscription as init
 
   assert.equal(requested.length, 1)
   assert.match(requested[0] ?? '', /subscriptions\/list/)
+})
+
+test('the limited-license fallback retries a transient content failure and never saves a silent gap', async () => {
+  const requested: string[] = []
+  const service = new TenantSyncService(
+    {} as never,
+    {
+      getTenantManagementActivityContext: async () => ({
+        accessToken: 'management-token',
+        publisherIdentifier: 'publisher-id',
+      }),
+    } as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
+  )
+  const tenantId = '11111111-1111-4111-8111-111111111111'
+  const contentUri = `https://manage.office.com/api/v1.0/${tenantId}/activity/feed/audit/content-1`
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    requested.push(url)
+    if (url.includes('/subscriptions/list')) {
+      return new Response(JSON.stringify([{
+        contentType: 'Audit.AzureActiveDirectory',
+        status: 'enabled',
+      }]), { status: 200 })
+    }
+    if (url.includes('/subscriptions/content')) {
+      return new Response(JSON.stringify([{ contentUri }]), { status: 200 })
+    }
+    return new Response(JSON.stringify({ error: { code: 'ServiceUnavailable' } }), {
+      status: 503,
+      headers: { 'Retry-After': '0' },
+    })
+  }
+  try {
+    await assert.rejects(
+      (service as any).fetchLimitedLoginActivity(
+        {
+          id: 'tenant-1',
+          organizationId: 'org-1',
+          microsoftTenantId: tenantId,
+          connection: {
+            connectionMode: 'HAWKVIEW_MANAGED',
+            clientId: null,
+            credentialReference: null,
+          },
+        },
+        new Date('2026-08-21T12:00:00.000Z'),
+        new Date('2026-08-21T12:05:00.000Z'),
+      ),
+      (error: unknown) =>
+        error instanceof MicrosoftGraphCollectionError &&
+        error.status === 503 &&
+        error.graphErrorCode === 'ServiceUnavailable',
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(requested.filter((url) => url.includes('content-1')).length, 3)
 })

@@ -10,6 +10,11 @@ import { createHash, randomBytes } from 'node:crypto'
 import { decodeJwt, jwtVerify, SignJWT } from 'jose'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { SecretStoreService } from '../secrets/secret-store.service.js'
+import {
+  fetchMicrosoftWithRetry,
+  microsoftErrorMetadata,
+  MicrosoftRequestError,
+} from './microsoft-request.js'
 
 const DEFAULT_REQUIRED_PERMISSIONS = [
   'Organization.Read.All',
@@ -374,11 +379,16 @@ export class MicrosoftConsentService {
     microsoftTenantId: string,
     credentials: { clientId: string; clientSecret: string }
   ) {
-    const { accessToken, grantedPermissions: graphPermissions } =
-      await this.requestAccessToken(
-        microsoftTenantId,
-        credentials
-      )
+    let graphToken: Awaited<ReturnType<MicrosoftConsentService['requestAccessToken']>>
+    try {
+      graphToken = await this.requestAccessToken(microsoftTenantId, credentials)
+    } catch (error) {
+      if (error instanceof MicrosoftRequestError) {
+        throw new BadGatewayException(error.message)
+      }
+      throw error
+    }
+    const { accessToken, grantedPermissions: graphPermissions } = graphToken
 
     // Application permissions are resource-specific. ActivityFeed.Read is
     // issued by the Office 365 Management APIs, so it never appears in a
@@ -400,15 +410,15 @@ export class MicrosoftConsentService {
       ...new Set([...graphPermissions, ...managementPermissions]),
     ]
 
-    const organizationResponse = await fetch(
+    const organizationResponse = await fetchMicrosoftWithRetry(
       'https://graph.microsoft.com/v1.0/organization?$select=id,displayName,verifiedDomains',
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
           Accept: 'application/json',
         },
-        signal: AbortSignal.timeout(15_000),
-      }
+      },
+      { label: 'Microsoft organization verification', timeoutMs: 15_000 },
     )
 
     if (!organizationResponse.ok) {
@@ -458,7 +468,7 @@ export class MicrosoftConsentService {
   ) {
     const { clientId, clientSecret } = credentials
     const tokenUrl = `https://login.microsoftonline.com/${microsoftTenantId}/oauth2/v2.0/token`
-    const tokenResponse = await fetch(tokenUrl, {
+    const tokenResponse = await fetchMicrosoftWithRetry(tokenUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -467,12 +477,21 @@ export class MicrosoftConsentService {
         scope,
         grant_type: 'client_credentials',
       }),
-      signal: AbortSignal.timeout(15_000),
+    }, {
+      label: 'Microsoft tenant access-token acquisition',
+      timeoutMs: 15_000,
+      // Client-credentials token acquisition is idempotent. Retrying only
+      // transport/429/5xx failures never repeats a user or tenant mutation.
+      retryUnsafeMethod: true,
     })
 
     if (!tokenResponse.ok) {
-      throw new BadGatewayException(
-        'Microsoft consent was granted, but HawkView could not obtain a tenant access token.'
+      const metadata = await microsoftErrorMetadata(tokenResponse)
+      throw new MicrosoftRequestError(
+        `Microsoft tenant access-token acquisition returned ${tokenResponse.status}.`,
+        tokenResponse.status,
+        metadata.code,
+        metadata.requestId,
       )
     }
 

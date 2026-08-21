@@ -333,6 +333,33 @@ test('an optional failed collector is exposed as an operational attention item',
   assert.match(result.attention.find((item) => item.key === 'sync-sign_ins')?.label ?? '', /Sign-ins data/)
 })
 
+test('temporary Microsoft failures stay in automatic-retry state before becoming actionable', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const transient = (failures: number) => completeCurrentStates(now).map((state) =>
+    state.resourceType === 'CONDITIONAL_ACCESS'
+      ? {
+          ...state,
+          status: 'FAILED',
+          lastErrorCode: 'MICROSOFT_TRANSIENT',
+          lastErrorMessage: 'Microsoft temporarily could not provide conditional access data. HawkView retained the last successful data. HawkView will retry automatically.',
+          consecutiveFailures: failures,
+        }
+      : state,
+  )
+
+  const first = deriveTenantHealth({ ...baseInput(), now, syncStates: transient(1) })
+  assert.equal(first.resourceHealth.find((item) => item.resourceType === 'CONDITIONAL_ACCESS')?.classification, 'PENDING')
+  assert.equal(first.attention.some((item) => item.key === 'sync-conditional_access'), false)
+  assert.equal(first.operations.failedJobs, 0)
+
+  const persistent = deriveTenantHealth({ ...baseInput(), now, syncStates: transient(3) })
+  const issue = persistent.attention.find((item) => item.key === 'sync-conditional_access')
+  assert.equal(issue?.severity, 'medium')
+  assert.equal(issue?.actionLabel, 'View synchronization')
+  assert.match(issue?.label ?? '', /refresh is delayed/i)
+  assert.doesNotMatch(issue?.label ?? '', /review policies|permission/i)
+})
+
 test('a required Exchange Admin API failure cannot leave tenant health healthy', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   const states = [
