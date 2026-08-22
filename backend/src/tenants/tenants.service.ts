@@ -26,6 +26,7 @@ import {
   type TenantSyncFreshness,
 } from './service-sync-freshness.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
+import { buildExchangeReadOnlyRbacSetup } from './exchange-rbac-setup.js'
 
 const TENANT_DELETION_ROLES = [
   MembershipRole.MSP_OWNER,
@@ -40,6 +41,18 @@ const TENANT_ONBOARDING_ROLES = [
 
 const MICROSOFT_TENANT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export const preserveOptionalExchangeConsent = (
+  graphPermissions: string[],
+  previouslyRecorded: string[]
+) => [
+  ...new Set([
+    ...graphPermissions,
+    ...previouslyRecorded.filter(
+      (permission) => permission === 'Exchange.ManageAsAppV2'
+    ),
+  ]),
+]
 
 @Injectable()
 export class TenantsService {
@@ -349,6 +362,7 @@ export class TenantsService {
             connectionMode: true,
             clientId: true,
             credentialReference: true,
+            consentedPermissions: true,
           },
         },
       },
@@ -389,7 +403,10 @@ export class TenantsService {
           },
           data: {
             status: connected ? 'CONNECTED' : 'ERROR',
-            consentedPermissions: verification.grantedPermissions,
+            consentedPermissions: preserveOptionalExchangeConsent(
+              verification.grantedPermissions,
+              tenant.connection.consentedPermissions
+            ),
             lastVerifiedAt: now,
             lastErrorCode: connected ? null : 'missing-permissions',
             lastErrorMessage: connected
@@ -904,6 +921,93 @@ export class TenantsService {
     }
   }
 
+  async createExchangeReadOnlyConsentUrlForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string,
+  ) {
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: {
+        id: true,
+        organizationId: true,
+        microsoftTenantId: true,
+        connection: { select: { connectionMode: true } },
+      },
+    })
+    if (!tenant?.connection) throw new NotFoundException('Customer tenant was not found.')
+    if (tenant.connection.connectionMode !== 'HAWKVIEW_MANAGED') {
+      throw new BadRequestException(
+        'Customer-managed connectors must add Exchange.ManageAsAppV2 to their own app registration before configuring the read-only Exchange role.',
+      )
+    }
+    const consent = await this.microsoftConsent.createExchangeReadOnlyConsentUrl(
+      tenant.microsoftTenantId,
+      { customerTenantId: tenant.id, organizationId: tenant.organizationId },
+    )
+    await this.prisma.tenantConnection.update({
+      where: {
+        customerTenantId_organizationId: {
+          customerTenantId: tenant.id,
+          organizationId: tenant.organizationId,
+        },
+      },
+      data: {
+        consentStateHash: consent.stateHash,
+        consentStateExpiresAt: consent.expiresAt,
+      },
+    })
+    return {
+      consentUrl: consent.consentUrl,
+      permission: 'Exchange.ManageAsAppV2',
+      optional: true,
+    }
+  }
+
+  async getExchangeReadOnlySetupForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string,
+  ) {
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: {
+        connection: {
+          select: {
+            connectionMode: true,
+            clientId: true,
+            consentedPermissions: true,
+            exchangeReadOnlyEnabledAt: true,
+          },
+        },
+      },
+    })
+    if (!tenant?.connection) throw new NotFoundException('Customer tenant was not found.')
+    const applicationId = tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+      ? tenant.connection.clientId
+      : await this.microsoftConsent.getManagedConnectorApplicationId()
+    if (!applicationId) {
+      throw new BadRequestException('The Microsoft application ID required for Exchange setup is unavailable.')
+    }
+    return {
+      ...buildExchangeReadOnlyRbacSetup(applicationId),
+      consentGranted: tenant.connection.consentedPermissions.includes('Exchange.ManageAsAppV2'),
+      enabledAt: tenant.connection.exchangeReadOnlyEnabledAt?.toISOString() ?? null,
+    }
+  }
+
+  async assertCanConfigureExchangeReadOnly(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string,
+  ) {
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: { id: true },
+    })
+    if (!tenant) throw new NotFoundException('Customer tenant was not found.')
+  }
+
   async createManagedOnboardingUrlForIdentity(identity: AuthenticatedIdentity) {
     const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
     if (organizationIds.length === 0) {
@@ -936,7 +1040,7 @@ export class TenantsService {
       customerTenantId?: string
       organizationId: string
       nonce: string
-      flow: 'existing-tenant' | 'discover-tenant'
+      flow: 'existing-tenant' | 'discover-tenant' | 'exchange-readonly'
     }
     try {
       state = await this.microsoftConsent.verifyConsentState(stateToken)
@@ -961,6 +1065,10 @@ export class TenantsService {
           select: {
             consentStateHash: true,
             consentStateExpiresAt: true,
+            connectionMode: true,
+            clientId: true,
+            credentialReference: true,
+            consentedPermissions: true,
           },
         },
       },
@@ -997,6 +1105,10 @@ export class TenantsService {
         consentStateExpiresAt: null,
       },
     })
+
+    if (state.flow === 'exchange-readonly') {
+      return this.completeExchangeReadOnlyConsent(query, tenant)
+    }
 
     const returnedTenantId =
       typeof query.tenant === 'string' ? query.tenant.toLowerCase() : ''
@@ -1049,7 +1161,10 @@ export class TenantsService {
           },
           data: {
             status: connected ? 'CONNECTED' : 'ERROR',
-            consentedPermissions: verification.grantedPermissions,
+            consentedPermissions: preserveOptionalExchangeConsent(
+              verification.grantedPermissions,
+              tenant.connection.consentedPermissions
+            ),
             consentedAt: now,
             lastVerifiedAt: now,
             lastErrorCode: connected ? null : 'missing-permissions',
@@ -1092,6 +1207,70 @@ export class TenantsService {
     }
   }
 
+  private async completeExchangeReadOnlyConsent(
+    query: Record<string, unknown>,
+    tenant: {
+      id: string
+      organizationId: string
+      microsoftTenantId: string
+      connection: {
+        connectionMode: string
+        clientId: string | null
+        credentialReference: string | null
+        consentedPermissions: string[]
+      } | null
+    },
+  ) {
+    const returnedTenantId = typeof query.tenant === 'string' ? query.tenant.toLowerCase() : ''
+    const granted = query.admin_consent === 'True' || query.admin_consent === 'true'
+    const microsoftError = typeof query.error === 'string' ? query.error : null
+    if (microsoftError || !granted || returnedTenantId !== tenant.microsoftTenantId.toLowerCase()) {
+      return this.buildFrontendConsentRedirect(
+        'exchange-readonly-error',
+        microsoftError ?? (granted ? 'tenant-mismatch' : 'consent-denied'),
+        tenant.id,
+        true,
+      )
+    }
+    if (!tenant.connection) {
+      return this.buildFrontendConsentRedirect('exchange-readonly-error', 'connection-missing', tenant.id, true)
+    }
+    try {
+      const verification = await this.microsoftConsent.verifyTenantExchangeConsent({
+        microsoftTenantId: tenant.microsoftTenantId,
+        connectionMode: tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+          ? 'CUSTOMER_MANAGED'
+          : 'HAWKVIEW_MANAGED',
+        clientId: tenant.connection.clientId,
+        credentialReference: tenant.connection.credentialReference,
+      })
+      const now = new Date()
+      await this.prisma.tenantConnection.update({
+        where: {
+          customerTenantId_organizationId: {
+            customerTenantId: tenant.id,
+            organizationId: tenant.organizationId,
+          },
+        },
+        data: {
+          consentedPermissions: [
+            ...new Set([...tenant.connection.consentedPermissions, verification.permission]),
+          ].sort(),
+          consentedAt: now,
+          lastVerifiedAt: now,
+        },
+      })
+      return this.buildFrontendConsentRedirect('exchange-readonly-consented', null, tenant.id, true)
+    } catch {
+      return this.buildFrontendConsentRedirect(
+        'exchange-readonly-error',
+        'exchange-consent-verification-failed',
+        tenant.id,
+        true,
+      )
+    }
+  }
+
   private async completeDiscoveredMicrosoftConsent(
     query: Record<string, unknown>,
     state: { organizationId: string; nonce: string }
@@ -1118,7 +1297,12 @@ export class TenantsService {
       select: {
         id: true,
         organizationId: true,
-        connection: { select: { connectionMode: true } },
+        connection: {
+          select: {
+            connectionMode: true,
+            consentedPermissions: true,
+          },
+        },
       },
     })
     if (existing && existing.organizationId !== state.organizationId) {
@@ -1144,7 +1328,13 @@ export class TenantsService {
               create: { connectionMode: 'HAWKVIEW_MANAGED' },
             },
           },
-          select: { id: true, organizationId: true },
+          select: {
+            id: true,
+            organizationId: true,
+            connection: {
+              select: { consentedPermissions: true },
+            },
+          },
         })
 
     try {
@@ -1172,7 +1362,10 @@ export class TenantsService {
           data: {
             connectionMode: 'HAWKVIEW_MANAGED',
             status: connected ? 'CONNECTED' : 'ERROR',
-            consentedPermissions: verification.grantedPermissions,
+            consentedPermissions: preserveOptionalExchangeConsent(
+              verification.grantedPermissions,
+              tenant.connection?.consentedPermissions ?? []
+            ),
             consentedAt: now,
             lastVerifiedAt: now,
             consentStateHash: null,
@@ -1321,13 +1514,20 @@ export class TenantsService {
   private buildFrontendConsentRedirect(
     result: string,
     error: string | null,
-    customerTenantId?: string
+    customerTenantId?: string,
+    tenantSettings = false,
   ) {
     const frontendUrl = process.env.FRONTEND_APP_URL?.trim()
     if (!frontendUrl) throw new Error('FRONTEND_APP_URL is not configured.')
 
-    const url = new URL('/tenants', frontendUrl)
+    const url = new URL(
+      tenantSettings && customerTenantId
+        ? `/tenants/${encodeURIComponent(customerTenantId)}/settings`
+        : '/tenants',
+      frontendUrl,
+    )
     url.searchParams.set('microsoftConsent', result)
+    if (tenantSettings) url.searchParams.set('tab', 'administration')
     if (error) url.searchParams.set('error', error)
     if (customerTenantId) url.searchParams.set('tenantId', customerTenantId)
     return url.toString()

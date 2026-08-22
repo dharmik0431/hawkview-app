@@ -720,6 +720,7 @@ model TenantConnection {
   lastVerifiedAt        DateTime?               @map("last_verified_at") @db.Timestamptz(6)
   lastErrorCode         String?                 @map("last_error_code") @db.VarChar(100)
   lastErrorMessage      String?                 @map("last_error_message") @db.Text
+  exchangeReadOnlyEnabledAt DateTime?            @map("exchange_read_only_enabled_at") @db.Timestamptz(6)
   createdAt             DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt             DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
   customerTenant        CustomerTenant          @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)

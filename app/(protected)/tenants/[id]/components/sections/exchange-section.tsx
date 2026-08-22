@@ -1500,7 +1500,7 @@ export default function ExchangePage({
                 <h3 className="font-semibold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider text-slate-500">
                   Mailbox Data & Configuration
                 </h3>
-                <div className="grid grid-cols-3 gap-3 pt-1">
+                <div className="grid grid-cols-2 gap-3 pt-1 sm:grid-cols-4">
                   <div>
                     <span className="text-slate-500 dark:text-slate-400 block text-[11px]">Mailbox Size</span>
                     <span className="font-semibold text-slate-900 dark:text-slate-100">
@@ -1516,10 +1516,54 @@ export default function ExchangePage({
                   <div>
                     <span className="text-slate-500 dark:text-slate-400 block text-[11px]">Mailbox retention-policy assignment</span>
                     <span className="font-medium text-slate-800 dark:text-slate-200">
-                      Not collected in standard mode
+                      Not available from this read-only API
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 dark:text-slate-400 block text-[11px]">Maximum Send Size</span>
+                    <span className="font-medium text-slate-800 dark:text-slate-200">
+                      {inspectingMailbox.exchangeReadOnly?.maxSendSize ?? 'Not reported by Microsoft'}
                     </span>
                   </div>
                 </div>
+              </div>
+
+              <div className="space-y-3 rounded-xl border border-cyan-200 bg-cyan-50/40 p-3.5 dark:border-cyan-900/70 dark:bg-cyan-950/20">
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-cyan-900 dark:text-cyan-200">
+                    Exchange read-only delegation
+                  </h3>
+                  <Badge className={inspectingMailbox.exchangeReadOnly?.collected
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                    : 'border-slate-200 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300'}>
+                    {inspectingMailbox.exchangeReadOnly?.collected
+                      ? 'Collected'
+                      : inspectingMailbox.exchangeReadOnly?.enabled
+                        ? 'Not collected'
+                        : 'Not enabled'}
+                  </Badge>
+                </div>
+                <div>
+                  <span className="block text-[11px] text-slate-500 dark:text-slate-400">Send on behalf</span>
+                  {Array.isArray(inspectingMailbox.exchangeReadOnly?.sendOnBehalfTo) ? (
+                    inspectingMailbox.exchangeReadOnly.sendOnBehalfTo.length > 0 ? (
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {inspectingMailbox.exchangeReadOnly.sendOnBehalfTo.map((delegate: string) => (
+                          <span key={delegate} className="rounded border border-cyan-200 bg-white px-2 py-1 font-mono text-[11px] text-cyan-900 dark:border-cyan-800 dark:bg-slate-900 dark:text-cyan-200">
+                            {delegate}
+                          </span>
+                        ))}
+                      </div>
+                    ) : <span className="font-medium text-slate-800 dark:text-slate-200">None reported by Microsoft</span>
+                  ) : <span className="font-medium text-slate-800 dark:text-slate-200">Not reported by Microsoft</span>}
+                </div>
+                <div className="grid grid-cols-2 gap-3 border-t border-cyan-100 pt-3 dark:border-cyan-900/60">
+                  <div><span className="block text-[11px] text-slate-500">Full Access</span><span className="font-medium text-slate-700 dark:text-slate-300">Not available from this API</span></div>
+                  <div><span className="block text-[11px] text-slate-500">Send As</span><span className="font-medium text-slate-700 dark:text-slate-300">Not available from this API</span></div>
+                </div>
+                <p className="text-[10px] leading-relaxed text-slate-500">
+                  Source: {inspectingMailbox.exchangeReadOnly?.source ?? 'Optional Exchange Get-Mailbox enrichment is not enabled'}. This is configuration evidence, not proof that a delegate used the mailbox.
+                </p>
               </div>
 
               {/* Related Rules Section */}

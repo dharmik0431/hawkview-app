@@ -67,6 +67,7 @@ import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
+import { ExchangeReadonlySetup } from '@/components/tenants/exchange-readonly-setup'
 import { cn } from '@/lib/utils'
 
 function formatDate(isoString?: string | null) {
@@ -194,6 +195,7 @@ export default function TenantSettingsPage() {
   const sectionParam = searchParams.get('section')
   const resourceParam = searchParams.get('resource')
   const tabParam = searchParams.get('tab')
+  const microsoftConsentResult = searchParams.get('microsoftConsent')
   const hash = typeof window !== 'undefined' ? window.location.hash : ''
 
   const auditSyncDeepLink = isM365AuditSyncDeepLink(sectionParam, resourceParam) || hash === '#sync-health'
@@ -1820,6 +1822,13 @@ export default function TenantSettingsPage() {
               )}
             </div>
           </div>
+
+          <ExchangeReadonlySetup
+            tenantId={String(tenant.id)}
+            connectionMode={tenant.connectionMode === 'customer-managed' ? 'customer-managed' : 'hawkview-managed'}
+            active={activeTab === 'administration'}
+            consentResult={microsoftConsentResult}
+          />
 
           {/* Tenant Activity and Ownership Section */}
           <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 space-y-4 shadow-2xs">
