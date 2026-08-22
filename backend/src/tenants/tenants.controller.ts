@@ -101,6 +101,43 @@ export class TenantsController {
     )
   }
 
+  @Post(':id/exchange-readonly/consent')
+  createExchangeReadOnlyConsentUrl(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    return this.tenantsService.createExchangeReadOnlyConsentUrlForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
+  @Get(':id/exchange-readonly/setup')
+  getExchangeReadOnlySetup(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    return this.tenantsService.getExchangeReadOnlySetupForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
+  @Post(':id/exchange-readonly/verify')
+  async verifyExchangeReadOnly(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    await this.tenantsService.assertCanConfigureExchangeReadOnly(
+      request.auth,
+      customerTenantId,
+    )
+    return this.tenantSyncService.verifyExchangeReadOnlyForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
   @Delete(':id')
   removePendingTenant(
     @Req() request: AuthenticatedRequest,

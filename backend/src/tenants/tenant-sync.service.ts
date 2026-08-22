@@ -52,6 +52,10 @@ import {
   summarizeExchangeMailboxRuleActions,
 } from './exchange-mailbox-rule-details.js'
 import {
+  projectExchangeReadOnlyPage,
+  type ExchangeReadOnlyMailbox,
+} from './exchange-readonly-projection.js'
+import {
   buildRelatedExchangeRuleAuditResponse,
   normalizeRelatedExchangeRuleAuditRequest,
   RELATED_EXCHANGE_RULE_AUDIT_CANDIDATE_LIMIT,
@@ -1002,6 +1006,7 @@ interface TenantSyncTarget {
     clientId: string | null
     credentialReference: string | null
     lastVerifiedAt: Date | null
+    exchangeReadOnlyEnabledAt: Date | null
   } | null
 }
 
@@ -1098,6 +1103,7 @@ export class TenantSyncService {
             clientId: true,
             credentialReference: true,
             lastVerifiedAt: true,
+            exchangeReadOnlyEnabledAt: true,
           },
         },
       },
@@ -1171,6 +1177,46 @@ export class TenantSyncService {
     return result.bundle
   }
 
+  async verifyExchangeReadOnlyForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string,
+  ) {
+    const tenant = await this.getReadableTenant(identity, customerTenantId)
+    if (!tenant.connection) throw new BadRequestException('The Microsoft tenant connection is incomplete.')
+    const accessToken = await this.microsoftConsent.getTenantExchangeAccessToken({
+      microsoftTenantId: tenant.microsoftTenantId,
+      connectionMode: tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+        ? 'CUSTOMER_MANAGED'
+        : 'HAWKVIEW_MANAGED',
+      clientId: tenant.connection.clientId,
+      credentialReference: tenant.connection.credentialReference,
+    })
+    const rows = await this.collectExchangeReadOnlyMailboxes(tenant, accessToken)
+    const enabledAt = new Date()
+    await this.saveSnapshot(
+      tenant,
+      'EXCHANGE_MAILBOX_CONFIGURATION',
+      authoritativeSnapshot(rows),
+      async (transaction) => {
+        await transaction.tenantConnection.update({
+          where: {
+            customerTenantId_organizationId: {
+              customerTenantId: tenant.id,
+              organizationId: tenant.organizationId,
+            },
+          },
+          data: { exchangeReadOnlyEnabledAt: enabledAt },
+        })
+      },
+    )
+    return {
+      enabled: true,
+      enabledAt: enabledAt.toISOString(),
+      collectedMailboxes: rows.length,
+      allowedCmdlets: ['Get-Mailbox'],
+    }
+  }
+
   async syncDueTenants() {
     const now = new Date()
     const limit = Math.max(
@@ -1199,6 +1245,7 @@ export class TenantSyncService {
             clientId: true,
             credentialReference: true,
             lastVerifiedAt: true,
+            exchangeReadOnlyEnabledAt: true,
           },
         },
         syncStates: {
@@ -1636,6 +1683,12 @@ export class TenantSyncService {
           this.syncExchangeMailboxRules(tenant, snapshotAccessToken),
       },
     ]
+    if (tenant.connection.exchangeReadOnlyEnabledAt) {
+      snapshotModules.push({
+        resource: 'EXCHANGE_MAILBOX_CONFIGURATION',
+        synchronize: () => this.syncExchangeMailboxConfiguration(tenant),
+      })
+    }
     const snapshotResults = await Promise.allSettled(
       snapshotModules.map((module) => module.synchronize())
     )
@@ -3940,6 +3993,104 @@ export class TenantSyncService {
     })
   }
 
+  private async collectExchangeReadOnlyMailboxes(
+    tenant: TenantSyncTarget,
+    accessToken: string,
+  ): Promise<ExchangeReadOnlyMailbox[]> {
+    const select = [
+      'ExternalDirectoryObjectId',
+      'UserPrincipalName',
+      'PrimarySmtpAddress',
+      'DisplayName',
+      'RecipientType',
+      'RecipientTypeDetails',
+      'MaxSendSize',
+      'GrantSendOnBehalfTo',
+      'GrantSendOnBehalfToWithDisplayNames',
+    ].join(',')
+    const requestBody = {
+      CmdletInput: {
+        CmdletName: 'Get-Mailbox',
+        Parameters: {
+          ResultSize: 'Unlimited',
+          IncludeGrantSendOnBehalfToWithDisplayNames: true,
+        },
+      },
+    }
+    const rows: ExchangeReadOnlyMailbox[] = []
+    const visited = new Set<string>()
+    const deadlineAt = Date.now() + 4 * 60 * 1_000
+    let nextUrl = `https://outlook.office365.com/adminapi/v2.0/${encodeURIComponent(tenant.microsoftTenantId)}/Mailbox?$select=${encodeURIComponent(select)}`
+    while (nextUrl) {
+      if (!nextUrl.startsWith('https://outlook.office365.com/')) {
+        throw new Error('Microsoft returned an invalid Exchange pagination link.')
+      }
+      if (visited.size >= 50 || visited.has(nextUrl)) {
+        throw new Error('Microsoft Exchange pagination exceeded the read-only collection safety limit.')
+      }
+      visited.add(nextUrl)
+      const remainingMs = deadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        throw new Error('Microsoft Exchange read-only collection exceeded its four-minute safety limit.')
+      }
+      const response = await this.fetchGraphPage(
+        nextUrl,
+        accessToken,
+        'Exchange read-only mailbox configuration',
+        {
+          timeoutMs: Math.min(60_000, remainingMs),
+          deadlineAt,
+          retryUnsafeMethod: true,
+          init: {
+            method: 'POST',
+            headers: {
+              Accept: 'application/json',
+              'Content-Type': 'application/json',
+              'X-AnchorMailbox': `APP:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@${tenant.microsoftTenantId}`,
+            },
+            body: JSON.stringify(requestBody),
+          },
+        },
+      )
+      const page = await response.json() as unknown
+      const pageRecord = page && typeof page === 'object' && !Array.isArray(page)
+        ? page as Record<string, unknown>
+        : null
+      rows.push(...projectExchangeReadOnlyPage(
+        Array.isArray(page) ? page : pageRecord?.value ?? [],
+      ))
+      if (rows.length > 20_000) {
+        throw new Error('Microsoft Exchange returned more than 20,000 mailboxes; the baseline was not advanced.')
+      }
+      nextUrl = typeof pageRecord?.['@odata.nextLink'] === 'string'
+        ? pageRecord['@odata.nextLink']
+        : ''
+    }
+    return rows
+  }
+
+  private async syncExchangeMailboxConfiguration(tenant: TenantSyncTarget) {
+    return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_CONFIGURATION', async () => {
+      if (!tenant.connection?.exchangeReadOnlyEnabledAt) {
+        throw new Error('Optional Exchange read-only enrichment is not enabled for this tenant.')
+      }
+      const accessToken = await this.microsoftConsent.getTenantExchangeAccessToken({
+        microsoftTenantId: tenant.microsoftTenantId,
+        connectionMode: tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+          ? 'CUSTOMER_MANAGED'
+          : 'HAWKVIEW_MANAGED',
+        clientId: tenant.connection.clientId,
+        credentialReference: tenant.connection.credentialReference,
+      })
+      const rows = await this.collectExchangeReadOnlyMailboxes(tenant, accessToken)
+      await this.saveSnapshot(
+        tenant,
+        'EXCHANGE_MAILBOX_CONFIGURATION',
+        authoritativeSnapshot(rows),
+      )
+    })
+  }
+
   private async syncExchangeAcceptedDomains(
     tenant: { id: string; organizationId: string },
     accessToken: string
@@ -4387,6 +4538,7 @@ export class TenantSyncService {
     status: string
     connection: {
       lastVerifiedAt: Date | null
+      exchangeReadOnlyEnabledAt: Date | null
     } | null
   }) {
     const m365AuditToday = m365AuditUsageDate()
@@ -4628,10 +4780,23 @@ export class TenantSyncService {
       snapshotByResource.get('EXCHANGE_MAILBOX_USAGE') ?? []
     const exchangeMailboxSettings =
       snapshotByResource.get('EXCHANGE_MAILBOX_SETTINGS') ?? []
+    const exchangeMailboxConfiguration =
+      snapshotByResource.get('EXCHANGE_MAILBOX_CONFIGURATION') ?? []
     const exchangeAcceptedDomains =
       snapshotByResource.get('EXCHANGE_ACCEPTED_DOMAINS') ?? []
     const exchangeMailboxRules =
       snapshotByResource.get('EXCHANGE_MAILBOX_RULES') ?? []
+    const exchangeConfigurationByIdentity = new Map<string, any>()
+    for (const mailbox of exchangeMailboxConfiguration) {
+      for (const identity of [
+        mailbox?.externalDirectoryObjectId,
+        mailbox?.userPrincipalName,
+        mailbox?.primarySmtpAddress,
+      ]) {
+        const normalized = normalizeExchangeIdentity(identity)
+        if (normalized) exchangeConfigurationByIdentity.set(normalized, mailbox)
+      }
+    }
     const domainDnsHealth = snapshotByResource.get('DOMAIN_DNS_HEALTH') ?? []
     const exchangeUsageByIdentity = new Map<string, Record<string, string>>()
     for (const row of exchangeMailboxUsage as Array<Record<string, string>>) {
@@ -5217,17 +5382,27 @@ export class TenantSyncService {
               exchangeMailboxSettings.length,
               'EXCHANGE_MAILBOX_SETTINGS'
             ),
-            configuration: {
-              value: null,
-              state: 'NOT_COLLECTED_LEAST_PRIVILEGE',
-              reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE',
-              message: 'Standard mode does not collect mailbox delegation or mailbox retention-policy assignments because Microsoft Graph does not expose those tenant-wide administrative facts.',
-              source: 'HawkView standard least-privilege mode',
-              endpoint: null,
-              lastAttemptAt: null,
-              lastSuccessfulAt: null,
-              isStale: false,
-            },
+            configuration: tenant.connection?.exchangeReadOnlyEnabledAt
+              ? {
+                  ...collectionState(
+                    'exchange.mailboxes.configuration',
+                    exchangeMailboxConfiguration.length,
+                    'EXCHANGE_MAILBOX_CONFIGURATION'
+                  ),
+                  source: 'Microsoft Exchange Online Admin API',
+                  endpoint: '/adminapi/v2.0/Mailbox',
+                }
+              : {
+                  value: null,
+                  state: 'OPTIONAL_NOT_ENABLED',
+                  reasonCode: 'OPTIONAL_NOT_ENABLED',
+                  message: 'Optional Exchange read-only enrichment is not enabled. Standard Graph mailbox inventory remains available.',
+                  source: 'HawkView standard least-privilege mode',
+                  endpoint: null,
+                  lastAttemptAt: null,
+                  lastSuccessfulAt: null,
+                  isStale: false,
+                },
             usage: collectionState(
               'exchange.mailboxes.usage',
               exchangeMailboxUsage.length,
@@ -5240,6 +5415,7 @@ export class TenantSyncService {
             mailboxUsage: exchangeSync('EXCHANGE_MAILBOX_USAGE'),
             acceptedDomains: exchangeSync('EXCHANGE_ACCEPTED_DOMAINS'),
             inboxRules: exchangeSync('EXCHANGE_MAILBOX_RULES'),
+            configuration: exchangeSync('EXCHANGE_MAILBOX_CONFIGURATION'),
           },
           mailboxes: exchangeMailboxInventory.map((mailbox: any) => {
             const directoryUpn = String(
@@ -5279,6 +5455,9 @@ export class TenantSyncService {
               .find(Boolean)
             const settings = mailboxIdentities
               .map((identity) => exchangeMailboxSettingsByIdentity.get(identity))
+              .find(Boolean)
+            const configuration = mailboxIdentities
+              .map((identity) => exchangeConfigurationByIdentity.get(identity))
               .find(Boolean)
             const storageBytes = parseUsageNumber(
               usageValue(usage, 'Storage Used (Byte)', 'Storage Used Bytes')
@@ -5334,10 +5513,33 @@ export class TenantSyncService {
               itemCount,
               archiveEnabled: parseUsageBoolean(usageValue(usage, 'Has Archive')),
               retentionLabel: null,
+              exchangeReadOnly: {
+                enabled: Boolean(tenant.connection?.exchangeReadOnlyEnabledAt),
+                collected: Boolean(configuration),
+                maxSendSize:
+                  typeof configuration?.maxSendSize === 'string'
+                    ? configuration.maxSendSize
+                    : null,
+                sendOnBehalfTo: Array.isArray(configuration?.sendOnBehalfTo)
+                  ? configuration.sendOnBehalfTo
+                  : null,
+                fullAccess: null,
+                sendAs: null,
+                source: configuration
+                  ? 'Microsoft Exchange Online Admin API — Get-Mailbox'
+                  : null,
+                configurationCollectedAt: configuration
+                  ? snapshotObservedAtByResource
+                      .get('EXCHANGE_MAILBOX_CONFIGURATION')
+                      ?.toISOString() ?? null
+                  : null,
+              },
               delegation: {
-                fullAccess: [],
-                sendAs: [],
-                sendOnBehalf: [],
+                fullAccess: null,
+                sendAs: null,
+                sendOnBehalf: Array.isArray(configuration?.sendOnBehalfTo)
+                  ? configuration.sendOnBehalfTo
+                  : null,
               },
               lastLogon: usage?.['Last Activity Date'] || null,
               collection: {
@@ -5351,17 +5553,27 @@ export class TenantSyncService {
                   Boolean(settings),
                   'EXCHANGE_MAILBOX_SETTINGS'
                 ),
-                configuration: {
-                  value: null,
-                  state: 'NOT_COLLECTED_LEAST_PRIVILEGE',
-                  reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE',
-                  message: 'Mailbox delegation and mailbox retention-policy assignments are not collected in HawkView standard mode.',
-                  source: 'HawkView standard least-privilege mode',
-                  endpoint: null,
-                  lastAttemptAt: null,
-                  lastSuccessfulAt: null,
-                  isStale: false,
-                },
+                configuration: tenant.connection?.exchangeReadOnlyEnabledAt
+                  ? {
+                      ...collectionState(
+                        'exchange.mailboxes.configuration',
+                        configuration ?? null,
+                        'EXCHANGE_MAILBOX_CONFIGURATION'
+                      ),
+                      source: 'Microsoft Exchange Online Admin API',
+                      endpoint: '/adminapi/v2.0/Mailbox',
+                    }
+                  : {
+                      value: null,
+                      state: 'OPTIONAL_NOT_ENABLED',
+                      reasonCode: 'OPTIONAL_NOT_ENABLED',
+                      message: 'Optional Get-Mailbox enrichment is not enabled. Full Access, Send As, and retention assignments are not available from this read-only API.',
+                      source: 'HawkView standard least-privilege mode',
+                      endpoint: null,
+                      lastAttemptAt: null,
+                      lastSuccessfulAt: null,
+                      isStale: false,
+                    },
                 usage: collectionState(
                   'exchange.mailboxes.usage',
                   storageBytes,

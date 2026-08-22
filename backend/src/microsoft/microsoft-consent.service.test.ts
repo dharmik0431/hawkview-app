@@ -106,6 +106,102 @@ test('standard onboarding requests only the compiled least-privilege permissions
   assert.equal(required.includes('Reports.Read.All'), true)
 })
 
+test('optional Exchange consent is isolated from the standard Graph consent scope', async () => {
+  const priorRedirect = process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI
+  process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI = 'https://app.hawkview.example/auth/microsoft/callback'
+  try {
+    const service = new MicrosoftConsentService({
+      platformMicrosoftConnector: {
+        findUnique: async () => ({
+          clientId: '11111111-2222-4333-8444-555555555555',
+          homeTenantId: 'home-tenant',
+          credentialReference: 'managed-secret',
+        }),
+      },
+    } as never, {
+      accessOrCreate: async () => 'a'.repeat(64),
+      access: async () => 'managed-secret-value',
+    } as never)
+    const exchange = await service.createExchangeReadOnlyConsentUrl(
+      'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      {
+        customerTenantId: 'tenant-record',
+        organizationId: 'organization-record',
+      },
+    )
+    const standard = await service.createAdminConsentUrl(
+      'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      {
+        customerTenantId: 'tenant-record',
+        organizationId: 'organization-record',
+      },
+    )
+    assert.equal(new URL(exchange.consentUrl).searchParams.get('scope'), 'https://outlook.office365.com/.default')
+    assert.equal(new URL(standard.consentUrl).searchParams.get('scope'), 'https://graph.microsoft.com/.default')
+    const state = await service.verifyConsentState(new URL(exchange.consentUrl).searchParams.get('state')!)
+    assert.equal(state.flow, 'exchange-readonly')
+  } finally {
+    if (priorRedirect === undefined) delete process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI
+    else process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI = priorRedirect
+  }
+})
+
+test('optional Exchange token requires the exact app-only permission', async () => {
+  const service = new MicrosoftConsentService({
+    platformMicrosoftConnector: {
+      findUnique: async () => ({
+        clientId: 'managed-app',
+        homeTenantId: 'home-tenant',
+        credentialReference: 'managed-secret',
+      }),
+    },
+  } as never, {
+    access: async () => 'secret',
+  } as never)
+  ;(service as any).requestAccessToken = async (_tenant: string, _credentials: unknown, scope: string) => ({
+    accessToken: 'exchange-token',
+    grantedPermissions: scope === 'https://outlook.office365.com/.default'
+      ? ['Exchange.ManageAsAppV2']
+      : [],
+    directoryRoleIds: [],
+  })
+  assert.equal(await service.getTenantExchangeAccessToken({
+    microsoftTenantId: 'tenant',
+    connectionMode: 'HAWKVIEW_MANAGED',
+    clientId: null,
+    credentialReference: null,
+  }), 'exchange-token')
+
+  ;(service as any).requestAccessToken = async () => ({
+    accessToken: 'wrong-token',
+    grantedPermissions: ['Exchange.ManageAsApp'],
+  })
+  await assert.rejects(
+    service.getTenantExchangeAccessToken({
+      microsoftTenantId: 'tenant',
+      connectionMode: 'HAWKVIEW_MANAGED',
+      clientId: null,
+      credentialReference: null,
+    }),
+    /Exchange\.ManageAsAppV2/,
+  )
+
+  ;(service as any).requestAccessToken = async () => ({
+    accessToken: 'broad-token',
+    grantedPermissions: ['Exchange.ManageAsAppV2'],
+    directoryRoleIds: ['29232cdf-9323-42fd-ade2-1d097af3e4de'],
+  })
+  await assert.rejects(
+    service.getTenantExchangeAccessToken({
+      microsoftTenantId: 'tenant',
+      connectionMode: 'HAWKVIEW_MANAGED',
+      clientId: null,
+      credentialReference: null,
+    }),
+    /broader Microsoft Entra directory role/,
+  )
+})
+
 test('managed and customer verification paths do not make a deprecated override missing', async () => {
   const prior = process.env.MICROSOFT_REQUIRED_PERMISSIONS
   process.env.MICROSOFT_REQUIRED_PERMISSIONS = [

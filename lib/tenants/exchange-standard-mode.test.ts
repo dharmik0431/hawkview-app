@@ -6,19 +6,20 @@ function source(relativePath: string): string {
   return readFileSync(new URL(`../../${relativePath}`, import.meta.url), 'utf8')
 }
 
-test('standard Exchange onboarding has no Exchange Admin API or PowerShell RBAC step', () => {
+test('standard Exchange onboarding remains Graph-only and optional enrichment is not a gate', () => {
   const tenants = source('app/(protected)/tenants/page.tsx')
   const settings = source('app/(protected)/tenants/[id]/settings/page.tsx')
   const consent = source('backend/src/microsoft/microsoft-consent.service.ts')
   const collector = source('backend/src/tenants/tenant-sync.service.ts')
 
-  for (const value of [tenants, settings, consent, collector]) {
-    assert.doesNotMatch(value, /Exchange\.ManageAsAppV2/)
-    assert.doesNotMatch(value, /ExchangeRbacSetup/)
-    assert.doesNotMatch(value, /getTenantExchangeAccessToken/)
-    assert.doesNotMatch(value, /outlook\.office365\.com\/adminapi/)
-    assert.doesNotMatch(value, /Get-Mailbox/)
-  }
+  assert.match(tenants, /optional Exchange mailbox enrichment/i)
+  assert.match(tenants, /is not required\s+to finish onboarding/)
+  assert.match(settings, /ExchangeReadonlySetup/)
+  assert.match(consent, /state\.flow === 'exchange-readonly'/)
+  assert.match(consent, /'https:\/\/graph\.microsoft\.com\/\.default'/)
+  assert.match(collector, /connection\?\.exchangeReadOnlyEnabledAt/)
+  assert.match(collector, /CmdletName: 'Get-Mailbox'/)
+  assert.doesNotMatch(tenants, /Global Reader|Exchange Administrator/)
 })
 
 test('Exchange customer UI does not fabricate retention or accepted-domain facts', () => {
@@ -27,6 +28,7 @@ test('Exchange customer UI does not fabricate retention or accepted-domain facts
   assert.doesNotMatch(component, /Accepted Domains/)
   assert.doesNotMatch(component, /d\.type \|\| 'Authoritative'/)
   assert.match(component, /Mailbox retention-policy assignment/)
-  assert.match(component, /Not collected in standard mode/)
+  assert.match(component, /Not available from this API/)
+  assert.match(component, /Optional Exchange Get-Mailbox enrichment is not enabled/)
   assert.match(component, /Tenant-associated Microsoft 365 domains/)
 })

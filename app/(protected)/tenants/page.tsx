@@ -1099,6 +1099,15 @@ export default function TenantsPage() {
                       <span className="mt-1 h-1.5 w-1.5 rounded-full bg-blue-500 shrink-0" />
                       <span>Approve access and return to HawkView automatically.</span>
                     </li>
+                    <li className="flex items-start gap-2">
+                      <span className="mt-1 h-1.5 w-1.5 rounded-full bg-blue-500 shrink-0" />
+                      <span>
+                        Optional Exchange mailbox enrichment can be enabled later
+                        from Tenant Settings. It is limited by Exchange RBAC to
+                        read-only <code>Get-Mailbox</code> access and is not required
+                        to finish onboarding.
+                      </span>
+                    </li>
                   </ul>
                 </div>
 
@@ -1106,6 +1115,8 @@ export default function TenantsPage() {
                   <ShieldCheck className="h-4 w-4 text-slate-400 shrink-0" />
                   <span>
                     HawkView never receives or stores your Microsoft administrator password.
+                    Standard onboarding grants Microsoft Graph access only; optional
+                    Exchange enrichment requires a separate administrator-approved setup.
                   </span>
                 </div>
 

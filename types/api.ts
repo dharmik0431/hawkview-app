@@ -72,6 +72,32 @@ export type MicrosoftConsentResponse = z.infer<
   typeof MicrosoftConsentResponseSchema
 >
 
+export const ExchangeReadOnlySetupSchema = z.object({
+  contractVersion: z.literal(2),
+  applicationId: z.string().uuid(),
+  permission: z.literal('Exchange.ManageAsAppV2'),
+  access: z.literal('READ_ONLY'),
+  roleGroupName: z.literal('HawkView Exchange Read Only'),
+  managementRoleName: z.literal('HawkView Get-Mailbox Read Only'),
+  parentRoleName: z.literal('View-Only Recipients'),
+  allowedCmdlets: z.tuple([z.literal('Get-Mailbox')]),
+  collectedFields: z.array(z.string().min(1).max(100)).max(10),
+  unavailableFields: z.array(z.string().min(1).max(100)).max(10),
+  setupScript: z.string().min(1).max(30_000),
+  docsUrl: z.string().url(),
+  consentGranted: z.boolean(),
+  enabledAt: z.string().datetime().nullable(),
+}).strict()
+
+export type ExchangeReadOnlySetup = z.infer<typeof ExchangeReadOnlySetupSchema>
+
+export const ExchangeReadOnlyVerificationSchema = z.object({
+  enabled: z.literal(true),
+  enabledAt: z.string().datetime(),
+  collectedMailboxes: z.number().int().nonnegative().max(20_000),
+  allowedCmdlets: z.tuple([z.literal('Get-Mailbox')]),
+}).strict()
+
 export const DashboardStatsSchema = z.object({
   totalUsers: z.number(),
   activeLicenses: z.number(),

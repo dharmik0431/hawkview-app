@@ -72,6 +72,8 @@ const PERMISSION_DESCRIPTIONS: Record<string, string> = {
     'Read Microsoft 365 unified audit activity for Exchange, SharePoint, Teams, Entra, and tenant administration; also supports limited-license login evidence.',
   'SecurityEvents.Read.All':
     'Read Microsoft Secure Score snapshots and security improvement data.',
+  'Exchange.ManageAsAppV2':
+    'Authorize the optional Exchange Admin API. Exchange RBAC separately limits HawkView to Get-Mailbox only.',
 }
 
 const GRAPH_RESOURCE_HOST = 'graph.microsoft.com'
@@ -162,7 +164,7 @@ interface ConsentState {
   customerTenantId?: string
   organizationId: string
   nonce: string
-  flow: 'existing-tenant' | 'discover-tenant'
+  flow: 'existing-tenant' | 'discover-tenant' | 'exchange-readonly'
 }
 
 interface MicrosoftOrganization {
@@ -220,6 +222,10 @@ export class MicrosoftConsentService {
     }
   }
 
+  async getManagedConnectorApplicationId() {
+    return (await this.getManagedConnector()).clientId
+  }
+
   getRequiredPermissions() {
     const configured = normalizeConfiguredRequiredPermissions(
       process.env.MICROSOFT_REQUIRED_PERMISSIONS
@@ -264,6 +270,16 @@ export class MicrosoftConsentService {
     })
   }
 
+  async createExchangeReadOnlyConsentUrl(
+    microsoftTenantId: string,
+    state: Omit<ConsentState, 'nonce' | 'flow'>,
+  ) {
+    return this.createConsentUrl(microsoftTenantId, {
+      ...state,
+      flow: 'exchange-readonly',
+    })
+  }
+
   private async createConsentUrl(
     microsoftTenantId: string,
     state: Omit<ConsentState, 'nonce'>
@@ -283,7 +299,12 @@ export class MicrosoftConsentService {
       `https://login.microsoftonline.com/${microsoftTenantId}/v2.0/adminconsent`
     )
     url.searchParams.set('client_id', connector.clientId)
-    url.searchParams.set('scope', 'https://graph.microsoft.com/.default')
+    url.searchParams.set(
+      'scope',
+      state.flow === 'exchange-readonly'
+        ? 'https://outlook.office365.com/.default'
+        : 'https://graph.microsoft.com/.default',
+    )
     url.searchParams.set('redirect_uri', configuration.redirectUri)
     url.searchParams.set('state', stateToken)
 
@@ -306,9 +327,10 @@ export class MicrosoftConsentService {
       }
     )
 
-    const flow =
-      payload.flow === 'discover-tenant'
-        ? 'discover-tenant'
+    const flow = payload.flow === 'discover-tenant'
+      ? 'discover-tenant'
+      : payload.flow === 'exchange-readonly' && typeof payload.customerTenantId === 'string'
+        ? 'exchange-readonly'
         : typeof payload.customerTenantId === 'string'
           ? 'existing-tenant'
           : null
@@ -317,7 +339,7 @@ export class MicrosoftConsentService {
       typeof payload.organizationId !== 'string' ||
       typeof payload.nonce !== 'string' ||
       !flow ||
-      (flow === 'existing-tenant' &&
+      ((flow === 'existing-tenant' || flow === 'exchange-readonly') &&
         typeof payload.customerTenantId !== 'string')
     ) {
       throw new Error('Microsoft consent state is invalid.')
@@ -510,10 +532,16 @@ export class MicrosoftConsentService {
           (permission): permission is string => typeof permission === 'string'
         )
       : []
+    const directoryRoleIds = Array.isArray(tokenClaims.wids)
+      ? tokenClaims.wids.filter(
+          (roleId): roleId is string => typeof roleId === 'string'
+        )
+      : []
 
     return {
       accessToken: tokenBody.access_token,
       grantedPermissions,
+      directoryRoleIds,
     }
   }
 
@@ -544,6 +572,51 @@ export class MicrosoftConsentService {
       credentials
     )
     return result.accessToken
+  }
+
+  async getTenantExchangeAccessToken(input: {
+    microsoftTenantId: string
+    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+    clientId: string | null
+    credentialReference: string | null
+  }) {
+    const credentials = input.connectionMode === 'CUSTOMER_MANAGED'
+      ? {
+          clientId: input.clientId ?? '',
+          clientSecret: input.credentialReference
+            ? await this.secretStore.access(input.credentialReference)
+            : '',
+        }
+      : await this.getManagedConnector()
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new ServiceUnavailableException('The Microsoft tenant connection is incomplete.')
+    }
+    const result = await this.requestAccessToken(
+      input.microsoftTenantId,
+      credentials,
+      'https://outlook.office365.com/.default',
+    )
+    if (!result.grantedPermissions.includes('Exchange.ManageAsAppV2')) {
+      throw new BadRequestException(
+        'Exchange.ManageAsAppV2 administrator consent has not been granted to this connector.',
+      )
+    }
+    if ((result.directoryRoleIds ?? []).length > 0) {
+      throw new BadRequestException(
+        'The Exchange connector has a broader Microsoft Entra directory role. Remove broad directory roles before enabling Get-Mailbox-only mode.',
+      )
+    }
+    return result.accessToken
+  }
+
+  async verifyTenantExchangeConsent(input: {
+    microsoftTenantId: string
+    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+    clientId: string | null
+    credentialReference: string | null
+  }) {
+    await this.getTenantExchangeAccessToken(input)
+    return { permission: 'Exchange.ManageAsAppV2' as const }
   }
 
   async verifyConnectedTenant(input: {
