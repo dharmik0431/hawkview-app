@@ -1,23 +1,27 @@
 'use client'
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { useLayoutEffect, useState } from 'react'
+import { useCallback, useLayoutEffect, useRef, useState } from 'react'
 import { useAuth } from '@/components/providers/auth-provider'
 import { registerIdentityCacheReset } from '@/lib/auth/data-isolation'
 
 export function QueryProvider({ children }: { children: React.ReactNode }) {
   const { cacheScope } = useAuth()
 
-  // The key forces a brand-new client before descendants render for a new
-  // identity/workspace. Cached tenant data is never shared across this edge.
   return (
-    <IdentityQueryProvider key={cacheScope}>
+    <IdentityQueryProvider cacheScope={cacheScope}>
       {children}
     </IdentityQueryProvider>
   )
 }
 
-function IdentityQueryProvider({ children }: { children: React.ReactNode }) {
+function IdentityQueryProvider({
+  cacheScope,
+  children,
+}: {
+  cacheScope: string
+  children: React.ReactNode
+}) {
   const [queryClient] = useState(
     () =>
       new QueryClient({
@@ -29,18 +33,25 @@ function IdentityQueryProvider({ children }: { children: React.ReactNode }) {
         },
       })
   )
+  const previousScope = useRef(cacheScope)
+  const reset = useCallback(() => {
+    void queryClient.cancelQueries()
+    queryClient.clear()
+  }, [queryClient])
 
   useLayoutEffect(() => {
-    const reset = () => {
-      void queryClient.cancelQueries()
-      queryClient.clear()
-    }
     const unregister = registerIdentityCacheReset(reset)
     return () => {
       unregister()
       reset()
     }
-  }, [queryClient])
+  }, [reset])
+
+  useLayoutEffect(() => {
+    if (previousScope.current === cacheScope) return
+    previousScope.current = cacheScope
+    reset()
+  }, [cacheScope, reset])
 
   return (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>

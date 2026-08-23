@@ -1,10 +1,19 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-21 during optional Exchange Get-Mailbox-only enrichment
+Last updated: 2026-08-23 during frontend authentication routing hardening
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P0 — frontend authentication routing hardening (release candidate, not deployed)
+
+- Repeated Google AI Studio builds exposed two distinct public-configuration failures behind the same `Failed to fetch` symptom: misspelled Supabase project hosts caused DNS failure, and a contaminated API-base value sent HawkView `/auth/bootstrap` to Supabase instead of the Render API. Next.js inlines `NEXT_PUBLIC_*` values at build time, so editing a repository `.env` file did not protect a build when the hosted builder injected a higher-precedence value.
+- One closed public-runtime configuration module now owns the exact production Supabase and HawkView API origins. Missing, malformed, credential-bearing, path/query/fragment-bearing, misspelled, cross-wired, or foreign production values resolve only to the code-owned canonical origin. Development overrides are limited to loopback HTTP origins. The obsolete `NEXT_PUBLIC_API_BASE_URL` alias is intentionally unsupported.
+- Every HawkView request constructs a root-relative URL through the approved API resolver and rejects protocol-relative or absolute endpoints. Supabase accepts only a bounded `sb_publishable_` browser key; secret-shaped or malformed keys fail closed. No secret, service-role key, proxy, CORS bypass, custom auth domain, or backend auth change was added.
+- Identity-bound React Query data is still synchronously cancelled and cleared before an account transition, query keys and memory caches remain subject/organization scoped, and late bootstrap results remain generation guarded. The former `key={cacheScope}` subtree remount was removed because it could unmount the login form while `signInWithPassword` was in flight; scope changes now reset the stable QueryClient without destroying the mounted authentication flow.
+- Confirmation and recovery redirects now use the code-owned HawkView application origin rather than the current editor/iframe origin. Signup no longer claims that a no-error Supabase response proves account creation or email delivery, clears the password after submission, and handles an immediately authenticated signup through the same HawkView bootstrap gate as sign-in. Login never navigates to the dashboard unless `/auth/bootstrap` produced a current HawkView session. Browser-visible errors use a closed, non-reflective mapper that distinguishes credentials, confirmation, throttling, network/DNS, and HawkView bootstrap failure without exposing provider internals.
+- Exact release scope is **11 paths**: this PM record, `.env.example`, the auth form, API and Supabase clients, QueryProvider, the existing isolation source-contract test, and new public-runtime/auth-error modules with their tests. Validation passes: complete frontend **129/129**, root TypeScript, root lint with zero warnings/errors, production Next build with all 21 pages generated, and `git diff --check`. No key, account, Supabase, Render, GAS, or live environment is changed by this code release; GAS remains user-published after merge.
 
 ## P1 — optional Exchange Get-Mailbox-only enrichment (local, unpublished)
 
