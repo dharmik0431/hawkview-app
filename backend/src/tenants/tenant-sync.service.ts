@@ -4268,49 +4268,21 @@ export class TenantSyncService {
             .map((site) => [site.id, site])
         ).values()
       )
-      const enrichedSites: any[] = []
-      for (let index = 0; index < uniqueSites.length; index += 8) {
-        if (Date.now() >= deadlineAt) {
-          throw new Error('SharePoint site inventory reached a bounded collection limit before completion.')
-        }
-        const batch = uniqueSites.slice(index, index + 8)
-        const batchRows = await Promise.all(
-          batch.map(async (site) => {
-            if (typeof site?.id !== 'string')
-              return {
-                ...site,
-                driveQuota: null,
-                externalSharing: null,
-                guestsCount: null,
-              }
-            const driveResponse = await this.fetchGraphPage(
-              `https://graph.microsoft.com/v1.0/sites/${encodeURIComponent(site.id)}/drive?$select=id,quota`,
-              accessToken,
-              'SharePoint drive quota',
-              {
-                timeoutMs: sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs),
-                deadlineAt,
-                acceptedStatuses: [404],
-              },
-            )
-            const drive = driveResponse.ok
-              ? ((await readBoundedSharePointJson(driveResponse, limits.responseBytes)) as any)
-              : null
-            return {
-              ...site,
-              driveQuota: drive?.quota ?? null,
-              // Standard mode intentionally avoids SharePoint-resource
-              // access enrichment. Never carry old privileged access
-              // observations forward as current.
-              externalSharing: null,
-              guestsCount: null,
-              sharingCapability: null,
-              siteAccessMetadataState: 'NOT_COLLECTED_LEAST_PRIVILEGE',
-            }
-          })
-        )
-        enrichedSites.push(...batchRows)
-      }
+      const enrichedSites = uniqueSites.map((site) => ({
+        ...site,
+        // Microsoft Graph does not support application authentication for
+        // GET /sites/{siteId}/drive. Site storage facts come from the bounded
+        // Reports.Read.All usage collector instead, so site inventory must not
+        // depend on an unsupported per-site drive request.
+        driveQuota: null,
+        // Standard mode intentionally avoids SharePoint-resource access
+        // enrichment. Never carry old privileged access observations forward
+        // as current.
+        externalSharing: null,
+        guestsCount: null,
+        sharingCapability: null,
+        siteAccessMetadataState: 'NOT_COLLECTED_LEAST_PRIVILEGE',
+      }))
 
       await this.saveSnapshot(
         tenant,

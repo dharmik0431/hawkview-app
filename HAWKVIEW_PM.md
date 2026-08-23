@@ -1,10 +1,18 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-23 during frontend authentication routing hardening
+Last updated: 2026-08-23 during SharePoint application-authorization repair
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P0 — SharePoint site inventory application-authorization repair (release candidate)
+
+- A user-authorized manual sync on Aug 23 at 10:06 AM reproduced `SHAREPOINT_SITES` as `Blocked Permission` after HawkView had verified all 18 required consent scopes, including `Sites.Read.All`. The failure was current rather than stale UI state.
+- The standard collector correctly uses `Sites.Read.All` for the tenant root site and site search, but then issued `GET /sites/{siteId}/drive` for every discovered site. Microsoft documents that Get Drive does not support application authentication. That optional enrichment could therefore turn an otherwise authorized site inventory into a tenant-wide permission failure.
+- Site inventory no longer calls the unsupported per-site drive endpoint. It saves the authoritative root/search inventory with `driveQuota: null`. Storage usage, allocation, activity, ownership, and report-deleted signals continue to come from the existing bounded `Reports.Read.All` SharePoint usage collector; the contract already treats default-drive quota as optional and non-authoritative.
+- No new Microsoft permission, SharePoint resource token, REST call, schema, migration, UI change, tenant consent, or live configuration is required. Focused regressions prove the collector makes no per-site drive request, does not request SharePoint-resource tokens or site-user REST, clears historic privileged fields, and still advances a complete inventory snapshot.
+- Scope is this PM record, the SharePoint collector, and its focused change-evidence regression. Validation passes: complete backend **304 passed / 2 intentional legacy SharePoint REST skips**, backend TypeScript, Prisma validation with a non-production placeholder URL, production backend build, and `git diff --check`. Publication is authorized; deployment and post-deploy tenant synchronization remain pending.
 
 ## P0 — frontend authentication routing hardening (release candidate, not deployed)
 
