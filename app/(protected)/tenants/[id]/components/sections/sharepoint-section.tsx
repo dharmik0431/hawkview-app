@@ -296,6 +296,11 @@ export default function SharePointPage({
   const SP_SITES: any[] = sharePointView.sites
   const SITE_TABLE_ROWS: any[] = sharePointView.siteTableRows
   const siteCountLabel: string = sharePointView.inventory.countLabel
+  const reportIdentifiersConcealed = sharePointView.reportPrivacy?.identifiersConcealed === true
+  const concealedSiteCount = typeof sharePointView.reportPrivacy?.concealedSiteCount === 'number'
+    ? sharePointView.reportPrivacy.concealedSiteCount
+    : 0
+  const selectedSiteIdentifiersConcealed = selectedSite?.activityDataStatus === 'identifiers-concealed'
 
   // Collection Status strip data
   const collectionInfo = sp?.collection ?? {}
@@ -704,6 +709,53 @@ export default function SharePointPage({
             )}
           </div>
         )}
+
+        {/* Microsoft usage-report privacy limitation. This is not a missing
+            HawkView permission: Microsoft returned the report with Site IDs
+            and URLs concealed, so its rows cannot be joined to Graph sites. */}
+        {reportIdentifiersConcealed && (
+          <div
+            role="status"
+            className="rounded-xl border border-amber-200 dark:border-amber-800/70 bg-amber-50/90 dark:bg-amber-950/35 px-4 py-3 text-xs text-amber-950 dark:text-amber-100"
+          >
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden="true" />
+              <div className="min-w-0 flex-1 space-y-1">
+                <div className="font-semibold">Microsoft report identifiers are concealed</div>
+                <p className="text-amber-800 dark:text-amber-200 leading-relaxed">
+                  HawkView has the required permission and collected the SharePoint usage report, but Microsoft hid its Site IDs and URLs. Site-level storage, activity, owner, file, and page-view data cannot be matched to {concealedSiteCount > 0 ? concealedSiteCount : siteCountLabel} discovered sites.
+                </p>
+                <details className="group pt-0.5">
+                  <summary className="inline-flex cursor-pointer list-none items-center gap-1.5 font-semibold text-amber-900 dark:text-amber-100 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 rounded-sm">
+                    <Info className="h-3.5 w-3.5" aria-hidden="true" />
+                    How to enable site-level reporting
+                    <ChevronDown className="h-3.5 w-3.5 group-open:rotate-180 transition-transform" aria-hidden="true" />
+                  </summary>
+                  <div className="mt-2 rounded-lg border border-amber-200/80 dark:border-amber-800/60 bg-white/70 dark:bg-slate-950/30 p-3 text-amber-900 dark:text-amber-100">
+                    <ol className="list-decimal pl-4 space-y-1">
+                      <li>Open the Microsoft 365 admin center.</li>
+                      <li>Go to <span className="font-semibold">Settings → Org settings → Services → Reports</span>.</li>
+                      <li>Enable <span className="font-semibold">Display concealed user, group, and site names in all reports</span>, then save.</li>
+                      <li>Wait several minutes and select <span className="font-semibold">Sync Now</span> in HawkView.</li>
+                    </ol>
+                    <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-300">
+                      This Microsoft privacy setting is organization-wide and affects Microsoft 365 usage reports. Changing it does not grant HawkView additional permissions.
+                    </p>
+                    <a
+                      href="https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/activity-reports?view=o365-worldwide#show-user-group-or-site-details-in-the-reports"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="mt-2 inline-flex items-center gap-1 font-semibold text-amber-900 dark:text-amber-100 hover:underline"
+                    >
+                      Microsoft setup documentation
+                      <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                    </a>
+                  </div>
+                </details>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ================= EXACTLY THREE PRIMARY TABS ================= */}
@@ -815,10 +867,12 @@ export default function SharePointPage({
                 </div>
               </div>
               <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-                {calculatedInactive90Count ?? 'Not reported'}
+                {reportIdentifiersConcealed ? 'Unavailable' : calculatedInactive90Count ?? 'Not reported'}
               </div>
               <div className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                {calculatedInactive90Count === null
+                {reportIdentifiersConcealed
+                  ? 'Microsoft report identifiers are concealed'
+                  : calculatedInactive90Count === null
                   ? 'Microsoft D180 activity evidence unavailable'
                   : 'No activity in 90+ days'}
               </div>
@@ -833,13 +887,15 @@ export default function SharePointPage({
                 </div>
               </div>
               <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-                {matchedUsageSiteCount ?? 'Not reported'}{' '}
-                {matchedUsageSiteCount !== null && (
+                {reportIdentifiersConcealed ? 'Unavailable' : matchedUsageSiteCount ?? 'Not reported'}{' '}
+                {!reportIdentifiersConcealed && matchedUsageSiteCount !== null && (
                   <span className="text-sm font-normal text-slate-500">/ {siteCountLabel}</span>
                 )}
               </div>
               <div className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                {matchedUsageSiteCount === null
+                {reportIdentifiersConcealed
+                  ? 'Matching unavailable — Microsoft concealed Site IDs and URLs'
+                  : matchedUsageSiteCount === null
                   ? 'Microsoft usage-row matching unavailable'
                   : SP_SITES.length > 0
                     ? `${Math.round((matchedUsageSiteCount / SP_SITES.length) * 100)}% matched · ${sitesWithActivityCount} with reported activity dates`
@@ -891,7 +947,9 @@ export default function SharePointPage({
                   <div className="flex items-center justify-between gap-3 text-xs">
                     <span className="font-semibold text-slate-700 dark:text-slate-300">Activity-date coverage</span>
                     <span className="text-slate-500 dark:text-slate-400">
-                      {sharePointView.usageReport.exactClaimsAvailable
+                      {reportIdentifiersConcealed
+                        ? 'Unavailable — report identifiers concealed'
+                        : sharePointView.usageReport.exactClaimsAvailable
                         ? matchedUsageSiteCount !== null
                           ? `${sitesWithActivityCount} of ${matchedUsageSiteCount} matched sites include a reported date`
                           : `${sitesWithActivityCount} sites include a reported activity date; matched-row total unavailable`
@@ -975,7 +1033,9 @@ export default function SharePointPage({
                     <User className="h-3.5 w-3.5 text-slate-400 shrink-0" aria-hidden="true" />
                     <span>
                       {sitesMissingOwnerCount === null
-                        ? 'Reported-owner coverage not available from the current D180 projection'
+                        ? reportIdentifiersConcealed
+                          ? 'Reported-owner matching unavailable — identifiers concealed'
+                          : 'Reported-owner coverage not available from the current D180 projection'
                         : <>Reported owner unavailable for <strong className="text-slate-800 dark:text-slate-200">{sitesMissingOwnerCount}</strong> matched D180 usage rows</>}
                     </span>
                   </div>
@@ -1459,10 +1519,14 @@ export default function SharePointPage({
                         {/* Storage */}
                         <td className="p-3 whitespace-nowrap">
                           <div className="font-semibold text-slate-900 dark:text-slate-100">
-                            {formatStorageGB(site.storageUsedGB)}
+                            {site.activityDataStatus === 'identifiers-concealed'
+                              ? 'Unavailable'
+                              : formatStorageGB(site.storageUsedGB)}
                           </div>
                           <div className="mt-0.5 text-[10px] text-slate-400">
-                            {site.storageUsedSource === 'microsoft-d180-usage-report'
+                            {site.activityDataStatus === 'identifiers-concealed'
+                              ? 'Identifiers concealed by Microsoft'
+                              : site.storageUsedSource === 'microsoft-d180-usage-report'
                               ? 'D180 usage report'
                               : site.storageUsedSource === 'graph-default-drive-best-effort'
                                 ? 'Graph default-drive estimate'
@@ -1485,7 +1549,9 @@ export default function SharePointPage({
 
                         {/* Last Activity */}
                         <td className="p-3 whitespace-nowrap text-slate-600 dark:text-slate-300 font-medium">
-                          {formatDate(activityDate)}
+                          {site.activityDataStatus === 'identifiers-concealed'
+                            ? 'Unavailable'
+                            : formatDate(activityDate)}
                         </td>
 
                         {/* Activity State Badge */}
@@ -1514,10 +1580,10 @@ export default function SharePointPage({
                         </td>
 
                         {/* Optional Columns */}
-                        {visibleOptionalCols.has('fileCount') && <td className="p-3 font-medium">{site.fileCount ?? 'Not reported'}</td>}
-                        {visibleOptionalCols.has('activeFileCount') && <td className="p-3 font-medium">{site.activeFileCount ?? 'Not reported'}</td>}
-                        {visibleOptionalCols.has('pageViews') && <td className="p-3 font-medium">{site.pageViews ?? 'Not reported'}</td>}
-                        {visibleOptionalCols.has('visitedPages') && <td className="p-3 font-medium">{site.visitedPages ?? 'Not reported'}</td>}
+                        {visibleOptionalCols.has('fileCount') && <td className="p-3 font-medium">{site.activityDataStatus === 'identifiers-concealed' ? 'Unavailable' : site.fileCount ?? 'Not reported'}</td>}
+                        {visibleOptionalCols.has('activeFileCount') && <td className="p-3 font-medium">{site.activityDataStatus === 'identifiers-concealed' ? 'Unavailable' : site.activeFileCount ?? 'Not reported'}</td>}
+                        {visibleOptionalCols.has('pageViews') && <td className="p-3 font-medium">{site.activityDataStatus === 'identifiers-concealed' ? 'Unavailable' : site.pageViews ?? 'Not reported'}</td>}
+                        {visibleOptionalCols.has('visitedPages') && <td className="p-3 font-medium">{site.activityDataStatus === 'identifiers-concealed' ? 'Unavailable' : site.visitedPages ?? 'Not reported'}</td>}
                         {visibleOptionalCols.has('reportRefreshedAt') && <td className="p-3">{formatDate(site.reportRefreshedAt)}</td>}
                         {visibleOptionalCols.has('reportPeriod') && <td className="p-3">{site.reportPeriod || 'Not reported'}</td>}
                         {visibleOptionalCols.has('createdDate') && <td className="p-3">{formatDate(site.createdDate)}</td>}
@@ -1959,6 +2025,20 @@ export default function SharePointPage({
               </button>
             </div>
 
+            {selectedSiteIdentifiersConcealed && (
+              <div className="rounded-lg border border-amber-200 dark:border-amber-800/70 bg-amber-50/90 dark:bg-amber-950/35 p-3 text-xs text-amber-900 dark:text-amber-100">
+                <div className="flex items-start gap-2">
+                  <Info className="h-4 w-4 mt-0.5 shrink-0" aria-hidden="true" />
+                  <div>
+                    <div className="font-semibold">Site-level report data cannot be matched</div>
+                    <p className="mt-0.5 leading-relaxed text-amber-800 dark:text-amber-200">
+                      Microsoft concealed this report row&apos;s Site ID and URL. HawkView collected the report, but cannot safely attach its usage values to this discovered site. Use the setup instructions above to enable site-level reporting.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Section 1: Identity */}
             <div className="space-y-2">
               <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Site Identity</h3>
@@ -1966,7 +2046,9 @@ export default function SharePointPage({
                 <div>
                   <span className="text-slate-400 block">Reported Owner</span>
                   <span className="font-semibold text-slate-900 dark:text-white">
-                    {selectedSite.ownerDisplayName || selectedSite.ownerPrincipalName || 'Not reported'}
+                    {selectedSiteIdentifiersConcealed
+                      ? 'Unavailable — identifiers concealed'
+                      : selectedSite.ownerDisplayName || selectedSite.ownerPrincipalName || 'Not reported'}
                   </span>
                 </div>
                 <div>
@@ -1991,24 +2073,26 @@ export default function SharePointPage({
                 <div>
                   <span className="text-slate-400 block">Last Reported Activity</span>
                   <span className="font-semibold text-slate-900 dark:text-white">
-                    {formatDate(selectedSite.lastActivityAt || selectedSite.lastActivity)}
+                    {selectedSiteIdentifiersConcealed
+                      ? 'Unavailable — identifiers concealed'
+                      : formatDate(selectedSite.lastActivityAt || selectedSite.lastActivity)}
                   </span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">File Count</span>
-                  <span className="font-medium text-slate-800 dark:text-slate-200">{selectedSite.fileCount ?? 'Not reported'}</span>
+                  <span className="font-medium text-slate-800 dark:text-slate-200">{selectedSiteIdentifiersConcealed ? 'Unavailable' : selectedSite.fileCount ?? 'Not reported'}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Active File Count</span>
-                  <span className="font-medium text-slate-800 dark:text-slate-200">{selectedSite.activeFileCount ?? 'Not reported'}</span>
+                  <span className="font-medium text-slate-800 dark:text-slate-200">{selectedSiteIdentifiersConcealed ? 'Unavailable' : selectedSite.activeFileCount ?? 'Not reported'}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Page Views</span>
-                  <span className="font-medium text-slate-800 dark:text-slate-200">{selectedSite.pageViews ?? 'Not reported'}</span>
+                  <span className="font-medium text-slate-800 dark:text-slate-200">{selectedSiteIdentifiersConcealed ? 'Unavailable' : selectedSite.pageViews ?? 'Not reported'}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Visited Pages</span>
-                  <span className="font-medium text-slate-800 dark:text-slate-200">{selectedSite.visitedPages ?? 'Not reported'}</span>
+                  <span className="font-medium text-slate-800 dark:text-slate-200">{selectedSiteIdentifiersConcealed ? 'Unavailable' : selectedSite.visitedPages ?? 'Not reported'}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">MS Report Refreshed</span>
@@ -2023,22 +2107,28 @@ export default function SharePointPage({
               <div className="grid grid-cols-2 gap-2 text-xs bg-slate-50 dark:bg-slate-800/50 p-3 rounded-lg border border-slate-100 dark:border-slate-800">
                 <div>
                   <span className="text-slate-400 block">
-                    {selectedSite.storageUsedSource === 'graph-default-drive-best-effort'
+                    {selectedSiteIdentifiersConcealed
+                      ? 'Storage Used'
+                      : selectedSite.storageUsedSource === 'graph-default-drive-best-effort'
                       ? 'Best-effort Graph Drive Used'
                       : selectedSite.storageUsedSource === 'microsoft-d180-usage-report'
                         ? 'D180 Reported Storage Used'
                         : 'Storage Used'}
                   </span>
-                  <span className="font-semibold text-slate-900 dark:text-white">{formatStorageGB(selectedSite.storageUsedGB)}</span>
+                  <span className="font-semibold text-slate-900 dark:text-white">
+                    {selectedSiteIdentifiersConcealed ? 'Unavailable — identifiers concealed' : formatStorageGB(selectedSite.storageUsedGB)}
+                  </span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">
-                    {selectedSite.storageUsedSource === 'graph-default-drive-best-effort'
+                    {selectedSiteIdentifiersConcealed
+                      ? 'D180 Reported Allocation'
+                      : selectedSite.storageUsedSource === 'graph-default-drive-best-effort'
                       ? 'Best-effort Graph Drive Total'
                       : 'D180 Reported Allocation'}
                   </span>
                   <span className="font-semibold text-slate-900 dark:text-white">
-                    {formatStorageGB(
+                    {selectedSiteIdentifiersConcealed ? 'Unavailable' : formatStorageGB(
                       selectedSite.storageUsedSource === 'graph-default-drive-best-effort'
                         ? selectedSite.bestEffortDriveStorageTotalGB
                         : selectedSite.storageQuotaGB
