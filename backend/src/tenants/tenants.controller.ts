@@ -42,6 +42,11 @@ export class TenantsController {
     )
   }
 
+  @Get('microsoft/access-contract')
+  getMicrosoftAccessContract() {
+    return this.tenantsService.getMicrosoftAccessContract()
+  }
+
   @Get(':id')
   getTenantBundle(
     @Req() request: AuthenticatedRequest,

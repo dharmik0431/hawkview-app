@@ -18,6 +18,13 @@ const stateSet = new Set<string>(READINESS_STATES)
 const permissionStatuses = new Set(['CONFIRMED', 'MISSING', 'UNVERIFIED', 'NOT_APPLICABLE'])
 const freshStates = new Set(['CURRENT', 'AGING', 'STALE', 'NEVER_SUCCEEDED', 'UNKNOWN'])
 const capabilityStatuses = new Set(['CONFIGURED', 'UNVERIFIED', 'NOT_CONFIGURED'])
+const datasetTiers = new Set(['CORE', 'CAPABILITY_OPTIONAL', 'FALLBACK'])
+const datasetPermissionStatuses = new Set(['CONFIRMED', 'MISSING', 'UNVERIFIED', 'NOT_APPLICABLE'])
+const permissionResources = new Set(['MICROSOFT_GRAPH', 'OFFICE_365_MANAGEMENT_API', 'EXCHANGE_ONLINE'])
+const permissionConsentModes = new Set(['DEFAULT', 'SEPARATE_OPT_IN'])
+const licenseKinds = new Set(['NONE', 'ENTRA_ID_P1_OR_P2', 'SHAREPOINT_SERVICE_PLAN', 'EXCHANGE_SERVICE_PLAN', 'UNIFIED_AUDIT_ENABLED'])
+const licenseStates = new Set(['NOT_REQUIRED', 'SATISFIED', 'NOT_LICENSED', 'UNVERIFIED'])
+const failureScopes = new Set(['DATASET_ONLY', 'WORKLOAD'])
 const CLOSED_UNKNOWN_STATE: ReadinessState = 'UNSUPPORTED'
 const READINESS_ORDER: Record<ReadinessState, number> = {
   BLOCKED_PERMISSION: 0, BLOCKED_TENANT_CONFIGURATION: 1, NOT_LICENSED: 3,
@@ -26,8 +33,10 @@ const READINESS_ORDER: Record<ReadinessState, number> = {
 }
 
 export type CollectionReadinessView = {
+  accessContractVersion: 1 | null
   overallState: ReadinessState
   evaluatedAt: string | null
+  permissionVerifiedAt: string | null
   reasonCode: string | null
   reason: string | null
   remediation: string | null
@@ -45,6 +54,7 @@ export type CollectionReadinessView = {
     reason: string | null
     lastVerifiedAt: string | null
     remediation: string
+    datasets: AccessDatasetReadiness[]
     capabilities: Array<{
       key: string
       label: string
@@ -67,6 +77,38 @@ export type CollectionReadinessView = {
   }>
 }
 
+export type AccessDatasetReadiness = {
+  key: string
+  label: string
+  tier: 'CORE' | 'CAPABILITY_OPTIONAL' | 'FALLBACK'
+  state: ReadinessState
+  permissionStatus: 'CONFIRMED' | 'MISSING' | 'UNVERIFIED' | 'NOT_APPLICABLE'
+  permissions: Array<{
+    resource: 'MICROSOFT_GRAPH' | 'OFFICE_365_MANAGEMENT_API' | 'EXCHANGE_ONLINE'
+    name: string
+    type: 'APPLICATION'
+    consentMode: 'DEFAULT' | 'SEPARATE_OPT_IN'
+    grantStatus: 'CONFIRMED' | 'MISSING' | 'UNVERIFIED'
+  }>
+  permissionMatch: 'ALL' | 'ANY'
+  evidenceMode: 'RESOURCE_STATE' | 'COMPOSITE_RESOURCE_STATE' | 'NOT_DURABLY_OBSERVED'
+  licensePrerequisite: {
+    kind: 'NONE' | 'ENTRA_ID_P1_OR_P2' | 'SHAREPOINT_SERVICE_PLAN' | 'EXCHANGE_SERVICE_PLAN' | 'UNIFIED_AUDIT_ENABLED'
+    state: 'NOT_REQUIRED' | 'SATISFIED' | 'NOT_LICENSED' | 'UNVERIFIED'
+  }
+  fallbackDatasetKey: string | null
+  failureScope: 'DATASET_ONLY' | 'WORKLOAD'
+  resourceTypes: string[]
+  endpointPatterns: string[]
+  documentationUrl: string
+  lastAttemptAt: string | null
+  lastSuccessfulAt: string | null
+  freshness: 'CURRENT' | 'AGING' | 'STALE' | 'NEVER_SUCCEEDED' | 'UNKNOWN'
+  reasonCode: string | null
+  reason: string | null
+  remediation: string
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const prototype = Object.getPrototypeOf(value)
@@ -82,6 +124,18 @@ function text(value: unknown, max = 500): string | null {
 function timestamp(value: unknown) {
   const candidate = text(value, 64)
   return candidate && Number.isFinite(new Date(candidate).getTime()) ? candidate : null
+}
+
+function httpsUrl(value: unknown): string | null {
+  const candidate = text(value, 500)
+  if (!candidate) return null
+  try {
+    const parsed = new URL(candidate)
+    if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'learn.microsoft.com' || parsed.username || parsed.password || parsed.port || parsed.hash) return null
+    return parsed.toString()
+  } catch {
+    return null
+  }
 }
 
 function state(value: unknown): ReadinessState | null {
@@ -122,9 +176,115 @@ function capability(value: unknown) {
     : null
 }
 
+function datasetPermission(value: unknown): AccessDatasetReadiness['permissions'][number] | null {
+  const candidate = record(value)
+  if (!candidate || candidate.type !== 'APPLICATION') return null
+  const resource = typeof candidate.resource === 'string' && permissionResources.has(candidate.resource)
+    ? candidate.resource as AccessDatasetReadiness['permissions'][number]['resource']
+    : null
+  const consentMode = typeof candidate.consentMode === 'string' && permissionConsentModes.has(candidate.consentMode)
+    ? candidate.consentMode as AccessDatasetReadiness['permissions'][number]['consentMode']
+    : null
+  const name = text(candidate.name, 160)
+  const grantStatus = typeof candidate.grantStatus === 'string' && ['CONFIRMED', 'MISSING', 'UNVERIFIED'].includes(candidate.grantStatus)
+    ? candidate.grantStatus as AccessDatasetReadiness['permissions'][number]['grantStatus']
+    : null
+  return resource && consentMode && name && grantStatus ? { resource, name, type: 'APPLICATION', consentMode, grantStatus } : null
+}
+
+function accessDataset(value: unknown, index: number): AccessDatasetReadiness {
+  const candidate = record(value)
+  const key = text(candidate?.key, 100)
+  const label = text(candidate?.label, 160)
+  const tier = typeof candidate?.tier === 'string' && datasetTiers.has(candidate.tier)
+    ? candidate.tier as AccessDatasetReadiness['tier']
+    : null
+  const datasetState = state(candidate?.state)
+  const permissionStatus = typeof candidate?.permissionStatus === 'string' && datasetPermissionStatuses.has(candidate.permissionStatus)
+    ? candidate.permissionStatus as AccessDatasetReadiness['permissionStatus']
+    : null
+  const permissionMatch = typeof candidate?.permissionMatch === 'string' && ['ALL', 'ANY'].includes(candidate.permissionMatch)
+    ? candidate.permissionMatch as AccessDatasetReadiness['permissionMatch']
+    : null
+  const evidenceMode = typeof candidate?.evidenceMode === 'string' && ['RESOURCE_STATE', 'COMPOSITE_RESOURCE_STATE', 'NOT_DURABLY_OBSERVED'].includes(candidate.evidenceMode)
+    ? candidate.evidenceMode as AccessDatasetReadiness['evidenceMode']
+    : null
+  const license = record(candidate?.licensePrerequisite)
+  const licenseKind = typeof license?.kind === 'string' && licenseKinds.has(license.kind)
+    ? license.kind as AccessDatasetReadiness['licensePrerequisite']['kind']
+    : null
+  const licenseState = typeof license?.state === 'string' && licenseStates.has(license.state)
+    ? license.state as AccessDatasetReadiness['licensePrerequisite']['state']
+    : null
+  const failureScope = typeof candidate?.failureScope === 'string' && failureScopes.has(candidate.failureScope)
+    ? candidate.failureScope as AccessDatasetReadiness['failureScope']
+    : null
+  const freshness = typeof candidate?.freshness === 'string' && freshStates.has(candidate.freshness)
+    ? candidate.freshness as AccessDatasetReadiness['freshness']
+    : null
+  const remediation = text(candidate?.remediation)
+  const documentationUrl = httpsUrl(candidate?.documentationUrl)
+  const rawPermissions = Array.isArray(candidate?.permissions) ? candidate.permissions : []
+  const permissions = rawPermissions.slice(0, 16).map(datasetPermission).filter((item): item is NonNullable<ReturnType<typeof datasetPermission>> => Boolean(item))
+  const rawResourceTypes = Array.isArray(candidate?.resourceTypes) ? candidate.resourceTypes : []
+  const resourceTypes = rawResourceTypes.slice(0, 16).map((item) => text(item, 100)).filter((item): item is string => Boolean(item))
+  const rawEndpointPatterns = Array.isArray(candidate?.endpointPatterns) ? candidate.endpointPatterns : []
+  const endpointPatterns = rawEndpointPatterns.slice(0, 16).map((item) => text(item, 240)).filter((item): item is string => Boolean(item))
+  const fallbackValid = candidate?.fallbackDatasetKey === null || typeof candidate?.fallbackDatasetKey === 'string'
+  const invalid = !candidate || !key || !label || !tier || !datasetState || !permissionStatus || !permissionMatch || !evidenceMode || !licenseKind || !licenseState || !failureScope || !freshness || !remediation || !documentationUrl || !fallbackValid || rawPermissions.length > 16 || permissions.length !== rawPermissions.length || rawResourceTypes.length > 16 || resourceTypes.length !== rawResourceTypes.length || rawEndpointPatterns.length > 16 || endpointPatterns.length !== rawEndpointPatterns.length
+  if (invalid) {
+    return {
+      key: `invalid_access_dataset_${index}`,
+      label: 'Access dataset validation',
+      tier: 'CORE',
+      state: 'UNSUPPORTED',
+      permissionStatus: 'UNVERIFIED',
+      permissions: [],
+      permissionMatch: 'ALL',
+      evidenceMode: 'NOT_DURABLY_OBSERVED',
+      licensePrerequisite: { kind: 'NONE', state: 'UNVERIFIED' },
+      fallbackDatasetKey: null,
+      failureScope: 'WORKLOAD',
+      resourceTypes: [],
+      endpointPatterns: [],
+      documentationUrl: 'https://learn.microsoft.com/',
+      lastAttemptAt: null,
+      lastSuccessfulAt: null,
+      freshness: 'UNKNOWN',
+      reasonCode: 'MALFORMED_ACCESS_DATASET',
+      reason: 'HawkView received an unsupported access dataset contract.',
+      remediation: 'Refresh after the service returns a supported Microsoft access contract.',
+    }
+  }
+  return {
+    key,
+    label,
+    tier,
+    state: datasetState,
+    permissionStatus,
+    permissions,
+    permissionMatch,
+    evidenceMode,
+    licensePrerequisite: { kind: licenseKind, state: licenseState },
+    fallbackDatasetKey: text(candidate.fallbackDatasetKey, 100),
+    failureScope,
+    resourceTypes,
+    endpointPatterns,
+    documentationUrl,
+    lastAttemptAt: timestamp(candidate.lastAttemptAt),
+    lastSuccessfulAt: timestamp(candidate.lastSuccessfulAt),
+    freshness,
+    reasonCode: text(candidate.reasonCode, 120),
+    reason: text(candidate.reason),
+    remediation,
+  }
+}
+
 export function normalizeCollectionReadiness(value: unknown): CollectionReadinessView | null {
   const candidate = record(value)
   if (!candidate || !Array.isArray(candidate.workloads)) return null
+  const hasAccessContract = candidate.accessContractVersion === 1
+  if (candidate.accessContractVersion !== undefined && !hasAccessContract) return null
   const workloads: CollectionReadinessView['workloads'] = []
   const rawWorkloads = candidate.workloads
   const boundedWorkloads = rawWorkloads.slice(0, 256)
@@ -150,6 +310,7 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
         configuredCapability: 'UNVERIFIED', permissionStatus: 'UNVERIFIED', requiredPermissions: [],
         lastAttemptAt: null, lastSuccessfulAt: null, freshness: 'UNKNOWN', reasonCode: 'MALFORMED_READINESS_ROW', reason: 'HawkView received a malformed readiness row.', lastVerifiedAt: null,
         remediation: 'Refresh the tenant data after the service reports a valid readiness response.', capabilities: [], components: [], exchangeRbac: null,
+        datasets: [],
       })
       continue
     }
@@ -159,6 +320,11 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
     const capabilities = Array.isArray(row.capabilities)
       ? row.capabilities.slice(0, 8).map(capability).filter((item): item is NonNullable<ReturnType<typeof capability>> => Boolean(item))
       : []
+    const datasets = hasAccessContract && Array.isArray(row.datasets)
+      ? row.datasets.slice(0, 64).map(accessDataset)
+      : []
+    const accessContractInvalid = hasAccessContract && (!Array.isArray(row.datasets) || row.datasets.length === 0 || row.datasets.length > 64)
+    if (accessContractInvalid) datasets.push(accessDataset(null, datasets.length))
     const rawComponents = Array.isArray(row.components) ? row.components : []
     const oversizedComponents = rawComponents.length > 16
     let malformedComponents = false
@@ -184,10 +350,15 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
     const rbacState = state(rbac?.state)
     const rbacStatus = text(rbac?.status, 40)
     const rbacReason = text(rbac?.reason)
-    const rowCandidate = { state: rowState, reasonCode: text(row.reasonCode, 120), reason: text(row.reason), remediation }
-    const selected = components.reduce<typeof rowCandidate | CollectionReadinessView['workloads'][number]['components'][number]>((worst, candidate) => {
-      return READINESS_ORDER[candidate.state] < READINESS_ORDER[worst.state] ? candidate : worst
-    }, rowCandidate)
+    const invalidAccessDataset = datasets.some((dataset) => dataset.key.startsWith('invalid_access_dataset_'))
+    const rowCandidate = invalidAccessDataset
+      ? { state: 'UNSUPPORTED' as const, reasonCode: 'MALFORMED_ACCESS_DATASET', reason: 'HawkView received an unsupported access dataset contract.', remediation: 'Refresh after the service returns a supported Microsoft access contract.' }
+      : { state: rowState, reasonCode: text(row.reasonCode, 120), reason: text(row.reason), remediation }
+    const selected = hasAccessContract
+      ? rowCandidate
+      : components.reduce<typeof rowCandidate | CollectionReadinessView['workloads'][number]['components'][number]>((worst, candidate) => {
+          return READINESS_ORDER[candidate.state] < READINESS_ORDER[worst.state] ? candidate : worst
+        }, rowCandidate)
     const selectedComponent = 'label' in selected ? selected : null
     workloads.push({
       key,
@@ -206,6 +377,7 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
         ? `Review ${selectedComponent.label}: ${selectedComponent.reason ?? 'this component could not be safely verified.'}`
         : remediation,
       capabilities,
+      datasets,
       components,
       exchangeRbac: rbacState && rbacStatus && rbacReason ? { status: rbacStatus, state: rbacState, reason: rbacReason } : null,
     })
@@ -216,6 +388,7 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
       configuredCapability: 'UNVERIFIED', permissionStatus: 'UNVERIFIED', requiredPermissions: [],
       lastAttemptAt: null, lastSuccessfulAt: null, freshness: 'UNKNOWN', reasonCode: 'READINESS_ROW_LIMIT_EXCEEDED', reason: 'HawkView received more readiness rows than this bounded contract permits.', lastVerifiedAt: null,
       remediation: 'Refresh the tenant data after the service reports a valid readiness response.', capabilities: [], components: [], exchangeRbac: null,
+      datasets: [],
     })
   }
   if (!workloads.length) return null
@@ -226,7 +399,7 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
   }
   const normalizedWorkloads = Array.from(unique.values())
   const overall = normalizedWorkloads.reduce<CollectionReadinessView['workloads'][number] | null>((selected, row) => !selected || READINESS_ORDER[row.state] < READINESS_ORDER[selected.state] ? row : selected, null)
-  return { overallState: overall?.state ?? 'UNSUPPORTED', evaluatedAt: timestamp(candidate.evaluatedAt), reasonCode: overall?.reasonCode ?? null, reason: overall?.reason ?? null, remediation: overall?.remediation ?? null, workloads: normalizedWorkloads }
+  return { accessContractVersion: hasAccessContract ? 1 : null, overallState: overall?.state ?? 'UNSUPPORTED', evaluatedAt: timestamp(candidate.evaluatedAt), permissionVerifiedAt: timestamp(candidate.permissionVerifiedAt), reasonCode: overall?.reasonCode ?? null, reason: overall?.reason ?? null, remediation: overall?.remediation ?? null, workloads: normalizedWorkloads }
 }
 
 export function readinessLabel(value: string) {

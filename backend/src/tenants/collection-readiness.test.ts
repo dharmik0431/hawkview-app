@@ -48,6 +48,8 @@ function row(result: ReturnType<typeof deriveCollectionReadiness>, key: string) 
 
 test('does not report a connected tenant as ready when collection has never succeeded', () => {
   const result = deriveCollectionReadiness(input({ syncStates: [] }))
+  assert.equal(result.permissionVerifiedAt, current.toISOString())
+  assert.equal(result.evaluatedAt, now.toISOString())
   assert.equal(result.overallState, 'UNVERIFIED')
   assert.equal(row(result, 'entra_directory_audit').state, 'NEVER_SUCCEEDED')
   assert.equal(row(result, 'm365_unified_audit').state, 'NEVER_SUCCEEDED')
@@ -263,15 +265,17 @@ test('keeps subscription verification separate from successful polling and selec
   assert.equal(result.reason, row(result, result.workloads.find((item) => item.state === result.overallState)?.key ?? '').reason)
 })
 
-test('keeps a missing Graph mailbox permission authoritative', () => {
+test('keeps a missing optional Graph mailbox permission dataset-scoped', () => {
   const withoutMailboxSettings = permissions.filter((permission) => permission !== 'MailboxSettings.Read')
   const result = deriveCollectionReadiness(input({ consentedPermissions: withoutMailboxSettings }))
   const exchange = row(result, 'exchange')
-  assert.equal(exchange.permissionStatus, 'MISSING')
-  assert.equal(exchange.state, 'BLOCKED_PERMISSION')
-  assert.equal(exchange.reasonCode, 'MICROSOFT_PERMISSION_NOT_CONFIRMED')
-  assert.match(exchange.reason ?? '', /MailboxSettings\.Read/)
-  assert.equal(result.overallState, 'BLOCKED_PERMISSION')
+  assert.equal(exchange.permissionStatus, 'CONFIRMED')
+  assert.equal(exchange.state, 'READY')
+  const mailboxSettings = exchange.datasets?.find((dataset) => dataset.key === 'exchange_mailbox_settings_rules')
+  assert.equal(mailboxSettings?.permissionStatus, 'MISSING')
+  assert.equal(mailboxSettings?.state, 'BLOCKED_PERMISSION')
+  assert.match(mailboxSettings?.reason ?? '', /MailboxSettings\.Read/)
+  assert.notEqual(result.overallState, 'BLOCKED_PERMISSION')
 })
 
 test('marks absent verification as unverified, revoked connection as blocked, and secure score failure as visible', () => {
@@ -286,27 +290,98 @@ test('marks absent verification as unverified, revoked connection as blocked, an
   const states = allResources.map((resource) => sync(resource))
   states.splice(states.findIndex((state) => state.resourceType === 'SECURE_SCORES'), 1, sync('SECURE_SCORES', { status: 'FAILED', lastErrorCode: '403', lastErrorMessage: 'Forbidden' }))
   const secureScoreFailure = deriveCollectionReadiness(input({ syncStates: states }))
-  assert.equal(row(secureScoreFailure, 'entra_security_configuration').state, 'BLOCKED_PERMISSION')
+  assert.equal(row(secureScoreFailure, 'entra_security_configuration').state, 'READY')
+  assert.equal(row(secureScoreFailure, 'entra_security_configuration').datasets?.find((dataset) => dataset.key === 'entra_secure_scores')?.state, 'BLOCKED_PERMISSION')
 
   states.splice(states.findIndex((state) => state.resourceType === 'SECURE_SCORES'), 1, sync('SECURE_SCORES', { lastSuccessfulAt: new Date('2026-08-15T00:00:00.000Z') }))
-  assert.equal(row(deriveCollectionReadiness(input({ syncStates: states })), 'entra_security_configuration').state, 'STALE')
+  const staleSecureScore = row(deriveCollectionReadiness(input({ syncStates: states })), 'entra_security_configuration')
+  assert.equal(staleSecureScore.state, 'READY')
+  assert.equal(staleSecureScore.datasets?.find((dataset) => dataset.key === 'entra_secure_scores')?.state, 'STALE')
 })
 
-test('treats every active collector grant as a verified requirement instead of silently declaring its workload ready', () => {
-  const expectations: Array<[string, string]> = [
-    ['Member.Read.Hidden', 'entra_directory'],
-    ['Device.Read.All', 'entra_directory'],
-    ['RoleManagement.Read.Directory', 'entra_directory'],
-    ['Policy.Read.AuthenticationMethod', 'entra_security_configuration'],
-    ['SecurityEvents.Read.All', 'entra_security_configuration'],
+test('keeps required and optional collector grants independently visible', () => {
+  const expectations: Array<[string, string, string, 'READY' | 'PARTIAL']> = [
+    ['Member.Read.Hidden', 'entra_directory', 'entra_hidden_group_members', 'PARTIAL'],
+    ['Device.Read.All', 'entra_directory', 'entra_devices', 'PARTIAL'],
+    ['RoleManagement.Read.Directory', 'entra_directory', 'entra_directory_roles', 'PARTIAL'],
+    ['Policy.Read.AuthenticationMethod', 'entra_security_configuration', 'entra_authentication_policy', 'PARTIAL'],
+    ['SecurityEvents.Read.All', 'entra_security_configuration', 'entra_secure_scores', 'READY'],
   ]
-  for (const [permission, workload] of expectations) {
+  for (const [permission, workload, datasetKey, parentState] of expectations) {
     const result = deriveCollectionReadiness(input({ consentedPermissions: permissions.filter((value) => value !== permission) }))
     const value = row(result, workload)
-    assert.equal(value.permissionStatus, 'MISSING', permission)
-    assert.equal(value.state, 'BLOCKED_PERMISSION', permission)
-    assert.match(value.remediation, /permission/i)
+    assert.equal(value.state, parentState, permission)
+    const dataset = value.datasets?.find((candidate) => candidate.key === datasetKey)
+    assert.equal(dataset?.permissionStatus, 'MISSING', permission)
+    assert.equal(dataset?.state, 'BLOCKED_PERMISSION', permission)
+    assert.match(dataset?.remediation ?? '', /Grant/i)
   }
+})
+
+test('keeps exact per-scope grant truth for an ALL-permission dataset', () => {
+  const result = deriveCollectionReadiness(input({
+    consentedPermissions: permissions.filter((permission) => permission !== 'Directory.Read.All'),
+  }))
+  const audit = row(result, 'entra_directory_audit').datasets?.find(
+    (dataset) => dataset.key === 'entra_directory_audit',
+  )
+  assert.equal(audit?.permissionStatus, 'MISSING')
+  assert.deepEqual(
+    audit?.permissions.map((permission) => [permission.name, permission.grantStatus]),
+    [['AuditLog.Read.All', 'CONFIRMED'], ['Directory.Read.All', 'MISSING']],
+  )
+})
+
+test('reports one composite authentication-registration dataset for the premium report or per-user fallback', () => {
+  const withoutAudit = deriveCollectionReadiness(input({
+    consentedPermissions: permissions.filter((permission) => permission !== 'AuditLog.Read.All'),
+  }))
+  const fallbackReady = row(withoutAudit, 'entra_security_configuration')
+  assert.equal(fallbackReady.state, 'READY')
+  const fallbackCoverage = fallbackReady.datasets?.find((dataset) => dataset.key === 'entra_authentication_registration_coverage')
+  assert.equal(fallbackCoverage?.state, 'READY')
+  assert.equal(fallbackCoverage?.permissionMatch, 'ANY')
+  assert.equal(fallbackCoverage?.evidenceMode, 'COMPOSITE_RESOURCE_STATE')
+  assert.deepEqual(
+    fallbackCoverage?.permissions.map((permission) => [permission.name, permission.grantStatus]),
+    [['AuditLog.Read.All', 'MISSING'], ['UserAuthenticationMethod.Read.All', 'CONFIRMED']],
+  )
+
+  const withoutFallback = row(deriveCollectionReadiness(input({
+    consentedPermissions: permissions.filter((permission) => permission !== 'UserAuthenticationMethod.Read.All'),
+  })), 'entra_security_configuration')
+  assert.equal(withoutFallback.state, 'READY')
+  const reportCoverage = withoutFallback.datasets?.find((dataset) => dataset.key === 'entra_authentication_registration_coverage')
+  assert.equal(reportCoverage?.state, 'READY')
+  assert.deepEqual(
+    reportCoverage?.permissions.map((permission) => [permission.name, permission.grantStatus]),
+    [['AuditLog.Read.All', 'CONFIRMED'], ['UserAuthenticationMethod.Read.All', 'MISSING']],
+  )
+
+  const withoutEither = row(deriveCollectionReadiness(input({
+    consentedPermissions: permissions.filter((permission) => !['AuditLog.Read.All', 'UserAuthenticationMethod.Read.All'].includes(permission)),
+  })), 'entra_security_configuration')
+  assert.equal(withoutEither.state, 'PARTIAL')
+  assert.equal(withoutEither.datasets?.find((dataset) => dataset.key === 'entra_authentication_registration_coverage')?.state, 'BLOCKED_PERMISSION')
+})
+
+test('does not claim source-specific authentication readiness from the shared successful snapshot state', () => {
+  const result = row(deriveCollectionReadiness(input()), 'entra_security_configuration')
+  const coverage = result.datasets?.find((dataset) => dataset.key === 'entra_authentication_registration_coverage')
+  const requirements = result.datasets?.find((dataset) => dataset.key === 'entra_per_user_mfa_requirements')
+
+  // AUTH_REGISTRATIONS is SUCCEEDED both for the premium report and when the
+  // collector catches non-premium and completes its per-user methods fallback.
+  assert.equal(coverage?.state, 'READY')
+  assert.equal(coverage?.evidenceMode, 'COMPOSITE_RESOURCE_STATE')
+  assert.equal(result.datasets?.some((dataset) => dataset.key === 'entra_authentication_methods_fallback'), false)
+
+  // The beta requirements enrichment catches failures while the same shared
+  // snapshot still succeeds, so no source-specific READY claim is defensible.
+  assert.equal(requirements?.state, 'UNVERIFIED')
+  assert.equal(requirements?.lastSuccessfulAt, null)
+  assert.equal(requirements?.reasonCode, 'SOURCE_AVAILABILITY_NOT_DURABLY_OBSERVED')
+  assert.equal(requirements?.evidenceMode, 'NOT_DURABLY_OBSERVED')
 })
 
 test('connection verification failures override historical collection success without erasing that evidence', () => {
@@ -328,14 +403,15 @@ test('distinguishes a bounded audit backlog from a completed scheduler run', () 
   assert.equal(row(result, 'm365_unified_audit').state, 'BACKLOGGED')
 })
 
-test('keeps a workload partial when one persisted collector is still running after other data succeeded', () => {
+test('keeps an optional dataset visible while it is running without degrading its healthy parent', () => {
   const states = allResources.map((resource) => sync(resource))
   states.splice(states.findIndex((state) => state.resourceType === 'SHAREPOINT_USAGE'), 1, sync('SHAREPOINT_USAGE', {
     status: 'RUNNING',
     lastErrorMessage: 'Usage report collection is in progress.',
   }))
   const result = deriveCollectionReadiness(input({ syncStates: states }))
-  assert.equal(row(result, 'sharepoint_onedrive').state, 'PARTIAL')
+  assert.equal(row(result, 'sharepoint_onedrive').state, 'READY')
+  assert.equal(row(result, 'sharepoint_onedrive').datasets?.find((dataset) => dataset.key === 'sharepoint_usage_reports')?.state, 'PARTIAL')
   assert.equal(row(result, 'sharepoint_onedrive').lastSuccessfulAt, current.toISOString())
 })
 

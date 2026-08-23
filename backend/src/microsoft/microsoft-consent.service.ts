@@ -15,66 +15,14 @@ import {
   microsoftErrorMetadata,
   MicrosoftRequestError,
 } from './microsoft-request.js'
-
-const DEFAULT_REQUIRED_PERMISSIONS = [
-  'Organization.Read.All',
-  'User.Read.All',
-  'GroupMember.Read.All',
-  'Member.Read.Hidden',
-  'AuditLog.Read.All',
-  'Directory.Read.All',
-  'UserAuthenticationMethod.Read.All',
-  'Policy.Read.All',
-  'Policy.Read.AuthenticationMethod',
-  'Device.Read.All',
-  'RoleManagement.Read.Directory',
-  'Application.Read.All',
-  'Sites.Read.All',
-  'SharePointTenantSettings.Read.All',
-  'Reports.Read.All',
-  'MailboxSettings.Read',
-  'ActivityFeed.Read',
-  'SecurityEvents.Read.All',
-] as const
-
-const PERMISSION_DESCRIPTIONS: Record<string, string> = {
-  'Organization.Read.All':
-    'Read the Microsoft 365 organization name, domains, and subscription details.',
-  'User.Read.All': 'Read users and their basic directory profile information.',
-  'GroupMember.Read.All':
-    'Read Microsoft 365 and security groups and their user memberships.',
-  'Member.Read.Hidden':
-    'Read memberships for Microsoft groups whose membership list is hidden.',
-  'AuditLog.Read.All':
-    'Read sign-in activity and user MFA registration status.',
-  'Directory.Read.All':
-    'Allow Microsoft Graph to evaluate tenant licensing reliably when HawkView reads sign-in activity.',
-  'UserAuthenticationMethod.Read.All':
-    'Read which authentication method types users have registered when tenant-level MFA reporting is unavailable.',
-  'Policy.Read.All':
-    'Read Conditional Access policies, named locations, and the separate legacy per-user MFA requirement state.',
-  'Policy.Read.AuthenticationMethod':
-    'Read the tenant authentication-method policy.',
-  'Device.Read.All': 'Read Microsoft Entra registered and managed devices.',
-  'RoleManagement.Read.Directory':
-    'Read Microsoft Entra directory role assignments.',
-  'Application.Read.All':
-    'Resolve application IDs in Conditional Access policies to readable names.',
-  'Sites.Read.All':
-    'Read SharePoint site inventory and document-library storage usage.',
-  'SharePointTenantSettings.Read.All':
-    'Read tenant-level SharePoint and OneDrive storage and sharing settings.',
-  'Reports.Read.All':
-    'Read SharePoint site usage, storage consumption, ownership, and last activity reports.',
-  'MailboxSettings.Read':
-    'Read mailbox inbox rules for Exchange security visibility.',
-  'ActivityFeed.Read':
-    'Read Microsoft 365 unified audit activity for Exchange, SharePoint, Teams, Entra, and tenant administration; also supports limited-license login evidence.',
-  'SecurityEvents.Read.All':
-    'Read Microsoft Secure Score snapshots and security improvement data.',
-  'Exchange.ManageAsAppV2':
-    'Authorize the optional Exchange Admin API. Exchange RBAC separately limits HawkView to Get-Mailbox only.',
-}
+import {
+  CONNECTION_REQUIRED_PERMISSIONS,
+  DEFAULT_REQUIRED_PERMISSIONS,
+  MICROSOFT_ACCESS_CAPABILITIES,
+  MICROSOFT_ACCESS_CONTRACT_VERSION,
+  MICROSOFT_APPLICATION_PERMISSIONS,
+  PERMISSION_DESCRIPTIONS,
+} from './microsoft-access-contract.js'
 
 const GRAPH_RESOURCE_HOST = 'graph.microsoft.com'
 const MANAGEMENT_RESOURCE_HOST = 'manage.office.com'
@@ -245,12 +193,31 @@ export class MicrosoftConsentService {
       ...new Set([...DEFAULT_REQUIRED_PERMISSIONS, ...configured.permissions]),
     ]
 
-    return permissions.map((name) => ({
-      name,
-      description:
-        PERMISSION_DESCRIPTIONS[name] ??
-        'Required by a configured HawkView Microsoft synchronization module.',
-    }))
+    return permissions.map((name) => {
+      const definition = MICROSOFT_APPLICATION_PERMISSIONS.find((permission) => permission.name === name)
+      const capabilities = MICROSOFT_ACCESS_CAPABILITIES.filter((capability) =>
+        capability.applicationPermissions.some((permission) => permission.name === name),
+      )
+      return {
+        name,
+        description: PERMISSION_DESCRIPTIONS[name] ?? 'Required by a configured HawkView Microsoft synchronization module.',
+        resource: definition?.resource ?? 'MICROSOFT_GRAPH',
+        type: 'APPLICATION' as const,
+        consentMode: definition?.consentMode ?? 'DEFAULT',
+        connectionRequired: definition?.connectionRequired ?? false,
+        tier: capabilities.some((capability) => capability.tier === 'CORE') ? 'CORE' as const : 'CAPABILITY_OPTIONAL' as const,
+        purpose: capabilities.map((capability) => capability.label),
+      }
+    })
+  }
+
+  getAccessContract() {
+    return {
+      version: MICROSOFT_ACCESS_CONTRACT_VERSION,
+      requestedPermissions: this.getRequiredPermissions(),
+      connectionRequiredPermissions: [...CONNECTION_REQUIRED_PERMISSIONS],
+      capabilities: MICROSOFT_ACCESS_CAPABILITIES,
+    }
   }
 
   async createAdminConsentUrl(
@@ -376,6 +343,10 @@ export class MicrosoftConsentService {
         const verification = await this.verifyTenant(microsoftTenantId)
         lastVerification = verification
         lastError = null
+        // Prefer a complete projection while Microsoft propagates the full
+        // one-click grant. Capability permissions do not gate the connection,
+        // but returning on the first baseline role would persist a misleading
+        // partial grant set when the remaining roles are still propagating.
         if (verification.missingPermissions.length === 0) {
           return verification
         }
@@ -474,12 +445,20 @@ export class MicrosoftConsentService {
     const missingPermissions = requiredPermissionNames.filter(
       (permission) => !grantedPermissions.includes(permission)
     )
+    const missingRequiredPermissions = CONNECTION_REQUIRED_PERMISSIONS.filter(
+      (permission) => !grantedPermissions.includes(permission),
+    )
+    const missingNonConnectionPermissions = missingPermissions.filter(
+      (permission) => !missingRequiredPermissions.includes(permission),
+    )
 
     return {
       displayName: organization.displayName,
       primaryDomain,
       grantedPermissions: [...new Set(grantedPermissions)].sort(),
       missingPermissions,
+      missingRequiredPermissions,
+      missingNonConnectionPermissions,
     }
   }
 
@@ -707,9 +686,9 @@ export class MicrosoftConsentService {
         clientSecret: input.clientSecret,
       }
     )
-    if (verification.missingPermissions.length > 0) {
+    if (verification.missingRequiredPermissions.length > 0) {
       throw new BadRequestException(
-        `The connector is missing: ${verification.missingPermissions.join(', ')}.`
+        `The connector is missing connection-required permission(s): ${verification.missingRequiredPermissions.join(', ')}.`
       )
     }
 
@@ -757,9 +736,9 @@ export class MicrosoftConsentService {
         clientSecret: input.clientSecret,
       }
     )
-    if (verification.missingPermissions.length > 0) {
+    if (verification.missingRequiredPermissions.length > 0) {
       throw new BadRequestException(
-        `The customer-managed application is missing: ${verification.missingPermissions.join(', ')}.`
+        `The customer-managed application is missing connection-required permission(s): ${verification.missingRequiredPermissions.join(', ')}.`
       )
     }
     const credentialReference = await this.secretStore.store(
