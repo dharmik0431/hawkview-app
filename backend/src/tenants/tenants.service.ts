@@ -42,6 +42,18 @@ const TENANT_ONBOARDING_ROLES = [
 const MICROSOFT_TENANT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
+export function effectiveMicrosoftConnectionStatus(
+  status: string | null,
+  lastErrorCode: string | null,
+  missingRequiredPermissions: readonly string[],
+) {
+  return status === 'ERROR' &&
+    lastErrorCode === 'missing-permissions' &&
+    missingRequiredPermissions.length === 0
+    ? 'ACTIVE'
+    : status
+}
+
 export const preserveOptionalExchangeConsent = (
   graphPermissions: string[],
   previouslyRecorded: string[]
@@ -65,6 +77,10 @@ export class TenantsService {
     @Inject(NotificationsService)
     private readonly notifications: NotificationsService
   ) {}
+
+  getMicrosoftAccessContract() {
+    return this.microsoftConsent.getAccessContract()
+  }
 
   private parseMicrosoftTenantId(body: unknown) {
     if (!body || typeof body !== 'object') {
@@ -250,18 +266,33 @@ export class TenantsService {
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
     const connectionStatus = tenant.connection?.status ?? null
-    const effectiveStatus =
-      connectionStatus === 'ERROR' || connectionStatus === 'REVOKED'
-        ? 'disconnected'
-        : connectionStatus === 'PENDING_CONSENT'
-          ? 'pending'
-          : tenant.status.toLowerCase()
-
     const missingPermissions = requiredPermissions
       .map((permission) => permission.name)
       .filter((permission) => !consentedPermissions.includes(permission))
-    const collectionReadiness = deriveCollectionReadiness({
+    const accessContract = this.microsoftConsent.getAccessContract()
+    const missingRequiredPermissions = accessContract.connectionRequiredPermissions
+      .filter((permission) => !consentedPermissions.includes(permission))
+    const missingNonConnectionPermissions = missingPermissions
+      .filter((permission) => !missingRequiredPermissions.includes(permission))
+    // Before the access contract, any missing one-click capability grant was
+    // persisted as a connection-wide ERROR. Interpret only that legacy error
+    // as active when the actual connection baseline is present; other ERROR
+    // causes remain disconnected and the database is not mutated on a read.
+    const effectiveConnectionStatus = effectiveMicrosoftConnectionStatus(
       connectionStatus,
+      tenant.connection?.lastErrorCode ?? null,
+      missingRequiredPermissions,
+    )
+    const legacyOptionalPermissionError =
+      connectionStatus === 'ERROR' && effectiveConnectionStatus === 'ACTIVE'
+    const effectiveStatus =
+      effectiveConnectionStatus === 'ERROR' || effectiveConnectionStatus === 'REVOKED'
+        ? 'disconnected'
+        : effectiveConnectionStatus === 'PENDING_CONSENT'
+          ? 'pending'
+          : tenant.status.toLowerCase()
+    const collectionReadiness = deriveCollectionReadiness({
+      connectionStatus: effectiveConnectionStatus,
       connectionVerifiedAt: tenant.connection?.lastVerifiedAt,
       consentedPermissions,
       syncStates: tenant.syncStates,
@@ -281,9 +312,9 @@ export class TenantsService {
     const health = deriveTenantHealth({
       tenantId: tenant.id,
       effectiveStatus,
-      connectionStatus,
+      connectionStatus: effectiveConnectionStatus,
       connectionLastVerifiedAt: tenant.connection?.lastVerifiedAt ?? null,
-      missingPermissions,
+      missingPermissions: missingRequiredPermissions,
       syncStates: tenant.syncStates,
       authSnapshot: tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.AUTH_REGISTRATIONS) ?? null,
       riskyIdentityCount,
@@ -301,7 +332,7 @@ export class TenantsService {
       domain: tenant.primaryDomain,
       status: effectiveStatus,
       connectionStatus:
-        tenant.connection?.status.toLowerCase().replaceAll('_', '-') ?? null,
+        effectiveConnectionStatus?.toLowerCase().replaceAll('_', '-') ?? null,
       connectionMode:
         tenant.connection?.connectionMode === 'CUSTOMER_MANAGED'
           ? 'customer-managed'
@@ -314,8 +345,15 @@ export class TenantsService {
           ?.toISOString() ?? null,
       requiredPermissions,
       consentedPermissions,
+      // Compatibility: missingPermissions remains the complete set of scopes
+      // offered by one-click consent. Connection/health gates use the two
+      // explicit fields below and never infer global failure from this list.
       missingPermissions,
-      connectionErrorCode: tenant.connection?.lastErrorCode ?? null,
+      missingRequiredPermissions,
+      missingNonConnectionPermissions,
+      connectionErrorCode: legacyOptionalPermissionError
+        ? null
+        : tenant.connection?.lastErrorCode ?? null,
       secureScore: getMicrosoftSecureScore(
         tenant.entraSnapshots.find(
           (snapshot) => snapshot.resourceType === SyncResourceType.SECURE_SCORES,
@@ -383,7 +421,7 @@ export class TenantsService {
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
       })
-      const connected = verification.missingPermissions.length === 0
+      const connected = verification.missingRequiredPermissions.length === 0
 
       await this.prisma.$transaction([
         this.prisma.customerTenant.update({
@@ -411,7 +449,7 @@ export class TenantsService {
             lastErrorCode: connected ? null : 'missing-permissions',
             lastErrorMessage: connected
               ? null
-              : `Missing permissions: ${verification.missingPermissions.join(', ')}`,
+              : `Missing connection-required permissions: ${verification.missingRequiredPermissions.join(', ')}`,
           },
         }),
       ])
@@ -1140,7 +1178,7 @@ export class TenantsService {
       const verification = await this.microsoftConsent.verifyTenantAfterConsent(
         tenant.microsoftTenantId
       )
-      const connected = verification.missingPermissions.length === 0
+      const connected = verification.missingRequiredPermissions.length === 0
       const now = new Date()
 
       await this.prisma.$transaction([
@@ -1170,7 +1208,7 @@ export class TenantsService {
             lastErrorCode: connected ? null : 'missing-permissions',
             lastErrorMessage: connected
               ? null
-              : `Missing permissions: ${verification.missingPermissions.join(', ')}`,
+              : `Missing connection-required permissions: ${verification.missingRequiredPermissions.join(', ')}`,
           },
         }),
       ])
@@ -1182,7 +1220,7 @@ export class TenantsService {
         await this.notifyMissingPermissions(
           tenant.id,
           tenant.organizationId,
-          verification.missingPermissions
+          verification.missingRequiredPermissions
         )
       }
 
@@ -1340,7 +1378,7 @@ export class TenantsService {
     try {
       const verification =
         await this.microsoftConsent.verifyTenantAfterConsent(returnedTenantId)
-      const connected = verification.missingPermissions.length === 0
+      const connected = verification.missingRequiredPermissions.length === 0
       const now = new Date()
 
       await this.prisma.$transaction([
@@ -1373,7 +1411,7 @@ export class TenantsService {
             lastErrorCode: connected ? null : 'missing-permissions',
             lastErrorMessage: connected
               ? null
-              : `Missing permissions: ${verification.missingPermissions.join(', ')}`,
+              : `Missing connection-required permissions: ${verification.missingRequiredPermissions.join(', ')}`,
           },
         }),
       ])
@@ -1385,7 +1423,7 @@ export class TenantsService {
         await this.notifyMissingPermissions(
           tenant.id,
           tenant.organizationId,
-          verification.missingPermissions
+          verification.missingRequiredPermissions
         )
       }
 

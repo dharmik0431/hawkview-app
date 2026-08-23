@@ -1,5 +1,10 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
 import { deriveSignInEntitlement } from './sign-in-entitlement.js'
+import {
+  capabilitiesForWorkload,
+  MICROSOFT_ACCESS_CONTRACT_VERSION,
+  type MicrosoftAccessCapability,
+} from '../microsoft/microsoft-access-contract.js'
 
 /**
  * A customer-facing view of persisted collection evidence.  It deliberately
@@ -56,6 +61,8 @@ export type CollectionReadinessRow = {
   reason: string | null
   lastVerifiedAt?: string | null
   remediation: string
+  /** Dataset-level access truth. This is authoritative for capability/permission UI. */
+  datasets?: AccessDatasetReadiness[]
   /** Informational capability boundaries do not degrade supported workload readiness. */
   capabilities?: Array<{
     key: string
@@ -83,14 +90,50 @@ export type CollectionReadinessRow = {
   }
 }
 
+export type AccessDatasetReadiness = {
+  key: string
+  label: string
+  tier: 'CORE' | 'CAPABILITY_OPTIONAL' | 'FALLBACK'
+  state: CollectionReadinessState
+  permissionStatus: Exclude<PermissionGrantStatus, 'NOT_APPLICABLE'> | 'NOT_APPLICABLE'
+  permissions: Array<{
+    resource: 'MICROSOFT_GRAPH' | 'OFFICE_365_MANAGEMENT_API' | 'EXCHANGE_ONLINE'
+    name: string
+    type: 'APPLICATION'
+    consentMode: 'DEFAULT' | 'SEPARATE_OPT_IN'
+    /** Resource-specific verified status for this exact application role. */
+    grantStatus: 'CONFIRMED' | 'MISSING' | 'UNVERIFIED'
+  }>
+  permissionMatch: 'ALL' | 'ANY'
+  evidenceMode: 'RESOURCE_STATE' | 'COMPOSITE_RESOURCE_STATE' | 'NOT_DURABLY_OBSERVED'
+  licensePrerequisite: {
+    kind: 'NONE' | 'ENTRA_ID_P1_OR_P2' | 'SHAREPOINT_SERVICE_PLAN' | 'EXCHANGE_SERVICE_PLAN' | 'UNIFIED_AUDIT_ENABLED'
+    state: 'NOT_REQUIRED' | 'SATISFIED' | 'NOT_LICENSED' | 'UNVERIFIED'
+  }
+  fallbackDatasetKey: string | null
+  failureScope: 'DATASET_ONLY' | 'WORKLOAD'
+  resourceTypes: string[]
+  endpointPatterns: string[]
+  documentationUrl: string
+  lastAttemptAt: string | null
+  lastSuccessfulAt: string | null
+  freshness: CollectionReadinessRow['freshness']
+  reasonCode: string | null
+  reason: string | null
+  remediation: string
+}
+
 export type CollectionReadiness = {
   version: 1
+  accessContractVersion: 1
   overallState: CollectionReadinessState
   /** Diagnostics always belong to the same selected worst workload as overallState. */
   reasonCode: string | null
   reason: string | null
   lastAttemptAt: string | null
   lastSuccessfulAt: string | null
+  /** Last persisted resource-specific consent verification, never API evaluation time. */
+  permissionVerifiedAt: string | null
   evaluatedAt: string
   workloads: CollectionReadinessRow[]
 }
@@ -154,10 +197,14 @@ const permissionStatus = (
   requiredPermissions: string[],
   consented: Set<string>,
   verificationKnown: boolean,
+  match: 'ALL' | 'ANY' = 'ALL',
 ): PermissionGrantStatus => {
   if (requiredPermissions.length === 0) return 'NOT_APPLICABLE'
   if (!verificationKnown) return 'UNVERIFIED'
-  return requiredPermissions.every((permission) => consented.has(permission.toLowerCase()))
+  const matched = match === 'ANY'
+    ? requiredPermissions.some((permission) => consented.has(permission.toLowerCase()))
+    : requiredPermissions.every((permission) => consented.has(permission.toLowerCase()))
+  return matched
     ? 'CONFIRMED'
     : 'MISSING'
 }
@@ -349,6 +396,142 @@ function workload(
   }
 }
 
+function datasetReadiness(
+  capability: MicrosoftAccessCapability,
+  states: Map<string, ReadinessSyncState>,
+  consented: Set<string>,
+  verificationKnown: boolean,
+  now: Date,
+  applicability: {
+    sharepoint: 'APPLICABLE' | 'NOT_LICENSED' | 'UNVERIFIED'
+    exchange: 'APPLICABLE' | 'NOT_LICENSED' | 'UNVERIFIED'
+    signIn: 'PREMIUM' | 'NON_PREMIUM' | 'UNVERIFIED'
+  },
+): AccessDatasetReadiness {
+  const permissionNames = capability.applicationPermissions.map((permission) => permission.name)
+  const permissionMatch = capability.permissionMatch ?? 'ALL'
+  const evidenceMode = capability.evidenceMode ?? 'RESOURCE_STATE'
+  const grants = permissionStatus(permissionNames, consented, verificationKnown, permissionMatch)
+  const signInLicensingDisposition = capability.workloadKey === 'sign_ins'
+    ? applicability.signIn === 'PREMIUM' ? 'FAILED_TRANSIENT' as const : applicability.signIn === 'NON_PREMIUM' ? 'NOT_LICENSED' as const : 'UNVERIFIED' as const
+    : undefined
+  const resourceRows = capability.resourceTypes.map((resourceType) =>
+    fromSyncState(states.get(resourceType), now, resourceType === 'AUDIT_LOGS' || resourceType === 'SIGN_INS' || resourceType === 'M365_AUDIT' ? 'incremental' : 'daily', signInLicensingDisposition),
+  )
+  let dynamic = selectedWorst(resourceRows) ?? {
+    state: 'NEVER_SUCCEEDED' as const,
+    lastAttemptAt: null,
+    lastSuccessfulAt: null,
+    freshness: 'NEVER_SUCCEEDED' as const,
+    reasonCode: 'COLLECTOR_NOT_STARTED',
+    reason: 'HawkView has not recorded a collection attempt for this dataset.',
+  }
+  let licenseState: AccessDatasetReadiness['licensePrerequisite']['state'] = 'NOT_REQUIRED'
+  if (capability.licensePrerequisite === 'SHAREPOINT_SERVICE_PLAN') {
+    licenseState = applicability.sharepoint === 'APPLICABLE' ? 'SATISFIED' : applicability.sharepoint
+  } else if (capability.licensePrerequisite === 'EXCHANGE_SERVICE_PLAN') {
+    licenseState = applicability.exchange === 'APPLICABLE' ? 'SATISFIED' : applicability.exchange
+  } else if (capability.licensePrerequisite === 'ENTRA_ID_P1_OR_P2') {
+    licenseState = applicability.signIn === 'PREMIUM' ? 'SATISFIED' : applicability.signIn === 'NON_PREMIUM' ? 'NOT_LICENSED' : 'UNVERIFIED'
+  } else if (capability.licensePrerequisite === 'UNIFIED_AUDIT_ENABLED') {
+    licenseState = dynamic.state === 'READY' ? 'SATISFIED' : 'UNVERIFIED'
+  }
+  if (licenseState === 'NOT_LICENSED') {
+    dynamic = { ...dynamic, state: 'NOT_LICENSED', reasonCode: 'SERVICE_PLAN_NOT_ENABLED', reason: 'Current authoritative service-plan evidence does not enable this dataset.' }
+  } else if (licenseState === 'UNVERIFIED' && capability.licensePrerequisite !== 'UNIFIED_AUDIT_ENABLED') {
+    dynamic = {
+      ...dynamic,
+      state: 'UNVERIFIED',
+      reasonCode: capability.workloadKey === 'sign_ins' ? 'SIGN_IN_ENTITLEMENT_UNVERIFIED' : 'SERVICE_PLAN_UNVERIFIED',
+      reason: capability.workloadKey === 'sign_ins'
+        ? 'HawkView does not yet have current service-plan evidence to select the licensed Graph source or limited audit-feed fallback.'
+        : 'Current authoritative service-plan evidence does not yet establish this dataset entitlement.',
+    }
+  } else if (grants === 'MISSING') {
+    dynamic = { ...dynamic, state: 'BLOCKED_PERMISSION', reasonCode: 'MICROSOFT_PERMISSION_NOT_CONFIRMED', reason: `HawkView verified that this dataset is missing: ${permissionNames.filter((permission) => !consented.has(permission.toLowerCase())).join(', ')}.` }
+  } else if (grants === 'UNVERIFIED') {
+    dynamic = { ...dynamic, state: 'UNVERIFIED', reasonCode: 'MICROSOFT_PERMISSION_UNVERIFIED', reason: 'HawkView has not completed resource-specific permission verification for this dataset.' }
+  } else if (evidenceMode === 'NOT_DURABLY_OBSERVED') {
+    dynamic = {
+      ...dynamic,
+      state: 'UNVERIFIED',
+      lastAttemptAt: null,
+      lastSuccessfulAt: null,
+      freshness: 'UNKNOWN',
+      reasonCode: 'SOURCE_AVAILABILITY_NOT_DURABLY_OBSERVED',
+      reason: 'The shared collection state does not durably prove that this optional Microsoft enrichment succeeded.',
+    }
+  }
+  return {
+    key: capability.key,
+    label: capability.label,
+    tier: capability.tier,
+    state: dynamic.state,
+    permissionStatus: grants,
+    permissions: capability.applicationPermissions.map((permission) => ({
+      ...permission,
+      type: 'APPLICATION' as const,
+      consentMode: permission.resource === 'EXCHANGE_ONLINE' ? 'SEPARATE_OPT_IN' as const : 'DEFAULT' as const,
+      grantStatus: !verificationKnown
+        ? 'UNVERIFIED' as const
+        : consented.has(permission.name.toLowerCase())
+          ? 'CONFIRMED' as const
+          : 'MISSING' as const,
+    })),
+    permissionMatch,
+    evidenceMode,
+    licensePrerequisite: { kind: capability.licensePrerequisite, state: licenseState },
+    fallbackDatasetKey: capability.fallbackCapabilityKey,
+    failureScope: capability.failureScope,
+    resourceTypes: [...capability.resourceTypes],
+    endpointPatterns: [...capability.endpointPatterns],
+    documentationUrl: capability.documentationUrl,
+    lastAttemptAt: dynamic.lastAttemptAt,
+    lastSuccessfulAt: dynamic.lastSuccessfulAt,
+    freshness: dynamic.freshness,
+    reasonCode: dynamic.reasonCode,
+    reason: dynamic.reason,
+    remediation: grants === 'MISSING' ? `Grant ${permissionNames.join(' and ')} for this dataset; unrelated datasets continue independently.` : 'HawkView will re-evaluate this dataset during its normal scheduled collection.',
+  }
+}
+
+function applyDatasetContract(
+  row: CollectionReadinessRow,
+  datasets: AccessDatasetReadiness[],
+  selectedDatasetKeys?: Set<string>,
+) {
+  row.datasets = datasets
+  const selected = datasets.filter((dataset) =>
+    selectedDatasetKeys ? selectedDatasetKeys.has(dataset.key) : dataset.tier === 'CORE',
+  )
+  const byKey = new Map(datasets.map((dataset) => [dataset.key, dataset]))
+  const contributing = selected.map((dataset) => {
+    if (selectedDatasetKeys || dataset.state === 'READY' || !dataset.fallbackDatasetKey) return dataset
+    const fallback = byKey.get(dataset.fallbackDatasetKey)
+    return fallback?.state === 'READY' ? fallback : dataset
+  })
+  if (!contributing.length) return
+  const usable = contributing.filter((dataset) => dataset.state === 'READY')
+  const selectedWorstRow = selectedWorst(contributing)!
+  // One unavailable dataset is visible as PARTIAL and cannot erase healthy
+  // sibling datasets. Optional/fallback datasets never degrade the parent.
+  row.state = usable.length > 0 && usable.length < contributing.length ? 'PARTIAL' : selectedWorstRow.state
+  row.reasonCode = row.state === 'PARTIAL' ? 'DATASET_PARTIALLY_AVAILABLE' : selectedWorstRow.reasonCode
+  row.reason = row.state === 'PARTIAL'
+    ? `${usable.length} of ${contributing.length} required datasets are currently available. Review dataset status for the exact boundary.`
+    : selectedWorstRow.reason
+  row.lastAttemptAt = selectedWorstRow.lastAttemptAt
+  row.lastSuccessfulAt = selectedWorstRow.lastSuccessfulAt
+  row.freshness = selectedWorstRow.freshness
+  const required = [...new Set(contributing.flatMap((dataset) => dataset.permissions.map((permission) => permission.name)))]
+  row.permissionStatus = contributing.some((dataset) => dataset.permissionStatus === 'UNVERIFIED')
+    ? 'UNVERIFIED'
+    : contributing.some((dataset) => dataset.permissionStatus === 'MISSING')
+      ? 'MISSING'
+      : required.length ? 'CONFIRMED' : 'NOT_APPLICABLE'
+  row.configuredCapability = row.permissionStatus === 'CONFIRMED' ? 'CONFIGURED' : row.permissionStatus === 'MISSING' ? 'NOT_CONFIGURED' : 'UNVERIFIED'
+}
+
 function m365SubscriptionReadiness(subscription: M365ActivitySubscriptionState | undefined, now: Date) {
   if (!subscription) {
     return {
@@ -413,7 +596,7 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
         ? 'Confirm ActivityFeed.Read has tenant-wide admin consent. HawkView will use the limited Microsoft 365 audit-feed source because the collected service plans do not include Entra ID P1/P2.'
         : 'Confirm AuditLog.Read.All, Directory.Read.All, and ActivityFeed.Read while HawkView verifies the tenant entitlement and selects the best available sign-in source.'
   const rows = [
-    workload({ key: 'entra_directory_audit', workload: 'Entra directory audit', resourceTypes: ['AUDIT_LOGS'], requiredPermissions: ['AuditLog.Read.All'], cadence: 'incremental', remediation: 'Confirm AuditLog.Read.All has tenant-wide admin consent, then allow the scheduled collector to recheck.' }, states, consented, verificationKnown, now),
+    workload({ key: 'entra_directory_audit', workload: 'Entra directory audit', resourceTypes: ['AUDIT_LOGS'], requiredPermissions: ['AuditLog.Read.All', 'Directory.Read.All'], cadence: 'incremental', remediation: 'Confirm AuditLog.Read.All and Directory.Read.All have tenant-wide admin consent, then allow the scheduled collector to recheck.' }, states, consented, verificationKnown, now),
     workload({ key: 'sign_ins', workload: 'Entra sign-ins', resourceTypes: ['SIGN_INS'], requiredPermissions: signInPermissions, cadence: 'incremental', remediation: signInRemediation, licensingFailureDisposition: signInEntitlement === 'PREMIUM' ? 'FAILED_TRANSIENT' : signInEntitlement === 'NON_PREMIUM' ? 'NOT_LICENSED' : 'UNVERIFIED' }, states, consented, verificationKnown, now),
     workload({ key: 'entra_directory', workload: 'Entra directory inventory', resourceTypes: ['USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES'], requiredPermissions: ['User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory'], cadence: 'daily', remediation: 'Confirm the required directory, hidden-membership, device, and role-management application permissions. HawkView rechecks during normal collection.' }, states, consented, verificationKnown, now),
     workload({ key: 'entra_security_configuration', workload: 'Entra security configuration', resourceTypes: ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES'], requiredPermissions: ['UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'SecurityEvents.Read.All'], cadence: 'daily', remediation: 'Confirm the required authentication-method, policy, application, and Secure Score permissions. A successful OAuth connection alone does not verify every collector.' }, states, consented, verificationKnown, now),
@@ -465,6 +648,32 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     components: subscriptionComponents,
   })
 
+  const applicability = {
+    sharepoint: sharePointApplicability,
+    exchange: exchangeApplicability,
+    signIn: signInEntitlement,
+  }
+  for (const row of rows) {
+    const datasets = capabilitiesForWorkload(row.key).map((capability) =>
+      datasetReadiness(capability, states, consented, verificationKnown, now, applicability),
+    )
+    if (row.key === 'm365_unified_audit' && datasets[0]) {
+      datasets[0] = {
+        ...datasets[0],
+        state: row.state,
+        lastAttemptAt: row.lastAttemptAt,
+        lastSuccessfulAt: row.lastSuccessfulAt,
+        freshness: row.freshness,
+        reasonCode: row.reasonCode,
+        reason: row.reason,
+      }
+    }
+    const selected = row.key === 'sign_ins'
+      ? new Set(signInEntitlement === 'NON_PREMIUM' ? ['entra_sign_ins_activity_feed'] : signInEntitlement === 'PREMIUM' ? ['entra_sign_ins_graph'] : ['entra_sign_ins_graph', 'entra_sign_ins_activity_feed'])
+      : undefined
+    applyDatasetContract(row, datasets, selected)
+  }
+
   if (connectionUnavailable) {
     for (const row of rows) {
       const preservedSuccessfulAt = (row.components ?? [])
@@ -479,17 +688,27 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
       row.permissionStatus = 'UNVERIFIED'
       row.lastSuccessfulAt = preservedSuccessfulAt
       row.remediation = 'Reconnect or complete Microsoft administrator consent, then HawkView will recheck automatically.'
+      row.datasets = row.datasets?.map((dataset) => ({
+        ...dataset,
+        state: 'BLOCKED_PERMISSION',
+        permissionStatus: 'UNVERIFIED',
+        reasonCode: 'MICROSOFT_CONNECTION_NOT_READY',
+        reason: 'Microsoft connection consent is pending, revoked, or unavailable.',
+        remediation: 'Reconnect or complete Microsoft administrator consent, then HawkView will recheck automatically.',
+      }))
     }
   }
 
   const overall = selectedWorst(rows)!
   return {
     version: 1,
+    accessContractVersion: MICROSOFT_ACCESS_CONTRACT_VERSION,
     overallState: overall.state,
     reasonCode: overall.reasonCode,
     reason: overall.reason,
     lastAttemptAt: overall.lastAttemptAt,
     lastSuccessfulAt: overall.lastSuccessfulAt,
+    permissionVerifiedAt: iso(input.connectionVerifiedAt),
     evaluatedAt: now.toISOString(),
     workloads: rows,
   }

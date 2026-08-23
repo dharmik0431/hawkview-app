@@ -9,6 +9,7 @@ import { useAuth } from '@/components/providers/auth-provider'
 import { apiClient } from '@/lib/api/client'
 import { auditSyncFocusTarget, isM365AuditSyncDeepLink, m365AuditSyncHealth } from '@/lib/tenants/audit-sync-health'
 import { normalizeCollectionReadiness, readinessDiagnostic, readinessLabel, readinessRemediation, synchronizationReadinessSummary, READINESS_STATES } from '@/lib/tenants/collection-readiness'
+import { datasetStateNeedsTenantAction, datasetTierLabel, microsoftAccessDatasetView, microsoftAccessSummary, normalizeMicrosoftAccessCatalog, normalizeMicrosoftVerificationTimestamp } from '@/lib/tenants/microsoft-access-contract'
 import {
   settingsConnectionHealth,
   settingsOverallHealth,
@@ -120,69 +121,6 @@ function formatModuleName(rawName: string) {
   return rawName.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (l) => l.toUpperCase())
 }
 
-const PERMISSION_DESCRIPTIONS: Record<string, { purpose: string; breadth: string; service: string }> = {
-  'Directory.Read.All': {
-    purpose: 'Reads tenant directory data including organization, domains, users, groups, and device registrations.',
-    breadth: 'Broad directory read access across all user accounts, groups, and organizational configurations.',
-    service: 'Microsoft Graph',
-  },
-  'AuditLog.Read.All': {
-    purpose: 'Reads audit log data, sign-in activity logs, and directory security audit entries.',
-    breadth: 'Full read access to historical security sign-in events and administrative audit records.',
-    service: 'Microsoft Graph',
-  },
-  'Sites.Read.All': {
-    purpose: 'Reads documents, lists, and metadata across all SharePoint sites and OneDrive libraries.',
-    breadth: 'Broad read access to all tenant document content, site architecture, and user personal files without signed-in user context.',
-    service: 'Microsoft Graph',
-  },
-  'Mail.Read': {
-    purpose: 'Reads email messages and mailbox metadata across user mailboxes.',
-    breadth: 'Access to email content, subject lines, recipients, and attachments.',
-    service: 'Microsoft Graph',
-  },
-  'Reports.Read.All': {
-    purpose: 'Reads Microsoft 365 service usage reports and activity analytics.',
-    breadth: 'Access to tenant-wide usage, active users, storage trends, and application telemetry.',
-    service: 'Microsoft Graph',
-  },
-  'User.Read.All': {
-    purpose: 'Reads full user profiles, account statuses, licenses, and directory attributes.',
-    breadth: 'Access to all user profile details across the organization.',
-    service: 'Microsoft Graph',
-  },
-  'Group.Read.All': {
-    purpose: 'Reads group properties, memberships, Teams channels, and security groups.',
-    breadth: 'Access to all Microsoft 365 groups, security groups, and team structures.',
-    service: 'Microsoft Graph',
-  },
-  'Policy.Read.All': {
-    purpose: 'Reads Entra ID Conditional Access policies, authentication methods, and security baselines.',
-    breadth: 'Access to security policies and identity posture configurations.',
-    service: 'Microsoft Graph',
-  },
-  'Organization.Read.All': {
-    purpose: 'Reads organization contact and subscription information.',
-    breadth: 'Access to tenant-level organization profiles and subscription details.',
-    service: 'Microsoft Graph',
-  },
-  'Domain.Read.All': {
-    purpose: 'Reads verified domain names and DNS status for the organization.',
-    breadth: 'Access to custom domain and DNS validation records.',
-    service: 'Microsoft Graph',
-  },
-  'Exchange.ManageAsApp': {
-    purpose: 'Accesses Exchange Online PowerShell and Admin APIs for mailbox inventory and hygiene.',
-    breadth: 'Privileged app-only access to Exchange Online management APIs.',
-    service: 'Exchange Online',
-  },
-  'ActivityFeed.Read': {
-    purpose: 'Reads Microsoft 365 unified audit activity for supported workloads.',
-    breadth: 'Tenant-wide administrative audit evidence from the Office 365 Management Activity API.',
-    service: 'Office 365 Management API',
-  },
-}
-
 export default function TenantSettingsPage() {
   const params = useParams<{ id: string }>()
   const searchParams = useSearchParams()
@@ -207,6 +145,7 @@ export default function TenantSettingsPage() {
 
   const [bundle, setBundle] = useState<TenantBundle | null>(null)
   const [tenantListRecord, setTenantListRecord] = useState<any | null>(null)
+  const [microsoftAccessContract, setMicrosoftAccessContract] = useState<unknown>(null)
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading')
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -286,9 +225,14 @@ export default function TenantSettingsPage() {
     setLoadError(null)
 
     try {
-      const [bundleRes, listRes] = await Promise.allSettled([
+      const [bundleRes, listRes, accessContractRes] = await Promise.allSettled([
         apiClient.get<any>(`/api/tenants/${encodeURIComponent(String(tenantId))}`),
         apiClient.get<any>('/api/tenants'),
+        queryClient.fetchQuery({
+          queryKey: ['microsoft-access-contract', session?.user.id ?? 'unavailable'],
+          queryFn: () => apiClient.get<unknown>('/api/tenants/microsoft/access-contract'),
+          staleTime: 60 * 60 * 1000,
+        }),
       ])
 
       let loadedBundle: TenantBundle | null = null
@@ -303,6 +247,7 @@ export default function TenantSettingsPage() {
         )
         if (found) setTenantListRecord(found)
       }
+      setMicrosoftAccessContract(accessContractRes.status === 'fulfilled' ? accessContractRes.value : null)
 
       if (!loadedBundle && bundleRes.status === 'rejected') {
         throw new Error('Unable to load tenant configuration.')
@@ -314,7 +259,7 @@ export default function TenantSettingsPage() {
       setLoadError(msg)
       setLoadState('error')
     }
-  }, [tenantId])
+  }, [queryClient, session?.user.id, tenantId])
 
   useEffect(() => {
     fetchTenantData()
@@ -336,13 +281,9 @@ export default function TenantSettingsPage() {
         rawBundleTenant.id ||
         tenantId,
       provider: rawListTenant.provider || rawBundleTenant.provider || 'microsoft',
-      status: rawListTenant.status || rawBundleTenant.status || null,
-      connectionStatus: rawListTenant.connectionStatus || rawBundleTenant.connectionStatus || null,
+      connectionStatus: rawListTenant.connectionStatus ?? null,
       connectionMode: rawListTenant.connectionMode || rawBundleTenant.connectionMode || 'hawkview-managed',
       lastSync: rawListTenant.lastSync || rawBundleTenant.lastSync || null,
-      requiredPermissions: rawListTenant.requiredPermissions || rawBundleTenant.requiredPermissions || null,
-      consentedPermissions: rawListTenant.consentedPermissions || rawBundleTenant.consentedPermissions || null,
-      missingPermissions: rawListTenant.missingPermissions || rawBundleTenant.missingPermissions || null,
       connectionErrorCode: rawListTenant.connectionErrorCode || rawBundleTenant.connectionErrorCode || null,
       organization: rawListTenant.organization || rawBundleTenant.organization || null,
       connectedAt: rawListTenant.connectedAt || rawBundleTenant.connectedAt || null,
@@ -480,20 +421,31 @@ export default function TenantSettingsPage() {
   }
 
   // Computed health & collection views
-  const hasPermissionsData = Array.isArray(tenant.requiredPermissions) && tenant.requiredPermissions.length > 0
-  const missingPermsCount = Array.isArray(tenant.missingPermissions) ? tenant.missingPermissions.length : 0
-  const connectionHealth = settingsConnectionHealth(tenant.connectionStatus || tenant.status)
-  const normalizedConnectionStatus = String(tenant.connectionStatus || tenant.status || '').toLowerCase()
+  const connectionHealth = settingsConnectionHealth(tenant.connectionStatus)
+  const normalizedConnectionStatus = String(tenant.connectionStatus ?? '').toLowerCase()
   const isConnectionLost = connectionHealth.state === 'DISCONNECTED'
-  const requiresMicrosoftReconnection =
-    isConnectionLost ||
-    ['pending-consent', 'pending', 'warning'].includes(normalizedConnectionStatus) ||
-    missingPermsCount > 0
-
   const collectionReadiness = useMemo(
     () => normalizeCollectionReadiness(tenantListRecord?.collectionReadiness),
     [tenantListRecord]
   )
+  const accessCatalog = useMemo(
+    () => normalizeMicrosoftAccessCatalog(microsoftAccessContract),
+    [microsoftAccessContract],
+  )
+  const accessSummary = useMemo(
+    () => microsoftAccessSummary(collectionReadiness, accessCatalog),
+    [accessCatalog, collectionReadiness],
+  )
+  const permissionVerificationAt = useMemo(
+    () => normalizeMicrosoftVerificationTimestamp(collectionReadiness?.permissionVerifiedAt),
+    [collectionReadiness],
+  )
+  const hasPermissionsData = accessSummary.contractAvailable
+  const missingPermsCount = accessSummary.missingConnectionRequired + accessSummary.missingCore
+  const requiresMicrosoftReconnection =
+    isConnectionLost ||
+    ['pending-consent', 'pending', 'warning'].includes(normalizedConnectionStatus) ||
+    accessSummary.missingConnectionRequired > 0
   const synchronizationSummary = useMemo(
     () => synchronizationReadinessSummary(collectionReadiness),
     [collectionReadiness]
@@ -586,20 +538,6 @@ export default function TenantSettingsPage() {
       })
     }
 
-    // Missing permissions
-    if (missingPermsCount > 0) {
-      items.push({
-        id: 'missing-permissions',
-        title: 'Microsoft Graph Permissions',
-        status: `Missing (${missingPermsCount})`,
-        statusVariant: 'amber',
-        explanation: Array.isArray(tenant.missingPermissions) ? tenant.missingPermissions.join(', ') : 'Permissions required for tenant synchronization are missing.',
-        timestamp: formatDate(tenant.lastSync),
-        actionLabel: 'Review Permissions',
-        targetTab: 'permissions',
-      })
-    }
-
     // Audit Sync issues
     if (auditSync && auditSync.classification !== 'READY' && auditSync.classification !== 'HEALTHY') {
       items.push({
@@ -616,7 +554,7 @@ export default function TenantSettingsPage() {
     }
 
     return items
-  }, [collectionReadiness, missingPermsCount, tenant.missingPermissions, tenant.lastSync, auditSync])
+  }, [collectionReadiness, auditSync])
 
   // Filtered & Sorted Collection Workloads
   const filteredWorkloads = useMemo(() => {
@@ -629,7 +567,8 @@ export default function TenantSettingsPage() {
         (w) =>
           w.workload.toLowerCase().includes(q) ||
           w.key.toLowerCase().includes(q) ||
-          w.components.some((c) => c.label.toLowerCase().includes(q))
+          w.components.some((c) => c.label.toLowerCase().includes(q)) ||
+          w.datasets.some((dataset) => dataset.label.toLowerCase().includes(q))
       )
     }
 
@@ -662,29 +601,7 @@ export default function TenantSettingsPage() {
 
   // Filtered Permissions list
   const filteredPermissions = useMemo(() => {
-    if (!Array.isArray(tenant.requiredPermissions)) return []
-
-    const list = tenant.requiredPermissions.map((perm: any) => {
-      const name = typeof perm === 'string' ? perm : perm.name
-      const detail = PERMISSION_DESCRIPTIONS[name] || {
-        purpose: typeof perm === 'object' ? perm.description : 'Required for read-only tenant synchronization.',
-        breadth: 'Provides read-only access to relevant service endpoints.',
-        service: 'Microsoft Graph',
-      }
-      const isConsented = Array.isArray(tenant.consentedPermissions) ? tenant.consentedPermissions.includes(name) : true
-      const isMissing = Array.isArray(tenant.missingPermissions) ? tenant.missingPermissions.includes(name) : false
-      const status = isMissing ? 'Missing' : isConsented ? 'Granted' : 'Not verified'
-
-      return {
-        name,
-        service: detail.service,
-        type: 'Application',
-        required: true,
-        status,
-        purpose: detail.purpose,
-        breadth: detail.breadth,
-      }
-    })
+    const list = accessSummary.permissions
 
     return list.filter((p: any) => {
       if (permSearch.trim()) {
@@ -695,7 +612,7 @@ export default function TenantSettingsPage() {
       if (permStatusFilter !== 'ALL' && p.status !== permStatusFilter) return false
       return true
     })
-  }, [tenant.requiredPermissions, tenant.consentedPermissions, tenant.missingPermissions, permSearch, permServiceFilter, permStatusFilter])
+  }, [accessSummary.permissions, permSearch, permServiceFilter, permStatusFilter])
 
   // Modules list for Synchronization Tab
   const moduleRows = useMemo(() => {
@@ -886,7 +803,7 @@ export default function TenantSettingsPage() {
                 {isConnectionLost
                   ? 'HawkView can no longer access this tenant. Previously synchronized data remains available, but new synchronization is paused until access is restored.'
                   : missingPermsCount > 0
-                  ? 'HawkView has added read-only capabilities that this tenant has not approved yet. Existing data remains available while an administrator reviews the update.'
+                  ? 'One or more core datasets are missing required read-only access. Optional enrichment does not block otherwise healthy collection.'
                   : 'This tenant is registered, but synchronization cannot complete until a Global Administrator grants the required read-only permissions.'}
               </p>
             </div>
@@ -1001,8 +918,8 @@ export default function TenantSettingsPage() {
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/40 p-4 space-y-1">
               <div className="text-xs text-slate-500 dark:text-slate-400 font-medium">Permissions Granted</div>
               <div className="text-base font-bold text-slate-900 dark:text-white">
-                {Array.isArray(tenant.consentedPermissions) && Array.isArray(tenant.requiredPermissions)
-                  ? `${tenant.consentedPermissions.length} / ${tenant.requiredPermissions.length} scopes`
+                {accessSummary.contractAvailable
+                  ? `${accessSummary.granted} / ${accessSummary.permissions.length} verified scopes`
                   : 'Not available'}
               </div>
             </div>
@@ -1336,7 +1253,7 @@ export default function TenantSettingsPage() {
                             </td>
                             <td className="px-3 py-3 text-center">
                               <Badge variant="outline" className="text-[10px]">
-                                {w.components.length}
+                                {w.datasets.length || w.components.length}
                               </Badge>
                             </td>
                             <td className="px-3 py-3 text-right">
@@ -1402,7 +1319,56 @@ export default function TenantSettingsPage() {
                                   </div>
                                 )}
 
-                                {/* Component Statuses */}
+                                {/* Dataset-level Microsoft access contract */}
+                                {w.datasets.length > 0 && (
+                                  <div className="space-y-2">
+                                    <div className="font-semibold text-xs text-slate-700 dark:text-slate-300">
+                                      Dataset capabilities ({w.datasets.length})
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                                      {w.datasets.map((rawDataset) => {
+                                        const dataset = microsoftAccessDatasetView(rawDataset, accessCatalog)
+                                        if (!dataset) {
+                                          return (
+                                            <div key={rawDataset.key} className="p-2.5 rounded-lg border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-1.5">
+                                              <div className="flex items-start justify-between gap-2">
+                                                <span className="font-medium text-slate-900 dark:text-white">Unsupported capability contract</span>
+                                                <Badge variant="secondary" className="text-[10px] shrink-0">Unsupported</Badge>
+                                              </div>
+                                              <p className="text-[11px] text-slate-500">Static capability metadata was not available for key {rawDataset.key}.</p>
+                                            </div>
+                                          )
+                                        }
+                                        return (
+                                          <div
+                                            key={dataset.key}
+                                            className="p-2.5 rounded-lg border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-1.5"
+                                          >
+                                            <div className="flex items-start justify-between gap-2">
+                                              <div>
+                                                <span className="font-medium text-slate-900 dark:text-white block">{dataset.label}</span>
+                                                <span className="text-[11px] text-slate-500">{datasetTierLabel(dataset.tier)}</span>
+                                              </div>
+                                              <Badge
+                                                variant={dataset.state === 'READY' ? 'success' : datasetStateNeedsTenantAction(dataset) ? 'destructive' : 'secondary'}
+                                                className="text-[10px] shrink-0"
+                                              >
+                                                {readinessLabel(dataset.state)}
+                                              </Badge>
+                                            </div>
+                                            <div className="text-[11px] text-slate-500">
+                                              Permission: {readinessLabel(dataset.permissionStatus)}
+                                              {dataset.fallbackDatasetKey ? ` · Fallback: ${dataset.fallbackDatasetKey}` : ''}
+                                            </div>
+                                            {dataset.reason && <p className="text-[11px] text-slate-600 dark:text-slate-400">{dataset.reason}</p>}
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* Legacy component statuses */}
                                 {w.components.length > 0 && (
                                   <div className="space-y-2">
                                     <div className="font-semibold text-xs text-slate-700 dark:text-slate-300">
@@ -1458,21 +1424,21 @@ export default function TenantSettingsPage() {
           {/* Top Summary Strip */}
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Required Permissions</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Connection / Core</span>
               <div className="text-lg font-bold text-slate-900 dark:text-white pt-0.5">
-                {Array.isArray(tenant.requiredPermissions) ? tenant.requiredPermissions.length : 'Not available'}
+                {hasPermissionsData ? `${accessSummary.connectionRequired} / ${accessSummary.core}` : 'Not available'}
               </div>
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Granted Permissions</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Optional / Fallback</span>
               <div className="text-lg font-bold text-emerald-600 dark:text-emerald-400 pt-0.5">
-                {Array.isArray(tenant.consentedPermissions) ? tenant.consentedPermissions.length : 'Not available'}
+                {hasPermissionsData ? `${accessSummary.optional} / ${accessSummary.fallback + accessSummary.alternative}` : 'Not available'}
               </div>
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Missing Permissions</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Missing Core</span>
               <div className="text-lg font-bold text-amber-600 dark:text-amber-400 pt-0.5">
                 {missingPermsCount}
               </div>
@@ -1481,8 +1447,12 @@ export default function TenantSettingsPage() {
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
               <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Verification State</span>
               <div className="pt-0.5">
-                {missingPermsCount > 0 ? (
+                {!hasPermissionsData ? (
+                  <Badge variant="secondary" className="text-[10px]">Not verified</Badge>
+                ) : missingPermsCount > 0 ? (
                   <Badge variant="destructive" className="text-[10px]">Action Required</Badge>
+                ) : accessSummary.missingOptional > 0 || accessSummary.unverified > 0 ? (
+                  <Badge variant="secondary" className="text-[10px]">Core available</Badge>
                 ) : (
                   <Badge variant="success" className="text-[10px]">Verified</Badge>
                 )}
@@ -1490,9 +1460,9 @@ export default function TenantSettingsPage() {
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs col-span-2 sm:col-span-1">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Latest Permission Evidence</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Latest Permission Verification</span>
               <div className="text-xs font-semibold text-slate-900 dark:text-white pt-0.5 truncate">
-                {formatDate(tenant.lastSync)}
+                {formatDate(permissionVerificationAt)}
               </div>
             </div>
           </div>
@@ -1534,10 +1504,10 @@ export default function TenantSettingsPage() {
                     <th className="px-4 py-3">Permission Name</th>
                     <th className="px-3 py-3">API / Service</th>
                     <th className="px-3 py-3">Type</th>
-                    <th className="px-3 py-3">Required</th>
+                    <th className="px-3 py-3">Requirement</th>
                     <th className="px-3 py-3">Status</th>
                     <th className="px-4 py-3">Purpose & Scope Breadth</th>
-                    <th className="px-3 py-3">Latest Permission Evidence</th>
+                    <th className="px-3 py-3">Latest Permission Verification</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
@@ -1555,7 +1525,7 @@ export default function TenantSettingsPage() {
                         </td>
                         <td className="px-3 py-3 text-slate-600 dark:text-slate-300">{p.service}</td>
                         <td className="px-3 py-3 text-slate-500 dark:text-slate-400">{p.type}</td>
-                        <td className="px-3 py-3 text-slate-700 dark:text-slate-300 font-medium">Yes</td>
+                        <td className="px-3 py-3 text-slate-700 dark:text-slate-300 font-medium">{p.requirement}</td>
                         <td className="px-3 py-3">
                           {p.status === 'Granted' && <Badge variant="success" className="text-[10px]">Granted</Badge>}
                           {p.status === 'Missing' && <Badge variant="destructive" className="text-[10px]">Missing</Badge>}
@@ -1563,9 +1533,9 @@ export default function TenantSettingsPage() {
                         </td>
                         <td className="px-4 py-3 max-w-md space-y-0.5">
                           <p className="font-medium text-slate-800 dark:text-slate-200">{p.purpose}</p>
-                          <p className="text-[11px] text-slate-500 leading-snug">{p.breadth}</p>
+                          <p className="text-[11px] text-slate-500 leading-snug">{p.consentMode}</p>
                         </td>
-                        <td className="px-3 py-3 text-slate-500 dark:text-slate-400">{formatDate(tenant.lastSync)}</td>
+                        <td className="px-3 py-3 text-slate-500 dark:text-slate-400">{formatDate(permissionVerificationAt)}</td>
                       </tr>
                     ))
                   )}

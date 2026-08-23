@@ -64,9 +64,15 @@ export const MicrosoftConsentResponseSchema = z.object({
     z.object({
       name: z.string(),
       description: z.string(),
-    })
+      resource: z.enum(['MICROSOFT_GRAPH', 'OFFICE_365_MANAGEMENT_API', 'EXCHANGE_ONLINE']),
+      type: z.literal('APPLICATION'),
+      consentMode: z.enum(['DEFAULT', 'SEPARATE_OPT_IN']),
+      tier: z.enum(['CORE', 'CAPABILITY_OPTIONAL']),
+      connectionRequired: z.boolean(),
+      purpose: z.array(z.string()),
+    }).strict()
   ),
-})
+}).strict()
 
 export type MicrosoftConsentResponse = z.infer<
   typeof MicrosoftConsentResponseSchema

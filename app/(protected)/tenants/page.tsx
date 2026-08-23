@@ -35,9 +35,9 @@ import { apiClient } from '@/lib/api/client'
 import { useAuth } from '@/components/providers/auth-provider'
 import type {
   CreateTenantResponse,
-  MicrosoftConsentResponse,
   Tenant,
 } from '@/types/api'
+import { normalizeMicrosoftConsentReview, type MicrosoftConsentReview } from '@/lib/tenants/microsoft-access-contract'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 
@@ -310,7 +310,7 @@ export default function TenantsPage() {
     tone: 'success' | 'warning'
   } | null>(null)
   const [consentReview, setConsentReview] =
-    useState<MicrosoftConsentResponse | null>(null)
+    useState<MicrosoftConsentReview | null>(null)
   const [isSavingTenant, setIsSavingTenant] = useState(false)
 
   const loading = isLoading || isFetching
@@ -502,7 +502,7 @@ export default function TenantsPage() {
         setOnboardingStep('select')
         setOnboardingError(null)
         setConsentMessage({
-          text: 'Microsoft consent completed, but required permissions are missing.',
+          text: 'Microsoft consent completed, but a connection-required permission is missing.',
           tone: 'warning',
         })
       } else {
@@ -589,9 +589,11 @@ export default function TenantsPage() {
         })
         return
       }
-      const consent = await apiClient.post<MicrosoftConsentResponse>(
+      const rawConsent = await apiClient.post<unknown>(
         `/api/tenants/${created.tenant.id}/microsoft-consent`
       )
+      const consent = normalizeMicrosoftConsentReview(rawConsent)
+      if (!consent) throw new Error('HawkView received an unsupported Microsoft access contract. Refresh and try again.')
       setConsentReview(consent)
     } catch (createError) {
       setOnboardingError(
@@ -605,7 +607,7 @@ export default function TenantsPage() {
   }
 
   const openMicrosoftConsentPopup = async (
-    getConsent: () => Promise<MicrosoftConsentResponse>
+    getConsent: () => Promise<MicrosoftConsentReview>
   ) => {
     const width = 640
     const height = 760
@@ -674,11 +676,12 @@ export default function TenantsPage() {
   const handleManagedOnboarding = () => {
     setOnboardingError(null)
     setHawkviewPreviewMessage(null)
-    void openMicrosoftConsentPopup(() =>
-      apiClient.post<MicrosoftConsentResponse>(
-        '/api/tenants/microsoft/onboarding'
-      )
-    )
+    void openMicrosoftConsentPopup(async () => {
+      const rawConsent = await apiClient.post<unknown>('/api/tenants/microsoft/onboarding')
+      const consent = normalizeMicrosoftConsentReview(rawConsent)
+      if (!consent) throw new Error('HawkView received an unsupported Microsoft access contract. Refresh and try again.')
+      return consent
+    })
   }
 
   const handleSort = (field: SortField) => {
@@ -937,7 +940,7 @@ export default function TenantsPage() {
                     Permissions requested by HawkView
                   </h2>
                   <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-                    A Microsoft 365 administrator will review these permissions on Microsoft&apos;s consent screen.
+                    A Microsoft 365 administrator will review HawkView&apos;s current default read-only access on Microsoft&apos;s consent screen. Optional capabilities are identified below and do not determine whether the tenant is connected.
                   </p>
                 </div>
                 <div className="grid gap-3 max-h-60 overflow-y-auto pr-1">
@@ -949,9 +952,22 @@ export default function TenantsPage() {
                       <p className="font-semibold text-slate-900 dark:text-white">
                         {permission.name}
                       </p>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        <Badge variant={permission.connectionRequired ? 'default' : 'secondary'} className="text-[10px]">
+                          {permission.connectionRequired ? 'Connection required' : permission.tier === 'CORE' ? 'Core dataset' : 'Optional / fallback capability'}
+                        </Badge>
+                        <Badge variant="outline" className="text-[10px]">
+                          {permission.resource === 'MICROSOFT_GRAPH' ? 'Microsoft Graph' : permission.resource === 'OFFICE_365_MANAGEMENT_API' ? 'Office 365 Management API' : 'Exchange Online'}
+                        </Badge>
+                      </div>
                       <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
                         {permission.description}
                       </p>
+                      {permission.purpose.length > 0 && (
+                        <p className="mt-1 text-xs text-slate-500 dark:text-slate-500">
+                          Enables: {permission.purpose.join(', ')}
+                        </p>
+                      )}
                     </div>
                   ))}
                 </div>

@@ -246,3 +246,62 @@ test('managed and customer verification paths do not make a deprecated override 
     else process.env.MICROSOFT_REQUIRED_PERMISSIONS = prior
   }
 })
+
+test('keeps a connector connected when optional capability grants are absent', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    value: [{ id: 'tenant-1', displayName: 'Tenant', verifiedDomains: [] }],
+  }))) as typeof fetch
+  try {
+    const service = new MicrosoftConsentService({} as never, {} as never)
+    ;(service as any).requestAccessToken = async (_tenant: string, _credentials: unknown, scope?: string) => ({
+      accessToken: 'token',
+      grantedPermissions: scope === 'https://manage.office.com/.default' ? [] : ['Organization.Read.All'],
+    })
+    const result = await service.verifyTenantWithCredentials('tenant-1', { clientId: 'app', clientSecret: 'secret' })
+    assert.deepEqual(result.missingRequiredPermissions, [])
+    assert.equal(result.missingNonConnectionPermissions.length, 17)
+    assert.deepEqual(result.missingPermissions, result.missingNonConnectionPermissions)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('waits boundedly for the full grant projection without making nonconnection grants a connection gate', async () => {
+  const service = new MicrosoftConsentService({} as never, {} as never)
+  const baselineOnly = {
+    displayName: 'Tenant',
+    primaryDomain: null,
+    grantedPermissions: ['Organization.Read.All'],
+    missingPermissions: ['Sites.Read.All'],
+    missingRequiredPermissions: [],
+    missingNonConnectionPermissions: ['Sites.Read.All'],
+  }
+  const complete = {
+    ...baselineOnly,
+    grantedPermissions: ['Organization.Read.All', 'Sites.Read.All'],
+    missingPermissions: [],
+    missingNonConnectionPermissions: [],
+  }
+  let attempts = 0
+  ;(service as any).verifyTenant = async () => (++attempts === 1 ? baselineOnly : complete)
+  const originalSetTimeout = globalThis.setTimeout
+  globalThis.setTimeout = ((callback: (...args: unknown[]) => void) => {
+    callback()
+    return 0 as unknown as NodeJS.Timeout
+  }) as typeof setTimeout
+  try {
+    assert.deepEqual(await service.verifyTenantAfterConsent('tenant-1'), complete)
+    assert.equal(attempts, 2)
+
+    attempts = 0
+    ;(service as any).verifyTenant = async () => {
+      attempts += 1
+      return baselineOnly
+    }
+    assert.deepEqual(await service.verifyTenantAfterConsent('tenant-1'), baselineOnly)
+    assert.equal(attempts, 6)
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+  }
+})
