@@ -974,6 +974,7 @@ test('enforces the SharePoint response byte ceiling from the actual stream, not 
 test('runs the real bounded SharePoint orchestration without SharePoint-resource tokens or site-user REST calls', async () => {
   const tokenHosts: string[] = []
   const saved: any[] = []
+  const calls: string[] = []
   const service = new TenantSyncService({
     tenantDomain: { findFirst: async () => ({ name: 'contoso.onmicrosoft.com' }) },
   } as never, {
@@ -984,12 +985,12 @@ test('runs the real bounded SharePoint orchestration without SharePoint-resource
   const originalFetch = globalThis.fetch
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = String(input)
+    calls.push(url)
     if (url.includes('/sites/root')) return new Response(JSON.stringify({ id: 'root', webUrl: 'https://contoso.sharepoint.com' }))
     if (url.includes('/v1.0/sites?')) return new Response(JSON.stringify({ value: [
       { id: 'root', webUrl: 'https://contoso.sharepoint.com' },
       { id: 'my', webUrl: 'https://contoso-my.sharepoint.com/personal/a' },
     ] }))
-    if (url.includes('/drive?')) return new Response(JSON.stringify({ quota: {} }))
     if (url.includes('/_api/web/siteusers')) return new Response(JSON.stringify({ value: [] }))
     throw new Error(`unexpected request ${url}`)
   }) as typeof fetch
@@ -1002,6 +1003,8 @@ test('runs the real bounded SharePoint orchestration without SharePoint-resource
   assert.deepEqual(tokenHosts, [])
   assert.equal(saved.length, 1)
   assert.equal(saved[0]?.[1], 'SHAREPOINT_SITES')
+  assert.equal(calls.some((url) => /\/sites\/[^?]+\/drive(?:\?|$)/i.test(url)), false)
+  assert.equal(saved[0]?.[2]?.rows?.every((site: any) => site.driveQuota === null), true)
 })
 
 test('real SharePoint pagination aborts before a snapshot baseline can advance', async () => {
@@ -1196,7 +1199,6 @@ test('a complete Graph SharePoint inventory advances after a historic REST-acces
     const url = String(input); calls.push(url)
     if (url.includes('/sites/root')) return new Response(JSON.stringify({ id: 'root', displayName: 'Root', webUrl: 'https://contoso.sharepoint.com' }))
     if (url.includes('/v1.0/sites?')) return new Response(JSON.stringify({ value: [] }))
-    if (url.includes('/drive?')) return new Response(JSON.stringify({ quota: { used: 1 } }))
     throw new Error(`unexpected request ${url}`)
   }) as typeof fetch
   try {
@@ -1206,7 +1208,8 @@ test('a complete Graph SharePoint inventory advances after a historic REST-acces
   assert.equal(saves[0]?.[2]?.completeness, 'authoritative_complete')
   assert.equal(saves[0]?.[2]?.rows?.[0]?.siteAccessMetadataState, 'NOT_COLLECTED_LEAST_PRIVILEGE')
   assert.equal(saves[0]?.[2]?.rows?.[0]?.externalSharing, null)
-  assert.equal(calls.some((url) => /_api\/web\/siteusers|\.sharepoint\.com\/\.default/i.test(url)), false)
+  assert.equal(saves[0]?.[2]?.rows?.[0]?.driveQuota, null)
+  assert.equal(calls.some((url) => /_api\/web\/siteusers|\.sharepoint\.com\/\.default|\/sites\/[^?]+\/drive(?:\?|$)/i.test(url)), false)
 })
 
 test('retires historic privileged SharePoint access fields without fabricating evidence, while preserving real site changes', async () => {
