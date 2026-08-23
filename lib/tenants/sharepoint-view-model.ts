@@ -475,6 +475,12 @@ export function buildSharePointViewModel(value: unknown) {
     canonicalOneDriveReportRefresh &&
     hasValidatedProjectedRows(oneDriveUsageProjection)
   )
+  const sharePointIdentifiersConcealed = Boolean(
+    contract && (
+      boolean(own(sharePointReport, 'identifiersConcealed')) === true ||
+      projectedSites.some((site) => own(site, 'activityDataStatus') === 'identifiers-concealed')
+    )
+  )
   const exactD180EvidenceAvailable = contract
     ? canonicalUsageEvidenceAvailable
     : contractEnvelope
@@ -489,6 +495,9 @@ export function buildSharePointViewModel(value: unknown) {
     : contractEnvelope
       ? projectedSites.map(stripUnverifiedLegacyUsage)
       : projectedSites.map((site) => validLegacyD180Row(site) ? site : stripUnverifiedLegacyUsage(site))
+  const concealedSiteCount = sites.filter(
+    (site) => own(site, 'activityDataStatus') === 'identifiers-concealed'
+  ).length
   const projectionIncomplete = clientSiteCapped || contractProjectionIncomplete || Boolean(
     contractEnvelope && (!contract || !canonicalUsageEvidenceAvailable || !canonicalOneDriveEvidenceAvailable)
   )
@@ -522,6 +531,13 @@ export function buildSharePointViewModel(value: unknown) {
       exactClaimsAvailable: exactD180EvidenceAvailable,
       state: sharePointReportState,
       reportRefreshedAt: contractEnvelope ? (contract ? canonicalReportRefresh : null) : legacyReportRefresh,
+    },
+    reportPrivacy: {
+      identifiersConcealed: sharePointIdentifiersConcealed,
+      concealedSiteCount,
+      limitation: sharePointIdentifiersConcealed
+        ? 'microsoft-report-identifiers-concealed'
+        : null,
     },
     oneDriveUsageReport: {
       projectionComplete: canonicalOneDriveEvidenceAvailable,

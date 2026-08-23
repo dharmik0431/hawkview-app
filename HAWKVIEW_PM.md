@@ -1,10 +1,17 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-23 after SharePoint usage-report truth repair merge and deployment verification
+Last updated: 2026-08-23 after local SharePoint concealed-report explanation implementation
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P1 — SharePoint concealed-report explanation (local, unpublished)
+
+- A successful GreenTech synchronization proved the standard SharePoint permission and collectors were working, while every discovered site remained unmatched because Microsoft's usage report concealed Site IDs and Site URLs. This is a Microsoft 365 report privacy setting, not a missing HawkView permission and not a failed Graph API call.
+- The SharePoint view now carries the existing backend `identifiersConcealed` evidence through its strict adapter. It shows one amber explanation with a small expandable setup guide: Microsoft 365 admin center → Settings → Org settings → Services → Reports → enable **Display concealed user, group, and site names in all reports**, save, wait for Microsoft to apply the organization-wide setting, then run Sync Now. The copy explicitly says this setting does not grant HawkView additional permissions and links to Microsoft's setup documentation.
+- Site-level matching, storage, activity, reported owner, file, and page-view fields say unavailable because identifiers are concealed instead of implying zero activity, a permission failure, or a collection failure. Valid tenant-level aggregate report totals remain visible because identifier concealment prevents site joins but does not invalidate the report's aggregate numbers.
+- Exact scope is this PM record plus the SharePoint section and its strict view-model source/test. No backend collector, Microsoft permission, consent, API call, schema, migration, tenant setting, synchronization, GAS, Render, or live state was changed. Focused SharePoint tests pass **20/20**; the complete frontend helper suite passes **152/152**; root TypeScript and lint pass with zero warnings or errors; the production Next build compiled, typechecked, and generated all **21/21** static pages. `git diff --check` passes with line-ending notices only. Publication remains pending.
 
 ## P0 — SharePoint usage-report truth repair (merged via PR #180; backend deployed; GAS publish pending)
 

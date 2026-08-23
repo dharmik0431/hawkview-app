@@ -42,7 +42,7 @@ test('maps the P0-7 contract to the fields consumed by the approved SharePoint U
         notifications: { fileActivityEnabled: true },
       },
       usageReports: {
-        sharePoint: { state: 'available', reportRefreshDate: '2026-08-18' },
+        sharePoint: { state: 'available', reportRefreshDate: '2026-08-18', identifiersConcealed: false },
         oneDrive: { state: 'available', reportRefreshDate: '2026-08-18' },
       },
       sites: [{
@@ -82,8 +82,59 @@ test('maps the P0-7 contract to the fields consumed by the approved SharePoint U
   assert.equal(view.oneDriveAccounts[0]?.type, 'OneDrive')
   assert.equal(view.oneDriveAccounts[0]?.storageQuotaGB, 10)
   assert.equal(view.oneDriveUsageReport.exactClaimsAvailable, true)
+  assert.equal(view.reportPrivacy.identifiersConcealed, false)
+  assert.equal(view.reportPrivacy.concealedSiteCount, 0)
   assert.equal(view.sync.status, 'success')
   assert.equal(view.inventory.countLabel, '1')
+})
+
+test('explains Microsoft-concealed report identifiers without calling them missing permissions', () => {
+  const view = buildSharePointViewModel({
+    dataContract: {
+      contractVersion: 2,
+      projection: {
+        sites: { inputRows: 2, projectedRows: 2, invalidRows: 0, truncated: false },
+        sharePointUsage: { inputRows: 2, projectedRows: 2, invalidRows: 0, truncated: false },
+        oneDriveUsage: { inputRows: 1, projectedRows: 1, invalidRows: 0, truncated: false },
+      },
+      usageReports: {
+        sharePoint: { state: 'available', reportRefreshDate: '2026-08-18', identifiersConcealed: true },
+        oneDrive: { state: 'available', reportRefreshDate: '2026-08-18' },
+      },
+      overview: {
+        sharePointSiteCount: 2,
+        sharePointSitesWithMatchedUsage: 0,
+        sharePointSitesWithoutMatchedUsage: 2,
+      },
+      sites: [
+        {
+          id: 'site-1',
+          name: 'Operations',
+          url: 'https://contoso.sharepoint.com/sites/operations',
+          usageReportMatch: 'identifiers-concealed',
+          usage: {},
+        },
+        {
+          id: 'site-2',
+          name: 'Projects',
+          url: 'https://contoso.sharepoint.com/sites/projects',
+          usageReportMatch: 'identifiers-concealed',
+          usage: {},
+        },
+      ],
+      oneDriveAccounts: [{
+        id: 'od-1',
+        ownerPrincipalName: 'alex@contoso.com',
+        reportRefreshDate: '2026-08-18',
+        reportPeriod: 'D30',
+      }],
+    },
+  })
+
+  assert.equal(view.reportPrivacy.identifiersConcealed, true)
+  assert.equal(view.reportPrivacy.concealedSiteCount, 2)
+  assert.equal(view.reportPrivacy.limitation, 'microsoft-report-identifiers-concealed')
+  assert.equal(view.sites.every((site) => site.activityDataStatus === 'identifiers-concealed'), true)
 })
 
 test('supports the current legacy backend DTO without inventing activity or owner data', () => {
@@ -646,6 +697,11 @@ test('renders authoritative deleted and matched-owner counts without recomputing
   assert.match(source, /deletedState === true \? 'Yes' : deletedState === false \? 'No' : 'Not reported'/)
   assert.match(source, /usageDeletedFilter === 'active' && deletedState !== false/)
   assert.match(source, /const hasActivity = Boolean\(s\.lastActivityAt \|\| s\.lastActivity\)/)
+  assert.match(source, /Microsoft report identifiers are concealed/)
+  assert.match(source, /Display concealed user, group, and site names in all reports/)
+  assert.match(source, /Changing it does not grant HawkView additional permissions/)
+  assert.match(source, /Matching unavailable — Microsoft concealed Site IDs and URLs/)
+  assert.doesNotMatch(source, /Missing permission on HawkView/)
 })
 
 test('preserves Microsoft reported-deleted truth as an explicit tri-state', () => {
