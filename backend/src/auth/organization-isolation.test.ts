@@ -355,8 +355,9 @@ test('tenant list scopes secondary sign-in and audit queries by organization and
       },
     },
     customerTenant: {
-      findMany: async ({ where }: { where: unknown }) => {
+      findMany: async ({ where, select }: { where: unknown; select: unknown }) => {
         observed.tenantWhere = where
+        observed.tenantSelect = select
         return []
       },
     },
@@ -379,6 +380,21 @@ test('tenant list scopes secondary sign-in and audit queries by organization and
   assert.deepEqual(observed.tenantWhere, {
     organizationId: { in: ['organization-a'] },
   })
+  assert.deepEqual(
+    (observed.tenantSelect as any).collectionFieldStates,
+    {
+      where: {
+        fieldKey: {
+          in: ['sharepoint.usage-projection', 'onedrive.usage-projection'],
+        },
+      },
+      select: { fieldKey: true, state: true, reasonCode: true },
+    },
+  )
+  assert.deepEqual(
+    (observed.tenantSelect as any).entraSnapshots.where.resourceType.in,
+    ['AUTH_REGISTRATIONS', 'SECURE_SCORES'],
+  )
   assert.deepEqual(
     (observed.signInWhere as Record<string, unknown>).organizationId,
     { in: ['organization-a'] },

@@ -27,6 +27,7 @@ import {
 } from './service-sync-freshness.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 import { buildExchangeReadOnlyRbacSetup } from './exchange-rbac-setup.js'
+import type { MicrosoftUsageSourceProjectionEvidence } from './sharepoint-data-contract.js'
 
 const TENANT_DELETION_ROLES = [
   MembershipRole.MSP_OWNER,
@@ -254,6 +255,11 @@ export class TenantsService {
       payload: unknown
       observedAt: Date
     }>
+    collectionFieldStates?: Array<{
+      fieldKey: string
+      state: string
+      reasonCode: string | null
+    }>
     m365ActivitySubscriptions: Array<{
       contentType: string
       status: string
@@ -291,6 +297,22 @@ export class TenantsService {
         : effectiveConnectionStatus === 'PENDING_CONSENT'
           ? 'pending'
           : tenant.status.toLowerCase()
+    const usageProjectionEvidence = (fieldKey: string): MicrosoftUsageSourceProjectionEvidence => {
+      const field = tenant.collectionFieldStates?.find((candidate) => candidate.fieldKey === fieldKey)
+      if (!field) {
+        return { state: 'UNVERIFIED_LEGACY', reasonCode: 'USAGE_PROJECTION_NOT_DURABLY_VERIFIED' }
+      }
+      if (field.state === 'AVAILABLE' && field.reasonCode === null) {
+        return { state: 'AUTHORITATIVE_COMPLETE', reasonCode: null }
+      }
+      if (field.reasonCode === 'USAGE_PROJECTION_NOT_DURABLY_VERIFIED') {
+        return { state: 'UNVERIFIED_LEGACY', reasonCode: field.reasonCode }
+      }
+      if (field.reasonCode === 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE') {
+        return { state: 'PARTIAL', reasonCode: field.reasonCode }
+      }
+      return { state: 'REJECTED', reasonCode: 'USAGE_PROJECTION_EVIDENCE_INVALID' }
+    }
     const collectionReadiness = deriveCollectionReadiness({
       connectionStatus: effectiveConnectionStatus,
       connectionVerifiedAt: tenant.connection?.lastVerifiedAt,
@@ -303,6 +325,8 @@ export class TenantsService {
       licenseServicePlans: tenant.tenantLicenses.some((license) => !Array.isArray(license.servicePlans))
         ? null
         : tenant.tenantLicenses.flatMap((license) => license.servicePlans as Array<{ servicePlanId?: string; servicePlanName: string; provisioningStatus: string }>),
+      sharePointUsageProjectionEvidence: usageProjectionEvidence('sharepoint.usage-projection'),
+      oneDriveUsageProjectionEvidence: usageProjectionEvidence('onedrive.usage-projection'),
     })
     const notApplicableResourceTypes = collectionReadiness.workloads
       .filter((workload) => workload.state === 'NOT_LICENSED' || workload.state === 'UNSUPPORTED')
@@ -522,6 +546,14 @@ export class TenantsService {
         },
         orderBy: { observedAt: 'desc' as const },
         select: { resourceType: true, payload: true, observedAt: true },
+      },
+      collectionFieldStates: {
+        where: {
+          fieldKey: {
+            in: ['sharepoint.usage-projection', 'onedrive.usage-projection'] as string[],
+          },
+        },
+        select: { fieldKey: true, state: true, reasonCode: true },
       },
       connection: {
         select: {

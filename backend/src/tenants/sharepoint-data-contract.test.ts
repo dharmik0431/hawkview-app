@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TenantSyncService } from './tenant-sync.service.js'
+import { TenantsService } from './tenants.service.js'
 import {
+  buildMicrosoftUsageReportSnapshot,
   buildSharePointDataContract,
+  inspectMicrosoftUsageProjectionEvidence,
+  MICROSOFT_USAGE_REPORT_DATASET,
   ONEDRIVE_USAGE_OBSERVATION_DAYS,
   SHAREPOINT_CONTRACT_LIMITS,
   SHAREPOINT_DATA_CONTRACT_VERSION,
@@ -10,6 +14,174 @@ import {
 } from './sharepoint-data-contract.js'
 
 const GIB = 1024 ** 3
+const COMPLETE_SOURCE_EVIDENCE = { state: 'AUTHORITATIVE_COMPLETE', reasonCode: null } as const
+const PARTIAL_SOURCE_EVIDENCE = { state: 'PARTIAL', reasonCode: 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE' } as const
+const REJECTED_SOURCE_EVIDENCE = { state: 'REJECTED', reasonCode: 'USAGE_PROJECTION_EVIDENCE_INVALID' } as const
+const LEGACY_SOURCE_EVIDENCE = { state: 'UNVERIFIED_LEGACY', reasonCode: 'USAGE_PROJECTION_NOT_DURABLY_VERIFIED' } as const
+
+test('canonicalizes only exact Microsoft numeric or D-prefixed report periods', () => {
+  const snapshot = buildMicrosoftUsageReportSnapshot(
+    [{ 'Report Period': '180', 'Report Refresh Date': '2026-08-18', 'Site URL': 'https://tenant.sharepoint.com/sites/ops' }],
+    [{ 'Report Period': 'D30', 'Report Refresh Date': '2026-08-18', 'Site URL': 'https://tenant-my.sharepoint.com/personal/alex_tenant_com' }],
+  )
+  assert.equal(snapshot[0].hawkviewDataset, MICROSOFT_USAGE_REPORT_DATASET)
+  assert.equal(snapshot[0].sharePointSites[0]?.['Report Period'], 'D180')
+  assert.equal(snapshot[0].oneDriveAccounts[0]?.['Report Period'], 'D30')
+  assert.deepEqual(inspectMicrosoftUsageProjectionEvidence(snapshot), {
+    ...COMPLETE_SOURCE_EVIDENCE,
+    sharePoint: COMPLETE_SOURCE_EVIDENCE,
+    oneDrive: COMPLETE_SOURCE_EVIDENCE,
+  })
+  const historical = buildSharePointDataContract({
+    sites: [{ id: 'tenant.sharepoint.com,site-guid,web-guid', webUrl: 'https://tenant.sharepoint.com/sites/ops' }],
+    settings: null,
+    settingsSynchronized: false,
+    usageSynchronized: true,
+    activityAsOf: new Date('2026-08-19T00:00:00.000Z'),
+    sharePointUsage: [{
+      'Report Period': '180',
+      'Report Refresh Date': '2026-08-18',
+      'Site Id': 'site-guid',
+      'Site URL': 'https://tenant.sharepoint.com/sites/ops',
+      'Is Deleted': 'False',
+      'Last Activity Date': '2026-01-01',
+      'Storage Used (Byte)': String(GIB),
+      'Storage Allocated (Byte)': String(10 * GIB),
+    }],
+    oneDriveUsage: [],
+  })
+  assert.equal(historical.usageReports.sharePoint.state, 'available')
+  assert.equal(historical.overview.sharePointInactive90Days, 1)
+  assert.equal(historical.overview.sharePointStorageUsedGB, 1)
+
+  for (const hostile of ['ALL', 'D30', '180 days', 'D180?access_token=secret', '', null]) {
+    assert.throws(
+      () => buildMicrosoftUsageReportSnapshot(
+        [{ 'Report Period': hostile }],
+        [{ 'Report Period': '30' }],
+      ),
+      /unexpected Report Period/,
+    )
+  }
+  assert.deepEqual(
+    inspectMicrosoftUsageProjectionEvidence([{
+      ...snapshot[0],
+      projectionEvidence: {
+        ...snapshot[0].projectionEvidence,
+        sharePoint: { requestedPeriod: 'D180', rowCount: 999 },
+      },
+    }]),
+    { ...REJECTED_SOURCE_EVIDENCE, sharePoint: REJECTED_SOURCE_EVIDENCE, oneDrive: COMPLETE_SOURCE_EVIDENCE },
+  )
+  assert.deepEqual(
+    inspectMicrosoftUsageProjectionEvidence([{
+      hawkviewDataset: 'microsoft-usage-reports-v1',
+      sharePointSites: [],
+      oneDriveAccounts: [],
+    }]),
+    { ...LEGACY_SOURCE_EVIDENCE, sharePoint: LEGACY_SOURCE_EVIDENCE, oneDrive: LEGACY_SOURCE_EVIDENCE },
+  )
+
+  const emptySnapshot = buildMicrosoftUsageReportSnapshot([], [])
+  assert.deepEqual(emptySnapshot[0].projectionEvidence, {
+    version: 1,
+    state: 'PARTIAL',
+    sharePoint: { state: 'PARTIAL', requestedPeriod: 'D180', rowCount: 0 },
+    oneDrive: { state: 'PARTIAL', requestedPeriod: 'D30', rowCount: 0 },
+  })
+  assert.deepEqual(inspectMicrosoftUsageProjectionEvidence(emptySnapshot), {
+    ...PARTIAL_SOURCE_EVIDENCE,
+    sharePoint: PARTIAL_SOURCE_EVIDENCE,
+    oneDrive: PARTIAL_SOURCE_EVIDENCE,
+  })
+
+  const sharePointOnlySnapshot = buildMicrosoftUsageReportSnapshot(
+    [{ 'Report Period': 180, 'Report Refresh Date': '2026-08-18', 'Site URL': 'https://tenant.sharepoint.com/sites/ops' }],
+    [],
+  )
+  assert.deepEqual(inspectMicrosoftUsageProjectionEvidence(sharePointOnlySnapshot), {
+    ...PARTIAL_SOURCE_EVIDENCE,
+    sharePoint: COMPLETE_SOURCE_EVIDENCE,
+    oneDrive: PARTIAL_SOURCE_EVIDENCE,
+  })
+
+  const tamperedPeriod = structuredClone(snapshot)
+  tamperedPeriod[0].sharePointSites[0]['Report Period'] = 'D30'
+  assert.deepEqual(inspectMicrosoftUsageProjectionEvidence(tamperedPeriod), {
+    ...REJECTED_SOURCE_EVIDENCE,
+    sharePoint: REJECTED_SOURCE_EVIDENCE,
+    oneDrive: COMPLETE_SOURCE_EVIDENCE,
+  })
+
+  const tamperedRefresh = structuredClone(snapshot)
+  ;(tamperedRefresh[0].oneDriveAccounts[0] as Record<string, unknown>)['Report Refresh Date'] = '2026-02-30'
+  assert.deepEqual(inspectMicrosoftUsageProjectionEvidence(tamperedRefresh), {
+    ...REJECTED_SOURCE_EVIDENCE,
+    sharePoint: COMPLETE_SOURCE_EVIDENCE,
+    oneDrive: REJECTED_SOURCE_EVIDENCE,
+  })
+})
+
+test('keeps empty synchronized usage reports partial and all exact report aggregates unknown', () => {
+  const contract = buildSharePointDataContract({
+    sites: [{
+      id: 'tenant.sharepoint.com,site-guid,web-guid',
+      displayName: 'Known inventory site',
+      webUrl: 'https://tenant.sharepoint.com/sites/known',
+    }],
+    settings: null,
+    settingsSynchronized: false,
+    sharePointUsage: [],
+    oneDriveUsage: [],
+    usageSynchronized: true,
+    activityAsOf: new Date('2026-08-19T12:00:00.000Z'),
+  })
+
+  assert.equal(contract.usageReports.sharePoint.state, 'partial')
+  assert.equal(contract.usageReports.sharePoint.reportRefreshDate, null)
+  assert.equal(contract.usageReports.oneDrive.state, 'partial')
+  assert.equal(contract.overview.sharePointReportedDeletedCount, null)
+  assert.equal(contract.overview.sharePointInactive90Days, null)
+  assert.equal(contract.overview.sharePointInactive180Days, null)
+  assert.equal(contract.overview.sharePointStorageUsedGB, null)
+  assert.equal(contract.overview.oneDriveAccountCount, null)
+})
+
+test('rejects mixed-refresh and duplicate report rows for exact aggregates', () => {
+  const base = {
+    'Report Period': 'D180',
+    'Is Deleted': 'False',
+    'Storage Used (Byte)': String(GIB),
+    'Storage Allocated (Byte)': String(10 * GIB),
+  }
+  for (const sharePointUsage of [
+    [
+      { ...base, 'Site Id': 'site-a', 'Site URL': 'https://tenant.sharepoint.com/sites/a', 'Report Refresh Date': '2026-08-18' },
+      { ...base, 'Site Id': 'site-b', 'Site URL': 'https://tenant.sharepoint.com/sites/b', 'Report Refresh Date': '2026-08-17' },
+    ],
+    [
+      { ...base, 'Site Id': 'site-a', 'Site URL': 'https://tenant.sharepoint.com/sites/a', 'Report Refresh Date': '2026-08-18' },
+      { ...base, 'Site Id': 'site-a', 'Site URL': 'https://tenant.sharepoint.com/sites/a', 'Report Refresh Date': '2026-08-18' },
+    ],
+  ]) {
+    const contract = buildSharePointDataContract({
+      sites: [
+        { id: 'site-a', webUrl: 'https://tenant.sharepoint.com/sites/a' },
+        { id: 'site-b', webUrl: 'https://tenant.sharepoint.com/sites/b' },
+      ],
+      settings: null,
+      settingsSynchronized: false,
+      sharePointUsage,
+      oneDriveUsage: [],
+      usageSynchronized: true,
+      activityAsOf: new Date('2026-08-19T12:00:00.000Z'),
+    })
+    assert.equal(contract.usageReports.sharePoint.state, 'partial')
+    assert.equal(contract.overview.sharePointStorageUsedGB, null)
+    assert.equal(contract.overview.sharePointReportedDeletedCount, null)
+    assert.equal(contract.overview.sharePointInactive90Days, null)
+  }
+})
 
 test('projects the supported tenant settings through a closed truthful contract', () => {
   const contract = buildSharePointDataContract({
@@ -199,6 +371,88 @@ test('projects SharePoint and OneDrive report data without claiming per-site acc
   assert.equal(contract.oneDriveAccounts[0].storageUtilizationPercent, 10)
 })
 
+test('the real usage collector stamps requested periods before an authoritative save', async () => {
+  const sharePointCsv = [
+    'Report Refresh Date,Site Id,Site URL,Is Deleted,Last Activity Date,Storage Used (Byte),Storage Allocated (Byte),Report Period',
+    '2026-08-18,site-guid,https://contoso.sharepoint.com/sites/ops,False,2026-08-17,1073741824,10737418240,180',
+  ].join('\r\n')
+  const oneDriveCsv = [
+    'Report Refresh Date,Site URL,Owner Principal Name,Is Deleted,Last Activity Date,Storage Used (Byte),Storage Allocated (Byte),Report Period',
+    '2026-08-18,https://contoso-my.sharepoint.com/personal/alex_contoso_com,alex@contoso.com,False,2026-08-18,1,10,D30',
+  ].join('\r\n')
+  const saved: unknown[][] = []
+  const service = new TenantSyncService(
+    {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+  )
+  ;(service as any).runSnapshotSync = async (
+    _tenant: unknown,
+    _resource: string,
+    work: () => Promise<void>,
+  ) => work()
+  ;(service as any).saveSnapshot = async (...args: unknown[]) => saved.push(args)
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input) => new Response(
+    String(input).includes('getSharePointSiteUsageDetail')
+      ? sharePointCsv
+      : oneDriveCsv,
+    { status: 200, headers: { 'content-type': 'text/csv' } },
+  )
+  try {
+    await (service as any).syncSharePointUsage(
+      { id: 'tenant-1', organizationId: 'org-1' },
+      'graph-token',
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(saved.length, 1)
+  const collection = saved[0]?.[2] as {
+    completeness: string
+    rows: Array<Record<string, any>>
+  }
+  assert.equal(collection.completeness, 'authoritative_complete')
+  assert.equal(collection.rows[0]?.hawkviewDataset, MICROSOFT_USAGE_REPORT_DATASET)
+  assert.equal(collection.rows[0]?.sharePointSites[0]?.['Report Period'], 'D180')
+  assert.equal(collection.rows[0]?.oneDriveAccounts[0]?.['Report Period'], 'D30')
+  assert.deepEqual(inspectMicrosoftUsageProjectionEvidence(collection.rows), {
+    ...COMPLETE_SOURCE_EVIDENCE,
+    sharePoint: COMPLETE_SOURCE_EVIDENCE,
+    oneDrive: COMPLETE_SOURCE_EVIDENCE,
+  })
+})
+
+test('the real usage collector refuses an unexpected period before baseline save', async () => {
+  let saved = false
+  const service = new TenantSyncService(
+    {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+  )
+  ;(service as any).runSnapshotSync = async (
+    _tenant: unknown,
+    _resource: string,
+    work: () => Promise<void>,
+  ) => work()
+  ;(service as any).saveSnapshot = async () => { saved = true }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input) => new Response(
+    String(input).includes('getSharePointSiteUsageDetail')
+      ? 'Report Refresh Date,Report Period\r\n2026-08-18,ALL'
+      : 'Report Refresh Date,Report Period\r\n2026-08-18,30',
+    { status: 200, headers: { 'content-type': 'text/csv' } },
+  )
+  try {
+    await assert.rejects(
+      () => (service as any).syncSharePointUsage(
+        { id: 'tenant-1', organizationId: 'org-1' },
+        'graph-token',
+      ),
+      /unexpected Report Period/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(saved, false)
+})
+
 test('labels usage-report deleted rows as signals and never claims recoverability', () => {
   const contract = buildSharePointDataContract({
     sites: [],
@@ -290,7 +544,7 @@ test('identifies concealed SharePoint report identifiers without guessing site m
   assert.equal(contract.usageReports.sharePoint.identifiersConcealed, true)
   assert.equal(contract.usageReports.sharePoint.matchedSiteCount, 0)
   assert.equal(contract.sites[0].usage.activityState, 'unavailable')
-  assert.equal(contract.overview.sharePointSitesMissingReportedOwner, 0)
+  assert.equal(contract.overview.sharePointSitesMissingReportedOwner, null)
 })
 
 test('does not convert an omitted Microsoft activity date into inactivity', () => {
@@ -331,8 +585,8 @@ test('does not convert an omitted Microsoft activity date into inactivity', () =
       lastActivityAt: null,
     }
   )
-  assert.equal(contract.overview.sharePointInactive90Days, 0)
-  assert.equal(contract.overview.sharePointInactive180Days, 0)
+  assert.equal(contract.overview.sharePointInactive90Days, null)
+  assert.equal(contract.overview.sharePointInactive180Days, null)
 })
 
 test('fails closed on hostile, inherited, malformed, and out-of-range values', () => {
@@ -488,11 +742,12 @@ test('serializes the tenant bundle with organization isolation and a legacy shar
       payload: [{
         hawkviewDataset: 'microsoft-usage-reports-v1',
         sharePointSites: [{
-          'Report Period': 'D180',
+          'Report Period': '180',
           'Report Refresh Date': '2026-08-18',
           'Site Id': 'site-guid',
           'Site URL': 'https://contoso.sharepoint.com/sites/operations',
           'Is Deleted': 'False',
+          'Last Activity Date': '2026-01-01',
           'Storage Used (Byte)': String(GIB),
           'Storage Allocated (Byte)': String(10 * GIB),
         }],
@@ -559,5 +814,187 @@ test('serializes the tenant bundle with organization isolation and a legacy shar
   })
   assert.equal(sharePoint.dataContract.contractVersion, SHAREPOINT_DATA_CONTRACT_VERSION)
   assert.equal(sharePoint.dataContract.sites[0].usageReportMatch, 'matched')
+  assert.equal(sharePoint.dataContract.overview.sharePointInactive90Days, 1)
+  assert.equal(sharePoint.overview.inactiveSites90Days, 1)
   assert.doesNotMatch(JSON.stringify(sharePoint.dataContract), /must-not-enter-the-contract|access_token/)
+
+  ;(snapshots[2] as any).payload[0].sharePointSites[0]['Report Period'] = 'ALL'
+  const invalid = await (service as any).buildBundle({
+    id: expectedScope.customerTenantId,
+    organizationId: expectedScope.organizationId,
+    microsoftTenantId: '11111111-1111-4111-8111-111111111111',
+    displayName: 'Contoso',
+    primaryDomain: 'contoso.com',
+    status: 'CONNECTED',
+    connection: { lastVerifiedAt: successfulAt },
+  })
+  assert.equal(invalid.bundle.sharepoint.dataContract.usageReports.sharePoint.state, 'partial')
+  assert.equal(invalid.bundle.sharepoint.dataContract.overview.sharePointInactive90Days, null)
+  assert.equal(invalid.bundle.sharepoint.overview.inactiveSites90Days, null)
+
+  const usageV2 = (sharePointRefresh: string, oneDriveRefresh: string) => buildMicrosoftUsageReportSnapshot(
+    [{
+      'Report Period': 'D180',
+      'Report Refresh Date': sharePointRefresh,
+      'Site Id': 'site-guid',
+      'Site URL': 'https://contoso.sharepoint.com/sites/operations',
+      'Is Deleted': 'False',
+      'Last Activity Date': '2026-01-01',
+      'Storage Used (Byte)': String(GIB),
+      'Storage Allocated (Byte)': String(10 * GIB),
+    }],
+    [{
+      'Report Period': 'D30',
+      'Report Refresh Date': oneDriveRefresh,
+      'Site URL': 'https://contoso-my.sharepoint.com/personal/alex_contoso_com',
+      'Owner Principal Name': 'alex@contoso.com',
+      'Is Deleted': 'False',
+      'Storage Used (Byte)': String(GIB),
+      'Storage Allocated (Byte)': String(10 * GIB),
+    }],
+  )
+  for (const [sharePointRefresh, oneDriveRefresh] of [
+    ['2026-08-17', '2026-08-18'],
+    ['2026-08-18', '2026-08-17'],
+  ]) {
+    ;(snapshots[2] as any).payload = usageV2(sharePointRefresh, oneDriveRefresh)
+    const independentlyRefreshed = await (service as any).buildBundle({
+      id: expectedScope.customerTenantId,
+      organizationId: expectedScope.organizationId,
+      microsoftTenantId: '11111111-1111-4111-8111-111111111111',
+      displayName: 'Contoso',
+      primaryDomain: 'contoso.com',
+      status: 'CONNECTED',
+      connection: { lastVerifiedAt: successfulAt },
+    })
+    assert.equal(independentlyRefreshed.bundle.sharepoint.dataContract.usageReports.sharePoint.state, 'available')
+    assert.equal(independentlyRefreshed.bundle.sharepoint.dataContract.usageReports.oneDrive.state, 'available')
+  }
+
+  const tamperedV2 = usageV2('2026-08-18', '2026-08-18')
+  tamperedV2[0].projectionEvidence.sharePoint.rowCount = 999
+  ;(snapshots[2] as any).payload = tamperedV2
+  const rejectedSource = await (service as any).buildBundle({
+    id: expectedScope.customerTenantId,
+    organizationId: expectedScope.organizationId,
+    microsoftTenantId: '11111111-1111-4111-8111-111111111111',
+    displayName: 'Contoso',
+    primaryDomain: 'contoso.com',
+    status: 'CONNECTED',
+    connection: { lastVerifiedAt: successfulAt },
+  })
+  assert.equal(rejectedSource.bundle.sharepoint.dataContract.usageReports.sharePoint.state, 'partial')
+  assert.equal(rejectedSource.bundle.sharepoint.dataContract.overview.sharePointStorageUsedGB, null)
+  assert.equal(rejectedSource.bundle.sharepoint.dataContract.overview.sharePointInactive90Days, null)
+  assert.equal(rejectedSource.bundle.sharepoint.dataContract.usageReports.oneDrive.state, 'available')
+  assert.equal(rejectedSource.bundle.sharepoint.dataContract.overview.oneDriveAccountCount, 1)
+})
+
+test('tenant-list mapping uses only tenant-scoped compact projection fields', () => {
+  const service = new TenantsService(
+    {} as never,
+    {
+      getRequiredPermissions: () => [{ name: 'Reports.Read.All' }],
+      getAccessContract: () => ({ connectionRequiredPermissions: [] }),
+    } as never,
+    {} as never,
+  )
+  const current = new Date()
+  const tenant = {
+    id: 'tenant-a',
+    microsoftTenantId: '11111111-1111-4111-8111-111111111111',
+    displayName: 'Tenant A',
+    primaryDomain: 'tenant-a.example',
+    status: 'ACTIVE',
+    organization: { id: 'org-a', name: 'Org A', slug: 'org-a' },
+    connection: {
+      connectionMode: 'HAWKVIEW_MANAGED',
+      status: 'ACTIVE',
+      consentedPermissions: ['Reports.Read.All'],
+      lastVerifiedAt: current,
+      lastErrorCode: null,
+    },
+    tenantLicenses: [{
+      enabledUnits: 1,
+      servicePlans: [{ servicePlanName: 'SHAREPOINTENTERPRISE', provisioningStatus: 'Success' }],
+    }],
+    syncStates: ['LICENSES', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'].map((resourceType) => ({
+      resourceType,
+      status: 'SUCCEEDED',
+      lastAttemptAt: current,
+      lastSuccessfulAt: current,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+      consecutiveFailures: 0,
+    })),
+    entraSnapshots: [],
+    collectionFieldStates: [
+      { fieldKey: 'sharepoint.usage-projection', state: 'AVAILABLE', reasonCode: null },
+      { fieldKey: 'onedrive.usage-projection', state: 'PENDING', reasonCode: 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE' },
+    ],
+    m365ActivitySubscriptions: [],
+  }
+  const mapped = (service as any).mapTenant(tenant)
+  const datasets = mapped.collectionReadiness.workloads.find(
+    (workload: any) => workload.key === 'sharepoint_onedrive',
+  ).datasets
+  assert.equal(datasets.find((dataset: any) => dataset.key === 'sharepoint_usage_reports').state, 'READY')
+  assert.equal(datasets.find((dataset: any) => dataset.key === 'onedrive_usage_reports').state, 'PARTIAL')
+
+  const otherTenant = (service as any).mapTenant({
+    ...tenant,
+    id: 'tenant-b',
+    organization: { id: 'org-b', name: 'Org B', slug: 'org-b' },
+    collectionFieldStates: [],
+  })
+  const otherDatasets = otherTenant.collectionReadiness.workloads.find(
+    (workload: any) => workload.key === 'sharepoint_onedrive',
+  ).datasets
+  assert.equal(otherDatasets.find((dataset: any) => dataset.key === 'sharepoint_usage_reports').state, 'UNVERIFIED')
+  assert.equal(otherDatasets.find((dataset: any) => dataset.key === 'onedrive_usage_reports').state, 'UNVERIFIED')
+})
+
+test('materializes tenant-scoped SharePoint and OneDrive projection proof into bounded field rows', async () => {
+  const scope = { organizationId: 'org-a', customerTenantId: 'tenant-a' }
+  const payload = buildMicrosoftUsageReportSnapshot(
+    [{ 'Report Period': '180', 'Report Refresh Date': '2026-08-18', 'Site URL': 'https://tenant.sharepoint.com/sites/ops' }],
+    [],
+  )
+  const writes: any[] = []
+  const prisma = {
+    syncState: {
+      findMany: async ({ where }: any) => {
+        assert.deepEqual(where, scope)
+        return [{
+          resourceType: 'SHAREPOINT_USAGE', status: 'SUCCEEDED',
+          lastAttemptAt: new Date('2026-08-19T12:00:00.000Z'),
+          lastSuccessfulAt: new Date('2026-08-19T12:00:00.000Z'),
+          lastErrorMessage: null,
+        }]
+      },
+    },
+    tenantEntraSnapshot: {
+      findMany: async ({ where, select }: any) => {
+        assert.deepEqual(where, scope)
+        assert.deepEqual(select, { resourceType: true, payload: true })
+        return [{ resourceType: 'SHAREPOINT_USAGE', payload }]
+      },
+    },
+    tenantCollectionFieldState: {
+      upsert: async (args: any) => writes.push(args),
+    },
+  }
+  const service = new TenantSyncService(
+    prisma as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+  )
+  await (service as any).refreshCollectionFieldStates({ id: scope.customerTenantId, organizationId: scope.organizationId })
+
+  const sharePoint = writes.find((write) => write.create.fieldKey === 'sharepoint.usage-projection')
+  const oneDrive = writes.find((write) => write.create.fieldKey === 'onedrive.usage-projection')
+  assert.equal(sharePoint.create.organizationId, scope.organizationId)
+  assert.equal(sharePoint.create.customerTenantId, scope.customerTenantId)
+  assert.equal(sharePoint.create.state, 'AVAILABLE')
+  assert.equal(sharePoint.create.reasonCode, null)
+  assert.equal(oneDrive.create.state, 'PENDING')
+  assert.equal(oneDrive.create.reasonCode, 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE')
 })
