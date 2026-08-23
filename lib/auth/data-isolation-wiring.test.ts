@@ -6,7 +6,7 @@ function source(path: string) {
   return readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
 }
 
-test('A logout B account switch clears and replaces the query client synchronously', () => {
+test('A logout B account switch clears queries without unmounting the login flow', () => {
   const auth = source('components/providers/auth-provider.tsx')
   const queries = source('components/providers/query-provider.tsx')
 
@@ -18,7 +18,9 @@ test('A logout B account switch clears and replaces the query client synchronous
     auth,
     /const signOut = useCallback\(async \(\) => \{[\s\S]{0,160}beginIdentityTransition\(null\)[\s\S]{0,160}supabase\.auth\.signOut\(\)/
   )
-  assert.match(queries, /<IdentityQueryProvider key=\{cacheScope\}>/)
+  assert.match(queries, /<IdentityQueryProvider cacheScope=\{cacheScope\}>/)
+  assert.doesNotMatch(queries, /key=\{cacheScope\}/)
+  assert.match(queries, /previousScope\.current === cacheScope/)
   assert.match(queries, /queryClient\.cancelQueries\(\)/)
   assert.match(queries, /queryClient\.clear\(\)/)
 })

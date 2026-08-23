@@ -1,7 +1,5 @@
-// The public API location is supplied by each frontend environment so the
-// backend can move between hosting providers without a source-code change.
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL?.trim().replace(/\/$/, '') ?? ''
+import { buildHawkViewApiUrl } from '@/lib/config/public-runtime-config'
+
 const API_TIMEOUT_MS = 15_000
 
 async function getIdentityToken() {
@@ -35,21 +33,16 @@ async function fetchApi<T>(
 ): Promise<T> {
   const { params, timeoutMs = API_TIMEOUT_MS, ...fetchOptions } = options
 
-  if (!API_BASE_URL) {
-    throw new ApiError(
-      0,
-      'HawkView API is not configured. Set NEXT_PUBLIC_API_URL.'
-    )
+  let url: URL
+  try {
+    url = buildHawkViewApiUrl(endpoint)
+  } catch {
+    throw new ApiError(0, 'HawkView API request path is invalid.')
   }
-
-  if (!endpoint.startsWith('/')) {
-    throw new ApiError(0, 'API endpoints must start with "/".')
-  }
-
-  let url = `${API_BASE_URL}${endpoint}`
   if (params) {
-    const searchParams = new URLSearchParams(params)
-    url += `?${searchParams.toString()}`
+    Object.entries(params).forEach(([key, value]) => {
+      url.searchParams.set(key, value)
+    })
   }
 
   const timeoutController = new AbortController()
@@ -61,7 +54,7 @@ async function fetchApi<T>(
   let response: Response
   try {
     const identityToken = await getIdentityToken()
-    response = await fetch(url, {
+    response = await fetch(url.href, {
       ...fetchOptions,
       signal,
       // Authenticated tenant responses must never be reused by the browser's
@@ -71,9 +64,7 @@ async function fetchApi<T>(
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        ...(identityToken
-          ? { Authorization: `Bearer ${identityToken}` }
-          : {}),
+        ...(identityToken ? { Authorization: `Bearer ${identityToken}` } : {}),
         ...fetchOptions.headers,
       },
     })
@@ -132,11 +123,7 @@ export const apiClient = {
       body: data ? JSON.stringify(data) : undefined,
     }),
 
-  delete: <T>(
-    endpoint: string,
-    data?: unknown,
-    options?: FetchOptions
-  ) =>
+  delete: <T>(endpoint: string, data?: unknown, options?: FetchOptions) =>
     fetchApi<T>(endpoint, {
       ...options,
       method: 'DELETE',

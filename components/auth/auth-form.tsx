@@ -12,13 +12,10 @@ import { supabase } from '@/lib/auth/supabase'
 import { useAuth } from '@/components/providers/auth-provider'
 import { ProviderButtons } from '@/components/auth/provider-buttons'
 import { cn } from '@/lib/utils'
+import { readableAuthError } from '@/lib/auth/auth-errors'
+import { buildHawkViewAppUrl } from '@/lib/config/public-runtime-config'
 
 export type AuthMode = 'sign-in' | 'sign-up' | 'reset'
-
-function readableAuthError(error: unknown) {
-  if (error instanceof Error) return error.message
-  return 'Authentication could not be completed.'
-}
 
 interface AuthFormProps {
   initialMode: AuthMode
@@ -137,7 +134,7 @@ export function AuthForm({ initialMode }: AuthFormProps) {
       if (mode === 'reset') {
         const { error: resetError } = await supabase.auth.resetPasswordForEmail(
           email.trim(),
-          { redirectTo: `${window.location.origin}/reset-password` }
+          { redirectTo: buildHawkViewAppUrl('/reset-password').href }
         )
         if (resetError) throw resetError
         setNotice(
@@ -147,28 +144,37 @@ export function AuthForm({ initialMode }: AuthFormProps) {
       }
 
       if (mode === 'sign-up') {
-        const { error: signUpError } = await supabase.auth.signUp({
-          email: email.trim(),
-          password,
-          options: {
-            data: { display_name: displayName.trim() },
-            emailRedirectTo: `${window.location.origin}/login`,
-          },
-        })
+        const { data: signUpData, error: signUpError } =
+          await supabase.auth.signUp({
+            email: email.trim(),
+            password,
+            options: {
+              data: { display_name: displayName.trim() },
+              emailRedirectTo: buildHawkViewAppUrl('/login').href,
+            },
+          })
         if (signUpError) throw signUpError
+        setPassword('')
+        if (signUpData.session) {
+          const nextSession = await refreshSession()
+          if (!nextSession) throw new Error('HAWKVIEW_SESSION_UNAVAILABLE')
+          router.replace('/dashboard')
+          return
+        }
         setNotice(
-          'Your account was created. Check your email and verify it before signing in.'
+          'If this address is eligible for a new or unconfirmed account, check your inbox and spam folder for a verification link.'
         )
         return
       }
 
       const { error: signInError } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
-          password,
-        })
+        email: email.trim(),
+        password,
+      })
       if (signInError) throw signInError
 
-      await refreshSession()
+      const nextSession = await refreshSession()
+      if (!nextSession) throw new Error('HAWKVIEW_SESSION_UNAVAILABLE')
       router.replace('/dashboard')
     } catch (authError) {
       setError(readableAuthError(authError))
