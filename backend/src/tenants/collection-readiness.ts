@@ -5,6 +5,7 @@ import {
   MICROSOFT_ACCESS_CONTRACT_VERSION,
   type MicrosoftAccessCapability,
 } from '../microsoft/microsoft-access-contract.js'
+import type { MicrosoftUsageSourceProjectionEvidence } from './sharepoint-data-contract.js'
 
 /**
  * A customer-facing view of persisted collection evidence.  It deliberately
@@ -146,6 +147,9 @@ type ReadinessInput = {
   subscriptions?: M365ActivitySubscriptionState[]
   /** null means the durable license inventory is absent, stale, or not authoritative. */
   licenseServicePlans?: Array<{ servicePlanId?: string; servicePlanName: string; provisioningStatus: string }> | null
+  /** Compact field-state proofs; tenant-list reads never load the report-row snapshot. */
+  sharePointUsageProjectionEvidence?: MicrosoftUsageSourceProjectionEvidence | null
+  oneDriveUsageProjectionEvidence?: MicrosoftUsageSourceProjectionEvidence | null
   now?: Date
 }
 
@@ -407,6 +411,7 @@ function datasetReadiness(
     exchange: 'APPLICABLE' | 'NOT_LICENSED' | 'UNVERIFIED'
     signIn: 'PREMIUM' | 'NON_PREMIUM' | 'UNVERIFIED'
   },
+  usageProjectionEvidence?: MicrosoftUsageSourceProjectionEvidence | null,
 ): AccessDatasetReadiness {
   const permissionNames = capability.applicationPermissions.map((permission) => permission.name)
   const permissionMatch = capability.permissionMatch ?? 'ALL'
@@ -461,6 +466,26 @@ function datasetReadiness(
       reasonCode: 'SOURCE_AVAILABILITY_NOT_DURABLY_OBSERVED',
       reason: 'The shared collection state does not durably prove that this optional Microsoft enrichment succeeded.',
     }
+  }
+  if (
+    ['sharepoint_usage_reports', 'onedrive_usage_reports'].includes(capability.key) &&
+    dynamic.state === 'READY' &&
+    usageProjectionEvidence &&
+    usageProjectionEvidence.state !== 'AUTHORITATIVE_COMPLETE'
+  ) {
+    dynamic = usageProjectionEvidence.state === 'UNVERIFIED_LEGACY'
+      ? {
+          ...dynamic,
+          state: 'UNVERIFIED',
+          reasonCode: usageProjectionEvidence.reasonCode,
+          reason: 'The stored Microsoft usage report predates HawkView projection evidence. A normal collection will verify it without reconnecting.',
+        }
+      : {
+          ...dynamic,
+          state: 'PARTIAL',
+          reasonCode: usageProjectionEvidence.reasonCode,
+          reason: 'The Microsoft usage report collection succeeded, but its stored projection evidence is invalid or incomplete.',
+        }
   }
   return {
     key: capability.key,
@@ -655,7 +680,19 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   }
   for (const row of rows) {
     const datasets = capabilitiesForWorkload(row.key).map((capability) =>
-      datasetReadiness(capability, states, consented, verificationKnown, now, applicability),
+      datasetReadiness(
+        capability,
+        states,
+        consented,
+        verificationKnown,
+        now,
+        applicability,
+        capability.key === 'sharepoint_usage_reports'
+          ? input.sharePointUsageProjectionEvidence
+          : capability.key === 'onedrive_usage_reports'
+            ? input.oneDriveUsageProjectionEvidence
+            : null,
+      ),
     )
     if (row.key === 'm365_unified_audit' && datasets[0]) {
       datasets[0] = {

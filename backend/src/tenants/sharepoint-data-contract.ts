@@ -1,6 +1,8 @@
 export const SHAREPOINT_DATA_CONTRACT_VERSION = 2 as const
 export const SHAREPOINT_USAGE_OBSERVATION_DAYS = 180 as const
 export const ONEDRIVE_USAGE_OBSERVATION_DAYS = 30 as const
+export const MICROSOFT_USAGE_REPORT_PROJECTION_VERSION = 1 as const
+export const MICROSOFT_USAGE_REPORT_DATASET = 'microsoft-usage-reports-v2' as const
 export const SHAREPOINT_CONTRACT_LIMITS = Object.freeze({
   sites: 10_000,
   sharePointUsageRows: 20_000,
@@ -16,6 +18,17 @@ export const SHAREPOINT_CONTRACT_LIMITS = Object.freeze({
 })
 
 type JsonRecord = Record<string, unknown>
+export type MicrosoftUsageReportPeriod = 'D180' | 'D30'
+export type MicrosoftUsageSourceProjectionEvidence =
+  | { state: 'AUTHORITATIVE_COMPLETE'; reasonCode: null }
+  | { state: 'PARTIAL'; reasonCode: 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE' }
+  | { state: 'UNVERIFIED_LEGACY'; reasonCode: 'USAGE_PROJECTION_NOT_DURABLY_VERIFIED' }
+  | { state: 'REJECTED'; reasonCode: 'USAGE_PROJECTION_EVIDENCE_INVALID' }
+
+export type MicrosoftUsageProjectionEvidence = MicrosoftUsageSourceProjectionEvidence & {
+  sharePoint: MicrosoftUsageSourceProjectionEvidence
+  oneDrive: MicrosoftUsageSourceProjectionEvidence
+}
 
 export type SharePointDataContractInput = {
   sites: unknown
@@ -200,8 +213,196 @@ function boundedRecords(value: unknown, limit: number) {
   return { rows, inputRows: value.length, invalidRows, truncated: value.length > limit }
 }
 
+/**
+ * Microsoft report requests use D-prefixed periods, while report exports can
+ * represent the same period as either `D180`/`D30` or `180`/`30`. Accept only
+ * those exact Microsoft-shaped representations and return the code-owned
+ * requested value. Arbitrary row text can never select a different period.
+ */
+export function canonicalMicrosoftUsageReportPeriod(
+  value: unknown,
+  expected: MicrosoftUsageReportPeriod,
+) {
+  const raw =
+    typeof value === 'number' && Number.isSafeInteger(value)
+      ? String(value)
+      : safeText(value, 4)?.toUpperCase()
+  return raw === expected || raw === expected.slice(1) ? expected : null
+}
+
+export function normalizeMicrosoftUsageReportRows(
+  value: unknown,
+  expected: MicrosoftUsageReportPeriod,
+) {
+  const limit = expected === 'D180'
+    ? SHAREPOINT_CONTRACT_LIMITS.sharePointUsageRows
+    : SHAREPOINT_CONTRACT_LIMITS.oneDriveUsageRows
+  const input = boundedRecords(value, limit)
+  if (input.truncated || input.invalidRows > 0) {
+    throw new Error(`Microsoft ${expected} usage report exceeded HawkView's safe row contract.`)
+  }
+  return input.rows.map((row) => {
+    if (!canonicalMicrosoftUsageReportPeriod(own(row, 'Report Period'), expected)) {
+      throw new Error(`Microsoft ${expected} usage report returned an unexpected Report Period.`)
+    }
+    return { ...row, 'Report Period': expected }
+  })
+}
+
+function usageRowIdentity(row: JsonRecord, source: 'sharePoint' | 'oneDrive') {
+  const siteId = normalizedSiteId(own(row, 'Site Id'))
+  if (siteId) return `site:${siteId}`
+  const url = normalizedSharePointUrl(own(row, 'Site URL'))
+  if (url) return `url:${url}`
+  if (source === 'oneDrive') {
+    const upn = safeText(own(row, 'Owner Principal Name'), 320)?.toLowerCase()
+    if (upn) return `upn:${upn}`
+  }
+  return null
+}
+
+function coherentUsageRows(
+  rows: JsonRecord[],
+  expected: MicrosoftUsageReportPeriod,
+  source: 'sharePoint' | 'oneDrive',
+  asOf: Date,
+) {
+  if (rows.length === 0) return false
+  const refreshDates = new Set<string>()
+  const identities = new Set<string>()
+  for (const row of rows) {
+    if (canonicalMicrosoftUsageReportPeriod(own(row, 'Report Period'), expected) !== expected) return false
+    if (!validReportDates(row, asOf)) return false
+    const refresh = calendarDate(own(row, 'Report Refresh Date'), asOf)?.text
+    const identity = usageRowIdentity(row, source)
+    if (!refresh || !identity || identities.has(identity)) return false
+    refreshDates.add(refresh)
+    identities.add(identity)
+  }
+  return refreshDates.size === 1
+}
+
+export function buildMicrosoftUsageReportSnapshot(
+  sharePointUsage: unknown,
+  oneDriveUsage: unknown,
+) {
+  const sharePointSites = normalizeMicrosoftUsageReportRows(sharePointUsage, 'D180')
+  const oneDriveAccounts = normalizeMicrosoftUsageReportRows(oneDriveUsage, 'D30')
+  const activityAsOf = new Date()
+  const sharePointEvidenceComplete = coherentUsageRows(sharePointSites, 'D180', 'sharePoint', activityAsOf)
+  const oneDriveEvidenceComplete = coherentUsageRows(oneDriveAccounts, 'D30', 'oneDrive', activityAsOf)
+  const projectionState =
+    sharePointEvidenceComplete && oneDriveEvidenceComplete
+      ? 'AUTHORITATIVE_COMPLETE'
+      : 'PARTIAL'
+  return [{
+    hawkviewDataset: MICROSOFT_USAGE_REPORT_DATASET,
+    projectionEvidence: {
+      version: MICROSOFT_USAGE_REPORT_PROJECTION_VERSION,
+      state: projectionState,
+      sharePoint: {
+        state: sharePointEvidenceComplete ? 'AUTHORITATIVE_COMPLETE' : 'PARTIAL',
+        requestedPeriod: 'D180',
+        rowCount: sharePointSites.length,
+      },
+      oneDrive: {
+        state: oneDriveEvidenceComplete ? 'AUTHORITATIVE_COMPLETE' : 'PARTIAL',
+        requestedPeriod: 'D30',
+        rowCount: oneDriveAccounts.length,
+      },
+    },
+    sharePointSites,
+    oneDriveAccounts,
+  }]
+}
+
+/**
+ * Bounded readiness verification of the collector stamp and the exact row
+ * period/date invariants it attests. Older payloads remain usable by the
+ * tenant bundle, but are not promoted to durably verified readiness until the
+ * normal collector refreshes them.
+ */
+export function inspectMicrosoftUsageProjectionEvidence(
+  payload: unknown,
+): MicrosoftUsageProjectionEvidence {
+  const rejected: MicrosoftUsageSourceProjectionEvidence = {
+    state: 'REJECTED', reasonCode: 'USAGE_PROJECTION_EVIDENCE_INVALID',
+  }
+  const legacy: MicrosoftUsageSourceProjectionEvidence = {
+    state: 'UNVERIFIED_LEGACY', reasonCode: 'USAGE_PROJECTION_NOT_DURABLY_VERIFIED',
+  }
+  const rejectAll = (): MicrosoftUsageProjectionEvidence => ({ ...rejected, sharePoint: rejected, oneDrive: rejected })
+  if (!Array.isArray(payload) || payload.length !== 1) {
+    return rejectAll()
+  }
+  const envelope = isPlainRecord(payload[0]) ? payload[0] : null
+  if (!envelope) {
+    return rejectAll()
+  }
+  if (own(envelope, 'hawkviewDataset') === 'microsoft-usage-reports-v1') {
+    return { ...legacy, sharePoint: legacy, oneDrive: legacy }
+  }
+  if (own(envelope, 'hawkviewDataset') !== MICROSOFT_USAGE_REPORT_DATASET) {
+    return rejectAll()
+  }
+  const evidenceValue = own(envelope, 'projectionEvidence')
+  const evidence = isPlainRecord(evidenceValue) ? evidenceValue : null
+  const sharePointValue = evidence ? own(evidence, 'sharePoint') : null
+  const oneDriveValue = evidence ? own(evidence, 'oneDrive') : null
+  const sharePoint = isPlainRecord(sharePointValue) ? sharePointValue : null
+  const oneDrive = isPlainRecord(oneDriveValue) ? oneDriveValue : null
+  const sharePointRows = own(envelope, 'sharePointSites')
+  const oneDriveRows = own(envelope, 'oneDriveAccounts')
+  const globalEvidenceValid =
+    own(evidence ?? undefined, 'version') === MICROSOFT_USAGE_REPORT_PROJECTION_VERSION &&
+    ['AUTHORITATIVE_COMPLETE', 'PARTIAL'].includes(String(own(evidence ?? undefined, 'state'))) &&
+    Array.isArray(sharePointRows) &&
+    Array.isArray(oneDriveRows) &&
+    sharePointRows.length <= SHAREPOINT_CONTRACT_LIMITS.sharePointUsageRows &&
+    oneDriveRows.length <= SHAREPOINT_CONTRACT_LIMITS.oneDriveUsageRows
+  if (!globalEvidenceValid) {
+    return rejectAll()
+  }
+  const now = new Date()
+  const complete: MicrosoftUsageSourceProjectionEvidence = { state: 'AUTHORITATIVE_COMPLETE', reasonCode: null }
+  const partial: MicrosoftUsageSourceProjectionEvidence = {
+    state: 'PARTIAL', reasonCode: 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE',
+  }
+  const sourceResult = (
+    sourceEvidence: JsonRecord | null,
+    rows: unknown[],
+    expected: MicrosoftUsageReportPeriod,
+    source: 'sharePoint' | 'oneDrive',
+    limit: number,
+  ): MicrosoftUsageSourceProjectionEvidence => {
+    const structural =
+      ['AUTHORITATIVE_COMPLETE', 'PARTIAL'].includes(String(own(sourceEvidence ?? undefined, 'state'))) &&
+      own(sourceEvidence ?? undefined, 'requestedPeriod') === expected &&
+      unsignedInteger(own(sourceEvidence ?? undefined, 'rowCount'), limit) === rows.length &&
+      rows.every(isPlainRecord)
+    if (!structural) return rejected
+    const sourceComplete = coherentUsageRows(rows as JsonRecord[], expected, source, now)
+    const stampedComplete = own(sourceEvidence ?? undefined, 'state') === 'AUTHORITATIVE_COMPLETE'
+    if (sourceComplete !== stampedComplete) return rejected
+    return sourceComplete ? complete : partial
+  }
+  const sharePointResult = sourceResult(sharePoint, sharePointRows, 'D180', 'sharePoint', SHAREPOINT_CONTRACT_LIMITS.sharePointUsageRows)
+  const oneDriveResult = sourceResult(oneDrive, oneDriveRows, 'D30', 'oneDrive', SHAREPOINT_CONTRACT_LIMITS.oneDriveUsageRows)
+  const sharePointComplete = sharePointResult.state === 'AUTHORITATIVE_COMPLETE'
+  const oneDriveComplete = oneDriveResult.state === 'AUTHORITATIVE_COMPLETE'
+  const projectionComplete = sharePointComplete && oneDriveComplete
+  const anyRejected = sharePointResult.state === 'REJECTED' || oneDriveResult.state === 'REJECTED'
+  const aggregateState = anyRejected ? 'REJECTED' : projectionComplete ? 'AUTHORITATIVE_COMPLETE' : 'PARTIAL'
+  const aggregateStampValid = own(evidence ?? undefined, 'state') === (projectionComplete ? 'AUTHORITATIVE_COMPLETE' : 'PARTIAL')
+  return aggregateState === 'AUTHORITATIVE_COMPLETE' && aggregateStampValid
+    ? { ...complete, sharePoint: sharePointResult, oneDrive: oneDriveResult }
+    : aggregateState === 'PARTIAL' && aggregateStampValid
+      ? { ...partial, sharePoint: sharePointResult, oneDrive: oneDriveResult }
+      : { ...rejected, sharePoint: sharePointResult, oneDrive: oneDriveResult }
+}
+
 function expectedPeriod(row: JsonRecord, expected: 'D180' | 'D30') {
-  return safeText(own(row, 'Report Period'), 4)?.toUpperCase() === expected
+  return canonicalMicrosoftUsageReportPeriod(own(row, 'Report Period'), expected) === expected
 }
 
 function validReportDates(row: JsonRecord, asOf: Date) {
@@ -349,8 +550,8 @@ export function buildSharePointDataContract(input: SharePointDataContractInput) 
   const oneDriveRows = oneDrivePeriodRows.filter((row) => validReportDates(row, activityAsOf))
   const invalidSharePointDateRows = sharePointPeriodRows.length - sharePointRows.length
   const invalidOneDriveDateRows = oneDrivePeriodRows.length - oneDriveRows.length
-  const sharePointProjectionComplete = input.usageSynchronized && !sharePointInput.truncated && sharePointInput.invalidRows === 0 && invalidSharePointPeriodRows === 0 && invalidSharePointDateRows === 0
-  const oneDriveProjectionComplete = input.usageSynchronized && !oneDriveInput.truncated && oneDriveInput.invalidRows === 0 && invalidOneDrivePeriodRows === 0 && invalidOneDriveDateRows === 0
+  const sharePointProjectionComplete = input.usageSynchronized && !sharePointInput.truncated && sharePointInput.invalidRows === 0 && invalidSharePointPeriodRows === 0 && invalidSharePointDateRows === 0 && coherentUsageRows(sharePointRows, 'D180', 'sharePoint', activityAsOf)
+  const oneDriveProjectionComplete = input.usageSynchronized && !oneDriveInput.truncated && oneDriveInput.invalidRows === 0 && invalidOneDrivePeriodRows === 0 && invalidOneDriveDateRows === 0 && coherentUsageRows(oneDriveRows, 'D30', 'oneDrive', activityAsOf)
 
   const usageByUrl = new Map<string, JsonRecord>()
   const usageBySiteId = new Map<string, JsonRecord>()
@@ -458,6 +659,14 @@ export function buildSharePointDataContract(input: SharePointDataContractInput) 
   const currentOneDriveRows = oneDriveRows.filter((row) => reportDeleted(own(row, 'Is Deleted')) === false)
   const sharePointTotalsAuthoritative = sharePointProjectionComplete && sharePointRows.every((row) => reportDeleted(own(row, 'Is Deleted')) !== null)
   const oneDriveTotalsAuthoritative = oneDriveProjectionComplete && oneDriveRows.every((row) => reportDeleted(own(row, 'Is Deleted')) !== null)
+  const sharePointActivityCoverageComplete =
+    sharePointProjectionComplete &&
+    sites.length > 0 &&
+    sites.every(
+      (site) =>
+        site.usageReportMatch === 'matched' &&
+        site.usage.activityState === 'reported',
+    )
   const sharePointUsedBytes = sharePointTotalsAuthoritative ? sumKnown(currentSharePointRows, 'Storage Used (Byte)') : null
   const sharePointAllocatedBytes = sharePointTotalsAuthoritative ? sumKnown(currentSharePointRows, 'Storage Allocated (Byte)') : null
   const oneDriveUsedBytes = oneDriveTotalsAuthoritative ? sumKnown(currentOneDriveRows, 'Storage Used (Byte)') : null
@@ -498,8 +707,8 @@ export function buildSharePointDataContract(input: SharePointDataContractInput) 
       sharePointReportedDeletedCount: sharePointTotalsAuthoritative ? reportedDeletedSites.length : null,
       sharePointStorageUsedGB: bytesToGigabytes(sharePointUsedBytes),
       sharePointReportedAllocationGB: bytesToGigabytes(sharePointAllocatedBytes),
-      sharePointInactive90Days: sharePointProjectionComplete ? sites.filter((site) => site.usage.activityState === 'reported' && site.usage.activityAgeDays !== null && site.usage.activityAgeDays >= 90).length : null,
-      sharePointInactive180Days: sharePointProjectionComplete ? sites.filter((site) => site.usage.activityState === 'reported' && site.usage.activityAgeDays !== null && site.usage.activityAgeDays >= 180).length : null,
+      sharePointInactive90Days: sharePointActivityCoverageComplete ? sites.filter((site) => site.usage.activityAgeDays !== null && site.usage.activityAgeDays >= 90).length : null,
+      sharePointInactive180Days: sharePointActivityCoverageComplete ? sites.filter((site) => site.usage.activityAgeDays !== null && site.usage.activityAgeDays >= 180).length : null,
       sharePointSitesMissingReportedOwner: sharePointProjectionComplete ? sites.filter((site) => site.usageReportMatch === 'matched' && !site.usage.hasReportedOwner).length : null,
       sharePointSitesWithMatchedUsage: sharePointProjectionComplete ? sites.filter((site) => site.usageReportMatch === 'matched').length : null,
       sharePointSitesWithoutMatchedUsage: sharePointProjectionComplete ? sites.filter((site) => site.usageReportMatch !== 'matched').length : null,

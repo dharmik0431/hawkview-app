@@ -49,6 +49,39 @@ function timestamp(value: unknown): string | null {
   return Number.isFinite(parsed.getTime()) ? candidate : null
 }
 
+function observedTimestamp(value: unknown): string | null {
+  const candidate = text(value, 64)
+  if (!candidate) return null
+  let parsed: Date
+  const calendarDate = /^(\d{4})-(\d{2})-(\d{2})$/.exec(candidate)
+  if (calendarDate) {
+    const [, yearText, monthText, dayText] = calendarDate
+    const year = Number(yearText)
+    const month = Number(monthText)
+    const day = Number(dayText)
+    parsed = new Date(Date.UTC(year, month - 1, day))
+    if (
+      parsed.getUTCFullYear() !== year ||
+      parsed.getUTCMonth() !== month - 1 ||
+      parsed.getUTCDate() !== day
+    ) return null
+  } else {
+    // Contract observation timestamps, when present instead of Microsoft report
+    // dates, must be canonical UTC ISO values with explicit milliseconds.
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(candidate)) return null
+    parsed = new Date(candidate)
+    if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== candidate) return null
+  }
+  return parsed.getTime() <= Date.now() + 5 * 60_000 ? candidate : null
+}
+
+function maxObservedTimestamp(values: unknown[]): string | null {
+  return values
+    .map(observedTimestamp)
+    .filter((value): value is string => Boolean(value))
+    .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0] ?? null
+}
+
 function safeUrl(value: unknown): string | null {
   const candidate = text(value, 2_000)
   if (!candidate) return null
@@ -74,6 +107,16 @@ function safeUrl(value: unknown): string | null {
 export function sharePointRetentionDaysLabel(value: unknown): string {
   const days = integer(value, 36_500)
   return days === null ? 'Not reported by Microsoft' : `${days} days`
+}
+
+export function sharePointReportedDeletedState(value: unknown): boolean | null {
+  const site = record(value)
+  if (!site) return null
+  const isDeleted = boolean(own(site, 'isDeleted'))
+  const usageDeleted = boolean(own(site, 'usageReportDeleted'))
+  if (isDeleted === true || usageDeleted === true) return true
+  if (isDeleted === false || usageDeleted === false) return false
+  return null
 }
 
 function stringList(value: unknown, max = 256): string[] {
@@ -150,50 +193,67 @@ function projectTenantSettings(source: unknown, contractSource: unknown): Record
   return projected
 }
 
-function projectSite(value: unknown): Record<string, unknown> | null {
+function projectSite(value: unknown, contractMode = false): Record<string, unknown> | null {
   const site = record(value)
   if (!site) return null
   const usage = record(own(site, 'usage'))
   const drive = record(own(site, 'bestEffortDefaultDriveQuota'))
   const id = first(text(own(site, 'id'), 256), safeUrl(own(site, 'url')))
   if (!id) return null
-  const used = first(
-    finiteNumber(own(usage, 'storageUsedGB'), MAX_STORAGE_GB),
-    finiteNumber(own(site, 'storageUsedGB'), MAX_STORAGE_GB),
-    finiteNumber(own(drive, 'usedGB'), MAX_STORAGE_GB),
+  const reportedUsed = finiteNumber(own(usage, 'storageUsedGB'), MAX_STORAGE_GB)
+  const reportedAllocated = finiteNumber(own(usage, 'storageAllocatedGB'), MAX_STORAGE_GB)
+  const legacyUsed = contractMode ? null : finiteNumber(own(site, 'storageUsedGB'), MAX_STORAGE_GB)
+  const legacyAllocated = contractMode ? null : finiteNumber(own(site, 'storageQuotaGB'), MAX_STORAGE_GB)
+  const bestEffortDriveUsed = finiteNumber(own(drive, 'usedGB'), MAX_STORAGE_GB)
+  const bestEffortDriveTotal = finiteNumber(own(drive, 'totalGB'), MAX_STORAGE_GB)
+  const used = first(reportedUsed, legacyUsed, bestEffortDriveUsed)
+  const allocated = first(reportedAllocated, legacyAllocated)
+  const activityAgeDays = first(
+    integer(own(usage, 'activityAgeDays'), 100_000),
+    contractMode ? null : integer(own(site, 'activityAgeDays'), 100_000),
   )
-  const allocated = first(
-    finiteNumber(own(usage, 'storageAllocatedGB'), MAX_STORAGE_GB),
-    finiteNumber(own(site, 'storageQuotaGB'), MAX_STORAGE_GB),
+  const reportedDeleted = first(
+    boolean(own(usage, 'microsoftReportedDeleted')),
+    contractMode ? null : boolean(own(site, 'usageReportDeleted')),
+    contractMode ? null : boolean(own(site, 'isDeleted')),
   )
-  const activityAgeDays = first(integer(own(usage, 'activityAgeDays'), 100_000), integer(own(site, 'activityAgeDays'), 100_000))
-  const reportedDeleted = first(boolean(own(usage, 'microsoftReportedDeleted')), boolean(own(site, 'usageReportDeleted')), boolean(own(site, 'isDeleted')))
   return {
     id,
     name: first(text(own(site, 'name'), 500), text(own(site, 'displayName'), 500), 'Unnamed SharePoint site'),
     description: text(own(site, 'description'), 1_000),
     url: safeUrl(first(own(site, 'url'), own(site, 'webUrl'))),
     type: siteType(first(own(site, 'siteType'), own(site, 'type'), own(usage, 'rootWebTemplate'))),
-    ownerDisplayName: first(text(own(usage, 'ownerDisplayName'), 500), text(own(site, 'ownerDisplayName'), 500)),
-    ownerPrincipalName: first(text(own(usage, 'ownerPrincipalName'), 500), text(own(site, 'ownerPrincipalName'), 500)),
-    hasReportedOwner: first(boolean(own(usage, 'hasReportedOwner')), boolean(own(site, 'hasReportedOwner'))),
+    ownerDisplayName: first(text(own(usage, 'ownerDisplayName'), 500), contractMode ? null : text(own(site, 'ownerDisplayName'), 500)),
+    ownerPrincipalName: first(text(own(usage, 'ownerPrincipalName'), 500), contractMode ? null : text(own(site, 'ownerPrincipalName'), 500)),
+    hasReportedOwner: first(boolean(own(usage, 'hasReportedOwner')), contractMode ? null : boolean(own(site, 'hasReportedOwner'))),
     storageUsedGB: used,
     storageQuotaGB: allocated,
+    reportedStorageUsedGB: reportedUsed,
+    reportedStorageAllocatedGB: reportedAllocated,
+    bestEffortDriveStorageUsedGB: bestEffortDriveUsed,
+    bestEffortDriveStorageTotalGB: bestEffortDriveTotal,
+    storageUsedSource: reportedUsed !== null
+      ? 'microsoft-d180-usage-report'
+      : legacyUsed !== null
+        ? 'legacy-backend'
+        : bestEffortDriveUsed !== null
+          ? 'graph-default-drive-best-effort'
+          : 'unavailable',
     storageUtilizationPercent: first(finiteNumber(own(usage, 'storageUtilizationPercent'), 100), allocated && used !== null ? Math.min(100, (used / allocated) * 100) : null),
-    lastActivityAt: first(timestamp(own(usage, 'lastActivityAt')), timestamp(own(site, 'lastActivityAt'))),
+    lastActivityAt: first(timestamp(own(usage, 'lastActivityAt')), contractMode ? null : timestamp(own(site, 'lastActivityAt'))),
     activityAgeDays,
-    activityState: first(text(own(usage, 'activityState'), 80), text(own(site, 'activityStatus'), 80), 'unavailable'),
+    activityState: first(text(own(usage, 'activityState'), 80), contractMode ? null : text(own(site, 'activityStatus'), 80), 'unavailable'),
     activityDataStatus: first(text(own(site, 'usageReportMatch'), 80), text(own(site, 'activityDataStatus'), 80)),
     activitySource: text(own(site, 'activitySource'), 120),
-    fileCount: first(integer(own(usage, 'fileCount')), integer(own(site, 'fileCount'))),
-    activeFileCount: first(integer(own(usage, 'activeFileCount')), integer(own(site, 'activeFileCount'))),
-    pageViews: first(integer(own(usage, 'pageViewCount')), integer(own(site, 'pageViews'))),
-    visitedPages: first(integer(own(usage, 'visitedPageCount')), integer(own(site, 'visitedPages'))),
-    reportRefreshedAt: first(timestamp(own(usage, 'reportRefreshDate')), timestamp(own(site, 'reportRefreshedAt'))),
-    reportPeriod: first(text(own(usage, 'reportPeriod'), 20), text(own(site, 'reportPeriod'), 20)),
+    fileCount: first(integer(own(usage, 'fileCount')), contractMode ? null : integer(own(site, 'fileCount'))),
+    activeFileCount: first(integer(own(usage, 'activeFileCount')), contractMode ? null : integer(own(site, 'activeFileCount'))),
+    pageViews: first(integer(own(usage, 'pageViewCount')), contractMode ? null : integer(own(site, 'pageViews'))),
+    visitedPages: first(integer(own(usage, 'visitedPageCount')), contractMode ? null : integer(own(site, 'visitedPages'))),
+    reportRefreshedAt: first(timestamp(own(usage, 'reportRefreshDate')), contractMode ? null : timestamp(own(site, 'reportRefreshedAt'))),
+    reportPeriod: first(text(own(usage, 'reportPeriod'), 20), contractMode ? null : text(own(site, 'reportPeriod'), 20)),
     createdDate: first(timestamp(own(site, 'createdAt')), timestamp(own(site, 'createdDateTime')), timestamp(own(site, 'createdDate'))),
     graphLastModified: first(timestamp(own(site, 'graphLastModifiedAt')), timestamp(own(site, 'lastModifiedAt')), timestamp(own(site, 'lastModifiedDateTime')), timestamp(own(site, 'graphLastModified'))),
-    rootTemplate: first(text(own(usage, 'rootWebTemplate'), 120), text(own(site, 'rootTemplate'), 120)),
+    rootTemplate: first(text(own(usage, 'rootWebTemplate'), 120), contractMode ? null : text(own(site, 'rootTemplate'), 120)),
     usageReportDeleted: reportedDeleted,
     isDeleted: reportedDeleted,
     collection: record(own(site, 'collection')),
@@ -251,6 +311,37 @@ function projectDeletedSignal(value: unknown): Record<string, unknown> | null {
   }
 }
 
+function stripUnverifiedLegacyUsage(site: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...site,
+    ownerDisplayName: null,
+    ownerPrincipalName: null,
+    hasReportedOwner: null,
+    storageUsedGB: null,
+    storageQuotaGB: null,
+    reportedStorageUsedGB: null,
+    reportedStorageAllocatedGB: null,
+    bestEffortDriveStorageUsedGB: null,
+    bestEffortDriveStorageTotalGB: null,
+    storageUsedSource: 'unavailable',
+    storageUtilizationPercent: null,
+    lastActivityAt: null,
+    activityAgeDays: null,
+    activityState: 'unavailable',
+    activityDataStatus: null,
+    activitySource: null,
+    fileCount: null,
+    activeFileCount: null,
+    pageViews: null,
+    visitedPages: null,
+    reportRefreshedAt: null,
+    reportPeriod: null,
+    rootTemplate: null,
+    usageReportDeleted: null,
+    isDeleted: null,
+  }
+}
+
 function maxTimestamp(values: unknown[]): string | null {
   return values
     .map(timestamp)
@@ -262,7 +353,9 @@ export type SharePointViewModel = ReturnType<typeof buildSharePointViewModel>
 
 export function buildSharePointViewModel(value: unknown) {
   const source = record(value) ?? {}
-  const contract = record(own(source, 'dataContract'))
+  const contractEnvelope = record(own(source, 'dataContract'))
+  const suppliedContractVersion = finiteNumber(own(contractEnvelope, 'contractVersion'), 100)
+  const contract = suppliedContractVersion === 2 ? contractEnvelope : null
   const contractOverview = record(own(contract, 'overview'))
   const projection = record(own(contract, 'projection'))
   const siteProjection = record(own(projection, 'sites'))
@@ -285,13 +378,59 @@ export function buildSharePointViewModel(value: unknown) {
           ? 'success'
           : 'never-synced'
 
-  const rawSites = Array.isArray(own(contract, 'sites'))
-    ? (own(contract, 'sites') as unknown[])
+  const rawSites = Array.isArray(own(contractEnvelope, 'sites'))
+    ? (own(contractEnvelope, 'sites') as unknown[])
     : Array.isArray(own(source, 'sites'))
       ? (own(source, 'sites') as unknown[])
       : []
   const clientSiteCapped = rawSites.length > MAX_SITE_ROWS
-  const sites = rawSites.slice(0, MAX_SITE_ROWS).map(projectSite).filter((site): site is NonNullable<ReturnType<typeof projectSite>> => Boolean(site))
+  const projectedSites = rawSites
+    .slice(0, MAX_SITE_ROWS)
+    .map((site) => projectSite(site, Boolean(contractEnvelope)))
+    .filter((site): site is NonNullable<ReturnType<typeof projectSite>> => Boolean(site))
+
+  const legacyCollection = record(own(source, 'collection'))
+  const legacyReports = record(own(legacyCollection, 'reports'))
+  const legacyReportRefresh = first(
+    observedTimestamp(own(source, 'reportRefreshedAt')),
+    observedTimestamp(own(legacyReports, 'refreshedAt')),
+    maxObservedTimestamp(projectedSites.map((site) => own(site, 'reportRefreshedAt'))),
+  )
+  const validLegacyD180Row = (site: PlainRecord) => {
+    const period = text(own(site, 'reportPeriod'), 20)?.toUpperCase()
+    const activitySource = text(own(site, 'activitySource'), 120)?.toLowerCase()
+    const siteReportRefresh = observedTimestamp(own(site, 'reportRefreshedAt'))
+    const rawActivityAt = own(site, 'lastActivityAt')
+    const activityAt = rawActivityAt === null || rawActivityAt === undefined
+      ? null
+      : observedTimestamp(rawActivityAt)
+    const activityDateCoherent = rawActivityAt === null || rawActivityAt === undefined || Boolean(
+      activityAt &&
+      siteReportRefresh &&
+      (
+        siteReportRefresh.length === 10
+          ? activityAt.slice(0, 10) <= siteReportRefresh
+          : new Date(activityAt).getTime() <= new Date(siteReportRefresh).getTime()
+      )
+    )
+    const refreshCoherent = Boolean(
+      legacyReportRefresh &&
+      siteReportRefresh &&
+      legacyReportRefresh.slice(0, 10) === siteReportRefresh.slice(0, 10)
+    )
+    return Boolean(
+      siteReportRefresh &&
+      refreshCoherent &&
+      activityDateCoherent &&
+      (period === 'D180' || activitySource === 'microsoft-d180-report')
+    )
+  }
+  const legacyD180Evidence = Boolean(
+    !contractEnvelope &&
+    legacyReportRefresh &&
+    projectedSites.length > 0 &&
+    projectedSites.every(validLegacyD180Row)
+  )
 
   const incompleteProjectionRow = (row: PlainRecord | null) => {
     if (!row) return true
@@ -304,50 +443,177 @@ export function buildSharePointViewModel(value: unknown) {
     return inputRows === null || projectedRows === null || invalidRows === null || truncated === null ||
       truncated || invalidRows > 0 || invalidPeriodRows > 0 || invalidDateRows > 0 || projectedRows < inputRows
   }
-  const contractProjectionIncomplete = Boolean(contract) && (
+  const hasValidatedProjectedRows = (row: PlainRecord | null) => {
+    if (incompleteProjectionRow(row)) return false
+    const inputRows = integer(own(row, 'inputRows'), MAX_COUNT)
+    const projectedRows = integer(own(row, 'projectedRows'), MAX_COUNT)
+    return inputRows !== null && projectedRows !== null && inputRows > 0 && projectedRows > 0
+  }
+  const contractProjectionIncomplete = Boolean(contractEnvelope) && (
+    !contract ||
     incompleteProjectionRow(siteProjection) ||
     incompleteProjectionRow(sharePointUsageProjection) ||
     incompleteProjectionRow(oneDriveUsageProjection)
   )
-  const projectionIncomplete = clientSiteCapped || contractProjectionIncomplete
+  const inventoryProjectionIncomplete = clientSiteCapped || Boolean(
+    contractEnvelope && (!contract || incompleteProjectionRow(siteProjection))
+  )
+  const inventoryTruncated = clientSiteCapped || Boolean(contract && boolean(own(siteProjection, 'truncated')) === true)
+  const sharePointReportState = text(own(sharePointReport, 'state'), 40)?.toLowerCase() ?? null
+  const canonicalReportRefresh = observedTimestamp(own(sharePointReport, 'reportRefreshDate'))
+  const oneDriveReportState = text(own(oneDriveReport, 'state'), 40)?.toLowerCase() ?? null
+  const canonicalOneDriveReportRefresh = observedTimestamp(own(oneDriveReport, 'reportRefreshDate'))
+  const canonicalUsageEvidenceAvailable = Boolean(
+    contract &&
+    sharePointReportState === 'available' &&
+    canonicalReportRefresh &&
+    hasValidatedProjectedRows(sharePointUsageProjection)
+  )
+  const canonicalOneDriveEvidenceAvailable = Boolean(
+    contract &&
+    oneDriveReportState === 'available' &&
+    canonicalOneDriveReportRefresh &&
+    hasValidatedProjectedRows(oneDriveUsageProjection)
+  )
+  const exactD180EvidenceAvailable = contract
+    ? canonicalUsageEvidenceAvailable
+    : contractEnvelope
+      ? false
+      : legacyD180Evidence
+  // Old bundles mixed Graph inventory with report-derived values without a
+  // durable report-state contract. Preserve the inventory row, but do not
+  // publish exact D180 usage/activity/owner/deleted facts unless that bundle
+  // independently carries a valid D180 observation and refresh timestamp.
+  const sites: Record<string, unknown>[] = contract
+    ? projectedSites
+    : contractEnvelope
+      ? projectedSites.map(stripUnverifiedLegacyUsage)
+      : projectedSites.map((site) => validLegacyD180Row(site) ? site : stripUnverifiedLegacyUsage(site))
+  const projectionIncomplete = clientSiteCapped || contractProjectionIncomplete || Boolean(
+    contractEnvelope && (!contract || !canonicalUsageEvidenceAvailable || !canonicalOneDriveEvidenceAvailable)
+  )
   const syncStatus = projectionIncomplete && !['failed', 'running'].includes(baseSyncStatus)
     ? 'partial'
     : baseSyncStatus
 
-  const rawDeleted = Array.isArray(own(contract, 'reportedDeletedSites'))
-    ? (own(contract, 'reportedDeletedSites') as unknown[])
+  const rawDeleted = Array.isArray(own(contractEnvelope, 'reportedDeletedSites'))
+    ? (own(contractEnvelope, 'reportedDeletedSites') as unknown[])
     : Array.isArray(own(source, 'deletedSites'))
       ? (own(source, 'deletedSites') as unknown[])
       : []
-  const reportedDeletedSites = rawDeleted.slice(0, MAX_DELETED_ROWS).map(projectDeletedSignal).filter((site): site is NonNullable<ReturnType<typeof projectDeletedSignal>> => Boolean(site))
+  const projectedDeletedSites = rawDeleted.slice(0, MAX_DELETED_ROWS).map(projectDeletedSignal).filter((site): site is NonNullable<ReturnType<typeof projectDeletedSignal>> => Boolean(site))
+  const reportedDeletedSites = exactD180EvidenceAvailable ? projectedDeletedSites : []
 
-  const rawOneDrive = Array.isArray(own(contract, 'oneDriveAccounts'))
+  const rawOneDrive = canonicalOneDriveEvidenceAvailable && Array.isArray(own(contract, 'oneDriveAccounts'))
     ? (own(contract, 'oneDriveAccounts') as unknown[])
-    : Array.isArray(own(source, 'oneDriveAccounts'))
-      ? (own(source, 'oneDriveAccounts') as unknown[])
-      : []
+    : []
 
   return {
-    contractVersion: text(own(contract, 'contractVersion'), 40) ?? finiteNumber(own(contract, 'contractVersion'), 100),
+    contractPresent: Boolean(contractEnvelope),
+    contractVersion: text(own(contractEnvelope, 'contractVersion'), 40) ?? finiteNumber(own(contractEnvelope, 'contractVersion'), 100),
     inventory: {
-      projectionComplete: !projectionIncomplete,
-      truncated: clientSiteCapped || boolean(own(siteProjection, 'truncated')) === true,
-      countAtLeast: projectionIncomplete,
-      countLabel: projectionIncomplete ? `${sites.length}+` : String(sites.length),
+      projectionComplete: !inventoryProjectionIncomplete,
+      truncated: inventoryTruncated,
+      countAtLeast: inventoryTruncated,
+      countLabel: inventoryTruncated ? `${sites.length}+` : String(sites.length),
+    },
+    usageReport: {
+      projectionComplete: canonicalUsageEvidenceAvailable,
+      exactClaimsAvailable: exactD180EvidenceAvailable,
+      state: sharePointReportState,
+      reportRefreshedAt: contractEnvelope ? (contract ? canonicalReportRefresh : null) : legacyReportRefresh,
+    },
+    oneDriveUsageReport: {
+      projectionComplete: canonicalOneDriveEvidenceAvailable,
+      exactClaimsAvailable: canonicalOneDriveEvidenceAvailable,
+      state: oneDriveReportState,
+      reportRefreshedAt: contract ? canonicalOneDriveReportRefresh : null,
     },
     overview: {
-      totalSites: first(integer(own(contractOverview, 'sharePointSiteCount')), integer(own(contractOverview, 'discoveredSharePointSiteCount')), integer(own(legacyOverview, 'totalSites')), sites.length),
-      totalStorageQuotaGB: first(finiteNumber(own(contractOverview, 'sharePointReportedAllocationGB'), MAX_STORAGE_GB), finiteNumber(own(legacyOverview, 'totalStorageQuotaGB'), MAX_STORAGE_GB)),
-      storageQuotaSource: first(text(own(legacyOverview, 'storageQuotaSource'), 120), 'reported-site-allocation'),
+      totalSites: contract
+        ? first(integer(own(contractOverview, 'sharePointSiteCount')), integer(own(contractOverview, 'discoveredSharePointSiteCount')), sites.length)
+        : contractEnvelope
+          ? sites.length
+          : first(integer(own(legacyOverview, 'totalSites')), sites.length),
+      reportedStorageUsedGB: contract
+        ? canonicalUsageEvidenceAvailable
+          ? finiteNumber(own(contractOverview, 'sharePointStorageUsedGB'), MAX_STORAGE_GB)
+          : null
+        : null,
+      totalStorageQuotaGB: contract
+        ? canonicalUsageEvidenceAvailable
+          ? finiteNumber(own(contractOverview, 'sharePointReportedAllocationGB'), MAX_STORAGE_GB)
+          : null
+        : contractEnvelope
+          ? null
+          : legacyD180Evidence
+            ? finiteNumber(own(legacyOverview, 'totalStorageQuotaGB'), MAX_STORAGE_GB)
+            : null,
+      storageQuotaSource: contract
+        ? 'reported-site-allocation'
+        : contractEnvelope
+          ? 'unavailable'
+          : first(text(own(legacyOverview, 'storageQuotaSource'), 120), 'reported-site-allocation'),
       oneDriveStorageLimitGB: finiteNumber(own(legacyOverview, 'oneDriveStorageLimitGB'), MAX_STORAGE_GB),
       siteStorageLimitsMode: text(own(legacyOverview, 'siteStorageLimitsMode'), 80),
-      inactiveSites90Days: first(integer(own(contractOverview, 'sharePointInactive90Days')), integer(own(legacyOverview, 'inactiveSites90Days'))),
-      inactiveSites180Days: first(integer(own(contractOverview, 'sharePointInactive180Days')), integer(own(legacyOverview, 'inactiveSites180Days'))),
+      inactiveSites90Days: contract
+        ? canonicalUsageEvidenceAvailable
+          ? integer(own(contractOverview, 'sharePointInactive90Days'))
+          : null
+        : contractEnvelope
+          ? null
+          : legacyD180Evidence
+            ? integer(own(legacyOverview, 'inactiveSites90Days'))
+            : null,
+      inactiveSites180Days: contract
+        ? canonicalUsageEvidenceAvailable
+          ? integer(own(contractOverview, 'sharePointInactive180Days'))
+          : null
+        : contractEnvelope
+          ? null
+          : legacyD180Evidence
+            ? integer(own(legacyOverview, 'inactiveSites180Days'))
+            : null,
       // The contract distinguishes a missing usage-row match from a matched row
       // that has no reported activity date. The approved UI computes the latter
       // from projected site rows, so do not substitute the former here.
-      sitesWithoutActivityData: integer(own(legacyOverview, 'sitesWithoutActivityData')),
-      sitesMissingReportedOwner: first(integer(own(contractOverview, 'sharePointSitesMissingReportedOwner')), integer(own(legacyOverview, 'sitesMissingReportedOwner'))),
+      sitesWithoutActivityData: contract
+        ? null
+        : contractEnvelope
+          ? null
+          : legacyD180Evidence
+            ? integer(own(legacyOverview, 'sitesWithoutActivityData'))
+            : null,
+      sitesMissingReportedOwner: contract
+        ? canonicalUsageEvidenceAvailable
+          ? integer(own(contractOverview, 'sharePointSitesMissingReportedOwner'))
+          : null
+        : contractEnvelope
+          ? null
+          : legacyD180Evidence
+            ? integer(own(legacyOverview, 'sitesMissingReportedOwner'))
+            : null,
+      sitesWithMatchedUsage: contract
+        ? canonicalUsageEvidenceAvailable
+          ? integer(own(contractOverview, 'sharePointSitesWithMatchedUsage'))
+          : null
+        : contractEnvelope
+          ? null
+          : legacyD180Evidence
+            ? sites.filter((site) => {
+              const status = text(own(site, 'activityDataStatus'), 80)?.toLowerCase()
+              const activitySource = text(own(site, 'activitySource'), 120)?.toLowerCase()
+              return status === 'matched' || activitySource === 'microsoft-d180-report'
+            }).length
+            : null,
+      sitesWithoutMatchedUsage: contract
+        ? canonicalUsageEvidenceAvailable
+          ? integer(own(contractOverview, 'sharePointSitesWithoutMatchedUsage'))
+          : null
+        : null,
+      reportedDeletedCount: contract && canonicalUsageEvidenceAvailable
+        ? integer(own(contractOverview, 'sharePointReportedDeletedCount'))
+        : null,
       sharingCapability: first(text(own(record(own(contract, 'tenantSettings')) ? record(own(record(own(contract, 'tenantSettings')), 'externalSharing')) : null, 'capability'), 120), text(own(legacyOverview, 'sharingCapability'), 120), text(own(legacyOverview, 'sharingSharePoint'), 120)),
     },
     sites,
@@ -359,7 +625,7 @@ export function buildSharePointViewModel(value: unknown) {
       status: syncStatus,
       lastAttemptAt: maxTimestamp(syncRows.map((row) => own(row, 'lastAttemptAt'))),
       lastSuccessAt: maxTimestamp(syncRows.map((row) => own(row, 'lastSuccessfulAt'))),
-      reportRefreshedAt: first(timestamp(own(sharePointReport, 'reportRefreshDate')), timestamp(own(oneDriveReport, 'reportRefreshDate'))),
+      reportRefreshedAt: contractEnvelope ? (contract ? canonicalReportRefresh : null) : legacyReportRefresh,
     },
   }
 }

@@ -43,7 +43,13 @@ import {
   deriveSignInEntitlement,
   type SignInEntitlement,
 } from './sign-in-entitlement.js'
-import { buildSharePointDataContract } from './sharepoint-data-contract.js'
+import {
+  buildMicrosoftUsageReportSnapshot,
+  buildSharePointDataContract,
+  inspectMicrosoftUsageProjectionEvidence,
+  MICROSOFT_USAGE_REPORT_DATASET,
+  type MicrosoftUsageSourceProjectionEvidence,
+} from './sharepoint-data-contract.js'
 import {
   exchangeMailboxRuleCompoundId,
   projectExchangeMailboxRuleDetails,
@@ -1883,7 +1889,8 @@ export class TenantSyncService {
     const hasSnapshot = (resource: string) => snapshotByResource.has(resource as any)
     const correlationId = (message: string | null) =>
       message?.match(/(?:request|correlation)[^0-9a-f]*([0-9a-f]{8}-[0-9a-f-]{27,})/i)?.[1] ?? null
-    const resources: Array<{ key: string; resource: string; source: string; endpoint: string; unsupported?: boolean; capability?: 'NOT_COLLECTED_LEAST_PRIVILEGE' }> = [
+    const usageProjection = inspectMicrosoftUsageProjectionEvidence(snapshotFor('SHAREPOINT_USAGE'))
+    const resources: Array<{ key: string; resource: string; source: string; endpoint: string; unsupported?: boolean; capability?: 'NOT_COLLECTED_LEAST_PRIVILEGE'; projectionEvidence?: MicrosoftUsageSourceProjectionEvidence }> = [
       { key: 'exchange.mailboxes.inventory', resource: 'EXCHANGE_MAILBOXES', source: 'Microsoft Graph', endpoint: '/users' },
       { key: 'exchange.mailboxes.settings', resource: 'EXCHANGE_MAILBOX_SETTINGS', source: 'Microsoft Graph', endpoint: '/users/{id}/mailboxSettings' },
       { key: 'exchange.mailboxes.usage', resource: 'EXCHANGE_MAILBOX_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getMailboxUsageDetail' },
@@ -1891,6 +1898,8 @@ export class TenantSyncService {
       { key: 'sharepoint.sites.access', resource: 'SHAREPOINT_SITES', source: 'HawkView standard least-privilege mode', endpoint: 'not-collected-in-standard-mode', capability: 'NOT_COLLECTED_LEAST_PRIVILEGE' },
       { key: 'sharepoint.tenant.settings', resource: 'SHAREPOINT_SETTINGS', source: 'Microsoft Graph', endpoint: '/admin/sharepoint/settings' },
       { key: 'sharepoint.usage', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
+      { key: 'sharepoint.usage-projection', resource: 'SHAREPOINT_USAGE', source: 'HawkView validated Microsoft Graph report projection', endpoint: '/reports/getSharePointSiteUsageDetail', projectionEvidence: usageProjection.sharePoint },
+      { key: 'onedrive.usage-projection', resource: 'SHAREPOINT_USAGE', source: 'HawkView validated Microsoft Graph report projection', endpoint: '/reports/getOneDriveUsageAccountDetail', projectionEvidence: usageProjection.oneDrive },
       { key: 'sharepoint.activity', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
       { key: 'sharepoint.owners', resource: 'SHAREPOINT_SITES', source: 'Microsoft Graph', endpoint: '/sites', unsupported: true },
       { key: 'sharepoint.deleted-sites', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
@@ -1904,7 +1913,7 @@ export class TenantSyncService {
         sync?.status === 'SUCCEEDED' &&
         Array.isArray(conditionalAccessPayload) &&
         conditionalAccessPayload.length === 0
-      const result = deriveCollectionFieldState({
+      const resourceResult = deriveCollectionFieldState({
         syncStatus: sync?.status,
         lastErrorMessage: sync?.lastErrorMessage,
         hasPriorSnapshot: hasSnapshot(definition.resource),
@@ -1912,6 +1921,18 @@ export class TenantSyncService {
         unsupportedMessage: 'Microsoft Graph site inventory does not provide a reliable site-owner roster.',
         notConfigured: hasNoConditionalAccessPolicies,
       })
+      const result = !definition.projectionEvidence || resourceResult.state !== 'AVAILABLE'
+        ? resourceResult
+        : definition.projectionEvidence.state === 'AUTHORITATIVE_COMPLETE'
+          ? resourceResult
+          : {
+              state: definition.projectionEvidence.state === 'REJECTED' ? 'FAILED' as const : 'PENDING' as const,
+              reasonCode: definition.projectionEvidence.reasonCode,
+              message: definition.projectionEvidence.state === 'UNVERIFIED_LEGACY'
+                ? 'The stored Microsoft usage report predates HawkView projection evidence. A normal collection will verify it.'
+                : 'The stored Microsoft usage report does not contain complete validated period and refresh-date evidence.',
+              isStale: definition.projectionEvidence.state !== 'UNVERIFIED_LEGACY',
+            }
       await this.prisma.tenantCollectionFieldState.upsert({
         where: { customerTenantId_fieldKey: { customerTenantId: tenant.id, fieldKey: definition.key } },
         create: {
@@ -4373,13 +4394,10 @@ export class TenantSyncService {
           'OneDrive'
         ),
       ])
-      const payload = [
-        {
-          hawkviewDataset: 'microsoft-usage-reports-v1',
-          sharePointSites: parseCsvRows(sharePointReport),
-          oneDriveAccounts: parseCsvRows(oneDriveReport),
-        },
-      ]
+      const payload = buildMicrosoftUsageReportSnapshot(
+        parseCsvRows(sharePointReport),
+        parseCsvRows(oneDriveReport),
+      )
       await this.saveSnapshot(tenant, 'SHAREPOINT_USAGE', authoritativeSnapshot(payload))
     })
   }
@@ -4741,12 +4759,23 @@ export class TenantSyncService {
       snapshotByResource.get('SHAREPOINT_USAGE') ?? []
     const combinedUsage =
       sharePointUsageSnapshot.length === 1 &&
-      sharePointUsageSnapshot[0]?.hawkviewDataset ===
-        'microsoft-usage-reports-v1'
+      ['microsoft-usage-reports-v1', MICROSOFT_USAGE_REPORT_DATASET].includes(
+        sharePointUsageSnapshot[0]?.hawkviewDataset,
+      )
         ? sharePointUsageSnapshot[0]
         : null
-    const sharePointUsage = combinedUsage?.sharePointSites ?? sharePointUsageSnapshot
-    const oneDriveUsage = combinedUsage?.oneDriveAccounts ?? []
+    const combinedUsageProjection =
+      combinedUsage?.hawkviewDataset === MICROSOFT_USAGE_REPORT_DATASET
+        ? inspectMicrosoftUsageProjectionEvidence([combinedUsage])
+        : null
+    const sharePointUsage = combinedUsageProjection &&
+      combinedUsageProjection.sharePoint.state !== 'AUTHORITATIVE_COMPLETE'
+        ? []
+        : combinedUsage?.sharePointSites ?? sharePointUsageSnapshot
+    const oneDriveUsage = combinedUsageProjection &&
+      combinedUsageProjection.oneDrive.state !== 'AUTHORITATIVE_COMPLETE'
+        ? []
+        : combinedUsage?.oneDriveAccounts ?? []
     const exchangeMailboxes = snapshotByResource.get('EXCHANGE_MAILBOXES') ?? []
     const exchangeMailboxUsage =
       snapshotByResource.get('EXCHANGE_MAILBOX_USAGE') ?? []
@@ -5118,8 +5147,18 @@ export class TenantSyncService {
       oneDriveUsage,
       settingsSynchronized: sharePointSettingsSynchronized,
       usageSynchronized: sharePointUsageSynchronized,
-      activityAsOf: sharePointActivityAsOf,
+      // SharePoint and OneDrive reports refresh independently. Validate both
+      // against the current request time; each row's inactivity age is still
+      // calculated from its own Microsoft Report Refresh Date.
+      activityAsOf: new Date(),
     })
+    const sharePointUsageProjectionAvailable =
+      sharePointDataContract.usageReports.sharePoint.state === 'available'
+    const canonicalSharePointSitesWithActivity = sharePointUsageProjectionAvailable
+      ? sharePointDataContract.sites.filter(
+          (site) => site.usage.activityState === 'reported',
+        ).length
+      : null
     const getSharePointActivity = (site: any) => {
       const usage = getSharePointUsage(site)
       if (!usage) {
@@ -5171,17 +5210,6 @@ export class TenantSyncService {
       }
     }
     const sharePointActivity = sharePointSites.map(getSharePointActivity)
-    const inactiveSharePointSites90Days = sharePointActivity.filter(
-      ({ activityAgeDays }) =>
-        typeof activityAgeDays === 'number' && activityAgeDays >= 90
-    ).length
-    const inactiveSharePointSites180Days = sharePointActivity.filter(
-      ({ activityAgeDays }) =>
-        typeof activityAgeDays === 'number' && activityAgeDays >= 180
-    ).length
-    const sharePointSitesWithoutActivity = sharePointActivity.filter(
-      ({ activityAgeDays }) => activityAgeDays === null
-    ).length
     const licenseNameBySkuId = new Map(
       licenses.map((license) => [
         license.microsoftSkuId.toLowerCase(),
@@ -5739,39 +5767,26 @@ export class TenantSyncService {
                   ? 'Automatic'
                   : 'Manual'
                 : 'Unavailable from Microsoft Graph',
-            sitesMissingReportedOwner: sharePointUsageSynchronized
-              ? sharePointSites.filter((site) => {
-                  const usage = getSharePointUsage(site)
-                  return ![
-                    usage?.['Owner Principal Name'],
-                    usage?.['Owner Display Name'],
-                  ].some(
-                    (owner) =>
-                      typeof owner === 'string' && Boolean(owner.trim())
-                  )
-                }).length
-              : null,
-            activityAsOf: sharePointActivityAsOf.toISOString(),
+            sitesMissingReportedOwner:
+              sharePointDataContract.overview.sharePointSitesMissingReportedOwner,
+            activityAsOf: parsedSharePointActivityAsOf?.toISOString() ?? null,
             activityObservationWindowDays: 180,
-            inactiveSites90Days: sharePointUsageSynchronized
-              ? inactiveSharePointSites90Days
-              : null,
-            inactiveSites180Days: sharePointUsageSynchronized
-              ? inactiveSharePointSites180Days
-              : null,
-            sitesWithActivityData: sharePointUsageSynchronized
-              ? sharePointSites.length - sharePointSitesWithoutActivity
-              : null,
-            sitesWithoutActivityData: sharePointUsageSynchronized
-              ? sharePointSitesWithoutActivity
-              : null,
+            inactiveSites90Days:
+              sharePointDataContract.overview.sharePointInactive90Days,
+            inactiveSites180Days:
+              sharePointDataContract.overview.sharePointInactive180Days,
+            sitesWithActivityData: canonicalSharePointSitesWithActivity,
+            sitesWithoutActivityData:
+              canonicalSharePointSitesWithActivity === null
+                ? null
+                : Math.max(
+                    0,
+                    sharePointDataContract.sites.length -
+                      canonicalSharePointSitesWithActivity,
+                  ),
             activityDataStatus: sharePointUsageIdentifiersConcealed
               ? 'identifiers-concealed'
-              : sharePointUsageSynchronized
-                ? sharePointSitesWithoutActivity === 0
-                  ? 'available'
-                  : 'partial'
-                : 'unavailable',
+              : sharePointDataContract.usageReports.sharePoint.state,
             activityReportRows: sharePointUsageRowsWithActivity.length,
             matchedActivitySites: matchedSharePointUsageRows.size,
             activityDataMessage: sharePointUsageIdentifiersConcealed

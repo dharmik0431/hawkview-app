@@ -415,6 +415,94 @@ test('keeps an optional dataset visible while it is running without degrading it
   assert.equal(row(result, 'sharepoint_onedrive').lastSuccessfulAt, current.toISOString())
 })
 
+test('does not call a SharePoint usage projection ready without durable valid evidence', () => {
+  const authoritative = deriveCollectionReadiness(input({
+    sharePointUsageProjectionEvidence: {
+      state: 'AUTHORITATIVE_COMPLETE',
+      reasonCode: null,
+    },
+    oneDriveUsageProjectionEvidence: {
+      state: 'AUTHORITATIVE_COMPLETE',
+      reasonCode: null,
+    },
+  }))
+  assert.equal(
+    row(authoritative, 'sharepoint_onedrive').datasets?.find(
+      (dataset) => dataset.key === 'sharepoint_usage_reports',
+    )?.state,
+    'READY',
+  )
+  assert.equal(
+    row(authoritative, 'sharepoint_onedrive').datasets?.find(
+      (dataset) => dataset.key === 'onedrive_usage_reports',
+    )?.state,
+    'READY',
+  )
+
+  const legacy = deriveCollectionReadiness(input({
+    sharePointUsageProjectionEvidence: {
+      state: 'UNVERIFIED_LEGACY',
+      reasonCode: 'USAGE_PROJECTION_NOT_DURABLY_VERIFIED',
+    },
+  }))
+  const legacyDataset = row(legacy, 'sharepoint_onedrive').datasets?.find(
+    (dataset) => dataset.key === 'sharepoint_usage_reports',
+  )
+  assert.equal(legacyDataset?.state, 'UNVERIFIED')
+  assert.equal(legacyDataset?.reasonCode, 'USAGE_PROJECTION_NOT_DURABLY_VERIFIED')
+  assert.equal(row(legacy, 'sharepoint_onedrive').state, 'READY')
+
+  const incomplete = deriveCollectionReadiness(input({
+    sharePointUsageProjectionEvidence: {
+      state: 'PARTIAL',
+      reasonCode: 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE',
+    },
+  }))
+  const incompleteDataset = row(incomplete, 'sharepoint_onedrive').datasets?.find(
+    (dataset) => dataset.key === 'sharepoint_usage_reports',
+  )
+  assert.equal(incompleteDataset?.state, 'PARTIAL')
+  assert.equal(incompleteDataset?.reasonCode, 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE')
+  assert.equal(row(incomplete, 'sharepoint_onedrive').state, 'READY')
+
+  const oneDriveIncomplete = deriveCollectionReadiness(input({
+    sharePointUsageProjectionEvidence: {
+      state: 'AUTHORITATIVE_COMPLETE',
+      reasonCode: null,
+    },
+    oneDriveUsageProjectionEvidence: {
+      state: 'PARTIAL',
+      reasonCode: 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE',
+    },
+  }))
+  assert.equal(
+    row(oneDriveIncomplete, 'sharepoint_onedrive').datasets?.find(
+      (dataset) => dataset.key === 'sharepoint_usage_reports',
+    )?.state,
+    'READY',
+  )
+  assert.equal(
+    row(oneDriveIncomplete, 'sharepoint_onedrive').datasets?.find(
+      (dataset) => dataset.key === 'onedrive_usage_reports',
+    )?.state,
+    'PARTIAL',
+  )
+  assert.equal(row(oneDriveIncomplete, 'sharepoint_onedrive').state, 'READY')
+
+  const rejected = deriveCollectionReadiness(input({
+    sharePointUsageProjectionEvidence: {
+      state: 'REJECTED',
+      reasonCode: 'USAGE_PROJECTION_EVIDENCE_INVALID',
+    },
+  }))
+  const rejectedDataset = row(rejected, 'sharepoint_onedrive').datasets?.find(
+    (dataset) => dataset.key === 'sharepoint_usage_reports',
+  )
+  assert.equal(rejectedDataset?.state, 'PARTIAL')
+  assert.equal(rejectedDataset?.reasonCode, 'USAGE_PROJECTION_EVIDENCE_INVALID')
+  assert.equal(row(rejected, 'sharepoint_onedrive').state, 'READY')
+})
+
 test('automatically reflects an M365 subscription recovering after provisioning without reconnecting', () => {
   const pending: Array<{
     contentType: string

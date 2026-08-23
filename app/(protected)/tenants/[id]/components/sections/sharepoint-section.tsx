@@ -47,6 +47,7 @@ import { cn } from '@/lib/utils'
 import { formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import {
   buildSharePointViewModel,
+  sharePointReportedDeletedState,
   sharePointRetentionDaysLabel,
 } from '@/lib/tenants/sharepoint-view-model'
 
@@ -241,6 +242,10 @@ export default function SharePointPage({
         : typeof rawOverview.storageQuotaGB === 'number'
           ? rawOverview.storageQuotaGB
           : null,
+    reportedStorageUsedGB:
+      typeof rawOverview.reportedStorageUsedGB === 'number'
+        ? rawOverview.reportedStorageUsedGB
+        : null,
     storageQuotaSource:
       rawOverview.storageQuotaSource ?? rawOverview.quotaSource ?? null,
     oneDriveStorageLimitGB:
@@ -267,6 +272,18 @@ export default function SharePointPage({
       typeof rawOverview.sitesMissingReportedOwner === 'number'
         ? rawOverview.sitesMissingReportedOwner
         : null,
+    sitesWithMatchedUsage:
+      typeof rawOverview.sitesWithMatchedUsage === 'number'
+        ? rawOverview.sitesWithMatchedUsage
+        : null,
+    sitesWithoutMatchedUsage:
+      typeof rawOverview.sitesWithoutMatchedUsage === 'number'
+        ? rawOverview.sitesWithoutMatchedUsage
+        : null,
+    reportedDeletedCount:
+      typeof rawOverview.reportedDeletedCount === 'number'
+        ? rawOverview.reportedDeletedCount
+        : null,
     sharingCapability:
       rawOverview.sharingCapability ??
       rawOverview.sharingSharePoint ??
@@ -288,7 +305,7 @@ export default function SharePointPage({
 
   const lastAttemptRaw = sharePointSync.lastAttemptAt || collectionInfo.lastAttemptAt || bundle?.lastSyncAt
   const lastSuccessRaw = sharePointSync.lastSuccessAt || collectionInfo.lastSuccessAt || bundle?.lastSuccessSyncAt
-  const reportRefreshedRaw = sharePointSync.reportRefreshedAt || sp?.reportRefreshedAt || collectionInfo?.reports?.refreshedAt
+  const reportRefreshedRaw = sharePointSync.reportRefreshedAt
 
   const lastAttemptFormatted = formatTenantTimestamp(lastAttemptRaw)
   const lastSuccessFormatted = formatTenantTimestamp(lastSuccessRaw)
@@ -317,6 +334,10 @@ export default function SharePointPage({
 
   // Derived metrics from real runtime fields
   const totalStorageUsedGB = useMemo(() => {
+    if (sharePointView.contractPresent) {
+      return SP_OVERVIEW.reportedStorageUsedGB
+    }
+    if (!sharePointView.usageReport.exactClaimsAvailable) return null
     let sum = 0
     let hasValue = false
     for (const site of SP_SITES) {
@@ -326,9 +347,28 @@ export default function SharePointPage({
       }
     }
     return hasValue ? Math.round(sum * 100) / 100 : null
+  }, [SP_OVERVIEW.reportedStorageUsedGB, SP_SITES, sharePointView.contractPresent, sharePointView.usageReport.exactClaimsAvailable])
+
+  const bestEffortDriveStorageUsedGB = useMemo(() => {
+    let sum = 0
+    let hasValue = false
+    for (const site of SP_SITES) {
+      if (
+        typeof site.bestEffortDriveStorageUsedGB === 'number' &&
+        !isNaN(site.bestEffortDriveStorageUsedGB)
+      ) {
+        sum += site.bestEffortDriveStorageUsedGB
+        hasValue = true
+      }
+    }
+    return hasValue ? Math.round(sum * 100) / 100 : null
   }, [SP_SITES])
 
   const aggregateReportedAllocationGB = useMemo(() => {
+    if (sharePointView.contractPresent) {
+      return SP_OVERVIEW.totalStorageQuotaGB
+    }
+    if (!sharePointView.usageReport.exactClaimsAvailable) return null
     let sum = 0
     let hasValue = false
     for (const site of SP_SITES) {
@@ -338,53 +378,70 @@ export default function SharePointPage({
       }
     }
     return hasValue ? Math.round(sum * 100) / 100 : null
-  }, [SP_SITES])
+  }, [SP_OVERVIEW.totalStorageQuotaGB, SP_SITES, sharePointView.contractPresent, sharePointView.usageReport.exactClaimsAvailable])
 
   const sitesWithActivityCount = useMemo(() => {
     return SP_SITES.filter((s) => s.lastActivityAt || s.lastActivity).length
   }, [SP_SITES])
 
+  const matchedUsageSiteCount = useMemo(() => {
+    return SP_OVERVIEW.sitesWithMatchedUsage
+  }, [SP_OVERVIEW.sitesWithMatchedUsage])
+
   const calculatedInactive90Count = useMemo(() => {
     if (typeof SP_OVERVIEW.inactiveSites90Days === 'number') {
       return SP_OVERVIEW.inactiveSites90Days
     }
+    if (!sharePointView.usageReport.exactClaimsAvailable) return null
     return SP_SITES.filter((s) => {
       const days = typeof s.activityAgeDays === 'number' ? s.activityAgeDays : null
       return days !== null && days >= 90
     }).length
-  }, [SP_OVERVIEW.inactiveSites90Days, SP_SITES])
+  }, [SP_OVERVIEW.inactiveSites90Days, SP_SITES, sharePointView.usageReport.exactClaimsAvailable])
 
   const calculatedInactive180Count = useMemo(() => {
     if (typeof SP_OVERVIEW.inactiveSites180Days === 'number') {
       return SP_OVERVIEW.inactiveSites180Days
     }
+    if (!sharePointView.usageReport.exactClaimsAvailable) return null
     return SP_SITES.filter((s) => {
       const days = typeof s.activityAgeDays === 'number' ? s.activityAgeDays : null
       return days !== null && days >= 180
     }).length
-  }, [SP_OVERVIEW.inactiveSites180Days, SP_SITES])
+  }, [SP_OVERVIEW.inactiveSites180Days, SP_SITES, sharePointView.usageReport.exactClaimsAvailable])
 
   const calculatedUnreportedActivityCount = useMemo(() => {
     if (typeof SP_OVERVIEW.sitesWithoutActivityData === 'number') {
       return SP_OVERVIEW.sitesWithoutActivityData
     }
+    if (!sharePointView.usageReport.exactClaimsAvailable) return null
     return SP_SITES.filter((s) => !s.lastActivityAt && !s.lastActivity).length
-  }, [SP_OVERVIEW.sitesWithoutActivityData, SP_SITES])
+  }, [SP_OVERVIEW.sitesWithoutActivityData, SP_SITES, sharePointView.usageReport.exactClaimsAvailable])
 
-  const activeWithin90Count = Math.max(0, sitesWithActivityCount - calculatedInactive90Count)
-  const inactive90To179Count = Math.max(0, calculatedInactive90Count - calculatedInactive180Count)
+  const activityDistributionAvailable = [
+    calculatedInactive90Count,
+    calculatedInactive180Count,
+    calculatedUnreportedActivityCount,
+  ].every((value) => typeof value === 'number')
+  const activeWithin90Count = activityDistributionAvailable
+    ? Math.max(0, sitesWithActivityCount - (calculatedInactive90Count as number))
+    : null
+  const inactive90To179Count = activityDistributionAvailable
+    ? Math.max(0, (calculatedInactive90Count as number) - (calculatedInactive180Count as number))
+    : null
+  const activityDistribution = {
+    activeUnder90: activeWithin90Count ?? 0,
+    inactive90To179: inactive90To179Count ?? 0,
+    inactive180Plus: calculatedInactive180Count ?? 0,
+    unreported: calculatedUnreportedActivityCount ?? 0,
+  }
 
-  const sitesMissingOwnerCount = useMemo(() => {
-    if (typeof SP_OVERVIEW.sitesMissingReportedOwner === 'number') {
-      return SP_OVERVIEW.sitesMissingReportedOwner
-    }
-    return SP_SITES.filter((s) => s.hasReportedOwner !== true).length
-  }, [SP_OVERVIEW.sitesMissingReportedOwner, SP_SITES])
+  const sitesMissingOwnerCount = SP_OVERVIEW.sitesMissingReportedOwner
 
-  const usageReportMarkedDeletedCount = useMemo(() => {
-    return sharePointView.reportedDeletedSites.length +
-      SP_SITES.filter((s) => s.isDeleted === true || s.usageReportDeleted === true).length
-  }, [SP_SITES, sharePointView.reportedDeletedSites.length])
+  // This count is emitted once by the authoritative D180 contract. Do not add
+  // the deleted-signal array to matched site flags: the same Microsoft row can
+  // legitimately appear in both projections.
+  const usageReportMarkedDeletedCount = SP_OVERVIEW.reportedDeletedCount
 
   // Check for typed OneDrive accounts collection
   const ONEDRIVE_ACCOUNTS: any[] = sharePointView.oneDriveAccounts
@@ -428,25 +485,27 @@ export default function SharePointPage({
 
       // Storage filter
       const hasUsed = typeof s.storageUsedGB === 'number'
+      const hasReportedUsed = s.storageUsedSource === 'microsoft-d180-usage-report'
       const hasQuota = typeof s.storageQuotaGB === 'number' && s.storageQuotaGB > 0
       const pct =
         hasUsed && hasQuota
           ? Math.min(100, Math.round((s.storageUsedGB / s.storageQuotaGB) * 100))
           : null
 
-      if (storageFilter === 'reported' && !hasUsed) return false
-      if (storageFilter === 'unreported' && hasUsed) return false
+      if (storageFilter === 'reported' && !hasReportedUsed) return false
+      if (storageFilter === 'unreported' && hasReportedUsed) return false
       if (storageFilter === 'nearCapacity' && (pct === null || pct < 80)) return false
 
-      // Report Data Availability filter
+      // Activity-date evidence is distinct from whether a D180 usage row
+      // matched this site. This filter intentionally covers only the date.
       const hasActivity = Boolean(s.lastActivityAt || s.lastActivity)
       if (reportAvailabilityFilter === 'reported' && !hasActivity) return false
       if (reportAvailabilityFilter === 'missing' && hasActivity) return false
 
       // Usage Deleted filter
-      const isDeletedInReport = s.isDeleted === true || s.usageReportDeleted === true
-      if (usageDeletedFilter === 'deleted' && !isDeletedInReport) return false
-      if (usageDeletedFilter === 'active' && isDeletedInReport) return false
+      const deletedState = sharePointReportedDeletedState(s)
+      if (usageDeletedFilter === 'deleted' && deletedState !== true) return false
+      if (usageDeletedFilter === 'active' && deletedState !== false) return false
 
       // Search query
       if (!q) return true
@@ -739,7 +798,11 @@ export default function SharePointPage({
                 {formatStorageGB(totalStorageUsedGB)}
               </div>
               <div className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                Usage report storage
+                {totalStorageUsedGB !== null
+                  ? 'Microsoft D180 usage report storage'
+                  : bestEffortDriveStorageUsedGB !== null
+                    ? `D180 storage not reported · Graph default-drive estimate ${formatStorageGB(bestEffortDriveStorageUsedGB)}`
+                    : 'D180 storage not reported by Microsoft'}
               </div>
             </div>
 
@@ -752,28 +815,35 @@ export default function SharePointPage({
                 </div>
               </div>
               <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-                {calculatedInactive90Count}
+                {calculatedInactive90Count ?? 'Not reported'}
               </div>
               <div className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                No activity in 90+ days
+                {calculatedInactive90Count === null
+                  ? 'Microsoft D180 activity evidence unavailable'
+                  : 'No activity in 90+ days'}
               </div>
             </div>
 
             {/* Card 4: Activity coverage (Emerald Accent) */}
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 shadow-2xs hover:shadow-xs transition-shadow">
               <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 font-medium">
-                <span>Activity coverage</span>
+                <span>D180 usage matches</span>
                 <div className="p-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-100 dark:border-emerald-900/40">
                   <Activity className="h-4 w-4" aria-hidden="true" />
                 </div>
               </div>
               <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-                {sitesWithActivityCount} <span className="text-sm font-normal text-slate-500">/ {siteCountLabel}</span>
+                {matchedUsageSiteCount ?? 'Not reported'}{' '}
+                {matchedUsageSiteCount !== null && (
+                  <span className="text-sm font-normal text-slate-500">/ {siteCountLabel}</span>
+                )}
               </div>
               <div className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                {SP_SITES.length > 0
-                  ? `${Math.round((sitesWithActivityCount / SP_SITES.length) * 100)}% of projected sites matched`
-                  : 'No sites'}
+                {matchedUsageSiteCount === null
+                  ? 'Microsoft usage-row matching unavailable'
+                  : SP_SITES.length > 0
+                    ? `${Math.round((matchedUsageSiteCount / SP_SITES.length) * 100)}% matched · ${sitesWithActivityCount} with reported activity dates`
+                    : 'No sites'}
               </div>
             </div>
           </div>
@@ -802,49 +872,65 @@ export default function SharePointPage({
                     {formatStorageGB(totalStorageUsedGB)}
                   </div>
                   <div className="text-xs text-slate-600 dark:text-slate-400 font-medium">
-                    of {formatStorageGB(aggregateReportedAllocationGB)} aggregate reported allocation
+                    of {formatStorageGB(aggregateReportedAllocationGB)} aggregate D180 reported allocation
                     {totalStorageUsedGB !== null && aggregateReportedAllocationGB !== null && aggregateReportedAllocationGB > 0 && (
                       <span> · {totalStorageUsedGB / aggregateReportedAllocationGB < 0.0001 ? '<0.01%' : `${((totalStorageUsedGB / aggregateReportedAllocationGB) * 100).toFixed(2)}%`}</span>
                     )}
                   </div>
-                  <div className="text-[11px] text-slate-400">Microsoft D180 usage report</div>
+                  <div className="text-[11px] text-slate-400">
+                    {totalStorageUsedGB !== null
+                      ? 'Microsoft D180 usage report'
+                      : bestEffortDriveStorageUsedGB !== null
+                        ? `D180 usage unavailable; Graph default-drive estimate is ${formatStorageGB(bestEffortDriveStorageUsedGB)}`
+                        : 'Microsoft D180 usage not reported'}
+                  </div>
                 </div>
 
                 {/* Activity Distribution */}
                 <div className="space-y-2.5 pt-1">
+                  <div className="flex items-center justify-between gap-3 text-xs">
+                    <span className="font-semibold text-slate-700 dark:text-slate-300">Activity-date coverage</span>
+                    <span className="text-slate-500 dark:text-slate-400">
+                      {sharePointView.usageReport.exactClaimsAvailable
+                        ? matchedUsageSiteCount !== null
+                          ? `${sitesWithActivityCount} of ${matchedUsageSiteCount} matched sites include a reported date`
+                          : `${sitesWithActivityCount} sites include a reported activity date; matched-row total unavailable`
+                        : 'Not available'}
+                    </span>
+                  </div>
                   {/* Slim, softly colored horizontal segmented bar */}
-                  {SP_SITES.length > 0 ? (
+                  {SP_SITES.length > 0 && activityDistributionAvailable ? (
                     <>
                       <div className="h-2 rounded-full overflow-hidden flex bg-slate-100 dark:bg-slate-800 w-full" aria-hidden="true">
-                        {activeWithin90Count > 0 && (
+                        {activityDistribution.activeUnder90 > 0 && (
                           <div
                             className="bg-teal-600/80 dark:bg-teal-500/80 h-full transition-all"
-                            style={{ width: `${(activeWithin90Count / SP_SITES.length) * 100}%` }}
+                            style={{ width: `${(activityDistribution.activeUnder90 / SP_SITES.length) * 100}%` }}
                           />
                         )}
-                        {inactive90To179Count > 0 && (
+                        {activityDistribution.inactive90To179 > 0 && (
                           <div
                             className="bg-amber-500/80 dark:bg-amber-500/80 h-full transition-all"
-                            style={{ width: `${(inactive90To179Count / SP_SITES.length) * 100}%` }}
+                            style={{ width: `${(activityDistribution.inactive90To179 / SP_SITES.length) * 100}%` }}
                           />
                         )}
-                        {calculatedInactive180Count > 0 && (
+                        {activityDistribution.inactive180Plus > 0 && (
                           <div
                             className="bg-orange-600/80 dark:bg-orange-500/80 h-full transition-all"
-                            style={{ width: `${(calculatedInactive180Count / SP_SITES.length) * 100}%` }}
+                            style={{ width: `${(activityDistribution.inactive180Plus / SP_SITES.length) * 100}%` }}
                           />
                         )}
-                        {calculatedUnreportedActivityCount > 0 && (
+                        {activityDistribution.unreported > 0 && (
                           <div
                             className="bg-slate-300 dark:bg-slate-600 h-full transition-all"
-                            style={{ width: `${(calculatedUnreportedActivityCount / SP_SITES.length) * 100}%` }}
+                            style={{ width: `${(activityDistribution.unreported / SP_SITES.length) * 100}%` }}
                           />
                         )}
                       </div>
 
                       {/* Accessible Text */}
                       <div className="sr-only">
-                        Activity distribution across {sharePointView.inventory.countAtLeast ? 'at least ' : ''}{SP_SITES.length} projected sites: {activeWithin90Count} active under 90 days, {inactive90To179Count} inactive 90 to 179 days, {calculatedInactive180Count} inactive 180 or more days, and {calculatedUnreportedActivityCount} activity not reported.
+                        Activity distribution across {sharePointView.inventory.countAtLeast ? 'at least ' : ''}{SP_SITES.length} projected sites: {activityDistribution.activeUnder90} active under 90 days, {activityDistribution.inactive90To179} inactive 90 to 179 days, {activityDistribution.inactive180Plus} inactive 180 or more days, and {activityDistribution.unreported} activity not reported.
                       </div>
 
                       {/* Clean 2-column 2-row legend (No boxes, no colons after labels) */}
@@ -852,30 +938,34 @@ export default function SharePointPage({
                         <div className="flex items-center gap-2">
                           <span className="h-2 w-2 rounded-full bg-teal-600/80 dark:bg-teal-500/80 shrink-0" aria-hidden="true" />
                           <span className="text-slate-600 dark:text-slate-400">Active under 90 days</span>
-                          <span className="font-bold text-slate-900 dark:text-white ml-auto">{activeWithin90Count}</span>
+                          <span className="font-bold text-slate-900 dark:text-white ml-auto">{activityDistribution.activeUnder90}</span>
                         </div>
 
                         <div className="flex items-center gap-2">
                           <span className="h-2 w-2 rounded-full bg-amber-500/80 dark:bg-amber-500/80 shrink-0" aria-hidden="true" />
                           <span className="text-slate-600 dark:text-slate-400">Inactive 90–179 days</span>
-                          <span className="font-bold text-slate-900 dark:text-white ml-auto">{inactive90To179Count}</span>
+                          <span className="font-bold text-slate-900 dark:text-white ml-auto">{activityDistribution.inactive90To179}</span>
                         </div>
 
                         <div className="flex items-center gap-2">
                           <span className="h-2 w-2 rounded-full bg-orange-600/80 dark:bg-orange-500/80 shrink-0" aria-hidden="true" />
                           <span className="text-slate-600 dark:text-slate-400">Inactive 180+ days</span>
-                          <span className="font-bold text-slate-900 dark:text-white ml-auto">{calculatedInactive180Count}</span>
+                          <span className="font-bold text-slate-900 dark:text-white ml-auto">{activityDistribution.inactive180Plus}</span>
                         </div>
 
                         <div className="flex items-center gap-2">
                           <span className="h-2 w-2 rounded-full bg-slate-300 dark:bg-slate-600 shrink-0" aria-hidden="true" />
                           <span className="text-slate-600 dark:text-slate-400">Activity not reported</span>
-                          <span className="font-bold text-slate-900 dark:text-white ml-auto">{calculatedUnreportedActivityCount}</span>
+                          <span className="font-bold text-slate-900 dark:text-white ml-auto">{activityDistribution.unreported}</span>
                         </div>
                       </div>
                     </>
                   ) : (
-                    <div className="text-xs text-slate-500 italic">No sites available for activity distribution.</div>
+                    <div className="text-xs text-slate-500 italic">
+                      {SP_SITES.length === 0
+                        ? 'No sites available for activity distribution.'
+                        : 'Microsoft D180 activity distribution is not available for this projection.'}
+                    </div>
                   )}
                 </div>
 
@@ -883,7 +973,11 @@ export default function SharePointPage({
                 <div className="pt-3 border-t border-slate-100 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 flex flex-wrap items-center gap-x-4 gap-y-1.5">
                   <div className="flex items-center gap-1.5">
                     <User className="h-3.5 w-3.5 text-slate-400 shrink-0" aria-hidden="true" />
-                    <span>Reported owner unavailable for <strong className="text-slate-800 dark:text-slate-200">{sitesMissingOwnerCount}</strong> sites</span>
+                    <span>
+                      {sitesMissingOwnerCount === null
+                        ? 'Reported-owner coverage not available from the current D180 projection'
+                        : <>Reported owner unavailable for <strong className="text-slate-800 dark:text-slate-200">{sitesMissingOwnerCount}</strong> matched D180 usage rows</>}
+                    </span>
                   </div>
 
                   <span className="text-slate-300 dark:text-slate-700 hidden sm:inline" aria-hidden="true">•</span>
@@ -891,7 +985,7 @@ export default function SharePointPage({
                   <div className="flex items-center gap-1.5">
                     <FileText className="h-3.5 w-3.5 text-slate-400 shrink-0" aria-hidden="true" />
                     <span>
-                      {reportRefreshedRaw || lastSuccessRaw || SP_SITES.length > 0
+                      {usageReportMarkedDeletedCount !== null
                         ? `${usageReportMarkedDeletedCount} rows marked deleted in current D180 report`
                         : 'Marked-deleted status not available'}
                     </span>
@@ -1018,7 +1112,7 @@ export default function SharePointPage({
               <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800 space-y-1">
                 <div className="text-slate-500 flex items-center justify-between">
                   <span>SharePoint report</span>
-                  <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                  <span className={cn('h-2 w-2 rounded-full', reportRefreshedRaw ? 'bg-emerald-500' : 'bg-slate-400')} />
                 </div>
                 <div className="font-bold text-slate-900 dark:text-slate-100">{reportRefreshedFormatted}</div>
               </div>
@@ -1135,15 +1229,15 @@ export default function SharePointPage({
                     </div>
 
                     <div>
-                      <label className="text-[11px] font-medium text-slate-500 block mb-1">Report Data Availability</label>
+                      <label className="text-[11px] font-medium text-slate-500 block mb-1">Activity Date Availability</label>
                       <select
                         value={reportAvailabilityFilter}
                         onChange={(e) => setReportAvailabilityFilter(e.target.value as any)}
                         className="w-full h-8 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-2 text-slate-700 dark:text-slate-300"
                       >
                         <option value="all">All Sites</option>
-                        <option value="reported">Report Data Available</option>
-                        <option value="missing">Report Data Missing</option>
+                        <option value="reported">Activity Date Reported</option>
+                        <option value="missing">Activity Date Not Reported</option>
                       </select>
                     </div>
 
@@ -1156,7 +1250,7 @@ export default function SharePointPage({
                       >
                         <option value="all">All Statuses</option>
                         <option value="deleted">Marked Deleted in Report</option>
-                        <option value="active">Active in Report</option>
+                        <option value="active">Not Marked Deleted in Report</option>
                       </select>
                     </div>
                   </div>
@@ -1331,7 +1425,8 @@ export default function SharePointPage({
                         ? Math.min(100, Math.round((site.storageUsedGB / site.storageQuotaGB) * 100))
                         : null
 
-                    const isMarkedDeleted = site.isDeleted === true || site.usageReportDeleted === true
+                    const deletedState = sharePointReportedDeletedState(site)
+                    const isMarkedDeleted = deletedState === true
 
                     return (
                       <tr
@@ -1365,6 +1460,15 @@ export default function SharePointPage({
                         <td className="p-3 whitespace-nowrap">
                           <div className="font-semibold text-slate-900 dark:text-slate-100">
                             {formatStorageGB(site.storageUsedGB)}
+                          </div>
+                          <div className="mt-0.5 text-[10px] text-slate-400">
+                            {site.storageUsedSource === 'microsoft-d180-usage-report'
+                              ? 'D180 usage report'
+                              : site.storageUsedSource === 'graph-default-drive-best-effort'
+                                ? 'Graph default-drive estimate'
+                                : site.storageUsedSource === 'legacy-backend'
+                                  ? 'Legacy collected value'
+                                  : 'Source unavailable'}
                           </div>
                           {storagePct !== null && (
                             <div className="w-20 bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full mt-1 overflow-hidden">
@@ -1415,11 +1519,15 @@ export default function SharePointPage({
                         {visibleOptionalCols.has('pageViews') && <td className="p-3 font-medium">{site.pageViews ?? 'Not reported'}</td>}
                         {visibleOptionalCols.has('visitedPages') && <td className="p-3 font-medium">{site.visitedPages ?? 'Not reported'}</td>}
                         {visibleOptionalCols.has('reportRefreshedAt') && <td className="p-3">{formatDate(site.reportRefreshedAt)}</td>}
-                        {visibleOptionalCols.has('reportPeriod') && <td className="p-3">{site.reportPeriod || 'D180'}</td>}
+                        {visibleOptionalCols.has('reportPeriod') && <td className="p-3">{site.reportPeriod || 'Not reported'}</td>}
                         {visibleOptionalCols.has('createdDate') && <td className="p-3">{formatDate(site.createdDate)}</td>}
                         {visibleOptionalCols.has('graphLastModified') && <td className="p-3">{formatDate(site.graphLastModified)}</td>}
                         {visibleOptionalCols.has('rootTemplate') && <td className="p-3">{site.rootTemplate || 'Not reported'}</td>}
-                        {visibleOptionalCols.has('usageReportDeleted') && <td className="p-3">{isMarkedDeleted ? 'Yes' : 'No'}</td>}
+                        {visibleOptionalCols.has('usageReportDeleted') && (
+                          <td className="p-3">
+                            {deletedState === true ? 'Yes' : deletedState === false ? 'No' : 'Not reported'}
+                          </td>
+                        )}
 
                         {/* Action Chevron */}
                         <td className="p-3 text-right">
@@ -1914,12 +2022,28 @@ export default function SharePointPage({
               <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Storage & Allocation</h3>
               <div className="grid grid-cols-2 gap-2 text-xs bg-slate-50 dark:bg-slate-800/50 p-3 rounded-lg border border-slate-100 dark:border-slate-800">
                 <div>
-                  <span className="text-slate-400 block">Reported Storage Used</span>
+                  <span className="text-slate-400 block">
+                    {selectedSite.storageUsedSource === 'graph-default-drive-best-effort'
+                      ? 'Best-effort Graph Drive Used'
+                      : selectedSite.storageUsedSource === 'microsoft-d180-usage-report'
+                        ? 'D180 Reported Storage Used'
+                        : 'Storage Used'}
+                  </span>
                   <span className="font-semibold text-slate-900 dark:text-white">{formatStorageGB(selectedSite.storageUsedGB)}</span>
                 </div>
                 <div>
-                  <span className="text-slate-400 block">Reported Allocation</span>
-                  <span className="font-semibold text-slate-900 dark:text-white">{formatStorageGB(selectedSite.storageQuotaGB)}</span>
+                  <span className="text-slate-400 block">
+                    {selectedSite.storageUsedSource === 'graph-default-drive-best-effort'
+                      ? 'Best-effort Graph Drive Total'
+                      : 'D180 Reported Allocation'}
+                  </span>
+                  <span className="font-semibold text-slate-900 dark:text-white">
+                    {formatStorageGB(
+                      selectedSite.storageUsedSource === 'graph-default-drive-best-effort'
+                        ? selectedSite.bestEffortDriveStorageTotalGB
+                        : selectedSite.storageQuotaGB
+                    )}
+                  </span>
                 </div>
               </div>
             </div>
