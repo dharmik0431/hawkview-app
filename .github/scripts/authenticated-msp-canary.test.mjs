@@ -41,7 +41,7 @@ function successfulFetch() {
           { slot: 'A', accessToken: tokenA, tokenType: 'bearer', expiresIn: 3600, email: 'canary-a@example.test', expectedOrganizationId: ids.orgA, expectedTenantId: ids.tenantA },
           { slot: 'B', accessToken: tokenB, tokenType: 'bearer', expiresIn: 3600, email: 'canary-b@example.test', expectedOrganizationId: ids.orgB, expectedTenantId: ids.tenantB },
         ],
-      })
+      }, 201)
     }
     const authorization = init.headers?.Authorization
     const own = authorization === `Bearer ${tokenA}`
