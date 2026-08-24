@@ -180,7 +180,7 @@ export async function runAuthenticatedCanary({
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ deploymentRevision: revision }),
-    })
+    }, [201])
   ).body
   const issuedRecord = record(issued)
   assert(issuedRecord?.contractVersion === 1, 'Canary session contract was unsupported')
