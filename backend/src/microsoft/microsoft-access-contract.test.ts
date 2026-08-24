@@ -13,7 +13,7 @@ import { MicrosoftConsentService } from './microsoft-consent.service.js'
 import { effectiveMicrosoftConnectionStatus } from '../tenants/tenants.service.js'
 
 test('registers every requested application permission against a real capability and exact resource', () => {
-  assert.equal(DEFAULT_REQUIRED_PERMISSIONS.length, 18)
+  assert.equal(DEFAULT_REQUIRED_PERMISSIONS.length, 19)
   assert.deepEqual(CONNECTION_REQUIRED_PERMISSIONS, ['Organization.Read.All'])
   assert.equal(new Set(DEFAULT_REQUIRED_PERMISSIONS).size, DEFAULT_REQUIRED_PERMISSIONS.length)
   for (const name of DEFAULT_REQUIRED_PERMISSIONS) {
@@ -60,6 +60,7 @@ test('matches current high-risk collector endpoints without retired SharePoint d
 
 test('keeps current Microsoft call-site families represented in the registry', () => {
   const tenantSync = readFileSync(fileURLToPath(new URL('../tenants/tenant-sync.service.ts', import.meta.url)), 'utf8')
+  const consentService = readFileSync(fileURLToPath(new URL('./microsoft-consent.service.ts', import.meta.url)), 'utf8')
   const activity = readFileSync(fileURLToPath(new URL('../tenants/m365-management-activity.service.ts', import.meta.url)), 'utf8')
   const registered = MICROSOFT_ACCESS_CAPABILITIES.flatMap((capability) => capability.endpointPatterns).join('\n')
   const pairs = [
@@ -97,13 +98,16 @@ test('keeps current Microsoft call-site families represented in the registry', (
     assert.ok(activity.includes(needle), `activity call disappeared: ${needle}`)
     assert.ok(registered.includes(needle), `activity call is not registered: ${needle}`)
   }
+  assert.ok(consentService.includes('/v1.0/admin/reportSettings?$select=displayConcealedNames'))
+  assert.ok(registered.includes('/v1.0/admin/reportSettings?$select=displayConcealedNames'))
+  assert.equal(consentService.includes('PATCH') && consentService.includes('/admin/reportSettings'), false)
 })
 
 test('publishes canonical permission metadata without turning optional coverage into a connection gate', () => {
   const contract = new MicrosoftConsentService({} as never, {} as never).getAccessContract()
   assert.equal(contract.version, 1)
   assert.deepEqual(contract.connectionRequiredPermissions, ['Organization.Read.All'])
-  assert.equal(contract.requestedPermissions.length, 18)
+  assert.equal(contract.requestedPermissions.length, 19)
   const activity = contract.requestedPermissions.find((permission) => permission.name === 'ActivityFeed.Read')
   assert.equal(activity?.resource, 'OFFICE_365_MANAGEMENT_API')
   assert.equal(activity?.type, 'APPLICATION')

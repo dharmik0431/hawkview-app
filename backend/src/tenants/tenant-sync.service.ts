@@ -1211,7 +1211,10 @@ export class TenantSyncService {
               organizationId: tenant.organizationId,
             },
           },
-          data: { exchangeReadOnlyEnabledAt: enabledAt },
+          data: {
+            exchangeReadOnlyEnabledAt: enabledAt,
+            exchangeReadOnlySkippedAt: null,
+          },
         })
       },
     )

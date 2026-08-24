@@ -1118,10 +1118,10 @@ export default function TenantsPage() {
                     <li className="flex items-start gap-2">
                       <span className="mt-1 h-1.5 w-1.5 rounded-full bg-blue-500 shrink-0" />
                       <span>
-                        Optional Exchange mailbox enrichment can be enabled later
-                        from Tenant Settings. It is limited by Exchange RBAC to
-                        read-only <code>Get-Mailbox</code> access and is not required
-                        to finish onboarding.
+                        After Microsoft returns, HawkView opens a saved setup guide
+                        for optional Exchange <code>Get-Mailbox</code>-only RBAC and
+                        Microsoft 365 report-name visibility. Either optional step
+                        can be safely deferred and resumed later.
                       </span>
                     </li>
                   </ul>
@@ -1131,8 +1131,9 @@ export default function TenantsPage() {
                   <ShieldCheck className="h-4 w-4 text-slate-400 shrink-0" />
                   <span>
                     HawkView never receives or stores your Microsoft administrator password.
-                    Standard onboarding grants Microsoft Graph access only; optional
-                    Exchange enrichment requires a separate administrator-approved setup.
+                    Standard onboarding grants only the read application permissions shown
+                    on Microsoft&apos;s consent screen; optional Exchange enrichment requires a
+                    separate administrator-approved consent and least-privilege RBAC setup.
                   </span>
                 </div>
 
@@ -1636,7 +1637,17 @@ export default function TenantsPage() {
 
                         {/* Context-Sensitive Primary Action */}
                         <td className="py-3.5 px-4 text-right whitespace-nowrap">
-                          {statusInfo.key === 'needs_attention' ? (
+                          {tenant.onboarding?.complete === false ? (
+                            <Link href={tenant.onboarding.resumeUrl}>
+                              <Button
+                                size="sm"
+                                className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm"
+                              >
+                                <span>Continue setup</span>
+                                <ChevronRight className="h-3.5 w-3.5" />
+                              </Button>
+                            </Link>
+                          ) : statusInfo.key === 'needs_attention' ? (
                             <Button
                               size="sm"
                               onClick={() => setSelectedDrawerTenant(tenant)}
@@ -1736,7 +1747,14 @@ export default function TenantsPage() {
 
                   <div className="pt-2 flex items-center justify-between border-t border-slate-100 dark:border-slate-800">
                     <TenantIdPill tenantId={tenant.microsoftTenantId || tenant.id} />
-                    {statusInfo.key === 'needs_attention' ? (
+                    {tenant.onboarding?.complete === false ? (
+                      <Link href={tenant.onboarding.resumeUrl}>
+                        <Button size="sm" className="h-8 px-3 gap-1 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white">
+                          <span>Continue setup</span>
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        </Button>
+                      </Link>
+                    ) : statusInfo.key === 'needs_attention' ? (
                       <Button
                         size="sm"
                         onClick={() => setSelectedDrawerTenant(tenant)}

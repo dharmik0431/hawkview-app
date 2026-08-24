@@ -226,6 +226,38 @@ export class TenantsService {
     )
   }
 
+  private async getTenantOnboardingActor(identity: AuthenticatedIdentity) {
+    const user = await this.prisma.user.findUnique({
+      where: { authProviderUserId: identity.subject },
+      select: { id: true, disabledAt: true },
+    })
+    if (!user || user.disabledAt) {
+      throw new ForbiddenException('This HawkView account cannot onboard tenants.')
+    }
+    return user.id
+  }
+
+  private async recordConsentAttempt(input: {
+    identity: AuthenticatedIdentity
+    organizationId: string
+    customerTenantId?: string
+    flow: 'DISCOVER_TENANT' | 'EXISTING_TENANT' | 'EXCHANGE_READ_ONLY'
+    stateHash: string
+    expiresAt: Date
+  }) {
+    const initiatedByUserId = await this.getTenantOnboardingActor(input.identity)
+    await this.prisma.microsoftConsentAttempt.create({
+      data: {
+        organizationId: input.organizationId,
+        customerTenantId: input.customerTenantId,
+        initiatedByUserId,
+        flow: input.flow,
+        stateHash: input.stateHash,
+        expiresAt: input.expiresAt,
+      },
+    })
+  }
+
   private mapTenant(tenant: {
     id: string
     microsoftTenantId: string
@@ -239,6 +271,7 @@ export class TenantsService {
       consentedPermissions: string[]
       lastVerifiedAt: Date | null
       lastErrorCode: string | null
+      onboardingCompletedAt?: Date | null
     } | null
     tenantLicenses: Array<{ enabledUnits: number; servicePlans?: unknown }>
     syncStates: Array<{
@@ -361,6 +394,11 @@ export class TenantsService {
         tenant.connection?.connectionMode === 'CUSTOMER_MANAGED'
           ? 'customer-managed'
           : 'hawkview-managed',
+      onboarding: {
+        complete: Boolean(tenant.connection?.onboardingCompletedAt),
+        completedAt: tenant.connection?.onboardingCompletedAt?.toISOString() ?? null,
+        resumeUrl: `/tenants/${tenant.id}/onboarding`,
+      },
       lastSync:
         tenant.syncStates
           .map((state) => state.lastSuccessfulAt)
@@ -531,6 +569,7 @@ export class TenantsService {
           lastAttemptAt: true,
           lastSuccessfulAt: true,
           lastErrorCode: true,
+          onboardingCompletedAt: true,
           lastErrorMessage: true,
           consecutiveFailures: true,
         },
@@ -978,11 +1017,17 @@ export class TenantsService {
       },
       data: {
         status: 'PENDING_CONSENT',
-        consentStateHash: consent.stateHash,
-        consentStateExpiresAt: consent.expiresAt,
         lastErrorCode: null,
         lastErrorMessage: null,
       },
+    })
+    await this.recordConsentAttempt({
+      identity,
+      organizationId: tenant.organizationId,
+      customerTenantId: tenant.id,
+      flow: 'EXISTING_TENANT',
+      stateHash: consent.stateHash,
+      expiresAt: consent.expiresAt,
     })
 
     return {
@@ -1023,9 +1068,16 @@ export class TenantsService {
         },
       },
       data: {
-        consentStateHash: consent.stateHash,
-        consentStateExpiresAt: consent.expiresAt,
+        exchangeReadOnlySkippedAt: null,
       },
+    })
+    await this.recordConsentAttempt({
+      identity,
+      organizationId: tenant.organizationId,
+      customerTenantId: tenant.id,
+      flow: 'EXCHANGE_READ_ONLY',
+      stateHash: consent.stateHash,
+      expiresAt: consent.expiresAt,
     })
     return {
       consentUrl: consent.consentUrl,
@@ -1066,6 +1118,185 @@ export class TenantsService {
     }
   }
 
+  async getTenantOnboardingForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string,
+  ) {
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: {
+        id: true,
+        displayName: true,
+        primaryDomain: true,
+        microsoftTenantId: true,
+        connection: {
+          select: {
+            connectionMode: true,
+            status: true,
+            clientId: true,
+            credentialReference: true,
+            consentedPermissions: true,
+            exchangeReadOnlyEnabledAt: true,
+            exchangeReadOnlySkippedAt: true,
+            reportSettingsLastCheckedAt: true,
+            reportIdentifiersVisible: true,
+            reportVisibilityDeferredAt: true,
+            onboardingCompletedAt: true,
+            lastErrorCode: true,
+            lastErrorMessage: true,
+          },
+        },
+      },
+    })
+    if (!tenant?.connection) throw new NotFoundException('Customer tenant was not found.')
+
+    const coreComplete = tenant.connection.status === 'CONNECTED'
+    const exchangeStatus = tenant.connection.exchangeReadOnlyEnabledAt
+      ? 'VERIFIED'
+      : tenant.connection.exchangeReadOnlySkippedAt
+        ? 'DEFERRED'
+        : tenant.connection.consentedPermissions.includes('Exchange.ManageAsAppV2')
+          ? 'RBAC_REQUIRED'
+          : 'CONSENT_REQUIRED'
+    const reportStatus = tenant.connection.reportIdentifiersVisible === true
+      ? 'VERIFIED'
+      : tenant.connection.reportVisibilityDeferredAt
+          ? 'DEFERRED'
+          : tenant.connection.reportIdentifiersVisible === false
+            ? 'ACTION_REQUIRED'
+            : tenant.connection.consentedPermissions.includes('ReportSettings.Read.All')
+              ? 'CHECK_REQUIRED'
+              : 'PERMISSION_REQUIRED'
+
+    return {
+      version: 1 as const,
+      tenant: {
+        id: tenant.id,
+        name: tenant.displayName ?? tenant.primaryDomain ?? 'Microsoft 365 tenant',
+        primaryDomain: tenant.primaryDomain,
+        microsoftTenantId: tenant.microsoftTenantId,
+      },
+      completedAt: tenant.connection.onboardingCompletedAt?.toISOString() ?? null,
+      canFinish: coreComplete &&
+        (exchangeStatus === 'VERIFIED' || exchangeStatus === 'DEFERRED') &&
+        (reportStatus === 'VERIFIED' || reportStatus === 'DEFERRED'),
+      steps: {
+        microsoftAccess: {
+          required: true,
+          status: coreComplete ? 'VERIFIED' as const : tenant.connection.status === 'PENDING_CONSENT' ? 'CONSENT_REQUIRED' as const : 'ERROR' as const,
+          errorCode: coreComplete ? null : tenant.connection.lastErrorCode,
+          errorMessage: coreComplete ? null : tenant.connection.lastErrorMessage,
+        },
+        exchangeReadOnly: {
+          required: false,
+          status: exchangeStatus,
+          enabledAt: tenant.connection.exchangeReadOnlyEnabledAt?.toISOString() ?? null,
+          deferredAt: tenant.connection.exchangeReadOnlySkippedAt?.toISOString() ?? null,
+          permission: 'Exchange.ManageAsAppV2' as const,
+          capability: 'Get-Mailbox only' as const,
+          disclaimer: 'Exchange.ManageAsAppV2 permits authentication to the Exchange Admin API. HawkView activates this option only after verifying a custom Exchange RBAC assignment that exposes Get-Mailbox and no broader Microsoft Entra directory role. HawkView does not run Set-, New-, or Remove- cmdlets.',
+        },
+        reportVisibility: {
+          required: false,
+          status: reportStatus,
+          identifiersVisible: tenant.connection.reportIdentifiersVisible,
+          lastCheckedAt: tenant.connection.reportSettingsLastCheckedAt?.toISOString() ?? null,
+          deferredAt: tenant.connection.reportVisibilityDeferredAt?.toISOString() ?? null,
+          permission: 'ReportSettings.Read.All' as const,
+          adminCenterUrl: 'https://admin.microsoft.com/#/Settings/Services',
+          settingPath: ['Settings', 'Org settings', 'Services', 'Reports'],
+          settingLabel: 'Display concealed user, group, and site names in all reports',
+          disclaimer: 'HawkView can read this privacy setting but cannot change it. A Microsoft 365 administrator must update it in the Microsoft 365 admin center.',
+        },
+      },
+    }
+  }
+
+  async skipExchangeReadOnlyForIdentity(identity: AuthenticatedIdentity, customerTenantId: string) {
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: { id: true, organizationId: true },
+    })
+    if (!tenant) throw new NotFoundException('Customer tenant was not found.')
+    await this.prisma.tenantConnection.update({
+      where: { customerTenantId_organizationId: { customerTenantId: tenant.id, organizationId: tenant.organizationId } },
+      data: { exchangeReadOnlySkippedAt: new Date() },
+    })
+    return this.getTenantOnboardingForIdentity(identity, customerTenantId)
+  }
+
+  async deferReportVisibilityForIdentity(identity: AuthenticatedIdentity, customerTenantId: string) {
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: { id: true, organizationId: true },
+    })
+    if (!tenant) throw new NotFoundException('Customer tenant was not found.')
+    await this.prisma.tenantConnection.update({
+      where: { customerTenantId_organizationId: { customerTenantId: tenant.id, organizationId: tenant.organizationId } },
+      data: { reportVisibilityDeferredAt: new Date() },
+    })
+    return this.getTenantOnboardingForIdentity(identity, customerTenantId)
+  }
+
+  async verifyReportVisibilityForIdentity(identity: AuthenticatedIdentity, customerTenantId: string) {
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: {
+        id: true,
+        organizationId: true,
+        microsoftTenantId: true,
+        connection: { select: { connectionMode: true, clientId: true, credentialReference: true } },
+      },
+    })
+    if (!tenant?.connection) throw new NotFoundException('Customer tenant was not found.')
+    const result = await this.microsoftConsent.readTenantReportPrivacySetting({
+      microsoftTenantId: tenant.microsoftTenantId,
+      connectionMode: tenant.connection.connectionMode === 'CUSTOMER_MANAGED' ? 'CUSTOMER_MANAGED' : 'HAWKVIEW_MANAGED',
+      clientId: tenant.connection.clientId,
+      credentialReference: tenant.connection.credentialReference,
+    })
+    const checkedAt = new Date()
+    await this.prisma.tenantConnection.update({
+      where: { customerTenantId_organizationId: { customerTenantId: tenant.id, organizationId: tenant.organizationId } },
+      data: {
+        reportSettingsLastCheckedAt: checkedAt,
+        reportIdentifiersVisible: result.identifiersVisible,
+        reportVisibilityDeferredAt: result.identifiersVisible ? null : undefined,
+      },
+    })
+    return {
+      verification: { ...result, checkedAt: checkedAt.toISOString() },
+      onboarding: await this.getTenantOnboardingForIdentity(identity, customerTenantId),
+    }
+  }
+
+  async completeTenantOnboardingForIdentity(identity: AuthenticatedIdentity, customerTenantId: string) {
+    const state = await this.getTenantOnboardingForIdentity(identity, customerTenantId)
+    if (state.completedAt) return state
+    if (!state.canFinish) {
+      throw new ConflictException('Resolve or explicitly defer each optional setup step before finishing onboarding.')
+    }
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: { id: true, organizationId: true },
+    })
+    if (!tenant) throw new NotFoundException('Customer tenant was not found.')
+    await this.prisma.tenantConnection.updateMany({
+      where: {
+        customerTenantId: tenant.id,
+        organizationId: tenant.organizationId,
+        onboardingCompletedAt: null,
+      },
+      data: { onboardingCompletedAt: new Date() },
+    })
+    return this.getTenantOnboardingForIdentity(identity, customerTenantId)
+  }
+
   async assertCanConfigureExchangeReadOnly(
     identity: AuthenticatedIdentity,
     customerTenantId: string,
@@ -1094,10 +1325,57 @@ export class TenantsService {
     const consent = await this.microsoftConsent.createTenantDiscoveryConsentUrl(
       organizationIds[0]
     )
+    await this.recordConsentAttempt({
+      identity,
+      organizationId: organizationIds[0],
+      flow: 'DISCOVER_TENANT',
+      stateHash: consent.stateHash,
+      expiresAt: consent.expiresAt,
+    })
     return {
       consentUrl: consent.consentUrl,
       requiredPermissions: this.microsoftConsent.getRequiredPermissions(),
     }
+  }
+
+  private async consumeConsentAttempt(state: {
+    customerTenantId?: string
+    organizationId: string
+    nonce: string
+    flow: 'existing-tenant' | 'discover-tenant' | 'exchange-readonly'
+  }) {
+    const stateHash = this.microsoftConsent.hashConsentNonce(state.nonce)
+    const expectedFlow = state.flow === 'discover-tenant'
+      ? 'DISCOVER_TENANT'
+      : state.flow === 'exchange-readonly'
+        ? 'EXCHANGE_READ_ONLY'
+        : 'EXISTING_TENANT'
+    const attempt = await this.prisma.microsoftConsentAttempt.findUnique({
+      where: { stateHash },
+      select: {
+        id: true,
+        organizationId: true,
+        customerTenantId: true,
+        flow: true,
+        expiresAt: true,
+        consumedAt: true,
+      },
+    })
+    if (
+      !attempt ||
+      attempt.organizationId !== state.organizationId ||
+      attempt.flow !== expectedFlow ||
+      attempt.customerTenantId !== (state.customerTenantId ?? null) ||
+      attempt.expiresAt.getTime() < Date.now() ||
+      attempt.consumedAt
+    ) {
+      return null
+    }
+    const consumed = await this.prisma.microsoftConsentAttempt.updateMany({
+      where: { id: attempt.id, consumedAt: null, expiresAt: { gt: new Date() } },
+      data: { consumedAt: new Date(), resultCode: 'CALLBACK_RECEIVED' },
+    })
+    return consumed.count === 1 ? attempt.id : null
   }
 
   async completeMicrosoftConsent(query: Record<string, unknown>) {
@@ -1118,8 +1396,19 @@ export class TenantsService {
       return this.buildFrontendConsentRedirect('error', 'invalid-state')
     }
 
+
+    const consentAttemptId = await this.consumeConsentAttempt(state)
+    if (!consentAttemptId) {
+      return this.buildFrontendConsentRedirect(
+        'error',
+        'expired-or-used-state',
+        state.customerTenantId,
+        Boolean(state.customerTenantId),
+      )
+    }
+
     if (state.flow === 'discover-tenant') {
-      return this.completeDiscoveredMicrosoftConsent(query, state)
+      return this.completeDiscoveredMicrosoftConsent(query, state, consentAttemptId)
     }
 
     const tenant = await this.prisma.customerTenant.findFirst({
@@ -1133,8 +1422,6 @@ export class TenantsService {
         microsoftTenantId: true,
         connection: {
           select: {
-            consentStateHash: true,
-            consentStateExpiresAt: true,
             connectionMode: true,
             clientId: true,
             credentialReference: true,
@@ -1146,35 +1433,9 @@ export class TenantsService {
     if (!tenant) {
       return this.buildFrontendConsentRedirect('error', 'tenant-not-found')
     }
-
-    const returnedStateHash = this.microsoftConsent.hashConsentNonce(
-      state.nonce
-    )
-    if (
-      !tenant.connection?.consentStateHash ||
-      returnedStateHash !== tenant.connection.consentStateHash ||
-      !tenant.connection.consentStateExpiresAt ||
-      tenant.connection.consentStateExpiresAt.getTime() < Date.now()
-    ) {
-      return this.buildFrontendConsentRedirect(
-        'error',
-        'expired-or-used-state',
-        tenant.id
-      )
+    if (!tenant.connection) {
+      return this.buildFrontendConsentRedirect('error', 'connection-missing', tenant.id, true)
     }
-
-    await this.prisma.tenantConnection.update({
-      where: {
-        customerTenantId_organizationId: {
-          customerTenantId: tenant.id,
-          organizationId: tenant.organizationId,
-        },
-      },
-      data: {
-        consentStateHash: null,
-        consentStateExpiresAt: null,
-      },
-    })
 
     if (state.flow === 'exchange-readonly') {
       return this.completeExchangeReadOnlyConsent(query, tenant)
@@ -1203,7 +1464,7 @@ export class TenantsService {
           ? query.error_description
           : 'Microsoft administrator consent was not completed.'
       )
-      return this.buildFrontendConsentRedirect('error', errorCode, tenant.id)
+      return this.buildFrontendConsentRedirect('error', errorCode, tenant.id, true)
     }
 
     try {
@@ -1259,7 +1520,8 @@ export class TenantsService {
       return this.buildFrontendConsentRedirect(
         connected ? 'success' : 'missing-permissions',
         connected ? null : 'missing-permissions',
-        tenant.id
+        tenant.id,
+        true,
       )
     } catch (error) {
       await this.recordConnectionError(
@@ -1272,7 +1534,8 @@ export class TenantsService {
       return this.buildFrontendConsentRedirect(
         'error',
         'verification-failed',
-        tenant.id
+        tenant.id,
+        true,
       )
     }
   }
@@ -1343,7 +1606,8 @@ export class TenantsService {
 
   private async completeDiscoveredMicrosoftConsent(
     query: Record<string, unknown>,
-    state: { organizationId: string; nonce: string }
+    state: { organizationId: string; nonce: string },
+    consentAttemptId: string,
   ) {
     const returnedTenantId =
       typeof query.tenant === 'string' ? query.tenant.toLowerCase() : ''
@@ -1407,6 +1671,11 @@ export class TenantsService {
           },
         })
 
+    await this.prisma.microsoftConsentAttempt.update({
+      where: { id: consentAttemptId },
+      data: { customerTenantId: tenant.id },
+    })
+
     try {
       const verification =
         await this.microsoftConsent.verifyTenantAfterConsent(returnedTenantId)
@@ -1438,8 +1707,6 @@ export class TenantsService {
             ),
             consentedAt: now,
             lastVerifiedAt: now,
-            consentStateHash: null,
-            consentStateExpiresAt: null,
             lastErrorCode: connected ? null : 'missing-permissions',
             lastErrorMessage: connected
               ? null
@@ -1462,7 +1729,8 @@ export class TenantsService {
       return this.buildFrontendConsentRedirect(
         connected ? 'success' : 'missing-permissions',
         connected ? null : 'missing-permissions',
-        tenant.id
+        tenant.id,
+        true,
       )
     } catch (error) {
       await this.recordConnectionError(
@@ -1475,7 +1743,8 @@ export class TenantsService {
       return this.buildFrontendConsentRedirect(
         'error',
         'verification-failed',
-        tenant.id
+        tenant.id,
+        true,
       )
     }
   }
@@ -1585,19 +1854,18 @@ export class TenantsService {
     result: string,
     error: string | null,
     customerTenantId?: string,
-    tenantSettings = false,
+    tenantOnboarding = false,
   ) {
     const frontendUrl = process.env.FRONTEND_APP_URL?.trim()
     if (!frontendUrl) throw new Error('FRONTEND_APP_URL is not configured.')
 
     const url = new URL(
-      tenantSettings && customerTenantId
-        ? `/tenants/${encodeURIComponent(customerTenantId)}/settings`
+      tenantOnboarding && customerTenantId
+        ? `/tenants/${encodeURIComponent(customerTenantId)}/onboarding`
         : '/tenants',
       frontendUrl,
     )
     url.searchParams.set('microsoftConsent', result)
-    if (tenantSettings) url.searchParams.set('tab', 'administration')
     if (error) url.searchParams.set('error', error)
     if (customerTenantId) url.searchParams.set('tenantId', customerTenantId)
     return url.toString()

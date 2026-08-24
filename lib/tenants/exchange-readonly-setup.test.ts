@@ -59,7 +59,7 @@ test('settings setup is optional, staged, and verifies before enabling', () => {
   assert.doesNotMatch(source, /Global Reader|Exchange Administrator|Recipient Management/)
 })
 
-test('optional consent returns to Administration and does not masquerade as collection verification', () => {
+test('optional consent returns to resumable onboarding and does not masquerade as collection verification', () => {
   const backend = readFileSync(
     new URL('../../backend/src/tenants/tenants.service.ts', import.meta.url),
     'utf8',
@@ -68,7 +68,8 @@ test('optional consent returns to Administration and does not masquerade as coll
     new URL('../../app/(protected)/tenants/[id]/settings/page.tsx', import.meta.url),
     'utf8',
   )
-  assert.match(backend, /if \(tenantSettings\) url\.searchParams\.set\('tab', 'administration'\)/)
+  assert.match(backend, /tenantOnboarding && customerTenantId[\s\S]{0,200}\/onboarding/)
+  assert.match(backend, /completeExchangeReadOnlyConsent\(query, tenant\)/)
   assert.match(settings, /consentResult=\{microsoftConsentResult\}/)
   assert.doesNotMatch(settings, /searchParams\.get\('error'\)[\s\S]{0,200}ExchangeReadonlySetup/)
 })

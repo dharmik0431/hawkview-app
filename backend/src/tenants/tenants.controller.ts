@@ -128,6 +128,61 @@ export class TenantsController {
     )
   }
 
+  @Get(':id/onboarding')
+  getTenantOnboarding(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    return this.tenantsService.getTenantOnboardingForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
+  @Post(':id/onboarding/exchange-readonly/defer')
+  deferExchangeReadOnly(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    return this.tenantsService.skipExchangeReadOnlyForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
+  @Post(':id/onboarding/report-visibility/verify')
+  verifyReportVisibility(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    return this.tenantsService.verifyReportVisibilityForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
+  @Post(':id/onboarding/report-visibility/defer')
+  deferReportVisibility(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    return this.tenantsService.deferReportVisibilityForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
+  @Post(':id/onboarding/complete')
+  completeTenantOnboarding(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+  ) {
+    return this.tenantsService.completeTenantOnboardingForIdentity(
+      request.auth,
+      customerTenantId,
+    )
+  }
+
   @Post(':id/exchange-readonly/verify')
   async verifyExchangeReadOnly(
     @Req() request: AuthenticatedRequest,

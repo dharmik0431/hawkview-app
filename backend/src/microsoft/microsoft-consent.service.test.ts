@@ -230,7 +230,7 @@ test('managed and customer verification paths do not make a deprecated override 
               'AuditLog.Read.All', 'Directory.Read.All', 'UserAuthenticationMethod.Read.All', 'Policy.Read.All',
               'Policy.Read.AuthenticationMethod', 'Device.Read.All', 'RoleManagement.Read.Directory',
               'Application.Read.All', 'Sites.Read.All', 'SharePointTenantSettings.Read.All',
-              'Reports.Read.All', 'MailboxSettings.Read', 'SecurityEvents.Read.All',
+              'Reports.Read.All', 'ReportSettings.Read.All', 'MailboxSettings.Read', 'SecurityEvents.Read.All',
             ],
       })
       const result = await service.verifyConnectedTenant({
@@ -260,8 +260,58 @@ test('keeps a connector connected when optional capability grants are absent', a
     })
     const result = await service.verifyTenantWithCredentials('tenant-1', { clientId: 'app', clientSecret: 'secret' })
     assert.deepEqual(result.missingRequiredPermissions, [])
-    assert.equal(result.missingNonConnectionPermissions.length, 17)
+    assert.equal(result.missingNonConnectionPermissions.length, 18)
     assert.deepEqual(result.missingPermissions, result.missingNonConnectionPermissions)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('reads but never changes the Microsoft 365 report privacy setting', async () => {
+  const originalFetch = globalThis.fetch
+  let observedMethod = ''
+  globalThis.fetch = (async (_input, init) => {
+    observedMethod = init?.method ?? 'GET'
+    return new Response(JSON.stringify({ displayConcealedNames: false }), { status: 200 })
+  }) as typeof fetch
+  try {
+    const service = new MicrosoftConsentService({} as never, {} as never)
+    ;(service as any).getManagedConnector = async () => ({ clientId: 'app', clientSecret: 'secret' })
+    ;(service as any).requestAccessToken = async () => ({
+      accessToken: 'token',
+      grantedPermissions: ['ReportSettings.Read.All'],
+    })
+    const result = await service.readTenantReportPrivacySetting({
+      microsoftTenantId: 'tenant',
+      connectionMode: 'HAWKVIEW_MANAGED',
+      clientId: null,
+      credentialReference: null,
+    })
+    assert.deepEqual(result, { status: 'READY', identifiersVisible: true, retryable: false })
+    assert.equal(observedMethod, 'GET')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('reports missing read permission without calling Microsoft report settings', async () => {
+  const originalFetch = globalThis.fetch
+  let called = false
+  globalThis.fetch = (async () => {
+    called = true
+    return new Response('{}')
+  }) as typeof fetch
+  try {
+    const service = new MicrosoftConsentService({} as never, {} as never)
+    ;(service as any).getManagedConnector = async () => ({ clientId: 'app', clientSecret: 'secret' })
+    ;(service as any).requestAccessToken = async () => ({ accessToken: 'token', grantedPermissions: [] })
+    assert.deepEqual(await service.readTenantReportPrivacySetting({
+      microsoftTenantId: 'tenant',
+      connectionMode: 'HAWKVIEW_MANAGED',
+      clientId: null,
+      credentialReference: null,
+    }), { status: 'MISSING_PERMISSION', identifiersVisible: null, retryable: false })
+    assert.equal(called, false)
   } finally {
     globalThis.fetch = originalFetch
   }
