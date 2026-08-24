@@ -111,7 +111,7 @@ async function verifyIdentityBoundary(fetchImpl, session, foreignSession) {
       method: 'POST',
       headers: { Authorization: `Bearer ${session.accessToken}` },
       cache: 'no-store',
-    })
+    }, [201])
   ).body
   const bootstrapRecord = record(bootstrap)
   const user = record(bootstrapRecord?.user)
