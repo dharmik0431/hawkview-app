@@ -48,7 +48,7 @@ function successfulFetch() {
       ? { email: 'canary-a@example.test', org: ids.orgA, tenant: ids.tenantA, foreign: ids.tenantB }
       : { email: 'canary-b@example.test', org: ids.orgB, tenant: ids.tenantB, foreign: ids.tenantA }
     if (url.pathname === '/auth/bootstrap') {
-      return jsonResponse({ user: { email: own.email, memberships: [{ organization: { id: own.org } }] } })
+      return jsonResponse({ user: { email: own.email, memberships: [{ organization: { id: own.org } }] } }, 201)
     }
     if (url.pathname === '/api/tenants') return jsonResponse({ tenants: [{ id: own.tenant }] })
     if (url.pathname === `/api/tenants/${own.tenant}/onboarding`) return jsonResponse({ tenantId: own.tenant })
