@@ -32,6 +32,8 @@ jobs:
           mapfile -t tests < <(find lib -type f -name '*.test.ts' -print | sort)
           test "${#tests[@]}" -gt 0
           node --experimental-strip-types --test "${tests[@]}"
+      - name: Release canary contract tests
+        run: node --test .github/scripts/authenticated-msp-canary.test.mjs
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build

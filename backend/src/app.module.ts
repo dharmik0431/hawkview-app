@@ -7,6 +7,7 @@ import { SecretsModule } from './secrets/secrets.module.js'
 import { NotificationsModule } from './notifications/notifications.module.js'
 import { ChangesModule } from './changes/changes.module.js'
 import { WorkspaceModule } from './workspace/workspace.module.js'
+import { AuthenticatedCanaryModule } from './canary/authenticated-canary.module.js'
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { WorkspaceModule } from './workspace/workspace.module.js'
     NotificationsModule,
     ChangesModule,
     WorkspaceModule,
+    AuthenticatedCanaryModule,
   ],
 })
 export class AppModule {}
