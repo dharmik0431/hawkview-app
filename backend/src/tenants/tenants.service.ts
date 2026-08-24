@@ -13,6 +13,7 @@ import {
   MembershipRole,
   SyncResourceType,
 } from '../generated/prisma/enums.js'
+import type { Prisma } from '../generated/prisma/client.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
@@ -569,7 +570,6 @@ export class TenantsService {
           lastAttemptAt: true,
           lastSuccessfulAt: true,
           lastErrorCode: true,
-          onboardingCompletedAt: true,
           lastErrorMessage: true,
           consecutiveFailures: true,
         },
@@ -601,6 +601,7 @@ export class TenantsService {
           consentedPermissions: true,
           lastVerifiedAt: true,
           lastErrorCode: true,
+          onboardingCompletedAt: true,
         },
       },
       m365ActivitySubscriptions: {
@@ -613,7 +614,7 @@ export class TenantsService {
           lastError: true,
         },
       },
-    } as const
+    } as const satisfies Prisma.CustomerTenantSelect
   }
 
   async listForIdentity(identity: AuthenticatedIdentity) {

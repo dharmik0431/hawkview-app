@@ -395,6 +395,14 @@ test('tenant list scopes secondary sign-in and audit queries by organization and
     (observed.tenantSelect as any).entraSnapshots.where.resourceType.in,
     ['AUTH_REGISTRATIONS', 'SECURE_SCORES'],
   )
+  assert.equal(
+    (observed.tenantSelect as any).syncStates.select.onboardingCompletedAt,
+    undefined,
+  )
+  assert.equal(
+    (observed.tenantSelect as any).connection.select.onboardingCompletedAt,
+    true,
+  )
   assert.deepEqual(
     (observed.signInWhere as Record<string, unknown>).organizationId,
     { in: ['organization-a'] },
