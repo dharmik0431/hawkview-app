@@ -1,10 +1,17 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-23 after resumable Microsoft tenant onboarding merge and backend deployment verification
+Last updated: 2026-08-23 for the tenant-directory Prisma selection incident repair
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P0 incident — tenant directory returned HTTP 500 after resumable onboarding release (local repair; unpublished)
+
+- After the PR #184 backend deployment and matching GAS publication, multiple correctly isolated MSP accounts received `Internal server error` from `GET /api/tenants`; the tenant directory therefore rendered zero summary cards plus an explicit load failure instead of showing cached or cross-account tenant data. This was not lost tenant membership and not an identity-isolation regression.
+- Root cause was deterministic in `TenantsService.tenantSelect()`: the new `onboardingCompletedAt` field belongs to `TenantConnection`, but it was accidentally placed inside the nested Prisma `SyncState` selection. Prisma rejects an unknown model field at runtime before returning any tenant rows, which made every non-empty accessible workspace fail with HTTP 500. Empty-access workspaces returned before this query and were unaffected.
+- The repair moves `onboardingCompletedAt` to the existing `connection` selection consumed by `mapTenant`. The selection object now uses `satisfies Prisma.CustomerTenantSelect`, so a field placed on the wrong Prisma model becomes a TypeScript error instead of a production-only runtime failure. The organization-isolation regression asserts both the forbidden SyncState placement and the required TenantConnection placement.
+- Exact local scope is this PM record, `backend/src/tenants/tenants.service.ts`, and `backend/src/auth/organization-isolation.test.ts`. Focused identity/onboarding tests pass **18/18**; the complete backend suite passes **333 with 2 intentional legacy SharePoint REST skips**; backend TypeScript, Prisma validation, the production backend build, and `git diff --check` pass. No schema, migration, frontend, GAS, Microsoft permission, consent, tenant membership, synchronization, or live-state change is included. Publication and post-deploy two-account verification are still pending.
 
 ## P0 — resumable Microsoft tenant onboarding (merged via PR #184; backend deployed; GAS and app-registration permission pending)
 
