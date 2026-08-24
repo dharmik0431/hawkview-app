@@ -12,8 +12,8 @@ test('standard Exchange onboarding remains Graph-only and optional enrichment is
   const consent = source('backend/src/microsoft/microsoft-consent.service.ts')
   const collector = source('backend/src/tenants/tenant-sync.service.ts')
 
-  assert.match(tenants, /optional Exchange mailbox enrichment/i)
-  assert.match(tenants, /is not required\s+to finish onboarding/)
+  assert.match(tenants, /optional Exchange enrichment requires/i)
+  assert.match(tenants, /optional step\s+can be safely deferred and resumed later/)
   assert.match(settings, /ExchangeReadonlySetup/)
   assert.match(consent, /state\.flow === 'exchange-readonly'/)
   assert.match(consent, /'https:\/\/graph\.microsoft\.com\/\.default'/)
