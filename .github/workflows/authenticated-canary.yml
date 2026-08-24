@@ -1,0 +1,32 @@
+name: Authenticated two-MSP canary
+
+on:
+  deployment_status:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: authenticated-canary-hawkview-api-dev
+  cancel-in-progress: true
+
+jobs:
+  tenant-isolation:
+    name: Authenticated tenant isolation
+    if: >-
+      vars.HAWKVIEW_AUTH_CANARY_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.deployment_status.state == 'success' &&
+        github.event.deployment.environment == 'main - hawkview-api-dev'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      EXPECTED_REVISION: ${{ github.event.deployment.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXPECTED_REVISION }}
+      - name: Verify two authenticated MSP boundaries
+        run: node .github/scripts/authenticated-msp-canary.mjs
