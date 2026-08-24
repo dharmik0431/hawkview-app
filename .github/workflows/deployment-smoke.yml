@@ -1,0 +1,57 @@
+name: Deployed API smoke check
+
+on:
+  deployment_status:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  api-health:
+    name: Exact deployment API health
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.deployment_status.state == 'success' &&
+       github.event.deployment.environment == 'main - hawkview-api-dev')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify API and database health
+        shell: bash
+        env:
+          EXPECTED_REVISION: ${{ github.event.deployment.sha }}
+        run: |
+          node <<'NODE'
+          const expectedRevision = process.env.EXPECTED_REVISION?.trim().toLowerCase()
+          const checks = [
+            ['https://hawkview-api-dev.onrender.com/health', value =>
+              value?.status === 'ok' &&
+              (!expectedRevision || value?.revision === expectedRevision)],
+            ['https://hawkview-api-dev.onrender.com/health/database', value =>
+              value?.status === 'ok' && value?.database === 'connected' && value?.schema === 'current'],
+          ]
+
+          for (const [url, accepts] of checks) {
+            let lastError
+            for (let attempt = 1; attempt <= 6; attempt += 1) {
+              try {
+                const response = await fetch(url, {
+                  headers: { accept: 'application/json' },
+                  signal: AbortSignal.timeout(10_000),
+                })
+                const body = await response.json()
+                if (!response.ok || !accepts(body)) {
+                  throw new Error(`Unexpected ${response.status} response`)
+                }
+                console.log(`${url} is healthy`)
+                lastError = undefined
+                break
+              } catch (error) {
+                lastError = error
+                if (attempt < 6) await new Promise(resolve => setTimeout(resolve, 10_000))
+              }
+            }
+            if (lastError) throw lastError
+          }
+          NODE

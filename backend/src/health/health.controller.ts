@@ -7,6 +7,13 @@ import {
 import { Public } from '../auth/public.decorator.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 
+const FULL_GIT_REVISION = /^[0-9a-f]{40}$/i
+
+export function normalizeDeploymentRevision(value: string | undefined) {
+  const candidate = value?.trim() ?? ''
+  return FULL_GIT_REVISION.test(candidate) ? candidate.toLowerCase() : null
+}
+
 @Public()
 @Controller('health')
 export class HealthController {
@@ -19,6 +26,7 @@ export class HealthController {
   getHealth() {
     return {
       status: 'ok',
+      revision: normalizeDeploymentRevision(process.env.RENDER_GIT_COMMIT),
     }
   }
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { onboardingNextStep, TenantOnboardingSchema } from './tenant-onboarding'
+import { onboardingNextStep, TenantOnboardingSchema } from './tenant-onboarding.ts'
 
 const base = {
   version: 1,

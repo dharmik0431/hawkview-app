@@ -1,10 +1,19 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-23 for the tenant-directory Prisma selection incident repair
+Last updated: 2026-08-23 for repository release-safety gates and database integration coverage
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P0 — required release gates and real-database tenant isolation (local implementation; unpublished)
+
+- The repository previously had no GitHub Actions workflows or required status checks. Local unit/type/build validation could therefore be green while an invalid Prisma selection failed only when a live tenant-list query executed against PostgreSQL. The release-safety workflow now defines separate `Frontend quality` and `Backend quality and database integration` jobs for every pull request to `main`.
+- Frontend quality runs the complete frontend helper/source suite, TypeScript, lint, and the production Next build from the locked dependency graph. Backend quality starts disposable PostgreSQL 16, generates and validates the Prisma client/schema, applies every committed migration, runs the complete backend suite, and creates the production backend bundle.
+- A database-gated integration test creates two UUID-scoped MSP users, organizations, memberships, tenants, and connections in the migrated disposable database. It invokes the real `TenantsService.listForIdentity` Prisma query for both provider subjects and proves A sees only A, B sees only B, and both receive the durable onboarding projection. The records are removed after the test. The test is skipped outside an explicitly enabled database-integration run and never targets production.
+- A deployment-status workflow verifies the exact successful Render `main - hawkview-api-dev` deployment. `/health` now publishes only a validated full Git revision from Render's `RENDER_GIT_COMMIT`; the smoke check requires it to equal GitHub's deployment SHA, then verifies database health/schema with bounded retries. No repository or production credential is needed for these public health checks.
+- Branch protection remains a one-time GitHub operator action after both checks first exist: require the two named checks, an up-to-date branch, and resolved conversations; block force pushes/deletion. Do not require self-approval while there is only one reviewer. The next increment is an authenticated two-MSP canary using dedicated non-production identities and a server-controlled short-lived login flow, never personal passwords or a long-lived bearer token.
+- Current local scope is this PM record, two workflow files, the release-safety runbook, the health controller/test, the real-database tenant-directory integration test, and two stale frontend source-contract test repairs exposed by running every helper test. No production database, migration, frontend behavior, tenant, membership, Microsoft permission, consent, synchronization, Render setting, or secret has been changed. Clean validation passes the complete frontend suite **154/154**; the complete backend suite against all **35** migrations and disposable PostgreSQL passes **335 with 2 intentional legacy SharePoint REST skips**; root/backend TypeScript; lint with zero warnings/errors; Prisma generate/validate/migrate; both production builds; workflow YAML parsing; and `git diff --check`. The two disposable PostgreSQL clusters used for focused and full-suite rehearsal were stopped and their test-only data was removed. The implementation is locally committed and unpublished pending publication authorization.
 
 ## P0 incident — tenant directory returned HTTP 500 after resumable onboarding release (fixed via PR #186; backend deployed)
 

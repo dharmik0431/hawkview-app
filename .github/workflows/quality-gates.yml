@@ -1,0 +1,80 @@
+name: Required quality gates
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-quality:
+    name: Frontend quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: sb_publishable_ci_validation_only_0123456789
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Frontend tests
+        shell: bash
+        run: |
+          mapfile -t tests < <(find lib -type f -name '*.test.ts' -print | sort)
+          test "${#tests[@]}" -gt 0
+          node --experimental-strip-types --test "${tests[@]}"
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+  backend-quality:
+    name: Backend quality and database integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: postgresql://hawkview_ci:hawkview_ci@127.0.0.1:5432/hawkview_ci
+      HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS: '1'
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: hawkview_ci
+          POSTGRES_PASSWORD: hawkview_ci
+          POSTGRES_DB: hawkview_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hawkview_ci -d hawkview_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm run db:generate
+      - run: npm run db:validate
+      - name: Apply every committed migration
+        run: npm run db:migrate:deploy
+      - name: Backend tests, including real PostgreSQL isolation
+        shell: bash
+        run: |
+          mapfile -t tests < <(find src -type f -name '*.test.ts' -print | sort)
+          test "${#tests[@]}" -gt 0
+          ./node_modules/.bin/tsx --test "${tests[@]}"
+      - run: npm run build
