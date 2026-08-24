@@ -51,6 +51,7 @@ const identity: AuthenticatedIdentity = {
 
 function authorizedUser() {
   return {
+    id: 'user-a',
     disabledAt: null,
     memberships: [{
       organizationId: 'organization-a',
@@ -130,6 +131,9 @@ test('keeps optional consent separate and rejects HawkView consent for customer-
     },
     tenantConnection: {
       update: async (input: unknown) => { connectionUpdate = input },
+    },
+    microsoftConsentAttempt: {
+      create: async () => ({ id: 'attempt-a' }),
     },
   } as unknown as PrismaService
   const service = new TenantsService(prisma, {

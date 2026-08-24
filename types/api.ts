@@ -11,6 +11,11 @@ export const TenantSchema = z.object({
     .enum(['pending-consent', 'connected', 'error', 'revoked'])
     .nullable(),
   connectionMode: z.enum(['hawkview-managed', 'customer-managed']),
+  onboarding: z.object({
+    complete: z.boolean(),
+    completedAt: z.string().datetime().nullable(),
+    resumeUrl: z.string(),
+  }).strict().optional(),
   lastSync: z.string().nullable(),
   secureScore: z.number().nullable(),
   healthScore: z.number().min(0).max(100),
@@ -76,6 +81,16 @@ export const MicrosoftConsentResponseSchema = z.object({
 
 export type MicrosoftConsentResponse = z.infer<
   typeof MicrosoftConsentResponseSchema
+>
+
+export const ExchangeReadOnlyConsentResponseSchema = z.object({
+  consentUrl: z.string().url(),
+  permission: z.literal('Exchange.ManageAsAppV2'),
+  optional: z.literal(true),
+}).strict()
+
+export type ExchangeReadOnlyConsentResponse = z.infer<
+  typeof ExchangeReadOnlyConsentResponseSchema
 >
 
 export const ExchangeReadOnlySetupSchema = z.object({

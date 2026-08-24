@@ -88,6 +88,12 @@ enum SyncStateStatus {
   FAILED
 }
 
+enum MicrosoftConsentFlow {
+  DISCOVER_TENANT
+  EXISTING_TENANT
+  EXCHANGE_READ_ONLY
+}
+
 model User {
   id                 String         @id @default(uuid()) @db.Uuid
   authProviderUserId String?        @unique @map("auth_provider_user_id") @db.VarChar(128)
@@ -106,6 +112,7 @@ model User {
   notificationStates NotificationUserState[]
   notificationPreferences NotificationPreference[]
   foundedOrganizations Organization[] @relation("OrganizationFounder")
+  microsoftConsentAttempts MicrosoftConsentAttempt[]
 
   @@index([platformRole])
   @@index([disabledAt])
@@ -211,6 +218,7 @@ model Organization {
   changeEvidenceEvents ChangeEvidenceEvent[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
+  microsoftConsentAttempts MicrosoftConsentAttempt[]
   notificationPreferences NotificationPreference[]
   createdBy          User?                      @relation("OrganizationFounder", fields: [createdByUserId], references: [id], onDelete: SetNull)
 
@@ -282,6 +290,7 @@ model CustomerTenant {
   changeEvidenceEvents ChangeEvidenceEvent[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
+  microsoftConsentAttempts MicrosoftConsentAttempt[]
 
   @@unique([id, organizationId])
   @@index([organizationId, status])
@@ -721,6 +730,11 @@ model TenantConnection {
   lastErrorCode         String?                 @map("last_error_code") @db.VarChar(100)
   lastErrorMessage      String?                 @map("last_error_message") @db.Text
   exchangeReadOnlyEnabledAt DateTime?            @map("exchange_read_only_enabled_at") @db.Timestamptz(6)
+  exchangeReadOnlySkippedAt DateTime?            @map("exchange_read_only_skipped_at") @db.Timestamptz(6)
+  reportSettingsLastCheckedAt DateTime?           @map("report_settings_last_checked_at") @db.Timestamptz(6)
+  reportIdentifiersVisible Boolean?              @map("report_identifiers_visible")
+  reportVisibilityDeferredAt DateTime?            @map("report_visibility_deferred_at") @db.Timestamptz(6)
+  onboardingCompletedAt DateTime?                 @map("onboarding_completed_at") @db.Timestamptz(6)
   createdAt             DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt             DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
   customerTenant        CustomerTenant          @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
@@ -728,6 +742,27 @@ model TenantConnection {
   @@unique([customerTenantId, organizationId])
   @@index([organizationId, status])
   @@map("tenant_connections")
+}
+
+model MicrosoftConsentAttempt {
+  id                 String               @id @default(uuid()) @db.Uuid
+  organizationId     String               @map("organization_id") @db.Uuid
+  customerTenantId   String?              @map("customer_tenant_id") @db.Uuid
+  initiatedByUserId  String?              @map("initiated_by_user_id") @db.Uuid
+  flow               MicrosoftConsentFlow
+  stateHash          String               @unique @map("state_hash") @db.VarChar(64)
+  expiresAt          DateTime             @map("expires_at") @db.Timestamptz(6)
+  consumedAt         DateTime?            @map("consumed_at") @db.Timestamptz(6)
+  resultCode         String?              @map("result_code") @db.VarChar(100)
+  createdAt          DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  organization       Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant     CustomerTenant?      @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  initiatedBy        User?                @relation(fields: [initiatedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@index([customerTenantId, flow, createdAt(sort: Desc)])
+  @@index([expiresAt])
+  @@map("microsoft_consent_attempts")
 }
 
 model PlatformMicrosoftConnector {

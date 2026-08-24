@@ -598,6 +598,90 @@ export class MicrosoftConsentService {
     return { permission: 'Exchange.ManageAsAppV2' as const }
   }
 
+  async readTenantReportPrivacySetting(input: {
+    microsoftTenantId: string
+    connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
+    clientId: string | null
+    credentialReference: string | null
+  }) {
+    const credentials = input.connectionMode === 'CUSTOMER_MANAGED'
+      ? {
+          clientId: input.clientId ?? '',
+          clientSecret: input.credentialReference
+            ? await this.secretStore.access(input.credentialReference)
+            : '',
+        }
+      : await this.getManagedConnector()
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      return {
+        status: 'CONNECTION_INCOMPLETE' as const,
+        identifiersVisible: null,
+        retryable: false,
+      }
+    }
+
+    let token: Awaited<ReturnType<MicrosoftConsentService['requestAccessToken']>>
+    try {
+      token = await this.requestAccessToken(input.microsoftTenantId, credentials)
+    } catch {
+      return {
+        status: 'TOKEN_UNAVAILABLE' as const,
+        identifiersVisible: null,
+        retryable: true,
+      }
+    }
+
+    if (!token.grantedPermissions.includes('ReportSettings.Read.All')) {
+      return {
+        status: 'MISSING_PERMISSION' as const,
+        identifiersVisible: null,
+        retryable: false,
+      }
+    }
+
+    try {
+      const response = await fetchMicrosoftWithRetry(
+        'https://graph.microsoft.com/v1.0/admin/reportSettings?$select=displayConcealedNames',
+        {
+          headers: {
+            Authorization: `Bearer ${token.accessToken}`,
+            Accept: 'application/json',
+          },
+        },
+        { label: 'Microsoft 365 report privacy verification', timeoutMs: 15_000 },
+      )
+      if (!response.ok) {
+        return {
+          status: response.status === 401 || response.status === 403
+            ? 'MICROSOFT_DENIED' as const
+            : 'MICROSOFT_UNAVAILABLE' as const,
+          identifiersVisible: null,
+          retryable: response.status === 429 || response.status >= 500,
+        }
+      }
+      const body = await response.json() as { displayConcealedNames?: unknown }
+      if (typeof body.displayConcealedNames !== 'boolean') {
+        return {
+          status: 'INVALID_RESPONSE' as const,
+          identifiersVisible: null,
+          retryable: true,
+        }
+      }
+      return {
+        status: body.displayConcealedNames ? 'IDENTIFIERS_CONCEALED' as const : 'READY' as const,
+        identifiersVisible: !body.displayConcealedNames,
+        retryable: false,
+      }
+    } catch {
+      return {
+        status: 'NETWORK_ERROR' as const,
+        identifiersVisible: null,
+        retryable: true,
+      }
+    }
+  }
+
   async verifyConnectedTenant(input: {
     microsoftTenantId: string
     connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
