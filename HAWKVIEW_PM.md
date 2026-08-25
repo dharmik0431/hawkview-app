@@ -1,10 +1,18 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-24 for the authenticated two-MSP deployment canary release
+Last updated: 2026-08-24 for the branded production API origin cutover preparation
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## P0 — branded production API origin (implementation ready; deployment cutover pending)
+
+- `api.hawkviewapp.com` is attached to the existing Render API service, domain ownership is verified, and Render has issued its managed TLS certificate. Independent public checks on 2026-08-24 returned the live revision from `GET /health` and `database: connected` plus `schema: current` from `GET /health/database`. The root `hawkviewapp.com` and `www.hawkviewapp.com` domains were removed from the API service so they remain available for the future marketing site.
+- The code-owned production API origin, frontend example configuration, scheduler fallback, public deployment smoke checks, authenticated two-MSP canary target, GitHub OIDC audience, Render Blueprint domain declaration, Microsoft callback documentation, and deployment runbook now use only `https://api.hawkviewapp.com`. Regression tests pin the public runtime and both canary halves to the branded origin so an environment typo or later edit cannot silently route production back to an arbitrary host.
+- This branch deliberately leaves Render's legacy `onrender.com` hostname enabled and leaves the internal Render service/deployment name unchanged. Before disabling the legacy hostname, add `https://api.hawkviewapp.com/api/tenants/microsoft/admin-consent/callback` to the existing Microsoft home app registration, set Render `MICROSOFT_ADMIN_CONSENT_REDIRECT_URI` to that exact URL, deploy the matching backend/frontend, run deployment smoke plus the authenticated two-MSP canary through the branded domain, and prove scheduler delivery. Only then may the legacy Render subdomain be disabled.
+- The Render Blueprint still declares the Free instance because changing instance type creates a billing consequence that was not authorized in code. Render documents that Free web services are not for production and spin down after inactivity; upgrading the live API to an always-on paid instance remains a required operator action before launch.
+- Clean local validation passed the branded public-runtime suite **9/9**, authenticated canary runner **4/4**, backend GitHub OIDC suite **9/9**, frontend TypeScript, lint with zero warnings/errors, and the Next production build with **21/21** pages. Backend TypeScript passed after generating the current Prisma client; the final esbuild packaging step could not run through the temporary cross-worktree dependency junction, while the unchanged packaging command remains covered by pull-request CI. No Render variable, Microsoft callback, app registration, frontend publication, scheduler, customer consent, tenant data, or billing setting was changed by this branch.
 
 ## P0 — authenticated two-MSP post-deployment canary (merged via PR #190; backend deployed, activation pending)
 

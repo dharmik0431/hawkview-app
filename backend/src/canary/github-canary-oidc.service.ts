@@ -2,7 +2,7 @@ import { Injectable, UnauthorizedException } from '@nestjs/common'
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose'
 
 export const HAWKVIEW_CANARY_AUDIENCE =
-  'https://hawkview-api-dev.onrender.com/api/internal/canary/sessions'
+  'https://api.hawkviewapp.com/api/internal/canary/sessions'
 export const HAWKVIEW_GITHUB_REPOSITORY = 'dharmik0431/hawkview-app'
 export const HAWKVIEW_GITHUB_REPOSITORY_ID = '1227480788'
 export const HAWKVIEW_CANARY_WORKFLOW_REF =

@@ -1,5 +1,5 @@
 const DEFAULT_TARGET_URL =
-  'https://hawkview-api-dev.onrender.com/api/internal/sync/due-tenants'
+  'https://api.hawkviewapp.com/api/internal/sync/due-tenants'
 
 const targetUrl =
   process.env.SCHEDULER_TARGET_URL?.trim() || DEFAULT_TARGET_URL

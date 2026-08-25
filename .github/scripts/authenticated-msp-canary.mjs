@@ -1,8 +1,8 @@
 import { pathToFileURL } from 'node:url'
 
 export const CANARY_AUDIENCE =
-  'https://hawkview-api-dev.onrender.com/api/internal/canary/sessions'
-export const API_ORIGIN = 'https://hawkview-api-dev.onrender.com'
+  'https://api.hawkviewapp.com/api/internal/canary/sessions'
+export const API_ORIGIN = 'https://api.hawkviewapp.com'
 const FULL_GIT_REVISION = /^[0-9a-f]{40}$/i
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
