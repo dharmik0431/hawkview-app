@@ -25,10 +25,10 @@ jobs:
           node <<'NODE'
           const expectedRevision = process.env.EXPECTED_REVISION?.trim().toLowerCase()
           const checks = [
-            ['https://hawkview-api-dev.onrender.com/health', value =>
+            ['https://api.hawkviewapp.com/health', value =>
               value?.status === 'ok' &&
               (!expectedRevision || value?.revision === expectedRevision)],
-            ['https://hawkview-api-dev.onrender.com/health/database', value =>
+            ['https://api.hawkviewapp.com/health/database', value =>
               value?.status === 'ok' && value?.database === 'connected' && value?.schema === 'current'],
           ]
 

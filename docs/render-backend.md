@@ -20,7 +20,7 @@ development and publishing surface.
 | `FRONTEND_ORIGINS`                     | Comma-separated published and preview frontend origins, without paths                     |
 | `FRONTEND_APP_URL`                     | The published HawkView frontend origin, without a trailing slash                          |
 | `GAS_PREVIEW_PROJECT_NUMBER`           | `660434798674`                                                                            |
-| `MICROSOFT_ADMIN_CONSENT_REDIRECT_URI` | `https://hawkview-api-dev.onrender.com/api/tenants/microsoft/admin-consent/callback`      |
+| `MICROSOFT_ADMIN_CONSENT_REDIRECT_URI` | `https://api.hawkviewapp.com/api/tenants/microsoft/admin-consent/callback`               |
 | `MICROSOFT_REQUIRED_PERMISSIONS`       | The same permission list currently configured on the API                                  |
 | `SCHEDULER_SHARED_SECRET`              | A random value of at least 32 characters; use the same value in the replacement scheduler |
 
@@ -43,7 +43,7 @@ passes against the Render URL:
    `POST /api/internal/sync/due-tenants` successfully.
 
 Only after these checks pass should `NEXT_PUBLIC_API_URL` be permanently changed
-to `https://hawkview-api-dev.onrender.com` and the Cloud Run service and Google
+to `https://api.hawkviewapp.com` and the Cloud Run service and Google
 Cloud Scheduler be disabled.
 
 ## Instance choice

@@ -14,6 +14,11 @@ import {
   resolveSupabaseOrigin,
 } from './public-runtime-config.ts'
 
+test('pins production HawkView traffic to the branded public domains', () => {
+  assert.equal(CANONICAL_HAWKVIEW_API_ORIGIN, 'https://api.hawkviewapp.com')
+  assert.equal(CANONICAL_HAWKVIEW_APP_ORIGIN, 'https://console.hawkviewapp.com')
+})
+
 test('production always resolves Supabase authentication to the canonical project', () => {
   for (const value of [
     undefined,
@@ -42,7 +47,7 @@ test('production always resolves HawkView data requests to the canonical API', (
     'https://attacker.example',
     `${CANONICAL_HAWKVIEW_API_ORIGIN}/auth/bootstrap`,
     `${CANONICAL_HAWKVIEW_API_ORIGIN}#fragment`,
-    'https://user:password@hawkview-api-dev.onrender.com',
+    'https://user:password@api.hawkviewapp.com',
   ]) {
     assert.equal(
       resolveHawkViewApiOrigin(value, 'production'),

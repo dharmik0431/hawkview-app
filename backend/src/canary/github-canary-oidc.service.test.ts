@@ -2,10 +2,18 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   assertGitHubCanaryClaims,
+  HAWKVIEW_CANARY_AUDIENCE,
   HAWKVIEW_CANARY_WORKFLOW_REF,
   HAWKVIEW_GITHUB_REPOSITORY,
   HAWKVIEW_GITHUB_REPOSITORY_ID,
 } from './github-canary-oidc.service.js'
+
+test('pins GitHub OIDC to the branded production API audience', () => {
+  assert.equal(
+    HAWKVIEW_CANARY_AUDIENCE,
+    'https://api.hawkviewapp.com/api/internal/canary/sessions',
+  )
+})
 
 const now = 1_800_000_000
 const revision = 'a'.repeat(40)

@@ -12,6 +12,14 @@ const ids = {
 const tokenA = `a.${'x'.repeat(120)}.a`
 const tokenB = `b.${'x'.repeat(120)}.b`
 
+test('targets only the branded production API', () => {
+  assert.equal(API_ORIGIN, 'https://api.hawkviewapp.com')
+  assert.equal(
+    CANARY_AUDIENCE,
+    'https://api.hawkviewapp.com/api/internal/canary/sessions',
+  )
+})
+
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,

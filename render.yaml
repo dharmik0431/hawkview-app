@@ -3,6 +3,12 @@ services:
     name: hawkview-api-dev
     runtime: docker
     plan: free
+    domains:
+      - api.hawkviewapp.com
+    # Keep the legacy Render hostname reachable until the frontend, scheduler,
+    # Microsoft callback, smoke check, and authenticated canary all pass through
+    # the branded domain. Disable it in a later verified cutover.
+    renderSubdomainPolicy: enabled
     region: ohio
     dockerContext: ./backend
     dockerfilePath: ./backend/Dockerfile

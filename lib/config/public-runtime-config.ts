@@ -3,7 +3,7 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/
 export const CANONICAL_SUPABASE_ORIGIN =
   'https://lvjqyvrtlkmhseelofda.supabase.co'
 export const CANONICAL_HAWKVIEW_API_ORIGIN =
-  'https://hawkview-api-dev.onrender.com'
+  'https://api.hawkviewapp.com'
 export const CANONICAL_HAWKVIEW_APP_ORIGIN = 'https://console.hawkviewapp.com'
 
 type RuntimeEnvironment = 'development' | 'production' | 'test' | undefined
