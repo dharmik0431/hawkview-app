@@ -506,3 +506,25 @@ Status: combined backend/frontend implementation on `codex/p0-msp-workspace-onbo
 Deployment prerequisite: apply `20260820200000_add_msp_organization_onboarding` before starting the matching backend. Deploy the matching backend before publishing the frontend/GAS gate. GAS remains user-managed and must be pulled from merged `main` and published separately after backend health/migration verification.
 
 Final QA validation includes the complete backend suite with 258 passed and two intentional legacy SharePoint REST skips, 94 frontend helper/source tests, 19 focused onboarding/organization/synchronization tests, root and backend TypeScript, frontend lint, Prisma validation with a non-production placeholder URL, both production builds, and exact diff/scope checks. The clean integration rerun reproduced the full test, TypeScript, lint, Prisma, root production-build, and diff/scope passes. Its backend TypeScript phase passed, but the local Windows sandbox blocked esbuild from traversing an ancestor directory before it could resolve `src/main.ts`; no source or build-configuration diagnostic was emitted, and the final independent QA backend build remains the clean-runner confirmation. Initial QA findings covering concurrency, active-owner policy, organization selection, cross-tab/late-response races, deceptive domain input, inactive organizations, and stale Admin profile state were repaired before the final P0=0/P1=0 approval.
+## P1 — HawkView authentication email branding (repository package; production activation pending)
+
+- All email currently initiated by HawkView is delivered through hosted Supabase Auth: signup confirmation, workspace
+  invitation, invited-user setup recovery, and password reset. The release also owns branded templates for Supabase
+  magic-link, reauthentication, email-change, and security-notification messages so a future dashboard toggle cannot
+  expose default Supabase copy.
+- One version-controlled manifest supplies a compact, accessible HawkView HTML shell and concise transactional
+  subjects for all 13 supported message types. It preserves the existing `ConfirmationURL` and OTP variables, adds no
+  auth callback or redirect behavior, includes no remote image/tracking pixel, and never interpolates user-controlled
+  profile, address, phone, provider, or factor text into HTML.
+- The guarded management utility defaults to an explicit `--check` or `--apply` mode, requires a short-lived Supabase
+  management token and exact project reference, and requires a second exact project-reference confirmation before any
+  write. It updates only differing managed subject/body fields, verifies them with a second read, prints no template
+  bodies or secrets, and does not change SMTP credentials, confirmation policy, redirect URLs, rate limits, or
+  security-notification enablement.
+- Production activation remains a deliberate Supabase operator step after code review: verify the dedicated
+  `auth.hawkviewapp.com` sending domain with custom SMTP, configure SPF/DKIM/DMARC, disable email tracking/link
+  rewriting, apply the manifest, and execute the documented signup/invite/recovery/security acceptance matrix. The
+  repository release alone does not alter live email delivery.
+- Local validation: focused email-template tests **5/5 pass** and `git diff --check` passes. Exact local scope is this
+  PM record, the template manifest/test, the guarded management utility, and the operator runbook. No account, email,
+  SMTP, DNS, Supabase, Render, GAS, tenant, permission, schema, migration, or live state has changed.
