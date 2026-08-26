@@ -55,6 +55,7 @@ export function authenticatedIdentityFromSupabasePayload(
       payload.user_metadata?.full_name?.trim() ||
       undefined,
     signInProvider: payload.app_metadata?.provider,
+    assuranceLevel: payload.aal,
   }
 }
 

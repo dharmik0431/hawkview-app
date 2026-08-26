@@ -5,6 +5,8 @@ export interface AuthenticatedIdentity {
   email: string
   displayName?: string
   signInProvider?: string
+  /** Always present for identities produced by IdentityTokenVerifier. */
+  assuranceLevel?: 'aal1' | 'aal2'
 }
 
 export interface AuthenticatedRequest extends Request {

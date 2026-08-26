@@ -6,15 +6,14 @@ import { useNotifications } from '@/components/providers/notification-provider'
 import { supabase } from '@/lib/auth/supabase'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { MfaSecurityPanel } from '@/components/auth/mfa-security-panel'
 import {
   KeyRound,
-  ShieldCheck,
   Laptop,
   Lock,
   Loader2,
   CheckCircle2,
   Info,
-  Shield,
   Globe,
 } from 'lucide-react'
 function parseAuthError(error: any): string {
@@ -232,39 +231,7 @@ export default function SecuritySettingsPage() {
       </div>
 
       {/* SECTION 2: MULTI-FACTOR AUTHENTICATION */}
-      <div className="rounded-xl border border-border bg-card p-6 text-card-foreground shadow-sm">
-        <div className="flex items-center justify-between border-b border-border pb-4 mb-5">
-          <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-              <ShieldCheck className="h-5 w-5" aria-hidden="true" />
-            </div>
-            <div>
-              <h2 className="text-base font-semibold text-foreground">
-                Multi-Factor Authentication
-              </h2>
-              <p className="text-xs text-muted-foreground mt-0.5">
-                Authentication information available to HawkView.
-              </p>
-            </div>
-          </div>
-
-          <span className="inline-flex items-center rounded-md bg-muted px-2.5 py-1 text-xs font-semibold text-muted-foreground ring-1 ring-inset ring-border">
-            Not reported
-          </span>
-        </div>
-
-        <p className="text-xs text-muted-foreground leading-relaxed mb-4">
-          HawkView does not currently receive a reliable enrollment status for
-          your own HawkView sign-in. Configure or reset MFA through the account
-          provider shown above. This is separate from the Microsoft 365 tenant
-          MFA data HawkView monitors for customers.
-        </p>
-
-        <div className="flex items-center gap-2 pt-4 border-t border-border text-xs text-muted-foreground">
-          <Shield className="h-4 w-4 text-blue-500 shrink-0" aria-hidden="true" />
-          <span>No enrollment or recovery action is inferred by HawkView.</span>
-        </div>
-      </div>
+      <MfaSecurityPanel />
 
       {/* SECTION 3: CURRENT SESSION */}
       <div className="rounded-xl border border-border bg-card p-6 text-card-foreground shadow-sm">

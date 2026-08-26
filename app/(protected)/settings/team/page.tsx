@@ -240,6 +240,7 @@ function isValidEmail(email: string): boolean {
 function MemberActionMenu({
   member,
   isFinalOwner,
+  isSelf,
   onAccountDetails,
   onChangeRole,
   onResendInvitation,
@@ -251,6 +252,7 @@ function MemberActionMenu({
 }: {
   member: Member
   isFinalOwner: boolean
+  isSelf: boolean
   onAccountDetails: (m: Member) => void
   onChangeRole: (m: Member) => void
   onResendInvitation: (m: Member) => void
@@ -323,8 +325,9 @@ function MemberActionMenu({
 
           {/* Reset HawkView MFA */}
           <DropdownMenu.Item
+            disabled={isSelf}
             onSelect={() => onMfaReset(member)}
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
+            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer data-[disabled]:opacity-50 data-[disabled]:pointer-events-none"
           >
             <ShieldCheck className="h-3.5 w-3.5 text-muted-foreground" />
             <span>Reset HawkView MFA</span>
@@ -957,6 +960,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
       if (action === 'SUSPEND' || action === 'REMOVE') {
         if (isSelf || isFinal) return false
       }
+      if (action === 'MFA_RESET' && isSelf) return false
       return true
     })
 
@@ -2308,6 +2312,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                             <MemberActionMenu
                               member={member}
                               isFinalOwner={isFinalOwner}
+                              isSelf={isSelf}
                               onAccountDetails={setAccountDrawerMember}
                               onChangeRole={setRoleChangeMember}
                               onResendInvitation={handleResendInvitation}
@@ -2402,6 +2407,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                           <MemberActionMenu
                             member={member}
                             isFinalOwner={isFinalOwner}
+                            isSelf={isSelf}
                             onAccountDetails={setAccountDrawerMember}
                             onChangeRole={setRoleChangeMember}
                             onResendInvitation={handleResendInvitation}
@@ -2804,7 +2810,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                   <p className="text-[11px] text-muted-foreground">Mandate multi-factor authentication for all workspace members.</p>
                 </div>
                 <span className="text-xs text-muted-foreground font-medium bg-muted px-2.5 py-1 rounded border border-border/60">
-                  Configuration unavailable
+                  Enforced for all members
                 </span>
               </div>
 
@@ -3697,7 +3703,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
               )}
               {confirmModal.type === 'MFA_RESET' && (
                 <p>
-                  This removes multi-factor authentication enrollment for their <strong>HawkView account</strong>. The member will be required to re-enroll MFA on their next HawkView sign-in. This does not alter Microsoft Entra ID or M365 MFA.
+                  This removes every authenticator from their <strong>HawkView account</strong>, signs out their active sessions, and requires enrollment again. This does not alter Microsoft Entra ID or M365 MFA.
                 </p>
               )}
               {confirmModal.type === 'REMOVE' && (

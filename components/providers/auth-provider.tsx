@@ -25,6 +25,7 @@ import {
   WorkspaceChangeSignalGuard,
   subscribeWorkspaceChanges,
 } from '@/lib/auth/workspace-onboarding-sync'
+import { mfaAccessStatus } from '@/lib/auth/mfa'
 
 interface AuthContextValue {
   identityUser: User | null
@@ -32,8 +33,34 @@ interface AuthContextValue {
   isLoading: boolean
   configurationError: boolean
   cacheScope: string
+  mfa: HawkViewMfaState
+  refreshMfa: () => Promise<HawkViewMfaState>
   refreshSession: () => Promise<HawkViewSession | null>
   signOut: () => Promise<void>
+}
+
+export type HawkViewMfaFactor = {
+  id: string
+  friendlyName: string
+  createdAt: string | null
+  updatedAt: string | null
+}
+
+export type HawkViewMfaState = {
+  status:
+    | 'signed-out'
+    | 'loading'
+    | 'enrollment-required'
+    | 'challenge-required'
+    | 'verified'
+    | 'error'
+  factors: HawkViewMfaFactor[]
+  message?: string
+}
+
+const signedOutMfaState: HawkViewMfaState = {
+  status: 'signed-out',
+  factors: [],
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -42,6 +69,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [identityUser, setIdentityUser] = useState<User | null>(null)
   const [session, setSession] = useState<HawkViewSession | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [mfa, setMfa] = useState<HawkViewMfaState>(signedOutMfaState)
   const transitionGuard = useRef(new AuthTransitionGuard())
   const workspaceSignalGuard = useRef(new WorkspaceChangeSignalGuard())
   const passiveRefreshLimiter = useRef(new PassiveWorkspaceRefreshLimiter())
@@ -68,11 +96,68 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       bootstrapInFlight.current = null
       setIdentityUser(user)
       commitSession(null)
+      setMfa(user ? { status: 'loading', factors: [] } : signedOutMfaState)
       setIsLoading(Boolean(user?.email_confirmed_at))
       return ticket
     },
     [commitSession]
   )
+
+  const refreshMfa = useCallback(async (): Promise<HawkViewMfaState> => {
+    if (!supabase) {
+      const unavailable: HawkViewMfaState = {
+        status: 'error',
+        factors: [],
+        message: 'HawkView authentication is not configured.',
+      }
+      setMfa(unavailable)
+      return unavailable
+    }
+
+    const sessionResult = await supabase.auth.getSession()
+    const subject = sessionResult.data.session?.user.id
+    if (!subject) {
+      setMfa(signedOutMfaState)
+      return signedOutMfaState
+    }
+
+    const [assurance, factorResult] = await Promise.all([
+      supabase.auth.mfa.getAuthenticatorAssuranceLevel(),
+      supabase.auth.mfa.listFactors(),
+    ])
+    if (assurance.error || factorResult.error) {
+      const failed: HawkViewMfaState = {
+        status: 'error',
+        factors: [],
+        message:
+          assurance.error?.message ||
+          factorResult.error?.message ||
+          'MFA status could not be verified.',
+      }
+      setMfa(failed)
+      return failed
+    }
+
+    const current = await supabase.auth.getSession()
+    if (current.data.session?.user.id !== subject) return signedOutMfaState
+
+    const factors = factorResult.data.totp.map((factor) => ({
+      id: factor.id,
+      friendlyName: factor.friendly_name || 'Authenticator app',
+      createdAt: factor.created_at || null,
+      updatedAt: factor.updated_at || null,
+    }))
+    const next: HawkViewMfaState = {
+      status: mfaAccessStatus(
+        assurance.data.currentLevel,
+        assurance.data.nextLevel,
+        factors.length,
+      ),
+      factors,
+    }
+    setMfa(next)
+    return next
+  }, [])
 
   const bootstrapIdentity = useCallback(
     (user: User, ticket: AuthTransitionTicket) => {
@@ -94,6 +179,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             before.data.session.user.id !== user.id ||
             !transitionGuard.current.isCurrent(ticket)
           ) {
+            return null
+          }
+
+          const mfaState = await refreshMfa()
+          if (
+            mfaState.status !== 'verified' ||
+            !transitionGuard.current.isCurrent(ticket)
+          ) {
+            commitSession(null)
             return null
           }
 
@@ -124,7 +218,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       bootstrapInFlight.current = { ticket, promise }
       return promise
     },
-    [commitSession]
+    [commitSession, refreshMfa]
   )
 
   const refreshSession = useCallback(async () => {
@@ -173,7 +267,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return
       }
 
-      if (subjectChanged || !sessionRef.current || _event === 'USER_UPDATED') {
+      if (
+        subjectChanged ||
+        !sessionRef.current ||
+        _event === 'USER_UPDATED' ||
+        _event === 'MFA_CHALLENGE_VERIFIED'
+      ) {
         setIsLoading(true)
         // Return from the auth callback before invoking another Supabase auth
         // method; late results are guarded by the transition ticket.
@@ -252,10 +351,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isLoading,
       configurationError: !isSupabaseConfigured,
       cacheScope,
+      mfa,
+      refreshMfa,
       refreshSession,
       signOut,
     }),
-    [cacheScope, identityUser, isLoading, refreshSession, session, signOut]
+    [cacheScope, identityUser, isLoading, mfa, refreshMfa, refreshSession, session, signOut]
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
