@@ -28,6 +28,24 @@ const GRAPH_RESOURCE_HOST = 'graph.microsoft.com'
 const MANAGEMENT_RESOURCE_HOST = 'manage.office.com'
 const SHAREPOINT_RESOURCE_APP_ID = '00000003-0000-0ff1-ce00-000000000000'
 const DEPRECATED_SHAREPOINT_FULL_CONTROL = 'sites.fullcontrol.all'
+export const PRODUCTION_MICROSOFT_ADMIN_CONSENT_REDIRECT_URI =
+  'https://api.hawkviewapp.com/api/tenants/microsoft/admin-consent/callback'
+
+/**
+ * Production consent is a code-owned security boundary. Render variables may
+ * survive a domain migration because Blueprint `sync: false` values are not
+ * overwritten by a deploy, so production must never trust that mutable value
+ * to choose the OAuth callback authority.
+ */
+export function resolveMicrosoftAdminConsentRedirectUri(
+  configured: string | undefined,
+  nodeEnvironment: string | undefined = process.env.NODE_ENV,
+): string | null {
+  if (nodeEnvironment?.trim().toLowerCase() === 'production') {
+    return PRODUCTION_MICROSOFT_ADMIN_CONSENT_REDIRECT_URI
+  }
+  return configured?.trim() || null
+}
 
 type ConfiguredPermissionOverride = {
   name: string
@@ -129,6 +147,7 @@ interface MicrosoftOrganization {
 export class MicrosoftConsentService {
   private readonly logger = new Logger(MicrosoftConsentService.name)
   private rejectedPermissionOverrideWarning?: string
+  private redirectConfigurationWarningEmitted = false
   constructor(
     @Inject(PrismaService)
     private readonly prisma: PrismaService,
@@ -137,11 +156,26 @@ export class MicrosoftConsentService {
   ) {}
 
   private async getStateConfiguration() {
-    const redirectUri = process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI?.trim()
+    const configuredRedirectUri =
+      process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI?.trim()
+    const redirectUri = resolveMicrosoftAdminConsentRedirectUri(
+      configuredRedirectUri,
+    )
 
     if (!redirectUri) {
       throw new ServiceUnavailableException(
         'Microsoft tenant consent is not configured yet.'
+      )
+    }
+    if (
+      process.env.NODE_ENV?.trim().toLowerCase() === 'production' &&
+      configuredRedirectUri &&
+      configuredRedirectUri !== redirectUri &&
+      !this.redirectConfigurationWarningEmitted
+    ) {
+      this.redirectConfigurationWarningEmitted = true
+      this.logger.warn(
+        'Ignored a non-canonical Microsoft admin-consent redirect URI in production.',
       )
     }
     const stateSecret = await this.secretStore.accessOrCreate(
