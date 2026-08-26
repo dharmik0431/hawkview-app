@@ -1,10 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 180" role="img" aria-label="HawkView">
   <rect width="720" height="180" rx="20" fill="#0F172A"/>
-  <g transform="translate(20 8) scale(.64)">
-    <path fill="#FFFFFF" d="M18 44c39 6 76 18 108 36 26 14 47 28 66 38 14 7 29 9 46 7l-15 15c-11 10-25 15-42 15h-18l-28 28-19-9 21-24-30-18-47-9-26-26 52 12 36 14-30-27C69 69 44 56 18 44Z"/>
-    <path fill="#3B82F6" d="M35 79c31 7 62 18 91 34l31 18-18 14-30-17-48-11-26-38Z"/>
-    <path fill="#60A5FA" d="M55 111c20 5 40 12 59 22l15 9-13 11-18-10-25-7-18-25Z"/>
-    <path fill="#FFFFFF" d="M199 118c14-13 27-19 39-17-5 10-12 18-23 24l-16-7Z"/>
+  <g transform="translate(20 22) scale(.70)">
+    <path fill="#FFFFFF" d="M12 18c49 14 98 37 137 66 13 10 20 25 34 32 13 7 28-2 40 5 7 4 10 11 9 19-5-4-10-2-13 5-11 11-28 16-48 16h-36l21-19c6-6 6-11-1-17C120 96 72 53 12 18Z"/>
+    <path fill="#3B82F6" d="M31 54c43 14 81 34 114 57l25 19-14 12-18-13c-30-23-63-40-97-50L31 54Z"/>
+    <path fill="#FFFFFF" d="M54 91c34 11 64 27 89 47l10 8-24 17-32 17H55l60-38c-17-13-37-24-53-30L54 91Z"/>
   </g>
-  <text x="202" y="118" fill="#FFFFFF" font-family="Manrope, Inter, Arial, sans-serif" font-size="76" font-weight="700" letter-spacing="-2.5">HawkView</text>
+  <text x="210" y="118" fill="#FFFFFF" font-family="Manrope, Inter, Arial, sans-serif" font-size="76" font-weight="700" letter-spacing="-2.5">HawkView</text>
 </svg>
