@@ -33,6 +33,10 @@ import {
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 import { deriveTenantSyncFreshness } from './service-sync-freshness.js'
 import {
+  deriveInitialSyncStatus,
+  initialSyncStateRequiresAction,
+} from './initial-sync-status.js'
+import {
   deriveAuditReconciliationResources,
   type AuditReconciliationResource,
 } from './audit-change-reconciliation.js'
@@ -1012,6 +1016,8 @@ interface TenantSyncTarget {
     clientId: string | null
     credentialReference: string | null
     lastVerifiedAt: Date | null
+    consentedAt: Date | null
+    onboardingCompletedAt: Date | null
     exchangeReadOnlyEnabledAt: Date | null
   } | null
 }
@@ -1109,6 +1115,8 @@ export class TenantSyncService {
             clientId: true,
             credentialReference: true,
             lastVerifiedAt: true,
+            consentedAt: true,
+            onboardingCompletedAt: true,
             exchangeReadOnlyEnabledAt: true,
           },
         },
@@ -1254,6 +1262,8 @@ export class TenantSyncService {
             clientId: true,
             credentialReference: true,
             lastVerifiedAt: true,
+            consentedAt: true,
+            onboardingCompletedAt: true,
             exchangeReadOnlyEnabledAt: true,
           },
         },
@@ -1821,35 +1831,60 @@ export class TenantSyncService {
         customerTenantId: tenant.id,
         lastAttemptAt: { gte: now },
       },
-      select: { resourceType: true, status: true },
+      select: {
+        resourceType: true,
+        status: true,
+        lastAttemptAt: true,
+        lastSuccessfulAt: true,
+        lastErrorCode: true,
+        lastErrorMessage: true,
+      },
     })
-    const failedResources = attemptedStates
-      .filter((state) => state.status === 'FAILED')
+    const failedStates = attemptedStates.filter(
+      (state) => state.status === 'FAILED',
+    )
+    const failedResources = failedStates.map((state) => state.resourceType)
+    const actionRequiredResources = failedStates
+      .filter(initialSyncStateRequiresAction)
+      .map((state) => state.resourceType)
+    const retryingResources = failedStates
+      .filter((state) => !initialSyncStateRequiresAction(state))
       .map((state) => state.resourceType)
     const initialSync = !existingState?.lastSuccessfulAt
     if (initialSync) {
+      const actionRequired = actionRequiredResources.length > 0
+      const retrying = !actionRequired && retryingResources.length > 0
       await this.notifications.publishIncident({
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
-        eventType:
-          failedResources.length > 0
-            ? 'tenant.initial_sync_partial'
+        eventType: actionRequired
+          ? 'tenant.initial_sync_action_required'
+          : retrying
+            ? 'tenant.initial_sync_in_progress'
             : 'tenant.initial_sync_completed',
-        category: failedResources.length > 0 ? 'warning' : 'success',
-        severity: failedResources.length > 0 ? 'medium' : 'info',
+        category: actionRequired ? 'warning' : retrying ? 'info' : 'success',
+        severity: actionRequired ? 'medium' : 'info',
         title:
-          failedResources.length > 0
-            ? 'Initial tenant sync completed with gaps'
-            : 'Initial tenant sync completed',
+          actionRequired
+            ? 'Initial tenant sync needs attention'
+            : retrying
+              ? 'Initial tenant sync in progress'
+              : 'Initial tenant sync completed',
         description:
-          failedResources.length > 0
-            ? `${failedResources.length} data source${failedResources.length === 1 ? '' : 's'} could not be collected. HawkView will retry automatically.`
-            : 'HawkView finished collecting the tenant data required for monitoring.',
+          actionRequired
+            ? `${actionRequiredResources.length} data source${actionRequiredResources.length === 1 ? '' : 's'} requires administrator action before collection can finish.`
+            : retrying
+              ? `HawkView is still collecting Microsoft 365 data and will automatically retry ${retryingResources.length} data source${retryingResources.length === 1 ? '' : 's'}. No action is required yet.`
+              : 'HawkView finished collecting the tenant data required for monitoring.',
         dedupeKey: `tenant:${tenant.id}:initial-sync`,
         source: 'tenant-sync',
         actionUrl: `/tenants/${tenant.id}`,
         actionLabel: 'View tenant',
-        metadata: { failedResources },
+        metadata: {
+          failedResources,
+          retryingResources,
+          actionRequiredResources,
+        },
       })
     }
     return {
@@ -4531,6 +4566,8 @@ export class TenantSyncService {
     status: string
     connection: {
       lastVerifiedAt: Date | null
+      consentedAt: Date | null
+      onboardingCompletedAt: Date | null
       exchangeReadOnlyEnabledAt: Date | null
     } | null
   }) {
@@ -5229,6 +5266,13 @@ export class TenantSyncService {
         ? new Date(Math.max(...successfulDates.map((date) => date.getTime())))
         : null
     const syncFreshness = deriveTenantSyncFreshness(syncStates)
+    const initialSync = deriveInitialSyncStatus({
+      startedAt:
+        tenant.connection?.onboardingCompletedAt ??
+        tenant.connection?.consentedAt ??
+        null,
+      syncStates,
+    })
 
     return {
       bundle: {
@@ -5253,6 +5297,7 @@ export class TenantSyncService {
           ),
           lastSync: lastSync?.toISOString() ?? null,
           syncFreshness,
+          initialSync,
         },
         dns: (() => {
           const selectedDomain =

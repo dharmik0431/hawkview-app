@@ -175,15 +175,17 @@ export function TenantOverview({
 
   // Default to Active issues whenever unresolved issues exist; otherwise Recommendations
   const [activeTab, setActiveTab] = useState<'issues' | 'recommendations'>(
-    display.issueCount > 0 ? 'issues' : 'recommendations'
+    display.issueCount > 0 || display.state === 'syncing'
+      ? 'issues'
+      : 'recommendations'
   )
 
   // Update tab if issue count changes
   useEffect(() => {
-    if (display.issueCount > 0) {
+    if (display.issueCount > 0 || display.state === 'syncing') {
       setActiveTab('issues')
     }
-  }, [display.issueCount])
+  }, [display.issueCount, display.state])
 
   // Escape key handler for remediation drawer
   useEffect(() => {
@@ -201,6 +203,7 @@ export function TenantOverview({
     (bundle as any)?.missingPermissions?.length > 0
 
   const connectionState = display.connection
+  const isSyncProgress = display.state === 'syncing'
 
   const connectionLabel = missingPerms
     ? 'Permission required'
@@ -213,16 +216,27 @@ export function TenantOverview({
           : 'Not verified'
 
   const hasUrgentAttention =
-    display.issueCount > 0 || missingPerms || display.state === 'needs-attention'
+    !isSyncProgress &&
+    (display.issueCount > 0 || missingPerms || display.state === 'needs-attention')
 
   const lastSyncText = display.lastSuccessfulSync
     ? formatTenantTimestamp(display.lastSuccessfulSync)
     : 'No successful sync'
 
   const issueCountText =
-    display.issueCount === 1
+    isSyncProgress
+      ? 'This can take a few minutes'
+      : display.issueCount === 1
       ? '1 actionable issue'
       : `${display.issueCount} actionable issues`
+
+  const summaryLabel = isSyncProgress
+    ? display.isInitialSync
+      ? 'Initial sync in progress'
+      : 'Synchronization in progress'
+    : hasUrgentAttention
+      ? 'Needs Attention'
+      : 'Healthy'
 
   return (
     <div className="space-y-5">
@@ -230,20 +244,24 @@ export function TenantOverview({
       <div
         className={cn(
           'flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-4 py-3 text-[14px] rounded-xs transition-colors',
-          hasUrgentAttention
+          isSyncProgress
+            ? 'border-l-2 border-l-blue-500 bg-blue-50/50 dark:bg-blue-950/20 text-slate-800 dark:text-slate-200'
+            : hasUrgentAttention
             ? 'border-l-2 border-l-amber-500 bg-amber-50/40 dark:bg-amber-950/20 text-slate-800 dark:text-slate-200'
             : 'border-l-2 border-l-emerald-500 bg-slate-50 dark:bg-slate-900/60 text-slate-700 dark:text-slate-300'
         )}
       >
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          {hasUrgentAttention ? (
+          {isSyncProgress ? (
+            <RefreshCw className="h-4 w-4 text-blue-600 shrink-0 animate-spin" aria-hidden="true" />
+          ) : hasUrgentAttention ? (
             <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" aria-hidden="true" />
           ) : (
             <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" aria-hidden="true" />
           )}
 
           <span className="text-[15px] font-semibold text-slate-900 dark:text-white">
-            {hasUrgentAttention ? 'Needs Attention' : 'Healthy'}
+            {summaryLabel}
           </span>
 
           <span className="text-slate-300 dark:text-slate-700">•</span>
@@ -252,11 +270,18 @@ export function TenantOverview({
 
           <span className="text-slate-300 dark:text-slate-700">•</span>
 
-          <span>Last successful sync {lastSyncText}</span>
+          <span>
+            {isSyncProgress
+              ? 'Collecting Microsoft 365 data'
+              : `Last successful sync ${lastSyncText}`}
+          </span>
 
           <span className="text-slate-300 dark:text-slate-700">•</span>
 
-          <span className={cn(display.issueCount > 0 && 'font-semibold text-amber-700 dark:text-amber-400')}>
+          <span className={cn(
+            isSyncProgress && 'font-medium text-blue-700 dark:text-blue-300',
+            !isSyncProgress && display.issueCount > 0 && 'font-semibold text-amber-700 dark:text-amber-400'
+          )}>
             {issueCountText}
           </span>
         </div>
@@ -383,6 +408,18 @@ export function TenantOverview({
                     </div>
                   ))}
                 </div>
+              ) : isSyncProgress ? (
+                <div className="py-10 px-5 text-center text-[14px] text-slate-600 dark:text-slate-300 flex flex-col items-center justify-center gap-2 rounded-md border border-blue-200/80 dark:border-blue-900 bg-blue-50/40 dark:bg-blue-950/20">
+                  <RefreshCw className="h-6 w-6 text-blue-600 dark:text-blue-400 animate-spin" aria-hidden="true" />
+                  <span className="font-semibold text-slate-900 dark:text-white">
+                    {display.isInitialSync
+                      ? 'Initial synchronization is in progress'
+                      : 'Synchronization is in progress'}
+                  </span>
+                  <span className="max-w-xl">
+                    HawkView is collecting Microsoft 365 data. Some services become available at different times, and temporary gaps are retried automatically. You can leave this page and return later.
+                  </span>
+                </div>
               ) : (
                 <div className="py-8 text-center text-[14px] text-slate-500 dark:text-slate-400 flex flex-col items-center justify-center gap-1">
                   <CheckCircle2 className="h-5 w-5 text-emerald-500" />
@@ -497,12 +534,24 @@ export function TenantOverview({
               </div>
             </div>
 
+            {isSyncProgress && (
+              <div>
+                <div className="text-xs text-slate-500 dark:text-slate-400 font-medium">Synchronization</div>
+                <div className="font-semibold text-blue-700 dark:text-blue-300 mt-0.5 flex items-center gap-1.5">
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                  <span>{display.isInitialSync ? 'Initial sync in progress' : 'In progress'}</span>
+                </div>
+              </div>
+            )}
+
             <div>
               <div className="text-xs text-slate-500 dark:text-slate-400 font-medium">Last successful sync</div>
               <div className="font-semibold text-slate-900 dark:text-white mt-0.5">
                 {display.lastSuccessfulSync
                   ? formatTenantTimestamp(display.lastSuccessfulSync)
-                  : 'No successful sync'}
+                  : isSyncProgress
+                    ? 'Collecting now'
+                    : 'No successful sync'}
               </div>
             </div>
 

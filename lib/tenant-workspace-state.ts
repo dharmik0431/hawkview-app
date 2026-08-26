@@ -64,12 +64,36 @@ function syncEntries(bundle: TenantBundle | null | undefined) {
   )
 }
 
-function newestSuccessfulSync(bundle: TenantBundle | null | undefined) {
+function newestSuccessfulSync(
+  bundle: TenantBundle | null | undefined,
+  notBefore?: string | null
+) {
+  const minimum = notBefore ? new Date(notBefore).getTime() : null
   const values = syncEntries(bundle)
     .map(([, sync]) => sync.lastSuccessfulAt)
     .filter((value): value is string => Boolean(value))
+    .filter(
+      (value) =>
+        minimum === null ||
+        Number.isNaN(minimum) ||
+        new Date(value).getTime() >= minimum
+    )
     .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())
-  return values[0] ?? (bundle?.tenant as any)?.lastSync ?? null
+  if (values[0]) return values[0]
+
+  const tenantLastSync = (bundle?.tenant as any)?.lastSync ?? null
+  if (!tenantLastSync || minimum === null || Number.isNaN(minimum)) {
+    return tenantLastSync
+  }
+  return new Date(tenantLastSync).getTime() >= minimum ? tenantLastSync : null
+}
+
+function resourceTypeForSyncEntry(service: string, sync: TenantSyncStatus) {
+  if (sync.resourceType) return sync.resourceType.toUpperCase()
+  return service
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .toUpperCase()
 }
 
 function connectionState(tenant: any): TenantConnectionState {
@@ -92,10 +116,35 @@ export function deriveTenantWorkspaceDisplay(
   const connection = connectionState(tenant)
   const entries = syncEntries(bundle)
   const issues: TenantIssue[] = []
+  const initialSync = tenant?.initialSync as
+    | {
+        status?: string
+        startedAt?: string | null
+        pendingResources?: string[]
+        retryingResources?: string[]
+        actionRequiredResources?: string[]
+      }
+    | undefined
+  const initialSyncStatus = normalized(initialSync?.status).replaceAll('-', '_')
+  const backendInitialSyncInProgress = initialSyncStatus === 'in_progress'
+  const backendInitialSyncDelayed = initialSyncStatus === 'delayed'
+  const deferredInitialSyncResources = new Set(
+    [
+      ...(initialSync?.pendingResources ?? []),
+      ...(initialSync?.retryingResources ?? []),
+    ].map((resource) => resource.toUpperCase())
+  )
 
   for (const [service, sync] of entries) {
     const status = normalized(sync.status)
     if (sync.lastError || ['failed', 'error', 'partial'].includes(status)) {
+      const resourceType = resourceTypeForSyncEntry(service, sync)
+      if (
+        (backendInitialSyncInProgress || backendInitialSyncDelayed) &&
+        deferredInitialSyncResources.has(resourceType)
+      ) {
+        continue
+      }
       const sLower = service.toLowerCase()
       const rawError = String(sync.lastError || '')
       const isForbidden = rawError.includes('403') || rawError.toLowerCase().includes('forbidden') || rawError.toLowerCase().includes('access denied')
@@ -110,7 +159,9 @@ export function deriveTenantWorkspaceDisplay(
         : sLower.includes('license') ? 'license-activity'
         : 'settings'
 
-      const serviceName = sLower.includes('group') ? 'Entra Groups'
+      const serviceName = sLower.includes('m365audit') ? 'Microsoft 365 audit'
+        : sLower.includes('signin') ? 'Sign-ins'
+        : sLower.includes('group') ? 'Entra Groups'
         : sLower.includes('user') ? 'Entra Users'
         : sLower.includes('entra') ? 'Entra ID'
         : sLower.includes('exchange') || sLower.includes('mailbox') ? 'Exchange'
@@ -215,13 +266,40 @@ export function deriveTenantWorkspaceDisplay(
     })
   }
 
-  const lastSuccessfulSync = newestSuccessfulSync(bundle)
-  const isInitialSync =
+  if (backendInitialSyncDelayed) {
+    issues.push({
+      id: 'initial-sync-delayed',
+      service: 'Microsoft 365',
+      severity: 'Warning',
+      title: 'Initial synchronization is taking longer than expected',
+      detail:
+        'HawkView is still collecting Microsoft 365 data and will continue retrying automatically.',
+      explanation:
+        'HawkView is still collecting Microsoft 365 data and will continue retrying automatically.',
+      impact:
+        'Some tenant pages may remain incomplete until the initial collection finishes.',
+      recommendedSteps: [
+        'Allow HawkView to continue retrying automatically.',
+        'Use Retry synchronization if you want to request another collection now.',
+      ],
+      action: 'Retry synchronization',
+      targetModule: 'settings',
+    })
+  }
+
+  const lastSuccessfulSync = newestSuccessfulSync(
+    bundle,
+    initialSync?.startedAt ?? null
+  )
+  const legacyInitialSync =
     connection === 'connected' &&
     !lastSuccessfulSync &&
     (manualSyncing || entries.some(([, s]) => ['pending', 'queued', 'running', 'syncing'].includes(normalized(s.status))))
+  const isInitialSync =
+    backendInitialSyncInProgress || backendInitialSyncDelayed || legacyInitialSync
   const isSyncing =
     manualSyncing ||
+    backendInitialSyncInProgress ||
     entries.some(([, s]) => ['pending', 'queued', 'running', 'syncing'].includes(normalized(s.status)))
 
   const explicitStale = Boolean(
