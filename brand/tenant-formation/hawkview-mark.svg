@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">HawkView Tenant Formation mark</title>
+  <desc id="desc">A forward-flying hawk formed by three nested observation paths.</desc>
+  <path fill="#0F2747" d="M18 44c39 6 76 18 108 36 26 14 47 28 66 38 14 7 29 9 46 7l-15 15c-11 10-25 15-42 15h-18l-28 28-19-9 21-24-30-18-47-9-26-26 52 12 36 14-30-27C69 69 44 56 18 44Z"/>
+  <path fill="#2563EB" d="M35 79c31 7 62 18 91 34l31 18-18 14-30-17-48-11-26-38Z"/>
+  <path fill="#60A5FA" d="M55 111c20 5 40 12 59 22l15 9-13 11-18-10-25-7-18-25Z"/>
+  <path fill="#0F2747" d="M199 118c14-13 27-19 39-17-5 10-12 18-23 24l-16-7Z"/>
+</svg>
