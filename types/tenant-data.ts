@@ -65,4 +65,5 @@ export type TenantSyncStatus = {
   status: string
   lastSuccessfulAt: string | null
   lastError: string | null
+  resourceType?: string
 }
