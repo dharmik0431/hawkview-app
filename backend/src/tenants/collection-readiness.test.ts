@@ -18,10 +18,10 @@ function sync(resourceType: string, overrides: Record<string, unknown> = {}) {
 }
 
 const allResources = [
-  'AUDIT_LOGS', 'SIGN_INS', 'USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES', 'ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE', 'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES', 'M365_AUDIT',
+  'AUDIT_LOGS', 'SIGN_INS', 'USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS', 'RISKY_USERS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES', 'ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE', 'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES', 'M365_AUDIT',
 ]
 
-const permissions = ['Organization.Read.All', 'User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory', 'UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'AuditLog.Read.All', 'Directory.Read.All', 'Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All', 'MailboxSettings.Read', 'ActivityFeed.Read', 'SecurityEvents.Read.All']
+const permissions = ['Organization.Read.All', 'User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory', 'UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'IdentityRiskyUser.Read.All', 'Application.Read.All', 'AuditLog.Read.All', 'Directory.Read.All', 'Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All', 'MailboxSettings.Read', 'ActivityFeed.Read', 'SecurityEvents.Read.All']
 
 function input(overrides: Record<string, unknown> = {}) {
   return {
@@ -117,6 +117,28 @@ test('uses authoritative service-plan semantics without treating pending plans a
     syncStates: allResources.map((resource) => sync(resource, resource === 'LICENSES' ? { lastSuccessfulAt: new Date('2026-08-16T00:00:00.000Z') } : {})),
   }))
   assert.equal(row(staleLicenses, 'exchange').state, 'UNVERIFIED')
+})
+
+test('keeps Microsoft Identity Protection risk explicitly P2-only', () => {
+  const p1Only = deriveCollectionReadiness(input())
+  const p1Dataset = row(p1Only, 'entra_identity_protection').datasets?.find(
+    (dataset) => dataset.key === 'entra_identity_protection_risky_users',
+  )
+  assert.equal(p1Dataset?.licensePrerequisite.kind, 'ENTRA_ID_P2')
+  assert.equal(p1Dataset?.licensePrerequisite.state, 'NOT_LICENSED')
+  assert.equal(p1Dataset?.state, 'NOT_LICENSED')
+
+  const p2 = deriveCollectionReadiness(input({
+    licenseServicePlans: [
+      ...(input().licenseServicePlans ?? []),
+      { servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' },
+    ],
+  }))
+  const p2Dataset = row(p2, 'entra_identity_protection').datasets?.find(
+    (dataset) => dataset.key === 'entra_identity_protection_risky_users',
+  )
+  assert.equal(p2Dataset?.licensePrerequisite.state, 'SATISFIED')
+  assert.equal(p2Dataset?.state, 'READY')
 })
 
 test('selects sign-in permissions from current authoritative Entra entitlement evidence', () => {

@@ -13,7 +13,7 @@ import { MicrosoftConsentService } from './microsoft-consent.service.js'
 import { effectiveMicrosoftConnectionStatus } from '../tenants/tenants.service.js'
 
 test('registers every requested application permission against a real capability and exact resource', () => {
-  assert.equal(DEFAULT_REQUIRED_PERMISSIONS.length, 19)
+  assert.equal(DEFAULT_REQUIRED_PERMISSIONS.length, 20)
   assert.deepEqual(CONNECTION_REQUIRED_PERMISSIONS, ['Organization.Read.All'])
   assert.equal(new Set(DEFAULT_REQUIRED_PERMISSIONS).size, DEFAULT_REQUIRED_PERMISSIONS.length)
   for (const name of DEFAULT_REQUIRED_PERMISSIONS) {
@@ -38,12 +38,12 @@ test('keeps the registry bounded, unique, documented, and collector-complete', (
     }
   }
   assert.deepEqual(MICROSOFT_COLLECTOR_RESOURCE_TYPES, [
-    'APPLICATIONS', 'AUDIT_LOGS', 'AUTH_METHOD_POLICIES', 'AUTH_REGISTRATIONS',
+    'APPLICATIONS', 'AUDIT_LOGS', 'AUTHENTICATION_STRENGTHS', 'AUTH_METHOD_POLICIES', 'AUTH_REGISTRATIONS',
     'CONDITIONAL_ACCESS', 'DEVICES', 'DIRECTORY_ROLES', 'DOMAINS',
     'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_CONFIGURATION',
     'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE',
     'GROUPS', 'LICENSES', 'M365_AUDIT', 'NAMED_LOCATIONS',
-    'ORGANIZATION_CONFIGURATION', 'SECURE_SCORES', 'SECURITY_DEFAULTS',
+    'ORGANIZATION_CONFIGURATION', 'RISKY_USERS', 'SECURE_SCORES', 'SECURITY_DEFAULTS',
     'SERVICE_PRINCIPALS', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_SITES',
     'SHAREPOINT_USAGE', 'SIGN_INS', 'USERS',
   ])
@@ -75,11 +75,13 @@ test('keeps current Microsoft call-site families represented in the registry', (
     ['/authentication/methods', '/authentication/methods'],
     ['/policies/authenticationMethodsPolicy', '/policies/authenticationMethodsPolicy'],
     ['/identity/conditionalAccess/policies', '/identity/conditionalAccess/policies'],
+    ['/policies/authenticationStrengthPolicies', '/policies/authenticationStrengthPolicies'],
     ['/identity/conditionalAccess/namedLocations', '/identity/conditionalAccess/namedLocations'],
     ['/policies/identitySecurityDefaultsEnforcementPolicy', '/policies/identitySecurityDefaultsEnforcementPolicy'],
     ['/applications?', '/applications'],
     ['/servicePrincipals?', '/servicePrincipals'],
     ['/security/secureScores', '/security/secureScores'],
+    ['/identityProtection/riskyUsers', '/identityProtection/riskyUsers'],
     ['/subscribedSkus', '/subscribedSkus'],
     ['/admin/sharepoint/settings', '/admin/sharepoint/settings'],
     ['/sites?search=', '/sites?search=*'],
@@ -107,7 +109,7 @@ test('publishes canonical permission metadata without turning optional coverage 
   const contract = new MicrosoftConsentService({} as never, {} as never).getAccessContract()
   assert.equal(contract.version, 1)
   assert.deepEqual(contract.connectionRequiredPermissions, ['Organization.Read.All'])
-  assert.equal(contract.requestedPermissions.length, 19)
+  assert.equal(contract.requestedPermissions.length, 20)
   const activity = contract.requestedPermissions.find((permission) => permission.name === 'ActivityFeed.Read')
   assert.equal(activity?.resource, 'OFFICE_365_MANAGEMENT_API')
   assert.equal(activity?.type, 'APPLICATION')

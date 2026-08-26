@@ -90,9 +90,12 @@ import { ErrorState } from '@/components/common/error-state'
 import { useAuth } from '@/components/providers/auth-provider'
 import { IdentityScopedMemoryCache } from '@/lib/auth/data-isolation'
 import {
+  effectiveMfaEnforcementPresentation,
   mfaRegistrationPresentation,
   perUserMfaPresentation,
+  tenantUserEffectiveMfaEnforcement,
   tenantUserMfaRegistration,
+  type EffectiveMfaEnforcement,
   type MfaBadgeTone,
 } from '@/lib/tenants/mfa-status'
 
@@ -247,6 +250,16 @@ type TenantUser = {
   mfa: 'Enforced' | 'Enabled' | 'Disabled' | 'Unknown'
   mfaRegistration?: 'Registered' | 'Not registered' | 'Unknown'
   perUserMfaState?: 'Enabled' | 'Enforced' | 'Disabled' | 'Unknown'
+  effectiveMfaEnforcement?: EffectiveMfaEnforcement
+  microsoftRisk?: {
+    userRisk?: MicrosoftRiskFact
+    signInRisk?: MicrosoftRiskFact
+  }
+  postureRisk?: {
+    contractVersion: 1
+    mfaEnforcementExposure: 'low' | 'medium' | 'unknown'
+    overall: 'low' | 'medium' | 'high' | 'unknown'
+  }
   lastLogin: string
   driveUsage: string
   mailUsage: string
@@ -254,6 +267,13 @@ type TenantUser = {
   licenses: string[]
   groups: string[]
   devices: { name: string; os: string; lastSync: string; status: string }[]
+}
+
+type MicrosoftRiskFact = {
+  value: 'low' | 'medium' | 'high' | 'none' | 'unknown'
+  source: string
+  observedAt: string | null
+  state: 'REPORTED' | 'NOT_REPORTED' | 'STALE' | 'FAILED' | 'PERMISSION_LIMITED'
 }
 
 function getUserRoles(u: { role?: string; roles?: string[] }): string[] {
@@ -4092,7 +4112,7 @@ export default function TenantDetailsPage() {
                         </div>
 
                         <div className="border-b border-slate-200 bg-blue-50/60 px-4 py-2 text-xs text-blue-900 dark:border-slate-800 dark:bg-blue-950/20 dark:text-blue-200">
-                          MFA registration shows whether Microsoft reports a registered MFA method. Per-user MFA is the separate legacy Enabled, Enforced, or Disabled requirement and is read from Microsoft Graph beta when available. Conditional Access and security defaults are evaluated separately.
+                          MFA registration, legacy per-user MFA, and effective MFA enforcement are separate facts. HawkView shows Conditional Access coverage only from the versioned backend evaluation; conditional, report-only, stale, partial, or permission-limited evidence never counts as enforced.
                         </div>
 
                       <div className="overflow-x-auto no-scrollbar">
@@ -4125,9 +4145,15 @@ export default function TenantDetailsPage() {
                               />
                               <th
                                 scope="col"
+                                className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 min-w-[210px]"
+                              >
+                                MFA enforcement
+                              </th>
+                              <th
+                                scope="col"
                                 className="hidden lg:table-cell px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 min-w-[150px]"
                               >
-                                Per-user MFA
+                                Legacy per-user MFA
                               </th>
                               <UserSortHeader
                                 field="role"
@@ -4161,6 +4187,8 @@ export default function TenantDetailsPage() {
                                 mfaRegistrationPresentation(u)
                               const perUserMfaBadge =
                                 perUserMfaPresentation(u)
+                              const effectiveMfaBadge =
+                                effectiveMfaEnforcementPresentation(u)
 
                               const userRoles = getUserRoles(u)
                               const firstRole =
@@ -4213,6 +4241,9 @@ export default function TenantDetailsPage() {
                                   </td>
                                   <td className="hidden md:table-cell px-4 py-3.5 min-w-[160px]">
                                     <MfaFactBadge {...mfaRegistrationBadge} />
+                                  </td>
+                                  <td className="px-4 py-3.5 min-w-[210px] max-w-[320px]">
+                                    <MfaFactBadge {...effectiveMfaBadge} />
                                   </td>
                                   <td className="hidden lg:table-cell px-4 py-3.5 min-w-[150px]">
                                     <MfaFactBadge {...perUserMfaBadge} />
@@ -4650,7 +4681,11 @@ export default function TenantDetailsPage() {
                         {...mfaRegistrationPresentation(selectedUser)}
                       />
                       <MfaFactBadge
-                        prefix="Per-user MFA"
+                        prefix="MFA enforcement"
+                        {...effectiveMfaEnforcementPresentation(selectedUser)}
+                      />
+                      <MfaFactBadge
+                        prefix="Legacy per-user MFA"
                         {...perUserMfaPresentation(selectedUser)}
                       />
                     </div>
@@ -4665,6 +4700,72 @@ export default function TenantDetailsPage() {
                     User ID
                   </div>
                   <CopyPill value={selectedUser.id} />
+                </div>
+              </div>
+
+              {(() => {
+                const enforcement =
+                  tenantUserEffectiveMfaEnforcement(selectedUser)
+                return (
+                  <div className="rounded-2xl border bg-white p-4">
+                    <div className="text-sm font-semibold text-slate-900">
+                      Effective MFA enforcement
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Backend contract v{enforcement?.contractVersion ?? 1} · Evidence observed {formatUserDateTime(enforcement?.evidenceObservedAt)}
+                    </div>
+                    <div className="mt-3">
+                      <MfaFactBadge
+                        {...effectiveMfaEnforcementPresentation(selectedUser)}
+                      />
+                    </div>
+                    <div className="mt-3 space-y-2">
+                      {enforcement?.policies.length ? (
+                        enforcement.policies.map((policy) => (
+                          <div key={`${policy.id}:${policy.outcome}`} className="rounded-xl border bg-muted/20 px-3 py-2">
+                            <div className="text-sm font-medium text-slate-900">
+                              {policy.name}
+                            </div>
+                            <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+                              Policy ID: {policy.id}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {policy.state} · {policy.outcome}
+                              {policy.materialConditions.length
+                                ? ` · Conditions: ${policy.materialConditions.join(', ')}`
+                                : ''}
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="text-sm text-muted-foreground">
+                          No qualifying policy evidence was reported. Unknown does not mean not covered.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })()}
+
+              <div className="rounded-2xl border bg-white p-4">
+                <div className="text-sm font-semibold text-slate-900">
+                  Microsoft Identity Protection risk
+                </div>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  {([
+                    ['User risk', selectedUser.microsoftRisk?.userRisk],
+                    ['Latest sign-in risk', selectedUser.microsoftRisk?.signInRisk],
+                  ] as const).map(([label, fact]) => (
+                    <div key={label} className="rounded-xl border bg-muted/20 px-3 py-2">
+                      <div className="text-xs text-muted-foreground">{label}</div>
+                      <div className="mt-1 text-sm font-semibold capitalize text-slate-900">
+                        {fact?.state === 'REPORTED' ? fact.value : 'Not reported'}
+                      </div>
+                      <div className="mt-1 text-[11px] text-muted-foreground">
+                        {fact?.source ?? 'Microsoft evidence unavailable'} · {fact?.state ?? 'NOT_REPORTED'}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
 
