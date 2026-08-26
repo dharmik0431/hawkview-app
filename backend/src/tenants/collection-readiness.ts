@@ -108,7 +108,7 @@ export type AccessDatasetReadiness = {
   permissionMatch: 'ALL' | 'ANY'
   evidenceMode: 'RESOURCE_STATE' | 'COMPOSITE_RESOURCE_STATE' | 'NOT_DURABLY_OBSERVED'
   licensePrerequisite: {
-    kind: 'NONE' | 'ENTRA_ID_P1_OR_P2' | 'SHAREPOINT_SERVICE_PLAN' | 'EXCHANGE_SERVICE_PLAN' | 'UNIFIED_AUDIT_ENABLED'
+    kind: 'NONE' | 'ENTRA_ID_P1_OR_P2' | 'ENTRA_ID_P2' | 'SHAREPOINT_SERVICE_PLAN' | 'EXCHANGE_SERVICE_PLAN' | 'UNIFIED_AUDIT_ENABLED'
     state: 'NOT_REQUIRED' | 'SATISFIED' | 'NOT_LICENSED' | 'UNVERIFIED'
   }
   fallbackDatasetKey: string | null
@@ -166,6 +166,16 @@ function servicePlanApplicability(plans: ReadinessInput['licenseServicePlans'], 
   // neither proof of entitlement nor proof that the workload is unlicensed.
   if (recognized.some((plan) => plan.provisioningStatus.toUpperCase() === 'SUCCESS')) return 'APPLICABLE' as const
   return recognized.every((plan) => plan.provisioningStatus.toUpperCase() === 'DISABLED')
+    ? 'NOT_LICENSED' as const
+    : 'UNVERIFIED' as const
+}
+
+function entraP2Applicability(plans: ReadinessInput['licenseServicePlans']) {
+  if (!plans) return 'UNVERIFIED' as const
+  const p2 = plans.filter((plan) => plan.servicePlanName.toUpperCase() === 'AAD_PREMIUM_P2')
+  if (!p2.length) return 'NOT_LICENSED' as const
+  if (p2.some((plan) => plan.provisioningStatus.toUpperCase() === 'SUCCESS')) return 'APPLICABLE' as const
+  return p2.every((plan) => plan.provisioningStatus.toUpperCase() === 'DISABLED')
     ? 'NOT_LICENSED' as const
     : 'UNVERIFIED' as const
 }
@@ -410,6 +420,7 @@ function datasetReadiness(
     sharepoint: 'APPLICABLE' | 'NOT_LICENSED' | 'UNVERIFIED'
     exchange: 'APPLICABLE' | 'NOT_LICENSED' | 'UNVERIFIED'
     signIn: 'PREMIUM' | 'NON_PREMIUM' | 'UNVERIFIED'
+    identityProtection: 'APPLICABLE' | 'NOT_LICENSED' | 'UNVERIFIED'
   },
   usageProjectionEvidence?: MicrosoftUsageSourceProjectionEvidence | null,
 ): AccessDatasetReadiness {
@@ -438,6 +449,10 @@ function datasetReadiness(
     licenseState = applicability.exchange === 'APPLICABLE' ? 'SATISFIED' : applicability.exchange
   } else if (capability.licensePrerequisite === 'ENTRA_ID_P1_OR_P2') {
     licenseState = applicability.signIn === 'PREMIUM' ? 'SATISFIED' : applicability.signIn === 'NON_PREMIUM' ? 'NOT_LICENSED' : 'UNVERIFIED'
+  } else if (capability.licensePrerequisite === 'ENTRA_ID_P2') {
+    licenseState = applicability.identityProtection === 'APPLICABLE'
+      ? 'SATISFIED'
+      : applicability.identityProtection
   } else if (capability.licensePrerequisite === 'UNIFIED_AUDIT_ENABLED') {
     licenseState = dynamic.state === 'READY' ? 'SATISFIED' : 'UNVERIFIED'
   }
@@ -603,6 +618,9 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   const licensesCurrent = fromSyncState(states.get('LICENSES'), now, 'daily').state === 'READY'
   const sharePointApplicability = licensesCurrent ? servicePlanApplicability(input.licenseServicePlans, 'sharepoint') : 'UNVERIFIED'
   const exchangeApplicability = licensesCurrent ? servicePlanApplicability(input.licenseServicePlans, 'exchange') : 'UNVERIFIED'
+  const identityProtectionApplicability = licensesCurrent
+    ? entraP2Applicability(input.licenseServicePlans)
+    : 'UNVERIFIED'
   const signInEntitlement = deriveSignInEntitlement({
     licenses: [{ servicePlans: input.licenseServicePlans }],
     licenseSync: states.get('LICENSES'),
@@ -624,7 +642,8 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     workload({ key: 'entra_directory_audit', workload: 'Entra directory audit', resourceTypes: ['AUDIT_LOGS'], requiredPermissions: ['AuditLog.Read.All', 'Directory.Read.All'], cadence: 'incremental', remediation: 'Confirm AuditLog.Read.All and Directory.Read.All have tenant-wide admin consent, then allow the scheduled collector to recheck.' }, states, consented, verificationKnown, now),
     workload({ key: 'sign_ins', workload: 'Entra sign-ins', resourceTypes: ['SIGN_INS'], requiredPermissions: signInPermissions, cadence: 'incremental', remediation: signInRemediation, licensingFailureDisposition: signInEntitlement === 'PREMIUM' ? 'FAILED_TRANSIENT' : signInEntitlement === 'NON_PREMIUM' ? 'NOT_LICENSED' : 'UNVERIFIED' }, states, consented, verificationKnown, now),
     workload({ key: 'entra_directory', workload: 'Entra directory inventory', resourceTypes: ['USERS', 'GROUPS', 'DEVICES', 'DIRECTORY_ROLES'], requiredPermissions: ['User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden', 'Device.Read.All', 'RoleManagement.Read.Directory'], cadence: 'daily', remediation: 'Confirm the required directory, hidden-membership, device, and role-management application permissions. HawkView rechecks during normal collection.' }, states, consented, verificationKnown, now),
-    workload({ key: 'entra_security_configuration', workload: 'Entra security configuration', resourceTypes: ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES'], requiredPermissions: ['UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'SecurityEvents.Read.All'], cadence: 'daily', remediation: 'Confirm the required authentication-method, policy, application, and Secure Score permissions. A successful OAuth connection alone does not verify every collector.' }, states, consented, verificationKnown, now),
+    workload({ key: 'entra_security_configuration', workload: 'Entra security configuration', resourceTypes: ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS', 'APPLICATIONS', 'SERVICE_PRINCIPALS', 'SECURITY_DEFAULTS', 'SECURE_SCORES'], requiredPermissions: ['UserAuthenticationMethod.Read.All', 'Policy.Read.AuthenticationMethod', 'Policy.Read.All', 'Application.Read.All', 'SecurityEvents.Read.All'], cadence: 'daily', remediation: 'Confirm the required authentication-method, policy, application, and Secure Score permissions. A successful OAuth connection alone does not verify every collector.' }, states, consented, verificationKnown, now),
+    workload({ key: 'entra_identity_protection', workload: 'Microsoft Identity Protection risk', resourceTypes: ['RISKY_USERS'], requiredPermissions: ['IdentityRiskyUser.Read.All'], cadence: 'daily', remediation: 'Confirm the read-only IdentityRiskyUser.Read.All application permission and tenant-wide admin consent. Missing risk evidence remains unknown and never changes MFA enforcement truth.' }, states, consented, verificationKnown, now),
     workload({ key: 'office_365_tenant_configuration', workload: 'Microsoft 365 tenant configuration', resourceTypes: ['ORGANIZATION_CONFIGURATION', 'DOMAINS', 'LICENSES', 'DOMAIN_DNS_HEALTH'], requiredPermissions: ['Organization.Read.All'], cadence: 'daily', remediation: 'Confirm Organization.Read.All and review the exact collector result. Domain DNS readiness is collected independently and does not imply a tenant setting change.' }, states, consented, verificationKnown, now),
     workload({ key: 'sharepoint_onedrive', workload: 'SharePoint and OneDrive', resourceTypes: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'], requiredPermissions: ['Sites.Read.All', 'SharePointTenantSettings.Read.All', 'Reports.Read.All'], cadence: 'daily', remediation: 'Confirm the listed SharePoint and Reports permissions, then wait for the next scheduled inventory collection.', capabilities: [{ key: 'sharepoint_site_access_metadata', label: 'Site access metadata', state: 'NOT_COLLECTED_LEAST_PRIVILEGE', reasonCode: 'NOT_COLLECTED_LEAST_PRIVILEGE', source: 'HawkView standard least-privilege mode', message: 'Standard mode does not collect current site-user, site collection administrator, sharing-member, or per-site permission metadata. SharePoint and OneDrive administrative events remain available when Microsoft audit evidence is available.' }] }, states, consented, verificationKnown, now),
     workload({ key: 'exchange', workload: 'Exchange mailbox visibility', resourceTypes: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'], requiredPermissions: ['User.Read.All', 'MailboxSettings.Read', 'Reports.Read.All', 'Organization.Read.All'], cadence: 'daily', remediation: 'Confirm the listed Microsoft Graph application permissions, then allow the next scheduled collection to verify mailbox inventory, usage, rules, and tenant-associated domains.', capabilities: [
@@ -677,6 +696,7 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     sharepoint: sharePointApplicability,
     exchange: exchangeApplicability,
     signIn: signInEntitlement,
+    identityProtection: identityProtectionApplicability,
   }
   for (const row of rows) {
     const datasets = capabilitiesForWorkload(row.key).map((capability) =>

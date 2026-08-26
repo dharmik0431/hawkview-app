@@ -299,7 +299,7 @@ test('managed and customer verification paths do not make a deprecated override 
           ? ['ActivityFeed.Read']
           : [
               'Organization.Read.All', 'User.Read.All', 'GroupMember.Read.All', 'Member.Read.Hidden',
-              'AuditLog.Read.All', 'Directory.Read.All', 'UserAuthenticationMethod.Read.All', 'Policy.Read.All',
+              'AuditLog.Read.All', 'IdentityRiskyUser.Read.All', 'Directory.Read.All', 'UserAuthenticationMethod.Read.All', 'Policy.Read.All',
               'Policy.Read.AuthenticationMethod', 'Device.Read.All', 'RoleManagement.Read.Directory',
               'Application.Read.All', 'Sites.Read.All', 'SharePointTenantSettings.Read.All',
               'Reports.Read.All', 'ReportSettings.Read.All', 'MailboxSettings.Read', 'SecurityEvents.Read.All',
@@ -332,7 +332,7 @@ test('keeps a connector connected when optional capability grants are absent', a
     })
     const result = await service.verifyTenantWithCredentials('tenant-1', { clientId: 'app', clientSecret: 'secret' })
     assert.deepEqual(result.missingRequiredPermissions, [])
-    assert.equal(result.missingNonConnectionPermissions.length, 18)
+    assert.equal(result.missingNonConnectionPermissions.length, 19)
     assert.deepEqual(result.missingPermissions, result.missingNonConnectionPermissions)
   } finally {
     globalThis.fetch = originalFetch

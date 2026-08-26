@@ -40,6 +40,11 @@ type InternalAuthSync = {
     registrations: unknown[],
     limits?: Readonly<AuthRegistrationFallbackLimits>,
   ) => Promise<unknown[]>
+  enrichAuthenticationRegistrationsWithConditionalAccessContext: (
+    accessToken: string,
+    registrations: unknown[],
+    limits?: Readonly<AuthRegistrationFallbackLimits>,
+  ) => Promise<unknown[]>
   runSnapshotSync: (
     tenant: TenantRef,
     resource: string,
@@ -126,6 +131,7 @@ test('falls back only for the exact non-premium report error', async () => {
     return [{ id: 'fallback-user' }]
   }
   subject.enrichAuthenticationRegistrationsWithPerUserMfaState = async (_token, rows) => rows
+  subject.enrichAuthenticationRegistrationsWithConditionalAccessContext = async (_token, rows) => rows
   subject.collectEntraCollection = async () => {
     throw new MicrosoftGraphCollectionError(
       'Microsoft auth registrations synchronization returned 403.',
@@ -169,6 +175,7 @@ test('uses the actual Graph response path to classify non-premium and permission
     return [{ id: 'fallback-user' }]
   }
   subject.enrichAuthenticationRegistrationsWithPerUserMfaState = async (_token, rows) => rows
+  subject.enrichAuthenticationRegistrationsWithConditionalAccessContext = async (_token, rows) => rows
   const originalFetch = globalThis.fetch
   globalThis.fetch = async () => new Response(JSON.stringify({
     error: {
@@ -497,6 +504,36 @@ test('rejects duplicate or incomplete Graph batch response IDs', async () => {
       subject.collectPerUserAuthenticationMethods('graph-token'),
       /incomplete batch response/,
     )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('collects complete transitive group evidence and fails closed per user when Graph is partial', async () => {
+  const subject = internal(serviceWithPrisma({}))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body))
+    assert.match(request.requests[0].url, /transitiveMemberOf\/microsoft\.graph\.group/)
+    return new Response(JSON.stringify({
+      responses: [
+        { id: '1', status: 200, body: { value: [{ id: 'nested-group' }, { id: 'direct-group' }] } },
+        { id: '2', status: 403, body: { error: { code: 'Authorization_RequestDenied' } } },
+      ],
+    }), { status: 200 })
+  }
+  try {
+    const rows = await subject.enrichAuthenticationRegistrationsWithConditionalAccessContext(
+      'graph-token',
+      [{ id: 'user-1' }, { id: 'user-2' }],
+    ) as Array<Record<string, any>>
+    assert.deepEqual(rows[0]?.conditionalAccessContext.transitiveGroupIds, [
+      'direct-group',
+      'nested-group',
+    ])
+    assert.equal(rows[0]?.conditionalAccessContext.membershipComplete, true)
+    assert.equal(rows[1]?.conditionalAccessContext.membershipComplete, false)
+    assert.equal(rows[1]?.conditionalAccessContext.reasonCode, 'PERMISSION_LIMITED')
   } finally {
     globalThis.fetch = originalFetch
   }

@@ -48,6 +48,12 @@ import {
   type SignInEntitlement,
 } from './sign-in-entitlement.js'
 import {
+  deriveUserPostureRisk,
+  evaluateEffectiveMfaEnforcement,
+  type MfaEvidenceState,
+  type MicrosoftRiskFact,
+} from './effective-mfa-enforcement.js'
+import {
   buildMicrosoftUsageReportSnapshot,
   buildSharePointDataContract,
   inspectMicrosoftUsageProjectionEvidence,
@@ -739,12 +745,14 @@ type EntraSnapshotResource =
   | 'AUTH_REGISTRATIONS'
   | 'AUTH_METHOD_POLICIES'
   | 'CONDITIONAL_ACCESS'
+  | 'AUTHENTICATION_STRENGTHS'
   | 'NAMED_LOCATIONS'
   | 'DEVICES'
   | 'DIRECTORY_ROLES'
   | 'SERVICE_PRINCIPALS'
   | 'APPLICATIONS'
   | 'SECURE_SCORES'
+  | 'RISKY_USERS'
   | 'SECURITY_DEFAULTS'
   | 'GROUPS'
   | 'SHAREPOINT_SITES'
@@ -779,7 +787,13 @@ export function normalizePerUserMfaState(value: unknown): PerUserMfaState | null
     : null
 }
 
-export function projectMfaTruth(registration: unknown) {
+export function projectMfaTruth(registration: unknown): {
+  mfa: 'Unknown' | 'Enabled' | 'Disabled'
+  mfaRegistration: 'Registered' | 'Not registered' | 'Unknown'
+  perUserMfaState: 'Enabled' | 'Enforced' | 'Disabled' | 'Unknown'
+  mfaRegistrationSource: string | null
+  perUserMfaStateSource: string | null
+} {
   const row = plainRecord(registration) ? registration : null
   const isRegistered =
     typeof row?.isMfaRegistered === 'boolean'
@@ -819,6 +833,82 @@ export function projectMfaTruth(registration: unknown) {
       perUserState === null
         ? null
         : 'microsoft-graph-beta-authentication-requirements',
+  }
+}
+
+function mfaEvidenceState(
+  state: {
+    status?: string | null
+    lastSuccessfulAt?: Date | null
+    lastErrorCode?: string | null
+    lastErrorMessage?: string | null
+  } | null | undefined,
+  now: Date,
+  maxAgeMs = 26 * 60 * 60 * 1000,
+): MfaEvidenceState {
+  const observedAt = state?.lastSuccessfulAt?.toISOString() ?? null
+  const code = String(state?.lastErrorCode ?? '').toLowerCase()
+  const message = String(state?.lastErrorMessage ?? '').toLowerCase()
+  if (
+    code.includes('403') ||
+    code.includes('401') ||
+    code.includes('permission') ||
+    code.includes('consent') ||
+    message.includes('permission') ||
+    message.includes('consent') ||
+    message.includes('access denied')
+  ) {
+    return { status: 'PERMISSION_LIMITED', observedAt, reason: 'Microsoft permission unavailable' }
+  }
+  if (state?.status === 'PARTIAL') {
+    return { status: 'FAILED', observedAt, reason: 'Microsoft evidence is partial' }
+  }
+  if (state?.status === 'FAILED') {
+    return { status: 'FAILED', observedAt, reason: 'Microsoft collection failed' }
+  }
+  if (!state?.lastSuccessfulAt) {
+    return { status: 'MISSING', observedAt: null, reason: 'No successful collection' }
+  }
+  if (now.getTime() - state.lastSuccessfulAt.getTime() > maxAgeMs) {
+    return { status: 'STALE', observedAt, reason: 'Microsoft evidence is stale' }
+  }
+  if (state.status !== 'SUCCEEDED') {
+    return { status: 'FAILED', observedAt, reason: 'Microsoft evidence is incomplete' }
+  }
+  return { status: 'FRESH', observedAt, reason: null }
+}
+
+function microsoftRiskValue(value: unknown): MicrosoftRiskFact['value'] {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if (normalized === 'high' || normalized === 'medium' || normalized === 'low') {
+    return normalized
+  }
+  if (normalized === 'none' || normalized === 'hidden') return 'none'
+  return 'unknown'
+}
+
+function microsoftRiskFact(input: {
+  value: unknown
+  source: string
+  observedAt: string | null
+  evidence: MfaEvidenceState
+}): MicrosoftRiskFact {
+  const value = microsoftRiskValue(input.value)
+  const state: MicrosoftRiskFact['state'] =
+    input.evidence.status === 'PERMISSION_LIMITED'
+      ? 'PERMISSION_LIMITED'
+      : input.evidence.status === 'FAILED'
+        ? 'FAILED'
+        : input.evidence.status === 'STALE'
+          ? 'STALE'
+          : input.evidence.status === 'FRESH' && value !== 'unknown'
+            ? 'REPORTED'
+            : 'NOT_REPORTED'
+  return {
+    value,
+    source: input.source,
+    observedAt: input.observedAt,
+    state,
   }
 }
 
@@ -1372,6 +1462,10 @@ export class TenantSyncService {
         tenant, accessToken, 'CONDITIONAL_ACCESS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies',
       ),
+      AUTHENTICATION_STRENGTHS: () => this.syncEntraCollection(
+        tenant, accessToken, 'AUTHENTICATION_STRENGTHS',
+        'https://graph.microsoft.com/v1.0/policies/authenticationStrengthPolicies',
+      ),
       NAMED_LOCATIONS: () => this.syncEntraCollection(
         tenant, accessToken, 'NAMED_LOCATIONS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations',
@@ -1382,7 +1476,11 @@ export class TenantSyncService {
       ),
       DIRECTORY_ROLES: () => this.syncEntraCollection(
         tenant, accessToken, 'DIRECTORY_ROLES',
-        'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName)',
+        'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)',
+      ),
+      RISKY_USERS: () => this.syncEntraCollection(
+        tenant, accessToken, 'RISKY_USERS',
+        'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime',
       ),
       SERVICE_PRINCIPALS: () => this.syncEntraCollection(
         tenant, accessToken, 'SERVICE_PRINCIPALS',
@@ -1748,6 +1846,12 @@ export class TenantSyncService {
       this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
+        'AUTHENTICATION_STRENGTHS',
+        'https://graph.microsoft.com/v1.0/policies/authenticationStrengthPolicies'
+      ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
         'NAMED_LOCATIONS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
       ),
@@ -1764,7 +1868,13 @@ export class TenantSyncService {
         tenant,
         snapshotAccessToken,
         'DIRECTORY_ROLES',
-        'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName)'
+        'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)'
+      ),
+      this.syncEntraCollection(
+        tenant,
+        snapshotAccessToken,
+        'RISKY_USERS',
+        'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime'
       ),
       this.syncEntraCollection(
         tenant,
@@ -1803,12 +1913,14 @@ export class TenantSyncService {
           'AUTH_REGISTRATIONS',
           'AUTH_METHOD_POLICIES',
           'CONDITIONAL_ACCESS',
+          'AUTHENTICATION_STRENGTHS',
           'NAMED_LOCATIONS',
           'SIGN_INS',
           'AUDIT_LOGS',
           'M365_AUDIT',
           'DEVICES',
           'DIRECTORY_ROLES',
+          'RISKY_USERS',
           'SERVICE_PRINCIPALS',
           'APPLICATIONS',
           'SECURE_SCORES',
@@ -2726,6 +2838,10 @@ export class TenantSyncService {
         accessToken,
         registrations,
       )
+      registrations = await this.enrichAuthenticationRegistrationsWithConditionalAccessContext(
+        accessToken,
+        registrations,
+      )
       await this.saveEntraSnapshot(tenant, 'AUTH_REGISTRATIONS', registrations)
     })
   }
@@ -2857,6 +2973,158 @@ export class TenantSyncService {
         perUserMfaState: states.get(row.id) ?? null,
         perUserMfaStateSource:
           'microsoft-graph-beta-authentication-requirements',
+      }
+    })
+  }
+
+  private async enrichAuthenticationRegistrationsWithConditionalAccessContext(
+    accessToken: string,
+    registrations: unknown[],
+    limits: Readonly<AuthRegistrationFallbackLimits> =
+      AUTH_REGISTRATION_FALLBACK_LIMITS,
+  ) {
+    assertAuthRegistrationFallbackLimits(limits)
+    const ids = [
+      ...new Set(
+        registrations
+          .filter(plainRecord)
+          .map((row) => row.id)
+          .filter(
+            (id): id is string =>
+              typeof id === 'string' && id.length > 0 && id.length <= 128,
+          ),
+      ),
+    ].sort((left, right) => left.localeCompare(right))
+    const observedAt = new Date().toISOString()
+    const contexts = new Map<
+      string,
+      {
+        transitiveGroupIds: string[]
+        membershipComplete: boolean
+        observedAt: string
+        reasonCode?: string
+      }
+    >()
+    const unavailable = (reasonCode: string) =>
+      registrations.map((row) =>
+        plainRecord(row)
+          ? {
+              ...row,
+              conditionalAccessContext: {
+                transitiveGroupIds: [],
+                membershipComplete: false,
+                observedAt,
+                reasonCode,
+              },
+            }
+          : row,
+      )
+
+    if (ids.length === 0) return unavailable('NO_USER_ID')
+    if (
+      ids.length > limits.maxUsers ||
+      Math.ceil(ids.length / limits.batchSize) > limits.maxBatches
+    ) {
+      return unavailable('BOUNDED_LIMIT_EXCEEDED')
+    }
+
+    const deadline = Date.now() + limits.collectorDeadlineMs
+    try {
+      for (let offset = 0; offset < ids.length; offset += limits.batchSize) {
+        const remainingMs = deadline - Date.now()
+        if (remainingMs <= 0) throw new Error('collector deadline reached')
+        const batchIds = ids.slice(offset, offset + limits.batchSize)
+        const response = await this.fetchGraphPage(
+          'https://graph.microsoft.com/v1.0/$batch',
+          accessToken,
+          'transitive Conditional Access group membership',
+          {
+            retryUnsafeMethod: true,
+            timeoutMs: Math.max(1, Math.min(limits.requestTimeoutMs, remainingMs)),
+            deadlineAt: deadline,
+            init: {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                requests: batchIds.map((userId, index) => ({
+                  id: String(index + 1),
+                  method: 'GET',
+                  url:
+                    `/users/${encodeURIComponent(userId)}/transitiveMemberOf/` +
+                    'microsoft.graph.group?$select=id&$top=999',
+                })),
+              }),
+            },
+          },
+        )
+        const parsed = JSON.parse(
+          await readBoundedResponseText(response, limits.responseBytes),
+        ) as unknown
+        if (!plainRecord(parsed) || !Array.isArray(parsed.responses)) {
+          throw new Error('invalid batch response')
+        }
+        const responseById = new Map<string, Record<string, unknown>>()
+        for (const item of parsed.responses) {
+          if (plainRecord(item) && typeof item.id === 'string') {
+            responseById.set(item.id, item)
+          }
+        }
+        batchIds.forEach((userId, index) => {
+          const item = responseById.get(String(index + 1))
+          const body = plainRecord(item?.body) ? item.body : null
+          const values = body && Array.isArray(body.value) ? body.value : null
+          const complete =
+            item?.status === 200 &&
+            values !== null &&
+            typeof body?.['@odata.nextLink'] !== 'string'
+          contexts.set(userId, {
+            transitiveGroupIds: complete
+              ? [
+                  ...new Set(
+                    values
+                      .filter(plainRecord)
+                      .map((value) => value.id)
+                      .filter(
+                        (id): id is string =>
+                          typeof id === 'string' && id.length > 0 && id.length <= 128,
+                      ),
+                  ),
+                ].sort((left, right) => left.localeCompare(right))
+              : [],
+            membershipComplete: complete,
+            observedAt,
+            ...(!complete
+              ? {
+                  reasonCode:
+                    item?.status === 401 || item?.status === 403
+                      ? 'PERMISSION_LIMITED'
+                      : 'INCOMPLETE_GRAPH_RESPONSE',
+                }
+              : {}),
+          })
+        })
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Conditional Access membership evidence is unavailable. MFA registration and legacy per-user state remain available. ${safeErrorMessage(
+          error,
+          'Microsoft did not return transitive group membership.',
+        )}`,
+      )
+      return unavailable('COLLECTION_FAILED')
+    }
+
+    return registrations.map((row) => {
+      if (!plainRecord(row) || typeof row.id !== 'string') return row
+      return {
+        ...row,
+        conditionalAccessContext:
+          contexts.get(row.id) ?? {
+            transitiveGroupIds: [],
+            membershipComplete: false,
+            observedAt,
+            reasonCode: 'INCOMPLETE_GRAPH_RESPONSE',
+          },
       }
     })
   }
@@ -3842,7 +4110,7 @@ export class TenantSyncService {
           tenant,
           accessToken,
           'DIRECTORY_ROLES',
-          'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName)'
+          'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)'
         ),
       SERVICE_PRINCIPALS: () =>
         this.syncEntraCollection(
@@ -4963,17 +5231,37 @@ export class TenantSyncService {
     )
     const roleAssignments = snapshotByResource.get('DIRECTORY_ROLES') ?? []
     const roleNamesByUserId = new Map<string, string[]>()
+    const roleTemplateIdsByPrincipalId = new Map<string, string[]>()
     for (const assignment of roleAssignments) {
       if (typeof assignment?.principalId !== 'string') continue
       const roleName = assignment?.roleDefinition?.displayName
-      if (typeof roleName !== 'string' || !roleName.trim()) continue
-      const current = roleNamesByUserId.get(assignment.principalId) ?? []
-      current.push(roleName.trim())
-      roleNamesByUserId.set(
-        assignment.principalId,
-        [...new Set(current)].sort()
-      )
+      if (typeof roleName === 'string' && roleName.trim()) {
+        const current = roleNamesByUserId.get(assignment.principalId) ?? []
+        current.push(roleName.trim())
+        roleNamesByUserId.set(
+          assignment.principalId,
+          [...new Set(current)].sort()
+        )
+      }
+      const roleTemplateId = assignment?.roleDefinition?.templateId
+      if (typeof roleTemplateId === 'string' && roleTemplateId.trim()) {
+        const current = roleTemplateIdsByPrincipalId.get(assignment.principalId) ?? []
+        current.push(roleTemplateId.trim())
+        roleTemplateIdsByPrincipalId.set(
+          assignment.principalId,
+          [...new Set(current)].sort(),
+        )
+      }
     }
+    const conditionalAccessPolicies =
+      snapshotByResource.get('CONDITIONAL_ACCESS') ?? []
+    const authenticationStrengths =
+      snapshotByResource.get('AUTHENTICATION_STRENGTHS') ?? []
+    const riskyUserById = new Map(
+      (snapshotByResource.get('RISKY_USERS') ?? [])
+        .filter((row) => typeof row?.id === 'string')
+        .map((row) => [row.id, row]),
+    )
     const devices = snapshotByResource.get('DEVICES') ?? []
     const devicesByUserId = new Map<
       string,
@@ -5054,6 +5342,27 @@ export class TenantSyncService {
     }
     const syncStateByResource = new Map(
       syncStates.map((state) => [state.resourceType, state])
+    )
+    const mfaEvaluationNow = new Date()
+    const conditionalAccessEvidence = mfaEvidenceState(
+      syncStateByResource.get('CONDITIONAL_ACCESS'),
+      mfaEvaluationNow,
+    )
+    const authenticationStrengthEvidence = mfaEvidenceState(
+      syncStateByResource.get('AUTHENTICATION_STRENGTHS'),
+      mfaEvaluationNow,
+    )
+    const directoryRoleEvidence = mfaEvidenceState(
+      syncStateByResource.get('DIRECTORY_ROLES'),
+      mfaEvaluationNow,
+    )
+    const riskyUserEvidence = mfaEvidenceState(
+      syncStateByResource.get('RISKY_USERS'),
+      mfaEvaluationNow,
+    )
+    const signInRiskEvidence = mfaEvidenceState(
+      syncStateByResource.get('SIGN_INS'),
+      mfaEvaluationNow,
     )
     const collectionStateByKey = new Map(
       collectionFieldStates.map((field) => [field.fieldKey, field])
@@ -5323,6 +5632,106 @@ export class TenantSyncService {
           const normalizedUpn = user.userPrincipalName.toLowerCase()
           const oneDrive = oneDriveUsageByUpn.get(normalizedUpn)
           const mailboxUsage = exchangeUsageByIdentity.get(normalizedUpn)
+          const mfaTruth = projectMfaTruth(registration)
+          const context = plainRecord(registration?.conditionalAccessContext)
+            ? registration.conditionalAccessContext
+            : null
+          const transitiveGroupIds = Array.isArray(context?.transitiveGroupIds)
+            ? context.transitiveGroupIds.filter(
+                (id: unknown): id is string =>
+                  typeof id === 'string' && id.length > 0 && id.length <= 128,
+              )
+            : null
+          const membershipEvidence: MfaEvidenceState =
+            context?.membershipComplete === true && transitiveGroupIds
+              ? {
+                  status: 'FRESH',
+                  observedAt:
+                    typeof context.observedAt === 'string'
+                      ? context.observedAt
+                      : null,
+                  reason: null,
+                }
+              : context?.reasonCode === 'PERMISSION_LIMITED'
+                ? {
+                    status: 'PERMISSION_LIMITED',
+                    observedAt:
+                      typeof context?.observedAt === 'string'
+                        ? context.observedAt
+                        : null,
+                    reason: 'Microsoft group membership permission unavailable',
+                  }
+                : {
+                    status: registration ? 'FAILED' : 'MISSING',
+                    observedAt:
+                      typeof context?.observedAt === 'string'
+                        ? context.observedAt
+                        : null,
+                    reason: registration
+                      ? 'Transitive group membership is incomplete'
+                      : 'No user authentication evidence',
+                  }
+          const activeRoleTemplateIds = [
+            user.microsoftUserId,
+            ...(transitiveGroupIds ?? []),
+          ].flatMap(
+            (principalId) =>
+              roleTemplateIdsByPrincipalId.get(principalId) ?? [],
+          )
+          const effectiveMfaEnforcement = evaluateEffectiveMfaEnforcement({
+            subject: {
+              id: user.microsoftUserId,
+              userType:
+                user.userType === 'Guest'
+                  ? 'Guest'
+                  : user.userType === 'Member'
+                    ? 'Member'
+                    : 'Unknown',
+              externalTenantId: null,
+              transitiveGroupIds,
+              activeRoleTemplateIds:
+                directoryRoleEvidence.status === 'FRESH'
+                  ? [...new Set(activeRoleTemplateIds)].sort()
+                  : null,
+            },
+            policies: conditionalAccessPolicies,
+            authenticationStrengths,
+            evidence: {
+              policies: conditionalAccessEvidence,
+              membership: membershipEvidence,
+              roles: directoryRoleEvidence,
+              authenticationStrengths: authenticationStrengthEvidence,
+            },
+            now: mfaEvaluationNow,
+          })
+          const riskyUser = riskyUserById.get(user.microsoftUserId)
+          const microsoftUserRisk = microsoftRiskFact({
+            value:
+              riskyUser?.riskLevel ??
+              (riskyUserEvidence.status === 'FRESH' ? 'none' : undefined),
+            source: 'Microsoft Identity Protection riskyUsers',
+            observedAt:
+              typeof riskyUser?.riskLastUpdatedDateTime === 'string'
+                ? riskyUser.riskLastUpdatedDateTime
+                : riskyUserEvidence.observedAt,
+            evidence: riskyUserEvidence,
+          })
+          const microsoftSignInRisk = microsoftRiskFact({
+            value: lastSignIn?.riskLevel,
+            source: 'Microsoft Entra sign-in logs',
+            observedAt:
+              lastSignIn?.eventDateTime instanceof Date
+                ? lastSignIn.eventDateTime.toISOString()
+                : signInRiskEvidence.observedAt,
+            evidence: signInRiskEvidence,
+          })
+          const postureRisk = deriveUserPostureRisk({
+            mfaRegistration: mfaTruth.mfaRegistration,
+            legacyPerUserMfa: mfaTruth.perUserMfaState,
+            effectiveMfa: effectiveMfaEnforcement,
+            microsoftUserRisk,
+            microsoftSignInRisk,
+          })
           return {
             id: user.microsoftUserId,
             name: user.displayName,
@@ -5330,7 +5739,13 @@ export class TenantSyncService {
             type: user.userType === 'Guest' ? 'Guest' : 'Member',
             role: roleNames.length > 0 ? roleNames.join(', ') : 'User',
             status: user.accountEnabled ? 'Enabled' : 'Disabled',
-            ...projectMfaTruth(registration),
+            ...mfaTruth,
+            effectiveMfaEnforcement,
+            microsoftRisk: {
+              userRisk: microsoftUserRisk,
+              signInRisk: microsoftSignInRisk,
+            },
+            postureRisk,
             lastLogin:
               lastSignIn?.eventDateTime instanceof Date
                 ? lastSignIn.eventDateTime.toISOString()
