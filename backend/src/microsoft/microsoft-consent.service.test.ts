@@ -3,7 +3,37 @@ import test from 'node:test'
 import {
   MicrosoftConsentService,
   normalizeConfiguredRequiredPermissions,
+  PRODUCTION_MICROSOFT_ADMIN_CONSENT_REDIRECT_URI,
+  resolveMicrosoftAdminConsentRedirectUri,
 } from './microsoft-consent.service.js'
+
+test('production consent is pinned to the branded HawkView callback', () => {
+  assert.equal(
+    resolveMicrosoftAdminConsentRedirectUri(
+      'https://hawkview-api-dev.onrender.com/api/tenants/microsoft/admin-consent/callback',
+      'production',
+    ),
+    PRODUCTION_MICROSOFT_ADMIN_CONSENT_REDIRECT_URI,
+  )
+  assert.equal(
+    resolveMicrosoftAdminConsentRedirectUri(undefined, 'production'),
+    PRODUCTION_MICROSOFT_ADMIN_CONSENT_REDIRECT_URI,
+  )
+})
+
+test('non-production consent keeps an explicitly configured callback', () => {
+  assert.equal(
+    resolveMicrosoftAdminConsentRedirectUri(
+      ' http://localhost:8080/api/tenants/microsoft/admin-consent/callback ',
+      'development',
+    ),
+    'http://localhost:8080/api/tenants/microsoft/admin-consent/callback',
+  )
+  assert.equal(
+    resolveMicrosoftAdminConsentRedirectUri(undefined, 'test'),
+    null,
+  )
+})
 
 test('filters only resource-qualified deprecated SharePoint full-control overrides', () => {
   const result = normalizeConfiguredRequiredPermissions([
@@ -104,6 +134,48 @@ test('standard onboarding requests only the compiled least-privilege permissions
   assert.equal(required.includes('Exchange.ManageAsAppV2'), false)
   assert.equal(required.includes('MailboxSettings.Read'), true)
   assert.equal(required.includes('Reports.Read.All'), true)
+})
+
+test('a stale Render variable cannot enter a production Microsoft consent request', async () => {
+  const priorRedirect = process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI
+  const priorNodeEnvironment = process.env.NODE_ENV
+  process.env.NODE_ENV = 'production'
+  process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI =
+    'https://hawkview-api-dev.onrender.com/api/tenants/microsoft/admin-consent/callback'
+  try {
+    const service = new MicrosoftConsentService({
+      platformMicrosoftConnector: {
+        findUnique: async () => ({
+          clientId: '11111111-2222-4333-8444-555555555555',
+          homeTenantId: 'home-tenant',
+          credentialReference: 'managed-secret',
+        }),
+      },
+    } as never, {
+      accessOrCreate: async () => 'a'.repeat(64),
+      access: async () => 'managed-secret-value',
+    } as never)
+    const consent = await service.createAdminConsentUrl(
+      'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      {
+        customerTenantId: 'tenant-record',
+        organizationId: 'organization-record',
+      },
+    )
+    assert.equal(
+      new URL(consent.consentUrl).searchParams.get('redirect_uri'),
+      PRODUCTION_MICROSOFT_ADMIN_CONSENT_REDIRECT_URI,
+    )
+    assert.doesNotMatch(consent.consentUrl, /onrender\.com/i)
+  } finally {
+    if (priorRedirect === undefined) {
+      delete process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI
+    } else {
+      process.env.MICROSOFT_ADMIN_CONSENT_REDIRECT_URI = priorRedirect
+    }
+    if (priorNodeEnvironment === undefined) delete process.env.NODE_ENV
+    else process.env.NODE_ENV = priorNodeEnvironment
+  }
 })
 
 test('optional Exchange consent is isolated from the standard Graph consent scope', async () => {
