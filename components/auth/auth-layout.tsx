@@ -1,9 +1,9 @@
 'use client'
 
 import React, { useEffect, useState } from 'react'
-import { Eye, Moon, Sun, Shield, Layers, Activity } from 'lucide-react'
+import { Moon, Sun, Shield, Layers, Activity } from 'lucide-react'
 import { useTheme } from 'next-themes'
-import { cn } from '@/lib/utils'
+import { HawkViewBrand } from '@/components/brand/hawkview-brand'
 
 export function AuthLayout({ children }: { children: React.ReactNode }) {
   const { theme, setTheme, resolvedTheme } = useTheme()
@@ -42,14 +42,10 @@ export function AuthLayout({ children }: { children: React.ReactNode }) {
         />
 
         {/* Top Brand Header */}
-        <div className="relative z-10 flex items-center gap-3">
-          <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-blue-600/30 shrink-0">
-            <Eye className="w-5 h-5" aria-hidden="true" />
-          </div>
-          <span className="text-2xl font-bold text-white tracking-tight">
-            HawkView
-          </span>
-        </div>
+        <HawkViewBrand
+          className="relative z-10"
+          wordmarkClassName="text-2xl text-white"
+        />
 
         {/* Center Content Section */}
         <div className="relative z-10 space-y-8 my-auto max-w-lg">
@@ -93,14 +89,11 @@ export function AuthLayout({ children }: { children: React.ReactNode }) {
         {/* Top Header Controls (Theme toggle & Mobile Logo) */}
         <div className="w-full flex items-center justify-between gap-4 max-w-[440px] mx-auto lg:max-w-none">
           {/* Mobile/Tablet Header Branding */}
-          <div className="flex items-center gap-2.5 lg:hidden">
-            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white shadow-sm shrink-0">
-              <Eye className="w-4 h-4" aria-hidden="true" />
-            </div>
-            <span className="text-lg font-bold text-slate-900 dark:text-white tracking-tight">
-              HawkView
-            </span>
-          </div>
+          <HawkViewBrand
+            className="lg:hidden"
+            markClassName="h-8 w-8"
+            wordmarkClassName="text-lg text-slate-900 dark:text-white"
+          />
 
           {/* Theme Toggle Button */}
           {mounted && (

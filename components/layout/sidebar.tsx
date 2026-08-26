@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 import { History as HistoryIcon, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useAuth } from '@/components/providers/auth-provider'
 import { useSidebar } from '@/components/providers/sidebar-provider'
+import { HawkViewBrand } from '@/components/brand/hawkview-brand'
 import {
   Tooltip,
   TooltipContent,
@@ -20,7 +21,6 @@ import {
   Activity,
   Shield,
   ShieldCheck,
-  Eye,
   HelpCircle,
   Mail,
 } from 'lucide-react'
@@ -92,14 +92,11 @@ export function Sidebar() {
               isCollapsed && 'justify-center px-0'
             )}
           >
-            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0">
-              <Eye className="w-5 h-5 text-white" aria-hidden="true" />
-            </div>
-            {!isCollapsed && (
-              <span className="text-xl font-semibold text-white whitespace-nowrap overflow-hidden">
-                HawkView
-              </span>
-            )}
+            <HawkViewBrand
+              compact={isCollapsed}
+              markClassName="h-8 w-8"
+              wordmarkClassName="text-xl text-white"
+            />
           </div>
 
           {/* Main nav (scrolls if needed) */}

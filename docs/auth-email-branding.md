@@ -16,9 +16,10 @@ authentication and security-notification email.
 - MFA method added or removed notifications
 - Sign-in method linked or removed notifications
 
-The templates are deliberately transactional: one HawkView wordmark, one action, no marketing copy, no remote images,
-no tracking pixels, and no interpolation of user-controlled profile fields. Existing Supabase confirmation URLs and
-HawkView redirect behavior are preserved.
+The templates are deliberately transactional: one HawkView wordmark with the compact Tenant Formation mark, one
+action, no marketing copy, no remote images, no tracking pixels, and no interpolation of user-controlled profile
+fields. The mark is a small embedded PNG data URI, so displaying it does not make an external request. Existing
+Supabase confirmation URLs and HawkView redirect behavior are preserved.
 
 ## Safe deployment
 

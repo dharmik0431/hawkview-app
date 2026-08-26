@@ -7,6 +7,9 @@ const BRAND = Object.freeze({
   surface: '#f8fafc',
 })
 
+const BRAND_MARK_DATA_URI =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAFxGAABcRgEUlENBAAACmklEQVRYhc2Xb0hTYRTG73flXhi5uxXrD1awW7Oy1khF+pBhjKbVMjBsBIMgqRxYEI3KP2BpLcjKL4URlRBJZWKSKUJ9i1mBEkJfojLJarba7u5qe+K9dnW4u3Lb9a4Dz9fz/N5zzvvyHoqKiSw2T8uwXCPNGl/QWuMPhuWghEgumuWGGJZrIB6UXDA6bjfNcn6lTBPCEA8dZ48zZ1guOt/mMYpOQ2SxeVo1Ti5TiW/ZuuU5FOm52uYzMtZTNGt8mSkAMpgE4HsGAfxU5so/Jeq/AyjeYkfrlXa461pQaquCbmm++hVgl+SjqeUyQoIAPhTCo8eDOHDoOAwrLOq2wFJsw+vRN5BCCIfR3fME23ftV28G9MvWo/N+D2bH8Mgoqmvc0BrWzg/AakcXjBU3YSiohsZgFlsiFx/GxnGk9hQ0C03KAFxovYr2G3ewo+Y2CuuDogpOfoXJ8RCVtdcR4EOyIKRVDqcrfYBcrggTn78gIAAlZ6YAYlV04i2u9fsQ/iXLgd6+QWzaXJ5eCxxOl5jsbHc4DkBS2flJDIwkoADw3PsKzZ42lFc4YS60YlGuObkZMG0ogcN1MSGApKMdAib8Ucw1yCwldQs0iy3Qr6uE9XAHjt3yYW8bHwdR2szjgffnHMwvJX8NGZkHamCYh80zA2I9x/+1HYnMkwaQtGbjVnT2PIP7riDKF5BvQSQSQV//U2wr25f8O8D8Q3LvQjDI4937MdH0dKNHBE3pFjApmCcqseIATQqapwSwp+ogPo5/UsRcBEjlR0xey3tdvXF3OpWfMUW2oHSSpAkwRFrQkCkAhjXWZXIxmczWr1wgrWZ21VeznFU7Z++HdjIUapw8zlwKsquRdYnWcl4lFxaSi+QkPZ8u+5/4DRLnd3V7Q2x5AAAAAElFTkSuQmCC'
+
 function paragraph(value) {
   return `<p style="margin:0 0 16px;color:${BRAND.navy};font-size:16px;line-height:24px;">${value}</p>`
 }
@@ -40,7 +43,7 @@ function brandedEmail({ preheader, title, paragraphs, action, code, security = f
           <tr>
             <td style="padding:28px 32px 20px;border-bottom:1px solid ${BRAND.border};">
               <table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr>
-                <td style="width:38px;height:38px;border-radius:10px;background:${BRAND.blue};color:#ffffff;font-size:20px;font-weight:800;text-align:center;vertical-align:middle;">H</td>
+                <td style="width:38px;height:38px;vertical-align:middle;"><img src="${BRAND_MARK_DATA_URI}" width="38" height="38" alt="" style="display:block;width:38px;height:38px;border:0;border-radius:9px;"></td>
                 <td style="padding-left:12px;color:${BRAND.navy};font-size:20px;font-weight:800;">${BRAND.name}</td>
               </tr></table>
             </td>

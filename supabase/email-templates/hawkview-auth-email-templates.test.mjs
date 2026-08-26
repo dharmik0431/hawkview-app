@@ -29,13 +29,14 @@ test('the manifest owns every supported authentication and security email subjec
   }
 })
 
-test('all emails use the same accessible HawkView shell without tracking or remote media', () => {
+test('all emails use the embedded HawkView mark without tracking or remote media', () => {
   for (const name of templateNames) {
     const content = HAWKVIEW_AUTH_EMAIL_TEMPLATE_PATCH[`mailer_templates_${name}_content`]
     assert.match(content, /<!doctype html>/i)
     assert.match(content, />HawkView</)
     assert.match(content, /role="presentation"/)
-    assert.doesNotMatch(content, /<img\b/i)
+    assert.match(content, /<img src="data:image\/png;base64,/i)
+    assert.equal(content.match(/<img\b/gi)?.length, 1)
     assert.doesNotMatch(content, /https?:\/\//i)
     assert.ok(content.length < 20_000)
   }
