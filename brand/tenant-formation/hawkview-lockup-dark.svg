@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 180" role="img" aria-label="HawkView">
+  <rect width="720" height="180" rx="20" fill="#0F172A"/>
+  <g transform="translate(20 8) scale(.64)">
+    <path fill="#FFFFFF" d="M18 44c39 6 76 18 108 36 26 14 47 28 66 38 14 7 29 9 46 7l-15 15c-11 10-25 15-42 15h-18l-28 28-19-9 21-24-30-18-47-9-26-26 52 12 36 14-30-27C69 69 44 56 18 44Z"/>
+    <path fill="#3B82F6" d="M35 79c31 7 62 18 91 34l31 18-18 14-30-17-48-11-26-38Z"/>
+    <path fill="#60A5FA" d="M55 111c20 5 40 12 59 22l15 9-13 11-18-10-25-7-18-25Z"/>
+    <path fill="#FFFFFF" d="M199 118c14-13 27-19 39-17-5 10-12 18-23 24l-16-7Z"/>
+  </g>
+  <text x="202" y="118" fill="#FFFFFF" font-family="Manrope, Inter, Arial, sans-serif" font-size="76" font-weight="700" letter-spacing="-2.5">HawkView</text>
+</svg>
