@@ -162,9 +162,17 @@ test('browser clients use the centralized destinations without legacy fallbacks'
   assert.doesNotMatch(supabaseClient, /createClient\(\s*process\.env/)
 })
 
-test('auth forms use stable links and never navigate without HawkView bootstrap', () => {
+test('auth forms use stable links and protected bootstrap requires verified MFA', () => {
   const authForm = readFileSync(
     new URL('../../components/auth/auth-form.tsx', import.meta.url),
+    'utf8'
+  )
+  const authProvider = readFileSync(
+    new URL('../../components/providers/auth-provider.tsx', import.meta.url),
+    'utf8'
+  )
+  const protectedRoute = readFileSync(
+    new URL('../../components/auth/protected-route.tsx', import.meta.url),
     'utf8'
   )
 
@@ -173,8 +181,18 @@ test('auth forms use stable links and never navigate without HawkView bootstrap'
   assert.doesNotMatch(authForm, /window\.location\.origin/)
   assert.match(
     authForm,
-    /const nextSession = await refreshSession\(\)[\s\S]{0,100}if \(!nextSession\)/
+    /await refreshSession\(\)[\s\S]{0,100}router\.replace\('\/dashboard'\)/
   )
+  assert.match(
+    authProvider,
+    /mfaState\.status !== 'verified'[\s\S]{0,300}commitSession\(null\)/
+  )
+  assert.match(
+    authProvider,
+    /mfaState\.status !== 'verified'[\s\S]{0,800}'\/auth\/bootstrap'/
+  )
+  assert.match(protectedRoute, /if \(mfa\.status !== 'verified'\)/)
+  assert.match(protectedRoute, /return <MfaAccessGate \/>/)
   assert.match(
     authForm,
     /If this address is eligible for a new or unconfirmed account/

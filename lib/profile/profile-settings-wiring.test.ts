@@ -37,11 +37,15 @@ test('every profile navigation destination exists and has an explicit topbar tit
   assert.match(topbar, /'\/settings': 'Microsoft Connector'/)
 })
 
-test('security and notification pages fail honestly instead of fabricating state or hanging', () => {
+test('security page uses verified MFA factors and notification failures remain honest', () => {
   const security = source('app/(protected)/profile/security/page.tsx')
-  assert.match(security, /Not reported/)
+  const mfaPanel = source('components/auth/mfa-security-panel.tsx')
+  assert.match(security, /<MfaSecurityPanel \/>/)
   assert.match(security, /Other active sessions are not listed/)
-  assert.doesNotMatch(security, />Enrolled</)
+  assert.match(mfaPanel, /mfa\.factors\.map/)
+  assert.match(mfaPanel, /supabase\.auth\.mfa\.unenroll/)
+  assert.match(mfaPanel, /Required · Enabled/)
+  assert.doesNotMatch(mfaPanel, /Not reported/)
   assert.doesNotMatch(security, /Reset 2FA/)
   assert.doesNotMatch(security, /Verification tokens are synchronized/)
 
