@@ -94,6 +94,7 @@ export function Sidebar() {
           >
             <HawkViewBrand
               compact={isCollapsed}
+              appearance="dark"
               markClassName="h-8 w-8"
               wordmarkClassName="text-xl text-white"
             />

@@ -43,6 +43,7 @@ export function AuthLayout({ children }: { children: React.ReactNode }) {
 
         {/* Top Brand Header */}
         <HawkViewBrand
+          appearance="dark"
           className="relative z-10"
           wordmarkClassName="text-2xl text-white"
         />
