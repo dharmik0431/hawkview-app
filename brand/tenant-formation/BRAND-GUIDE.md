@@ -16,6 +16,12 @@ The mark depicts one forward-flying hawk assembled from three nested flight path
 - Product/UI companion: Inter 400–600
 - Technical data: IBM Plex Mono 400–500
 
+## Master geometry
+
+- The approved production mark uses a `336 × 256` view box.
+- Treat `hawkview-mark.svg` as the geometry source of truth for every export.
+- Do not reconstruct the mark from a favicon, PNG, screenshot, or presentation preview.
+
 ## Clear space
 
 Maintain clear space equal to the height of the blue center ribbon (approximately 18% of the mark width) on every side. Do not place text, borders, or other symbols inside this area.
