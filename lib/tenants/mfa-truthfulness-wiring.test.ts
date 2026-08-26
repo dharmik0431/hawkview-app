@@ -6,28 +6,31 @@ function source(path: string) {
   return readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
 }
 
-test('tenant users render registration and legacy per-user MFA as separate Microsoft facts', () => {
+test('tenant users render registration, enforcement, and legacy per-user MFA as separate facts', () => {
   const page = source('app/(protected)/tenants/[id]/page.tsx')
   assert.match(page, /MFA registration/)
-  assert.match(page, /Per-user MFA/)
-  assert.match(page, /Microsoft Graph beta when available/)
-  assert.match(page, /Conditional Access and security defaults are evaluated separately/)
+  assert.match(page, /MFA enforcement/)
+  assert.match(page, /Legacy per-user MFA/)
+  assert.match(page, /versioned backend evaluation/)
   assert.match(page, /mfaRegistrationPresentation\(u\)/)
+  assert.match(page, /effectiveMfaEnforcementPresentation\(u\)/)
   assert.match(page, /perUserMfaPresentation\(u\)/)
   assert.match(page, /<MfaFactBadge \{\.\.\.mfaRegistrationBadge\} \/>/)
+  assert.match(page, /<MfaFactBadge \{\.\.\.effectiveMfaBadge\} \/>/)
   assert.match(page, /<MfaFactBadge \{\.\.\.perUserMfaBadge\} \/>/)
 })
 
 test('user security facts precede role and type in the table', () => {
   const page = source('app/(protected)/tenants/[id]/page.tsx')
-  const banner = page.indexOf('MFA registration shows whether')
+  const banner = page.indexOf('MFA registration, legacy per-user MFA')
   const start = page.indexOf('<thead', banner)
   const end = page.indexOf('{USERS.length === 0', start)
   const table = page.slice(start, end)
   const order = [
     'label="Status"',
     'label="MFA registration"',
-    'Per-user MFA',
+    'MFA enforcement',
+    'Legacy per-user MFA',
     'label="Role"',
     'label="Type"',
   ].map((label) => table.indexOf(label))
