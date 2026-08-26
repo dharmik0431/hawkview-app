@@ -38,6 +38,7 @@ import type {
   Tenant,
 } from '@/types/api'
 import { normalizeMicrosoftConsentReview, type MicrosoftConsentReview } from '@/lib/tenants/microsoft-access-contract'
+import { microsoftConsentErrorMessage } from '@/lib/tenants/microsoft-consent-errors'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 
@@ -460,9 +461,9 @@ export default function TenantsPage() {
       })
       queryClient.invalidateQueries({ queryKey: ['tenants'] })
     } else if (result === 'error') {
-      setOnboardingError(
-        'Microsoft administrator consent could not be verified. Review the tenant connection and try again.'
-      )
+      setShowOnboarding(true)
+      setOnboardingStep('select')
+      setOnboardingError(microsoftConsentErrorMessage(consentError))
       queryClient.invalidateQueries({ queryKey: ['tenants'] })
     }
 
@@ -506,11 +507,9 @@ export default function TenantsPage() {
           tone: 'warning',
         })
       } else {
-        setShowOnboarding(false)
+        setShowOnboarding(true)
         setOnboardingStep('select')
-        setOnboardingError(
-          'Microsoft administrator consent could not be verified. Review the tenant connection and try again.'
-        )
+        setOnboardingError(microsoftConsentErrorMessage(message.error))
       }
 
       queryClient.invalidateQueries({ queryKey: ['tenants'] })
@@ -1257,7 +1256,11 @@ export default function TenantsPage() {
             )}
 
             {onboardingError && (
-              <p className="mt-4 text-sm font-medium text-red-600 dark:text-red-400">
+              <p
+                role="alert"
+                aria-live="assertive"
+                className="mt-4 text-sm font-medium text-red-600 dark:text-red-400"
+              >
                 {onboardingError}
               </p>
             )}
