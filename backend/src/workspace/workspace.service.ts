@@ -657,6 +657,11 @@ export class WorkspaceService {
   async resetHawkViewMfa(identity: AuthenticatedIdentity, membershipId: string, body: unknown) {
     const actor = await this.ownerContext(identity, requiredOrganizationId(body))
     const member = await this.memberForOwner(actor.organizationId, membershipId)
+    if (member.userId === actor.userId) {
+      throw new BadRequestException(
+        'Use Account & Security to manage your own HawkView authenticators.',
+      )
+    }
     if (!member.user.authProviderUserId) {
       throw new BadRequestException('This invited member has not completed HawkView account setup yet.')
     }

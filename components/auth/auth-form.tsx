@@ -28,6 +28,7 @@ export function AuthForm({ initialMode }: AuthFormProps) {
     session,
     isLoading: isAuthLoading,
     refreshSession,
+    mfa,
   } = useAuth()
 
   const [mode, setMode] = useState<AuthMode>(initialMode)
@@ -56,10 +57,14 @@ export function AuthForm({ initialMode }: AuthFormProps) {
   }, [initialMode])
 
   useEffect(() => {
-    if (!isAuthLoading && identityUser?.email_confirmed_at && session) {
+    if (
+      !isAuthLoading &&
+      identityUser?.email_confirmed_at &&
+      (session || (mfa.status !== 'loading' && mfa.status !== 'signed-out'))
+    ) {
       router.replace('/dashboard')
     }
-  }, [identityUser, isAuthLoading, router, session])
+  }, [identityUser, isAuthLoading, mfa.status, router, session])
 
   const changeMode = (nextMode: AuthMode) => {
     setMode(nextMode)
@@ -156,8 +161,7 @@ export function AuthForm({ initialMode }: AuthFormProps) {
         if (signUpError) throw signUpError
         setPassword('')
         if (signUpData.session) {
-          const nextSession = await refreshSession()
-          if (!nextSession) throw new Error('HAWKVIEW_SESSION_UNAVAILABLE')
+          await refreshSession()
           router.replace('/dashboard')
           return
         }
@@ -173,8 +177,7 @@ export function AuthForm({ initialMode }: AuthFormProps) {
       })
       if (signInError) throw signInError
 
-      const nextSession = await refreshSession()
-      if (!nextSession) throw new Error('HAWKVIEW_SESSION_UNAVAILABLE')
+      await refreshSession()
       router.replace('/dashboard')
     } catch (authError) {
       setError(readableAuthError(authError))

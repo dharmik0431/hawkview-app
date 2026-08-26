@@ -19,7 +19,16 @@ test('accepts a signed permanent Supabase session identity contract', () => {
     email: 'owner@example.com',
     displayName: 'Owner',
     signInProvider: 'email',
+    assuranceLevel: 'aal1',
   })
+})
+
+test('preserves an AAL2 session as a strongly authenticated identity', () => {
+  assert.equal(
+    authenticatedIdentityFromSupabasePayload({ ...validPayload, aal: 'aal2' })
+      .assuranceLevel,
+    'aal2',
+  )
 })
 
 for (const [name, override] of [
