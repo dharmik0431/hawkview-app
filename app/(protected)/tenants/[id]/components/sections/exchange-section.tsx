@@ -478,7 +478,7 @@ export default function ExchangePage({
         type: 'permission',
         title: 'Exchange synchronization requires attention',
         target: 'Exchange Graph API Collection',
-        reason: mailboxesSyncStatus?.lastError || 'Microsoft Graph returned an error or insufficient permissions during collection.',
+        reason: 'Exchange collection did not complete. Review Microsoft access and retry synchronization.',
         onAction: () => {
           if (onSync) onSync()
         }

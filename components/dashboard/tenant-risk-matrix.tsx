@@ -124,8 +124,8 @@ export function TenantRiskMatrix({
         const scoreB = b.secureScore ?? -1
         cmp = scoreA - scoreB
       } else if (sortColumn === 'users_at_risk') {
-        const usersA = a.riskyIdentityCount ?? 0
-        const usersB = b.riskyIdentityCount ?? 0
+        const usersA = a.riskyIdentityCount ?? -1
+        const usersB = b.riskyIdentityCount ?? -1
         cmp = usersA - usersB
       } else if (sortColumn === 'active_threats') {
         const threatsA = getTenantThreatsInfo(a).count ?? -1
@@ -343,7 +343,9 @@ export function TenantRiskMatrix({
                           </div>
                           <div className="border-t border-slate-100 dark:border-slate-800 pt-2 flex items-center justify-between gap-2">
                             <span className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">HawkView Health</span>
-                            <span className="font-bold text-slate-700 dark:text-slate-200">{t.healthScore}%</span>
+                            <span className="font-bold text-slate-700 dark:text-slate-200">
+                              {Number.isFinite(t.healthScore) ? `${t.healthScore}%` : 'Not reported'}
+                            </span>
                           </div>
                         </div>
                       </td>
@@ -577,7 +579,9 @@ export function TenantRiskMatrix({
                       )}
                       <div className="border-t border-slate-200 dark:border-slate-700 pt-1.5 mt-1.5 flex items-center justify-between gap-2">
                         <span className="text-[10px] uppercase font-bold text-slate-400">HawkView Health</span>
-                        <span className="font-bold text-slate-700 dark:text-slate-200">{t.healthScore}%</span>
+                        <span className="font-bold text-slate-700 dark:text-slate-200">
+                          {Number.isFinite(t.healthScore) ? `${t.healthScore}%` : 'Not reported'}
+                        </span>
                       </div>
                     </div>
 

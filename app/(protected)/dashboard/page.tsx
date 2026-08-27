@@ -17,6 +17,7 @@ import {
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
+  Building2,
 } from 'lucide-react'
 
 import { useTenants } from '@/lib/api/hooks'
@@ -30,6 +31,9 @@ import {
   getTenantThreatsInfo,
 } from '@/components/dashboard/tenant-risk-matrix-helpers'
 import type { Tenant } from '@/types/api'
+import { LoadingState } from '@/components/common/loading-state'
+import { ErrorState } from '@/components/common/error-state'
+import { EmptyState } from '@/components/common/empty-state'
 
 export type Severity = 'critical' | 'high' | 'medium'
 type TabKey = 'queue' | 'matrix'
@@ -95,6 +99,17 @@ function formatAge(iso?: string) {
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n))
+}
+
+function numericEvidence(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? clamp(value, min, max)
+    : null
+}
+
+function evidenceCount(value: number | null, partial: boolean) {
+  if (value === null || (partial && value === 0)) return 'Not reported'
+  return partial ? `≥${value}` : String(value)
 }
 
 function severityStripe(sev: Severity) {
@@ -175,12 +190,15 @@ function getKeyResult(q: QueueItem): string {
     if (q.metricValue && q.metricValue !== '—') {
       return `Risky users: ${q.metricValue}`
     }
-    return 'Risky users: 1'
+    return 'Risky users: Not reported'
   }
 
   // 6. Connection / Auth required
   if (key.includes('connection') || label.includes('connection') || label.includes('reconnect')) {
-    return 'Connection: Disconnected'
+    const normalized = `${label} ${why}`.toLowerCase()
+    return normalized.includes('disconnect') || normalized.includes('reconnect')
+      ? 'Connection: Disconnected'
+      : 'Connection: Not reported'
   }
   if (key.includes('authorization') || label.includes('authorization')) {
     return 'Authorization: Required'
@@ -255,14 +273,16 @@ function ScrollPanel({ children }: { children: React.ReactNode }) {
 
 type TenantRow = Tenant & {
   top: AttentionItem[]
+  attentionReported: boolean
   topSeverity?: Severity
   lastCriticalAt?: string
-  identityDetected: number
+  identityDetected: number | null
 }
 
 function buildTenants(source: any[]): TenantRow[] {
   return (source ?? []).map((t: any) => {
-    const attention = (t.attention ?? []) as AttentionItem[]
+    const attentionReported = Array.isArray(t.attention)
+    const attention = (attentionReported ? t.attention : []) as AttentionItem[]
     const top = topAttention(attention)
 
     const topSeverity =
@@ -276,19 +296,20 @@ function buildTenants(source: any[]): TenantRow[] {
       .map((a) => a.detectedAt as string)
       .sort((a, b) => parseTime(b) - parseTime(a))[0]
 
-    const healthScore = clamp(Number(t.healthScore ?? 100), 0, 100)
-    const mfaCoverage =
-      t.mfaCoverage == null ? null : clamp(Number(t.mfaCoverage), 0, 100)
-    const identityDetected = Math.max(0, Number(t.riskyIdentityCount ?? 0))
+    const healthScore = numericEvidence(t.healthScore, 0, 100)
+    const mfaCoverage = numericEvidence(t.mfaCoverage, 0, 100)
+    const identityDetected = numericEvidence(t.riskyIdentityCount, 0)
 
     return {
       ...t,
       attention,
+      attentionReported,
       top,
       topSeverity,
       lastCriticalAt,
       healthScore,
       mfaCoverage,
+      riskyIdentityCount: identityDetected,
       identityDetected,
     }
   })
@@ -318,21 +339,33 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
 
   if (label.includes('risky') || label.includes('risk')) {
     return {
-      metricLabel: 'AT RISK',
-      metricValue: `${Math.max(1, tenant.identityDetected)} Users`,
+      metricLabel: 'RISK EVIDENCE',
+      metricValue:
+        tenant.identityDetected === null
+          ? 'Not reported'
+          : `${tenant.identityDetected} user${tenant.identityDetected === 1 ? '' : 's'}`,
     }
   }
 
   if (label.includes('external')) {
-    return { metricLabel: 'AT RISK', metricValue: `Data` }
+    return { metricLabel: 'EVIDENCE', metricValue: 'External access reported' }
   }
 
-  return { metricLabel: 'AT RISK', metricValue: '—' }
+  return { metricLabel: 'EVIDENCE', metricValue: 'Not reported' }
 }
 
 export default function DashboardPage() {
   const router = useRouter()
-  const { data } = useTenants()
+  const tenantQuery = useTenants()
+  const {
+    data,
+    isLoading,
+    isError,
+    isFetching,
+    isStale,
+    dataUpdatedAt,
+    refetch,
+  } = tenantQuery
   const [tab, setTab] = React.useState<TabKey>('queue')
 
   const [selectedQueueItem, setSelectedQueueItem] = React.useState<QueueItem | null>(null)
@@ -401,17 +434,17 @@ export default function DashboardPage() {
 
       // 2. Has Risky Users
       if (matrixHasRiskyUsers === 'yes') {
-        if ((t.riskyIdentityCount ?? 0) <= 0) return false
+        if (typeof t.riskyIdentityCount !== 'number' || t.riskyIdentityCount <= 0) return false
       } else if (matrixHasRiskyUsers === 'no') {
-        if ((t.riskyIdentityCount ?? 0) > 0) return false
+        if (t.riskyIdentityCount !== 0) return false
       }
 
       // 3. Has Active Threats
       const threatsInfo = getTenantThreatsInfo(t)
       if (matrixHasThreats === 'yes') {
-        if ((threatsInfo.count ?? 0) <= 0) return false
+        if (typeof threatsInfo.count !== 'number' || threatsInfo.count <= 0) return false
       } else if (matrixHasThreats === 'no') {
-        if ((threatsInfo.count ?? 0) > 0) return false
+        if (threatsInfo.count !== 0) return false
       }
 
       // 4. Data Availability
@@ -498,32 +531,92 @@ export default function DashboardPage() {
   }, [queueItems, sortField, sortDir])
 
   const kpis = React.useMemo(() => {
-    const riskyIdentities = queueItems.filter((q) =>
-      (q.item.label ?? '').toLowerCase().includes('risky')
-    ).length
+    const reportedRiskCounts = tenants
+      .map((tenant) => tenant.identityDetected)
+      .filter((value): value is number => value !== null)
+    const riskyIdentities =
+      reportedRiskCounts.length === 0
+        ? null
+        : reportedRiskCounts.reduce((total, value) => total + value, 0)
 
+    const attentionPartial = tenants.some((tenant) => !tenant.attentionReported)
     const criticalTenants = tenants.filter(
-      (t) => t.topSeverity === 'critical'
+      (t) => t.attentionReported && t.topSeverity === 'critical'
     ).length
 
-    const mfaGaps = tenants.filter((t) =>
-      (t.top ?? []).some((a: AttentionItem) =>
-        (a.label ?? '').toLowerCase().includes('mfa')
-      )
-    ).length
+    const reportedMfa = tenants.filter((tenant) => tenant.mfaCoverage !== null)
+    const mfaGaps =
+      reportedMfa.length === 0
+        ? null
+        : reportedMfa.filter((tenant) => (tenant.mfaCoverage as number) < 85)
+            .length
 
+    const reportedHealthScores = tenants
+      .map((tenant) => tenant.healthScore)
+      .filter((value): value is number => value !== null && value !== undefined)
     const avgScore =
-      tenants.length === 0
-        ? 0
+      reportedHealthScores.length === 0
+        ? null
         : Math.round(
-            tenants.reduce((acc, t) => acc + (Number(t.healthScore) || 0), 0) /
-              tenants.length
+            reportedHealthScores.reduce((total, value) => total + value, 0) /
+              reportedHealthScores.length,
           )
 
-    return { riskyIdentities, criticalTenants, mfaGaps, avgScore }
-  }, [tenants, queueItems])
+    return {
+      riskyIdentities,
+      criticalTenants,
+      mfaGaps,
+      avgScore,
+      riskPartial: reportedRiskCounts.length < tenants.length,
+      attentionPartial,
+      mfaPartial: reportedMfa.length < tenants.length,
+      healthPartial: reportedHealthScores.length < tenants.length,
+    }
+  }, [tenants])
 
-  const queueCount = queueItems.length
+  const hasPartialEvidence = React.useMemo(
+    () =>
+      Boolean(data?.error) ||
+      tenants.some(
+        (tenant) =>
+          tenant.healthScore == null ||
+          tenant.mfaCoverage == null ||
+          tenant.identityDetected == null ||
+          !tenant.attentionReported ||
+          !tenant.lastSync,
+      ),
+    [data?.error, tenants],
+  )
+
+  if (isLoading) {
+    return <LoadingState message="Loading dashboard evidence…" />
+  }
+
+  if (isError && !data?.tenants) {
+    return (
+      <ErrorState
+        message="HawkView could not load dashboard evidence. No health or risk state is being inferred."
+        onRetry={() => void refetch()}
+      />
+    )
+  }
+
+  if (tenants.length === 0) {
+    return (
+      <EmptyState
+        icon={Building2}
+        title="No managed tenants"
+        description="Onboard a Microsoft 365 tenant to begin collecting security and configuration evidence."
+        actionLabel="Open tenant directory"
+        href="/tenants"
+      />
+    )
+  }
+
+  const queueCount = evidenceCount(
+    queueItems.length,
+    tenants.some((tenant) => !tenant.attentionReported),
+  )
   const matrixCount = tenants.length
 
   const reset = () => {
@@ -539,6 +632,42 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-5">
+      {isError ? (
+        <div
+          role="alert"
+          className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100"
+        >
+          <div className="font-semibold">Dashboard refresh failed</div>
+          <div className="mt-1 text-xs leading-5">
+            Showing previously loaded evidence. Values may be stale; HawkView has
+            not replaced unavailable facts with zero or healthy states.
+          </div>
+        </div>
+      ) : isFetching ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100"
+        >
+          Refreshing dashboard evidence…
+        </div>
+      ) : isStale && dataUpdatedAt > 0 ? (
+        <div
+          role="status"
+          className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100"
+        >
+          <span className="font-semibold">Stale dashboard evidence.</span>{' '}
+          HawkView is showing the last loaded tenant data while it awaits a refresh.
+        </div>
+      ) : hasPartialEvidence ? (
+        <div
+          role="status"
+          className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+        >
+          <span className="font-semibold">Partial dashboard evidence.</span>{' '}
+          Unreported health, MFA, risk, or synchronization values remain visibly unavailable.
+        </div>
+      ) : null}
       {/* KPI Cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card className="rounded-2xl">
@@ -549,10 +678,10 @@ export default function DashboardPage() {
                   Risky Identities
                 </div>
                 <div className="mt-1 text-3xl font-bold">
-                  {kpis.riskyIdentities}
+                  {evidenceCount(kpis.riskyIdentities, kpis.riskPartial)}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
-                  Requires immediate attention
+                  {kpis.riskPartial ? 'Partial Microsoft risk evidence' : 'Microsoft risk evidence'}
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-red-50 border border-red-100 flex items-center justify-center">
@@ -570,10 +699,10 @@ export default function DashboardPage() {
                   Critical Tenants
                 </div>
                 <div className="mt-1 text-3xl font-bold">
-                  {kpis.criticalTenants}
+                  {evidenceCount(kpis.criticalTenants, kpis.attentionPartial)}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
-                  Current critical signals
+                  {kpis.attentionPartial ? 'Partial critical-signal evidence' : 'Current critical signals'}
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-amber-50 border border-amber-100 flex items-center justify-center">
@@ -590,9 +719,9 @@ export default function DashboardPage() {
                 <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
                   MFA Registration Gaps
                 </div>
-                <div className="mt-1 text-3xl font-bold">{kpis.mfaGaps}</div>
+                <div className="mt-1 text-3xl font-bold">{evidenceCount(kpis.mfaGaps, kpis.mfaPartial)}</div>
                 <div className="mt-1 text-xs text-slate-500">
-                  Tenants &lt; 85% coverage
+                  {kpis.mfaPartial ? 'Partial registration evidence' : 'Tenants below 85% registration'}
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-blue-50 border border-blue-100 flex items-center justify-center">
@@ -609,9 +738,11 @@ export default function DashboardPage() {
                 <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
                   Avg Health Score
                 </div>
-                <div className="mt-1 text-3xl font-bold">{kpis.avgScore}%</div>
+                <div className="mt-1 text-3xl font-bold">
+                  {kpis.avgScore === null ? 'Not reported' : `${kpis.avgScore}%`}
+                </div>
                 <div className="mt-1 text-xs text-slate-500">
-                  Derived from current signals
+                  {kpis.healthPartial ? 'Average of reported scores only' : 'Derived from reported signals'}
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-green-50 border border-green-100 flex items-center justify-center">

@@ -40,10 +40,10 @@ export function UserMenu() {
   const membership = session?.user.memberships?.[0]
   const fullName =
     session?.user.displayName || session?.user.email || 'HawkView User'
-  const email = session?.user.email || 'user@hawkview.net'
-  const orgName = membership?.organization?.name || 'HawkView Organization'
+  const email = session?.user.email || 'Not reported'
+  const orgName = membership?.organization?.name || 'Not reported'
 
-  const rawRole = membership?.role || session?.user.platformRole || 'MSP_ADMIN'
+  const rawRole = membership?.role || session?.user.platformRole || 'Not reported'
   const roleDisplay = rawRole
     .replace('MSP_', '')
     .replace('PLATFORM_', '')

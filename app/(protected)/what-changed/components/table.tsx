@@ -359,7 +359,7 @@ export function WhatChangedView() {
           <div className="flex items-center gap-2">
             <AlertCircle className="h-4 w-4 shrink-0" />
             <span>
-              {error instanceof Error ? error.message : 'The investigation activity could not be loaded.'}
+              The investigation activity could not be loaded. Please retry.
             </span>
           </div>
           <Button

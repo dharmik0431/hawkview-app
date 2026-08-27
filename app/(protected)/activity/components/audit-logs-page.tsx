@@ -5,19 +5,28 @@ import { ArrowUp, ArrowDown, ArrowUpDown, ChevronRight } from 'lucide-react'
 import type { AuditEvent } from '../data/types'
 import { SignInDrawer } from './signin-drawer'
 
-function fmtUTC(iso: string) {
+function fmtUTC(iso?: string) {
+  if (!iso) return 'Not reported'
   const date = new Date(iso)
   return Number.isFinite(date.getTime())
     ? date.toISOString().replace('T', ' ').replace('Z', '').slice(0, 19)
-    : iso
+    : 'Not reported'
 }
 
 function ResultPill({ result }: { result?: string }) {
-  const isSuccess = String(result ?? 'Success').toLowerCase() === 'success'
+  const normalized = String(result ?? '').trim().toLowerCase()
+  const isSuccess = normalized === 'success' || normalized === 'succeeded'
   if (isSuccess) {
     return (
       <span className="inline-flex items-center rounded-md bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700 border border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-800">
         Success
+      </span>
+    )
+  }
+  if (!normalized || normalized === 'not reported') {
+    return (
+      <span className="inline-flex items-center rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
+        Not reported
       </span>
     )
   }
@@ -183,7 +192,7 @@ export function AuditLogsPage({
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {sortedRows.map((row) => (
                   <tr
-                    key={row.id}
+                    key={row.rowKey}
                     tabIndex={0}
                     role="button"
                     className="group border-b last:border-b-0 hover:bg-slate-100/60 dark:hover:bg-slate-800/50 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-slate-100/80 dark:focus-visible:bg-slate-800/80"
@@ -207,16 +216,16 @@ export function AuditLogsPage({
                         {row.activity}
                       </div>
                       <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                        {row.service ?? row.operationType ?? 'Microsoft Entra'}
+                        {row.service ?? row.operationType ?? 'Not reported'}
                       </div>
                     </td>
 
                     <td className="px-4 py-3 max-w-[200px]">
                       <div
                         className="font-medium text-slate-800 dark:text-slate-200 truncate"
-                        title={row.actor ?? 'System'}
+                        title={row.actor ?? 'Not reported'}
                       >
-                        {row.actor ?? 'System'}
+                        {row.actor ?? 'Not reported'}
                       </div>
                       {row.actorPrincipalName ? (
                         <div
@@ -231,18 +240,18 @@ export function AuditLogsPage({
                     <td className="px-4 py-3 max-w-[200px]">
                       <div
                         className="truncate text-slate-700 dark:text-slate-300"
-                        title={row.target ?? '—'}
+                        title={row.target ?? 'Not reported'}
                       >
-                        {row.target ?? '—'}
+                        {row.target ?? 'Not reported'}
                       </div>
                     </td>
 
                     <td className="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-300">
-                      {row.service ?? row.operationType ?? '—'}
+                      {row.service ?? row.operationType ?? 'Not reported'}
                     </td>
 
                     <td className="px-4 py-3 whitespace-nowrap text-xs text-slate-500 dark:text-slate-400">
-                      {row.category ?? '—'}
+                      {row.category ?? 'Not reported'}
                     </td>
 
                     <td className="px-4 py-3 whitespace-nowrap">
@@ -261,7 +270,7 @@ export function AuditLogsPage({
                       colSpan={8}
                       className="px-4 py-12 text-center text-muted-foreground"
                     >
-                      No audit logs match your filters.
+                      No audit events were reported for the selected range and filters.
                     </td>
                   </tr>
                 ) : null}

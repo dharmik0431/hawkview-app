@@ -160,7 +160,8 @@ const roles: Array<{ value: MembershipRole; label: string; description: string }
 ]
 
 function errorMessage(error: unknown, fallback: string) {
-  return error instanceof Error ? error.message : fallback
+  void error
+  return fallback
 }
 
 function formatDate(value: string | null | undefined): string {
@@ -892,7 +893,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
         'Email address',
         'Workspace role',
         'Account status',
-        'Authentication status',
+        'Account record status',
         'Added date',
         'Last activity',
         'Current user',
@@ -917,8 +918,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
           sanitizeCsv(member.status === 'ACTIVE' ? 'Active' : 'Suspended'),
           sanitizeCsv(
             member.hasHawkViewAccount
-              ? 'Authentication configured'
-              : 'Authentication setup required'
+              ? 'HawkView account record present'
+              : 'HawkView account record not reported'
           ),
           sanitizeCsv(formatDate(member.joinedAt || member.createdAt)),
           sanitizeCsv('Not available'),
@@ -1976,8 +1977,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       className="h-8 rounded-md border border-input bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                     >
                       <option value="ALL">All auth states</option>
-                      <option value="CONFIGURED">Authentication configured</option>
-                      <option value="AWAITING_SETUP">Authentication setup required</option>
+                      <option value="CONFIGURED">Account record present</option>
+                      <option value="AWAITING_SETUP">Account record not reported</option>
                     </select>
 
                     {(searchQuery || roleFilter !== 'ALL' || statusFilter !== 'ALL' || authStatusFilter !== 'ALL') && (
@@ -2286,17 +2287,17 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                             {member.hasHawkViewAccount ? (
                               <div className="group relative inline-flex items-center gap-1 font-medium text-foreground cursor-help">
                                 <ShieldCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                                <span>Authentication configured</span>
+                                <span>Account record present</span>
                                 <div className="absolute left-0 bottom-full mb-1.5 hidden group-hover:block z-30 w-56 rounded-md bg-popover border border-border p-2 text-[11px] font-normal text-popover-foreground shadow-md pointer-events-none">
-                                  HawkView MSP console login account is active and configured.
+                                  HawkView has an account record for this member. This does not verify the authentication provider or recent sign-in activity.
                                 </div>
                               </div>
                             ) : (
                               <div className="group relative inline-flex items-center gap-1 font-medium text-amber-600 dark:text-amber-400 cursor-help">
                                 <Clock className="h-3.5 w-3.5 shrink-0" />
-                                <span>Authentication setup required</span>
+                                <span>Account record not reported</span>
                                 <div className="absolute left-0 bottom-full mb-1.5 hidden group-hover:block z-30 w-56 rounded-md bg-popover border border-border p-2 text-[11px] font-normal text-popover-foreground shadow-md pointer-events-none">
-                                  Member needs to set up their HawkView console password.
+                                  HawkView did not receive an account record for this member. The authentication provider and setup state are not inferred.
                                 </div>
                               </div>
                             )}
@@ -2678,65 +2679,25 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
       {/* TAB 4: SECURITY */}
       {activeTab === 'security' && (
         <div className="space-y-6 animate-in fade-in duration-200">
-          {/* Section 1: Authentication Status */}
+          {/* Section 1: Authentication evidence */}
           <div className="rounded-xl border border-border bg-card p-5 shadow-sm space-y-4">
             <div className="flex items-center justify-between border-b border-border pb-3">
               <div className="flex items-center gap-2">
                 <ShieldCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
-                <h2 className="text-sm font-bold text-foreground">Authentication Status</h2>
+                <h2 className="text-sm font-bold text-foreground">Authentication Evidence</h2>
               </div>
             </div>
 
-            <div className="divide-y divide-border text-xs">
-              <div className="py-2.5 flex items-center justify-between gap-2">
-                <div>
-                  <p className="font-semibold text-foreground">Primary Authentication Provider</p>
-                  <p className="text-[11px] text-muted-foreground">Supabase Identity & Authentication Engine</p>
-                </div>
-                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
-                  Enabled
-                </span>
+            <div className="py-3 flex flex-col gap-2 text-xs sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="font-semibold text-foreground">Workspace authentication configuration</p>
+                <p className="text-[11px] text-muted-foreground">
+                  Provider availability and enforcement are not included in the current workspace contract.
+                </p>
               </div>
-
-              <div className="py-2.5 flex items-center justify-between gap-2">
-                <div>
-                  <p className="font-semibold text-foreground">Email / Password Credentials</p>
-                  <p className="text-[11px] text-muted-foreground">Standard email address and password authentication</p>
-                </div>
-                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
-                  Enabled
-                </span>
-              </div>
-
-              <div className="py-2.5 flex items-center justify-between gap-2">
-                <div>
-                  <p className="font-semibold text-foreground">Google Sign-In</p>
-                  <p className="text-[11px] text-muted-foreground">Google Workspace OAuth 2.0 single sign-on</p>
-                </div>
-                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
-                  Enabled
-                </span>
-              </div>
-
-              <div className="py-2.5 flex items-center justify-between gap-2">
-                <div>
-                  <p className="font-semibold text-foreground">Microsoft Sign-In</p>
-                  <p className="text-[11px] text-muted-foreground">Microsoft Entra ID / 365 OAuth single sign-on</p>
-                </div>
-                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40">
-                  Enabled
-                </span>
-              </div>
-
-              <div className="py-2.5 flex items-center justify-between gap-2">
-                <div>
-                  <p className="font-semibold text-foreground">HawkView MFA Support</p>
-                  <p className="text-[11px] text-muted-foreground">Time-based One-Time Password (TOTP) enrollment capabilities</p>
-                </div>
-                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-300/40 dark:border-blue-800/40">
-                  Supported (Available, Not Enforced)
-                </span>
-              </div>
+              <span className="inline-flex w-fit items-center rounded border border-border bg-muted/40 px-2 py-0.5 text-[11px] font-semibold text-muted-foreground">
+                Not reported
+              </span>
             </div>
           </div>
 
@@ -3433,8 +3394,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                 <p className="text-[11px] font-medium text-muted-foreground">HawkView Account Status</p>
                 <p className="font-semibold text-foreground">
                   {accountDrawerMember.hasHawkViewAccount
-                    ? 'Configured (Active Auth Provider ID)'
-                    : 'Awaiting initial setup / invitation acceptance'}
+                    ? 'HawkView account record present'
+                    : 'HawkView account record not reported'}
                 </p>
               </div>
 

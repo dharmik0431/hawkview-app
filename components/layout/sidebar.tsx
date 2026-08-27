@@ -17,15 +17,12 @@ import {
 import {
   LayoutDashboard,
   Building2,
-  FileBarChart,
   Activity,
-  Shield,
   ShieldCheck,
-  HelpCircle,
   Mail,
 } from 'lucide-react'
 
-const navigation = [
+export const coreNavigation = [
   {
     title: 'MAIN',
     items: [
@@ -33,13 +30,6 @@ const navigation = [
       { name: 'Tenants', href: '/tenants', icon: Building2 },
       { name: 'Activity Logs', href: '/activity', icon: Activity },
       { name: 'What Changed?', href: '/what-changed', icon: HistoryIcon },
-    ],
-  },
-  {
-    title: 'MANAGEMENT',
-    items: [
-      { name: 'Security Insights', href: '/security', icon: Shield },
-      { name: 'Reports', href: '/reports', icon: FileBarChart },
     ],
   },
 ]
@@ -106,7 +96,7 @@ export function Sidebar() {
             aria-label="Main navigation"
           >
             <ul role="list" className="flex flex-col gap-y-6">
-              {navigation.map((group) => (
+              {coreNavigation.map((group) => (
                 <li key={group.title}>
                   {!isCollapsed && (
                     <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider px-2 mb-2 whitespace-nowrap overflow-hidden">
@@ -196,35 +186,8 @@ export function Sidebar() {
 
             <Tooltip>
               <TooltipTrigger asChild>
-                <Link
-                  href="/help"
-                  className={cn(
-                    'flex rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
-                    isCollapsed
-                      ? 'h-10 w-10 items-center justify-center mx-auto'
-                      : 'px-3 py-2 items-center justify-center gap-2',
-                    pathname === '/help'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-slate-800 text-slate-200 hover:bg-slate-700 hover:text-white'
-                  )}
-                  aria-label="Help"
-                >
-                  <HelpCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
-                  {!isCollapsed && <span>Help</span>}
-                  {isCollapsed && <span className="sr-only">Help</span>}
-                </Link>
-              </TooltipTrigger>
-              {isCollapsed && (
-                <TooltipContent side="right" sideOffset={12}>
-                  Help
-                </TooltipContent>
-              )}
-            </Tooltip>
-
-            <Tooltip>
-              <TooltipTrigger asChild>
                 <a
-                  href="mailto:support@hawkview.net?subject=HawkView%20Support"
+                  href="mailto:support@hawkviewapp.com?subject=HawkView%20Support"
                   className={cn(
                     'flex rounded-lg text-sm font-medium text-slate-200 transition-colors hover:bg-slate-700 hover:text-white bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500',
                     isCollapsed

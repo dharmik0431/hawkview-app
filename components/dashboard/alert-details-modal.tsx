@@ -99,7 +99,7 @@ function getKeyResultText(q: QueueItem): string {
     if (q.metricValue && q.metricValue !== '—') {
       return `Risky users: ${q.metricValue}`
     }
-    return 'Risky users: 1'
+    return 'Risky users: Not reported'
   }
 
   if (key.includes('connection') || label.includes('connection') || label.includes('reconnect')) {

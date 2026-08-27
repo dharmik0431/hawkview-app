@@ -18,9 +18,9 @@ export const TenantSchema = z.object({
   }).strict().optional(),
   lastSync: z.string().nullable(),
   secureScore: z.number().nullable(),
-  healthScore: z.number().min(0).max(100),
-  mfaCoverage: z.number().min(0).max(100).nullable(),
-  riskyIdentityCount: z.number().int().nonnegative(),
+  healthScore: z.number().min(0).max(100).nullish(),
+  mfaCoverage: z.number().min(0).max(100).nullish(),
+  riskyIdentityCount: z.number().int().nonnegative().nullish(),
   attention: z.array(z.object({
     key: z.string(),
     label: z.string(),

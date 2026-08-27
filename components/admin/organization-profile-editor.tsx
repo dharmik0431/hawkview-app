@@ -31,9 +31,8 @@ const COMMON_TIME_ZONES = [
 ]
 
 function safeError(error: unknown) {
-  return error instanceof Error && error.message.trim()
-    ? error.message.slice(0, 300)
-    : 'HawkView could not update the workspace profile.'
+  void error
+  return 'HawkView could not update the workspace profile. Please retry.'
 }
 
 export function OrganizationProfileEditor({

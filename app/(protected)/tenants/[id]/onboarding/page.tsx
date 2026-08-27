@@ -31,6 +31,7 @@ import {
   type ExchangeReadOnlySetup,
 } from '@/types/api'
 import { Button } from '@/components/ui/button'
+import { microsoftConsentErrorMessage } from '@/lib/tenants/microsoft-consent-errors'
 
 type BusyAction =
   | 'core-consent'
@@ -86,9 +87,9 @@ export default function TenantOnboardingPage() {
       } else {
         setExchangeSetup(null)
       }
-    } catch (cause) {
+    } catch {
       if (generation !== loadGeneration.current) return
-      setError(cause instanceof Error ? cause.message : 'Tenant setup could not be loaded.')
+      setError('Tenant setup could not be loaded. Please retry.')
     }
   }, [tenantId])
 
@@ -114,9 +115,7 @@ export default function TenantOnboardingPage() {
     } else if (consentResult === 'exchange-readonly-consented') {
       setNotice('Exchange consent was verified. Complete the least-privilege RBAC step below.')
     } else if (consentResult) {
-      setError(consentError
-        ? `Microsoft authorization was not completed (${consentError}). You can safely retry.`
-        : 'Microsoft authorization was not completed. You can safely retry.')
+      setError(microsoftConsentErrorMessage(consentError))
     }
     if (consentResult) {
       currentUrl.searchParams.delete('microsoftConsent')
@@ -134,8 +133,8 @@ export default function TenantOnboardingPage() {
     setNotice(null)
     try {
       await operation()
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'This setup action could not be completed.')
+    } catch {
+      setError('This setup action could not be completed. Please retry.')
     } finally {
       setBusy(null)
     }

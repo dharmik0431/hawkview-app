@@ -1,7 +1,10 @@
 export type ActivityTab = 'signins' | 'audit'
 
 export type SignInEvent = {
-  id: string
+  /** Internal rendering identity. Never present as Microsoft evidence. */
+  rowKey: string
+  /** Microsoft-supplied event identifier, when reported. */
+  eventId?: string
   createdAt: string
 
   userDisplayName: string
@@ -10,12 +13,12 @@ export type SignInEvent = {
 
   appDisplayName: string
   appId?: string
-  status: 'Success' | 'Failure'
+  status: 'Success' | 'Failure' | 'Not reported'
   failureReason?: string
   errorCode?: string
   additionalDetails?: string
 
-  conditionalAccess?: 'Applied' | 'Not Applied'
+  conditionalAccess?: 'Applied' | 'Not Applied' | 'Not reported'
   appliedCaPolicies?: string[]
   authMethod?: string
 
@@ -36,11 +39,24 @@ export type SignInEvent = {
   correlationId?: string
   requestId?: string
   riskLevel?: string
-  raw?: any
+}
+
+export type AuditTargetResource = {
+  displayName?: string
+  userPrincipalName?: string
+  id?: string
+  type?: string
+}
+
+export type AuditModifiedProperty = {
+  name: string
 }
 
 export type AuditEvent = {
-  id: string
+  /** Internal rendering identity. Never present as Microsoft evidence. */
+  rowKey: string
+  /** Microsoft-supplied event identifier, when reported. */
+  eventId?: string
   createdAt: string
   activity: string
   category?: string
@@ -56,13 +72,8 @@ export type AuditEvent = {
   target?: string
   targetType?: string
   targetId?: string
-  targetResources?: any[]
-  modifiedProperties?: Array<{
-    name: string
-    oldValue?: string
-    newValue?: string
-  }>
+  targetResources?: AuditTargetResource[]
+  modifiedProperties?: AuditModifiedProperty[]
   tenantName?: string
   tenantId?: string
-  raw?: any
 }

@@ -37,19 +37,19 @@ export default function ProfilePage() {
   const { notify } = useNotifications()
 
   // User identity details from session
-  const rawEmail = session?.user.email || 'user@hawkview.net'
+  const rawEmail = session?.user.email || 'Not reported'
   const rawDisplayName =
     session?.user.displayName || rawEmail.split('@')[0] || 'HawkView User'
   const membership = session?.user.memberships?.[0]
-  const orgName = membership?.organization?.name || 'HawkView Organization'
-  const rawRole = membership?.role || session?.user.platformRole || 'MSP_ADMIN'
+  const orgName = membership?.organization?.name || 'Not reported'
+  const rawRole = membership?.role || session?.user.platformRole || 'Not reported'
   const roleDisplay = rawRole
     .replace('MSP_', '')
     .replace('PLATFORM_', '')
     .toLowerCase()
     .replace(/^\w/, (l) => l.toUpperCase())
 
-  const signInProvider = session?.signInProvider || 'Supabase Auth'
+  const signInProvider = session?.signInProvider || 'Not reported'
 
   // Detect user time zone
   const detectedTimeZone = useMemo(() => {

@@ -14,11 +14,21 @@ import {
 import { SignInLogsPage } from './components/signin-logs-page'
 import { AuditLogsPage } from './components/audit-logs-page'
 import type { ActivityTab, AuditEvent, SignInEvent } from './data/types'
+import {
+  hasIncompleteActivityEvidence,
+  normalizeAuditEvent,
+  normalizeSignInEvent,
+} from './data/normalize'
 import { apiClient } from '@/lib/api/client'
 import { triggerNotification } from '@/components/providers/notification-provider'
 import { exportSignInsToCsv, exportAuditLogsToCsv } from './utils/csv-exporter'
+import { LoadingState } from '@/components/common/loading-state'
+import { ErrorState } from '@/components/common/error-state'
+import { EmptyState } from '@/components/common/empty-state'
+import { Building2 } from 'lucide-react'
 
-function parseISO(iso: string) {
+function parseISO(iso?: string) {
+  if (!iso) return 0
   const d = new Date(iso)
   const t = d.getTime()
   return Number.isFinite(t) ? t : 0
@@ -33,13 +43,15 @@ function daysToMs(days: number) {
 }
 
 function inPresetRange(
-  createdAt: string,
+  createdAt: string | undefined,
   preset: ActivityFiltersValue['datePreset'],
   from: string,
   to: string
 ) {
   const t = parseISO(createdAt)
-  if (!t) return false
+  if (!t) {
+    return preset !== 'custom' || (!from && !to)
+  }
 
   if (preset === 'custom') {
     if (!from || !to) return true // if not set yet, don't block
@@ -83,8 +95,17 @@ function compareIPs(ipA?: string, ipB?: string): number {
 
 export default function ActivityPage() {
   const [tab, setTab] = React.useState<ActivityTab>('signins')
+  const signInsTabRef = React.useRef<HTMLButtonElement>(null)
+  const auditTabRef = React.useRef<HTMLButtonElement>(null)
 
-  const [loaded, setLoaded] = React.useState(false)
+  const [directoryState, setDirectoryState] = React.useState<
+    'loading' | 'ready' | 'error'
+  >('loading')
+  const [directoryReloadKey, setDirectoryReloadKey] = React.useState(0)
+  const [bundleState, setBundleState] = React.useState<
+    'idle' | 'loading' | 'ready' | 'error'
+  >('idle')
+  const [bundleReloadKey, setBundleReloadKey] = React.useState(0)
   const [tenants, setTenants] = React.useState<
     Array<{ id: string; name: string }>
   >([])
@@ -120,48 +141,62 @@ export default function ActivityPage() {
   // Load tenant directory
   React.useEffect(() => {
     let alive = true
+    const controller = new AbortController()
+    setDirectoryState('loading')
     apiClient
-      .get<any>('/api/tenants')
+      .get<any>('/api/tenants', { signal: controller.signal })
       .then((data) => {
         if (!alive) return
         setTenants(
           (data.tenants ?? []).map((t: any) => ({ id: t.id, name: t.name }))
         )
-        setLoaded(true)
+        setDirectoryState('ready')
       })
       .catch(() => {
-        if (alive) setLoaded(true)
+        if (alive) setDirectoryState('error')
       })
     return () => {
       alive = false
+      controller.abort()
     }
-  }, [])
+  }, [directoryReloadKey])
 
   // Load tenant detail bundle
   React.useEffect(() => {
     let alive = true
+    const controller = new AbortController()
     if (!filters.tenantId) {
       setSelectedBundle(null)
+      setBundleState('idle')
       return () => {
         alive = false
+        controller.abort()
       }
     }
 
+    setSelectedBundle(null)
+    setBundleState('loading')
     apiClient
-      .get<any>(`/api/tenants/${encodeURIComponent(filters.tenantId)}`)
+      .get<any>(`/api/tenants/${encodeURIComponent(filters.tenantId)}`, {
+        signal: controller.signal,
+      })
       .then((data) => {
         if (!alive) return
         setSelectedBundle(data.bundle ?? null)
+        setBundleState(data.bundle ? 'ready' : 'error')
       })
       .catch(() => {
-        if (alive) setSelectedBundle(null)
+        if (alive) {
+          setSelectedBundle(null)
+          setBundleState('error')
+        }
       })
 
     return () => {
-      if (!alive) return
       alive = false
+      controller.abort()
     }
-  }, [filters.tenantId])
+  }, [bundleReloadKey, filters.tenantId])
 
   // Build user dropdown options
   const userOptions = React.useMemo(() => {
@@ -180,177 +215,27 @@ export default function ActivityPage() {
 
   // Map raw sign-in events
   const rawSignInEvents = React.useMemo<SignInEvent[]>(() => {
-    if (!loaded || !selectedBundle) return []
+    if (bundleState !== 'ready' || !selectedBundle) return []
     const all = (selectedBundle.signIns ?? []) as any[]
+    const tenantId = selectedBundle?.tenant?.id ?? selectedBundle?.id
+    const tenantName = selectedBundle?.tenant?.name ?? selectedBundle?.name
 
-    return all.map((s: any) => {
-      const createdAt =
-        s.createdAt ?? s.ts ?? s.time ?? new Date().toISOString()
-      const city = s.city ?? s.location?.city
-      const country = s.country ?? s.location?.country
-      const location =
-        s.location ?? (city && country ? `${city}, ${country}` : undefined)
-
-      const statusRaw = String(s.status ?? s.result ?? 'Success').toLowerCase()
-      const isSuccess =
-        statusRaw === 'success' || statusRaw === 'ok' || statusRaw === '0'
-
-      const caRaw = String(
-        s.conditionalAccess ?? s.condAccess ?? s.appliedConditionalAccess ?? ''
-      ).toLowerCase()
-      const isCaApplied =
-        ['success', 'failure', 'applied', 'true'].includes(caRaw) ||
-        Boolean(s.appliedConditionalAccessPolicies?.length)
-
-      return {
-        id: String(
-          s.id ?? `${createdAt}-${s.userPrincipalName ?? Math.random()}`
-        ),
-        createdAt,
-        userDisplayName:
-          s.userDisplayName ?? s.user ?? s.displayName ?? 'Unknown',
-        userPrincipalName:
-          s.userPrincipalName ??
-          s.upn ??
-          s.userPrincipal ??
-          'unknown@tenant.com',
-        userId: s.userId ?? s.id ?? undefined,
-
-        appDisplayName: s.appDisplayName ?? s.app ?? 'Unknown',
-        appId: s.appId ?? s.appIdGuid ?? undefined,
-
-        status: isSuccess ? 'Success' : 'Failure',
-        failureReason:
-          s.failureReason ?? s.errorDetail ?? s.statusReason ?? undefined,
-        errorCode: s.errorCode
-          ? String(s.errorCode)
-          : s.errorNumber
-            ? String(s.errorNumber)
-            : undefined,
-        additionalDetails: s.additionalDetails ?? undefined,
-
-        conditionalAccess: isCaApplied ? 'Applied' : 'Not Applied',
-        appliedCaPolicies: Array.isArray(s.appliedConditionalAccessPolicies)
-          ? s.appliedConditionalAccessPolicies.map((p: any) =>
-              typeof p === 'string' ? p : (p?.displayName ?? p?.name)
-            )
-          : undefined,
-        authMethod: s.authMethod ?? s.authenticationRequirement ?? undefined,
-
-        ipAddress: s.ipAddress ?? s.ip ?? undefined,
-        location,
-        country,
-        city,
-
-        clientAppUsed: s.clientAppUsed ?? s.client ?? s.clientApp ?? undefined,
-        device:
-          s.device ?? s.deviceName ?? s.deviceDetail?.displayName ?? undefined,
-        os:
-          s.os ??
-          s.operatingSystem ??
-          s.deviceDetail?.operatingSystem ??
-          undefined,
-        browser: s.browser ?? s.deviceDetail?.browser ?? undefined,
-        managedState:
-          s.managedState ??
-          (s.deviceDetail?.isCompliant
-            ? 'Compliant'
-            : s.deviceDetail?.isManaged
-              ? 'Managed'
-              : undefined),
-        userAgent: s.userAgent ?? undefined,
-        tenantName:
-          selectedBundle?.tenant?.name ?? selectedBundle?.name ?? undefined,
-        tenantId: selectedBundle?.tenant?.id ?? selectedBundle?.id ?? undefined,
-        correlationId: s.correlationId ?? undefined,
-        requestId: s.requestId ?? undefined,
-        riskLevel: s.riskLevel ?? s.riskState ?? s.risk ?? undefined,
-        raw: s,
-      } as SignInEvent
-    })
-  }, [loaded, selectedBundle])
+    return all.map((event, index) =>
+      normalizeSignInEvent(event, { tenantId, tenantName, index }),
+    )
+  }, [bundleState, selectedBundle])
 
   // Map raw audit events
   const rawAuditEvents = React.useMemo<AuditEvent[]>(() => {
-    if (!loaded || !selectedBundle) return []
+    if (bundleState !== 'ready' || !selectedBundle) return []
     const all = (selectedBundle.auditLogs ?? []) as any[]
+    const tenantId = selectedBundle?.tenant?.id ?? selectedBundle?.id
+    const tenantName = selectedBundle?.tenant?.name ?? selectedBundle?.name
 
-    return all.map((event: any) => {
-      const initiatedBy = event.initiatedBy ?? {}
-      const actorName =
-        initiatedBy?.user?.displayName ??
-        event.actorDisplayName ??
-        event.actor ??
-        event.user ??
-        initiatedBy?.app?.displayName
-      const actorUpn =
-        initiatedBy?.user?.userPrincipalName ??
-        initiatedBy?.app?.servicePrincipalName ??
-        (typeof event.actor === 'string' && event.actor.includes('@')
-          ? event.actor
-          : undefined)
-      const actorType = initiatedBy?.user
-        ? 'User'
-        : initiatedBy?.app
-          ? 'Application'
-          : (event.actorType ?? 'System')
-      const actorId =
-        initiatedBy?.user?.id ??
-        initiatedBy?.app?.id ??
-        event.actorId ??
-        undefined
-
-      const targets = Array.isArray(event.targetResources)
-        ? event.targetResources
-        : []
-      const primaryTarget = targets[0]
-      const targetName =
-        targets.length > 0
-          ? targets
-              .map(
-                (target: any) =>
-                  target?.displayName ?? target?.userPrincipalName ?? target?.id
-              )
-              .filter(Boolean)
-              .join(', ')
-          : (event.target ?? undefined)
-
-      return {
-        id: String(event.id ?? Math.random()),
-        createdAt:
-          event.createdAt ?? event.time ?? event.ts ?? new Date().toISOString(),
-        activity:
-          event.activity ??
-          event.activityDisplayName ??
-          event.action ??
-          'Directory activity',
-        category: event.category ?? undefined,
-        operationType: event.operationType ?? undefined,
-        result: event.result ?? event.status ?? 'Success',
-        resultReason: event.resultReason ?? event.statusReason ?? undefined,
-        correlationId: event.correlationId ?? undefined,
-        service: event.service ?? event.loggedByService ?? undefined,
-        actor: actorName ?? actorUpn ?? 'System',
-        actorPrincipalName: actorUpn,
-        actorType,
-        actorId,
-        target: targetName,
-        targetType:
-          primaryTarget?.type ?? primaryTarget?.groupType ?? undefined,
-        targetId: primaryTarget?.id ?? undefined,
-        targetResources: targets,
-        modifiedProperties: Array.isArray(primaryTarget?.modifiedProperties)
-          ? primaryTarget.modifiedProperties
-          : Array.isArray(event.modifiedProperties)
-            ? event.modifiedProperties
-            : undefined,
-        tenantName:
-          selectedBundle?.tenant?.name ?? selectedBundle?.name ?? undefined,
-        tenantId: selectedBundle?.tenant?.id ?? selectedBundle?.id ?? undefined,
-        raw: event,
-      } as AuditEvent
-    })
-  }, [loaded, selectedBundle])
+    return all.map((event, index) =>
+      normalizeAuditEvent(event, { tenantId, tenantName, index }),
+    )
+  }, [bundleState, selectedBundle])
 
   // Dynamically extract available filter options from real event data
   const filterOptions = React.useMemo<FilterOptions>(() => {
@@ -367,11 +252,10 @@ export default function ActivityPage() {
 
     // Sign-in options
     const rawStatuses = uniqueVals(rawSignInEvents.map((s) => s.status))
-    const statuses =
-      rawStatuses.length > 0 ? rawStatuses : ['Success', 'Failure']
+    const statuses = rawStatuses
 
     const rawCA = uniqueVals(rawSignInEvents.map((s) => s.conditionalAccess))
-    const caResults = rawCA.length > 0 ? rawCA : ['Applied', 'Not Applied']
+    const caResults = rawCA
 
     const apps = uniqueVals(rawSignInEvents.map((s) => s.appDisplayName))
     const locations = uniqueVals(rawSignInEvents.map((s) => s.location))
@@ -382,7 +266,7 @@ export default function ActivityPage() {
 
     // Audit options
     const rawResults = uniqueVals(rawAuditEvents.map((a) => a.result))
-    const results = rawResults.length > 0 ? rawResults : ['Success', 'Failure']
+    const results = rawResults
 
     const activities = uniqueVals(rawAuditEvents.map((a) => a.activity))
     const categories = uniqueVals(rawAuditEvents.map((a) => a.category))
@@ -414,7 +298,7 @@ export default function ActivityPage() {
 
   // Processed and sorted Sign-in rows
   const signInRows = React.useMemo<SignInEvent[]>(() => {
-    if (!loaded || !selectedBundle) return []
+    if (bundleState !== 'ready' || !selectedBundle) return []
     const q = filters.search.trim().toLowerCase()
     const adv = advancedFilters
 
@@ -531,7 +415,7 @@ export default function ActivityPage() {
       return signInSortOrder === 'asc' ? cmp : -cmp
     })
   }, [
-    loaded,
+    bundleState,
     selectedBundle,
     rawSignInEvents,
     filters,
@@ -542,7 +426,7 @@ export default function ActivityPage() {
 
   // Processed and sorted Audit rows
   const auditRows = React.useMemo<AuditEvent[]>(() => {
-    if (!loaded || !selectedBundle) return []
+    if (bundleState !== 'ready' || !selectedBundle) return []
     const q = filters.search.trim().toLowerCase()
     const adv = advancedFilters
 
@@ -637,7 +521,7 @@ export default function ActivityPage() {
       return auditSortOrder === 'asc' ? cmp : -cmp
     })
   }, [
-    loaded,
+    bundleState,
     selectedBundle,
     rawAuditEvents,
     filters,
@@ -728,19 +612,47 @@ export default function ActivityPage() {
     }
   }
 
+  function handleTabKeyDown(
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    currentTab: ActivityTab,
+  ) {
+    if (!filters.tenantId) return
+    let nextTab: ActivityTab | null = null
+    if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+      nextTab = currentTab === 'signins' ? 'audit' : 'signins'
+    } else if (event.key === 'Home') {
+      nextTab = 'signins'
+    } else if (event.key === 'End') {
+      nextTab = 'audit'
+    }
+    if (!nextTab) return
+    event.preventDefault()
+    setTab(nextTab)
+    ;(nextTab === 'signins' ? signInsTabRef : auditTabRef).current?.focus()
+  }
+
   const activeMatchingCount =
     tab === 'signins' ? signInRows.length : auditRows.length
+  const signInCountLabel =
+    bundleState === 'ready' ? String(signInRows.length) : 'Not reported'
+  const auditCountLabel =
+    bundleState === 'ready' ? String(auditRows.length) : 'Not reported'
   const activeSyncState =
     tab === 'signins'
       ? selectedBundle?.sync?.signIns
       : selectedBundle?.sync?.auditLogs
+  const activeSyncStatus = String(activeSyncState?.status ?? '').toLowerCase()
+  const activityEvidencePartial = hasIncompleteActivityEvidence(
+    rawSignInEvents,
+    rawAuditEvents,
+  )
 
   return (
     <div className="space-y-4">
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>
-          <div className="text-2xl font-semibold">Audit Logs</div>
+          <div className="text-2xl font-semibold">Activity Logs</div>
           <div className="text-sm text-muted-foreground">
             Unified visibility into Sign-in and Audit events across managed
             tenants.
@@ -748,16 +660,15 @@ export default function ActivityPage() {
         </div>
 
         <Badge variant="secondary" className="h-8 px-3 rounded-full">
-          Retention: 6 months
+          Retention: Not reported
         </Badge>
       </div>
 
       {/* Note banner */}
       <div className="rounded-lg border bg-blue-50/50 dark:bg-blue-950/30 px-4 py-3 text-sm text-blue-900 dark:text-blue-200 border-blue-200/60 dark:border-blue-900/50">
-        <span className="font-medium">Note:</span> Logs displayed here are
-        ingested from source tenants. It may take{' '}
-        <span className="font-medium">15–20 minutes</span> for new sign-in or
-        audit events to appear in this dashboard.
+        <span className="font-medium">Collection note:</span> Logs are reported
+        by Microsoft for the selected tenant. Availability and refresh timing
+        vary by workload, permissions, and Microsoft retention policy.
       </div>
 
       {/* Filters Toolbar */}
@@ -779,8 +690,15 @@ export default function ActivityPage() {
       </div>
 
       {/* Tabs */}
-      <div className="flex items-center gap-6 border-b">
+      <div className="flex items-center gap-6 border-b" role="tablist" aria-label="Activity log type">
         <button
+          ref={signInsTabRef}
+          id="activity-tab-signins"
+          type="button"
+          role="tab"
+          aria-selected={tab === 'signins'}
+          aria-controls="activity-log-panel"
+          tabIndex={tab === 'signins' ? 0 : -1}
           className={[
             'px-1 pb-2 text-sm font-medium transition-colors',
             tab === 'signins'
@@ -789,13 +707,21 @@ export default function ActivityPage() {
             !filters.tenantId ? 'opacity-50 cursor-not-allowed' : '',
           ].join(' ')}
           onClick={() => filters.tenantId && setTab('signins')}
+          onKeyDown={(event) => handleTabKeyDown(event, 'signins')}
           disabled={!filters.tenantId}
           title={!filters.tenantId ? 'Select a tenant first' : undefined}
         >
-          Sign-in logs ({filters.tenantId ? signInRows.length : 0})
+          Sign-in logs ({filters.tenantId ? signInCountLabel : 'Not reported'})
         </button>
 
         <button
+          ref={auditTabRef}
+          id="activity-tab-audit"
+          type="button"
+          role="tab"
+          aria-selected={tab === 'audit'}
+          aria-controls="activity-log-panel"
+          tabIndex={tab === 'audit' ? 0 : -1}
           className={[
             'px-1 pb-2 text-sm font-medium transition-colors',
             tab === 'audit'
@@ -804,28 +730,85 @@ export default function ActivityPage() {
             !filters.tenantId ? 'opacity-50 cursor-not-allowed' : '',
           ].join(' ')}
           onClick={() => filters.tenantId && setTab('audit')}
+          onKeyDown={(event) => handleTabKeyDown(event, 'audit')}
           disabled={!filters.tenantId}
           title={!filters.tenantId ? 'Select a tenant first' : undefined}
         >
-          Audit logs ({filters.tenantId ? auditRows.length : 0})
+          Audit logs ({filters.tenantId ? auditCountLabel : 'Not reported'})
         </button>
       </div>
 
       {/* Main Content Area */}
-      {filters.tenantId && activeSyncState?.status === 'failed' && (
-        <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+      <div
+        id="activity-log-panel"
+        role="tabpanel"
+        aria-labelledby={`activity-tab-${tab}`}
+        tabIndex={0}
+        className="space-y-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+      >
+      {filters.tenantId && activeSyncStatus === 'failed' && (
+        <div role="alert" className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           <div className="font-semibold">
             {tab === 'signins' ? 'Sign-in' : 'Directory audit'} log sync failed
           </div>
           <div className="mt-1 text-xs leading-5">
-            {activeSyncState.lastError ||
-              'Microsoft did not make this log dataset available. Previously retained events remain visible.'}
+            HawkView could not refresh this dataset. Previously retained events,
+            when available, remain visible. Review the tenant connection and
+            permissions before retrying.
           </div>
         </div>
       )}
-      {!loaded ? (
-        <div className="rounded-lg border bg-background p-6 text-sm text-muted-foreground">
-          Loading…
+      {filters.tenantId &&
+      ['running', 'pending', 'in_progress', 'syncing'].includes(activeSyncStatus) ? (
+        <div
+          className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="font-semibold">Sync in progress</div>
+          <div className="mt-1 text-xs leading-5">
+            HawkView is collecting the latest {tab === 'signins' ? 'sign-in' : 'directory audit'} events.
+            Current results may be incomplete until this attempt finishes.
+          </div>
+        </div>
+      ) : null}
+      {filters.tenantId &&
+      bundleState === 'ready' &&
+      (activityEvidencePartial || ['partial', 'stale'].includes(activeSyncStatus)) ? (
+        <div
+          className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100"
+          role="status"
+        >
+          <div className="font-semibold">
+            {activeSyncStatus === 'stale' ? 'Stale log evidence' : 'Partial log evidence'}
+          </div>
+          <div className="mt-1 text-xs leading-5">
+            Some event fields or collection evidence were not reported. HawkView
+            preserves those values as “Not reported” and does not infer success,
+            identity, or timestamps.
+          </div>
+        </div>
+      ) : null}
+      {directoryState === 'loading' ? (
+        <div className="rounded-lg border bg-background">
+          <LoadingState message="Loading tenant directory…" />
+        </div>
+      ) : directoryState === 'error' ? (
+        <div className="rounded-lg border bg-background">
+          <ErrorState
+            message="HawkView could not load the tenant directory. No activity status is being inferred."
+            onRetry={() => setDirectoryReloadKey((value) => value + 1)}
+          />
+        </div>
+      ) : tenants.length === 0 ? (
+        <div className="rounded-lg border bg-background">
+          <EmptyState
+            icon={Building2}
+            title="No managed tenants"
+            description="Onboard a tenant before reviewing sign-in and directory audit evidence."
+            actionLabel="Open tenant directory"
+            href="/tenants"
+          />
         </div>
       ) : !filters.tenantId ? (
         <div className="rounded-lg border bg-background p-10 text-center">
@@ -837,6 +820,17 @@ export default function ActivityPage() {
             Choose a tenant from the dropdown above to view their specific audit
             and sign-in logs.
           </div>
+        </div>
+      ) : bundleState === 'loading' ? (
+        <div className="rounded-lg border bg-background">
+          <LoadingState message="Loading reported activity evidence…" />
+        </div>
+      ) : bundleState === 'error' ? (
+        <div className="rounded-lg border bg-background">
+          <ErrorState
+            message="HawkView could not load activity evidence for this tenant. No success state is being shown."
+            onRetry={() => setBundleReloadKey((value) => value + 1)}
+          />
         </div>
       ) : tab === 'signins' ? (
         <SignInLogsPage
@@ -853,6 +847,7 @@ export default function ActivityPage() {
           onSort={handleAuditSort}
         />
       )}
+      </div>
     </div>
   )
 }
