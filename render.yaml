@@ -26,7 +26,7 @@ services:
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: HAWKVIEW_AUTH_REDIRECT_URL
-        sync: false
+        value: https://console.hawkviewapp.com/auth/confirm
       - key: SECRET_ENCRYPTION_KEY
         sync: false
       - key: FRONTEND_ORIGINS

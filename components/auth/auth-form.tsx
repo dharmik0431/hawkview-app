@@ -139,7 +139,7 @@ export function AuthForm({ initialMode }: AuthFormProps) {
       if (mode === 'reset') {
         const { error: resetError } = await supabase.auth.resetPasswordForEmail(
           email.trim(),
-          { redirectTo: buildHawkViewAppUrl('/reset-password').href }
+          { redirectTo: buildHawkViewAppUrl('/auth/confirm').href }
         )
         if (resetError) throw resetError
         setNotice(
@@ -155,7 +155,7 @@ export function AuthForm({ initialMode }: AuthFormProps) {
             password,
             options: {
               data: { display_name: displayName.trim() },
-              emailRedirectTo: buildHawkViewAppUrl('/login').href,
+              emailRedirectTo: buildHawkViewAppUrl('/auth/confirm').href,
             },
           })
         if (signUpError) throw signUpError

@@ -4,6 +4,7 @@ import React, { useState, useEffect, useMemo } from 'react'
 import { useAuth } from '@/components/providers/auth-provider'
 import { useNotifications } from '@/components/providers/notification-provider'
 import { supabase } from '@/lib/auth/supabase'
+import { buildHawkViewAppUrl } from '@/lib/config/public-runtime-config'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { MfaSecurityPanel } from '@/components/auth/mfa-security-panel'
@@ -100,7 +101,7 @@ export default function SecuritySettingsPage() {
       }
 
       const { error } = await supabase.auth.resetPasswordForEmail(userEmail, {
-        redirectTo: `${window.location.origin}/reset-password`,
+        redirectTo: buildHawkViewAppUrl('/auth/confirm').href,
       })
       if (error) throw error
 

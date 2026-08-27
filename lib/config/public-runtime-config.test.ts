@@ -176,8 +176,10 @@ test('auth forms use stable links and protected bootstrap requires verified MFA'
     'utf8'
   )
 
-  assert.match(authForm, /buildHawkViewAppUrl\('\/login'\)/)
-  assert.match(authForm, /buildHawkViewAppUrl\('\/reset-password'\)/)
+  assert.equal(
+    authForm.match(/buildHawkViewAppUrl\('\/auth\/confirm'\)/g)?.length,
+    2
+  )
   assert.doesNotMatch(authForm, /window\.location\.origin/)
   assert.match(
     authForm,
