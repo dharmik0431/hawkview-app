@@ -22,6 +22,7 @@ const BEARER_OR_JWT =
 const EMBEDDED_STRUCTURE = /(?:^|\s)(?:\{|\[)\s*(?:"|'|\{|\[)/
 const UNSAFE_OBJECT_KEY = /^(?:__proto__|prototype|constructor)$/i
 const SAFE_PROPERTY_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._:/()[\]\-]{0,127}$/
+const MALFORMED_PERCENT_ENCODING = /%(?![0-9A-Fa-f]{2})/
 
 function isRecord(value: unknown): value is RecordValue {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -48,6 +49,43 @@ function stripUrlCredentialsAndQuery(value: string): string {
   })
 }
 
+function containsUnsafeDiagnosticShape(value: string) {
+  return (
+    SENSITIVE_ASSIGNMENT.test(value) ||
+    BEARER_OR_JWT.test(value) ||
+    EMBEDDED_STRUCTURE.test(value)
+  )
+}
+
+/**
+ * Inspects the original scalar and no more than two percent-decoded forms.
+ * Decoded content is used only for rejection and is never returned to callers.
+ */
+function passesBoundedEncodedInspection(value: string, maxLength: number) {
+  let inspection = value
+  for (let layer = 0; layer <= 2; layer += 1) {
+    if (
+      inspection.length > maxLength ||
+      containsUnsafeDiagnosticShape(inspection)
+    ) {
+      return false
+    }
+    if (!inspection.includes('%')) return true
+    if (MALFORMED_PERCENT_ENCODING.test(inspection)) return false
+    if (layer === 2) return false
+
+    try {
+      const decoded = decodeURIComponent(inspection)
+      if (decoded.length > maxLength) return false
+      if (decoded === inspection) return true
+      inspection = decoded
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
 /** Bounded scalar evidence safe for UI and CSV. Objects are never serialized. */
 export function sanitizeActivityText(
   value: unknown,
@@ -61,7 +99,12 @@ export function sanitizeActivityText(
   }
 
   const original = String(value)
-  if (original.length > maxLength) return undefined
+  if (
+    original.length > maxLength ||
+    !passesBoundedEncodedInspection(original, maxLength)
+  ) {
+    return '[Redacted]'
+  }
 
   let text = original
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
@@ -71,15 +114,8 @@ export function sanitizeActivityText(
 
   // A credential marker invalidates the whole scalar. Partial replacement can
   // leave trailing words from whitespace-containing secrets.
-  if (
-    SENSITIVE_ASSIGNMENT.test(text) ||
-    BEARER_OR_JWT.test(text) ||
-    EMBEDDED_STRUCTURE.test(text)
-  ) {
-    return '[Redacted]'
-  }
-
   text = stripUrlCredentialsAndQuery(text)
+  if (text.length > maxLength) return '[Redacted]'
   return text
 }
 
@@ -94,15 +130,6 @@ function reportedText(...values: unknown[]): string | undefined {
 function diagnosticText(...values: unknown[]): string | undefined {
   for (const value of values) {
     if (typeof value !== 'string' && typeof value !== 'number') continue
-    const original = String(value)
-    if (
-      original.length > MAX_DIAGNOSTIC_LENGTH ||
-      SENSITIVE_ASSIGNMENT.test(original) ||
-      BEARER_OR_JWT.test(original) ||
-      EMBEDDED_STRUCTURE.test(original)
-    ) {
-      continue
-    }
     const sanitized = sanitizeActivityText(value, MAX_DIAGNOSTIC_LENGTH)
     if (sanitized && sanitized !== '[Redacted]') return sanitized
   }

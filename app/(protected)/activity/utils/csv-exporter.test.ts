@@ -105,3 +105,41 @@ test('the six reproduced secret payloads never survive normalization or CSV seri
     })
   })
 })
+
+test('percent-encoded credentials and structured secrets never reach CSV', () => {
+  const payloads = [
+    'password%3DENCODEDSECRET',
+    'password%253DDOUBLESECRET',
+    'client%5Fsecret%3DENCODEDCLIENTSECRET',
+    'password%3GMALFORMEDSECRET',
+    'client_secret%E0%A4%AMALFORMEDUTF8SECRET',
+    '%7B%22access_token%22%3A%5B%22JSONARRAYSECRET1%22%5D%7D',
+    '%257B%2522access_token%2522%253A%255B%2522JSONARRAYSECRET2%2522%255D%257D',
+  ]
+  const secretFragments = [
+    'ENCODEDSECRET',
+    'DOUBLESECRET',
+    'ENCODEDCLIENTSECRET',
+    'MALFORMEDSECRET',
+    'MALFORMEDUTF8SECRET',
+    'JSONARRAYSECRET1',
+    'JSONARRAYSECRET2',
+  ]
+
+  payloads.forEach((payload, index) => {
+    const signIn = normalizeSignInEvent(
+      { failureReason: payload },
+      { tenantId: 'tenant-1', index },
+    )
+    const audit = normalizeAuditEvent(
+      { resultReason: payload },
+      { tenantId: 'tenant-1', index },
+    )
+    const csv = `${buildSignInsCsvContent([signIn])}\n${buildAuditLogsCsvContent([audit])}\n${sanitizeCsvValue(payload)}`
+
+    assert.equal(csv.includes(payload), false)
+    secretFragments.forEach((fragment) => {
+      assert.equal(csv.includes(fragment), false)
+    })
+  })
+})

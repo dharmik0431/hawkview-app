@@ -203,13 +203,54 @@ test('safe Microsoft diagnostics retain only bounded message and sanitized host/
     {
       errorCode: 'AADSTS50011',
       failureReason:
-        'AADSTS50011: Redirect URI mismatch at https://user:pass@login.microsoftonline.com/common/oauth2?request=unsafe#fragment',
+        'AADSTS50011: Redirect URI mismatch at https://user:pass@login.microsoftonline.com/common/path%20name?request=unsafe#fragment',
     },
     { tenantId: 'opaque-tenant-reference', index: 10 },
   )
 
   assert.equal(event.errorCode, 'AADSTS50011')
-  assert.match(event.failureReason ?? '', /https:\/\/login\.microsoftonline\.com\/common\/oauth2/)
+  assert.match(event.failureReason ?? '', /https:\/\/login\.microsoftonline\.com\/common\/path%20name/)
   assert.doesNotMatch(event.failureReason ?? '', /user:pass|request=unsafe|fragment/)
   assert.equal(event.tenantId, 'opaque-tenant-reference')
+})
+
+test('percent-encoded credentials, malformed encodings, and encoded JSON fail closed', () => {
+  const payloads = [
+    'password%3DENCODEDSECRET',
+    'password%253DDOUBLESECRET',
+    'client%5Fsecret%3DENCODEDCLIENTSECRET',
+    'password%3GMALFORMEDSECRET',
+    'client_secret%E0%A4%AMALFORMEDUTF8SECRET',
+    '%7B%22access_token%22%3A%5B%22JSONARRAYSECRET1%22%5D%7D',
+    '%257B%2522access_token%2522%253A%255B%2522JSONARRAYSECRET2%2522%255D%257D',
+  ]
+  const secretFragments = [
+    'ENCODEDSECRET',
+    'DOUBLESECRET',
+    'ENCODEDCLIENTSECRET',
+    'MALFORMEDSECRET',
+    'MALFORMEDUTF8SECRET',
+    'JSONARRAYSECRET1',
+    'JSONARRAYSECRET2',
+  ]
+
+  payloads.forEach((payload, index) => {
+    const signIn = normalizeSignInEvent(
+      { failureReason: payload, additionalDetails: payload },
+      { tenantId: 'tenant-1', index },
+    )
+    const audit = normalizeAuditEvent(
+      { resultReason: payload },
+      { tenantId: 'tenant-1', index },
+    )
+
+    assert.equal(signIn.failureReason, undefined)
+    assert.equal(signIn.additionalDetails, undefined)
+    assert.equal(audit.resultReason, undefined)
+    const serialized = JSON.stringify({ signIn, audit })
+    assert.equal(serialized.includes(payload), false)
+    secretFragments.forEach((fragment) => {
+      assert.equal(serialized.includes(fragment), false)
+    })
+  })
 })
