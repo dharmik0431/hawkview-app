@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  compactEffectiveMfaEnforcementPresentation,
   effectiveMfaEnforcementPresentation,
   mfaRegistrationPresentation,
   perUserMfaPresentation,
@@ -81,6 +82,49 @@ test('keeps conditional and report-only enforcement visibly non-enforced', () =>
       projection('REPORT_ONLY', 'Would be covered (report-only); not enforced'),
     ),
     { label: 'Would be covered (report-only); not enforced', tone: 'info' },
+  )
+})
+
+test('uses compact table labels without hiding the backend-owned detail contract', () => {
+  const projection = (status: string) => ({
+    effectiveMfaEnforcement: {
+      contractVersion: 1,
+      status,
+      label: 'Authoritative backend detail',
+      policies: [],
+      evidenceObservedAt: null,
+      riskReductionAllowed: status === 'COVERED_BY_CONDITIONAL_ACCESS',
+    },
+  })
+  assert.deepEqual(
+    compactEffectiveMfaEnforcementPresentation(
+      projection('COVERED_BY_CONDITIONAL_ACCESS'),
+    ),
+    { label: 'Covered by CA', tone: 'positive' },
+  )
+  assert.deepEqual(
+    compactEffectiveMfaEnforcementPresentation(
+      projection('CONDITIONALLY_COVERED'),
+    ),
+    { label: 'Conditionally covered', tone: 'caution' },
+  )
+  assert.deepEqual(
+    compactEffectiveMfaEnforcementPresentation(projection('REPORT_ONLY')),
+    { label: 'Report-only', tone: 'info' },
+  )
+  assert.deepEqual(
+    compactEffectiveMfaEnforcementPresentation(projection('NOT_COVERED')),
+    { label: 'Not covered', tone: 'caution' },
+  )
+  assert.deepEqual(
+    compactEffectiveMfaEnforcementPresentation(projection('UNKNOWN')),
+    { label: 'Coverage unknown', tone: 'neutral' },
+  )
+  assert.equal(
+    tenantUserEffectiveMfaEnforcement(
+      projection('COVERED_BY_CONDITIONAL_ACCESS'),
+    )?.label,
+    'Authoritative backend detail',
   )
 })
 test('labels older Enabled and Disabled bundle values as registration facts', () => {

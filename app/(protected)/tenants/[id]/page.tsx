@@ -78,18 +78,26 @@ import {
   ArrowUpDown,
   AppWindow,
   Building2,
+  Info,
 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
 import { useAuth } from '@/components/providers/auth-provider'
 import { IdentityScopedMemoryCache } from '@/lib/auth/data-isolation'
 import {
+  compactEffectiveMfaEnforcementPresentation,
   effectiveMfaEnforcementPresentation,
   mfaRegistrationPresentation,
   perUserMfaPresentation,
@@ -236,6 +244,78 @@ function MfaFactBadge({
     >
       {prefix ? `${prefix}: ${label}` : label}
     </Badge>
+  )
+}
+
+function EffectiveMfaTableBadge({ user }: { user: unknown }) {
+  const enforcement = tenantUserEffectiveMfaEnforcement(user)
+  const compact = compactEffectiveMfaEnforcementPresentation(user)
+  const detail = enforcement?.label ?? 'MFA enforcement unknown'
+
+  return (
+    <TooltipProvider delayDuration={150}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div
+            tabIndex={0}
+            aria-label={`${compact.label}. Focus or hover for Conditional Access policy evidence.`}
+            onClick={(event) => event.stopPropagation()}
+            className="inline-flex max-w-full items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+          >
+            <MfaFactBadge {...compact} />
+            <Info
+              aria-hidden="true"
+              className="h-3.5 w-3.5 shrink-0 text-slate-400 dark:text-slate-500"
+            />
+          </div>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          align="start"
+          className="w-80 max-w-[calc(100vw-2rem)] p-3"
+        >
+          <div className="space-y-2">
+            <div>
+              <div className="font-semibold text-white">MFA enforcement</div>
+              <div className="mt-0.5 leading-relaxed text-slate-200">
+                {detail}
+              </div>
+            </div>
+            {enforcement?.policies.length ? (
+              <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+                {enforcement.policies.map((policy) => (
+                  <div
+                    key={`${policy.id}:${policy.outcome}`}
+                    className="rounded-md border border-slate-700 bg-slate-800/80 p-2"
+                  >
+                    <div className="font-medium text-white">{policy.name}</div>
+                    <div className="mt-0.5 break-all font-mono text-[10px] text-slate-300">
+                      Policy ID: {policy.id}
+                    </div>
+                    <div className="mt-1 text-[11px] text-slate-300">
+                      {policy.state} · {policy.outcome}
+                    </div>
+                    {policy.materialConditions.length ? (
+                      <div className="mt-1 text-[11px] leading-relaxed text-amber-200">
+                        Conditions: {policy.materialConditions.join(', ')}
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[11px] leading-relaxed text-slate-300">
+                No qualifying Conditional Access policy evidence was reported.
+                Unknown does not mean not covered.
+              </div>
+            )}
+            <div className="border-t border-slate-700 pt-2 text-[10px] text-slate-400">
+              Evidence observed {formatUserDateTime(enforcement?.evidenceObservedAt)}
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   )
 }
 
@@ -4187,9 +4267,6 @@ export default function TenantDetailsPage() {
                                 mfaRegistrationPresentation(u)
                               const perUserMfaBadge =
                                 perUserMfaPresentation(u)
-                              const effectiveMfaBadge =
-                                effectiveMfaEnforcementPresentation(u)
-
                               const userRoles = getUserRoles(u)
                               const firstRole =
                                 userRoles.length > 0 ? userRoles[0] : null
@@ -4243,7 +4320,7 @@ export default function TenantDetailsPage() {
                                     <MfaFactBadge {...mfaRegistrationBadge} />
                                   </td>
                                   <td className="px-4 py-3.5 min-w-[210px] max-w-[320px]">
-                                    <MfaFactBadge {...effectiveMfaBadge} />
+                                    <EffectiveMfaTableBadge user={u} />
                                   </td>
                                   <td className="hidden lg:table-cell px-4 py-3.5 min-w-[150px]">
                                     <MfaFactBadge {...perUserMfaBadge} />
