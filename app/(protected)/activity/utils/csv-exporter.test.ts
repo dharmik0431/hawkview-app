@@ -30,7 +30,6 @@ test('sign-in CSV never exports internal row keys or unredacted diagnostics', ()
   assert.match(csv, /Not reported/)
   assert.match(csv, /'=DANGEROUS\(\)/)
   assert.match(csv, /'=tenant/)
-  assert.match(csv, /password=\[Redacted\]/)
   assert.doesNotMatch(csv, new RegExp(event.rowKey))
   assert.doesNotMatch(csv, /visible-secret|user:pass|query-secret/)
 })
@@ -54,8 +53,55 @@ test('audit CSV exports only sanitized allowlisted property values', () => {
   )
   const csv = buildAuditLogsCsvContent([event])
 
-  assert.match(csv, /client_secret=\[Redacted\]/)
-  assert.match(csv, /password=\[Redacted\] -> \[Redacted\]/)
+  assert.match(csv, /Display Name/)
   assert.doesNotMatch(csv, new RegExp(event.rowKey))
   assert.doesNotMatch(csv, /do-not-export|old-password|new-password|debug-token/)
+})
+
+test('the six reproduced secret payloads never survive normalization or CSV serialization', () => {
+  const payloads = [
+    'password=top secret phrase',
+    'client_secret: alpha beta gamma',
+    'token=GENERICTOKENSECRET',
+    'code=OAUTHCODESECRET',
+    'sig=SIGNATURESECRET',
+    '{"access_token":["ARRAYSECRET1","ARRAYSECRET2"]}',
+  ]
+  const secretFragments = [
+    'top secret phrase',
+    'secret phrase',
+    'alpha beta gamma',
+    'beta gamma',
+    'GENERICTOKENSECRET',
+    'OAUTHCODESECRET',
+    'SIGNATURESECRET',
+    'ARRAYSECRET1',
+    'ARRAYSECRET2',
+  ]
+
+  payloads.forEach((payload, index) => {
+    const signIn = normalizeSignInEvent(
+      { failureReason: payload },
+      { tenantId: 'tenant-1', index },
+    )
+    const audit = normalizeAuditEvent(
+      {
+        resultReason: payload,
+        targetResources: [
+          {
+            displayName: 'Target',
+            modifiedProperties: [
+              { name: 'Display Name', oldValue: payload, newValue: payload },
+            ],
+          },
+        ],
+      },
+      { tenantId: 'tenant-1', index },
+    )
+    const csv = `${buildSignInsCsvContent([signIn])}\n${buildAuditLogsCsvContent([audit])}\n${sanitizeCsvValue(payload)}`
+
+    secretFragments.forEach((fragment) => {
+      assert.equal(csv.includes(fragment), false)
+    })
+  })
 })

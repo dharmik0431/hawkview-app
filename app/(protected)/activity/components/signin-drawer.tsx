@@ -389,18 +389,16 @@ export function SignInDrawer({
                     <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
                       Modified Properties ({auditEv.modifiedProperties.length})
                     </span>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      Property values are not displayed because Microsoft audit
+                      payloads may contain credentials or other sensitive data.
+                    </p>
                     <div className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-hidden text-xs">
                       <table className="w-full text-left border-collapse">
                         <thead className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-semibold">
                           <tr>
                             <th className="p-2 border-b border-slate-200 dark:border-slate-800">
                               Property
-                            </th>
-                            <th className="p-2 border-b border-slate-200 dark:border-slate-800">
-                              Old Value
-                            </th>
-                            <th className="p-2 border-b border-slate-200 dark:border-slate-800">
-                              New Value
                             </th>
                           </tr>
                         </thead>
@@ -412,12 +410,6 @@ export function SignInDrawer({
                             >
                               <td className="p-2 font-medium font-sans text-slate-900 dark:text-slate-100">
                                 {prop.name}
-                              </td>
-                              <td className="p-2 text-slate-500 dark:text-slate-400 break-all">
-                                {prop.oldValue || 'Not reported'}
-                              </td>
-                              <td className="p-2 text-emerald-700 dark:text-emerald-400 break-all">
-                                {prop.newValue || 'Not reported'}
                               </td>
                             </tr>
                           ))}

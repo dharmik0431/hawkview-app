@@ -94,12 +94,9 @@ test('hostile sign-in diagnostics are scalar-only, redacted, bounded, and URL-sa
 
   const serialized = JSON.stringify(event)
   assert.doesNotMatch(serialized, /hunter2|token-value|top-level-secret|top-level-token|nested-secret|debug-secret|user:pass|client_secret=secret/)
-  assert.match(event.failureReason ?? '', /password=\[Redacted\]/)
-  assert.match(event.failureReason ?? '', /access_token=\[Redacted\]/)
-  assert.match(event.failureReason ?? '', /https:\/\/example\.com\/path/)
+  assert.equal(event.failureReason, undefined)
   assert.equal(event.additionalDetails, undefined)
-  assert.equal(event.userAgent?.includes('\u0000'), false)
-  assert.equal(event.userAgent?.length, 2_000)
+  assert.equal(event.userAgent, undefined)
   assert.equal('raw' in event, false)
 })
 
@@ -129,9 +126,8 @@ test('audit targets and modified properties use a closed safe shape', () => {
     { displayName: 'Safe target', userPrincipalName: undefined, id: 'target-id', type: 'User' },
   ])
   assert.deepEqual(event.modifiedProperties, [
-    { name: 'client_secret', oldValue: '[Redacted]', newValue: '[Redacted]' },
-    { name: 'Display Name', oldValue: '=old', newValue: '+new' },
-    { name: 'Nested', oldValue: undefined, newValue: undefined },
+    { name: 'Display Name' },
+    { name: 'Nested' },
   ])
   const serialized = JSON.stringify(event)
   assert.doesNotMatch(serialized, /target-password|nested-token|old-secret|new-secret|"raw"/)
@@ -148,4 +144,72 @@ test('prototype-backed objects are not treated as reported event evidence', () =
   assert.equal(event.eventId, undefined)
   assert.equal(event.result, 'Not reported')
   assert.doesNotMatch(JSON.stringify(event), /inherited-id|prototype-secret/)
+})
+
+test('exact multiword and alias payloads fail closed across diagnostics and property values', () => {
+  const payloads = [
+    'password=top secret phrase',
+    'client_secret: alpha beta gamma',
+    'token=GENERICTOKENSECRET',
+    'code=OAUTHCODESECRET',
+    'sig=SIGNATURESECRET',
+    '{"access_token":["ARRAYSECRET1","ARRAYSECRET2"]}',
+  ]
+  const secretFragments = [
+    'top secret phrase',
+    'secret phrase',
+    'alpha beta gamma',
+    'beta gamma',
+    'GENERICTOKENSECRET',
+    'OAUTHCODESECRET',
+    'SIGNATURESECRET',
+    'ARRAYSECRET1',
+    'ARRAYSECRET2',
+  ]
+
+  payloads.forEach((payload, index) => {
+    const signIn = normalizeSignInEvent(
+      { failureReason: payload, additionalDetails: payload },
+      { tenantId: 'tenant-1', index },
+    )
+    const audit = normalizeAuditEvent(
+      {
+        resultReason: payload,
+        targetResources: [
+          {
+            displayName: 'Target',
+            modifiedProperties: [
+              { name: 'Display Name', oldValue: payload, newValue: payload },
+            ],
+          },
+        ],
+      },
+      { tenantId: 'tenant-1', index },
+    )
+
+    assert.equal(signIn.failureReason, undefined)
+    assert.equal(signIn.additionalDetails, undefined)
+    assert.equal(audit.resultReason, undefined)
+    assert.deepEqual(audit.modifiedProperties, [{ name: 'Display Name' }])
+    const serialized = JSON.stringify({ signIn, audit })
+    secretFragments.forEach((fragment) => {
+      assert.equal(serialized.includes(fragment), false)
+    })
+  })
+})
+
+test('safe Microsoft diagnostics retain only bounded message and sanitized host/path', () => {
+  const event = normalizeSignInEvent(
+    {
+      errorCode: 'AADSTS50011',
+      failureReason:
+        'AADSTS50011: Redirect URI mismatch at https://user:pass@login.microsoftonline.com/common/oauth2?request=unsafe#fragment',
+    },
+    { tenantId: 'opaque-tenant-reference', index: 10 },
+  )
+
+  assert.equal(event.errorCode, 'AADSTS50011')
+  assert.match(event.failureReason ?? '', /https:\/\/login\.microsoftonline\.com\/common\/oauth2/)
+  assert.doesNotMatch(event.failureReason ?? '', /user:pass|request=unsafe|fragment/)
+  assert.equal(event.tenantId, 'opaque-tenant-reference')
 })

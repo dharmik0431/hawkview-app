@@ -14,7 +14,12 @@ const MAX_MODIFIED_PROPERTIES = 50
 const MAX_POLICIES = 50
 
 const SENSITIVE_KEY =
-  /^(?:password|passwd|pwd|secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|authorization|cookie|set-cookie|accountkey|private[_-]?key)$/i
+  /^(?:password|passwd|pwd|secret|client[_-]?secret|token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|authorization|authorization[_-]?code|oauth[_-]?(?:authorization[_-]?)?code|code|sig|signature|cookie|set-cookie|accountkey|private[_-]?key)$/i
+const SENSITIVE_ASSIGNMENT =
+  /(?:^|[\s"'`{[(,;])(?:password|passwd|pwd|secret|client[\s_-]*secret|token|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|api[\s_-]*key|apikey|authorization|authorization[\s_-]*code|oauth[\s_-]*(?:authorization[\s_-]*)?code|code|sig|signature|cookie|set-cookie|accountkey|private[\s_-]*key)\s*["']?\s*[:=]/i
+const BEARER_OR_JWT =
+  /\bBearer\s+\S+|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/i
+const EMBEDDED_STRUCTURE = /(?:^|\s)(?:\{|\[)\s*(?:"|'|\{|\[)/
 const UNSAFE_OBJECT_KEY = /^(?:__proto__|prototype|constructor)$/i
 const SAFE_PROPERTY_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._:/()[\]\-]{0,127}$/
 
@@ -55,25 +60,27 @@ export function sanitizeActivityText(
     return undefined
   }
 
-  let text = String(value)
+  const original = String(value)
+  if (original.length > maxLength) return undefined
+
+  let text = original
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
   if (!text) return undefined
 
-  text = stripUrlCredentialsAndQuery(text)
-  text = text
-    .replace(
-      /\b(password|passwd|pwd|secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|authorization|cookie|set-cookie|accountkey|private[_-]?key)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}&]+)/gi,
-      '$1=[Redacted]',
-    )
-    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [Redacted]')
-    .replace(
-      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
-      '[Redacted token]',
-    )
+  // A credential marker invalidates the whole scalar. Partial replacement can
+  // leave trailing words from whitespace-containing secrets.
+  if (
+    SENSITIVE_ASSIGNMENT.test(text) ||
+    BEARER_OR_JWT.test(text) ||
+    EMBEDDED_STRUCTURE.test(text)
+  ) {
+    return '[Redacted]'
+  }
 
-  return text.slice(0, Math.max(1, maxLength))
+  text = stripUrlCredentialsAndQuery(text)
+  return text
 }
 
 function reportedText(...values: unknown[]): string | undefined {
@@ -86,8 +93,18 @@ function reportedText(...values: unknown[]): string | undefined {
 
 function diagnosticText(...values: unknown[]): string | undefined {
   for (const value of values) {
+    if (typeof value !== 'string' && typeof value !== 'number') continue
+    const original = String(value)
+    if (
+      original.length > MAX_DIAGNOSTIC_LENGTH ||
+      SENSITIVE_ASSIGNMENT.test(original) ||
+      BEARER_OR_JWT.test(original) ||
+      EMBEDDED_STRUCTURE.test(original)
+    ) {
+      continue
+    }
     const sanitized = sanitizeActivityText(value, MAX_DIAGNOSTIC_LENGTH)
-    if (sanitized) return sanitized
+    if (sanitized && sanitized !== '[Redacted]') return sanitized
   }
   return undefined
 }
@@ -187,16 +204,10 @@ function normalizeModifiedProperties(value: unknown): AuditModifiedProperty[] | 
       return []
     }
     const canonicalName = name.replace(/[ .:/()[\]-]/g, '_')
-    const sensitive = SENSITIVE_KEY.test(canonicalName)
-    return [{
-      name,
-      oldValue: sensitive
-        ? '[Redacted]'
-        : diagnosticText(ownValue(property, 'oldValue')),
-      newValue: sensitive
-        ? '[Redacted]'
-        : diagnosticText(ownValue(property, 'newValue')),
-    }]
+    if (SENSITIVE_KEY.test(canonicalName)) return []
+    // Property names are useful investigation context. Values are arbitrary
+    // Microsoft payloads and are not carried into the beta UI/CSV contract.
+    return [{ name }]
   })
   return properties.length ? properties : undefined
 }

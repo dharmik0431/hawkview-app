@@ -50,8 +50,6 @@ export type AuditTargetResource = {
 
 export type AuditModifiedProperty = {
   name: string
-  oldValue?: string
-  newValue?: string
 }
 
 export type AuditEvent = {
