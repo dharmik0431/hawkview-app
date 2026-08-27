@@ -18,18 +18,24 @@ authentication and security-notification email.
 
 The templates are deliberately transactional: one HawkView wordmark with the compact Tenant Formation mark, one
 action, no marketing copy, no remote images, no tracking pixels, and no interpolation of user-controlled profile
-fields. The mark is a small embedded PNG data URI, so displaying it does not make an external request. Existing
-Supabase confirmation URLs and HawkView redirect behavior are preserved.
+fields. The mark is a 944-byte embedded PNG data URI, so displaying it does not make an external request. Every
+action email links first to `https://console.hawkviewapp.com/auth/confirm` with only Supabase's one-time token hash
+and a closed supported email type in the URL fragment. Fragments are not sent in HTTP requests or referrer headers.
+The browser removes the token hash from history immediately and waits for a deliberate user click before verification,
+preventing automated mail scanners from consuming the link. Raw
+`*.supabase.co/auth/v1/verify` URLs are never rendered in HawkView email HTML.
 
 ## Safe deployment
 
-1. Configure a production custom SMTP provider in Supabase Auth before relying on these messages for customers. Use the
-   dedicated authentication sender `no-reply@auth.hawkviewapp.com` and set the sender name to `HawkView` after that
-   subdomain has been verified with the selected provider.
-2. Configure SPF, DKIM, and DMARC for that sender domain. Disable click/open tracking for authentication mail because
-   link rewriting can invalidate Supabase confirmation links.
-3. Confirm the Supabase Site URL and redirect allow list contain the exact published HawkView origin and the login and
-   reset-password destinations used by the application.
+1. Verify `auth.hawkviewapp.com` in the production SMTP provider before changing the live sender. Then configure
+   Supabase Auth to use the dedicated sender `no-reply@auth.hawkviewapp.com` with sender name `HawkView`. The
+   management utility detects sender drift but intentionally does not change SMTP identity or credentials.
+2. Configure SPF, DKIM, and DMARC for that sender domain. In Resend, open **Domains > auth.hawkviewapp.com >
+   Tracking** and verify both Click Tracking and Open Tracking are disabled. After rollout, inspect a delivered raw
+   message and confirm the CTA still points directly to `https://console.hawkviewapp.com/auth/confirm`; no provider
+   tracking hostname may replace it.
+3. Confirm the Supabase Site URL is `https://console.hawkviewapp.com` and its redirect allow list contains the exact
+   `https://console.hawkviewapp.com/auth/confirm` URL. Do not add wildcard or preview-host redirects in production.
 4. Create a short-lived Supabase personal access token. Never store it in a repository file, shell history, build log,
    screenshot, or CI artifact.
 5. Check drift without changing the project:
@@ -50,20 +56,27 @@ Supabase confirmation URLs and HawkView redirect behavior are preserved.
 7. Remove the token from the process environment and revoke it after use.
 
 The utility reads the current hosted configuration, updates only differing managed subject/body fields, reads it back,
-and fails if any managed field still differs. It never changes SMTP credentials, confirmation requirements, redirect
-URLs, rate limits, or security-notification enablement.
+and fails if any managed field still differs. It also fails closed when the sender address or name differs from the
+dedicated delivery policy, but it never changes SMTP identity or credentials. Sender changes remain a separately
+controlled Supabase/Resend operation after the domain is proven verified. The utility does not change confirmation
+requirements, redirect allow lists, rate limits, tracking, or security-notification enablement.
+
+Every generated HTML body must remain at or below 8 KiB, and the embedded image must remain at or below 1 KiB. The
+current invitation and recovery bodies are approximately 4 KiB. A materially larger delivered MIME message requires
+inspection of live template drift, MIME parts, provider transformations, and recipient transport expansion.
 
 ## Acceptance matrix
 
 Use fresh test addresses and verify each applicable flow in both desktop Outlook and Gmail:
 
-- Signup confirmation opens the published HawkView login route and the confirmed account can sign in.
-- Workspace invitation opens the intended account-setup route and preserves the inviter workspace.
+- Signup confirmation verifies at the HawkView-owned endpoint and continues to the signed-in HawkView flow.
+- Workspace invitation verifies at the HawkView-owned endpoint, opens password setup, and preserves the inviter workspace.
 - Password reset opens `/reset-password`, allows one successful reset, and does not accept the same link twice.
 - A second invitation for an unaccepted user sends the branded recovery/setup message.
 - Enabled security notifications use the HawkView shell and contain no secret, password, session, or access token.
 - Plain-text fallback generated by the mail provider remains understandable.
-- Delivery logs show SPF, DKIM, and DMARC passing; no confirmation URL is rewritten by provider tracking.
+- Delivery logs show SPF, DKIM, DMARC, and composite authentication passing; the visible CTA host remains
+  `console.hawkviewapp.com` and is not rewritten by provider tracking.
 
 Security-notification enablement is intentionally not managed by the template utility. Enable each notification in the
 Supabase dashboard only after SMTP delivery and the corresponding end-to-end flow have been verified.

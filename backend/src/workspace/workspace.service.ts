@@ -14,6 +14,7 @@ import {
 } from '../generated/prisma/enums.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { resolveHawkViewAuthRedirectUrl } from './auth-email-config.js'
 import {
   parseOrganizationSettings,
   parseOrganizationId,
@@ -493,6 +494,18 @@ export class WorkspaceService {
     return { url, serviceRoleKey }
   }
 
+  private authEmailRedirectUrl() {
+    try {
+      return resolveHawkViewAuthRedirectUrl(
+        process.env.HAWKVIEW_AUTH_REDIRECT_URL
+      )
+    } catch {
+      throw new ServiceUnavailableException(
+        'HawkView account administration is not configured correctly. Contact a platform administrator.',
+      )
+    }
+  }
+
   private async supabaseAdminRequest(path: string, init: RequestInit) {
     const { url, serviceRoleKey } = this.supabaseConfiguration()
     let response: Response
@@ -550,7 +563,7 @@ export class WorkspaceService {
           body: JSON.stringify({
             email,
             data: displayName ? { display_name: displayName } : undefined,
-            redirect_to: process.env.HAWKVIEW_AUTH_REDIRECT_URL?.trim() || undefined,
+            redirect_to: this.authEmailRedirectUrl(),
           }),
         }) as { id?: unknown; user?: { id?: unknown } } | null
         const authProviderUserId = typeof invite?.id === 'string'
@@ -579,7 +592,7 @@ export class WorkspaceService {
           method: 'POST',
           body: JSON.stringify({
             email: user.email,
-            redirect_to: process.env.HAWKVIEW_AUTH_REDIRECT_URL?.trim() || undefined,
+            redirect_to: this.authEmailRedirectUrl(),
           }),
         })
         user = await this.prisma.user.update({
@@ -644,7 +657,10 @@ export class WorkspaceService {
     try {
       await this.supabaseAdminRequest('/auth/v1/recover', {
         method: 'POST',
-        body: JSON.stringify({ email: member.user.email, redirect_to: process.env.HAWKVIEW_AUTH_REDIRECT_URL?.trim() || undefined }),
+        body: JSON.stringify({
+          email: member.user.email,
+          redirect_to: this.authEmailRedirectUrl(),
+        }),
       })
       await this.audit(actor, 'HAWKVIEW_PASSWORD_RESET_SENT', member.user)
       return { sent: true }

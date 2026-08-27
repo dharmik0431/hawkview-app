@@ -10,6 +10,22 @@ const BRAND = Object.freeze({
 const BRAND_MARK_DATA_URI =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAsTAAALEwEAmpwYAAADYklEQVRYhe2WXYhVVRTH195n9rk6KZPpg5My0jT3rnVuiqRhH6ATaCGi5szd66hTEKhnqwMiYlhPhQpRPQgaiL5EDz5J9EFPgumLWJBiqPgFUQ2IVjP7XAWzUaeJfc443vHeHrzHxgdnweLAOZy1f+f/X/usDTAWj31I5C4IOmc8MiE85OUSOZakuwHYG32C9vYGiXxJEg9K5FMelZY+GhWI/0kgEhD9vUf82qhCCNQ7hgGGQfi4h5qdSqMCIVFvlcR3aoD86p5BKzf9f6uby43JNSi9KJAPVUGkeV2Q3g1tK5996Os3mj+aVWSP5kz59eRGPpwtiPdI5N5qED0gkL+EIFzwUCGUiXf7Jh70jT2RM3aTg4K2xTkPWQviryXx3zXs+cHDcJlro+wExjYpE59LIRKQO8rYIw2mbwOY61NgVtckGfBagXy4ulf0T0D8cmaGcca2qMheugcxlJG9rYw9pKJ4DWwsTwLqaJbImyXqMxVq3Jao38yuxFtXnmiIbLeK7IUqkFSZfmXib1XUtwr4rC8LHA73CvINKHRSNgDqaIbC6ikAg0KtK8/1jX1PRfawb+zN+2FUZH/OmXgh5HmaRH1xSI0fYa5R9QMU2ZekjwnibyTyGqCVheT+lp7xuai8SEX2I9eofmQHhhS55a+LO6DILZL0ZQchiHdmVGHFZNdYFf5eEaS/cL4DhXPc4MqtLbf5Jv78ri259fGrQOFL6W7RA86abBCt3CSI9ybFqrafviqQP3Y7Qxnb5UfxX35kex2UJDZD0P0y0NsAeRbkO1uTxFVP16FGOFMQfyKJz48YWun2+wWKXGyIbLsfxddc4zZ2/z5VEr9bEzzN806p+lQp8lNeEC5xHkvks3fVgKD0nNoQP582a7wX4AMpiPf9B4BTpw/yPA/qjqAzL4i/G1GwyC3ps9J8txNq2GYF6l3OIoG83QE++MK4fKJA/lCSvllhwzHA0ivOa4H6qxpf2yuR33HvjqjV9iBDzZ2cXHOhvlpR/HQyBwr8jCDeX/V7Ru5PpufsN56EDCHcoUQSX6go/JuDcV8giD9LfsE1x3bH9CwLgxeEiyTqkxVS/+m6G2a8PQ6w9IIgPiCIDw4n8qfJKft+qesJSbzaHclS/3SPJH4fijwhc+GxGAsYGf8CS8qzAQ+l0pYAAAAASUVORK5CYII='
 
+export const HAWKVIEW_AUTH_EMAIL_ORIGIN = 'https://console.hawkviewapp.com'
+export const HAWKVIEW_AUTH_EMAIL_CONFIRM_PATH = '/auth/confirm'
+export const HAWKVIEW_AUTH_EMAIL_MAX_HTML_BYTES = 8 * 1024
+export const HAWKVIEW_AUTH_EMAIL_MAX_IMAGE_BYTES = 1024
+export const HAWKVIEW_AUTH_EMAIL_DELIVERY_POLICY = Object.freeze({
+  senderEmail: 'no-reply@auth.hawkviewapp.com',
+  senderName: 'HawkView',
+  sendingDomain: 'auth.hawkviewapp.com',
+  clickTracking: false,
+  openTracking: false,
+})
+
+function confirmationActionUrl(type) {
+  return `${HAWKVIEW_AUTH_EMAIL_ORIGIN}${HAWKVIEW_AUTH_EMAIL_CONFIRM_PATH}#token_hash={{ .TokenHash }}&amp;type=${type}`
+}
+
 function paragraph(value) {
   return `<p style="margin:0 0 16px;color:${BRAND.navy};font-size:16px;line-height:24px;">${value}</p>`
 }
@@ -66,7 +82,6 @@ function brandedEmail({ preheader, title, paragraphs, action, code, security = f
 </html>`
 }
 
-const confirmationUrl = '{{ .ConfirmationURL }}'
 const token = '{{ .Token }}'
 
 const templates = {
@@ -76,7 +91,7 @@ const templates = {
       preheader: 'Confirm your email address to finish creating your HawkView account.',
       title: 'Confirm your email address',
       paragraphs: ['Use the button below to verify your email address and finish creating your HawkView account.'],
-      action: { href: confirmationUrl, label: 'Confirm email address' },
+      action: { href: confirmationActionUrl('signup'), label: 'Confirm email address' },
     }),
   },
   invite: {
@@ -85,7 +100,7 @@ const templates = {
       preheader: 'Accept your invitation to join a HawkView workspace.',
       title: 'You have been invited',
       paragraphs: ['A HawkView workspace administrator invited you to join their team. Use the button below to accept the invitation and finish account setup.'],
-      action: { href: confirmationUrl, label: 'Accept invitation' },
+      action: { href: confirmationActionUrl('invite'), label: 'Accept invitation' },
     }),
   },
   recovery: {
@@ -94,7 +109,7 @@ const templates = {
       preheader: 'Use this secure link to reset your HawkView password.',
       title: 'Reset your password',
       paragraphs: ['We received a request to reset the password for your HawkView account. Use the button below to choose a new password.'],
-      action: { href: confirmationUrl, label: 'Reset password' },
+      action: { href: confirmationActionUrl('recovery'), label: 'Reset password' },
     }),
   },
   magic_link: {
@@ -103,7 +118,7 @@ const templates = {
       preheader: 'Use this one-time link to sign in to HawkView.',
       title: 'Sign in to HawkView',
       paragraphs: ['Use the button below to securely sign in. This link is intended only for you and expires shortly.'],
-      action: { href: confirmationUrl, label: 'Sign in to HawkView' },
+      action: { href: confirmationActionUrl('magiclink'), label: 'Sign in to HawkView' },
     }),
   },
   reauthentication: {
@@ -121,7 +136,7 @@ const templates = {
       preheader: 'Confirm the requested email-address change for your HawkView account.',
       title: 'Confirm your new email address',
       paragraphs: ['Use the button below to confirm the requested email-address change for your HawkView account.'],
-      action: { href: confirmationUrl, label: 'Confirm new email address' },
+      action: { href: confirmationActionUrl('email_change'), label: 'Confirm new email address' },
     }),
   },
   password_changed_notification: {
