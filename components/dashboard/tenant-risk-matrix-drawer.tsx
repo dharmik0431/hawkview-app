@@ -311,7 +311,7 @@ export function TenantRiskMatrixDrawer({
                     <div className="text-sm font-bold text-slate-900 dark:text-slate-100">
                       {identityInfo.mfaText}
                     </div>
-                    {identityInfo.mfaValue !== null && identityInfo.mfaValue < 85 && (
+                    {typeof identityInfo.mfaValue === 'number' && identityInfo.mfaValue < 85 && (
                       <div className="text-[11px] text-amber-700 dark:text-amber-400 font-medium">
                         Below recommended 85% baseline
                       </div>
@@ -346,7 +346,9 @@ export function TenantRiskMatrixDrawer({
                     </Tooltip>
 
                     <span className="font-bold text-base text-slate-900 dark:text-slate-100">
-                      {tenant.healthScore} / 100
+                      {Number.isFinite(tenant.healthScore)
+                        ? `${tenant.healthScore} / 100`
+                        : 'Not reported'}
                     </span>
                   </div>
                 </div>
@@ -377,7 +379,7 @@ export function TenantRiskMatrixDrawer({
                 </div>
               </div>
 
-              {activeIssues.count > 0 && (
+              {typeof activeIssues.count === 'number' && activeIssues.count > 0 && (
                 <div className="text-[11px] text-amber-800 dark:text-amber-300 flex items-center gap-1.5 px-1">
                   <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
                   <span>
@@ -393,12 +395,19 @@ export function TenantRiskMatrixDrawer({
                     <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0" />
                     <span>Active Issues</span>
                     <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border-0 text-xs px-2 py-0.5">
-                      {activeIssues.count}
+                      {activeIssues.count ?? 'Not reported'}
                     </Badge>
                   </h3>
                 </div>
 
-                {attentionItems.length === 0 ? (
+                {!activeIssues.evidenceAvailable ? (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 text-center dark:border-slate-800 dark:bg-slate-800/30">
+                    <Info className="mx-auto h-6 w-6 text-slate-500" aria-hidden="true" />
+                    <p className="mt-1 text-xs font-semibold text-slate-800 dark:text-slate-200">
+                      Active issue evidence not reported
+                    </p>
+                  </div>
+                ) : attentionItems.length === 0 ? (
                   <div className="p-4 text-center rounded-xl border border-emerald-200 bg-emerald-50/50 dark:border-emerald-900/40 dark:bg-emerald-950/20 space-y-1">
                     <CheckCircle2 className="h-6 w-6 text-emerald-600 dark:text-emerald-400 mx-auto" />
                     <p className="text-xs font-semibold text-emerald-900 dark:text-emerald-300">

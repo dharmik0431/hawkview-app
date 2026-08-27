@@ -10,12 +10,12 @@ export type SignInEvent = {
 
   appDisplayName: string
   appId?: string
-  status: 'Success' | 'Failure'
+  status: 'Success' | 'Failure' | 'Not reported'
   failureReason?: string
   errorCode?: string
   additionalDetails?: string
 
-  conditionalAccess?: 'Applied' | 'Not Applied'
+  conditionalAccess?: 'Applied' | 'Not Applied' | 'Not reported'
   appliedCaPolicies?: string[]
   authMethod?: string
 

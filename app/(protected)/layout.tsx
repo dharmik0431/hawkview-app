@@ -17,6 +17,12 @@ function ProtectedShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="min-h-screen bg-background text-foreground">
+      <a
+        href="#main-content"
+        className="sr-only z-[100] rounded-md bg-background px-4 py-2 text-foreground shadow focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+      >
+        Skip to main content
+      </a>
       <Sidebar />
       <div
         className={cn(
@@ -25,7 +31,9 @@ function ProtectedShell({ children }: { children: React.ReactNode }) {
         )}
       >
         <Topbar />
-        <main className="py-3.5 px-4 sm:px-5 lg:px-6">{children}</main>
+        <main id="main-content" tabIndex={-1} className="py-3.5 px-4 sm:px-5 lg:px-6">
+          {children}
+        </main>
       </div>
     </div>
   )

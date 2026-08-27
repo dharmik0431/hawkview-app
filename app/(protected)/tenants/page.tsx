@@ -548,7 +548,9 @@ export default function TenantsPage() {
   )
 
   const tenants: Tenant[] = useMemo(() => data?.tenants || [], [data?.tenants])
-  const errorMessage = error ? (error as Error).message : data?.error || null
+  const errorMessage = error || data?.error
+    ? 'The tenant directory could not be loaded. Please retry.'
+    : null
 
   const handleRetry = () => {
     queryClient.invalidateQueries({ queryKey: ['tenants'] })
@@ -664,11 +666,7 @@ export default function TenantsPage() {
       popup.close()
       consentPopupRef.current = null
       setIsSavingTenant(false)
-      setOnboardingError(
-        err instanceof Error
-          ? err.message
-          : 'Microsoft tenant onboarding could not be started.'
-      )
+      setOnboardingError('Microsoft tenant onboarding could not be started. Please retry.')
     }
   }
 

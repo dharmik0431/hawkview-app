@@ -1,9 +1,9 @@
 import type { SignInEvent, AuditEvent } from '../data/types'
 
 function fmtUTC(iso?: string) {
-  if (!iso) return ''
+  if (!iso) return 'Not reported'
   const date = new Date(iso)
-  if (!Number.isFinite(date.getTime())) return iso
+  if (!Number.isFinite(date.getTime())) return 'Not reported'
   return date.toISOString().replace('T', ' ').replace('Z', ' UTC').slice(0, 23)
 }
 

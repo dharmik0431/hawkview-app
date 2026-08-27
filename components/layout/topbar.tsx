@@ -2,10 +2,9 @@
 
 import React, { useEffect, useMemo, useState } from 'react'
 import { usePathname } from 'next/navigation'
-import { Button } from '@/components/ui/button'
-import { FileText } from 'lucide-react'
 import { NotificationPanel } from '@/components/layout/notification-panel'
 import { UserMenu } from '@/components/layout/user-menu'
+import { MobileNavigation } from '@/components/layout/mobile-navigation'
 import { apiClient } from '@/lib/api/client'
 import { tenantNameFromBundleResponse } from '@/lib/tenants/tenant-api-view'
 import { useAuth } from '@/components/providers/auth-provider'
@@ -17,6 +16,7 @@ const pageTitles: Record<string, string> = {
   '/reports': 'Reports',
   '/alerts': 'Alerts & Notifications',
   '/activity': 'Activity Logs',
+  '/what-changed': 'What Changed?',
   '/users': 'User Directory',
   '/licensing': 'Licensing Overview',
   '/security': 'Security Insights',
@@ -136,6 +136,7 @@ export function Topbar() {
 
   return (
     <div className="sticky top-0 z-40 flex h-16 shrink-0 items-center gap-x-4 border-b border-border bg-background px-4 shadow-sm sm:gap-x-6 sm:px-6 lg:px-8">
+      <MobileNavigation />
       {!isHideTitleRoute && (
         <h1
           className="text-xl font-semibold text-foreground truncate max-w-[200px] sm:max-w-[360px] md:max-w-md lg:max-w-lg"
@@ -146,17 +147,6 @@ export function Topbar() {
       )}
 
       <div className="flex flex-1 justify-end items-center gap-x-3 sm:gap-x-4">
-        {/* Changelog button */}
-        <Button
-          variant="ghost"
-          size="sm"
-          className="gap-2 text-muted-foreground hover:text-foreground"
-          aria-label="Changelog"
-        >
-          <FileText className="h-4 w-4" aria-hidden="true" />
-          <span className="hidden sm:inline">Changelog</span>
-        </Button>
-
         {/* Notification Bell Panel */}
         <NotificationPanel />
 

@@ -1485,8 +1485,7 @@ export default function TenantDetailsPage() {
       setLoadState('ready')
       if (refresh) setSyncState('success')
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'Unable to load tenant data.'
+      const message = 'Unable to load tenant data. Please retry.'
       if (refresh) {
         setSyncState('fail')
       } else if (cachedBundle) {

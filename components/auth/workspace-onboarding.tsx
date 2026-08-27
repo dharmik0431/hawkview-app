@@ -41,9 +41,8 @@ const COMMON_TIME_ZONES = [
 ]
 
 function safeError(error: unknown, fallback: string) {
-  return error instanceof Error && error.message.trim()
-    ? error.message.slice(0, 300)
-    : fallback
+  void error
+  return fallback
 }
 
 export function WorkspaceOnboardingGate({

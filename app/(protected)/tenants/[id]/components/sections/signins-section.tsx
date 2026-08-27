@@ -360,8 +360,7 @@ export default function SignInActivitySection({
           <div>
             <p className="text-sm font-semibold">Sign-in logs are unavailable</p>
             <p className="mt-1 text-xs leading-5">
-              {syncStatus.lastError ||
-                'Microsoft did not return sign-in events for this tenant. Existing retained events remain available.'}
+              Microsoft did not return sign-in events for this tenant. Existing retained events remain available. Review the tenant connection or retry synchronization.
             </p>
           </div>
         </div>

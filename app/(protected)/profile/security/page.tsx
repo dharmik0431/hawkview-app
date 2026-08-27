@@ -31,7 +31,7 @@ function parseAuthError(error: any): string {
     case 'auth/user-disabled':
       return 'This user account has been disabled.'
     default:
-      return error.message || 'Failed to send password reset email.'
+      return 'Failed to send password reset email. Please retry.'
   }
 }
 
@@ -40,8 +40,9 @@ export default function SecuritySettingsPage() {
   const { notify } = useNotifications()
 
   const userEmail =
-    session?.user.email || identityUser?.email || 'user@hawkview.net'
-  const signInProvider = session?.signInProvider || 'Supabase Auth'
+    session?.user.email || identityUser?.email || 'Not reported'
+  const signInProvider = session?.signInProvider || 'Not reported'
+  const isProviderReported = signInProvider !== 'Not reported'
 
   // Determine if user uses standard email/password or SSO
   const isSsoUser = useMemo(() => {
@@ -190,13 +191,20 @@ export default function SecuritySettingsPage() {
               Password Status
             </p>
             <p className="text-xs text-muted-foreground mt-0.5">
-              {isSsoUser
+              {!isProviderReported
+                ? 'Authentication method not reported by the identity service.'
+                : isSsoUser
                 ? `Managed via ${signInProvider} single sign-on.`
                 : 'Password authentication active.'}
             </p>
           </div>
 
-          {isSsoUser ? (
+          {!isProviderReported ? (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/40 px-3 py-2 rounded-lg border border-border">
+              <Info className="h-4 w-4 text-blue-500 shrink-0" aria-hidden="true" />
+              <span>Password controls are unavailable until the authentication method is reported.</span>
+            </div>
+          ) : isSsoUser ? (
             <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/40 px-3 py-2 rounded-lg border border-border">
               <Info className="h-4 w-4 text-blue-500 shrink-0" />
               <span>

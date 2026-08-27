@@ -17,9 +17,9 @@ import {
 import type { SignInEvent, AuditEvent } from '../data/types'
 
 function fmtLocal(iso?: string) {
-  if (!iso) return 'Not available'
+  if (!iso) return 'Not reported'
   const date = new Date(iso)
-  if (!Number.isFinite(date.getTime())) return iso
+  if (!Number.isFinite(date.getTime())) return 'Not reported'
   return date.toLocaleString(undefined, {
     dateStyle: 'medium',
     timeStyle: 'medium',
@@ -27,9 +27,9 @@ function fmtLocal(iso?: string) {
 }
 
 function fmtUTC(iso?: string) {
-  if (!iso) return 'Not available'
+  if (!iso) return 'Not reported'
   const date = new Date(iso)
-  if (!Number.isFinite(date.getTime())) return iso
+  if (!Number.isFinite(date.getTime())) return 'Not reported'
   return date.toISOString().replace('T', ' ').replace('Z', ' UTC').slice(0, 23)
 }
 
@@ -99,7 +99,6 @@ function DataRow({
   breakAll?: boolean
   children?: React.ReactNode
 }) {
-  if (value === undefined && value === null && !children) return null
   const displayVal =
     value !== undefined && value !== null ? String(value) : undefined
 
@@ -118,10 +117,10 @@ function DataRow({
               breakAll ? 'break-all' : 'break-words',
             ].join(' ')}
           >
-            {displayVal || 'Not available'}
+            {displayVal || 'Not reported'}
           </span>
         )}
-        {copyable && displayVal && displayVal !== 'Not available' ? (
+        {copyable && displayVal && displayVal !== 'Not reported' ? (
           <CopyButton text={displayVal} label={label} />
         ) : null}
       </div>
@@ -140,23 +139,56 @@ export function SignInDrawer({
 }) {
   const [mounted, setMounted] = React.useState(false)
   const [jsonCopied, setJsonCopied] = React.useState(false)
+  const panelRef = React.useRef<HTMLDivElement>(null)
+  const closeButtonRef = React.useRef<HTMLButtonElement>(null)
+  const previousFocusRef = React.useRef<HTMLElement | null>(null)
 
   React.useEffect(() => {
     setMounted(true)
   }, [])
 
-  // Close on Escape key
   React.useEffect(() => {
+    if (!open) return
+    previousFocusRef.current = document.activeElement as HTMLElement | null
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    closeButtonRef.current?.focus()
+
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape' && open) {
+      if (e.key === 'Escape') {
         onClose()
+        return
+      }
+      if (e.key !== 'Tab' || !panelRef.current) return
+
+      const focusables = panelRef.current.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+      if (focusables.length === 0) {
+        e.preventDefault()
+        panelRef.current.focus()
+        return
+      }
+
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault()
+        first.focus()
       }
     }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      document.removeEventListener('keydown', handleKeyDown)
+      previousFocusRef.current?.focus()
+    }
   }, [open, onClose])
 
-  if (!mounted) return null
+  if (!mounted || !open) return null
 
   const isAudit = Boolean(event && ('activity' in event || 'actor' in event))
   const signInEv = !isAudit ? (event as SignInEvent | null) : null
@@ -171,11 +203,11 @@ export function SignInDrawer({
     setTimeout(() => setJsonCopied(false), 2000)
   }
 
-  const isSuccess = event
-    ? String(
-        (event as any).result ?? (event as any).status ?? 'Success'
-      ).toLowerCase() === 'success'
-    : true
+  const reportedResult = event
+    ? String((event as any).result ?? (event as any).status ?? 'Not reported')
+    : 'Not reported'
+  const isSuccess = reportedResult.toLowerCase() === 'success'
+  const isResultReported = reportedResult.toLowerCase() !== 'not reported'
 
   return (
     <>
@@ -183,7 +215,7 @@ export function SignInDrawer({
       <div
         className={[
           'fixed inset-0 z-40 bg-black/50 backdrop-blur-xs transition-opacity duration-200',
-          open ? 'opacity-100' : 'opacity-0 pointer-events-none',
+          'opacity-100',
         ].join(' ')}
         onClick={onClose}
         aria-hidden="true"
@@ -191,10 +223,12 @@ export function SignInDrawer({
 
       {/* Drawer Panel */}
       <div
+        ref={panelRef}
+        tabIndex={-1}
         className={[
           'fixed inset-y-0 right-0 z-50 w-full sm:w-[560px] md:w-[600px] max-w-full bg-background border-l border-border shadow-2xl',
           'transition-transform duration-200 ease-out flex flex-col',
-          open ? 'translate-x-0' : 'translate-x-full',
+          'translate-x-0',
         ].join(' ')}
         role="dialog"
         aria-modal="true"
@@ -210,25 +244,25 @@ export function SignInDrawer({
                 </span>
                 {isAudit ? (
                   <Badge
-                    variant={isSuccess ? 'outline' : 'destructive'}
+                    variant={isSuccess ? 'outline' : isResultReported ? 'destructive' : 'secondary'}
                     className={
                       isSuccess
                         ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-400 dark:border-emerald-800'
                         : ''
                     }
                   >
-                    {auditEv?.result || 'Success'}
+                    {auditEv?.result || 'Not reported'}
                   </Badge>
                 ) : (
                   <Badge
-                    variant={isSuccess ? 'outline' : 'destructive'}
+                    variant={isSuccess ? 'outline' : isResultReported ? 'destructive' : 'secondary'}
                     className={
                       isSuccess
                         ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-400 dark:border-emerald-800'
                         : ''
                     }
                   >
-                    {signInEv?.status || 'Success'}
+                    {signInEv?.status || 'Not reported'}
                   </Badge>
                 )}
                 {signInEv?.conditionalAccess ? (
@@ -253,6 +287,7 @@ export function SignInDrawer({
             </div>
 
             <Button
+              ref={closeButtonRef}
               variant="ghost"
               size="icon"
               onClick={onClose}
@@ -388,10 +423,10 @@ export function SignInDrawer({
                                 {prop.name}
                               </td>
                               <td className="p-2 text-slate-500 dark:text-slate-400 break-all">
-                                {prop.oldValue || '—'}
+                                {prop.oldValue || 'Not reported'}
                               </td>
                               <td className="p-2 text-emerald-700 dark:text-emerald-400 break-all">
-                                {prop.newValue || '—'}
+                                {prop.newValue || 'Not reported'}
                               </td>
                             </tr>
                           ))}
@@ -515,7 +550,7 @@ export function SignInDrawer({
                 ) : null}
                 <DataRow
                   label="Conditional Access"
-                  value={signInEv.conditionalAccess || 'Not Applied'}
+                  value={signInEv.conditionalAccess || 'Not reported'}
                 />
                 {signInEv.appliedCaPolicies &&
                 signInEv.appliedCaPolicies.length > 0 ? (

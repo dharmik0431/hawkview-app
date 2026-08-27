@@ -21,6 +21,7 @@ export type MatrixOverallStateKey =
   | 'stale'
   | 'syncing'
   | 'pending_setup'
+  | 'unknown'
   | 'healthy'
 
 export interface MatrixOverallStateInfo {
@@ -47,6 +48,12 @@ export function getTenantMatrixOverallState(
   const isPending =
     ['pending-consent', 'pending'].includes(connectionStatus) ||
     tenantStatus === 'pending'
+  const hasExplicitConnection = ['connected', 'error', 'revoked', 'disconnected', 'pending-consent', 'pending'].includes(connectionStatus)
+  const hasBaselineEvidence =
+    Number.isFinite(tenant.healthScore) &&
+    Number.isFinite(tenant.riskyIdentityCount) &&
+    tenant.mfaCoverage != null &&
+    Array.isArray(tenant.attention)
 
   const hasCriticalAttention = attentionItems.some(
     (item) => item.severity === 'critical'
@@ -92,7 +99,30 @@ export function getTenantMatrixOverallState(
     }
   }
 
-  // 4. Stale / Awaiting Sync
+  // 4. Pending and unknown evidence must be resolved before freshness.
+  if (isPending) {
+    return {
+      key: 'pending_setup',
+      label: 'Pending Setup',
+      badgeClass:
+        'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
+      icon: Clock,
+      rank: 5,
+    }
+  }
+
+  if (!hasExplicitConnection || !hasBaselineEvidence) {
+    return {
+      key: 'unknown',
+      label: 'Partial Data',
+      badgeClass:
+        'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
+      icon: Info,
+      rank: 5,
+    }
+  }
+
+  // 5. Stale / Awaiting Sync
   if (!tenant.lastSync) {
     return {
       key: 'stale',
@@ -117,18 +147,6 @@ export function getTenantMatrixOverallState(
     }
   }
 
-  // 5. Pending Setup
-  if (isPending) {
-    return {
-      key: 'pending_setup',
-      label: 'Pending Setup',
-      badgeClass:
-        'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
-      icon: Clock,
-      rank: 5,
-    }
-  }
-
   // 6. Healthy
   return {
     key: 'healthy',
@@ -142,6 +160,7 @@ export function getTenantMatrixOverallState(
 
 export function getTenantActiveIssuesInfo(tenant: Tenant) {
   const attentionItems = computeTenantAttention(tenant)
+  const evidenceAvailable = Array.isArray(tenant.attention)
 
   const missingPerms = tenant.missingPermissions || []
   const isDisconnected =
@@ -154,18 +173,28 @@ export function getTenantActiveIssuesInfo(tenant: Tenant) {
 
   if (isDisconnected) {
     return {
-      count: attentionItems.length || 1,
+      count: evidenceAvailable ? attentionItems.length : null,
       highestSeverity: 'critical' as const,
       summaryText: 'Microsoft connection lost',
+      evidenceAvailable,
     }
   }
 
   const totalCount = attentionItems.length
+  if (!evidenceAvailable) {
+    return {
+      count: null,
+      highestSeverity: 'unknown' as const,
+      summaryText: 'Issue evidence not reported',
+      evidenceAvailable: false,
+    }
+  }
   if (totalCount === 0) {
     return {
       count: 0,
       highestSeverity: 'none' as const,
       summaryText: 'No active issues',
+      evidenceAvailable: true,
     }
   }
 
@@ -188,7 +217,7 @@ export function getTenantActiveIssuesInfo(tenant: Tenant) {
   ) {
     summaryParts.push(`MFA registration: ${tenant.mfaCoverage}% covered`)
   }
-  if (tenant.riskyIdentityCount > 0) {
+  if (typeof tenant.riskyIdentityCount === 'number' && tenant.riskyIdentityCount > 0) {
     summaryParts.push(`${tenant.riskyIdentityCount} risky identities`)
   }
 
@@ -205,6 +234,7 @@ export function getTenantActiveIssuesInfo(tenant: Tenant) {
     count: totalCount,
     highestSeverity,
     summaryText,
+    evidenceAvailable: true,
   }
 }
 
@@ -237,7 +267,9 @@ export function getTenantIdentityInfo(tenant: Tenant) {
 
   // Risky Identities
   let riskyText = 'Risk data unavailable'
-  let riskyCount: number | null = tenant.riskyIdentityCount
+  let riskyCount: number | null = Number.isFinite(tenant.riskyIdentityCount)
+    ? (tenant.riskyIdentityCount as number)
+    : null
 
   if (isDisconnected) {
     riskyText = 'Risk data unavailable'
@@ -245,12 +277,14 @@ export function getTenantIdentityInfo(tenant: Tenant) {
     riskyText = 'Awaiting synchronization'
   } else if (tenant.missingPermissions && tenant.missingPermissions.some(p => p.toLowerCase().includes('identityrisk') || p.toLowerCase().includes('audit'))) {
     riskyText = 'Permission required'
-  } else if (tenant.riskyIdentityCount > 0) {
+  } else if (riskyCount !== null && riskyCount > 0) {
     riskyText = `${tenant.riskyIdentityCount} risky ${
       tenant.riskyIdentityCount === 1 ? 'identity' : 'identities'
     }`
-  } else {
+  } else if (riskyCount === 0) {
     riskyText = 'No risky identities detected'
+  } else {
+    riskyText = 'Risk data not reported'
   }
 
   return {
@@ -266,10 +300,13 @@ export function getTenantConnectionDataInfo(tenant: Tenant) {
   const connectionStatus = String(tenant.connectionStatus || '').toLowerCase()
   const missingPerms = tenant.missingPermissions || []
 
-  let connectionText = 'Microsoft: Connected'
-  let connectionState: 'connected' | 'disconnected' | 'pending' = 'connected'
+  let connectionText = 'Microsoft: Not reported'
+  let connectionState: 'connected' | 'disconnected' | 'pending' | 'unknown' = 'unknown'
 
-  if (['error', 'revoked', 'disconnected'].includes(connectionStatus)) {
+  if (connectionStatus === 'connected') {
+    connectionText = 'Microsoft: Connected'
+    connectionState = 'connected'
+  } else if (['error', 'revoked', 'disconnected'].includes(connectionStatus)) {
     connectionText = 'Microsoft: Disconnected'
     connectionState = 'disconnected'
   } else if (['pending-consent', 'pending'].includes(connectionStatus)) {
@@ -277,8 +314,8 @@ export function getTenantConnectionDataInfo(tenant: Tenant) {
     connectionState = 'pending'
   }
 
-  let dataText = 'Data: Current'
-  let dataStatus: 'current' | 'partial' | 'stale' | 'failed' | 'awaiting_sync' = 'current'
+  let dataText = 'Data: Not reported'
+  let dataStatus: 'current' | 'partial' | 'stale' | 'failed' | 'awaiting_sync' | 'unknown' = 'unknown'
 
   if (connectionState === 'disconnected') {
     dataText = 'Data: Failed'
@@ -286,6 +323,9 @@ export function getTenantConnectionDataInfo(tenant: Tenant) {
   } else if (connectionState === 'pending') {
     dataText = 'Data: Awaiting Sync'
     dataStatus = 'awaiting_sync'
+  } else if (connectionState === 'unknown') {
+    dataText = 'Data: Not reported'
+    dataStatus = 'unknown'
   } else if (missingPerms.length > 0) {
     dataText = 'Data: Partial · Permission required'
     dataStatus = 'partial'
@@ -293,11 +333,16 @@ export function getTenantConnectionDataInfo(tenant: Tenant) {
     dataText = 'Data: Awaiting Sync'
     dataStatus = 'awaiting_sync'
   } else {
-    const hoursOld =
-      (Date.now() - new Date(tenant.lastSync).getTime()) / (1000 * 60 * 60)
-    if (hoursOld > 24) {
+    const syncTime = new Date(tenant.lastSync).getTime()
+    if (!Number.isFinite(syncTime)) {
+      dataText = 'Data: Timestamp not reported'
+      dataStatus = 'unknown'
+    } else if ((Date.now() - syncTime) / (1000 * 60 * 60) > 24) {
       dataText = 'Data: Stale'
       dataStatus = 'stale'
+    } else {
+      dataText = 'Data: Current'
+      dataStatus = 'current'
     }
   }
 
@@ -323,8 +368,8 @@ export function getTenantSyncTimeInfo(lastSync: string | null) {
     const timeMs = d.getTime()
     if (isNaN(timeMs)) {
       return {
-        display: lastSync,
-        fullTimestamp: lastSync,
+        display: 'Not reported',
+        fullTimestamp: 'Synchronization time was not reported in a supported format',
         isStale: false,
       }
     }
@@ -357,8 +402,8 @@ export function getTenantSyncTimeInfo(lastSync: string | null) {
     }
   } catch {
     return {
-      display: lastSync,
-      fullTimestamp: lastSync,
+      display: 'Not reported',
+      fullTimestamp: 'Synchronization time was not reported in a supported format',
       isStale: false,
     }
   }
@@ -388,7 +433,7 @@ export function getTenantRecommendedAction(tenant: Tenant) {
     }
   }
 
-  if (tenant.riskyIdentityCount > 0) {
+  if (typeof tenant.riskyIdentityCount === 'number' && tenant.riskyIdentityCount > 0) {
     return {
       label: 'Review risky users',
       destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`,
@@ -412,7 +457,7 @@ export function getTenantRecommendedAction(tenant: Tenant) {
     }
   }
 
-  if (missingPerms.length > 0 || (tenant.mfaCoverage !== null && tenant.mfaCoverage < 85)) {
+  if (missingPerms.length > 0 || (typeof tenant.mfaCoverage === 'number' && tenant.mfaCoverage < 85)) {
     return {
       label: 'Review security posture',
       destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`,
@@ -531,7 +576,17 @@ export function getTenantRiskyUsersInfo(tenant: Tenant) {
     }
   }
 
-  const count = tenant.riskyIdentityCount ?? 0
+  const count = Number.isFinite(tenant.riskyIdentityCount)
+    ? (tenant.riskyIdentityCount as number)
+    : null
+  if (count === null) {
+    return {
+      count: null,
+      label: 'Risk data not reported',
+      statusType: 'unavailable' as const,
+      breakdownNote: 'Microsoft risk evidence unavailable',
+    }
+  }
   return {
     count,
     label: count === 0 ? '0 users at risk' : `${count} user${count === 1 ? '' : 's'} at risk`,
@@ -571,6 +626,16 @@ export function getTenantThreatsInfo(tenant: Tenant) {
   }
 
   const attentionItems = computeTenantAttention(tenant)
+
+  if (!Array.isArray(tenant.attention)) {
+    return {
+      count: null,
+      isConfirmedZero: false,
+      label: 'Threat evidence not reported',
+      statusType: 'unavailable' as const,
+      resolvedCount: null,
+    }
+  }
 
   const count = attentionItems.length
   return {
@@ -673,6 +738,20 @@ export function getPrimaryConcern(tenant: Tenant) {
     return {
       title: mediumItem.label,
       detail: mediumItem.why || 'Active security issue recorded.',
+      severity: 'info' as const,
+      icon: Info,
+    }
+  }
+
+  if (
+    !Array.isArray(tenant.attention) ||
+    !Number.isFinite(tenant.healthScore) ||
+    !Number.isFinite(tenant.riskyIdentityCount) ||
+    tenant.mfaCoverage == null
+  ) {
+    return {
+      title: 'Partial Security Evidence',
+      detail: 'One or more posture signals were not reported. HawkView cannot confirm a healthy state.',
       severity: 'info' as const,
       icon: Info,
     }

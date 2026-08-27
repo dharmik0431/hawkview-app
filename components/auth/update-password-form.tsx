@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { supabase } from '@/lib/auth/supabase'
+import { readableAuthError } from '@/lib/auth/auth-errors'
 
 export function UpdatePasswordForm() {
   const router = useRouter()
@@ -63,7 +64,7 @@ export function UpdatePasswordForm() {
     setIsLoading(false)
 
     if (updateError) {
-      setError(updateError.message)
+      setError(readableAuthError(updateError))
       return
     }
 

@@ -5,9 +5,11 @@ import { ArrowUp, ArrowDown, ArrowUpDown, ChevronRight } from 'lucide-react'
 import type { SignInEvent } from '../data/types'
 import { SignInDrawer } from './signin-drawer'
 
-function fmtUTC(iso: string) {
-  const s = iso.includes('T') ? iso : new Date(iso).toISOString()
-  return s.replace('T', ' ').replace('Z', '').slice(0, 19)
+function fmtUTC(iso?: string) {
+  if (!iso) return 'Not reported'
+  const parsed = new Date(iso)
+  if (!Number.isFinite(parsed.getTime())) return 'Not reported'
+  return parsed.toISOString().replace('T', ' ').replace('Z', '').slice(0, 19)
 }
 
 function StatusPill({ status }: { status: SignInEvent['status'] }) {
@@ -15,6 +17,13 @@ function StatusPill({ status }: { status: SignInEvent['status'] }) {
     return (
       <span className="inline-flex items-center rounded-md bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700 border border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-800">
         Success
+      </span>
+    )
+  }
+  if (status === 'Not reported') {
+    return (
+      <span className="inline-flex items-center rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
+        Not reported
       </span>
     )
   }
@@ -259,23 +268,27 @@ export function SignInLogsPage({
                         <span className="text-xs font-medium text-blue-600 dark:text-blue-400">
                           Applied
                         </span>
-                      ) : (
+                      ) : r.conditionalAccess === 'Not Applied' ? (
                         <span className="text-xs text-slate-400 dark:text-slate-500">
                           Not Applied
+                        </span>
+                      ) : (
+                        <span className="text-xs text-slate-500 dark:text-slate-400">
+                          Not reported
                         </span>
                       )}
                     </td>
 
                     <td className="px-4 py-3 whitespace-nowrap text-xs font-mono text-slate-600 dark:text-slate-300">
-                      {r.ipAddress ?? '—'}
+                      {r.ipAddress ?? 'Not reported'}
                     </td>
 
                     <td className="px-4 py-3 max-w-[180px]">
                       <div
                         className="truncate text-slate-500 dark:text-slate-400 text-xs"
-                        title={r.location ?? '—'}
+                        title={r.location ?? 'Not reported'}
                       >
-                        {r.location ?? '—'}
+                        {r.location ?? 'Not reported'}
                       </div>
                     </td>
 
@@ -291,7 +304,7 @@ export function SignInLogsPage({
                       colSpan={8}
                       className="px-4 py-12 text-center text-muted-foreground"
                     >
-                      No sign-in logs match your filters.
+                      No sign-in events were reported for the selected range and filters.
                     </td>
                   </tr>
                 ) : null}

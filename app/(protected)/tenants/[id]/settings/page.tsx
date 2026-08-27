@@ -254,9 +254,8 @@ export default function TenantSettingsPage() {
       }
 
       setLoadState('ready')
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unable to load tenant settings.'
-      setLoadError(msg)
+    } catch {
+      setLoadError('Unable to load tenant settings. Please retry.')
       setLoadState('error')
     }
   }, [queryClient, session?.user.id, tenantId])
@@ -317,12 +316,10 @@ export default function TenantSettingsPage() {
         second: 'numeric',
       }).format(new Date())
       setVerifyNotice(`Connection status refreshed at ${timeStr}.`)
-    } catch (error) {
+    } catch {
       await queryClient.invalidateQueries({ queryKey: ['tenants'] })
       await fetchTenantData()
-      setVerifyNotice(
-        error instanceof Error ? error.message : 'Unable to verify the Microsoft connection.'
-      )
+      setVerifyNotice('Unable to verify the Microsoft connection. Please retry.')
     } finally {
       setIsVerifying(false)
     }
@@ -345,9 +342,8 @@ export default function TenantSettingsPage() {
         message: 'Tenant synchronization completed successfully.',
         type: 'success',
       })
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Synchronization failed.'
-      setSyncNotice({ message: msg, type: 'error' })
+    } catch {
+      setSyncNotice({ message: 'Synchronization could not be completed. Please retry.', type: 'error' })
     } finally {
       setIsSyncing(false)
       window.setTimeout(() => setSyncNotice(null), 5000)
@@ -362,10 +358,8 @@ export default function TenantSettingsPage() {
       if (res?.consentUrl) {
         window.open(res.consentUrl, '_blank')
       }
-    } catch (err) {
-      setConsentError(
-        err instanceof Error ? err.message : 'Microsoft consent workflow is unavailable.'
-      )
+    } catch {
+      setConsentError('Microsoft consent workflow is unavailable. Please retry.')
     } finally {
       setIsReviewingConsent(false)
     }
@@ -394,9 +388,8 @@ export default function TenantSettingsPage() {
       })
       await queryClient.invalidateQueries({ queryKey: ['tenants'] })
       router.push('/tenants')
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to disconnect and delete tenant.'
-      setDeleteError(msg)
+    } catch {
+      setDeleteError('The tenant could not be disconnected and deleted. Please retry.')
       setIsDeleting(false)
     }
   }
