@@ -125,6 +125,26 @@ export function effectiveMfaEnforcementPresentation(
   return { label: fact.label, tone: 'neutral' }
 }
 
+export function compactEffectiveMfaEnforcementPresentation(
+  value: unknown,
+): MfaBadgePresentation {
+  const fact = tenantUserEffectiveMfaEnforcement(value)
+  if (!fact) return { label: 'Coverage unknown', tone: 'neutral' }
+  if (fact.status === 'COVERED_BY_CONDITIONAL_ACCESS') {
+    return { label: 'Covered by CA', tone: 'positive' }
+  }
+  if (fact.status === 'CONDITIONALLY_COVERED') {
+    return { label: 'Conditionally covered', tone: 'caution' }
+  }
+  if (fact.status === 'REPORT_ONLY') {
+    return { label: 'Report-only', tone: 'info' }
+  }
+  if (fact.status === 'NOT_COVERED') {
+    return { label: 'Not covered', tone: 'caution' }
+  }
+  return { label: 'Coverage unknown', tone: 'neutral' }
+}
+
 export function tenantUserMfaRegistration(value: unknown): MfaRegistrationState {
   if (!plainRecord(value)) return 'Unknown'
   const explicit = own(value, 'mfaRegistration')

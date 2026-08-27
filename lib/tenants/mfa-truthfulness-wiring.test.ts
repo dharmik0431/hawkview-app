@@ -13,11 +13,27 @@ test('tenant users render registration, enforcement, and legacy per-user MFA as 
   assert.match(page, /Legacy per-user MFA/)
   assert.match(page, /versioned backend evaluation/)
   assert.match(page, /mfaRegistrationPresentation\(u\)/)
-  assert.match(page, /effectiveMfaEnforcementPresentation\(u\)/)
+  assert.match(page, /compactEffectiveMfaEnforcementPresentation\(user\)/)
+  assert.match(page, /effectiveMfaEnforcementPresentation\(selectedUser\)/)
   assert.match(page, /perUserMfaPresentation\(u\)/)
   assert.match(page, /<MfaFactBadge \{\.\.\.mfaRegistrationBadge\} \/>/)
-  assert.match(page, /<MfaFactBadge \{\.\.\.effectiveMfaBadge\} \/>/)
+  assert.match(page, /<EffectiveMfaTableBadge user=\{u\} \/>/)
   assert.match(page, /<MfaFactBadge \{\.\.\.perUserMfaBadge\} \/>/)
+})
+
+test('MFA enforcement table badge stays compact and exposes exact policy evidence on hover or focus', () => {
+  const page = source('app/(protected)/tenants/[id]/page.tsx')
+  assert.match(page, /Focus or hover for Conditional Access policy evidence/)
+  assert.match(page, /Policy ID: \{policy\.id\}/)
+  assert.match(page, /policy\.materialConditions\.join\(', '\)/)
+  assert.match(page, /Evidence observed \{formatUserDateTime/)
+  assert.match(page, /max-h-56[\s\S]*overflow-y-auto/)
+})
+
+test('shared badges preserve their configured colors on hover across the app', () => {
+  const badge = source('components/ui/badge.tsx')
+  assert.doesNotMatch(badge, /hover:bg-/)
+  assert.doesNotMatch(badge, /hover:text-/)
 })
 
 test('user security facts precede role and type in the table', () => {
