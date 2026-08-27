@@ -219,7 +219,7 @@ export function SignInLogsPage({
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {sortedRows.map((r) => (
                   <tr
-                    key={r.id}
+                    key={r.rowKey}
                     tabIndex={0}
                     role="button"
                     className="group border-b last:border-b-0 hover:bg-slate-100/60 dark:hover:bg-slate-800/50 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-slate-100/80 dark:focus-visible:bg-slate-800/80"

@@ -1,13 +1,93 @@
-import type { AuditEvent, SignInEvent } from './types'
+import type {
+  AuditEvent,
+  AuditModifiedProperty,
+  AuditTargetResource,
+  SignInEvent,
+} from './types'
 
-type RecordValue = Record<string, any>
+type RecordValue = Record<string, unknown>
+
+const MAX_EVIDENCE_LENGTH = 512
+const MAX_DIAGNOSTIC_LENGTH = 2_000
+const MAX_TARGETS = 25
+const MAX_MODIFIED_PROPERTIES = 50
+const MAX_POLICIES = 50
+
+const SENSITIVE_KEY =
+  /^(?:password|passwd|pwd|secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|authorization|cookie|set-cookie|accountkey|private[_-]?key)$/i
+const UNSAFE_OBJECT_KEY = /^(?:__proto__|prototype|constructor)$/i
+const SAFE_PROPERTY_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._:/()[\]\-]{0,127}$/
+
+function isRecord(value: unknown): value is RecordValue {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function ownValue(source: unknown, key: string): unknown {
+  if (!isRecord(source) || UNSAFE_OBJECT_KEY.test(key)) return undefined
+  const descriptor = Object.getOwnPropertyDescriptor(source, key)
+  return descriptor && 'value' in descriptor ? descriptor.value : undefined
+}
+
+function stripUrlCredentialsAndQuery(value: string): string {
+  return value.replace(/https?:\/\/[^\s<>"']+/gi, (candidate) => {
+    try {
+      const parsed = new URL(candidate)
+      return `${parsed.protocol}//${parsed.host}${parsed.pathname}`
+    } catch {
+      return '[Redacted URL]'
+    }
+  })
+}
+
+/** Bounded scalar evidence safe for UI and CSV. Objects are never serialized. */
+export function sanitizeActivityText(
+  value: unknown,
+  maxLength = MAX_EVIDENCE_LENGTH,
+): string | undefined {
+  if (
+    typeof value !== 'string' &&
+    !(typeof value === 'number' && Number.isFinite(value))
+  ) {
+    return undefined
+  }
+
+  let text = String(value)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!text) return undefined
+
+  text = stripUrlCredentialsAndQuery(text)
+  text = text
+    .replace(
+      /\b(password|passwd|pwd|secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|authorization|cookie|set-cookie|accountkey|private[_-]?key)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}&]+)/gi,
+      '$1=[Redacted]',
+    )
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [Redacted]')
+    .replace(
+      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+      '[Redacted token]',
+    )
+
+  return text.slice(0, Math.max(1, maxLength))
+}
 
 function reportedText(...values: unknown[]): string | undefined {
   for (const value of values) {
-    if (typeof value === 'string' && value.trim()) {
-      return value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 2_000)
-    }
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+    const sanitized = sanitizeActivityText(value)
+    if (sanitized) return sanitized
+  }
+  return undefined
+}
+
+function diagnosticText(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const sanitized = sanitizeActivityText(value, MAX_DIAGNOSTIC_LENGTH)
+    if (sanitized) return sanitized
   }
   return undefined
 }
@@ -19,7 +99,7 @@ function reportedTimestamp(...values: unknown[]): string {
   return Number.isFinite(parsed.getTime()) ? value : ''
 }
 
-function deterministicEventId(
+function internalRowKey(
   kind: 'signin' | 'audit',
   tenantId: string | undefined,
   index: number,
@@ -30,11 +110,11 @@ function deterministicEventId(
     .join('|')
 
   let hash = 2166136261
-  for (let i = 0; i < seed.length; i += 1) {
-    hash ^= seed.charCodeAt(i)
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index)
     hash = Math.imul(hash, 16777619)
   }
-  return `${kind}-unreported-id-${(hash >>> 0).toString(16)}`
+  return `row-${kind}-${(hash >>> 0).toString(16)}`
 }
 
 function normalizeSignInResult(value: unknown): SignInEvent['status'] {
@@ -46,15 +126,16 @@ function normalizeSignInResult(value: unknown): SignInEvent['status'] {
 }
 
 function normalizeConditionalAccess(
-  event: RecordValue,
+  source: RecordValue,
 ): SignInEvent['conditionalAccess'] {
+  const policies = ownValue(source, 'appliedConditionalAccessPolicies')
   const raw = reportedText(
-    event.conditionalAccess,
-    event.condAccess,
-    event.appliedConditionalAccess,
+    ownValue(source, 'conditionalAccess'),
+    ownValue(source, 'condAccess'),
+    ownValue(source, 'appliedConditionalAccess'),
   )?.toLowerCase()
-  if (Array.isArray(event.appliedConditionalAccessPolicies)) {
-    if (event.appliedConditionalAccessPolicies.length > 0) return 'Applied'
+  if (Array.isArray(policies)) {
+    if (policies.length > 0) return 'Applied'
     if (raw) return 'Not Applied'
   }
   if (['success', 'failure', 'applied', 'true'].includes(raw ?? '')) {
@@ -66,99 +147,153 @@ function normalizeConditionalAccess(
   return 'Not reported'
 }
 
+function normalizePolicies(source: RecordValue): string[] | undefined {
+  const policies = ownValue(source, 'appliedConditionalAccessPolicies')
+  if (!Array.isArray(policies)) return undefined
+
+  const normalized = policies
+    .slice(0, MAX_POLICIES)
+    .map((policy) => {
+      if (typeof policy === 'string') return reportedText(policy)
+      return reportedText(ownValue(policy, 'displayName'), ownValue(policy, 'name'))
+    })
+    .filter((policy): policy is string => Boolean(policy))
+  return normalized.length ? normalized : undefined
+}
+
+function normalizeTargetResources(value: unknown): AuditTargetResource[] | undefined {
+  if (!Array.isArray(value)) return undefined
+
+  const targets = value.slice(0, MAX_TARGETS).flatMap((target) => {
+    if (!isRecord(target)) return []
+    const normalized: AuditTargetResource = {
+      displayName: reportedText(ownValue(target, 'displayName')),
+      userPrincipalName: reportedText(ownValue(target, 'userPrincipalName')),
+      id: reportedText(ownValue(target, 'id')),
+      type: reportedText(ownValue(target, 'type'), ownValue(target, 'groupType')),
+    }
+    return Object.values(normalized).some(Boolean) ? [normalized] : []
+  })
+  return targets.length ? targets : undefined
+}
+
+function normalizeModifiedProperties(value: unknown): AuditModifiedProperty[] | undefined {
+  if (!Array.isArray(value)) return undefined
+
+  const properties = value.slice(0, MAX_MODIFIED_PROPERTIES).flatMap((property) => {
+    if (!isRecord(property)) return []
+    const name = reportedText(ownValue(property, 'name'))
+    if (!name || UNSAFE_OBJECT_KEY.test(name) || !SAFE_PROPERTY_NAME.test(name)) {
+      return []
+    }
+    const canonicalName = name.replace(/[ .:/()[\]-]/g, '_')
+    const sensitive = SENSITIVE_KEY.test(canonicalName)
+    return [{
+      name,
+      oldValue: sensitive
+        ? '[Redacted]'
+        : diagnosticText(ownValue(property, 'oldValue')),
+      newValue: sensitive
+        ? '[Redacted]'
+        : diagnosticText(ownValue(property, 'newValue')),
+    }]
+  })
+  return properties.length ? properties : undefined
+}
+
 export function normalizeSignInEvent(
   source: RecordValue,
   context: { tenantId?: string; tenantName?: string; index: number },
 ): SignInEvent {
-  const createdAt = reportedTimestamp(source.createdAt, source.ts, source.time)
-  const userPrincipalName = reportedText(
-    source.userPrincipalName,
-    source.upn,
-    source.userPrincipal,
+  const locationObject = ownValue(source, 'location')
+  const deviceDetail = ownValue(source, 'deviceDetail')
+  const createdAt = reportedTimestamp(
+    ownValue(source, 'createdAt'),
+    ownValue(source, 'ts'),
+    ownValue(source, 'time'),
   )
-  const city = reportedText(source.city, source.location?.city)
-  const country = reportedText(source.country, source.location?.country)
+  const userPrincipalName = reportedText(
+    ownValue(source, 'userPrincipalName'),
+    ownValue(source, 'upn'),
+    ownValue(source, 'userPrincipal'),
+  )
+  const city = reportedText(
+    ownValue(source, 'city'),
+    ownValue(locationObject, 'city'),
+  )
+  const country = reportedText(
+    ownValue(source, 'country'),
+    ownValue(locationObject, 'country'),
+  )
   const location =
-    reportedText(typeof source.location === 'string' ? source.location : undefined) ??
+    reportedText(typeof locationObject === 'string' ? locationObject : undefined) ??
     (city && country ? `${city}, ${country}` : city ?? country)
-  const reportedId = reportedText(source.id)
+  const eventId = reportedText(ownValue(source, 'id'), ownValue(source, 'eventId'))
 
   return {
-    id:
-      reportedId ??
-      deterministicEventId(
-        'signin',
-        context.tenantId,
-        context.index,
-        createdAt,
-        userPrincipalName,
-        source.appId,
-      ),
+    rowKey: internalRowKey(
+      'signin', context.tenantId, context.index, eventId, createdAt, userPrincipalName,
+    ),
+    eventId,
     createdAt,
     userDisplayName:
-      reportedText(source.userDisplayName, source.user, source.displayName) ??
-      'Not reported',
+      reportedText(
+        ownValue(source, 'userDisplayName'),
+        ownValue(source, 'user'),
+        ownValue(source, 'displayName'),
+      ) ?? 'Not reported',
     userPrincipalName: userPrincipalName ?? 'Not reported',
-    userId: reportedText(source.userId),
+    userId: reportedText(ownValue(source, 'userId')),
     appDisplayName:
-      reportedText(source.appDisplayName, source.app) ?? 'Not reported',
-    appId: reportedText(source.appId, source.appIdGuid),
-    status: normalizeSignInResult(source.status ?? source.result),
-    failureReason: reportedText(
-      source.failureReason,
-      source.errorDetail,
-      source.statusReason,
+      reportedText(ownValue(source, 'appDisplayName'), ownValue(source, 'app')) ??
+      'Not reported',
+    appId: reportedText(ownValue(source, 'appId'), ownValue(source, 'appIdGuid')),
+    status: normalizeSignInResult(
+      ownValue(source, 'status') ?? ownValue(source, 'result'),
     ),
-    errorCode: reportedText(source.errorCode, source.errorNumber),
-    additionalDetails: reportedText(source.additionalDetails),
+    failureReason: diagnosticText(
+      ownValue(source, 'failureReason'),
+      ownValue(source, 'errorDetail'),
+      ownValue(source, 'statusReason'),
+    ),
+    errorCode: reportedText(
+      ownValue(source, 'errorCode'), ownValue(source, 'errorNumber'),
+    ),
+    additionalDetails: diagnosticText(ownValue(source, 'additionalDetails')),
     conditionalAccess: normalizeConditionalAccess(source),
-    appliedCaPolicies: Array.isArray(source.appliedConditionalAccessPolicies)
-      ? source.appliedConditionalAccessPolicies.slice(0, 50)
-          .map((policy: any) =>
-            typeof policy === 'string'
-              ? reportedText(policy)
-              : reportedText(policy?.displayName, policy?.name),
-          )
-          .filter((policy): policy is string => Boolean(policy))
-      : undefined,
+    appliedCaPolicies: normalizePolicies(source),
     authMethod: reportedText(
-      source.authMethod,
-      source.authenticationRequirement,
+      ownValue(source, 'authMethod'), ownValue(source, 'authenticationRequirement'),
     ),
-    ipAddress: reportedText(source.ipAddress, source.ip),
+    ipAddress: reportedText(ownValue(source, 'ipAddress'), ownValue(source, 'ip')),
     location,
     country,
     city,
     clientAppUsed: reportedText(
-      source.clientAppUsed,
-      source.client,
-      source.clientApp,
+      ownValue(source, 'clientAppUsed'), ownValue(source, 'client'), ownValue(source, 'clientApp'),
     ),
     device: reportedText(
-      source.device,
-      source.deviceName,
-      source.deviceDetail?.displayName,
+      ownValue(source, 'device'), ownValue(source, 'deviceName'), ownValue(deviceDetail, 'displayName'),
     ),
     os: reportedText(
-      source.os,
-      source.operatingSystem,
-      source.deviceDetail?.operatingSystem,
+      ownValue(source, 'os'), ownValue(source, 'operatingSystem'), ownValue(deviceDetail, 'operatingSystem'),
     ),
-    browser: reportedText(source.browser, source.deviceDetail?.browser),
+    browser: reportedText(ownValue(source, 'browser'), ownValue(deviceDetail, 'browser')),
     managedState:
-      reportedText(source.managedState) ??
-      (source.deviceDetail?.isCompliant === true
+      reportedText(ownValue(source, 'managedState')) ??
+      (ownValue(deviceDetail, 'isCompliant') === true
         ? 'Compliant'
-        : source.deviceDetail?.isManaged === true
+        : ownValue(deviceDetail, 'isManaged') === true
           ? 'Managed'
           : undefined),
-    userAgent: reportedText(source.userAgent),
-    tenantName: context.tenantName,
-    tenantId: context.tenantId,
-    correlationId: reportedText(source.correlationId),
-    requestId: reportedText(source.requestId),
-    riskLevel: reportedText(source.riskLevel, source.riskState, source.risk),
-    raw: source,
+    userAgent: diagnosticText(ownValue(source, 'userAgent')),
+    tenantName: reportedText(context.tenantName),
+    tenantId: reportedText(context.tenantId),
+    correlationId: reportedText(ownValue(source, 'correlationId')),
+    requestId: reportedText(ownValue(source, 'requestId')),
+    riskLevel: reportedText(
+      ownValue(source, 'riskLevel'), ownValue(source, 'riskState'), ownValue(source, 'risk'),
+    ),
   }
 }
 
@@ -166,90 +301,77 @@ export function normalizeAuditEvent(
   source: RecordValue,
   context: { tenantId?: string; tenantName?: string; index: number },
 ): AuditEvent {
-  const initiatedBy = source.initiatedBy ?? {}
+  const initiatedBy = ownValue(source, 'initiatedBy')
+  const initiatedUser = ownValue(initiatedBy, 'user')
+  const initiatedApp = ownValue(initiatedBy, 'app')
+  const actorValue = ownValue(source, 'actor')
   const actorName = reportedText(
-    initiatedBy?.user?.displayName,
-    source.actorDisplayName,
-    typeof source.actor === 'string' && !source.actor.includes('@')
-      ? source.actor
-      : undefined,
-    source.user,
-    initiatedBy?.app?.displayName,
+    ownValue(initiatedUser, 'displayName'),
+    ownValue(source, 'actorDisplayName'),
+    typeof actorValue === 'string' && !actorValue.includes('@') ? actorValue : undefined,
+    ownValue(source, 'user'),
+    ownValue(initiatedApp, 'displayName'),
   )
   const actorPrincipalName = reportedText(
-    initiatedBy?.user?.userPrincipalName,
-    initiatedBy?.app?.servicePrincipalName,
-    typeof source.actor === 'string' && source.actor.includes('@')
-      ? source.actor
-      : undefined,
+    ownValue(initiatedUser, 'userPrincipalName'),
+    ownValue(initiatedApp, 'servicePrincipalName'),
+    typeof actorValue === 'string' && actorValue.includes('@') ? actorValue : undefined,
   )
-  const actorType = initiatedBy?.user
+  const actorType = isRecord(initiatedUser)
     ? 'User'
-    : initiatedBy?.app
+    : isRecord(initiatedApp)
       ? 'Application'
-      : reportedText(source.actorType) ?? 'Not reported'
+      : reportedText(ownValue(source, 'actorType')) ?? 'Not reported'
   const actorId = reportedText(
-    initiatedBy?.user?.id,
-    initiatedBy?.app?.id,
-    source.actorId,
+    ownValue(initiatedUser, 'id'), ownValue(initiatedApp, 'id'), ownValue(source, 'actorId'),
   )
-  const targets = Array.isArray(source.targetResources)
-    ? source.targetResources.slice(0, 50)
-    : []
-  const primaryTarget = targets[0]
+  const originalTargets = ownValue(source, 'targetResources')
+  const targetResources = normalizeTargetResources(originalTargets)
+  const primaryTarget = targetResources?.[0]
   const target =
-    targets.length > 0
-      ? targets
-          .map((item: any) =>
-            reportedText(item?.displayName, item?.userPrincipalName, item?.id),
-          )
-          .filter(Boolean)
-          .join(', ') || undefined
-      : reportedText(source.target)
-  const createdAt = reportedTimestamp(source.createdAt, source.time, source.ts)
+    targetResources
+      ?.map((item) => item.displayName ?? item.userPrincipalName ?? item.id)
+      .filter((item): item is string => Boolean(item))
+      .join(', ') || reportedText(ownValue(source, 'target'))
+  const createdAt = reportedTimestamp(
+    ownValue(source, 'createdAt'), ownValue(source, 'time'), ownValue(source, 'ts'),
+  )
   const activity =
     reportedText(
-      source.activity,
-      source.activityDisplayName,
-      source.action,
+      ownValue(source, 'activity'), ownValue(source, 'activityDisplayName'), ownValue(source, 'action'),
     ) ?? 'Not reported'
-  const reportedId = reportedText(source.id)
+  const eventId = reportedText(ownValue(source, 'id'), ownValue(source, 'eventId'))
+  const originalPrimaryTarget = Array.isArray(originalTargets) ? originalTargets[0] : undefined
 
   return {
-    id:
-      reportedId ??
-      deterministicEventId(
-        'audit',
-        context.tenantId,
-        context.index,
-        createdAt,
-        activity,
-        actorPrincipalName,
-      ),
+    rowKey: internalRowKey(
+      'audit', context.tenantId, context.index, eventId, createdAt, activity, actorPrincipalName,
+    ),
+    eventId,
     createdAt,
     activity,
-    category: reportedText(source.category),
-    operationType: reportedText(source.operationType),
-    result: reportedText(source.result, source.status) ?? 'Not reported',
-    resultReason: reportedText(source.resultReason, source.statusReason),
-    correlationId: reportedText(source.correlationId),
-    service: reportedText(source.service, source.loggedByService),
+    category: reportedText(ownValue(source, 'category')),
+    operationType: reportedText(ownValue(source, 'operationType')),
+    result:
+      reportedText(ownValue(source, 'result'), ownValue(source, 'status')) ?? 'Not reported',
+    resultReason: diagnosticText(
+      ownValue(source, 'resultReason'), ownValue(source, 'statusReason'),
+    ),
+    correlationId: reportedText(ownValue(source, 'correlationId')),
+    service: reportedText(ownValue(source, 'service'), ownValue(source, 'loggedByService')),
     actor: actorName ?? actorPrincipalName ?? 'Not reported',
     actorPrincipalName,
     actorType,
     actorId,
     target,
-    targetType: reportedText(primaryTarget?.type, primaryTarget?.groupType),
-    targetId: reportedText(primaryTarget?.id),
-    targetResources: targets,
-    modifiedProperties: Array.isArray(primaryTarget?.modifiedProperties)
-      ? primaryTarget.modifiedProperties.slice(0, 100)
-      : Array.isArray(source.modifiedProperties)
-        ? source.modifiedProperties.slice(0, 100)
-        : undefined,
-    tenantName: context.tenantName,
-    tenantId: context.tenantId,
-    raw: source,
+    targetType: primaryTarget?.type,
+    targetId: primaryTarget?.id,
+    targetResources,
+    modifiedProperties: normalizeModifiedProperties(
+      ownValue(originalPrimaryTarget, 'modifiedProperties') ?? ownValue(source, 'modifiedProperties'),
+    ),
+    tenantName: reportedText(context.tenantName),
+    tenantId: reportedText(context.tenantId),
   }
 }
 

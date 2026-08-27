@@ -26,6 +26,8 @@ test('dashboard renders explicit evidence states and has no healthy or risky fab
 test('activity normalization never invents timestamps, identities, outcomes, or random IDs', () => {
   const activity = source('app/(protected)/activity/page.tsx')
   const normalize = source('app/(protected)/activity/data/normalize.ts')
+  const drawer = source('app/(protected)/activity/components/signin-drawer.tsx')
+  const csv = source('app/(protected)/activity/utils/csv-exporter.ts')
 
   for (const text of [activity, normalize]) {
     assert.doesNotMatch(text, /unknown@tenant\.com/)
@@ -36,6 +38,24 @@ test('activity normalization never invents timestamps, identities, outcomes, or 
   assert.doesNotMatch(activity, /filters\.tenantId \? signInRows\.length : 0/)
   assert.match(normalize, /Not reported/)
   assert.match(activity, /Partial log evidence/)
+  assert.doesNotMatch(drawer, /Copy JSON|Raw event \(JSON\)|event\.raw/)
+  assert.doesNotMatch(csv, /event\.rowKey/)
+  assert.match(drawer, /event\.eventId \?\? 'Not reported'/)
+  assert.match(csv, /event\.eventId \|\| 'Not reported'/)
+})
+
+test('activity tabs expose associated panel semantics and keyboard navigation', () => {
+  const activity = source('app/(protected)/activity/page.tsx')
+
+  assert.match(activity, /role="tablist"/)
+  assert.match(activity, /aria-controls="activity-log-panel"/)
+  assert.match(activity, /role="tabpanel"/)
+  assert.match(activity, /aria-labelledby={`activity-tab-\${tab}`}/)
+  assert.match(activity, /event\.key === 'ArrowRight'/)
+  assert.match(activity, /event\.key === 'ArrowLeft'/)
+  assert.match(activity, /event\.key === 'Home'/)
+  assert.match(activity, /event\.key === 'End'/)
+  assert.match(activity, /\.current\?\.focus\(\)/)
 })
 
 test('workspace security surfaces do not advertise unverified provider enablement', () => {

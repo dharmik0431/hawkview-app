@@ -95,6 +95,8 @@ function compareIPs(ipA?: string, ipB?: string): number {
 
 export default function ActivityPage() {
   const [tab, setTab] = React.useState<ActivityTab>('signins')
+  const signInsTabRef = React.useRef<HTMLButtonElement>(null)
+  const auditTabRef = React.useRef<HTMLButtonElement>(null)
 
   const [directoryState, setDirectoryState] = React.useState<
     'loading' | 'ready' | 'error'
@@ -610,6 +612,25 @@ export default function ActivityPage() {
     }
   }
 
+  function handleTabKeyDown(
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    currentTab: ActivityTab,
+  ) {
+    if (!filters.tenantId) return
+    let nextTab: ActivityTab | null = null
+    if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+      nextTab = currentTab === 'signins' ? 'audit' : 'signins'
+    } else if (event.key === 'Home') {
+      nextTab = 'signins'
+    } else if (event.key === 'End') {
+      nextTab = 'audit'
+    }
+    if (!nextTab) return
+    event.preventDefault()
+    setTab(nextTab)
+    ;(nextTab === 'signins' ? signInsTabRef : auditTabRef).current?.focus()
+  }
+
   const activeMatchingCount =
     tab === 'signins' ? signInRows.length : auditRows.length
   const signInCountLabel =
@@ -671,9 +692,13 @@ export default function ActivityPage() {
       {/* Tabs */}
       <div className="flex items-center gap-6 border-b" role="tablist" aria-label="Activity log type">
         <button
+          ref={signInsTabRef}
+          id="activity-tab-signins"
           type="button"
           role="tab"
           aria-selected={tab === 'signins'}
+          aria-controls="activity-log-panel"
+          tabIndex={tab === 'signins' ? 0 : -1}
           className={[
             'px-1 pb-2 text-sm font-medium transition-colors',
             tab === 'signins'
@@ -682,6 +707,7 @@ export default function ActivityPage() {
             !filters.tenantId ? 'opacity-50 cursor-not-allowed' : '',
           ].join(' ')}
           onClick={() => filters.tenantId && setTab('signins')}
+          onKeyDown={(event) => handleTabKeyDown(event, 'signins')}
           disabled={!filters.tenantId}
           title={!filters.tenantId ? 'Select a tenant first' : undefined}
         >
@@ -689,9 +715,13 @@ export default function ActivityPage() {
         </button>
 
         <button
+          ref={auditTabRef}
+          id="activity-tab-audit"
           type="button"
           role="tab"
           aria-selected={tab === 'audit'}
+          aria-controls="activity-log-panel"
+          tabIndex={tab === 'audit' ? 0 : -1}
           className={[
             'px-1 pb-2 text-sm font-medium transition-colors',
             tab === 'audit'
@@ -700,6 +730,7 @@ export default function ActivityPage() {
             !filters.tenantId ? 'opacity-50 cursor-not-allowed' : '',
           ].join(' ')}
           onClick={() => filters.tenantId && setTab('audit')}
+          onKeyDown={(event) => handleTabKeyDown(event, 'audit')}
           disabled={!filters.tenantId}
           title={!filters.tenantId ? 'Select a tenant first' : undefined}
         >
@@ -708,6 +739,13 @@ export default function ActivityPage() {
       </div>
 
       {/* Main Content Area */}
+      <div
+        id="activity-log-panel"
+        role="tabpanel"
+        aria-labelledby={`activity-tab-${tab}`}
+        tabIndex={0}
+        className="space-y-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+      >
       {filters.tenantId && activeSyncStatus === 'failed' && (
         <div role="alert" className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           <div className="font-semibold">
@@ -809,6 +847,7 @@ export default function ActivityPage() {
           onSort={handleAuditSort}
         />
       )}
+      </div>
     </div>
   )
 }
