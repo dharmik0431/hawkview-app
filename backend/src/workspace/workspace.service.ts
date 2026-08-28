@@ -2,6 +2,8 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
   Inject,
   Injectable,
   NotFoundException,
@@ -24,6 +26,9 @@ import {
 
 const ROLE_VALUES = new Set(Object.values(MembershipRole))
 const STATUS_VALUES = new Set(Object.values(MembershipStatus))
+const AUTH_EMAIL_RATE_LIMITED_CODE = 'AUTH_EMAIL_RATE_LIMITED'
+const AUTH_EMAIL_RATE_LIMITED_MESSAGE =
+  'Authentication email sending is temporarily rate-limited. Please wait a few minutes and try again.'
 
 type OwnerContext = {
   userId: string
@@ -526,6 +531,17 @@ export class WorkspaceService {
     let result: unknown = null
     try { result = text ? JSON.parse(text) : null } catch { result = null }
     if (!response.ok) {
+      const isAuthenticationEmailRequest = path === '/auth/v1/invite' || path === '/auth/v1/recover'
+      if (response.status === HttpStatus.TOO_MANY_REQUESTS && isAuthenticationEmailRequest) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.TOO_MANY_REQUESTS,
+            code: AUTH_EMAIL_RATE_LIMITED_CODE,
+            message: AUTH_EMAIL_RATE_LIMITED_MESSAGE,
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        )
+      }
       throw new BadRequestException('The requested HawkView account operation could not be completed.')
     }
     return result

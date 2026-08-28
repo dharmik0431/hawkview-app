@@ -46,6 +46,7 @@ import {
   X,
 } from 'lucide-react'
 import { apiClient } from '@/lib/api/client'
+import { workspaceAdminErrorMessage } from '@/lib/auth/workspace-admin-errors'
 import { useAuth } from '@/components/providers/auth-provider'
 import { OrganizationProfileEditor } from '@/components/admin/organization-profile-editor'
 import { Button } from '@/components/ui/button'
@@ -160,8 +161,7 @@ const roles: Array<{ value: MembershipRole; label: string; description: string }
 ]
 
 function errorMessage(error: unknown, fallback: string) {
-  void error
-  return fallback
+  return workspaceAdminErrorMessage(error, fallback)
 }
 
 function formatDate(value: string | null | undefined): string {
@@ -1190,8 +1190,10 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
       await action()
       setNotice(successNotice)
       await loadAllData(true)
+      return true
     } catch (requestError) {
       setError(errorMessage(requestError, 'That administrative action could not be completed.'))
+      return false
     } finally {
       setSubmitting(false)
       setActiveMenuId(null)
@@ -1218,7 +1220,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
       return
     }
 
-    await runAction(
+    const invitationSent = await runAction(
       () =>
         apiClient.post('/api/workspace/members/invite', {
           organizationId: selectedOrganizationId,
@@ -1228,6 +1230,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
         }),
       `Invitation sent to ${trimmedEmail}. The member will receive a secure HawkView setup link.`
     )
+    if (!invitationSent) return
     setInviteModalOpen(false)
     setInviteEmail('')
     setInviteName('')
