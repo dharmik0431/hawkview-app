@@ -95,3 +95,14 @@ test('Admin workspace reads and mutations carry one URL-selected organization UU
   )
   assert.doesNotMatch(workspacePage, /find\(\(m\) => m\.role === 'MSP_OWNER'\) \|\|/)
 })
+
+test('team invitation failures preserve the form and use only the safe error contract', () => {
+  assert.match(workspacePage, /workspaceAdminErrorMessage\(error, fallback\)/)
+  assert.match(workspacePage, /const invitationSent = await runAction\(/)
+  const failureGuard = workspacePage.indexOf('if (!invitationSent) return')
+  const modalClose = workspacePage.indexOf('setInviteModalOpen(false)', failureGuard)
+  assert.ok(failureGuard > 0)
+  assert.ok(modalClose > failureGuard)
+  assert.match(workspacePage, /setNotice\(successNotice\)[\s\S]*return true/)
+  assert.match(workspacePage, /catch \(requestError\)[\s\S]*return false/)
+})

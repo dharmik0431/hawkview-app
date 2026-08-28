@@ -326,6 +326,8 @@ test('the limited-license fallback retries a transient content failure and never
     })
   }
   try {
+    const end = new Date()
+    const start = new Date(end.getTime() - 5 * 60 * 1000)
     await assert.rejects(
       (service as any).fetchLimitedLoginActivity(
         {
@@ -338,8 +340,8 @@ test('the limited-license fallback retries a transient content failure and never
             credentialReference: null,
           },
         },
-        new Date('2026-08-21T12:00:00.000Z'),
-        new Date('2026-08-21T12:05:00.000Z'),
+        start,
+        end,
       ),
       (error: unknown) =>
         error instanceof MicrosoftGraphCollectionError &&

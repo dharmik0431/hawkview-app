@@ -20,7 +20,8 @@ interface FetchOptions extends RequestInit {
 class ApiError extends Error {
   constructor(
     public status: number,
-    message: string
+    message: string,
+    public code: string | null = null
   ) {
     super(message)
     this.name = 'ApiError'
@@ -83,7 +84,12 @@ async function fetchApi<T>(
       response.status,
       body?.error?.message ||
         body?.message ||
-        `HawkView API returned ${response.status}.`
+        `HawkView API returned ${response.status}.`,
+      typeof body?.error?.code === 'string'
+        ? body.error.code
+        : typeof body?.code === 'string'
+          ? body.code
+          : null
     )
   }
 
