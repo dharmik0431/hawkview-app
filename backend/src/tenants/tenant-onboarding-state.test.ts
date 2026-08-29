@@ -53,6 +53,10 @@ test('derives resumable steps from durable tenant truth', async () => {
   assert.equal(initial.steps.microsoftAccess.status, 'VERIFIED')
   assert.equal(initial.steps.exchangeReadOnly.status, 'CONSENT_REQUIRED')
   assert.equal(initial.steps.reportVisibility.status, 'CHECK_REQUIRED')
+  assert.equal(
+    initial.steps.reportVisibility.settingLabel,
+    'Conceal user, group, and site names in all reports',
+  )
   assert.equal(initial.canFinish, false)
 
   current = tenant({
@@ -68,11 +72,18 @@ test('derives resumable steps from durable tenant truth', async () => {
 
 test('report verification persists only the read result and never mutates Microsoft', async () => {
   let updateData: unknown
+  let current = tenant({
+    exchangeReadOnlySkippedAt: new Date('2026-08-23T13:00:00.000Z'),
+    reportVisibilityDeferredAt: new Date('2026-08-23T13:01:00.000Z'),
+  })
   const prisma = {
     user: { findUnique: async () => activeUser },
-    customerTenant: { findFirst: async () => tenant() },
+    customerTenant: { findFirst: async () => current },
     tenantConnection: {
-      update: async ({ data }: { data: unknown }) => { updateData = data },
+      update: async ({ data }: { data: Record<string, unknown> }) => {
+        updateData = data
+        current = tenant({ ...current.connection, ...data })
+      },
     },
   } as unknown as PrismaService
   const service = new TenantsService(prisma, {
@@ -85,6 +96,8 @@ test('report verification persists only the read result and never mutates Micros
   assert.equal((updateData as { reportIdentifiersVisible?: unknown }).reportIdentifiersVisible, true)
   assert.equal((updateData as { reportVisibilityDeferredAt?: unknown }).reportVisibilityDeferredAt, null)
   assert.ok((updateData as { reportSettingsLastCheckedAt?: unknown }).reportSettingsLastCheckedAt instanceof Date)
+  assert.equal(result.onboarding.steps.reportVisibility.status, 'VERIFIED')
+  assert.equal(result.onboarding.steps.reportVisibility.deferredAt, null)
 })
 
 test('a consent callback nonce is accepted at most once', async () => {

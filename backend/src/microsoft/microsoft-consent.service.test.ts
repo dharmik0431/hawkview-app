@@ -366,6 +366,71 @@ test('reads but never changes the Microsoft 365 report privacy setting', async (
   }
 })
 
+test('reports concealed identifiers when Microsoft returns the setting enabled', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    displayConcealedNames: true,
+  }), { status: 200 })) as typeof fetch
+  try {
+    const service = new MicrosoftConsentService({} as never, {} as never)
+    ;(service as any).getManagedConnector = async () => ({ clientId: 'app', clientSecret: 'secret' })
+    ;(service as any).requestAccessToken = async () => ({
+      accessToken: 'token',
+      grantedPermissions: ['ReportSettings.Read.All'],
+    })
+    assert.deepEqual(await service.readTenantReportPrivacySetting({
+      microsoftTenantId: 'tenant',
+      connectionMode: 'HAWKVIEW_MANAGED',
+      clientId: null,
+      credentialReference: null,
+    }), {
+      status: 'IDENTIFIERS_CONCEALED',
+      identifiersVisible: false,
+      retryable: false,
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('distinguishes Microsoft denial and invalid payload from network failure', async () => {
+  const originalFetch = globalThis.fetch
+  try {
+    const service = new MicrosoftConsentService({} as never, {} as never)
+    ;(service as any).getManagedConnector = async () => ({ clientId: 'app', clientSecret: 'secret' })
+    ;(service as any).requestAccessToken = async () => ({
+      accessToken: 'token',
+      grantedPermissions: ['ReportSettings.Read.All'],
+    })
+
+    globalThis.fetch = (async () => new Response('{}', { status: 403 })) as typeof fetch
+    assert.deepEqual(await service.readTenantReportPrivacySetting({
+      microsoftTenantId: 'tenant',
+      connectionMode: 'HAWKVIEW_MANAGED',
+      clientId: null,
+      credentialReference: null,
+    }), {
+      status: 'MICROSOFT_DENIED',
+      identifiersVisible: null,
+      retryable: false,
+    })
+
+    globalThis.fetch = (async () => new Response('not-json', { status: 200 })) as typeof fetch
+    assert.deepEqual(await service.readTenantReportPrivacySetting({
+      microsoftTenantId: 'tenant',
+      connectionMode: 'HAWKVIEW_MANAGED',
+      clientId: null,
+      credentialReference: null,
+    }), {
+      status: 'INVALID_RESPONSE',
+      identifiersVisible: null,
+      retryable: true,
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('reports missing read permission without calling Microsoft report settings', async () => {
   const originalFetch = globalThis.fetch
   let called = false

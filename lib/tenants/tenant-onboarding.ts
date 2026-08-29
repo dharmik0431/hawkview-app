@@ -37,7 +37,7 @@ const ReportVisibilityStepSchema = z.object({
     z.literal('Services'),
     z.literal('Reports'),
   ]),
-  settingLabel: z.literal('Display concealed user, group, and site names in all reports'),
+  settingLabel: z.literal('Conceal user, group, and site names in all reports'),
   disclaimer: z.string().min(1).max(1000),
 }).strict()
 
@@ -79,6 +79,12 @@ export const ReportVisibilityVerificationSchema = z.object({
 }).strict()
 
 export type TenantOnboarding = z.infer<typeof TenantOnboardingSchema>
+export type ReportVisibilityVerification = z.infer<
+  typeof ReportVisibilityVerificationSchema
+>['verification']
+export type ReportVisibilityVerificationResult = z.infer<
+  typeof ReportVisibilityVerificationSchema
+>
 
 export function onboardingNextStep(state: TenantOnboarding) {
   if (state.steps.microsoftAccess.status !== 'VERIFIED') return 'microsoftAccess' as const

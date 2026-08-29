@@ -1207,7 +1207,7 @@ export class TenantsService {
           permission: 'ReportSettings.Read.All' as const,
           adminCenterUrl: 'https://admin.microsoft.com/#/Settings/Services',
           settingPath: ['Settings', 'Org settings', 'Services', 'Reports'],
-          settingLabel: 'Display concealed user, group, and site names in all reports',
+          settingLabel: 'Conceal user, group, and site names in all reports',
           disclaimer: 'HawkView can read this privacy setting but cannot change it. A Microsoft 365 administrator must update it in the Microsoft 365 admin center.',
         },
       },
