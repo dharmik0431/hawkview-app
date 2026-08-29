@@ -6,13 +6,14 @@ import {
   HttpStatus,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import {
   MembershipRole,
-  MembershipStatus,
+  MembershipStatus
 } from '../generated/prisma/enums.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
@@ -23,6 +24,15 @@ import {
   sameOrganizationSettings,
   workspaceOnboardingView,
 } from './organization-onboarding.js'
+import {
+  createWorkspaceAuditOperation,
+  safeWorkspaceAuditMetadata,
+  type WorkspaceAuditMetadata,
+  type WorkspaceAuditOperation,
+  WORKSPACE_AUDIT_EVENT_VERSION,
+  workspaceAuditErrorCode,
+  workspaceAuditExpiration,
+} from './workspace-audit.js'
 
 const ROLE_VALUES = new Set(Object.values(MembershipRole))
 const STATUS_VALUES = new Set(Object.values(MembershipStatus))
@@ -39,8 +49,6 @@ type OwnerContext = {
   timeZone: string | null
   onboardingCompletedAt: Date | null
 }
-
-type AuditMetadata = Record<string, string | number | boolean | null>
 
 type MemberRecord = {
   id: string
@@ -82,11 +90,12 @@ function stringValue(body: Record<string, unknown>, name: string): string {
 
 @Injectable()
 export class WorkspaceService {
+  private readonly logger = new Logger(WorkspaceService.name)
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
   private async ownerContext(
     identity: AuthenticatedIdentity,
-    requestedOrganizationId?: string,
+    requestedOrganizationId?: string
   ): Promise<OwnerContext> {
     const actor = await this.prisma.user.findUnique({
       where: { authProviderUserId: identity.subject },
@@ -120,7 +129,7 @@ export class WorkspaceService {
       throw new ForbiddenException('This HawkView account is disabled.')
     }
     const memberships = actor.memberships.filter(
-      ({ organization }) => !requestedOrganizationId || organization.id === requestedOrganizationId,
+      ({ organization }) => !requestedOrganizationId || organization.id === requestedOrganizationId
     )
     if (memberships.length === 0) {
       throw new ForbiddenException('Only an active MSP owner can manage this workspace team.')
@@ -139,7 +148,7 @@ export class WorkspaceService {
 
   private async memberForOwner(
     organizationId: string,
-    membershipId: string,
+    membershipId: string
   ): Promise<MemberRecord> {
     const membership = await this.prisma.membership.findFirst({
       where: { id: membershipId, organizationId },
@@ -164,7 +173,7 @@ export class WorkspaceService {
 
   private async ownerCount(organizationId: string): Promise<number> {
     return this.prisma.membership.count({
-      where: { organizationId, role: MembershipRole.MSP_OWNER, status: MembershipStatus.ACTIVE },
+      where: { organizationId, role: MembershipRole.MSP_OWNER, status: MembershipStatus.ACTIVE, },
     })
   }
 
@@ -172,7 +181,7 @@ export class WorkspaceService {
     actor: OwnerContext,
     member: MemberRecord,
     nextRole: MembershipRole,
-    nextStatus: MembershipStatus,
+    nextStatus: MembershipStatus
   ) {
     const removesOwner =
       member.role === MembershipRole.MSP_OWNER &&
@@ -188,7 +197,7 @@ export class WorkspaceService {
       organization.createdByUserId === member.userId
     ) {
       throw new BadRequestException(
-        'The founding MSP owner cannot be removed or demoted until organization setup is complete.',
+        'The founding MSP owner cannot be removed or demoted until organization setup is complete.'
       )
     }
     if (member.userId === actor.userId) {
@@ -201,23 +210,57 @@ export class WorkspaceService {
 
   private async audit(
     actor: OwnerContext,
-    action: string,
-    target?: Pick<MemberRecord['user'], 'id' | 'email'>,
-    outcome = 'SUCCEEDED',
-    metadata?: AuditMetadata,
+    evidence: WorkspaceAuditOperation & {
+    action: string
+      outcome: 'STARTED' | 'SUCCEEDED' | 'FAILED'
+      stage: string
+      errorCode?: string | null
+      targetType: 'ORGANIZATION' | 'WORKSPACE_MEMBER'
+      targetUserId?: string | null
+      targetOpaqueId: string
+      metadata?: WorkspaceAuditMetadata
+    },
+    client: Pick<PrismaService, 'workspaceAdminAuditLog'> = this.prisma
   ) {
-    await this.prisma.workspaceAdminAuditLog.create({
+    await client.workspaceAdminAuditLog.create({
       data: {
         organizationId: actor.organizationId,
         actorUserId: actor.userId,
-        actorEmail: actor.email,
-        targetUserId: target?.id,
-        targetEmail: target?.email,
+        // Actor and target emails are intentionally not duplicated into new
+        // audit rows. Internal IDs remain enough to resolve authorized views.
+        actorEmail: null,
+        targetUserId: evidence.targetUserId ?? null,
+        targetEmail: null,
+        targetType: evidence.targetType,
+        targetOpaqueId: evidence.targetOpaqueId.slice(0, 128),
+        action: evidence.
         action,
-        outcome,
-        metadata: metadata as Prisma.InputJsonObject | undefined,
+        outcome: evidence.outcome,
+        stage: evidence.stage,
+        errorCode: evidence.errorCode ?? null,
+        requestId: evidence.requestId,
+        operationId: evidence.operationId,
+        eventVersion: WORKSPACE_AUDIT_EVENT_VERSION,
+        metadata: safeWorkspaceAuditMetadata(evidence. metadata) as
+          | Prisma.InputJsonObject | undefined,
+        expiresAt: workspaceAuditExpiration(),
       },
     })
+  }
+
+  private operation(requestId?: string) {
+    return createWorkspaceAuditOperation(requestId)
+  }
+
+  private memberTarget(
+    operation: WorkspaceAuditOperation,
+    userId?: string | null
+  ) {
+    return {
+      targetType: 'WORKSPACE_MEMBER' as const,
+      targetUserId: userId ?? null,
+      targetOpaqueId: userId || `invite:${operation.operationId}`,
+    }
   }
 
   private organizationSettingsView(organization: {
@@ -258,7 +301,7 @@ export class WorkspaceService {
   private async assertOrganizationAuthority(
     transaction: Prisma.TransactionClient,
     actor: OwnerContext,
-    requireFounder: boolean,
+    requireFounder: boolean
   ) {
     const activeOrganization = await transaction.organization.findFirst({
       where: {
@@ -287,7 +330,7 @@ export class WorkspaceService {
     }
     if (requireFounder && activeOrganization.createdByUserId !== actor.userId) {
       throw new ForbiddenException(
-        'Only the founding MSP owner can manage this organization identity.',
+        'Only the founding MSP owner can manage this organization identity.'
       )
     }
     return activeOrganization
@@ -296,12 +339,16 @@ export class WorkspaceService {
   async completeOrganizationOnboarding(
     identity: AuthenticatedIdentity,
     body: unknown,
+    requestId?: string
   ) {
     const input = parseOrganizationSettings(body)
     const actor = await this.ownerContext(identity, input.organizationId)
     const completedAt = new Date()
+    const operation = this.operation(requestId)
 
-    return this.prisma.$transaction(async (transaction) => {
+    try {
+
+    return await this.prisma.$transaction(async (transaction) => {
       const result = await transaction.organization.updateMany({
         where: {
           ...this.activeOwnerWhere(actor, true),
@@ -319,7 +366,7 @@ export class WorkspaceService {
         const organization = await this.assertOrganizationAuthority(
           transaction,
           actor,
-          true,
+          true
         )
         if (
           organization.onboardingCompletedAt &&
@@ -329,11 +376,11 @@ export class WorkspaceService {
         }
         if (organization.onboardingCompletedAt) {
           throw new ConflictException(
-            'Organization setup is already complete. Use organization settings to make changes.',
+            'Organization setup is already complete. Use organization settings to make changes.'
           )
         }
         throw new ConflictException(
-          'Organization setup changed while this request was being processed. Refresh and try again.',
+          'Organization setup changed while this request was being processed. Refresh and try again.'
         )
       }
 
@@ -347,37 +394,51 @@ export class WorkspaceService {
           onboardingCompletedAt: true,
         },
       })
-      await transaction.workspaceAdminAuditLog.create({
-        data: {
-          organizationId: actor.organizationId,
-          actorUserId: actor.userId,
-          actorEmail: actor.email,
+      await this.audit(
+          actor,{
+            ...operation,
           action: 'ORGANIZATION_ONBOARDING_COMPLETED',
           outcome: 'SUCCEEDED',
-          metadata: {
-            organizationName: input.organizationName,
-            businessDomain: input.businessDomain,
-            timeZone: input.timeZone,
+            stage: 'COMPLETED',
+            targetType: 'ORGANIZATION',
+            targetOpaqueId: actor.organizationId,
+          metadata: { changedFields: ['name', 'businessDomain', 'timeZone']
           },
         },
-      })
+          transaction)
       return this.organizationSettingsView(organization)
     })
+  } catch (error) {
+      await this.audit(actor, {
+        ...operation,
+        action: 'ORGANIZATION_ONBOARDING_FAILED',
+        outcome: 'FAILED',
+        stage: 'ORGANIZATION_PERSISTENCE',
+        errorCode: workspaceAuditErrorCode(error),
+        targetType: 'ORGANIZATION',
+        targetOpaqueId: actor.organizationId,
+      })
+      throw error
+    }
   }
 
-  async updateOrganization(identity: AuthenticatedIdentity, body: unknown) {
+  async updateOrganization(identity: AuthenticatedIdentity, body: unknown,
+    requestId?: string) {
     const input = parseOrganizationSettings(body)
     const actor = await this.ownerContext(identity, input.organizationId)
+    const operation = this.operation(requestId)
 
-    return this.prisma.$transaction(async (transaction) => {
+    try {
+
+    return await this.prisma.$transaction(async (transaction) => {
       const current = await this.assertOrganizationAuthority(
         transaction,
         actor,
-        false,
+        false
       )
       if (!current.onboardingCompletedAt) {
         throw new ConflictException(
-          'Complete organization setup before changing organization settings.',
+          'Complete organization setup before changing organization settings.'
         )
       }
       if (sameOrganizationSettings(current, input)) {
@@ -398,7 +459,7 @@ export class WorkspaceService {
       })
       if (result.count !== 1) {
         throw new ConflictException(
-          'Organization settings changed while this request was being processed. Refresh and try again.',
+          'Organization settings changed while this request was being processed. Refresh and try again.'
         )
       }
       const organization = await transaction.organization.findUniqueOrThrow({
@@ -417,18 +478,31 @@ export class WorkspaceService {
         changedFields.push('businessDomain')
       }
       if (current.timeZone !== organization.timeZone) changedFields.push('timeZone')
-      await transaction.workspaceAdminAuditLog.create({
-        data: {
-          organizationId: actor.organizationId,
-          actorUserId: actor.userId,
-          actorEmail: actor.email,
+      await this.audit(
+          actor,{
+            ...operation,
           action: 'ORGANIZATION_SETTINGS_UPDATED',
           outcome: 'SUCCEEDED',
+            stage: 'COMPLETED',
+            targetType: 'ORGANIZATION',
+            targetOpaqueId: actor.organizationId,
           metadata: { changedFields },
         },
-      })
+          transaction)
       return this.organizationSettingsView(organization)
     })
+    } catch (error) {
+      await this.audit(actor, {
+        ...operation,
+        action: 'ORGANIZATION_SETTINGS_UPDATE_FAILED',
+        outcome: 'FAILED',
+        stage: 'ORGANIZATION_PERSISTENCE',
+        errorCode: workspaceAuditErrorCode(error),
+        targetType: 'ORGANIZATION',
+        targetOpaqueId: actor.organizationId,
+      })
+      throw error
+    }
   }
 
   private memberView(member: MemberRecord) {
@@ -480,8 +554,22 @@ export class WorkspaceService {
 
   async listAuditLogs(identity: AuthenticatedIdentity, organizationId?: string) {
     const actor = await this.ownerContext(identity, parseOrganizationId(organizationId))
+    const now = new Date()
+    try {
+      await this.prisma.workspaceAdminAuditLog.deleteMany({
+        where: {
+          organizationId: actor.organizationId,
+          expiresAt: { lte: now },
+        },
+      })
+    } catch {
+      // Retention cleanup must not turn a read into an outage. Expired rows are
+      // still excluded below and a later authorized read retries cleanup.
+      this.logger.warn('Workspace audit retention cleanup was unavailable.')
+    }
     const items = await this.prisma.workspaceAdminAuditLog.findMany({
-      where: { organizationId: actor.organizationId },
+      where: { organizationId: actor.organizationId,
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }], },
       orderBy: { createdAt: 'desc' },
       take: 100,
     })
@@ -493,7 +581,7 @@ export class WorkspaceService {
     const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()
     if (!url || !serviceRoleKey) {
       throw new ServiceUnavailableException(
-        'HawkView account administration is not configured. Contact a platform administrator.',
+        'HawkView account administration is not configured. Contact a platform administrator.'
       )
     }
     return { url, serviceRoleKey }
@@ -506,7 +594,7 @@ export class WorkspaceService {
       )
     } catch {
       throw new ServiceUnavailableException(
-        'HawkView account administration is not configured correctly. Contact a platform administrator.',
+        'HawkView account administration is not configured correctly. Contact a platform administrator.'
       )
     }
   }
@@ -539,7 +627,7 @@ export class WorkspaceService {
             code: AUTH_EMAIL_RATE_LIMITED_CODE,
             message: AUTH_EMAIL_RATE_LIMITED_MESSAGE,
           },
-          HttpStatus.TOO_MANY_REQUESTS,
+          HttpStatus.TOO_MANY_REQUESTS
         )
       }
       throw new BadRequestException('The requested HawkView account operation could not be completed.')
@@ -547,21 +635,39 @@ export class WorkspaceService {
     return result
   }
 
-  async inviteMember(identity: AuthenticatedIdentity, body: unknown) {
+  async inviteMember(identity: AuthenticatedIdentity, body: unknown,
+    requestId?: string) {
     const candidate = record(body)
-    const actor = await this.ownerContext(identity, requiredOrganizationId(body))
+    const actor = await this.ownerContext(identity, requiredOrganizationId(body)
+    )
+    const operation = this.operation(requestId)
     const email = stringValue(candidate, 'email').toLowerCase()
     const displayName = stringValue(candidate, 'displayName') || null
     const role = stringValue(candidate, 'role') as MembershipRole
-    if (!/^\S+@\S+\.\S+$/.test(email)) throw new BadRequestException('Enter a valid email address.')
-    if (!ROLE_VALUES.has(role)) throw new BadRequestException('Select a valid workspace role.')
-
-    let user = await this.prisma.user.findUnique({ where: { email } })
+    let stage = 'REQUEST_VALIDATION'
+    let target = this.memberTarget(operation)
+    let user: MemberRecord['user'] | null = null
     let delivery: 'INVITE' | 'SETUP_LINK' = 'INVITE'
+
+    // The intent is durable before any external email side effect. If this
+    // write fails the request stops and Supabase is never called.
+    await this.audit(actor, {
+      ...operation,
+      ...target,
+      action: 'WORKSPACE_MEMBER_INVITE_REQUESTED',
+      outcome: 'STARTED',
+      stage: 'REQUEST_ACCEPTED',
+    })
+
     try {
+    if (!/^\S+@\S+\.\S+$/.test(email)) { throw new BadRequestException('Enter a valid email address.')
+      }
+    if (!ROLE_VALUES.has(role)) { throw new BadRequestException('Select a valid workspace role.')
+      } user = await this.prisma.user.findUnique({ where: { email } })
+      target = this.memberTarget(operation, user?.id)
       if (user?.disabledAt) {
         throw new BadRequestException(
-          'This HawkView account is disabled and cannot be invited.',
+          'This HawkView account is disabled and cannot be invited.'
         )
       }
       if (
@@ -570,21 +676,31 @@ export class WorkspaceService {
         (!user.inviteSentAt || user.inviteAcceptedAt)
       ) {
         throw new BadRequestException(
-          'This email is associated with an existing HawkView profile that cannot be relinked by invitation. Contact a platform administrator.',
+          'This email is associated with an existing HawkView profile that cannot be relinked by invitation. Contact a platform administrator.'
         )
       }
       if (!user || !user.authProviderUserId) {
-        const invite = await this.supabaseAdminRequest('/auth/v1/invite', {
+        stage = 'AUTH_PROVIDER'
+        const invite = ( await this.supabaseAdminRequest('/auth/v1/invite', {
           method: 'POST',
           body: JSON.stringify({
             email,
             data: displayName ? { display_name: displayName } : undefined,
             redirect_to: this.authEmailRedirectUrl(),
           }),
-        }) as { id?: unknown; user?: { id?: unknown } } | null
+        })) as { id?: unknown; user?: { id?: unknown } } | null
         const authProviderUserId = typeof invite?.id === 'string'
           ? invite.id
           : typeof invite?.user?.id === 'string' ? invite.user.id : null
+        await this.audit(actor, {
+          ...operation,
+          ...target,
+          action: 'WORKSPACE_MEMBER_INVITE_PROVIDER_ACCEPTED',
+          outcome: 'SUCCEEDED',
+          stage: 'AUTH_PROVIDER',
+          metadata: { delivery },
+        })
+        stage = 'USER_PERSISTENCE'
         if (user) {
           user = await this.prisma.user.update({
             where: { id: user.id },
@@ -597,13 +713,15 @@ export class WorkspaceService {
           })
         } else {
           user = await this.prisma.user.create({
-            data: { email, displayName, authProviderUserId, inviteSentAt: new Date() },
+            data: { email, displayName, authProviderUserId, inviteSentAt: new Date(), },
           })
         }
+        target = this.memberTarget(operation, user.id)
       } else if (!user.inviteAcceptedAt) {
         // Supabase will not issue a second invite for an existing Auth user.
         // A recovery link lets a pending recipient securely set their password.
         delivery = 'SETUP_LINK'
+        stage = 'AUTH_PROVIDER'
         await this.supabaseAdminRequest('/auth/v1/recover', {
           method: 'POST',
           body: JSON.stringify({
@@ -611,65 +729,180 @@ export class WorkspaceService {
             redirect_to: this.authEmailRedirectUrl(),
           }),
         })
+        await this.audit(actor, {
+          ...operation,
+          ...target,
+          action: 'WORKSPACE_MEMBER_INVITE_PROVIDER_ACCEPTED',
+          outcome: 'SUCCEEDED',
+          stage: 'AUTH_PROVIDER',
+          metadata: { delivery },
+        })
+        stage = 'USER_PERSISTENCE'
         user = await this.prisma.user.update({
           where: { id: user.id },
           data: { inviteSentAt: new Date() },
         })
       } else {
         throw new BadRequestException(
-          'This member has already completed HawkView account setup. Use password reset instead.',
+          'This member has already completed HawkView account setup. Use password reset instead.'
         )
+    }
+    if (!user) { throw new ServiceUnavailableException('HawkView invitation could not be created.')
+      }
+      target = this.memberTarget(operation, user.id)
+      stage = 'MEMBERSHIP_PERSISTENCE'
+    const membership = await this.prisma.$transaction(async (transaction) => {
+        const persisted = await transaction.membership.upsert({
+      where: { userId_organizationId: { userId: user!.id, organizationId: actor.organizationId, }, },
+      create: { userId: user!.id, organizationId: actor.organizationId, role, status: MembershipStatus.ACTIVE, },
+      update: { role, status: MembershipStatus.ACTIVE },
+      include: { user: { select: { id: true, email: true, displayName: true, authProviderUserId: true, disabledAt: true, inviteSentAt: true, inviteAcceptedAt: true, createdAt: true, }, }, },
+    })
+    await this.audit(actor,
+          {
+            ...operation,
+            ...target,
+            action: 'WORKSPACE_MEMBER_INVITED',
+            outcome: 'SUCCEEDED',
+            stage: 'COMPLETED',
+            metadata: { role, delivery },
+          },
+          transaction
+        )
+        return persisted })
+    return { member: this.memberView(membership), delivery,
+        operationId: operation.operationId,
+        requestId: operation.requestId,
       }
     } catch (error) {
-      await this.audit(actor, 'WORKSPACE_MEMBER_INVITE', user ?? undefined, 'FAILED', { email, role, delivery })
-      throw error
-    }
-    if (!user) throw new ServiceUnavailableException('HawkView invitation could not be created.')
-    const membership = await this.prisma.membership.upsert({
-      where: { userId_organizationId: { userId: user.id, organizationId: actor.organizationId } },
-      create: { userId: user.id, organizationId: actor.organizationId, role, status: MembershipStatus.ACTIVE },
-      update: { role, status: MembershipStatus.ACTIVE },
-      include: { user: { select: { id: true, email: true, displayName: true, authProviderUserId: true, disabledAt: true, inviteSentAt: true, inviteAcceptedAt: true, createdAt: true } } },
-    })
-    await this.audit(actor, 'WORKSPACE_MEMBER_INVITED', membership.user, 'SUCCEEDED', { role, delivery })
-    return { member: this.memberView(membership), delivery }
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_INVITE_FAILED',
+        outcome: 'FAILED',
+        stage,
+        errorCode: workspaceAuditErrorCode(error),
+        metadata: {
+          ...(ROLE_VALUES.has(role) ? { role } : {}),
+          delivery,
+        },
+      })
+      throw error }
   }
 
-  async updateMember(identity: AuthenticatedIdentity, membershipId: string, body: unknown) {
+  async updateMember(identity: AuthenticatedIdentity, membershipId: string, body: unknown,
+    requestId?: string) {
     const candidate = record(body)
     const actor = await this.ownerContext(identity, requiredOrganizationId(body))
+    const operation = this.operation(requestId)
     const member = await this.memberForOwner(actor.organizationId, membershipId)
+    const target = this.memberTarget(operation, member.userId)
+    let stage = 'REQUEST_VALIDATION'
+    try {
     const roleValue = stringValue(candidate, 'role')
     const statusValue = stringValue(candidate, 'status')
-    const role = roleValue ? roleValue as MembershipRole : member.role
-    const status = statusValue ? statusValue as MembershipStatus : member.status
+    const role = roleValue ? ( roleValue as MembershipRole) : member.role
+    const status = statusValue ? ( statusValue as MembershipStatus) : member.status
     if (!ROLE_VALUES.has(role) || !STATUS_VALUES.has(status)) {
       throw new BadRequestException('Invalid workspace role or status.')
     }
     await this.protectOwner(actor, member, role, status)
-    const updated = await this.prisma.membership.update({
+      stage = 'MEMBERSHIP_PERSISTENCE'
+    const updated = await this.prisma.$transaction(async (transaction) => {
+        const persisted = await transaction.membership.update({
       where: { id: member.id }, data: { role, status },
-      include: { user: { select: { id: true, email: true, displayName: true, authProviderUserId: true, disabledAt: true, inviteSentAt: true, inviteAcceptedAt: true, createdAt: true } } },
+      include: { user: { select: { id: true, email: true, displayName: true, authProviderUserId: true, disabledAt: true, inviteSentAt: true, inviteAcceptedAt: true, createdAt: true, }, }, },
     })
-    await this.audit(actor, 'WORKSPACE_MEMBER_UPDATED', updated.user, 'SUCCEEDED', { role, status })
-    return { member: this.memberView(updated) }
+    await this.audit(actor,
+          {
+            ...operation,
+            ...target,
+            action: 'WORKSPACE_MEMBER_UPDATED',
+            outcome: 'SUCCEEDED',
+            stage: 'COMPLETED',
+            metadata: { role, status,
+              priorRole: member.role,
+              priorStatus: member.status,
+            },
+          },
+          transaction
+        )
+        return persisted })
+    return { member: this.memberView(updated),
+        operationId: operation.operationId,
+        requestId: operation.requestId,
+      }
+    } catch (error) {
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_UPDATE_FAILED',
+        outcome: 'FAILED',
+        stage,
+        errorCode: workspaceAuditErrorCode(error),
+        metadata: { priorRole: member.role, priorStatus: member.status },
+      })
+      throw error }
   }
 
-  async removeMember(identity: AuthenticatedIdentity, membershipId: string, organizationId?: string) {
+  async removeMember(identity: AuthenticatedIdentity, membershipId: string, organizationId?: string,
+    requestId?: string) {
     const actor = await this.ownerContext(
       identity,
-      parseOrganizationId(organizationId),
+      parseOrganizationId(organizationId)
+    )
+    const operation = this.operation(requestId
     )
     const member = await this.memberForOwner(actor.organizationId, membershipId)
+    const target = this.memberTarget(operation, member.userId)
+    let stage = 'REQUEST_VALIDATION'
+    try {
     await this.protectOwner(actor, member, MembershipRole.MSP_VIEWER, MembershipStatus.SUSPENDED)
-    await this.prisma.membership.delete({ where: { id: member.id } })
-    await this.audit(actor, 'WORKSPACE_MEMBER_REMOVED', member.user)
-    return { removed: true }
+      stage = 'MEMBERSHIP_PERSISTENCE'
+    await this.prisma.$transaction(async (transaction) => {
+        await transaction.membership.delete({ where: { id: member.id } })
+    await this.audit(actor,
+          {
+            ...operation,
+            ...target,
+            action: 'WORKSPACE_MEMBER_REMOVED',
+            outcome: 'SUCCEEDED',
+            stage: 'COMPLETED',
+            metadata: { priorRole: member.role, priorStatus: member.status },
+          },
+          transaction
+        )
+      })
+    return { removed: true,
+        operationId: operation.operationId,
+        requestId: operation.requestId,
+      }
+    } catch (error) {
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_REMOVE_FAILED',
+        outcome: 'FAILED',
+        stage,
+        errorCode: workspaceAuditErrorCode(error),
+        metadata: { priorRole: member.role, priorStatus: member.status },
+      })
+      throw error }
   }
 
-  async sendPasswordReset(identity: AuthenticatedIdentity, membershipId: string, body: unknown) {
+  async sendPasswordReset(identity: AuthenticatedIdentity, membershipId: string, body: unknown,
+    requestId?: string) {
     const actor = await this.ownerContext(identity, requiredOrganizationId(body))
+    const operation = this.operation(requestId)
     const member = await this.memberForOwner(actor.organizationId, membershipId)
+    const target = this.memberTarget(operation, member.userId)
+    await this.audit(actor, {
+      ...operation,
+      ...target,
+      action: 'HAWKVIEW_PASSWORD_RESET_REQUESTED',
+      outcome: 'STARTED',
+      stage: 'REQUEST_ACCEPTED',
+    })
     try {
       await this.supabaseAdminRequest('/auth/v1/recover', {
         method: 'POST',
@@ -678,43 +911,87 @@ export class WorkspaceService {
           redirect_to: this.authEmailRedirectUrl(),
         }),
       })
-      await this.audit(actor, 'HAWKVIEW_PASSWORD_RESET_SENT', member.user)
-      return { sent: true }
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'HAWKVIEW_PASSWORD_RESET_SENT',
+        outcome: 'SUCCEEDED',
+        stage: 'AUTH_PROVIDER',
+      })
+      return { sent: true,
+        operationId: operation.operationId,
+        requestId: operation.requestId, }
     } catch (error) {
-      await this.audit(actor, 'HAWKVIEW_PASSWORD_RESET_SENT', member.user, 'FAILED')
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'HAWKVIEW_PASSWORD_RESET_FAILED',
+        outcome: 'FAILED',
+        stage: 'AUTH_PROVIDER',
+        errorCode: workspaceAuditErrorCode(error),
+      })
       throw error
     }
   }
 
-  async resetHawkViewMfa(identity: AuthenticatedIdentity, membershipId: string, body: unknown) {
+  async resetHawkViewMfa(identity: AuthenticatedIdentity, membershipId: string, body: unknown,
+    requestId?: string) {
     const actor = await this.ownerContext(identity, requiredOrganizationId(body))
+    const operation = this.operation(requestId)
     const member = await this.memberForOwner(actor.organizationId, membershipId)
+    const target = this.memberTarget(operation, member.userId)
+    let stage = 'REQUEST_VALIDATION'
+    await this.audit(actor, {
+      ...operation,
+      ...target,
+      action: 'HAWKVIEW_MFA_RESET_REQUESTED',
+      outcome: 'STARTED',
+      stage: 'REQUEST_ACCEPTED',
+    })
+    try {
     if (member.userId === actor.userId) {
       throw new BadRequestException(
-        'Use Account & Security to manage your own HawkView authenticators.',
+        'Use Account & Security to manage your own HawkView authenticators.'
       )
     }
     if (!member.user.authProviderUserId) {
       throw new BadRequestException('This invited member has not completed HawkView account setup yet.')
     }
-    try {
-      const result = await this.supabaseAdminRequest(
+      stage = 'AUTH_PROVIDER'
+      const result = ( await this.supabaseAdminRequest(
         `/auth/v1/admin/users/${encodeURIComponent(member.user.authProviderUserId)}/factors`,
-        { method: 'GET' },
-      ) as { factors?: Array<{ id?: unknown }> } | Array<{ id?: unknown }> | null
+        { method: 'GET' }
+      )
+      ) as
+        | { factors?: Array<{ id?: unknown }> } | Array<{ id?: unknown }> | null
       const factors = Array.isArray(result) ? result : Array.isArray(result?.factors) ? result.factors : []
       for (const factor of factors) {
         if (typeof factor.id === 'string') {
           await this.supabaseAdminRequest(
             `/auth/v1/admin/users/${encodeURIComponent(member.user.authProviderUserId)}/factors/${encodeURIComponent(factor.id)}`,
-            { method: 'DELETE' },
+            { method: 'DELETE' }
           )
         }
       }
-      await this.audit(actor, 'HAWKVIEW_MFA_RESET', member.user, 'SUCCEEDED', { factorsRemoved: factors.length })
-      return { factorsRemoved: factors.length }
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'HAWKVIEW_MFA_RESET',
+        outcome: 'SUCCEEDED',
+        stage: 'COMPLETED',
+        metadata: { factorsRemoved: factors.length }, })
+      return { factorsRemoved: factors.length,
+        operationId: operation.operationId,
+        requestId: operation.requestId, }
     } catch (error) {
-      await this.audit(actor, 'HAWKVIEW_MFA_RESET', member.user, 'FAILED')
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'HAWKVIEW_MFA_RESET_FAILED',
+        outcome: 'FAILED',
+        stage,
+        errorCode: workspaceAuditErrorCode(error),
+      })
       throw error
     }
   }

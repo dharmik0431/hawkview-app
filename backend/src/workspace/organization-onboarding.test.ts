@@ -27,7 +27,7 @@ test('organization setup accepts only canonical bounded values', () => {
       organizationName: 'GreenTech Services',
       businessDomain: 'greentech-services.net',
       timeZone: 'America/Toronto',
-    },
+    }
   )
 
   for (const businessDomain of [
@@ -56,7 +56,7 @@ test('organization setup accepts only canonical bounded values', () => {
           businessDomain,
           timeZone: 'America/Toronto',
         }),
-      /valid business domain/,
+      /valid business domain/
     )
   }
   assert.throws(
@@ -67,7 +67,7 @@ test('organization setup accepts only canonical bounded values', () => {
         businessDomain: null,
         timeZone: 'America/Toronto',
       }),
-    /valid MSP or organization name/,
+    /valid MSP or organization name/
   )
   assert.throws(
     () =>
@@ -77,7 +77,7 @@ test('organization setup accepts only canonical bounded values', () => {
         businessDomain: null,
         timeZone: 'America/Toronto',
       }),
-    /valid MSP or organization name/,
+    /valid MSP or organization name/
   )
   assert.throws(
     () =>
@@ -87,7 +87,7 @@ test('organization setup accepts only canonical bounded values', () => {
         businessDomain: null,
         timeZone: `America/Toronto\u202e`,
       }),
-    /valid IANA time zone/,
+    /valid IANA time zone/
   )
   assert.throws(
     () =>
@@ -97,7 +97,7 @@ test('organization setup accepts only canonical bounded values', () => {
         businessDomain: null,
         timeZone: 'Toronto',
       }),
-    /valid IANA time zone/,
+    /valid IANA time zone/
   )
   const inherited = Object.create({ organizationId: ORGANIZATION_ID })
   inherited.organizationName = 'GreenTech'
@@ -138,7 +138,7 @@ function workspaceFixture(options: {
 
   const transaction = {
     organization: {
-      updateMany: async ({ where, data }: {
+      updateMany: async ({ where, data, }: {
         where: Record<string, unknown>
         data: Record<string, unknown>
       }) => {
@@ -175,7 +175,7 @@ function workspaceFixture(options: {
   }
   const prisma = {
     user: {
-      findUnique: async ({ where }: { where: { authProviderUserId: string } }) => {
+      findUnique: async ({ where, }: { where: { authProviderUserId: string } }) => {
         assert.equal(where.authProviderUserId, identity.subject)
         const memberOrganizationId =
           options.actorOrganizationId ?? organization.id
@@ -185,11 +185,12 @@ function workspaceFixture(options: {
           disabledAt: null,
           memberships:
             memberOrganizationId === organization.id
-              ? [{ organization: { id: organization.id, name: organization.name } }]
+              ? [{ organization: { id: organization.id, name: organization.name, }, },]
               : [],
         }
       },
     },
+    workspaceAdminAuditLog: transaction.workspaceAdminAuditLog,
     $transaction: async <T>(callback: (client: typeof transaction) => Promise<T>) =>
       callback(transaction),
   } as unknown as PrismaService
@@ -224,9 +225,9 @@ test('first completion is atomic and identical concurrent retries are idempotent
   assert.equal(fixture.organization().slug, 'immutable-internal-slug')
   assert.equal(
     fixture.updatePayloads.some((data) =>
-      Object.prototype.hasOwnProperty.call(data, 'slug'),
+      Object.prototype.hasOwnProperty.call(data, 'slug')
     ),
-    false,
+    false
   )
 })
 
@@ -237,12 +238,13 @@ test('conflicting completion retry cannot overwrite the winning setup', async ()
     () =>
       fixture.service.completeOrganizationOnboarding(
         identity,
-        setup({ organizationName: 'Other MSP' }),
+        setup({ organizationName: 'Other MSP' })
       ),
-    /already complete/,
+    /already complete/
   )
   assert.equal(fixture.organization().name, 'GreenTech Services')
-  assert.equal(fixture.audits.length, 1)
+  assert.equal(fixture.audits.length, 2)
+  assert.equal(fixture.audits[ 1]?.action, 'ORGANIZATION_ONBOARDING_FAILED')
 })
 
 test('an invited owner cannot complete the founder organization before setup', async () => {
@@ -251,10 +253,11 @@ test('an invited owner cannot complete the founder organization before setup', a
   })
   await assert.rejects(
     () => invitedOwner.service.completeOrganizationOnboarding(identity, setup()),
-    /Only the founding MSP owner/,
+    /Only the founding MSP owner/
   )
   assert.equal(invitedOwner.organization().name, 'Temporary MSP Workspace')
-  assert.equal(invitedOwner.audits.length, 0)
+  assert.equal(invitedOwner.audits.length, 1)
+  assert.equal(invitedOwner.audits[ 0]?.outcome, 'FAILED')
 })
 
 test('after setup any active MSP owner can update the organization profile', async () => {
@@ -264,7 +267,7 @@ test('after setup any active MSP owner can update the organization profile', asy
   })
   const result = await invitedOwner.service.updateOrganization(
     identity,
-    setup({ organizationName: 'Updated by active owner' }),
+    setup({ organizationName: 'Updated by active owner' })
   )
   assert.equal(result.organization.name, 'Updated by active owner')
   assert.equal(invitedOwner.audits.length, 1)
@@ -312,6 +315,7 @@ test('the founding owner cannot be removed before initial setup is complete', as
         onboardingCompletedAt: null,
       }),
     },
+    workspaceAdminAuditLog: { create: async () => null },
   } as unknown as PrismaService
   const service = new WorkspaceService(prisma)
 
@@ -321,7 +325,7 @@ test('the founding owner cannot be removed before initial setup is complete', as
         organizationId: ORGANIZATION_ID,
         role: 'MSP_VIEWER',
       }),
-    /founding MSP owner cannot be removed or demoted until organization setup is complete/,
+    /founding MSP owner cannot be removed or demoted until organization setup is complete/
   )
   assert.equal(membershipUpdates, 0)
 })
@@ -387,11 +391,18 @@ test('after setup normal self and last-owner policies replace founder permanence
     },
     workspaceAdminAuditLog: { create: async () => null },
   } as unknown as PrismaService
+  ;(
+    prisma as unknown as {
+      $transaction: (
+        callback: (client: PrismaService) => Promise<unknown>
+      ) => Promise<unknown>
+    }
+  ).$transaction = async (callback) => callback(prisma)
 
   await new WorkspaceService(prisma).updateMember(
     identity,
     'founder-membership',
-    { organizationId: ORGANIZATION_ID, role: 'MSP_VIEWER' },
+    { organizationId: ORGANIZATION_ID, role: 'MSP_VIEWER' }
   )
   assert.equal(membershipUpdates, 1)
 })
@@ -402,7 +413,7 @@ test('organization update is active-owner scoped, optimistic, audited, and never
   })
   const result = await fixture.service.updateOrganization(
     identity,
-    setup({ organizationName: 'GreenTech MSP', businessDomain: '' }),
+    setup({ organizationName: 'GreenTech MSP', businessDomain: '' })
   )
   assert.equal(result.organization.name, 'GreenTech MSP')
   assert.equal(result.organization.businessDomain, null)
@@ -413,10 +424,10 @@ test('organization update is active-owner scoped, optimistic, audited, and never
 })
 
 test('cross-organization IDs fail before any organization mutation', async () => {
-  const fixture = workspaceFixture({ actorOrganizationId: OTHER_ORGANIZATION_ID })
+  const fixture = workspaceFixture({ actorOrganizationId: OTHER_ORGANIZATION_ID, })
   await assert.rejects(
     () => fixture.service.completeOrganizationOnboarding(identity, setup()),
-    /Only an active MSP owner/,
+    /Only an active MSP owner/
   )
   assert.equal(fixture.updatePayloads.length, 0)
 })
@@ -425,9 +436,9 @@ test('migration backfills existing organizations complete and selects a determin
   const sql = readFileSync(
     new URL(
       '../../prisma/migrations/20260820200000_add_msp_organization_onboarding/migration.sql',
-      import.meta.url,
+      import.meta.url
     ),
-    'utf8',
+    'utf8'
   )
   assert.match(sql, /UPDATE "organizations" AS organization/)
   assert.match(sql, /"onboarding_completed_at" = COALESCE/)
@@ -442,7 +453,7 @@ test('tenant onboarding requires durable organization setup completion', async (
   let consentCalls = 0
   const prisma = {
     user: {
-      findUnique: async ({ select }: { select: { memberships: { where: unknown } } }) => {
+      findUnique: async ({ select, }: { select: { memberships: { where: unknown } } }) => {
         membershipWhere = select.memberships.where
         return {
           disabledAt: null,
@@ -466,11 +477,11 @@ test('tenant onboarding requires durable organization setup completion', async (
 
   await assert.rejects(
     () => service.createManagedOnboardingUrlForIdentity(identity),
-    /Complete MSP organization setup before onboarding tenants/,
+    /Complete MSP organization setup before onboarding tenants/
   )
   assert.deepEqual(
     (membershipWhere as { organization: unknown }).organization,
-    { status: 'ACTIVE' },
+    { status: 'ACTIVE' }
   )
   assert.equal(consentCalls, 0)
 })

@@ -11,4 +11,5 @@ export interface AuthenticatedIdentity {
 
 export interface AuthenticatedRequest extends Request {
   auth: AuthenticatedIdentity
+  requestId: string
 }
