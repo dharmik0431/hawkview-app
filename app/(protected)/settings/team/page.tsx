@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
@@ -68,6 +68,12 @@ import {
   WorkspaceChangeSignalGuard,
   subscribeWorkspaceChanges,
 } from '@/lib/auth/workspace-onboarding-sync'
+import {
+  workspaceAuditActorLabel,
+  workspaceAuditMetadataRows,
+  workspaceAuditSafeIdentifier,
+  workspaceAuditTargetLabel,
+} from '@/lib/workspace/audit-evidence'
 
 type MembershipRole =
   | 'MSP_OWNER'
@@ -95,8 +101,15 @@ type AuditEntry = {
   actorEmail: string | null
   targetUserId?: string | null
   targetEmail: string | null
+  targetType?: string | null
+  targetOpaqueId?: string | null
   action: string
   outcome: string
+  stage?: string | null
+  errorCode?: string | null
+  requestId?: string | null
+  operationId?: string | null
+  eventVersion?: number
   metadata: Record<string, unknown> | null
   createdAt: string
 }
@@ -148,7 +161,8 @@ type BulkConfirmModalState = {
 } | null
 
 type ConfirmModal = {
-  type: 'PASSWORD_RESET' | 'MFA_RESET' | 'REMOVE' | 'SUSPEND' | 'REACTIVATE' | 'ROLE_CHANGE'
+  type:
+    | 'PASSWORD_RESET' | 'MFA_RESET' | 'REMOVE' | 'SUSPEND' | 'REACTIVATE' | 'ROLE_CHANGE'
   member: Member
   targetRole?: MembershipRole
 } | null
@@ -197,20 +211,29 @@ function formatActionLabel(action: string): string {
   const normalized = action.toUpperCase().replace(/^WORKSPACE_/, '').replace(/^HAWKVIEW_/, '')
   const friendlyMap: Record<string, string> = {
     MEMBER_INVITED: 'Member invited',
+    MEMBER_INVITE_REQUESTED: 'Member invitation requested',
+    MEMBER_INVITE_PROVIDER_ACCEPTED: 'Invitation accepted by email provider',
+    MEMBER_INVITE_FAILED: 'Member invitation failed',
     INVITE_MEMBER: 'Member invited',
     ROLE_CHANGED: 'Role changed',
     MEMBER_ROLE_CHANGED: 'Role changed',
     MEMBER_ROLE_UPDATED: 'Role changed',
+    MEMBER_UPDATE_FAILED: 'Member update failed',
     MEMBER_SUSPENDED: 'Member suspended',
     SUSPEND_MEMBER: 'Member suspended',
     MEMBER_RESTORED: 'Member restored',
     MEMBER_REACTIVATED: 'Member restored',
     REACTIVATE_MEMBER: 'Member restored',
     PASSWORD_RESET_SENT: 'Password reset sent',
+    PASSWORD_RESET_REQUESTED: 'Password reset requested',
+    PASSWORD_RESET_FAILED: 'Password reset failed',
     PASSWORD_RESET: 'Password reset sent',
     MFA_RESET: 'MFA reset',
+    MFA_RESET_REQUESTED: 'MFA reset requested',
+    MFA_RESET_FAILED: 'MFA reset failed',
     RESET_MFA: 'MFA reset',
     MEMBER_REMOVED: 'Workspace access removed',
+    MEMBER_REMOVE_FAILED: 'Workspace access removal failed',
     REMOVE_MEMBER: 'Workspace access removed',
   }
 
@@ -221,6 +244,16 @@ function formatActionLabel(action: string): string {
     .split('_')
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
     .join(' ')
+}
+
+function auditOutcomeStyle(outcome: string) {
+  if (outcome === 'SUCCEEDED') {
+    return 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40'
+  }
+  if (outcome === 'STARTED') {
+    return 'bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-300/40 dark:border-blue-800/40'
+  }
+  return 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-300/40 dark:border-rose-800/40'
 }
 
 function getInitials(displayName: string | null | undefined, email: string): string {
@@ -379,7 +412,7 @@ function MemberActionMenu({
   )
 }
 
-export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: AdminTab }) {
+export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: AdminTab }) {
   const { identityUser, session, isLoading: authLoading } = useAuth()
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -398,7 +431,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
           : `/admin/${tab}`
       )
     },
-    [router, searchParams],
+    [router, searchParams]
   )
 
   const [workspaceResponse, setWorkspace] = useState<WorkspaceResponse | null>(null)
@@ -448,7 +481,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
   const [auditDrawerEntry, setAuditDrawerEntry] = useState<AuditEntry | null>(null)
 
   // Selection & Bulk Action state
-  const [selectedMembershipIds, setSelectedMembershipIds] = useState<Set<string>>(new Set())
+  const [selectedMembershipIds, setSelectedMembershipIds] = useState<Set<string>
+  >(new Set())
   const [bulkConfirmModal, setBulkConfirmModal] = useState<BulkConfirmModalState>(null)
 
   // Tenants state for Overview summary
@@ -473,7 +507,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
   const isPrefDirty = useMemo(() => {
     if (!notificationPrefs || !formNotificationPrefs) return false
-    return JSON.stringify(notificationPrefs) !== JSON.stringify(formNotificationPrefs)
+    return ( JSON.stringify(notificationPrefs) !== JSON.stringify(formNotificationPrefs))
   }, [notificationPrefs, formNotificationPrefs])
 
   // Audit Log Tab state
@@ -496,7 +530,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [auditDrawerEntry, accountDrawerMember, roleChangeMember, confirmModal, inviteModalOpen])
+  }, [auditDrawerEntry, accountDrawerMember, roleChangeMember, confirmModal, inviteModalOpen,])
 
   const menuContainerRef = useRef<HTMLDivElement | null>(null)
 
@@ -536,12 +570,13 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
         : [],
     [auditEntriesResponse, selectedOrganizationId]
   )
+  const auditMembers = useMemo(() => workspace?.members ?? [], [workspace])
   const tenantsData = useMemo(
     () =>
       selectedOrganizationId
-        ? tenantsResponse?.filter(
+        ? ( tenantsResponse?.filter(
             (tenant) => tenant.organization.id === selectedOrganizationId
-          ) ?? null
+          ) ?? null)
         : null,
     [selectedOrganizationId, tenantsResponse]
   )
@@ -717,15 +752,18 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
   }, [workspace?.members])
 
   const suspendedMembersCount = useMemo(() => {
-    return workspace?.members.filter((m) => m.status === 'SUSPENDED').length ?? 0
+    return ( workspace?.members.filter((m) => m.status === 'SUSPENDED').length ?? 0
+    )
   }, [workspace?.members])
 
   const pendingSetupCount = useMemo(() => {
-    return workspace?.members.filter((m) => m.hasHawkViewAccount === false).length ?? 0
+    return ( workspace?.members.filter((m) => m.hasHawkViewAccount === false).length ?? 0
+    )
   }, [workspace?.members])
 
   const configuredAuthCount = useMemo(() => {
-    return workspace?.members.filter((m) => m.hasHawkViewAccount === true).length ?? 0
+    return ( workspace?.members.filter((m) => m.hasHawkViewAccount === true).length ?? 0
+    )
   }, [workspace?.members])
 
   const activeMembers = useMemo(() => {
@@ -733,7 +771,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
   }, [workspace?.members])
 
   const allActiveConfigured = useMemo(() => {
-    return activeMembers.length > 0 && activeMembers.every((m) => m.hasHawkViewAccount === true)
+    return ( activeMembers.length > 0 && activeMembers.every((m) => m.hasHawkViewAccount === true))
   }, [activeMembers])
 
   const securityAttentionCount = useMemo(() => {
@@ -799,7 +837,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
       return matchesSearch && matchesRole && matchesStatus && matchesAuthStatus
     })
-  }, [workspace?.members, searchQuery, roleFilter, statusFilter, authStatusFilter])
+  }, [workspace?.members, searchQuery, roleFilter, statusFilter, authStatusFilter,])
 
   const sortedMembers = useMemo(() => {
     return [...filteredMembers].sort((a, b) => {
@@ -948,7 +986,12 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
   // Bulk action execution
   const handleExecuteBulkAction = useCallback(async () => {
-    if (!bulkConfirmModal || selectedMembers.length === 0 || !selectedOrganizationId) return
+    if (
+      !bulkConfirmModal ||
+      selectedMembers.length === 0 ||
+      !selectedOrganizationId
+    )
+      return
     const { action, targetRole } = bulkConfirmModal
 
     const eligibleMembers = selectedMembers.filter((m) => {
@@ -966,7 +1009,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
     })
 
     if (eligibleMembers.length === 0) {
-      setError('None of the selected members are eligible for this operation due to owner protections.')
+      setError(
+        'None of the selected members are eligible for this operation due to owner protections.'
+      )
       setBulkConfirmModal(null)
       return
     }
@@ -1047,7 +1092,14 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
     } else {
       setError(`Bulk action failed: ${failedItems[0].reason}`)
     }
-  }, [bulkConfirmModal, selectedMembers, currentUserId, isFinalActiveOwner, loadAllData, selectedOrganizationId])
+  }, [
+    bulkConfirmModal,
+    selectedMembers,
+    currentUserId,
+    isFinalActiveOwner,
+    loadAllData,
+    selectedOrganizationId,
+  ])
 
   // Copy Org ID handler
   const handleCopyOrgId = async () => {
@@ -1065,15 +1117,21 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
   const filteredAndSortedAuditLogs = useMemo(() => {
     const logs = auditEntries.filter((entry) => {
       const q = auditSearch.trim().toLowerCase()
+      const actorLabel = workspaceAuditActorLabel(entry, auditMembers)
+      const targetLabel = workspaceAuditTargetLabel(entry, auditMembers)
       const matchesSearch =
         !q ||
         entry.action.toLowerCase().includes(q) ||
-        (entry.actorEmail && entry.actorEmail.toLowerCase().includes(q)) ||
-        (entry.targetEmail && entry.targetEmail.toLowerCase().includes(q)) ||
-        entry.id.toLowerCase().includes(q)
+        actorLabel.toLowerCase().includes(q) ||
+        targetLabel.toLowerCase().includes(q) ||
+        entry.id.toLowerCase().includes(q) ||
+        entry.requestId?.toLowerCase().includes(q) ||
+        entry.operationId?.toLowerCase().includes(q)
 
-      const matchesAction = auditActionFilter === 'ALL' || entry.action === auditActionFilter
-      const matchesOutcome = auditOutcomeFilter === 'ALL' || entry.outcome === auditOutcomeFilter
+      const matchesAction =
+        auditActionFilter === 'ALL' || entry.action === auditActionFilter
+      const matchesOutcome =
+        auditOutcomeFilter === 'ALL' || entry.outcome === auditOutcomeFilter
 
       let matchesDate = true
       const entryDate = new Date(entry.createdAt).getTime()
@@ -1091,7 +1149,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
           if (!isNaN(start)) matchesDate = matchesDate && entryDate >= start
         }
         if (auditCustomEndDate) {
-          const end = new Date(auditCustomEndDate).getTime() + 24 * 60 * 60 * 1000 - 1
+          const end =
+            new Date(auditCustomEndDate).getTime() + 24 * 60 * 60 * 1000 - 1
           if (!isNaN(end)) matchesDate = matchesDate && entryDate <= end
         }
       }
@@ -1110,11 +1169,11 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
         aVal = a.action.toLowerCase()
         bVal = b.action.toLowerCase()
       } else if (auditSortField === 'target') {
-        aVal = (a.targetEmail || 'workspace').toLowerCase()
-        bVal = (b.targetEmail || 'workspace').toLowerCase()
+        aVal = workspaceAuditTargetLabel(a, auditMembers).toLowerCase()
+        bVal = workspaceAuditTargetLabel(b, auditMembers).toLowerCase()
       } else if (auditSortField === 'actor') {
-        aVal = (a.actorEmail || 'system').toLowerCase()
-        bVal = (b.actorEmail || 'system').toLowerCase()
+        aVal = workspaceAuditActorLabel(a, auditMembers).toLowerCase()
+        bVal = workspaceAuditActorLabel(b, auditMembers).toLowerCase()
       } else if (auditSortField === 'outcome') {
         aVal = a.outcome.toLowerCase()
         bVal = b.outcome.toLowerCase()
@@ -1136,6 +1195,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
     auditCustomEndDate,
     auditSortField,
     auditSortDir,
+    auditMembers,
   ])
 
   // CSV Export handler
@@ -1151,20 +1211,23 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
       return `"${val}"`
     }
 
-    const headers = ['Event ID', 'Date & Time', 'Action', 'Affected Target', 'Performed By', 'Outcome', 'Reason/Message']
+    const headers = ['Event ID', 'Date & Time', 'Action', 'Affected Target', 'Performed By', 'Outcome',
+      'Stage',
+      'Error Code',
+      'Request ID',
+      'Operation ID',]
     const rows = filteredAndSortedAuditLogs.map((entry) => {
-      const reason =
-        (entry.metadata?.reason as string) ||
-        (entry.metadata?.message as string) ||
-        ''
       return [
         sanitizeCSV(entry.id),
         sanitizeCSV(formatDateTime(entry.createdAt)),
         sanitizeCSV(entry.action),
-        sanitizeCSV(entry.targetEmail || 'Workspace'),
-        sanitizeCSV(entry.actorEmail || 'System'),
+        sanitizeCSV(workspaceAuditTargetLabel(entry, auditMembers)),
+        sanitizeCSV(workspaceAuditActorLabel(entry, auditMembers)),
         sanitizeCSV(entry.outcome),
-        sanitizeCSV(reason),
+        sanitizeCSV(entry.stage || 'Not reported'),
+        sanitizeCSV(entry.errorCode || 'Not reported'),
+        sanitizeCSV(workspaceAuditSafeIdentifier(entry.requestId)),
+        sanitizeCSV(workspaceAuditSafeIdentifier(entry.operationId)),
       ].join(',')
     })
 
@@ -1841,18 +1904,14 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                           {formatActionLabel(entry.action)}
                         </td>
                         <td className="py-2.5 px-3 text-foreground/90 max-w-[180px] truncate">
-                          {entry.targetEmail || 'Workspace'}
+                          {workspaceAuditTargetLabel(entry, auditMembers)}
                         </td>
                         <td className="py-2.5 px-3 text-muted-foreground max-w-[180px] truncate">
-                          {entry.actorEmail || 'System'}
+                          {workspaceAuditActorLabel(entry, auditMembers)}
                         </td>
                         <td className="py-2.5 px-3 whitespace-nowrap">
                           <span
-                            className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold ${
-                              entry.outcome === 'SUCCEEDED'
-                                ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40'
-                                : 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-300/40 dark:border-rose-800/40'
-                            }`}
+                            className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold ${auditOutcomeStyle(entry.outcome)}`}
                           >
                             {entry.outcome === 'SUCCEEDED' ? 'Succeeded' : entry.outcome}
                           </span>
@@ -2008,7 +2067,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 p-2.5 rounded-lg border border-blue-200 dark:border-blue-900/60 bg-blue-50/70 dark:bg-blue-950/40 text-xs animate-in fade-in duration-150">
                   <div className="flex items-center gap-2 font-medium text-foreground">
                     <CheckSquare className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" aria-hidden="true" />
-                    <span>{selectedMembershipIds.size} {selectedMembershipIds.size === 1 ? 'member' : 'members'} selected</span>
+                    <span>{selectedMembershipIds.size} {' '}
+                      {selectedMembershipIds.size === 1 ? 'member' : 'members'}{' '} selected</span>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -2031,7 +2091,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                           className="z-50 w-56 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg text-left animate-in fade-in zoom-in-95 focus:outline-none"
                         >
                           <DropdownMenu.Item
-                            onSelect={() => setBulkConfirmModal({ action: 'ROLE_CHANGE', targetRole: 'MSP_TECHNICIAN' })}
+                            onSelect={() => setBulkConfirmModal({ action: 'ROLE_CHANGE', targetRole: 'MSP_TECHNICIAN', })}
                             className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
                           >
                             <Users className="h-3.5 w-3.5 text-muted-foreground" />
@@ -2126,7 +2186,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Member</span>
                         {sortField === 'member' ? (
-                          sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          sortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -2140,7 +2202,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Role</span>
                         {sortField === 'role' ? (
-                          sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          sortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -2154,7 +2218,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Status</span>
                         {sortField === 'status' ? (
-                          sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          sortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -2171,7 +2237,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Added</span>
                         {sortField === 'createdAt' ? (
-                          sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          sortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -2320,8 +2388,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                               onAccountDetails={setAccountDrawerMember}
                               onChangeRole={setRoleChangeMember}
                               onResendInvitation={handleResendInvitation}
-                              onPasswordReset={(m) => setConfirmModal({ type: 'PASSWORD_RESET', member: m })}
-                              onMfaReset={(m) => setConfirmModal({ type: 'MFA_RESET', member: m })}
+                              onPasswordReset={(m) => setConfirmModal({ type: 'PASSWORD_RESET', member: m, })}
+                              onMfaReset={(m) => setConfirmModal({ type: 'MFA_RESET', member: m, })}
                               onToggleStatus={(m) =>
                                 setConfirmModal({
                                   type: m.status === 'ACTIVE' ? 'SUSPEND' : 'REACTIVATE',
@@ -2415,7 +2483,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                             onAccountDetails={setAccountDrawerMember}
                             onChangeRole={setRoleChangeMember}
                             onResendInvitation={handleResendInvitation}
-                            onPasswordReset={(m) => setConfirmModal({ type: 'PASSWORD_RESET', member: m })}
+                            onPasswordReset={(m) => setConfirmModal({ type: 'PASSWORD_RESET', member: m, })}
                             onMfaReset={(m) => setConfirmModal({ type: 'MFA_RESET', member: m })}
                             onToggleStatus={(m) =>
                               setConfirmModal({
@@ -2850,7 +2918,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                     disabled={!notificationPrefs || prefSaving}
                     onCheckedChange={(checked) => {
                       if (!formNotificationPrefs) return
-                      setFormNotificationPrefs({ ...formNotificationPrefs, securityEnabled: Boolean(checked) })
+                      setFormNotificationPrefs({ ...formNotificationPrefs, securityEnabled: Boolean(checked), })
                     }}
                     aria-label="Toggle Security Alerts"
                   />
@@ -2873,7 +2941,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       disabled={!notificationPrefs || prefSaving}
                       onCheckedChange={(checked) => {
                         if (!formNotificationPrefs) return
-                        setFormNotificationPrefs({ ...formNotificationPrefs, connectionEnabled: Boolean(checked) })
+                        setFormNotificationPrefs({ ...formNotificationPrefs, connectionEnabled: Boolean(checked), })
                       }}
                       aria-label="Toggle Connection or consent problems"
                     />
@@ -2889,7 +2957,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       disabled={!notificationPrefs || prefSaving}
                       onCheckedChange={(checked) => {
                         if (!formNotificationPrefs) return
-                        setFormNotificationPrefs({ ...formNotificationPrefs, synchronizationEnabled: Boolean(checked) })
+                        setFormNotificationPrefs({ ...formNotificationPrefs, synchronizationEnabled: Boolean(checked), })
                       }}
                       aria-label="Toggle Synchronization failures"
                     />
@@ -2912,7 +2980,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                     disabled={!notificationPrefs || prefSaving}
                     onCheckedChange={(checked) => {
                       if (!formNotificationPrefs) return
-                      setFormNotificationPrefs({ ...formNotificationPrefs, accountEnabled: Boolean(checked) })
+                      setFormNotificationPrefs({ ...formNotificationPrefs, accountEnabled: Boolean(checked), })
                     }}
                     aria-label="Toggle Team Membership notifications"
                   />
@@ -3019,7 +3087,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
                 <div className="flex items-center gap-2 text-xs">
                   <span className="text-muted-foreground font-medium">
-                    Showing {filteredAndSortedAuditLogs.length} of {auditEntries.length} event(s)
+                    Showing {filteredAndSortedAuditLogs.length} of{' '} {auditEntries.length} event(s)
                   </span>
 
                   <Button
@@ -3156,7 +3224,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Date & Time</span>
                         {auditSortField === 'createdAt' ? (
-                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          auditSortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -3179,7 +3249,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Action</span>
                         {auditSortField === 'action' ? (
-                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          auditSortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -3202,7 +3274,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Affected Target</span>
                         {auditSortField === 'target' ? (
-                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          auditSortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -3225,7 +3299,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Performed By</span>
                         {auditSortField === 'actor' ? (
-                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          auditSortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -3248,7 +3324,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                       >
                         <span>Outcome</span>
                         {auditSortField === 'outcome' ? (
-                          auditSortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                          auditSortDir === 'asc' ? ( <ArrowUp className="h-3 w-3" />
+                          ) : ( <ArrowDown className="h-3 w-3" />
+                          )
                         ) : (
                           <ArrowUpDown className="h-3 w-3 opacity-40" />
                         )}
@@ -3300,21 +3378,22 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                           {formatActionLabel(entry.action)}
                         </td>
                         <td className="py-3 px-4 text-foreground/90 max-w-[180px] truncate">
-                          {entry.targetEmail || 'Workspace'}
+                          {workspaceAuditTargetLabel(entry, auditMembers)}
                         </td>
                         <td className="py-3 px-4 text-muted-foreground max-w-[180px] truncate">
-                          {entry.actorEmail || 'System'}
+                          {workspaceAuditActorLabel(entry, auditMembers)}
                         </td>
                         <td className="py-3 px-4 whitespace-nowrap">
                           <span
-                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold ${
-                              entry.outcome === 'SUCCEEDED'
-                                ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40'
-                                : 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-300/40 dark:border-rose-800/40'
-                            }`}
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold ${auditOutcomeStyle(entry.outcome)}`}
                           >
                             {entry.outcome === 'SUCCEEDED' ? (
-                              <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+                              <CheckCircle2
+                                className="h-3 w-3"
+                                aria-hidden="true"
+                              />
+                            ) : entry.outcome === 'STARTED' ? (
+                              <Clock className="h-3 w-3" aria-hidden="true" />
                             ) : (
                               <AlertCircle className="h-3 w-3" aria-hidden="true" />
                             )}
@@ -3411,12 +3490,14 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
               <div className="border-t border-border pt-3 space-y-2">
                 <h4 className="font-bold text-foreground">Recent Audit Actions for this Account</h4>
-                {auditEntries.filter((a) => a.targetEmail === accountDrawerMember.email).length === 0 ? (
+                {auditEntries.filter((a) => a.targetUserId === accountDrawerMember.userId ||
+                    a.targetEmail === accountDrawerMember.email).length === 0 ? (
                   <p className="text-muted-foreground">No recent administrative actions recorded for this account.</p>
                 ) : (
                   <div className="space-y-1.5 max-h-48 overflow-y-auto">
                     {auditEntries
-                      .filter((a) => a.targetEmail === accountDrawerMember.email)
+                      .filter((a) =>
+                          a.targetUserId === accountDrawerMember.userId || a.targetEmail === accountDrawerMember.email)
                       .slice(0, 5)
                       .map((action) => (
                         <div key={action.id} className="p-2 rounded bg-muted/50 text-[11px] flex justify-between">
@@ -3492,11 +3573,15 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                     className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold ${
                       auditDrawerEntry.outcome === 'SUCCEEDED'
                         ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-300/40 dark:border-emerald-800/40'
-                        : 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-300/40 dark:border-rose-800/40'
+                        : auditDrawerEntry.outcome === 'STARTED'
+                          ? 'bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-300/40 dark:border-blue-800/40'
+                          : 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border border-rose-300/40 dark:border-rose-800/40'
                     }`}
                   >
                     {auditDrawerEntry.outcome === 'SUCCEEDED' ? (
                       <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+                    ) : auditDrawerEntry.outcome === 'STARTED' ? (
+                      <Clock className="h-3 w-3" aria-hidden="true" />
                     ) : (
                       <AlertCircle className="h-3 w-3" aria-hidden="true" />
                     )}
@@ -3507,23 +3592,66 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
               <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Performed By</span>
-                <p className="font-semibold text-foreground">{auditDrawerEntry.actorEmail || 'System / Automated'}</p>
+                <p className="font-semibold text-foreground">{workspaceAuditActorLabel(auditDrawerEntry, auditMembers)}</p>
               </div>
 
               <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Affected Target</span>
-                <p className="font-semibold text-foreground">{auditDrawerEntry.targetEmail || 'Workspace Console'}</p>
+                <p className="font-semibold text-foreground">{workspaceAuditTargetLabel(auditDrawerEntry, auditMembers)}
+                </p>
               </div>
 
-              {auditDrawerEntry.metadata && Object.keys(auditDrawerEntry.metadata).length > 0 && (
-                <div className="space-y-1">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
                   <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                    Event Metadata
+                    Stage
                   </span>
-                  <pre className="p-3 rounded-lg bg-muted/50 border border-border text-[11px] font-mono overflow-x-auto whitespace-pre-wrap break-all text-foreground">
-                    {JSON.stringify(auditDrawerEntry.metadata, null, 2)}
-                  </pre>
+                  <p className="font-mono text-[11px] break-all">
+                    {auditDrawerEntry.stage || 'Not reported'}
+                  </p>
                 </div>
+                <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Safe error code
+                  </span>
+                  <p className="font-mono text-[11px] break-all">
+                    {auditDrawerEntry.errorCode || 'Not reported'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Request ID
+                </span>
+                <p className="font-mono text-[11px] text-foreground select-all break-all">
+                  {workspaceAuditSafeIdentifier(auditDrawerEntry.requestId)}
+                </p>
+              </div>
+
+              <div className="space-y-1 bg-muted/30 p-3 rounded-lg border border-border">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Operation ID
+                </span>
+                <p className="font-mono text-[11px] text-foreground select-all break-all">
+                  {workspaceAuditSafeIdentifier(auditDrawerEntry.operationId)}</p>
+              </div>
+
+              {workspaceAuditMetadataRows(auditDrawerEntry.metadata).length > 0 && (
+                <dl className="space-y-2 rounded-lg border border-border bg-muted/30 p-3">
+                    {workspaceAuditMetadataRows(auditDrawerEntry.metadata).map(
+                    (row) => (
+                      <div
+                        key={row.key}
+                        className="flex items-start justify-between gap-4"
+                      >
+                        <dt className="text-muted-foreground">{row.label}</dt>
+                        <dd className="text-right font-medium text-foreground">
+                          {row.value}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
               )}
             </div>
 
@@ -3552,7 +3680,8 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
           >
             <div className="flex items-center justify-between border-b border-border pb-3">
               <h3 id="role-change-title" className="text-sm font-bold">
-                Change role for {roleChangeMember.displayName || roleChangeMember.email}
+                Change role for {' '}
+                {roleChangeMember.displayName || roleChangeMember.email}
               </h3>
               <button
                 type="button"
@@ -3565,7 +3694,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
             </div>
 
             <p className="text-xs text-muted-foreground">
-              Select the new workspace role for <strong>{roleChangeMember.email}</strong>:
+              Select the new workspace role for{' '} <strong>{roleChangeMember.email}</strong>:
             </p>
 
             <div className="space-y-2">
@@ -3662,17 +3791,17 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
             <div className="text-xs text-muted-foreground space-y-2 bg-muted/40 p-3 rounded-lg border border-border">
               {confirmModal.type === 'PASSWORD_RESET' && (
                 <p>
-                  A password reset email will be sent for this user&apos;s <strong>HawkView account</strong>. This action does not affect Microsoft 365 passwords or tenant credentials.
+                  A password reset email will be sent for this user&apos;s{' '} <strong>HawkView account</strong>. This action does not affect Microsoft 365 passwords or tenant credentials.
                 </p>
               )}
               {confirmModal.type === 'MFA_RESET' && (
                 <p>
-                  This removes every authenticator from their <strong>HawkView account</strong>, signs out their active sessions, and requires enrollment again. This does not alter Microsoft Entra ID or M365 MFA.
+                  This removes every authenticator from their{' '} <strong>HawkView account</strong>, signs out their active sessions, and requires enrollment again. This does not alter Microsoft Entra ID or M365 MFA.
                 </p>
               )}
               {confirmModal.type === 'REMOVE' && (
                 <p>
-                  This will immediately remove <strong>{confirmModal.member.email}</strong> from this HawkView workspace.
+                  This will immediately remove{' '} <strong>{confirmModal.member.email}</strong> from this HawkView workspace.
                 </p>
               )}
               {confirmModal.type === 'SUSPEND' && (
@@ -3687,7 +3816,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
               )}
               {confirmModal.type === 'ROLE_CHANGE' && (
                 <p>
-                  The member&apos;s role will be updated to <strong>{roleLabel(confirmModal.targetRole!)}</strong>.
+                  The member&apos;s role will be updated to{' '} <strong>{roleLabel(confirmModal.targetRole!)}</strong>.
                 </p>
               )}
             </div>
@@ -3791,7 +3920,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                         key={r.value}
                         type="button"
                         onClick={() =>
-                          setBulkConfirmModal({ ...bulkConfirmModal, targetRole: r.value })
+                          setBulkConfirmModal({ ...bulkConfirmModal, targetRole: r.value, })
                         }
                         className={`w-full flex items-start justify-between p-2.5 rounded-lg border text-left text-xs transition-colors ${
                           isSelected
@@ -3916,7 +4045,7 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
               {/* Name (optional) */}
               <div className="space-y-1">
                 <Label htmlFor="invite-modal-name" className="text-xs font-medium">
-                  Name <span className="text-muted-foreground font-normal">(optional)</span>
+                  Name{' '} <span className="text-muted-foreground font-normal">(optional)</span>
                 </Label>
                 <Input
                   id="invite-modal-name"
@@ -4052,7 +4181,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
 
             <div className="space-y-2 max-h-80 overflow-y-auto">
               {auditEntries.filter(
-                (a) => a.targetEmail === memberAuditMember.email || a.actorEmail === memberAuditMember.email
+                (a) => a.targetUserId === memberAuditMember.userId ||
+                  a.actorUserId === memberAuditMember.userId ||
+                  a.targetEmail === memberAuditMember.email || a.actorEmail === memberAuditMember.email
               ).length === 0 ? (
                 <p className="text-xs text-muted-foreground text-center py-6">
                   No administrative events recorded for this member.
@@ -4060,7 +4191,9 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
               ) : (
                 auditEntries
                   .filter(
-                    (a) => a.targetEmail === memberAuditMember.email || a.actorEmail === memberAuditMember.email
+                    (a) =>
+                      a.targetUserId === memberAuditMember.userId ||
+                      a.actorUserId === memberAuditMember.userId || a.targetEmail === memberAuditMember.email || a.actorEmail === memberAuditMember.email
                   )
                   .map((entry) => (
                     <div
@@ -4072,17 +4205,13 @@ export function AdminPanelPage({ initialTab = 'overview' }: { initialTab?: Admin
                           {formatActionLabel(entry.action)}
                         </span>
                         <span
-                          className={`inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-medium ${
-                            entry.outcome === 'SUCCEEDED'
-                              ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                              : 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
-                          }`}
+                          className={`inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-medium ${auditOutcomeStyle(entry.outcome)}`}
                         >
                           {entry.outcome}
                         </span>
                       </div>
                       <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                        <span>By: {entry.actorEmail || 'System'}</span>
+                        <span>By: {workspaceAuditActorLabel(entry, auditMembers)}</span>
                         <span>{formatDateTime(entry.createdAt)}</span>
                       </div>
                     </div>

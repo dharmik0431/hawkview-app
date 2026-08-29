@@ -99,7 +99,9 @@ test('an MSP owner resets every factor only for a member in the selected workspa
       'membership-target',
       { organizationId }
     )
-    assert.deepEqual(result, { factorsRemoved: 2 })
+    assert.equal(result.factorsRemoved, 2)
+    assert.match(result.operationId, /^[0-9a-f-]{36}$/i)
+    assert.match(result.requestId, /^[0-9a-f-]{36}$/i)
     assert.deepEqual(
       requests.map(({ method }) => method),
       ['GET', 'DELETE', 'DELETE']
@@ -114,9 +116,9 @@ test('an MSP owner resets every factor only for a member in the selected workspa
       organizationId,
     })
     assert.ok(membershipQuery.include)
-    assert.equal(auditEntries.length, 1)
+    assert.equal(auditEntries.length, 2)
     assert.equal(
-      (auditEntries[0] as { data: { action: string } }).data.action,
+      (auditEntries[1] as { data: { action: string } }).data.action,
       'HAWKVIEW_MFA_RESET'
     )
   } finally {

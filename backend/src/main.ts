@@ -44,6 +44,7 @@ async function bootstrap() {
     ) => callback(null, isAllowedOrigin(origin)),
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Authorization', 'Content-Type'],
+    exposedHeaders: ['X-Request-ID'],
     credentials: true,
   })
   await app.listen(port, '0.0.0.0')
