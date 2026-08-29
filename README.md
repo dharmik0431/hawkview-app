@@ -169,17 +169,29 @@ sequenceDiagram
   participant Auth as Supabase Auth
   actor Member as Invitee
   Owner->>API: Invite email and role
-  API->>DB: Verify owner; create pending member
-  API->>Auth: Send fixed-destination invite
-  API->>DB: Record invite outcome
-  Auth-->>Member: Invitation email
+  API->>DB: Verify owner; inspect existing user profile
+  alt New Auth identity
+    API->>Auth: POST /auth/v1/invite
+  else Existing Auth identity awaiting setup
+    API->>Auth: POST /auth/v1/recover
+  end
+  alt Provider accepts email request
+    Auth-->>API: Provider success
+    API->>DB: Create/update user; upsert ACTIVE membership
+    API->>DB: Record successful audit outcome
+    Auth-->>Member: Invitation or setup email
+  else Provider rejects email request
+    Auth-->>API: Provider failure
+    API->>DB: Record failed audit outcome only
+    Note over API,DB: No new local user or membership is created
+  end
   Member->>Auth: Accept, set password, enroll MFA
   Member->>API: Bootstrap with AAL2 token
-  API->>DB: Claim exact pending invite
+  API->>DB: Complete account setup; load ACTIVE membership
   API-->>Web: Workspace context
 ```
 
-Only active owners manage members. Safety rules prevent self-removal and removal of the last active owner. Invitation delivery is rate-limited and provider errors are normalized.
+Only active owners manage members. A membership is `ACTIVE` as soon as the provider accepts the invitation/setup request; `inviteSentAt` and `inviteAcceptedAt` separately describe account-setup progress. A provider failure can create a failed audit record, but creates no new local user or membership. Safety rules prevent self-removal and removal of the last active owner. Invitation delivery is rate-limited and provider errors are normalized.
 
 ## Repository structure
 
@@ -340,6 +352,20 @@ Backend scripts (from `backend/`):
 | Focused tests | `npm run test:tenant-health`, `npm run test:service-sync-freshness`, `npm run test:collection-field-state`, `npm run test:changes`, `npm run test:m365-audit`, `npm run test:auth-registrations`, `npm run test:sharepoint-contract` |
 
 The backend has no lint, standalone typecheck, or all-tests script. CI discovers `backend/src/**/*.test.ts` and runs `tsx --test` after migrations. [.github/workflows/quality-gates.yml](.github/workflows/quality-gates.yml) is authoritative.
+
+### Real PostgreSQL isolation test
+
+`HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS` is a test-only opt-in. Without the exact value `1`, the real database test is skipped. Use an empty, disposable PostgreSQL 16 database: the test creates synthetic organizations, users, memberships, and tenants, then removes them. Set `DATABASE_URL` in the local shell from an approved development secret; never print or commit it. From `backend/`, prepare the database and run the focused CI-equivalent isolation coverage:
+
+```bash
+npm ci
+npm run db:generate
+npm run db:validate
+npm run db:migrate:deploy
+HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1 ./node_modules/.bin/tsx --test src/tenants/tenant-directory.database-integration.test.ts
+```
+
+In PowerShell, set `$env:HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS = '1'` and run `.\node_modules\.bin\tsx.cmd --test src\tenants\tenant-directory.database-integration.test.ts` after the same setup commands. CI sets the flag for its complete backend test discovery, so run the full discovered backend suite as well when changing shared authorization or Prisma behavior.
 
 ## Authentication, roles, authorization, and isolation
 
