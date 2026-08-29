@@ -51,9 +51,11 @@ function memberRecord(email: string) {
 }
 
 function fixture(options: { existingPendingUser?: boolean
+    initialAuditFailure?: boolean
     membershipFailure?: boolean } = {}) {
   let membershipWrites = 0
   let userWrites = 0
+  let auditAttempts = 0
   const audits: Array<{ data: Record<string, unknown> }> = []
   const email = 'fourth@example.com'
   const pendingUser = options.existingPendingUser
@@ -78,6 +80,10 @@ function fixture(options: { existingPendingUser?: boolean
   }
   const workspaceAdminAuditLog = {
     create: async (entry: { data: Record<string, unknown> }) => {
+      auditAttempts += 1
+      if (options.initialAuditFailure && auditAttempts === 1) {
+        throw new Error('audit storage unavailable')
+      }
       audits.push(entry)
       return entry
     },
@@ -127,7 +133,7 @@ function fixture(options: { existingPendingUser?: boolean
 
   return {
     service: new WorkspaceService(prisma),
-    counts: () => ({ membershipWrites, userWrites }),
+    counts: () => ({ auditAttempts, membershipWrites, userWrites }),
     audits,
   }
 }
@@ -157,7 +163,7 @@ test('a fourth workspace member is allowed when the authentication provider acce
 
   assert.equal(result.delivery, 'INVITE')
   assert.deepEqual(requestedPaths, ['/auth/v1/invite'])
-  assert.deepEqual(subject.counts(), { membershipWrites: 1, userWrites: 1 })
+  assert.deepEqual(subject.counts(), { auditAttempts: 3, membershipWrites: 1, userWrites: 1 })
   assert.deepEqual(
     subject.audits.map((entry) => entry.data.action),
     [
@@ -195,7 +201,7 @@ test('invite email rate limiting returns a safe stable API contract and performs
       return true
     }
   )
-  assert.deepEqual(subject.counts(), { membershipWrites: 0, userWrites: 0 })
+  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
   assert.deepEqual(
     subject.audits.map((entry) => entry.data.action),
     ['WORKSPACE_MEMBER_INVITE_REQUESTED', 'WORKSPACE_MEMBER_INVITE_FAILED']
@@ -225,7 +231,7 @@ test('pending-member setup email rate limiting uses the same safe contract and p
     }
   )
   assert.equal(requestedPath, '/auth/v1/recover')
-  assert.deepEqual(subject.counts(), { membershipWrites: 0, userWrites: 0 })
+  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
   assert.equal(subject.audits.at(-1)?.data.errorCode, 'AUTH_EMAIL_RATE_LIMITED')
 })
 
@@ -261,4 +267,24 @@ test('provider acceptance remains durably provable when membership persistence f
     JSON.stringify(subject.audits),
     /database detail|fourth@example/i
   )
+})
+
+test('an unavailable initial audit write fails closed before Supabase or local persistence', async () => {
+  configureEnvironment()
+  let providerCalls = 0
+  globalThis.fetch = async () => {
+    providerCalls += 1
+    return new Response(JSON.stringify({ id: 'auth-user-four' }), { status: 200 })
+  }
+  const subject = fixture({ initialAuditFailure: true })
+
+  await assert.rejects(() => invite(subject.service), /audit storage unavailable/)
+
+  assert.equal(providerCalls, 0)
+  assert.deepEqual(subject.counts(), {
+    auditAttempts: 1,
+    membershipWrites: 0,
+    userWrites: 0,
+  })
+  assert.deepEqual(subject.audits, [])
 })

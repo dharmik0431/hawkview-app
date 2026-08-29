@@ -264,7 +264,7 @@ model WorkspaceAdminAuditLog {
   operationId    String?   @map("operation_id") @db.Uuid
   eventVersion   Int       @default(1) @map("event_version")
   metadata      Json?
-  expiresAt      DateTime? @map("expires_at") @db.Timestamptz(6)
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(6)
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   @@index([organizationId, createdAt(sort: Desc)])

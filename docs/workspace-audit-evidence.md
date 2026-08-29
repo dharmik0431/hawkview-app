@@ -47,11 +47,16 @@ durable attempt record.
 
 ## Retention and access
 
-Version 2 rows expire 365 days after creation. The authorized MSP-owner audit
-read excludes expired rows and opportunistically prunes them. The expiry index
-supports a future dedicated maintenance job without changing the contract.
-Changing the retention period requires an explicit privacy/compliance review
-and a migration or versioned configuration change.
+All rows expire 365 days after creation. The migration backfills every legacy
+row to `created_at + 365 days`, including older rows that may contain actor or
+target email fields, and then makes `expires_at` non-nullable. The authorized
+MSP-owner audit read requires `expires_at` to be in the future and
+opportunistically prunes expired rows. If schema drift ever produces an
+unexpected NULL, the positive read predicate excludes it fail-closed rather
+than treating it as indefinitely readable. The expiry index supports a future
+dedicated maintenance job without changing the contract. Changing the
+retention period requires an explicit privacy/compliance review and a migration
+or versioned configuration change.
 
 Audit reads remain organization-scoped and owner-authorized. The endpoint
 currently returns the newest 100 unexpired rows. That bounded view is adequate

@@ -568,8 +568,13 @@ export class WorkspaceService {
       this.logger.warn('Workspace audit retention cleanup was unavailable.')
     }
     const items = await this.prisma.workspaceAdminAuditLog.findMany({
-      where: { organizationId: actor.organizationId,
-        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }], },
+      // A positive expiry predicate is deliberate defense in depth. PostgreSQL
+      // enforces NOT NULL after the retention migration, and any unexpected
+      // drifted NULL remains invisible rather than becoming indefinitely readable.
+      where: {
+        organizationId: actor.organizationId,
+        expiresAt: { gt: now },
+      },
       orderBy: { createdAt: 'desc' },
       take: 100,
     })
