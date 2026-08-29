@@ -254,13 +254,24 @@ model WorkspaceAdminAuditLog {
   actorEmail    String?  @map("actor_email") @db.VarChar(320)
   targetUserId  String?  @map("target_user_id") @db.Uuid
   targetEmail   String?  @map("target_email") @db.VarChar(320)
+  targetType     String?   @map("target_type") @db.VarChar(50)
+  targetOpaqueId String?   @map("target_opaque_id") @db.VarChar(128)
   action        String   @db.VarChar(100)
   outcome       String   @default("SUCCEEDED") @db.VarChar(30)
+  stage          String?   @db.VarChar(50)
+  errorCode      String?   @map("error_code") @db.VarChar(100)
+  requestId      String?   @map("request_id") @db.VarChar(100)
+  operationId    String?   @map("operation_id") @db.Uuid
+  eventVersion   Int       @default(1) @map("event_version")
   metadata      Json?
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(6)
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   @@index([organizationId, createdAt(sort: Desc)])
   @@index([targetUserId, createdAt(sort: Desc)])
+  @@index([organizationId, operationId, createdAt])
+  @@index([organizationId, requestId, createdAt])
+  @@index([expiresAt])
   @@map("workspace_admin_audit_logs")
 }
 

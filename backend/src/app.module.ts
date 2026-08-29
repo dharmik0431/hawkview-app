@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common'
+import { MiddlewareConsumer, Module, type NestModule } from '@nestjs/common'
 import { AuthModule } from './auth/auth.module.js'
 import { HealthModule } from './health/health.module.js'
 import { PrismaModule } from './prisma/prisma.module.js'
@@ -8,6 +8,7 @@ import { NotificationsModule } from './notifications/notifications.module.js'
 import { ChangesModule } from './changes/changes.module.js'
 import { WorkspaceModule } from './workspace/workspace.module.js'
 import { AuthenticatedCanaryModule } from './canary/authenticated-canary.module.js'
+import { RequestCorrelationMiddleware } from './request-correlation.middleware.js'
 
 @Module({
   imports: [
@@ -22,4 +23,7 @@ import { AuthenticatedCanaryModule } from './canary/authenticated-canary.module.
     AuthenticatedCanaryModule,
   ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(RequestCorrelationMiddleware).forRoutes('*')}
+}
