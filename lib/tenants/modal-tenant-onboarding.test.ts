@@ -1,0 +1,238 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import {
+  MICROSOFT_CONSENT_MESSAGE,
+  consentMessageFromSearch,
+  consentResultCanOpenSetup,
+  deferReportVisibilityWithServerState,
+  modalOnboardingCanComplete,
+  modalOnboardingStep,
+  modalStepStatus,
+  normalizeMicrosoftConsentMessage,
+  tenantSetupCanAutoOpen,
+  tenantSetupDismissedKey,
+  tenantSetupReturnPath,
+  withClearedTenantSetupDismissal,
+} from './modal-tenant-onboarding.ts'
+import type { TenantOnboarding } from './tenant-onboarding.ts'
+
+const tenantId = '11111111-1111-4111-8111-111111111111'
+
+const state = (
+  microsoftAccess: TenantOnboarding['steps']['microsoftAccess']['status'],
+  exchangeReadOnly: TenantOnboarding['steps']['exchangeReadOnly']['status'],
+  reportVisibility: TenantOnboarding['steps']['reportVisibility']['status'],
+  canFinish = false,
+): TenantOnboarding => ({
+  version: 1,
+  tenant: {
+    id: tenantId,
+    name: 'Contoso',
+    primaryDomain: 'contoso.example',
+    microsoftTenantId: '22222222-2222-4222-8222-222222222222',
+  },
+  completedAt: null,
+  canFinish,
+  steps: {
+    microsoftAccess: {
+      required: true,
+      status: microsoftAccess,
+      errorCode: null,
+      errorMessage: null,
+    },
+    exchangeReadOnly: {
+      required: false,
+      status: exchangeReadOnly,
+      enabledAt: exchangeReadOnly === 'VERIFIED' ? '2026-08-30T00:00:00.000Z' : null,
+      deferredAt: exchangeReadOnly === 'DEFERRED' ? '2026-08-30T00:00:00.000Z' : null,
+      permission: 'Exchange.ManageAsAppV2',
+      capability: 'Get-Mailbox only',
+      disclaimer: 'Optional and read-only.',
+    },
+    reportVisibility: {
+      required: false,
+      status: reportVisibility,
+      identifiersVisible: reportVisibility === 'VERIFIED' ? true : null,
+      lastCheckedAt: null,
+      deferredAt: reportVisibility === 'DEFERRED' ? '2026-08-30T00:00:00.000Z' : null,
+      permission: 'ReportSettings.Read.All',
+      adminCenterUrl: 'https://admin.microsoft.com/#/Settings/Services',
+      settingPath: ['Settings', 'Org settings', 'Services', 'Reports'],
+      settingLabel: 'Conceal user, group, and site names in all reports',
+      disclaimer: 'Read-only verification.',
+    },
+  },
+})
+
+test('only a valid successful callback with a tenant UUID can trigger setup', () => {
+  const success = consentMessageFromSearch(
+    `?microsoftConsent=success&tenantId=${tenantId}`,
+  )
+  assert.equal(consentResultCanOpenSetup(success), true)
+  assert.equal(tenantSetupCanAutoOpen(success, false), true)
+  assert.equal(tenantSetupCanAutoOpen(success, true), false)
+  assert.equal(tenantSetupReturnPath(success!), `/tenants?microsoftConsent=success&tenantId=${tenantId}`)
+
+  const exchangeConsent = consentMessageFromSearch(
+    `?microsoftConsent=exchange-readonly-consented&tenantId=${tenantId}`,
+  )
+  assert.equal(consentResultCanOpenSetup(exchangeConsent), true)
+  assert.equal(
+    tenantSetupReturnPath(exchangeConsent!),
+    `/tenants?microsoftConsent=exchange-readonly-consented&tenantId=${tenantId}`,
+  )
+
+  for (const query of [
+    '?microsoftConsent=success',
+    '?microsoftConsent=success&tenantId=foreign',
+    `?microsoftConsent=missing-permissions&tenantId=${tenantId}`,
+    `?microsoftConsent=error&tenantId=${tenantId}`,
+    `?microsoftConsent=exchange-readonly-error&tenantId=${tenantId}`,
+  ]) {
+    assert.equal(consentResultCanOpenSetup(consentMessageFromSearch(query)), false)
+  }
+})
+
+test('popup messages fail closed for hostile, inherited, and future values', () => {
+  assert.equal(normalizeMicrosoftConsentMessage(null), null)
+  assert.equal(normalizeMicrosoftConsentMessage({}), null)
+  assert.equal(normalizeMicrosoftConsentMessage({
+    type: MICROSOFT_CONSENT_MESSAGE,
+    result: 'future-success',
+    tenantId,
+  }), null)
+  assert.equal(normalizeMicrosoftConsentMessage(Object.create({
+    type: MICROSOFT_CONSENT_MESSAGE,
+    result: 'success',
+    tenantId,
+  })), null)
+})
+
+test('callback query parameters fail closed when duplicated or inconsistent', () => {
+  for (const query of [
+    `?microsoftConsent=success&microsoftConsent=error&tenantId=${tenantId}`,
+    `?microsoftConsent=success&microsoftConsent=success&tenantId=${tenantId}`,
+    `?microsoftConsent=success&tenantId=${tenantId}&tenantId=${tenantId}`,
+    `?microsoftConsent=success&tenantId=${tenantId}&error=unexpected`,
+    `?microsoftConsent=error&error=invalid-state&error=other`,
+    `?microsoftConsent=missing-permissions&tenantId=${tenantId}`,
+    `?microsoftConsent=exchange-readonly-error&tenantId=${tenantId}`,
+  ]) {
+    assert.equal(consentMessageFromSearch(query), null)
+  }
+
+  assert.equal(
+    consentMessageFromSearch(
+      `?microsoftConsent=missing-permissions&tenantId=${tenantId}&error=missing-permissions`,
+    )?.result,
+    'missing-permissions',
+  )
+  assert.equal(
+    consentMessageFromSearch('?microsoftConsent=error&error=invalid-state')?.result,
+    'error',
+  )
+})
+
+test('throwing session storage cannot block Exchange or report consent requests', async () => {
+  let exchangeRequests = 0
+  let reportRequests = 0
+  const throwingStorage = {
+    get sessionStorage(): { removeItem: (key: string) => void } {
+      throw new Error('storage disabled')
+    },
+  }
+  const throwingRemove = {
+    sessionStorage: {
+      removeItem: () => {
+        throw new Error('storage write denied')
+      },
+    },
+  }
+
+  await withClearedTenantSetupDismissal(
+    throwingStorage,
+    tenantId,
+    async () => { exchangeRequests += 1 },
+  )
+  await withClearedTenantSetupDismissal(
+    throwingRemove,
+    tenantId,
+    async () => { reportRequests += 1 },
+  )
+
+  assert.equal(exchangeRequests, 1)
+  assert.equal(reportRequests, 1)
+})
+
+test('server-confirmed truth selects the first incomplete actionable step', () => {
+  assert.equal(modalOnboardingStep(state('CONSENT_REQUIRED', 'CONSENT_REQUIRED', 'CHECK_REQUIRED')), 1)
+  assert.equal(modalOnboardingStep(state('ERROR', 'CONSENT_REQUIRED', 'CHECK_REQUIRED')), 1)
+  assert.equal(modalOnboardingStep(state('VERIFIED', 'CONSENT_REQUIRED', 'CHECK_REQUIRED')), 2)
+  assert.equal(modalOnboardingStep(state('VERIFIED', 'RBAC_REQUIRED', 'CHECK_REQUIRED')), 2)
+  assert.equal(modalOnboardingStep(state('VERIFIED', 'VERIFIED', 'CHECK_REQUIRED')), 3)
+  assert.equal(modalOnboardingStep(state('VERIFIED', 'DEFERRED', 'CHECK_REQUIRED')), 3)
+  assert.equal(modalOnboardingStep(state('VERIFIED', 'DEFERRED', 'DEFERRED', true)), 3)
+})
+
+test('progress distinguishes Exchange verification from consent and skip', () => {
+  assert.equal(modalStepStatus(state('VERIFIED', 'CONSENT_REQUIRED', 'CHECK_REQUIRED'), 2), 'Current')
+  assert.equal(modalStepStatus(state('VERIFIED', 'RBAC_REQUIRED', 'CHECK_REQUIRED'), 2), 'Current')
+  assert.equal(modalStepStatus(state('VERIFIED', 'VERIFIED', 'CHECK_REQUIRED'), 2), 'Complete')
+  assert.equal(modalStepStatus(state('VERIFIED', 'DEFERRED', 'CHECK_REQUIRED'), 2), 'Skipped')
+})
+
+test('completion requires refreshed canFinish plus verified report names', () => {
+  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'VERIFIED', 'VERIFIED', true)), true)
+  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'VERIFIED', true)), true)
+  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'DEFERRED', true)), true)
+  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'RBAC_REQUIRED', 'VERIFIED', true)), false)
+  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'VERIFIED', false)), false)
+  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'DEFERRED', false)), false)
+})
+
+test('report skip consumes only a strict refreshed DTO and fails closed', async () => {
+  const deferred = state('VERIFIED', 'DEFERRED', 'DEFERRED', true)
+  let resolveRequest: (value: unknown) => void = () => {
+    throw new Error('request resolver was not initialized')
+  }
+  const pending = deferReportVisibilityWithServerState(
+    () => new Promise((resolve) => { resolveRequest = resolve }),
+    (value) => value as TenantOnboarding,
+  )
+  let committed: TenantOnboarding | null = null
+  void pending.then((value) => { committed = value })
+  await Promise.resolve()
+  assert.equal(committed, null)
+
+  resolveRequest(deferred)
+  const parsed = await pending
+  assert.equal(parsed.steps.reportVisibility.status, 'DEFERRED')
+  assert.equal(modalStepStatus(parsed, 3), 'Skipped')
+  assert.equal(modalOnboardingCanComplete(parsed), true)
+
+  await assert.rejects(
+    deferReportVisibilityWithServerState(async () => {
+      throw new Error('network unavailable')
+    }, (value) => value as TenantOnboarding),
+    /network unavailable/,
+  )
+  await assert.rejects(
+    deferReportVisibilityWithServerState(async () => ({
+      ...deferred,
+      version: 2,
+    }), (value) => {
+      if ((value as { version?: number }).version !== 1) {
+        throw new Error('invalid onboarding version')
+      }
+      return value as TenantOnboarding
+    }),
+  )
+})
+
+test('session dismissal is scoped to the exact tenant', () => {
+  assert.equal(
+    tenantSetupDismissedKey(tenantId),
+    `hawkview:tenant-setup-dismissed:${tenantId}`,
+  )
+})
