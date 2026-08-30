@@ -23,6 +23,27 @@ export type MicrosoftConsentMessage = {
 
 export type ModalOnboardingStep = 1 | 2 | 3
 
+type DialogFocusTarget = {
+  focus: () => void
+  getAttribute?: (name: string) => string | null
+}
+
+type DialogFocusRoot = {
+  querySelectorAll: (selector: string) => ArrayLike<DialogFocusTarget>
+}
+
+type DialogKeyboardEvent = {
+  key: string
+  shiftKey: boolean
+  preventDefault: () => void
+}
+
+type SessionStorageOwner = {
+  readonly sessionStorage: {
+    removeItem: (key: string) => void
+  }
+}
+
 const own = (value: object, key: PropertyKey) =>
   Object.prototype.hasOwnProperty.call(value, key)
 
@@ -67,14 +88,34 @@ export function normalizeMicrosoftConsentMessage(
 
 export function consentMessageFromSearch(search: string) {
   const params = new URLSearchParams(search)
-  const result = params.get('microsoftConsent')
-  if (!result) return null
-  return normalizeMicrosoftConsentMessage({
+  const results = params.getAll('microsoftConsent')
+  const tenantIds = params.getAll('tenantId')
+  const errors = params.getAll('error')
+  if (results.length !== 1 || tenantIds.length > 1 || errors.length > 1) {
+    return null
+  }
+  const result = results[0]
+  const message = normalizeMicrosoftConsentMessage({
     type: MICROSOFT_CONSENT_MESSAGE,
     result,
-    error: params.get('error'),
-    tenantId: params.get('tenantId'),
+    error: errors[0] ?? null,
+    tenantId: tenantIds[0] ?? null,
   })
+  if (!message) return null
+
+  if (message.result === 'success' ||
+      message.result === 'exchange-readonly-consented') {
+    return message.tenantId && errors.length === 0 ? message : null
+  }
+  if (message.result === 'missing-permissions') {
+    return message.tenantId && message.error === 'missing-permissions'
+      ? message
+      : null
+  }
+  if (message.result === 'exchange-readonly-error') {
+    return message.tenantId && message.error ? message : null
+  }
+  return message.error ? message : null
 }
 
 export function consentResultCanOpenSetup(
@@ -89,6 +130,61 @@ export function consentResultCanOpenSetup(
 
 export function tenantSetupDismissedKey(tenantId: string) {
   return `hawkview:tenant-setup-dismissed:${tenantId}`
+}
+
+export async function withClearedTenantSetupDismissal<T>(
+  owner: SessionStorageOwner,
+  tenantId: string,
+  operation: () => Promise<T>,
+) {
+  try {
+    owner.sessionStorage.removeItem(tenantSetupDismissedKey(tenantId))
+  } catch {
+    // Session dismissal is a convenience only and must never block consent.
+  }
+  return operation()
+}
+
+export function handleDialogKeyboardBoundary(input: {
+  event: DialogKeyboardEvent
+  dialog: DialogFocusRoot | null
+  activeElement: unknown
+  closeDisabled: boolean
+  onClose: () => void
+}) {
+  const { event, dialog, activeElement, closeDisabled, onClose } = input
+  if (event.key === 'Escape') {
+    if (!closeDisabled) {
+      event.preventDefault()
+      onClose()
+    }
+    return
+  }
+  if (event.key !== 'Tab' || !dialog) return
+
+  const focusable = Array.from(dialog.querySelectorAll(
+    'button:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
+  )).filter((element) => element.getAttribute?.('aria-hidden') !== 'true')
+  if (focusable.length === 0) {
+    event.preventDefault()
+    return
+  }
+
+  const activeIndex = focusable.indexOf(activeElement as DialogFocusTarget)
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  if (event.shiftKey && activeIndex <= 0) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey &&
+      (activeIndex === -1 || activeIndex === focusable.length - 1)) {
+    event.preventDefault()
+    first.focus()
+  }
+}
+
+export function restoreDialogFocus(target: DialogFocusTarget | null) {
+  target?.focus()
 }
 
 export function tenantSetupCanAutoOpen(

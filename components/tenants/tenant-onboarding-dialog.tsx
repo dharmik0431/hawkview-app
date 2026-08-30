@@ -17,10 +17,12 @@ import {
 import { Button } from '@/components/ui/button'
 import { apiClient } from '@/lib/api/client'
 import {
+  handleDialogKeyboardBoundary,
   modalOnboardingCanComplete,
   modalOnboardingStep,
   modalStepStatus,
-  tenantSetupDismissedKey,
+  restoreDialogFocus,
+  withClearedTenantSetupDismissal,
   type ModalOnboardingStep,
 } from '@/lib/tenants/modal-tenant-onboarding'
 import {
@@ -181,31 +183,20 @@ export function TenantOnboardingDialog({
     return () => {
       window.clearTimeout(focusTimer)
       document.body.style.overflow = previousOverflow
-      priorFocusRef.current?.focus()
+      restoreDialogFocus(priorFocusRef.current)
     }
   }, [open])
 
   useEffect(() => {
     if (!open) return
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        if (!busy) onClose()
-        return
-      }
-      if (event.key !== 'Tab' || !dialogRef.current) return
-      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
-        'button:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
-      )).filter((element) => element.getAttribute('aria-hidden') !== 'true')
-      if (focusable.length === 0) return
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
+      handleDialogKeyboardBoundary({
+        event,
+        dialog: dialogRef.current,
+        activeElement: document.activeElement,
+        closeDisabled: Boolean(busy),
+        onClose,
+      })
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
@@ -216,9 +207,12 @@ export function TenantOnboardingDialog({
     setBusy('exchange-consent')
     setError(null)
     try {
-      window.sessionStorage.removeItem(tenantSetupDismissedKey(tenantId))
-      const raw = await apiClient.post<unknown>(
-        `/api/tenants/${encodeURIComponent(tenantId)}/exchange-readonly/consent`,
+      const raw = await withClearedTenantSetupDismissal(
+        window,
+        tenantId,
+        () => apiClient.post<unknown>(
+          `/api/tenants/${encodeURIComponent(tenantId)}/exchange-readonly/consent`,
+        ),
       )
       const consent = ExchangeReadOnlyConsentResponseSchema.parse(raw)
       window.location.assign(consent.consentUrl)
@@ -282,9 +276,12 @@ export function TenantOnboardingDialog({
     setBusy('report-consent')
     setError(null)
     try {
-      window.sessionStorage.removeItem(tenantSetupDismissedKey(tenantId))
-      const raw = await apiClient.post<unknown>(
-        `/api/tenants/${encodeURIComponent(tenantId)}/microsoft-consent`,
+      const raw = await withClearedTenantSetupDismissal(
+        window,
+        tenantId,
+        () => apiClient.post<unknown>(
+          `/api/tenants/${encodeURIComponent(tenantId)}/microsoft-consent`,
+        ),
       )
       const consent = MicrosoftConsentResponseSchema.parse(raw)
       window.location.assign(consent.consentUrl)

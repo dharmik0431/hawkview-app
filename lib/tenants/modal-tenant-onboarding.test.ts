@@ -12,6 +12,7 @@ import {
   tenantSetupCanAutoOpen,
   tenantSetupDismissedKey,
   tenantSetupReturnPath,
+  withClearedTenantSetupDismissal,
 } from './modal-tenant-onboarding.ts'
 import type { TenantOnboarding } from './tenant-onboarding.ts'
 
@@ -105,6 +106,62 @@ test('popup messages fail closed for hostile, inherited, and future values', () 
     result: 'success',
     tenantId,
   })), null)
+})
+
+test('callback query parameters fail closed when duplicated or inconsistent', () => {
+  for (const query of [
+    `?microsoftConsent=success&microsoftConsent=error&tenantId=${tenantId}`,
+    `?microsoftConsent=success&microsoftConsent=success&tenantId=${tenantId}`,
+    `?microsoftConsent=success&tenantId=${tenantId}&tenantId=${tenantId}`,
+    `?microsoftConsent=success&tenantId=${tenantId}&error=unexpected`,
+    `?microsoftConsent=error&error=invalid-state&error=other`,
+    `?microsoftConsent=missing-permissions&tenantId=${tenantId}`,
+    `?microsoftConsent=exchange-readonly-error&tenantId=${tenantId}`,
+  ]) {
+    assert.equal(consentMessageFromSearch(query), null)
+  }
+
+  assert.equal(
+    consentMessageFromSearch(
+      `?microsoftConsent=missing-permissions&tenantId=${tenantId}&error=missing-permissions`,
+    )?.result,
+    'missing-permissions',
+  )
+  assert.equal(
+    consentMessageFromSearch('?microsoftConsent=error&error=invalid-state')?.result,
+    'error',
+  )
+})
+
+test('throwing session storage cannot block Exchange or report consent requests', async () => {
+  let exchangeRequests = 0
+  let reportRequests = 0
+  const throwingStorage = {
+    get sessionStorage(): { removeItem: (key: string) => void } {
+      throw new Error('storage disabled')
+    },
+  }
+  const throwingRemove = {
+    sessionStorage: {
+      removeItem: () => {
+        throw new Error('storage write denied')
+      },
+    },
+  }
+
+  await withClearedTenantSetupDismissal(
+    throwingStorage,
+    tenantId,
+    async () => { exchangeRequests += 1 },
+  )
+  await withClearedTenantSetupDismissal(
+    throwingRemove,
+    tenantId,
+    async () => { reportRequests += 1 },
+  )
+
+  assert.equal(exchangeRequests, 1)
+  assert.equal(reportRequests, 1)
 })
 
 test('server-confirmed truth selects the first incomplete actionable step', () => {

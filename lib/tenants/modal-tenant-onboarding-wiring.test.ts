@@ -76,12 +76,20 @@ test('dialog provides keyboard, focus, live-region, zoom, and motion safety', ()
   assert.match(dialog, /role="dialog"/)
   assert.match(dialog, /aria-modal="true"/)
   assert.match(dialog, /aria-labelledby="tenant-setup-title"/)
-  assert.match(dialog, /event\.key === 'Escape'/)
-  assert.match(dialog, /event\.key !== 'Tab'/)
-  assert.match(dialog, /priorFocusRef\.current\?\.focus\(\)/)
+  assert.match(dialog, /handleDialogKeyboardBoundary\(\{/)
+  assert.match(dialog, /restoreDialogFocus\(priorFocusRef\.current\)/)
   assert.match(dialog, /aria-live="polite"/)
   assert.match(dialog, /max-h-\[calc\(100dvh-1rem\)\]/)
   assert.match(dialog, /motion-reduce:transition-none/)
+})
+
+test('both consent redirects use best-effort session dismissal storage', () => {
+  assert.equal(
+    (dialog.match(/withClearedTenantSetupDismissal\(/g) ?? []).length,
+    2,
+  )
+  assert.match(dialog, /exchange-readonly\/consent/)
+  assert.match(dialog, /microsoft-consent/)
 })
 
 test('successful callbacks resume the modal while failures retain the fallback route', () => {
