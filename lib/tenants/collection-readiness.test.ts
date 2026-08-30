@@ -20,6 +20,39 @@ test('normalizes a bounded readiness response and preserves useful M365 subscrip
   assert.equal(result?.workloads[0]?.components[0]?.state, 'READY')
   assert.equal(result?.workloads[0]?.components[0]?.lastVerifiedAt, '2026-08-18T11:56:00.000Z')
   assert.equal(readinessLabel('BLOCKED_TENANT_CONFIGURATION'), 'Blocked Tenant Configuration')
+  assert.equal(result?.evidence.riskyIdentities.count, null)
+})
+
+test('normalizes authoritative pilot evidence without turning unavailable counts into zero', () => {
+  const evidence = {
+    version: 1,
+    signIns: { availability: 'CURRENT_LIMITED', coverage: 'LIMITED', selectedSource: 'OFFICE_365_ACTIVITY_FEED', observedAt: '2026-08-18T11:55:00.000Z', reasonCode: 'SIGN_IN_FALLBACK_ACTIVE', reason: 'Current limited evidence.' },
+    riskyIdentities: { availability: 'NOT_LICENSED', count: 99, selectedSource: 'MICROSOFT_IDENTITY_PROTECTION', observedAt: '2026-08-18T11:55:00.000Z', reasonCode: 'SERVICE_PLAN_NOT_ENABLED', reason: 'P2 is not licensed.' },
+    conditionalAccess: { availability: 'READY', count: 0, selectedSource: 'MICROSOFT_GRAPH', observedAt: '2026-08-18T11:55:00.000Z', reasonCode: null, reason: null },
+    securityDefaults: { availability: 'READY', enabled: true, selectedSource: 'MICROSOFT_GRAPH', observedAt: '2026-08-18T11:55:00.000Z', reasonCode: null, reason: null },
+  }
+  const result = normalizeCollectionReadiness({ ...valid, evidence })
+  assert.equal(result?.evidence.signIns.availability, 'CURRENT_LIMITED')
+  assert.equal(result?.evidence.riskyIdentities.count, null)
+  assert.equal(result?.evidence.conditionalAccess.count, 0)
+  assert.equal(result?.evidence.securityDefaults.enabled, true)
+})
+
+test('downgrades claimed ready evidence when the authoritative value or observation is missing', () => {
+  const evidence = {
+    version: 1,
+    signIns: { availability: 'UNVERIFIED', coverage: 'NONE', selectedSource: null, observedAt: null, reasonCode: null, reason: null },
+    riskyIdentities: { availability: 'READY', count: null, selectedSource: 'MICROSOFT_IDENTITY_PROTECTION', observedAt: '2026-08-18T11:55:00.000Z', reasonCode: null, reason: null },
+    conditionalAccess: { availability: 'READY', count: 0, selectedSource: 'MICROSOFT_GRAPH', observedAt: null, reasonCode: null, reason: null },
+    securityDefaults: { availability: 'READY', enabled: null, selectedSource: 'MICROSOFT_GRAPH', observedAt: '2026-08-18T11:55:00.000Z', reasonCode: null, reason: null },
+  }
+  const result = normalizeCollectionReadiness({ ...valid, evidence })
+  assert.equal(result?.evidence.riskyIdentities.availability, 'UNVERIFIED')
+  assert.equal(result?.evidence.riskyIdentities.count, null)
+  assert.equal(result?.evidence.conditionalAccess.availability, 'UNVERIFIED')
+  assert.equal(result?.evidence.conditionalAccess.count, null)
+  assert.equal(result?.evidence.securityDefaults.availability, 'UNVERIFIED')
+  assert.equal(result?.evidence.securityDefaults.enabled, null)
 })
 
 test('preserves the explicit standard least-privilege SharePoint capability boundary without degrading readiness', () => {

@@ -49,6 +49,15 @@ test('keeps the registry bounded, unique, documented, and collector-complete', (
   ])
 })
 
+test('keeps Conditional Access licensing separate from Security Defaults', () => {
+  const conditionalAccess = MICROSOFT_ACCESS_CAPABILITIES.find((capability) => capability.key === 'entra_conditional_access')
+  const securityDefaults = MICROSOFT_ACCESS_CAPABILITIES.find((capability) => capability.key === 'entra_security_defaults')
+  assert.equal(conditionalAccess?.licensePrerequisite, 'ENTRA_ID_P1_OR_P2')
+  assert.deepEqual(conditionalAccess?.resourceTypes, ['CONDITIONAL_ACCESS', 'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS'])
+  assert.equal(securityDefaults?.licensePrerequisite, 'NONE')
+  assert.deepEqual(securityDefaults?.resourceTypes, ['SECURITY_DEFAULTS'])
+})
+
 test('matches current high-risk collector endpoints without retired SharePoint drive calls', () => {
   const endpoints = MICROSOFT_ACCESS_CAPABILITIES.flatMap((capability) => [...capability.endpointPatterns])
   assert.equal(endpoints.some((endpoint) => endpoint.includes('/sites/{siteId}/drive')), false)

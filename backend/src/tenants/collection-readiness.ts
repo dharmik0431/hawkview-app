@@ -137,6 +137,43 @@ export type CollectionReadiness = {
   permissionVerifiedAt: string | null
   evaluatedAt: string
   workloads: CollectionReadinessRow[]
+  evidence: PilotEvidenceProjection
+}
+
+export type PilotEvidenceProjection = {
+  version: 1
+  signIns: {
+    availability: CollectionReadinessState | 'CURRENT_LIMITED'
+    coverage: 'FULL' | 'LIMITED' | 'NONE'
+    selectedSource: 'MICROSOFT_GRAPH' | 'OFFICE_365_ACTIVITY_FEED' | null
+    observedAt: string | null
+    reasonCode: string | null
+    reason: string | null
+  }
+  riskyIdentities: {
+    availability: CollectionReadinessState
+    count: number | null
+    selectedSource: 'MICROSOFT_IDENTITY_PROTECTION'
+    observedAt: string | null
+    reasonCode: string | null
+    reason: string | null
+  }
+  conditionalAccess: {
+    availability: CollectionReadinessState
+    count: number | null
+    selectedSource: 'MICROSOFT_GRAPH'
+    observedAt: string | null
+    reasonCode: string | null
+    reason: string | null
+  }
+  securityDefaults: {
+    availability: CollectionReadinessState
+    enabled: boolean | null
+    selectedSource: 'MICROSOFT_GRAPH'
+    observedAt: string | null
+    reasonCode: string | null
+    reason: string | null
+  }
 }
 
 type ReadinessInput = {
@@ -150,6 +187,7 @@ type ReadinessInput = {
   /** Compact field-state proofs; tenant-list reads never load the report-row snapshot. */
   sharePointUsageProjectionEvidence?: MicrosoftUsageSourceProjectionEvidence | null
   oneDriveUsageProjectionEvidence?: MicrosoftUsageSourceProjectionEvidence | null
+  evidenceSnapshots?: Array<{ resourceType: string; payload: unknown; observedAt: Date }>
   now?: Date
 }
 
@@ -756,6 +794,76 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     }
   }
 
+  const snapshotByResource = new Map<string, NonNullable<ReadinessInput['evidenceSnapshots']>[number]>()
+  for (const snapshot of input.evidenceSnapshots ?? []) {
+    const selected = snapshotByResource.get(snapshot.resourceType)
+    if (!selected || snapshot.observedAt.getTime() > selected.observedAt.getTime()) {
+      snapshotByResource.set(snapshot.resourceType, snapshot)
+    }
+  }
+  const dataset = (workloadKey: string, datasetKey: string) =>
+    rows.find((row) => row.key === workloadKey)?.datasets?.find((candidate) => candidate.key === datasetKey)
+  const signInDataset = dataset('sign_ins', signInEntitlement === 'NON_PREMIUM' ? 'entra_sign_ins_activity_feed' : 'entra_sign_ins_graph')
+  const signInSync = states.get('SIGN_INS')
+  const fallbackSelected = /sign-ins-.*fallback-active/.test(signInSync?.lastErrorCode ?? '') && Boolean(signInSync?.lastSuccessfulAt)
+  const fallbackRunning = fallbackSelected && signInSync?.status === 'RUNNING'
+  const fallbackCurrent = fallbackRunning && signInSync?.lastSuccessfulAt
+    ? now.getTime() - signInSync.lastSuccessfulAt.getTime() <= 2 * 60 * 60 * 1000
+    : false
+  const riskyDataset = dataset('entra_identity_protection', 'entra_identity_protection_risky_users')
+  const conditionalAccessDataset = dataset('entra_security_configuration', 'entra_conditional_access')
+  const securityDefaultsDataset = dataset('entra_security_configuration', 'entra_security_defaults')
+  const riskySnapshot = snapshotByResource.get('RISKY_USERS')
+  const conditionalAccessSnapshot = snapshotByResource.get('CONDITIONAL_ACCESS')
+  const securityDefaultsSnapshot = snapshotByResource.get('SECURITY_DEFAULTS')
+  const riskyRows = Array.isArray(riskySnapshot?.payload) ? riskySnapshot.payload : null
+  const conditionalAccessRows = Array.isArray(conditionalAccessSnapshot?.payload) ? conditionalAccessSnapshot.payload : null
+  const securityDefaultsRows = Array.isArray(securityDefaultsSnapshot?.payload) ? securityDefaultsSnapshot.payload : null
+  const securityDefaultsValue = securityDefaultsRows?.[0]
+  const riskyEvidenceReady = riskyDataset?.state === 'READY' && riskyRows !== null && Boolean(riskySnapshot?.observedAt)
+  const conditionalAccessEvidenceReady = conditionalAccessDataset?.state === 'READY' && conditionalAccessRows !== null && Boolean(conditionalAccessSnapshot?.observedAt)
+  const securityDefaultsEnabled = securityDefaultsValue && typeof securityDefaultsValue === 'object' && typeof (securityDefaultsValue as { isEnabled?: unknown }).isEnabled === 'boolean'
+    ? (securityDefaultsValue as { isEnabled: boolean }).isEnabled
+    : null
+  const securityDefaultsEvidenceReady = securityDefaultsDataset?.state === 'READY' && securityDefaultsEnabled !== null && Boolean(securityDefaultsSnapshot?.observedAt)
+  const evidenceUnavailable = (state: CollectionReadinessState | undefined, ready: boolean) =>
+    state === 'READY' && !ready
+  const evidence: PilotEvidenceProjection = {
+    version: 1,
+    signIns: {
+      availability: fallbackCurrent ? 'CURRENT_LIMITED' : fallbackRunning ? 'STALE' : signInDataset?.state ?? 'UNVERIFIED',
+      coverage: fallbackSelected || signInEntitlement === 'NON_PREMIUM' ? 'LIMITED' : signInDataset?.state === 'READY' ? 'FULL' : 'NONE',
+      selectedSource: fallbackSelected || signInEntitlement === 'NON_PREMIUM' ? 'OFFICE_365_ACTIVITY_FEED' : signInEntitlement === 'PREMIUM' ? 'MICROSOFT_GRAPH' : null,
+      observedAt: fallbackSelected ? iso(signInSync?.lastSuccessfulAt) : signInDataset?.lastSuccessfulAt ?? null,
+      reasonCode: fallbackCurrent ? signInSync?.lastErrorCode ?? 'SIGN_IN_FALLBACK_ACTIVE' : fallbackRunning ? 'SIGN_IN_FALLBACK_STALE' : signInDataset?.reasonCode ?? null,
+      reason: fallbackCurrent ? safeReason(signInSync?.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' : fallbackRunning ? 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' : signInDataset?.reason ?? null,
+    },
+    riskyIdentities: {
+      availability: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'UNVERIFIED' : riskyDataset?.state ?? 'UNVERIFIED',
+      count: riskyEvidenceReady ? riskyRows.length : null,
+      selectedSource: 'MICROSOFT_IDENTITY_PROTECTION',
+      observedAt: riskyEvidenceReady ? iso(riskySnapshot?.observedAt) : null,
+      reasonCode: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : riskyDataset?.reasonCode ?? null,
+      reason: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'Current Microsoft Identity Protection evidence is unavailable.' : riskyDataset?.reason ?? null,
+    },
+    conditionalAccess: {
+      availability: evidenceUnavailable(conditionalAccessDataset?.state, conditionalAccessEvidenceReady) ? 'UNVERIFIED' : conditionalAccessDataset?.state ?? 'UNVERIFIED',
+      count: conditionalAccessEvidenceReady ? conditionalAccessRows.length : null,
+      selectedSource: 'MICROSOFT_GRAPH',
+      observedAt: conditionalAccessEvidenceReady ? iso(conditionalAccessSnapshot?.observedAt) : null,
+      reasonCode: evidenceUnavailable(conditionalAccessDataset?.state, conditionalAccessEvidenceReady) ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : conditionalAccessDataset?.reasonCode ?? null,
+      reason: evidenceUnavailable(conditionalAccessDataset?.state, conditionalAccessEvidenceReady) ? 'Current Conditional Access evidence is unavailable.' : conditionalAccessDataset?.reason ?? null,
+    },
+    securityDefaults: {
+      availability: evidenceUnavailable(securityDefaultsDataset?.state, securityDefaultsEvidenceReady) ? 'UNVERIFIED' : securityDefaultsDataset?.state ?? 'UNVERIFIED',
+      enabled: securityDefaultsEvidenceReady ? securityDefaultsEnabled : null,
+      selectedSource: 'MICROSOFT_GRAPH',
+      observedAt: securityDefaultsEvidenceReady ? iso(securityDefaultsSnapshot?.observedAt) : null,
+      reasonCode: evidenceUnavailable(securityDefaultsDataset?.state, securityDefaultsEvidenceReady) ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : securityDefaultsDataset?.reasonCode ?? null,
+      reason: evidenceUnavailable(securityDefaultsDataset?.state, securityDefaultsEvidenceReady) ? 'Current Security Defaults evidence is unavailable.' : securityDefaultsDataset?.reason ?? null,
+    },
+  }
+
   const overall = selectedWorst(rows)!
   return {
     version: 1,
@@ -768,5 +876,6 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     permissionVerifiedAt: iso(input.connectionVerifiedAt),
     evaluatedAt: now.toISOString(),
     workloads: rows,
+    evidence,
   }
 }

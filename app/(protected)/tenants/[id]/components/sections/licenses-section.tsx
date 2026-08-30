@@ -21,6 +21,7 @@ import {
   User,
   Layers,
 } from 'lucide-react'
+import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 
 export type LicenseStatus =
   | 'Available'
@@ -82,6 +83,7 @@ interface LicensesSectionProps {
   tenant?: any
   bundle?: any
   domains?: string[] | any[]
+  securityDefaultsEvidence?: PilotEvidenceView['securityDefaults'] | null
 }
 
 export default function LicensesSection({
@@ -92,6 +94,7 @@ export default function LicensesSection({
   tenant,
   bundle,
   domains = [],
+  securityDefaultsEvidence,
 }: LicensesSectionProps) {
   const syncCompleted =
     syncCompletedProp !== undefined
@@ -122,6 +125,10 @@ export default function LicensesSection({
 
   // (b) Security Defaults (On, Off, or Awaiting collection)
   const securityDefaultsState = useMemo<'On' | 'Off' | 'Awaiting collection'>(() => {
+    if (isMicrosoft) {
+      if (securityDefaultsEvidence?.availability !== 'READY' || securityDefaultsEvidence.enabled === null) return 'Awaiting collection'
+      return securityDefaultsEvidence.enabled ? 'On' : 'Off'
+    }
     if (!syncCompleted) return 'Awaiting collection'
     const sd =
       bundle?.securityDefaults ??
@@ -152,7 +159,7 @@ export default function LicensesSection({
         return 'Off'
     }
     return 'Awaiting collection'
-  }, [bundle, tenant, syncCompleted])
+  }, [bundle, isMicrosoft, securityDefaultsEvidence, tenant, syncCompleted])
 
   // (c) Tenant Domains (verified count & total count)
   const domainMetrics = useMemo(() => {
