@@ -24,6 +24,10 @@ import {
   type TenantOnboarding,
 } from '@/lib/tenants/tenant-onboarding'
 import {
+  executeReportVisibilityVerification,
+  type ReportVerificationFeedback,
+} from '@/lib/tenants/report-visibility-verification'
+import {
   ExchangeReadOnlyConsentResponseSchema,
   ExchangeReadOnlySetupSchema,
   ExchangeReadOnlyVerificationSchema,
@@ -55,6 +59,24 @@ const statusLabel = (status: string) => status === 'VERIFIED'
           ? 'Needs attention'
           : 'Action required'
 
+const formatLastChecked = (value: string | null) => {
+  if (!value) return 'Not checked yet'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? 'Not reported'
+    : new Intl.DateTimeFormat(undefined, {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      }).format(date)
+}
+
+const reportFeedbackClasses: Record<ReportVerificationFeedback['tone'], string> = {
+  info: 'border-blue-200 bg-blue-50 text-blue-900',
+  success: 'border-emerald-200 bg-emerald-50 text-emerald-900',
+  warning: 'border-amber-200 bg-amber-50 text-amber-950',
+  error: 'border-red-200 bg-red-50 text-red-900',
+}
+
 export default function TenantOnboardingPage() {
   const params = useParams<{ id: string }>()
   const router = useRouter()
@@ -65,6 +87,7 @@ export default function TenantOnboardingPage() {
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState<BusyAction>(null)
   const [copied, setCopied] = useState(false)
+  const [reportFeedback, setReportFeedback] = useState<ReportVerificationFeedback | null>(null)
   const loadGeneration = useRef(0)
 
   const loadState = useCallback(async () => {
@@ -172,22 +195,29 @@ export default function TenantOnboardingPage() {
     await loadState()
   })
 
-  const verifyReportVisibility = () => run('report-verify', async () => {
-    const raw = await apiClient.post<unknown>(
-      `/api/tenants/${encodeURIComponent(tenantId)}/onboarding/report-visibility/verify`,
-    )
-    const result = ReportVisibilityVerificationSchema.parse(raw)
-    setState(result.onboarding)
-    if (result.verification.status === 'READY') {
-      setNotice('Microsoft confirms identifiable report names are available.')
-    } else if (result.verification.status === 'IDENTIFIERS_CONCEALED') {
-      setError('Microsoft still reports that names are concealed. Save the setting in Microsoft 365, wait a few minutes, then verify again.')
-    } else if (result.verification.status === 'MISSING_PERMISSION') {
-      setError('ReportSettings.Read.All has not been granted to HawkView. Re-authorize Microsoft access, then retry this check.')
-    } else {
-      setError(`Microsoft could not verify the report setting (${result.verification.status}). ${result.verification.retryable ? 'Retry in a moment.' : 'Review Microsoft access.'}`)
+  const verifyReportVisibility = async () => {
+    if (busy !== null) return
+    setBusy('report-verify')
+    setError(null)
+    setNotice(null)
+    try {
+      const result = await executeReportVisibilityVerification({
+        request: async () => {
+          const raw = await apiClient.post<unknown>(
+            `/api/tenants/${encodeURIComponent(tenantId)}/onboarding/report-visibility/verify`,
+          )
+          return ReportVisibilityVerificationSchema.parse(raw)
+        },
+        onFeedback: setReportFeedback,
+      })
+      setState(result.onboarding)
+    } catch {
+      // The helper publishes a safe, status-specific inline failure. Raw
+      // provider and backend errors must never be rendered on this page.
+    } finally {
+      setBusy(null)
     }
-  })
+  }
 
   const deferReport = () => run('report-defer', async () => {
     const raw = await apiClient.post<unknown>(
@@ -281,14 +311,39 @@ export default function TenantOnboardingPage() {
 
           <section className={`rounded-2xl border bg-white p-5 shadow-sm dark:bg-slate-900 ${next === 'reportVisibility' ? 'border-blue-400 ring-2 ring-blue-100' : 'border-slate-200 dark:border-slate-800'}`}>
             <div className="flex items-start gap-3"><Circle className="mt-0.5 h-5 w-5 text-violet-600" /><div><h2 className="font-bold text-slate-950 dark:text-white">3. Show names in Microsoft 365 usage reports</h2><p className="mt-1 text-sm text-slate-600 dark:text-slate-400">Without this Microsoft setting, site and user identifiers are concealed and HawkView cannot match report activity to discovered SharePoint sites.</p></div></div>
-            <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700"><p>{state.steps.reportVisibility.disclaimer}</p><p className="mt-2 font-semibold">{state.steps.reportVisibility.settingPath.join(' → ')}</p><p className="mt-1">Enable: “{state.steps.reportVisibility.settingLabel}”</p></div>
+            <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+              <p>{state.steps.reportVisibility.disclaimer}</p>
+              <p className="mt-2 font-semibold">{state.steps.reportVisibility.settingPath.join(' → ')}</p>
+              <p className="mt-1">In Microsoft 365, <strong>UNCHECK</strong> “{state.steps.reportVisibility.settingLabel},” then <strong>Save</strong>.</p>
+              <p className="mt-2 text-xs text-slate-600">Microsoft permission and setting changes may take a few minutes to propagate. HawkView only reads this setting; it never changes it.</p>
+            </div>
             <div className="mt-4 flex flex-wrap gap-2">
               {state.steps.reportVisibility.status === 'PERMISSION_REQUIRED' ? <Button disabled={busy !== null} onClick={() => void beginCoreConsent()}>Grant read-only setting verification</Button> : <>
                 <Button asChild variant="outline"><a href={state.steps.reportVisibility.adminCenterUrl} target="_blank" rel="noopener noreferrer">Open Microsoft 365 settings <ExternalLink className="ml-2 h-4 w-4" /></a></Button>
-                <Button disabled={busy !== null} onClick={() => void verifyReportVisibility()}>{busy === 'report-verify' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}Verify setting</Button>
+                <Button
+                  disabled={busy !== null}
+                  aria-busy={busy === 'report-verify'}
+                  onClick={() => void verifyReportVisibility()}
+                >
+                  {busy === 'report-verify' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                  {busy === 'report-verify' ? 'Checking Microsoft…' : 'Verify setting'}
+                </Button>
               </>}
               {state.steps.reportVisibility.status !== 'VERIFIED' && <Button variant="ghost" disabled={busy !== null} onClick={() => void deferReport()}>Finish later</Button>}
             </div>
+            <p className="mt-3 text-xs text-slate-500">
+              Last checked with Microsoft: {formatLastChecked(reportFeedback?.checkedAt ?? state.steps.reportVisibility.lastCheckedAt)}
+            </p>
+            {reportFeedback && (
+              <div
+                role={reportFeedback.tone === 'error' || reportFeedback.tone === 'warning' ? 'alert' : 'status'}
+                aria-live="polite"
+                className={`mt-3 rounded-xl border p-4 text-sm ${reportFeedbackClasses[reportFeedback.tone]}`}
+              >
+                <p className="font-semibold">{reportFeedback.title}</p>
+                <p className="mt-1">{reportFeedback.message}</p>
+              </div>
+            )}
           </section>
 
           <div className="flex flex-col gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-5 sm:flex-row sm:items-center sm:justify-between">

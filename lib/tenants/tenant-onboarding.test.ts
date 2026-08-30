@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { onboardingNextStep, TenantOnboardingSchema } from './tenant-onboarding.ts'
+
+const onboardingPage = readFileSync(
+  new URL('../../app/(protected)/tenants/[id]/onboarding/page.tsx', import.meta.url),
+  'utf8',
+)
 
 const base = {
   version: 1,
@@ -32,7 +38,7 @@ const base = {
       permission: 'ReportSettings.Read.All',
       adminCenterUrl: 'https://admin.microsoft.com/#/Settings/Services',
       settingPath: ['Settings', 'Org settings', 'Services', 'Reports'],
-      settingLabel: 'Display concealed user, group, and site names in all reports',
+      settingLabel: 'Conceal user, group, and site names in all reports',
       disclaimer: 'HawkView cannot change it.',
     },
   },
@@ -54,4 +60,12 @@ test('strict onboarding contract resumes at the first unresolved step', () => {
 test('unknown fields and future contract versions fail closed', () => {
   assert.throws(() => TenantOnboardingSchema.parse({ ...base, version: 2 }))
   assert.throws(() => TenantOnboardingSchema.parse({ ...base, unexpected: true }))
+})
+
+test('report-setting verification has immediate inline feedback and correct read-only instructions', () => {
+  assert.match(onboardingPage, /Checking Microsoft/)
+  assert.match(onboardingPage, /aria-busy=/)
+  assert.match(onboardingPage, /Last checked with Microsoft/)
+  assert.match(onboardingPage, /UNCHECK/)
+  assert.doesNotMatch(onboardingPage, /Enable: “/)
 })

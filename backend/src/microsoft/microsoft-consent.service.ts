@@ -694,7 +694,16 @@ export class MicrosoftConsentService {
           retryable: response.status === 429 || response.status >= 500,
         }
       }
-      const body = await response.json() as { displayConcealedNames?: unknown }
+      let body: { displayConcealedNames?: unknown }
+      try {
+        body = await response.json() as { displayConcealedNames?: unknown }
+      } catch {
+        return {
+          status: 'INVALID_RESPONSE' as const,
+          identifiersVisible: null,
+          retryable: true,
+        }
+      }
       if (typeof body.displayConcealedNames !== 'boolean') {
         return {
           status: 'INVALID_RESPONSE' as const,
