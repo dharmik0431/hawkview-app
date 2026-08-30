@@ -5,6 +5,7 @@ import {
   MICROSOFT_CONSENT_MESSAGE,
   consentMessageFromSearch,
   consentResultCanOpenSetup,
+  deferReportVisibilityWithServerState,
   modalOnboardingCanComplete,
   modalOnboardingStep,
   modalStepStatus,
@@ -184,9 +185,49 @@ test('progress distinguishes Exchange verification from consent and skip', () =>
 test('completion requires refreshed canFinish plus verified report names', () => {
   assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'VERIFIED', 'VERIFIED', true)), true)
   assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'VERIFIED', true)), true)
+  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'DEFERRED', true)), true)
   assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'RBAC_REQUIRED', 'VERIFIED', true)), false)
-  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'DEFERRED', true)), false)
   assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'VERIFIED', false)), false)
+  assert.equal(modalOnboardingCanComplete(state('VERIFIED', 'DEFERRED', 'DEFERRED', false)), false)
+})
+
+test('report skip consumes only a strict refreshed DTO and fails closed', async () => {
+  const deferred = state('VERIFIED', 'DEFERRED', 'DEFERRED', true)
+  let resolveRequest: (value: unknown) => void = () => {
+    throw new Error('request resolver was not initialized')
+  }
+  const pending = deferReportVisibilityWithServerState(
+    () => new Promise((resolve) => { resolveRequest = resolve }),
+    (value) => value as TenantOnboarding,
+  )
+  let committed: TenantOnboarding | null = null
+  void pending.then((value) => { committed = value })
+  await Promise.resolve()
+  assert.equal(committed, null)
+
+  resolveRequest(deferred)
+  const parsed = await pending
+  assert.equal(parsed.steps.reportVisibility.status, 'DEFERRED')
+  assert.equal(modalStepStatus(parsed, 3), 'Skipped')
+  assert.equal(modalOnboardingCanComplete(parsed), true)
+
+  await assert.rejects(
+    deferReportVisibilityWithServerState(async () => {
+      throw new Error('network unavailable')
+    }, (value) => value as TenantOnboarding),
+    /network unavailable/,
+  )
+  await assert.rejects(
+    deferReportVisibilityWithServerState(async () => ({
+      ...deferred,
+      version: 2,
+    }), (value) => {
+      if ((value as { version?: number }).version !== 1) {
+        throw new Error('invalid onboarding version')
+      }
+      return value as TenantOnboarding
+    }),
+  )
 })
 
 test('session dismissal is scoped to the exact tenant', () => {

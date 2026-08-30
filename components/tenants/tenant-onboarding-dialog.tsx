@@ -17,6 +17,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { apiClient } from '@/lib/api/client'
 import {
+  deferReportVisibilityWithServerState,
   handleDialogKeyboardBoundary,
   modalOnboardingCanComplete,
   modalOnboardingStep,
@@ -49,6 +50,7 @@ type BusyAction =
   | 'exchange-skip'
   | 'report-consent'
   | 'report-verify'
+  | 'report-skip'
   | 'complete'
   | null
 
@@ -316,6 +318,31 @@ export function TenantOnboardingDialog({
     }
   }
 
+  const skipReportSetting = async () => {
+    if (!tenantId) return
+    setBusy('report-skip')
+    setError(null)
+    try {
+      const parsed = await deferReportVisibilityWithServerState(
+        () => apiClient.post<unknown>(
+          `/api/tenants/${encodeURIComponent(tenantId)}/onboarding/report-visibility/defer`,
+        ),
+        (value) => TenantOnboardingSchema.parse(value),
+      )
+      setState(parsed)
+      setReportFeedback(null)
+      if (parsed.steps.reportVisibility.status === 'DEFERRED') {
+        setStatusMessage('Named Microsoft 365 report attribution was skipped for now. Core inventory and security collection remain available.')
+      } else {
+        setStatusMessage('HawkView preserved the existing verified report setting.')
+      }
+    } catch {
+      setError('HawkView could not save the report-setting skip choice. Nothing was marked complete; retry or finish later.')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const completeSetup = async () => {
     if (!tenantId) return
     setBusy('complete')
@@ -351,6 +378,7 @@ export function TenantOnboardingDialog({
 
   const exchangeStatus = state?.steps.exchangeReadOnly.status ?? null
   const reportStatus = state?.steps.reportVisibility.status ?? null
+  const reportResolved = reportStatus === 'VERIFIED' || reportStatus === 'DEFERRED'
   const canComplete = state ? modalOnboardingCanComplete(state) : false
 
   return (
@@ -521,32 +549,59 @@ export function TenantOnboardingDialog({
                 <p className="text-sm leading-6 text-slate-600 dark:text-slate-300">
                   Identifiable names let HawkView match Microsoft usage reports to discovered users and SharePoint sites. HawkView can read this setting but cannot change it.
                 </p>
+                <p className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm leading-6 text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
+                  This step is optional. If you skip it, HawkView core inventory and security collection continue, but named Microsoft 365 usage and report attribution may remain limited until the setting is enabled and verified.
+                </p>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
                   <p className="font-semibold">{state.steps.reportVisibility.settingPath.join(' → ')}</p>
                   <p className="mt-2">In Microsoft 365, <strong>UNCHECK</strong> “{state.steps.reportVisibility.settingLabel},” then <strong>Save</strong>.</p>
                   <p className="mt-2 text-xs">Microsoft permission and setting changes may take a few minutes to propagate.</p>
                 </div>
+                {reportStatus === 'DEFERRED' && (
+                  <div role="status" className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
+                    Skipped for now. You can resume this setting from the full setup page later.
+                  </div>
+                )}
                 <div className="flex flex-wrap gap-2">
-                  {reportStatus === 'PERMISSION_REQUIRED' ? (
-                    <Button type="button" disabled={Boolean(busy)} onClick={() => void startReportConsent()}>
-                      {busy === 'report-consent' && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
-                      Re-consent Microsoft access
-                    </Button>
-                  ) : canComplete ? (
+                  {canComplete ? (
                     <Button type="button" disabled={Boolean(busy)} onClick={() => void completeSetup()}>
                       {busy === 'complete' && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
                       Finish setup
                     </Button>
-                  ) : (
-                    <Button
-                      type="button"
-                      aria-busy={busy === 'report-verify'}
-                      disabled={Boolean(busy)}
-                      onClick={() => void verifyReportSetting()}
-                    >
-                      {busy === 'report-verify' ? <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <RefreshCw className="mr-2 h-4 w-4" aria-hidden="true" />}
-                      {busy === 'report-verify' ? 'Checking Microsoft…' : 'Verify setting'}
+                  ) : reportResolved ? (
+                    <Button type="button" variant="outline" disabled={Boolean(busy)} onClick={() => void loadState()}>
+                      <RefreshCw className="mr-2 h-4 w-4" aria-hidden="true" />
+                      Refresh completion status
                     </Button>
+                  ) : (
+                    <>
+                      {reportStatus === 'PERMISSION_REQUIRED' && (
+                        <Button type="button" disabled={Boolean(busy)} onClick={() => void startReportConsent()}>
+                          {busy === 'report-consent' && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+                          Re-consent Microsoft access
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        variant={reportStatus === 'PERMISSION_REQUIRED' ? 'outline' : 'default'}
+                        aria-busy={busy === 'report-verify'}
+                        disabled={Boolean(busy)}
+                        onClick={() => void verifyReportSetting()}
+                      >
+                        {busy === 'report-verify' ? <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <RefreshCw className="mr-2 h-4 w-4" aria-hidden="true" />}
+                        {busy === 'report-verify' ? 'Checking Microsoft…' : 'Verify setting'}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        aria-busy={busy === 'report-skip'}
+                        disabled={Boolean(busy)}
+                        onClick={() => void skipReportSetting()}
+                      >
+                        {busy === 'report-skip' && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+                        Skip for now
+                      </Button>
+                    </>
                   )}
                   <Button asChild variant="outline">
                     <a href={state.steps.reportVisibility.adminCenterUrl} target="_blank" rel="noopener noreferrer">

@@ -145,6 +145,13 @@ export async function withClearedTenantSetupDismissal<T>(
   return operation()
 }
 
+export async function deferReportVisibilityWithServerState<T>(
+  request: () => Promise<unknown>,
+  parse: (value: unknown) => T,
+): Promise<T> {
+  return parse(await request())
+}
+
 export function handleDialogKeyboardBoundary(input: {
   event: DialogKeyboardEvent
   dialog: DialogFocusRoot | null
@@ -206,7 +213,7 @@ export function modalOnboardingCanComplete(state: TenantOnboarding) {
   return state.canFinish &&
     state.steps.microsoftAccess.status === 'VERIFIED' &&
     ['VERIFIED', 'DEFERRED'].includes(state.steps.exchangeReadOnly.status) &&
-    state.steps.reportVisibility.status === 'VERIFIED'
+    ['VERIFIED', 'DEFERRED'].includes(state.steps.reportVisibility.status)
 }
 
 export function modalStepStatus(
@@ -226,6 +233,7 @@ export function modalStepStatus(
     return active === 2 ? 'Current' : 'Not started'
   }
   if (state.steps.reportVisibility.status === 'VERIFIED') return 'Complete'
+  if (state.steps.reportVisibility.status === 'DEFERRED') return 'Skipped'
   return active === 3 ? 'Current' : 'Not started'
 }
 

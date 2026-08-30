@@ -45,14 +45,20 @@ test('Exchange consent, RBAC verification, and skip remain distinct', () => {
   assert.match(dialog, /ExchangeReadOnlyVerificationSchema\.parse\(raw\)[\s\S]*?loadState\(false\)/)
 })
 
-test('report verification reuses safe feedback and has no primary report skip', () => {
+test('report verification and optional skip consume strict server state', () => {
   assert.match(dialog, /executeReportVisibilityVerification/)
   assert.match(dialog, /ReportVisibilityVerificationSchema\.parse\(raw\)/)
   assert.match(dialog, /Re-consent Microsoft access/)
   assert.match(dialog, /Checking Microsoft…/)
   assert.match(dialog, /Last checked with Microsoft/)
   assert.match(dialog, /UNCHECK/)
-  assert.doesNotMatch(dialog, /report-visibility\/defer/)
+  assert.match(dialog, /report-visibility\/defer/)
+  assert.match(dialog, /deferReportVisibilityWithServerState/)
+  assert.match(dialog, /setState\(parsed\)/)
+  assert.match(dialog, /Nothing was marked complete/)
+  assert.match(dialog, /core inventory and security collection continue/)
+  assert.match(dialog, /named Microsoft 365 usage and report attribution may remain limited/)
+  assert.match(dialog, /Skip for now/)
 })
 
 test('final completion is gated by a fresh DTO and verified report state', () => {
@@ -61,6 +67,12 @@ test('final completion is gated by a fresh DTO and verified report state', () =>
   const completion = dialog.indexOf('/onboarding/complete')
   assert.ok(refresh >= 0 && gate > refresh && completion > gate)
   assert.match(dialog, /if \(!completed\.completedAt\)/)
+})
+
+test('report skip and modal Finish later remain distinct actions', () => {
+  assert.match(dialog, /onClick=\{\(\) => void skipReportSetting\(\)\}/)
+  assert.match(dialog, /onClick=\{onClose\}>Finish later/)
+  assert.equal((dialog.match(/report-visibility\/defer/g) ?? []).length, 1)
 })
 
 test('close is session-bounded while visible resume controls remain', () => {
