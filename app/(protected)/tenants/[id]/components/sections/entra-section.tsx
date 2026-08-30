@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { ShieldCheck, Search, Settings2, ChevronRight } from 'lucide-react'
+import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 
 type CaPolicyOrigin = 'MICROSOFT_TEMPLATE' | 'MICROSOFT_ENFORCED' | 'CUSTOM'
 type CaPolicyState = 'ON' | 'REPORT_ONLY' | 'OFF'
@@ -56,9 +57,11 @@ function accentBar(p: CaPolicy) {
 
 export default function EntraSection({
   policies,
+  evidence,
   onPolicyClick,
 }: {
   policies: CaPolicy[]
+  evidence: PilotEvidenceView | null
   onPolicyClick: (p: CaPolicy) => void
 }) {
   const [query, setQuery] = useState('')
@@ -95,10 +98,31 @@ export default function EntraSection({
     })
   }, [policies, query, originFilter, stateFilter])
 
+  const conditionalAccessEmptyMessage = useMemo(() => {
+    if (policies.length > 0) return null
+    const state = evidence?.conditionalAccess.availability
+    if (state === 'READY' && evidence?.conditionalAccess.count === 0) {
+      return { title: 'No Conditional Access policies found', detail: 'Microsoft returned a current, empty Conditional Access policy list.' }
+    }
+    if (state === 'NOT_LICENSED') {
+      return { title: 'Conditional Access is not licensed for this tenant', detail: 'The current Microsoft service-plan evidence does not include the Entra ID licensing required for Conditional Access.' }
+    }
+    if (state === 'BLOCKED_PERMISSION') {
+      return { title: 'Conditional Access evidence is unavailable', detail: 'Policy.Read.All is missing or has not been granted tenant-wide administrator consent.' }
+    }
+    return { title: 'Conditional Access evidence is unavailable', detail: evidence?.conditionalAccess.reason ?? 'HawkView does not have current authoritative Conditional Access evidence.' }
+  }, [evidence, policies.length])
+
   return (
     <Card className="rounded-2xl mt-5 shadow-sm bg-white dark:bg-slate-900">
       <CardContent className="p-0">
         <div className="px-6 pt-6">
+          {evidence?.securityDefaults.enabled === true && (
+            <div className="mb-4 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900" role="status">
+              <div className="font-semibold">Security Defaults is on</div>
+              <div className="mt-1 text-emerald-800">This is a separate Microsoft tenant control. It does not prove Conditional Access policy coverage or universal MFA enforcement.</div>
+            </div>
+          )}
           <div className="flex items-start justify-between gap-4">
             <div className="flex items-start gap-3">
               <div className="mt-0.5 flex h-10 w-10 items-center justify-center rounded-xl bg-muted/20 border">
@@ -246,7 +270,12 @@ export default function EntraSection({
           >
             {filtered.length === 0 ? (
               <div className="px-6 py-8 text-sm text-muted-foreground">
-                No policies match your search/filters.
+                {policies.length === 0 && conditionalAccessEmptyMessage ? (
+                  <div role="status">
+                    <div className="font-semibold text-slate-900 dark:text-white">{conditionalAccessEmptyMessage.title}</div>
+                    <div className="mt-1">{conditionalAccessEmptyMessage.detail}</div>
+                  </div>
+                ) : 'No policies match your search/filters.'}
               </div>
             ) : (
               filtered.map((p) => (

@@ -22,7 +22,7 @@ const datasetTiers = new Set(['CORE', 'CAPABILITY_OPTIONAL', 'FALLBACK'])
 const datasetPermissionStatuses = new Set(['CONFIRMED', 'MISSING', 'UNVERIFIED', 'NOT_APPLICABLE'])
 const permissionResources = new Set(['MICROSOFT_GRAPH', 'OFFICE_365_MANAGEMENT_API', 'EXCHANGE_ONLINE'])
 const permissionConsentModes = new Set(['DEFAULT', 'SEPARATE_OPT_IN'])
-const licenseKinds = new Set(['NONE', 'ENTRA_ID_P1_OR_P2', 'SHAREPOINT_SERVICE_PLAN', 'EXCHANGE_SERVICE_PLAN', 'UNIFIED_AUDIT_ENABLED'])
+const licenseKinds = new Set(['NONE', 'ENTRA_ID_P1_OR_P2', 'ENTRA_ID_P2', 'SHAREPOINT_SERVICE_PLAN', 'EXCHANGE_SERVICE_PLAN', 'UNIFIED_AUDIT_ENABLED'])
 const licenseStates = new Set(['NOT_REQUIRED', 'SATISFIED', 'NOT_LICENSED', 'UNVERIFIED'])
 const failureScopes = new Set(['DATASET_ONLY', 'WORKLOAD'])
 const CLOSED_UNKNOWN_STATE: ReadinessState = 'UNSUPPORTED'
@@ -40,6 +40,7 @@ export type CollectionReadinessView = {
   reasonCode: string | null
   reason: string | null
   remediation: string | null
+  evidence: PilotEvidenceView
   workloads: Array<{
     key: string
     workload: string
@@ -77,6 +78,42 @@ export type CollectionReadinessView = {
   }>
 }
 
+export type PilotEvidenceView = {
+  version: 1
+  signIns: {
+    availability: ReadinessState | 'CURRENT_LIMITED'
+    coverage: 'FULL' | 'LIMITED' | 'NONE'
+    selectedSource: 'MICROSOFT_GRAPH' | 'OFFICE_365_ACTIVITY_FEED' | null
+    observedAt: string | null
+    reasonCode: string | null
+    reason: string | null
+  }
+  riskyIdentities: {
+    availability: ReadinessState
+    count: number | null
+    selectedSource: 'MICROSOFT_IDENTITY_PROTECTION'
+    observedAt: string | null
+    reasonCode: string | null
+    reason: string | null
+  }
+  conditionalAccess: {
+    availability: ReadinessState
+    count: number | null
+    selectedSource: 'MICROSOFT_GRAPH'
+    observedAt: string | null
+    reasonCode: string | null
+    reason: string | null
+  }
+  securityDefaults: {
+    availability: ReadinessState
+    enabled: boolean | null
+    selectedSource: 'MICROSOFT_GRAPH'
+    observedAt: string | null
+    reasonCode: string | null
+    reason: string | null
+  }
+}
+
 export type AccessDatasetReadiness = {
   key: string
   label: string
@@ -93,7 +130,7 @@ export type AccessDatasetReadiness = {
   permissionMatch: 'ALL' | 'ANY'
   evidenceMode: 'RESOURCE_STATE' | 'COMPOSITE_RESOURCE_STATE' | 'NOT_DURABLY_OBSERVED'
   licensePrerequisite: {
-    kind: 'NONE' | 'ENTRA_ID_P1_OR_P2' | 'SHAREPOINT_SERVICE_PLAN' | 'EXCHANGE_SERVICE_PLAN' | 'UNIFIED_AUDIT_ENABLED'
+    kind: 'NONE' | 'ENTRA_ID_P1_OR_P2' | 'ENTRA_ID_P2' | 'SHAREPOINT_SERVICE_PLAN' | 'EXCHANGE_SERVICE_PLAN' | 'UNIFIED_AUDIT_ENABLED'
     state: 'NOT_REQUIRED' | 'SATISFIED' | 'NOT_LICENSED' | 'UNVERIFIED'
   }
   fallbackDatasetKey: string | null
@@ -192,6 +229,34 @@ function datasetPermission(value: unknown): AccessDatasetReadiness['permissions'
   return resource && consentMode && name && grantStatus ? { resource, name, type: 'APPLICATION', consentMode, grantStatus } : null
 }
 
+function permissionProjection(
+  permissions: AccessDatasetReadiness['permissions'],
+  match: AccessDatasetReadiness['permissionMatch'],
+): AccessDatasetReadiness['permissionStatus'] {
+  if (permissions.length === 0) return 'NOT_APPLICABLE'
+  if (match === 'ANY') {
+    if (permissions.some((permission) => permission.grantStatus === 'CONFIRMED')) return 'CONFIRMED'
+    if (permissions.some((permission) => permission.grantStatus === 'UNVERIFIED')) return 'UNVERIFIED'
+    return 'MISSING'
+  }
+  if (permissions.some((permission) => permission.grantStatus === 'MISSING')) return 'MISSING'
+  if (permissions.some((permission) => permission.grantStatus === 'UNVERIFIED')) return 'UNVERIFIED'
+  return 'CONFIRMED'
+}
+
+function workloadPermissionProjection(datasets: AccessDatasetReadiness[]) {
+  const byKey = new Map(datasets.map((dataset) => [dataset.key, dataset]))
+  const core = datasets.filter((dataset) => dataset.tier === 'CORE')
+  const contributing = core.map((dataset) => {
+    const fallback = dataset.fallbackDatasetKey ? byKey.get(dataset.fallbackDatasetKey) : null
+    return dataset.state !== 'READY' && fallback?.state === 'READY' ? fallback : dataset
+  })
+  if (contributing.length === 0) return 'NOT_APPLICABLE' as const
+  if (contributing.some((dataset) => dataset.permissionStatus === 'MISSING')) return 'MISSING' as const
+  if (contributing.some((dataset) => dataset.permissionStatus === 'UNVERIFIED')) return 'UNVERIFIED' as const
+  return contributing.some((dataset) => dataset.permissionStatus === 'CONFIRMED') ? 'CONFIRMED' as const : 'NOT_APPLICABLE' as const
+}
+
 function accessDataset(value: unknown, index: number): AccessDatasetReadiness {
   const candidate = record(value)
   const key = text(candidate?.key, 100)
@@ -231,7 +296,8 @@ function accessDataset(value: unknown, index: number): AccessDatasetReadiness {
   const rawEndpointPatterns = Array.isArray(candidate?.endpointPatterns) ? candidate.endpointPatterns : []
   const endpointPatterns = rawEndpointPatterns.slice(0, 16).map((item) => text(item, 240)).filter((item): item is string => Boolean(item))
   const fallbackValid = candidate?.fallbackDatasetKey === null || typeof candidate?.fallbackDatasetKey === 'string'
-  const invalid = !candidate || !key || !label || !tier || !datasetState || !permissionStatus || !permissionMatch || !evidenceMode || !licenseKind || !licenseState || !failureScope || !freshness || !remediation || !documentationUrl || !fallbackValid || rawPermissions.length > 16 || permissions.length !== rawPermissions.length || rawResourceTypes.length > 16 || resourceTypes.length !== rawResourceTypes.length || rawEndpointPatterns.length > 16 || endpointPatterns.length !== rawEndpointPatterns.length
+  const permissionConsistent = permissionStatus !== null && permissionMatch !== null && permissionProjection(permissions, permissionMatch) === permissionStatus
+  const invalid = !candidate || !key || !label || !tier || !datasetState || !permissionStatus || !permissionMatch || !permissionConsistent || !evidenceMode || !licenseKind || !licenseState || !failureScope || !freshness || !remediation || !documentationUrl || !fallbackValid || rawPermissions.length > 16 || permissions.length !== rawPermissions.length || rawResourceTypes.length > 16 || resourceTypes.length !== rawResourceTypes.length || rawEndpointPatterns.length > 16 || endpointPatterns.length !== rawEndpointPatterns.length
   if (invalid) {
     return {
       key: `invalid_access_dataset_${index}`,
@@ -277,6 +343,49 @@ function accessDataset(value: unknown, index: number): AccessDatasetReadiness {
     reasonCode: text(candidate.reasonCode, 120),
     reason: text(candidate.reason),
     remediation,
+  }
+}
+
+const UNKNOWN_EVIDENCE: PilotEvidenceView = {
+  version: 1,
+  signIns: { availability: 'UNVERIFIED', coverage: 'NONE', selectedSource: null, observedAt: null, reasonCode: 'EVIDENCE_UNAVAILABLE', reason: 'Current sign-in evidence is unavailable.' },
+  riskyIdentities: { availability: 'UNVERIFIED', count: null, selectedSource: 'MICROSOFT_IDENTITY_PROTECTION', observedAt: null, reasonCode: 'EVIDENCE_UNAVAILABLE', reason: 'Current Microsoft Identity Protection evidence is unavailable.' },
+  conditionalAccess: { availability: 'UNVERIFIED', count: null, selectedSource: 'MICROSOFT_GRAPH', observedAt: null, reasonCode: 'EVIDENCE_UNAVAILABLE', reason: 'Current Conditional Access evidence is unavailable.' },
+  securityDefaults: { availability: 'UNVERIFIED', enabled: null, selectedSource: 'MICROSOFT_GRAPH', observedAt: null, reasonCode: 'EVIDENCE_UNAVAILABLE', reason: 'Current Security Defaults evidence is unavailable.' },
+}
+
+function nullableCount(value: unknown) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+function pilotEvidence(value: unknown): PilotEvidenceView {
+  const candidate = record(value)
+  const signIns = record(candidate?.signIns)
+  const risky = record(candidate?.riskyIdentities)
+  const conditionalAccess = record(candidate?.conditionalAccess)
+  const securityDefaults = record(candidate?.securityDefaults)
+  const signInAvailability = signIns?.availability === 'CURRENT_LIMITED' ? 'CURRENT_LIMITED' : state(signIns?.availability)
+  const riskAvailability = state(risky?.availability)
+  const caAvailability = state(conditionalAccess?.availability)
+  const securityDefaultsAvailability = state(securityDefaults?.availability)
+  const coverage = typeof signIns?.coverage === 'string' && ['FULL', 'LIMITED', 'NONE'].includes(signIns.coverage) ? signIns.coverage as PilotEvidenceView['signIns']['coverage'] : null
+  const signInSource = signIns?.selectedSource === null || ['MICROSOFT_GRAPH', 'OFFICE_365_ACTIVITY_FEED'].includes(String(signIns?.selectedSource)) ? signIns?.selectedSource as PilotEvidenceView['signIns']['selectedSource'] : undefined
+  if (candidate?.version !== 1 || !signIns || !risky || !conditionalAccess || !securityDefaults || !signInAvailability || !riskAvailability || !caAvailability || !securityDefaultsAvailability || !coverage || signInSource === undefined || risky.selectedSource !== 'MICROSOFT_IDENTITY_PROTECTION' || conditionalAccess.selectedSource !== 'MICROSOFT_GRAPH' || securityDefaults.selectedSource !== 'MICROSOFT_GRAPH') return UNKNOWN_EVIDENCE
+  const riskCount = nullableCount(risky.count)
+  const caCount = nullableCount(conditionalAccess.count)
+  const enabled = typeof securityDefaults.enabled === 'boolean' ? securityDefaults.enabled : null
+  const riskObservedAt = timestamp(risky.observedAt)
+  const caObservedAt = timestamp(conditionalAccess.observedAt)
+  const securityDefaultsObservedAt = timestamp(securityDefaults.observedAt)
+  const normalizedRiskAvailability = riskAvailability === 'READY' && (riskCount === null || !riskObservedAt) ? 'UNVERIFIED' : riskAvailability
+  const normalizedCaAvailability = caAvailability === 'READY' && (caCount === null || !caObservedAt) ? 'UNVERIFIED' : caAvailability
+  const normalizedSecurityDefaultsAvailability = securityDefaultsAvailability === 'READY' && (enabled === null || !securityDefaultsObservedAt) ? 'UNVERIFIED' : securityDefaultsAvailability
+  return {
+    version: 1,
+    signIns: { availability: signInAvailability, coverage, selectedSource: signInSource, observedAt: timestamp(signIns.observedAt), reasonCode: text(signIns.reasonCode, 120), reason: text(signIns.reason) },
+    riskyIdentities: { availability: normalizedRiskAvailability, count: normalizedRiskAvailability === 'READY' ? riskCount : null, selectedSource: 'MICROSOFT_IDENTITY_PROTECTION', observedAt: normalizedRiskAvailability === 'READY' ? riskObservedAt : null, reasonCode: normalizedRiskAvailability !== riskAvailability ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : text(risky.reasonCode, 120), reason: normalizedRiskAvailability !== riskAvailability ? 'Current Microsoft Identity Protection evidence is unavailable.' : text(risky.reason) },
+    conditionalAccess: { availability: normalizedCaAvailability, count: normalizedCaAvailability === 'READY' ? caCount : null, selectedSource: 'MICROSOFT_GRAPH', observedAt: normalizedCaAvailability === 'READY' ? caObservedAt : null, reasonCode: normalizedCaAvailability !== caAvailability ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : text(conditionalAccess.reasonCode, 120), reason: normalizedCaAvailability !== caAvailability ? 'Current Conditional Access evidence is unavailable.' : text(conditionalAccess.reason) },
+    securityDefaults: { availability: normalizedSecurityDefaultsAvailability, enabled: normalizedSecurityDefaultsAvailability === 'READY' ? enabled : null, selectedSource: 'MICROSOFT_GRAPH', observedAt: normalizedSecurityDefaultsAvailability === 'READY' ? securityDefaultsObservedAt : null, reasonCode: normalizedSecurityDefaultsAvailability !== securityDefaultsAvailability ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : text(securityDefaults.reasonCode, 120), reason: normalizedSecurityDefaultsAvailability !== securityDefaultsAvailability ? 'Current Security Defaults evidence is unavailable.' : text(securityDefaults.reason) },
   }
 }
 
@@ -351,6 +460,7 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
     const rbacStatus = text(rbac?.status, 40)
     const rbacReason = text(rbac?.reason)
     const invalidAccessDataset = datasets.some((dataset) => dataset.key.startsWith('invalid_access_dataset_'))
+    const projectedPermissionStatus = hasAccessContract ? workloadPermissionProjection(datasets) : permissionStatus
     const rowCandidate = invalidAccessDataset
       ? { state: 'UNSUPPORTED' as const, reasonCode: 'MALFORMED_ACCESS_DATASET', reason: 'HawkView received an unsupported access dataset contract.', remediation: 'Refresh after the service returns a supported Microsoft access contract.' }
       : { state: rowState, reasonCode: text(row.reasonCode, 120), reason: text(row.reason), remediation }
@@ -364,8 +474,8 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
       key,
       workload,
       state: selected.state,
-      configuredCapability,
-      permissionStatus,
+      configuredCapability: projectedPermissionStatus === 'CONFIRMED' ? 'CONFIGURED' : projectedPermissionStatus === 'MISSING' ? 'NOT_CONFIGURED' : configuredCapability,
+      permissionStatus: projectedPermissionStatus,
       requiredPermissions,
       lastAttemptAt: timestamp(row.lastAttemptAt),
       lastSuccessfulAt: timestamp(row.lastSuccessfulAt),
@@ -399,7 +509,7 @@ export function normalizeCollectionReadiness(value: unknown): CollectionReadines
   }
   const normalizedWorkloads = Array.from(unique.values())
   const overall = normalizedWorkloads.reduce<CollectionReadinessView['workloads'][number] | null>((selected, row) => !selected || READINESS_ORDER[row.state] < READINESS_ORDER[selected.state] ? row : selected, null)
-  return { accessContractVersion: hasAccessContract ? 1 : null, overallState: overall?.state ?? 'UNSUPPORTED', evaluatedAt: timestamp(candidate.evaluatedAt), permissionVerifiedAt: timestamp(candidate.permissionVerifiedAt), reasonCode: overall?.reasonCode ?? null, reason: overall?.reason ?? null, remediation: overall?.remediation ?? null, workloads: normalizedWorkloads }
+  return { accessContractVersion: hasAccessContract ? 1 : null, overallState: overall?.state ?? 'UNSUPPORTED', evaluatedAt: timestamp(candidate.evaluatedAt), permissionVerifiedAt: timestamp(candidate.permissionVerifiedAt), reasonCode: overall?.reasonCode ?? null, reason: overall?.reason ?? null, remediation: overall?.remediation ?? null, evidence: pilotEvidence(candidate.evidence), workloads: normalizedWorkloads }
 }
 
 export function readinessLabel(value: string) {

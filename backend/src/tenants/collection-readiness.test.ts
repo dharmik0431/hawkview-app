@@ -141,6 +141,120 @@ test('keeps Microsoft Identity Protection risk explicitly P2-only', () => {
   assert.equal(p2Dataset?.state, 'READY')
 })
 
+test('projects Identity Protection counts only from fresh P2 snapshot evidence', () => {
+  const p1Only = deriveCollectionReadiness(input({
+    evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload: [{ id: 'must-not-count' }], observedAt: current }],
+  }))
+  assert.equal(p1Only.evidence.riskyIdentities.availability, 'NOT_LICENSED')
+  assert.equal(p1Only.evidence.riskyIdentities.count, null)
+
+  const p2Plans = [
+    ...(input().licenseServicePlans ?? []),
+    { servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' },
+  ]
+  const freshEmpty = deriveCollectionReadiness(input({
+    licenseServicePlans: p2Plans,
+    evidenceSnapshots: [
+      { resourceType: 'RISKY_USERS', payload: [], observedAt: current },
+      { resourceType: 'RISKY_USERS', payload: [{ id: 'older-risk-must-not-win' }], observedAt: new Date('2026-08-18T10:00:00.000Z') },
+    ],
+  }))
+  assert.equal(freshEmpty.evidence.riskyIdentities.availability, 'READY')
+  assert.equal(freshEmpty.evidence.riskyIdentities.count, 0)
+
+  const freshRisk = deriveCollectionReadiness(input({
+    licenseServicePlans: p2Plans,
+    evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload: [{ id: 'risk-1' }, { id: 'risk-2' }], observedAt: current }],
+  }))
+  assert.equal(freshRisk.evidence.riskyIdentities.count, 2)
+
+  const missingSnapshot = deriveCollectionReadiness(input({
+    licenseServicePlans: p2Plans,
+  }))
+  assert.equal(missingSnapshot.evidence.riskyIdentities.availability, 'UNVERIFIED')
+  assert.equal(missingSnapshot.evidence.riskyIdentities.count, null)
+  assert.equal(missingSnapshot.evidence.riskyIdentities.reasonCode, 'EVIDENCE_SNAPSHOT_UNAVAILABLE')
+
+  const missingPermission = deriveCollectionReadiness(input({
+    licenseServicePlans: p2Plans,
+    consentedPermissions: permissions.filter((permission) => permission !== 'IdentityRiskyUser.Read.All'),
+    evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload: [{ id: 'must-not-count' }], observedAt: current }],
+  }))
+  assert.equal(missingPermission.evidence.riskyIdentities.availability, 'BLOCKED_PERMISSION')
+  assert.equal(missingPermission.evidence.riskyIdentities.count, null)
+})
+
+test('separates unlicensed Conditional Access from current Security Defaults evidence', () => {
+  const basic = deriveCollectionReadiness(input({
+    licenseServicePlans: [
+      { servicePlanName: 'EXCHANGE_S_STANDARD', provisioningStatus: 'Success' },
+      { servicePlanName: 'SHAREPOINTSTANDARD', provisioningStatus: 'Success' },
+    ],
+    evidenceSnapshots: [
+      { resourceType: 'CONDITIONAL_ACCESS', payload: [], observedAt: current },
+      { resourceType: 'SECURITY_DEFAULTS', payload: [{ isEnabled: true }], observedAt: current },
+    ],
+  }))
+  assert.equal(basic.evidence.conditionalAccess.availability, 'NOT_LICENSED')
+  assert.equal(basic.evidence.conditionalAccess.count, null)
+  assert.equal(basic.evidence.securityDefaults.availability, 'READY')
+  assert.equal(basic.evidence.securityDefaults.enabled, true)
+
+  const premiumEmpty = deriveCollectionReadiness(input({
+    evidenceSnapshots: [{ resourceType: 'CONDITIONAL_ACCESS', payload: [], observedAt: current }],
+  }))
+  assert.equal(premiumEmpty.evidence.conditionalAccess.availability, 'READY')
+  assert.equal(premiumEmpty.evidence.conditionalAccess.count, 0)
+
+  const missingSnapshots = deriveCollectionReadiness(input())
+  assert.equal(missingSnapshots.evidence.conditionalAccess.availability, 'UNVERIFIED')
+  assert.equal(missingSnapshots.evidence.conditionalAccess.count, null)
+  assert.equal(missingSnapshots.evidence.securityDefaults.availability, 'UNVERIFIED')
+  assert.equal(missingSnapshots.evidence.securityDefaults.enabled, null)
+})
+
+test('selects current limited audit-feed sign-in evidence without claiming full Graph coverage', () => {
+  const result = deriveCollectionReadiness(input({
+    licenseServicePlans: [{ servicePlanName: 'EXCHANGE_S_STANDARD', provisioningStatus: 'Success' }],
+    consentedPermissions: ['ActivityFeed.Read'],
+    syncStates: allResources.map((resource) => sync(resource, resource === 'SIGN_INS' ? {
+      status: 'RUNNING',
+      lastErrorCode: 'sign-ins-non-premium-fallback-active',
+      lastErrorMessage: 'Current limited audit-feed login evidence is available.',
+    } : {})),
+  }))
+  assert.equal(result.evidence.signIns.availability, 'CURRENT_LIMITED')
+  assert.equal(result.evidence.signIns.coverage, 'LIMITED')
+  assert.equal(result.evidence.signIns.selectedSource, 'OFFICE_365_ACTIVITY_FEED')
+  assert.equal(row(result, 'sign_ins').state, 'PARTIAL')
+
+  const stale = deriveCollectionReadiness(input({
+    licenseServicePlans: [{ servicePlanName: 'EXCHANGE_S_STANDARD', provisioningStatus: 'Success' }],
+    consentedPermissions: ['ActivityFeed.Read'],
+    syncStates: allResources.map((resource) => sync(resource, resource === 'SIGN_INS' ? {
+      status: 'RUNNING',
+      lastSuccessfulAt: new Date('2026-08-18T08:00:00.000Z'),
+      lastErrorCode: 'sign-ins-non-premium-fallback-active',
+      lastErrorMessage: 'Audit-feed login evidence has not refreshed.',
+    } : {})),
+  }))
+  assert.equal(stale.evidence.signIns.availability, 'STALE')
+  assert.equal(stale.evidence.signIns.selectedSource, 'OFFICE_365_ACTIVITY_FEED')
+  assert.equal(stale.evidence.signIns.reasonCode, 'SIGN_IN_FALLBACK_STALE')
+
+  const failed = deriveCollectionReadiness(input({
+    licenseServicePlans: [{ servicePlanName: 'EXCHANGE_S_STANDARD', provisioningStatus: 'Success' }],
+    consentedPermissions: ['ActivityFeed.Read'],
+    syncStates: allResources.map((resource) => sync(resource, resource === 'SIGN_INS' ? {
+      status: 'FAILED',
+      lastErrorCode: 'sign-ins-non-premium-fallback-active',
+      lastErrorMessage: 'Audit-feed login evidence failed.',
+    } : {})),
+  }))
+  assert.notEqual(failed.evidence.signIns.availability, 'CURRENT_LIMITED')
+  assert.equal(failed.evidence.signIns.selectedSource, 'OFFICE_365_ACTIVITY_FEED')
+})
+
 test('selects sign-in permissions from current authoritative Entra entitlement evidence', () => {
   const premium = row(deriveCollectionReadiness(input()), 'sign_ins')
   assert.deepEqual(premium.requiredPermissions, [

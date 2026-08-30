@@ -1233,7 +1233,9 @@ export default function TenantSettingsPage() {
                               {readinessLabel(w.configuredCapability)}
                             </td>
                             <td className="px-3 py-3 text-slate-600 dark:text-slate-300">
-                              {readinessLabel(w.permissionStatus)}
+                              {w.permissionStatus === 'CONFIRMED'
+                                ? 'Applicable permissions confirmed'
+                                : readinessLabel(w.permissionStatus)}
                             </td>
                             <td className="px-3 py-3 text-slate-600 dark:text-slate-300">
                               {readinessLabel(w.freshness)}
@@ -1318,9 +1320,14 @@ export default function TenantSettingsPage() {
                                     <div className="font-semibold text-xs text-slate-700 dark:text-slate-300">
                                       Dataset capabilities ({w.datasets.length})
                                     </div>
+                                    {!accessCatalog && (
+                                      <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900" role="status">
+                                        Capability catalog enrichment is unavailable. Verified tenant permission and readiness evidence remains visible below.
+                                      </div>
+                                    )}
                                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
                                       {w.datasets.map((rawDataset) => {
-                                        const dataset = microsoftAccessDatasetView(rawDataset, accessCatalog)
+                                        const dataset = accessCatalog ? microsoftAccessDatasetView(rawDataset, accessCatalog) : rawDataset
                                         if (!dataset) {
                                           return (
                                             <div key={rawDataset.key} className="p-2.5 rounded-lg border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-1.5">

@@ -54,6 +54,80 @@ test('M365 audit collection findings open the audit synchronization health panel
   assert.equal(finding?.actionUrl.includes('what-changed'), false)
 })
 
+test('reports current limited sign-in fallback without a synchronization-failure action', () => {
+  const result = deriveTenantHealth({
+    ...baseInput(),
+    now: new Date('2026-08-07T12:05:00.000Z'),
+    riskyIdentityCount: null,
+    syncStates: [{
+      resourceType: 'SIGN_INS', status: 'RUNNING', lastAttemptAt: new Date('2026-08-07T12:00:00.000Z'),
+      lastSuccessfulAt: new Date('2026-08-07T12:00:00.000Z'), lastErrorCode: 'sign-ins-non-premium-fallback-active',
+      lastErrorMessage: 'Current limited audit-feed login evidence is available.', consecutiveFailures: 0,
+    }],
+  })
+  assert.equal(result.resourceHealth.find((item) => item.resourceType === 'SIGN_INS')?.classification, 'PARTIAL')
+  assert.equal(result.attention.some((item) => item.key === 'sync-sign_ins'), false)
+  assert.equal(result.attention.find((item) => item.key === 'sign-ins-limited-evidence')?.label, 'Limited sign-in evidence is active')
+  assert.equal(result.operations.failedJobs, 0)
+  assert.equal(result.operations.partialJobs, 1)
+  assert.equal(result.riskyIdentityCount, null)
+})
+
+test('creates exactly one selected sign-in action when audit-feed fallback evidence is stale or failed', () => {
+  const now = new Date('2026-08-07T15:00:00.000Z')
+  const stale = deriveTenantHealth({
+    ...baseInput(),
+    now,
+    syncStates: [{
+      resourceType: 'SIGN_INS', status: 'RUNNING', lastAttemptAt: now,
+      lastSuccessfulAt: new Date('2026-08-07T12:00:00.000Z'), lastErrorCode: 'sign-ins-non-premium-fallback-active',
+      lastErrorMessage: 'Audit-feed login evidence has not refreshed.', consecutiveFailures: 0,
+    }],
+  })
+  assert.equal(stale.resourceHealth.find((item) => item.resourceType === 'SIGN_INS')?.classification, 'STALE')
+  assert.deepEqual(stale.attention.filter((item) => item.key === 'sync-sign_ins').map((item) => item.label), ['Sign-ins data could not be synchronized'])
+  assert.equal(stale.attention.some((item) => item.key === 'sign-ins-limited-evidence'), false)
+  assert.equal(stale.operations.activeIssues, 1)
+  assert.equal(stale.operations.pendingJobs, 0)
+
+  const failed = deriveTenantHealth({
+    ...baseInput(),
+    now,
+    syncStates: [{
+      resourceType: 'SIGN_INS', status: 'FAILED', lastAttemptAt: now,
+      lastSuccessfulAt: new Date('2026-08-07T14:55:00.000Z'), lastErrorCode: 'sign-ins-non-premium-fallback-active',
+      lastErrorMessage: 'Audit-feed login evidence failed.', consecutiveFailures: 1,
+    }],
+  })
+  assert.equal(failed.resourceHealth.find((item) => item.resourceType === 'SIGN_INS')?.classification, 'FAILED')
+  assert.deepEqual(failed.attention.filter((item) => item.key === 'sync-sign_ins').map((item) => item.label), ['Sign-ins data could not be synchronized'])
+  assert.equal(failed.attention.some((item) => item.key === 'sign-ins-limited-evidence'), false)
+  assert.equal(failed.operations.activeIssues, 1)
+})
+
+test('does not turn an explicitly unlicensed Conditional Access collector into an action item', () => {
+  const result = deriveTenantHealth({
+    ...baseInput(),
+    notApplicableResourceTypes: ['CONDITIONAL_ACCESS'],
+  })
+  const conditionalAccess = result.resourceHealth.find((item) => item.resourceType === 'CONDITIONAL_ACCESS')
+  assert.equal(conditionalAccess?.classification, 'NOT_LICENSED')
+  assert.equal(result.attention.some((item) => item.key === 'sync-conditional_access'), false)
+  assert.equal(result.data.notLicensedResources, 1)
+})
+
+test('keeps unsupported capability evidence separate from licensing evidence', () => {
+  const result = deriveTenantHealth({
+    ...baseInput(),
+    unsupportedResourceTypes: ['CONDITIONAL_ACCESS'],
+  })
+  const conditionalAccess = result.resourceHealth.find((item) => item.resourceType === 'CONDITIONAL_ACCESS')
+  assert.equal(conditionalAccess?.classification, 'UNSUPPORTED')
+  assert.equal(result.data.notLicensedResources, 0)
+  assert.equal(result.data.unsupportedResources, 1)
+  assert.equal(result.attention.some((item) => item.key === 'sync-conditional_access'), false)
+})
+
 test('redacts credential-shaped collector failures before tenant health is returned', () => {
   const result = deriveTenantHealth({
     ...baseInput(),

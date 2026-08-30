@@ -106,9 +106,41 @@ test('fails malformed and unknown dataset fields closed and visibly unsupported'
   assert.equal(microsoftAccessSummary(readiness, catalog(readiness!.workloads[0].datasets)).permissions.length, 0)
 })
 
+test('retains normalized permission evidence when only catalog enrichment is unavailable', () => {
+  const readiness = contract([dataset('core_inventory', 'CORE')])
+  const summary = microsoftAccessSummary(readiness, null)
+  assert.equal(summary.contractAvailable, true)
+  assert.equal(summary.permissions[0]?.name, 'core_inventory.Read.All')
+  assert.equal(summary.permissions[0]?.status, 'Granted')
+  assert.equal(summary.permissions[0]?.requirement, 'Core dataset')
+})
+
+test('accepts the canonical P2 license boundary without invalidating the access catalog', () => {
+  const p2 = {
+    ...dataset('identity_risk', 'CAPABILITY_OPTIONAL'),
+    licensePrerequisite: { kind: 'ENTRA_ID_P2' as const, state: 'SATISFIED' as const },
+  }
+  const readiness = contract([p2])
+  const accessCatalog = catalog(readiness!.workloads[0].datasets)
+  assert.ok(accessCatalog)
+  assert.equal(accessCatalog?.capabilities[0]?.licensePrerequisite, 'ENTRA_ID_P2')
+  assert.equal(microsoftAccessSummary(readiness, accessCatalog).contractAvailable, true)
+})
+
+test('fails a contradictory aggregate permission claim closed', () => {
+  const contradictory = {
+    ...dataset('directory', 'CORE', 'READY', 'CONFIRMED'),
+    permissions: [{ resource: 'MICROSOFT_GRAPH', name: 'directory.Read.All', type: 'APPLICATION', consentMode: 'DEFAULT', grantStatus: 'MISSING' }],
+  }
+  const readiness = contract([contradictory])
+  assert.equal(readiness?.workloads[0].state, 'UNSUPPORTED')
+  assert.equal(readiness?.workloads[0].permissionStatus, 'UNVERIFIED')
+  assert.equal(readiness?.workloads[0].datasets[0].reasonCode, 'MALFORMED_ACCESS_DATASET')
+})
+
 test('deduplicates permissions and keeps the strongest requirement and worst verification state', () => {
   const shared = dataset('optional', 'CAPABILITY_OPTIONAL', 'BLOCKED_PERMISSION', 'MISSING')
-  const core = { ...dataset('core', 'CORE'), permissions: shared.permissions }
+  const core = { ...dataset('core', 'CORE', 'BLOCKED_PERMISSION', 'MISSING'), permissions: shared.permissions }
   const readiness = contract([shared, core])
   const summary = microsoftAccessSummary(readiness, catalog(readiness!.workloads[0].datasets))
   assert.equal(summary.permissions.length, 1)

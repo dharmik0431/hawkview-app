@@ -107,8 +107,8 @@ function numericEvidence(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER)
     : null
 }
 
-function evidenceCount(value: number | null, partial: boolean) {
-  if (value === null || (partial && value === 0)) return 'Not reported'
+function evidenceCount(value: number | null, partial: boolean, unavailableLabel = 'Not reported') {
+  if (value === null || (partial && value === 0)) return unavailableLabel
   return partial ? `≥${value}` : String(value)
 }
 
@@ -678,7 +678,7 @@ export default function DashboardPage() {
                   Risky Identities
                 </div>
                 <div className="mt-1 text-3xl font-bold">
-                  {evidenceCount(kpis.riskyIdentities, kpis.riskPartial)}
+                  {evidenceCount(kpis.riskyIdentities, kpis.riskPartial, 'Unavailable')}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
                   {kpis.riskPartial ? 'Partial Microsoft risk evidence' : 'Microsoft risk evidence'}

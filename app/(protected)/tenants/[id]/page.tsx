@@ -26,6 +26,7 @@ import { TenantOverview } from './components/tenant-overview'
 import TenantBreadcrumb from './components/tenant-breadcrumb'
 import TenantSettingsPage from './settings/page'
 import { deriveTenantWorkspaceDisplay, formatTenantTimestamp } from '@/lib/tenant-workspace-state'
+import { normalizeCollectionReadiness } from '@/lib/tenants/collection-readiness'
 import {
   parseTenantPath,
   tenantEntraPath,
@@ -1523,6 +1524,14 @@ export default function TenantDetailsPage() {
   }, [cacheScope])
 
   const tenant = useMemo(() => bundle?.tenant, [bundle])
+  const tenantListRecord = useMemo(
+    () => tenantsList.find((candidate) => String(candidate?.id) === resolvedTenantId) ?? null,
+    [resolvedTenantId, tenantsList]
+  )
+  const collectionReadiness = useMemo(
+    () => normalizeCollectionReadiness(tenantListRecord?.collectionReadiness),
+    [tenantListRecord]
+  )
 
   // ✅ JSON/TS-backed datasets (per-tenant)
   const USERS = useMemo(
@@ -2003,7 +2012,9 @@ export default function TenantDetailsPage() {
   // same components receive the normalized live Graph data.
   const displayedCaPolicies =
     tenant?.provider === 'microsoft'
-      ? ((bundle?.entra?.caPolicies ?? []) as ConditionalAccessPolicy[])
+      ? collectionReadiness?.evidence.conditionalAccess.availability === 'READY'
+        ? ((bundle?.entra?.caPolicies ?? []) as ConditionalAccessPolicy[])
+        : []
       : caPolicies
   const displayedAuthMethods =
     tenant?.provider === 'microsoft'
@@ -3880,6 +3891,7 @@ export default function TenantDetailsPage() {
               tenant={tenant}
               bundle={bundle}
               domains={domains}
+              securityDefaultsEvidence={collectionReadiness?.evidence.securityDefaults ?? null}
             />
           ) : (
             <DnsSection tenant={tenant} domains={domains} dns={bundle?.dns} />
@@ -4539,6 +4551,7 @@ export default function TenantDetailsPage() {
                     >
                       <EntraSection
                         policies={displayedCaPolicies as any}
+                        evidence={collectionReadiness?.evidence ?? null}
                         onPolicyClick={(p) => setSelectedPolicy(p as any)}
                       />
                     </div>

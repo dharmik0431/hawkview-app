@@ -141,7 +141,7 @@ function accessCapability(value: unknown): MicrosoftAccessCapability | null {
   const tier = typeof candidate?.tier === 'string' && ['CORE', 'CAPABILITY_OPTIONAL', 'FALLBACK'].includes(candidate.tier)
     ? candidate.tier as MicrosoftAccessCapability['tier']
     : null
-  const licensePrerequisite = typeof candidate?.licensePrerequisite === 'string' && ['NONE', 'ENTRA_ID_P1_OR_P2', 'SHAREPOINT_SERVICE_PLAN', 'EXCHANGE_SERVICE_PLAN', 'UNIFIED_AUDIT_ENABLED'].includes(candidate.licensePrerequisite)
+  const licensePrerequisite = typeof candidate?.licensePrerequisite === 'string' && ['NONE', 'ENTRA_ID_P1_OR_P2', 'ENTRA_ID_P2', 'SHAREPOINT_SERVICE_PLAN', 'EXCHANGE_SERVICE_PLAN', 'UNIFIED_AUDIT_ENABLED'].includes(candidate.licensePrerequisite)
     ? candidate.licensePrerequisite as MicrosoftAccessCapability['licensePrerequisite']
     : null
   const failureScope = typeof candidate?.failureScope === 'string' && ['DATASET_ONLY', 'WORKLOAD'].includes(candidate.failureScope)
@@ -177,7 +177,7 @@ function accessCapability(value: unknown): MicrosoftAccessCapability | null {
   for (const rawAlternative of rawAlternatives) {
     const alternative = plainRecord(rawAlternative)
     const alternativeKey = boundedText(alternative?.key, 120)
-    const alternativeLicense = typeof alternative?.licensePrerequisite === 'string' && ['NONE', 'ENTRA_ID_P1_OR_P2', 'SHAREPOINT_SERVICE_PLAN', 'EXCHANGE_SERVICE_PLAN', 'UNIFIED_AUDIT_ENABLED'].includes(alternative.licensePrerequisite)
+    const alternativeLicense = typeof alternative?.licensePrerequisite === 'string' && ['NONE', 'ENTRA_ID_P1_OR_P2', 'ENTRA_ID_P2', 'SHAREPOINT_SERVICE_PLAN', 'EXCHANGE_SERVICE_PLAN', 'UNIFIED_AUDIT_ENABLED'].includes(alternative.licensePrerequisite)
       ? alternative.licensePrerequisite as MicrosoftAccessCapability['licensePrerequisite']
       : null
     const alternativeEndpoints = boundedStringArray(alternative?.endpointPatterns, 32, 500)
@@ -317,7 +317,7 @@ export function microsoftAccessSummary(readiness: CollectionReadinessView | null
     unverified: 0,
     permissions: [],
   }
-  if (!readiness || readiness.accessContractVersion !== 1 || !catalog) {
+  if (!readiness || readiness.accessContractVersion !== 1) {
     return unavailable
   }
 
@@ -333,7 +333,7 @@ export function microsoftAccessSummary(readiness: CollectionReadinessView | null
   let unjoinedDataset = false
   for (const workload of readiness.workloads) {
     for (const rawDataset of workload.datasets) {
-      const dataset = microsoftAccessDatasetView(rawDataset, catalog)
+      const dataset = catalog ? microsoftAccessDatasetView(rawDataset, catalog) : rawDataset
       if (!dataset) {
         unjoinedDataset = true
         continue
@@ -363,8 +363,8 @@ export function microsoftAccessSummary(readiness: CollectionReadinessView | null
   }
   if (unjoinedDataset) return unavailable
 
-  const catalogByKey = new Map(catalog.requestedPermissions.map((permission) => [`${permission.resource}:${permission.name}:${permission.consentMode}`, permission]))
-  const connectionRequired = new Set(catalog.connectionRequiredPermissions)
+  const catalogByKey = new Map((catalog?.requestedPermissions ?? []).map((permission) => [`${permission.resource}:${permission.name}:${permission.consentMode}`, permission]))
+  const connectionRequired = new Set(catalog?.connectionRequiredPermissions ?? [])
   const permissions = Array.from(byKey.entries()).map(([key, item]) => {
     const affectedDatasets = Array.from(item.datasetLabels).sort().slice(0, 16)
     const catalogPermission = catalogByKey.get(key)

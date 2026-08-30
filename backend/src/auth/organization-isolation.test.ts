@@ -342,7 +342,7 @@ test('notifications cannot fall back to email or query data without a subject-li
   assert.equal(notificationQueries, 0)
 })
 
-test('tenant list scopes secondary sign-in and audit queries by organization and tenant', async () => {
+test('tenant list scopes authoritative snapshots and audit queries by organization and tenant', async () => {
   const observed: Record<string, unknown> = {}
   const prisma = {
     user: {
@@ -358,12 +358,6 @@ test('tenant list scopes secondary sign-in and audit queries by organization and
       findMany: async ({ where, select }: { where: unknown; select: unknown }) => {
         observed.tenantWhere = where
         observed.tenantSelect = select
-        return []
-      },
-    },
-    signInLog: {
-      findMany: async ({ where }: { where: unknown }) => {
-        observed.signInWhere = where
         return []
       },
     },
@@ -393,7 +387,11 @@ test('tenant list scopes secondary sign-in and audit queries by organization and
   )
   assert.deepEqual(
     (observed.tenantSelect as any).entraSnapshots.where.resourceType.in,
-    ['AUTH_REGISTRATIONS', 'SECURE_SCORES'],
+    ['AUTH_REGISTRATIONS', 'SECURE_SCORES', 'RISKY_USERS', 'CONDITIONAL_ACCESS', 'SECURITY_DEFAULTS'],
+  )
+  assert.deepEqual(
+    (observed.tenantSelect as any).entraSnapshots.select,
+    { resourceType: true, payload: true, observedAt: true },
   )
   assert.equal(
     (observed.tenantSelect as any).syncStates.select.onboardingCompletedAt,
@@ -404,16 +402,8 @@ test('tenant list scopes secondary sign-in and audit queries by organization and
     true,
   )
   assert.deepEqual(
-    (observed.signInWhere as Record<string, unknown>).organizationId,
-    { in: ['organization-a'] },
-  )
-  assert.deepEqual(
     (observed.auditWhere as Record<string, unknown>).organizationId,
     { in: ['organization-a'] },
-  )
-  assert.deepEqual(
-    (observed.signInWhere as Record<string, unknown>).customerTenantId,
-    { in: [] },
   )
   assert.deepEqual(
     (observed.auditWhere as Record<string, unknown>).customerTenantId,

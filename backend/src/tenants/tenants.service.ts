@@ -302,7 +302,7 @@ export class TenantsService {
       lastSuccessfulPollAt: Date | null
       lastError: string | null
     }>
-  }, riskyIdentityCount = 0, auditEvents: TenantAuditEvent[] = []) {
+  }, auditEvents: TenantAuditEvent[] = []) {
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
     const connectionStatus = tenant.connection?.status ?? null
@@ -361,12 +361,17 @@ export class TenantsService {
         : tenant.tenantLicenses.flatMap((license) => license.servicePlans as Array<{ servicePlanId?: string; servicePlanName: string; provisioningStatus: string }>),
       sharePointUsageProjectionEvidence: usageProjectionEvidence('sharepoint.usage-projection'),
       oneDriveUsageProjectionEvidence: usageProjectionEvidence('onedrive.usage-projection'),
+      evidenceSnapshots: tenant.entraSnapshots,
     })
-    const notApplicableResourceTypes = collectionReadiness.workloads
-      .filter((workload) => workload.state === 'NOT_LICENSED' || workload.state === 'UNSUPPORTED')
-      .flatMap((workload) => workload.components?.map((component) => component.key) ?? [])
+    const readinessResourceTypes = (readinessState: 'NOT_LICENSED' | 'UNSUPPORTED') => collectionReadiness.workloads
+      .flatMap((workload) => [
+        ...(workload.state === readinessState ? (workload.components?.map((component) => component.key) ?? []) : []),
+        ...(workload.datasets?.filter((dataset) => dataset.state === readinessState).flatMap((dataset) => dataset.resourceTypes) ?? []),
+      ])
       .filter((key) => !['LICENSE_APPLICABILITY', 'PERMISSION_GRANT'].includes(key))
-    const syncFreshness = deriveTenantSyncFreshness(tenant.syncStates, new Date(), notApplicableResourceTypes)
+    const notApplicableResourceTypes = readinessResourceTypes('NOT_LICENSED')
+    const unsupportedResourceTypes = readinessResourceTypes('UNSUPPORTED')
+    const syncFreshness = deriveTenantSyncFreshness(tenant.syncStates, new Date(), [...notApplicableResourceTypes, ...unsupportedResourceTypes])
     const health = deriveTenantHealth({
       tenantId: tenant.id,
       effectiveStatus,
@@ -375,9 +380,10 @@ export class TenantsService {
       missingPermissions: missingRequiredPermissions,
       syncStates: tenant.syncStates,
       authSnapshot: tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.AUTH_REGISTRATIONS) ?? null,
-      riskyIdentityCount,
+      riskyIdentityCount: collectionReadiness.evidence.riskyIdentities.count,
       auditEvents,
       notApplicableResourceTypes,
+      unsupportedResourceTypes,
     })
 
     return {
@@ -580,6 +586,9 @@ export class TenantsService {
             in: [
               SyncResourceType.AUTH_REGISTRATIONS,
               SyncResourceType.SECURE_SCORES,
+              SyncResourceType.RISKY_USERS,
+              SyncResourceType.CONDITIONAL_ACCESS,
+              SyncResourceType.SECURITY_DEFAULTS,
             ] as SyncResourceType[],
           },
         },
@@ -628,24 +637,7 @@ export class TenantsService {
     })
 
     const tenantIds = tenants.map((tenant) => tenant.id)
-    const [riskySignIns, auditEvents] = await Promise.all([
-      this.prisma.signInLog.findMany({
-        where: {
-          organizationId: { in: organizationIds },
-          customerTenantId: { in: tenantIds },
-          eventDateTime: {
-            gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
-          },
-          riskLevel: { not: null },
-        },
-        select: {
-          customerTenantId: true,
-          userId: true,
-          userPrincipalName: true,
-          riskLevel: true,
-        },
-      }),
-      this.prisma.directoryAuditLog.findMany({
+    const auditEvents = await this.prisma.directoryAuditLog.findMany({
         where: {
           organizationId: { in: organizationIds },
           customerTenantId: { in: tenantIds },
@@ -666,19 +658,7 @@ export class TenantsService {
           initiatedBy: true,
           targetResources: true,
         },
-      }),
-    ])
-    const riskyUsersByTenant = new Map<string, Set<string>>()
-    for (const row of riskySignIns) {
-      if (!['low', 'medium', 'high'].includes(row.riskLevel?.toLowerCase() ?? '')) {
-        continue
-      }
-      const identity =
-        row.userId ?? row.userPrincipalName?.toLowerCase() ?? 'unknown'
-      const users = riskyUsersByTenant.get(row.customerTenantId) ?? new Set()
-      users.add(identity)
-      riskyUsersByTenant.set(row.customerTenantId, users)
-    }
+      })
 
     const auditEventsByTenant = new Map<string, TenantAuditEvent[]>()
     for (const event of auditEvents) {
@@ -690,7 +670,6 @@ export class TenantsService {
     const mappedTenants = tenants.map((tenant) =>
         this.mapTenant(
           tenant,
-          riskyUsersByTenant.get(tenant.id)?.size ?? 0,
           auditEventsByTenant.get(tenant.id) ?? []
         )
       )
