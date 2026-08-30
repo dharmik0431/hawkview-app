@@ -36,6 +36,12 @@ import {
 } from '@/types/api'
 import { Button } from '@/components/ui/button'
 import { microsoftConsentErrorMessage } from '@/lib/tenants/microsoft-consent-errors'
+import {
+  MICROSOFT_CONSENT_CHANNEL,
+  consentMessageFromSearch,
+  consentResultCanOpenSetup,
+  tenantSetupReturnPath,
+} from '@/lib/tenants/modal-tenant-onboarding'
 
 type BusyAction =
   | 'core-consent'
@@ -120,12 +126,23 @@ export default function TenantOnboardingPage() {
     const currentUrl = new URL(window.location.href)
     const consentResult = currentUrl.searchParams.get('microsoftConsent')
     const consentError = currentUrl.searchParams.get('error')
+    const consentMessage = consentMessageFromSearch(currentUrl.search)
 
-    // A tenant-discovery popup hands the durable setup route back to the main
-    // app. Progress is server-owned, so closing this window loses nothing.
+    // A successful popup callback only triggers the parent modal. The parent
+    // still refetches the server-owned DTO before displaying any completed step.
+    // Failed callbacks keep using this full-page recovery route.
     if (window.opener && !window.opener.closed) {
       try {
-        window.opener.location.assign(currentUrl.href)
+        if (consentResultCanOpenSetup(consentMessage)) {
+          if ('BroadcastChannel' in window) {
+            const channel = new BroadcastChannel(MICROSOFT_CONSENT_CHANNEL)
+            channel.postMessage(consentMessage)
+            channel.close()
+          }
+          window.opener.postMessage(consentMessage, window.location.origin)
+        } else {
+          window.opener.location.assign(currentUrl.href)
+        }
         window.close()
         return
       } catch {
@@ -133,10 +150,12 @@ export default function TenantOnboardingPage() {
       }
     }
 
-    if (consentResult === 'success') {
-      setNotice('Microsoft access was verified. Continue with the optional data-quality steps.')
-    } else if (consentResult === 'exchange-readonly-consented') {
-      setNotice('Exchange consent was verified. Complete the least-privilege RBAC step below.')
+    if (consentResultCanOpenSetup(consentMessage)) {
+      const returnPath = tenantSetupReturnPath(consentMessage)
+      if (returnPath) {
+        window.location.replace(returnPath)
+        return
+      }
     } else if (consentResult) {
       setError(microsoftConsentErrorMessage(consentError))
     }

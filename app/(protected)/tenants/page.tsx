@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import {
   Search,
   Plus,
@@ -39,6 +40,16 @@ import type {
 } from '@/types/api'
 import { normalizeMicrosoftConsentReview, type MicrosoftConsentReview } from '@/lib/tenants/microsoft-access-contract'
 import { microsoftConsentErrorMessage } from '@/lib/tenants/microsoft-consent-errors'
+import {
+  MICROSOFT_CONSENT_CHANNEL,
+  MICROSOFT_CONSENT_POPUP_MARKER,
+  consentMessageFromSearch,
+  consentResultCanOpenSetup,
+  normalizeMicrosoftConsentMessage,
+  normalizedTenantId,
+  tenantSetupCanAutoOpen,
+  tenantSetupDismissedKey,
+} from '@/lib/tenants/modal-tenant-onboarding'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 
@@ -52,6 +63,7 @@ import {
   getTenantDisplayStatus,
   type DisplayStatusKey,
 } from '@/components/tenants/tenant-status-badge'
+import { TenantOnboardingDialog } from '@/components/tenants/tenant-onboarding-dialog'
 
 type Provider = 'microsoft' | 'google'
 type ProviderFilter = 'all' | 'microsoft' | 'google'
@@ -64,17 +76,6 @@ type StatusFilter =
 type ViewMode = 'list' | 'tile'
 type SortField = 'name' | 'status' | 'needsAttention' | 'lastSync'
 type SortOrder = 'asc' | 'desc'
-
-const MICROSOFT_CONSENT_MESSAGE = 'hawkview:microsoft-consent-complete'
-const MICROSOFT_CONSENT_CHANNEL = 'hawkview:microsoft-consent'
-const MICROSOFT_CONSENT_POPUP_MARKER = 'hawkview:microsoft-consent-popup'
-
-type MicrosoftConsentMessage = {
-  type: typeof MICROSOFT_CONSENT_MESSAGE
-  result: string
-  error: string | null
-  tenantId: string | null
-}
 
 function SortHeader({
   field,
@@ -257,6 +258,7 @@ function TenantIdPill({ tenantId }: { tenantId: string }) {
 
 export default function TenantsPage() {
   const queryClient = useQueryClient()
+  const router = useRouter()
   const { session } = useAuth()
   const { data, isLoading, isFetching, error, refetch } = useTenants()
 
@@ -281,6 +283,7 @@ export default function TenantsPage() {
   const consentPopupMonitorRef = useRef<ReturnType<typeof setInterval> | null>(
     null
   )
+  const handledConsentMessagesRef = useRef(new Set<string>())
 
   const [searchQuery, setSearchQuery] = useState('')
   const [providerFilter, setProviderFilter] = useState<ProviderFilter>('all')
@@ -313,6 +316,7 @@ export default function TenantsPage() {
   const [consentReview, setConsentReview] =
     useState<MicrosoftConsentReview | null>(null)
   const [isSavingTenant, setIsSavingTenant] = useState(false)
+  const [setupTenantId, setSetupTenantId] = useState<string | null>(null)
 
   const loading = isLoading || isFetching
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
@@ -371,6 +375,52 @@ export default function TenantsPage() {
     ]
   )
 
+  const openTenantSetup = useCallback((
+    value: string,
+    automatic = false,
+  ) => {
+    const id = normalizedTenantId(value)
+    if (!id) return false
+    let dismissed = false
+    try {
+      dismissed = window.sessionStorage.getItem(tenantSetupDismissedKey(id)) === 'true'
+      if (!automatic) window.sessionStorage.removeItem(tenantSetupDismissedKey(id))
+    } catch {
+      // Session dismissal is a convenience only. Server state remains authoritative.
+    }
+    if (automatic && dismissed) return false
+    setShowOnboarding(false)
+    setConsentReview(null)
+    setOnboardingError(null)
+    setSetupTenantId(id)
+    return true
+  }, [])
+
+  const closeTenantSetup = useCallback(() => {
+    if (setupTenantId) {
+      try {
+        window.sessionStorage.setItem(
+          tenantSetupDismissedKey(setupTenantId),
+          'true',
+        )
+      } catch {
+        // The visible Continue setup action remains available without storage.
+      }
+    }
+    setSetupTenantId(null)
+  }, [setupTenantId])
+
+  const completeTenantSetup = useCallback((completedTenantId: string) => {
+    try {
+      window.sessionStorage.removeItem(tenantSetupDismissedKey(completedTenantId))
+    } catch {
+      // Completion is durable on the server.
+    }
+    setSetupTenantId(null)
+    void queryClient.invalidateQueries({ queryKey: ['tenants'] })
+    router.push(tenantOverviewPath(completedTenantId))
+  }, [queryClient, router])
+
   useEffect(() => {
     if (!showOnboarding) return
 
@@ -415,26 +465,26 @@ export default function TenantsPage() {
 
   useEffect(() => {
     const searchParams = new URLSearchParams(window.location.search)
-    const result = searchParams.get('microsoftConsent')
-    const consentError = searchParams.get('error')
-    const tenantId = searchParams.get('tenantId')
-    if (!result) return
-
-    const message: MicrosoftConsentMessage = {
-      type: MICROSOFT_CONSENT_MESSAGE,
-      result,
-      error: consentError,
-      tenantId,
+    if (!searchParams.has('microsoftConsent')) return
+    const message = consentMessageFromSearch(window.location.search)
+    let hasPopupMarker = false
+    try {
+      hasPopupMarker =
+        window.sessionStorage.getItem(MICROSOFT_CONSENT_POPUP_MARKER) === 'true'
+    } catch {
+      // Popup detection still uses window.name/opener when storage is unavailable.
     }
-    const hasPopupMarker =
-      window.sessionStorage.getItem(MICROSOFT_CONSENT_POPUP_MARKER) === 'true'
     const isConsentPopup =
       hasPopupMarker ||
       window.name === 'hawkview-microsoft-consent' ||
       (window.opener && !window.opener.closed)
 
-    if (isConsentPopup) {
-      window.sessionStorage.removeItem(MICROSOFT_CONSENT_POPUP_MARKER)
+    if (isConsentPopup && message) {
+      try {
+        window.sessionStorage.removeItem(MICROSOFT_CONSENT_POPUP_MARKER)
+      } catch {
+        // The callback message is still validated before it is forwarded.
+      }
       if ('BroadcastChannel' in window) {
         const channel = new BroadcastChannel(MICROSOFT_CONSENT_CHANNEL)
         channel.postMessage(message)
@@ -447,24 +497,36 @@ export default function TenantsPage() {
       return
     }
 
-    if (result === 'success') {
-      setConsentMessage({
-        text: 'Microsoft 365 consent is verified. HawkView will begin read-only scheduled collection through Microsoft Graph.',
-        tone: 'success',
-      })
-      setShowOnboarding(false)
-      queryClient.invalidateQueries({ queryKey: ['tenants'] })
-    } else if (result === 'missing-permissions') {
+    if (consentResultCanOpenSetup(message)) {
+      let dismissed = false
+      try {
+        dismissed = window.sessionStorage.getItem(
+          tenantSetupDismissedKey(message.tenantId),
+        ) === 'true'
+      } catch {
+        // Continue without session-only dismissal persistence.
+      }
+      if (tenantSetupCanAutoOpen(message, dismissed)) {
+        openTenantSetup(message.tenantId, true)
+      }
+      setConsentMessage(null)
+      void queryClient.invalidateQueries({ queryKey: ['tenants'] })
+    } else if (message?.result === 'missing-permissions') {
       setConsentMessage({
         text: 'Microsoft consent completed, but required administrator permissions are missing.',
         tone: 'warning',
       })
-      queryClient.invalidateQueries({ queryKey: ['tenants'] })
-    } else if (result === 'error') {
+      void queryClient.invalidateQueries({ queryKey: ['tenants'] })
+    } else if (message?.result === 'error') {
       setShowOnboarding(true)
       setOnboardingStep('select')
-      setOnboardingError(microsoftConsentErrorMessage(consentError))
-      queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      setOnboardingError(microsoftConsentErrorMessage(message.error))
+      void queryClient.invalidateQueries({ queryKey: ['tenants'] })
+    } else if (!message) {
+      setConsentMessage({
+        text: 'The Microsoft return could not be validated. No tenant setup state was assumed.',
+        tone: 'warning',
+      })
     }
 
     const cleanUrl = new URL(window.location.href)
@@ -472,14 +534,21 @@ export default function TenantsPage() {
     cleanUrl.searchParams.delete('error')
     cleanUrl.searchParams.delete('tenantId')
     window.history.replaceState({}, '', cleanUrl)
-  }, [queryClient])
+  }, [openTenantSetup, queryClient])
 
   useEffect(() => {
     const handleConsentResult = (data: unknown) => {
-      if (!data || typeof data !== 'object') return
-
-      const message = data as Partial<MicrosoftConsentMessage>
-      if (message.type !== MICROSOFT_CONSENT_MESSAGE) return
+      const message = normalizeMicrosoftConsentMessage(data)
+      if (!message) return
+      const messageKey = `${message.result}:${message.tenantId ?? ''}:${message.error ?? ''}`
+      if (handledConsentMessagesRef.current.has(messageKey)) return
+      handledConsentMessagesRef.current.add(messageKey)
+      // BroadcastChannel and postMessage can deliver the same callback together.
+      // Keep the guard short-lived so a later legitimate re-consent for the same
+      // tenant can still resume setup in this browser session.
+      window.setTimeout(() => {
+        handledConsentMessagesRef.current.delete(messageKey)
+      }, 1_000)
 
       if (consentPopupMonitorRef.current) {
         clearInterval(consentPopupMonitorRef.current)
@@ -490,14 +559,11 @@ export default function TenantsPage() {
       setIsSavingTenant(false)
       setConsentReview(null)
 
-      if (message.result === 'success') {
+      if (consentResultCanOpenSetup(message)) {
         setOnboardingError(null)
-        setConsentMessage({
-          text: 'Microsoft 365 consent is verified. HawkView will begin read-only scheduled collection through Microsoft Graph.',
-          tone: 'success',
-        })
-        setShowOnboarding(false)
+        setConsentMessage(null)
         setOnboardingStep('select')
+        openTenantSetup(message.tenantId, true)
       } else if (message.result === 'missing-permissions') {
         setShowOnboarding(false)
         setOnboardingStep('select')
@@ -506,14 +572,23 @@ export default function TenantsPage() {
           text: 'Microsoft consent completed, but a connection-required permission is missing.',
           tone: 'warning',
         })
+      } else if (message.result === 'exchange-readonly-error') {
+        setShowOnboarding(false)
+        setOnboardingStep('select')
+        setConsentMessage({
+          text: 'Optional Exchange consent was not confirmed. Resume tenant setup to retry or skip this step.',
+          tone: 'warning',
+        })
       } else {
         setShowOnboarding(true)
         setOnboardingStep('select')
         setOnboardingError(microsoftConsentErrorMessage(message.error))
       }
 
-      queryClient.invalidateQueries({ queryKey: ['tenants'] })
-      setTimeout(() => onboardButtonRef.current?.focus(), 0)
+      void queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      if (!consentResultCanOpenSetup(message)) {
+        setTimeout(() => onboardButtonRef.current?.focus(), 0)
+      }
     }
 
     const handleConsentMessage = (event: MessageEvent<unknown>) => {
@@ -535,7 +610,7 @@ export default function TenantsPage() {
       window.removeEventListener('message', handleConsentMessage)
       channel?.close()
     }
-  }, [queryClient])
+  }, [openTenantSetup, queryClient])
 
   useEffect(
     () => () => {
@@ -1266,6 +1341,13 @@ export default function TenantsPage() {
         </div>
       )}
 
+      <TenantOnboardingDialog
+        open={Boolean(setupTenantId)}
+        tenantId={setupTenantId}
+        onClose={closeTenantSetup}
+        onCompleted={completeTenantSetup}
+      />
+
       {/* Notifications / Banners */}
       {consentMessage && (
         <Card
@@ -1639,15 +1721,14 @@ export default function TenantsPage() {
                         {/* Context-Sensitive Primary Action */}
                         <td className="py-3.5 px-4 text-right whitespace-nowrap">
                           {tenant.onboarding?.complete === false ? (
-                            <Link href={tenant.onboarding.resumeUrl}>
-                              <Button
-                                size="sm"
-                                className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm"
-                              >
-                                <span>Continue setup</span>
-                                <ChevronRight className="h-3.5 w-3.5" />
-                              </Button>
-                            </Link>
+                            <Button
+                              size="sm"
+                              onClick={() => openTenantSetup(String(tenant.id))}
+                              className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm"
+                            >
+                              <span>Continue setup</span>
+                              <ChevronRight className="h-3.5 w-3.5" />
+                            </Button>
                           ) : statusInfo.key === 'needs_attention' ? (
                             <Button
                               size="sm"
@@ -1749,12 +1830,14 @@ export default function TenantsPage() {
                   <div className="pt-2 flex items-center justify-between border-t border-slate-100 dark:border-slate-800">
                     <TenantIdPill tenantId={tenant.microsoftTenantId || tenant.id} />
                     {tenant.onboarding?.complete === false ? (
-                      <Link href={tenant.onboarding.resumeUrl}>
-                        <Button size="sm" className="h-8 px-3 gap-1 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white">
-                          <span>Continue setup</span>
-                          <ChevronRight className="h-3.5 w-3.5" />
-                        </Button>
-                      </Link>
+                      <Button
+                        size="sm"
+                        onClick={() => openTenantSetup(String(tenant.id))}
+                        className="h-8 px-3 gap-1 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white"
+                      >
+                        <span>Continue setup</span>
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      </Button>
                     ) : statusInfo.key === 'needs_attention' ? (
                       <Button
                         size="sm"

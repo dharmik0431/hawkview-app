@@ -19,19 +19,22 @@ test('does not expose unknown Microsoft consent errors', () => {
   assert.equal(microsoftConsentErrorMessage(null), expected)
 })
 
-test('keeps both consent error return paths visible to the user', () => {
+test('keeps callback errors on the recovery path and opens setup only after success', () => {
   const tenantPage = readFileSync(
     new URL('../../app/(protected)/tenants/page.tsx', import.meta.url),
+    'utf8',
+  )
+  const fallbackPage = readFileSync(
+    new URL('../../app/(protected)/tenants/[id]/onboarding/page.tsx', import.meta.url),
     'utf8',
   )
 
   assert.match(
     tenantPage,
-    /else if \(result === 'error'\) \{\s+setShowOnboarding\(true\)\s+setOnboardingStep\('select'\)\s+setOnboardingError\(microsoftConsentErrorMessage\(consentError\)\)/,
+    /else if \(message\?\.result === 'error'\) \{\s+setShowOnboarding\(true\)\s+setOnboardingStep\('select'\)\s+setOnboardingError\(microsoftConsentErrorMessage\(message\.error\)\)/,
   )
-  assert.match(
-    tenantPage,
-    /\} else \{\s+setShowOnboarding\(true\)\s+setOnboardingStep\('select'\)\s+setOnboardingError\(microsoftConsentErrorMessage\(message\.error\)\)/,
-  )
+  assert.match(tenantPage, /consentResultCanOpenSetup\(message\)/)
+  assert.match(fallbackPage, /window\.opener\.location\.assign\(currentUrl\.href\)/)
+  assert.match(fallbackPage, /microsoftConsentErrorMessage\(consentError\)/)
   assert.match(tenantPage, /role="alert"\s+aria-live="assertive"/)
 })
