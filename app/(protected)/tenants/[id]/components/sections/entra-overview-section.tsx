@@ -89,7 +89,7 @@ interface EntraOverviewSectionProps {
   bundle: any
   users: TenantUser[]
   signIns: SignInEvent[]
-  caPolicies: CaPolicy[]
+  caPolicies: unknown
   conditionalAccessEvidence: PilotEvidenceView['conditionalAccess'] | null
   authMethods: AuthMethodRow[]
   namedLocations: NamedLocation[]

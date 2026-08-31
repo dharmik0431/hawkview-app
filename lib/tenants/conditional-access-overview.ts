@@ -15,6 +15,27 @@ export type ConditionalAccessOverviewState = {
   contributesWarning: boolean
 }
 
+const POLICY_STATES = new Set<ConditionalAccessOverviewPolicy['state']>([
+  'ON',
+  'REPORT_ONLY',
+  'OFF',
+])
+
+function policy(value: unknown): ConditionalAccessOverviewPolicy | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) return null
+    const state = Object.getOwnPropertyDescriptor(value, 'state')
+    if (!state || !('value' in state) || !POLICY_STATES.has(state.value as ConditionalAccessOverviewPolicy['state'])) {
+      return null
+    }
+    return { state: state.value as ConditionalAccessOverviewPolicy['state'] }
+  } catch {
+    return null
+  }
+}
+
 const unavailable = (
   value: string,
   detail: string,
@@ -28,7 +49,7 @@ const unavailable = (
 
 export function conditionalAccessOverviewState(
   evidence: ConditionalAccessOverviewEvidence | null | undefined,
-  policies: ConditionalAccessOverviewPolicy[],
+  policies: unknown,
 ): ConditionalAccessOverviewState {
   const availability = evidence?.availability ?? 'UNVERIFIED'
   const count = evidence?.count ?? null
@@ -64,6 +85,27 @@ export function conditionalAccessOverviewState(
     )
   }
 
+  if (
+    count === null ||
+    !Number.isSafeInteger(count) ||
+    count < 0 ||
+    !Array.isArray(policies) ||
+    policies.length !== count
+  ) {
+    return unavailable(
+      'Conditional Access policy details unavailable',
+      'Current policy details do not match the authoritative evidence count.',
+    )
+  }
+
+  const normalizedPolicies = policies.map(policy)
+  if (normalizedPolicies.some((candidate) => candidate === null)) {
+    return unavailable(
+      'Conditional Access policy details unavailable',
+      'Current policy details contain an unsupported or malformed policy state.',
+    )
+  }
+
   if (count === 0) {
     return {
       authoritative: true,
@@ -74,19 +116,7 @@ export function conditionalAccessOverviewState(
     }
   }
 
-  if (
-    count === null ||
-    !Number.isSafeInteger(count) ||
-    count < 0 ||
-    policies.length !== count
-  ) {
-    return unavailable(
-      'Conditional Access policy details unavailable',
-      'Current policy details do not match the authoritative evidence count.',
-    )
-  }
-
-  const enabled = policies.filter((policy) => policy.state === 'ON').length
+  const enabled = normalizedPolicies.filter((candidate) => candidate?.state === 'ON').length
   const warning = enabled === 0
   return {
     authoritative: true,

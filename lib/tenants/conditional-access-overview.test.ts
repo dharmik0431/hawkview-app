@@ -46,6 +46,40 @@ test('renders an authoritative empty Conditional Access result with neutral word
   assert.equal(result.contributesWarning, false)
 })
 
+test('rejects an authoritative zero count when policy details are not empty', () => {
+  const result = conditionalAccessOverviewState(
+    { availability: 'READY', count: 0 },
+    [{ state: 'ON' }],
+  )
+  assert.equal(result.authoritative, false)
+  assert.equal(result.value, 'Conditional Access policy details unavailable')
+  assert.equal(result.status, 'neutral')
+  assert.equal(result.contributesWarning, false)
+  assert.doesNotMatch(result.value, /\d+ of \d+/)
+})
+
+test('rejects malformed policy states instead of converting them to disabled policies', () => {
+  const result = conditionalAccessOverviewState(
+    { availability: 'READY', count: 1 },
+    [{ state: 'ENABLED' }],
+  )
+  assert.equal(result.authoritative, false)
+  assert.equal(result.value, 'Conditional Access policy details unavailable')
+  assert.equal(result.status, 'neutral')
+  assert.equal(result.contributesWarning, false)
+  assert.doesNotMatch(result.value, /\d+ of \d+/)
+})
+
+test('rejects non-plain policy objects at the runtime boundary', () => {
+  const result = conditionalAccessOverviewState(
+    { availability: 'READY', count: 1 },
+    [Object.assign(new Date(), { state: 'ON' })],
+  )
+  assert.equal(result.authoritative, false)
+  assert.equal(result.value, 'Conditional Access policy details unavailable')
+  assert.equal(result.status, 'neutral')
+})
+
 test('fails closed when ready policy details do not match the authoritative count', () => {
   const result = conditionalAccessOverviewState(
     { availability: 'READY', count: 2 },

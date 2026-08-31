@@ -19,6 +19,8 @@ test('tenant security views consume the server-owned Conditional Access and Secu
   assert.match(conditionalAccess, /Security Defaults is on/)
   assert.match(conditionalAccess, /does not prove Conditional Access policy coverage or universal MFA enforcement/)
   assert.match(licenses, /securityDefaultsEvidence\?\.availability !== 'READY'/)
+  assert.match(page, /const overviewCaPolicies: unknown =/)
+  assert.match(page, /caPolicies=\{overviewCaPolicies\}/)
   assert.match(page, /conditionalAccessEvidence=\{collectionReadiness\?\.evidence\.conditionalAccess \?\? null\}/)
   assert.match(overview, /conditionalAccessOverviewState\(conditionalAccessEvidence, caPolicies\)/)
   assert.match(overview, /if \(caOverview\.status === 'neutral'\) \{\s*return 'Incomplete data'/)

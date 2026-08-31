@@ -2016,6 +2016,10 @@ export default function TenantDetailsPage() {
         ? ((bundle?.entra?.caPolicies ?? []) as ConditionalAccessPolicy[])
         : []
       : caPolicies
+  const overviewCaPolicies: unknown =
+    tenant?.provider === 'microsoft'
+      ? bundle?.entra?.caPolicies ?? []
+      : caPolicies
   const displayedAuthMethods =
     tenant?.provider === 'microsoft'
       ? ((bundle?.entra?.authMethods ?? []) as AuthMethodRow[])
@@ -4081,7 +4085,7 @@ export default function TenantDetailsPage() {
                     bundle={bundle}
                     users={USERS as any}
                     signIns={SIGNINS}
-                    caPolicies={displayedCaPolicies as any}
+                    caPolicies={overviewCaPolicies}
                     conditionalAccessEvidence={collectionReadiness?.evidence.conditionalAccess ?? null}
                     authMethods={displayedAuthMethods as any}
                     namedLocations={displayedNamedLocations as any}
