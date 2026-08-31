@@ -10,6 +10,7 @@ test('tenant security views consume the server-owned Conditional Access and Secu
   const page = source('app/(protected)/tenants/[id]/page.tsx')
   const conditionalAccess = source('app/(protected)/tenants/[id]/components/sections/entra-section.tsx')
   const licenses = source('app/(protected)/tenants/[id]/components/sections/licenses-section.tsx')
+  const overview = source('app/(protected)/tenants/[id]/components/sections/entra-overview-section.tsx')
 
   assert.match(page, /collectionReadiness\?\.evidence\.conditionalAccess\.availability === 'READY'/)
   assert.match(page, /evidence=\{collectionReadiness\?\.evidence \?\? null\}/)
@@ -18,6 +19,10 @@ test('tenant security views consume the server-owned Conditional Access and Secu
   assert.match(conditionalAccess, /Security Defaults is on/)
   assert.match(conditionalAccess, /does not prove Conditional Access policy coverage or universal MFA enforcement/)
   assert.match(licenses, /securityDefaultsEvidence\?\.availability !== 'READY'/)
+  assert.match(page, /conditionalAccessEvidence=\{collectionReadiness\?\.evidence\.conditionalAccess \?\? null\}/)
+  assert.match(overview, /conditionalAccessOverviewState\(conditionalAccessEvidence, caPolicies\)/)
+  assert.match(overview, /if \(caOverview\.status === 'neutral'\) \{\s*return 'Incomplete data'/)
+  assert.doesNotMatch(overview, /caPoliciesSynchronized && enabledCaPoliciesCount === 0/)
 })
 
 test('permission and risk presentation retain bounded evidence instead of inventing status', () => {

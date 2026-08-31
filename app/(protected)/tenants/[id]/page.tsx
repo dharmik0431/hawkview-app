@@ -4082,6 +4082,7 @@ export default function TenantDetailsPage() {
                     users={USERS as any}
                     signIns={SIGNINS}
                     caPolicies={displayedCaPolicies as any}
+                    conditionalAccessEvidence={collectionReadiness?.evidence.conditionalAccess ?? null}
                     authMethods={displayedAuthMethods as any}
                     namedLocations={displayedNamedLocations as any}
                     onNavigateTab={(tab, secView) =>

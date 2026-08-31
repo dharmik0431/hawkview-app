@@ -4,6 +4,8 @@ import { useMemo } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { tenantUserMfaRegistration } from '@/lib/tenants/mfa-status'
+import { conditionalAccessOverviewState } from '@/lib/tenants/conditional-access-overview'
+import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 import {
   ChevronRight,
   Clock,
@@ -88,6 +90,7 @@ interface EntraOverviewSectionProps {
   users: TenantUser[]
   signIns: SignInEvent[]
   caPolicies: CaPolicy[]
+  conditionalAccessEvidence: PilotEvidenceView['conditionalAccess'] | null
   authMethods: AuthMethodRow[]
   namedLocations: NamedLocation[]
   onNavigateTab: (
@@ -139,6 +142,7 @@ export default function EntraOverviewSection({
   users,
   signIns,
   caPolicies,
+  conditionalAccessEvidence,
   authMethods,
   namedLocations,
   onNavigateTab,
@@ -186,11 +190,10 @@ export default function EntraOverviewSection({
     : null
 
   // SECURITY DATA CALCULATIONS
-  const caPoliciesSynchronized =
-    Array.isArray(bundle?.entra?.caPolicies) || caPolicies.length > 0
-  const enabledCaPoliciesCount = caPolicies.filter(
-    (p) => p.state === 'ON'
-  ).length
+  const caOverview = useMemo(
+    () => conditionalAccessOverviewState(conditionalAccessEvidence, caPolicies),
+    [conditionalAccessEvidence, caPolicies]
+  )
 
   const authMethodsSynchronized =
     Array.isArray(bundle?.entra?.authMethods) &&
@@ -237,7 +240,7 @@ export default function EntraOverviewSection({
   const overallStatus: 'Healthy' | 'Needs attention' | 'Incomplete data' =
     useMemo(() => {
       if (
-        !caPoliciesSynchronized &&
+        !caOverview.authoritative &&
         !usersSynchronized &&
         !authMethodsSynchronized
       ) {
@@ -245,19 +248,21 @@ export default function EntraOverviewSection({
       }
       if (
         failedSignInsCount > 0 ||
-        (caPoliciesSynchronized && enabledCaPoliciesCount === 0) ||
+        caOverview.contributesWarning ||
         (usersSynchronized && mfaRegistrationCoveragePct < 80) ||
         (bundle?.entra?.riskyUsers?.length || 0) > 0
       ) {
         return 'Needs attention'
       }
+      if (caOverview.status === 'neutral') {
+        return 'Incomplete data'
+      }
       return 'Healthy'
     }, [
-      caPoliciesSynchronized,
+      caOverview,
       usersSynchronized,
       authMethodsSynchronized,
       failedSignInsCount,
-      enabledCaPoliciesCount,
       mfaRegistrationCoveragePct,
       bundle?.entra?.riskyUsers,
     ])
@@ -268,15 +273,9 @@ export default function EntraOverviewSection({
       {
         id: 'ca',
         name: 'Conditional Access',
-        value: caPoliciesSynchronized
-          ? `${enabledCaPoliciesCount} of ${caPolicies.length} policies enabled`
-          : 'Awaiting collection',
-        detail: 'Access control and risk enforcement',
-        status: !caPoliciesSynchronized
-          ? 'neutral'
-          : enabledCaPoliciesCount > 0
-            ? 'healthy'
-            : 'warning',
+        value: caOverview.value,
+        detail: caOverview.detail,
+        status: caOverview.status,
         action: () => onNavigateTab('security', 'policies'),
       },
       {
@@ -339,9 +338,7 @@ export default function EntraOverviewSection({
       },
     ]
   }, [
-    caPoliciesSynchronized,
-    enabledCaPoliciesCount,
-    caPolicies.length,
+    caOverview,
     usersSynchronized,
     mfaRegisteredUsersCount,
     activeUsersCount,
@@ -635,11 +632,7 @@ export default function EntraOverviewSection({
                     Security Posture
                   </span>
                   <div className="text-sm font-bold text-slate-900 dark:text-slate-100 mt-1">
-                    {caPoliciesSynchronized
-                      ? `${enabledCaPoliciesCount} of ${caPolicies.length} Conditional Access policies enabled`
-                      : usersSynchronized
-                        ? `MFA registration coverage at ${mfaRegistrationCoveragePct}% across ${activeUsersCount} active users`
-                        : 'Directory identity security posture'}
+                    {caOverview.value}
                   </div>
                 </div>
                 {/* Overall Badge */}
