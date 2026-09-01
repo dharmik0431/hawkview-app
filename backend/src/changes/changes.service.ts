@@ -550,7 +550,9 @@ export class ChangesService {
     return { changes: events, tenants: allTenants.map((tenant) => ({ id: tenant.id, name: names.get(tenant.id)! })), summary, range: { from: from.toISOString(), to: to.toISOString() }, ...(pageSize ? { pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } } : {}) }
   }
 
-  async detail(identity: AuthenticatedIdentity, sourceId: string) {
+  async detail(identity: AuthenticatedIdentity, sourceId: string, requestedTenantId: unknown) {
+    const customerTenantId = text(requestedTenantId)
+    if (!customerTenantId) throw new BadRequestException('Select a tenant for this investigation event.')
     const separator = sourceId.indexOf(':')
     if (separator <= 0) throw new BadRequestException('Use a valid change event identifier.')
     if (sourceId.slice(0, separator) === 'signin') {
@@ -568,13 +570,21 @@ export class ChangesService {
       throw new BadRequestException('Use a valid change event identifier.')
     }
     const organizationIds = await this.organizationIds(identity)
+    const scopedTenants = await this.prisma.customerTenant.findMany({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: { id: true },
+      take: 1,
+    })
+    if (!scopedTenants.some((tenant) => tenant.id === customerTenantId)) {
+      throw new BadRequestException('This investigation event is unavailable or outside retention.')
+    }
     const projectedEvent = await this.prisma.changeEvidenceEvent.findFirst({
-      where: { source, sourceEventId, organizationId: { in: organizationIds } },
+      where: { source, sourceEventId, customerTenantId, organizationId: { in: organizationIds } },
     })
     const fallbackAudit = projectedEvent || source !== 'DIRECTORY_AUDIT'
       ? null
       : await this.prisma.directoryAuditLog.findFirst({
-          where: { microsoftAuditId: sourceEventId, organizationId: { in: organizationIds } },
+          where: { microsoftAuditId: sourceEventId, customerTenantId, organizationId: { in: organizationIds } },
         })
     if (!projectedEvent && !fallbackAudit) throw new BadRequestException('This investigation event is unavailable or outside retention.')
 

@@ -246,6 +246,90 @@ test('keeps identical Microsoft source IDs isolated by tenant across totals, fil
   assert.deepEqual(tenantFiltered.pagination, { page: 1, pageSize: 1, total: 1, totalPages: 1 })
 })
 
+test('requires tenant identity and resolves a shared Microsoft event ID only inside that tenant', async () => {
+  const events = ['tenant-1', 'tenant-2'].map((customerTenantId, index) => ({
+    id: `shared-row-${index + 1}`, source: 'DIRECTORY_AUDIT', sourceEventId: 'shared:detail:id',
+    eventDateTime: new Date(`2026-08-01T1${index + 1}:00:00.000Z`), customerTenantId, organizationId: 'org-1',
+    category: 'Apps', severity: 'High', operationName: 'Update application', summary: 'Updated',
+    actorId: null, actorPrincipalName: 'owner@example.test', actorDisplayName: null, targetId: `app-${index + 1}`,
+    targetDisplayName: `App ${index + 1}`, targetType: 'application', ipAddress: null, location: null,
+    beforeState: null, afterState: null, correlationId: null, changedFields: [], workload: 'Microsoft Entra ID',
+    result: 'success', raw: { operationType: 'Update' },
+  }))
+  events.push({
+    ...events[0]!,
+    id: 'tenant-1-only-row',
+    sourceEventId: 'tenant-1:only:id',
+    targetId: 'tenant-1-only-app',
+    targetDisplayName: 'Tenant 1 only app',
+  })
+  const detailQueries: any[] = []
+  const service = new ChangesService(changesPrisma({
+    customerTenant: {
+      findMany: async () => [
+        { id: 'tenant-1', displayName: 'Tenant One', primaryDomain: 'one.example' },
+        { id: 'tenant-2', displayName: 'Tenant Two', primaryDomain: 'two.example' },
+      ],
+    },
+    changeEvidenceEvent: {
+      findFirst: async (args: any) => {
+        detailQueries.push(args)
+        return events.find((event) =>
+          event.customerTenantId === args.where.customerTenantId &&
+          event.source === args.where.source &&
+          event.sourceEventId === args.where.sourceEventId
+        ) ?? null
+      },
+      findMany: async () => [],
+    },
+  }) as never)
+
+  await assert.rejects(
+    () => service.detail(identity, 'audit:shared:detail:id', undefined),
+    /Select a tenant for this investigation event/,
+  )
+  const tenantOneDetail = await service.detail(identity, 'audit:shared:detail:id', 'tenant-1')
+  const tenantTwoDetail = await service.detail(identity, 'audit:shared:detail:id', 'tenant-2')
+  assert.equal(tenantOneDetail.event.customerTenantId, 'tenant-1')
+  assert.equal(tenantOneDetail.event.targetDisplayName, 'App 1')
+  assert.equal(tenantTwoDetail.event.customerTenantId, 'tenant-2')
+  assert.equal(tenantTwoDetail.event.targetDisplayName, 'App 2')
+  assert.deepEqual(detailQueries.map((query) => query.where), ['tenant-1', 'tenant-2'].map((customerTenantId) => ({
+    source: 'DIRECTORY_AUDIT',
+    sourceEventId: 'shared:detail:id',
+    customerTenantId,
+    organizationId: { in: ['org-1'] },
+  })))
+
+  await assert.rejects(
+    () => service.detail(identity, 'audit:tenant-1:only:id', 'tenant-2'),
+    /unavailable or outside retention/,
+  )
+})
+
+test('fails closed before evidence lookup when a detail tenant is outside the organization', async () => {
+  let evidenceLookups = 0
+  let fallbackLookups = 0
+  const service = new ChangesService(changesPrisma({
+    customerTenant: { findMany: async () => [{ id: 'tenant-1' }] },
+    changeEvidenceEvent: {
+      findFirst: async () => { evidenceLookups += 1; return null },
+      findMany: async () => [],
+    },
+    directoryAuditLog: {
+      findMany: async () => [],
+      findFirst: async () => { fallbackLookups += 1; return null },
+    },
+  }) as never)
+
+  await assert.rejects(
+    () => service.detail(identity, 'audit:shared-detail-id', 'tenant-outside-org'),
+    /unavailable or outside retention/,
+  )
+  assert.equal(evidenceLookups, 0)
+  assert.equal(fallbackLookups, 0)
+})
+
 test('exposes M365 workload evidence with a source-specific stable identifier', async () => {
   const event = {
     id: 'm365-evidence-1', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'exchange-record-1', eventDateTime: new Date('2026-08-01T13:00:00.000Z'), customerTenantId: 'tenant-1', category: 'Exchange', severity: 'High', operationName: 'Set-Mailbox', summary: 'Exchange reported Set-Mailbox.', actorPrincipalName: 'admin@example.test', actorDisplayName: null, targetDisplayName: 'mailbox@example.test', ipAddress: null, location: null, beforeState: null, afterState: { ForwardingAddress: 'review@example.test' }, correlationId: 'corr-m365', changedFields: ['ForwardingAddress'], workload: 'Exchange', result: 'Succeeded',
@@ -319,7 +403,7 @@ test('presents Exchange mailbox-rule snapshot evidence consistently in list and 
     normalized: true, changedFields: ['forwardTo'], workload: 'Exchange Online', result: 'Detected',
     source: 'Exchange Online', provenance: 'HawkView snapshot comparison', microsoftSource: 'Microsoft Graph mailbox rules',
   })
-  const detail = await service.detail(identity, 'evidence:SNAPSHOT_DIFFERENCE:exchange-rule:mailbox@example.test:rule-1')
+  const detail = await service.detail(identity, 'evidence:SNAPSHOT_DIFFERENCE:exchange-rule:mailbox@example.test:rule-1', 'tenant-1')
   assert.equal(detail.event.source, 'Exchange Online')
   assert.deepEqual((detail.event.evidence as { provenance?: string; microsoftSource?: string }), {
     source: 'Exchange Online', provenance: 'HawkView snapshot comparison', microsoftSource: 'Microsoft Graph mailbox rules',
@@ -337,7 +421,7 @@ test('keeps directory audit display source as Entra in list and detail', async (
   const service = new ChangesService(changesPrisma({ changeEvidenceEvent: { findMany: async () => [event], findFirst: async () => event } }) as never)
   const list = await service.list(identity, range)
   assert.equal(list.changes[0]?.source, 'Entra')
-  const detail = await service.detail(identity, 'audit:directory-1')
+  const detail = await service.detail(identity, 'audit:directory-1', 'tenant-1')
   assert.equal(detail.event.source, 'Entra')
   assert.equal((detail.event.evidence as { provenance?: string }).provenance, 'Microsoft Graph directoryAudit')
 })
@@ -357,7 +441,7 @@ test('reclassifies retained historical fields identically in list and detail', a
   }) as never)
 
   const list = await service.list(identity, range)
-  const detail = await service.detail(identity, 'audit:historical-directory-1')
+  const detail = await service.detail(identity, 'audit:historical-directory-1', 'tenant-1')
   const listTruth = {
     category: list.changes[0]?.category,
     severity: list.changes[0]?.severity,
@@ -471,7 +555,7 @@ test('uses an exact Microsoft correlation ID for supporting sign-ins and never i
     // returning only the matching row simulates that query result.
     signInLog: { findMany: async (args: unknown) => { signInQuery = args; void moreThanOneHundredNearbyButUnrelated; return [matchingSignIn] } },
   }) as never)
-  const result = await service.detail(identity, 'audit:audit-correlation')
+  const result = await service.detail(identity, 'audit:audit-correlation', 'tenant-1')
   assert.equal(result.relatedSignIns.length, 1)
   assert.equal(result.relatedSignIns[0]?.id, 'sign-in-matching')
   assert.match(String(result.relatedSignIns[0]?.relationship), /does not establish causation/)
@@ -494,7 +578,7 @@ test('does not attach nearby sign-ins when Microsoft did not provide a correlati
     changeEvidenceEvent: { findFirst: async () => event, findMany: async () => [] },
     signInLog: { findMany: async () => { signInQueryCount += 1; return [] } },
   }) as never)
-  const result = await service.detail(identity, 'audit:audit-no-correlation')
+  const result = await service.detail(identity, 'audit:audit-no-correlation', 'tenant-1')
   assert.deepEqual(result.relatedSignIns, [])
   assert.equal(signInQueryCount, 0)
 })
@@ -534,7 +618,7 @@ test('groups destructive mailbox activity as non-causal evidence around a compro
       supporting('mail-unrelated', 'SoftDelete', 'other@example.test'),
     ] },
   }) as never)
-  const result = await service.detail(identity, 'audit:app-registration')
+  const result = await service.detail(identity, 'audit:app-registration', 'tenant-1')
   assert.equal(result.relatedMailboxActivity.length, 1)
   assert.equal(result.relatedMailboxActivity[0]?.operation, 'MoveToDeletedItems')
   assert.equal(result.relatedMailboxActivity[0]?.count, 4)
@@ -547,7 +631,7 @@ test('groups destructive mailbox activity as non-causal evidence around a compro
 test('does not expose a standalone sign-in through the change detail endpoint', async () => {
   const service = new ChangesService(changesPrisma() as never)
   await assert.rejects(
-    () => service.detail(identity, 'signin:sign-in-1'),
+    () => service.detail(identity, 'signin:sign-in-1', 'tenant-1'),
     /Sign-ins are available only as correlated supporting evidence/
   )
 })
@@ -565,11 +649,12 @@ test('returns a redacted raw directory-audit detail when its projection is unava
     changeEvidenceEvent: { findFirst: async () => null, findMany: async () => [] },
     directoryAuditLog: { findMany: async () => [], findFirst: async (args: unknown) => { fallbackQuery = args; return sourceAudit } },
   }) as never)
-  const result = await service.detail(identity, 'audit:audit-raw-detail-1')
+  const result = await service.detail(identity, 'audit:audit-raw-detail-1', 'tenant-1')
   assert.equal(result.event.sourceEventId, 'audit-raw-detail-1')
   assert.equal(result.event.actorPrincipalName, 'owner@example.test')
   assert.equal((result.event.raw as Record<string, unknown>).clientSecret, '[REDACTED]')
   assert.deepEqual(fallbackQuery.where.organizationId, { in: ['org-1'] })
+  assert.equal(fallbackQuery.where.customerTenantId, 'tenant-1')
 })
 
 test('does not silently truncate a timeline with more than 5,000 records', async () => {
@@ -658,7 +743,7 @@ test('derives product guidance only from the trusted snapshot catalog, never sto
   }) as never)
   const list = await service.list(identity, range)
   const listImpact = (list.changes[0]?.evidence as { potentialImpact?: unknown }).potentialImpact
-  const detail = await service.detail(identity, 'evidence:SNAPSHOT_DIFFERENCE:organization:displayName')
+  const detail = await service.detail(identity, 'evidence:SNAPSHOT_DIFFERENCE:organization:displayName', 'tenant-1')
   const detailImpact = (detail.event.evidence as { potentialImpact?: unknown }).potentialImpact
   assert.deepEqual(listImpact, {
     kind: 'product_guidance', impactId: 'organization.identity_changed',
