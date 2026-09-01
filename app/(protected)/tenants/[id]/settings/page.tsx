@@ -7,12 +7,13 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '@/components/providers/auth-provider'
 
 import { apiClient } from '@/lib/api/client'
-import { auditSyncFocusTarget, auditSyncRequiresAction, isM365AuditSyncDeepLink, m365AuditSyncHealth } from '@/lib/tenants/audit-sync-health'
+import { auditSyncFocusTarget, isM365AuditSyncDeepLink, m365AuditSyncHealth } from '@/lib/tenants/audit-sync-health'
 import { isActionableReadinessState, normalizeCollectionReadiness, readinessDiagnostic, readinessLabel, readinessRemediation, synchronizationReadinessSummary, READINESS_STATES } from '@/lib/tenants/collection-readiness'
 import { datasetStateNeedsTenantAction, datasetTierLabel, microsoftAccessDatasetView, microsoftAccessSummary, normalizeMicrosoftAccessCatalog, normalizeMicrosoftVerificationTimestamp } from '@/lib/tenants/microsoft-access-contract'
 import {
   settingsConnectionHealth,
   settingsOverallHealth,
+  settingsPriorityAttentionItems,
   settingsSynchronizationAttention,
   settingsSynchronizationStateLabel,
   settingsSynchronizationRows,
@@ -498,56 +499,10 @@ export default function TenantSettingsPage() {
   }, [synchronizationSummary])
 
   // Priority Attention Items computation
-  const priorityAttentionItems = useMemo(() => {
-    const items: Array<{
-      id: string
-      title: string
-      status: string
-      statusVariant: 'amber' | 'red' | 'blue'
-      explanation: string
-      timestamp: string
-      actionLabel: string
-      targetTab: string
-      targetRowId?: string
-    }> = []
-
-    // Non-ready workloads from collection readiness
-    if (collectionReadiness?.workloads) {
-      collectionReadiness.workloads.forEach((w) => {
-        if (isActionableReadinessState(w.state)) {
-          const isRed = ['BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION', 'FAILED_TRANSIENT'].includes(w.state)
-          items.push({
-            id: `collection-${w.key}`,
-            title: w.workload,
-            status: readinessLabel(w.state),
-            statusVariant: isRed ? 'red' : 'amber',
-            explanation: readinessDiagnostic(w.reasonCode, w.reason) || w.remediation || 'Requires attention.',
-            timestamp: formatDate(w.lastAttemptAt || w.lastVerifiedAt),
-            actionLabel: 'Investigate in Collection',
-            targetTab: 'collection',
-            targetRowId: `row-${w.key}`,
-          })
-        }
-      })
-    }
-
-    // Audit Sync issues
-    if (auditSync && auditSyncRequiresAction(auditSync) && !items.some((item) => item.id === 'collection-m365_audit')) {
-      items.push({
-        id: 'audit-sync',
-        title: 'Microsoft 365 Unified Audit',
-        status: readinessLabel(auditSync.classification),
-        statusVariant: 'amber',
-        explanation: auditSync.message || 'Audit log synchronization requires attention.',
-        timestamp: formatDate(auditSync.lastAttemptAt),
-        actionLabel: 'Investigate in Sync',
-        targetTab: 'synchronization',
-        targetRowId: 'row-m365_unified_audit',
-      })
-    }
-
-    return items
-  }, [collectionReadiness, auditSync])
+  const priorityAttentionItems = useMemo(
+    () => settingsPriorityAttentionItems(collectionReadiness, auditSync),
+    [collectionReadiness, auditSync],
+  )
   const priorityAttentionVerified = collectionReadiness !== null
 
   // Filtered & Sorted Collection Workloads
@@ -974,7 +929,7 @@ export default function TenantSettingsPage() {
                         >
                           {item.status}
                         </Badge>
-                        <span className="text-slate-400 dark:text-slate-500 text-[11px]">• {item.timestamp}</span>
+                        <span className="text-slate-400 dark:text-slate-500 text-[11px]">• {formatDate(item.timestamp)}</span>
                       </div>
                       <p className="text-slate-600 dark:text-slate-300 text-xs leading-relaxed">{item.explanation}</p>
                     </div>

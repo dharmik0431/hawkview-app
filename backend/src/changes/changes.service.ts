@@ -4,7 +4,6 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { redactSensitiveValues } from './change-evidence.service.js'
 import {
   classifyEvidence,
-  legacyCategory,
   PRIMARY_CHANGE_CLASSIFICATIONS,
   type ChangeClassification,
 } from './change-classification.js'
@@ -31,6 +30,35 @@ type TimelineEvent = {
   target?: string
   ip?: string
   [key: string]: unknown
+}
+
+type TimelineEvidenceIdentity = {
+  customerTenantId: string
+  source: string
+  sourceEventId: string
+}
+
+function timelineEvidenceIdentity(event: TimelineEvent): TimelineEvidenceIdentity | null {
+  if (event.id.startsWith('audit:')) {
+    return {
+      customerTenantId: event.tenantId,
+      source: 'DIRECTORY_AUDIT',
+      sourceEventId: event.id.slice('audit:'.length),
+    }
+  }
+  if (!event.id.startsWith('evidence:')) return null
+  const sourceAndId = event.id.slice('evidence:'.length)
+  const separator = sourceAndId.indexOf(':')
+  if (separator <= 0) return null
+  return {
+    customerTenantId: event.tenantId,
+    source: sourceAndId.slice(0, separator),
+    sourceEventId: sourceAndId.slice(separator + 1),
+  }
+}
+
+function timelineEvidenceKey(identity: TimelineEvidenceIdentity) {
+  return [identity.customerTenantId, identity.source, identity.sourceEventId].join('\u0000')
 }
 const object = (value: unknown): JsonObject =>
   value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : {}
@@ -248,6 +276,17 @@ function normalizedEvidenceTrust(event: Parameters<typeof normalizedEvidenceClas
     : classifyEvidenceTrust(input)
 }
 
+function normalizedEvidenceProjection(event: Parameters<typeof normalizedEvidenceClassification>[0]) {
+  const trust = normalizedEvidenceTrust(event)
+  return {
+    classification: normalizedEvidenceClassification(event),
+    category: trust.evidenceClass === 'PRIMARY_CHANGE' ? trust.category : 'Unknown',
+    severity: trust.evidenceClass === 'PRIMARY_CHANGE' ? trust.severity : 'Low',
+    presentation: sourcePresentation(event),
+    trust,
+  }
+}
+
 function directoryAuditProjection(log: {
   activityDisplayName: string
   category: string | null
@@ -423,9 +462,7 @@ export class ChangesService {
       const location = object(event.location)
       const before = object(event.beforeState)
       const after = object(event.afterState)
-      const classification = normalizedEvidenceClassification(event)
-      const trust = normalizedEvidenceTrust(event)
-      const presentation = sourcePresentation(event)
+      const { classification, category, severity, presentation } = normalizedEvidenceProjection(event)
       const potentialImpact = potentialImpactFor(event)
       return {
         id: event.source === 'DIRECTORY_AUDIT'
@@ -437,8 +474,8 @@ export class ChangesService {
         tenantId: event.customerTenantId,
         tenantName: names.get(event.customerTenantId) ?? 'Microsoft tenant',
         provider: 'Microsoft' as const,
-        category: trust.evidenceClass === 'PRIMARY_CHANGE' ? trust.category : 'Unknown',
-        severity: trust.evidenceClass === 'PRIMARY_CHANGE' ? trust.severity : 'Low',
+        category,
+        severity,
         title: event.operationName,
         summary: event.summary,
         actor: event.actorPrincipalName ?? event.actorDisplayName ?? undefined,
@@ -453,7 +490,7 @@ export class ChangesService {
         before,
         after,
         correlationId: event.correlationId ?? undefined,
-        ...eventGuidance(event.category, before, after),
+        ...eventGuidance(category, before, after),
         evidence: {
           normalized: true,
           changedFields: array(event.changedFields),
@@ -467,20 +504,22 @@ export class ChangesService {
     // A projection is created during subsequent syncs. Keep previously
     // retained raw records visible and let the normalized record replace its
     // identical source event when both are present.
-    const bySourceEvent = new Map<string, TimelineEvent>(
-      changes.map((event): [string, TimelineEvent] => [event.id, event])
-    )
+    const bySourceEvent = new Map<string, TimelineEvent>()
+    for (const event of changes) {
+      const identity = timelineEvidenceIdentity(event)
+      if (identity) bySourceEvent.set(timelineEvidenceKey(identity), event)
+    }
     for (const event of normalized) {
       // Microsoft can surface the same Entra record through Graph and the
       // Management Activity API. Exact source IDs are safe to collapse; if
       // Microsoft supplies only an uncertain similarity, retain both records.
-      const sourceEventId = String(event.id).split(':').at(-1)
+      const identity = timelineEvidenceIdentity(event)
+      if (!identity) continue
       if (
-        String(event.id).startsWith('evidence:M365_UNIFIED_AUDIT:') &&
-        sourceEventId &&
-        bySourceEvent.has(`audit:${sourceEventId}`)
+        identity.source === 'M365_UNIFIED_AUDIT' &&
+        bySourceEvent.has(timelineEvidenceKey({ ...identity, source: 'DIRECTORY_AUDIT' }))
       ) continue
-      bySourceEvent.set(event.id, event)
+      bySourceEvent.set(timelineEvidenceKey(identity), event)
     }
     let events: TimelineEvent[] = [...bySourceEvent.values()]
     const requestedCategory = text(query.category)
@@ -539,16 +578,19 @@ export class ChangesService {
         })
     if (!projectedEvent && !fallbackAudit) throw new BadRequestException('This investigation event is unavailable or outside retention.')
 
-    const fallbackKind = fallbackAudit ? legacyCategory(
-      fallbackAudit.activityDisplayName,
-      fallbackAudit.category,
-      fallbackAudit.operationType,
-      targetResourceTypes(fallbackAudit.targetResources),
-    ) : null
     const fallbackDetails = fallbackAudit ? targetDetails(fallbackAudit.targetResources) : null
-    const classification = projectedEvent
-      ? normalizedEvidenceClassification(projectedEvent)
-      : directoryAuditProjection(fallbackAudit!).classification
+    const projection = projectedEvent
+      ? normalizedEvidenceProjection(projectedEvent)
+      : (() => {
+          const projected = directoryAuditProjection(fallbackAudit!)
+          return {
+            classification: projected.classification,
+            category: projected.trust.category,
+            severity: projected.trust.severity,
+            presentation: sourcePresentation({ source: 'DIRECTORY_AUDIT' }),
+          }
+        })()
+    const { classification } = projection
     if (!PRIMARY_CHANGE_CLASSIFICATIONS.has(classification)) {
       throw new BadRequestException('This record is telemetry rather than a tenant change investigation event.')
     }
@@ -559,8 +601,8 @@ export class ChangesService {
       eventDateTime: fallbackAudit!.eventDateTime,
       customerTenantId: fallbackAudit!.customerTenantId,
       organizationId: fallbackAudit!.organizationId,
-      category: fallbackKind!.category,
-      severity: fallbackKind!.severity,
+      category: projection.category,
+      severity: projection.severity,
       operationName: fallbackAudit!.activityDisplayName,
       summary: [fallbackAudit!.operationType, fallbackAudit!.result, fallbackAudit!.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change',
       actorId: null,
@@ -766,12 +808,15 @@ export class ChangesService {
         source: candidate.source,
         relationship: 'Shares an exact actor or target within the one-hour investigation window; this association does not establish causation.',
       }))
-    const presentation = sourcePresentation(event)
+    const presentation = projection.presentation
     const potentialImpact = potentialImpactFor(event)
     return {
       event: {
         ...event,
+        category: projection.category,
+        severity: projection.severity,
         source: presentation.source,
+        classification,
         evidence: {
           ...presentation,
           ...(potentialImpact ? { potentialImpact } : {}),

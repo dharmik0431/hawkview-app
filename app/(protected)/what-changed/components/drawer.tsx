@@ -22,6 +22,7 @@ import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { ChangeEvent, isAppRelatedEvent, productGuidanceForImpactId } from '../data/change-types'
 import { classifyEvent } from '../data/event-classifier'
+import { activateDrawerFocus, handleDrawerKeyboard } from './drawer-focus'
 
 function pretty(obj: any) {
   return JSON.stringify(obj ?? {}, null, 2)
@@ -98,42 +99,23 @@ export function WhatChangedDrawer({
   const [showRawJson, setShowRawJson] = React.useState(false)
   const closeButtonRef = React.useRef<HTMLButtonElement>(null)
   const panelRef = React.useRef<HTMLElement>(null)
-  const previouslyFocusedRef = React.useRef<HTMLElement | null>(null)
 
   React.useEffect(() => {
-    if (!open) return
-    previouslyFocusedRef.current = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null
-    window.requestAnimationFrame(() => closeButtonRef.current?.focus())
-    return () => previouslyFocusedRef.current?.focus()
+    if (!open || !panelRef.current) return
+    let restoreFocus: (() => void) | undefined
+    const frame = window.requestAnimationFrame(() => {
+      if (panelRef.current) restoreFocus = activateDrawerFocus(panelRef.current, closeButtonRef.current)
+    })
+    return () => {
+      window.cancelAnimationFrame(frame)
+      restoreFocus?.()
+    }
   }, [open])
 
   // Keep keyboard focus inside the active modal and return it to the opener.
   React.useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape' && open) {
-        onClose()
-        return
-      }
-      if (e.key !== 'Tab' || !open || !panelRef.current) return
-      const focusable = Array.from(panelRef.current.querySelectorAll<HTMLElement>(
-        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
-      )).filter((element) => !element.hasAttribute('hidden'))
-      if (focusable.length === 0) {
-        e.preventDefault()
-        panelRef.current.focus()
-        return
-      }
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (e.shiftKey && (document.activeElement === first || !panelRef.current.contains(document.activeElement))) {
-        e.preventDefault()
-        last.focus()
-      } else if (!e.shiftKey && (document.activeElement === last || !panelRef.current.contains(document.activeElement))) {
-        e.preventDefault()
-        first.focus()
-      }
+      if (open && panelRef.current) handleDrawerKeyboard(e, panelRef.current, onClose)
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
@@ -172,6 +154,7 @@ export function WhatChangedDrawer({
         aria-modal={open ? true : undefined}
         aria-label="Event details"
         tabIndex={-1}
+        inert={!open}
       >
         {/* Drawer Header */}
         {(() => {

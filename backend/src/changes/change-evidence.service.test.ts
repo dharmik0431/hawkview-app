@@ -208,6 +208,44 @@ test('never queries another organization tenant selected through the investigati
   for (const scope of queriedTenantScopes) assert.deepEqual(scope, { in: [] })
 })
 
+test('keeps identical Microsoft source IDs isolated by tenant across totals, filters, and pages', async () => {
+  const events = ['tenant-1', 'tenant-2'].map((customerTenantId, index) => ({
+    id: `row-${index + 1}`, source: 'DIRECTORY_AUDIT', sourceEventId: 'shared-microsoft-id',
+    eventDateTime: new Date(`2026-08-01T1${index + 1}:00:00.000Z`), customerTenantId,
+    category: 'Apps', severity: 'High', operationName: 'Update application', summary: 'Updated',
+    actorPrincipalName: 'owner@example.test', actorDisplayName: null, targetDisplayName: `App ${index + 1}`,
+    targetType: 'application', ipAddress: null, location: null, beforeState: null, afterState: null,
+    correlationId: null, changedFields: [], workload: 'Microsoft Entra ID', result: 'success', raw: { operationType: 'Update' },
+  }))
+  const service = new ChangesService(changesPrisma({
+    customerTenant: {
+      findMany: async () => [
+        { id: 'tenant-1', displayName: 'Tenant One', primaryDomain: 'one.example' },
+        { id: 'tenant-2', displayName: 'Tenant Two', primaryDomain: 'two.example' },
+      ],
+    },
+    changeEvidenceEvent: {
+      findMany: async (args: { where: { customerTenantId: { in: string[] } } }) =>
+        events.filter((event) => args.where.customerTenantId.in.includes(event.customerTenantId)),
+    },
+  }) as never)
+
+  const firstPage = await service.list(identity, { ...range, page: '1', pageSize: '1' })
+  const secondPage = await service.list(identity, { ...range, page: '2', pageSize: '1' })
+  assert.equal(firstPage.summary.total, 2)
+  assert.deepEqual(firstPage.pagination, { page: 1, pageSize: 1, total: 2, totalPages: 2 })
+  assert.deepEqual(secondPage.pagination, { page: 2, pageSize: 1, total: 2, totalPages: 2 })
+  assert.deepEqual(
+    new Set([firstPage.changes[0]?.tenantId, secondPage.changes[0]?.tenantId]),
+    new Set(['tenant-1', 'tenant-2']),
+  )
+
+  const tenantFiltered = await service.list(identity, { ...range, tenantId: 'tenant-2', page: '1', pageSize: '1' })
+  assert.equal(tenantFiltered.summary.total, 1)
+  assert.equal(tenantFiltered.changes[0]?.tenantId, 'tenant-2')
+  assert.deepEqual(tenantFiltered.pagination, { page: 1, pageSize: 1, total: 1, totalPages: 1 })
+})
+
 test('exposes M365 workload evidence with a source-specific stable identifier', async () => {
   const event = {
     id: 'm365-evidence-1', source: 'M365_UNIFIED_AUDIT', sourceEventId: 'exchange-record-1', eventDateTime: new Date('2026-08-01T13:00:00.000Z'), customerTenantId: 'tenant-1', category: 'Exchange', severity: 'High', operationName: 'Set-Mailbox', summary: 'Exchange reported Set-Mailbox.', actorPrincipalName: 'admin@example.test', actorDisplayName: null, targetDisplayName: 'mailbox@example.test', ipAddress: null, location: null, beforeState: null, afterState: { ForwardingAddress: 'review@example.test' }, correlationId: 'corr-m365', changedFields: ['ForwardingAddress'], workload: 'Exchange', result: 'Succeeded',
@@ -302,6 +340,40 @@ test('keeps directory audit display source as Entra in list and detail', async (
   const detail = await service.detail(identity, 'audit:directory-1')
   assert.equal(detail.event.source, 'Entra')
   assert.equal((detail.event.evidence as { provenance?: string }).provenance, 'Microsoft Graph directoryAudit')
+})
+
+test('reclassifies retained historical fields identically in list and detail', async () => {
+  const event = {
+    id: 'historical-directory-1', source: 'DIRECTORY_AUDIT', sourceEventId: 'historical-directory-1',
+    eventDateTime: new Date('2026-08-01T13:00:00.000Z'), customerTenantId: 'tenant-1', organizationId: 'org-1',
+    category: 'Licenses', severity: 'Low', operationName: 'Update application', summary: 'Updated',
+    actorId: null, actorPrincipalName: 'admin@example.test', actorDisplayName: null, targetId: 'app-1',
+    targetDisplayName: 'Application', targetType: 'application', ipAddress: null, location: null,
+    beforeState: null, afterState: null, correlationId: null, changedFields: [], workload: 'Microsoft Entra ID',
+    result: 'Succeeded', raw: { operationType: 'Update' },
+  }
+  const service = new ChangesService(changesPrisma({
+    changeEvidenceEvent: { findMany: async () => [event], findFirst: async () => event },
+  }) as never)
+
+  const list = await service.list(identity, range)
+  const detail = await service.detail(identity, 'audit:historical-directory-1')
+  const listTruth = {
+    category: list.changes[0]?.category,
+    severity: list.changes[0]?.severity,
+    source: list.changes[0]?.source,
+    classification: list.changes[0]?.classification,
+  }
+  const detailTruth = {
+    category: detail.event.category,
+    severity: detail.event.severity,
+    source: detail.event.source,
+    classification: detail.event.classification,
+  }
+  assert.deepEqual(listTruth, {
+    category: 'Apps', severity: 'High', source: 'Entra', classification: 'permission_change',
+  })
+  assert.deepEqual(detailTruth, listTruth)
 })
 
 test('keeps routine Exchange mailbox actions out of What Changed while retaining real inbox-rule changes', async () => {

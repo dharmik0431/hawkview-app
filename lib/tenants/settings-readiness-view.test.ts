@@ -4,6 +4,7 @@ import { normalizeCollectionReadiness, synchronizationReadinessSummary } from '.
 import {
   settingsConnectionHealth,
   settingsOverallHealth,
+  settingsPriorityAttentionItems,
   settingsSynchronizationAttention,
   settingsSynchronizationStateLabel,
   settingsSynchronizationRows,
@@ -124,4 +125,26 @@ test('keeps successful and informational readiness out of Priority attention', (
   assert.deepEqual(settingsOverallHealth(summary), {
     state: 'UNVERIFIED', label: 'Collection status informational',
   })
+})
+
+test('deduplicates actionable Unified Audit readiness and resource health by canonical workload key', () => {
+  const readiness = normalizeCollectionReadiness({
+    ...readinessPayload,
+    workloads: [{
+      ...readinessPayload.workloads[1],
+      key: 'm365_unified_audit',
+      state: 'FAILED_TRANSIENT',
+      reasonCode: 'UPSTREAM_FAILURE',
+      reason: 'The selected audit workload failed.',
+    }],
+  })
+  const items = settingsPriorityAttentionItems(readiness, {
+    classification: 'FAILED_TRANSIENT',
+    message: 'The audit resource health also reports a failure.',
+    lastAttemptAt: '2026-08-19T14:58:00.000Z',
+  })
+
+  assert.equal(items.length, 1)
+  assert.equal(items[0]?.id, 'collection-m365_unified_audit')
+  assert.equal(items[0]?.targetRowId, 'row-m365_unified_audit')
 })

@@ -3,7 +3,7 @@
 import * as React from 'react'
 import { useSearchParams } from 'next/navigation'
 import { History, ShieldAlert, AlertCircle, RefreshCw, X } from 'lucide-react'
-import { useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery } from '@tanstack/react-query'
 import { apiClient } from '@/lib/api/client'
 import {
   TimeWindowValue,
@@ -14,18 +14,17 @@ import { InvestigationToolbar, ToolbarFilterState } from './investigation-toolba
 import { SummaryStrip, SummaryCategoryKey } from './summary-strip'
 import { WhatChangedRow } from './row'
 import { WhatChangedDrawer } from './drawer'
-import { type ChangeEvent, isAppRelatedEvent, normalizeChangesResponse } from '../data/change-types'
+import {
+  type ChangeEvent,
+  type NormalizedChangesResponse,
+  isAppRelatedEvent,
+  mergeChangesPages,
+  normalizeChangesResponse,
+} from '../data/change-types'
 import { classifyEvent } from '../data/event-classifier'
 import { Button } from '@/components/ui/button'
 
-type ChangesResponse = {
-  changes: ChangeEvent[]
-  tenants: { id: string; name: string }[]
-  validPayload: boolean
-  partialPayload: boolean
-  discardedCount: number
-  summary?: { total: number; changes: number; signIns: number; highRisk: number; apps: number }
-}
+const CHANGE_PAGE_SIZE = 250
 
 function uniqTenants(events: ChangeEvent[]) {
   const map = new Map<string, { id: string; name: string }>()
@@ -135,9 +134,18 @@ export function WhatChangedView() {
   }, [timeWindow.from, timeWindow.to])
 
   // Data Query
-  const { data, isLoading, error, refetch } = useQuery<ChangesResponse>({
+  const {
+    data: pagedData,
+    isLoading,
+    error,
+    refetch,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteQuery<NormalizedChangesResponse>({
     queryKey: ['changes', toolbarFilters.tenant, timeWindow.from, timeWindow.to],
-    queryFn: async ({ signal }) => {
+    initialPageParam: 1,
+    queryFn: async ({ signal, pageParam }) => {
       const fromIso = parseISOOrLocal(timeWindow.from).toISOString()
       const toIso = parseISOOrLocal(timeWindow.to).toISOString()
       const response = await apiClient.get('/api/changes', {
@@ -145,15 +153,29 @@ export function WhatChangedView() {
         params: {
           from: fromIso,
           to: toIso,
+          page: String(pageParam),
+          pageSize: String(CHANGE_PAGE_SIZE),
           ...(toolbarFilters.tenant !== 'all' ? { tenantId: toolbarFilters.tenant } : {}),
         },
       })
-      return normalizeChangesResponse(response)
+      const normalized = normalizeChangesResponse(response)
+      return {
+        ...normalized,
+        partialPayload: normalized.partialPayload || !normalized.pagination,
+      }
     },
+    getNextPageParam: (lastPage) => lastPage.pagination && lastPage.pagination.page < lastPage.pagination.totalPages
+      ? lastPage.pagination.page + 1
+      : undefined,
     retry: false,
     staleTime: 5 * 60 * 1000,
     enabled: Boolean(timeWindow.from && timeWindow.to && isValidTimeRange),
   })
+
+  const data = React.useMemo(
+    () => mergeChangesPages(pagedData?.pages ?? []),
+    [pagedData?.pages],
+  )
 
   const rawChanges = React.useMemo(() => data?.changes ?? [], [data?.changes])
   const tenants = React.useMemo(() => data?.tenants ?? uniqTenants(rawChanges), [data?.tenants, rawChanges])
@@ -407,7 +429,7 @@ export function WhatChangedView() {
         {!isLoading && (
           <div className="flex items-center justify-between border-b border-border/60 pb-2">
             <h2 className="text-sm font-bold text-foreground tracking-tight">
-              {getCategoryHeadingLabel(selectedCategory)} — {finalFilteredChanges.length}
+              {getCategoryHeadingLabel(selectedCategory)} — {finalFilteredChanges.length} shown
             </h2>
 
             {selectedCategory !== 'all' && (
@@ -513,6 +535,25 @@ export function WhatChangedView() {
                 Clear Filters
               </Button>}
             </div>
+          </div>
+        )}
+
+        {hasNextPage && (
+          <div className="flex flex-col items-center gap-2 border-t border-border/60 pt-4">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={isFetchingNextPage}
+              onClick={() => fetchNextPage()}
+              className="text-xs gap-1.5"
+            >
+              <RefreshCw className={isFetchingNextPage ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} aria-hidden="true" />
+              {isFetchingNextPage ? 'Loading older evidence…' : 'Load older evidence'}
+            </Button>
+            <span className="text-[11px] text-muted-foreground" role="status" aria-live="polite">
+              {rawChanges.length} of {data.summary?.total ?? data.pagination?.total ?? rawChanges.length} evidence records loaded
+            </span>
           </div>
         )}
       </div>}

@@ -154,6 +154,23 @@ export type ChangeEvent = {
   after?: Record<string, any>
 }
 
+export type ChangesPagination = {
+  page: number
+  pageSize: number
+  total: number
+  totalPages: number
+}
+
+export type NormalizedChangesResponse = {
+  changes: ChangeEvent[]
+  tenants: { id: string; name: string }[]
+  validPayload: boolean
+  partialPayload: boolean
+  discardedCount: number
+  summary?: { total: number; changes: number; signIns: number; highRisk: number; apps: number }
+  pagination?: ChangesPagination
+}
+
 type UnknownRecord = Record<string, unknown>
 
 function record(value: unknown): UnknownRecord | null {
@@ -419,14 +436,7 @@ export function normalizeChangeEvent(value: unknown): ChangeEvent | null {
   }
 }
 
-export function normalizeChangesResponse(value: unknown): {
-  changes: ChangeEvent[]
-  tenants: { id: string; name: string }[]
-  validPayload: boolean
-  partialPayload: boolean
-  discardedCount: number
-  summary?: { total: number; changes: number; signIns: number; highRisk: number; apps: number }
-} {
+export function normalizeChangesResponse(value: unknown): NormalizedChangesResponse {
   const input = record(value)
   const candidates = Array.isArray(input?.changes) ? input.changes : []
   const normalized = candidates.map(normalizeChangeEvent)
@@ -462,13 +472,57 @@ export function normalizeChangesResponse(value: unknown): {
       apps: summaryRecord.apps as number,
     }
     : undefined
+  const paginationRecord = record(input?.pagination)
+  const pagination = paginationRecord &&
+    Number.isSafeInteger(paginationRecord.page) && (paginationRecord.page as number) >= 1 &&
+    Number.isSafeInteger(paginationRecord.pageSize) && (paginationRecord.pageSize as number) >= 1 && (paginationRecord.pageSize as number) <= 250 &&
+    Number.isSafeInteger(paginationRecord.total) && (paginationRecord.total as number) >= 0 &&
+    Number.isSafeInteger(paginationRecord.totalPages) && (paginationRecord.totalPages as number) >= 0 &&
+    paginationRecord.totalPages === Math.ceil((paginationRecord.total as number) / (paginationRecord.pageSize as number)) &&
+    ((paginationRecord.totalPages as number) === 0
+      ? paginationRecord.page === 1
+      : (paginationRecord.page as number) <= (paginationRecord.totalPages as number))
+    ? {
+      page: paginationRecord.page as number,
+      pageSize: paginationRecord.pageSize as number,
+      total: paginationRecord.total as number,
+      totalPages: paginationRecord.totalPages as number,
+    }
+    : undefined
   const validPayload = Boolean(input && Array.isArray(input.changes))
   return {
     changes,
     tenants,
     summary,
+    pagination,
     validPayload,
     partialPayload: validPayload && (!Array.isArray(input?.tenants) || summary === undefined),
     discardedCount: normalized.filter((event) => event === null).length + duplicateCount,
+  }
+}
+
+export function mergeChangesPages(pages: NormalizedChangesResponse[]): NormalizedChangesResponse | undefined {
+  if (!pages.length) return undefined
+  const uniqueChanges = new Map<string, ChangeEvent>()
+  let crossPageDuplicates = 0
+  for (const page of pages) for (const event of page.changes) {
+    const key = event.rowKey ?? `${event.tenantId}:${event.id}`
+    if (uniqueChanges.has(key)) {
+      crossPageDuplicates++
+      continue
+    }
+    uniqueChanges.set(key, event)
+  }
+  const uniqueTenants = new Map<string, { id: string; name: string }>()
+  for (const page of pages) for (const tenant of page.tenants) uniqueTenants.set(tenant.id, tenant)
+  const lastPage = pages[pages.length - 1]
+  return {
+    changes: Array.from(uniqueChanges.values()),
+    tenants: Array.from(uniqueTenants.values()),
+    validPayload: pages.every((page) => page.validPayload),
+    partialPayload: pages.some((page) => page.partialPayload),
+    discardedCount: pages.reduce((total, page) => total + page.discardedCount, 0) + crossPageDuplicates,
+    summary: pages[0]?.summary,
+    pagination: lastPage?.pagination,
   }
 }
