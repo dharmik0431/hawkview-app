@@ -107,3 +107,21 @@ test('does not call collection healthy while a required workload is failing', ()
     label: 'Collection needs attention',
   })
 })
+
+test('keeps successful and informational readiness out of Priority attention', () => {
+  const readiness = normalizeCollectionReadiness({
+    ...readinessPayload,
+    overallState: 'PARTIAL',
+    workloads: ['READY', 'INITIALIZING', 'PARTIAL', 'UNVERIFIED', 'NOT_LICENSED', 'UNSUPPORTED'].map((state, index) => ({
+      ...readinessPayload.workloads[1], key: `neutral-${index}`, state,
+    })),
+  })
+  const summary = synchronizationReadinessSummary(readiness)
+  assert.equal(summary?.attentionWorkloads, 0)
+  assert.deepEqual(settingsSynchronizationAttention(settingsSynchronizationRows(readiness)), {
+    total: 0, failed: 0, blocked: 0, backlogged: 0, stale: 0, other: 0, label: 'None',
+  })
+  assert.deepEqual(settingsOverallHealth(summary), {
+    state: 'UNVERIFIED', label: 'Collection status informational',
+  })
+})

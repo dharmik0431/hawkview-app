@@ -216,3 +216,20 @@ export function m365AuditSyncHealth(value: unknown) {
     lastSuccessfulAt: typeof resource.lastSuccessfulAt === 'string' ? resource.lastSuccessfulAt : null,
   }
 }
+
+const ACTIONABLE_AUDIT_SYNC_CLASSIFICATIONS = new Set([
+  'FAILED',
+  'PERMISSION_REQUIRED',
+  'STALE',
+  'BACKLOGGED',
+  'FAILED_TRANSIENT',
+  'BLOCKED_PERMISSION',
+  'BLOCKED_TENANT_CONFIGURATION',
+  'NEVER_SUCCEEDED',
+])
+
+/** Closed mapping: unfamiliar and successful states never become priority. */
+export function auditSyncRequiresAction(value: { classification?: unknown } | null) {
+  return typeof value?.classification === 'string' &&
+    ACTIONABLE_AUDIT_SYNC_CLASSIFICATIONS.has(value.classification.toUpperCase())
+}

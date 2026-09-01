@@ -1,5 +1,6 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
-import { isKnownMicrosoftSystemEvent } from '../changes/change-classification.js'
+import { classifyEvidence, isKnownMicrosoftSystemEvent, PRIMARY_CHANGE_CLASSIFICATIONS } from '../changes/change-classification.js'
+import type { PilotEvidenceProjection } from './collection-readiness.js'
 
 /**
  * Backend-owned tenant health model.  This deliberately keeps connection,
@@ -22,7 +23,7 @@ type SyncState = { resourceType: string; status: string; lastAttemptAt: Date | n
 export type TenantAuditEvent = { microsoftAuditId: string; eventDateTime: Date; activityDisplayName: string; category: string | null; operationType: string | null; result: string | null; initiatedBy: unknown; targetResources: unknown }
 
 export type ResourceHealth = { resourceType: string; required: boolean; classification: ResourceClassification; reasonCode: string | null; message: string | null; lastAttemptAt: string | null; lastSuccessfulAt: string | null }
-type HealthInput = { tenantId: string; effectiveStatus: string; connectionStatus: string | null; connectionLastVerifiedAt?: Date | null; missingPermissions: string[]; syncStates: SyncState[]; authSnapshot: { payload: unknown; observedAt: Date } | null; riskyIdentityCount: number | null; auditEvents?: TenantAuditEvent[]; /** Only collector components backed by an authoritative NOT_LICENSED readiness row. */ notApplicableResourceTypes?: string[]; /** Collector components backed by an explicit unsupported capability boundary, never a licensing inference. */ unsupportedResourceTypes?: string[]; now?: Date }
+type HealthInput = { tenantId: string; effectiveStatus: string; connectionStatus: string | null; connectionLastVerifiedAt?: Date | null; missingPermissions: string[]; syncStates: SyncState[]; authSnapshot: { payload: unknown; observedAt: Date } | null; riskyIdentityCount: number | null; signInEvidence?: PilotEvidenceProjection['signIns']; auditEvents?: TenantAuditEvent[]; /** Only collector components backed by an authoritative NOT_LICENSED readiness row. */ notApplicableResourceTypes?: string[]; /** Collector components backed by an explicit unsupported capability boundary, never a licensing inference. */ unsupportedResourceTypes?: string[]; now?: Date }
 
 /** Central policy.  Optional collectors affect completeness but are never used
  * to claim that a tenant is disconnected or that required telemetry succeeded. */
@@ -73,6 +74,7 @@ function objectValueRaw(value: unknown, key: string): unknown { return typeof va
 function objectValue(value: unknown, key: string) { const item = objectValueRaw(value, key); return typeof item === 'string' && item.trim() ? item.trim() : null }
 function auditActor(value: unknown) { return objectValue(objectValueRaw(value, 'user'), 'userPrincipalName') ?? objectValue(objectValueRaw(value, 'user'), 'displayName') ?? objectValue(objectValueRaw(value, 'app'), 'displayName') ?? objectValue(value, 'displayName') }
 function auditTarget(value: unknown) { if (!Array.isArray(value)) return null; for (const target of value) { const name = objectValue(target, 'displayName') ?? objectValue(target, 'userPrincipalName'); if (name) return name }; return null }
+function auditTargetTypes(value: unknown) { if (!Array.isArray(value)) return []; return value.flatMap((target) => { const type = objectValue(target, 'type'); return type ? [type] : [] }) }
 function auditPayloadText(value: unknown): string { if (typeof value === 'string') return value.toLowerCase(); if (Array.isArray(value)) return value.map(auditPayloadText).join(' '); return typeof value === 'object' && value !== null ? Object.values(value as Record<string, unknown>).map(auditPayloadText).join(' ') : '' }
 
 function auditFinding(tenantId: string, event: TenantAuditEvent): TenantAttention | null {
@@ -80,6 +82,11 @@ function auditFinding(tenantId: string, event: TenantAuditEvent): TenantAttentio
   const text = `${event.activityDisplayName} ${event.category ?? ''} ${event.operationType ?? ''}`.toLowerCase(); const payloadText = auditPayloadText(event.targetResources)
   const destructive = /disable|disabled|delete|deleted|remove|removed|turn off/.test(`${text} ${payloadText}`); const actor = auditActor(event.initiatedBy); const target = auditTarget(event.targetResources)
   if (isKnownMicrosoftSystemEvent({ source: 'DIRECTORY_AUDIT', activity: event.activityDisplayName, category: event.category, operationType: event.operationType, actor, target })) return null
+  if (!PRIMARY_CHANGE_CLASSIFICATIONS.has(classifyEvidence({
+    source: 'DIRECTORY_AUDIT', activity: event.activityDisplayName, category: event.category,
+    operationType: event.operationType, targetResourceTypes: auditTargetTypes(event.targetResources),
+    actor, target, result: event.result,
+  }))) return null
   const context = [actor ? `By ${actor}.` : null, target ? `Affected: ${target}.` : null].filter(Boolean).join(' '); const base = { detectedAt: event.eventDateTime.toISOString(), actionLabel: 'Investigate change', actionUrl: `/what-changed?tenantId=${encodeURIComponent(tenantId)}&from=${encodeURIComponent(event.eventDateTime.toISOString())}` }
   if (/conditional access|named location/.test(text)) return { ...base, key: `audit-ca-${event.microsoftAuditId}`, label: destructive ? 'Conditional Access policy was disabled or removed' : 'Conditional Access policy changed', severity: destructive ? 'critical' : 'high', why: context || event.activityDisplayName }
   if (/authentication method|security info|strong authentication|mfa/.test(text)) return { ...base, key: `audit-auth-${event.microsoftAuditId}`, label: destructive ? `MFA or authentication method was removed${target ? ` for ${target}` : ''}` : `Authentication methods changed${target ? ` for ${target}` : ''}`, severity: destructive ? 'critical' : 'high', why: context || event.activityDisplayName }
@@ -101,6 +108,34 @@ function classify(state: SyncState | undefined, now: Date): Omit<ResourceHealth,
   const age = now.getTime() - state.lastSuccessfulAt.getTime()
   if (age > freshnessWindow(state.resourceType).agingMs) return { ...base, classification: 'STALE', reasonCode: 'stale-success', message: 'The last successful collection is outside its scheduled freshness window.' }
   return { ...base, classification: 'SUCCESS', reasonCode: null, message: null }
+}
+
+function classifySelectedSignInEvidence(
+  evidence: PilotEvidenceProjection['signIns'] | undefined,
+  state: SyncState | undefined,
+): Omit<ResourceHealth, 'resourceType' | 'required'> | null {
+  if (!evidence?.selectedSource) return null
+  const base = {
+    lastAttemptAt: state?.lastAttemptAt?.toISOString() ?? evidence.observedAt,
+    lastSuccessfulAt: evidence.observedAt,
+    reasonCode: evidence.reasonCode,
+    message: sanitizeHealthMessage(evidence.reason),
+  }
+  if (evidence.availability === 'CURRENT_LIMITED') {
+    return {
+      ...base,
+      classification: 'PARTIAL',
+      message: base.message ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.',
+    }
+  }
+  if (evidence.availability === 'READY') return { ...base, classification: 'SUCCESS', reasonCode: null, message: null }
+  if (evidence.availability === 'STALE') return { ...base, classification: 'STALE' }
+  if (evidence.availability === 'BLOCKED_PERMISSION') return { ...base, classification: 'PERMISSION_REQUIRED' }
+  if (evidence.availability === 'FAILED_TRANSIENT') return { ...base, classification: 'FAILED' }
+  if (evidence.availability === 'NOT_LICENSED') return { ...base, classification: 'NOT_LICENSED' }
+  if (evidence.availability === 'UNSUPPORTED') return { ...base, classification: 'UNSUPPORTED' }
+  if (evidence.availability === 'BACKLOGGED' || evidence.availability === 'INITIALIZING') return { ...base, classification: 'PENDING' }
+  return { ...base, classification: 'NOT_CONFIGURED' }
 }
 
 function freshness(resources: ResourceHealth[], now: Date): FreshnessStatus {
@@ -135,7 +170,13 @@ export function deriveTenantHealth(input: HealthInput) {
     ? { resourceType: item.resourceType, required: item.required, classification: 'UNSUPPORTED' as const, reasonCode: 'CAPABILITY_UNSUPPORTED', message: 'This collector is outside the supported Microsoft capability boundary.', lastAttemptAt: null, lastSuccessfulAt: null }
     : notApplicable.has(item.resourceType)
       ? { resourceType: item.resourceType, required: item.required, classification: 'NOT_LICENSED' as const, reasonCode: 'SERVICE_PLAN_NOT_ENABLED', message: 'Authoritative subscription inventory shows this workload is not enabled.', lastAttemptAt: null, lastSuccessfulAt: null }
-      : ({ resourceType: item.resourceType, required: item.required, ...classify(states.get(item.resourceType), now) }))
+      : ({
+          resourceType: item.resourceType,
+          required: item.required,
+          ...(item.resourceType === 'SIGN_INS'
+            ? classifySelectedSignInEvidence(input.signInEvidence, states.get(item.resourceType)) ?? classify(states.get(item.resourceType), now)
+            : classify(states.get(item.resourceType), now)),
+        }))
   const applicable = resources.filter((r) => r.classification !== 'UNSUPPORTED' && r.classification !== 'NOT_LICENSED'); const successful = applicable.filter((r) => r.classification === 'SUCCESS' || r.classification === 'EMPTY'); const failed = applicable.filter((r) => r.classification === 'FAILED' || r.classification === 'PERMISSION_REQUIRED'); const pending = applicable.filter((r) => r.classification === 'PENDING' || r.classification === 'NOT_CONFIGURED'); const stale = applicable.filter((r) => r.classification === 'STALE'); const unsupported = resources.filter((r) => r.classification === 'UNSUPPORTED'); const notLicensed = resources.filter((r) => r.classification === 'NOT_LICENSED'); const requiredProblems = resources.filter((r) => r.required && ['FAILED', 'PERMISSION_REQUIRED', 'STALE'].includes(r.classification))
   // Every real failed collector is an operational issue, even when the
   // collector is optional for completeness.  Required stale collectors also
@@ -146,7 +187,8 @@ export function deriveTenantHealth(input: HealthInput) {
     resource.classification === 'FAILED' ||
     resource.classification === 'PERMISSION_REQUIRED' ||
     (resource.required && resource.classification === 'STALE') ||
-    (resource.resourceType === 'SIGN_INS' && resource.classification === 'STALE' && isSignInFallback(states.get('SIGN_INS')))
+    (resource.resourceType === 'SIGN_INS' && resource.classification === 'STALE' &&
+      (Boolean(input.signInEvidence?.selectedSource) || isSignInFallback(states.get('SIGN_INS'))))
   )
   for (const resource of attentionProblems) { const state = states.get(resource.resourceType); const retrying = retryableSyncState(state); const action = syncAction(input.tenantId, resource.resourceType, state); attention.push({ key: `sync-${resource.resourceType.toLowerCase()}`, label: retrying ? `${resource.resourceType.replaceAll('_', ' ').toLowerCase()} refresh is delayed` : syncIssueLabel(resource.resourceType), severity: retrying ? (state?.consecutiveFailures && state.consecutiveFailures >= 6 ? 'high' : 'medium') : state?.consecutiveFailures && state.consecutiveFailures >= 3 ? 'critical' : 'high', why: resource.message ?? 'Collection is not current.', detectedAt: resource.lastAttemptAt, actionLabel: action.label, actionUrl: action.url }) }
   const currentFreshness = freshness(resources, now); const completenessPercent = applicable.length ? Math.round((successful.length / applicable.length) * 100) : null
@@ -167,8 +209,31 @@ export function deriveTenantHealth(input: HealthInput) {
   // Historic failures for a currently not-licensed workload are evidence, but
   // not a current operational outage.
   const activeResourceTypes = new Set(TENANT_HEALTH_RESOURCE_REGISTRY.map((resource) => resource.resourceType))
-  const operationalStates = input.syncStates.filter((state) => activeResourceTypes.has(state.resourceType) && !notApplicable.has(state.resourceType) && !unsupportedTypes.has(state.resourceType) && !(retryableSyncState(state) && state.consecutiveFailures < 3))
-  const failedJobs = operationalStates.filter((s) => s.status === 'FAILED').length; const pendingJobs = operationalStates.filter((s) => s.status === 'RUNNING' && !isSignInFallback(s)).length; const partialJobs = operationalStates.filter((s) => (s.status === 'FAILED' && s.lastSuccessfulAt !== null) || currentLimitedFallback(s, now)).length; const requiredStaleJobs = requiredProblems.filter((resource) => resource.classification === 'STALE').length; const selectedFallbackStaleJobs = resources.filter((resource) => resource.resourceType === 'SIGN_INS' && resource.classification === 'STALE' && isSignInFallback(states.get('SIGN_INS'))).length; const operations = { status: failedJobs >= 3 ? 'FAILED' as OperationsStatus : failedJobs > 0 || requiredStaleJobs > 0 || selectedFallbackStaleJobs > 0 ? 'DEGRADED' as OperationsStatus : pendingJobs > 0 ? 'SYNCING' as OperationsStatus : operationalStates.length ? 'HEALTHY' as OperationsStatus : 'UNKNOWN' as OperationsStatus, activeIssues: failedJobs + requiredStaleJobs + selectedFallbackStaleJobs, failedJobs, partialJobs, pendingJobs, lastSuccessfulJobAt: latestDate(operationalStates.map((s) => s.lastSuccessfulAt)), issues: operationalStates.filter((s) => s.status === 'FAILED' || (isSignInFallback(s) && resources.find((resource) => resource.resourceType === 'SIGN_INS')?.classification === 'STALE')).map((s) => ({ resourceType: s.resourceType, reasonCode: s.lastErrorCode, message: sanitizeHealthMessage(s.lastErrorMessage), consecutiveFailures: s.consecutiveFailures })) }
+  const signInHealth = resources.find((resource) => resource.resourceType === 'SIGN_INS')
+  const authoritativeSignInEvidence = Boolean(input.signInEvidence?.selectedSource)
+  const operationalStates = input.syncStates.filter((state) =>
+    activeResourceTypes.has(state.resourceType) &&
+    !notApplicable.has(state.resourceType) &&
+    !unsupportedTypes.has(state.resourceType) &&
+    !(authoritativeSignInEvidence && state.resourceType === 'SIGN_INS') &&
+    !(retryableSyncState(state) && state.consecutiveFailures < 3),
+  )
+  const signInFailed = authoritativeSignInEvidence && ['FAILED', 'PERMISSION_REQUIRED'].includes(signInHealth?.classification ?? '') ? 1 : 0
+  const signInPending = authoritativeSignInEvidence && signInHealth?.classification === 'PENDING' ? 1 : 0
+  const signInPartial = authoritativeSignInEvidence && signInHealth?.classification === 'PARTIAL' ? 1 : 0
+  const failedJobs = operationalStates.filter((s) => s.status === 'FAILED').length + signInFailed
+  const pendingJobs = operationalStates.filter((s) => s.status === 'RUNNING' && !isSignInFallback(s)).length + signInPending
+  const partialJobs = operationalStates.filter((s) => (s.status === 'FAILED' && s.lastSuccessfulAt !== null) || currentLimitedFallback(s, now)).length + signInPartial
+  const requiredStaleJobs = requiredProblems.filter((resource) => resource.classification === 'STALE').length
+  const selectedFallbackStaleJobs = signInHealth?.classification === 'STALE' &&
+    (authoritativeSignInEvidence || isSignInFallback(states.get('SIGN_INS'))) ? 1 : 0
+  const operationalIssues = operationalStates
+    .filter((s) => s.status === 'FAILED' || (isSignInFallback(s) && signInHealth?.classification === 'STALE'))
+    .map((s) => ({ resourceType: s.resourceType, reasonCode: s.lastErrorCode, message: sanitizeHealthMessage(s.lastErrorMessage), consecutiveFailures: s.consecutiveFailures }))
+  if (authoritativeSignInEvidence && signInHealth && ['FAILED', 'PERMISSION_REQUIRED', 'STALE'].includes(signInHealth.classification)) {
+    operationalIssues.push({ resourceType: 'SIGN_INS', reasonCode: signInHealth.reasonCode, message: signInHealth.message ?? 'Selected sign-in evidence needs attention.', consecutiveFailures: states.get('SIGN_INS')?.consecutiveFailures ?? 0 })
+  }
+  const operations = { status: failedJobs >= 3 ? 'FAILED' as OperationsStatus : failedJobs > 0 || requiredStaleJobs > 0 || selectedFallbackStaleJobs > 0 ? 'DEGRADED' as OperationsStatus : pendingJobs > 0 ? 'SYNCING' as OperationsStatus : operationalStates.length || authoritativeSignInEvidence ? 'HEALTHY' as OperationsStatus : 'UNKNOWN' as OperationsStatus, activeIssues: failedJobs + requiredStaleJobs + selectedFallbackStaleJobs, failedJobs, partialJobs, pendingJobs, lastSuccessfulJobAt: latestDate([...operationalStates.map((s) => s.lastSuccessfulAt), signInHealth?.lastSuccessfulAt ? new Date(signInHealth.lastSuccessfulAt) : null]), issues: operationalIssues }
   // Apply the published precedence in order. Pending consent is informative,
   // but must never hide a critical finding or a failed synchronization job.
   const overallStatus: OverallStatus = connection.status === 'DISCONNECTED' ? 'DISCONNECTED' : security.status === 'CRITICAL' || operations.status === 'FAILED' ? 'CRITICAL' : requiredProblems.length > 0 || operations.status === 'DEGRADED' || security.highFindings >= 2 ? 'DEGRADED' : connection.status === 'PENDING' ? 'PENDING' : data.status === 'PARTIAL' || security.status === 'AT_RISK' || security.status === 'NEEDS_REVIEW' || unsupported.length > 0 ? 'ATTENTION' : connection.status === 'HEALTHY' && data.status === 'COMPLETE' && data.freshnessStatus === 'CURRENT' && security.status === 'HEALTHY' && operations.status === 'HEALTHY' ? 'HEALTHY' : 'UNKNOWN'

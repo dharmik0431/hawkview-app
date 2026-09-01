@@ -198,8 +198,13 @@ export class ChangeEvidenceService {
   ) {
     if (records.length === 0) return
     const data = records.map((record) => {
-      const kind = legacyCategory(record.activityDisplayName, record.category)
       const target = targetState(record.targetResources)
+      const kind = legacyCategory(
+        record.activityDisplayName,
+        record.category,
+        record.operationType,
+        [target.targetType],
+      )
       const initiatedBy = actor(record.initiatedBy)
       const initiated = object(record.initiatedBy)
       const initiatingUser = object(initiated.user)

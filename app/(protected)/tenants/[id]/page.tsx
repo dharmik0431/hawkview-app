@@ -1677,8 +1677,12 @@ export default function TenantDetailsPage() {
   >('idle')
 
   const workspaceDisplay = useMemo(() => {
-    return deriveTenantWorkspaceDisplay(bundle, syncState === 'syncing')
-  }, [bundle, syncState])
+    return deriveTenantWorkspaceDisplay(
+      bundle,
+      syncState === 'syncing',
+      collectionReadiness?.evidence.signIns ?? null,
+    )
+  }, [bundle, collectionReadiness, syncState])
 
   // Domain selector (per tenant)
   const domains = tenant?.domains?.length
@@ -4570,6 +4574,7 @@ export default function TenantDetailsPage() {
                     >
                       <SignInActivitySection
                         signIns={SIGNINS}
+                        signInEvidence={collectionReadiness?.evidence.signIns ?? null}
                         syncStatus={bundle?.sync?.signIns}
                         freshness={bundle?.tenant?.syncFreshness?.services?.signInLogs}
                         signInView={signInView}

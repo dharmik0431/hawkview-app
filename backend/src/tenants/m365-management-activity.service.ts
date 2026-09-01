@@ -7,9 +7,10 @@ import {
   classifyManagementActivity,
   type ManagementActivityRole,
 } from '../changes/m365-activity-classification.js'
+import { classifyEvidenceTrust } from '../changes/evidence-trust-catalog.js'
 import type { Prisma } from '../generated/prisma/client.js'
 
-export { classifyManagementActivity } from '../changes/m365-activity-classification.js'
+export { classifyManagementActivity, managementActivityRoleFromEvidence } from '../changes/m365-activity-classification.js'
 
 export const M365_ACTIVITY_CONTENT_TYPES = [
   'Audit.AzureActiveDirectory',
@@ -316,22 +317,16 @@ export async function readBoundedText(response: Response, maximumBytes: number) 
 }
 
 function categoryFor(operation: string, workload: string | null) {
-  const value = `${operation} ${workload ?? ''}`.toLowerCase()
-  if (/conditional access|authentication|mfa|security default/.test(value)) return 'Conditional Access'
-  if (/application|service principal|consent|oauth|permission/.test(value)) return 'Apps'
-  if (/role|administrator|admin/.test(value)) return 'Roles'
-  if (/group|team|channel|member|owner/.test(value)) return 'Groups'
-  if (/license|subscription|sku/.test(value)) return 'Licenses'
-  if (/exchange|mailbox|inbox|transport|forward/.test(value)) return 'Exchange'
-  if (/sharepoint|onedrive|site|sharing|link/.test(value)) return 'SharePoint'
-  if (/domain/.test(value)) return 'Domains'
-  return 'Microsoft 365'
+  const classified = classifyEvidenceTrust({
+    source: 'Office 365 Management Activity API', workload, operation,
+  })
+  return classified.category === 'Unknown' ? 'Microsoft 365' : classified.category
 }
 
-function severityFor(operation: string) {
-  return /permission|consent|role|administrator|policy|security|mfa|forward|delegat|sharing|anonymous|rule|credential|secret/i.test(operation)
-    ? 'High'
-    : 'Medium'
+function severityFor(operation: string, workload: string | null) {
+  return classifyEvidenceTrust({
+    source: 'Office 365 Management Activity API', workload, operation,
+  }).severity
 }
 
 function changedState(record: JsonObject) {
@@ -1178,7 +1173,7 @@ export class M365ManagementActivityService {
             eventDateTime: validDate(record.CreationTime)!,
             workload,
             category: categoryFor(operation, workload),
-            severity: severityFor(operation),
+            severity: severityFor(operation, workload),
             operationName: operation.slice(0, 500),
             summary: `${workload ?? 'Microsoft 365'} reported ${operation}${text(record.ResultStatus) ? ` · ${text(record.ResultStatus)}` : ''}.`,
             actorId: boundedText(record.UserKey, 128),

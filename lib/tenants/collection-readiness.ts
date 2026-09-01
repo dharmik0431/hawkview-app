@@ -13,7 +13,7 @@ export const READINESS_STATES = [
   'NEVER_SUCCEEDED',
 ] as const
 
-type ReadinessState = (typeof READINESS_STATES)[number]
+export type ReadinessState = (typeof READINESS_STATES)[number]
 const stateSet = new Set<string>(READINESS_STATES)
 const permissionStatuses = new Set(['CONFIRMED', 'MISSING', 'UNVERIFIED', 'NOT_APPLICABLE'])
 const freshStates = new Set(['CURRENT', 'AGING', 'STALE', 'NEVER_SUCCEEDED', 'UNKNOWN'])
@@ -30,6 +30,24 @@ const READINESS_ORDER: Record<ReadinessState, number> = {
   BLOCKED_PERMISSION: 0, BLOCKED_TENANT_CONFIGURATION: 1, NOT_LICENSED: 3,
   UNSUPPORTED: 2, FAILED_TRANSIENT: 4, STALE: 5, BACKLOGGED: 6, PARTIAL: 7,
   UNVERIFIED: 8, INITIALIZING: 9, NEVER_SUCCEEDED: 10, READY: 11,
+}
+
+const ACTIONABLE_READINESS_STATES = new Set<ReadinessState>([
+  'BLOCKED_PERMISSION',
+  'BLOCKED_TENANT_CONFIGURATION',
+  'FAILED_TRANSIENT',
+  'STALE',
+  'BACKLOGGED',
+  'NEVER_SUCCEEDED',
+])
+
+/**
+ * The single frontend predicate for work that needs administrator attention.
+ * Informational, capability-limited, and in-progress evidence remains visible
+ * without being promoted into the Priority queue.
+ */
+export function isActionableReadinessState(state: ReadinessState) {
+  return ACTIONABLE_READINESS_STATES.has(state)
 }
 
 export type CollectionReadinessView = {
@@ -540,9 +558,9 @@ export function readinessRemediation(state: ReadinessState, remediation: string)
 /**
  * The legacy synchronization card is a summary of required collection
  * readiness, never a report that a scheduler invocation happened to finish.
- * NOT_LICENSED is intentionally shown as not applicable rather than counted
- * as a failed required workload. Every other non-READY workload keeps the
- * summary non-healthy and contributes its own observed status.
+ * NOT_LICENSED and UNSUPPORTED are intentionally shown as not applicable.
+ * Transitional and limited states remain informational; only the shared
+ * actionable predicate contributes to the attention total.
  */
 export type SynchronizationReadinessSummary = {
   overallState: ReadinessState
@@ -559,7 +577,9 @@ export function synchronizationReadinessSummary(
   readiness: CollectionReadinessView | null,
 ): SynchronizationReadinessSummary | null {
   if (!readiness) return null
-  const applicable = readiness.workloads.filter((workload) => workload.state !== 'NOT_LICENSED')
+  const applicable = readiness.workloads.filter((workload) =>
+    workload.state !== 'NOT_LICENSED' && workload.state !== 'UNSUPPORTED',
+  )
   const pool = applicable.length ? applicable : readiness.workloads
   const selected = pool.reduce<CollectionReadinessView['workloads'][number] | null>((worst, workload) => {
     return !worst || READINESS_ORDER[workload.state] < READINESS_ORDER[worst.state] ? workload : worst
@@ -569,7 +589,7 @@ export function synchronizationReadinessSummary(
     overallState: selected.state,
     applicableWorkloads: applicable.length,
     currentWorkloads: applicable.filter((workload) => workload.state === 'READY').length,
-    attentionWorkloads: applicable.filter((workload) => workload.state !== 'READY').length,
+    attentionWorkloads: applicable.filter((workload) => isActionableReadinessState(workload.state)).length,
     primaryReason: selected.reason,
     primaryReasonCode: selected.reasonCode,
     primaryLastAttemptAt: selected.lastAttemptAt,

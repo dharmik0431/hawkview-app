@@ -1,4 +1,5 @@
 import type { TenantBundle, TenantSyncStatus } from '@/types/tenant-data'
+import type { PilotEvidenceView } from './tenants/collection-readiness'
 
 export type TenantWorkspaceState =
   | 'healthy'
@@ -110,7 +111,8 @@ function connectionState(tenant: any): TenantConnectionState {
 
 export function deriveTenantWorkspaceDisplay(
   bundle: TenantBundle | null | undefined,
-  manualSyncing = false
+  manualSyncing = false,
+  signInEvidence: PilotEvidenceView['signIns'] | null = null,
 ): TenantWorkspaceDisplay {
   const tenant = bundle?.tenant as any
   const connection = connectionState(tenant)
@@ -136,9 +138,13 @@ export function deriveTenantWorkspaceDisplay(
   )
 
   for (const [service, sync] of entries) {
+    const resourceType = resourceTypeForSyncEntry(service, sync)
+    // Once readiness has selected an evidence source, its state is authoritative.
+    // A failed non-selected Graph attempt must not override current audit-feed
+    // evidence or create a duplicate retry action.
+    if (resourceType === 'SIGN_INS' && signInEvidence?.selectedSource) continue
     const status = normalized(sync.status)
     if (sync.lastError || ['failed', 'error', 'partial'].includes(status)) {
-      const resourceType = resourceTypeForSyncEntry(service, sync)
       if (
         (backendInitialSyncInProgress || backendInitialSyncDelayed) &&
         deferredInitialSyncResources.has(resourceType)
@@ -221,6 +227,39 @@ export function deriveTenantWorkspaceDisplay(
         targetModule: moduleKey,
       })
     }
+  }
+
+  if (
+    signInEvidence?.selectedSource &&
+    ['STALE', 'FAILED_TRANSIENT', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence.availability)
+  ) {
+    const blocked = signInEvidence.availability === 'BLOCKED_PERMISSION' ||
+      signInEvidence.availability === 'BLOCKED_TENANT_CONFIGURATION'
+    const stale = signInEvidence.availability === 'STALE'
+    issues.push({
+      id: 'sync-signIns',
+      service: 'Sign-ins',
+      severity: blocked || signInEvidence.availability === 'FAILED_TRANSIENT' ? 'Error' : 'Warning',
+      title: blocked
+        ? 'Selected sign-in source is blocked'
+        : stale
+          ? 'Selected sign-in evidence is stale'
+          : 'Selected sign-in collection failed',
+      detail: signInEvidence.reason ?? 'The selected Microsoft sign-in evidence source needs attention.',
+      explanation: signInEvidence.reason ?? 'The selected Microsoft sign-in evidence source needs attention.',
+      impact: stale
+        ? 'Retained sign-in evidence remains available but is outside the current freshness window.'
+        : 'Current sign-in evidence is unavailable from the selected source.',
+      technicalDetails: signInEvidence.reasonCode
+        ? `Selected evidence state: ${signInEvidence.availability} (${signInEvidence.reasonCode})`
+        : `Selected evidence state: ${signInEvidence.availability}`,
+      recommendedSteps: blocked
+        ? ['Review the selected sign-in source permissions in Tenant Settings.']
+        : ['Retry synchronization for the selected sign-in source.', 'Review Microsoft service health if the issue persists.'],
+      action: blocked ? 'Review permissions' : 'Retry synchronization',
+      lastDetectedAt: signInEvidence.observedAt,
+      targetModule: blocked ? 'settings' : 'entra',
+    })
   }
 
   if (connection === 'disconnected') {

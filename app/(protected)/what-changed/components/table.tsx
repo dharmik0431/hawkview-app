@@ -15,11 +15,15 @@ import { SummaryStrip, SummaryCategoryKey } from './summary-strip'
 import { WhatChangedRow } from './row'
 import { WhatChangedDrawer } from './drawer'
 import { type ChangeEvent, isAppRelatedEvent, normalizeChangesResponse } from '../data/change-types'
+import { classifyEvent } from '../data/event-classifier'
 import { Button } from '@/components/ui/button'
 
 type ChangesResponse = {
   changes: ChangeEvent[]
   tenants: { id: string; name: string }[]
+  validPayload: boolean
+  partialPayload: boolean
+  discardedCount: number
   summary?: { total: number; changes: number; signIns: number; highRisk: number; apps: number }
 }
 
@@ -35,7 +39,7 @@ function uniqTenants(events: ChangeEvent[]) {
 
 function dateKey(ts: string, useUtc = false) {
   const d = new Date(ts)
-  if (isNaN(d.getTime())) return '1970-01-01'
+  if (isNaN(d.getTime())) return 'unknown-date'
   if (useUtc) {
     return d.toISOString().slice(0, 10)
   }
@@ -211,11 +215,11 @@ export function WhatChangedView() {
       const isSignIn = e.eventType === 'sign-in' || e.category === 'Sign-ins'
       if (isSignIn) {
         signIns++
-      } else {
+      } else if (e.eventType === 'change') {
         changes++
       }
 
-      if (e.severity === 'High') {
+      if (classifyEvent(e).isHighRisk) {
         highRisk++
       }
 
@@ -235,13 +239,13 @@ export function WhatChangedView() {
       const isSignIn = e.eventType === 'sign-in' || e.category === 'Sign-ins'
 
       if (selectedCategory === 'changes') {
-        return !isSignIn
+        return e.eventType === 'change'
       }
       if (selectedCategory === 'signIns') {
         return isSignIn
       }
       if (selectedCategory === 'highRisk') {
-        return e.severity === 'High'
+        return classifyEvent(e).isHighRisk
       }
       if (selectedCategory === 'apps') {
         return isAppRelatedEvent(e)
@@ -293,13 +297,13 @@ export function WhatChangedView() {
   }, [finalFilteredChanges, timeWindow.useUtc])
 
   const selectedEvent = React.useMemo(
-    () => finalFilteredChanges.find((x) => x.id === selectedId) ?? null,
+    () => finalFilteredChanges.find((x) => (x.rowKey ?? x.id) === selectedId) ?? null,
     [finalFilteredChanges, selectedId]
   )
 
   // Close drawer if selected event no longer matches filters
   React.useEffect(() => {
-    if (selectedId && !finalFilteredChanges.some((x) => x.id === selectedId)) {
+    if (selectedId && !finalFilteredChanges.some((x) => (x.rowKey ?? x.id) === selectedId)) {
       setDrawerOpen(false)
       setSelectedId(null)
     }
@@ -344,8 +348,20 @@ export function WhatChangedView() {
         onReset={handleResetFilters}
       />
 
+      {isLoading && (
+        <div role="status" aria-live="polite" className="rounded-xl border border-border bg-card p-8 text-center space-y-3">
+          <div className="inline-flex items-center justify-center rounded-full bg-primary/10 p-3 text-primary animate-spin">
+            <RefreshCw className="h-5 w-5" aria-hidden="true" />
+          </div>
+          <div className="text-sm font-medium text-foreground">Reconstructing the selected time window…</div>
+          <p className="text-xs text-muted-foreground max-w-sm mx-auto">
+            Gathering retained administrative evidence from HawkView.
+          </p>
+        </div>
+      )}
+
       {/* Clickable Investigation Summary Strip */}
-      {!isLoading && (
+      {!isLoading && !error && data?.validPayload && (
         <SummaryStrip
           summary={summaryCounts}
           selectedCategory={selectedCategory}
@@ -355,7 +371,7 @@ export function WhatChangedView() {
 
       {/* Error state */}
       {error && (
-        <div className="rounded-xl border border-destructive/50 bg-destructive/10 p-4 text-xs text-destructive flex items-center justify-between gap-3">
+        <div role="alert" className="rounded-xl border border-destructive/50 bg-destructive/10 p-4 text-xs text-destructive flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <AlertCircle className="h-4 w-4 shrink-0" />
             <span>
@@ -375,8 +391,18 @@ export function WhatChangedView() {
         </div>
       )}
 
+      {!isLoading && !error && data && (!data.validPayload || data.partialPayload || data.discardedCount > 0) && (
+        <div role="status" aria-live="polite" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          {!data.validPayload
+            ? 'Change evidence is unavailable because the service response could not be verified.'
+            : data.discardedCount > 0
+            ? `Some evidence could not be displayed (${data.discardedCount} malformed ${data.discardedCount === 1 ? 'record' : 'records'}).`
+            : 'Change evidence is partially available because response metadata could not be verified.'}
+        </div>
+      )}
+
       {/* Timeline List Section */}
-      <div className="space-y-4 pt-1">
+      {!error && data?.validPayload && <div className="space-y-4 pt-1">
         {/* Selected Category Heading */}
         {!isLoading && (
           <div className="flex items-center justify-between border-b border-border/60 pb-2">
@@ -399,20 +425,7 @@ export function WhatChangedView() {
           </div>
         )}
 
-        {isLoading ? (
-          /* Loading State */
-          <div className="rounded-xl border border-border bg-card p-8 text-center space-y-3">
-            <div className="inline-flex items-center justify-center rounded-full bg-primary/10 p-3 text-primary animate-spin">
-              <RefreshCw className="h-5 w-5" />
-            </div>
-            <div className="text-sm font-medium text-foreground">
-              Reconstructing the selected time window…
-            </div>
-            <p className="text-xs text-muted-foreground max-w-sm mx-auto">
-              Gathering evidence logs, directory mutations, and sign-in activity.
-            </p>
-          </div>
-        ) : groupedTimeline.length ? (
+        {groupedTimeline.length ? (
           /* Timeline Sections */
           groupedTimeline.map((group) => (
             <div key={group.key} className="space-y-2">
@@ -431,11 +444,11 @@ export function WhatChangedView() {
               <div className="pt-1">
                 {group.items.map((e) => (
                   <WhatChangedRow
-                    key={e.id}
+                    key={e.rowKey ?? e.id}
                     e={e}
-                    isActive={drawerOpen && e.id === selectedId}
+                    isActive={drawerOpen && (e.rowKey ?? e.id) === selectedId}
                     useUtc={timeWindow.useUtc}
-                    onClick={() => handleOpenDrawer(e.id)}
+                    onClick={() => handleOpenDrawer(e.rowKey ?? e.id)}
                   />
                 ))}
               </div>
@@ -448,10 +461,18 @@ export function WhatChangedView() {
               <ShieldAlert className="h-6 w-6" />
             </div>
             <div className="text-sm font-semibold text-foreground">
-              No matching events were found.
+              {rawChanges.length === 0 && !data.partialPayload && data.discardedCount === 0
+                ? 'No administrative changes were reported for this range.'
+                : rawChanges.length === 0
+                  ? 'No verified administrative changes can be displayed.'
+                  : 'No events match the selected filters.'}
             </div>
             <p className="text-xs text-muted-foreground max-w-md mx-auto">
-              Try another category, expand the time range, or clear filters.
+              {rawChanges.length === 0 && !data.partialPayload && data.discardedCount === 0
+                ? 'HawkView received an authoritative empty result for the selected time range.'
+                : rawChanges.length === 0
+                  ? 'Some response evidence was unavailable or malformed, so this is not a verified zero.'
+                  : 'Try another category or clear the active filters.'}
             </p>
             <div className="pt-2 flex flex-wrap justify-center gap-2">
               {selectedCategory !== 'all' && (
@@ -465,7 +486,7 @@ export function WhatChangedView() {
                   View Evidence Events ({summaryCounts.total})
                 </Button>
               )}
-              <Button
+              {rawChanges.length > 0 && <Button
                 type="button"
                 variant="outline"
                 size="sm"
@@ -481,8 +502,8 @@ export function WhatChangedView() {
                 className="text-xs"
               >
                 Expand to Last 7 Days
-              </Button>
-              <Button
+              </Button>}
+              {rawChanges.length > 0 && <Button
                 type="button"
                 variant="ghost"
                 size="sm"
@@ -490,11 +511,11 @@ export function WhatChangedView() {
                 className="text-xs"
               >
                 Clear Filters
-              </Button>
+              </Button>}
             </div>
           </div>
         )}
-      </div>
+      </div>}
 
       {/* Details Slide-over Drawer */}
       <WhatChangedDrawer

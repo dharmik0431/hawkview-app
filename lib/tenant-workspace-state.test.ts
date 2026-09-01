@@ -89,3 +89,54 @@ test('uses one customer-friendly delayed message instead of raw retry failures',
     'Initial synchronization is taking longer than expected'
   )
 })
+
+test('does not promote a failed non-selected Graph attempt over current limited sign-in evidence', () => {
+  const data = bundle()
+  data.tenant.initialSync = undefined
+  data.sync = {
+    signIns: {
+      status: 'failed',
+      lastSuccessfulAt: null,
+      lastError: 'Microsoft Graph returned 403 for premium sign-in logs.',
+      resourceType: 'SIGN_INS',
+    },
+  }
+
+  const display = deriveTenantWorkspaceDisplay(data, false, {
+    availability: 'CURRENT_LIMITED',
+    coverage: 'LIMITED',
+    selectedSource: 'OFFICE_365_ACTIVITY_FEED',
+    observedAt: '2026-08-26T17:10:00.000Z',
+    reasonCode: 'SIGN_IN_FALLBACK_ACTIVE',
+    reason: 'Current limited sign-in evidence is available.',
+  })
+
+  assert.equal(display.issueCount, 0)
+  assert.equal(display.issues.some((issue) => issue.action === 'Retry synchronization'), false)
+})
+
+test('creates exactly one action for an actionable selected sign-in source', () => {
+  const data = bundle()
+  data.tenant.initialSync = undefined
+  data.sync = {
+    signIns: {
+      status: 'failed',
+      lastSuccessfulAt: null,
+      lastError: 'A non-selected source also failed.',
+      resourceType: 'SIGN_INS',
+    },
+  }
+
+  const display = deriveTenantWorkspaceDisplay(data, false, {
+    availability: 'STALE',
+    coverage: 'LIMITED',
+    selectedSource: 'OFFICE_365_ACTIVITY_FEED',
+    observedAt: '2026-08-26T16:00:00.000Z',
+    reasonCode: 'SIGN_IN_FALLBACK_STALE',
+    reason: 'The selected audit-feed evidence is stale.',
+  })
+
+  assert.equal(display.issueCount, 1)
+  assert.equal(display.issues[0]?.title, 'Selected sign-in evidence is stale')
+  assert.equal(display.issues[0]?.action, 'Retry synchronization')
+})

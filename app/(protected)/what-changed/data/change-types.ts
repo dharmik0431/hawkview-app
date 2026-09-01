@@ -1,4 +1,18 @@
-export type ChangeSeverity = 'High' | 'Medium' | 'Low'
+export type ChangeSeverity = 'High' | 'Medium' | 'Low' | 'Unknown'
+export type PrimaryChangeClassification =
+  | 'configuration_change'
+  | 'permission_change'
+  | 'identity_change'
+  | 'security_control_change'
+  | 'administrative_action'
+
+const PRIMARY_CHANGE_CLASSIFICATIONS = new Set<PrimaryChangeClassification>([
+  'configuration_change',
+  'permission_change',
+  'identity_change',
+  'security_control_change',
+  'administrative_action',
+])
 
 export type ChangeCategory =
   | 'Roles'
@@ -107,11 +121,7 @@ export function isAppRelatedEvent(e: ChangeEvent): boolean {
   if (e.eventType === 'sign-in' || e.category === 'Sign-ins') {
     return false
   }
-  if (e.category === 'Apps') {
-    return true
-  }
-  const text = `${e.title} ${e.summary} ${e.category} ${e.target ?? ''}`.toLowerCase()
-  return /service\s*principal|application|app\s*registration|credential|client\s*secret|certificate|key\s*credential|oauth|permission\s*grant|consent|app\s*role|approle|enterprise\s*app/i.test(text)
+  return e.category === 'Apps'
 }
 
 export type ChangeEvent = {
@@ -119,7 +129,7 @@ export type ChangeEvent = {
   ts: string // ISO string
   tenantId: string
   tenantName: string
-  provider: 'Microsoft' | 'Google'
+  provider: 'Microsoft' | 'Google' | 'Unknown'
   category: ChangeCategory
   severity: ChangeSeverity
   title: string
@@ -127,6 +137,8 @@ export type ChangeEvent = {
   actor?: string
   target?: string
   source: ChangeSource
+  classification?: PrimaryChangeClassification
+  rowKey?: string
   eventType?: 'change' | 'sign-in'
   correlationId?: string
   recoveryGuidance?: string[]
@@ -359,11 +371,16 @@ export function normalizeChangeEvent(value: unknown): ChangeEvent | null {
   const id = boundedText(input.id, '', 300)
   const ts = boundedText(input.ts, '', 100)
   const tenantId = boundedText(input.tenantId, '', 300)
-  if (!id || !ts || !tenantId) return null
+  if (!id || !ts || !tenantId || Number.isNaN(Date.parse(ts))) return null
+  const classification = typeof input.classification === 'string' &&
+    PRIMARY_CHANGE_CLASSIFICATIONS.has(input.classification as PrimaryChangeClassification)
+    ? input.classification as PrimaryChangeClassification
+    : null
+  if (!classification) return null
   const severity = input.severity === 'High' || input.severity === 'Medium' || input.severity === 'Low'
     ? input.severity
-    : 'Low'
-  const provider = input.provider === 'Google' ? 'Google' : 'Microsoft'
+    : 'Unknown'
+  const provider = input.provider === 'Google' ? 'Google' : input.provider === 'Microsoft' ? 'Microsoft' : 'Unknown'
   const before = normalizeState(input.before)
   const after = normalizeState(input.after)
   return {
@@ -374,12 +391,13 @@ export function normalizeChangeEvent(value: unknown): ChangeEvent | null {
     provider,
     category: normalizeChangeCategory(input.category),
     severity,
-    title: boundedText(input.title, 'Microsoft administrative change', 500),
-    summary: boundedText(input.summary, 'No summary was provided by Microsoft.', 2_000),
+    title: boundedText(input.title, 'Administrative change', 500),
+    summary: boundedText(input.summary, 'Not reported', 2_000),
     actor: boundedText(input.actor, '', 500) || undefined,
     target: boundedText(input.target, '', 500) || undefined,
     source: normalizeChangeSource(input.source),
-    eventType: input.eventType === 'sign-in' ? 'sign-in' : 'change',
+    classification,
+    eventType: input.eventType === 'sign-in' ? 'sign-in' : input.eventType === 'change' ? 'change' : undefined,
     correlationId: boundedText(input.correlationId, '', 500) || undefined,
     before,
     after,
@@ -404,12 +422,27 @@ export function normalizeChangeEvent(value: unknown): ChangeEvent | null {
 export function normalizeChangesResponse(value: unknown): {
   changes: ChangeEvent[]
   tenants: { id: string; name: string }[]
+  validPayload: boolean
+  partialPayload: boolean
+  discardedCount: number
   summary?: { total: number; changes: number; signIns: number; highRisk: number; apps: number }
 } {
   const input = record(value)
-  const changes = Array.isArray(input?.changes)
-    ? input.changes.map(normalizeChangeEvent).filter((event): event is ChangeEvent => event !== null)
-    : []
+  const candidates = Array.isArray(input?.changes) ? input.changes : []
+  const normalized = candidates.map(normalizeChangeEvent)
+  const unique = new Map<string, ChangeEvent>()
+  let duplicateCount = 0
+  for (const event of normalized) {
+    if (!event) continue
+    const rowKey = `${event.tenantId}:${event.id}`
+    if (unique.has(rowKey)) {
+      duplicateCount++
+      continue
+    }
+    event.rowKey = rowKey
+    unique.set(rowKey, event)
+  }
+  const changes = Array.from(unique.values())
   const tenants = Array.isArray(input?.tenants)
     ? input.tenants.map(record).flatMap((tenant) => {
       const id = boundedText(tenant?.id, '', 300)
@@ -418,7 +451,9 @@ export function normalizeChangesResponse(value: unknown): {
     })
     : []
   const summaryRecord = record(input?.summary)
-  const summary = summaryRecord && ['total', 'changes', 'signIns', 'highRisk', 'apps'].every((key) => typeof summaryRecord[key] === 'number')
+  const summary = summaryRecord && ['total', 'changes', 'signIns', 'highRisk', 'apps'].every((key) =>
+    typeof summaryRecord[key] === 'number' && Number.isSafeInteger(summaryRecord[key]) && (summaryRecord[key] as number) >= 0
+  )
     ? {
       total: summaryRecord.total as number,
       changes: summaryRecord.changes as number,
@@ -427,5 +462,13 @@ export function normalizeChangesResponse(value: unknown): {
       apps: summaryRecord.apps as number,
     }
     : undefined
-  return { changes, tenants, summary }
+  const validPayload = Boolean(input && Array.isArray(input.changes))
+  return {
+    changes,
+    tenants,
+    summary,
+    validPayload,
+    partialPayload: validPayload && (!Array.isArray(input?.tenants) || summary === undefined),
+    discardedCount: normalized.filter((event) => event === null).length + duplicateCount,
+  }
 }

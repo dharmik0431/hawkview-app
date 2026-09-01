@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ChangeEvidenceService, redactSensitiveValues } from './change-evidence.service.js'
 import { classifyEvidence, isPrimaryChange } from './change-classification.js'
+import { classifyEvidenceTrust, EVIDENCE_TRUST_CATALOG_VERSION } from './evidence-trust-catalog.js'
 import { ChangesService } from './changes.service.js'
 import {
   MICROSOFT_ADMIN_CHANGE_CATALOG,
@@ -78,12 +79,13 @@ const range = {
 
 test('classifies evidence and keeps authentication telemetry out of the primary timeline', () => {
   assert.equal(classifyEvidence({ source: 'SIGN_IN', activity: 'Successful sign-in' }), 'authentication_evidence')
-  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Update conditional access policy' }), 'security_control_change')
-  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Add app role assignment' }), 'permission_change')
+  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Update conditional access policy', operationType: 'Update', targetResourceTypes: ['conditionalAccessPolicy'] }), 'security_control_change')
+  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Add app role assignment', operationType: 'Add', targetResourceTypes: ['appRoleAssignment'] }), 'permission_change')
   assert.equal(classifyEvidence({ source: 'SNAPSHOT_DIFFERENCE', activity: 'Microsoft 365 organization identity changed', category: 'Organization' }), 'configuration_change')
-  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Add member to group' }), 'identity_change')
-  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Update license assignment' }), 'configuration_change')
-  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Reset user password' }), 'administrative_action')
+  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Add member to group', operationType: 'Add', targetResourceTypes: ['group'] }), 'identity_change')
+  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Update license assignment', operationType: 'Update', targetResourceTypes: ['assignedLicense'] }), 'configuration_change')
+  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Reset user password', operationType: 'Update', targetResourceTypes: ['user'] }), 'administrative_action')
+  assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Reset user password', operationType: 'Update', targetResourceTypes: ['user'], result: 'failed' }), 'system_or_collection_event')
   assert.equal(isPrimaryChange({ source: 'SIGN_IN', activity: 'Successful sign-in' }), false)
 })
 
@@ -107,26 +109,56 @@ test('uses structured audit metadata without hiding real policy or synchronizati
   assert.equal(isPrimaryChange({ source: 'DIRECTORY_AUDIT', activity: 'Unmapped Microsoft operation', category: 'Unknown' }), false)
 })
 
+test('suppresses read suffixes and routine synchronization telemetry before noun classification', () => {
+  for (const activity of ['Policy_Get', 'Groups_List', 'Applications_Read', 'Report_Export', 'InventorySyncCompleted', 'CollectionRefreshStarted']) {
+    assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity, category: 'Groups', operationType: 'Update' }), 'system_or_collection_event', activity)
+  }
+  assert.equal(
+    classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Update directory synchronization configuration', category: 'DirectoryManagement', operationType: 'Update', targetResourceTypes: ['synchronizationJob'] }),
+    'configuration_change',
+  )
+})
+
+test('uses an immutable versioned catalog for Microsoft 365 audit trust decisions', () => {
+  const cases = [
+    [{ source: 'Office 365 Management Activity API', operation: 'Policy_Get', workload: 'AzureActiveDirectory' }, 'SYSTEM_OR_COLLECTION_EVENT'],
+    [{ source: 'Office 365 Management Activity API', operation: 'MessageCreated', workload: 'MicrosoftTeams' }, 'INFORMATIONAL_ACTIVITY'],
+    [{ source: 'Office 365 Management Activity API', operation: 'TaskCreated', workload: 'Microsoft To Do' }, 'INFORMATIONAL_ACTIVITY'],
+    [{ source: 'Office 365 Management Activity API', operation: 'Set-InboxRule', workload: 'Exchange' }, 'PRIMARY_CHANGE'],
+    [{ source: 'Office 365 Management Activity API', operation: 'Set-SPOTenant', workload: 'SharePoint' }, 'PRIMARY_CHANGE'],
+  ] as const
+  for (const [input, expected] of cases) {
+    const result = classifyEvidenceTrust(input)
+    assert.equal(result.version, EVIDENCE_TRUST_CATALOG_VERSION)
+    assert.equal(result.evidenceClass, expected)
+    assert.ok(Object.isFrozen(result))
+  }
+  assert.equal(classifyEvidenceTrust({
+    source: 'DIRECTORY_AUDIT', operation: 'Update application', category: 'Apps', operationType: 'Update',
+    targetResourceTypes: ['application'], result: 'UnknownFutureValue',
+  }).evidenceClass, 'SYSTEM_OR_COLLECTION_EVENT')
+})
+
 test('keeps narrow Microsoft portal and service maintenance noise out of change investigations', () => {
   assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Features_GetFeaturesAsync', category: 'Groups', operationType: 'Update' }), 'system_or_collection_event')
   assert.equal(classifyEvidence({
     source: 'DIRECTORY_AUDIT', activity: 'Set Company Information', category: 'Users', operationType: 'Update',
-    actor: 'Microsoft Office 365 Portal', beforeState: { 'Included Updated Properties': null }, afterState: { 'Included Updated Properties': '' },
+    actor: 'Microsoft Office 365 Portal', targetResourceTypes: ['organization'], beforeState: { 'Included Updated Properties': null }, afterState: { 'Included Updated Properties': '' },
   }), 'system_or_collection_event')
   assert.equal(classifyEvidence({
     source: 'DIRECTORY_AUDIT', activity: 'Set Company Information', category: 'Users', operationType: 'Update',
-    actor: 'Microsoft Office 365 Portal', beforeState: { displayName: 'Old Co' }, afterState: { displayName: 'New Co' },
+    actor: 'Microsoft Office 365 Portal', targetResourceTypes: ['organization'], beforeState: { displayName: 'Old Co' }, afterState: { displayName: 'New Co' },
   }), 'identity_change')
   assert.equal(classifyEvidence({
     source: 'DIRECTORY_AUDIT', activity: 'Update service principal', category: 'Applications', operationType: 'Update',
     actor: 'Microsoft Azure AD Internal - Jit Provisioning',
   }), 'system_or_collection_event')
   assert.equal(classifyEvidence({
-    source: 'M365_UNIFIED_AUDIT', activity: 'Set-Mailbox', category: 'Exchange',
+    source: 'M365_UNIFIED_AUDIT', workload: 'Exchange', activity: 'Set-Mailbox', category: 'Exchange',
     actor: 'NT SERVICE\\MSExchangeAdminApiNetCore (Microsoft.Exchange.AdminApi.NetCore)', afterState: { Arbitration: 'True' },
   }), 'system_or_collection_event')
   assert.equal(classifyEvidence({
-    source: 'M365_UNIFIED_AUDIT', activity: 'Set-Mailbox', category: 'Exchange',
+    source: 'M365_UNIFIED_AUDIT', workload: 'Exchange', activity: 'Set-Mailbox', category: 'Exchange',
     actor: 'admin@example.test', afterState: { ForwardingAddress: 'review@example.test' },
   }), 'configuration_change')
 })
@@ -150,6 +182,30 @@ test('returns a stable paginated change-only timeline from normalized evidence',
   assert.equal(result.summary.total, 1)
   assert.equal(result.summary.changes, 1)
   assert.equal(result.summary.signIns, 0)
+})
+
+test('never queries another organization tenant selected through the investigation filter', async () => {
+  const queriedTenantScopes: unknown[] = []
+  const service = new ChangesService(changesPrisma({
+    directoryAuditLog: {
+      findMany: async (args: { where: { customerTenantId: unknown } }) => {
+        queriedTenantScopes.push(args.where.customerTenantId)
+        return []
+      },
+      findFirst: async () => null,
+    },
+    changeEvidenceEvent: {
+      findMany: async (args: { where: { customerTenantId: unknown } }) => {
+        queriedTenantScopes.push(args.where.customerTenantId)
+        return []
+      },
+    },
+  }) as never)
+
+  const result = await service.list(identity, { ...range, tenantId: 'tenant-from-another-org' })
+  assert.deepEqual(result.changes, [])
+  assert.equal(queriedTenantScopes.length, 2)
+  for (const scope of queriedTenantScopes) assert.deepEqual(scope, { in: [] })
 })
 
 test('exposes M365 workload evidence with a source-specific stable identifier', async () => {
@@ -294,7 +350,7 @@ test('suppresses an actorless snapshot when authoritative Microsoft audit eviden
 
 test('keeps source timeline available when normalized evidence is malformed or unavailable', async () => {
   const sourceAudit = {
-    id: 'raw-1', microsoftAuditId: 'audit-raw-1', activityDisplayName: 'Reset user password', category: 'UserManagement', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), customerTenantId: 'tenant-1', operationType: null, result: 'success', resultReason: null, initiatedBy: null, targetResources: null, additionalDetails: null, raw: {}, correlationId: null,
+    id: 'raw-1', microsoftAuditId: 'audit-raw-1', activityDisplayName: 'Reset user password', category: 'UserManagement', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), customerTenantId: 'tenant-1', operationType: 'Update', result: 'success', resultReason: null, initiatedBy: null, targetResources: [{ type: 'User', displayName: 'user@example.test' }], additionalDetails: null, raw: {}, correlationId: null,
   }
   const service = new ChangesService(changesPrisma({
     directoryAuditLog: { findMany: async () => [sourceAudit] },
@@ -308,7 +364,7 @@ test('keeps source timeline available when normalized evidence is malformed or u
 
 test('uses one normalized event when source and evidence represent the same Microsoft event', async () => {
   const sourceAudit = {
-    id: 'raw-1', microsoftAuditId: 'audit-raw-1', activityDisplayName: 'Reset user password', category: 'UserManagement', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), customerTenantId: 'tenant-1', operationType: null, result: 'success', resultReason: null, initiatedBy: null, targetResources: null, additionalDetails: null, raw: {}, correlationId: null,
+    id: 'raw-1', microsoftAuditId: 'audit-raw-1', activityDisplayName: 'Reset user password', category: 'UserManagement', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), customerTenantId: 'tenant-1', operationType: 'Update', result: 'success', resultReason: null, initiatedBy: null, targetResources: [{ type: 'User', displayName: 'user@example.test' }], additionalDetails: null, raw: {}, correlationId: null,
   }
   const evidence = {
     id: 'evidence-1', source: 'DIRECTORY_AUDIT', sourceEventId: 'audit-raw-1', eventDateTime: sourceAudit.eventDateTime, customerTenantId: 'tenant-1', category: 'Passwords', severity: 'High', operationName: 'Reset user password', summary: 'A password was reset', actorPrincipalName: 'owner@example.test', actorDisplayName: null, targetDisplayName: 'user@example.test', ipAddress: null, location: null, beforeState: null, afterState: null, correlationId: null, changedFields: ['passwordProfile'], workload: 'Microsoft Entra ID', result: 'success',
@@ -476,7 +532,7 @@ test('projects directory evidence with deduplication and redacted configuration 
   } as never)
   await service.projectDirectoryAudits(
     { id: 'tenant-1', organizationId: 'org-1' },
-    [{ microsoftAuditId: 'audit-1', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), activityDisplayName: 'Update application credential', category: 'ApplicationManagement', targetResources: [{ id: 'app-1', displayName: 'Example app', modifiedProperties: [{ displayName: 'clientSecret', oldValue: 'old-secret', newValue: 'new-secret' }] }], initiatedBy: {}, raw: { clientSecret: 'new-secret' }, ingestedAt: new Date('2026-08-01T12:00:01.000Z'), expiresAt: new Date('2027-02-01T12:00:00.000Z') }]
+    [{ microsoftAuditId: 'audit-1', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), activityDisplayName: 'Update application credential', category: 'ApplicationManagement', operationType: 'Update', targetResources: [{ id: 'app-1', type: 'Application', displayName: 'Example app', modifiedProperties: [{ displayName: 'clientSecret', oldValue: 'old-secret', newValue: 'new-secret' }] }], initiatedBy: {}, raw: { clientSecret: 'new-secret' }, ingestedAt: new Date('2026-08-01T12:00:01.000Z'), expiresAt: new Date('2027-02-01T12:00:00.000Z') }]
   )
   assert.equal(createManyArgs.skipDuplicates, true)
   assert.equal(createManyArgs.data[0].raw.clientSecret, '[REDACTED]')
@@ -551,7 +607,7 @@ test('does not derive product guidance for unrecognized or Microsoft-audit evide
   }
   const service = new ChangesService(changesPrisma({ changeEvidenceEvent: { findMany: async () => [event] } }) as never)
   const list = await service.list(identity, range)
-  assert.equal((list.changes[0]?.evidence as { potentialImpact?: unknown }).potentialImpact, undefined)
+  assert.deepEqual(list.changes, [])
 })
 
 test('records domain additions, removals, and default transitions with domain guidance', () => {

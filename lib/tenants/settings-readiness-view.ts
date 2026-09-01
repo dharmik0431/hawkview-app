@@ -2,6 +2,7 @@ import type {
   CollectionReadinessView,
   SynchronizationReadinessSummary,
 } from './collection-readiness.ts'
+import { isActionableReadinessState } from './collection-readiness.ts'
 
 export type SettingsSynchronizationRow = {
   key: string
@@ -77,21 +78,23 @@ export function settingsSynchronizationStateLabel(
 export function settingsSynchronizationAttention(
   rows: SettingsSynchronizationRow[],
 ): SettingsSynchronizationAttention {
-  const applicable = rows.filter((row) => row.status !== 'NOT_LICENSED')
+  const applicable = rows.filter((row) =>
+    row.status !== 'NOT_LICENSED' && row.status !== 'UNSUPPORTED',
+  )
   const failed = applicable.filter((row) => row.status === 'FAILED_TRANSIENT').length
   const blocked = applicable.filter((row) =>
     ['BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(row.status),
   ).length
   const backlogged = applicable.filter((row) => row.status === 'BACKLOGGED').length
   const stale = applicable.filter((row) => row.status === 'STALE').length
-  const total = applicable.filter((row) => row.status !== 'READY').length
+  const total = applicable.filter((row) => isActionableReadinessState(row.status)).length
   const other = Math.max(0, total - failed - blocked - backlogged - stale)
   const parts = [
     failed ? `${failed} temporary failure${failed === 1 ? '' : 's'}` : null,
     blocked ? `${blocked} blocked` : null,
     backlogged ? `${backlogged} processing backlog${backlogged === 1 ? '' : 's'}` : null,
     stale ? `${stale} stale` : null,
-    other ? `${other} not ready` : null,
+    other ? `${other} never collected` : null,
   ].filter((part): part is string => Boolean(part))
 
   return {
@@ -138,5 +141,8 @@ export function settingsOverallHealth(
   if (summary.overallState === 'READY') {
     return { state: 'HEALTHY', label: 'Collection healthy' }
   }
-  return { state: 'NEEDS_ATTENTION', label: 'Collection needs attention' }
+  if (summary.attentionWorkloads > 0) {
+    return { state: 'NEEDS_ATTENTION', label: 'Collection needs attention' }
+  }
+  return { state: 'UNVERIFIED', label: 'Collection status informational' }
 }

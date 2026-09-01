@@ -32,7 +32,7 @@ function hasValues(value: Record<string, unknown> | undefined) {
 }
 
 function riskReasons(event: ChangeEvent): string[] {
-  if (event.severity !== 'High') return []
+  if (!classifyEvent(event).isHighRisk) return []
   if (event.category === 'Passwords') return ['This is high risk because it changed the credentials for a user account. A password reset can immediately change who can access that account.']
   if (event.category === 'MFA') return ['This is high risk because it changed authentication methods or security information, which can alter MFA protection for an account.']
   if (event.category === 'Conditional Access') return ['This is high risk because it changed Conditional Access or a named location, which can alter security controls for many users.']
@@ -96,12 +96,43 @@ export function WhatChangedDrawer({
 }: WhatChangedDrawerProps) {
   const [copiedSection, setCopiedSection] = React.useState<string | null>(null)
   const [showRawJson, setShowRawJson] = React.useState(false)
+  const closeButtonRef = React.useRef<HTMLButtonElement>(null)
+  const panelRef = React.useRef<HTMLElement>(null)
+  const previouslyFocusedRef = React.useRef<HTMLElement | null>(null)
 
-  // Handle escape key to close drawer
+  React.useEffect(() => {
+    if (!open) return
+    previouslyFocusedRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    window.requestAnimationFrame(() => closeButtonRef.current?.focus())
+    return () => previouslyFocusedRef.current?.focus()
+  }, [open])
+
+  // Keep keyboard focus inside the active modal and return it to the opener.
   React.useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape' && open) {
         onClose()
+        return
+      }
+      if (e.key !== 'Tab' || !open || !panelRef.current) return
+      const focusable = Array.from(panelRef.current.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )).filter((element) => !element.hasAttribute('hidden'))
+      if (focusable.length === 0) {
+        e.preventDefault()
+        panelRef.current.focus()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (e.shiftKey && (document.activeElement === first || !panelRef.current.contains(document.activeElement))) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && (document.activeElement === last || !panelRef.current.contains(document.activeElement))) {
+        e.preventDefault()
+        first.focus()
       }
     }
     window.addEventListener('keydown', handleKeyDown)
@@ -130,14 +161,17 @@ export function WhatChangedDrawer({
 
       {/* Slide-over panel */}
       <aside
+        ref={panelRef}
         className={cn(
           'fixed inset-y-0 right-0 z-50 w-full sm:w-[600px] bg-background border-l border-border shadow-2xl',
           'transition-transform duration-200 ease-out flex flex-col',
           open ? 'translate-x-0' : 'translate-x-full'
         )}
-        role="dialog"
-        aria-modal="true"
+        role={open ? 'dialog' : undefined}
+        aria-hidden={!open}
+        aria-modal={open ? true : undefined}
         aria-label="Event details"
+        tabIndex={-1}
       >
         {/* Drawer Header */}
         {(() => {
@@ -167,7 +201,7 @@ export function WhatChangedDrawer({
                     <span className="truncate max-w-[180px]">{event?.tenantName ?? 'Tenant'}</span>
                   </Badge>
 
-                  {event?.severity === 'High' && (
+                  {classification?.isHighRisk && (
                     <Badge variant="destructive" className="text-[10px] tracking-wider uppercase font-semibold shrink-0">
                       HIGH RISK
                     </Badge>
@@ -186,6 +220,7 @@ export function WhatChangedDrawer({
               </div>
 
               <Button
+                ref={closeButtonRef}
                 type="button"
                 variant="ghost"
                 size="icon"

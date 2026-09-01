@@ -17,6 +17,7 @@ const baseEvent = {
   tenantName: 'Contoso',
   provider: 'Microsoft',
   severity: 'Medium',
+  classification: 'configuration_change',
   title: 'Configuration changed',
   summary: 'HawkView detected a state difference.',
 }
@@ -37,6 +38,44 @@ test('normalizes every current backend What Changed source/workload label to a t
   }
   for (const [source, expected] of Object.entries(BACKEND_EMITTED_SOURCE_LABELS)) {
     assert.equal(normalizeChangeSource(source), expected, source)
+  }
+})
+
+test('fails closed for malformed, non-primary, invalid-date, and duplicate evidence rows', () => {
+  assert.equal(normalizeChangeEvent({ ...baseEvent, classification: 'system_or_collection_event' }), null)
+  assert.equal(normalizeChangeEvent({ ...baseEvent, ts: 'not-a-date' }), null)
+  assert.equal(normalizeChangeEvent(Object.create({ ...baseEvent })), null)
+
+  const normalized = normalizeChangesResponse({
+    changes: [
+      baseEvent,
+      { ...baseEvent },
+      { ...baseEvent, id: '', title: 'malformed' },
+    ],
+    tenants: [],
+    summary: { total: 3, changes: 3, signIns: 0, highRisk: 0, apps: 0 },
+  })
+  assert.equal(normalized.validPayload, true)
+  assert.equal(normalized.partialPayload, false)
+  assert.equal(normalized.discardedCount, 2)
+  assert.equal(normalized.changes.length, 1)
+  assert.equal(normalized.changes[0]?.rowKey, 'tenant-1:evidence:SNAPSHOT_DIFFERENCE:event-1')
+
+  const invalid = normalizeChangesResponse({ changes: null })
+  assert.equal(invalid.validPayload, false)
+  assert.equal(invalid.changes.length, 0)
+
+  const partial = normalizeChangesResponse({ changes: [], tenants: [] })
+  assert.equal(partial.validPayload, true)
+  assert.equal(partial.partialPayload, true)
+
+  for (const malformedCount of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5]) {
+    const malformedSummary = normalizeChangesResponse({
+      changes: [], tenants: [],
+      summary: { total: malformedCount, changes: 0, signIns: 0, highRisk: 0, apps: 0 },
+    })
+    assert.equal(malformedSummary.summary, undefined)
+    assert.equal(malformedSummary.partialPayload, true)
   }
 })
 

@@ -11,6 +11,7 @@ import {
 import {
   managementActivityRoleFromEvidence,
 } from './m365-activity-classification.js'
+import { classifyEvidenceTrust, classifyLegacyDirectoryProjection } from './evidence-trust-catalog.js'
 import { productGuidanceForSnapshot } from './microsoft-admin-change-catalog.js'
 
 type JsonObject = Record<string, unknown>
@@ -189,6 +190,8 @@ function normalizedEvidenceClassification(event: {
   operationName: string
   category?: string | null
   workload?: string | null
+  targetType?: string | null
+  result?: string | null
   raw?: unknown
   actorPrincipalName?: string | null
   actorDisplayName?: string | null
@@ -196,43 +199,84 @@ function normalizedEvidenceClassification(event: {
   beforeState?: unknown
   afterState?: unknown
 }): ChangeClassification {
-  if (event.source === 'M365_UNIFIED_AUDIT') {
-    const role = managementActivityRoleFromEvidence(event)
-    if (role === 'security_supporting_activity') return 'security_supporting_activity'
-    if (role === 'routine_activity') return 'system_or_collection_event'
+  const raw = object(event.raw)
+  const operationType = text(raw.operationType) ?? text(raw.OperationType)
+  if (event.source === 'DIRECTORY_AUDIT' && !operationType && !event.targetType) {
+    return classifyLegacyDirectoryProjection({
+      source: event.source,
+      operation: event.operationName,
+      category: event.category,
+      actor: event.actorPrincipalName ?? event.actorDisplayName,
+      result: event.result ?? text(raw.ResultStatus) ?? text(raw.result),
+      beforeState: event.beforeState,
+      afterState: event.afterState,
+    }).classification
   }
   return classifyEvidence({
     source: event.source,
+    workload: event.workload,
     activity: event.operationName,
     category: event.category,
+    operationType,
+    targetResourceTypes: [event.targetType],
     actor: event.actorPrincipalName ?? event.actorDisplayName,
     target: event.targetDisplayName,
+    result: event.result ?? text(raw.ResultStatus) ?? text(raw.result),
     beforeState: event.beforeState,
     afterState: event.afterState,
     raw: event.raw,
   })
 }
 
+function normalizedEvidenceTrust(event: Parameters<typeof normalizedEvidenceClassification>[0]) {
+  const raw = object(event.raw)
+  const operationType = text(raw.operationType) ?? text(raw.OperationType)
+  const input = {
+    source: event.source,
+    workload: event.workload,
+    operation: event.operationName,
+    category: event.category,
+    operationType,
+    targetResourceTypes: [event.targetType],
+    actor: event.actorPrincipalName ?? event.actorDisplayName,
+    result: event.result ?? text(raw.ResultStatus) ?? text(raw.result),
+    beforeState: event.beforeState,
+    afterState: event.afterState,
+  }
+  return event.source === 'DIRECTORY_AUDIT' && !operationType && !event.targetType
+    ? classifyLegacyDirectoryProjection(input)
+    : classifyEvidenceTrust(input)
+}
+
 function directoryAuditProjection(log: {
   activityDisplayName: string
   category: string | null
   operationType: string | null
+  result: string | null
   targetResources: unknown
   initiatedBy: unknown
 }) {
   const details = targetDetails(log.targetResources)
+  const resourceTypes = targetResourceTypes(log.targetResources)
   const classification = classifyEvidence({
     source: 'DIRECTORY_AUDIT',
     activity: log.activityDisplayName,
     category: log.category,
     operationType: log.operationType,
-    targetResourceTypes: targetResourceTypes(log.targetResources),
+    targetResourceTypes: resourceTypes,
     actor: actorFrom(log.initiatedBy),
+    result: log.result,
     target: details.target,
     beforeState: details.before,
     afterState: details.after,
   })
-  return { details, classification }
+  const trust = classifyEvidenceTrust({
+    source: 'DIRECTORY_AUDIT', operation: log.activityDisplayName, category: log.category,
+    operationType: log.operationType, targetResourceTypes: resourceTypes, actor: actorFrom(log.initiatedBy),
+    result: log.result,
+    beforeState: details.before, afterState: details.after,
+  })
+  return { details, classification, trust }
 }
 
 function evidenceTargetKeys(event: {
@@ -353,8 +397,8 @@ export class ChangesService {
     const changes = auditLogs
       .map((log) => ({ log, ...directoryAuditProjection(log) }))
       .filter(({ classification }) => PRIMARY_CHANGE_CLASSIFICATIONS.has(classification))
-      .map(({ log, details, classification }) => {
-        const kind = legacyCategory(log.activityDisplayName, log.category)
+      .map(({ log, details, classification, trust }) => {
+        const kind = { category: trust.category, severity: trust.severity }
         const presentation = sourcePresentation({ source: 'DIRECTORY_AUDIT' })
         return { id: `audit:${log.microsoftAuditId}`, eventType: 'change' as const, classification, ts: log.eventDateTime.toISOString(), tenantId: log.customerTenantId, tenantName: names.get(log.customerTenantId) ?? 'Microsoft tenant', provider: 'Microsoft' as const, category: kind.category, severity: kind.severity, title: log.activityDisplayName, summary: [log.operationType, log.result, log.resultReason].filter(Boolean).join(' · ') || 'Microsoft directory change', actor: actorFrom(log.initiatedBy), target: details.target, source: presentation.source, before: details.before, after: details.after, correlationId: log.correlationId ?? undefined, ...eventGuidance(kind.category, details.before, details.after), evidence: { ...evidenceFrom(log), ...presentation } }
       })
@@ -366,7 +410,7 @@ export class ChangesService {
           source: 'DIRECTORY_AUDIT',
           customerTenantId: log.customerTenantId,
           eventDateTime: log.eventDateTime,
-          category: legacyCategory(log.activityDisplayName, log.category).category,
+          category: directoryAuditProjection(log).trust.category,
           targetId: text(primaryTarget.id) ?? null,
           targetDisplayName: text(primaryTarget.userPrincipalName) ?? text(primaryTarget.displayName) ?? text(primaryTarget.id) ?? null,
         }
@@ -380,6 +424,7 @@ export class ChangesService {
       const before = object(event.beforeState)
       const after = object(event.afterState)
       const classification = normalizedEvidenceClassification(event)
+      const trust = normalizedEvidenceTrust(event)
       const presentation = sourcePresentation(event)
       const potentialImpact = potentialImpactFor(event)
       return {
@@ -392,8 +437,8 @@ export class ChangesService {
         tenantId: event.customerTenantId,
         tenantName: names.get(event.customerTenantId) ?? 'Microsoft tenant',
         provider: 'Microsoft' as const,
-        category: event.category,
-        severity: event.severity,
+        category: trust.evidenceClass === 'PRIMARY_CHANGE' ? trust.category : 'Unknown',
+        severity: trust.evidenceClass === 'PRIMARY_CHANGE' ? trust.severity : 'Low',
         title: event.operationName,
         summary: event.summary,
         actor: event.actorPrincipalName ?? event.actorDisplayName ?? undefined,
@@ -494,7 +539,12 @@ export class ChangesService {
         })
     if (!projectedEvent && !fallbackAudit) throw new BadRequestException('This investigation event is unavailable or outside retention.')
 
-    const fallbackKind = fallbackAudit ? legacyCategory(fallbackAudit.activityDisplayName, fallbackAudit.category) : null
+    const fallbackKind = fallbackAudit ? legacyCategory(
+      fallbackAudit.activityDisplayName,
+      fallbackAudit.category,
+      fallbackAudit.operationType,
+      targetResourceTypes(fallbackAudit.targetResources),
+    ) : null
     const fallbackDetails = fallbackAudit ? targetDetails(fallbackAudit.targetResources) : null
     const classification = projectedEvent
       ? normalizedEvidenceClassification(projectedEvent)

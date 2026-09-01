@@ -151,7 +151,8 @@ export function WhatChangedRow({
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-500/10 text-slate-600 dark:text-slate-400 border border-slate-500/20">
-                  <span>Completed</span>
+                  <AlertTriangle className="h-3 w-3 shrink-0" aria-hidden="true" />
+                  <span>Not reported</span>
                 </span>
               )}
 
