@@ -21,6 +21,7 @@ export type SettingsPriorityAttentionItem = {
   actionLabel: string
   targetTab: string
   targetRowId?: string
+  scope: 'CORE_COLLECTION' | 'OPTIONAL_CAPABILITY'
 }
 
 type SettingsAuditSyncEvidence = {
@@ -37,6 +38,8 @@ export function settingsPriorityAttentionItems(
   const items = (readiness?.workloads ?? []).flatMap((workload) => {
     if (!isActionableReadinessState(workload.state)) return []
     const isRed = ['BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION', 'FAILED_TRANSIENT'].includes(workload.state)
+    const datasets = workload.datasets ?? []
+    const optionalOnly = datasets.length > 0 && datasets.every((dataset) => dataset.tier !== 'CORE')
     return [{
       id: `collection-${workload.key}`,
       title: workload.workload,
@@ -47,6 +50,7 @@ export function settingsPriorityAttentionItems(
       actionLabel: 'Investigate in Collection',
       targetTab: 'collection',
       targetRowId: `row-${workload.key}`,
+      scope: optionalOnly ? 'OPTIONAL_CAPABILITY' as const : 'CORE_COLLECTION' as const,
     }]
   })
 
@@ -62,6 +66,7 @@ export function settingsPriorityAttentionItems(
       actionLabel: 'Investigate in Sync',
       targetTab: 'synchronization',
       targetRowId: `row-${M365_UNIFIED_AUDIT_WORKLOAD_KEY}`,
+      scope: 'CORE_COLLECTION',
     })
   }
 

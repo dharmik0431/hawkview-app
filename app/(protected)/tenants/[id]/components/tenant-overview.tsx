@@ -198,16 +198,11 @@ export function TenantOverview({
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [selectedIssue])
 
-  const missingPerms =
-    (bundle?.tenant as any)?.missingPermissions?.length > 0 ||
-    (bundle as any)?.missingPermissions?.length > 0
-
   const connectionState = display.connection
   const isSyncProgress = display.state === 'syncing'
+  const isHealthUnverified = !display.attentionVerified
 
-  const connectionLabel = missingPerms
-    ? 'Permission required'
-    : connectionState === 'connected'
+  const connectionLabel = connectionState === 'connected'
       ? 'Connected'
       : connectionState === 'disconnected'
         ? 'Disconnected'
@@ -217,7 +212,8 @@ export function TenantOverview({
 
   const hasUrgentAttention =
     !isSyncProgress &&
-    (display.issueCount > 0 || missingPerms || display.state === 'needs-attention')
+    display.attentionVerified &&
+    (display.issueCount > 0 || display.state === 'needs-attention')
 
   const lastSyncText = display.lastSuccessfulSync
     ? formatTenantTimestamp(display.lastSuccessfulSync)
@@ -226,6 +222,8 @@ export function TenantOverview({
   const issueCountText =
     isSyncProgress
       ? 'This can take a few minutes'
+      : isHealthUnverified
+        ? 'Actionable issue status unavailable'
       : display.issueCount === 1
       ? '1 actionable issue'
       : `${display.issueCount} actionable issues`
@@ -236,6 +234,8 @@ export function TenantOverview({
       : 'Synchronization in progress'
     : hasUrgentAttention
       ? 'Needs Attention'
+      : isHealthUnverified
+        ? 'Health not verified'
       : 'Healthy'
 
   return (
@@ -248,6 +248,8 @@ export function TenantOverview({
             ? 'border-l-2 border-l-blue-500 bg-blue-50/50 dark:bg-blue-950/20 text-slate-800 dark:text-slate-200'
             : hasUrgentAttention
             ? 'border-l-2 border-l-amber-500 bg-amber-50/40 dark:bg-amber-950/20 text-slate-800 dark:text-slate-200'
+            : isHealthUnverified
+            ? 'border-l-2 border-l-slate-400 bg-slate-50 dark:bg-slate-900/60 text-slate-700 dark:text-slate-300'
             : 'border-l-2 border-l-emerald-500 bg-slate-50 dark:bg-slate-900/60 text-slate-700 dark:text-slate-300'
         )}
       >
@@ -256,6 +258,8 @@ export function TenantOverview({
             <RefreshCw className="h-4 w-4 text-blue-600 shrink-0 animate-spin" aria-hidden="true" />
           ) : hasUrgentAttention ? (
             <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" aria-hidden="true" />
+          ) : isHealthUnverified ? (
+            <Info className="h-4 w-4 text-slate-500 shrink-0" aria-hidden="true" />
           ) : (
             <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" aria-hidden="true" />
           )}
@@ -324,7 +328,7 @@ export function TenantOverview({
                     : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 border-transparent'
                 )}
               >
-                Active issues ({display.issueCount})
+                Active issues ({display.attentionVerified ? display.issueCount : 'Not verified'})
               </button>
               <button
                 type="button"
@@ -419,6 +423,12 @@ export function TenantOverview({
                   <span className="max-w-xl">
                     HawkView is collecting Microsoft 365 data. Some services become available at different times, and temporary gaps are retried automatically. You can leave this page and return later.
                   </span>
+                </div>
+              ) : isHealthUnverified ? (
+                <div role="status" className="py-8 text-center text-[14px] text-slate-500 dark:text-slate-400 flex flex-col items-center justify-center gap-1">
+                  <Info className="h-5 w-5 text-slate-400" />
+                  <span className="font-semibold text-slate-900 dark:text-white">Actionable issue status unavailable</span>
+                  <span>HawkView has not received the tenant-wide health result needed to make a zero-issue claim.</span>
                 </div>
               ) : (
                 <div className="py-8 text-center text-[14px] text-slate-500 dark:text-slate-400 flex flex-col items-center justify-center gap-1">
@@ -522,11 +532,9 @@ export function TenantOverview({
                 <span
                   className={cn(
                     'h-2 w-2 rounded-full',
-                    connectionState === 'connected' && !missingPerms
+                    connectionState === 'connected'
                       ? 'bg-emerald-500'
-                      : missingPerms
-                        ? 'bg-amber-500'
-                        : 'bg-red-500'
+                      : 'bg-red-500'
                   )}
                   aria-hidden="true"
                 />
@@ -558,7 +566,7 @@ export function TenantOverview({
             <div>
               <div className="text-xs text-slate-500 dark:text-slate-400 font-medium">Active issues</div>
               <div className="font-semibold text-slate-900 dark:text-white mt-0.5">
-                {display.issueCount}
+                {display.attentionVerified ? display.issueCount : 'Not verified'}
               </div>
             </div>
 

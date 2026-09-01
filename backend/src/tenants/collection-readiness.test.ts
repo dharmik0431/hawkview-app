@@ -120,7 +120,10 @@ test('uses authoritative service-plan semantics without treating pending plans a
 })
 
 test('keeps Microsoft Identity Protection risk explicitly P2-only', () => {
-  const p1Only = deriveCollectionReadiness(input())
+  const p1Only = deriveCollectionReadiness(input({
+    consentedPermissions: permissions.filter((permission) => permission !== 'IdentityRiskyUser.Read.All'),
+  }))
+  assert.equal(row(p1Only, 'entra_identity_protection').state, 'NOT_LICENSED')
   const p1Dataset = row(p1Only, 'entra_identity_protection').datasets?.find(
     (dataset) => dataset.key === 'entra_identity_protection_risky_users',
   )
@@ -139,6 +142,24 @@ test('keeps Microsoft Identity Protection risk explicitly P2-only', () => {
   )
   assert.equal(p2Dataset?.licensePrerequisite.state, 'SATISFIED')
   assert.equal(p2Dataset?.state, 'READY')
+  assert.equal(row(p2, 'entra_identity_protection').state, 'READY')
+
+  const p2MissingPermission = deriveCollectionReadiness(input({
+    licenseServicePlans: [
+      ...(input().licenseServicePlans ?? []),
+      { servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' },
+    ],
+    consentedPermissions: permissions.filter((permission) => permission !== 'IdentityRiskyUser.Read.All'),
+  }))
+  assert.equal(row(p2MissingPermission, 'entra_identity_protection').state, 'BLOCKED_PERMISSION')
+
+  const entitlementUnknown = deriveCollectionReadiness(input({
+    syncStates: allResources.map((resource) => sync(resource, resource === 'LICENSES'
+      ? { lastSuccessfulAt: new Date('2026-08-16T00:00:00.000Z') }
+      : {})),
+    consentedPermissions: permissions.filter((permission) => permission !== 'IdentityRiskyUser.Read.All'),
+  }))
+  assert.equal(row(entitlementUnknown, 'entra_identity_protection').state, 'UNVERIFIED')
 })
 
 test('projects Identity Protection counts only from fresh P2 snapshot evidence', () => {

@@ -1,6 +1,7 @@
 import type { AttentionItem } from '@/types/attention'
 
 const ATTENTION_SEVERITIES = new Set(['critical', 'high', 'medium'])
+const TENANT_HEALTH_SEVERITIES = new Set(['critical', 'high', 'medium', 'low'])
 
 function own(value: object, key: string) {
   return Object.prototype.hasOwnProperty.call(value, key)
@@ -21,6 +22,11 @@ function safeAttentionText(value: unknown, maxLength: number): string | null {
  * health from connection state alone is what previously let the directory say
  * Healthy while the tenant workspace showed failed collectors.
  */
+export type TenantActionableHealthProjection = {
+  status: 'VERIFIED' | 'UNAVAILABLE'
+  items: AttentionItem[]
+}
+
 function authoritativeAttention(value: unknown): AttentionItem[] | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const record = value as Record<string, unknown>
@@ -41,26 +47,46 @@ function authoritativeAttention(value: unknown): AttentionItem[] | null {
         : undefined
 
   if (!Array.isArray(source)) return null
+  if (source.length > 100) return null
 
-  return source.slice(0, 100).flatMap((item): AttentionItem[] => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+  const items: AttentionItem[] = []
+  for (const item of source) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null
     const row = item as Record<string, unknown>
     const key = safeAttentionText(row.key, 160)
     const label = safeAttentionText(row.label, 240)
     const why = safeAttentionText(row.why, 1000)
     const severity = row.severity
-    if (!key || !label || !why || typeof severity !== 'string' || !ATTENTION_SEVERITIES.has(severity)) {
-      return []
+    if (!key || !label || !why || typeof severity !== 'string' || !TENANT_HEALTH_SEVERITIES.has(severity)) {
+      return null
     }
+    // Low severity findings are verified informational coverage, not tenant
+    // actions. Accept the row without inflating actionable counts.
+    if (!ATTENTION_SEVERITIES.has(severity)) continue
     const detectedAt = safeAttentionText(row.detectedAt, 80) ?? undefined
-    return [{
+    items.push({
       key,
       label,
       why,
       severity: severity as AttentionItem['severity'],
       ...(detectedAt ? { detectedAt } : {}),
-    }]
-  })
+    })
+  }
+  return items
+}
+
+/**
+ * The tenant-list health response is the authority for tenant-wide actionable
+ * health. Keep an authoritative empty result distinct from a missing contract
+ * so detail surfaces cannot turn an unavailable result into Healthy / 0.
+ */
+export function tenantActionableHealthProjection(
+  value: unknown,
+): TenantActionableHealthProjection {
+  const items = authoritativeAttention(value)
+  return items === null
+    ? { status: 'UNAVAILABLE', items: [] }
+    : { status: 'VERIFIED', items }
 }
 
 function isAdminRole(role: unknown) {
@@ -156,8 +182,8 @@ export function computeTenantAttention(bundle: any): AttentionItem[] {
   const items: AttentionItem[] = []
   if (!bundle) return items
 
-  const backendFindings = authoritativeAttention(bundle)
-  if (backendFindings !== null) return backendFindings
+  const backendFindings = tenantActionableHealthProjection(bundle)
+  if (backendFindings.status === 'VERIFIED') return backendFindings.items
 
   const connectionStatus = String(
     bundle?.connectionStatus ?? bundle?.tenant?.connectionStatus ?? ''

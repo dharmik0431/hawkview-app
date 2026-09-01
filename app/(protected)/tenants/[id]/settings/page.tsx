@@ -7,6 +7,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '@/components/providers/auth-provider'
 
 import { apiClient } from '@/lib/api/client'
+import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { auditSyncFocusTarget, isM365AuditSyncDeepLink, m365AuditSyncHealth } from '@/lib/tenants/audit-sync-health'
 import { isActionableReadinessState, normalizeCollectionReadiness, readinessDiagnostic, readinessLabel, readinessRemediation, synchronizationReadinessSummary, READINESS_STATES } from '@/lib/tenants/collection-readiness'
 import { datasetStateNeedsTenantAction, datasetTierLabel, microsoftAccessDatasetView, microsoftAccessSummary, normalizeMicrosoftAccessCatalog, normalizeMicrosoftVerificationTimestamp } from '@/lib/tenants/microsoft-access-contract'
@@ -129,6 +130,11 @@ export default function TenantSettingsPage() {
   const queryClient = useQueryClient()
   const { session } = useAuth()
   const tenantId = params?.id
+  const {
+    actionableHealth: tenantWideHealth,
+    tenant: tenantListRecord,
+    refetch: refetchTenantOperationalProjection,
+  } = useTenantOperationalProjection(tenantId)
 
   // Deep Link detection
   const sectionParam = searchParams.get('section')
@@ -145,7 +151,6 @@ export default function TenantSettingsPage() {
   const [focusedRowId, setFocusedRowId] = useState<string | null>(null)
 
   const [bundle, setBundle] = useState<TenantBundle | null>(null)
-  const [tenantListRecord, setTenantListRecord] = useState<any | null>(null)
   const [microsoftAccessContract, setMicrosoftAccessContract] = useState<unknown>(null)
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading')
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -226,9 +231,8 @@ export default function TenantSettingsPage() {
     setLoadError(null)
 
     try {
-      const [bundleRes, listRes, accessContractRes] = await Promise.allSettled([
+      const [bundleRes, accessContractRes] = await Promise.allSettled([
         apiClient.get<any>(`/api/tenants/${encodeURIComponent(String(tenantId))}`),
-        apiClient.get<any>('/api/tenants'),
         queryClient.fetchQuery({
           queryKey: ['microsoft-access-contract', session?.user.id ?? 'unavailable'],
           queryFn: () => apiClient.get<unknown>('/api/tenants/microsoft/access-contract'),
@@ -242,12 +246,6 @@ export default function TenantSettingsPage() {
         setBundle(loadedBundle)
       }
 
-      if (listRes.status === 'fulfilled' && listRes.value?.tenants) {
-        const found = listRes.value.tenants.find(
-          (t: any) => String(t.id).toLowerCase() === String(tenantId).toLowerCase()
-        )
-        if (found) setTenantListRecord(found)
-      }
       setMicrosoftAccessContract(accessContractRes.status === 'fulfilled' ? accessContractRes.value : null)
 
       if (!loadedBundle && bundleRes.status === 'rejected') {
@@ -267,8 +265,8 @@ export default function TenantSettingsPage() {
 
   // Merged tenant data object
   const tenant = useMemo(() => {
-    const rawBundleTenant = bundle?.tenant || {}
-    const rawListTenant = tenantListRecord || {}
+    const rawBundleTenant = (bundle?.tenant || {}) as Record<string, any>
+    const rawListTenant = (tenantListRecord || {}) as Record<string, any>
     return {
       ...rawBundleTenant,
       ...rawListTenant,
@@ -310,6 +308,7 @@ export default function TenantSettingsPage() {
     try {
       await apiClient.post(`/api/tenants/${encodeURIComponent(String(tenantId))}/verify-connection`)
       await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      await refetchTenantOperationalProjection()
       await fetchTenantData()
       const timeStr = new Intl.DateTimeFormat(undefined, {
         hour: 'numeric',
@@ -319,6 +318,7 @@ export default function TenantSettingsPage() {
       setVerifyNotice(`Connection status refreshed at ${timeStr}.`)
     } catch {
       await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      await refetchTenantOperationalProjection()
       await fetchTenantData()
       setVerifyNotice('Unable to verify the Microsoft connection. Please retry.')
     } finally {
@@ -339,6 +339,8 @@ export default function TenantSettingsPage() {
       if (res?.bundle) {
         setBundle(res.bundle)
       }
+      await queryClient.invalidateQueries({ queryKey: ['tenants'] })
+      await refetchTenantOperationalProjection()
       setSyncNotice({
         message: 'Tenant synchronization completed successfully.',
         type: 'success',
@@ -825,7 +827,7 @@ export default function TenantSettingsPage() {
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Overall Health</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Collection Health</span>
               <div className="pt-0.5">{overallHealthBadge}</div>
             </div>
 
@@ -844,7 +846,7 @@ export default function TenantSettingsPage() {
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs col-span-2 sm:col-span-1">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Actionable Issues</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Collection Issues</span>
               <div className="font-bold text-sm pt-0.5 flex items-center gap-1.5">
                 {!priorityAttentionVerified ? (
                   <span className="text-slate-600 dark:text-slate-300">Not verified</span>
@@ -853,6 +855,11 @@ export default function TenantSettingsPage() {
                 ) : (
                   <span className="text-emerald-600 dark:text-emerald-400">0 issues</span>
                 )}
+              </div>
+              <div className="text-[10px] text-slate-500 dark:text-slate-400 pt-1">
+                {tenantWideHealth.status === 'VERIFIED'
+                  ? `Tenant-wide actionable issues: ${tenantWideHealth.items.length}`
+                  : 'Tenant-wide actionable status: Not verified'}
               </div>
             </div>
           </div>
@@ -928,6 +935,9 @@ export default function TenantSettingsPage() {
                           className="text-[10px] px-2 py-0"
                         >
                           {item.status}
+                        </Badge>
+                        <Badge variant="outline" className="text-[10px] px-2 py-0">
+                          {item.scope === 'OPTIONAL_CAPABILITY' ? 'Optional coverage' : 'Core collection'}
                         </Badge>
                         <span className="text-slate-400 dark:text-slate-500 text-[11px]">• {formatDate(item.timestamp)}</span>
                       </div>

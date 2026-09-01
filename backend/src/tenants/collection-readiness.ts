@@ -579,9 +579,17 @@ function applyDatasetContract(
   selectedDatasetKeys?: Set<string>,
 ) {
   row.datasets = datasets
-  const selected = datasets.filter((dataset) =>
-    selectedDatasetKeys ? selectedDatasetKeys.has(dataset.key) : dataset.tier === 'CORE',
-  )
+  const coreDatasets = datasets.filter((dataset) => dataset.tier === 'CORE')
+  // A workload made entirely of optional capability datasets (currently
+  // Identity Protection) still needs its dataset-level entitlement truth.
+  // Otherwise the earlier workload-wide permission check can incorrectly
+  // report BLOCKED_PERMISSION for a tenant that is authoritatively not
+  // licensed, or whose P2 entitlement is not yet known.
+  const selected = selectedDatasetKeys
+    ? datasets.filter((dataset) => selectedDatasetKeys.has(dataset.key))
+    : coreDatasets.length > 0
+      ? coreDatasets
+      : datasets
   const byKey = new Map(datasets.map((dataset) => [dataset.key, dataset]))
   const contributing = selected.map((dataset) => {
     if (selectedDatasetKeys || dataset.state === 'READY' || !dataset.fallbackDatasetKey) return dataset

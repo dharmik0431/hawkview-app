@@ -9,7 +9,7 @@ import {
   HelpCircle,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
-import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
+import { tenantActionableHealthProjection } from '@/lib/attention/computeTenantAttention'
 import type { Tenant } from '@/types/api'
 import { cn } from '@/lib/utils'
 
@@ -21,6 +21,7 @@ export type DisplayStatusKey =
   | 'syncing'
   | 'partially_synchronized'
   | 'stale'
+  | 'unverified'
 
 export interface DisplayStatusInfo {
   key: DisplayStatusKey
@@ -34,9 +35,9 @@ export interface DisplayStatusInfo {
 export function getTenantDisplayStatus(tenant: Tenant): DisplayStatusInfo {
   const connectionStatus = String(tenant.connectionStatus || '').toLowerCase()
   const tenantStatus = String(tenant.status || '').toLowerCase()
-  const missingPerms = tenant.missingPermissions || []
 
-  const attentionItems = computeTenantAttention(tenant)
+  const actionableHealth = tenantActionableHealthProjection(tenant)
+  const attentionItems = actionableHealth.items
 
   // 1. Disconnected
   if (
@@ -71,7 +72,7 @@ export function getTenantDisplayStatus(tenant: Tenant): DisplayStatusInfo {
   }
 
   // 3. Needs Attention
-  if (attentionItems.length > 0 || missingPerms.length > 0) {
+  if (attentionItems.length > 0) {
     const hasCritical = attentionItems.some((item) => item.severity === 'critical')
     return {
       key: 'needs_attention',
@@ -82,6 +83,21 @@ export function getTenantDisplayStatus(tenant: Tenant): DisplayStatusInfo {
       icon: AlertTriangle,
       primaryActionLabel: 'Review issues',
       primaryActionVariant: 'default',
+    }
+  }
+
+  // A missing or malformed tenant-health projection is not evidence of zero
+  // actionable findings. Keep connection state visible without claiming
+  // Healthy until the backend-owned result is available.
+  if (actionableHealth.status === 'UNAVAILABLE') {
+    return {
+      key: 'unverified',
+      label: 'Health Not Verified',
+      badgeClass:
+        'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
+      icon: HelpCircle,
+      primaryActionLabel: 'View tenant',
+      primaryActionVariant: 'outline',
     }
   }
 

@@ -147,4 +147,51 @@ test('deduplicates actionable Unified Audit readiness and resource health by can
   assert.equal(items.length, 1)
   assert.equal(items[0]?.id, 'collection-m365_unified_audit')
   assert.equal(items[0]?.targetRowId, 'row-m365_unified_audit')
+  assert.equal(items[0]?.scope, 'CORE_COLLECTION')
+})
+
+test('labels an optional-only blocked capability without presenting it as a core collection failure', () => {
+  const readiness = normalizeCollectionReadiness({
+    ...readinessPayload,
+    accessContractVersion: 1,
+    overallState: 'BLOCKED_PERMISSION',
+    workloads: [{
+      ...readinessPayload.workloads[0],
+      key: 'entra_identity_protection',
+      workload: 'Microsoft Identity Protection risk',
+      state: 'BLOCKED_PERMISSION',
+      datasets: [{
+        key: 'entra_identity_protection_risky_users',
+        label: 'Microsoft Identity Protection user risk',
+        tier: 'CAPABILITY_OPTIONAL',
+        state: 'BLOCKED_PERMISSION',
+        permissionStatus: 'MISSING',
+        permissions: [{
+          resource: 'MICROSOFT_GRAPH',
+          name: 'IdentityRiskyUser.Read.All',
+          type: 'APPLICATION',
+          consentMode: 'DEFAULT',
+          grantStatus: 'MISSING',
+        }],
+        permissionMatch: 'ALL',
+        evidenceMode: 'RESOURCE_STATE',
+        licensePrerequisite: { kind: 'ENTRA_ID_P2', state: 'SATISFIED' },
+        fallbackDatasetKey: null,
+        failureScope: 'DATASET_ONLY',
+        resourceTypes: ['RISKY_USERS'],
+        endpointPatterns: ['GET /v1.0/identityProtection/riskyUsers'],
+        documentationUrl: 'https://learn.microsoft.com/graph/api/riskyuser-list',
+        lastAttemptAt: null,
+        lastSuccessfulAt: null,
+        freshness: 'NEVER_SUCCEEDED',
+        reasonCode: 'MICROSOFT_PERMISSION_NOT_CONFIRMED',
+        reason: 'The optional scope is missing.',
+        remediation: 'Grant the optional read-only scope to enable this capability.',
+      }],
+    }],
+  })
+
+  const items = settingsPriorityAttentionItems(readiness, null)
+  assert.equal(items.length, 1)
+  assert.equal(items[0]?.scope, 'OPTIONAL_CAPABILITY')
 })
