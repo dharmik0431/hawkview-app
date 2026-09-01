@@ -1,4 +1,10 @@
 import type { TenantBundle, TenantSyncStatus } from '@/types/tenant-data'
+import type {
+  AttentionItem,
+} from '@/types/attention'
+import type {
+  TenantActionableHealthProjection,
+} from './attention/computeTenantAttention'
 import type { PilotEvidenceView } from './tenants/collection-readiness'
 
 export type TenantWorkspaceState =
@@ -9,6 +15,7 @@ export type TenantWorkspaceState =
   | 'pending-setup'
   | 'partially-synchronized'
   | 'stale'
+  | 'unverified'
 
 export type TenantConnectionState =
   | 'connected'
@@ -41,6 +48,7 @@ export type TenantWorkspaceDisplay = {
   issues: TenantIssue[]
   isInitialSync: boolean
   isStale: boolean
+  attentionVerified: boolean
 }
 
 const STATE_LABELS: Record<TenantWorkspaceState, string> = {
@@ -51,6 +59,56 @@ const STATE_LABELS: Record<TenantWorkspaceState, string> = {
   'pending-setup': 'Pending Setup',
   'partially-synchronized': 'Partially Synchronized',
   stale: 'Stale',
+  unverified: 'Health Not Verified',
+}
+
+function attentionService(item: AttentionItem) {
+  const key = item.key.toLowerCase()
+  if (key.includes('risky') || key.includes('identity')) return 'Identity Protection'
+  if (key.includes('sign')) return 'Sign-ins'
+  if (key.includes('conditional')) return 'Conditional Access'
+  if (key.includes('mfa') || key.includes('auth')) return 'Authentication'
+  if (key.includes('audit')) return 'Microsoft 365 audit'
+  if (key.includes('sharepoint')) return 'SharePoint / OneDrive'
+  if (key.includes('exchange')) return 'Exchange'
+  return 'Microsoft 365'
+}
+
+function attentionTargetModule(item: AttentionItem) {
+  const key = item.key.toLowerCase()
+  if (
+    key.includes('authorization') ||
+    key.includes('permission') ||
+    key.includes('connection') ||
+    key.startsWith('sync-')
+  ) return 'settings'
+  if (
+    key.includes('identity') ||
+    key.includes('risky') ||
+    key.includes('mfa') ||
+    key.includes('auth') ||
+    key.includes('conditional')
+  ) return 'entra'
+  return 'settings'
+}
+
+function workspaceIssueFromAttention(item: AttentionItem): TenantIssue {
+  const severity = item.severity === 'critical'
+    ? 'Critical' as const
+    : item.severity === 'high'
+      ? 'Error' as const
+      : 'Warning' as const
+  return {
+    id: item.key,
+    service: attentionService(item),
+    severity,
+    title: item.label,
+    detail: item.why,
+    explanation: item.why,
+    action: 'Review issue',
+    lastDetectedAt: item.detectedAt ?? null,
+    targetModule: attentionTargetModule(item),
+  }
 }
 
 function normalized(value: unknown) {
@@ -113,11 +171,15 @@ export function deriveTenantWorkspaceDisplay(
   bundle: TenantBundle | null | undefined,
   manualSyncing = false,
   signInEvidence: PilotEvidenceView['signIns'] | null = null,
+  actionableHealth: TenantActionableHealthProjection | null = null,
 ): TenantWorkspaceDisplay {
   const tenant = bundle?.tenant as any
   const connection = connectionState(tenant)
   const entries = syncEntries(bundle)
-  const issues: TenantIssue[] = []
+  const issues: TenantIssue[] = actionableHealth?.status === 'VERIFIED'
+    ? actionableHealth.items.map(workspaceIssueFromAttention)
+    : []
+  const useLegacyIssueDerivation = actionableHealth === null
   const initialSync = tenant?.initialSync as
     | {
         status?: string
@@ -137,7 +199,7 @@ export function deriveTenantWorkspaceDisplay(
     ].map((resource) => resource.toUpperCase())
   )
 
-  for (const [service, sync] of entries) {
+  for (const [service, sync] of useLegacyIssueDerivation ? entries : []) {
     const resourceType = resourceTypeForSyncEntry(service, sync)
     // Once readiness has selected an evidence source, its state is authoritative.
     // A failed non-selected Graph attempt must not override current audit-feed
@@ -230,6 +292,7 @@ export function deriveTenantWorkspaceDisplay(
   }
 
   if (
+    useLegacyIssueDerivation &&
     signInEvidence?.selectedSource &&
     ['STALE', 'FAILED_TRANSIENT', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence.availability)
   ) {
@@ -262,7 +325,7 @@ export function deriveTenantWorkspaceDisplay(
     })
   }
 
-  if (connection === 'disconnected') {
+  if (useLegacyIssueDerivation && connection === 'disconnected') {
     issues.push({
       id: 'connection-disconnected',
       service: 'Microsoft 365',
@@ -286,7 +349,7 @@ export function deriveTenantWorkspaceDisplay(
     : Array.isArray((bundle as any)?.missingPermissions)
       ? (bundle as any).missingPermissions
       : []
-  if (missingPermissions.length) {
+  if (useLegacyIssueDerivation && missingPermissions.length) {
     issues.push({
       id: 'missing-permissions',
       service: 'Entra ID',
@@ -305,7 +368,7 @@ export function deriveTenantWorkspaceDisplay(
     })
   }
 
-  if (backendInitialSyncDelayed) {
+  if (useLegacyIssueDerivation && backendInitialSyncDelayed) {
     issues.push({
       id: 'initial-sync-delayed',
       service: 'Microsoft 365',
@@ -354,6 +417,7 @@ export function deriveTenantWorkspaceDisplay(
   else if (connection === 'pending') state = 'pending-setup'
   else if (isSyncing) state = 'syncing'
   else if (issues.length) state = partial ? 'partially-synchronized' : 'needs-attention'
+  else if (actionableHealth?.status === 'UNAVAILABLE') state = 'unverified'
   else if (explicitStale) state = 'stale'
   else if (partial) state = 'partially-synchronized'
   else if (connection === 'unknown' && !lastSuccessfulSync) state = 'pending-setup'
@@ -375,6 +439,7 @@ export function deriveTenantWorkspaceDisplay(
     issues,
     isInitialSync,
     isStale: explicitStale,
+    attentionVerified: actionableHealth?.status !== 'UNAVAILABLE',
   }
 }
 
@@ -393,5 +458,6 @@ export function statusTone(state: TenantWorkspaceState) {
   if (state === 'syncing') return 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300'
   if (state === 'disconnected') return 'border-red-200 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300'
   if (state === 'pending-setup') return 'border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300'
+  if (state === 'unverified') return 'border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300'
   return 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300'
 }

@@ -26,6 +26,7 @@ import { TenantOverview } from './components/tenant-overview'
 import TenantBreadcrumb from './components/tenant-breadcrumb'
 import TenantSettingsPage from './settings/page'
 import { deriveTenantWorkspaceDisplay, formatTenantTimestamp } from '@/lib/tenant-workspace-state'
+import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { normalizeCollectionReadiness } from '@/lib/tenants/collection-readiness'
 import {
   parseTenantPath,
@@ -1360,6 +1361,12 @@ export default function TenantDetailsPage() {
   const searchParams = useSearchParams()
   const tenantId = params?.id
   const resolvedTenantId = String(tenantId || '')
+  const {
+    actionableHealth,
+    tenant: tenantListRecord,
+    tenants: tenantsList,
+    refetch: refetchTenantOperationalProjection,
+  } = useTenantOperationalProjection(resolvedTenantId)
   const routeState = useMemo(
     () => parseTenantPath(pathname, resolvedTenantId),
     [pathname, resolvedTenantId]
@@ -1444,7 +1451,6 @@ export default function TenantDetailsPage() {
       getCachedTenantBundle(cacheScope, resolvedTenantId) ? 'ready' : 'loading'
   )
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [tenantsList, setTenantsList] = useState<any[]>([])
 
   const fetchBundle = useCallback(async (refresh = false) => {
     if (!tenantId) return
@@ -1484,7 +1490,10 @@ export default function TenantDetailsPage() {
       setBundle(data.bundle)
       setLoadError(null)
       setLoadState('ready')
-      if (refresh) setSyncState('success')
+      if (refresh) {
+        await refetchTenantOperationalProjection()
+        setSyncState('success')
+      }
     } catch (error) {
       const message = 'Unable to load tenant data. Please retry.'
       if (refresh) {
@@ -1505,29 +1514,13 @@ export default function TenantDetailsPage() {
         window.setTimeout(() => setSyncState('idle'), 1400)
       }
     }
-  }, [cacheScope, tenantId])
+  }, [cacheScope, refetchTenantOperationalProjection, tenantId])
 
   useEffect(() => {
     void fetchBundle(false)
   }, [fetchBundle])
 
-  useEffect(() => {
-    setTenantsList([])
-    apiClient
-      .get<any>('/api/tenants')
-      .then((data) => {
-        if (data?.tenants?.length) {
-          setTenantsList(data.tenants)
-        }
-      })
-      .catch(() => {})
-  }, [cacheScope])
-
   const tenant = useMemo(() => bundle?.tenant, [bundle])
-  const tenantListRecord = useMemo(
-    () => tenantsList.find((candidate) => String(candidate?.id) === resolvedTenantId) ?? null,
-    [resolvedTenantId, tenantsList]
-  )
   const collectionReadiness = useMemo(
     () => normalizeCollectionReadiness(tenantListRecord?.collectionReadiness),
     [tenantListRecord]
@@ -1681,8 +1674,9 @@ export default function TenantDetailsPage() {
       bundle,
       syncState === 'syncing',
       collectionReadiness?.evidence.signIns ?? null,
+      actionableHealth,
     )
-  }, [bundle, collectionReadiness, syncState])
+  }, [actionableHealth, bundle, collectionReadiness, syncState])
 
   // Domain selector (per tenant)
   const domains = tenant?.domains?.length

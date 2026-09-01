@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { TenantBundle } from '../types/tenant-data.ts'
+import { tenantActionableHealthProjection } from './attention/computeTenantAttention.ts'
 import { deriveTenantWorkspaceDisplay } from './tenant-workspace-state.ts'
 
 function bundle(overrides: Partial<TenantBundle> = {}): TenantBundle {
@@ -139,4 +140,87 @@ test('creates exactly one action for an actionable selected sign-in source', () 
   assert.equal(display.issueCount, 1)
   assert.equal(display.issues[0]?.title, 'Selected sign-in evidence is stale')
   assert.equal(display.issues[0]?.action, 'Retry synchronization')
+})
+
+test('uses an authoritative core permission finding instead of a healthy-looking detail bundle', () => {
+  const data = bundle()
+  data.tenant.initialSync = undefined
+  ;(data.tenant as Record<string, unknown>).missingPermissions = ['IdentityRiskyUser.Read.All']
+  data.sync = {
+    users: {
+      status: 'success',
+      lastSuccessfulAt: '2026-08-26T17:00:00.000Z',
+      lastError: null,
+    },
+  }
+  const health = tenantActionableHealthProjection({
+    tenantHealth: {
+      attention: [{
+        key: 'authorization-required',
+        label: 'Required Microsoft permissions are missing',
+        severity: 'high',
+        why: 'A connection-required Microsoft permission is missing.',
+      }],
+    },
+  })
+
+  const display = deriveTenantWorkspaceDisplay(data, false, null, health)
+
+  assert.equal(display.state, 'needs-attention')
+  assert.equal(display.stateLabel, 'Needs Attention')
+  assert.equal(display.attentionVerified, true)
+  assert.equal(display.issueCount, 1)
+  assert.equal(display.issues[0]?.id, 'authorization-required')
+})
+
+test('preserves an authoritative healthy zero and multiple tenant-wide findings exactly', () => {
+  const data = bundle()
+  data.tenant.initialSync = undefined
+  ;(data.tenant as Record<string, unknown>).missingPermissions = ['IdentityRiskyUser.Read.All']
+  data.sync = {
+    users: {
+      status: 'success',
+      lastSuccessfulAt: '2026-08-26T17:00:00.000Z',
+      lastError: null,
+    },
+  }
+
+  const healthy = deriveTenantWorkspaceDisplay(
+    data,
+    false,
+    null,
+    tenantActionableHealthProjection({ attention: [] }),
+  )
+  assert.equal(healthy.state, 'healthy')
+  assert.equal(healthy.issueCount, 0)
+
+  const multiple = deriveTenantWorkspaceDisplay(
+    data,
+    false,
+    null,
+    tenantActionableHealthProjection({
+      attention: [
+        { key: 'sync-users', label: 'User collection failed', severity: 'high', why: 'Collection failed.' },
+        { key: 'mfa-coverage', label: 'MFA registration needs review', severity: 'medium', why: 'Coverage is below target.' },
+      ],
+    }),
+  )
+  assert.equal(multiple.state, 'needs-attention')
+  assert.equal(multiple.issueCount, 2)
+})
+
+test('does not call tenant health healthy when the tenant-list projection is unavailable', () => {
+  const data = bundle()
+  data.tenant.initialSync = undefined
+  data.sync = {}
+
+  const display = deriveTenantWorkspaceDisplay(data, false, null, {
+    status: 'UNAVAILABLE',
+    items: [],
+  })
+
+  assert.equal(display.state, 'unverified')
+  assert.equal(display.stateLabel, 'Health Not Verified')
+  assert.equal(display.attentionVerified, false)
+  assert.equal(display.issueCount, 0)
 })

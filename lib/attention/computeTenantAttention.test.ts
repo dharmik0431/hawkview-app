@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { computeTenantAttention } from './computeTenantAttention.ts'
+import {
+  computeTenantAttention,
+  tenantActionableHealthProjection,
+} from './computeTenantAttention.ts'
 
 test('does not turn unavailable MFA registration into a disabled or enforcement finding', () => {
   const findings = computeTenantAttention({
@@ -59,15 +62,36 @@ test('an authoritative empty attention list stays empty', () => {
   assert.deepEqual(findings, [])
 })
 
-test('drops malformed authoritative attention rows rather than rendering arbitrary payloads', () => {
-  const findings = computeTenantAttention({
+test('does not treat the complete optional permission catalog as core tenant attention', () => {
+  const projection = tenantActionableHealthProjection({
+    connectionStatus: 'connected',
+    missingPermissions: ['IdentityRiskyUser.Read.All'],
+    attention: [],
+  })
+  assert.deepEqual(projection, { status: 'VERIFIED', items: [] })
+})
+
+test('fails closed when an authoritative attention result contains malformed rows', () => {
+  const projection = tenantActionableHealthProjection({
     attention: [
       { key: 'safe', label: 'Safe issue', severity: 'medium', why: 'Review this issue.' },
       { key: 'unsafe', label: 'Unsafe issue', severity: 'critical', why: 'token=abc\nBearer secret' },
       { key: 'unknown', label: 'Unknown severity', severity: 'low', why: 'Not in the public contract.' },
     ],
   })
-  assert.deepEqual(findings, [{ key: 'safe', label: 'Safe issue', severity: 'medium', why: 'Review this issue.' }])
+  assert.deepEqual(projection, { status: 'UNAVAILABLE', items: [] })
+})
+
+test('accepts low-severity coverage as verified informational evidence without inflating action count', () => {
+  const projection = tenantActionableHealthProjection({
+    attention: [{
+      key: 'sign-ins-limited-evidence',
+      label: 'Limited sign-in evidence is active',
+      severity: 'low',
+      why: 'Current limited evidence is available.',
+    }],
+  })
+  assert.deepEqual(projection, { status: 'VERIFIED', items: [] })
 })
 
 test('tenant directory and dashboard consumers keep the backend attention contract intact', () => {
@@ -83,7 +107,8 @@ test('tenant directory and dashboard consumers keep the backend attention contra
   for (const source of sources) {
     assert.doesNotMatch(source, /computeTenantAttention\(\{[\s\S]{0,240}connectionStatus/)
   }
-  assert.match(sources[0], /computeTenantAttention\(tenant\)/)
-  assert.match(sources[1], /computeTenantAttention\(tenant\)/)
+  assert.match(sources[0], /tenantActionableHealthProjection\(tenant\)/)
+  assert.match(sources[1], /tenantActionableHealthProjection\(tenant\)/)
+  assert.doesNotMatch(sources[1], /tenant\.missingPermissions/)
   assert.match(sources[2], /computeTenantAttention\(tenant\)/)
 })

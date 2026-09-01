@@ -53,7 +53,10 @@ import {
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 
-import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
+import {
+  computeTenantAttention,
+  tenantActionableHealthProjection,
+} from '@/lib/attention/computeTenantAttention'
 import { topAttention } from '@/lib/attention/topAttention'
 import { TenantIssueDrawer } from '@/components/tenants/tenant-issue-drawer'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
@@ -770,6 +773,7 @@ export default function TenantsPage() {
     let healthy = 0
     let needsAttention = 0
     let disconnectedPending = 0
+    let unverified = 0
 
     tenants.forEach((t) => {
       const displayStatus = getTenantDisplayStatus(t)
@@ -777,6 +781,8 @@ export default function TenantsPage() {
         healthy++
       } else if (displayStatus.key === 'needs_attention') {
         needsAttention++
+      } else if (displayStatus.key === 'unverified') {
+        unverified++
       } else {
         disconnectedPending++
       }
@@ -786,7 +792,7 @@ export default function TenantsPage() {
       total: tenants.length,
       healthy,
       needsAttention,
-      disconnectedPending,
+      disconnectedPending: disconnectedPending + unverified,
     }
   }, [tenants])
 
@@ -813,7 +819,8 @@ export default function TenantsPage() {
       } else if (statusFilter === 'disconnected_pending') {
         matchesStatus =
           displayStatus.key === 'disconnected' ||
-          displayStatus.key === 'pending_setup'
+          displayStatus.key === 'pending_setup' ||
+          displayStatus.key === 'unverified'
       } else if (statusFilter === 'stale') {
         matchesStatus = displayStatus.key === 'stale'
       }
@@ -842,7 +849,8 @@ export default function TenantsPage() {
             stale: 4,
             syncing: 5,
             partially_synchronized: 6,
-            healthy: 7,
+            unverified: 7,
+            healthy: 8,
           }
           const rankA = statusRank[getTenantDisplayStatus(a).key] || 99
           const rankB = statusRank[getTenantDisplayStatus(b).key] || 99
@@ -963,7 +971,7 @@ export default function TenantsPage() {
         <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
           <div>
             <p className="text-xs font-semibold text-red-600 dark:text-red-400 uppercase tracking-wider">
-              Disconnected / Pending
+              Disconnected / Pending / Unverified
             </p>
             <p className="text-2xl font-extrabold text-red-700 dark:text-red-400 mt-0.5">
               {counts.disconnectedPending}
@@ -1463,7 +1471,7 @@ export default function TenantsPage() {
                   : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
               )}
             >
-              Offline/Pending
+              Offline/Pending/Unverified
             </button>
           </div>
 
@@ -1641,7 +1649,8 @@ export default function TenantsPage() {
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
                   {sortedTenants.map((tenant) => {
                     const statusInfo = getTenantDisplayStatus(tenant)
-                    const attentionItems = computeTenantAttention(tenant)
+                    const actionableHealth = tenantActionableHealthProjection(tenant)
+                    const attentionItems = actionableHealth.items
 
                     return (
                       <tr
@@ -1694,6 +1703,11 @@ export default function TenantsPage() {
                               <span>{attentionItems.length} issue{attentionItems.length > 1 ? 's' : ''}</span>
                               <ChevronRight className="h-3.5 w-3.5 opacity-60 ml-0.5" />
                             </button>
+                          ) : actionableHealth.status === 'UNAVAILABLE' ? (
+                            <span className="inline-flex items-center gap-1 text-xs text-slate-500 dark:text-slate-400 font-medium">
+                              <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                              <span>Not verified</span>
+                            </span>
                           ) : (
                             <span className="inline-flex items-center gap-1 text-xs text-slate-400 dark:text-slate-500 font-medium">
                               <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
@@ -1763,7 +1777,8 @@ export default function TenantsPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {sortedTenants.map((tenant) => {
               const statusInfo = getTenantDisplayStatus(tenant)
-              const attentionItems = computeTenantAttention(tenant)
+              const actionableHealth = tenantActionableHealthProjection(tenant)
+              const attentionItems = actionableHealth.items
 
               return (
                 <Card
@@ -1802,6 +1817,11 @@ export default function TenantsPage() {
                           <AlertTriangle className="h-3.5 w-3.5" />
                           <span>{attentionItems.length} Needs Review</span>
                         </button>
+                      ) : actionableHealth.status === 'UNAVAILABLE' ? (
+                        <span className="text-slate-500 dark:text-slate-400 font-semibold flex items-center gap-1">
+                          <AlertCircle className="h-3.5 w-3.5" />
+                          <span>Not verified</span>
+                        </span>
                       ) : (
                         <span className="text-emerald-600 font-semibold flex items-center gap-1">
                           <CheckCircle2 className="h-3.5 w-3.5" />

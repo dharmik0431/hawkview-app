@@ -2,6 +2,10 @@ import { useQuery } from '@tanstack/react-query'
 import type { TenantsResponse, DashboardSummaryResponse } from '@/types/api'
 import { apiClient } from './client'
 import { useAuth } from '@/components/providers/auth-provider'
+import {
+  projectTenantOperationalHealth,
+  type TenantOperationalProjection,
+} from '@/lib/tenants/operational-health-projection'
 
 export function useTenants() {
   const { cacheScope } = useAuth()
@@ -12,6 +16,27 @@ export function useTenants() {
     retry: false,
     staleTime: 5 * 60 * 1000,
   })
+}
+
+/**
+ * Shared tenant-list projection used by Directory, Overview, and Settings.
+ * The list endpoint owns tenant-wide health; a detail bundle must never
+ * overwrite its verified findings or turn an unavailable result into zero.
+ */
+export function useTenantOperationalProjection(
+  tenantId?: string | null,
+): TenantOperationalProjection & { refetch: ReturnType<typeof useTenants>['refetch'] } {
+  const query = useTenants()
+  const projection = projectTenantOperationalHealth({
+    tenantId,
+    response: query.data,
+    queryState: query.isLoading ? 'LOADING' : query.isError ? 'ERROR' : 'SUCCESS',
+  })
+
+  return {
+    ...projection,
+    refetch: query.refetch,
+  }
 }
 
 export function useTenantBundle(tenantId?: string) {
