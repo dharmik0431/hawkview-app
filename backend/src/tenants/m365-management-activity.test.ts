@@ -7,6 +7,7 @@ import {
   compactManagementEvidence,
   classifyManagementActivity,
   isPrimaryManagementActivity,
+  managementActivityRoleFromEvidence,
   managementContentWindows,
   readBoundedJson,
   readBoundedText,
@@ -49,27 +50,27 @@ function record(overrides: Record<string, unknown> = {}) {
 }
 
 test('keeps genuine M365 administration changes and excludes routine user activity', () => {
-  for (const operation of [
-    'Set-Mailbox',
-    'Add-MailboxPermission',
-    'New-TransportRule',
-    'Remove-TransportRule',
-    'Set-InboxRule',
-    'Set-AcceptedDomain',
-    'SiteCollectionAdminAdded',
-    'SharingSet',
-    'AddedToSecureLink',
-    'Set-SPOTenant',
-    'TeamSettingChanged',
-    'MemberAdded',
-    'MemberRemoved',
-    'ChannelDeleted',
-    'TeamCreated',
-    'Update conditional access policy',
-    'Add service principal credentials',
-    'Consent to application',
-  ]) {
-    assert.equal(isPrimaryManagementActivity(record({ Operation: operation })), true, operation)
+  for (const [operation, workload] of [
+    ['Set-Mailbox', 'Exchange'],
+    ['Add-MailboxPermission', 'Exchange'],
+    ['New-TransportRule', 'Exchange'],
+    ['Remove-TransportRule', 'Exchange'],
+    ['Set-InboxRule', 'Exchange'],
+    ['Set-AcceptedDomain', 'Exchange'],
+    ['SiteCollectionAdminAdded', 'SharePoint'],
+    ['SharingSet', 'SharePoint'],
+    ['AddedToSecureLink', 'SharePoint'],
+    ['Set-SPOTenant', 'SharePoint'],
+    ['TeamSettingChanged', 'MicrosoftTeams'],
+    ['MemberAdded', 'MicrosoftTeams'],
+    ['MemberRemoved', 'MicrosoftTeams'],
+    ['ChannelDeleted', 'MicrosoftTeams'],
+    ['TeamCreated', 'MicrosoftTeams'],
+    ['Update conditional access policy', 'AzureActiveDirectory'],
+    ['Add service principal credentials', 'AzureActiveDirectory'],
+    ['Consent to application', 'AzureActiveDirectory'],
+  ] as const) {
+    assert.equal(isPrimaryManagementActivity(record({ Operation: operation, Workload: workload })), true, operation)
   }
   for (const operation of [
     'UserLoggedIn',
@@ -97,6 +98,23 @@ test('keeps genuine M365 administration changes and excludes routine user activi
   assert.equal(classifyManagementActivity(record({ Operation: 'Create' })), 'routine_activity')
   assert.equal(classifyManagementActivity(record({ Operation: 'Update' })), 'routine_activity')
   assert.equal(classifyManagementActivity(record({ Operation: 'FileAccessed' })), 'routine_activity')
+})
+
+test('fails closed for read, sync, Teams message, To Do, and legacy-promoted telemetry', () => {
+  for (const candidate of [
+    record({ Operation: 'Features_Get', Workload: 'AzureActiveDirectory' }),
+    record({ Operation: 'Policy_GetDetails', Workload: 'AzureActiveDirectory' }),
+    record({ Operation: 'CollectorSyncCompleted', Workload: 'Microsoft365' }),
+    record({ Operation: 'MessageCreated', Workload: 'MicrosoftTeams' }),
+    record({ Operation: 'ChatMessageUpdated', Workload: 'MicrosoftTeams' }),
+    record({ Operation: 'TaskCreated', Workload: 'Microsoft To Do' }),
+  ]) {
+    assert.equal(classifyManagementActivity(candidate), 'routine_activity', String(candidate.Operation))
+  }
+  assert.equal(managementActivityRoleFromEvidence({
+    operationName: 'MessageCreated', workload: 'MicrosoftTeams',
+    raw: { hawkviewEvidenceRole: 'primary_change', Operation: 'MessageCreated', Workload: 'MicrosoftTeams' },
+  }), 'routine_activity')
 })
 
 test('retains investigation fields while redacting secrets named inside Microsoft parameter arrays', () => {

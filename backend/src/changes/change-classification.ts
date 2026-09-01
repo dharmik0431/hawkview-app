@@ -1,3 +1,5 @@
+import { classifyEvidenceTrust } from './evidence-trust-catalog.js'
+
 /**
  * Internal evidence classifications for the investigation timeline.
  *
@@ -34,14 +36,21 @@ export type LegacyChangeCategory =
   | 'Devices'
   | 'Licenses'
   | 'Users'
+  | 'Organization'
+  | 'Domains'
+  | 'Exchange'
+  | 'SharePoint'
+  | 'Unknown'
 
 type EvidenceClassificationInput = {
   source?: string | null
+  workload?: string | null
   activity: string
   category?: string | null
   operationType?: string | null
   targetResourceTypes?: Array<string | null | undefined>
   actor?: string | null
+  result?: string | null
   target?: string | null
   beforeState?: unknown
   afterState?: unknown
@@ -99,55 +108,35 @@ export function isKnownMicrosoftSystemEvent(input: EvidenceClassificationInput):
   return false
 }
 
-export function legacyCategory(activity: string, category?: string | null): {
+export function legacyCategory(
+  activity: string,
+  category?: string | null,
+  operationType?: string | null,
+  targetResourceTypes?: Array<string | null | undefined>,
+): {
   category: LegacyChangeCategory
   severity: 'Low' | 'Medium' | 'High'
 } {
-  const value = `${activity} ${category ?? ''}`.toLowerCase()
-  if (/authentication method|security info|mfa|strong authentication/.test(value)) return { category: 'MFA', severity: 'High' }
-  if (/password/.test(value)) return { category: 'Passwords', severity: 'High' }
-  if (/conditional access|named location/.test(value)) return { category: 'Conditional Access', severity: 'High' }
-  if (/service principal|application|app registration|credential|oauth/.test(value)) return { category: 'Apps', severity: 'High' }
-  if (/role|eligible assignment|member to role/.test(value)) return { category: 'Roles', severity: 'High' }
-  if (/group/.test(value)) return { category: 'Groups', severity: 'Medium' }
-  if (/device/.test(value)) return { category: 'Devices', severity: 'Medium' }
-  if (/license/.test(value)) return { category: 'Licenses', severity: 'Medium' }
-  return { category: 'Users', severity: 'Low' }
+  const trusted = classifyEvidenceTrust({
+    source: 'DIRECTORY_AUDIT', operation: activity, category, operationType, targetResourceTypes,
+  })
+  return { category: trusted.category, severity: trusted.severity }
 }
 
 export function classifyEvidence(input: EvidenceClassificationInput): ChangeClassification {
-  const source = input.source?.toUpperCase() ?? ''
-  const activity = input.activity.toLowerCase()
-  const category = input.category?.toLowerCase() ?? ''
-  const operationType = input.operationType?.toLowerCase() ?? ''
-  const targetTypes = (input.targetResourceTypes ?? []).filter(Boolean).join(' ').toLowerCase()
-  const value = `${activity} ${category} ${targetTypes}`
-
-  // A sign-in is authentication telemetry, not proof that a configuration or
-  // administrative change occurred.
-  if (source === 'SIGN_IN') return 'authentication_evidence'
-
   if (isKnownMicrosoftSystemEvent(input)) return 'system_or_collection_event'
-
-  // Directory audits contain read/report/health operations as well as changes.
-  // Evaluate their structured operation first, so a report *about* a policy or
-  // synchronization configuration is not shown as a policy/configuration change.
-  if (
-    /^(get|list|read|report|export|view|search)\b/.test(activity)
-    || /^(read|report|export|view|search)$/i.test(operationType)
-    || /health check|inventory refresh|telemetry|collection status/.test(value)
-  ) return 'system_or_collection_event'
-
-  if (/conditional access|named location|sign[ -]?in frequency|authentication method|security info|mfa|strong authentication|security default/.test(value)) return 'security_control_change'
-  if (/consent|permission|oauth|app role|app registration|service principal|application/.test(value)) return 'permission_change'
-  if (/role assignment|directory role|administrator|eligible assignment|password reset|reset password|reset.*password|disable user|delete user/.test(value)) return 'administrative_action'
-  if (/synchroni[sz]/.test(value)) return 'configuration_change'
-  if (/group|member|user|device/.test(value)) return 'identity_change'
-  if (/license|subscription|domain|organization|tenant identity|exchange|mailbox|sharepoint|onedrive|site|setting|configuration|policy/.test(value)) return 'configuration_change'
-
-  // Preserve unknown source evidence in storage, but do not present it as an
-  // administrative change until a narrow mapping has been reviewed.
-  return 'system_or_collection_event'
+  return classifyEvidenceTrust({
+    source: input.source,
+    workload: input.workload,
+    operation: input.activity,
+    category: input.category,
+    operationType: input.operationType,
+    targetResourceTypes: input.targetResourceTypes,
+    actor: input.actor,
+    result: input.result,
+    beforeState: input.beforeState,
+    afterState: input.afterState,
+  }).classification
 }
 
 export function isPrimaryChange(input: EvidenceClassificationInput) {

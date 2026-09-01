@@ -240,91 +240,15 @@ function determineCategoryKey(e: ChangeEvent): EventCategoryKey {
     return 'admin-role'
   }
 
-  // 3. Structured evidence target types
+  // 3. Structured evidence target types. Do not infer from titles or summary
+  // text: those fields are Microsoft/user-controlled presentation evidence.
   const targetTypes = (e.evidence?.targets ?? []).map((t) => (t.targetType ?? '').toLowerCase())
   if (targetTypes.includes('serviceprincipal')) {
     return 'enterprise-app'
   }
 
-  // 4. Activity name, target name, summary & service string matching
-  const title = (e.title ?? '').toLowerCase()
-  const summary = (e.summary ?? '').toLowerCase()
-  const target = (e.target ?? '').toLowerCase()
-  const source = (e.source ?? '').toLowerCase()
-  const loggedService = (e.evidence?.loggedByService ?? '').toLowerCase()
-  const text = `${title} ${summary} ${target} ${source} ${loggedService}`
-
-  // DNS / Domain
-  if (/dns|dmarc|spf|dkim|cname|mx record|txt record|domain|custom domain/i.test(text)) {
-    return 'dns-domain'
-  }
-
-  // App registration
-  if (
-    /app registration|credential added|client secret|certificate|key credential|register app|add application|application updated/i.test(
-      text
-    ) ||
-    (e.category === 'Apps' && /registration|credential|secret|certificate/i.test(text))
-  ) {
-    return 'app-registration'
-  }
-
-  // Enterprise application / Service principal
-  if (
-    /service principal|serviceprincipal|enterprise app|enterprise application|permission grant|consent to application|approle/i.test(
-      text
-    ) ||
-    (e.category === 'Apps' && /service principal|enterprise|permission|grant|consent/i.test(text))
-  ) {
-    return 'enterprise-app'
-  }
-
-  // Generic Apps fallback
   if (e.category === 'Apps') {
-    if (/registration|credential|secret|certificate/i.test(text)) {
-      return 'app-registration'
-    }
     return 'enterprise-app'
-  }
-
-  // Exchange / Mail
-  if (/exchange|mailbox|mail flow|transport rule|anti-spam|anti-phishing|inbox rule|outlook/i.test(text)) {
-    return 'exchange'
-  }
-
-  // SharePoint / OneDrive
-  if (/sharepoint|onedrive|site collection|document library|sharing policy/i.test(text)) {
-    return 'sharepoint'
-  }
-
-  // Conditional Access / Security policy
-  if (/conditional access|security policy|authentication method|named location|risk policy|identity protection|security baseline|password policy/i.test(text)) {
-    return 'security-policy'
-  }
-
-  // Administrative role
-  if (/admin role|directory role|global administrator|privileged|pim|role assignment/i.test(text)) {
-    return 'admin-role'
-  }
-
-  // Group
-  if (/group|group membership|added to group|removed from group/i.test(text)) {
-    return 'group'
-  }
-
-  // User
-  if (/user|user account|account disabled|user created|password reset|mfa registered/i.test(text)) {
-    return 'user'
-  }
-
-  // License
-  if (/license|sku|subscription/i.test(text)) {
-    return 'license'
-  }
-
-  // Device
-  if (/device|intune|mdm|compliant device/i.test(text)) {
-    return 'device'
   }
 
   // Fallback to General audit event
@@ -333,46 +257,20 @@ function determineCategoryKey(e: ChangeEvent): EventCategoryKey {
 
 function determineResultStatus(e: ChangeEvent): EventResultStatus {
   const resultVal = (e.evidence?.result ?? '').toLowerCase()
-  const title = (e.title ?? '').toLowerCase()
-  const summary = (e.summary ?? '').toLowerCase()
-  const text = `${title} ${summary} ${resultVal}`
-
-  if (
-    resultVal.includes('fail') ||
-    resultVal.includes('interrupted') ||
-    resultVal.includes('blocked') ||
-    text.includes('failed') ||
-    text.includes('failure') ||
-    text.includes('blocked') ||
-    text.includes('denied')
-  ) {
+  if (['failed', 'failure', 'blocked', 'denied', 'interrupted', 'false'].includes(resultVal)) {
     return 'failure'
   }
 
-  if (
-    resultVal.includes('success') ||
-    e.evidence?.result === 'success' ||
-    e.evidence?.result === 'Success'
-  ) {
+  if (['success', 'succeeded', 'completed', 'true'].includes(resultVal)) {
     return 'success'
   }
-
-  if (e.evidence?.result) {
-    return 'success'
-  }
-
-  if (e.eventType === 'sign-in') {
-    return 'success'
-  }
-
-  // Default for standard executed changes
-  return 'success'
+  return 'unknown'
 }
 
-function formatResultText(status: EventResultStatus, e: ChangeEvent): string {
+function formatResultText(status: EventResultStatus): string {
   if (status === 'failure') return 'Failed'
   if (status === 'success') return 'Success'
-  return 'Unknown'
+  return 'Not reported'
 }
 
 export function classifyEvent(e: ChangeEvent): EventClassification {
@@ -380,8 +278,8 @@ export function classifyEvent(e: ChangeEvent): EventClassification {
   const categoryConfig = CATEGORY_CONFIGS[catKey]
 
   const resultStatus = determineResultStatus(e)
-  const resultText = formatResultText(resultStatus, e)
-  const isHighRisk = e.severity === 'High'
+  const resultText = formatResultText(resultStatus)
+  const isHighRisk = e.severity === 'High' && catKey !== 'general-audit'
 
   const accessibleLabel = `${categoryConfig.label} event, ${resultText.toLowerCase()}${
     isHighRisk ? ', high risk' : ''

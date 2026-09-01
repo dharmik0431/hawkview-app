@@ -4,6 +4,7 @@ import { normalizeCollectionReadiness, synchronizationReadinessSummary } from '.
 import {
   settingsConnectionHealth,
   settingsOverallHealth,
+  settingsPriorityAttentionItems,
   settingsSynchronizationAttention,
   settingsSynchronizationStateLabel,
   settingsSynchronizationRows,
@@ -106,4 +107,44 @@ test('does not call collection healthy while a required workload is failing', ()
     state: 'NEEDS_ATTENTION',
     label: 'Collection needs attention',
   })
+})
+
+test('keeps successful and informational readiness out of Priority attention', () => {
+  const readiness = normalizeCollectionReadiness({
+    ...readinessPayload,
+    overallState: 'PARTIAL',
+    workloads: ['READY', 'INITIALIZING', 'PARTIAL', 'UNVERIFIED', 'NOT_LICENSED', 'UNSUPPORTED'].map((state, index) => ({
+      ...readinessPayload.workloads[1], key: `neutral-${index}`, state,
+    })),
+  })
+  const summary = synchronizationReadinessSummary(readiness)
+  assert.equal(summary?.attentionWorkloads, 0)
+  assert.deepEqual(settingsSynchronizationAttention(settingsSynchronizationRows(readiness)), {
+    total: 0, failed: 0, blocked: 0, backlogged: 0, stale: 0, other: 0, label: 'None',
+  })
+  assert.deepEqual(settingsOverallHealth(summary), {
+    state: 'UNVERIFIED', label: 'Collection status informational',
+  })
+})
+
+test('deduplicates actionable Unified Audit readiness and resource health by canonical workload key', () => {
+  const readiness = normalizeCollectionReadiness({
+    ...readinessPayload,
+    workloads: [{
+      ...readinessPayload.workloads[1],
+      key: 'm365_unified_audit',
+      state: 'FAILED_TRANSIENT',
+      reasonCode: 'UPSTREAM_FAILURE',
+      reason: 'The selected audit workload failed.',
+    }],
+  })
+  const items = settingsPriorityAttentionItems(readiness, {
+    classification: 'FAILED_TRANSIENT',
+    message: 'The audit resource health also reports a failure.',
+    lastAttemptAt: '2026-08-19T14:58:00.000Z',
+  })
+
+  assert.equal(items.length, 1)
+  assert.equal(items[0]?.id, 'collection-m365_unified_audit')
+  assert.equal(items[0]?.targetRowId, 'row-m365_unified_audit')
 })

@@ -8,11 +8,12 @@ import { useAuth } from '@/components/providers/auth-provider'
 
 import { apiClient } from '@/lib/api/client'
 import { auditSyncFocusTarget, isM365AuditSyncDeepLink, m365AuditSyncHealth } from '@/lib/tenants/audit-sync-health'
-import { normalizeCollectionReadiness, readinessDiagnostic, readinessLabel, readinessRemediation, synchronizationReadinessSummary, READINESS_STATES } from '@/lib/tenants/collection-readiness'
+import { isActionableReadinessState, normalizeCollectionReadiness, readinessDiagnostic, readinessLabel, readinessRemediation, synchronizationReadinessSummary, READINESS_STATES } from '@/lib/tenants/collection-readiness'
 import { datasetStateNeedsTenantAction, datasetTierLabel, microsoftAccessDatasetView, microsoftAccessSummary, normalizeMicrosoftAccessCatalog, normalizeMicrosoftVerificationTimestamp } from '@/lib/tenants/microsoft-access-contract'
 import {
   settingsConnectionHealth,
   settingsOverallHealth,
+  settingsPriorityAttentionItems,
   settingsSynchronizationAttention,
   settingsSynchronizationStateLabel,
   settingsSynchronizationRows,
@@ -498,56 +499,11 @@ export default function TenantSettingsPage() {
   }, [synchronizationSummary])
 
   // Priority Attention Items computation
-  const priorityAttentionItems = useMemo(() => {
-    const items: Array<{
-      id: string
-      title: string
-      status: string
-      statusVariant: 'amber' | 'red' | 'blue'
-      explanation: string
-      timestamp: string
-      actionLabel: string
-      targetTab: string
-      targetRowId?: string
-    }> = []
-
-    // Non-ready workloads from collection readiness
-    if (collectionReadiness?.workloads) {
-      collectionReadiness.workloads.forEach((w) => {
-        if (w.state !== 'READY') {
-          const isRed = ['BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION', 'FAILED_TRANSIENT'].includes(w.state)
-          items.push({
-            id: `collection-${w.key}`,
-            title: w.workload,
-            status: readinessLabel(w.state),
-            statusVariant: isRed ? 'red' : 'amber',
-            explanation: readinessDiagnostic(w.reasonCode, w.reason) || w.remediation || 'Requires attention.',
-            timestamp: formatDate(w.lastAttemptAt || w.lastVerifiedAt),
-            actionLabel: 'Investigate in Collection',
-            targetTab: 'collection',
-            targetRowId: `row-${w.key}`,
-          })
-        }
-      })
-    }
-
-    // Audit Sync issues
-    if (auditSync && auditSync.classification !== 'READY' && auditSync.classification !== 'HEALTHY') {
-      items.push({
-        id: 'audit-sync',
-        title: 'Microsoft 365 Unified Audit',
-        status: readinessLabel(auditSync.classification),
-        statusVariant: 'amber',
-        explanation: auditSync.message || 'Audit log synchronization requires attention.',
-        timestamp: formatDate(auditSync.lastAttemptAt),
-        actionLabel: 'Investigate in Sync',
-        targetTab: 'synchronization',
-        targetRowId: 'row-m365_unified_audit',
-      })
-    }
-
-    return items
-  }, [collectionReadiness, auditSync])
+  const priorityAttentionItems = useMemo(
+    () => settingsPriorityAttentionItems(collectionReadiness, auditSync),
+    [collectionReadiness, auditSync],
+  )
+  const priorityAttentionVerified = collectionReadiness !== null
 
   // Filtered & Sorted Collection Workloads
   const filteredWorkloads = useMemo(() => {
@@ -567,7 +523,7 @@ export default function TenantSettingsPage() {
 
     if (collectionFilterState !== 'ALL') {
       if (collectionFilterState === 'ATTENTION') {
-        list = list.filter((w) => w.state !== 'READY')
+        list = list.filter((w) => isActionableReadinessState(w.state))
       } else {
         list = list.filter((w) => w.state === collectionFilterState)
       }
@@ -745,7 +701,7 @@ export default function TenantSettingsPage() {
 
         {/* Action Notices */}
         {verifyNotice && (
-          <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 dark:bg-emerald-950/30 dark:border-emerald-900/50 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
+          <div role="status" aria-live="polite" className="rounded-lg border border-emerald-200 bg-emerald-50/80 dark:bg-emerald-950/30 dark:border-emerald-900/50 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
             <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
             <span>{verifyNotice}</span>
           </div>
@@ -753,6 +709,8 @@ export default function TenantSettingsPage() {
 
         {syncNotice && (
           <div
+            role={syncNotice.type === 'success' ? 'status' : 'alert'}
+            aria-live={syncNotice.type === 'success' ? 'polite' : 'assertive'}
             className={cn(
               'rounded-lg border px-3 py-2 text-xs flex items-center gap-2',
               syncNotice.type === 'success'
@@ -773,6 +731,7 @@ export default function TenantSettingsPage() {
       {/* RECONNECTION WARNING BANNER */}
       {requiresMicrosoftReconnection && (
         <div
+          role="alert"
           className={cn(
             'rounded-xl border p-4 shadow-2xs text-xs space-y-3',
             isConnectionLost
@@ -824,8 +783,11 @@ export default function TenantSettingsPage() {
           </TabsTrigger>
           <TabsTrigger value="collection" className="rounded-lg text-xs font-semibold px-4 py-2 cursor-pointer flex items-center gap-1.5">
             <span>Collection</span>
-            {collectionReadiness?.workloads.some((w) => w.state !== 'READY') && (
-              <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" />
+            {collectionReadiness?.workloads.some((w) => isActionableReadinessState(w.state)) && (
+              <span className="inline-flex items-center">
+                <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" aria-hidden="true" />
+                <span className="sr-only">Needs attention</span>
+              </span>
             )}
           </TabsTrigger>
           <TabsTrigger value="permissions" className="rounded-lg text-xs font-semibold px-4 py-2 cursor-pointer flex items-center gap-1.5">
@@ -839,7 +801,10 @@ export default function TenantSettingsPage() {
           <TabsTrigger value="synchronization" className="rounded-lg text-xs font-semibold px-4 py-2 cursor-pointer flex items-center gap-1.5">
             <span>Synchronization</span>
             {synchronizationSummary && synchronizationSummary.attentionWorkloads > 0 && (
-              <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" />
+              <span className="inline-flex items-center">
+                <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" aria-hidden="true" />
+                <span className="sr-only">Needs attention</span>
+              </span>
             )}
           </TabsTrigger>
           <TabsTrigger value="administration" className="rounded-lg text-xs font-semibold px-4 py-2 cursor-pointer">
@@ -881,7 +846,9 @@ export default function TenantSettingsPage() {
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs col-span-2 sm:col-span-1">
               <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Actionable Issues</span>
               <div className="font-bold text-sm pt-0.5 flex items-center gap-1.5">
-                {priorityAttentionItems.length > 0 ? (
+                {!priorityAttentionVerified ? (
+                  <span className="text-slate-600 dark:text-slate-300">Not verified</span>
+                ) : priorityAttentionItems.length > 0 ? (
                   <span className="text-amber-600 dark:text-amber-400">{priorityAttentionItems.length} issues needing review</span>
                 ) : (
                   <span className="text-emerald-600 dark:text-emerald-400">0 issues</span>
@@ -935,13 +902,19 @@ export default function TenantSettingsPage() {
                 <h2 className="text-sm font-bold text-slate-900 dark:text-white">Priority attention</h2>
               </div>
               <span className="text-xs text-slate-500">
-                {priorityAttentionItems.length} item{priorityAttentionItems.length !== 1 ? 's' : ''} require administrative review
+                {priorityAttentionVerified
+                  ? `${priorityAttentionItems.length} item${priorityAttentionItems.length !== 1 ? 's' : ''} require administrative review`
+                  : 'Attention status is not verified'}
               </span>
             </div>
 
-            {priorityAttentionItems.length === 0 ? (
-              <div className="text-xs text-slate-500 dark:text-slate-400 py-4 text-center">
-                No priority issues detected across tenant connections, collection readiness, or permissions.
+            {!priorityAttentionVerified ? (
+              <div role="status" className="text-xs text-slate-500 dark:text-slate-400 py-4 text-center">
+                Priority attention is unavailable because collection readiness was not reported.
+              </div>
+            ) : priorityAttentionItems.length === 0 ? (
+              <div role="status" className="text-xs text-slate-500 dark:text-slate-400 py-4 text-center">
+                No actionable collection issues were reported by the current readiness evidence.
               </div>
             ) : (
               <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
@@ -956,7 +929,7 @@ export default function TenantSettingsPage() {
                         >
                           {item.status}
                         </Badge>
-                        <span className="text-slate-400 dark:text-slate-500 text-[11px]">• {item.timestamp}</span>
+                        <span className="text-slate-400 dark:text-slate-500 text-[11px]">• {formatDate(item.timestamp)}</span>
                       </div>
                       <p className="text-slate-600 dark:text-slate-300 text-xs leading-relaxed">{item.explanation}</p>
                     </div>
@@ -1139,7 +1112,7 @@ export default function TenantSettingsPage() {
                 onClick={() => setCollectionFilterState('ATTENTION')}
                 className="h-7 text-xs px-2.5 rounded-lg"
               >
-                Needs Attention ({collectionReadiness?.workloads.filter((w) => w.state !== 'READY').length || 0})
+                Needs Attention ({collectionReadiness?.workloads.filter((w) => isActionableReadinessState(w.state)).length || 0})
               </Button>
               <Button
                 type="button"
@@ -1192,7 +1165,9 @@ export default function TenantSettingsPage() {
                   {filteredWorkloads.length === 0 ? (
                     <tr>
                       <td colSpan={9} className="px-4 py-8 text-center text-slate-500">
-                        No workloads matching the selected filter criteria.
+                        {collectionReadiness
+                          ? 'No workloads match the selected filter criteria.'
+                          : 'Collection readiness is unavailable and no zero-issue claim can be made.'}
                       </td>
                     </tr>
                   ) : (

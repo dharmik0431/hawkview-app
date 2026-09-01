@@ -73,6 +73,46 @@ test('reports current limited sign-in fallback without a synchronization-failure
   assert.equal(result.riskyIdentityCount, null)
 })
 
+test('uses selected current limited evidence instead of a failed non-selected Graph state', () => {
+  const now = new Date('2026-08-07T12:05:00.000Z')
+  const result = deriveTenantHealth({
+    ...baseInput(),
+    now,
+    signInEvidence: {
+      availability: 'CURRENT_LIMITED', coverage: 'LIMITED', selectedSource: 'OFFICE_365_ACTIVITY_FEED',
+      observedAt: '2026-08-07T12:00:00.000Z', reasonCode: 'SIGN_IN_FALLBACK_ACTIVE',
+      reason: 'Current limited audit-feed login evidence is available.',
+    },
+    syncStates: [{
+      resourceType: 'SIGN_INS', status: 'FAILED', lastAttemptAt: now,
+      lastSuccessfulAt: null, lastErrorCode: '403', lastErrorMessage: 'Graph sign-ins denied.', consecutiveFailures: 9,
+    }],
+  })
+  assert.equal(result.resourceHealth.find((item) => item.resourceType === 'SIGN_INS')?.classification, 'PARTIAL')
+  assert.equal(result.attention.some((item) => item.key === 'sync-sign_ins'), false)
+  assert.equal(result.attention.filter((item) => item.key === 'sign-ins-limited-evidence').length, 1)
+  assert.equal(result.operations.failedJobs, 0)
+  assert.equal(result.operations.activeIssues, 0)
+})
+
+test('creates one truthful action for each actionable selected sign-in evidence state', () => {
+  const now = new Date('2026-08-07T12:05:00.000Z')
+  for (const availability of ['STALE', 'FAILED_TRANSIENT', 'BLOCKED_PERMISSION'] as const) {
+    const result = deriveTenantHealth({
+      ...baseInput(), now,
+      signInEvidence: {
+        availability, coverage: 'LIMITED', selectedSource: 'OFFICE_365_ACTIVITY_FEED',
+        observedAt: '2026-08-07T11:00:00.000Z', reasonCode: `SIGN_INS_${availability}`,
+        reason: 'The selected evidence source needs attention.',
+      },
+      syncStates: [{ resourceType: 'SIGN_INS', status: 'SUCCEEDED', lastAttemptAt: now, lastSuccessfulAt: now, lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 }],
+    })
+    assert.equal(result.attention.filter((item) => item.key === 'sync-sign_ins').length, 1, availability)
+    assert.equal(result.attention.some((item) => item.key === 'sign-ins-limited-evidence'), false, availability)
+    assert.equal(result.operations.activeIssues, 1, availability)
+  }
+})
+
 test('creates exactly one selected sign-in action when audit-feed fallback evidence is stale or failed', () => {
   const now = new Date('2026-08-07T15:00:00.000Z')
   const stale = deriveTenantHealth({
@@ -269,7 +309,7 @@ test('disabled Conditional Access policies create deep-linked audit findings', (
       operationType: 'Update',
       result: 'success',
       initiatedBy: { user: { userPrincipalName: 'admin@example.com' } },
-      targetResources: [{ displayName: 'Require MFA' }],
+      targetResources: [{ displayName: 'Require MFA', type: 'conditionalAccessPolicy' }],
     }],
   })
 
@@ -291,6 +331,7 @@ test('detects a disabled Conditional Access state inside Microsoft modified prop
       initiatedBy: null,
       targetResources: [{
         displayName: 'Require MFA',
+        type: 'conditionalAccessPolicy',
         modifiedProperties: [{ displayName: 'State', newValue: 'disabled' }],
       }],
     }],
@@ -311,7 +352,7 @@ test('removed authentication methods identify the affected user', () => {
       operationType: 'Delete',
       result: 'success',
       initiatedBy: { user: { userPrincipalName: 'admin@example.com' } },
-      targetResources: [{ displayName: 'Alex User' }],
+      targetResources: [{ displayName: 'Alex User', type: 'authenticationMethod' }],
     }],
   })
 
@@ -332,13 +373,25 @@ test('does not turn Microsoft JIT service-principal provisioning into a customer
   assert.deepEqual(result.attention, [])
 })
 
+test('does not promote directory reads or collector telemetry into tenant health findings', () => {
+  const now = new Date('2026-08-07T12:00:00.000Z')
+  const result = deriveTenantHealth({
+    ...baseInput(), now,
+    auditEvents: [
+      { microsoftAuditId: 'read', eventDateTime: now, activityDisplayName: 'Applications_Get', category: 'Applications', operationType: 'Update', result: 'success', initiatedBy: null, targetResources: [] },
+      { microsoftAuditId: 'sync', eventDateTime: now, activityDisplayName: 'InventorySyncCompleted', category: 'Groups', operationType: 'Update', result: 'success', initiatedBy: null, targetResources: [] },
+    ],
+  })
+  assert.equal(result.attention.some((item) => item.key.startsWith('audit-')), false)
+})
+
 test('retains a named-administrator application change as an actionable alert', () => {
   const result = deriveTenantHealth({
     ...baseInput(),
     auditEvents: [{
       microsoftAuditId: 'audit-app', eventDateTime: new Date('2026-08-07T12:00:00.000Z'),
       activityDisplayName: 'Update application', category: 'ApplicationManagement', operationType: 'Update', result: 'success',
-      initiatedBy: { user: { userPrincipalName: 'admin@example.test' } }, targetResources: [{ displayName: 'Customer Integration' }],
+      initiatedBy: { user: { userPrincipalName: 'admin@example.test' } }, targetResources: [{ displayName: 'Customer Integration', type: 'application' }],
     }],
   })
   assert.equal(result.attention[0]?.label, 'Application access changed')
@@ -503,7 +556,7 @@ test('daily inventory collectors become stale only after the daily grace window'
 test('revoked access and critical security findings take precedence', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   assert.equal(deriveTenantHealth({ ...baseInput(), connectionStatus: 'REVOKED', now }).overallStatus, 'DISCONNECTED')
-  const critical = deriveTenantHealth({ ...baseInput(), now, syncStates: completeCurrentStates(now), auditEvents: [{ microsoftAuditId: 'critical', eventDateTime: now, activityDisplayName: 'Disable conditional access policy', category: 'Policy', operationType: 'Update', result: 'success', initiatedBy: null, targetResources: [] }] })
+  const critical = deriveTenantHealth({ ...baseInput(), now, syncStates: completeCurrentStates(now), auditEvents: [{ microsoftAuditId: 'critical', eventDateTime: now, activityDisplayName: 'Disable conditional access policy', category: 'Policy', operationType: 'Update', result: 'success', initiatedBy: null, targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }] }] })
   assert.equal(critical.security.status, 'CRITICAL')
   assert.equal(critical.overallStatus, 'CRITICAL')
 })
@@ -511,7 +564,7 @@ test('revoked access and critical security findings take precedence', () => {
 test('initial collection is pending and failed newer state overrides older success', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   assert.equal(deriveTenantHealth({ ...baseInput(), effectiveStatus: 'pending', connectionStatus: 'PENDING_CONSENT', now }).overallStatus, 'PENDING')
-  const pendingWithCriticalFinding = deriveTenantHealth({ ...baseInput(), effectiveStatus: 'pending', connectionStatus: 'PENDING_CONSENT', now, auditEvents: [{ microsoftAuditId: 'pending-critical', eventDateTime: now, activityDisplayName: 'Disable conditional access policy', category: 'Policy', operationType: 'Update', result: 'success', initiatedBy: null, targetResources: [] }] })
+  const pendingWithCriticalFinding = deriveTenantHealth({ ...baseInput(), effectiveStatus: 'pending', connectionStatus: 'PENDING_CONSENT', now, auditEvents: [{ microsoftAuditId: 'pending-critical', eventDateTime: now, activityDisplayName: 'Disable conditional access policy', category: 'Policy', operationType: 'Update', result: 'success', initiatedBy: null, targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }] }] })
   assert.equal(pendingWithCriticalFinding.overallStatus, 'CRITICAL')
   const states = completeCurrentStates(now).map((state) => state.resourceType === 'USERS' ? { ...state, status: 'FAILED', lastAttemptAt: now, lastSuccessfulAt: new Date('2026-08-13T11:59:00.000Z'), lastErrorMessage: 'latest attempt failed' } : state)
   const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })

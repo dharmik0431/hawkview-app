@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { auditSyncFocusTarget, isM365AuditSyncDeepLink, m365AuditSyncHealth, sanitizeSyncFailure } from './audit-sync-health.ts'
+import { auditSyncFocusTarget, auditSyncRequiresAction, isM365AuditSyncDeepLink, m365AuditSyncHealth, sanitizeSyncFailure } from './audit-sync-health.ts'
 
 test('recognizes only the M365 audit synchronization deep link', () => {
   assert.equal(isM365AuditSyncDeepLink('sync', 'M365_AUDIT'), true)
@@ -120,4 +120,14 @@ test('selects and sanitizes M365 audit resource health for settings display', ()
     message: 'Microsoft rejected client_secret=[REDACTED]',
     lastAttemptAt: '2026-08-18T10:00:00.000Z', lastSuccessfulAt: '2026-08-18T09:00:00.000Z',
   })
+})
+
+test('only actionable audit synchronization classifications enter Priority attention', () => {
+  for (const classification of ['SUCCESS', 'READY', 'CURRENT', 'HEALTHY', 'PARTIAL', 'INITIALIZING', 'NOT_LICENSED', 'UNSUPPORTED']) {
+    assert.equal(auditSyncRequiresAction({ classification }), false, classification)
+  }
+  for (const classification of ['FAILED', 'STALE', 'BACKLOGGED', 'PERMISSION_REQUIRED', 'FAILED_TRANSIENT']) {
+    assert.equal(auditSyncRequiresAction({ classification }), true, classification)
+  }
+  assert.equal(auditSyncRequiresAction({ classification: 'attacker-value' }), false)
 })

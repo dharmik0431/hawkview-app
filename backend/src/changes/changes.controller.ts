@@ -12,7 +12,11 @@ export class ChangesController {
   }
 
   @Get(':id')
-  detail(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
-    return this.changes.detail(request.auth, id)
+  detail(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Query('tenantId') tenantId: string | undefined,
+  ) {
+    return this.changes.detail(request.auth, id, tenantId)
   }
 }

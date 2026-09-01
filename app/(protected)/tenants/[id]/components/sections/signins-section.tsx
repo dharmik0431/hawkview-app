@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 import type { TenantSyncStatus } from '@/types/tenant-data'
 import type { ServiceSyncFreshness } from '@/types/tenant-data'
+import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 
 export type SignInResult = 'Success' | 'Failure'
 
@@ -52,6 +53,7 @@ interface SignInActivitySectionProps {
   onSignInViewChange: (view: 'list' | 'map') => void
   syncStatus?: TenantSyncStatus
   freshness?: ServiceSyncFreshness | null
+  signInEvidence?: PilotEvidenceView['signIns'] | null
 }
 
 function formatSignInTime(dateStr: string) {
@@ -72,7 +74,7 @@ function formatSignInTime(dateStr: string) {
 function withinTimeWindow(createdAtIso: string, window: TimeWindow): boolean {
   try {
     const t = new Date(createdAtIso).getTime()
-    if (isNaN(t)) return true
+    if (isNaN(t)) return false
     const now = new Date().getTime()
     const diffHours = (now - t) / (1000 * 3600)
     if (window === '24h') return diffHours <= 24
@@ -114,6 +116,7 @@ export default function SignInActivitySection({
   onSignInViewChange,
   syncStatus,
   freshness,
+  signInEvidence,
 }: SignInActivitySectionProps) {
   const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
   const [resultFilter, setResultFilter] = useState<
@@ -123,11 +126,12 @@ export default function SignInActivitySection({
   const [currentPage, setCurrentPage] = useState(1)
   const [mapLoadError, setMapLoadError] = useState<string | null>(null)
   const pageSize = 10
-  const hasLimitedActivity = signIns.some(
-    (event) =>
-      event.isLimited ||
-      event.dataSource === 'microsoft-365-management-activity'
-  )
+  const hasLimitedActivity = signInEvidence?.availability === 'CURRENT_LIMITED' &&
+    signInEvidence.coverage === 'LIMITED' &&
+    signInEvidence.selectedSource === 'OFFICE_365_ACTIVITY_FEED'
+  const selectedEvidenceFailed = signInEvidence?.selectedSource !== null &&
+    ['FAILED_TRANSIENT', 'STALE', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence?.availability ?? '')
+  const showCollectionFailure = selectedEvidenceFailed || (!signInEvidence?.selectedSource && syncStatus?.status === 'failed')
   const freshnessLabel = !freshness
     ? 'Freshness unavailable'
     : freshness.status === 'RUNNING'
@@ -354,28 +358,28 @@ export default function SignInActivitySection({
 
   return (
     <div className="mt-4 space-y-3">
-      {syncStatus?.status === 'failed' && (
-        <div className="flex gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+      {showCollectionFailure && (
+        <div role="alert" className="flex gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
           <div>
-            <p className="text-sm font-semibold">Sign-in logs are unavailable</p>
+            <p className="text-sm font-semibold">Sign-in collection needs attention</p>
             <p className="mt-1 text-xs leading-5">
-              Microsoft did not return sign-in events for this tenant. Existing retained events remain available. Review the tenant connection or retry synchronization.
+              {signIns.length
+                ? 'The selected sign-in source is stale or failed. Retained events remain visible with their original timestamps while HawkView awaits current evidence.'
+                : 'The selected sign-in source is stale, blocked, or failed and no retained events are available for this range.'}
             </p>
           </div>
         </div>
       )}
-      {syncStatus?.status !== 'failed' && hasLimitedActivity && (
-        <div className="flex gap-3 rounded-xl border border-blue-200 bg-blue-50 p-4 text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
+      {!showCollectionFailure && hasLimitedActivity && (
+        <div role="status" aria-live="polite" className="flex gap-3 rounded-xl border border-blue-200 bg-blue-50 p-4 text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
           <Info className="mt-0.5 h-5 w-5 shrink-0" />
           <div>
             <p className="text-sm font-semibold">Limited login activity</p>
             <p className="mt-1 text-xs leading-5">
-              This tenant does not license full Microsoft Entra sign-in logs.
-              HawkView is retaining login events available through the
-              Microsoft 365 unified audit feed. Conditional Access, risk,
-              device, location, and authentication-step details are not
-              available in this fallback feed.
+              HawkView is using current login evidence from the Microsoft 365
+              audit feed. This limited source does not include Conditional
+              Access, risk, device, location, or authentication-step details.
             </p>
           </div>
         </div>
@@ -389,8 +393,7 @@ export default function SignInActivitySection({
               Sign-in Activity
             </h2>
             <p className="text-xs text-muted-foreground mt-0.5">
-              Monitor real-time directory sign-in events, locations, and
-              authentication outcomes.
+              Review sign-in evidence and the details supplied by the selected Microsoft source.
             </p>
             <p className="mt-1 text-xs font-medium text-slate-600 dark:text-slate-300" title={freshness?.lastSuccessfulCollectionAt ?? undefined}>
               {freshnessLabel}
@@ -485,7 +488,9 @@ export default function SignInActivitySection({
                         colSpan={6}
                         className="px-5 py-12 text-center text-muted-foreground"
                       >
-                        No sign-in events match the selected filter criteria.
+                        {hasLimitedActivity && signIns.length === 0
+                          ? 'No limited sign-in events were reported for this range.'
+                          : 'No sign-in events match the selected filter criteria.'}
                       </td>
                     </tr>
                   ) : (

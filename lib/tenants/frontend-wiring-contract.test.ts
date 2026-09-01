@@ -25,6 +25,7 @@ test('Exchange badges use resource sync aliases and the strict status helper', (
 
 test('Settings consumes readiness, preserves the audit deep link, and has no healthy fallback', () => {
   const component = source('app/(protected)/tenants/[id]/settings/page.tsx')
+  const readinessView = source('lib/tenants/settings-readiness-view.ts')
   const compact = component.replace(/\s+/g, ' ')
   assert.match(component, /normalizeCollectionReadiness\(tenantListRecord\?\.collectionReadiness\)/)
   assert.match(component, /apiClient\.get<unknown>\('\/api\/tenants\/microsoft\/access-contract'\)/)
@@ -41,7 +42,9 @@ test('Settings consumes readiness, preserves the audit deep link, and has no hea
   assert.match(component, /w\.datasets\.map/)
   assert.match(component, /microsoftAccessDatasetView\(rawDataset, accessCatalog\)/)
   assert.match(component, /datasetTierLabel\(dataset\.tier\)/)
-  assert.match(component, /row-m365_unified_audit/)
+  assert.match(component, /settingsPriorityAttentionItems\(collectionReadiness, auditSync\)/)
+  assert.match(readinessView, /M365_UNIFIED_AUDIT_WORKLOAD_KEY = 'm365_unified_audit'/)
+  assert.match(readinessView, /`row-\$\{M365_UNIFIED_AUDIT_WORKLOAD_KEY\}`/)
   assert.match(component, /settingsConnectionHealth/)
   assert.match(component, /settingsConnectionHealth\(tenant\.connectionStatus\)/)
   assert.match(component, /isM365AuditSyncDeepLink\(sectionParam, resourceParam\)/)

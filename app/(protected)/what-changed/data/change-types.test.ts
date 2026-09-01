@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   BACKEND_EMITTED_SOURCE_LABELS,
+  mergeChangesPages,
   normalizeChangeCategory,
   normalizeChangeEvent,
   normalizeChangeSource,
@@ -17,6 +18,7 @@ const baseEvent = {
   tenantName: 'Contoso',
   provider: 'Microsoft',
   severity: 'Medium',
+  classification: 'configuration_change',
   title: 'Configuration changed',
   summary: 'HawkView detected a state difference.',
 }
@@ -40,12 +42,76 @@ test('normalizes every current backend What Changed source/workload label to a t
   }
 })
 
+test('fails closed for malformed, non-primary, invalid-date, and duplicate evidence rows', () => {
+  assert.equal(normalizeChangeEvent({ ...baseEvent, classification: 'system_or_collection_event' }), null)
+  assert.equal(normalizeChangeEvent({ ...baseEvent, ts: 'not-a-date' }), null)
+  assert.equal(normalizeChangeEvent(Object.create({ ...baseEvent })), null)
+
+  const normalized = normalizeChangesResponse({
+    changes: [
+      baseEvent,
+      { ...baseEvent },
+      { ...baseEvent, id: '', title: 'malformed' },
+    ],
+    tenants: [],
+    summary: { total: 3, changes: 3, signIns: 0, highRisk: 0, apps: 0 },
+    pagination: { page: 1, pageSize: 250, total: 1, totalPages: 1 },
+  })
+  assert.equal(normalized.validPayload, true)
+  assert.equal(normalized.partialPayload, false)
+  assert.equal(normalized.discardedCount, 2)
+  assert.equal(normalized.changes.length, 1)
+  assert.equal(normalized.changes[0]?.rowKey, 'tenant-1:evidence:SNAPSHOT_DIFFERENCE:event-1')
+  assert.deepEqual(normalized.pagination, { page: 1, pageSize: 250, total: 1, totalPages: 1 })
+
+  const invalid = normalizeChangesResponse({ changes: null })
+  assert.equal(invalid.validPayload, false)
+  assert.equal(invalid.changes.length, 0)
+
+  const partial = normalizeChangesResponse({ changes: [], tenants: [] })
+  assert.equal(partial.validPayload, true)
+  assert.equal(partial.partialPayload, true)
+
+  for (const malformedCount of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5]) {
+    const malformedSummary = normalizeChangesResponse({
+      changes: [], tenants: [],
+      summary: { total: malformedCount, changes: 0, signIns: 0, highRisk: 0, apps: 0 },
+    })
+    assert.equal(malformedSummary.summary, undefined)
+    assert.equal(malformedSummary.partialPayload, true)
+  }
+
+  const malformedPagination = normalizeChangesResponse({
+    changes: [], tenants: [], summary: { total: 0, changes: 0, signIns: 0, highRisk: 0, apps: 0 },
+    pagination: { page: 1, pageSize: 0, total: -1, totalPages: 99 },
+  })
+  assert.equal(malformedPagination.pagination, undefined)
+})
+
 test('uses Unknown fallbacks for unrecognized or malicious category/source values', () => {
   assert.equal(normalizeChangeCategory('<img src=x onerror=alert(1)>'), 'Unknown')
   assert.equal(normalizeChangeSource('javascript:alert(1)'), 'Unknown')
   const event = normalizeChangeEvent({ ...baseEvent, category: 'Organization<script>', source: '//evil.example' })
   assert.equal(event?.category, 'Unknown')
   assert.equal(event?.source, 'Unknown')
+})
+
+test('merges bounded pages without collapsing identical source IDs across tenants', () => {
+  const first = normalizeChangesResponse({
+    changes: [baseEvent], tenants: [{ id: 'tenant-1', name: 'Contoso' }],
+    summary: { total: 2, changes: 2, signIns: 0, highRisk: 0, apps: 0 },
+    pagination: { page: 1, pageSize: 1, total: 2, totalPages: 2 },
+  })
+  const second = normalizeChangesResponse({
+    changes: [{ ...baseEvent, tenantId: 'tenant-2', tenantName: 'Fabrikam' }],
+    tenants: [{ id: 'tenant-2', name: 'Fabrikam' }],
+    summary: { total: 2, changes: 2, signIns: 0, highRisk: 0, apps: 0 },
+    pagination: { page: 2, pageSize: 1, total: 2, totalPages: 2 },
+  })
+  const merged = mergeChangesPages([first, second])
+  assert.deepEqual(merged?.changes.map((event) => event.tenantId), ['tenant-1', 'tenant-2'])
+  assert.deepEqual(merged?.pagination, { page: 2, pageSize: 1, total: 2, totalPages: 2 })
+  assert.equal(merged?.discardedCount, 0)
 })
 
 test('normalizes only the closed review and recovery guidance labels', () => {

@@ -1,3 +1,5 @@
+import { classifyEvidenceTrust } from './evidence-trust-catalog.js'
+
 export type ManagementActivityRole =
   | 'primary_change'
   | 'security_supporting_activity'
@@ -14,38 +16,6 @@ function object(value: unknown): JsonObject {
 function text(value: unknown) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
-
-function normalizedOperation(value: string) {
-  return value.toLowerCase().replace(/[^a-z0-9]/g, '')
-}
-
-const routineOperation =
-  /(?:userloggedin|userloginfailed|signin|logon|file(?:accessed|previewed|downloaded|modified|uploaded|synced|deleted|moved|renamed|copied|recycled|restored)|folder(?:accessed|modified|created|deleted|moved|renamed)|pageviewed|searchquery|searchsession|usage(?:report)?|report(?:downloaded|exported|viewed))/i
-
-const genericChangeOperation =
-  /(?:^|[-_. ])(?:new|set|add|added|remove|removed|update|updated|create|created|delete|deleted|enable|enabled|disable|disabled|grant|granted|revoke|revoked|assign|assigned|unassign|unassigned|change|changed|modify|modified|restore|restored|reset|install|installed|uninstall|uninstalled|activate|activated|deactivate|deactivated)(?:[-_. ]|$)|(?:policy|permission|consent|role|administrator|admin|sharing|anonymouslink|companylink|securelink|inboxrule|transportrule|forwarding|delegation|domain|license|mailbox|sitecollection|teamsetting|channelsetting)/i
-
-const exchangeAdministrativeOperation =
-  /(?:inboxrule|transportrule|mailboxpermission|recipientpermission|sendaspermission|forwarding|accepted.?domain|remote.?domain|organizationconfig|sharingpolicy|retentionpolicy|roleassignmentpolicy|journalrule|adminauditlog|malwarefilter|antiphish|hostedcontentfilter|safeattachment|safelink|quarantinepolicy|dlppolicy)|^(?:new|set|remove|enable|disable)-(?:mailbox|casmailbox)$/i
-
-const exchangeSupportingOperations = new Set([
-  'move',
-  'delete',
-  'movetodeleteditems',
-  'softdelete',
-  'harddelete',
-  'sendas',
-  'sendonbehalf',
-  'mailitemsaccessed',
-  'messageaccessed',
-])
-
-const exchangeRoutineItemOperations = new Set([
-  'create',
-  'update',
-  'copy',
-  'send',
-])
 
 /**
  * Classify Office 365 Management Activity records by their investigation role.
@@ -65,30 +35,16 @@ export function classifyManagementActivity(
     return 'routine_activity'
   }
 
-  const compactOperation = normalizedOperation(operation)
-  const isExchange = /exchange/i.test(workload)
-
-  // Explicit Exchange administrative nouns win over generic telemetry rules.
-  // This preserves inbox rules, forwarding, delegation, transport rules, and
-  // tenant/mailbox configuration even if Microsoft uses a generic change verb.
-  if (isExchange && exchangeAdministrativeOperation.test(operation)) {
-    return 'primary_change'
-  }
-
-  if (isExchange && exchangeSupportingOperations.has(compactOperation)) {
-    return 'security_supporting_activity'
-  }
-
-  if (isExchange && exchangeRoutineItemOperations.has(compactOperation)) {
-    return 'routine_activity'
-  }
-
-  if (routineOperation.test(operation)) return 'routine_activity'
-
-  const normalized = operation.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-  return genericChangeOperation.test(normalized)
-    ? 'primary_change'
-    : 'routine_activity'
+  const trusted = classifyEvidenceTrust({
+    source: 'Office 365 Management Activity API',
+    workload,
+    operation,
+    result,
+    actor: text(value.UserId) ?? text(value.UserKey),
+  })
+  if (trusted.evidenceClass === 'PRIMARY_CHANGE') return 'primary_change'
+  if (trusted.evidenceClass === 'SECURITY_SUPPORTING_ACTIVITY') return 'security_supporting_activity'
+  return 'routine_activity'
 }
 
 export function managementActivityRoleFromEvidence(input: {
@@ -97,14 +53,8 @@ export function managementActivityRoleFromEvidence(input: {
   raw?: unknown
 }): ManagementActivityRole {
   const raw = object(input.raw)
-  const recordedRole = text(raw.hawkviewEvidenceRole)
-  if (
-    recordedRole === 'primary_change' ||
-    recordedRole === 'security_supporting_activity' ||
-    recordedRole === 'routine_activity'
-  ) {
-    return recordedRole
-  }
+  // Reclassify retained legacy rows with the current catalog. A historical
+  // primary flag cannot promote an operation that is now known to be routine.
   return classifyManagementActivity({
     ...raw,
     Operation: text(raw.Operation) ?? input.operationName,
