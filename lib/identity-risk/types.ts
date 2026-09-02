@@ -57,16 +57,23 @@ export type MicrosoftEntraRiskyUser = {
   observedAt: string
 }
 
+export type IdentityRiskPageInfo = {
+  hasMore: boolean
+  nextCursor: string | null
+}
+
 export type HawkViewIdentitySignalsView = {
   channel: 'HAWKVIEW_IDENTITY_SIGNALS'
   meta: IdentityRiskChannelMeta
   findings: HawkViewIdentityFinding[] | null
+  pageInfo: IdentityRiskPageInfo | null
 }
 
 export type MicrosoftEntraRiskyUsersView = {
   channel: 'MICROSOFT_ENTRA_RISKY_USERS'
   meta: IdentityRiskChannelMeta
   users: MicrosoftEntraRiskyUser[] | null
+  pageInfo: IdentityRiskPageInfo | null
 }
 
 export type IdentityRiskViewModel = {

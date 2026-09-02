@@ -87,7 +87,6 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
       return {
         label: 'Unable to load',
         detail:
-          meta.limitation ??
           'This channel could not be loaded. Retry without assuming that no findings exist.',
         className:
           'border-red-200 bg-red-50 text-red-950 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200',
@@ -309,6 +308,16 @@ function HawkViewCard({
           </div>
         )}
 
+        {view.pageInfo?.hasMore && (
+          <div
+            role="status"
+            className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-xs leading-relaxed text-blue-900 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200"
+          >
+            More HawkView findings are available. This preview shows only the
+            current bounded page and must not be treated as a complete result set.
+          </div>
+        )}
+
         {confirmedEmpty && (
           <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-800/50">
             <div className="flex items-center gap-2 font-semibold text-slate-900 dark:text-slate-100">
@@ -439,6 +448,16 @@ function MicrosoftCard({
             {view.users.map((user) => (
               <MicrosoftUserRow key={user.id} user={user} />
             ))}
+          </div>
+        )}
+
+        {view.pageInfo?.hasMore && (
+          <div
+            role="status"
+            className="rounded-lg border border-violet-200 bg-violet-50 px-4 py-3 text-xs leading-relaxed text-violet-900 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-200"
+          >
+            More Microsoft risky-user records are available. This preview shows
+            only the current bounded page and is not a complete Microsoft result set.
           </div>
         )}
 

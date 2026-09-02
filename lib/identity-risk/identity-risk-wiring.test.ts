@@ -37,3 +37,17 @@ test('the UI states its investigation-only and no-safe-verdict boundaries', () =
   assert.match(section, /an empty snapshot is not a safe verdict/)
   assert.doesNotMatch(section, /compromise probability/i)
 })
+
+test('the Security tabs implement complete keyboard tab semantics', () => {
+  assert.match(tenantPage, /tabIndex=\{isActive \? 0 : -1\}/)
+  assert.match(tenantPage, /event\.key === 'ArrowRight'/)
+  assert.match(tenantPage, /event\.key === 'ArrowLeft'/)
+  assert.match(tenantPage, /event\.key === 'Home'/)
+  assert.match(tenantPage, /event\.key === 'End'/)
+})
+
+test('bounded pages disclose when more records exist', () => {
+  assert.match(section, /More HawkView findings are available/)
+  assert.match(section, /More Microsoft risky-user records are available/)
+  assert.match(section, /must not be treated as a complete result set/)
+})

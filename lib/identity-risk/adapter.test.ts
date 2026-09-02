@@ -9,7 +9,7 @@ function channelMeta(overrides: Record<string, unknown> = {}) {
     version: 1,
     capability: 'FULL',
     status: 'AVAILABLE',
-    sourceLabel: 'Current authoritative evidence',
+    sourceLabel: 'HawkView Identity Signals',
     observedAt: now,
     freshness: 'CURRENT',
     limitation: null,
@@ -36,7 +36,7 @@ function finding(overrides: Record<string, unknown> = {}) {
     sourceLabels: ['Microsoft Entra directory audit'],
     missingEvidenceLabels: [],
     benignAlternativeCodes: ['APPROVED_ACCOUNT_PROVISIONING'],
-    investigationGuidanceCode: 'REVIEW_PRIVILEGE_ASSIGNMENT',
+    investigationGuidanceCode: 'REVIEW_ACCESS',
     investigationGuidance:
       'Confirm the identity and privilege assignment with an authorized administrator.',
     ...overrides,
@@ -70,11 +70,13 @@ function validResponses(): {
       ...channelMeta(),
       channel: 'HAWKVIEW_IDENTITY_SIGNALS',
       findings: [finding()],
+      pageInfo: { hasMore: false, nextCursor: null },
     },
     microsoftRiskyUsers: {
       ...channelMeta({ sourceLabel: 'Microsoft Entra Risky Users' }),
       channel: 'MICROSOFT_ENTRA_RISKY_USERS',
       users: [microsoftUser()],
+      pageInfo: { hasMore: false, nextCursor: null },
     },
   }
 }
@@ -86,7 +88,7 @@ test('adapts the two channels without merging their records', () => {
   assert.equal(view.hawkView.findings?.[0]?.ruleIds[0], 'HV-ID-CHG-001.v1')
   assert.equal(
     view.hawkView.findings?.[0]?.investigationGuidanceCode,
-    'REVIEW_PRIVILEGE_ASSIGNMENT'
+    'REVIEW_ACCESS'
   )
   assert.equal(view.microsoft.channel, 'MICROSOFT_ENTRA_RISKY_USERS')
   assert.equal(view.microsoft.users?.[0]?.riskState, 'atRisk')
@@ -95,24 +97,25 @@ test('adapts the two channels without merging their records', () => {
 test('preserves stale, learning, and not-evaluated capability states', () => {
   for (const status of ['STALE', 'LEARNING', 'NOT_EVALUATED'] as const) {
     const responses = validResponses()
+    const capability = status === 'NOT_EVALUATED' ? 'UNAVAILABLE' : 'PARTIAL'
     responses.hawkViewSummary = {
       ...responses.hawkViewSummary,
       status,
-      capability: 'PARTIAL',
+      capability,
       freshness: status === 'STALE' ? 'STALE' : 'UNKNOWN',
       limitation: `${status} evidence state`,
     }
     responses.hawkViewFindings = {
       ...responses.hawkViewFindings,
       status,
-      capability: 'PARTIAL',
+      capability,
       freshness: status === 'STALE' ? 'STALE' : 'UNKNOWN',
       limitation: `${status} evidence state`,
     }
 
     const view = adaptIdentityRiskResponses(responses)
     assert.equal(view.hawkView.meta.status, status)
-    assert.equal(view.hawkView.meta.capability, 'PARTIAL')
+    assert.equal(view.hawkView.meta.capability, capability)
   }
 })
 
@@ -165,7 +168,7 @@ test('fails closed when required finding fields or enums are malformed', () => {
     finding({ title: undefined }),
     finding({ affectedIdentity: { id: 'opaque', label: 'User', type: 'DEVICE' } }),
     finding({ severity: 'PROBABLE' }),
-    finding({ sourceLabels: [] }),
+    finding({ ruleIds: [] }),
     finding({ investigationGuidance: '' }),
   ]) {
     const responses = validResponses()
@@ -190,4 +193,170 @@ test('does not convert missing channel payloads into empty success', () => {
   assert.equal(view.hawkView.findings, null)
   assert.equal(view.microsoft.meta.status, 'NOT_EVALUATED')
   assert.equal(view.microsoft.users, null)
+})
+
+test('rejects inherited properties and unknown fields instead of projecting them', () => {
+  const inherited = validResponses()
+  const ownSummary = { ...inherited.hawkViewSummary }
+  delete ownSummary.version
+  inherited.hawkViewSummary = Object.assign(
+    Object.create({ version: 1 }),
+    ownSummary
+  )
+  assert.equal(
+    adaptIdentityRiskResponses(inherited).hawkView.meta.status,
+    'NOT_EVALUATED'
+  )
+
+  const unknownEnvelope = validResponses()
+  unknownEnvelope.microsoftRiskyUsers = {
+    ...unknownEnvelope.microsoftRiskyUsers,
+    debugPayload: 'not contracted',
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(unknownEnvelope).microsoft.meta.status,
+    'NOT_EVALUATED'
+  )
+
+  const crossChannelField = validResponses()
+  crossChannelField.microsoftRiskyUsers = {
+    ...crossChannelField.microsoftRiskyUsers,
+    users: [microsoftUser({ investigationGuidance: 'Review activity.' })],
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(crossChannelField).microsoft.meta.status,
+    'ERROR'
+  )
+})
+
+test('rejects secret-shaped strings and autonomous instructions', () => {
+  for (const unsafeFinding of [
+    finding({ title: 'password=TOPSECRET' }),
+    finding({
+      investigationGuidance:
+        'Review eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+    }),
+    finding({
+      investigationGuidance:
+        'Review https://admin:credential@example.invalid/evidence',
+    }),
+    finding({ investigationGuidance: 'Disable the account immediately.' }),
+  ]) {
+    const responses = validResponses()
+    responses.hawkViewFindings = {
+      ...responses.hawkViewFindings,
+      findings: [unsafeFinding],
+    }
+    assert.equal(adaptIdentityRiskResponses(responses).hawkView.meta.status, 'ERROR')
+  }
+
+  const unsafeLimitation = validResponses()
+  unsafeLimitation.microsoftRiskyUsers = {
+    ...unsafeLimitation.microsoftRiskyUsers,
+    limitation: 'access_token=TOPSECRET',
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(unsafeLimitation).microsoft.meta.status,
+    'ERROR'
+  )
+})
+
+test('rejects oversized pages and invalid cursor state', () => {
+  const oversized = validResponses()
+  oversized.hawkViewSummary = {
+    ...oversized.hawkViewSummary,
+    findings: 50_000,
+  }
+  oversized.hawkViewFindings = {
+    ...oversized.hawkViewFindings,
+    findings: new Array(50_000).fill(finding()),
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+  assert.equal(adaptIdentityRiskResponses(oversized).hawkView.meta.status, 'ERROR')
+
+  const unsafeCursor = validResponses()
+  unsafeCursor.microsoftRiskyUsers = {
+    ...unsafeCursor.microsoftRiskyUsers,
+    pageInfo: { hasMore: true, nextCursor: 'token=TOPSECRET' },
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(unsafeCursor).microsoft.meta.status,
+    'ERROR'
+  )
+})
+
+test('accepts an exact bounded page and preserves explicit continuation state', () => {
+  const responses = validResponses()
+  const findings = Array.from({ length: 100 }, (_, index) =>
+    finding({
+      id: `opaque-finding-${index}`,
+      affectedIdentity: {
+        id: `opaque-identity-${index}`,
+        label: `Reported identity ${index}`,
+        type: 'USER',
+      },
+    })
+  )
+  responses.hawkViewSummary = {
+    ...responses.hawkViewSummary,
+    findings: 101,
+  }
+  responses.hawkViewFindings = {
+    ...responses.hawkViewFindings,
+    findings,
+    pageInfo: { hasMore: true, nextCursor: 'safe-cursor-2' },
+  }
+
+  const view = adaptIdentityRiskResponses(responses).hawkView
+  assert.equal(view.meta.status, 'AVAILABLE')
+  assert.equal(view.findings?.length, 100)
+  assert.deepEqual(view.pageInfo, {
+    hasMore: true,
+    nextCursor: 'safe-cursor-2',
+  })
+})
+
+test('rejects duplicate row identifiers', () => {
+  const responses = validResponses()
+  responses.hawkViewSummary = {
+    ...responses.hawkViewSummary,
+    findings: 2,
+  }
+  responses.hawkViewFindings = {
+    ...responses.hawkViewFindings,
+    findings: [finding(), finding()],
+  }
+  assert.equal(adaptIdentityRiskResponses(responses).hawkView.meta.status, 'ERROR')
+})
+
+test('rejects contradictory metadata and future evidence timestamps', () => {
+  for (const findingsMeta of [
+    { capability: 'UNAVAILABLE' },
+    { freshness: 'STALE' },
+    { observedAt: '2026-09-01T12:00:00.000Z' },
+    { limitation: 'Different limitation' },
+    { observedAt: new Date(Date.now() + 6 * 60 * 1_000).toISOString() },
+  ]) {
+    const responses = validResponses()
+    responses.hawkViewFindings = {
+      ...responses.hawkViewFindings,
+      ...findingsMeta,
+    }
+    assert.equal(adaptIdentityRiskResponses(responses).hawkView.meta.status, 'ERROR')
+  }
+})
+
+test('requires the final actionable contract rather than weakening for the backend foundation', () => {
+  const foundation = validResponses()
+  const foundationFinding: Record<string, unknown> = finding()
+  delete foundationFinding.explanation
+  foundation.hawkViewFindings = {
+    ...foundation.hawkViewFindings,
+    mode: 'SHADOW',
+    findings: [foundationFinding],
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(foundation).hawkView.meta.status,
+    'NOT_EVALUATED'
+  )
 })
