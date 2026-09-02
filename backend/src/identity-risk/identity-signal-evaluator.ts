@@ -5,10 +5,9 @@ import {
   IDENTITY_RISK_ENGINE_VERSION,
   IDENTITY_SIGNAL_CATALOG_VERSION,
   IDENTITY_SIGNAL_CHANNEL,
-  IDENTITY_SIGNAL_MAX_EVIDENCE_ITEMS,
-  IDENTITY_SIGNAL_MAX_EVIDENCE_REFERENCES,
-  IDENTITY_SIGNAL_MAX_EVIDENCE_REFERENCE_LENGTH,
-  IDENTITY_SIGNAL_MAX_SUBJECT_REFERENCE_LENGTH,
+  IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES,
+  IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES,
+  IDENTITY_SIGNAL_MAX_BATCH_OUTPUT_BYTES,
   type AccountClass,
   type ApprovedCatalog,
   type AuthEvent,
@@ -24,6 +23,14 @@ import {
   type NetworkContextEntry,
 } from './identity-signal-contract.js'
 import { identitySignalRuleDefinition } from './identity-signal-catalog.js'
+import {
+  boundedInputBytes,
+  boundedRuntimeBytes,
+  isApprovedCatalogRuntime,
+  isEvaluationContextRuntime,
+  isIdentitySignalCandidateRuntime,
+  isOpaqueIdentityReference,
+} from './identity-signal-runtime.js'
 
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
@@ -61,7 +68,7 @@ function canonicalize(value: unknown): unknown {
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
       .filter(([key]) => key !== 'digest')
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => bytewiseCompare(left, right))
       .map(([key, entry]) => [key, canonicalize(entry)]),
   )
 }
@@ -75,20 +82,46 @@ function parseTime(value: string): number | null {
   return Number.isFinite(result) ? result : null
 }
 
-function sortedUnique<Value extends string>(values: readonly Value[]): Value[] {
-  return [...new Set(values.filter((value) => typeof value === 'string' && value.length > 0))].sort()
+function bytewiseCompare(left: string, right: string): number {
+  const length = Math.min(left.length, right.length)
+  for (let index = 0; index < length; index += 1) {
+    const difference = left.charCodeAt(index) - right.charCodeAt(index)
+    if (difference !== 0) return difference
+  }
+  return left.length - right.length
 }
 
-function isBoundedProjection(value: string, maximumLength: number): boolean {
-  return value.length > 0 && value.length <= maximumLength && !/[\u0000-\u001f\u007f]/u.test(value)
+function sortedUnique<Value extends string>(values: readonly Value[]): Value[] {
+  return [...new Set(values.filter((value) => typeof value === 'string' && value.length > 0))].sort(bytewiseCompare)
 }
 
 function projectedSubject(candidate: IdentitySignalCandidate) {
   return Object.freeze({
     ...candidate.subject,
-    opaqueId: isBoundedProjection(candidate.subject.opaqueId, IDENTITY_SIGNAL_MAX_SUBJECT_REFERENCE_LENGTH)
+    opaqueId: isOpaqueIdentityReference(candidate.subject.opaqueId)
       ? candidate.subject.opaqueId
       : 'INVALID_SUBJECT_REFERENCE',
+  })
+}
+
+function operationalNotEvaluated(reason: Extract<IdentitySignalReasonCode, 'EVIDENCE_MALFORMED' | 'RULE_CONFIG_UNAPPROVED' | 'EVALUATION_BUDGET_EXCEEDED'>): IdentitySignalResult {
+  return Object.freeze({
+    engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+    catalogVersion: IDENTITY_SIGNAL_CATALOG_VERSION,
+    channel: IDENTITY_SIGNAL_CHANNEL,
+    ruleId: null,
+    subject: Object.freeze({ type: 'SOURCE', opaqueId: 'EVALUATION_INPUT' }),
+    status: 'NOT_EVALUATED',
+    severity: null,
+    confidence: null,
+    coverage: 'UNAVAILABLE',
+    reasonCodes: Object.freeze([reason]),
+    evidenceReferences: Object.freeze([]),
+    sourceLabels: Object.freeze([]),
+    titleCode: 'IDENTITY_SIGNAL_EVALUATION_UNAVAILABLE',
+    explanationCode: 'IDENTITY_SIGNAL_NOT_EVALUATED',
+    investigationGuidanceCode: null,
+    benignAlternativeCodes: Object.freeze([]),
   })
 }
 
@@ -155,7 +188,7 @@ function catalogFor(context: IdentitySignalEvaluationContext, catalogType: Catal
   const now = parseTime(context.evaluatedAt)
   if (now === null) return null
   const catalog = context.catalogs?.find((entry) => entry.catalogType === catalogType)
-  if (!catalog || catalog.status !== 'APPROVED' || !catalog.version || !/^[a-f0-9]{64}$/i.test(catalog.digest)) return null
+  if (!catalog || !isApprovedCatalogRuntime(catalog) || catalog.status !== 'APPROVED') return null
   const approvers = new Set(catalog.approverIds.filter(Boolean))
   if (approvers.size < 2) return null
   const normalizedValues = sortedUnique(catalog.values.map((value) => value.trim().toLowerCase()).filter(Boolean))
@@ -208,7 +241,7 @@ function contextEntries(context: IdentitySignalEvaluationContext, type: NetworkC
       const end = parseTime(entry.expiresAt)
       return start !== null && end !== null && start <= now && now < end
     })
-    .sort((left, right) => left.id.localeCompare(right.id))
+    .sort((left, right) => bytewiseCompare(left.id, right.id))
 }
 
 function exactContextMatch(entry: NetworkContextEntry, values: {
@@ -233,14 +266,6 @@ function contextCoversEvents(entry: NetworkContextEntry, events: readonly AuthEv
 }
 
 function gate(context: IdentitySignalEvaluationContext, candidate: IdentitySignalCandidate): IdentitySignalResult | null {
-  const referencesValid = candidate.evidenceReferences.length <= IDENTITY_SIGNAL_MAX_EVIDENCE_REFERENCES &&
-    candidate.evidenceReferences.every((reference) =>
-      isBoundedProjection(reference, IDENTITY_SIGNAL_MAX_EVIDENCE_REFERENCE_LENGTH))
-  if (!context.organizationId || !context.customerTenantId ||
-      !isBoundedProjection(candidate.subject.opaqueId, IDENTITY_SIGNAL_MAX_SUBJECT_REFERENCE_LENGTH) ||
-      candidate.evidence.length > IDENTITY_SIGNAL_MAX_EVIDENCE_ITEMS || !referencesValid) {
-    return notEvaluated(candidate, 'EVIDENCE_MALFORMED')
-  }
   if (context.engineVersion !== IDENTITY_RISK_ENGINE_VERSION || context.catalogVersion !== IDENTITY_SIGNAL_CATALOG_VERSION) {
     return notEvaluated(candidate, 'RULE_CONFIG_UNAPPROVED')
   }
@@ -254,7 +279,7 @@ function gate(context: IdentitySignalEvaluationContext, candidate: IdentitySigna
   if (candidate.evidenceState === 'CAPPED') return notEvaluated(candidate, 'EVIDENCE_CAPPED', 'PARTIAL')
   if (candidate.evidenceState === 'MALFORMED') return notEvaluated(candidate, 'EVIDENCE_MALFORMED')
   const now = parseTime(context.evaluatedAt)
-  if (now === null || context.futureClockSkewToleranceMs === null || !Number.isFinite(context.futureClockSkewToleranceMs) || context.futureClockSkewToleranceMs < 0) {
+  if (now === null || context.futureClockSkewToleranceMs === null || !Number.isInteger(context.futureClockSkewToleranceMs) || context.futureClockSkewToleranceMs < 0 || context.futureClockSkewToleranceMs > 300_000) {
     return notEvaluated(candidate, 'RULE_CONFIG_UNAPPROVED')
   }
   const maximum = RULE_MAX_EVIDENCE_AGE_HOURS[candidate.ruleId]
@@ -296,7 +321,7 @@ function timeWithin(value: string, startExclusive: number, endInclusive: number)
 function hasEventSequence(events: readonly AuthEvent[], failureKinds: readonly AuthEvent['outcome'][], threshold: number) {
   const ordered = [...events].sort((left, right) => {
     const time = (parseTime(left.occurredAt) ?? 0) - (parseTime(right.occurredAt) ?? 0)
-    return time || left.id.localeCompare(right.id)
+    return time || bytewiseCompare(left.id, right.id)
   })
   const distinct = [...new Map(ordered.map((entry) => [entry.id, entry])).values()]
   for (const success of distinct.filter((entry) => entry.outcome === 'SUCCESS')) {
@@ -337,7 +362,7 @@ function haversineKm(left: { latitude: number; longitude: number }, right: { lat
   return 6371.0088 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
-export function evaluateIdentitySignal(
+function evaluateValidatedIdentitySignal(
   context: IdentitySignalEvaluationContext,
   candidate: IdentitySignalCandidate,
 ): IdentitySignalResult {
@@ -604,11 +629,49 @@ export function evaluateIdentitySignal(
   }
 }
 
-export function evaluateIdentitySignals(
-  context: IdentitySignalEvaluationContext,
-  candidates: readonly IdentitySignalCandidate[],
-) {
-  return [...candidates]
-    .sort((left, right) => `${left.ruleId}:${left.subject.type}:${left.subject.opaqueId}`.localeCompare(`${right.ruleId}:${right.subject.type}:${right.subject.opaqueId}`))
-    .map((candidate) => evaluateIdentitySignal(context, candidate))
+export function evaluateIdentitySignal(context: unknown, candidate: unknown): IdentitySignalResult {
+  try {
+    if (!isEvaluationContextRuntime(context)) return operationalNotEvaluated('RULE_CONFIG_UNAPPROVED')
+    if (!isIdentitySignalCandidateRuntime(candidate)) return operationalNotEvaluated('EVIDENCE_MALFORMED')
+    return evaluateValidatedIdentitySignal(context, candidate)
+  } catch {
+    return operationalNotEvaluated('EVIDENCE_MALFORMED')
+  }
+}
+
+function evaluateIdentitySignalsWithinBoundary(
+  context: unknown,
+  candidates: readonly unknown[],
+): readonly IdentitySignalResult[] {
+  if (!Array.isArray(candidates)) return Object.freeze([operationalNotEvaluated('EVIDENCE_MALFORMED')])
+  if (candidates.length > IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES) {
+    return Object.freeze([operationalNotEvaluated('EVALUATION_BUDGET_EXCEEDED')])
+  }
+  if (!isEvaluationContextRuntime(context)) return Object.freeze([operationalNotEvaluated('RULE_CONFIG_UNAPPROVED')])
+  let inputBytes = boundedInputBytes(context, IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES)
+  if (inputBytes === null) return Object.freeze([operationalNotEvaluated('EVALUATION_BUDGET_EXCEEDED')])
+  for (const candidate of candidates) {
+    const candidateBytes = boundedInputBytes(candidate, IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES - inputBytes)
+    if (candidateBytes === null) return Object.freeze([operationalNotEvaluated('EVALUATION_BUDGET_EXCEEDED')])
+    inputBytes += candidateBytes
+  }
+  const results = candidates.map((candidate) => evaluateIdentitySignal(context, candidate))
+  let outputBytes = 0
+  for (const output of results) {
+    const resultBytes = boundedRuntimeBytes(output, IDENTITY_SIGNAL_MAX_BATCH_OUTPUT_BYTES - outputBytes)
+    if (resultBytes === null) return Object.freeze([operationalNotEvaluated('EVALUATION_BUDGET_EXCEEDED')])
+    outputBytes += resultBytes
+  }
+  return Object.freeze(results.sort((left, right) => bytewiseCompare(
+    `${left.ruleId ?? ''}:${left.subject.type}:${left.subject.opaqueId}`,
+    `${right.ruleId ?? ''}:${right.subject.type}:${right.subject.opaqueId}`,
+  )))
+}
+
+export function evaluateIdentitySignals(context: unknown, candidates: readonly unknown[]): readonly IdentitySignalResult[] {
+  try {
+    return evaluateIdentitySignalsWithinBoundary(context, candidates)
+  } catch {
+    return Object.freeze([operationalNotEvaluated('EVIDENCE_MALFORMED')])
+  }
 }

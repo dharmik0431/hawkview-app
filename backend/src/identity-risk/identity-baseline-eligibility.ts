@@ -1,4 +1,27 @@
 import type { AccountClass } from './identity-signal-contract.js'
+import { isOpaqueIdentityReference } from './identity-signal-runtime.js'
+
+export const BASELINE_PERSISTENCE_CONTRACT_VERSION = 'hawkview-identity-baseline-persistence/1' as const
+
+/**
+ * Platform-owned persistence obligation. The platform must derive both scope IDs
+ * from the authenticated job context, enforce an organization/tenant/contribution
+ * unique key, and persist the decision audit plus pre-feedback checkpoint in the
+ * same transaction before applying a reviewed contribution. Duplicate source
+ * identities must be idempotent. Retention cannot outlive the lawful source data.
+ * The pure evaluator deliberately cannot implement or bypass these obligations.
+ */
+export type BaselinePersistenceObligation = Readonly<{
+  contractVersion: typeof BASELINE_PERSISTENCE_CONTRACT_VERSION
+  organizationId: string
+  customerTenantId: string
+  baselineVersion: string
+  accountClassCatalogVersion: string
+  contributionKey: string
+  sourceObservationIds: readonly string[]
+  decisionAuditId: string | null
+  preFeedbackCheckpointId: string | null
+}>
 
 export type BaselineContributionInput = Readonly<{
   subjectId: string
@@ -32,6 +55,9 @@ export type BaselineContributionDecision = Readonly<{
 }>
 
 const DAY_MS = 24 * 60 * 60 * 1000
+const MAX_BASELINE_OBSERVATIONS = 128
+const MAX_EXISTING_CONTRIBUTION_KEYS = 366
+const MAX_REVIEWERS = 16
 
 function validDay(value: string) {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
@@ -41,8 +67,14 @@ function reject(reasonCode: BaselineContributionDecision['reasonCode']): Baselin
   return Object.freeze({ status: 'REJECTED', reasonCode, contributionKey: null })
 }
 
-export function assessBaselineContribution(input: BaselineContributionInput): BaselineContributionDecision {
-  if (!input.subjectId || !input.propertyKey || !Number.isFinite(Date.parse(input.evaluatedAt))) {
+function assessBaselineContributionWithinBoundary(input: BaselineContributionInput): BaselineContributionDecision {
+  if (!isOpaqueIdentityReference(input.subjectId, 160) || !isOpaqueIdentityReference(input.propertyKey, 160) ||
+      !Number.isFinite(Date.parse(input.evaluatedAt)) || !Array.isArray(input.observations) ||
+      input.observations.length > MAX_BASELINE_OBSERVATIONS || !Array.isArray(input.existingContributionKeys) ||
+      input.existingContributionKeys.length > MAX_EXISTING_CONTRIBUTION_KEYS ||
+      !input.existingContributionKeys.every((key) => isOpaqueIdentityReference(key, 384)) ||
+      !['HUMAN', 'PRIVILEGED_HUMAN', 'SERVICE', 'SHARED', 'BREAK_GLASS', 'UNKNOWN'].includes(input.accountClass) ||
+      typeof input.unresolvedFinding !== 'boolean') {
     return reject('BASELINE_INPUT_MALFORMED')
   }
   if (input.unresolvedFinding) return reject('BASELINE_UNRESOLVED_FINDING')
@@ -50,7 +82,7 @@ export function assessBaselineContribution(input: BaselineContributionInput): Ba
     return reject('BASELINE_ACCOUNT_CLASS_UNSUPPORTED')
   }
   const observations = [...new Map(input.observations.map((entry) => [entry.id, entry])).values()]
-  if (observations.some((entry) => !entry.id || !validDay(entry.utcDay) || !Number.isFinite(Date.parse(entry.observedAt)))) {
+  if (observations.some((entry) => !isOpaqueIdentityReference(entry.id) || !validDay(entry.utcDay) || !Number.isFinite(Date.parse(entry.observedAt)))) {
     return reject('BASELINE_INPUT_MALFORMED')
   }
   const days = [...new Set(observations.map((entry) => entry.utcDay))].sort()
@@ -64,7 +96,11 @@ export function assessBaselineContribution(input: BaselineContributionInput): Ba
     return Object.freeze({ status: 'ELIGIBLE', reasonCode: 'BASELINE_SOURCE_RECURRENCE_MET', contributionKey })
   }
   if (input.review.outcome !== 'AUTHORIZED_BENIGN') return reject('BASELINE_REVIEW_OUTCOME_INELIGIBLE')
-  const reviewers = new Set(input.review.reviewerIds.filter(Boolean))
+  if (!Array.isArray(input.review.reviewerIds) || input.review.reviewerIds.length > MAX_REVIEWERS ||
+      !input.review.reviewerIds.every((reviewerId) => isOpaqueIdentityReference(reviewerId, 128))) {
+    return reject('BASELINE_INPUT_MALFORMED')
+  }
+  const reviewers = new Set(input.review.reviewerIds)
   const sensitive = input.accountClass !== 'HUMAN'
   if (sensitive && reviewers.size < 2) return reject('BASELINE_REVIEW_DUAL_APPROVAL_REQUIRED')
   if (!sensitive && reviewers.size < 1) return reject('BASELINE_INPUT_MALFORMED')
@@ -76,4 +112,12 @@ export function assessBaselineContribution(input: BaselineContributionInput): Ba
     return Object.freeze({ status: 'PENDING', reasonCode: 'BASELINE_REVIEW_COOLING', contributionKey: null })
   }
   return Object.freeze({ status: 'ELIGIBLE', reasonCode: 'BASELINE_REVIEW_ELIGIBLE', contributionKey })
+}
+
+export function assessBaselineContribution(input: BaselineContributionInput): BaselineContributionDecision {
+  try {
+    return assessBaselineContributionWithinBoundary(input)
+  } catch {
+    return reject('BASELINE_INPUT_MALFORMED')
+  }
 }

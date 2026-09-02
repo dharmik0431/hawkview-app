@@ -5,6 +5,9 @@ export const IDENTITY_SIGNAL_MAX_SUBJECT_REFERENCE_LENGTH = 160 as const
 export const IDENTITY_SIGNAL_MAX_EVIDENCE_REFERENCES = 32 as const
 export const IDENTITY_SIGNAL_MAX_EVIDENCE_REFERENCE_LENGTH = 256 as const
 export const IDENTITY_SIGNAL_MAX_EVIDENCE_ITEMS = 128 as const
+export const IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES = 1_000 as const
+export const IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES = 2_000_000 as const
+export const IDENTITY_SIGNAL_MAX_BATCH_OUTPUT_BYTES = 2_000_000 as const
 
 export const IDENTITY_SIGNAL_RULE_IDS = [
   'HV-ID-EXP-001.v1',
@@ -60,6 +63,7 @@ export type IdentitySignalReasonCode =
   | 'IDENTIFIER_DOMAIN_UNVERIFIED'
   | 'NO_MATCH'
   | 'RULE_MATCHED'
+  | 'EVALUATION_BUDGET_EXCEEDED'
 
 export type CatalogType =
   | 'PRIVILEGED_ROLE_GROUP'
@@ -180,7 +184,7 @@ export type IdentitySignalResult = Readonly<{
   engineVersion: typeof IDENTITY_RISK_ENGINE_VERSION
   catalogVersion: typeof IDENTITY_SIGNAL_CATALOG_VERSION
   channel: typeof IDENTITY_SIGNAL_CHANNEL
-  ruleId: IdentitySignalRuleId
+  ruleId: IdentitySignalRuleId | null
   subject: IdentitySignalSubject
   status: IdentitySignalStatus
   severity: IdentitySignalSeverity | null

@@ -4,6 +4,9 @@ import test from 'node:test'
 import {
   IDENTITY_RISK_ENGINE_VERSION,
   IDENTITY_SIGNAL_CATALOG_VERSION,
+  IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES,
+  IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES,
+  IDENTITY_SIGNAL_MAX_BATCH_OUTPUT_BYTES,
   IDENTITY_SIGNAL_RULE_IDS,
   type AccountClass,
   type ApprovedCatalog,
@@ -38,7 +41,7 @@ function approvedCatalog(
     expiresAt: '2027-08-01T00:00:00.000Z',
     values: options.values ?? [],
     accountClasses: options.accountClasses,
-    contextEntries: options.contextEntries,
+    contextEntries: options.contextEntries ?? (catalogType === 'NETWORK_CONTEXT' ? [] : undefined),
   }
   return Object.freeze({ ...value, digest: computeIdentitySignalCatalogDigest(value) })
 }
@@ -56,7 +59,7 @@ function context(overrides: Partial<IdentitySignalEvaluationContext> = {}): Iden
     featureFlags: Object.fromEntries(IDENTITY_SIGNAL_RULE_IDS.map((ruleId) => [ruleId, true])),
     catalogs: [
       approvedCatalog('PRIVILEGED_ROLE_GROUP', { values: ['privileged-op'] }),
-      approvedCatalog('HIGH_IMPACT_OPERATION', { values: ['reset mfa'] }),
+      approvedCatalog('HIGH_IMPACT_OPERATION', { values: ['reset-mfa'] }),
       approvedCatalog('HIGH_IMPACT_APPLICATION_PERMISSION', { values: ['directory.readwrite.all'] }),
       approvedCatalog('LEGACY_CLIENT', { values: ['imap'] }),
       approvedCatalog('ACCOUNT_CLASS', {
@@ -109,7 +112,7 @@ test('feature flags, readiness, partial coverage, stale evidence, and future evi
   assert.equal(evaluateIdentitySignal(context(), { ...candidate, evidence: [{ observedAt: '2026-09-01T00:00:00.000Z', maxAgeHours: 2 }] }).reasonCodes[0], 'EVIDENCE_STALE')
   assert.equal(evaluateIdentitySignal(context(), { ...candidate, evidence: [{ observedAt: '2026-09-02T12:06:00.000Z', maxAgeHours: 2 }] }).reasonCodes[0], 'EVIDENCE_FUTURE_DATED')
   assert.equal(evaluateIdentitySignal(context({ futureClockSkewToleranceMs: null }), candidate).reasonCodes[0], 'RULE_CONFIG_UNAPPROVED')
-  assert.equal(evaluateIdentitySignal(context({ organizationId: '' }), candidate).reasonCodes[0], 'EVIDENCE_MALFORMED')
+  assert.equal(evaluateIdentitySignal(context({ organizationId: '' }), candidate).reasonCodes[0], 'RULE_CONFIG_UNAPPROVED')
 })
 
 test('missing, draft, single-approved, expired, or digest-tampered catalogs cannot enable dependent rules', () => {
@@ -163,7 +166,7 @@ test('lifecycle privilege rules require successful cataloged operations and exac
 })
 
 test('privileged-change burst includes anchor and excludes an event exactly 15 minutes older', () => {
-  const event = (id: string, occurredAt: string) => ({ id, occurredAt, actorId: 'actor-1', operation: 'reset mfa', succeeded: true })
+  const event = (id: string, occurredAt: string) => ({ id, occurredAt, actorId: 'actor-1', operation: 'reset-mfa', succeeded: true })
   const candidate = {
     ...common('HV-ID-CHG-003.v1'), anchorAt: NOW, actorId: 'actor-1',
     events: [
@@ -178,7 +181,7 @@ test('privileged-change burst includes anchor and excludes an event exactly 15 m
 
 test('administrative rarity and security weakening use locked thresholds and transitions', () => {
   const rarity = {
-    ...common('HV-ID-CHG-004.v1'), operation: 'reset mfa', actorBaselineEvents: 20,
+    ...common('HV-ID-CHG-004.v1'), operation: 'reset-mfa', actorBaselineEvents: 20,
     tenantBaselineEvents: 100, actorOperationCount: 0, tenantOperationCount: 2,
     baselineActiveDays: 30, succeeded: true,
   }
@@ -331,22 +334,30 @@ test('unexpected break-glass use is the sole direct Critical rule and approved w
   assert.equal(evaluateIdentitySignal(context({ catalogs: context().catalogs!.map((entry) => entry.catalogType === 'NETWORK_CONTEXT' ? maintenance : entry) }), candidate).status, 'SUPPRESSED')
 })
 
-test('output is deterministic, sorted, evidence-bounded, and unaffected by Microsoft-risk-shaped extras', () => {
+test('output is deterministic, sorted, evidence-bounded, and excludes Microsoft risk by construction', () => {
   const candidate = {
     ...common('HV-ID-EXP-001.v1', 'admin-1'), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED' as const,
-    microsoftUserRisk: 'high', microsoftSignInRisk: 'high', raw: { access_token: 'must-not-appear' },
   } as IdentitySignalCandidate
   const first = evaluateIdentitySignal(context(), candidate)
   const second = evaluateIdentitySignal(context(), candidate)
   assert.deepEqual(first, second)
   assert.deepEqual(first.evidenceReferences, ['evidence-a', 'evidence-b'])
   const serialized = JSON.stringify(first)
-  assert.ok(!serialized.includes('microsoftUserRisk'))
-  assert.ok(!serialized.includes('access_token'))
-  assert.ok(!serialized.includes('must-not-appear'))
+  assert.ok(!serialized.includes('microsoft'))
   assert.equal(first.channel, 'HAWKVIEW_IDENTITY_SIGNALS')
   assert.equal('probability' in first, false)
   assert.equal('score' in first, false)
+})
+
+test('unknown detector properties fail closed and never reach output', () => {
+  const candidate = {
+    ...common('HV-ID-EXP-001.v1', 'admin-1'), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED',
+    microsoftUserRisk: 'high', raw: { access_token: 'must-not-appear' },
+  }
+  const output = evaluateIdentitySignal(context(), candidate)
+  assert.equal(output.status, 'NOT_EVALUATED')
+  assert.equal(output.ruleId, null)
+  assert.ok(!JSON.stringify(output).includes('must-not-appear'))
 })
 
 test('oversized or control-character output references fail closed and are never emitted', () => {
@@ -368,7 +379,7 @@ test('oversized or control-character output references fail closed and are never
     subject: { type: 'USER', opaqueId: 'x'.repeat(161) },
   })
   assert.equal(oversizedSubject.status, 'NOT_EVALUATED')
-  assert.equal(oversizedSubject.subject.opaqueId, 'INVALID_SUBJECT_REFERENCE')
+  assert.equal(oversizedSubject.subject.opaqueId, 'EVALUATION_INPUT')
 })
 
 test('batch evaluation order is stable across reordered candidates', () => {
@@ -377,4 +388,138 @@ test('batch evaluation order is stable across reordered candidates', () => {
     { ...common('HV-ID-EXP-001.v1', 'admin-1'), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED' },
   ]
   assert.deepEqual(evaluateIdentitySignals(context(), candidates), evaluateIdentitySignals(context(), [...candidates].reverse()))
+})
+
+test('unknown, accessor-backed, and prototype detector output never throws or echoes input', () => {
+  const valid = {
+    ...common('HV-ID-EXP-001.v1', 'admin-1'), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED' as const,
+  }
+  const unknownRule = { ...valid, ruleId: 'HV-ID-UNKNOWN-999.v1', raw: 'provider-secret' }
+  const inherited = Object.assign(Object.create({ raw: 'inherited-secret' }), valid)
+  const hostileProxy = new Proxy(valid, {
+    getPrototypeOf() { throw new Error('prototype trap must not escape') },
+  })
+  const accessor = { ...valid } as Record<string, unknown>
+  Object.defineProperty(accessor, 'ruleId', {
+    enumerable: true,
+    get() { throw new Error('getter must never run') },
+  })
+  for (const hostile of [unknownRule, inherited, accessor, hostileProxy]) {
+    let output: ReturnType<typeof evaluateIdentitySignal> | undefined
+    assert.doesNotThrow(() => { output = evaluateIdentitySignal(context(), hostile) })
+    assert.ok(output)
+    assert.equal(output.status, 'NOT_EVALUATED')
+    assert.equal(output.ruleId, null)
+    assert.deepEqual(output.reasonCodes, ['EVIDENCE_MALFORMED'])
+    assert.ok(!JSON.stringify(output).includes('secret'))
+  }
+  let batch: ReturnType<typeof evaluateIdentitySignals> | undefined
+  assert.doesNotThrow(() => { batch = evaluateIdentitySignals(context(), [unknownRule, valid, accessor]) })
+  assert.ok(batch)
+  assert.equal(batch.length, 3)
+  assert.equal(batch.filter((entry) => entry.status === 'MATCHED').length, 1)
+})
+
+test('opaque privacy grammar rejects principals, URLs, credentials, JWTs, and provider snippets at every output sink', () => {
+  const valid = {
+    ...common('HV-ID-EXP-001.v1', 'admin-1'), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED' as const,
+  }
+  const jwt = `${'a'.repeat(12)}.${'b'.repeat(12)}.${'c'.repeat(12)}`
+  const hostileCandidates = [
+    { ...valid, subject: { type: 'USER', opaqueId: 'person@example.com' } },
+    { ...valid, subject: { type: 'USER', opaqueId: 'Bearer-secret-value' } },
+    { ...valid, evidenceReferences: ['https://provider.example/event?token=secret-value'] },
+    { ...valid, evidenceReferences: [jwt] },
+    { ...valid, subject: { type: 'USER', opaqueId: 'constructor' } },
+  ]
+  for (const hostile of hostileCandidates) {
+    const serialized = JSON.stringify(evaluateIdentitySignal(context(), hostile))
+    assert.ok(!serialized.includes('person@example.com'))
+    assert.ok(!serialized.includes('provider.example'))
+    assert.ok(!serialized.includes('secret-value'))
+    assert.ok(!serialized.includes(jwt))
+  }
+
+  const invalidCatalogs = [
+    approvedCatalog('PRIVILEGED_ROLE_GROUP', { approvers: ['reviewer-a', 'owner@example.com'] }),
+    approvedCatalog('PRIVILEGED_ROLE_GROUP', { values: ['access-token-secret'] }),
+    approvedCatalog('ACCOUNT_CLASS', { accountClasses: { 'owner@example.com': 'HUMAN' } }),
+    approvedCatalog('NETWORK_CONTEXT', { contextEntries: [{
+      id: 'https://provider.example/context', type: 'SHARED_EGRESS', startsAt: '2026-09-02T11:00:00.000Z',
+      expiresAt: '2026-09-02T13:00:00.000Z', sourceFingerprint: 'source-1',
+    }] }),
+  ]
+  for (const catalog of invalidCatalogs) {
+    const output = evaluateIdentitySignal(context({ catalogs: [catalog] }), valid)
+    assert.equal(output.status, 'NOT_EVALUATED')
+    assert.equal(output.ruleId, null)
+    assert.ok(!JSON.stringify(output).includes('owner@example.com'))
+    assert.ok(!JSON.stringify(output).includes('provider.example'))
+    assert.ok(!JSON.stringify(output).includes('access-token-secret'))
+  }
+})
+
+test('clock skew is a bounded version-owned policy from zero through five minutes', () => {
+  const candidate = {
+    ...common('HV-ID-EXP-001.v1', 'admin-1'),
+    evidence: [{ observedAt: '2026-09-02T12:05:00.000Z', maxAgeHours: 2 }],
+    privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED' as const,
+  }
+  assert.equal(evaluateIdentitySignal(context({ futureClockSkewToleranceMs: 0 }), {
+    ...candidate,
+    evidence: [{ observedAt: NOW, maxAgeHours: 2 }],
+  }).status, 'MATCHED')
+  assert.equal(evaluateIdentitySignal(context({ futureClockSkewToleranceMs: 300_000 }), candidate).status, 'MATCHED')
+  const rejected = evaluateIdentitySignal(context({ futureClockSkewToleranceMs: 300_001 }), candidate)
+  assert.equal(rejected.status, 'NOT_EVALUATED')
+  assert.deepEqual(rejected.reasonCodes, ['RULE_CONFIG_UNAPPROVED'])
+})
+
+test('candidate count and byte budgets reject adversarial batches with one bounded operational result', () => {
+  assert.equal(IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES, 1_000)
+  assert.equal(IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES, 2_000_000)
+  assert.equal(IDENTITY_SIGNAL_MAX_BATCH_OUTPUT_BYTES, 2_000_000)
+  const candidate = {
+    ...common('HV-ID-EXP-001.v1', 'admin-1'), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED' as const,
+  }
+  const fiftyThousand = new Array(50_000).fill(candidate)
+  const countRejected = evaluateIdentitySignals(context(), fiftyThousand)
+  assert.equal(countRejected.length, 1)
+  assert.deepEqual(countRejected[0]!.reasonCodes, ['EVALUATION_BUDGET_EXCEEDED'])
+  assert.equal(fiftyThousand.length, 50_000)
+
+  const largeReferences = Array.from({ length: 32 }, (_, index) => `r${index}-${'x'.repeat(250)}`)
+  const largeValidCandidate = { ...candidate, evidenceReferences: largeReferences }
+  const byteRejected = evaluateIdentitySignals(context(), new Array(150).fill(largeValidCandidate))
+  assert.equal(byteRejected.length, 1)
+  assert.deepEqual(byteRejected[0]!.reasonCodes, ['EVALUATION_BUDGET_EXCEEDED'])
+  assert.ok(Object.isFrozen(byteRejected))
+})
+
+test('catalog validation rejects duplicates, unknown fields, invalid classes, prototypes, and remains order independent', () => {
+  const candidate = {
+    ...common('HV-ID-EXP-001.v1', 'admin-1'), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED' as const,
+  }
+  const validCatalogs = context().catalogs!
+  assert.deepEqual(
+    evaluateIdentitySignal(context({ catalogs: validCatalogs }), candidate),
+    evaluateIdentitySignal(context({ catalogs: [...validCatalogs].reverse() }), candidate),
+  )
+  const duplicate = context({ catalogs: [...validCatalogs, validCatalogs[0]!] })
+  assert.deepEqual(evaluateIdentitySignal(duplicate, candidate).reasonCodes, ['RULE_CONFIG_UNAPPROVED'])
+
+  const extra = { ...validCatalogs[0]!, providerPayload: 'do-not-echo' }
+  assert.deepEqual(evaluateIdentitySignal(context({ catalogs: [extra as ApprovedCatalog] }), candidate).reasonCodes, ['RULE_CONFIG_UNAPPROVED'])
+  const invalidClass = approvedCatalog('ACCOUNT_CLASS', { accountClasses: { 'admin-1': 'ADMIN' as AccountClass } })
+  assert.deepEqual(evaluateIdentitySignal(context({ catalogs: [invalidClass] }), candidate).reasonCodes, ['RULE_CONFIG_UNAPPROVED'])
+  const inherited = Object.assign(Object.create({ raw: 'secret' }), validCatalogs[0]!) as ApprovedCatalog
+  assert.deepEqual(evaluateIdentitySignal(context({ catalogs: [inherited] }), candidate).reasonCodes, ['RULE_CONFIG_UNAPPROVED'])
+})
+
+test('batch result ordering uses canonical bytewise comparison', () => {
+  const make = (opaqueId: string): IdentitySignalCandidate => ({
+    ...common('HV-ID-EXP-001.v1', opaqueId), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED',
+  })
+  const output = evaluateIdentitySignals(context(), [make('admin-a'), make('admin-Z'), make('admin-A')])
+  assert.deepEqual(output.map((entry) => entry.subject.opaqueId), ['admin-A', 'admin-Z', 'admin-a'])
 })

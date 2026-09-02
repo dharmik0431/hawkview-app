@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { assessBaselineContribution, type BaselineContributionInput } from './identity-baseline-eligibility.js'
+import {
+  BASELINE_PERSISTENCE_CONTRACT_VERSION,
+  assessBaselineContribution,
+  type BaselineContributionInput,
+  type BaselinePersistenceObligation,
+} from './identity-baseline-eligibility.js'
 
 const base: BaselineContributionInput = {
   subjectId: 'user-1',
@@ -66,4 +71,35 @@ test('break-glass and non-authorized-benign outcomes never enter ordinary baseli
     ...base,
     review: { outcome: 'FALSE_POSITIVE', decidedAt: '2026-09-01T00:00:00.000Z', reviewerIds: ['reviewer-1'] },
   }).reasonCode, 'BASELINE_REVIEW_OUTCOME_INELIGIBLE')
+})
+
+test('baseline IDs use the same opaque privacy boundary', () => {
+  assert.equal(assessBaselineContribution({ ...base, subjectId: 'person@example.com' }).reasonCode, 'BASELINE_INPUT_MALFORMED')
+  assert.equal(assessBaselineContribution({ ...base, propertyKey: 'access_token:secret-value' }).reasonCode, 'BASELINE_INPUT_MALFORMED')
+  assert.equal(assessBaselineContribution({
+    ...base,
+    review: { outcome: 'AUTHORIZED_BENIGN', decidedAt: '2026-09-01T00:00:00.000Z', reviewerIds: ['Bearer-secret'] },
+  }).reasonCode, 'BASELINE_INPUT_MALFORMED')
+  assert.equal(assessBaselineContribution({ ...base, accountClass: 'ADMIN' as BaselineContributionInput['accountClass'] }).reasonCode, 'BASELINE_INPUT_MALFORMED')
+  assert.doesNotThrow(() => assessBaselineContribution(new Proxy(base, {
+    get() { throw new Error('malformed input must not escape') },
+  })))
+})
+
+test('platform persistence contract keeps scope and idempotency outside the pure decision', () => {
+  const decision = assessBaselineContribution(base)
+  const obligation = {
+    contractVersion: BASELINE_PERSISTENCE_CONTRACT_VERSION,
+    organizationId: 'org-a',
+    customerTenantId: 'tenant-a',
+    baselineVersion: 'baseline-v1',
+    accountClassCatalogVersion: 'account-class-v1',
+    contributionKey: decision.contributionKey!,
+    sourceObservationIds: base.observations.map((entry) => entry.id),
+    decisionAuditId: null,
+    preFeedbackCheckpointId: null,
+  } satisfies BaselinePersistenceObligation
+  assert.equal(obligation.contractVersion, 'hawkview-identity-baseline-persistence/1')
+  assert.equal('organizationId' in decision, false)
+  assert.equal('customerTenantId' in decision, false)
 })
