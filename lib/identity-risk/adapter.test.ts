@@ -38,7 +38,7 @@ function finding(overrides: Record<string, unknown> = {}) {
     benignAlternativeCodes: ['APPROVED_ACCOUNT_PROVISIONING'],
     investigationGuidanceCode: 'REVIEW_ACCESS',
     investigationGuidance:
-      'Confirm the identity and privilege assignment with an authorized administrator.',
+      'Review the identity, role assignment, and related authorized change evidence.',
     ...overrides,
   }
 }
@@ -98,11 +98,13 @@ test('preserves stale, learning, and not-evaluated capability states', () => {
   for (const status of ['STALE', 'LEARNING', 'NOT_EVALUATED'] as const) {
     const responses = validResponses()
     const capability = status === 'NOT_EVALUATED' ? 'UNAVAILABLE' : 'PARTIAL'
+    const observedAt = status === 'NOT_EVALUATED' ? null : now
     responses.hawkViewSummary = {
       ...responses.hawkViewSummary,
       status,
       capability,
       freshness: status === 'STALE' ? 'STALE' : 'UNKNOWN',
+      observedAt,
       limitation: `${status} evidence state`,
     }
     responses.hawkViewFindings = {
@@ -110,6 +112,7 @@ test('preserves stale, learning, and not-evaluated capability states', () => {
       status,
       capability,
       freshness: status === 'STALE' ? 'STALE' : 'UNKNOWN',
+      observedAt,
       limitation: `${status} evidence state`,
     }
 
@@ -241,6 +244,11 @@ test('rejects secret-shaped strings and autonomous instructions', () => {
         'Review https://admin:credential@example.invalid/evidence',
     }),
     finding({ investigationGuidance: 'Disable the account immediately.' }),
+    finding({ title: 'Bearer TOPSECRET-CREDENTIAL' }),
+    finding({ explanation: '{"access_token":["ARRAYSECRET1"]}' }),
+    finding({ title: 'code=OAUTHCODESECRET' }),
+    finding({ title: 'password%3DENCODEDSECRET' }),
+    finding({ investigationGuidance: 'Review and wipe this mailbox immediately.' }),
   ]) {
     const responses = validResponses()
     responses.hawkViewFindings = {
@@ -257,6 +265,16 @@ test('rejects secret-shaped strings and autonomous instructions', () => {
   }
   assert.equal(
     adaptIdentityRiskResponses(unsafeLimitation).microsoft.meta.status,
+    'ERROR'
+  )
+
+  const unsafeRiskDetail = validResponses()
+  unsafeRiskDetail.microsoftRiskyUsers = {
+    ...unsafeRiskDetail.microsoftRiskyUsers,
+    users: [microsoftUser({ riskDetail: 'attackerControlledDetail' })],
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(unsafeRiskDetail).microsoft.meta.status,
     'ERROR'
   )
 })
@@ -344,6 +362,18 @@ test('rejects contradictory metadata and future evidence timestamps', () => {
     }
     assert.equal(adaptIdentityRiskResponses(responses).hawkView.meta.status, 'ERROR')
   }
+
+  const unsafeErrorState = validResponses()
+  unsafeErrorState.microsoftRiskyUsers = {
+    ...unsafeErrorState.microsoftRiskyUsers,
+    capability: 'UNAVAILABLE',
+    status: 'ERROR',
+    freshness: 'UNKNOWN',
+    limitation: null,
+  }
+  const errorView = adaptIdentityRiskResponses(unsafeErrorState).microsoft
+  assert.equal(errorView.meta.status, 'ERROR')
+  assert.equal(errorView.users, null)
 })
 
 test('requires the final actionable contract rather than weakening for the backend foundation', () => {

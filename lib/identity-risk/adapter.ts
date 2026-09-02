@@ -50,12 +50,16 @@ const ruleCatalog = new Set([
   'HV-ID-MBX-002.v1',
   'HV-ID-MBX-003.v1',
 ])
-const guidanceCodes = new Set([
-  'REVIEW_ACTIVITY',
-  'REVIEW_ACCESS',
-  'REVIEW_MAILBOX_RULE',
-  'REVIEW_CONFIGURATION',
-])
+const guidanceCatalog = Object.freeze({
+  REVIEW_ACTIVITY:
+    'Review the bounded source evidence with an authorized administrator.',
+  REVIEW_ACCESS:
+    'Review the identity, role assignment, and related authorized change evidence.',
+  REVIEW_MAILBOX_RULE:
+    'Review the mailbox rule and confirm the destination is authorized.',
+  REVIEW_CONFIGURATION:
+    'Review the configuration and confirm the change is authorized.',
+})
 const benignAlternativeCodes = new Set([
   'APPROVED_ACCOUNT_PROVISIONING',
   'APPROVED_SHARED_CONTEXT',
@@ -73,6 +77,24 @@ const missingEvidenceCatalog = new Set([
   'INSUFFICIENT_INDEPENDENT_CONTEXT',
   'MAILBOX_RULE_PROJECTION_INCOMPLETE',
   'RULE_CONFIG_UNAPPROVED',
+])
+const microsoftRiskDetailCatalog = new Set([
+  'none',
+  'adminGeneratedTemporaryPassword',
+  'userPerformedSecuredPasswordChange',
+  'userPerformedSecuredPasswordReset',
+  'adminConfirmedSigninSafe',
+  'aiConfirmedSigninSafe',
+  'userPassedMFADrivenByRiskBasedPolicy',
+  'adminDismissedAllRiskForUser',
+  'adminConfirmedSigninCompromised',
+  'hidden',
+  'adminConfirmedUserCompromised',
+  'm365DAdminDismissedDetection',
+  'userChangedPasswordOnPremises',
+  'adminDismissedRiskForSignIn',
+  'adminConfirmedAccountSafe',
+  'unknownFutureValue',
 ])
 
 type RecordValue = Record<string, unknown>
@@ -94,12 +116,30 @@ function exactKeys(value: RecordValue, keys: readonly string[]) {
 }
 
 function containsSecret(value: string) {
-  return (
-    /\b(?:password|passwd|pwd|secret|token|access[-_ ]?token|refresh[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|authorization|bearer|private[-_ ]?key|session[-_ ]?id)\s*[:=]/i.test(value) ||
-    /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(value) ||
-    /\bhttps?:\/\/[^\s/:@]+:[^\s/@]+@/i.test(value) ||
-    /[?&](?:access_token|refresh_token|token|code|key|sig|password|secret)=/i.test(value)
-  )
+  const candidates = [value]
+  let decoded = value
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const next = decodeURIComponent(decoded)
+      if (next === decoded) break
+      candidates.push(next)
+      decoded = next
+    } catch {
+      break
+    }
+  }
+
+  return candidates.some((candidate) => {
+    const trimmed = candidate.trim()
+    return (
+      /^[\[{]/.test(trimmed) ||
+      /\b(?:password|passwd|pwd|secret|token|access[-_ ]?token|refresh[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|authorization|private[-_ ]?key|session[-_ ]?id|oauth[-_ ]?code|code)\b[\s"'\[\]{}:,=%]+\S+/i.test(candidate) ||
+      /\bbearer\s+[A-Za-z0-9._~+\/=:-]{8,}/i.test(candidate) ||
+      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(candidate) ||
+      /\bhttps?:\/\/[^\s/:@]+:[^\s/@]+@/i.test(candidate) ||
+      /[?&](?:access_token|refresh_token|token|code|key|sig|password|secret)=/i.test(candidate)
+    )
+  })
 }
 
 function boundedString(value: unknown, max = 500): string | null {
@@ -200,17 +240,22 @@ function adaptMeta(
     (status === 'AVAILABLE' &&
       capability !== 'UNAVAILABLE' &&
       freshness === 'CURRENT' &&
-      observedAt !== null) ||
+      observedAt !== null &&
+      (capability === 'FULL' || limitation !== null)) ||
     (status === 'STALE' &&
       capability !== 'UNAVAILABLE' &&
       freshness === 'STALE' &&
-      observedAt !== null) ||
+      observedAt !== null &&
+      limitation !== null) ||
     (status === 'LEARNING' &&
       capability !== 'UNAVAILABLE' &&
-      freshness === 'UNKNOWN') ||
+      freshness === 'UNKNOWN' &&
+      limitation !== null) ||
     ((status === 'NOT_EVALUATED' || status === 'UNAVAILABLE' || status === 'ERROR') &&
       capability === 'UNAVAILABLE' &&
-      freshness === 'UNKNOWN')
+      freshness === 'UNKNOWN' &&
+      observedAt === null &&
+      limitation !== null)
 
   if (!coherentState) return null
 
@@ -315,6 +360,11 @@ function adaptFinding(value: unknown): HawkViewIdentityFinding | null {
   )
   const investigationGuidanceCode = boundedString(source.investigationGuidanceCode, 120)
   const investigationGuidance = boundedString(source.investigationGuidance, 300)
+  const catalogGuidance = investigationGuidanceCode
+    ? guidanceCatalog[
+        investigationGuidanceCode as keyof typeof guidanceCatalog
+      ]
+    : null
 
   if (
     !id ||
@@ -337,12 +387,9 @@ function adaptFinding(value: unknown): HawkViewIdentityFinding | null {
     !missingEvidenceLabels ||
     !benignAlternatives ||
     !investigationGuidanceCode ||
-    !guidanceCodes.has(investigationGuidanceCode) ||
+    !catalogGuidance ||
     !investigationGuidance ||
-    !/^(?:Review|Confirm|Compare|Investigate)\b/.test(investigationGuidance) ||
-    /\b(?:disable|reset|revoke|delete|remove|block|suspend|terminate|quarantine)\b/i.test(
-      investigationGuidance
-    )
+    investigationGuidance !== catalogGuidance
   ) {
     return null
   }
@@ -366,7 +413,7 @@ function adaptFinding(value: unknown): HawkViewIdentityFinding | null {
     missingEvidenceLabels,
     benignAlternativeCodes: benignAlternatives,
     investigationGuidanceCode,
-    investigationGuidance,
+    investigationGuidance: catalogGuidance,
   }
 }
 
@@ -418,7 +465,7 @@ function adaptMicrosoftUser(value: unknown): MicrosoftEntraRiskyUser | null {
     !riskLevel ||
     !riskState ||
     (source.riskDetail !== null && source.riskDetail !== undefined &&
-      (!riskDetail || !/^[A-Za-z][A-Za-z0-9]*$/.test(riskDetail))) ||
+      (!riskDetail || !microsoftRiskDetailCatalog.has(riskDetail))) ||
     !observedAt
   ) {
     return null
