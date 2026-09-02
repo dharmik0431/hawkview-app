@@ -213,6 +213,8 @@ function formatActionLabel(action: string): string {
     MEMBER_INVITED: 'Member invited',
     MEMBER_INVITE_REQUESTED: 'Member invitation requested',
     MEMBER_INVITE_PROVIDER_ACCEPTED: 'Invitation accepted by email provider',
+    MEMBER_INVITE_PROVIDER_RESOLVED: 'Invitation request processed by email provider',
+    MEMBER_INVITE_REQUEST_RESOLVED: 'Invitation request resolved',
     MEMBER_INVITE_FAILED: 'Member invitation failed',
     MEMBER_INVITE_RESEND_REQUESTED: 'Invitation resend requested',
     MEMBER_INVITE_RESEND_PROVIDER_ACCEPTED: 'Resent invitation accepted by email provider',
@@ -1297,7 +1299,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
           displayName: inviteName.trim() || undefined,
           role: inviteRole,
         }),
-      `Invitation sent to ${trimmedEmail}. The member will receive a secure HawkView setup link.`
+      `Invitation request accepted for ${trimmedEmail}. If eligible, the recipient will receive a HawkView invitation.`
     )
     if (!invitationSent) return
     setInviteModalOpen(false)

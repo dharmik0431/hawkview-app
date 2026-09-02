@@ -203,6 +203,7 @@ test('a fourth workspace member is allowed when the authentication provider acce
 
   const result = await invite(subject.service)
 
+  assert.equal(result.accepted, true)
   assert.equal(result.delivery, 'INVITE')
   assert.deepEqual(requestedPaths, ['/auth/v1/invite'])
   assert.deepEqual(subject.counts(), { auditAttempts: 3, membershipWrites: 1, userWrites: 1 })
@@ -210,8 +211,8 @@ test('a fourth workspace member is allowed when the authentication provider acce
     subject.audits.map((entry) => entry.data.action),
     [
       'WORKSPACE_MEMBER_INVITE_REQUESTED',
-      'WORKSPACE_MEMBER_INVITE_PROVIDER_ACCEPTED',
-      'WORKSPACE_MEMBER_INVITED',
+      'WORKSPACE_MEMBER_INVITE_PROVIDER_RESOLVED',
+      'WORKSPACE_MEMBER_INVITE_REQUEST_RESOLVED',
     ]
   )
   assert.equal(
@@ -254,58 +255,85 @@ test('invite email rate limiting returns a safe stable API contract and performs
     /fourth@example|provider detail/i)
 })
 
-test('the email-address invite endpoint does not reveal or mutate an existing account', async () => {
+test('the email-address invite endpoint accepts an existing account without local mutation', async () => {
   configureEnvironment()
   let providerCalls = 0
   globalThis.fetch = async () => {
     providerCalls += 1
-    return new Response(null, { status: 200 })
+    return new Response(JSON.stringify({ id: 'auth-user-four' }), { status: 200 })
   }
   const subject = fixture({ existingPendingUser: true })
 
-  await assert.rejects(
-    () => invite(subject.service),
-    (error: unknown) => {
-      const candidate = error as { getStatus?: () => number; getResponse?: () => unknown }
-      assert.equal(candidate.getStatus?.(), 409)
-      assert.match(
-        String((candidate.getResponse?.() as { message?: unknown }).message),
-        /cannot be created/i
-      )
-      return true
-    }
+  const result = await invite(subject.service)
+
+  assert.deepEqual(
+    { accepted: result.accepted, delivery: result.delivery },
+    { accepted: true, delivery: 'INVITE' }
   )
-  assert.equal(providerCalls, 0)
-  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
-  assert.equal(subject.audits.at(-1)?.data.errorCode, 'WORKSPACE_CONFLICT')
+  assert.equal(providerCalls, 1)
+  assert.deepEqual(subject.counts(), { auditAttempts: 3, membershipWrites: 0, userWrites: 0 })
+  assert.deepEqual(
+    subject.audits.map((entry) => entry.data.action),
+    [
+      'WORKSPACE_MEMBER_INVITE_REQUESTED',
+      'WORKSPACE_MEMBER_INVITE_PROVIDER_RESOLVED',
+      'WORKSPACE_MEMBER_INVITE_REQUEST_RESOLVED',
+    ]
+  )
   assert.equal(subject.audits.at(-1)?.data.targetUserId, null)
 })
 
-test('ordinary invite returns the same generic conflict for every existing account state', async () => {
+test('ordinary invite has one generic response and audit contract for new and existing accounts', async () => {
   configureEnvironment()
-  const responses: unknown[] = []
+  const responses: Array<{ accepted: boolean; delivery: string }> = []
+  const auditContracts: string[] = []
   let providerCalls = 0
-  globalThis.fetch = async () => {
-    providerCalls += 1
-    return new Response(null, { status: 200 })
-  }
 
-  for (const existingUserState of ['PENDING', 'ACCEPTED', 'DISABLED', 'LEGACY'] as const) {
+  for (const existingUserState of [undefined, 'PENDING', 'ACCEPTED', 'DISABLED', 'LEGACY'] as const) {
+    globalThis.fetch = async () => {
+      providerCalls += 1
+      return existingUserState === 'ACCEPTED'
+        ? new Response(JSON.stringify({ code: 'email_exists', message: 'private detail' }), {
+            status: 422,
+          })
+        : new Response(JSON.stringify({ id: 'auth-user-four' }), { status: 200 })
+    }
     const subject = fixture({ existingUserState })
-    await assert.rejects(
-      () => invite(subject.service),
-      (error: unknown) => {
-        const candidate = error as { getStatus?: () => number; getResponse?: () => unknown }
-        assert.equal(candidate.getStatus?.(), 409)
-        responses.push(candidate.getResponse?.())
-        return true
-      }
+    const result = await invite(subject.service)
+    responses.push({ accepted: result.accepted, delivery: result.delivery })
+    auditContracts.push(
+      JSON.stringify(
+        subject.audits.map((entry) => ({
+          action: entry.data.action,
+          outcome: entry.data.outcome,
+          stage: entry.data.stage,
+          targetUserId: entry.data.targetUserId,
+          metadata: entry.data.metadata,
+        }))
+      )
     )
   }
 
-  assert.equal(providerCalls, 0)
+  assert.equal(providerCalls, 5)
   assert.equal(new Set(responses.map((response) => JSON.stringify(response))).size, 1)
-  assert.doesNotMatch(JSON.stringify(responses), /disabled|pending|accepted|legacy|provider/i)
+  assert.equal(new Set(auditContracts).size, 1)
+  assert.doesNotMatch(
+    JSON.stringify({ responses, auditContracts }),
+    /disabled|pending|legacy|private detail/i
+  )
+})
+
+test('only the exact provider email-exists contract is privacy-normalized', async () => {
+  configureEnvironment()
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ code: 'unexpected_provider_error', message: 'private detail' }), {
+      status: 422,
+    })
+  const subject = fixture({ existingUserState: 'ACCEPTED' })
+
+  await assert.rejects(() => invite(subject.service), /could not be completed/i)
+  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
+  assert.doesNotMatch(JSON.stringify(subject.audits), /private detail|unexpected_provider_error/i)
 })
 
 test('a pending or expired member receives a fresh invitation without role or status mutation', async () => {
@@ -484,7 +512,7 @@ test('provider acceptance remains durably provable when membership persistence f
     [
       ['WORKSPACE_MEMBER_INVITE_REQUESTED', 'STARTED', 'REQUEST_ACCEPTED'],
       [
-        'WORKSPACE_MEMBER_INVITE_PROVIDER_ACCEPTED',
+        'WORKSPACE_MEMBER_INVITE_PROVIDER_RESOLVED',
         'SUCCEEDED',
         'AUTH_PROVIDER',
       ],

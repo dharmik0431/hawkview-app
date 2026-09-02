@@ -95,7 +95,7 @@ const templates = {
     }),
   },
   invite: {
-    subject: 'Your HawkView invitation',
+    subject: 'HawkView invitation sent or resent',
     content: brandedEmail({
       preheader: 'Accept the invitation sent or resent by your HawkView workspace administrator.',
       title: 'Your HawkView invitation',

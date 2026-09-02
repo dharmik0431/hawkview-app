@@ -9,7 +9,7 @@ authentication and security-notification email.
 - Confirm signup
 - Invite user
 - Magic link
-- Password recovery and invited-user setup recovery
+- Password recovery for accepted HawkView accounts only
 - Reauthentication code
 - Email-address change confirmation
 - Password, email, and phone change notifications

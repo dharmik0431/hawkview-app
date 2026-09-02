@@ -42,6 +42,7 @@ const AUTH_EMAIL_RATE_LIMITED_MESSAGE =
 const INVITATION_NOT_PENDING_CODE = 'INVITATION_NOT_PENDING'
 const PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT_CODE =
   'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT'
+const EXISTING_AUTH_ACCOUNT = Symbol('existing-auth-account')
 
 type OwnerContext = {
   userId: string
@@ -638,6 +639,20 @@ export class WorkspaceService {
           HttpStatus.TOO_MANY_REQUESTS
         )
       }
+      const providerCode =
+        result && typeof result === 'object' && !Array.isArray(result) &&
+        Object.prototype.hasOwnProperty.call(result, 'code')
+          ? (result as { code?: unknown }).code
+          : null
+      if (
+        path === '/auth/v1/invite' &&
+        response.status === HttpStatus.UNPROCESSABLE_ENTITY &&
+        providerCode === 'email_exists'
+      ) {
+        // Existing confirmed accounts are intentionally indistinguishable from
+        // eligible new addresses at this email-entry boundary.
+        return EXISTING_AUTH_ACCOUNT
+      }
       throw new BadRequestException('The requested HawkView account operation could not be completed.')
     }
     return result
@@ -671,46 +686,58 @@ export class WorkspaceService {
     if (!/^\S+@\S+\.\S+$/.test(email)) { throw new BadRequestException('Enter a valid email address.')
       }
     if (!ROLE_VALUES.has(role)) { throw new BadRequestException('Select a valid workspace role.')
-      } user = await this.prisma.user.findUnique({ where: { email } })
-      if (user) {
-        // Keep the email-address endpoint enumeration resistant. Authorized
-        // resends use an organization-scoped membership ID instead.
-        throw new ConflictException(
-          'That invitation cannot be created. Review the workspace member list or contact a platform administrator.'
-        )
       }
-      if (!user) {
-        stage = 'AUTH_PROVIDER'
-        const invite = ( await this.supabaseAdminRequest('/auth/v1/invite', {
-          method: 'POST',
-          body: JSON.stringify({
-            email,
-            data: displayName ? { display_name: displayName } : undefined,
-            redirect_to: this.authEmailRedirectUrl(),
-          }),
-        })) as { id?: unknown; user?: { id?: unknown } } | null
-        const authProviderUserId = typeof invite?.id === 'string'
-          ? invite.id
-          : typeof invite?.user?.id === 'string' ? invite.user.id : null
+      stage = 'AUTH_PROVIDER'
+      const invite = await this.supabaseAdminRequest('/auth/v1/invite', {
+        method: 'POST',
+        body: JSON.stringify({
+          email,
+          data: displayName ? { display_name: displayName } : undefined,
+          redirect_to: this.authEmailRedirectUrl(),
+        }),
+      })
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_INVITE_PROVIDER_RESOLVED',
+        outcome: 'SUCCEEDED',
+        stage: 'AUTH_PROVIDER',
+        metadata: { delivery },
+      })
+
+      stage = 'USER_PERSISTENCE'
+      user = await this.prisma.user.findUnique({ where: { email } })
+      if (invite === EXISTING_AUTH_ACCOUNT || user) {
         await this.audit(actor, {
           ...operation,
           ...target,
-          action: 'WORKSPACE_MEMBER_INVITE_PROVIDER_ACCEPTED',
+          action: 'WORKSPACE_MEMBER_INVITE_REQUEST_RESOLVED',
           outcome: 'SUCCEEDED',
-          stage: 'AUTH_PROVIDER',
-          metadata: { delivery },
+          stage: 'COMPLETED',
+          metadata: { role, delivery },
         })
-        stage = 'USER_PERSISTENCE'
-        user = await this.prisma.user.create({
-          data: { email, displayName, authProviderUserId, inviteSentAt: new Date(), },
-        })
-        target = this.memberTarget(operation, user.id)
+        return {
+          accepted: true,
+          delivery,
+          operationId: operation.operationId,
+          requestId: operation.requestId,
+        }
       }
-    if (!user) { throw new ServiceUnavailableException('HawkView invitation could not be created.')
-      }
+
+      const providerInvite = invite as
+        | { id?: unknown; user?: { id?: unknown } }
+        | null
+      const authProviderUserId = typeof providerInvite?.id === 'string'
+        ? providerInvite.id
+        : typeof providerInvite?.user?.id === 'string'
+          ? providerInvite.user.id
+          : null
+      user = await this.prisma.user.create({
+        data: { email, displayName, authProviderUserId, inviteSentAt: new Date(), },
+      })
       target = this.memberTarget(operation, user.id)
       stage = 'MEMBERSHIP_PERSISTENCE'
-    const membership = await this.prisma.$transaction(async (transaction) => {
+    await this.prisma.$transaction(async (transaction) => {
         const persisted = await transaction.membership.upsert({
       where: { userId_organizationId: { userId: user!.id, organizationId: actor.organizationId, }, },
       create: { userId: user!.id, organizationId: actor.organizationId, role, status: MembershipStatus.ACTIVE, },
@@ -720,8 +747,8 @@ export class WorkspaceService {
     await this.audit(actor,
           {
             ...operation,
-            ...target,
-            action: 'WORKSPACE_MEMBER_INVITED',
+            ...this.memberTarget(operation),
+            action: 'WORKSPACE_MEMBER_INVITE_REQUEST_RESOLVED',
             outcome: 'SUCCEEDED',
             stage: 'COMPLETED',
             metadata: { role, delivery },
@@ -729,7 +756,7 @@ export class WorkspaceService {
           transaction
         )
         return persisted })
-    return { member: this.memberView(membership), delivery,
+    return { accepted: true, delivery,
         operationId: operation.operationId,
         requestId: operation.requestId,
       }

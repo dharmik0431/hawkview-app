@@ -115,6 +115,9 @@ test('pending invitations and accepted-account password resets remain separate a
 })
 
 test('team invitation failures preserve the form and use only the safe error contract', () => {
+  assert.match(workspacePage, /Invitation request accepted/)
+  assert.match(workspacePage, /If eligible, the recipient will receive a HawkView invitation/)
+  assert.doesNotMatch(workspacePage, /Invitation sent to/)
   assert.match(workspacePage, /workspaceAdminErrorMessage\(error, fallback\)/)
   assert.match(workspacePage, /const invitationSent = await runAction\(/)
   const failureGuard = workspacePage.indexOf('if (!invitationSent) return')
