@@ -1,0 +1,499 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { ForbiddenException } from '@nestjs/common'
+import type { PrismaService } from '../prisma/prisma.service.js'
+import { IdentityRiskService } from './identity-risk.service.js'
+
+const identity = { subject: 'auth-user', email: 'owner@example.com' }
+const organizationId = '11111111-1111-4111-8111-111111111111'
+const tenantId = '22222222-2222-4222-8222-222222222222'
+const runId = '33333333-3333-4333-8333-333333333333'
+
+function scoped(overrides: Record<string, unknown> = {}) {
+  return {
+    user: {
+      findUnique: async () => ({
+        disabledAt: null,
+        memberships: [{ organizationId, role: 'MSP_OWNER' }],
+      }),
+    },
+    customerTenant: {
+      findFirst: async () => ({ id: tenantId, organizationId }),
+    },
+    syncState: {
+      findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: new Date() }),
+    },
+    ...overrides,
+  } as unknown as PrismaService
+}
+
+function currentRun(now: Date) {
+  return {
+    id: runId,
+    engineVersion: 'hawkview-identity-engine/1',
+    catalogVersion: 'hawkview-identity-signals/v1',
+    capability: 'FULL',
+    completedAt: now,
+    alertDeliveryDisabled: true,
+  }
+}
+
+function finding(index: number, observedAt: Date) {
+  return {
+    id: `finding-${String(index).padStart(3, '0')}`,
+    state: 'OPEN',
+    severity: 'HIGH',
+    confidence: 'HIGH',
+    coverage: 'FULL',
+    ruleId: 'HV-ID-CHG-001.v1',
+    subjectType: 'USER',
+    subjectId: `identity-${String(index).padStart(3, '0')}`,
+    observedAt,
+    explanation: { token: 'must never be projected' },
+  }
+}
+
+test('default OFF returns stable empty envelopes without risk-table reads', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  let riskReads = 0
+  try {
+    const prisma = scoped({
+      identityRiskEvaluationRun: {
+        findFirst: async () => { riskReads += 1; throw new Error('unexpected') },
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => { riskReads += 1; throw new Error('unexpected') },
+      },
+    })
+    const service = new IdentityRiskService(prisma)
+    const summary = await service.summary(identity, tenantId)
+    const findings = await service.findings(identity, tenantId)
+    const microsoft = await service.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(summary.status, 'UNAVAILABLE')
+    assert.equal(summary.counts.identitiesNeedingReview.exact, false)
+    assert.deepEqual(findings.pageInfo, { hasMore: false, nextCursor: null })
+    assert.deepEqual(microsoft.users, [])
+    assert.equal(riskReads, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('cross-organization tenant access is denied before evidence reads', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  let evidenceReads = 0
+  try {
+    const prisma = scoped({
+      customerTenant: { findFirst: async () => null },
+      identityRiskEvaluationRun: {
+        findFirst: async () => { evidenceReads += 1; return null },
+      },
+    })
+    await assert.rejects(
+      () => new IdentityRiskService(prisma).findings(identity, tenantId),
+      ForbiddenException,
+    )
+    assert.equal(evidenceReads, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('summary and findings use one completed run and server-owned bounded wording', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = 'unit-test-only-cursor-secret-at-least-32-bytes'
+  const now = new Date()
+  let findingsWhere: unknown
+  try {
+    const rows = [finding(1, now)]
+    const prisma = scoped({
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskRuleCoverage: {
+        findMany: async () => [{
+          ruleId: 'HV-ID-CHG-001.v1',
+          matchedCount: 1,
+          suppressedCount: 0,
+          notMatchedCount: 25,
+          notEvaluatedCount: 0,
+          countsCapped: false,
+        }],
+      },
+      identityRiskFinding: {
+        count: async () => 1,
+        findMany: async (args: { where: unknown; distinct?: unknown }) => {
+          if (args.distinct) return [{ subjectId: 'identity-001' }]
+          findingsWhere = args.where
+          return rows
+        },
+      },
+    })
+    const service = new IdentityRiskService(prisma)
+    const summary = await service.summary(identity, tenantId)
+    const page = await service.findings(identity, tenantId)
+    assert.equal(summary.engineVersion, 'hawkview-identity-engine/1')
+    assert.equal(summary.catalogVersion, 'hawkview-identity-signals/v1')
+    assert.equal(summary.evaluatedAt, now.toISOString())
+    assert.deepEqual(summary.counts.identitiesNeedingReview, {
+      value: 1, exact: true, capped: false,
+    })
+    assert.equal(page.evaluatedAt, summary.evaluatedAt)
+    assert.equal(page.findings[0]?.ruleIds[0], 'HV-ID-CHG-001.v1')
+    assert.equal(
+      page.findings[0]?.explanation,
+      'An authoritative lifecycle event was followed by a privileged access assignment within the versioned rule window.',
+    )
+    assert.equal(JSON.stringify(page).includes('must never be projected'), false)
+    assert.equal(
+      (findingsWhere as { organizationId?: unknown }).organizationId,
+      organizationId,
+    )
+    assert.equal(
+      (findingsWhere as { customerTenantId?: unknown }).customerTenantId,
+      tenantId,
+    )
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+    if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+    else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
+  }
+})
+
+test('findings use default 50 pagination and disclose a scoped cursor', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = 'unit-test-only-cursor-secret-at-least-32-bytes'
+  const now = new Date()
+  try {
+    const rows = Array.from({ length: 51 }, (_, index) =>
+      finding(index, new Date(now.getTime() - index * 1_000)),
+    )
+    const prisma = scoped({
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskFinding: { findMany: async () => rows },
+    })
+    const page = await new IdentityRiskService(prisma).findings(identity, tenantId)
+    assert.equal(page.findings.length, 50)
+    assert.equal(page.pageInfo.hasMore, true)
+    assert.match(page.pageInfo.nextCursor ?? '', /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/)
+    assert.doesNotMatch(page.pageInfo.nextCursor ?? '', new RegExp(tenantId, 'i'))
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+    if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+    else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
+  }
+})
+
+test('summary labels capped database and unique-subject counts explicitly', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  try {
+    const prisma = scoped({
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskRuleCoverage: {
+        findMany: async () => [{
+          ruleId: 'HV-ID-CHG-001.v1',
+          matchedCount: 9,
+          suppressedCount: 0,
+          notMatchedCount: 1,
+          notEvaluatedCount: 0,
+          countsCapped: true,
+        }],
+      },
+      identityRiskFinding: {
+        count: async () => 10_001,
+        findMany: async () => Array.from(
+          { length: 10_001 },
+          (_, index) => ({ subjectId: `identity-${index}` }),
+        ),
+      },
+    })
+    const summary = await new IdentityRiskService(prisma).summary(identity, tenantId)
+    assert.deepEqual(summary.counts.openFindings, {
+      value: 10_000, exact: false, capped: true,
+    })
+    assert.deepEqual(summary.counts.identitiesNeedingReview, {
+      value: 10_000, exact: false, capped: true,
+    })
+    assert.deepEqual(summary.counts.matchedResults, {
+      value: 9, exact: false, capped: true,
+    })
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('Microsoft projection stays separate, bounded, tenant-opaque, and exact', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  try {
+    const prisma = scoped({
+      syncState: {
+        findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: now }),
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => ({
+          observedAt: now,
+          payload: [{
+            id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            userDisplayName: 'Example User',
+            userPrincipalName: 'user@example.com',
+            riskLevel: 'high',
+            riskState: 'atRisk',
+            riskDetail: 'adminConfirmedUserCompromised',
+            riskLastUpdatedDateTime: now.toISOString(),
+            rawSecret: 'must not escape',
+          }],
+        }),
+      },
+    })
+    const page = await new IdentityRiskService(prisma).microsoftRiskyUsers(
+      identity,
+      tenantId,
+    )
+    assert.equal(page.channel, 'MICROSOFT_ENTRA_RISKY_USERS')
+    assert.equal(page.engineVersion, null)
+    assert.equal(page.users.length, 1)
+    assert.match(page.users[0]?.id ?? '', /^msru_[a-f0-9]{32}$/)
+    assert.deepEqual(Object.keys(page.users[0] ?? {}).sort(), [
+      'id', 'identityLabel', 'observedAt', 'riskDetail', 'riskLevel', 'riskState',
+    ])
+    assert.equal(JSON.stringify(page).includes('rawSecret'), false)
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+  }
+})
+
+test('Microsoft results use the same default 50 page and scoped cursor contract', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET =
+    'unit-test-only-cursor-secret-at-least-32-bytes'
+  const now = new Date()
+  try {
+    const payload = Array.from({ length: 51 }, (_, index) => ({
+      id: `microsoft-risk-${String(index).padStart(3, '0')}`,
+      userDisplayName: `Example User ${index}`,
+      riskLevel: 'medium',
+      riskState: 'atRisk',
+      riskDetail: 'none',
+      riskLastUpdatedDateTime: new Date(now.getTime() - index * 1_000).toISOString(),
+    }))
+    const prisma = scoped({
+      syncState: {
+        findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: now }),
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => ({ observedAt: now, payload }),
+      },
+    })
+    const page = await new IdentityRiskService(prisma).microsoftRiskyUsers(
+      identity,
+      tenantId,
+    )
+    assert.equal(page.users.length, 50)
+    assert.equal(page.pageInfo.hasMore, true)
+    assert.match(page.pageInfo.nextCursor ?? '', /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/)
+    assert.equal(page.evaluatedAt, now.toISOString())
+    assert.equal(page.observedAt, now.toISOString())
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+    if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+    else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
+  }
+})
+
+test('empty or future Microsoft snapshots fail closed and never report zero risk', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    const empty = new IdentityRiskService(scoped({
+      tenantEntraSnapshot: {
+        findFirst: async () => ({ payload: [], observedAt: new Date() }),
+      },
+    }))
+    const emptyResult = await empty.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(emptyResult.status, 'UNAVAILABLE')
+    assert.deepEqual(emptyResult.users, [])
+
+    const future = new IdentityRiskService(scoped({
+      syncState: {
+        findFirst: async () => ({
+          status: 'SUCCEEDED',
+          lastSuccessfulAt: new Date(Date.now() + 5 * 60 * 1_000 + 5_000),
+        }),
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => ({
+          payload: [{
+            id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            riskLevel: 'none',
+            riskState: 'none',
+          }],
+          observedAt: new Date(Date.now() + 5 * 60 * 1_000 + 5_000),
+        }),
+      },
+    }))
+    const futureResult = await future.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(futureResult.status, 'ERROR')
+    assert.deepEqual(futureResult.users, [])
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('failed Microsoft collection and malformed risk detail fail closed', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  const payload = [{
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    riskLevel: 'high',
+    riskState: 'atRisk',
+    riskLastUpdatedDateTime: now.toISOString(),
+  }]
+  try {
+    const failed = new IdentityRiskService(scoped({
+      syncState: {
+        findFirst: async () => ({ status: 'FAILED', lastSuccessfulAt: now }),
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => ({ payload, observedAt: now }),
+      },
+    }))
+    const failedResult = await failed.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(failedResult.status, 'ERROR')
+    assert.deepEqual(failedResult.users, [])
+
+    const malformed = new IdentityRiskService(scoped({
+      syncState: {
+        findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: now }),
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => ({
+          observedAt: now,
+          payload: [{ ...payload[0], riskDetail: { secret: 'forbidden' } }],
+        }),
+      },
+    }))
+    const malformedResult = await malformed.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(malformedResult.status, 'ERROR')
+    assert.deepEqual(malformedResult.users, [])
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('finding detail requires owner or admin and remains tenant scoped', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  let findingReads = 0
+  try {
+    const prisma = scoped({
+      user: {
+        findUnique: async () => ({
+          disabledAt: null,
+          memberships: [{ organizationId, role: 'MSP_TECHNICIAN' }],
+        }),
+      },
+      identityRiskFinding: {
+        findFirst: async () => { findingReads += 1; return null },
+      },
+    })
+    await assert.rejects(
+      () => new IdentityRiskService(prisma).findingDetail(identity, tenantId, 'finding-001'),
+      ForbiddenException,
+    )
+    assert.equal(findingReads, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('owner finding detail is bounded, catalog-owned, and scoped to the same run', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  let where: unknown
+  try {
+    const row = finding(1, now)
+    const prisma = scoped({
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskFinding: {
+        findFirst: async (args: { where: unknown }) => {
+          where = args.where
+          return row
+        },
+      },
+    })
+    const detail = await new IdentityRiskService(prisma).findingDetail(
+      identity,
+      tenantId,
+      row.id,
+    )
+    assert.equal(detail.finding?.id, row.id)
+    assert.deepEqual(detail.evidenceReferences, [])
+    assert.equal(JSON.stringify(detail).includes('must never be projected'), false)
+    assert.equal((where as { organizationId?: unknown }).organizationId, organizationId)
+    assert.equal((where as { customerTenantId?: unknown }).customerTenantId, tenantId)
+    assert.equal(
+      (where as { matchedResult?: { evaluationRunId?: unknown } }).matchedResult
+        ?.evaluationRunId,
+      runId,
+    )
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('retention pruning is ordered and scoped by both organization and tenant', async () => {
+  const calls: Array<{ model: string; where: unknown }> = []
+  const deleteModel = (model: string) => ({
+    deleteMany: async ({ where }: { where: unknown }) => {
+      calls.push({ model, where })
+      return { count: 1 }
+    },
+  })
+  const transaction = {
+    identityRiskFinding: deleteModel('finding'),
+    identityRiskMatchedResult: deleteModel('matched'),
+    identityRiskRuleCoverage: deleteModel('coverage'),
+    identityRiskEvaluationRun: deleteModel('run'),
+  }
+  const prisma = {
+    $transaction: async (callback: (value: typeof transaction) => unknown) => callback(transaction),
+  } as unknown as PrismaService
+  const result = await new IdentityRiskService(prisma).pruneExpired(
+    organizationId,
+    tenantId,
+    new Date(),
+  )
+  assert.deepEqual(result, {
+    findings: 1, matchedResults: 1, coverage: 1, runs: 1,
+  })
+  assert.deepEqual(calls.map((call) => call.model), [
+    'finding', 'matched', 'coverage', 'run',
+  ])
+  for (const call of calls) {
+    assert.equal((call.where as { organizationId?: unknown }).organizationId, organizationId)
+    assert.equal((call.where as { customerTenantId?: unknown }).customerTenantId, tenantId)
+  }
+})

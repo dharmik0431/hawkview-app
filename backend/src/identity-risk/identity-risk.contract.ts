@@ -1,17 +1,184 @@
-export type IdentitySignalOutcome = 'MATCHED' | 'NOT_MATCHED' | 'NOT_EVALUATED' | 'SUPPRESSED'
-export type IdentitySignalCoverage = 'FULL' | 'PARTIAL' | 'UNAVAILABLE'
-export type IdentitySignalContext = Readonly<{ organizationId: string; customerTenantId: string; evaluationAt: Date; engineVersion: string; sources: Readonly<Record<string, readonly Record<string, unknown>[]>> }>
-export type IdentitySignalResult = Readonly<{ ruleId: string; ruleVersion: string; outcome: IdentitySignalOutcome; coverage: IdentitySignalCoverage; reasonCode?: string; subjectType?: string; subjectId?: string; severity?: 'LOW'|'MEDIUM'|'HIGH'|'CRITICAL'; confidence?: 'LOW'|'MEDIUM'|'HIGH'; explanation?: Readonly<Record<string,string>>; observedAt?: Date }>
-/** Formulas are supplied by the detector owner; platform owns source gating and persistence. */
-export interface IdentitySignalDetector { readonly ruleId: string; evaluate(context: IdentitySignalContext): readonly IdentitySignalResult[] }
+export const IDENTITY_RISK_API_VERSION = 1 as const
+export const IDENTITY_RISK_ENGINE_VERSION = 'hawkview-identity-engine/1' as const
+export const IDENTITY_RISK_CATALOG_VERSION = 'hawkview-identity-signals/v1' as const
+export const MICROSOFT_RISK_CATALOG_VERSION = 'microsoft-entra-risky-users/v1' as const
+export const IDENTITY_RISK_MAX_FUTURE_SKEW_MS = 5 * 60 * 1_000
+export const IDENTITY_RISK_DEFAULT_PAGE_SIZE = 50
+export const IDENTITY_RISK_MAX_PAGE_SIZE = 100
+export const IDENTITY_RISK_MAX_RULE_IDS = 10
+export const IDENTITY_RISK_MAX_LIST_ITEMS = 10
 
-/** Public read contract. Frontend must reject any payload without version 1 + exact channel. */
-export type IdentityRiskReadiness = 'AVAILABLE' | 'STALE' | 'LEARNING' | 'NOT_EVALUATED' | 'UNAVAILABLE' | 'ERROR'
-export type IdentityRiskChannel = 'HAWKVIEW_IDENTITY_SIGNALS' | 'MICROSOFT_ENTRA_RISKY_USERS'
-export type IdentityRiskReadDto = Readonly<{ version: 1; channel: IdentityRiskChannel; capability: IdentitySignalCoverage; status: IdentityRiskReadiness; sourceLabel: string; observedAt: string | null; freshness: 'CURRENT'|'STALE'|'UNKNOWN'; limitation: string | null }>
+export type IdentitySignalOutcome =
+  | 'MATCHED'
+  | 'NOT_MATCHED'
+  | 'NOT_EVALUATED'
+  | 'SUPPRESSED'
+export type IdentitySignalCoverage = 'FULL' | 'PARTIAL' | 'UNAVAILABLE'
+export type IdentitySignalSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+export type IdentitySignalConfidence = 'LOW' | 'MEDIUM' | 'HIGH'
+export type IdentitySubjectType = 'USER' | 'MAILBOX' | 'APPLICATION' | 'UNKNOWN'
+
+export type IdentitySignalEvaluationContext = Readonly<{
+  organizationId: string
+  customerTenantId: string
+  evaluationAt: Date
+  engineVersion: string
+  catalogVersion: string
+  sources: Readonly<Record<string, readonly Readonly<Record<string, unknown>>[]>>
+}>
+
+export type IdentitySignalResult = Readonly<{
+  ruleId: string
+  outcome: IdentitySignalOutcome
+  coverage: IdentitySignalCoverage
+  reasonCode?: string
+  subjectType?: IdentitySubjectType
+  subjectId?: string
+  severity?: IdentitySignalSeverity
+  confidence?: IdentitySignalConfidence
+  observedAt?: Date
+}>
+
+/** Formulas are supplied by the detector owner; platform owns source gating and persistence. */
+export interface IdentitySignalDetector {
+  readonly ruleId: string
+  evaluate(
+    context: IdentitySignalEvaluationContext,
+  ): readonly IdentitySignalResult[] | Promise<readonly IdentitySignalResult[]>
+}
+
+export type IdentityRiskSourceBatch = Readonly<{
+  context: IdentitySignalEvaluationContext
+  orderedSourceWatermarks: readonly string[]
+  earliestSourceExpiry: Date | null
+  capability: IdentitySignalCoverage
+}>
+
+export type IdentityRiskReadiness =
+  | 'AVAILABLE'
+  | 'STALE'
+  | 'LEARNING'
+  | 'NOT_EVALUATED'
+  | 'UNAVAILABLE'
+  | 'ERROR'
+export type IdentityRiskChannel =
+  | 'HAWKVIEW_IDENTITY_SIGNALS'
+  | 'MICROSOFT_ENTRA_RISKY_USERS'
+export type IdentityRiskFreshness = 'CURRENT' | 'STALE' | 'UNKNOWN'
+
+export type IdentityRiskEnvelope = Readonly<{
+  version: 1
+  channel: IdentityRiskChannel
+  engineVersion: string | null
+  catalogVersion: string
+  evaluatedAt: string | null
+  capability: IdentitySignalCoverage
+  status: IdentityRiskReadiness
+  sourceLabel: string
+  observedAt: string | null
+  freshness: IdentityRiskFreshness
+  limitation: string | null
+}>
+
+export type IdentityRiskBoundedCount = Readonly<{
+  value: number
+  exact: boolean
+  capped: boolean
+}>
+
+export type IdentityRiskPageInfo = Readonly<{
+  hasMore: boolean
+  nextCursor: string | null
+}>
+
 export type IdentityRiskFindingDto = Readonly<{
-  id: string; state: 'OPEN'|'UPDATED'|'RESOLVED'|'EXPIRED'; severity: 'LOW'|'MEDIUM'|'HIGH'|'CRITICAL'; confidence: 'LOW'|'MEDIUM'|'HIGH'; coverage: IdentitySignalCoverage
-  title: string; affectedIdentity: Readonly<{ id: string; label: string; type: 'USER'|'MAILBOX'|'APPLICATION'|'UNKNOWN' }>
-  investigationGuidanceCode: 'REVIEW_ACTIVITY'|'REVIEW_ACCESS'|'REVIEW_MAILBOX_RULE'|'REVIEW_CONFIGURATION'
-  investigationGuidance: string; benignAlternativeCodes: readonly string[]; sourceLabels: readonly string[]; missingEvidenceLabels: readonly string[]; observedAt: string; ruleIds: readonly string[]
+  id: string
+  state: 'OPEN' | 'UPDATED' | 'RESOLVED' | 'EXPIRED'
+  severity: IdentitySignalSeverity
+  confidence: IdentitySignalConfidence
+  coverage: IdentitySignalCoverage
+  title: string
+  explanation: string
+  affectedIdentity: Readonly<{
+    id: string
+    label: string
+    type: IdentitySubjectType
+  }>
+  investigationGuidanceCode:
+    | 'REVIEW_ACTIVITY'
+    | 'REVIEW_ACCESS'
+    | 'REVIEW_MAILBOX_RULE'
+    | 'REVIEW_CONFIGURATION'
+  investigationGuidance: string
+  benignAlternativeCodes: readonly string[]
+  sourceLabels: readonly string[]
+  missingEvidenceLabels: readonly string[]
+  observedAt: string
+  ruleIds: readonly string[]
+}>
+
+export type MicrosoftRiskLevel =
+  | 'none'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'hidden'
+  | 'unknownFutureValue'
+export type MicrosoftRiskState =
+  | 'none'
+  | 'atRisk'
+  | 'remediated'
+  | 'dismissed'
+  | 'confirmedSafe'
+  | 'confirmedCompromised'
+  | 'unknownFutureValue'
+
+export type MicrosoftRiskDetail =
+  | 'none'
+  | 'adminGeneratedTemporaryPassword'
+  | 'userPerformedSecuredPasswordChange'
+  | 'userPerformedSecuredPasswordReset'
+  | 'adminConfirmedSigninSafe'
+  | 'aiConfirmedSigninSafe'
+  | 'userPassedMFADrivenByRiskBasedPolicy'
+  | 'adminDismissedAllRiskForUser'
+  | 'adminConfirmedSigninCompromised'
+  | 'hidden'
+  | 'adminConfirmedUserCompromised'
+  | 'm365DAdminDismissedDetection'
+  | 'userChangedPasswordOnPremises'
+  | 'adminDismissedRiskForSignIn'
+  | 'adminConfirmedAccountSafe'
+  | 'unknownFutureValue'
+
+export type MicrosoftRiskyUserDto = Readonly<{
+  id: string
+  identityLabel: string
+  riskLevel: MicrosoftRiskLevel
+  riskState: MicrosoftRiskState
+  riskDetail: MicrosoftRiskDetail | null
+  observedAt: string
+}>
+
+export type IdentityRiskControlType =
+  | 'ALERT_DELIVERY_DISABLED'
+  | 'EVALUATION_HARD_DISABLED'
+export type IdentityRiskControlScope =
+  | Readonly<{ type: 'GLOBAL' }>
+  | Readonly<{
+      type: 'TENANT'
+      organizationId: string
+      customerTenantId: string
+    }>
+
+export type IdentityRiskEvaluationRequest = Readonly<{
+  organizationId: string
+  customerTenantId: string
+  engineVersion: typeof IDENTITY_RISK_ENGINE_VERSION
+  catalogVersion: typeof IDENTITY_RISK_CATALOG_VERSION
+  windowStart: Date
+  windowEnd: Date
+  evaluationAt: Date
+  loadSources: () => Promise<IdentityRiskSourceBatch>
+  detectors: readonly IdentitySignalDetector[]
 }>
