@@ -101,7 +101,11 @@ test('pending invitations and accepted-account password resets remain separate a
   assert.match(workspacePage, /member\.hasHawkViewAccount && \(/)
   assert.match(
     workspacePage,
-    /action === 'RESEND_INVITE' && m\.hasHawkViewAccount !== false/
+    /canResendInvitation\(member, organizationId\)/
+  )
+  assert.match(
+    workspacePage,
+    /action === 'RESEND_INVITE'[\s\S]{0,160}!canResendInvitation\(m, selectedOrganizationId\)/
   )
   assert.match(
     workspacePage,
