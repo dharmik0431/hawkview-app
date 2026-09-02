@@ -10,6 +10,7 @@ function channelMeta(overrides: Record<string, unknown> = {}) {
     capability: 'FULL',
     status: 'AVAILABLE',
     sourceLabel: 'HawkView Identity Signals',
+    evaluatedAt: now,
     observedAt: now,
     freshness: 'CURRENT',
     limitation: null,
@@ -247,6 +248,8 @@ test('rejects secret-shaped strings and autonomous instructions', () => {
     finding({ title: 'Bearer TOPSECRET-CREDENTIAL' }),
     finding({ explanation: '{"access_token":["ARRAYSECRET1"]}' }),
     finding({ title: 'code=OAUTHCODESECRET' }),
+    finding({ title: 'authorization_code=OAUTHCODESECRET' }),
+    finding({ title: 'sig=SIGNATURESECRET' }),
     finding({ title: 'password%3DENCODEDSECRET' }),
     finding({ investigationGuidance: 'Review and wipe this mailbox immediately.' }),
   ]) {
@@ -353,7 +356,6 @@ test('rejects contradictory metadata and future evidence timestamps', () => {
     { freshness: 'STALE' },
     { observedAt: '2026-09-01T12:00:00.000Z' },
     { limitation: 'Different limitation' },
-    { observedAt: new Date(Date.now() + 6 * 60 * 1_000).toISOString() },
   ]) {
     const responses = validResponses()
     responses.hawkViewFindings = {
@@ -362,6 +364,30 @@ test('rejects contradictory metadata and future evidence timestamps', () => {
     }
     assert.equal(adaptIdentityRiskResponses(responses).hawkView.meta.status, 'ERROR')
   }
+
+  const futureEvidence = validResponses()
+  for (const key of ['hawkViewSummary', 'hawkViewFindings'] as const) {
+    futureEvidence[key] = {
+      ...futureEvidence[key],
+      observedAt: '2026-09-02T12:06:00.000Z',
+    }
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(futureEvidence).hawkView.meta.status,
+    'ERROR'
+  )
+
+  const toleratedSkew = validResponses()
+  for (const key of ['hawkViewSummary', 'hawkViewFindings'] as const) {
+    toleratedSkew[key] = {
+      ...toleratedSkew[key],
+      observedAt: '2026-09-02T12:05:00.000Z',
+    }
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(toleratedSkew).hawkView.meta.status,
+    'AVAILABLE'
+  )
 
   const unsafeErrorState = validResponses()
   unsafeErrorState.microsoftRiskyUsers = {

@@ -15,6 +15,7 @@ export type IdentityRiskChannelMeta = {
   status: IdentityRiskChannelStatus
   freshness: IdentityRiskFreshness
   sourceLabel: string
+  evaluatedAt: string | null
   observedAt: string | null
   limitation: string | null
 }

@@ -96,11 +96,17 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
 
 function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
   return (
-    <dl className="grid grid-cols-1 gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800 sm:grid-cols-3">
+    <dl className="grid grid-cols-1 gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800 sm:grid-cols-2 lg:grid-cols-4">
       <div>
         <dt className="text-slate-500 dark:text-slate-400">Source</dt>
         <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
           {meta.sourceLabel}
+        </dd>
+      </div>
+      <div>
+        <dt className="text-slate-500 dark:text-slate-400">Channel evaluated</dt>
+        <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
+          {formatTimestamp(meta.evaluatedAt)}
         </dd>
       </div>
       <div>

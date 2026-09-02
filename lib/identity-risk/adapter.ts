@@ -133,8 +133,10 @@ function containsSecret(value: string) {
     const trimmed = candidate.trim()
     return (
       /^[\[{]/.test(trimmed) ||
-      /\b(?:password|passwd|pwd|secret|token|access[-_ ]?token|refresh[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|authorization|private[-_ ]?key|session[-_ ]?id|oauth[-_ ]?code|code)\b[\s"'\[\]{}:,=%]+\S+/i.test(candidate) ||
+      /\b(?:password|passwd|pwd|secret|token|access[-_ ]?token|refresh[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|authorization|authorization[-_ ]?code|private[-_ ]?key|session[-_ ]?id|oauth[-_ ]?code|account[-_ ]?key|signature|sig|code|credential|cookie)\b[\s"'\[\]{}:,=%]+\S+/i.test(candidate) ||
       /\bbearer\s+[A-Za-z0-9._~+\/=:-]{8,}/i.test(candidate) ||
+      /-----BEGIN [A-Z ]*PRIVATE KEY-----/i.test(candidate) ||
+      /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{20,})\b/.test(candidate) ||
       /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(candidate) ||
       /\bhttps?:\/\/[^\s/:@]+:[^\s/@]+@/i.test(candidate) ||
       /[?&](?:access_token|refresh_token|token|code|key|sig|password|secret)=/i.test(candidate)
@@ -158,15 +160,22 @@ function boundedString(value: unknown, max = 500): string | null {
 
 function dateTime(value: unknown): string | null {
   const candidate = boundedString(value, 100)
-  if (!candidate) return null
-  const parsed = new Date(candidate)
-  if (
-    !Number.isFinite(parsed.getTime()) ||
-    parsed.getTime() > Date.now() + MAX_FUTURE_SKEW_MS
-  ) {
+  if (!candidate || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(candidate)) {
     return null
   }
-  return candidate
+  const parsed = new Date(candidate)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString() === candidate
+    ? candidate
+    : null
+}
+
+function observedDateTime(value: unknown, evaluatedAt: string): string | null {
+  const candidate = dateTime(value)
+  if (!candidate) return null
+  return new Date(candidate).getTime() <=
+    new Date(evaluatedAt).getTime() + MAX_FUTURE_SKEW_MS
+    ? candidate
+    : null
 }
 
 function enumValue<const T extends readonly string[]>(
@@ -205,6 +214,7 @@ function fallbackMeta(
     status,
     freshness: 'UNKNOWN',
     sourceLabel: 'Not reported',
+    evaluatedAt: null,
     observedAt: null,
     limitation,
   }
@@ -218,7 +228,11 @@ function adaptMeta(
   const status = enumValue(value.status, statuses)
   const freshness = enumValue(value.freshness, freshnessValues)
   const sourceLabel = boundedString(value.sourceLabel, 160)
-  const observedAt = value.observedAt === null ? null : dateTime(value.observedAt)
+  const evaluatedAt = dateTime(value.evaluatedAt)
+  const observedAt =
+    value.observedAt === null || !evaluatedAt
+      ? null
+      : observedDateTime(value.observedAt, evaluatedAt)
   const limitation =
     value.limitation === null
       ? null
@@ -230,6 +244,7 @@ function adaptMeta(
     !freshness ||
     !sourceLabel ||
     sourceLabel !== expectedSourceLabel ||
+    !evaluatedAt ||
     (value.observedAt !== null && !observedAt) ||
     (value.limitation !== null && !limitation)
   ) {
@@ -264,6 +279,7 @@ function adaptMeta(
     status,
     freshness,
     sourceLabel,
+    evaluatedAt,
     observedAt,
     limitation,
   }
@@ -275,6 +291,7 @@ function sameMeta(left: IdentityRiskChannelMeta, right: IdentityRiskChannelMeta)
     left.status === right.status &&
     left.freshness === right.freshness &&
     left.sourceLabel === right.sourceLabel &&
+    left.evaluatedAt === right.evaluatedAt &&
     left.observedAt === right.observedAt &&
     left.limitation === right.limitation
   )
@@ -297,7 +314,10 @@ function adaptPageInfo(value: unknown): IdentityRiskPageInfo | null {
   return { hasMore: source.hasMore, nextCursor }
 }
 
-function adaptFinding(value: unknown): HawkViewIdentityFinding | null {
+function adaptFinding(
+  value: unknown,
+  evaluatedAt: string
+): HawkViewIdentityFinding | null {
   const source = record(value)
   if (
     !source ||
@@ -343,7 +363,7 @@ function adaptFinding(value: unknown): HawkViewIdentityFinding | null {
     'APPLICATION',
     'UNKNOWN',
   ] as const)
-  const observedAt = dateTime(source.observedAt)
+  const observedAt = observedDateTime(source.observedAt, evaluatedAt)
   const ruleIds = catalogList(source.ruleIds, ruleCatalog, 10, 150)
   const sourceLabels = catalogList(source.sourceLabels, sourceLabelCatalog, 10, 120)
   const missingEvidenceLabels = catalogList(
@@ -417,7 +437,10 @@ function adaptFinding(value: unknown): HawkViewIdentityFinding | null {
   }
 }
 
-function adaptMicrosoftUser(value: unknown): MicrosoftEntraRiskyUser | null {
+function adaptMicrosoftUser(
+  value: unknown,
+  evaluatedAt: string
+): MicrosoftEntraRiskyUser | null {
   const source = record(value)
   if (
     !source ||
@@ -455,7 +478,7 @@ function adaptMicrosoftUser(value: unknown): MicrosoftEntraRiskyUser | null {
     source.riskDetail === null || source.riskDetail === undefined
       ? null
       : boundedString(source.riskDetail, 200)
-  const observedAt = dateTime(source.observedAt)
+  const observedAt = observedDateTime(source.observedAt, evaluatedAt)
 
   if (
     !id ||
@@ -520,6 +543,7 @@ export function adaptIdentityRiskResponses(input: {
       'capability',
       'status',
       'sourceLabel',
+      'evaluatedAt',
       'observedAt',
       'freshness',
       'limitation',
@@ -535,6 +559,7 @@ export function adaptIdentityRiskResponses(input: {
       'capability',
       'status',
       'sourceLabel',
+      'evaluatedAt',
       'observedAt',
       'freshness',
       'limitation',
@@ -545,8 +570,11 @@ export function adaptIdentityRiskResponses(input: {
     const meta = adaptMeta(summary, hawkViewSourceLabel)
     const findingMeta = adaptMeta(findingEnvelope, hawkViewSourceLabel)
     const rawFindings = findingEnvelope.findings
-    const findings = Array.isArray(rawFindings) && rawFindings.length <= MAX_PAGE_SIZE
-      ? rawFindings.map(adaptFinding)
+    const findings =
+      meta?.evaluatedAt &&
+      Array.isArray(rawFindings) &&
+      rawFindings.length <= MAX_PAGE_SIZE
+      ? rawFindings.map((finding) => adaptFinding(finding, meta.evaluatedAt!))
       : null
     const pageInfo = adaptPageInfo(findingEnvelope.pageInfo)
     if (
@@ -588,6 +616,7 @@ export function adaptIdentityRiskResponses(input: {
       'capability',
       'status',
       'sourceLabel',
+      'evaluatedAt',
       'observedAt',
       'freshness',
       'limitation',
@@ -597,8 +626,11 @@ export function adaptIdentityRiskResponses(input: {
   ) {
     const meta = adaptMeta(microsoftEnvelope, microsoftSourceLabel)
     const rawUsers = microsoftEnvelope.users
-    const users = Array.isArray(rawUsers) && rawUsers.length <= MAX_PAGE_SIZE
-      ? rawUsers.map(adaptMicrosoftUser)
+    const users =
+      meta?.evaluatedAt &&
+      Array.isArray(rawUsers) &&
+      rawUsers.length <= MAX_PAGE_SIZE
+      ? rawUsers.map((user) => adaptMicrosoftUser(user, meta.evaluatedAt!))
       : null
     const pageInfo = adaptPageInfo(microsoftEnvelope.pageInfo)
     if (
