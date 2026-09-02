@@ -77,6 +77,7 @@ test('Admin workspace reads and mutations carry one URL-selected organization UU
   assert.match(workspacePage, /organizationId: selectedOrganizationId, status:/)
   assert.match(workspacePage, /organizationId: selectedOrganizationId,\s+email:/)
   assert.match(workspacePage, /password-reset`,\s+\{ organizationId: selectedOrganizationId \}/)
+  assert.match(workspacePage, /resend-invite`,\s+\{ organizationId: selectedOrganizationId \}/)
   assert.match(workspacePage, /mfa-reset`,\s+\{ organizationId: selectedOrganizationId \}/)
   assert.match(workspacePage, /undefined,\s+\{ params: \{ organizationId: selectedOrganizationId \} \}/)
   assert.match(workspacePage, /workspaceResponse\?\.organization\.id === selectedOrganizationId/)
@@ -94,6 +95,23 @@ test('Admin workspace reads and mutations carry one URL-selected organization UU
     /organizationProfile && workspace\?\.canEditOrganization === true/
   )
   assert.doesNotMatch(workspacePage, /find\(\(m\) => m\.role === 'MSP_OWNER'\) \|\|/)
+})
+
+test('pending invitations and accepted-account password resets remain separate actions', () => {
+  assert.match(workspacePage, /member\.hasHawkViewAccount && \(/)
+  assert.match(
+    workspacePage,
+    /action === 'RESEND_INVITE' && m\.hasHawkViewAccount !== false/
+  )
+  assert.match(
+    workspacePage,
+    /action === 'PASSWORD_RESET' && m\.hasHawkViewAccount !== true/
+  )
+  assert.match(workspacePage, /fresh HawkView invitation link/)
+  assert.doesNotMatch(
+    workspacePage,
+    /RESEND_INVITE'[\s\S]{0,500}apiClient\.post\('\/api\/workspace\/members\/invite'/
+  )
 })
 
 test('team invitation failures preserve the form and use only the safe error contract', () => {

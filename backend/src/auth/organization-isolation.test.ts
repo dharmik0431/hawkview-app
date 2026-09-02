@@ -312,7 +312,7 @@ for (const profileState of ['legacy', 'accepted'] as const) {
           email: 'existing@example.com',
           role: 'MSP_VIEWER',
         }),
-      /cannot be relinked by invitation/,
+      /invitation cannot be created/,
     )
     assert.equal(membershipWrites, 0)
   })

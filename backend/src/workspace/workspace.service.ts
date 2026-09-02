@@ -39,6 +39,9 @@ const STATUS_VALUES = new Set(Object.values(MembershipStatus))
 const AUTH_EMAIL_RATE_LIMITED_CODE = 'AUTH_EMAIL_RATE_LIMITED'
 const AUTH_EMAIL_RATE_LIMITED_MESSAGE =
   'Authentication email sending is temporarily rate-limited. Please wait a few minutes and try again.'
+const INVITATION_NOT_PENDING_CODE = 'INVITATION_NOT_PENDING'
+const PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT_CODE =
+  'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT'
 
 type OwnerContext = {
   userId: string
@@ -652,7 +655,7 @@ export class WorkspaceService {
     let stage = 'REQUEST_VALIDATION'
     let target = this.memberTarget(operation)
     let user: MemberRecord['user'] | null = null
-    let delivery: 'INVITE' | 'SETUP_LINK' = 'INVITE'
+    const delivery = 'INVITE' as const
 
     // The intent is durable before any external email side effect. If this
     // write fails the request stops and Supabase is never called.
@@ -669,22 +672,14 @@ export class WorkspaceService {
       }
     if (!ROLE_VALUES.has(role)) { throw new BadRequestException('Select a valid workspace role.')
       } user = await this.prisma.user.findUnique({ where: { email } })
-      target = this.memberTarget(operation, user?.id)
-      if (user?.disabledAt) {
-        throw new BadRequestException(
-          'This HawkView account is disabled and cannot be invited.'
+      if (user) {
+        // Keep the email-address endpoint enumeration resistant. Authorized
+        // resends use an organization-scoped membership ID instead.
+        throw new ConflictException(
+          'That invitation cannot be created. Review the workspace member list or contact a platform administrator.'
         )
       }
-      if (
-        user &&
-        !user.authProviderUserId &&
-        (!user.inviteSentAt || user.inviteAcceptedAt)
-      ) {
-        throw new BadRequestException(
-          'This email is associated with an existing HawkView profile that cannot be relinked by invitation. Contact a platform administrator.'
-        )
-      }
-      if (!user || !user.authProviderUserId) {
+      if (!user) {
         stage = 'AUTH_PROVIDER'
         const invite = ( await this.supabaseAdminRequest('/auth/v1/invite', {
           method: 'POST',
@@ -706,52 +701,11 @@ export class WorkspaceService {
           metadata: { delivery },
         })
         stage = 'USER_PERSISTENCE'
-        if (user) {
-          user = await this.prisma.user.update({
-            where: { id: user.id },
-            data: {
-              displayName: displayName ?? user.displayName,
-              authProviderUserId,
-              inviteSentAt: new Date(),
-              inviteAcceptedAt: null,
-            },
-          })
-        } else {
-          user = await this.prisma.user.create({
-            data: { email, displayName, authProviderUserId, inviteSentAt: new Date(), },
-          })
-        }
+        user = await this.prisma.user.create({
+          data: { email, displayName, authProviderUserId, inviteSentAt: new Date(), },
+        })
         target = this.memberTarget(operation, user.id)
-      } else if (!user.inviteAcceptedAt) {
-        // Supabase will not issue a second invite for an existing Auth user.
-        // A recovery link lets a pending recipient securely set their password.
-        delivery = 'SETUP_LINK'
-        stage = 'AUTH_PROVIDER'
-        await this.supabaseAdminRequest('/auth/v1/recover', {
-          method: 'POST',
-          body: JSON.stringify({
-            email: user.email,
-            redirect_to: this.authEmailRedirectUrl(),
-          }),
-        })
-        await this.audit(actor, {
-          ...operation,
-          ...target,
-          action: 'WORKSPACE_MEMBER_INVITE_PROVIDER_ACCEPTED',
-          outcome: 'SUCCEEDED',
-          stage: 'AUTH_PROVIDER',
-          metadata: { delivery },
-        })
-        stage = 'USER_PERSISTENCE'
-        user = await this.prisma.user.update({
-          where: { id: user.id },
-          data: { inviteSentAt: new Date() },
-        })
-      } else {
-        throw new BadRequestException(
-          'This member has already completed HawkView account setup. Use password reset instead.'
-        )
-    }
+      }
     if (!user) { throw new ServiceUnavailableException('HawkView invitation could not be created.')
       }
       target = this.memberTarget(operation, user.id)
@@ -793,6 +747,112 @@ export class WorkspaceService {
         },
       })
       throw error }
+  }
+
+  async resendMemberInvitation(
+    identity: AuthenticatedIdentity,
+    membershipId: string,
+    body: unknown,
+    requestId?: string
+  ) {
+    const actor = await this.ownerContext(identity, requiredOrganizationId(body))
+    const operation = this.operation(requestId)
+    const member = await this.memberForOwner(actor.organizationId, membershipId)
+    const target = this.memberTarget(operation, member.userId)
+    const delivery = 'INVITE_RESEND' as const
+    let stage = 'REQUEST_VALIDATION'
+
+    // Persist intent before the provider side effect. If evidence storage is
+    // unavailable, no invitation email is sent.
+    await this.audit(actor, {
+      ...operation,
+      ...target,
+      action: 'WORKSPACE_MEMBER_INVITE_RESEND_REQUESTED',
+      outcome: 'STARTED',
+      stage: 'REQUEST_ACCEPTED',
+      metadata: { delivery },
+    })
+
+    try {
+      const invitationIsPending =
+        member.status === MembershipStatus.ACTIVE &&
+        !member.user.disabledAt &&
+        Boolean(member.user.authProviderUserId) &&
+        Boolean(member.user.inviteSentAt) &&
+        !member.user.inviteAcceptedAt
+
+      if (!invitationIsPending) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: INVITATION_NOT_PENDING_CODE,
+            message:
+              'This member does not have a pending HawkView invitation. Use password reset for an accepted account.',
+          },
+          HttpStatus.CONFLICT
+        )
+      }
+
+      stage = 'AUTH_PROVIDER'
+      await this.supabaseAdminRequest('/auth/v1/invite', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: member.user.email,
+          data: member.user.displayName
+            ? { display_name: member.user.displayName }
+            : undefined,
+          redirect_to: this.authEmailRedirectUrl(),
+        }),
+      })
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_INVITE_RESEND_PROVIDER_ACCEPTED',
+        outcome: 'SUCCEEDED',
+        stage: 'AUTH_PROVIDER',
+        metadata: { delivery },
+      })
+
+      stage = 'USER_PERSISTENCE'
+      const invitationSentAt = new Date()
+      const updated = await this.prisma.$transaction(async (transaction) => {
+        const user = await transaction.user.update({
+          where: { id: member.userId },
+          data: { inviteSentAt: invitationSentAt },
+        })
+        await this.audit(
+          actor,
+          {
+            ...operation,
+            ...target,
+            action: 'WORKSPACE_MEMBER_INVITATION_RESENT',
+            outcome: 'SUCCEEDED',
+            stage: 'COMPLETED',
+            metadata: { delivery },
+          },
+          transaction
+        )
+        return user
+      })
+
+      return {
+        member: this.memberView({ ...member, user: updated }),
+        delivery,
+        operationId: operation.operationId,
+        requestId: operation.requestId,
+      }
+    } catch (error) {
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_INVITE_RESEND_FAILED',
+        outcome: 'FAILED',
+        stage,
+        errorCode: workspaceAuditErrorCode(error),
+        metadata: { delivery },
+      })
+      throw error
+    }
   }
 
   async updateMember(identity: AuthenticatedIdentity, membershipId: string, body: unknown,
@@ -901,6 +961,7 @@ export class WorkspaceService {
     const operation = this.operation(requestId)
     const member = await this.memberForOwner(actor.organizationId, membershipId)
     const target = this.memberTarget(operation, member.userId)
+    let stage = 'REQUEST_VALIDATION'
     await this.audit(actor, {
       ...operation,
       ...target,
@@ -909,6 +970,22 @@ export class WorkspaceService {
       stage: 'REQUEST_ACCEPTED',
     })
     try {
+      const accountCanResetPassword =
+        !member.user.disabledAt &&
+        Boolean(member.user.authProviderUserId) &&
+        Boolean(member.user.inviteAcceptedAt)
+      if (!accountCanResetPassword) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT_CODE,
+            message:
+              'Password reset is available only after the member accepts their HawkView invitation.',
+          },
+          HttpStatus.CONFLICT
+        )
+      }
+      stage = 'AUTH_PROVIDER'
       await this.supabaseAdminRequest('/auth/v1/recover', {
         method: 'POST',
         body: JSON.stringify({
@@ -932,7 +1009,7 @@ export class WorkspaceService {
         ...target,
         action: 'HAWKVIEW_PASSWORD_RESET_FAILED',
         outcome: 'FAILED',
-        stage: 'AUTH_PROVIDER',
+        stage,
         errorCode: workspaceAuditErrorCode(error),
       })
       throw error

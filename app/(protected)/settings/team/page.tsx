@@ -214,6 +214,10 @@ function formatActionLabel(action: string): string {
     MEMBER_INVITE_REQUESTED: 'Member invitation requested',
     MEMBER_INVITE_PROVIDER_ACCEPTED: 'Invitation accepted by email provider',
     MEMBER_INVITE_FAILED: 'Member invitation failed',
+    MEMBER_INVITE_RESEND_REQUESTED: 'Invitation resend requested',
+    MEMBER_INVITE_RESEND_PROVIDER_ACCEPTED: 'Resent invitation accepted by email provider',
+    MEMBER_INVITATION_RESENT: 'Invitation resent',
+    MEMBER_INVITE_RESEND_FAILED: 'Invitation resend failed',
     INVITE_MEMBER: 'Member invited',
     ROLE_CHANGED: 'Role changed',
     MEMBER_ROLE_CHANGED: 'Role changed',
@@ -348,14 +352,16 @@ function MemberActionMenu({
             </DropdownMenu.Item>
           )}
 
-          {/* Password Reset */}
-          <DropdownMenu.Item
-            onSelect={() => onPasswordReset(member)}
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
-          >
-            <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
-            <span>Send HawkView password reset</span>
-          </DropdownMenu.Item>
+          {/* Password reset is distinct from accepting a pending invitation. */}
+          {member.hasHawkViewAccount && (
+            <DropdownMenu.Item
+              onSelect={() => onPasswordReset(member)}
+              className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
+            >
+              <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+              <span>Send HawkView password reset</span>
+            </DropdownMenu.Item>
+          )}
 
           {/* Reset HawkView MFA */}
           <DropdownMenu.Item
@@ -1005,6 +1011,8 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
         if (isSelf || isFinal) return false
       }
       if (action === 'MFA_RESET' && isSelf) return false
+      if (action === 'RESEND_INVITE' && m.hasHawkViewAccount !== false) return false
+      if (action === 'PASSWORD_RESET' && m.hasHawkViewAccount !== true) return false
       return true
     })
 
@@ -1041,12 +1049,10 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
             { organizationId: selectedOrganizationId, status: 'ACTIVE' }
           )
         } else if (action === 'RESEND_INVITE') {
-          await apiClient.post('/api/workspace/members/invite', {
-            organizationId: selectedOrganizationId,
-            email: member.email,
-            displayName: member.displayName || undefined,
-            role: member.role,
-          })
+          await apiClient.post(
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/resend-invite`,
+            { organizationId: selectedOrganizationId }
+          )
         } else if (action === 'PASSWORD_RESET') {
           await apiClient.post(
             `/api/workspace/members/${encodeURIComponent(member.membershipId)}/password-reset`,
@@ -1305,13 +1311,11 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
     if (!selectedOrganizationId) return
     await runAction(
       () =>
-        apiClient.post('/api/workspace/members/invite', {
-          organizationId: selectedOrganizationId,
-          email: member.email,
-          displayName: member.displayName || undefined,
-          role: member.role,
-        }),
-      `Invitation re-sent to ${member.email}. The member will receive a secure HawkView setup link.`
+        apiClient.post(
+          `/api/workspace/members/${encodeURIComponent(member.membershipId)}/resend-invite`,
+          { organizationId: selectedOrganizationId }
+        ),
+      `Invitation resent to ${member.email}. The member will receive a fresh HawkView invitation link.`
     )
   }
 

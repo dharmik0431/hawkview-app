@@ -31,3 +31,20 @@ test('fails closed for unknown, malformed, and inherited errors', () => {
     assert.equal(workspaceAdminErrorMessage(error, fallback), fallback)
   }
 })
+
+test('maps only the approved pending-invitation and accepted-account conflicts', () => {
+  assert.equal(
+    workspaceAdminErrorMessage(
+      { status: 409, code: 'INVITATION_NOT_PENDING' },
+      fallback,
+    ),
+    'This member no longer has a pending HawkView invitation. Use password reset only for an accepted account.',
+  )
+  assert.equal(
+    workspaceAdminErrorMessage(
+      { status: 409, code: 'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT' },
+      fallback,
+    ),
+    'This member has not accepted their HawkView invitation. Resend the invitation instead of sending a password reset.',
+  )
+})
