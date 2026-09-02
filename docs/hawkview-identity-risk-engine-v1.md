@@ -71,7 +71,7 @@ The following describes code at the base commit of this specification. It is an 
 | Directory audit | Graph `/auditLogs/directoryAudits`; `AUDIT_LOGS` | `AuditLog.Read.All` and `Directory.Read.All`; no premium prerequisite in HawkView's contract | Identity lifecycle and privileged administrative change | Full only for current authoritative events |
 | Microsoft 365 administrative audit | Office 365 Management Activity API; `M365_AUDIT` | `ActivityFeed.Read`, unified audit enabled; content and retention depend on tenant configuration and licensing | Cross-check and mailbox/administrative change evidence | Full, Partial, or Unavailable from collection state |
 | Authentication posture | `AUTH_REGISTRATIONS`, `AUTH_METHOD_POLICIES`, `CONDITIONAL_ACCESS`, `SECURITY_DEFAULTS` | Per-user method fallback is broadly available; registration report and Conditional Access require P1/P2; Security Defaults does not | MFA exposure and protection context | Never infer enforcement from registration alone |
-| Mailbox settings and inbox rules | Graph mailbox settings and inbox message rules; `EXCHANGE_MAILBOX_SETTINGS`, `EXCHANGE_MAILBOX_RULES` | `MailboxSettings.Read` plus Exchange service plan | External forwarding and suspicious rule configuration | Available only for mailboxes successfully covered |
+| Mailbox settings and inbox rules | Graph mailbox settings and inbox message rules; `EXCHANGE_MAILBOX_SETTINGS`, `EXCHANGE_MAILBOX_RULES` | `MailboxSettings.Read` plus Exchange service plan | External forwarding and suspicious rule configuration | Available only for mailboxes successfully covered; rules that need absence/change proof also require authoritative condition/action completeness markers |
 | Full Graph sign-ins | Graph `/auditLogs/signIns`; `SIGN_INS` | `AuditLog.Read.All`, `Directory.Read.All`, and Entra ID P1 or P2 | Location, derived ASN, device, browser/client/app, failure/success, and legacy-auth rules; MFA-denial rules need a new allowlisted normalized detail | `FULL` only when current and structurally valid |
 | Limited sign-in fallback | Office 365 Management Activity API login evidence; `SIGN_INS` | `ActivityFeed.Read` and unified audit enabled | Only rules whose exact required fields exist in the normalized fallback | Always `PARTIAL`; unsupported fields remain unavailable |
 | Microsoft risky users | Graph `/identityProtection/riskyUsers`; `RISKY_USERS` | `IdentityRiskyUser.Read.All` and Entra ID P2 | Separate display-only Microsoft channel | `Microsoft Entra Risky Users`; unavailable is not zero |
@@ -133,7 +133,7 @@ Catalog version: `hawkview-identity-signals/v1`. Stable IDs never change meaning
 
 `HV-ID-EXP`, `HV-ID-CHG`, `HV-ID-APP`, and `HV-ID-MBX` rules can run for Free/non-premium, P1, or P2 tenants when their exact directory, policy, audit, app, domain, or mailbox evidence gates pass. `HV-ID-AUTH` rules and `HV-ID-EXP-003` require current sign-in fields and therefore usually need P1/P2 full Graph sign-ins; a limited fallback may run only a rule that explicitly proves all of its fields. `MS-ENTRA-RISKY-USER` is P2-only Microsoft display evidence, not a HawkView rule.
 
-Every comparison catalog is immutable and has `catalogType`, semantic `version`, sorted normalized values, SHA-256 digest, `DRAFT` or `APPROVED` status, two approver IDs where the catalog controls privileged/sensitive behavior, and effective time. A rule that names a catalog returns `NOT_EVALUATED/RULE_CONFIG_UNAPPROVED` until that exact version is approved. Tenant overrides require the same versioning, expiry, authorization, and audit. The privileged-role/group, high-impact operation, high-impact application-permission, and trusted-network/mobile/VPN catalogs remain product decisions; dependent rules are **not implementable and disabled** until those catalogs are locked.
+Every comparison catalog is immutable and has `catalogType`, semantic `version`, sorted normalized values, SHA-256 digest, `DRAFT` or `APPROVED` status, two approver IDs where the catalog controls privileged/sensitive behavior, and effective time. A rule that names a catalog returns `NOT_EVALUATED/RULE_CONFIG_UNAPPROVED` until that exact version is approved. Tenant overrides require the same versioning, expiry, authorization, and audit. The privileged-role/group, high-impact operation, high-impact application-permission, account-class, and network/context catalogs remain product decisions; dependent rules are **not implementable and disabled** until those catalogs are locked.
 
 ### Exposure and posture
 
@@ -151,7 +151,7 @@ Every comparison catalog is immutable and has `catalogType`, semantic `version`,
 |---|---|---|---|---|
 | `HV-ID-CHG-001.v1` | New or re-enabled identity followed by privilege | Authoritative user lifecycle change and successful role/group privilege change | Events: 24 hours old or less | Privilege assigned within 24 hours of create/re-enable; High |
 | `HV-ID-CHG-002.v1` | Privileged guest or newly created identity | Authoritative guest state or user-create event plus role/group privilege change | Snapshot: 36 hours; event: 24 hours | Guest, or identity with an authoritative create event less than 7 days old, receives privilege; High |
-| `HV-ID-CHG-003.v1` | Burst of privileged administrative changes | Successful directory/M365 audit events with actor and target plus approved high-impact operation catalog | Events: 2 hours | At least 5 distinct cataloged events by one actor in any inclusive 15-minute rolling window; Medium, or High with a second independent family |
+| `HV-ID-CHG-003.v1` | Burst of privileged administrative changes | Successful directory/M365 audit events with actor and target plus approved high-impact operation catalog | Events: 2 hours | For an anchor event at `t`, at least 5 distinct cataloged events by one actor with event times in `(t - 15 minutes, t]`; Medium, or High with a second independent family |
 | `HV-ID-CHG-004.v1` | Unusual privileged change for actor | Successful audit events, approved high-impact operation catalog, and mature actor/tenant baseline | Events: 2 hours; baseline: preceding 30 active days, at least 20 actor and 100 tenant cataloged events | Operation count is exactly 0 for the actor and at most 2 for the tenant during the baseline; Medium |
 | `HV-ID-CHG-005.v1` | Identity protection was weakened | Successful audit evidence or two authoritative comparable states for Security Defaults, Conditional Access, or authentication-method policy | Event: 2 hours; snapshots: 36 hours | Security Defaults changed from enabled to disabled, an enabled MFA policy became report-only/disabled, or a strong grant was removed; High investigation lead, not compromise |
 
@@ -171,8 +171,8 @@ Role and group catalogs used to define privilege must be versioned. A write that
 | Stable ID | Rule | Required current evidence | Max evidence age | Initial deterministic condition |
 |---|---|---|---|---|
 | `HV-ID-MBX-001.v1` | Suspicious external forwarding or redirect | Current authoritative mailbox rule details and verified tenant domains | 36 hours | Enabled rule forwards or redirects to a recipient outside verified tenant domains; High investigation lead |
-| `HV-ID-MBX-002.v1` | Suspicious concealment rule | Current authoritative mailbox rule details | 36 hours | Enabled rule has no populated condition or exception and combines delete/permanent-delete/nonempty move target with mark-as-read or stop-processing; Medium exposure |
-| `HV-ID-MBX-003.v1` | Mailbox rule change after suspicious authentication | A successful rule-change event or two comparable states plus an independent sign-in family result for the same identity | Rule change/sign-in correlation: 2 hours | Elevate episode priority one band, maximum Critical; still not a compromise verdict |
+| `HV-ID-MBX-002.v1` | Suspicious concealment rule | Current authoritative mailbox rule details with `conditionsCompleteness=COMPLETE` and `actionsCompleteness=COMPLETE` from the approved projector version | 36 hours | Enabled rule has no populated condition or exception and combines delete/permanent-delete/nonempty move target with mark-as-read or stop-processing; Medium exposure |
+| `HV-ID-MBX-003.v1` | Mailbox rule change after suspicious authentication | A successful projected rule-change event with authoritative condition/action completeness markers both `COMPLETE`, or two authoritative comparable states with both markers `COMPLETE` on each state, plus an independent sign-in family result for the same identity | Rule change/sign-in correlation: 2 hours | Elevate episode priority one band, maximum Critical; still not a compromise verdict |
 
 External-domain matching must normalize addresses and domains, handle accepted/verified domains, and expose uncertainty. HawkView does not inspect message bodies.
 
@@ -184,15 +184,15 @@ These rules run only when every named field is available in lawful, current evid
 |---|---|---|---|
 | `HV-ID-AUTH-001.v1` | Disabled-account activity | Current disabled state (36 hours), authoritative disable time/event, and sign-in event (2 hours) | Authentication activity after the observed disable time; High if successful, Medium if failed |
 | `HV-ID-AUTH-002.v1` | Dormant-account activity | Mature full sign-in baseline and event (2 hours) | Successful interactive sign-in after at least 45 days without one; Medium |
-| `HV-ID-AUTH-003.v1` | Unfamiliar country, ASN, device, client, or app | Full sign-in fields (2 hours) and mature user/tenant baseline | At least two unfamiliar property groups in one successful interactive sign-in; Medium. One property alone is Low/non-actionable |
+| `HV-ID-AUTH-003.v1` | Unfamiliar country, ASN, device, client, or app | Full sign-in fields (2 hours), mature user/tenant baseline, and approved account-class plus network/context catalog versions | At least two unfamiliar property groups after the exact context masking below; Medium. One property alone is Low/non-actionable |
 | `HV-ID-AUTH-004.v1` | Atypical travel | Two full sign-ins (2 hours), reliable geolocation, mature baseline, suppression context | Required travel speed above 900 km/h and locations at least 500 km apart; suppress or lower for known VPN/NAT/mobile egress and common tenant egress; Medium |
-| `HV-ID-AUTH-005.v1` | Failure burst followed by success | Sign-in status, actor, time, IP/ASN when available (2 hours) | At least 10 failures for one identity in 10 minutes followed by success within 15 minutes; Medium; High only with independent follow-on change |
+| `HV-ID-AUTH-005.v1` | Failure burst followed by success | Sign-in status, actor, time, IP/ASN when available (2 hours), and approved account-class plus network/context catalog versions | At least 10 failures for one supported human identity in 10 minutes followed by success within 15 minutes; Medium; High only with independent follow-on change |
 | `HV-ID-AUTH-006.v1` | MFA-fatigue pattern | Full authentication detail/status sufficient to distinguish repeated MFA denial/timeout and later success (2 hours) | At least 3 MFA denials/timeouts in 10 minutes followed by success within 15 minutes; High investigation lead |
 | `HV-ID-AUTH-007.v1` | Privileged legacy authentication | Current privilege snapshot (36 hours) and successful sign-in client/protocol evidence (2 hours) | Privileged identity successfully uses a configured legacy-auth client; High exposure/activity finding |
-| `HV-ID-AUTH-008.v1` | Password-spray pattern followed by success | Complete tenant-wide sign-in failures/successes with actor, time, IP or derived ASN (2 hours) | One source produces at least 10 failures across at least 5 identities in 10 minutes, then succeeds for one targeted identity within 15 minutes; Medium, or High with an independent follow-on change |
+| `HV-ID-AUTH-008.v1` | Password-spray pattern followed by success | Complete tenant-wide sign-in failures/successes with actor, time, IP or derived ASN (2 hours), and approved account-class plus network/context catalog versions | One non-approved-shared source produces at least 10 failures across at least 5 classified human identities in 10 minutes, then succeeds for one targeted identity within 15 minutes; Medium, or High with an independent follow-on change |
 | `HV-ID-AUTH-009.v1` | Unexpected break-glass account use | Explicit current break-glass classification, successful interactive sign-in (2 hours), and approved exercise/maintenance context | A designated break-glass account signs in interactively outside an approved expiring window; Critical investigation priority, but not a compromise verdict |
 
-VPN, carrier NAT, mobile roaming, corporate egress, shared devices, service accounts, and expected travel are mandatory suppression inputs where applicable. Location, IP, device, time, app, or browser alone cannot produce High. A tenant-wide completeness gate is mandatory for spray detection; a truncated page or partial source returns `NOT_EVALUATED`.
+VPN, carrier NAT, mobile roaming, corporate egress, shared devices, service accounts, and expected travel are mandatory versioned context inputs where applicable. Location, IP, device, time, app, or browser alone cannot produce High. A tenant-wide completeness gate is mandatory for spray detection; a truncated page or partial source returns `NOT_EVALUATED`.
 
 Microsoft describes a minimum five-day learning period for unfamiliar sign-in properties and an atypical-travel learning period that ends after 14 days or 10 sign-ins, whichever happens first. These published concepts explain why cold-start protection matters; they are not HawkView thresholds and do not reveal Microsoft's algorithm. HawkView uses its own independently tested baseline rules below ([Microsoft risk catalog](https://learn.microsoft.com/en-us/entra/id-protection/concept-identity-protection-risks)).
 
@@ -206,19 +206,48 @@ This is not a HawkView signal and must not alter HawkView severity, confidence, 
 
 ## Deterministic comparison contract
 
-All timestamps are UTC instants. Fixed evaluation windows are half-open `[start, end)`. Rolling windows include the anchor event and events strictly newer than `anchor - duration`. Sort by `(eventTime ascending, canonicalSourceId ascending)`. Deduplicate by organization, customer tenant, source type, and canonical source ID. Two different payload hashes for the same scoped source ID are an integrity failure and activate `EVALUATION_HARD_DISABLED`; never pick one silently. Counts use distinct canonical source IDs. “At least” means `>=`; “above” means `>`; exact threshold ties match only when `>=` is stated. A missing comparison value never equals unfamiliar, external, or benign—it makes the rule `NOT_EVALUATED` when the value is required.
+All timestamps are UTC instants. Fixed evaluation windows are half-open `[start, end)`. Rolling windows include the anchor event and events strictly newer than `anchor - duration`. Every normalized source envelope declares either `IMMUTABLE_EVENT` or `AUTHORITATIVE_SNAPSHOT`; a provider object ID alone is never a complete source identity.
+
+- An immutable-event identity is `organizationId + customerTenantId + sourceType + canonicalEventId + authoritativeEventTime + sourceEventVersion`. Include event time or provider sequence/version when the provider ID is not guaranteed to identify one immutable version. Sort events by `(authoritativeEventTime ascending, immutableEventIdentity ascending)`.
+- A snapshot identity is `organizationId + customerTenantId + resourceType + objectId + authoritativeObservationId`. The observation ID identifies one complete collector snapshot/version and is paired with its `observedAt`, projector schema version, and source watermark. Sort snapshots by `(observedAt ascending, authoritativeObservationId ascending, objectId ascending)`.
+- The same scoped identity/version and same canonical payload hash is a duplicate and counts once. The same immutable-event identity, or the same snapshot observation identity/version, with different canonical payload hashes is a proven integrity conflict: stop that evaluation, activate `EVALUATION_HARD_DISABLED` for the affected scope, and never choose one silently.
+- A changed payload for the same resource/object in a later authoritative snapshot observation is normal change evidence. It must not activate a hard stop. Change rules compare the earlier and later comparable versions in deterministic observation order.
+
+Counts use distinct source identities after this classification and deduplication. “At least” means `>=`; “above” means `>`; exact threshold ties match only when `>=` is stated. A missing comparison value never equals unfamiliar, external, or benign—it makes the rule `NOT_EVALUATED` when the value is required.
 
 Versioned v1 defaults are:
 
 - **Baseline:** ordinary human behavior needs at least 7 distinct active UTC days and 20 eligible successful interactive sign-ins. Privileged behavior needs 14 active days and 20 sign-ins. Familiarity uses the preceding 30 active days.
 - **Unfamiliar properties (`HV-ID-AUTH-003`):** normalize country to uppercase ISO code, ASN to an integer, device to a tenant-keyed device-ID HMAC, client to the locked client enum, and application to lowercase GUID. A property is familiar only after the exact value appears in at least 5 eligible successful sign-ins on at least 3 distinct UTC days. Require at least 3 usable property groups; match when at least 2 usable groups are unfamiliar. A tie at 5 events/3 days is familiar.
 - **Travel (`HV-ID-AUTH-004`):** compare consecutive successful interactive sign-ins after deterministic sorting. Require `0 < elapsed <= 24 hours`, WGS84 Haversine distance `>= 500 km`, and speed `> 900 km/hour`. Equal timestamps, low-quality/missing coordinates, or an unapproved trusted-network/mobile/VPN catalog return `NOT_EVALUATED`. A pair matching an approved expiring egress exception is suppressed with an audited reason, not learned as normal.
-- **Administrative rarity:** `HV-ID-CHG-003` uses 5 distinct approved high-impact operations in 15 minutes. `HV-ID-CHG-004` uses the preceding 30 active days, minimum 20 actor and 100 tenant cataloged events, actor operation count `= 0`, and tenant operation count `<= 2`.
-- **Mailbox rules:** an address is external only when its lowercase IDNA domain is not an exact member of the current verified/accepted-domain set. `HV-ID-MBX-002` treats a rule as match-all only when every supported condition and exception is null, false, empty string, or empty array. An unknown populated condition/action field returns `NOT_EVALUATED`; it is never discarded. Action comparison is exact against the allowlisted normalized delete, permanent-delete, move-target, mark-as-read, and stop-processing fields.
+- **Administrative rarity:** for each `HV-ID-CHG-003` anchor at `t`, use exactly the rolling interval `(t - 15 minutes, t]` and match at 5 distinct approved high-impact operations. An event exactly 15 minutes older than the anchor is excluded. `HV-ID-CHG-004` uses the preceding 30 active days, minimum 20 actor and 100 tenant cataloged events, actor operation count `= 0`, and tenant operation count `<= 2`.
+- **Mailbox rules:** an address is external only when its lowercase IDNA domain is not an exact member of the current verified/accepted-domain set. `HV-ID-MBX-002` treats a rule as match-all only when every supported condition and exception is null, false, empty string, or empty array and both completeness markers are authoritative `COMPLETE`. `HV-ID-MBX-003` requires the same markers on every compared snapshot or on its authoritative projected change event. An incomplete, unavailable, stale, or non-authoritative marker returns `NOT_EVALUATED/MAILBOX_RULE_PROJECTION_INCOMPLETE`; it is never interpreted as an empty field. Action comparison is exact against the allowlisted normalized delete, permanent-delete, move-target, mark-as-read, and stop-processing fields.
 - **Authentication counts:** `HV-ID-AUTH-005` uses 10 distinct failures for one identity in 10 minutes and a success in the next 15 minutes. `HV-ID-AUTH-006` uses 3 distinct Microsoft-coded MFA denial/timeout events in 10 minutes and a success in the next 15 minutes. `HV-ID-AUTH-008` uses 10 distinct failures across at least 5 distinct identities from one exact tenant-keyed IP HMAC or derived ASN in 10 minutes and a success for a targeted identity in the next 15 minutes. Missing completeness markers return `NOT_EVALUATED`.
 - **Lifecycle, application, and privilege:** dormant means no eligible successful interactive sign-in for `>= 45 × 24 hours`. A new user means an authoritative create event less than `7 × 24 hours` before privilege assignment. A new application requires Microsoft `createdDateTime` or an authoritative create event within the preceding 24 hours; HawkView `firstSeenAt` alone does not qualify. `HV-ID-MBX-003` requires the mailbox change at or after the matched sign-in and strictly before `signInTime + 2 hours`. Approved maintenance/exercise windows are half-open and expiring. The break-glass rule matches outside every approved window. Security weakening compares exact before/after effective states: Security Defaults `true -> false`, policy `enabled -> reportOnly/disabled`, or approved strong grant present -> absent.
 
-The `privileged-role/group`, `high-impact-operation`, `high-impact-application-permission`, `legacy-client`, and `trusted-network/mobile/VPN` catalogs are inputs to these formulas, not hidden code constants. Rules requiring any unapproved catalog remain disabled and `NOT_EVALUATED/RULE_CONFIG_UNAPPROVED`. This is preferable to shipping a vague or non-reproducible rule.
+The `privileged-role/group`, `high-impact-operation`, `high-impact-application-permission`, `legacy-client`, `account-class`, and `network/context` catalogs are inputs to these formulas, not hidden code constants. Rules requiring any unapproved catalog remain disabled and `NOT_EVALUATED/RULE_CONFIG_UNAPPROVED`. This is preferable to shipping a vague or non-reproducible rule.
+
+### Deterministic account and network context
+
+The account-class catalog has only `HUMAN`, `PRIVILEGED_HUMAN`, `SERVICE`, `SHARED`, `BREAK_GLASS`, and `UNKNOWN`. Classification is tenant-scoped, versioned, authorized, and current for the evaluation window. The network/context catalog has exact, expiring entries of type `SHARED_EGRESS` (corporate, VPN, NAT, or mobile exit), `SHARED_DEVICE`, `EXPECTED_AUTH_RETRY`, `TRAVEL_EXCEPTION`, or `MAINTENANCE`. Entries use approved tenant-keyed HMAC fingerprints and exact app/client/subject scope where that type requires them; free-text labels never affect a rule. Identical evidence plus the same catalog versions and evaluation time must produce the same outcome.
+
+- **Common gate for `AUTH-003/005/008`:** an unapproved or missing catalog version returns `NOT_EVALUATED/RULE_CONFIG_UNAPPROVED`. An `UNKNOWN` subject returns `NOT_EVALUATED/ACCOUNT_CLASS_UNVERIFIED`. `SERVICE`, `SHARED`, and `BREAK_GLASS` are unsupported by these three ordinary-human rules and return `NOT_EVALUATED/ACCOUNT_CLASS_UNSUPPORTED`; break-glass activity is handled by `AUTH-009`.
+- **`AUTH-003`:** start with country, ASN, device, client, and app groups. An exact active `SHARED_EGRESS` match removes country and ASN from the usable groups; an exact active `SHARED_DEVICE` match removes device. If fewer than 3 usable groups remain, return `NOT_EVALUATED/INSUFFICIENT_INDEPENDENT_CONTEXT`. Otherwise match when at least 2 remaining groups are unfamiliar. If the unmasked values would have matched but approved masking reduces the remaining unfamiliar count below 2, return `SUPPRESSED/APPROVED_SHARED_CONTEXT`; otherwise return `NOT_MATCHED`. Masked properties never enter the subject baseline.
+- **`AUTH-005`:** generic shared egress or a shared device alone does not suppress a one-subject failure/success episode. Return `SUPPRESSED/EXPECTED_AUTH_RETRY` only when one active `EXPECTED_AUTH_RETRY` entry exactly matches the subject, app, client, device when specified, source fingerprint when specified, and the whole episode window. Otherwise apply the stated 10-failure/10-minute then success/15-minute thresholds.
+- **`AUTH-008`:** exclude `SERVICE`, `SHARED`, `BREAK_GLASS`, and `UNKNOWN` identities from failure and distinct-identity counts. If an exact active `SHARED_EGRESS` entry matches the source fingerprint, or every counted event matches one exact active `SHARED_DEVICE`, return `SUPPRESSED/APPROVED_SHARED_CONTEXT`. If at least 10 failures across at least 5 classified human identities remain, apply the success test. If the threshold is missed and any candidate identity was `UNKNOWN`, return `NOT_EVALUATED/ACCOUNT_CLASS_COVERAGE_INCOMPLETE`; otherwise return `NOT_MATCHED`. Approved corporate/VPN/NAT/mobile shared egress never contributes to a spray count.
+
+`SUPPRESSED` means the deterministic condition was neutralized by one exact approved, current context entry. It is counted only in bounded run/rule aggregates and creates no subject result, matched evidence, finding, or delivery. The underlying catalog entry is expiring, and its creation or change is audited. This is different from `NOT_EVALUATED`, which means required evidence or approved configuration was insufficient.
+
+### Mailbox projection completeness dependency
+
+Before `HV-ID-MBX-002.v1` or `HV-ID-MBX-003.v1` is enabled, the allowlisted mailbox-rule projector must examine the current Graph response inside the trusted collector, before unprojected properties are discarded. It must emit only sanitized normalized fields plus:
+
+- `projectorSchemaVersion` and the authoritative snapshot/change-event identity described above;
+- `conditionsCompleteness` and `actionsCompleteness`, each exactly `COMPLETE`, `INCOMPLETE`, or `UNAVAILABLE`;
+- sorted, deduplicated reason codes from the closed set `UNSUPPORTED_CONDITION_PRESENT`, `UNSUPPORTED_ACTION_PRESENT`, `SOURCE_SCHEMA_UNSUPPORTED`, `PAGE_INCOMPLETE`, and `PAYLOAD_MALFORMED`; and
+- bounded unsupported counts, capped at 20 per category with `countCapped=true` when exceeded.
+
+`COMPLETE` is allowed only after a successful, untruncated authoritative collection under an approved projector schema and after the projector confirms that no populated unsupported property was discarded for that category. Property names, values, recipients, and the raw Graph payload must not be copied into the engine, diagnostics, logs, or stored evidence. The capability/readiness layer carries these markers with the observation. Until this contract exists and the required markers are current and authoritative, both rules are disabled and return `NOT_EVALUATED/MAILBOX_RULE_PROJECTION_INCOMPLETE`.
 
 ## Exact v1 evaluation algorithm
 
@@ -236,8 +265,16 @@ evaluateTenant(orgId, tenantId, windowStart, windowEnd, engineVersion):
     return HARD_DISABLED
 
   load capability/readiness evidence WHERE organizationId=orgId AND customerTenantId=tenantId
-  load only rule-required source records using the same compound scope
+  load only allowlisted, rule-required source records using the same compound scope
   reject future-dated records outside the allowed clock-skew tolerance
+  classify each normalized envelope as IMMUTABLE_EVENT or AUTHORITATIVE_SNAPSHOT
+  construct its scoped source identity and canonical payload hash
+  collapse exact same-identity/same-hash duplicates
+  if one immutable event/version or one snapshot observation/version has conflicting hashes:
+    activate EVALUATION_HARD_DISABLED for the affected scope
+    recordOnce one bounded operational security event; stop reads/evaluation/writes/queues
+    return HARD_DISABLED
+  accept a changed object payload in a later authoritative snapshot as normal input
   runId = deterministicId(orgId, tenantId, engineVersion, catalogVersion,
     windowStart, windowEnd, ordered source watermarks)
   beginOrResumeRun(runId) using a unique idempotency constraint
@@ -253,6 +290,7 @@ evaluateTenant(orgId, tenantId, windowStart, windowEnd, engineVersion):
       every item is within rule.maxAge
       coverage supplies every field named by the rule
       pagination/cap/truncation state is complete where the rule requires completeness
+      mailbox condition/action completeness markers are authoritative where required
 
     if any gate fails:
       increment run-level NOT_EVALUATED counter for ruleId + reasonCode
@@ -272,12 +310,15 @@ evaluateTenant(orgId, tenantId, windowStart, windowEnd, engineVersion):
       continue
 
     normalized = canonicalize(required records)
-    matched = rule.evaluate(normalized, baseline, fixed rule constants)
-    if matched:
+    outcome = rule.evaluate(normalized, baseline, fixed rule constants,
+      approved account and context catalog versions)
+    if outcome is MATCHED:
       persist one immutable matched result and bounded evidence references with:
         severity, confidence, coverage, explanation, benignAlternatives,
         sourceTimes, maxAge, baselineMaturity, ruleVersion, engineVersion, runId
       increment run-level MATCHED counter
+    else if outcome is SUPPRESSED:
+      increment run-level SUPPRESSED counter; persist no subject result
     else:
       increment run-level NOT_MATCHED counter; persist no subject result
 
@@ -298,7 +339,7 @@ evaluateTenant(orgId, tenantId, windowStart, windowEnd, engineVersion):
 
 Severity bands are `LOW`, `MEDIUM`, `HIGH`, and `CRITICAL`. They describe investigation priority, not compromise probability. `CRITICAL` requires at least two independent families, including a high-specificity activity or change signal, except for the explicitly classified unexpected break-glass activity rule. Posture alone cannot produce it. Confidence describes evidence and rule specificity: `HIGH` requires authoritative complete evidence and a high-specificity condition, `MEDIUM` permits bounded ambiguity, and `LOW` is contextual/non-actionable.
 
-The dedupe key is a hash of `organizationId + customerTenantId + subjectType + subjectId + primaryRuleId + normalized episode bucket + engineVersion`. Reordered or duplicate source events must produce the same run ID, matched-evidence IDs, aggregate counters, and finding. A later source watermark creates a new run ID for the same time window; replaying the same ordered watermarks does not create another run.
+The dedupe key is a hash of `organizationId + customerTenantId + subjectType + subjectId + primaryRuleId + normalized episode bucket + engineVersion`. Reordered or duplicate immutable events and snapshot versions must produce the same run ID, matched-evidence IDs, aggregate counters, and finding. A later authoritative snapshot/source watermark creates a new run ID for the same time window; its changed object payload is evaluated as a new comparable version. Replaying the same ordered watermarks does not create another run.
 
 ## Finding lifecycle
 
@@ -320,7 +361,7 @@ The implementation has two different controls. They must not share one ambiguous
 | `ALERT_DELIVERY_DISABLED` | Global or one organization plus customer tenant | Continue source reads, evaluation, matched-evidence/finding writes, aggregates, and normal audit under existing controls. Do not enqueue or send customer alert deliveries. Show operators that delivery is muted. |
 | `EVALUATION_HARD_DISABLED` | Global or one organization plus customer tenant | Before any tenant evidence read, stop claiming/creating risk-evaluation and alert-delivery work. Perform no evaluation and write no risk evidence, aggregate, baseline, or finding. Record only one bounded, deduplicated operational security event for the hard-stop episode. |
 
-An isolation failure, secret exposure, integrity failure, or cross-tenant scope failure must activate `EVALUATION_HARD_DISABLED` at the broadest possibly affected scope. An alert storm without evidence-integrity concern may activate `ALERT_DELIVERY_DISABLED` while investigation continues. A tenant mute, maintenance window, rule exception, or finding suppression is never a hard stop; it is evaluated after normal evidence gating and remains expiring and audited.
+An isolation failure, secret exposure, proven source-integrity conflict, or cross-tenant scope failure must activate `EVALUATION_HARD_DISABLED` at the broadest possibly affected scope. For source identity, a proven conflict means different canonical content for the exact same scoped immutable event/version or authoritative snapshot observation/version; an object's changed content in a later authoritative observation is not a conflict. An alert storm without evidence-integrity concern may activate `ALERT_DELIVERY_DISABLED` while investigation continues. A tenant mute, maintenance window, rule exception, or finding suppression is never a hard stop; it is evaluated after normal evidence gating and remains expiring and audited.
 
 Hard-stop recovery is never automatic or timer-based. An authorized security operator must identify the affected scope, rotate exposed secrets when applicable, quarantine or remove unsafe risk-queue items, validate evidence and tenant boundaries, pass cross-tenant and idempotent-replay canaries, and record an explicit resume operation. New risk work may be accepted only after that operation succeeds. The one operational event contains only control name, scope type and opaque scope ID, safe reason code, incident/correlation ID, activation time, and actor/service ID; it contains no tenant evidence or provider payload.
 
@@ -361,10 +402,10 @@ Implementation requires new schema and endpoints; none are created by this docum
 
 Use immutable matched evidence, bounded run aggregates, and mutable workflow state:
 
-- `IdentityRiskEvaluationRun`: one idempotent row for organization, customer tenant, engine/catalog version, evaluation window, ordered source-watermark hash, status, start/end, aggregate expiry, and delivery-control state.
-- `IdentityRiskRuleCoverage`: at most one row per run and rule. It stores integer counts for eligible, matched, not matched, and not evaluated subjects plus allowlisted reason-code counts. It stores no ordinary subject IDs.
+- `IdentityRiskEvaluationRun`: one idempotent row for organization, customer tenant, engine/catalog version, evaluation window, ordered source-watermark/version hash, status, start/end, aggregate expiry, and delivery-control state.
+- `IdentityRiskRuleCoverage`: at most one row per run and rule. It stores integer counts for eligible, matched, suppressed, not matched, and not evaluated subjects plus allowlisted reason-code counts. It stores no ordinary subject IDs.
 - `IdentityRiskDiagnosticSample`: bounded, non-subject examples of schema/readiness reason codes for operations. Allow at most 20 samples per rule/reason/run and 200 total per run; stop writing when either cap is reached and set `samplesTruncated=true`.
-- `IdentityRiskEvidence`: immutable bounded evidence references only for a matched result, with canonical hash, source type/ID, event/observation time, freshness decision, allowlisted retained fields, expiry, rule, engine version, and run ID.
+- `IdentityRiskEvidence`: immutable bounded evidence references only for a matched result, with source-envelope kind, complete scoped event or snapshot-observation identity/version, canonical payload hash, event/observation time, freshness decision, approved projector schema/completeness markers when applicable, allowlisted retained fields, expiry, rule, engine version, and run ID.
 - `IdentityRiskMatchedResult`: immutable `MATCHED` result with severity, confidence, coverage, explanation inputs, benign alternatives, baseline maturity, evidence references, and deterministic replay ID. Do not create this row for ordinary `NOT_MATCHED` or `NOT_EVALUATED` subjects.
 - `IdentityRiskSubjectEvaluationDetail`: exceptional short-lived subject detail only when an authorized user explicitly requests evaluation detail or an abstention gates an already open finding. On-demand detail is not persisted by default; if persistence is needed, cap it at 100 active rows per tenant with a 24-hour TTL. Existing-finding gate detail is capped at one row per finding/rule/window and 1,000 active rows per tenant with a 7-day TTL. Both expire sooner when their source does.
 - `IdentityRiskFinding`: mutable current lifecycle state and current priority; links only to immutable matched results.
@@ -377,7 +418,7 @@ Ordinary `NOT_MATCHED` and `NOT_EVALUATED` outcomes live only in memory long eno
 
 Baseline maintenance is separate from rule-outcome persistence. It may write one bounded aggregate only for an identity whose eligible baseline changed; it must not write one baseline row per rule or per replayed run, and an unchanged or duplicate source event produces no baseline write.
 
-The deterministic run ID is a canonical hash of `organizationId + customerTenantId + engineVersion + catalogVersion + windowStart + windowEnd + orderedSourceWatermarkHash`. Add a unique compound constraint that includes organization, customer tenant, and run ID. The same source watermarks and window must upsert the same run, counters, samples, matched evidence, and findings; reordered or duplicated events cannot add writes.
+The deterministic run ID is a canonical hash of `organizationId + customerTenantId + engineVersion + catalogVersion + windowStart + windowEnd + orderedSourceWatermarkVersionHash`. That final hash covers each source's last complete authoritative event cursor or snapshot observation/version plus the stable identity/hash set used by the run. Add a unique compound constraint that includes organization, customer tenant, and run ID. The same source versions and window must upsert the same run, counters, samples, matched evidence, and findings; reordered or duplicated records cannot add writes, while a later authoritative snapshot version creates a new run.
 
 Every primary key, unique constraint, foreign key relationship, index used for retrieval, cache key, job payload, API query, replay, export, and delete must include or verify both `organizationId` and `customerTenantId`. Relations should use the existing compound tenant relationship pattern. A bare `customerTenantId`, Microsoft object ID, email, or user principal name is never sufficient authorization scope.
 
@@ -424,7 +465,7 @@ Proposed v1 routes are:
 | `POST /api/tenants/:tenantId/identity-signals/suppressions` | Create an expiring rule/subject exception | Privileged security role; reason, scope, expiry, and durable audit required |
 | `GET /api/tenants/:tenantId/microsoft-entra-risky-users` | Return only current Microsoft-attributed risk and capability state | Read-only; no write-back to Microsoft |
 
-The summary returns only the latest successfully completed run and one bounded aggregate per rule: run/window/version, eligible count, matched count, not-matched count, not-evaluated count, reason-code counts, and whether diagnostic samples were capped. These are evaluation-coverage counts, not counts of compromised or safe users. `notEvaluated` never contributes to an identity-signal total. **Identities needing review** counts unique subjects with open matched findings; it is not the sum of matched rules. A failed/partial run or any abstention that prevents required evaluation makes the relevant capability `Partial` or `Unavailable`.
+The summary returns only the latest successfully completed run and one bounded aggregate per rule: run/window/version, eligible count, matched count, suppressed count, not-matched count, not-evaluated count, reason-code counts, and whether diagnostic samples were capped. These are evaluation-coverage counts, not counts of compromised or safe users. `suppressed` and `notEvaluated` never contribute to an identity-signal total. **Identities needing review** counts unique subjects with open matched findings; it is not the sum of matched rules. A failed/partial run or any abstention that prevents required evaluation makes the relevant capability `Partial` or `Unavailable`.
 
 The server derives the MSP organization from the authenticated workspace. A request body cannot select or override the organization. The separate Microsoft endpoint/projection uses `channel: MICROSOFT_ENTRA_RISKY_USERS`; it is never embedded as a HawkView rule input. Bulk evaluation is an internal scheduled/replay job. The on-demand detail route is a bounded diagnostic and cannot create a finding or alert. API errors are safe and generic. Logs may include opaque organization, tenant, finding, operation, and request IDs, but not tenant content, UPNs, IP addresses, rule payloads, access tokens, or provider error bodies.
 
@@ -452,9 +493,11 @@ flowchart LR
   end
   subgraph HV[HawkView customer-tenant boundary]
     C[Collectors]
-    D[Stored source evidence]
+    D[Stored source repository]
+    T[Evaluation trigger with opaque scope only]
     S{Evaluation hard-disabled?}
     O[One bounded operational event]
+    X[End risk evaluation]
     R[Scoped source read and readiness]
     E[Rule gates]
     B[Tenant and user baselines]
@@ -466,9 +509,11 @@ flowchart LR
   end
   G --> C
   C --> D
+  D --> T
+  T --> S
   S -- Yes --> O
+  O --> X
   S -- No --> R
-  D --> R
   R --> E
   B --> E
   E --> F
@@ -508,7 +553,7 @@ stateDiagram-v2
 - **Environmental ambiguity:** VPNs, NAT, mobile networks, travel, shared devices, service/shared accounts, break-glass accounts, and small or sparse tenants can create false positives. Account classification and expiring suppressions are required.
 - **Bias:** tenant size, geography, work pattern, account class, and license/capability affect observed distributions. Do not collect protected demographic attributes. Monitor false-positive rates by operational strata without demographic inference.
 - **Poisoning and evasion:** attackers may slowly establish a baseline, replay known properties, remain under thresholds, suppress telemetry, or trigger alert fatigue. Use bounded learning, independent-family correlation, safe abstention, and drift monitoring.
-- **Safety controls:** isolation, secret exposure, integrity, or cross-tenant-scope failures activate `EVALUATION_HARD_DISABLED`, which permits only one bounded operational event and no risk-engine source reads, evaluation, evidence/finding writes, or queues. Alert-rate incidents without evidence-integrity concern can use `ALERT_DELIVERY_DISABLED`, which stops delivery while normal evaluation continues. Tenant mute and suppression never activate the hard stop.
+- **Safety controls:** isolation, secret exposure, a proven same-event/version or same-snapshot-observation/version content conflict, or cross-tenant-scope failures activate `EVALUATION_HARD_DISABLED`, which permits only one bounded operational event and no further risk-engine source reads, evaluation, evidence/finding writes, or queues. A normal payload change in a later authoritative snapshot does not. Alert-rate incidents without evidence-integrity concern can use `ALERT_DELIVERY_DISABLED`, which stops delivery while normal evaluation continues. Tenant mute and suppression never activate the hard stop.
 
 NIST recommends documented, repeatable measurement, uncertainty handling, independent review, safe failure, and ongoing monitoring for trustworthy systems ([AI RMF Core](https://airc.nist.gov/airmf-resources/airmf/5-sec-core/)). Privacy risk must be managed through collection, processing, retention, disclosure, and disposal ([NIST Privacy Framework](https://www.nist.gov/privacy-framework/privacy-framework)).
 
@@ -547,6 +592,11 @@ Required positive and benign/adversarial controls include:
 - service/shared account patterns versus expected automation or shared-account use;
 - identical source and subject identifiers in two customer tenants;
 - duplicate, late, reordered, paginated, capped, and clock-skewed records;
+- a mutable user, application, mailbox rule, or policy changes payload in a later authoritative snapshot: it is accepted as normal versioned input and the intended change rule evaluates once;
+- an exact duplicate of one immutable event or snapshot observation/version is idempotent, while conflicting content for that exact scoped identity/version activates the hard stop; reusing an object ID or provider event ID at a different authoritative time/version does not collide;
+- mailbox responses with supported empty fields, populated unsupported condition/action fields, incomplete pages, malformed content, and unsupported projector schemas; only an authoritative `COMPLETE` marker enables `HV-ID-MBX-002/003`, and no raw or unsupported field name/value is retained;
+- exact rolling-window boundary fixtures prove `HV-ID-CHG-003` includes the anchor and excludes an event exactly 15 minutes older;
+- `AUTH-003/005/008` replay across corporate egress, VPN, NAT, mobile exits, shared devices, expected retries, and every account class; exact approved context yields the specified `SUPPRESSED` or masked result, missing/unapproved context yields `NOT_EVALUATED`, and service/shared/break-glass/unknown identities never enter ordinary-human unfamiliarity or spray counts;
 - baseline poisoning and slow-and-low evasion;
 - malicious or compromised reviewer submits repeated benign approvals; influence remains one contribution per property/subject/day, sensitive dual approval cannot be self-satisfied, another tenant is unchanged, and checkpoint rollback/rebuild is exact or safely returns to `LEARNING`;
 - `ALERT_DELIVERY_DISABLED` still evaluates and persists matched evidence but creates no delivery work;
@@ -578,12 +628,15 @@ After promotion, monitor evidence freshness/completeness, `NOT_EVALUATED` rate, 
 
 ### Phase 0: telemetry and capability contract
 
-Dependencies: privacy review, threat model approval, account-class vocabulary, current collector/readiness contract, schema design, pseudonym-key decision, and the two safety-control designs.
+Dependencies: privacy review, threat model approval, account-class vocabulary, current collector/readiness contract, immutable-event versus versioned-snapshot identity design, authoritative mailbox-rule completeness projection, schema design, pseudonym-key decision, and the two safety-control designs.
 
 Acceptance criteria:
 
 - Versioned evidence and rule schemas enforce `organizationId + customerTenantId` on every key and query.
+- Source-envelope schemas distinguish immutable events from mutable versioned snapshots. Phase-0 tests prove same-version duplicates are idempotent, same-version conflicting content hard-stops, and a legitimate changed payload in a later authoritative observation is accepted and evaluated once.
 - Rule gates cover unavailable, blocked, stale, malformed, capped, future-dated, and partial evidence.
+- Approve exact versioned account-class and network/context catalogs and prove deterministic `AUTH-003/005/008` outcomes for shared egress/devices, expected retries, unknown/non-human classes, expiry boundaries, and reordered replay.
+- Add and test the allowlisted mailbox-rule projector contract: current authoritative condition/action completeness markers and bounded closed reason codes survive sanitization, while raw payloads and unsupported field names/values do not. Keep `HV-ID-MBX-002/003` disabled until this acceptance passes.
 - Add explicit completeness/truncation markers for tenant-wide aggregation and an allowlisted normalized MFA result field before enabling spray or MFA-fatigue rules; do not read arbitrary `raw` payloads in the engine.
 - Approve and test KMS/HMAC key derivation, rotation, key-version transition, incident recovery, and tenant deletion; document any shared-key exception and its blast radius.
 - Test bounded analyst feedback, sensitive dual approval, cooling periods, append-only audit, pre-feedback checkpoint rollback/rebuild, expired-source fallback to `LEARNING`, and malicious-reviewer isolation.
