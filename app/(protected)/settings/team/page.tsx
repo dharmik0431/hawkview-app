@@ -47,6 +47,7 @@ import {
 } from 'lucide-react'
 import { apiClient } from '@/lib/api/client'
 import { workspaceAdminErrorMessage } from '@/lib/auth/workspace-admin-errors'
+import { canResendInvitation } from '@/lib/auth/workspace-member-invitation'
 import { useAuth } from '@/components/providers/auth-provider'
 import { OrganizationProfileEditor } from '@/components/admin/organization-profile-editor'
 import { Button } from '@/components/ui/button'
@@ -279,6 +280,7 @@ function isValidEmail(email: string): boolean {
 
 function MemberActionMenu({
   member,
+  organizationId,
   isFinalOwner,
   isSelf,
   onAccountDetails,
@@ -291,6 +293,7 @@ function MemberActionMenu({
   onRemove,
 }: {
   member: Member
+  organizationId: string | null
   isFinalOwner: boolean
   isSelf: boolean
   onAccountDetails: (m: Member) => void
@@ -344,7 +347,7 @@ function MemberActionMenu({
           </DropdownMenu.Item>
 
           {/* Resend Invitation (for setup required / pending) */}
-          {!member.hasHawkViewAccount && (
+          {canResendInvitation(member, organizationId) && (
             <DropdownMenu.Item
               onSelect={() => onResendInvitation(member)}
               className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
@@ -919,6 +922,22 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
     return workspace.members.filter((m) => selectedMembershipIds.has(m.membershipId))
   }, [workspace?.members, selectedMembershipIds])
 
+  const resendEligibleSelectedMembers = useMemo(
+    () =>
+      selectedMembers.filter((member) =>
+        canResendInvitation(member, selectedOrganizationId)
+      ),
+    [selectedMembers, selectedOrganizationId]
+  )
+
+  const bulkActionMembers = useMemo(
+    () =>
+      bulkConfirmModal?.action === 'RESEND_INVITE'
+        ? resendEligibleSelectedMembers
+        : selectedMembers,
+    [bulkConfirmModal?.action, resendEligibleSelectedMembers, selectedMembers]
+  )
+
   const visibleSelectedCount = useMemo(() => {
     return sortedMembers.filter((m) => selectedMembershipIds.has(m.membershipId)).length
   }, [sortedMembers, selectedMembershipIds])
@@ -1013,14 +1032,20 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
         if (isSelf || isFinal) return false
       }
       if (action === 'MFA_RESET' && isSelf) return false
-      if (action === 'RESEND_INVITE' && m.hasHawkViewAccount !== false) return false
+      if (
+        action === 'RESEND_INVITE' &&
+        !canResendInvitation(m, selectedOrganizationId)
+      )
+        return false
       if (action === 'PASSWORD_RESET' && m.hasHawkViewAccount !== true) return false
       return true
     })
 
     if (eligibleMembers.length === 0) {
       setError(
-        'None of the selected members are eligible for this operation due to owner protections.'
+        action === 'RESEND_INVITE'
+          ? 'None of the selected members are active, enabled memberships awaiting HawkView account acceptance. No invitations were resent.'
+          : 'None of the selected members are eligible for this operation due to owner protections.'
       )
       setBulkConfirmModal(null)
       return
@@ -1092,13 +1117,23 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
     setBulkConfirmModal(null)
 
     if (failedItems.length === 0) {
-      setNotice(`${succeededIds.length} member(s) were successfully updated.`)
+      setNotice(
+        action === 'RESEND_INVITE'
+          ? `${succeededIds.length} HawkView invitation${succeededIds.length === 1 ? '' : 's'} resent.`
+          : `${succeededIds.length} member(s) were successfully updated.`
+      )
     } else if (succeededIds.length > 0) {
       setNotice(
-        `${succeededIds.length} member(s) updated successfully. ${failedItems.length} member(s) failed: ${failedItems[0].reason}`
+        action === 'RESEND_INVITE'
+          ? `${succeededIds.length} HawkView invitation${succeededIds.length === 1 ? '' : 's'} resent. ${failedItems.length} invitation${failedItems.length === 1 ? '' : 's'} could not be resent: ${failedItems[0].reason}`
+          : `${succeededIds.length} member(s) updated successfully. ${failedItems.length} member(s) failed: ${failedItems[0].reason}`
       )
     } else {
-      setError(`Bulk action failed: ${failedItems[0].reason}`)
+      setError(
+        action === 'RESEND_INVITE'
+          ? `No invitations were resent: ${failedItems[0].reason}`
+          : `Bulk action failed: ${failedItems[0].reason}`
+      )
     }
   }, [
     bulkConfirmModal,
@@ -1310,7 +1345,12 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
   }
 
   const handleResendInvitation = async (member: Member) => {
-    if (!selectedOrganizationId) return
+    if (!canResendInvitation(member, selectedOrganizationId)) {
+      setError(
+        'This member is not eligible for an invitation resend. Only active, enabled memberships awaiting HawkView account acceptance can receive a new invitation.'
+      )
+      return
+    }
     await runAction(
       () =>
         apiClient.post(
@@ -2121,8 +2161,9 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                           </DropdownMenu.Item>
 
                           <DropdownMenu.Item
+                            disabled={resendEligibleSelectedMembers.length === 0}
                             onSelect={() => setBulkConfirmModal({ action: 'RESEND_INVITE' })}
-                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer data-[disabled]:opacity-50 data-[disabled]:pointer-events-none"
                           >
                             <Mail className="h-3.5 w-3.5 text-muted-foreground" />
                             <span>Resend invitations</span>
@@ -2389,6 +2430,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                           <td className="py-3 px-4 text-right">
                             <MemberActionMenu
                               member={member}
+                              organizationId={selectedOrganizationId}
                               isFinalOwner={isFinalOwner}
                               isSelf={isSelf}
                               onAccountDetails={setAccountDrawerMember}
@@ -2484,6 +2526,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                         <div>
                           <MemberActionMenu
                             member={member}
+                            organizationId={selectedOrganizationId}
                             isFinalOwner={isFinalOwner}
                             isSelf={isSelf}
                             onAccountDetails={setAccountDrawerMember}
@@ -3889,11 +3932,13 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                       : bulkConfirmModal.action === 'MFA_RESET'
                       ? `Reset HawkView MFA for ${selectedMembers.length} members?`
                       : bulkConfirmModal.action === 'RESEND_INVITE'
-                      ? `Resend invitations to ${selectedMembers.length} members?`
+                      ? `Resend invitations to ${bulkActionMembers.length} members?`
                       : `Bulk remove ${selectedMembers.length} members from workspace?`}
                   </h3>
                   <p className="text-xs text-muted-foreground">
-                    {selectedMembers.length} team member{selectedMembers.length === 1 ? '' : 's'} selected
+                    {bulkConfirmModal.action === 'RESEND_INVITE'
+                      ? `${bulkActionMembers.length} eligible invitation recipient${bulkActionMembers.length === 1 ? '' : 's'}`
+                      : `${selectedMembers.length} team member${selectedMembers.length === 1 ? '' : 's'} selected`}
                   </p>
                 </div>
               </div>
@@ -3911,7 +3956,9 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
             <div className="text-xs text-muted-foreground bg-muted/40 p-3 rounded-lg border border-border space-y-1">
               <p className="font-medium text-foreground">Important Note:</p>
               <p>
-                This action affects HawkView accounts only and does not modify Microsoft 365 accounts.
+                {bulkConfirmModal.action === 'RESEND_INVITE'
+                  ? 'This sends a new HawkView invitation only to the eligible recipients listed below. It does not modify Microsoft 365 accounts.'
+                  : 'This action affects HawkView accounts only and does not modify Microsoft 365 accounts.'}
               </p>
             </div>
 
@@ -3952,9 +3999,13 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
 
             {/* Selected Members List with Protection Badges */}
             <div className="space-y-2">
-              <p className="text-xs font-semibold text-foreground">Affected Members ({selectedMembers.length})</p>
+              <p className="text-xs font-semibold text-foreground">
+                {bulkConfirmModal.action === 'RESEND_INVITE'
+                  ? `Invitation recipients (${bulkActionMembers.length})`
+                  : `Affected Members (${selectedMembers.length})`}
+              </p>
               <div className="max-h-48 overflow-y-auto divide-y divide-border border border-border rounded-lg bg-card text-xs">
-                {selectedMembers.map((m) => {
+                {bulkActionMembers.map((m) => {
                   const isSelf = m.userId === currentUserId
                   const isFinal = isFinalActiveOwner(m)
                   const isProtected =
@@ -3998,7 +4049,8 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                 onClick={() => void handleExecuteBulkAction()}
                 disabled={
                   submitting ||
-                  (bulkConfirmModal.action === 'ROLE_CHANGE' && !bulkConfirmModal.targetRole)
+                  (bulkConfirmModal.action === 'ROLE_CHANGE' && !bulkConfirmModal.targetRole) ||
+                  (bulkConfirmModal.action === 'RESEND_INVITE' && bulkActionMembers.length === 0)
                 }
                 className="h-8 text-xs font-semibold gap-1.5"
               >
