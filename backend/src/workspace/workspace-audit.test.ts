@@ -54,6 +54,27 @@ test('workspace audit errors expose only stable codes', () => {
     'WORKSPACE_REQUEST_REJECTED'
   )
   assert.equal(
+    workspaceAuditErrorCode(
+      new HttpException(
+        { code: 'INVITATION_NOT_PENDING', message: 'safe member state' },
+        409
+      )
+    ),
+    'INVITATION_NOT_PENDING'
+  )
+  assert.equal(
+    workspaceAuditErrorCode(
+      new HttpException(
+        {
+          code: 'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT',
+          message: 'safe member state',
+        },
+        409
+      )
+    ),
+    'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT'
+  )
+  assert.equal(
     workspaceAuditErrorCode(new Error('database secret')),
     'WORKSPACE_OPERATION_FAILED'
   )

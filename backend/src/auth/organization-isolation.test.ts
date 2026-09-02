@@ -262,6 +262,19 @@ test('disabled subject-linked owner cannot read team or audit data or perform ad
 for (const profileState of ['legacy', 'accepted'] as const) {
   test(`workspace invitation cannot turn an existing ${profileState} email profile into a pending identity claim`, async () => {
     let membershipWrites = 0
+    let userWrites = 0
+    const priorFetch = globalThis.fetch
+    const priorSupabaseUrl = process.env.SUPABASE_URL
+    const priorServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+    const priorRedirectUrl = process.env.HAWKVIEW_AUTH_REDIRECT_URL
+    process.env.SUPABASE_URL = 'https://example.supabase.co'
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key'
+    process.env.HAWKVIEW_AUTH_REDIRECT_URL =
+      'https://console.hawkviewapp.com/auth/confirm'
+    globalThis.fetch = async () =>
+      profileState === 'accepted'
+        ? new Response(JSON.stringify({ code: 'email_exists' }), { status: 422 })
+        : new Response(JSON.stringify({ id: 'existing-auth-user' }), { status: 200 })
     const prisma = {
       user: {
         findUnique: async ({ where }: { where: Record<string, unknown> }) => {
@@ -295,6 +308,10 @@ for (const profileState of ['legacy', 'accepted'] as const) {
             disabledAt: null,
           }
         },
+        create: async () => {
+          userWrites += 1
+          return null
+        },
       },
       membership: {
         upsert: async () => {
@@ -305,16 +322,25 @@ for (const profileState of ['legacy', 'accepted'] as const) {
       workspaceAdminAuditLog: { create: async () => null },
     } as unknown as PrismaService
 
-    await assert.rejects(
-      () =>
-        new WorkspaceService(prisma).inviteMember(identity, {
+    try {
+      const result = await new WorkspaceService(prisma).inviteMember(identity, {
           organizationId: WORKSPACE_ORGANIZATION_ID,
           email: 'existing@example.com',
           role: 'MSP_VIEWER',
-        }),
-      /cannot be relinked by invitation/,
-    )
-    assert.equal(membershipWrites, 0)
+      })
+      assert.equal(result.accepted, true)
+      assert.equal(result.delivery, 'INVITE')
+      assert.equal(membershipWrites, 0)
+      assert.equal(userWrites, 0)
+    } finally {
+      globalThis.fetch = priorFetch
+      if (priorSupabaseUrl === undefined) delete process.env.SUPABASE_URL
+      else process.env.SUPABASE_URL = priorSupabaseUrl
+      if (priorServiceRoleKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY
+      else process.env.SUPABASE_SERVICE_ROLE_KEY = priorServiceRoleKey
+      if (priorRedirectUrl === undefined) delete process.env.HAWKVIEW_AUTH_REDIRECT_URL
+      else process.env.HAWKVIEW_AUTH_REDIRECT_URL = priorRedirectUrl
+    }
   })
 }
 

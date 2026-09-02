@@ -95,11 +95,11 @@ const templates = {
     }),
   },
   invite: {
-    subject: 'You are invited to HawkView',
+    subject: 'HawkView invitation sent or resent',
     content: brandedEmail({
-      preheader: 'Accept your invitation to join a HawkView workspace.',
-      title: 'You have been invited',
-      paragraphs: ['A HawkView workspace administrator invited you to join their team. Use the button below to accept the invitation and finish account setup.'],
+      preheader: 'Accept the invitation sent or resent by your HawkView workspace administrator.',
+      title: 'Your HawkView invitation',
+      paragraphs: ['A HawkView workspace administrator sent or resent this invitation to join their team. Use the button below to accept the invitation and finish account setup.'],
       action: { href: confirmationActionUrl('invite'), label: 'Accept invitation' },
     }),
   },

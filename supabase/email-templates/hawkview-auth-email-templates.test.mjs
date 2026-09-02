@@ -117,6 +117,15 @@ test('templates never interpolate user-controlled profile or address fields', ()
   assert.doesNotMatch(combined, /{{ \.(?:Email|NewEmail|OldEmail|Phone|OldPhone|Provider|FactorType) }}/)
 })
 
+test('the invitation template is invitation-only for first delivery and resend', () => {
+  const subject = HAWKVIEW_AUTH_EMAIL_TEMPLATE_PATCH.mailer_subjects_invite
+  const content = HAWKVIEW_AUTH_EMAIL_TEMPLATE_PATCH.mailer_templates_invite_content
+  assert.equal(subject, 'HawkView invitation sent or resent')
+  assert.match(content, /sent or resent this invitation/i)
+  assert.match(content, /type=invite/)
+  assert.doesNotMatch(`${subject}\n${content}`, /password|recovery|reset/i)
+})
+
 test('the manifest does not change security-notification enablement', () => {
   assert.equal(
     HAWKVIEW_AUTH_EMAIL_TEMPLATE_KEYS.some((key) => key.startsWith('mailer_notifications_')),

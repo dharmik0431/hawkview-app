@@ -17,7 +17,11 @@ const SAFE_METADATA_KEYS = new Set([
   'role',
   'status',
 ])
-const SAFE_PROVIDER_CODES = new Set(['AUTH_EMAIL_RATE_LIMITED'])
+const SAFE_ERROR_CODES = new Set([
+  'AUTH_EMAIL_RATE_LIMITED',
+  'INVITATION_NOT_PENDING',
+  'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT',
+])
 
 export type WorkspaceAuditMetadata = Record<
   string,
@@ -86,7 +90,7 @@ export function workspaceAuditErrorCode(error: unknown): string {
     const response = error.getResponse()
     if (response && typeof response === 'object' && !Array.isArray(response)) {
       const code = (response as { code?: unknown }).code
-      if (typeof code === 'string' && SAFE_PROVIDER_CODES.has(code)) return code
+      if (typeof code === 'string' && SAFE_ERROR_CODES.has(code)) return code
     }
     switch (error.getStatus()) {
       case HttpStatus.BAD_REQUEST:

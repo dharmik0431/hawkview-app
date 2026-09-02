@@ -98,6 +98,20 @@ export class WorkspaceController {
     )
   }
 
+  @Post('members/:membershipId/resend-invite')
+  resendInvitation(
+    @Req() request: AuthenticatedRequest,
+    @Param('membershipId') membershipId: string,
+    @Body() body: unknown
+  ) {
+    return this.workspaceService.resendMemberInvitation(
+      request.auth,
+      membershipId,
+      body,
+      request.requestId
+    )
+  }
+
   @Post('members/:membershipId/mfa-reset')
   resetMfa(
     @Req() request: AuthenticatedRequest,

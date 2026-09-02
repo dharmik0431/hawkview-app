@@ -51,31 +51,59 @@ function memberRecord(email: string) {
 }
 
 function fixture(options: { existingPendingUser?: boolean
+    existingUserState?: 'PENDING' | 'ACCEPTED' | 'DISABLED' | 'LEGACY'
     initialAuditFailure?: boolean
-    membershipFailure?: boolean } = {}) {
+    membershipFailure?: boolean
+    memberState?: 'PENDING' | 'ACCEPTED' | 'SUSPENDED' | 'DISABLED'
+    crossOrganization?: boolean } = {}) {
   let membershipWrites = 0
   let userWrites = 0
   let auditAttempts = 0
   const audits: Array<{ data: Record<string, unknown> }> = []
   const email = 'fourth@example.com'
-  const pendingUser = options.existingPendingUser
+  const existingUserState = options.existingUserState ??
+    (options.existingPendingUser ? 'PENDING' : undefined)
+  const pendingUser = existingUserState
     ? {
         id: 'user-four',
         email,
         displayName: 'Fourth member',
-        authProviderUserId: 'auth-user-four',
-        disabledAt: null,
+        authProviderUserId: existingUserState === 'LEGACY' ? null : 'auth-user-four',
+        disabledAt:
+          existingUserState === 'DISABLED'
+            ? new Date('2026-08-28T12:30:00.000Z')
+            : null,
         inviteSentAt: new Date('2026-08-28T11:00:00.000Z'),
-        inviteAcceptedAt: null,
+        inviteAcceptedAt:
+          existingUserState === 'ACCEPTED'
+            ? new Date('2026-08-28T12:30:00.000Z')
+            : null,
         createdAt: new Date('2026-08-28T11:00:00.000Z'),
       }
     : null
+  const baseMember = memberRecord(email)
+  const managedMember = {
+    ...baseMember,
+    status: options.memberState === 'SUSPENDED' ? 'SUSPENDED' : baseMember.status,
+    user: {
+      ...baseMember.user,
+      inviteAcceptedAt:
+        options.memberState === 'ACCEPTED'
+          ? new Date('2026-08-28T13:00:00.000Z')
+          : null as Date | null,
+      disabledAt:
+        options.memberState === 'DISABLED'
+          ? new Date('2026-08-28T13:00:00.000Z')
+          : null as Date | null,
+    },
+  }
   const membership = {
+    findFirst: async () => options.crossOrganization ? null : managedMember,
     upsert: async () => {
       membershipWrites += 1
       if (options.membershipFailure)
         throw new Error('database detail must not escape')
-      return memberRecord(email)
+      return managedMember
     },
   }
   const workspaceAdminAuditLog = {
@@ -88,8 +116,7 @@ function fixture(options: { existingPendingUser?: boolean
       return entry
     },
   }
-  const prisma = {
-    user: {
+  const user = {
       findUnique: async ({ where }: { where: Record<string, unknown> }) => {
         if (Object.prototype.hasOwnProperty.call(where, 'authProviderUserId')) {
           return {
@@ -115,19 +142,22 @@ function fixture(options: { existingPendingUser?: boolean
         userWrites += 1
         return memberRecord(email).user
       },
-      update: async () => {
+      update: async ({ data }: { data: Record<string, unknown> }) => {
         userWrites += 1
-        return memberRecord(email).user
+        return { ...managedMember.user, ...data }
       },
-    },
+  }
+  const prisma = {
+    user,
     membership,
     workspaceAdminAuditLog,
     $transaction: async <T>(
       callback: (client: {
         membership: typeof membership
+        user: typeof user
         workspaceAdminAuditLog: typeof workspaceAdminAuditLog
       }) => Promise<T>
-    ) => callback( { membership,
+    ) => callback( { membership, user,
     workspaceAdminAuditLog }),
   } as unknown as PrismaService
 
@@ -147,6 +177,18 @@ async function invite(service: WorkspaceService) {
   })
 }
 
+async function resend(service: WorkspaceService) {
+  return service.resendMemberInvitation(identity, 'membership-four', {
+    organizationId,
+  })
+}
+
+async function passwordReset(service: WorkspaceService) {
+  return service.sendPasswordReset(identity, 'membership-four', {
+    organizationId,
+  })
+}
+
 test('a fourth workspace member is allowed when the authentication provider accepts the email', async () => {
   configureEnvironment()
   const requestedPaths: string[] = []
@@ -161,6 +203,7 @@ test('a fourth workspace member is allowed when the authentication provider acce
 
   const result = await invite(subject.service)
 
+  assert.equal(result.accepted, true)
   assert.equal(result.delivery, 'INVITE')
   assert.deepEqual(requestedPaths, ['/auth/v1/invite'])
   assert.deepEqual(subject.counts(), { auditAttempts: 3, membershipWrites: 1, userWrites: 1 })
@@ -168,8 +211,8 @@ test('a fourth workspace member is allowed when the authentication provider acce
     subject.audits.map((entry) => entry.data.action),
     [
       'WORKSPACE_MEMBER_INVITE_REQUESTED',
-      'WORKSPACE_MEMBER_INVITE_PROVIDER_ACCEPTED',
-      'WORKSPACE_MEMBER_INVITED',
+      'WORKSPACE_MEMBER_INVITE_PROVIDER_RESOLVED',
+      'WORKSPACE_MEMBER_INVITE_REQUEST_RESOLVED',
     ]
   )
   assert.equal(
@@ -212,17 +255,130 @@ test('invite email rate limiting returns a safe stable API contract and performs
     /fourth@example|provider detail/i)
 })
 
-test('pending-member setup email rate limiting uses the same safe contract and performs no local writes', async () => {
+test('the email-address invite endpoint accepts an existing account without local mutation', async () => {
   configureEnvironment()
-  let requestedPath = ''
-  globalThis.fetch = async (input) => {
-    requestedPath = new URL(String(input)).pathname
-    return new Response(null, { status: 429 })
+  let providerCalls = 0
+  globalThis.fetch = async () => {
+    providerCalls += 1
+    return new Response(JSON.stringify({ id: 'auth-user-four' }), { status: 200 })
   }
   const subject = fixture({ existingPendingUser: true })
 
+  const result = await invite(subject.service)
+
+  assert.deepEqual(
+    { accepted: result.accepted, delivery: result.delivery },
+    { accepted: true, delivery: 'INVITE' }
+  )
+  assert.equal(providerCalls, 1)
+  assert.deepEqual(subject.counts(), { auditAttempts: 3, membershipWrites: 0, userWrites: 0 })
+  assert.deepEqual(
+    subject.audits.map((entry) => entry.data.action),
+    [
+      'WORKSPACE_MEMBER_INVITE_REQUESTED',
+      'WORKSPACE_MEMBER_INVITE_PROVIDER_RESOLVED',
+      'WORKSPACE_MEMBER_INVITE_REQUEST_RESOLVED',
+    ]
+  )
+  assert.equal(subject.audits.at(-1)?.data.targetUserId, null)
+})
+
+test('ordinary invite has one generic response and audit contract for new and existing accounts', async () => {
+  configureEnvironment()
+  const responses: Array<{ accepted: boolean; delivery: string }> = []
+  const auditContracts: string[] = []
+  let providerCalls = 0
+
+  for (const existingUserState of [undefined, 'PENDING', 'ACCEPTED', 'DISABLED', 'LEGACY'] as const) {
+    globalThis.fetch = async () => {
+      providerCalls += 1
+      return existingUserState === 'ACCEPTED'
+        ? new Response(JSON.stringify({ code: 'email_exists', message: 'private detail' }), {
+            status: 422,
+          })
+        : new Response(JSON.stringify({ id: 'auth-user-four' }), { status: 200 })
+    }
+    const subject = fixture({ existingUserState })
+    const result = await invite(subject.service)
+    responses.push({ accepted: result.accepted, delivery: result.delivery })
+    auditContracts.push(
+      JSON.stringify(
+        subject.audits.map((entry) => ({
+          action: entry.data.action,
+          outcome: entry.data.outcome,
+          stage: entry.data.stage,
+          targetUserId: entry.data.targetUserId,
+          metadata: entry.data.metadata,
+        }))
+      )
+    )
+  }
+
+  assert.equal(providerCalls, 5)
+  assert.equal(new Set(responses.map((response) => JSON.stringify(response))).size, 1)
+  assert.equal(new Set(auditContracts).size, 1)
+  assert.doesNotMatch(
+    JSON.stringify({ responses, auditContracts }),
+    /disabled|pending|legacy|private detail/i
+  )
+})
+
+test('only the exact provider email-exists contract is privacy-normalized', async () => {
+  configureEnvironment()
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ code: 'unexpected_provider_error', message: 'private detail' }), {
+      status: 422,
+    })
+  const subject = fixture({ existingUserState: 'ACCEPTED' })
+
+  await assert.rejects(() => invite(subject.service), /could not be completed/i)
+  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
+  assert.doesNotMatch(JSON.stringify(subject.audits), /private detail|unexpected_provider_error/i)
+})
+
+test('a pending or expired member receives a fresh invitation without role or status mutation', async () => {
+  configureEnvironment()
+  const requests: Array<{ path: string; body: Record<string, unknown> }> = []
+  globalThis.fetch = async (input, init) => {
+    requests.push({
+      path: new URL(String(input)).pathname,
+      body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+    })
+    return new Response(JSON.stringify({ id: 'auth-user-four' }), { status: 200 })
+  }
+  const subject = fixture({ memberState: 'PENDING' })
+
+  const result = await resend(subject.service)
+
+  assert.equal(result.delivery, 'INVITE_RESEND')
+  assert.deepEqual(requests.map((request) => request.path), ['/auth/v1/invite'])
+  assert.equal(requests[0].body.redirect_to, 'https://console.hawkviewapp.com/auth/confirm')
+  assert.doesNotMatch(JSON.stringify(requests), /recover|password/i)
+  assert.equal(result.member.role, 'MSP_VIEWER')
+  assert.equal(result.member.status, 'ACTIVE')
+  assert.equal(result.member.hasHawkViewAccount, false)
+  assert.deepEqual(subject.counts(), { auditAttempts: 3, membershipWrites: 0, userWrites: 1 })
+  assert.deepEqual(
+    subject.audits.map((entry) => entry.data.action),
+    [
+      'WORKSPACE_MEMBER_INVITE_RESEND_REQUESTED',
+      'WORKSPACE_MEMBER_INVITE_RESEND_PROVIDER_ACCEPTED',
+      'WORKSPACE_MEMBER_INVITATION_RESENT',
+    ]
+  )
+  assert.equal(
+    new Set(subject.audits.map((entry) => entry.data.operationId)).size,
+    1
+  )
+})
+
+test('resend rate limiting is safe and leaves invitation state unchanged', async () => {
+  configureEnvironment()
+  globalThis.fetch = async () => new Response(null, { status: 429 })
+  const subject = fixture({ memberState: 'PENDING' })
+
   await assert.rejects(
-    () => invite(subject.service),
+    () => resend(subject.service),
     (error: unknown) => {
       const candidate = error as { getStatus?: () => number; getResponse?: () => unknown }
       assert.equal(candidate.getStatus?.(), 429)
@@ -230,9 +386,137 @@ test('pending-member setup email rate limiting uses the same safe contract and p
       return true
     }
   )
-  assert.equal(requestedPath, '/auth/v1/recover')
   assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
+  assert.equal(subject.audits.at(-1)?.data.action, 'WORKSPACE_MEMBER_INVITE_RESEND_FAILED')
   assert.equal(subject.audits.at(-1)?.data.errorCode, 'AUTH_EMAIL_RATE_LIMITED')
+})
+
+test('an unavailable resend intent audit fails closed before the provider call', async () => {
+  configureEnvironment()
+  let providerCalls = 0
+  globalThis.fetch = async () => {
+    providerCalls += 1
+    return new Response(null, { status: 200 })
+  }
+  const subject = fixture({ memberState: 'PENDING', initialAuditFailure: true })
+
+  await assert.rejects(() => resend(subject.service), /audit storage unavailable/)
+  assert.equal(providerCalls, 0)
+  assert.deepEqual(subject.counts(), { auditAttempts: 1, membershipWrites: 0, userWrites: 0 })
+  assert.deepEqual(subject.audits, [])
+})
+
+test('provider resend failure never falls back to recovery or changes local state', async () => {
+  configureEnvironment()
+  const paths: string[] = []
+  globalThis.fetch = async (input) => {
+    paths.push(new URL(String(input)).pathname)
+    return new Response(JSON.stringify({ message: 'private provider detail' }), { status: 500 })
+  }
+  const subject = fixture({ memberState: 'PENDING' })
+
+  await assert.rejects(() => resend(subject.service), /could not be completed/i)
+  assert.deepEqual(paths, ['/auth/v1/invite'])
+  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
+  assert.doesNotMatch(JSON.stringify(subject.audits), /private provider detail|fourth@example/i)
+})
+
+test('provider email-exists rejection cannot become a successful resend', async () => {
+  configureEnvironment()
+  const paths: string[] = []
+  globalThis.fetch = async (input) => {
+    paths.push(new URL(String(input)).pathname)
+    return new Response(
+      JSON.stringify({ code: 'email_exists', message: 'private provider detail' }),
+      { status: 422 }
+    )
+  }
+  const subject = fixture({ memberState: 'PENDING' })
+
+  await assert.rejects(() => resend(subject.service), /could not be completed/i)
+  assert.deepEqual(paths, ['/auth/v1/invite'])
+  assert.deepEqual(subject.counts(), {
+    auditAttempts: 2,
+    membershipWrites: 0,
+    userWrites: 0,
+  })
+  assert.equal(subject.audits.at(-1)?.data.action, 'WORKSPACE_MEMBER_INVITE_RESEND_FAILED')
+  assert.equal(subject.audits.at(-1)?.data.outcome, 'FAILED')
+  assert.doesNotMatch(JSON.stringify(subject.audits), /email_exists|private provider detail/i)
+})
+
+test('accepted, suspended, and disabled members cannot receive a resent invitation', async () => {
+  configureEnvironment()
+  for (const memberState of ['ACCEPTED', 'SUSPENDED', 'DISABLED'] as const) {
+    let providerCalls = 0
+    globalThis.fetch = async () => {
+      providerCalls += 1
+      return new Response(null, { status: 200 })
+    }
+    const subject = fixture({ memberState })
+    await assert.rejects(
+      () => resend(subject.service),
+      (error: unknown) => {
+        const candidate = error as { getStatus?: () => number; getResponse?: () => unknown }
+        assert.equal(candidate.getStatus?.(), 409)
+        assert.equal(
+          (candidate.getResponse?.() as { code?: unknown }).code,
+          'INVITATION_NOT_PENDING'
+        )
+        return true
+      }
+    )
+    assert.equal(providerCalls, 0)
+    assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
+  }
+})
+
+test('cross-organization resend fails before provider or audit side effects', async () => {
+  configureEnvironment()
+  let providerCalls = 0
+  globalThis.fetch = async () => {
+    providerCalls += 1
+    return new Response(null, { status: 200 })
+  }
+  const subject = fixture({ crossOrganization: true })
+
+  await assert.rejects(() => resend(subject.service), /not found/i)
+  assert.equal(providerCalls, 0)
+  assert.deepEqual(subject.counts(), { auditAttempts: 0, membershipWrites: 0, userWrites: 0 })
+})
+
+test('password reset is blocked for pending invitations and remains separate for accepted accounts', async () => {
+  configureEnvironment()
+  const paths: string[] = []
+  globalThis.fetch = async (input) => {
+    paths.push(new URL(String(input)).pathname)
+    return new Response(null, { status: 200 })
+  }
+
+  const pending = fixture({ memberState: 'PENDING' })
+  await assert.rejects(
+    () => passwordReset(pending.service),
+    (error: unknown) => {
+      const candidate = error as { getStatus?: () => number; getResponse?: () => unknown }
+      assert.equal(candidate.getStatus?.(), 409)
+      assert.equal(
+        (candidate.getResponse?.() as { code?: unknown }).code,
+        'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT'
+      )
+      return true
+    }
+  )
+  assert.deepEqual(paths, [])
+  assert.equal(pending.audits.at(-1)?.data.stage, 'REQUEST_VALIDATION')
+  assert.equal(
+    pending.audits.at(-1)?.data.errorCode,
+    'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT'
+  )
+
+  const accepted = fixture({ memberState: 'ACCEPTED' })
+  const result = await passwordReset(accepted.service)
+  assert.equal(result.sent, true)
+  assert.deepEqual(paths, ['/auth/v1/recover'])
 })
 
 test('provider acceptance remains durably provable when membership persistence fails', async () => {
@@ -252,7 +536,7 @@ test('provider acceptance remains durably provable when membership persistence f
     [
       ['WORKSPACE_MEMBER_INVITE_REQUESTED', 'STARTED', 'REQUEST_ACCEPTED'],
       [
-        'WORKSPACE_MEMBER_INVITE_PROVIDER_ACCEPTED',
+        'WORKSPACE_MEMBER_INVITE_PROVIDER_RESOLVED',
         'SUCCEEDED',
         'AUTH_PROVIDER',
       ],
