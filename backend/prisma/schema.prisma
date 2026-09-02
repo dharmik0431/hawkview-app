@@ -218,6 +218,8 @@ model Organization {
   m365AuditRecords M365AuditRecord[]
   m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
+  identityRiskEvaluationRuns IdentityRiskEvaluationRun[]
+  identityRiskFindings IdentityRiskFinding[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
   microsoftConsentAttempts MicrosoftConsentAttempt[]
@@ -301,6 +303,8 @@ model CustomerTenant {
   m365AuditRecords M365AuditRecord[]
   m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
+  identityRiskEvaluationRuns IdentityRiskEvaluationRun[]
+  identityRiskFindings IdentityRiskFinding[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
   microsoftConsentAttempts MicrosoftConsentAttempt[]
@@ -724,6 +728,63 @@ model ChangeEvidenceEvent {
   @@index([customerTenantId, correlationId])
   @@index([expiresAt])
   @@map("change_evidence_events")
+}
+
+// The identity-risk platform stores only matched evidence and bounded run
+// aggregates. It deliberately does not retain a row per user/rule abstention.
+model IdentityRiskEvaluationRun {
+  id                String         @id @default(uuid()) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  customerTenantId  String         @map("customer_tenant_id") @db.Uuid
+  runKey            String         @map("run_key") @db.VarChar(128)
+  engineVersion     String         @map("engine_version") @db.VarChar(100)
+  catalogVersion    String         @map("catalog_version") @db.VarChar(100)
+  status            String         @db.VarChar(30)
+  windowStart       DateTime       @map("window_start") @db.Timestamptz(6)
+  windowEnd         DateTime       @map("window_end") @db.Timestamptz(6)
+  sourceWatermarkHash String       @map("source_watermark_hash") @db.VarChar(128)
+  aggregate         Json           @default("{}") @db.JsonB
+  expiresAt         DateTime       @map("expires_at") @db.Timestamptz(6)
+  completedAt       DateTime?      @map("completed_at") @db.Timestamptz(6)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  findings          IdentityRiskFinding[]
+
+  @@unique([organizationId, customerTenantId, runKey])
+  @@index([organizationId, customerTenantId, completedAt(sort: Desc)])
+  @@index([expiresAt])
+  @@map("identity_risk_evaluation_runs")
+}
+
+model IdentityRiskFinding {
+  id                String         @id @default(uuid()) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  customerTenantId  String         @map("customer_tenant_id") @db.Uuid
+  evaluationRunId   String         @map("evaluation_run_id") @db.Uuid
+  dedupeKey         String         @map("dedupe_key") @db.VarChar(128)
+  ruleId            String         @map("rule_id") @db.VarChar(150)
+  ruleVersion       String         @map("rule_version") @db.VarChar(100)
+  subjectType       String         @map("subject_type") @db.VarChar(50)
+  subjectId         String         @map("subject_id") @db.VarChar(128)
+  state             String         @default("OPEN") @db.VarChar(30)
+  severity          String         @db.VarChar(20)
+  confidence        String         @db.VarChar(20)
+  coverage          String         @db.VarChar(20)
+  explanation       Json           @default("{}") @db.JsonB
+  evidence          Json           @default("[]") @db.JsonB
+  observedAt        DateTime       @map("observed_at") @db.Timestamptz(6)
+  expiresAt         DateTime       @map("expires_at") @db.Timestamptz(6)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  evaluationRun     IdentityRiskEvaluationRun @relation(fields: [evaluationRunId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, customerTenantId, dedupeKey])
+  @@index([organizationId, customerTenantId, state, observedAt(sort: Desc)])
+  @@index([expiresAt])
+  @@map("identity_risk_findings")
 }
 
 model TenantConnection {
