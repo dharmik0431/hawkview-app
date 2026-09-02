@@ -4,6 +4,8 @@ import './globals.css'
 import { QueryProvider } from '@/components/providers/query-provider'
 import { ThemeProvider } from '@/components/providers/theme-provider'
 import { AuthProvider } from '@/components/providers/auth-provider'
+import { FeatureFlagProvider } from '@/components/providers/feature-flag-provider'
+import { resolveServerFeatureFlags } from '@/lib/features/feature-flags'
 
 const inter = Inter({ subsets: ['latin'] })
 
@@ -22,6 +24,10 @@ export default function RootLayout({
 }: {
   children: React.ReactNode
 }) {
+  const featureFlags = resolveServerFeatureFlags({
+    identityRiskUi: process.env.HAWKVIEW_IDENTITY_RISK_UI_ENABLED,
+  })
+
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={inter.className}>
@@ -31,9 +37,11 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          <AuthProvider>
-            <QueryProvider>{children}</QueryProvider>
-          </AuthProvider>
+          <FeatureFlagProvider flags={featureFlags}>
+            <AuthProvider>
+              <QueryProvider>{children}</QueryProvider>
+            </AuthProvider>
+          </FeatureFlagProvider>
         </ThemeProvider>
       </body>
     </html>
