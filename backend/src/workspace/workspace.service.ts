@@ -608,7 +608,11 @@ export class WorkspaceService {
     }
   }
 
-  private async supabaseAdminRequest(path: string, init: RequestInit) {
+  private async supabaseAdminRequest(
+    path: string,
+    init: RequestInit,
+    options?: { normalizeExistingInvite?: boolean }
+  ) {
     const { url, serviceRoleKey } = this.supabaseConfiguration()
     let response: Response
     try {
@@ -645,6 +649,7 @@ export class WorkspaceService {
           ? (result as { code?: unknown }).code
           : null
       if (
+        options?.normalizeExistingInvite === true &&
         path === '/auth/v1/invite' &&
         response.status === HttpStatus.UNPROCESSABLE_ENTITY &&
         providerCode === 'email_exists'
@@ -688,14 +693,18 @@ export class WorkspaceService {
     if (!ROLE_VALUES.has(role)) { throw new BadRequestException('Select a valid workspace role.')
       }
       stage = 'AUTH_PROVIDER'
-      const invite = await this.supabaseAdminRequest('/auth/v1/invite', {
-        method: 'POST',
-        body: JSON.stringify({
-          email,
-          data: displayName ? { display_name: displayName } : undefined,
-          redirect_to: this.authEmailRedirectUrl(),
-        }),
-      })
+      const invite = await this.supabaseAdminRequest(
+        '/auth/v1/invite',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            email,
+            data: displayName ? { display_name: displayName } : undefined,
+            redirect_to: this.authEmailRedirectUrl(),
+          }),
+        },
+        { normalizeExistingInvite: true }
+      )
       await this.audit(actor, {
         ...operation,
         ...target,

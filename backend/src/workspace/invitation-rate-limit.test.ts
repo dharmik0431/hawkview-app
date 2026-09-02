@@ -421,6 +421,30 @@ test('provider resend failure never falls back to recovery or changes local stat
   assert.doesNotMatch(JSON.stringify(subject.audits), /private provider detail|fourth@example/i)
 })
 
+test('provider email-exists rejection cannot become a successful resend', async () => {
+  configureEnvironment()
+  const paths: string[] = []
+  globalThis.fetch = async (input) => {
+    paths.push(new URL(String(input)).pathname)
+    return new Response(
+      JSON.stringify({ code: 'email_exists', message: 'private provider detail' }),
+      { status: 422 }
+    )
+  }
+  const subject = fixture({ memberState: 'PENDING' })
+
+  await assert.rejects(() => resend(subject.service), /could not be completed/i)
+  assert.deepEqual(paths, ['/auth/v1/invite'])
+  assert.deepEqual(subject.counts(), {
+    auditAttempts: 2,
+    membershipWrites: 0,
+    userWrites: 0,
+  })
+  assert.equal(subject.audits.at(-1)?.data.action, 'WORKSPACE_MEMBER_INVITE_RESEND_FAILED')
+  assert.equal(subject.audits.at(-1)?.data.outcome, 'FAILED')
+  assert.doesNotMatch(JSON.stringify(subject.audits), /email_exists|private provider detail/i)
+})
+
 test('accepted, suspended, and disabled members cannot receive a resent invitation', async () => {
   configureEnvironment()
   for (const memberState of ['ACCEPTED', 'SUSPENDED', 'DISABLED'] as const) {
