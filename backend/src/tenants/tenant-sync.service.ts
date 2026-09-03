@@ -114,9 +114,55 @@ export const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
 export const GRAPH_LOG_PAGE_MAX_BYTES = 2 * 1024 * 1024
 /** Cumulative retained parsed log data. Page and row limits alone permit too much heap. */
 export const GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES = 8 * 1024 * 1024
+export type EntraCollectionLimits = {
+  pages: number
+  rows: number
+  pageBytes: number
+  materializedBytes: number
+  requestTimeoutMs: number
+  collectorDeadlineMs: number
+}
+
+export const ENTRA_COLLECTION_LIMITS: Readonly<EntraCollectionLimits> = Object.freeze({
+  pages: 50,
+  rows: 25_000,
+  pageBytes: 2 * 1024 * 1024,
+  materializedBytes: 8 * 1024 * 1024,
+  requestTimeoutMs: 30_000,
+  collectorDeadlineMs: 10 * 60_000,
+})
+const ENTRA_SMALL_COLLECTION_RESOURCES = new Set<EntraSnapshotResource>([
+  'AUTH_METHOD_POLICIES',
+  'CONDITIONAL_ACCESS',
+  'AUTHENTICATION_STRENGTHS',
+  'NAMED_LOCATIONS',
+  'DIRECTORY_ROLES',
+  'SECURE_SCORES',
+  'SECURITY_DEFAULTS',
+])
+
+export function entraCollectionLimitsForResource(
+  resourceType: EntraSnapshotResource,
+): Readonly<EntraCollectionLimits> {
+  if (!ENTRA_SMALL_COLLECTION_RESOURCES.has(resourceType)) return ENTRA_COLLECTION_LIMITS
+  return {
+    ...ENTRA_COLLECTION_LIMITS,
+    pages: resourceType === 'SECURE_SCORES' ? 2 : 10,
+    rows: resourceType === 'SECURE_SCORES' ? 100 : 5_000,
+    materializedBytes: resourceType === 'SECURE_SCORES' ? 1024 * 1024 : 4 * 1024 * 1024,
+  }
+}
+export const GROUP_RELATIONSHIP_LIMITS = Object.freeze({
+  rows: 100_000,
+  materializedBytes: 8 * 1024 * 1024,
+  collectorDeadlineMs: 10 * 60_000,
+})
 export const MAILBOX_USAGE_CSV_MAX_BYTES = 5 * 1024 * 1024
 export const MAILBOX_USAGE_CSV_MAX_ROWS = 20_000
 export const MAILBOX_USAGE_CSV_MAX_COLUMNS = 128
+export const MICROSOFT_USAGE_REPORT_CSV_MAX_BYTES = MAILBOX_USAGE_CSV_MAX_BYTES
+export const MICROSOFT_USAGE_REPORT_CSV_MAX_ROWS = MAILBOX_USAGE_CSV_MAX_ROWS
+export const MICROSOFT_USAGE_REPORT_CSV_MAX_COLUMNS = MAILBOX_USAGE_CSV_MAX_COLUMNS
 /** Mailbox views only consume these report fields. Do not retain arbitrary CSV columns. */
 const MAILBOX_USAGE_CSV_FIELDS = Object.freeze([
   'User Principal Name',
@@ -127,6 +173,25 @@ const MAILBOX_USAGE_CSV_FIELDS = Object.freeze([
   'Storage Used Bytes',
   'Item Count',
   'Items Count',
+])
+/** Fields consumed by the SharePoint/OneDrive usage contract. */
+export const MICROSOFT_USAGE_REPORT_CSV_FIELDS = Object.freeze([
+  'Report Refresh Date',
+  'Site Id',
+  'Site URL',
+  'Site Name',
+  'Is Deleted',
+  'Last Activity Date',
+  'Storage Used (Byte)',
+  'Storage Allocated (Byte)',
+  'Report Period',
+  'Owner Display Name',
+  'Owner Principal Name',
+  'Root Web Template',
+  'File Count',
+  'Active File Count',
+  'Page View Count',
+  'Visited Page Count',
 ])
 /** Hard ceilings keep a targeted SharePoint retry below the 15 minute USERS lease. */
 export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
@@ -147,14 +212,22 @@ export type SyncCollectorModule = {
   synchronize: () => Promise<unknown>
 }
 
-const isHeavyGraphLogResource = (resource: string) =>
-  resource === 'SIGN_INS' || resource === 'AUDIT_LOGS'
+const BOUNDED_MEMORY_COLLECTION_RESOURCES = new Set([
+  'LICENSES', 'ORGANIZATION_CONFIGURATION', 'DOMAINS', 'GROUPS',
+  'SHAREPOINT_SITES', 'SHAREPOINT_USAGE', 'EXCHANGE_MAILBOXES',
+  'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_MAILBOX_RULES',
+  'AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUTHENTICATION_STRENGTHS',
+  'NAMED_LOCATIONS', 'SIGN_INS', 'AUDIT_LOGS', 'DEVICES', 'DIRECTORY_ROLES',
+  'RISKY_USERS', 'SERVICE_PRINCIPALS', 'APPLICATIONS', 'SECURE_SCORES',
+])
+
+const isBoundedMemoryCollectionResource = (resource: string) =>
+  BOUNDED_MEMORY_COLLECTION_RESOURCES.has(resource)
 
 /**
- * Sign-ins and directory audit logs can each retain a bounded multi-page
- * result. Run those two collectors one after the other while allowing all
- * other independent collectors to proceed concurrently. Results preserve the
- * caller's original order so operational attribution cannot drift.
+ * All materializing collectors share one bounded-memory lane. Small,
+ * independently bounded collectors may still run concurrently. Results
+ * preserve caller order so operational attribution cannot drift.
  */
 export async function settleSyncCollectorModules(
   modules: ReadonlyArray<SyncCollectorModule>,
@@ -163,7 +236,7 @@ export async function settleSyncCollectorModules(
   const heavyIndexes: number[] = []
   const otherIndexes: number[] = []
   modules.forEach((module, index) => {
-    ;(isHeavyGraphLogResource(module.resource) ? heavyIndexes : otherIndexes).push(index)
+    ;(isBoundedMemoryCollectionResource(module.resource) ? heavyIndexes : otherIndexes).push(index)
   })
 
   const settleOne = async (index: number) => {
@@ -376,60 +449,6 @@ function summarizeAuthenticationMethodTargets(method: any) {
   return ids.length > 0
     ? `${ids.length} selected group(s)`
     : 'No users targeted'
-}
-
-export function parseCsvRows(csv: string): Record<string, string>[] {
-  if (Buffer.byteLength(csv, 'utf8') > MAILBOX_USAGE_CSV_MAX_BYTES) {
-    throw new Error('Microsoft mailbox usage report exceeded the bounded response-size limit.')
-  }
-  const rows: string[][] = []
-  let row: string[] = []
-  let field = ''
-  let quoted = false
-
-  for (let index = 0; index < csv.length; index += 1) {
-    const character = csv[index]
-    if (character === '"') {
-      if (quoted && csv[index + 1] === '"') {
-        field += '"'
-        index += 1
-      } else {
-        quoted = !quoted
-      }
-    } else if (character === ',' && !quoted) {
-      row.push(field)
-      field = ''
-    } else if ((character === '\n' || character === '\r') && !quoted) {
-      if (character === '\r' && csv[index + 1] === '\n') index += 1
-      row.push(field)
-      if (row.length > MAILBOX_USAGE_CSV_MAX_COLUMNS || rows.length >= MAILBOX_USAGE_CSV_MAX_ROWS) {
-        throw new Error('Microsoft mailbox usage report exceeded a bounded row or column limit.')
-      }
-      if (row.some((value) => value.length > 0)) rows.push(row)
-      row = []
-      field = ''
-    } else {
-      field += character
-    }
-  }
-  if (field.length > 0 || row.length > 0) {
-    if (row.length + 1 > MAILBOX_USAGE_CSV_MAX_COLUMNS || rows.length >= MAILBOX_USAGE_CSV_MAX_ROWS) {
-      throw new Error('Microsoft mailbox usage report exceeded a bounded row or column limit.')
-    }
-    row.push(field)
-    rows.push(row)
-  }
-
-  const [rawHeaders, ...values] = rows
-  if (!rawHeaders) return []
-  const headers = rawHeaders.map((header, index) =>
-    (index === 0 ? header.replace(/^\uFEFF/, '') : header).trim()
-  )
-  return values.map((columns) =>
-    Object.fromEntries(
-      headers.map((header, index) => [header, columns[index]?.trim() ?? ''])
-    )
-  )
 }
 
 /**
@@ -801,16 +820,6 @@ interface GraphGroup {
   }>
 }
 
-interface GraphGroupsPage {
-  value?: GraphGroup[]
-  '@odata.nextLink'?: string
-}
-
-interface GraphGroupMembersPage {
-  value?: Array<{ id?: string }>
-  '@odata.nextLink'?: string
-}
-
 type EntraSnapshotResource =
   | 'LICENSES'
   | 'ORGANIZATION_CONFIGURATION'
@@ -1030,6 +1039,7 @@ export function graphErrorCodeFromBody(body: string) {
 export async function readBoundedResponseText(
   response: Response,
   maximumBytes: number,
+  failureMessage = 'Microsoft Graph response exceeded the bounded response-size limit.',
 ) {
   const declaredLength = Number(response.headers.get('content-length') ?? '0')
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
@@ -1038,7 +1048,7 @@ export async function readBoundedResponseText(
     } catch {
       // A hostile/corrupt stream must not replace the safe bounded failure.
     }
-    throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
+    throw new Error(failureMessage)
   }
   if (!response.body) throw new Error('Microsoft Graph response body was unavailable.')
   const reader = response.body.getReader()
@@ -1051,8 +1061,12 @@ export async function readBoundedResponseText(
       if (!value) continue
       total += value.byteLength
       if (total > maximumBytes) {
-        await reader.cancel('Microsoft Graph error response exceeded bounded limit')
-        throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
+        try {
+          await reader.cancel('Microsoft response exceeded bounded limit')
+        } catch {
+          // A hostile/corrupt stream must not replace the stable bounded error.
+        }
+        throw new Error(failureMessage)
       }
       chunks.push(value)
     }
@@ -1086,15 +1100,19 @@ export async function parseBoundedGraphCollectionPage(
 }
 
 /**
- * Project the mailbox report as it is parsed instead of retaining every one of
- * its (up to 20k x 128) raw cells. The report remains byte/row/column bounded;
- * its persisted snapshot is limited to fields the mailbox API actually reads.
+ * Project a Microsoft usage report as it is parsed instead of retaining every
+ * one of its (up to 20k x 128) raw cells. The report remains byte/row/column
+ * bounded and its persisted snapshot is limited to an explicit field set.
  */
-export function parseMailboxUsageCsv(csv: string): Record<string, string>[] {
-  if (Buffer.byteLength(csv, 'utf8') > MAILBOX_USAGE_CSV_MAX_BYTES) {
-    throw new Error('Microsoft mailbox usage report exceeded the bounded response-size limit.')
+export function parseProjectedUsageCsv(
+  csv: string,
+  fields: ReadonlyArray<string>,
+  label: string,
+): Record<string, string>[] {
+  if (Buffer.byteLength(csv, 'utf8') > MICROSOFT_USAGE_REPORT_CSV_MAX_BYTES) {
+    throw new Error(`Microsoft ${label} usage report exceeded the bounded response-size limit.`)
   }
-  const selected = new Set(MAILBOX_USAGE_CSV_FIELDS)
+  const selected = new Set(fields)
   const result: Record<string, string>[] = []
   let headers: string[] | null = null
   let row: string[] = []
@@ -1105,8 +1123,8 @@ export function parseMailboxUsageCsv(csv: string): Record<string, string>[] {
     row.push(field)
     field = ''
     // Match the generic parser's ceiling: the header counts as one CSV row.
-    if (row.length > MAILBOX_USAGE_CSV_MAX_COLUMNS || (headers && result.length >= MAILBOX_USAGE_CSV_MAX_ROWS - 1)) {
-      throw new Error('Microsoft mailbox usage report exceeded a bounded row or column limit.')
+    if (row.length > MICROSOFT_USAGE_REPORT_CSV_MAX_COLUMNS || (headers && result.length >= MICROSOFT_USAGE_REPORT_CSV_MAX_ROWS - 1)) {
+      throw new Error(`Microsoft ${label} usage report exceeded a bounded row or column limit.`)
     }
     if (!row.some((value) => value.length > 0)) { row = []; return }
     if (!headers) {
@@ -1131,16 +1149,25 @@ export function parseMailboxUsageCsv(csv: string): Record<string, string>[] {
       if (quoted && csv[index + 1] === '"') { field += '"'; index += 1 } else quoted = !quoted
     } else if (character === ',' && !quoted) {
       row.push(field); field = ''
-      if (row.length >= MAILBOX_USAGE_CSV_MAX_COLUMNS) {
-        throw new Error('Microsoft mailbox usage report exceeded a bounded row or column limit.')
+      if (row.length >= MICROSOFT_USAGE_REPORT_CSV_MAX_COLUMNS) {
+        throw new Error(`Microsoft ${label} usage report exceeded a bounded row or column limit.`)
       }
     } else if ((character === '\n' || character === '\r') && !quoted) {
       if (character === '\r' && csv[index + 1] === '\n') index += 1
       completeRow()
     } else field += character
   }
+  if (quoted) throw new Error(`Microsoft ${label} usage report returned invalid quoted CSV.`)
   if (field.length > 0 || row.length > 0) completeRow()
   return result
+}
+
+export function parseMailboxUsageCsv(csv: string): Record<string, string>[] {
+  return parseProjectedUsageCsv(csv, MAILBOX_USAGE_CSV_FIELDS, 'mailbox')
+}
+
+export function parseMicrosoftUsageReportCsv(csv: string): Record<string, string>[] {
+  return parseProjectedUsageCsv(csv, MICROSOFT_USAGE_REPORT_CSV_FIELDS, 'SharePoint or OneDrive')
 }
 
 export function assertGraphCollectionBounds(input: {
@@ -2020,9 +2047,7 @@ export class TenantSyncService {
         synchronize: () => this.syncExchangeMailboxConfiguration(tenant),
       })
     }
-    const snapshotResults = await Promise.allSettled(
-      snapshotModules.map((module) => module.synchronize())
-    )
+    const snapshotResults = await settleSyncCollectorModules(snapshotModules)
     snapshotResults.forEach((result, index) => {
       if (result.status === 'rejected') {
         const resource = snapshotModules[index]?.resource ?? 'UNKNOWN'
@@ -2711,30 +2736,22 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'GROUPS', async () => {
-      const groups: GraphGroup[] = []
-      let groupsUrl =
+      const groupsUrl =
         'https://graph.microsoft.com/v1.0/groups?' +
         '$select=id,displayName,description,mail,mailNickname,mailEnabled,' +
         'securityEnabled,groupTypes,visibility,onPremisesSyncEnabled&' +
         '$top=999'
 
-      while (groupsUrl) {
-        if (!groupsUrl.startsWith('https://graph.microsoft.com/')) {
-          throw new Error('Microsoft returned an invalid groups link.')
-        }
-        const response = await this.fetchGraphPage(
-          groupsUrl, accessToken, 'groups', { timeoutMs: 20_000 },
-        )
-        const page = (await response.json()) as GraphGroupsPage
-        groups.push(
-          ...(page.value ?? []).filter(
-            (group) =>
-              typeof group.id === 'string' &&
-              typeof group.displayName === 'string'
-          )
-        )
-        groupsUrl = page['@odata.nextLink'] ?? ''
-      }
+      const groups = (await this.collectEntraCollection(
+        accessToken,
+        'GROUPS',
+        groupsUrl,
+      )).filter(
+        (group): group is GraphGroup =>
+          plainRecord(group) &&
+          typeof group.id === 'string' &&
+          typeof group.displayName === 'string',
+      )
 
       const groupTargets = groups.map((group) => ({
         id: group.id as string,
@@ -2794,67 +2811,93 @@ export class TenantSyncService {
 
       await this.saveSnapshot(tenant, 'GROUPS', authoritativeSnapshot(groups))
 
+      const relationshipDeadlineAt = Date.now() + GROUP_RELATIONSHIP_LIMITS.collectorDeadlineMs
+      let ownerRows = 0
+      let ownerBytes = 0
       const fetchGroupOwners = async (groupId: string) => {
-        const owners: NonNullable<GraphGroup['owners']> = []
-        let ownersUrl =
+        const remainingRows = GROUP_RELATIONSHIP_LIMITS.rows - ownerRows
+        const remainingBytes = GROUP_RELATIONSHIP_LIMITS.materializedBytes - ownerBytes
+        const remainingMs = relationshipDeadlineAt - Date.now()
+        if (remainingRows <= 0 || remainingBytes <= 0 || remainingMs <= 0) {
+          throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
+        }
+        const ownersUrl =
           `https://graph.microsoft.com/v1.0/groups/${encodeURIComponent(groupId)}` +
           '/owners?$select=id,displayName,userPrincipalName&$top=999'
-        while (ownersUrl) {
-          if (!ownersUrl.startsWith('https://graph.microsoft.com/')) {
-            throw new Error('Microsoft returned an invalid group-owners link.')
-          }
-          const response = await this.fetchGraphPage(
-            ownersUrl, accessToken, 'group owner', { timeoutMs: 20_000 },
-          )
-          const page = (await response.json()) as {
-            value?: NonNullable<GraphGroup['owners']>
-            '@odata.nextLink'?: string
-          }
-          owners.push(...(page.value ?? []))
-          ownersUrl = page['@odata.nextLink'] ?? ''
+        const owners = (await this.collectEntraCollection(
+          accessToken,
+          'GROUPS',
+          ownersUrl,
+          {
+            ...ENTRA_COLLECTION_LIMITS,
+            rows: remainingRows,
+            materializedBytes: remainingBytes,
+            collectorDeadlineMs: remainingMs,
+          },
+        )).filter(plainRecord) as NonNullable<GraphGroup['owners']>
+        const bytes = Buffer.byteLength(JSON.stringify(owners), 'utf8')
+        if (ownerRows + owners.length > GROUP_RELATIONSHIP_LIMITS.rows || ownerBytes + bytes > GROUP_RELATIONSHIP_LIMITS.materializedBytes) {
+          throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
         }
+        ownerRows += owners.length
+        ownerBytes += bytes
         return owners
       }
 
       const { ownersByGroupId, failures: ownerFailures } =
-        await collectGroupOwners(groupTargets, (group) =>
-          fetchGroupOwners(group.id)
+        await collectGroupOwners(
+          groupTargets,
+          (group) => fetchGroupOwners(group.id),
+          1,
         )
       for (const group of groups) {
         group.owners = ownersByGroupId.get(group.id as string) ?? []
       }
+      ownersByGroupId.clear()
       for (const failure of ownerFailures) {
         this.logOperationalFailure('GROUPS', 'RELATIONSHIP', 'OWNER_REFRESH_UNAVAILABLE')
       }
 
+      let memberRows = 0
+      let memberBytes = 0
       const fetchGroupMemberIds = async (groupId: string) => {
-        const memberIds: string[] = []
-        let membersUrl =
+        const remainingRows = GROUP_RELATIONSHIP_LIMITS.rows - memberRows
+        const remainingBytes = GROUP_RELATIONSHIP_LIMITS.materializedBytes - memberBytes
+        const remainingMs = relationshipDeadlineAt - Date.now()
+        if (remainingRows <= 0 || remainingBytes <= 0 || remainingMs <= 0) {
+          throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
+        }
+        const membersUrl =
           `https://graph.microsoft.com/v1.0/groups/${encodeURIComponent(groupId)}` +
           '/members?$select=id&$top=999'
-        while (membersUrl) {
-          if (!membersUrl.startsWith('https://graph.microsoft.com/')) {
-            throw new Error('Microsoft returned an invalid group-members link.')
-          }
-          const response = await this.fetchGraphPage(
-            membersUrl, accessToken, 'group membership', { timeoutMs: 20_000 },
-          )
-          const page = (await response.json()) as GraphGroupMembersPage
-          memberIds.push(
-            ...(page.value ?? [])
-              .map((member) => member.id)
-              .filter((id): id is string => typeof id === 'string')
-          )
-          membersUrl = page['@odata.nextLink'] ?? ''
+        const memberIds = (await this.collectEntraCollection(
+          accessToken,
+          'GROUPS',
+          membersUrl,
+          {
+            ...ENTRA_COLLECTION_LIMITS,
+            rows: remainingRows,
+            materializedBytes: remainingBytes,
+            collectorDeadlineMs: remainingMs,
+          },
+        )).map((member) => plainRecord(member) ? member.id : null)
+          .filter((id): id is string => typeof id === 'string')
+        const bytes = Buffer.byteLength(JSON.stringify(memberIds), 'utf8')
+        if (memberRows + memberIds.length > GROUP_RELATIONSHIP_LIMITS.rows || memberBytes + bytes > GROUP_RELATIONSHIP_LIMITS.materializedBytes) {
+          throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
         }
+        memberRows += memberIds.length
+        memberBytes += bytes
         return memberIds
       }
 
       // Keep concurrency bounded to avoid overwhelming Microsoft Graph while
       // still making the initial snapshot practical for tenants with many groups.
       const { memberIdsByGroupId, failures: membershipFailures } =
-        await collectGroupMemberships(groupTargets, (group) =>
-          fetchGroupMemberIds(group.id)
+        await collectGroupMemberships(
+          groupTargets,
+          (group) => fetchGroupMemberIds(group.id),
+          1,
         )
       for (const failure of membershipFailures) {
         this.logOperationalFailure('GROUPS', 'RELATIONSHIP', 'MEMBERSHIP_REFRESH_UNAVAILABLE')
@@ -2950,21 +2993,65 @@ export class TenantSyncService {
     accessToken: string,
     resourceType: EntraSnapshotResource,
     initialUrl: string,
+    limits: Readonly<EntraCollectionLimits> = entraCollectionLimitsForResource(resourceType),
   ) {
     const rows: unknown[] = []
+    const seenUrls = new Set<string>()
+    const deadlineAt = Date.now() + limits.collectorDeadlineMs
+    let pages = 0
+    let materializedBytes = 0
     let nextUrl = initialUrl
     while (nextUrl) {
+      pages += 1
+      if (
+        pages > limits.pages ||
+        Date.now() >= deadlineAt ||
+        seenUrls.has(nextUrl)
+      ) {
+        throw new Error(`Microsoft ${resourceType} synchronization exceeded a bounded collection limit.`)
+      }
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
       }
+      seenUrls.add(nextUrl)
       const response = await this.fetchGraphPage(
         nextUrl,
         accessToken,
         resourceType.toLowerCase(),
+        {
+          timeoutMs: Math.max(1, Math.min(limits.requestTimeoutMs, deadlineAt - Date.now())),
+          deadlineAt,
+        },
       )
-      const page = (await response.json()) as GraphCollectionPage
-      rows.push(...(page.value ?? []))
-      nextUrl = page['@odata.nextLink'] ?? ''
+      let page: GraphCollectionPage
+      try {
+        const parsed = JSON.parse(await readBoundedResponseText(
+          response,
+          limits.pageBytes,
+          `Microsoft ${resourceType} synchronization exceeded a bounded page-size limit.`,
+        )) as unknown
+        if (!plainRecord(parsed) || !Array.isArray(parsed.value)) throw new Error('invalid')
+        page = parsed as GraphCollectionPage
+      } catch (error) {
+        if (error instanceof Error && /bounded page-size limit/.test(error.message)) throw error
+        throw new Error(`Microsoft ${resourceType} synchronization returned an unreadable bounded response.`)
+      }
+      for (const value of page.value ?? []) {
+        const valueBytes = Buffer.byteLength(JSON.stringify(value), 'utf8')
+        if (
+          rows.length + 1 > limits.rows ||
+          materializedBytes + valueBytes > limits.materializedBytes
+        ) {
+          throw new Error(`Microsoft ${resourceType} synchronization exceeded a bounded collection limit.`)
+        }
+        materializedBytes += valueBytes
+        rows.push(value)
+      }
+      const candidate = page['@odata.nextLink']
+      if (candidate !== undefined && typeof candidate !== 'string') {
+        throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
+      }
+      nextUrl = candidate ?? ''
     }
     return rows
   }
@@ -4853,7 +4940,12 @@ export class TenantSyncService {
             init: { headers: { Accept: 'text/csv' }, redirect: 'manual' },
           },
         )
-        if (reportResponse.ok) return reportResponse.text()
+        const boundedUsageText = (response: Response) => readBoundedResponseText(
+          response,
+          MICROSOFT_USAGE_REPORT_CSV_MAX_BYTES,
+          `Microsoft ${label} usage report exceeded the bounded response-size limit.`,
+        )
+        if (reportResponse.ok) return boundedUsageText(reportResponse)
         if (reportResponse.status !== 302) {
           const graphRequestId = reportResponse.headers.get('request-id')
           throw new Error(
@@ -4876,22 +4968,22 @@ export class TenantSyncService {
             `Microsoft ${label} report download returned ${downloadResponse.status}.`
           )
         }
-        return downloadResponse.text()
+        return boundedUsageText(downloadResponse)
       }
 
-      const [sharePointReport, oneDriveReport] = await Promise.all([
-        downloadReport(
+      // Download and project one report at a time. Only the small allowlisted
+      // row projection remains live when the second report is collected.
+      const sharePointUsage = parseMicrosoftUsageReportCsv(await downloadReport(
           "https://graph.microsoft.com/v1.0/reports/getSharePointSiteUsageDetail(period='D180')",
           'SharePoint'
-        ),
-        downloadReport(
+        ))
+      const oneDriveUsage = parseMicrosoftUsageReportCsv(await downloadReport(
           "https://graph.microsoft.com/v1.0/reports/getOneDriveUsageAccountDetail(period='D30')",
           'OneDrive'
-        ),
-      ])
+        ))
       const payload = buildMicrosoftUsageReportSnapshot(
-        parseCsvRows(sharePointReport),
-        parseCsvRows(oneDriveReport),
+        sharePointUsage,
+        oneDriveUsage,
       )
       await this.saveSnapshot(tenant, 'SHAREPOINT_USAGE', authoritativeSnapshot(payload))
     })

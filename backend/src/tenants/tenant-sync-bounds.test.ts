@@ -3,6 +3,8 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import {
   assertGraphCollectionBounds,
+  ENTRA_COLLECTION_LIMITS,
+  entraCollectionLimitsForResource,
   GRAPH_LOG_COLLECTION_DEADLINE_MS,
   GRAPH_LOG_COLLECTION_MAX_PAGES,
   GRAPH_LOG_COLLECTION_MAX_ROWS,
@@ -11,9 +13,11 @@ import {
   MAILBOX_USAGE_CSV_MAX_BYTES,
   MAILBOX_USAGE_CSV_MAX_COLUMNS,
   MAILBOX_USAGE_CSV_MAX_ROWS,
+  MICROSOFT_USAGE_REPORT_CSV_FIELDS,
   parseBoundedGraphCollectionPage,
-  parseCsvRows,
   parseMailboxUsageCsv,
+  parseMicrosoftUsageReportCsv,
+  readBoundedResponseText,
   settleSyncCollectorModules,
   TenantSyncService,
 } from './tenant-sync.service.js'
@@ -66,7 +70,7 @@ test('Graph log collection has a cumulative retained-payload ceiling before pers
   )
 })
 
-test('full-sync collector schedule serializes heavy Graph logs while safe work remains concurrent', async () => {
+test('full-sync collector schedule serializes all materializing collectors while safe work remains concurrent', async () => {
   let signInActive = false
   let auditActive = false
   let safeStartedDuringSignIn = false
@@ -114,6 +118,20 @@ test('full-sync collector schedule serializes heavy Graph logs while safe work r
   ])
   assert.deepEqual(afterFailure, ['sign-in', 'audit'])
   assert.deepEqual(failureResults.map((result) => result.status), ['rejected', 'fulfilled'])
+
+  let active = 0
+  let maximumActive = 0
+  let releaseFirst!: () => void
+  const firstCanFinish = new Promise<void>((resolve) => { releaseFirst = resolve })
+  let safeSawActive = false
+  const boundedResults = await settleSyncCollectorModules([
+    { resource: 'GROUPS', synchronize: async () => { active += 1; maximumActive = Math.max(maximumActive, active); await firstCanFinish; active -= 1 } },
+    { resource: 'APPLICATIONS', synchronize: async () => { active += 1; maximumActive = Math.max(maximumActive, active); active -= 1 } },
+    { resource: 'M365_AUDIT', synchronize: async () => { safeSawActive = active === 1; releaseFirst() } },
+  ])
+  assert.deepEqual(boundedResults.map((result) => result.status), ['fulfilled', 'fulfilled', 'fulfilled'])
+  assert.equal(maximumActive, 1)
+  assert.equal(safeSawActive, true)
 })
 
 test('the actual full tenant sync uses the serialized heavy-collector schedule', async () => {
@@ -132,7 +150,7 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
   const service = new TenantSyncService(prisma, microsoftConsent as any, {} as any, notifications as any, {} as any, {} as any)
   ;(service as any).synchronizeUsers = async () => ({ deltaLink: 'next-delta' })
   for (const method of [
-    'syncLicenses', 'syncOrganizationConfiguration', 'syncDomains', 'syncGroups',
+    'syncLicenses', 'syncOrganizationConfiguration', 'syncDomains',
     'syncSharePointSites', 'syncSharePointSettings', 'syncSharePointUsage',
     'syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings',
     'syncExchangeAcceptedDomains', 'syncExchangeMailboxUsage',
@@ -140,26 +158,45 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
     'syncAuthenticationRegistrations', 'syncAuthenticationMethodPolicy',
     'syncM365AuditActivity', 'syncSecurityDefaults', 'refreshCollectionFieldStates',
   ]) (service as any)[method] = async () => undefined
+  ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+  const persistedResources: string[] = []
+  ;(service as any).saveSnapshot = async (_tenant: unknown, resource: string) => { persistedResources.push(resource) }
+  let activeGeneric = 0
+  let maximumGeneric = 0
+  ;(service as any).fetchGraphPage = async (url: string) => {
+    activeGeneric += 1
+    maximumGeneric = Math.max(maximumGeneric, activeGeneric)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    activeGeneric -= 1
+    return new Response(JSON.stringify({ value: [{ id: url.slice(-24) }] }))
+  }
+  ;(service as any).syncGroups = async (tenant: unknown, token: string) =>
+    (service as any).syncEntraCollection(
+      tenant,
+      token,
+      'GROUPS',
+      'https://graph.microsoft.com/v1.0/groups',
+    )
 
   let signInActive = false
   let safeStartedDuringSignIn = false
   let releaseSignIn!: () => void
+  let announceSignIn!: () => void
   const signInCanFinish = new Promise<void>((resolve) => { releaseSignIn = resolve })
+  const signInStarted = new Promise<void>((resolve) => { announceSignIn = resolve })
   ;(service as any).syncSignInLogs = async () => {
     signInActive = true
+    announceSignIn()
     await signInCanFinish
     signInActive = false
   }
   ;(service as any).syncDirectoryAuditLogs = async () => {
     assert.equal(signInActive, false)
   }
-  let safeReleased = false
-  ;(service as any).syncEntraCollection = async () => {
-    if (!safeReleased) {
-      safeReleased = true
-      safeStartedDuringSignIn = signInActive
-      releaseSignIn()
-    }
+  ;(service as any).syncM365AuditActivity = async () => {
+    await signInStarted
+    safeStartedDuringSignIn = signInActive
+    releaseSignIn()
   }
   const tenant = {
     id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
@@ -169,6 +206,76 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
   const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
   assert.equal(result.status, 'SUCCEEDED')
   assert.equal(safeStartedDuringSignIn, true)
+  assert.equal(maximumGeneric, 1)
+  assert.deepEqual(persistedResources, [
+    'GROUPS', 'CONDITIONAL_ACCESS', 'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS',
+    'DEVICES', 'DIRECTORY_ROLES', 'RISKY_USERS', 'SERVICE_PRINCIPALS',
+    'APPLICATIONS', 'SECURE_SCORES',
+  ])
+})
+
+test('actual full sync continues from a failed sign-in collector to audit without overlap and logs one safe outcome', async () => {
+  const prisma: any = {
+    syncState: {
+      findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: new Date(), deltaLink: null }),
+      updateMany: async () => ({ count: 1 }), update: async () => ({}), findMany: async () => [],
+    },
+    tenantConnection: { update: async () => ({}) },
+    $transaction: async (operations: Array<Promise<unknown>>) => Promise.all(operations),
+  }
+  const service = new TenantSyncService(
+    prisma,
+    { getTenantAccessToken: async () => 'token' } as any,
+    {} as any,
+    { publishIncident: async () => undefined } as any,
+    {} as any,
+    {} as any,
+  )
+  ;(service as any).synchronizeUsers = async () => ({ deltaLink: 'next-delta' })
+  for (const method of [
+    'syncLicenses', 'syncOrganizationConfiguration', 'syncDomains', 'syncGroups',
+    'syncSharePointSites', 'syncSharePointSettings', 'syncSharePointUsage',
+    'syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings',
+    'syncExchangeAcceptedDomains', 'syncExchangeMailboxUsage',
+    'syncExchangeMailboxRules', 'syncDomainDnsHealth',
+    'syncAuthenticationRegistrations', 'syncAuthenticationMethodPolicy',
+    'syncM365AuditActivity', 'syncSecurityDefaults', 'refreshCollectionFieldStates',
+  ]) (service as any)[method] = async () => undefined
+  ;(service as any).syncEntraCollection = async () => undefined
+
+  const order: string[] = []
+  let signInActive = false
+  ;(service as any).syncSignInLogs = async () => {
+    signInActive = true
+    order.push('sign-in:start')
+    signInActive = false
+    order.push('sign-in:failed')
+    throw new Error('user@example.test access_token=secret https://private.example/path')
+  }
+  ;(service as any).syncDirectoryAuditLogs = async () => {
+    assert.equal(signInActive, false)
+    order.push('audit:ran')
+  }
+  const messages: string[] = []
+  ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
+  const tenant = {
+    id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
+    displayName: null, primaryDomain: null, status: 'ACTIVE',
+    connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: null },
+  }
+  const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
+  assert.equal(result.status, 'SUCCEEDED')
+  assert.deepEqual(order, ['sign-in:start', 'sign-in:failed', 'audit:ran'])
+  assert.equal(messages.length, 1)
+  assert.deepEqual(JSON.parse(messages[0]!), {
+    event: 'microsoft_collection_runtime_failure',
+    resource: 'SIGN_INS',
+    phase: 'SNAPSHOT',
+    outcome: 'FAILED',
+    reasonCode: 'COLLECTION_UNAVAILABLE',
+  })
+  assert.equal(messages[0]!.includes('private'), false)
+  assert.equal(messages[0]!.includes('secret'), false)
 })
 
 test('isolated near-limit Graph collectors remain below a constrained Render memory envelope', () => {
@@ -183,24 +290,31 @@ test('isolated near-limit Graph collectors remain below a constrained Render mem
   const evidence = JSON.parse(marker.slice('HAWKVIEW_MEMORY_PROBE='.length))
   assert.equal(evidence.maximumConcurrentHeavyCollectors, 1)
   assert.equal(evidence.collectorsCompleted, 2)
+  assert.equal(evidence.maximumConcurrentGenericCollectors, 1)
+  assert.equal(evidence.safeObservedGenericCollector, true)
+  assert.equal(evidence.safeObservedUsageCollector, true)
+  assert.equal(evidence.safeOtherPayloadBytes, 8 * 1024 * 1024)
   assert.equal(evidence.mailboxRowsProjected, MAILBOX_USAGE_CSV_MAX_ROWS - 1)
   assert.equal(evidence.mailboxColumnsParsed, MAILBOX_USAGE_CSV_MAX_COLUMNS)
   assert.ok(evidence.mailboxCsvBytes <= MAILBOX_USAGE_CSV_MAX_BYTES)
+  assert.equal(evidence.usageReportRowsProjected, 2 * (MAILBOX_USAGE_CSV_MAX_ROWS - 1))
+  assert.ok(evidence.usageReportCsvBytes <= MAILBOX_USAGE_CSV_MAX_BYTES)
+  assert.ok(evidence.usageReportCsvBytes >= 4 * 1024 * 1024)
   assert.ok(evidence.peakRssMiB <= 300, JSON.stringify(evidence))
   assert.ok(evidence.rssGrowthMiB <= 160, JSON.stringify(evidence))
 })
 
 test('mailbox CSV byte, row and column limits accept exact values and reject plus one', () => {
   assert.ok(GRAPH_LOG_PAGE_MAX_BYTES < 8 * 1024 * 1024)
-  assert.doesNotThrow(() => parseCsvRows('a'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES)))
-  assert.throws(() => parseCsvRows('a'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES + 1)), /response-size/)
+  assert.doesNotThrow(() => parseMailboxUsageCsv('a'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES)))
+  assert.throws(() => parseMailboxUsageCsv('a'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES + 1)), /response-size/)
   const header = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, i) => `h${i}`).join(',')
   const row = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, i) => `v${i}`).join(',')
-  assert.doesNotThrow(() => parseCsvRows(`${header}\n${row}`))
-  assert.throws(() => parseCsvRows(`${header},extra\n${row},extra`), /row or column/)
+  assert.doesNotThrow(() => parseMailboxUsageCsv(`${header}\n${row}`))
+  assert.throws(() => parseMailboxUsageCsv(`${header},extra\n${row},extra`), /row or column/)
   const small = 'h\nv'
-  assert.doesNotThrow(() => parseCsvRows([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 2 }, () => 'v')].join('\n')))
-  assert.throws(() => parseCsvRows([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 1 }, () => 'v')].join('\n')), /row or column/)
+  assert.doesNotThrow(() => parseMailboxUsageCsv([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 2 }, () => 'v')].join('\n')))
+  assert.throws(() => parseMailboxUsageCsv([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 1 }, () => 'v')].join('\n')), /row or column/)
 })
 
 test('mailbox usage CSV projects only bounded mailbox fields rather than retaining arbitrary cells', () => {
@@ -212,6 +326,228 @@ test('mailbox usage CSV projects only bounded mailbox fields rather than retaini
     () => parseMailboxUsageCsv(['User Principal Name', ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS }, () => 'user@example.test')].join('\n')),
     /row or column/,
   )
+})
+
+test('SharePoint and OneDrive CSV projection preserves quoted UTF-8 newlines and only required fields', () => {
+  const csv = [
+    [...MICROSOFT_USAGE_REPORT_CSV_FIELDS, 'Unused Secret'].join(','),
+    ['2026-09-01', 'site-1', 'https://example.test/site', '"München\nOperations"', 'False', '2026-08-31', '42', '100', 'D180', 'Owner', 'owner@example.test', 'GROUP#0', '2', '1', '4', '3', 'must-not-persist'].join(','),
+  ].join('\r\n')
+  const rows = parseMicrosoftUsageReportCsv(csv)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]?.['Site Name'], 'München\nOperations')
+  assert.equal(rows[0]?.['Unused Secret'], undefined)
+  assert.deepEqual(Object.keys(rows[0]!), [...MICROSOFT_USAGE_REPORT_CSV_FIELDS])
+})
+
+test('usage CSV byte, row, and column limits accept their exact boundary and reject plus one', () => {
+  assert.doesNotThrow(() => parseMicrosoftUsageReportCsv('x'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES)))
+  assert.throws(() => parseMicrosoftUsageReportCsv('x'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES + 1)), /response-size/)
+  const header = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, index) => index === 0 ? 'Site Id' : `h${index}`).join(',')
+  const row = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, index) => index === 0 ? 'site' : 'v').join(',')
+  assert.doesNotThrow(() => parseMicrosoftUsageReportCsv(`${header}\n${row}`))
+  assert.throws(() => parseMicrosoftUsageReportCsv(`${header},extra\n${row},extra`), /row or column/)
+  const exactRows = ['Site Id', ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 1 }, () => 'site')].join('\n')
+  assert.equal(parseMicrosoftUsageReportCsv(exactRows).length, MAILBOX_USAGE_CSV_MAX_ROWS - 1)
+  assert.throws(() => parseMicrosoftUsageReportCsv(`${exactRows}\nsite`), /row or column/)
+})
+
+test('usage report transport accepts the exact byte cap and preserves a stable error when plus-one cancellation throws', async () => {
+  const exact = 'x'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES)
+  assert.equal((await readBoundedResponseText(
+    new Response(exact),
+    MAILBOX_USAGE_CSV_MAX_BYTES,
+    'USAGE_TOO_LARGE',
+  )).length, exact.length)
+  const declared = {
+    headers: new Headers({ 'content-length': String(MAILBOX_USAGE_CSV_MAX_BYTES + 1) }),
+    body: { cancel: async () => { throw new Error('hostile cancellation') } },
+  } as unknown as Response
+  await assert.rejects(
+    () => readBoundedResponseText(declared, MAILBOX_USAGE_CSV_MAX_BYTES, 'USAGE_TOO_LARGE'),
+    (error: Error) => error.message === 'USAGE_TOO_LARGE',
+  )
+  let streamedCancelled = false
+  const streamed = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(MAILBOX_USAGE_CSV_MAX_BYTES))
+      controller.enqueue(new Uint8Array(1))
+    },
+    cancel() { streamedCancelled = true; throw new Error('hostile cancellation') },
+  }))
+  await assert.rejects(
+    () => readBoundedResponseText(streamed, MAILBOX_USAGE_CSV_MAX_BYTES, 'USAGE_TOO_LARGE'),
+    (error: Error) => error.message === 'USAGE_TOO_LARGE',
+  )
+  assert.equal(streamedCancelled, true)
+})
+
+test('actual SharePoint usage collection cancels oversized transport and cannot persist a partial report', async () => {
+  let cancelled = false
+  let fetches = 0
+  let saves = 0
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async () => { saves += 1 }
+  ;(service as any).fetchGraphPage = async () => {
+    fetches += 1
+    return new Response(new ReadableStream({ cancel() { cancelled = true } }), {
+      headers: { 'content-length': String(MAILBOX_USAGE_CSV_MAX_BYTES + 1) },
+    })
+  }
+  await assert.rejects(
+    () => (service as any).syncSharePointUsage({ id: 'tenant', organizationId: 'org' }, 'token'),
+    /SharePoint usage report exceeded the bounded response-size limit/,
+  )
+  assert.equal(fetches, 1)
+  assert.equal(cancelled, true)
+  assert.equal(saves, 0)
+})
+
+test('generic Entra collection enforces page, row, retained-byte, deadline, and repeated-link limits before save', async () => {
+  assert.ok(ENTRA_COLLECTION_LIMITS.materializedBytes <= 8 * 1024 * 1024)
+  assert.deepEqual(entraCollectionLimitsForResource('DEVICES'), ENTRA_COLLECTION_LIMITS)
+  assert.deepEqual(entraCollectionLimitsForResource('CONDITIONAL_ACCESS'), {
+    ...ENTRA_COLLECTION_LIMITS, pages: 10, rows: 5_000, materializedBytes: 4 * 1024 * 1024,
+  })
+  assert.deepEqual(entraCollectionLimitsForResource('SECURE_SCORES'), {
+    ...ENTRA_COLLECTION_LIMITS, pages: 2, rows: 100, materializedBytes: 1024 * 1024,
+  })
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const baseLimits = { ...ENTRA_COLLECTION_LIMITS, pages: 2, rows: 2, pageBytes: 1024, materializedBytes: 32, collectorDeadlineMs: 60_000 }
+  const exactValue = { padding: 'x'.repeat(32 - Buffer.byteLength(JSON.stringify({ padding: '' }), 'utf8')) }
+  assert.equal(Buffer.byteLength(JSON.stringify(exactValue), 'utf8'), 32)
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [exactValue] }))
+  assert.deepEqual(
+    await (service as any).collectEntraCollection('token', 'DEVICES', 'https://graph.microsoft.com/v1.0/devices', baseLimits),
+    [exactValue],
+  )
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{ padding: `${exactValue.padding}x` }] }))
+  await assert.rejects(
+    () => (service as any).collectEntraCollection('token', 'DEVICES', 'https://graph.microsoft.com/v1.0/devices', baseLimits),
+    /bounded collection limit/,
+  )
+  const repeatedUrl = 'https://graph.microsoft.com/v1.0/devices'
+  let repeatCalls = 0
+  ;(service as any).fetchGraphPage = async () => {
+    repeatCalls += 1
+    return new Response(JSON.stringify({ value: [], '@odata.nextLink': repeatedUrl }))
+  }
+  await assert.rejects(
+    () => (service as any).collectEntraCollection('token', 'DEVICES', repeatedUrl, { ...baseLimits, materializedBytes: 1024 }),
+    /bounded collection limit/,
+  )
+  assert.equal(repeatCalls, 1)
+  let pageCalls = 0
+  ;(service as any).fetchGraphPage = async () => {
+    pageCalls += 1
+    return new Response(JSON.stringify({
+      value: [{ id: String(pageCalls) }],
+      '@odata.nextLink': pageCalls < 2 ? `${repeatedUrl}?page=${pageCalls + 1}` : undefined,
+    }))
+  }
+  assert.deepEqual(
+    await (service as any).collectEntraCollection('token', 'DEVICES', `${repeatedUrl}?page=1`, { ...baseLimits, materializedBytes: 1024 }),
+    [{ id: '1' }, { id: '2' }],
+  )
+  assert.equal(pageCalls, 2)
+  pageCalls = 0
+  ;(service as any).fetchGraphPage = async () => {
+    pageCalls += 1
+    return new Response(JSON.stringify({
+      value: [],
+      '@odata.nextLink': `${repeatedUrl}?page=${pageCalls + 1}`,
+    }))
+  }
+  await assert.rejects(
+    () => (service as any).collectEntraCollection('token', 'DEVICES', `${repeatedUrl}?page=1`, { ...baseLimits, pages: 1, materializedBytes: 1024 }),
+    /bounded collection limit/,
+  )
+  assert.equal(pageCalls, 1)
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{ id: '1' }, { id: '2' }, { id: '3' }] }))
+  await assert.rejects(
+    () => (service as any).collectEntraCollection('token', 'DEVICES', repeatedUrl, { ...baseLimits, materializedBytes: 1024 }),
+    /bounded collection limit/,
+  )
+  await assert.rejects(
+    () => (service as any).collectEntraCollection('token', 'DEVICES', repeatedUrl, { ...baseLimits, collectorDeadlineMs: 0, materializedBytes: 1024 }),
+    /bounded collection limit/,
+  )
+})
+
+test('generic Entra transport accepts the exact page-byte boundary', async () => {
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const base = JSON.stringify({ value: [], padding: '' })
+  const exact = JSON.stringify({ value: [], padding: 'x'.repeat(ENTRA_COLLECTION_LIMITS.pageBytes - Buffer.byteLength(base, 'utf8')) })
+  assert.equal(Buffer.byteLength(exact, 'utf8'), ENTRA_COLLECTION_LIMITS.pageBytes)
+  ;(service as any).fetchGraphPage = async () => new Response(exact)
+  await assert.doesNotReject(() => (service as any).collectEntraCollection(
+    'token', 'DEVICES', 'https://graph.microsoft.com/v1.0/devices',
+  ))
+})
+
+test('generic Entra oversized page cancels and the actual snapshot collector fails closed before persistence', async () => {
+  let cancelled = false
+  const saves: unknown[] = []
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async (...args: unknown[]) => saves.push(args)
+  ;(service as any).fetchGraphPage = async () => new Response(
+    new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(ENTRA_COLLECTION_LIMITS.pageBytes + 1)) }, cancel() { cancelled = true } }),
+  )
+  await assert.rejects(
+    () => (service as any).syncEntraCollection(
+      { id: 'tenant', organizationId: 'org' }, 'token', 'APPLICATIONS', 'https://graph.microsoft.com/v1.0/applications',
+    ),
+    /bounded page-size limit/,
+  )
+  assert.equal(cancelled, true)
+  assert.deepEqual(saves, [])
+})
+
+test('actual group inventory and relationship collectors share the bounded generic transport sequentially', async () => {
+  const saved: string[] = []
+  const relationshipCreates: unknown[] = []
+  const transaction = {
+    directoryGroup: { upsert: async () => undefined, deleteMany: async () => undefined },
+    directoryGroupMembership: {
+      deleteMany: async () => undefined,
+      createMany: async (args: unknown) => relationshipCreates.push(args),
+    },
+  }
+  const prisma: any = {
+    $transaction: async (work: (tx: typeof transaction) => Promise<void>) => work(transaction),
+    directoryUser: { findMany: async () => [{ id: 'user-row', microsoftUserId: 'user-1' }] },
+    directoryGroup: { findMany: async () => [
+      { id: 'group-row-1', microsoftGroupId: 'group-1' },
+      { id: 'group-row-2', microsoftGroupId: 'group-2' },
+    ] },
+  }
+  const service = new TenantSyncService(prisma, {} as any, {} as any, {} as any, {} as any, {} as any)
+  ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async (_tenant: unknown, resource: string) => saved.push(resource)
+  let active = 0
+  let maximumActive = 0
+  const requested: string[] = []
+  ;(service as any).fetchGraphPage = async (url: string) => {
+    active += 1
+    maximumActive = Math.max(maximumActive, active)
+    requested.push(url)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    active -= 1
+    if (url.includes('/owners')) return new Response(JSON.stringify({ value: [{ id: 'owner-1' }] }))
+    if (url.includes('/members')) return new Response(JSON.stringify({ value: [{ id: 'user-1' }] }))
+    return new Response(JSON.stringify({ value: [
+      { id: 'group-1', displayName: 'One' },
+      { id: 'group-2', displayName: 'Two' },
+    ] }))
+  }
+  await (service as any).syncGroups({ id: 'tenant', organizationId: 'org' }, 'token')
+  assert.equal(maximumActive, 1)
+  assert.deepEqual(saved, ['GROUPS'])
+  assert.equal(requested.filter((url) => url.includes('/owners')).length, 2)
+  assert.equal(requested.filter((url) => url.includes('/members')).length, 2)
+  assert.equal(relationshipCreates.length, 2)
 })
 
 test('Exchange initial sync-state failure closes the anonymous telemetry lifecycle before collection work', async () => {
