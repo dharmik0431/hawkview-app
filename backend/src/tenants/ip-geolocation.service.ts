@@ -90,6 +90,6 @@ export class IpGeolocationService {
   private warnOnce(message: string) {
     if (this.warned) return
     this.warned = true
-    this.logger.warn(message)
+    this.logger.warn(JSON.stringify({ event: 'ip_geolocation_database', phase: 'OPEN', outcome: 'FAILED', reasonCode: 'DATABASE_UNAVAILABLE' }))
   }
 }
