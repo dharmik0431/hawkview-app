@@ -1,13 +1,5 @@
-'use client'
-
-import React from 'react'
-import { AuthLayout } from '@/components/auth/auth-layout'
-import { AuthForm } from '@/components/auth/auth-form'
+import { LoginPageContent } from '@/components/auth/login-page-content'
 
 export default function LoginPage() {
-  return (
-    <AuthLayout>
-      <AuthForm initialMode="sign-in" />
-    </AuthLayout>
-  )
+  return <LoginPageContent />
 }

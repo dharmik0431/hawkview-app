@@ -8,6 +8,7 @@
     "start": "next start -H 0.0.0.0 -p 3000",
     "lint": "next lint",
     "test:notifications": "node --experimental-strip-types --test lib/notifications/normalize-response.test.ts",
+    "test:root-routes": "node --test scripts/root-route-production.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
