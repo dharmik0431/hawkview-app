@@ -9,6 +9,7 @@ import {
   NotFoundException,
 } from '@nestjs/common'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { isIP } from 'node:net'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import {
@@ -726,6 +727,43 @@ export type MailboxPaginationBounds = {
   maxTotalRecords?: number
   maxMaterializedBytes?: number
   deadlineAt?: number
+}
+
+export const LIMITED_SIGN_IN_ENRICHMENT_LIMITS = Object.freeze({
+  uniqueIps: 1000,
+  lookupWorkers: 8,
+  locationBytes: 256 * 1024,
+  addedRowBytes: 2 * 1024 * 1024,
+  historyPageRows: 250,
+  historyRows: 5000,
+  historyBytes: 2 * 1024 * 1024,
+  historyLocationBytes: 1024,
+  deadlineMs: 20_000,
+  statementTimeoutMs: 1000,
+})
+type LimitedSignInEnrichmentLimits = { [K in keyof typeof LIMITED_SIGN_IN_ENRICHMENT_LIMITS]: number }
+// GeoIP is local and its initial file-open promise cannot be cancelled. Keep a
+// process-wide ceiling even if an open stalls across multiple scheduled runs.
+let optionalLocationLookupsInFlight = 0
+
+function projectInferredLocation(value: unknown): SignInLocation | null {
+  if (!plainRecord(value)) return null
+  const label = (item: unknown) => typeof item === 'string' && item.length <= 128 ? item : null
+  const coordinates = plainRecord(value.geoCoordinates) ? value.geoCoordinates : {}
+  const latitude = coordinates.latitude; const longitude = coordinates.longitude
+  const geoCoordinates = typeof latitude === 'number' && Number.isFinite(latitude) && Math.abs(latitude) <= 90 &&
+    typeof longitude === 'number' && Number.isFinite(longitude) && Math.abs(longitude) <= 180 ? { latitude, longitude } : null
+  const location: SignInLocation = {
+    city: label(value.city), state: label(value.state), countryOrRegion: label(value.countryOrRegion),
+    geoCoordinates, source: 'MAXMIND_GEOLITE2',
+  }
+  return location.city || location.state || location.countryOrRegion || geoCoordinates ? location : null
+}
+
+/** Only diagnostic codes, never arbitrary provider prose or identifiers. */
+function safeLoginDiagnosticCode(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > 64) return null
+  return /^(?:AccountLocked|InvalidUserNameOrPassword|InvalidPassword|UserAccountNotFound|UserAccountDisabled|UserNotFound|PasswordExpired|InvalidGrant|MfaRequired|MFARequired|StrongAuthenticationRequired|InteractionRequired|ConditionalAccessBlocked|[0-9]{1,12})$/.test(value) ? value : null
 }
 
 const DEFAULT_MAILBOX_USER_PAGE_SIZE = 250
@@ -3857,6 +3895,11 @@ export class TenantSyncService {
       }
       const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel, { deadlineAt })
       const page = await parseBoundedGraphCollectionPage(response, resourceLabel)
+      const continuation = page['@odata.nextLink']
+      if (continuation !== undefined && continuation !== null &&
+          (typeof continuation !== 'string' || !continuation.trim())) {
+        throw new Error('Microsoft returned an invalid bounded collection pagination link.')
+      }
       for (const value of page.value ?? []) {
         // Values have already passed the per-page response cap. Account for
         // their retained representation before appending so a legal sequence
@@ -3869,7 +3912,7 @@ export class TenantSyncService {
         rows.push(value)
       }
       assertGraphCollectionBounds({ pageCount: pages, rowCount: rows.length, url: nextUrl, seenUrls: new Set(), deadlineAt })
-      nextUrl = page['@odata.nextLink'] ?? ''
+      nextUrl = continuation ?? ''
     }
     return rows
   }
@@ -3936,7 +3979,7 @@ export class TenantSyncService {
       : new Date(Date.now() - INITIAL_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
   }
 
-  private async syncSignInLogs(tenant: TenantSyncTarget, accessToken: string) {
+  private async syncSignInLogs(tenant: TenantSyncTarget, accessToken: string, enrichmentLimits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS) {
     return this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
       const start = await this.logSyncStart(tenant.id, 'SIGN_INS')
       const end = new Date()
@@ -3967,9 +4010,10 @@ export class TenantSyncService {
         limited = true
         limitedReason = this.signInFallbackReason(entitlement)
       }
-      const inferredLocations = limited
-        ? await this.enrichLimitedSignInLocations(rows)
-        : new Map<string, SignInLocation>()
+      const enrichmentDeadline = Date.now() + enrichmentLimits.deadlineMs
+      const enrichment = limited
+        ? await this.enrichLimitedSignInLocations(rows, enrichmentLimits, enrichmentDeadline)
+        : { locations: new Map<string, SignInLocation>(), partial: false }
       const ingestedAt = new Date()
       const expiresAt = logExpirationDate(ingestedAt)
       const records = rows
@@ -4041,17 +4085,25 @@ export class TenantSyncService {
           skipDuplicates: true,
         })
       }
-      if (limited && inferredLocations.size > 0) {
-        await this.backfillLimitedSignInLocations(
-          tenant.id,
-          inferredLocations
-        )
+      if (limited && enrichment.locations.size > 0) {
+        const history = await this.backfillLimitedSignInLocations(tenant, enrichment.locations, enrichmentLimits, enrichmentDeadline)
+        enrichment.partial ||= history.partial
       }
       await this.prisma.signInLog.deleteMany({
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
-      if (limitedReason) throw limitedReason
+      if (limitedReason) {
+        // Primary limited-source ingestion succeeded. Its freshness stamp may
+        // advance, but RUNNING + the partial code must never imply complete
+        // Graph coverage or complete optional geographic enrichment. Primary
+        // collection/persistence failures never reach this partial outcome.
+        if (enrichment.partial) throw new CollectionPartialError(
+          `${limitedReason.code}-geolocation-partial`,
+          `${limitedReason.message} Optional geographic enrichment is incomplete and will be retried within bounded limits; some locations may remain unknown.`,
+        )
+        throw limitedReason
+      }
     })
   }
 
@@ -4097,26 +4149,52 @@ export class TenantSyncService {
     )
   }
 
-  private async enrichLimitedSignInLocations(rows: any[]) {
+  private async enrichLimitedSignInLocations(
+    rows: any[],
+    limits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS,
+    deadlineAt = Date.now() + limits.deadlineMs,
+  ) {
     const locations = new Map<string, SignInLocation>()
-    const uniqueIps = [
-      ...new Set(
-        rows
-          .filter((row) => !this.hasCompleteSignInLocation(row?.location))
-          .map((row) =>
-            typeof row?.ipAddress === 'string' ? row.ipAddress.trim() : ''
-          )
-          .filter(Boolean)
-      ),
-    ]
-
-    await Promise.all(
-      uniqueIps.map(async (ipAddress) => {
-        const location = await this.ipGeolocation.lookup(ipAddress)
-        if (location) locations.set(ipAddress, location)
-      })
-    )
-
+    const ips = new Set<string>()
+    let partial = false
+    for (const row of rows) {
+      if (this.hasCompleteSignInLocation(row?.location)) continue
+      const ip = typeof row?.ipAddress === 'string' ? row.ipAddress.trim() : ''
+      if (!isIP(ip) || ips.has(ip)) continue
+      if (ips.size >= limits.uniqueIps) { partial = true; continue }
+      ips.add(ip)
+    }
+    const uniqueIps = [...ips]
+    let index = 0; let retainedBytes = 0
+    const workers = Math.min(limits.lookupWorkers, LIMITED_SIGN_IN_ENRICHMENT_LIMITS.lookupWorkers, uniqueIps.length)
+    await Promise.all(Array.from({ length: workers }, async () => {
+      while (index < uniqueIps.length) {
+        if (Date.now() >= deadlineAt || optionalLocationLookupsInFlight >= LIMITED_SIGN_IN_ENRICHMENT_LIMITS.lookupWorkers) { partial = true; return }
+        const ip = uniqueIps[index++]!
+        optionalLocationLookupsInFlight += 1
+        // Only the local lookup may outlive its caller. Its global slot is
+        // released when it settles, so repeated timeouts cannot fan out.
+        const request = Promise.resolve().then(() => this.ipGeolocation.lookup(ip))
+        const location = await new Promise<SignInLocation | null>((resolve) => {
+          const timer = setTimeout(() => { partial = true; resolve(null) }, Math.max(1, deadlineAt - Date.now()))
+          void request.then((value) => {
+            optionalLocationLookupsInFlight -= 1
+            clearTimeout(timer)
+            resolve(Date.now() < deadlineAt ? projectInferredLocation(value) : null)
+          }, () => {
+            optionalLocationLookupsInFlight -= 1
+            clearTimeout(timer)
+            resolve(null)
+          })
+        })
+        if (!location) { partial = true; continue }
+        const bytes = Buffer.byteLength(JSON.stringify([ip, location]), 'utf8')
+        if (retainedBytes + bytes > limits.locationBytes) { partial = true; return }
+        retainedBytes += bytes
+        locations.set(ip, location)
+      }
+    }))
+    let addedBytes = 0
     for (const row of rows) {
       if (
         this.hasCompleteSignInLocation(row?.location) ||
@@ -4125,10 +4203,14 @@ export class TenantSyncService {
         continue
       }
       const location = locations.get(row.ipAddress.trim())
-      if (location) row.location = this.mergeSignInLocations(row.location, location)
+      if (!location) continue
+      const merged = projectInferredLocation(this.mergeSignInLocations(row.location, location))
+      const bytes = Buffer.byteLength(JSON.stringify(merged), 'utf8')
+      if (addedBytes + bytes > limits.addedRowBytes || Date.now() >= deadlineAt) { partial = true; break }
+      addedBytes += bytes
+      row.location = merged
     }
-
-    return locations
+    return { locations, partial }
   }
 
   private hasCompleteSignInLocation(location: unknown) {
@@ -4191,34 +4273,82 @@ export class TenantSyncService {
   }
 
   private async backfillLimitedSignInLocations(
-    customerTenantId: string,
-    inferredLocations: Map<string, SignInLocation>
+    tenant: { id: string; organizationId: string },
+    inferredLocations: Map<string, SignInLocation>,
+    limits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS,
+    deadlineAt = Date.now() + limits.deadlineMs,
   ) {
-    const existing = await this.prisma.signInLog.findMany({
-      where: {
-        customerTenantId,
-        microsoftSignInId: { startsWith: 'management:' },
-        ipAddress: { in: [...inferredLocations.keys()] },
-      },
-      select: { id: true, ipAddress: true, location: true },
-    })
-
-    await Promise.all(
-      existing.map((record) => {
-        const inferred = record.ipAddress
-          ? inferredLocations.get(record.ipAddress.trim())
-          : undefined
-        if (!inferred || this.hasCompleteSignInLocation(record.location)) {
-          return Promise.resolve()
-        }
-        return this.prisma.signInLog.update({
-          where: { id: record.id },
-          data: {
-            location: this.mergeSignInLocations(record.location, inferred),
-          } as never,
-        })
-      })
-    )
+    const ips = [...inferredLocations.keys()]
+    if (!ips.length) return { partial: false, updatedRows: 0 }
+    if (ips.length > limits.uniqueIps || ips.some((ip) => !isIP(ip))) return { partial: true, updatedRows: 0 }
+    let cursor = '00000000-0000-0000-0000-000000000000'
+    let scannedRows = 0; let retainedBytes = 0; let updatedRows = 0; let partial = false
+    type HistoricalLocation = { id: string; ipAddress: string; location: unknown; locationOversized: boolean }
+    // Each committed enrichment marks its source. Subsequent runs exclude
+    // those rows and resume remaining work without a schema/cursor migration.
+    // One transaction/page and one awaited update at a time bound DB work.
+    while (scannedRows < limits.historyRows) {
+      if (Date.now() >= deadlineAt) return { partial: true, updatedRows }
+      const take = Math.min(limits.historyPageRows, limits.historyRows - scannedRows)
+      if (take < 1) return { partial: true, updatedRows }
+      try {
+        const page = await this.prisma.$transaction(async (transaction) => {
+          const setDeadline = async () => {
+            const remaining = deadlineAt - Date.now()
+            if (remaining <= 0) throw new Error('Optional sign-in enrichment deadline reached.')
+            // Database-enforced cancellation, scoped to this transaction. Do
+            // not race/abandon a Prisma promise or change connection defaults.
+            await transaction.$queryRaw(Prisma.sql`SELECT set_config('statement_timeout', ${String(Math.min(limits.statementTimeoutMs, remaining))}, true)`)
+          }
+          await setDeadline()
+          const rows = await transaction.$queryRaw<HistoricalLocation[]>(Prisma.sql`
+            SELECT id, ip_address AS "ipAddress",
+              CASE WHEN octet_length(location::text) <= ${limits.historyLocationBytes} THEN location ELSE NULL END AS location,
+              COALESCE(octet_length(location::text) > ${limits.historyLocationBytes}, false) AS "locationOversized"
+            FROM sign_in_logs
+            WHERE organization_id = ${tenant.organizationId}::uuid AND customer_tenant_id = ${tenant.id}::uuid
+              AND expires_at > ${new Date()} AND microsoft_sign_in_id LIKE 'management:%'
+              AND ip_address IN (${Prisma.join(ips)}) AND id > ${cursor}::uuid
+              AND NOT COALESCE(location->>'source' = 'MAXMIND_GEOLITE2', false)
+              AND NOT COALESCE(
+                lower(btrim(location->>'city')) NOT IN ('', 'unknown', 'undefined', 'null')
+                AND lower(btrim(COALESCE(location->>'countryOrRegion', location->>'country'))) NOT IN ('', 'unknown', 'undefined', 'null')
+                AND jsonb_typeof(location->'geoCoordinates'->'latitude') = 'number'
+                AND jsonb_typeof(location->'geoCoordinates'->'longitude') = 'number', false)
+            ORDER BY id ASC LIMIT ${take + 1}`)
+          if (rows.length > take + 1) throw new Error('Optional sign-in enrichment returned an oversized page.')
+          let pageBytes = 0; let pageUpdated = 0; let pagePartial = false
+          for (const record of rows.slice(0, take)) {
+            pageBytes += Buffer.byteLength(JSON.stringify(record), 'utf8')
+            if (retainedBytes + pageBytes > limits.historyBytes) throw new Error('Optional sign-in enrichment byte limit reached.')
+            if (record.locationOversized) { pagePartial = true; continue }
+            const inferred = inferredLocations.get(record.ipAddress)
+            if (!inferred || this.hasCompleteSignInLocation(record.location)) continue
+            const merged = projectInferredLocation(this.mergeSignInLocations(record.location, inferred))
+            await setDeadline()
+            const result = await transaction.signInLog.updateMany({
+              where: { id: record.id, organizationId: tenant.organizationId, customerTenantId: tenant.id,
+                expiresAt: { gt: new Date() }, location: { equals: record.location === null ? Prisma.AnyNull : record.location as Prisma.InputJsonValue } },
+              data: { location: merged as Prisma.InputJsonValue },
+            })
+            pageUpdated += result.count
+            if (result.count !== 1) pagePartial = true
+          }
+          return { rows: rows.slice(0, take), more: rows.length > take, pageBytes, pageUpdated, pagePartial }
+        }, { maxWait: Math.max(1, Math.min(1000, deadlineAt - Date.now())), timeout: Math.max(1, deadlineAt - Date.now()) })
+        scannedRows += page.rows.length; retainedBytes += page.pageBytes; updatedRows += page.pageUpdated
+        partial ||= page.pagePartial
+        if (!page.more) return { partial, updatedRows }
+        const next = page.rows.at(-1)?.id
+        if (!next || next <= cursor) return { partial: true, updatedRows }
+        cursor = next
+      } catch {
+        // A failed/timed-out page rolls back; prior pages and primary sign-in
+        // evidence remain valid. The next scheduled run retries missing rows.
+        return { partial: true, updatedRows }
+      }
+    }
+    return { partial: true, updatedRows }
   }
 
   private async fetchLimitedLoginActivity(
@@ -4327,7 +4457,17 @@ export class TenantSyncService {
       if (!Array.isArray(content)) throw new Error('Microsoft activity content returned an invalid bounded response.')
       const projected = content.map((value) => {
         const row = closedFields(value, ['RecordType', 'Operation', 'LoginStatus', 'ErrorCode', 'ResultStatus', 'Id', 'CreationTime', 'UserId', 'ObjectId', 'UserKey', 'UserDisplayName', 'Country', 'CountryOrRegion', 'City', 'Application', 'Workload', 'ClientIP'])
-        if (plainRecord(value) && Array.isArray(value.ExtendedProperties)) row.ExtendedProperties = value.ExtendedProperties.filter((item) => plainRecord(item) && ['LoginStatus', 'ErrorCode'].includes(String(item.Name))).map((item) => closedFields(item, ['Name', 'Value']))
+        if (plainRecord(value)) {
+          const diagnostic = safeLoginDiagnosticCode(value.LogonError)
+          if (diagnostic) row.LogonError = diagnostic
+          if (Array.isArray(value.ExtendedProperties)) row.ExtendedProperties = value.ExtendedProperties.flatMap((item) => {
+            if (!plainRecord(item) || typeof item.Name !== 'string') return []
+            const name = item.Name.toLowerCase()
+            if (['loginstatus', 'errorcode'].includes(name)) return [closedFields(item, ['Name', 'Value'])]
+            const code = ['loginerror', 'logonerror'].includes(name) ? safeLoginDiagnosticCode(item.Value) : null
+            return code ? [{ Name: item.Name, Value: code }] : []
+          })
+        }
         return row
       })
       budget.retain(projected)

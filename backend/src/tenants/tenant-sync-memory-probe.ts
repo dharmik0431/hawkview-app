@@ -1,6 +1,7 @@
 import {
   ENTRA_COLLECTION_LIMITS,
   GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES,
+  LIMITED_SIGN_IN_ENRICHMENT_LIMITS,
   MAILBOX_USAGE_CSV_MAX_COLUMNS,
   MAILBOX_USAGE_CSV_MAX_ROWS,
   parseMailboxUsageCsv,
@@ -271,6 +272,60 @@ actualModes.push('incremental-with-reconciliation')
 if (maximumConcurrentActualMaterializers !== 1 || actualUserWrites !== 2 * actualRows || actualSnapshots !== 16) throw new Error(`ACTUAL_PATH_MEMORY_PROBE_FAILED:${maximumConcurrentActualMaterializers}:${actualUserWrites}:${actualSnapshots}`)
 const actualPathPeakRss = peakRss
 
+// A logical 100k-row database fixture stays outside the JS heap, just like
+// PostgreSQL. Only the actual SQL LIMIT page is returned to the real backfill.
+// Neither syncSignInLogs, enrichment nor backfill is replaced in this probe.
+const historicalDatasetRows = 100_000
+const nonpremiumCurrentRows = 5_000
+const nonpremiumUpdatedIds = new Set<string>()
+let nonpremiumCreates = 0; let nonpremiumReadPages = 0; let maximumHistoryTake = 0
+let activeHistoryUpdates = 0; let maximumHistoryUpdates = 0
+let activeLocationLookups = 0; let maximumLocationLookups = 0; let locationLookups = 0
+let nonpremiumFinalState: any = null
+const nonpremiumPrisma: any = {
+  syncState: { upsert: async () => ({ lastSuccessfulAt: new Date('2026-01-01') }), update: async ({ data }: any) => { nonpremiumFinalState = data; return { consecutiveFailures: 0 } } },
+  signInLog: { findFirst: async () => null, createMany: async ({ data }: any) => { nonpremiumCreates += data.length }, deleteMany: async () => undefined, findMany: async () => { throw new Error('UNBOUNDED_HISTORY_READ') } },
+  $transaction: async (work: (transaction: any) => Promise<unknown>) => work({
+    $queryRaw: async (query: any) => {
+      if (query.strings.join('').includes('set_config')) {
+        if (!(Number(query.values[0]) > 0 && Number(query.values[0]) <= LIMITED_SIGN_IN_ENRICHMENT_LIMITS.statementTimeoutMs)) throw new Error('INVALID_STATEMENT_TIMEOUT')
+        return []
+      }
+      if (query.values[2] !== 'synthetic-org' || query.values[3] !== 'synthetic-tenant' || !(query.values[4] instanceof Date)) throw new Error('HISTORY_SCOPE_MISSING')
+      const take = query.values.at(-1); const cursor = Number(String(query.values.at(-2)).split('-').at(-1))
+      nonpremiumReadPages++; maximumHistoryTake = Math.max(maximumHistoryTake, take)
+      if (take > LIMITED_SIGN_IN_ENRICHMENT_LIMITS.historyPageRows + 1) throw new Error('UNBOUNDED_HISTORY_TAKE')
+      const page = []
+      for (let index = cursor + 1; index <= historicalDatasetRows && page.length < take; index++) {
+        const id = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`
+        if (!nonpremiumUpdatedIds.has(id)) page.push({ id, ipAddress: '10.1.0.1', location: null, locationOversized: false })
+      }
+      peakRss = Math.max(peakRss, process.memoryUsage().rss)
+      return page
+    },
+    signInLog: { updateMany: async ({ where }: any) => {
+      if (where.organizationId !== 'synthetic-org' || where.customerTenantId !== 'synthetic-tenant' || !where.expiresAt.gt || !where.location) throw new Error('HISTORY_UPDATE_SCOPE_MISSING')
+      activeHistoryUpdates++; maximumHistoryUpdates = Math.max(maximumHistoryUpdates, activeHistoryUpdates)
+      await new Promise<void>(resolve => setImmediate(resolve))
+      nonpremiumUpdatedIds.add(where.id); activeHistoryUpdates--
+      peakRss = Math.max(peakRss, process.memoryUsage().rss)
+      return { count: 1 }
+    } },
+  }),
+}
+const nonpremiumService = new TenantSyncService(nonpremiumPrisma, {} as any, { lookup: async () => {
+  locationLookups++; activeLocationLookups++; maximumLocationLookups = Math.max(maximumLocationLookups, activeLocationLookups)
+  await new Promise<void>(resolve => setImmediate(resolve)); activeLocationLookups--
+  return { city: 'Synthetic', countryOrRegion: 'ZZ', geoCoordinates: { latitude: 1, longitude: 2 }, source: 'MAXMIND_GEOLITE2' }
+} } as any, { resolveIncident: async () => undefined } as any, { pruneExpired: async () => undefined } as any, {} as any)
+;(nonpremiumService as any).signInEntitlement = async () => 'NON_PREMIUM'
+;(nonpremiumService as any).fetchGraphCollection = async () => { throw new Error('Authentication_RequestFromNonPremiumTenantOrB2CTenant') }
+;(nonpremiumService as any).fetchLimitedLoginActivity = async () => Array.from({ length: nonpremiumCurrentRows }, (_, index) => ({ id: `current-${index}`, createdDateTime: '2026-09-03T10:00:00Z', ipAddress: `10.1.${Math.floor(index / 250)}.${index % 250 + 1}`, status: { errorCode: 0 } }))
+await (nonpremiumService as any).syncSignInLogs(actualTenant, 'synthetic-token')
+peakRss = Math.max(peakRss, process.memoryUsage().rss)
+const nonpremiumPeakRss = peakRss
+if (nonpremiumCreates !== nonpremiumCurrentRows || nonpremiumUpdatedIds.size !== LIMITED_SIGN_IN_ENRICHMENT_LIMITS.historyRows || maximumHistoryUpdates !== 1 || maximumLocationLookups > 8 || locationLookups !== 1000 || nonpremiumFinalState.status !== 'RUNNING' || !(nonpremiumFinalState.lastSuccessfulAt instanceof Date) || Object.hasOwn(nonpremiumFinalState, 'deltaLink')) throw new Error('NONPREMIUM_ACTUAL_PATH_FAILED')
+
 console.log(`HAWKVIEW_MEMORY_PROBE=${JSON.stringify({
   baselineRssMiB: Math.round(baselineRss / MIB * 10) / 10,
   peakRssMiB: Math.round(peakRss / MIB * 10) / 10,
@@ -299,4 +354,18 @@ console.log(`HAWKVIEW_MEMORY_PROBE=${JSON.stringify({
   actualMaximumSnapshotBytes,
   actualModes,
   actualResources: [...actualResources].sort(),
+  nonpremiumPeakRssMiB: Math.round(nonpremiumPeakRss / MIB * 10) / 10,
+  historicalDatasetRows,
+  nonpremiumCurrentRows,
+  nonpremiumCreates,
+  nonpremiumReadPages,
+  nonpremiumUpdatedRows: nonpremiumUpdatedIds.size,
+  maximumHistoryTake,
+  maximumHistoryUpdates,
+  maximumLocationLookups,
+  locationLookups,
+  nonpremiumFinalStatus: nonpremiumFinalState.status,
+  nonpremiumFinalCode: nonpremiumFinalState.lastErrorCode,
+  nonpremiumPrimaryEvidenceTimestamp: nonpremiumFinalState.lastSuccessfulAt instanceof Date,
+  nonpremiumAdvancedCompleteBaseline: nonpremiumFinalState.status === 'SUCCEEDED' || Object.hasOwn(nonpremiumFinalState, 'deltaLink'),
 })}`)
