@@ -21,6 +21,7 @@ import EnterpriseAppsSection from './components/sections/enterprise-apps-section
 import SignInActivitySection from './components/sections/signins-section'
 import ExchangePage from './components/sections/exchange-section'
 import SharePointPage from './components/sections/sharepoint-section'
+import IdentityRiskSection from '@/components/identity-risk/identity-risk-section'
 import { TenantBlade } from './components/tenant-blade'
 import { TenantOverview } from './components/tenant-overview'
 import TenantBreadcrumb from './components/tenant-breadcrumb'
@@ -97,6 +98,7 @@ import { cn } from '@/lib/utils'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
 import { useAuth } from '@/components/providers/auth-provider'
+import { useFeatureFlags } from '@/components/providers/feature-flag-provider'
 import { IdentityScopedMemoryCache } from '@/lib/auth/data-isolation'
 import {
   compactEffectiveMfaEnforcementPresentation,
@@ -1355,6 +1357,7 @@ function formatUserDateTime(value?: string | null) {
 
 export default function TenantDetailsPage() {
   const { cacheScope } = useAuth()
+  const { identityRiskUi } = useFeatureFlags()
   const params = useParams<{ id: string }>()
   const pathname = usePathname()
   const router = useRouter()
@@ -1378,7 +1381,36 @@ export default function TenantDetailsPage() {
   }
 
   const signInViewParam = searchParams ? searchParams.get('signInView') : null
-  const securityView = routeState.securityView
+  const requestedSecurityView = routeState.securityView
+  const securityView =
+    requestedSecurityView === 'identity-risk' && !identityRiskUi
+      ? 'policies'
+      : requestedSecurityView
+  const securityTabs: Array<{
+    id: TenantRouteSecurityView
+    label: string
+  }> = [
+    { id: 'policies', label: 'Policies' },
+    { id: 'sign-ins', label: 'Sign-in Activity' },
+    { id: 'auth', label: 'Authentication' },
+    { id: 'locations', label: 'Named Locations' },
+    ...(identityRiskUi
+      ? [{ id: 'identity-risk' as const, label: 'Identity Risk' }]
+      : []),
+  ]
+
+  useEffect(() => {
+    if (
+      requestedSecurityView === 'identity-risk' &&
+      !identityRiskUi &&
+      resolvedTenantId
+    ) {
+      router.replace(
+        tenantEntraPath(resolvedTenantId, 'security', 'policies'),
+        { scroll: false }
+      )
+    }
+  }, [identityRiskUi, requestedSecurityView, resolvedTenantId, router])
 
   const signInView = signInViewParam === 'map' ? 'map' : 'list'
 
@@ -1400,6 +1432,30 @@ export default function TenantDetailsPage() {
   const handleSecurityViewChange = (secView: TenantRouteSecurityView) => {
     router.push(tenantEntraPath(resolvedTenantId, 'security', secView), {
       scroll: false,
+    })
+  }
+
+  const handleSecurityTabKeyDown = (
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    currentIndex: number
+  ) => {
+    let nextIndex: number | null = null
+    if (event.key === 'ArrowRight') {
+      nextIndex = (currentIndex + 1) % securityTabs.length
+    } else if (event.key === 'ArrowLeft') {
+      nextIndex = (currentIndex - 1 + securityTabs.length) % securityTabs.length
+    } else if (event.key === 'Home') {
+      nextIndex = 0
+    } else if (event.key === 'End') {
+      nextIndex = securityTabs.length - 1
+    }
+    if (nextIndex === null) return
+
+    event.preventDefault()
+    const nextTab = securityTabs[nextIndex]
+    handleSecurityViewChange(nextTab.id)
+    requestAnimationFrame(() => {
+      document.getElementById(`security-tab-${nextTab.id}`)?.focus()
     })
   }
 
@@ -4509,12 +4565,7 @@ export default function TenantDetailsPage() {
                       aria-label="Security section navigation"
                       className="inline-flex items-center gap-1 p-1 bg-slate-100/90 dark:bg-slate-800/70 rounded-lg border border-slate-200/70 dark:border-slate-800/80 max-w-full overflow-x-auto no-scrollbar flex-nowrap"
                     >
-                      {[
-                        { id: 'policies', label: 'Policies' },
-                        { id: 'sign-ins', label: 'Sign-in Activity' },
-                        { id: 'auth', label: 'Authentication' },
-                        { id: 'locations', label: 'Named Locations' },
-                      ].map((tab) => {
+                      {securityTabs.map((tab, tabIndex) => {
                         const isActive = securityView === tab.id
                         return (
                           <button
@@ -4524,8 +4575,12 @@ export default function TenantDetailsPage() {
                             id={`security-tab-${tab.id}`}
                             aria-selected={isActive}
                             aria-controls={`security-tabpanel-${tab.id}`}
+                            tabIndex={isActive ? 0 : -1}
+                            onKeyDown={(event) =>
+                              handleSecurityTabKeyDown(event, tabIndex)
+                            }
                             onClick={(e) => {
-                              handleSecurityViewChange(tab.id as any)
+                              handleSecurityViewChange(tab.id)
                               e.currentTarget.scrollIntoView({
                                 behavior: 'smooth',
                                 block: 'nearest',
@@ -4596,6 +4651,17 @@ export default function TenantDetailsPage() {
                       className="mt-4"
                     >
                       <NamedLocationsCard locations={displayedNamedLocations} />
+                    </div>
+                  )}
+
+                  {identityRiskUi && securityView === 'identity-risk' && (
+                    <div
+                      role="tabpanel"
+                      id="security-tabpanel-identity-risk"
+                      aria-labelledby="security-tab-identity-risk"
+                      className="mt-4"
+                    >
+                      <IdentityRiskSection tenantId={resolvedTenantId} />
                     </div>
                   )}
                 </div>

@@ -21,6 +21,7 @@ export type TenantRouteSecurityView =
   | 'sign-ins'
   | 'auth'
   | 'locations'
+  | 'identity-risk'
 
 export type TenantRouteState = {
   section: TenantRouteSection
@@ -81,6 +82,7 @@ const securitySegment: Record<TenantRouteSecurityView, string> = {
   'sign-ins': 'sign-ins',
   auth: 'authentication',
   locations: 'named-locations',
+  'identity-risk': 'identity-risk',
 }
 
 export function tenantEntraPath(
@@ -132,6 +134,7 @@ export function parseTenantPath(
       'sign-ins': 'sign-ins',
       authentication: 'auth',
       'named-locations': 'locations',
+      'identity-risk': 'identity-risk',
     }
     const entraTab = tabBySegment[parts[1]] || 'overview'
     const securityView =
