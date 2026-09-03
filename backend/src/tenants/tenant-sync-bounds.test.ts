@@ -103,7 +103,11 @@ test('scheduler-reachable runtime failure families log only closed identifiers',
 test('Graph streamed body matrix accepts cap boundaries and cancels every unsafe body', async () => {
   const valid = JSON.stringify({ value: [] })
   for (const size of [GRAPH_LOG_PAGE_MAX_BYTES - 1, GRAPH_LOG_PAGE_MAX_BYTES]) {
-    const padded = JSON.stringify({ value: [], padding: 'x'.repeat(size - valid.length - 14) })
+    let padding = 'x'.repeat(size - Buffer.byteLength(valid, 'utf8') - 14)
+    let padded = JSON.stringify({ value: [], padding })
+    padding = padding.slice(0, padding.length + size - Buffer.byteLength(padded, 'utf8'))
+    padded = JSON.stringify({ value: [], padding })
+    assert.equal(Buffer.byteLength(padded, 'utf8'), size)
     await assert.doesNotReject(() => parseBoundedGraphCollectionPage(new Response(padded), 'sign-in logs'))
   }
   for (const kind of ['single', 'multi', 'understated'] as const) {
@@ -121,7 +125,7 @@ test('Graph streamed body matrix accepts cap boundaries and cancels every unsafe
   let declaredCancelled = false
   const declared = new ReadableStream({ cancel() { declaredCancelled = true } })
   await assert.rejects(() => parseBoundedGraphCollectionPage(new Response(declared, { headers: { 'content-length': String(GRAPH_LOG_PAGE_MAX_BYTES + 1) } }), 'sign-in logs'), /unreadable bounded response/)
-  assert.equal(declaredCancelled, false)
+  assert.equal(declaredCancelled, true)
   await assert.rejects(() => parseBoundedGraphCollectionPage(new Response(new ReadableStream({ pull() { throw new Error('token=never') } })), 'directory audit logs'), /unreadable bounded response/)
 })
 

@@ -984,6 +984,11 @@ export async function readBoundedResponseText(
 ) {
   const declaredLength = Number(response.headers.get('content-length') ?? '0')
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
+    try {
+      await response.body?.cancel()
+    } catch {
+      // A hostile/corrupt stream must not replace the safe bounded failure.
+    }
     throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
   }
   if (!response.body) throw new Error('Microsoft Graph response body was unavailable.')
