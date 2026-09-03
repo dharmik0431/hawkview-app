@@ -24,6 +24,7 @@ import {
   boundedSafeString,
   decodeIdentityRiskCursor,
   encodeIdentityRiskCursor,
+  isIdentityRiskOpaqueReference,
   isPlainRecord,
   parsePageLimit,
   parseTimestamp,
@@ -116,6 +117,16 @@ function boundedCount(value: number): IdentityRiskBoundedCount {
   return value > MAX_SUMMARY_COUNT
     ? { value: MAX_SUMMARY_COUNT, exact: false, capped: true }
     : { value, exact: true, capped: false }
+}
+
+function projectEvidenceReferences(value: unknown): readonly string[] | null {
+  if (
+    !Array.isArray(value) ||
+    value.length > 32 ||
+    value.some((reference) => !isIdentityRiskOpaqueReference(reference)) ||
+    new Set(value).size !== value.length
+  ) return null
+  return Object.freeze([...(value as string[])].sort())
 }
 
 function emptyPage(): IdentityRiskPageInfo {
@@ -402,7 +413,8 @@ export class IdentityRiskService {
         (row.suppressedCountCapped && row.suppressedCount !== 1_000_000) ||
         (row.notMatchedCountCapped && row.notMatchedCount !== 1_000_000) ||
         (row.notEvaluatedCountCapped && row.notEvaluatedCount !== 1_000_000),
-      )
+      ) ||
+      subjects.some((row) => !isIdentityRiskOpaqueReference(row.subjectId))
     ) return { ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'), counts: unavailableCounts }
     const currentControls = await this.currentControls(tenant)
     if (currentControls.evaluationHardDisabled) {
@@ -636,6 +648,9 @@ export class IdentityRiskService {
         expiresAt: { gt: now },
         matchedResult: { evaluationRunId: run.id },
       },
+      include: {
+        matchedResult: { select: { evidence: true } },
+      },
     })
     const currentControls = await this.currentControls(tenant)
     if (currentControls.evaluationHardDisabled) {
@@ -664,14 +679,17 @@ export class IdentityRiskService {
     const finding = row
       ? this.projectFinding(row, now)
       : null
-    if (row && !finding) {
+    const evidenceReferences = row
+      ? projectEvidenceReferences(row.matchedResult.evidence)
+      : []
+    if (row && (!finding || !evidenceReferences)) {
       return {
         ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'),
         finding: null,
         evidenceReferences: [],
       }
     }
-    return { ...envelope, finding, evidenceReferences: [] }
+    return { ...envelope, finding, evidenceReferences }
   }
 
   async microsoftRiskyUsers(
@@ -860,7 +878,9 @@ export class IdentityRiskService {
   ): IdentityRiskFindingDto | null {
     const presentation = identityRiskRulePresentation(row.ruleId)
     const id = boundedOpaqueId(row.id, 200)
-    const subjectId = boundedOpaqueId(row.subjectId, 128)
+    const subjectId = isIdentityRiskOpaqueReference(row.subjectId)
+      ? row.subjectId
+      : null
     const observedAt = parseTimestamp(row.observedAt, platformNow)
     if (
       !presentation ||

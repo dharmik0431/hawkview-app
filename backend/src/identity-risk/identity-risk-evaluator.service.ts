@@ -7,10 +7,12 @@ import {
   IDENTITY_RISK_ENGINE_VERSION,
   IDENTITY_RISK_MAX_FUTURE_SKEW_MS,
   IDENTITY_RISK_RUN_RETENTION_MS,
+  IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION,
   type IdentityRiskBoundedCount,
   type IdentityRiskEvaluationRequest,
   type IdentityRiskSourceBatch,
   type IdentityRiskSourceEnvelope,
+  type IdentityRiskSourcePayload,
   type IdentitySignalDetector,
   type IdentitySignalEvaluationContext,
   type IdentitySignalResult,
@@ -27,6 +29,7 @@ import {
 import {
   boundedOpaqueId,
   boundedSafeString,
+  isIdentityRiskOpaqueReference,
   isPlainRecord,
   parseTimestamp,
 } from './identity-risk.validation.js'
@@ -51,12 +54,14 @@ const resultKeys = new Set([
   'ruleId',
   'outcome',
   'coverage',
-  'reasonCode',
+  'reasonCodes',
   'subjectType',
   'subjectId',
   'severity',
   'confidence',
+  'evidenceReferences',
   'observedAt',
+  'sourceLabels',
 ])
 const reasonCodes = new Set([
   'ACCOUNT_CLASS_COVERAGE_INCOMPLETE',
@@ -66,16 +71,88 @@ const reasonCodes = new Set([
   'DETECTOR_FAILED',
   'DETECTOR_OUTPUT_CONFLICT',
   'DETECTOR_OUTPUT_INVALID',
+  'EVALUATION_BUDGET_EXCEEDED',
   'EVIDENCE_CAPPED',
+  'EVIDENCE_FUTURE_DATED',
   'EVIDENCE_MALFORMED',
+  'EVIDENCE_PARTIAL',
   'EVIDENCE_STALE',
   'EVIDENCE_UNAVAILABLE',
+  'EXPECTED_AUTH_RETRY',
   'FUTURE_TIMESTAMP',
+  'APPROVED_MAINTENANCE_WINDOW',
+  'APPROVED_SHARED_CONTEXT',
+  'APPROVED_TRAVEL_EXCEPTION',
+  'IDENTIFIER_DOMAIN_UNVERIFIED',
   'INSUFFICIENT_INDEPENDENT_CONTEXT',
   'MAILBOX_RULE_PROJECTION_INCOMPLETE',
+  'NO_MATCH',
   'RESULT_LIMIT_EXCEEDED',
   'RULE_CONFIG_UNAPPROVED',
+  'RULE_FEATURE_DISABLED',
+  'RULE_MATCHED',
 ])
+
+const sourcePayloadKeys = new Set([
+  'attributes',
+  'recordReference',
+  'schemaVersion',
+  'subjectReference',
+])
+const sourceAttributeKeys = new Set(['name', 'value'])
+const approvedSourceAttributeNames = new Set([
+  'accountClass',
+  'actionsCompleteness',
+  'activeDays',
+  'actorBaselineEvents',
+  'actorOperationCount',
+  'applicationPermissionIds',
+  'authoritativeComparable',
+  'authoritativeCreatedAt',
+  'baselineActiveDays',
+  'capability',
+  'change',
+  'client',
+  'conditionsCompleteness',
+  'credentialMetadataChanged',
+  'declaredPermissions',
+  'effectiveMfa',
+  'enabled',
+  'eventAt',
+  'evidenceState',
+  'independentSignInAt',
+  'independentSignInRuleId',
+  'lastSuccessfulInteractiveSignInAt',
+  'lifecycle',
+  'lifecycleAt',
+  'mailboxChangeAt',
+  'normalizedMfaDetailComplete',
+  'observedAt',
+  'operation',
+  'outcome',
+  'populatedConditionCount',
+  'populatedExceptionCount',
+  'privilegeAt',
+  'privilegeOperation',
+  'privilegeSucceeded',
+  'privileged',
+  'projectionComplete',
+  'readiness',
+  'recipientAddresses',
+  'requiresFullCapability',
+  'sourceAsn',
+  'succeeded',
+  'successfulInteractive',
+  'successfulInteractiveSignIns',
+  'tenantBaselineEvents',
+  'tenantOperationCount',
+  'tenantWideComplete',
+  'userType',
+  'verifiedAcceptedDomains',
+])
+const hazardousSourceNames = new Set(['__PROTO__', 'CONSTRUCTOR', 'PROTOTYPE'])
+const forbiddenSourceText =
+  /(?:access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|bearer|oauth|password|passwd|secret|api[_-]?key|client[_-]?secret|credential|cookie|session|jwt|supabase|amazonses|amazonaws|resend|https?:\/\/)/iu
 
 type MutableCount = { value: number; exact: boolean; capped: boolean }
 type RuleAggregate = {
@@ -104,6 +181,99 @@ function sha256(...parts: readonly string[]) {
 
 function validDate(value: unknown): value is Date {
   return value instanceof Date && Number.isFinite(value.getTime())
+}
+
+function exactDataKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>) {
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const keys = Reflect.ownKeys(descriptors)
+  return keys.every((key) =>
+    typeof key === 'string' &&
+    allowed.has(key) &&
+    descriptors[key]?.enumerable === true &&
+    'value' in descriptors[key]!,
+  )
+}
+
+function approvedSourceName(value: unknown): string | null {
+  const source = boundedSafeString(value, 80)
+  if (!source || !/^[A-Z][A-Z0-9_]{0,79}$/u.test(source)) return null
+  if (hazardousSourceNames.has(source)) return null
+  const normalized = source.replace(/[^A-Z0-9]/gu, '').toLowerCase()
+  if (
+    normalized.includes('riskyuser') ||
+    normalized.includes('riskdetection') ||
+    normalized.includes('identityprotection') ||
+    normalized.includes('entraidprotection') ||
+    (normalized.includes('risk') &&
+      (normalized.includes('microsoft') ||
+        normalized.includes('entra') ||
+        normalized.includes('aad') ||
+        normalized.includes('user') ||
+        normalized.includes('identity') ||
+        normalized.includes('detection') ||
+        normalized.includes('protection')))
+  ) return null
+  return source
+}
+
+function approvedSourceScalar(value: unknown): boolean {
+  if (value === null || typeof value === 'boolean') return true
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && Math.abs(value) <= 1_000_000_000
+  }
+  const text = boundedSafeString(value, 320)
+  return Boolean(text && !forbiddenSourceText.test(text))
+}
+
+function approvedSourcePayload(value: unknown): IdentityRiskSourcePayload | null {
+  if (!isPlainRecord(value) || !exactDataKeys(value, sourcePayloadKeys)) return null
+  if (
+    value.schemaVersion !== IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION ||
+    !isIdentityRiskOpaqueReference(value.recordReference) ||
+    (value.subjectReference !== undefined &&
+      !isIdentityRiskOpaqueReference(value.subjectReference)) ||
+    !Array.isArray(value.attributes) ||
+    value.attributes.length > 256
+  ) return null
+  const names = new Set<string>()
+  const attributes: Array<IdentityRiskSourcePayload['attributes'][number]> = []
+  for (const attribute of value.attributes) {
+    if (!isPlainRecord(attribute) || !exactDataKeys(attribute, sourceAttributeKeys)) {
+      return null
+    }
+    if (
+      typeof attribute.name !== 'string' ||
+      !approvedSourceAttributeNames.has(attribute.name) ||
+      forbiddenSourceText.test(attribute.name) ||
+      names.has(attribute.name)
+    ) return null
+    names.add(attribute.name)
+    if (Array.isArray(attribute.value)) {
+      if (
+        attribute.value.length > 2_048 ||
+        !attribute.value.every(approvedSourceScalar)
+      ) return null
+      attributes.push(Object.freeze({
+        name: attribute.name,
+        value: Object.freeze([...attribute.value]),
+      }))
+    } else if (!approvedSourceScalar(attribute.value)) {
+      return null
+    } else {
+      attributes.push(Object.freeze({
+        name: attribute.name,
+        value: attribute.value as null | string | number | boolean,
+      }))
+    }
+  }
+  return Object.freeze({
+    schemaVersion: IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION,
+    recordReference: value.recordReference,
+    ...(value.subjectReference === undefined
+      ? {}
+      : { subjectReference: value.subjectReference }),
+    attributes: Object.freeze(attributes),
+  })
 }
 
 const MAX_CANONICAL_SOURCE_NODES = 2_000_000
@@ -184,7 +354,7 @@ type CanonicalSourceRecord = Readonly<{
   signature: string
   source: string
   sortTime: Date
-  payload: Readonly<Record<string, unknown>>
+  payload: IdentityRiskSourcePayload
 }>
 
 const immutableEnvelopeKeys = [
@@ -223,13 +393,15 @@ function canonicalSourceRecord(
   watermarks: ReadonlySet<string>,
   budget: CanonicalBudget,
 ): CanonicalSourceRecord | null {
-  if (!isPlainRecord(envelope) || !isPlainRecord(envelope.payload)) return null
-  const payloadHash = canonicalPayloadHash(envelope.payload, budget)
+  if (!isPlainRecord(envelope)) return null
+  const payload = approvedSourcePayload(envelope.payload)
+  if (!payload) return null
+  const payloadHash = canonicalPayloadHash(payload, budget)
   if (!payloadHash) return null
 
   if (envelope.kind === 'IMMUTABLE_EVENT') {
     if (Object.keys(envelope).sort().join(',') !== immutableEnvelopeKeys) return null
-    const source = boundedOpaqueId(envelope.sourceType, 80)
+    const source = approvedSourceName(envelope.sourceType)
     const eventId = boundedOpaqueId(envelope.canonicalEventId, 160)
     const version = boundedOpaqueId(envelope.sourceEventVersion, 80)
     const eventTime = parseTimestamp(envelope.authoritativeEventTime, platformNow)
@@ -237,8 +409,7 @@ function canonicalSourceRecord(
       !source ||
       !eventId ||
       !version ||
-      !eventTime ||
-      /RISKY_USERS|RISK_DETECTIONS|MICROSOFT_ENTRA_RISK/i.test(source)
+      !eventTime
     ) return null
     const identity = sha256(
       request.organizationId,
@@ -246,19 +417,21 @@ function canonicalSourceRecord(
       'IMMUTABLE_EVENT',
       source,
       eventId,
+      eventTime.toISOString(),
+      version,
     )
     return {
       identity,
-      signature: sha256(eventTime.toISOString(), version, payloadHash),
+      signature: payloadHash,
       source,
       sortTime: eventTime,
-      payload: envelope.payload,
+      payload,
     }
   }
 
   if (envelope.kind === 'AUTHORITATIVE_SNAPSHOT') {
     if (Object.keys(envelope).sort().join(',') !== snapshotEnvelopeKeys) return null
-    const source = boundedOpaqueId(envelope.resourceType, 80)
+    const source = approvedSourceName(envelope.resourceType)
     const objectId = boundedOpaqueId(envelope.objectId, 160)
     const observationId = boundedOpaqueId(
       envelope.authoritativeObservationId,
@@ -274,8 +447,7 @@ function canonicalSourceRecord(
       !projectorVersion ||
       !watermark ||
       !watermarks.has(watermark) ||
-      !observedAt ||
-      /RISKY_USERS|RISK_DETECTIONS|MICROSOFT_ENTRA_RISK/i.test(source)
+      !observedAt
     ) return null
     const identity = sha256(
       request.organizationId,
@@ -295,28 +467,33 @@ function canonicalSourceRecord(
       ),
       source,
       sortTime: observedAt,
-      payload: envelope.payload,
+      payload,
     }
   }
   return null
 }
 
-function canonicalizeSourceEnvelopes(
+type CanonicalizedSources =
+  | Readonly<{
+      status: 'OK'
+      sources: IdentitySignalEvaluationContext['sources']
+      sourceContentHash: string
+    }>
+  | Readonly<{ status: 'INTEGRITY_CONFLICT' | 'REJECTED' }>
+
+function canonicalizeSourceEnvelopesUnchecked(
   batch: IdentityRiskSourceBatch,
   request: IdentityRiskEvaluationRequest,
   platformNow: Date,
-): Readonly<{
-  sources: IdentitySignalEvaluationContext['sources']
-  sourceContentHash: string
-  integrityConflict: boolean
-}> | null {
+): CanonicalizedSources {
   if (
     !Array.isArray(batch.sourceEnvelopes) ||
     batch.sourceEnvelopes.length > MAX_SOURCE_ENVELOPES
-  ) return null
+  ) return { status: 'REJECTED' }
   const budget: CanonicalBudget = { nodes: 0, bytes: 0 }
   const watermarks = new Set(batch.orderedSourceWatermarks)
   const records = new Map<string, CanonicalSourceRecord>()
+  const sourceCounts = new Map<string, number>()
   for (const envelope of batch.sourceEnvelopes) {
     const record = canonicalSourceRecord(
       envelope,
@@ -325,10 +502,16 @@ function canonicalizeSourceEnvelopes(
       watermarks,
       budget,
     )
-    if (!record) return null
+    if (!record) return { status: 'REJECTED' }
+    const sourceCount = (sourceCounts.get(record.source) ?? 0) + 1
+    sourceCounts.set(record.source, sourceCount)
+    if (
+      sourceCounts.size > MAX_SOURCE_TYPES ||
+      sourceCount > MAX_SOURCE_RECORDS_PER_TYPE
+    ) return { status: 'REJECTED' }
     const existing = records.get(record.identity)
     if (existing && existing.signature !== record.signature) {
-      return { sources: {}, sourceContentHash: '', integrityConflict: true }
+      return { status: 'INTEGRITY_CONFLICT' }
     }
     if (!existing) records.set(record.identity, record)
   }
@@ -337,19 +520,46 @@ function canonicalizeSourceEnvelopes(
     left.sortTime.getTime() - right.sortTime.getTime() ||
     left.identity.localeCompare(right.identity),
   )
-  const sources: Record<string, Readonly<Record<string, unknown>>[]> = {}
+  const grouped = new Map<string, IdentityRiskSourcePayload[]>()
   const hash = createHash('sha256')
   for (const record of ordered) {
-    ;(sources[record.source] ??= []).push(record.payload)
+    const rows = grouped.get(record.source)
+    if (rows) rows.push(record.payload)
+    else grouped.set(record.source, [record.payload])
     if (
       !canonicalToken(hash, record.identity, budget) ||
       !canonicalToken(hash, record.signature, budget)
-    ) return null
+    ) return { status: 'REJECTED' }
   }
+  const sources = Object.create(null) as Record<
+    string,
+    readonly IdentityRiskSourcePayload[]
+  >
+  for (const [source, rows] of grouped) {
+    Object.defineProperty(sources, source, {
+      value: Object.freeze([...rows]),
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    })
+  }
+  Object.freeze(sources)
   return {
+    status: 'OK',
     sources,
     sourceContentHash: hash.digest('hex'),
-    integrityConflict: false,
+  }
+}
+
+function canonicalizeSourceEnvelopes(
+  batch: IdentityRiskSourceBatch,
+  request: IdentityRiskEvaluationRequest,
+  platformNow: Date,
+): CanonicalizedSources {
+  try {
+    return canonicalizeSourceEnvelopesUnchecked(batch, request, platformNow)
+  } catch {
+    return { status: 'REJECTED' }
   }
 }
 
@@ -433,6 +643,43 @@ function exactResultKeys(value: Record<string, unknown>) {
   return Object.keys(value).every((key) => resultKeys.has(key))
 }
 
+function normalizedReasonCodes(value: unknown): readonly string[] | null {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > MAX_REASON_CODES_PER_RULE ||
+    value.some((reason) =>
+      typeof reason !== 'string' ||
+      !reasonCodes.has(reason) ||
+      !boundedSafeString(reason, 80),
+    ) ||
+    new Set(value).size !== value.length
+  ) return null
+  return Object.freeze([...value].sort())
+}
+
+function normalizedOpaqueReferences(value: unknown): readonly string[] | null {
+  if (value === undefined) return Object.freeze([])
+  if (
+    !Array.isArray(value) ||
+    value.length > 32 ||
+    value.some((reference) => !isIdentityRiskOpaqueReference(reference)) ||
+    new Set(value).size !== value.length
+  ) return null
+  return Object.freeze([...value].sort())
+}
+
+function normalizedSourceLabels(value: unknown): readonly string[] | null {
+  if (value === undefined) return Object.freeze([])
+  if (
+    !Array.isArray(value) ||
+    value.length > 32 ||
+    value.some((label) => !boundedSafeString(label, 128)) ||
+    new Set(value).size !== value.length
+  ) return null
+  return Object.freeze([...value].sort())
+}
+
 function validateResult(
   value: unknown,
   detectorRuleId: IdentityRiskRuleId,
@@ -444,31 +691,44 @@ function validateResult(
     !outcomes.has(value.outcome as string) ||
     !coverages.has(value.coverage as string)
   ) return null
-  if (value.reasonCode !== undefined) {
-    const reason = boundedSafeString(value.reasonCode, 80)
-    if (!reason || !reasonCodes.has(reason)) return null
-  }
-  if (value.subjectId !== undefined && !boundedOpaqueId(value.subjectId, 128)) return null
-  if (value.subjectType !== undefined && !subjectTypes.has(value.subjectType as string)) return null
+  const normalizedReasons = normalizedReasonCodes(value.reasonCodes)
+  const evidenceReferences = normalizedOpaqueReferences(value.evidenceReferences)
+  const sourceLabels = normalizedSourceLabels(value.sourceLabels)
+  if (
+    !normalizedReasons ||
+    !evidenceReferences ||
+    !sourceLabels ||
+    !isIdentityRiskOpaqueReference(value.subjectId) ||
+    !subjectTypes.has(value.subjectType as string)
+  ) return null
 
   if (value.outcome === 'MATCHED') {
     const observedAt = parseTimestamp(value.observedAt, platformNow)
     if (
       value.coverage === 'UNAVAILABLE' ||
-      !boundedOpaqueId(value.subjectId, 128) ||
-      !subjectTypes.has(value.subjectType as string) ||
       !severities.has(value.severity as string) ||
       !confidences.has(value.confidence as string) ||
       !observedAt
     ) return null
-    return { ...value, observedAt } as IdentitySignalResult
+    return Object.freeze({
+      ...value,
+      reasonCodes: normalizedReasons,
+      evidenceReferences,
+      sourceLabels,
+      observedAt,
+    }) as IdentitySignalResult
   }
   if (
     value.severity !== undefined ||
     value.confidence !== undefined ||
     value.observedAt !== undefined
   ) return null
-  return value as IdentitySignalResult
+  return Object.freeze({
+    ...value,
+    reasonCodes: normalizedReasons,
+    evidenceReferences,
+    sourceLabels,
+  }) as IdentitySignalResult
 }
 
 function rejectedResultReason(
@@ -583,10 +843,10 @@ export class IdentityRiskEvaluatorService {
       request,
       platformNow,
     )
-    if (!canonicalSources) {
-      throw new Error('Identity risk source contract is invalid.')
-    }
-    if (canonicalSources.integrityConflict) {
+    if (canonicalSources.status !== 'OK') {
+      const reasonCode = canonicalSources.status === 'INTEGRITY_CONFLICT'
+        ? 'SOURCE_INTEGRITY_CONFLICT'
+        : 'SECRET_EXPOSURE'
       await this.safety.activate({
         controlType: 'EVALUATION_HARD_DISABLED',
         scope: {
@@ -594,7 +854,7 @@ export class IdentityRiskEvaluatorService {
           organizationId: request.organizationId,
           customerTenantId: request.customerTenantId,
         },
-        reasonCode: 'SOURCE_INTEGRITY_CONFLICT',
+        reasonCode,
         actorServiceId: 'identity-risk-evaluator',
         now: platformNow,
       })
@@ -1042,26 +1302,40 @@ export class IdentityRiskEvaluatorService {
         throw new Error('Identity risk detector output was rejected.')
       }
       const distinctResults: IdentitySignalResult[] = []
-      const matchedSignatures = new Map<string, string>()
+      const resultSignatures = new Map<string, string>()
+      const subjectOutcomes = new Map<string, string>()
       for (const result of validated as IdentitySignalResult[]) {
-        if (result.outcome !== 'MATCHED') {
-          distinctResults.push(result)
-          continue
+        const subjectKey = sha256(ruleId, result.subjectType, result.subjectId)
+        const existingOutcome = subjectOutcomes.get(subjectKey)
+        if (existingOutcome && existingOutcome !== result.outcome) {
+          await this.safety.recordDetectorRejection({
+            organizationId,
+            customerTenantId,
+            runKey,
+            ruleId,
+            reasonCode: 'DETECTOR_OUTPUT_CONFLICT',
+            now: platformNow,
+          })
+          throw new Error('Identity risk detector output was rejected.')
         }
+        subjectOutcomes.set(subjectKey, result.outcome)
         const duplicateKey = sha256(
           ruleId,
-          result.subjectType ?? '',
-          result.subjectId ?? '',
+          result.subjectType,
+          result.subjectId,
           result.observedAt?.toISOString() ?? '',
         )
         const signature = sha256(
           duplicateKey,
+          result.outcome,
           result.coverage,
           result.severity ?? '',
           result.confidence ?? '',
-          result.reasonCode ?? '',
+          ...result.reasonCodes,
+          ...(result.evidenceReferences ?? []),
+          ...(result.sourceLabels ?? []),
         )
-        const existing = matchedSignatures.get(duplicateKey)
+        const existing = resultSignatures.get(duplicateKey)
         if (existing === signature) continue
         if (existing) {
           await this.safety.recordDetectorRejection({
@@ -1074,7 +1348,7 @@ export class IdentityRiskEvaluatorService {
           })
           throw new Error('Identity risk detector output was rejected.')
         }
-        matchedSignatures.set(duplicateKey, signature)
+        resultSignatures.set(duplicateKey, signature)
         distinctResults.push(result)
       }
       for (const result of distinctResults) {
@@ -1097,7 +1371,9 @@ export class IdentityRiskEvaluatorService {
           add(aggregate.notMatched)
         } else {
           add(aggregate.notEvaluated)
-          addReason(aggregate, result.reasonCode ?? 'EVIDENCE_UNAVAILABLE')
+          for (const reasonCode of result.reasonCodes) {
+            addReason(aggregate, reasonCode)
+          }
         }
       }
     }
@@ -1143,6 +1419,12 @@ export class IdentityRiskEvaluatorService {
         })
         if (failed.count !== 1) throw new Error('Identity risk run lease was lost.')
         return { status: 'HARD_DISABLED' as const, safety }
+      }
+      if (input.matches.some(([, result]) =>
+        !isIdentityRiskOpaqueReference(result.subjectId) ||
+        !normalizedOpaqueReferences(result.evidenceReferences),
+      )) {
+        throw new Error('Identity risk persistence boundary rejected an opaque reference.')
       }
       for (const aggregate of input.aggregates) {
         await transaction.identityRiskRuleCoverage.upsert({
@@ -1202,7 +1484,7 @@ export class IdentityRiskEvaluatorService {
             confidence: result.confidence as string,
             coverage: result.coverage,
             observedAt,
-            evidence: [],
+            evidence: result.evidenceReferences ?? [],
             expiresAt: input.expiresAt,
             createdAt: input.platformNow,
           },

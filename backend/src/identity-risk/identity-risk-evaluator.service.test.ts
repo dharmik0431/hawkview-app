@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import type { PrismaService } from '../prisma/prisma.service.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
   IDENTITY_RISK_ENGINE_VERSION,
   IDENTITY_RISK_MAX_FUTURE_SKEW_MS,
+  IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION,
   type IdentityRiskEvaluationRequest,
+  type IdentityRiskSourcePayload,
   type IdentityRiskSourceEnvelope,
   type IdentitySignalDetector,
 } from './identity-risk.contract.js'
@@ -20,6 +23,24 @@ const tenantId = '22222222-2222-4222-8222-222222222222'
 const evaluationAt = new Date('2026-09-02T12:00:00.000Z')
 const windowStart = new Date('2026-09-02T10:00:00.000Z')
 const windowEnd = new Date('2026-09-02T12:00:00.000Z')
+
+function opaqueReference(kind: string, label: string) {
+  return `hvr1_${kind}_${createHash('sha256').update(label).digest('hex')}`
+}
+
+const platformSubjectId = opaqueReference('subject', 'user-1')
+
+function sourcePayload(
+  attributes: IdentityRiskSourcePayload['attributes'] = [],
+  reference = 'source-record-1',
+): IdentityRiskSourcePayload {
+  return {
+    schemaVersion: IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION,
+    recordReference: opaqueReference('evidence', reference),
+    subjectReference: platformSubjectId,
+    attributes,
+  }
+}
 
 function request(
   detector: IdentitySignalDetector,
@@ -159,11 +180,14 @@ const noMatchDetector: IdentitySignalDetector = {
     ruleId: 'HV-ID-CHG-001.v1',
     outcome: 'NOT_MATCHED',
     coverage: 'FULL',
+    reasonCodes: ['NO_MATCH'],
+    subjectType: 'USER',
+    subjectId: platformSubjectId,
   }],
 }
 
 function immutableSource(
-  payload: Readonly<Record<string, unknown>>,
+  payload: IdentityRiskSourcePayload,
   overrides: Partial<IdentityRiskSourceEnvelope> = {},
 ): IdentityRiskSourceEnvelope {
   return {
@@ -180,7 +204,7 @@ function immutableSource(
 function snapshotSource(
   observationId: string,
   observedAt: Date,
-  payload: Readonly<Record<string, unknown>>,
+  payload: IdentityRiskSourcePayload,
 ): IdentityRiskSourceEnvelope {
   return {
     kind: 'AUTHORITATIVE_SNAPSHOT',
@@ -254,6 +278,7 @@ test('alert delivery disable still evaluates and persists one matched result', a
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
+    const evidenceReference = opaqueReference('evidence', 'matched-evidence')
     const store = persistence([{
       controlType: 'ALERT_DELIVERY_DISABLED',
       episodeId: 'mute-episode',
@@ -266,8 +291,11 @@ test('alert delivery disable still evaluates and persists one matched result', a
         ruleId: 'HV-ID-CHG-001.v1',
         outcome: 'MATCHED',
         coverage: 'FULL',
+        reasonCodes: ['RULE_MATCHED'],
         subjectType: 'USER',
-        subjectId: 'opaque-user-1',
+        subjectId: platformSubjectId,
+        evidenceReferences: [evidenceReference],
+        sourceLabels: ['Microsoft Entra directory audit'],
         severity: 'HIGH',
         confidence: 'HIGH',
         observedAt: evaluationAt,
@@ -280,6 +308,7 @@ test('alert delivery disable still evaluates and persists one matched result', a
     assert.equal(result.status, 'COMPLETED')
     assert.equal(result.alertDeliveryDisabled, true)
     assert.equal(store.calls.matches.length, 1)
+    assert.deepEqual(store.calls.matches[0]?.evidence, [evidenceReference])
     assert.equal(store.calls.findings.length, 1)
     assert.equal(store.calls.coverage.length, 1)
     assert.equal(store.calls.runUpdates[0]?.alertDeliveryDisabled, true)
@@ -482,7 +511,7 @@ test('canonical source identities dedupe exact events and hard-stop same-waterma
       return noMatchDetector.evaluate(context)
     },
   }
-  const load = (payload: Readonly<Record<string, unknown>>, duplicate = false) =>
+  const load = (payload: IdentityRiskSourcePayload, duplicate = false) =>
     async () => {
       const envelope = immutableSource(payload)
       return {
@@ -505,8 +534,14 @@ test('canonical source identities dedupe exact events and hard-stop same-waterma
       observedSafety.service,
       { now: () => evaluationAt } as IdentityRiskPlatformClock,
     )
-    const first = await evaluator.evaluate(request(detector, load({ value: 1 }, true)))
-    const conflict = await evaluator.evaluate(request(detector, load({ value: 2 })))
+    const first = await evaluator.evaluate(request(
+      detector,
+      load(sourcePayload([{ name: 'enabled', value: true }]), true),
+    ))
+    const conflict = await evaluator.evaluate(request(
+      detector,
+      load(sourcePayload([{ name: 'enabled', value: false }])),
+    ))
     assert.equal(first.status, 'COMPLETED')
     assert.equal(projectedRows, 1)
     assert.equal(conflict.status, 'HARD_DISABLED')
@@ -526,17 +561,24 @@ test('canonical source identities dedupe exact events and hard-stop same-waterma
   }
 })
 
-test('conflicting duplicate source envelopes hard-stop before any run claim', async () => {
+test('immutable event time and source version are part of the canonical identity', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
     const store = persistence()
     const observedSafety = safety()
-    const first = immutableSource({ value: 1 })
-    const second = immutableSource(
-      { value: 2 },
+    const first = immutableSource(
+      sourcePayload([{ name: 'enabled', value: true }], 'immutable-v1'),
+    )
+    const sameVersionDifferentTime = immutableSource(
+      sourcePayload([{ name: 'enabled', value: false }], 'immutable-later-time'),
       {
         authoritativeEventTime: new Date(evaluationAt.getTime() - 1_000),
+      },
+    )
+    const sameTimeDifferentVersion = immutableSource(
+      sourcePayload([{ name: 'enabled', value: false }], 'immutable-v2'),
+      {
         sourceEventVersion: 'v2',
       },
     )
@@ -552,7 +594,47 @@ test('conflicting duplicate source envelopes hard-stop before any run claim', as
         engineVersion: IDENTITY_RISK_ENGINE_VERSION,
         catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
       },
-      sourceEnvelopes: [first, second],
+      sourceEnvelopes: [first, sameVersionDifferentTime, sameTimeDifferentVersion],
+      orderedSourceWatermarks: ['directory-0001'],
+      earliestSourceExpiry: null,
+      capability: 'FULL',
+    })))
+    assert.equal(result.status, 'COMPLETED')
+    assert.equal(store.calls.runCreates, 1)
+    assert.equal(store.calls.transactions, 2)
+    assert.equal(observedSafety.calls.activated.length, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('same immutable identity with conflicting content hard-stops before claim', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    const store = persistence()
+    const observedSafety = safety()
+    const result = await new IdentityRiskEvaluatorService(
+      store.prisma,
+      observedSafety.service,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
+    ).evaluate(request(noMatchDetector, async () => ({
+      context: {
+        organizationId,
+        customerTenantId: tenantId,
+        evaluationAt,
+        engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+        catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+      },
+      sourceEnvelopes: [
+        immutableSource(
+          sourcePayload([{ name: 'enabled', value: true }], 'conflict-a'),
+        ),
+        immutableSource(
+          sourcePayload([{ name: 'enabled', value: false }], 'conflict-b'),
+        ),
+      ],
       orderedSourceWatermarks: ['directory-0001'],
       earliestSourceExpiry: null,
       capability: 'FULL',
@@ -570,10 +652,160 @@ test('conflicting duplicate source envelopes hard-stop before any run claim', as
   }
 })
 
+test('secret-bearing and unapproved source payloads hard-stop before detector execution', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  let detectorCalls = 0
+  try {
+    const store = persistence()
+    const observedSafety = safety()
+    const detector = {
+      ...noMatchDetector,
+      evaluate: () => {
+        detectorCalls += 1
+        return noMatchDetector.evaluate({} as never)
+      },
+    }
+    const unsafePayload = {
+      ...sourcePayload(),
+      access_token: ['ARRAYSECRET1'],
+    } as never
+    const result = await new IdentityRiskEvaluatorService(
+      store.prisma,
+      observedSafety.service,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
+    ).evaluate(request(detector, async () => ({
+      context: {
+        organizationId,
+        customerTenantId: tenantId,
+        evaluationAt,
+        engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+        catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+      },
+      sourceEnvelopes: [immutableSource(unsafePayload)],
+      orderedSourceWatermarks: ['directory-0001'],
+      earliestSourceExpiry: null,
+      capability: 'FULL',
+    })))
+    assert.equal(result.status, 'HARD_DISABLED')
+    assert.equal(detectorCalls, 0)
+    assert.equal(store.calls.runCreates, 0)
+    assert.equal(store.calls.matches.length, 0)
+    assert.equal(store.calls.findings.length, 0)
+    assert.equal(observedSafety.calls.activated[0]?.reasonCode, 'SECRET_EXPOSURE')
+    assert.ok(!JSON.stringify(observedSafety.calls).includes('ARRAYSECRET1'))
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('hostile and Microsoft risk source aliases fail closed without prototype pollution', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    for (const sourceType of [
+      '__PROTO__',
+      'CONSTRUCTOR',
+      'RISKY_USERS',
+      'IDENTITY_RISK_USERS',
+      'USER_RISK_STATE',
+      'MICROSOFT_ENTRA_RISK_DETECTIONS',
+      'AAD_IDENTITY_PROTECTION',
+      'ENTRA_ID_PROTECTION',
+    ]) {
+      const store = persistence()
+      const observedSafety = safety()
+      const result = await new IdentityRiskEvaluatorService(
+        store.prisma,
+        observedSafety.service,
+        { now: () => evaluationAt } as IdentityRiskPlatformClock,
+      ).evaluate(request(noMatchDetector, async () => ({
+        context: {
+          organizationId,
+          customerTenantId: tenantId,
+          evaluationAt,
+          engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+          catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+        },
+        sourceEnvelopes: [immutableSource(sourcePayload(), { sourceType })],
+        orderedSourceWatermarks: ['directory-0001'],
+        earliestSourceExpiry: null,
+        capability: 'FULL',
+      })))
+      assert.equal(result.status, 'HARD_DISABLED', sourceType)
+      assert.equal(store.calls.runCreates, 0, sourceType)
+      assert.equal(observedSafety.calls.activated[0]?.reasonCode, 'SECRET_EXPOSURE')
+    }
+    assert.equal(
+      (Object.prototype as unknown as Record<string, unknown>).polluted,
+      undefined,
+    )
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('source type and per-type record limits are enforced independently', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const load = (sourceEnvelopes: IdentityRiskSourceEnvelope[]) => async () => ({
+    context: {
+      organizationId,
+      customerTenantId: tenantId,
+      evaluationAt,
+      engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+      catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+    },
+    sourceEnvelopes,
+    orderedSourceWatermarks: ['directory-0001'],
+    earliestSourceExpiry: null,
+    capability: 'FULL' as const,
+  })
+  try {
+    const tooManyTypes = Array.from({ length: 33 }, (_, index) =>
+      immutableSource(
+        sourcePayload([], `type-${index}`),
+        {
+          sourceType: `SOURCE_${String(index).padStart(2, '0')}`,
+          canonicalEventId: `event-${index}`,
+        },
+      ),
+    )
+    const typeStore = persistence()
+    const typeResult = await new IdentityRiskEvaluatorService(
+      typeStore.prisma,
+      safety().service,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
+    ).evaluate(request(noMatchDetector, load(tooManyTypes)))
+    assert.equal(typeResult.status, 'HARD_DISABLED')
+    assert.equal(typeStore.calls.runCreates, 0)
+
+    const tooManyRecords = Array.from({ length: 50_001 }, (_, index) =>
+      immutableSource(
+        sourcePayload([], `record-${index}`),
+        { canonicalEventId: `event-${index}` },
+      ),
+    )
+    const recordStore = persistence()
+    const recordResult = await new IdentityRiskEvaluatorService(
+      recordStore.prisma,
+      safety().service,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
+    ).evaluate(request(noMatchDetector, load(tooManyRecords)))
+    assert.equal(recordResult.status, 'HARD_DISABLED')
+    assert.equal(recordStore.calls.runCreates, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
 test('later authoritative snapshot observations may carry changed content', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
-  let projected: readonly Readonly<Record<string, unknown>>[] = []
+  let projected: readonly IdentityRiskSourcePayload[] = []
   try {
     const detector: IdentitySignalDetector = {
       ...noMatchDetector,
@@ -599,16 +831,23 @@ test('later authoritative snapshot observations may carry changed content', asyn
         snapshotSource(
           'observation-0001',
           new Date(evaluationAt.getTime() - 60_000),
-          { enabled: false },
+          sourcePayload([{ name: 'enabled', value: false }], 'snapshot-1'),
         ),
-        snapshotSource('observation-0002', evaluationAt, { enabled: true }),
+        snapshotSource(
+          'observation-0002',
+          evaluationAt,
+          sourcePayload([{ name: 'enabled', value: true }], 'snapshot-2'),
+        ),
       ],
       orderedSourceWatermarks: ['directory-0001'],
       earliestSourceExpiry: null,
       capability: 'FULL',
     })))
     assert.equal(result.status, 'COMPLETED')
-    assert.deepEqual(projected, [{ enabled: false }, { enabled: true }])
+    assert.deepEqual(projected, [
+      sourcePayload([{ name: 'enabled', value: false }], 'snapshot-1'),
+      sourcePayload([{ name: 'enabled', value: true }], 'snapshot-2'),
+    ])
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
@@ -710,8 +949,9 @@ test('exact duplicate matched outputs count and persist once while conflicts fai
     ruleId: 'HV-ID-CHG-001.v1',
     outcome: 'MATCHED' as const,
     coverage: 'FULL' as const,
+    reasonCodes: ['RULE_MATCHED'],
     subjectType: 'USER' as const,
-    subjectId: 'opaque-user-1',
+    subjectId: platformSubjectId,
     severity: 'HIGH' as const,
     confidence: 'HIGH' as const,
     observedAt: evaluationAt,
@@ -752,6 +992,70 @@ test('exact duplicate matched outputs count and persist once while conflicts fai
   }
 })
 
+test('all detector outcomes dedupe before counters and conflicting duplicates fail closed', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const result = (
+    outcome: 'NOT_MATCHED' | 'SUPPRESSED' | 'NOT_EVALUATED',
+    label: string,
+    reasonCode: string,
+  ) => Object.freeze({
+    ruleId: 'HV-ID-CHG-001.v1',
+    outcome,
+    coverage: outcome === 'NOT_EVALUATED' ? 'PARTIAL' as const : 'FULL' as const,
+    reasonCodes: Object.freeze([reasonCode]),
+    subjectType: 'USER' as const,
+    subjectId: opaqueReference('subject', label),
+  })
+  try {
+    const notMatched = result('NOT_MATCHED', 'not-matched', 'NO_MATCH')
+    const suppressed = result('SUPPRESSED', 'suppressed', 'APPROVED_SHARED_CONTEXT')
+    const notEvaluated = result('NOT_EVALUATED', 'not-evaluated', 'EVIDENCE_PARTIAL')
+    const store = persistence()
+    await new IdentityRiskEvaluatorService(
+      store.prisma,
+      safety().service,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
+    ).evaluate(request({
+      ruleId: 'HV-ID-CHG-001.v1',
+      evaluate: () => [
+        notMatched,
+        notMatched,
+        suppressed,
+        suppressed,
+        notEvaluated,
+        notEvaluated,
+      ],
+    }))
+    assert.equal(store.calls.coverage[0]?.eligibleCount, 2)
+    assert.equal(store.calls.coverage[0]?.notMatchedCount, 1)
+    assert.equal(store.calls.coverage[0]?.suppressedCount, 1)
+    assert.equal(store.calls.coverage[0]?.notEvaluatedCount, 1)
+
+    const conflictStore = persistence()
+    const observedSafety = safety()
+    await assert.rejects(
+      () => new IdentityRiskEvaluatorService(
+        conflictStore.prisma,
+        observedSafety.service,
+        { now: () => evaluationAt } as IdentityRiskPlatformClock,
+      ).evaluate(request({
+        ruleId: 'HV-ID-CHG-001.v1',
+        evaluate: () => [
+          notMatched,
+          { ...notMatched, coverage: 'PARTIAL', reasonCodes: ['EVIDENCE_PARTIAL'] },
+        ],
+      })),
+      /evaluation failed/,
+    )
+    assert.equal(conflictStore.calls.coverage.length, 0)
+    assert.deepEqual(observedSafety.calls.rejected, ['DETECTOR_OUTPUT_CONFLICT'])
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
 test('platform clock rejects future evaluation before safety, source, or risk writes', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
@@ -785,8 +1089,9 @@ test('platform clock rejects future evaluation before safety, source, or risk wr
         ruleId: 'HV-ID-CHG-001.v1',
         outcome: 'MATCHED',
         coverage: 'FULL',
+        reasonCodes: ['RULE_MATCHED'],
         subjectType: 'USER',
-        subjectId: 'opaque-user-boundary',
+        subjectId: opaqueReference('subject', 'boundary'),
         severity: 'HIGH',
         confidence: 'HIGH',
         observedAt: acceptedAt,
@@ -829,8 +1134,9 @@ test('platform clock rejects future evaluation before safety, source, or risk wr
         ruleId: 'HV-ID-CHG-001.v1',
         outcome: 'MATCHED',
         coverage: 'FULL',
+        reasonCodes: ['RULE_MATCHED'],
         subjectType: 'USER',
-        subjectId: 'opaque-user-too-future',
+        subjectId: opaqueReference('subject', 'too-future'),
         severity: 'HIGH',
         confidence: 'HIGH',
         observedAt: new Date(
@@ -1058,8 +1364,9 @@ test('malformed detector output fails the run with one safe event and no complet
         ruleId: 'HV-ID-CHG-001.v1',
         outcome: 'MATCHED',
         coverage: 'FULL',
+        reasonCodes: ['RULE_MATCHED'],
         subjectType: 'USER',
-        subjectId: 'opaque-user-1',
+        subjectId: platformSubjectId,
         severity: 'HIGH',
         confidence: 'HIGH',
         observedAt: evaluationAt,
@@ -1086,6 +1393,46 @@ test('malformed detector output fails the run with one safe event and no complet
   }
 })
 
+test('raw or secret-shaped detector subjects never reach persistence', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    for (const subjectId of ['ARRAYSECRET1', 'person@example.com', 'opaque-user-1']) {
+      const store = persistence()
+      const observedSafety = safety()
+      const detector: IdentitySignalDetector = {
+        ruleId: 'HV-ID-CHG-001.v1',
+        evaluate: () => [{
+          ruleId: 'HV-ID-CHG-001.v1',
+          outcome: 'MATCHED',
+          coverage: 'FULL',
+          reasonCodes: ['RULE_MATCHED'],
+          subjectType: 'USER',
+          subjectId,
+          severity: 'HIGH',
+          confidence: 'HIGH',
+          observedAt: evaluationAt,
+        }],
+      }
+      await assert.rejects(
+        () => new IdentityRiskEvaluatorService(
+          store.prisma,
+          observedSafety.service,
+          { now: () => evaluationAt } as IdentityRiskPlatformClock,
+        ).evaluate(request(detector)),
+        /evaluation failed/,
+      )
+      assert.equal(store.calls.matches.length, 0, subjectId)
+      assert.equal(store.calls.findings.length, 0, subjectId)
+      assert.deepEqual(observedSafety.calls.rejected, ['DETECTOR_OUTPUT_INVALID'])
+      assert.ok(!JSON.stringify(store.calls).includes(subjectId))
+    }
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
 test('future timestamps beyond five minutes fail while the trusted exact boundary matches', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
@@ -1095,8 +1442,9 @@ test('future timestamps beyond five minutes fail while the trusted exact boundar
       ruleId: 'HV-ID-CHG-001.v1',
       outcome: 'MATCHED' as const,
       coverage: 'FULL' as const,
+      reasonCodes: ['RULE_MATCHED'],
       subjectType: 'USER' as const,
-      subjectId: 'opaque-user-1',
+      subjectId: platformSubjectId,
       severity: 'HIGH' as const,
       confidence: 'HIGH' as const,
       observedAt: new Date(evaluationAt.getTime() + 5 * 60 * 1_000),
@@ -1145,14 +1493,16 @@ test('50,000 non-matches persist one run and one coverage row, never subject row
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
     const store = persistence()
-    const result = Object.freeze({
-      ruleId: 'HV-ID-CHG-001.v1',
-      outcome: 'NOT_MATCHED' as const,
-      coverage: 'FULL' as const,
-    })
     const detector: IdentitySignalDetector = {
       ruleId: 'HV-ID-CHG-001.v1',
-      evaluate: () => new Array(50_000).fill(result),
+      evaluate: () => Array.from({ length: 50_000 }, (_, index) => ({
+        ruleId: 'HV-ID-CHG-001.v1',
+        outcome: 'NOT_MATCHED' as const,
+        coverage: 'FULL' as const,
+        reasonCodes: ['NO_MATCH'],
+        subjectType: 'USER' as const,
+        subjectId: `hvr1_subject_${index.toString(16).padStart(64, '0')}`,
+      })),
     }
     await new IdentityRiskEvaluatorService(
       store.prisma,

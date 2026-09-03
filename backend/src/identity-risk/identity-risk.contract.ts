@@ -8,6 +8,8 @@ export const IDENTITY_RISK_DEFAULT_PAGE_SIZE = 50
 export const IDENTITY_RISK_MAX_PAGE_SIZE = 100
 export const IDENTITY_RISK_MAX_RULE_IDS = 10
 export const IDENTITY_RISK_MAX_LIST_ITEMS = 10
+export const IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION =
+  'hawkview-identity-source/v1' as const
 
 export type IdentitySignalOutcome =
   | 'MATCHED'
@@ -19,22 +21,43 @@ export type IdentitySignalSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
 export type IdentitySignalConfidence = 'LOW' | 'MEDIUM' | 'HIGH'
 export type IdentitySubjectType = 'USER' | 'MAILBOX' | 'APPLICATION' | 'UNKNOWN'
 
+export type IdentityRiskSourceScalar = string | number | boolean | null
+export type IdentityRiskSourceAttribute = Readonly<{
+  name: string
+  value: IdentityRiskSourceScalar | readonly IdentityRiskSourceScalar[]
+}>
+
+/**
+ * Versioned, data-only projection boundary for evaluator source records.
+ * Provider payloads, principals, credentials, tokens, and arbitrary objects are
+ * not valid source payloads. Projectors must emit only approved attributes and
+ * HawkView opaque references before the platform receives a batch.
+ */
+export type IdentityRiskSourcePayload = Readonly<{
+  schemaVersion: typeof IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION
+  recordReference: string
+  subjectReference?: string
+  attributes: readonly IdentityRiskSourceAttribute[]
+}>
+
 export type IdentitySignalEvaluationContext = Readonly<{
   organizationId: string
   customerTenantId: string
   evaluationAt: Date
   engineVersion: string
   catalogVersion: string
-  sources: Readonly<Record<string, readonly Readonly<Record<string, unknown>>[]>>
+  sources: Readonly<Record<string, readonly IdentityRiskSourcePayload[]>>
 }>
 
 export type IdentitySignalResult = Readonly<{
   ruleId: string
   outcome: IdentitySignalOutcome
   coverage: IdentitySignalCoverage
-  reasonCode?: string
-  subjectType?: IdentitySubjectType
-  subjectId?: string
+  reasonCodes: readonly string[]
+  subjectType: IdentitySubjectType
+  subjectId: string
+  evidenceReferences?: readonly string[]
+  sourceLabels?: readonly string[]
   severity?: IdentitySignalSeverity
   confidence?: IdentitySignalConfidence
   observedAt?: Date
@@ -55,7 +78,7 @@ export type IdentityRiskSourceEnvelope =
       canonicalEventId: string
       authoritativeEventTime: Date
       sourceEventVersion: string
-      payload: Readonly<Record<string, unknown>>
+      payload: IdentityRiskSourcePayload
     }>
   | Readonly<{
       kind: 'AUTHORITATIVE_SNAPSHOT'
@@ -65,7 +88,7 @@ export type IdentityRiskSourceEnvelope =
       observedAt: Date
       projectorSchemaVersion: string
       sourceWatermark: string
-      payload: Readonly<Record<string, unknown>>
+      payload: IdentityRiskSourcePayload
     }>
 
 export type IdentityRiskSourceBatch = Readonly<{

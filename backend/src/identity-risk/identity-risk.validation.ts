@@ -11,11 +11,37 @@ import {
 
 const SAFE_OPAQUE_ID = /^[A-Za-z0-9._:-]+$/
 const SAFE_CURSOR = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/
+const IDENTITY_RISK_OPAQUE_REFERENCE =
+  /^hvr1_([a-z]{2,24})_[a-f0-9]{64}$/u
+const IDENTITY_RISK_OPAQUE_REFERENCE_KINDS = new Set([
+  'org',
+  'tenant',
+  'subject',
+  'evidence',
+  'event',
+  'actor',
+  'application',
+  'mailbox',
+  'source',
+  'context',
+  'reviewer',
+  'device',
+  'property',
+  'contribution',
+  'baseline',
+  'audit',
+  'checkpoint',
+  'observation',
+])
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
-  const prototype = Object.getPrototypeOf(value)
-  return prototype === Object.prototype || prototype === null
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+  } catch {
+    return false
+  }
 }
 
 export function boundedSafeString(
@@ -38,6 +64,13 @@ export function boundedOpaqueId(
 ): string | null {
   const normalized = boundedSafeString(value, maximumLength)
   return normalized && SAFE_OPAQUE_ID.test(normalized) ? normalized : null
+}
+
+export function isIdentityRiskOpaqueReference(value: unknown): value is string {
+  const normalized = boundedSafeString(value, 160)
+  if (!normalized) return false
+  const match = IDENTITY_RISK_OPAQUE_REFERENCE.exec(normalized)
+  return Boolean(match && IDENTITY_RISK_OPAQUE_REFERENCE_KINDS.has(match[1]!))
 }
 
 export function parseTimestamp(

@@ -5,6 +5,7 @@ import {
   decodeIdentityRiskCursor,
   encodeIdentityRiskCursor,
   boundedSafeString,
+  isIdentityRiskOpaqueReference,
   parsePageLimit,
   parseTimestamp,
 } from './identity-risk.validation.js'
@@ -112,4 +113,18 @@ test('safe text rejects ASCII and Unicode formatting controls', () => {
   assert.equal(boundedSafeString('normal label', 20), 'normal label')
   assert.equal(boundedSafeString('line\nbreak', 20), null)
   assert.equal(boundedSafeString('spoof\u202eexe', 20), null)
+})
+
+test('platform identity references require an approved hvr1 kind and SHA-256 digest', () => {
+  assert.equal(
+    isIdentityRiskOpaqueReference(`hvr1_subject_${'a'.repeat(64)}`),
+    true,
+  )
+  for (const value of [
+    'ARRAYSECRET1',
+    'person@example.com',
+    `hvr1_unknown_${'a'.repeat(64)}`,
+    `hvr1_subject_${'A'.repeat(64)}`,
+    `hvr1_subject_${'a'.repeat(63)}`,
+  ]) assert.equal(isIdentityRiskOpaqueReference(value), false, value)
 })

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { ForbiddenException } from '@nestjs/common'
 import type { PrismaService } from '../prisma/prisma.service.js'
@@ -8,6 +9,10 @@ const identity = { subject: 'auth-user', email: 'owner@example.com' }
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const tenantId = '22222222-2222-4222-8222-222222222222'
 const runId = '33333333-3333-4333-8333-333333333333'
+
+function opaqueSubject(label: string) {
+  return `hvr1_subject_${createHash('sha256').update(label).digest('hex')}`
+}
 
 function scoped(overrides: Record<string, unknown> = {}) {
   return {
@@ -50,9 +55,10 @@ function finding(index: number, observedAt: Date) {
     coverage: 'FULL',
     ruleId: 'HV-ID-CHG-001.v1',
     subjectType: 'USER',
-    subjectId: `identity-${String(index).padStart(3, '0')}`,
+    subjectId: opaqueSubject(`identity-${String(index).padStart(3, '0')}`),
     observedAt,
     explanation: { token: 'must never be projected' },
+    matchedResult: { evidence: [] },
   }
 }
 
@@ -176,7 +182,7 @@ test('a hard-disable activated during reads suppresses every HawkView projection
       identityRiskFinding: {
         count: async () => 1,
         findMany: async (args: { distinct?: unknown }) =>
-          args.distinct ? [{ subjectId: 'identity-001' }] : [finding(1, now)],
+          args.distinct ? [{ subjectId: opaqueSubject('identity-001') }] : [finding(1, now)],
         findFirst: async () => finding(1, now),
       },
     }
@@ -235,7 +241,7 @@ test('current alert mute is reflected across HawkView projections without anothe
       identityRiskFinding: {
         count: async () => 1,
         findMany: async (args: { distinct?: unknown }) =>
-          args.distinct ? [{ subjectId: 'identity-001' }] : [finding(1, now)],
+          args.distinct ? [{ subjectId: opaqueSubject('identity-001') }] : [finding(1, now)],
         findFirst: async () => finding(1, now),
       },
     })
@@ -281,7 +287,7 @@ test('summary and findings use one completed run and server-owned bounded wordin
       identityRiskFinding: {
         count: async () => 1,
         findMany: async (args: { where: unknown; distinct?: unknown }) => {
-          if (args.distinct) return [{ subjectId: 'identity-001' }]
+          if (args.distinct) return [{ subjectId: opaqueSubject('identity-001') }]
           findingsWhere = args.where
           return rows
         },
@@ -316,6 +322,51 @@ test('summary and findings use one completed run and server-owned bounded wordin
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
     if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
     else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
+  }
+})
+
+test('raw or secret-shaped stored subjects fail closed at every HawkView API projection', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  const unsafeFinding = { ...finding(1, now), subjectId: 'ARRAYSECRET1' }
+  try {
+    const prisma = scoped({
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskRuleCoverage: {
+        findMany: async () => [{
+          ruleId: 'HV-ID-CHG-001.v1',
+          matchedCount: 1,
+          suppressedCount: 0,
+          notMatchedCount: 0,
+          notEvaluatedCount: 0,
+          matchedCountCapped: false,
+          suppressedCountCapped: false,
+          notMatchedCountCapped: false,
+          notEvaluatedCountCapped: false,
+        }],
+      },
+      identityRiskFinding: {
+        count: async () => 1,
+        findMany: async (args: { distinct?: unknown }) =>
+          args.distinct ? [{ subjectId: 'ARRAYSECRET1' }] : [unsafeFinding],
+        findFirst: async () => unsafeFinding,
+      },
+    })
+    const service = new IdentityRiskService(prisma)
+    const summary = await service.summary(identity, tenantId)
+    const findings = await service.findings(identity, tenantId)
+    const detail = await service.findingDetail(identity, tenantId, unsafeFinding.id)
+    assert.equal(summary.status, 'ERROR')
+    assert.equal(summary.counts.identitiesNeedingReview.exact, false)
+    assert.equal(findings.status, 'ERROR')
+    assert.deepEqual(findings.findings, [])
+    assert.equal(detail.status, 'ERROR')
+    assert.equal(detail.finding, null)
+    assert.ok(!JSON.stringify([summary, findings, detail]).includes('ARRAYSECRET1'))
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
   }
 })
 
@@ -407,7 +458,7 @@ test('summary labels capped database and unique-subject counts explicitly', asyn
         count: async () => 10_001,
         findMany: async () => Array.from(
           { length: 10_001 },
-          (_, index) => ({ subjectId: `identity-${index}` }),
+          (_, index) => ({ subjectId: opaqueSubject(`identity-${index}`) }),
         ),
       },
     })
@@ -782,7 +833,11 @@ test('owner finding detail is bounded, catalog-owned, and scoped to the same run
   const now = new Date()
   let where: unknown
   try {
-    const row = finding(1, now)
+    const evidenceReference = `hvr1_evidence_${'b'.repeat(64)}`
+    const row = {
+      ...finding(1, now),
+      matchedResult: { evidence: [evidenceReference] },
+    }
     const prisma = scoped({
       identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
       identityRiskFinding: {
@@ -798,7 +853,7 @@ test('owner finding detail is bounded, catalog-owned, and scoped to the same run
       row.id,
     )
     assert.equal(detail.finding?.id, row.id)
-    assert.deepEqual(detail.evidenceReferences, [])
+    assert.deepEqual(detail.evidenceReferences, [evidenceReference])
     assert.equal(JSON.stringify(detail).includes('must never be projected'), false)
     assert.equal((where as { organizationId?: unknown }).organizationId, organizationId)
     assert.equal((where as { customerTenantId?: unknown }).customerTenantId, tenantId)
@@ -807,6 +862,39 @@ test('owner finding detail is bounded, catalog-owned, and scoped to the same run
         ?.evaluationRunId,
       runId,
     )
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('finding detail rejects stored evidence that is raw, secret-shaped, duplicated, or over limit', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  const unsafeEvidence = [
+    'ARRAYSECRET1',
+    `hvr1_evidence_${'c'.repeat(64)}`,
+  ]
+  try {
+    const prisma = scoped({
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskFinding: {
+        findFirst: async () => ({
+          ...finding(1, now),
+          matchedResult: { evidence: unsafeEvidence },
+        }),
+      },
+    })
+    const detail = await new IdentityRiskService(prisma).findingDetail(
+      identity,
+      tenantId,
+      'finding-001',
+    )
+    assert.equal(detail.status, 'ERROR')
+    assert.equal(detail.finding, null)
+    assert.deepEqual(detail.evidenceReferences, [])
+    assert.ok(!JSON.stringify(detail).includes('ARRAYSECRET1'))
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
