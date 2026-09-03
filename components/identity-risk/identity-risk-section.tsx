@@ -88,6 +88,7 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
       return {
         label: 'Unable to load',
         detail:
+          meta.limitation ??
           'This channel could not be loaded. Retry without assuming that no findings exist.',
         className:
           'border-red-200 bg-red-50 text-red-950 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200',
@@ -97,7 +98,7 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
 
 function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
   return (
-    <dl className="grid grid-cols-1 gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800 sm:grid-cols-2 lg:grid-cols-5">
+    <dl className="grid grid-cols-1 gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800 sm:grid-cols-2 lg:grid-cols-6">
       <div>
         <dt className="text-slate-500 dark:text-slate-400">Source</dt>
         <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
@@ -123,9 +124,15 @@ function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
         </dd>
       </div>
       <div>
-        <dt className="text-slate-500 dark:text-slate-400">Contract version</dt>
+        <dt className="text-slate-500 dark:text-slate-400">Engine version</dt>
         <dd className="mt-0.5 break-words font-mono text-[11px] font-medium text-slate-800 dark:text-slate-200">
-          {meta.engineVersion ?? meta.catalogVersion ?? 'Not reported'}
+          {meta.engineVersion ?? (meta.catalogVersion ? 'Not applicable' : 'Not reported')}
+        </dd>
+      </div>
+      <div>
+        <dt className="text-slate-500 dark:text-slate-400">Catalog version</dt>
+        <dd className="mt-0.5 break-words font-mono text-[11px] font-medium text-slate-800 dark:text-slate-200">
+          {meta.catalogVersion ?? 'Not reported'}
         </dd>
       </div>
     </dl>
@@ -133,7 +140,9 @@ function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
 }
 
 function formatBoundedCount(count: { value: number; exact: boolean; capped: boolean }) {
-  if (count.capped) return `At least ${count.value.toLocaleString()}`
+  if (count.capped && count.value > 0) {
+    return `At least ${count.value.toLocaleString()}`
+  }
   return count.exact ? count.value.toLocaleString() : 'Not available'
 }
 

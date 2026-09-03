@@ -488,17 +488,19 @@ test('validates exact, capped, and unavailable summary count semantics', () => {
   capped.hawkViewSummary = {
     ...capped.hawkViewSummary,
     counts: summaryCounts({
-      matchedResults: boundedCount(24, false, true),
+      matchedResults: boundedCount(10_000, false, true),
     }),
   }
   assert.deepEqual(
     adaptIdentityRiskResponses(capped).hawkView.counts?.matchedResults,
-    boundedCount(24, false, true)
+    boundedCount(10_000, false, true)
   )
 
   for (const invalidCount of [
     boundedCount(1, true, true),
     boundedCount(1, false, false),
+    boundedCount(0, false, true),
+    boundedCount(9_999, false, true),
     boundedCount(10_001),
   ]) {
     const responses = validResponses()
@@ -508,6 +510,45 @@ test('validates exact, capped, and unavailable summary count semantics', () => {
     }
     assert.equal(adaptIdentityRiskResponses(responses).hawkView.counts, null)
   }
+})
+
+test('preserves a completed evaluation with unavailable source evidence as not evaluated', () => {
+  const responses = validResponses()
+  const notEvaluatedMeta = {
+    capability: 'UNAVAILABLE',
+    status: 'NOT_EVALUATED',
+    evaluatedAt: now,
+    observedAt: null,
+    freshness: 'UNKNOWN',
+    limitation:
+      'Approved HawkView identity-signal source evidence is not available for this evaluation.',
+  }
+  responses.hawkViewSummary = {
+    ...responses.hawkViewSummary,
+    ...notEvaluatedMeta,
+    counts: summaryCounts({
+      identitiesNeedingReview: boundedCount(0),
+      openFindings: boundedCount(0),
+      evaluatedRules: boundedCount(22),
+      matchedResults: boundedCount(0),
+      suppressedResults: boundedCount(0),
+      notMatchedResults: boundedCount(0),
+      notEvaluatedResults: boundedCount(22),
+    }),
+  }
+  responses.hawkViewFindings = {
+    ...responses.hawkViewFindings,
+    ...notEvaluatedMeta,
+    findings: [],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+
+  const view = adaptIdentityRiskResponses(responses).hawkView
+  assert.equal(view.meta.status, 'NOT_EVALUATED')
+  assert.equal(view.meta.evaluatedAt, now)
+  assert.equal(view.meta.observedAt, null)
+  assert.deepEqual(view.findings, [])
+  assert.match(view.meta.limitation ?? '', /source evidence is not available/)
 })
 
 test('preserves unavailable evidence and authoritative Microsoft empty as different states', () => {
@@ -566,4 +607,46 @@ test('rejects non-canonical evaluation time and cursor shapes', () => {
       'ERROR'
     )
   }
+})
+
+test('rejects evaluation envelopes beyond the independent current-time ceiling', () => {
+  const future = '2099-01-01T00:00:00.000Z'
+  const hawkView = validResponses()
+  for (const key of ['hawkViewSummary', 'hawkViewFindings'] as const) {
+    hawkView[key] = {
+      ...hawkView[key],
+      evaluatedAt: future,
+      observedAt: future,
+    }
+  }
+  const rejectedHawkView = adaptIdentityRiskResponses(hawkView).hawkView
+  assert.equal(rejectedHawkView.meta.status, 'ERROR')
+  assert.equal(rejectedHawkView.counts, null)
+  assert.match(rejectedHawkView.meta.limitation ?? '', /in the future/)
+  assert.match(rejectedHawkView.meta.limitation ?? '', /must not be treated as current/)
+
+  const microsoft = validResponses()
+  microsoft.microsoftRiskyUsers = {
+    ...microsoft.microsoftRiskyUsers,
+    evaluatedAt: future,
+    observedAt: future,
+  }
+  const rejectedMicrosoft = adaptIdentityRiskResponses(microsoft).microsoft
+  assert.equal(rejectedMicrosoft.meta.status, 'ERROR')
+  assert.equal(rejectedMicrosoft.users, null)
+  assert.match(rejectedMicrosoft.meta.limitation ?? '', /in the future/)
+
+  const receiptTime = Date.now()
+  const chainedFuture = validResponses()
+  for (const key of ['hawkViewSummary', 'hawkViewFindings'] as const) {
+    chainedFuture[key] = {
+      ...chainedFuture[key],
+      evaluatedAt: new Date(receiptTime + 4 * 60 * 1_000).toISOString(),
+      observedAt: new Date(receiptTime + 9 * 60 * 1_000).toISOString(),
+    }
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(chainedFuture).hawkView.meta.status,
+    'ERROR'
+  )
 })

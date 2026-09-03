@@ -63,5 +63,9 @@ test('summary counts retain investigation and evaluation semantics', () => {
 test('the UI distinguishes evaluated time and does not claim restricted detail support', () => {
   assert.match(section, /Channel evaluated/)
   assert.match(section, /Evidence observed/)
+  assert.match(section, /Engine version/)
+  assert.match(section, /Catalog version/)
+  assert.doesNotMatch(section, />Contract version</)
+  assert.match(section, /count\.capped && count\.value > 0/)
   assert.doesNotMatch(hook, /identity-signals\/findings\/\$\{/)
 })

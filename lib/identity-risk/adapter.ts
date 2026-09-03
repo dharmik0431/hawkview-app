@@ -179,13 +179,26 @@ function dateTime(value: unknown): string | null {
     : null
 }
 
-function observedDateTime(value: unknown, evaluatedAt: string): string | null {
+function observedDateTime(
+  value: unknown,
+  evaluatedAt: string,
+  trustedCurrentTimeMs: number
+): string | null {
   const candidate = dateTime(value)
   if (!candidate) return null
-  return new Date(candidate).getTime() <=
-    new Date(evaluatedAt).getTime() + MAX_FUTURE_SKEW_MS
+  const candidateTime = new Date(candidate).getTime()
+  return candidateTime <= new Date(evaluatedAt).getTime() + MAX_FUTURE_SKEW_MS &&
+    candidateTime <= trustedCurrentTimeMs + MAX_FUTURE_SKEW_MS
     ? candidate
     : null
+}
+
+function isFutureDateTime(value: unknown, trustedCurrentTimeMs: number) {
+  const candidate = dateTime(value)
+  return (
+    candidate !== null &&
+    new Date(candidate).getTime() > trustedCurrentTimeMs + MAX_FUTURE_SKEW_MS
+  )
 }
 
 function enumValue<const T extends readonly string[]>(
@@ -234,7 +247,8 @@ function fallbackMeta(
 
 function adaptMeta(
   value: RecordValue,
-  expectedSourceLabel: typeof hawkViewSourceLabel | typeof microsoftSourceLabel
+  expectedSourceLabel: typeof hawkViewSourceLabel | typeof microsoftSourceLabel,
+  trustedCurrentTimeMs: number
 ): IdentityRiskChannelMeta | null {
   const capability = enumValue(value.capability, capabilities)
   const status = enumValue(value.status, statuses)
@@ -247,7 +261,11 @@ function adaptMeta(
   const observedAt =
     value.observedAt === null || !evaluatedAt
       ? null
-      : observedDateTime(value.observedAt, evaluatedAt)
+      : observedDateTime(
+          value.observedAt,
+          evaluatedAt,
+          trustedCurrentTimeMs
+        )
   const limitation =
     value.limitation === null
       ? null
@@ -263,6 +281,9 @@ function adaptMeta(
       ? engineVersion !== hawkViewEngineVersion ||
         catalogVersion !== hawkViewCatalogVersion
       : engineVersion !== null || catalogVersion !== microsoftCatalogVersion) ||
+    (evaluatedAt !== null &&
+      new Date(evaluatedAt).getTime() >
+        trustedCurrentTimeMs + MAX_FUTURE_SKEW_MS) ||
     (value.evaluatedAt !== null && !evaluatedAt) ||
     (value.observedAt !== null && !observedAt) ||
     (value.limitation !== null && !limitation)
@@ -288,7 +309,12 @@ function adaptMeta(
       freshness === 'UNKNOWN' &&
       evaluatedAt !== null &&
       limitation !== null) ||
-    ((status === 'NOT_EVALUATED' || status === 'UNAVAILABLE' || status === 'ERROR') &&
+    (status === 'NOT_EVALUATED' &&
+      capability === 'UNAVAILABLE' &&
+      freshness === 'UNKNOWN' &&
+      observedAt === null &&
+      limitation !== null) ||
+    ((status === 'UNAVAILABLE' || status === 'ERROR') &&
       capability === 'UNAVAILABLE' &&
       freshness === 'UNKNOWN' &&
       evaluatedAt === null &&
@@ -351,6 +377,7 @@ function adaptBoundedCount(value: unknown) {
     typeof source.exact !== 'boolean' ||
     typeof source.capped !== 'boolean' ||
     (source.exact && source.capped) ||
+    (source.capped && source.value !== MAX_SUMMARY_COUNT) ||
     (!source.exact && !source.capped && source.value !== 0)
   ) {
     return null
@@ -388,7 +415,7 @@ function countsMatchMeta(
   meta: IdentityRiskChannelMeta
 ) {
   const values = Object.values(counts)
-  return meta.capability === 'UNAVAILABLE'
+  return meta.evaluatedAt === null
     ? values.every(
         (count) => count.value === 0 && !count.exact && !count.capped
       )
@@ -397,7 +424,8 @@ function countsMatchMeta(
 
 function adaptFinding(
   value: unknown,
-  evaluatedAt: string
+  evaluatedAt: string,
+  trustedCurrentTimeMs: number
 ): HawkViewIdentityFinding | null {
   const source = record(value)
   if (
@@ -444,7 +472,11 @@ function adaptFinding(
     'APPLICATION',
     'UNKNOWN',
   ] as const)
-  const observedAt = observedDateTime(source.observedAt, evaluatedAt)
+  const observedAt = observedDateTime(
+    source.observedAt,
+    evaluatedAt,
+    trustedCurrentTimeMs
+  )
   const ruleIds = catalogList(source.ruleIds, ruleCatalog, 10, 150)
   const sourceLabels = catalogList(source.sourceLabels, sourceLabelCatalog, 10, 120)
   const missingEvidenceLabels = catalogList(
@@ -520,7 +552,8 @@ function adaptFinding(
 
 function adaptMicrosoftUser(
   value: unknown,
-  evaluatedAt: string
+  evaluatedAt: string,
+  trustedCurrentTimeMs: number
 ): MicrosoftEntraRiskyUser | null {
   const source = record(value)
   if (
@@ -559,7 +592,11 @@ function adaptMicrosoftUser(
     source.riskDetail === null || source.riskDetail === undefined
       ? null
       : boundedString(source.riskDetail, 200)
-  const observedAt = observedDateTime(source.observedAt, evaluatedAt)
+  const observedAt = observedDateTime(
+    source.observedAt,
+    evaluatedAt,
+    trustedCurrentTimeMs
+  )
 
   if (
     !id ||
@@ -608,6 +645,9 @@ export function adaptIdentityRiskResponses(input: {
   hawkViewFindings: unknown
   microsoftRiskyUsers: unknown
 }): IdentityRiskViewModel {
+  // DTO timestamps are untrusted input. This independent receipt-time ceiling
+  // is an availability guard; the backend separately enforces platform time.
+  const trustedCurrentTimeMs = Date.now()
   const summary = record(input.hawkViewSummary)
   const findingEnvelope = record(input.hawkViewFindings)
   const microsoftEnvelope = record(input.microsoftRiskyUsers)
@@ -651,8 +691,12 @@ export function adaptIdentityRiskResponses(input: {
       'pageInfo',
     ])
   ) {
-    const meta = adaptMeta(summary, hawkViewSourceLabel)
-    const findingMeta = adaptMeta(findingEnvelope, hawkViewSourceLabel)
+    const meta = adaptMeta(summary, hawkViewSourceLabel, trustedCurrentTimeMs)
+    const findingMeta = adaptMeta(
+      findingEnvelope,
+      hawkViewSourceLabel,
+      trustedCurrentTimeMs
+    )
     const counts = adaptCounts(summary.counts)
     const rawFindings = findingEnvelope.findings
     const findings =
@@ -660,7 +704,11 @@ export function adaptIdentityRiskResponses(input: {
       rawFindings.length <= MAX_PAGE_SIZE &&
       (meta?.evaluatedAt || rawFindings.length === 0)
       ? rawFindings.map((finding) =>
-          adaptFinding(finding, meta?.evaluatedAt as string)
+          adaptFinding(
+            finding,
+            meta?.evaluatedAt as string,
+            trustedCurrentTimeMs
+          )
         )
       : null
     const pageInfo = adaptPageInfo(findingEnvelope.pageInfo)
@@ -683,9 +731,14 @@ export function adaptIdentityRiskResponses(input: {
         pageInfo,
       }
     } else {
+      const futureEvaluation =
+        isFutureDateTime(summary.evaluatedAt, trustedCurrentTimeMs) ||
+        isFutureDateTime(findingEnvelope.evaluatedAt, trustedCurrentTimeMs)
       hawkView = unavailableHawkViewIdentitySignals(
         'ERROR',
-        'HawkView identity signal data did not match the supported frontend contract.'
+        futureEvaluation
+          ? 'HawkView identity signal evaluation time is in the future, so this evidence is unavailable and must not be treated as current.'
+          : 'HawkView identity signal data did not match the supported frontend contract.'
       )
     }
   }
@@ -713,14 +766,22 @@ export function adaptIdentityRiskResponses(input: {
       'pageInfo',
     ])
   ) {
-    const meta = adaptMeta(microsoftEnvelope, microsoftSourceLabel)
+    const meta = adaptMeta(
+      microsoftEnvelope,
+      microsoftSourceLabel,
+      trustedCurrentTimeMs
+    )
     const rawUsers = microsoftEnvelope.users
     const users =
       Array.isArray(rawUsers) &&
       rawUsers.length <= MAX_PAGE_SIZE &&
       (meta?.evaluatedAt || rawUsers.length === 0)
       ? rawUsers.map((user) =>
-          adaptMicrosoftUser(user, meta?.evaluatedAt as string)
+          adaptMicrosoftUser(
+            user,
+            meta?.evaluatedAt as string,
+            trustedCurrentTimeMs
+          )
         )
       : null
     const pageInfo = adaptPageInfo(microsoftEnvelope.pageInfo)
@@ -738,9 +799,15 @@ export function adaptIdentityRiskResponses(input: {
         pageInfo,
       }
     } else {
+      const futureEvaluation = isFutureDateTime(
+        microsoftEnvelope.evaluatedAt,
+        trustedCurrentTimeMs
+      )
       microsoft = unavailableMicrosoftEntraRiskyUsers(
         'ERROR',
-        'Microsoft Entra risky-user data did not match the supported frontend contract.'
+        futureEvaluation
+          ? 'Microsoft Entra risky-user evaluation time is in the future, so this evidence is unavailable and must not be treated as current.'
+          : 'Microsoft Entra risky-user data did not match the supported frontend contract.'
       )
     }
   }
