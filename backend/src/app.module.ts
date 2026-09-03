@@ -9,6 +9,7 @@ import { ChangesModule } from './changes/changes.module.js'
 import { WorkspaceModule } from './workspace/workspace.module.js'
 import { AuthenticatedCanaryModule } from './canary/authenticated-canary.module.js'
 import { RequestCorrelationMiddleware } from './request-correlation.middleware.js'
+import { IdentityRiskModule } from './identity-risk/identity-risk.module.js'
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { RequestCorrelationMiddleware } from './request-correlation.middleware.j
     ChangesModule,
     WorkspaceModule,
     AuthenticatedCanaryModule,
+    IdentityRiskModule,
   ],
 })
 export class AppModule implements NestModule {

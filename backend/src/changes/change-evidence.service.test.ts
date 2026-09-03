@@ -1533,6 +1533,48 @@ test('actual scheduled service excludes active leases before its 1,000-candidate
   }
 })
 
+test('production scheduled sync invokes the approved identity-risk scheduler contract', async () => {
+  const tenant = scheduledTenant(1)
+  const requests: any[] = []
+  const identityRiskScheduler = {
+    runTenant: async (request: any) => {
+      requests.push(request)
+      return { status: 'OFF', runKey: null, alertDeliveryDisabled: true }
+    },
+  }
+  const service = new TenantSyncService(
+    { customerTenant: { findMany: async () => [tenant] } } as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    new ChangeEvidenceService({} as never),
+    {} as never,
+    identityRiskScheduler as never,
+  )
+  ;(service as any).syncConnectedTenant = async () => ({
+    status: 'SUCCEEDED',
+    failedResources: [],
+  })
+  const oldBatch = process.env.SCHEDULED_SYNC_BATCH_SIZE
+  process.env.SCHEDULED_SYNC_BATCH_SIZE = '1'
+  try {
+    const summary = await service.syncDueTenants()
+    assert.equal(summary.succeeded, 1)
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0]?.organizationId, tenant.organizationId)
+    assert.equal(requests[0]?.customerTenantId, tenant.id)
+    assert.equal(requests[0]?.engineVersion, 'hawkview-identity-engine/1')
+    assert.equal(requests[0]?.catalogVersion, 'hawkview-identity-signals/v1')
+    assert.deepEqual(requests[0]?.approvedEvaluator, { readiness: 'NOT_READY' })
+    const batch = await requests[0]?.loadSources()
+    assert.equal(batch.capability, 'UNAVAILABLE')
+    assert.deepEqual(batch.sourceEnvelopes, [])
+  } finally {
+    if (oldBatch === undefined) delete process.env.SCHEDULED_SYNC_BATCH_SIZE
+    else process.env.SCHEDULED_SYNC_BATCH_SIZE = oldBatch
+  }
+})
+
 test('targeted retry maps Named Locations to its exact tenant-level Graph collector only', async () => {
   const service = new TenantSyncService({} as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
   const calls: Array<{ resource: string; endpoint: string; token: string }> = []

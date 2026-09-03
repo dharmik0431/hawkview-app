@@ -93,6 +93,13 @@ import {
   m365AuditUsageLimits,
   validateManagementUrl,
 } from './m365-management-activity.service.js'
+import {
+  IdentityRiskEvaluationScheduler,
+} from '../identity-risk/identity-risk-evaluator.service.js'
+import {
+  IDENTITY_RISK_CATALOG_VERSION,
+  IDENTITY_RISK_ENGINE_VERSION,
+} from '../identity-risk/identity-risk.contract.js'
 
 const USER_SELECT =
   'id,displayName,userPrincipalName,mail,accountEnabled,userType,assignedLicenses'
@@ -1160,8 +1167,53 @@ export class TenantSyncService {
     @Inject(ChangeEvidenceService)
     private readonly changeEvidence: ChangeEvidenceService,
     @Inject(M365ManagementActivityService)
-    private readonly m365ManagementActivity: M365ManagementActivityService
+    private readonly m365ManagementActivity: M365ManagementActivityService,
+    @Inject(IdentityRiskEvaluationScheduler)
+    private readonly identityRiskEvaluationScheduler: IdentityRiskEvaluationScheduler | null = null,
   ) {}
+
+  /**
+   * Production scheduler hand-off for the version-pinned evaluator. Until the
+   * normalized projectors are enabled, it deliberately supplies no candidates
+   * and reports UNAVAILABLE capability. With the default OFF mode, the loader
+   * is never called and no risk rows are written.
+   */
+  private async runPostSyncIdentityRiskEvaluation(tenant: {
+    id: string
+    organizationId: string
+  }) {
+    if (!this.identityRiskEvaluationScheduler) return
+    const evaluationAt = new Date()
+    const windowStart = new Date(evaluationAt.getTime() - 24 * 60 * 60 * 1_000)
+    try {
+      await this.identityRiskEvaluationScheduler.runTenant({
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+        catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+        windowStart,
+        windowEnd: evaluationAt,
+        evaluationAt,
+        loadSources: async () => ({
+          context: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+            evaluationAt,
+            engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+            catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+          },
+          sourceEnvelopes: [],
+          orderedSourceWatermarks: [],
+          earliestSourceExpiry: null,
+          capability: 'UNAVAILABLE',
+        }),
+        approvedEvaluator: { readiness: 'NOT_READY' },
+      })
+    } catch {
+      // Identity-risk shadow evaluation is isolated from tenant collection.
+      this.logger.warn('Post-sync identity-risk evaluation failed.')
+    }
+  }
 
   private async getReadableTenant(
     identity: AuthenticatedIdentity,
@@ -1405,6 +1457,9 @@ export class TenantSyncService {
           incrementalOnly: !fullInventoryDue,
           includeBundle: false,
         })
+        if (result.status !== 'SKIPPED') {
+          await this.runPostSyncIdentityRiskEvaluation(tenant)
+        }
         results.push({
           tenantId: tenant.id,
           microsoftTenantId: tenant.microsoftTenantId,

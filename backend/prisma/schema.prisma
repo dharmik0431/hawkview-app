@@ -218,6 +218,11 @@ model Organization {
   m365AuditRecords M365AuditRecord[]
   m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
+  identityRiskEvaluationRuns IdentityRiskEvaluationRun[]
+  identityRiskRuleCoverage IdentityRiskRuleCoverage[]
+  identityRiskMatchedResults IdentityRiskMatchedResult[]
+  identityRiskFindings IdentityRiskFinding[]
+  identityRiskOperationalControls IdentityRiskOperationalControl[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
   microsoftConsentAttempts MicrosoftConsentAttempt[]
@@ -301,6 +306,11 @@ model CustomerTenant {
   m365AuditRecords M365AuditRecord[]
   m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
+  identityRiskEvaluationRuns IdentityRiskEvaluationRun[]
+  identityRiskRuleCoverage IdentityRiskRuleCoverage[]
+  identityRiskMatchedResults IdentityRiskMatchedResult[]
+  identityRiskFindings IdentityRiskFinding[]
+  identityRiskOperationalControls IdentityRiskOperationalControl[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
   microsoftConsentAttempts MicrosoftConsentAttempt[]
@@ -724,6 +734,174 @@ model ChangeEvidenceEvent {
   @@index([customerTenantId, correlationId])
   @@index([expiresAt])
   @@map("change_evidence_events")
+}
+
+// The identity-risk platform stores only matched evidence and bounded run
+// aggregates. It deliberately does not retain a row per user/rule abstention.
+model IdentityRiskEvaluationRun {
+  id                String         @id @default(uuid()) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  customerTenantId  String         @map("customer_tenant_id") @db.Uuid
+  runKey            String         @map("run_key") @db.VarChar(128)
+  engineVersion     String         @map("engine_version") @db.VarChar(100)
+  catalogVersion    String         @map("catalog_version") @db.VarChar(100)
+  status            String         @db.VarChar(30)
+  windowStart       DateTime       @map("window_start") @db.Timestamptz(6)
+  windowEnd         DateTime       @map("window_end") @db.Timestamptz(6)
+  sourceWatermarkHash String       @map("source_watermark_hash") @db.VarChar(128)
+  sourceContentHash   String       @map("source_content_hash") @db.VarChar(128)
+  capability        String         @default("UNAVAILABLE") @db.VarChar(20)
+  aggregate         Json           @default("{}") @db.JsonB
+  alertDeliveryDisabled Boolean    @default(false) @map("alert_delivery_disabled")
+  failureCode       String?        @map("failure_code") @db.VarChar(80)
+  leaseToken        String?        @map("lease_token") @db.Uuid
+  leaseExpiresAt    DateTime?      @map("lease_expires_at") @db.Timestamptz(6)
+  expiresAt         DateTime       @map("expires_at") @db.Timestamptz(6)
+  completedAt       DateTime?      @map("completed_at") @db.Timestamptz(6)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  ruleCoverage      IdentityRiskRuleCoverage[]
+  matchedResults    IdentityRiskMatchedResult[]
+
+  @@unique([organizationId, customerTenantId, runKey], map: "identity_risk_evaluation_runs_scope_key")
+  @@unique([id, organizationId, customerTenantId], map: "identity_risk_evaluation_runs_scope_id")
+  @@index([organizationId, customerTenantId, completedAt(sort: Desc)], map: "identity_risk_evaluation_runs_scope_completed")
+  @@index([organizationId, customerTenantId, status, leaseExpiresAt], map: "identity_risk_evaluation_runs_scope_lease")
+  @@index([expiresAt], map: "identity_risk_evaluation_runs_expiry")
+  @@map("identity_risk_evaluation_runs")
+}
+
+model IdentityRiskRuleCoverage {
+  id                  String                    @id @default(uuid()) @db.Uuid
+  organizationId      String                    @map("organization_id") @db.Uuid
+  customerTenantId    String                    @map("customer_tenant_id") @db.Uuid
+  evaluationRunId     String                    @map("evaluation_run_id") @db.Uuid
+  ruleId              String                    @map("rule_id") @db.VarChar(150)
+  eligibleCount       Int                       @default(0) @map("eligible_count")
+  matchedCount        Int                       @default(0) @map("matched_count")
+  suppressedCount     Int                       @default(0) @map("suppressed_count")
+  notMatchedCount     Int                       @default(0) @map("not_matched_count")
+  notEvaluatedCount   Int                       @default(0) @map("not_evaluated_count")
+  eligibleCountCapped     Boolean                   @default(false) @map("eligible_count_capped")
+  matchedCountCapped      Boolean                   @default(false) @map("matched_count_capped")
+  suppressedCountCapped   Boolean                   @default(false) @map("suppressed_count_capped")
+  notMatchedCountCapped   Boolean                   @default(false) @map("not_matched_count_capped")
+  notEvaluatedCountCapped Boolean                   @default(false) @map("not_evaluated_count_capped")
+  reasonCounts        Json                      @default("[]") @map("reason_counts") @db.JsonB
+  samplesTruncated    Boolean                   @default(false) @map("samples_truncated")
+  expiresAt           DateTime                  @map("expires_at") @db.Timestamptz(6)
+  createdAt           DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  organization        Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant      CustomerTenant            @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  evaluationRun       IdentityRiskEvaluationRun @relation(fields: [evaluationRunId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: Cascade)
+
+  @@unique([organizationId, customerTenantId, evaluationRunId, ruleId], map: "identity_risk_rule_coverage_scope_key")
+  @@index([organizationId, customerTenantId, evaluationRunId], map: "identity_risk_rule_coverage_scope_run")
+  @@index([expiresAt], map: "identity_risk_rule_coverage_expiry")
+  @@map("identity_risk_rule_coverage")
+}
+
+model IdentityRiskMatchedResult {
+  id                String                    @id @default(uuid()) @db.Uuid
+  organizationId    String                    @map("organization_id") @db.Uuid
+  customerTenantId  String                    @map("customer_tenant_id") @db.Uuid
+  evaluationRunId   String                    @map("evaluation_run_id") @db.Uuid
+  resultKey         String                    @map("result_key") @db.VarChar(128)
+  ruleId            String                    @map("rule_id") @db.VarChar(150)
+  subjectType       String                    @map("subject_type") @db.VarChar(50)
+  subjectId         String                    @map("subject_id") @db.VarChar(128)
+  severity          String                    @db.VarChar(20)
+  confidence        String                    @db.VarChar(20)
+  coverage          String                    @db.VarChar(20)
+  observedAt        DateTime                  @map("observed_at") @db.Timestamptz(6)
+  evidence          Json                      @default("[]") @db.JsonB
+  expiresAt         DateTime                  @map("expires_at") @db.Timestamptz(6)
+  createdAt         DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  organization      Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant            @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  evaluationRun     IdentityRiskEvaluationRun @relation(fields: [evaluationRunId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: Cascade)
+  findings          IdentityRiskFinding[]
+
+  @@unique([organizationId, customerTenantId, resultKey], map: "identity_risk_matched_results_scope_key")
+  @@unique([id, organizationId, customerTenantId], map: "identity_risk_matched_results_scope_id")
+  @@index([organizationId, customerTenantId, evaluationRunId], map: "identity_risk_matched_results_scope_run")
+  @@index([expiresAt], map: "identity_risk_matched_results_expiry")
+  @@map("identity_risk_matched_results")
+}
+
+model IdentityRiskFinding {
+  id                String         @id @default(uuid()) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  customerTenantId  String         @map("customer_tenant_id") @db.Uuid
+  matchedResultId   String         @map("matched_result_id") @db.Uuid
+  dedupeKey         String         @map("dedupe_key") @db.VarChar(128)
+  ruleId            String         @map("rule_id") @db.VarChar(150)
+  ruleVersion       String         @map("rule_version") @db.VarChar(100)
+  subjectType       String         @map("subject_type") @db.VarChar(50)
+  subjectId         String         @map("subject_id") @db.VarChar(128)
+  state             String         @default("OPEN") @db.VarChar(30)
+  severity          String         @db.VarChar(20)
+  confidence        String         @db.VarChar(20)
+  coverage          String         @db.VarChar(20)
+  observedAt        DateTime       @map("observed_at") @db.Timestamptz(6)
+  expiresAt         DateTime       @map("expires_at") @db.Timestamptz(6)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  matchedResult     IdentityRiskMatchedResult @relation(fields: [matchedResultId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: Cascade)
+
+  @@unique([organizationId, customerTenantId, dedupeKey], map: "identity_risk_findings_scope_key")
+  @@index([organizationId, customerTenantId, state, observedAt(sort: Desc), id(sort: Desc)], map: "identity_risk_findings_scope_state")
+  @@index([expiresAt], map: "identity_risk_findings_expiry")
+  @@map("identity_risk_findings")
+}
+
+model IdentityRiskOperationalControl {
+  id                String         @id @default(uuid()) @db.Uuid
+  controlType       String         @map("control_type") @db.VarChar(40)
+  scopeType         String         @map("scope_type") @db.VarChar(20)
+  scopeKey          String         @map("scope_key") @db.VarChar(128)
+  organizationId    String?        @map("organization_id") @db.Uuid
+  customerTenantId  String?        @map("customer_tenant_id") @db.Uuid
+  state             String         @db.VarChar(20)
+  episodeId         String         @map("episode_id") @db.Uuid
+  reasonCode        String         @map("reason_code") @db.VarChar(80)
+  actorServiceId    String         @map("actor_service_id") @db.VarChar(128)
+  activatedAt       DateTime       @map("activated_at") @db.Timestamptz(6)
+  resumedAt         DateTime?      @map("resumed_at") @db.Timestamptz(6)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization      Organization?  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant    CustomerTenant? @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  events            IdentityRiskOperationalEvent[]
+
+  @@unique([controlType, scopeKey], map: "identity_risk_operational_controls_scope_key")
+  @@index([scopeType, scopeKey, state], map: "identity_risk_operational_controls_scope_state")
+  @@map("identity_risk_operational_controls")
+}
+
+model IdentityRiskOperationalEvent {
+  id                String                         @id @default(uuid()) @db.Uuid
+  controlId         String?                        @map("control_id") @db.Uuid
+  eventKey          String                         @unique(map: "identity_risk_operational_events_event_key") @map("event_key") @db.VarChar(128)
+  eventType         String                         @map("event_type") @db.VarChar(50)
+  controlType       String?                        @map("control_type") @db.VarChar(40)
+  scopeType         String                         @map("scope_type") @db.VarChar(20)
+  scopeOpaqueId     String                         @map("scope_opaque_id") @db.VarChar(128)
+  reasonCode        String                         @map("reason_code") @db.VarChar(80)
+  correlationId     String                         @map("correlation_id") @db.Uuid
+  actorServiceId    String                         @map("actor_service_id") @db.VarChar(128)
+  expiresAt         DateTime                       @map("expires_at") @db.Timestamptz(6)
+  createdAt         DateTime                       @default(now()) @map("created_at") @db.Timestamptz(6)
+  control           IdentityRiskOperationalControl? @relation(fields: [controlId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)], map: "identity_risk_operational_events_created")
+  @@index([controlId, createdAt], map: "identity_risk_operational_events_control_created")
+  @@index([scopeType, scopeOpaqueId, expiresAt], map: "identity_risk_operational_events_scope_expiry")
+  @@index([expiresAt], map: "identity_risk_operational_events_expiry")
+  @@map("identity_risk_operational_events")
 }
 
 model TenantConnection {
