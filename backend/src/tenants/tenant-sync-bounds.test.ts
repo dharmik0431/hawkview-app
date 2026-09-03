@@ -11,6 +11,7 @@ import {
   MAILBOX_USAGE_CSV_MAX_ROWS,
   parseBoundedGraphCollectionPage,
   parseCsvRows,
+  TenantSyncService,
 } from './tenant-sync.service.js'
 
 test('an eight-megabyte Graph sign-in or audit page is cancelled before JSON parsing', async () => {
@@ -53,4 +54,24 @@ test('mailbox CSV byte, row and column limits accept exact values and reject plu
   const small = 'h\nv'
   assert.doesNotThrow(() => parseCsvRows([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 2 }, () => 'v')].join('\n')))
   assert.throws(() => parseCsvRows([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 1 }, () => 'v')].join('\n')), /row or column/)
+})
+
+test('Exchange initial sync-state failure closes the anonymous telemetry lifecycle before collection work', async () => {
+  const hostile = 'token=never user@example.com contoso.example https://secret.example/path'
+  let workCalls = 0
+  const service = new TenantSyncService({
+    syncState: { upsert: async () => { throw new Error(hostile) } },
+  } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const messages: string[] = []
+  ;(service as any).logger = { log: (message: string) => messages.push(message), warn: (message: string) => messages.push(message) }
+  await assert.rejects(
+    () => (service as any).runSnapshotSync({ id: 'tenant-private', organizationId: 'org-private' }, 'EXCHANGE_MAILBOX_CONFIGURATION', async () => { workCalls += 1 }),
+    /token=never/,
+  )
+  assert.equal(workCalls, 0)
+  assert.equal(messages.length, 2)
+  assert.equal(JSON.parse(messages[0]!).outcome, 'STARTED')
+  assert.equal(JSON.parse(messages[1]!).outcome, 'FAILED')
+  assert.equal(messages.join('\n').includes('tenant-private'), false)
+  assert.equal(messages.join('\n').includes(hostile), false)
 })
