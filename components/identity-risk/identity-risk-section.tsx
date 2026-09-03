@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils'
 import { useIdentityRiskChannels } from '@/lib/api/identity-risk-hooks'
 import type {
   HawkViewIdentityFinding,
+  HawkViewIdentityRiskCounts,
   HawkViewIdentitySignalsView,
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
@@ -96,7 +97,7 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
 
 function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
   return (
-    <dl className="grid grid-cols-1 gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800 sm:grid-cols-2 lg:grid-cols-4">
+    <dl className="grid grid-cols-1 gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-xs dark:border-slate-800 sm:grid-cols-2 lg:grid-cols-5">
       <div>
         <dt className="text-slate-500 dark:text-slate-400">Source</dt>
         <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
@@ -121,7 +122,66 @@ function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
           {meta.freshness.toLowerCase()}
         </dd>
       </div>
+      <div>
+        <dt className="text-slate-500 dark:text-slate-400">Contract version</dt>
+        <dd className="mt-0.5 break-words font-mono text-[11px] font-medium text-slate-800 dark:text-slate-200">
+          {meta.engineVersion ?? meta.catalogVersion ?? 'Not reported'}
+        </dd>
+      </div>
     </dl>
+  )
+}
+
+function formatBoundedCount(count: { value: number; exact: boolean; capped: boolean }) {
+  if (count.capped) return `At least ${count.value.toLocaleString()}`
+  return count.exact ? count.value.toLocaleString() : 'Not available'
+}
+
+function HawkViewCounts({ counts }: { counts: HawkViewIdentityRiskCounts }) {
+  const primary = [
+    ['Identities needing review', counts.identitiesNeedingReview],
+    ['Open findings', counts.openFindings],
+    ['Evaluated rules', counts.evaluatedRules],
+  ] as const
+  const outcomes = [
+    ['Matched', counts.matchedResults],
+    ['Suppressed', counts.suppressedResults],
+    ['Not matched', counts.notMatchedResults],
+    ['Not evaluated', counts.notEvaluatedResults],
+  ] as const
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/40">
+      <dl className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        {primary.map(([label, count]) => (
+          <div key={label}>
+            <dt className="text-xs text-slate-500 dark:text-slate-400">{label}</dt>
+            <dd className="mt-0.5 text-lg font-semibold text-slate-950 dark:text-slate-50">
+              {formatBoundedCount(count)}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      <div className="mt-3 border-t border-slate-200 pt-2 dark:border-slate-700">
+        <div className="text-xs font-medium text-slate-700 dark:text-slate-300">
+          Rule evaluation outcomes
+        </div>
+        <dl className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+          {outcomes.map(([label, count]) => (
+            <div key={label} className="flex gap-1">
+              <dt className="text-slate-500 dark:text-slate-400">{label}</dt>
+              <dd className="font-semibold text-slate-800 dark:text-slate-200">
+                {formatBoundedCount(count)}
+              </dd>
+            </div>
+          ))}
+        </dl>
+        <p className="mt-2 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+          Counts describe rule evaluation coverage and open investigation leads—not
+          compromised or safe identities.
+        </p>
+      </div>
+    </div>
   )
 }
 
@@ -305,6 +365,11 @@ function HawkViewCard({
 
       <div className="mt-4 space-y-4">
         <ChannelState meta={view.meta} />
+
+        {view.counts &&
+          (view.meta.status === 'AVAILABLE' || view.meta.status === 'STALE') && (
+            <HawkViewCounts counts={view.counts} />
+          )}
 
         {view.findings && view.findings.length > 0 && (
           <div className="space-y-2.5" aria-label="HawkView findings">

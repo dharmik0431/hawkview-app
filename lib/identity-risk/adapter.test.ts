@@ -4,12 +4,44 @@ import { adaptIdentityRiskResponses } from './adapter.ts'
 
 const now = '2026-09-02T12:00:00.000Z'
 
+function boundedCount(value: number, exact = true, capped = false) {
+  return { value, exact, capped }
+}
+
+function summaryCounts(overrides: Record<string, unknown> = {}) {
+  return {
+    identitiesNeedingReview: boundedCount(1),
+    openFindings: boundedCount(1),
+    evaluatedRules: boundedCount(22),
+    matchedResults: boundedCount(1),
+    suppressedResults: boundedCount(0),
+    notMatchedResults: boundedCount(20),
+    notEvaluatedResults: boundedCount(1),
+    ...overrides,
+  }
+}
+
+function unavailableSummaryCounts() {
+  const unavailable = boundedCount(0, false, false)
+  return summaryCounts({
+    identitiesNeedingReview: unavailable,
+    openFindings: unavailable,
+    evaluatedRules: unavailable,
+    matchedResults: unavailable,
+    suppressedResults: unavailable,
+    notMatchedResults: unavailable,
+    notEvaluatedResults: unavailable,
+  })
+}
+
 function channelMeta(overrides: Record<string, unknown> = {}) {
   return {
     version: 1,
     capability: 'FULL',
     status: 'AVAILABLE',
     sourceLabel: 'HawkView Identity Signals',
+    engineVersion: 'hawkview-identity-engine/1',
+    catalogVersion: 'hawkview-identity-signals/v1',
     evaluatedAt: now,
     observedAt: now,
     freshness: 'CURRENT',
@@ -65,7 +97,7 @@ function validResponses(): {
     hawkViewSummary: {
       ...channelMeta(),
       channel: 'HAWKVIEW_IDENTITY_SIGNALS',
-      findings: 1,
+      counts: summaryCounts(),
     },
     hawkViewFindings: {
       ...channelMeta(),
@@ -74,7 +106,11 @@ function validResponses(): {
       pageInfo: { hasMore: false, nextCursor: null },
     },
     microsoftRiskyUsers: {
-      ...channelMeta({ sourceLabel: 'Microsoft Entra Risky Users' }),
+      ...channelMeta({
+        sourceLabel: 'Microsoft Entra Risky Users',
+        engineVersion: null,
+        catalogVersion: 'microsoft-entra-risky-users/v1',
+      }),
       channel: 'MICROSOFT_ENTRA_RISKY_USERS',
       users: [microsoftUser()],
       pageInfo: { hasMore: false, nextCursor: null },
@@ -100,13 +136,18 @@ test('preserves stale, learning, and not-evaluated capability states', () => {
     const responses = validResponses()
     const capability = status === 'NOT_EVALUATED' ? 'UNAVAILABLE' : 'PARTIAL'
     const observedAt = status === 'NOT_EVALUATED' ? null : now
+    const evaluatedAt = status === 'NOT_EVALUATED' ? null : now
     responses.hawkViewSummary = {
       ...responses.hawkViewSummary,
       status,
       capability,
       freshness: status === 'STALE' ? 'STALE' : 'UNKNOWN',
       observedAt,
+      evaluatedAt,
       limitation: `${status} evidence state`,
+      ...(status === 'NOT_EVALUATED'
+        ? { counts: unavailableSummaryCounts() }
+        : {}),
     }
     responses.hawkViewFindings = {
       ...responses.hawkViewFindings,
@@ -114,7 +155,9 @@ test('preserves stale, learning, and not-evaluated capability states', () => {
       capability,
       freshness: status === 'STALE' ? 'STALE' : 'UNKNOWN',
       observedAt,
+      evaluatedAt,
       limitation: `${status} evidence state`,
+      ...(status === 'NOT_EVALUATED' ? { findings: [] } : {}),
     }
 
     const view = adaptIdentityRiskResponses(responses)
@@ -134,6 +177,7 @@ test('keeps license and permission limitations server-authored', () => {
       capability: 'UNAVAILABLE',
       status: 'UNAVAILABLE',
       freshness: 'UNKNOWN',
+      evaluatedAt: null,
       observedAt: null,
       limitation,
       users: [],
@@ -284,10 +328,6 @@ test('rejects secret-shaped strings and autonomous instructions', () => {
 
 test('rejects oversized pages and invalid cursor state', () => {
   const oversized = validResponses()
-  oversized.hawkViewSummary = {
-    ...oversized.hawkViewSummary,
-    findings: 50_000,
-  }
   oversized.hawkViewFindings = {
     ...oversized.hawkViewFindings,
     findings: new Array(50_000).fill(finding()),
@@ -320,12 +360,15 @@ test('accepts an exact bounded page and preserves explicit continuation state', 
   )
   responses.hawkViewSummary = {
     ...responses.hawkViewSummary,
-    findings: 101,
+    counts: summaryCounts({
+      identitiesNeedingReview: boundedCount(101),
+      openFindings: boundedCount(101),
+    }),
   }
   responses.hawkViewFindings = {
     ...responses.hawkViewFindings,
     findings,
-    pageInfo: { hasMore: true, nextCursor: 'safe-cursor-2' },
+    pageInfo: { hasMore: true, nextCursor: 'safe_cursor.signature' },
   }
 
   const view = adaptIdentityRiskResponses(responses).hawkView
@@ -333,16 +376,12 @@ test('accepts an exact bounded page and preserves explicit continuation state', 
   assert.equal(view.findings?.length, 100)
   assert.deepEqual(view.pageInfo, {
     hasMore: true,
-    nextCursor: 'safe-cursor-2',
+    nextCursor: 'safe_cursor.signature',
   })
 })
 
 test('rejects duplicate row identifiers', () => {
   const responses = validResponses()
-  responses.hawkViewSummary = {
-    ...responses.hawkViewSummary,
-    findings: 2,
-  }
   responses.hawkViewFindings = {
     ...responses.hawkViewFindings,
     findings: [finding(), finding()],
@@ -415,4 +454,116 @@ test('requires the final actionable contract rather than weakening for the backe
     adaptIdentityRiskResponses(foundation).hawkView.meta.status,
     'NOT_EVALUATED'
   )
+})
+
+test('accepts the final engine and catalog versions and rejects version drift', () => {
+  const valid = adaptIdentityRiskResponses(validResponses())
+  assert.equal(valid.hawkView.meta.engineVersion, 'hawkview-identity-engine/1')
+  assert.equal(valid.hawkView.meta.catalogVersion, 'hawkview-identity-signals/v1')
+  assert.equal(
+    valid.microsoft.meta.catalogVersion,
+    'microsoft-entra-risky-users/v1'
+  )
+
+  for (const [target, field, value] of [
+    ['hawkViewSummary', 'engineVersion', 'hawkview-identity-engine/2'],
+    ['hawkViewFindings', 'catalogVersion', 'hawkview-identity-signals/v2'],
+    ['microsoftRiskyUsers', 'engineVersion', 'hawkview-identity-engine/1'],
+    ['microsoftRiskyUsers', 'catalogVersion', 'microsoft-risk/v2'],
+  ] as const) {
+    const responses = validResponses()
+    responses[target] = { ...responses[target], [field]: value }
+    const view = adaptIdentityRiskResponses(responses)
+    assert.notEqual(
+      target === 'microsoftRiskyUsers'
+        ? view.microsoft.meta.status
+        : view.hawkView.meta.status,
+      'AVAILABLE'
+    )
+  }
+})
+
+test('validates exact, capped, and unavailable summary count semantics', () => {
+  const capped = validResponses()
+  capped.hawkViewSummary = {
+    ...capped.hawkViewSummary,
+    counts: summaryCounts({
+      matchedResults: boundedCount(24, false, true),
+    }),
+  }
+  assert.deepEqual(
+    adaptIdentityRiskResponses(capped).hawkView.counts?.matchedResults,
+    boundedCount(24, false, true)
+  )
+
+  for (const invalidCount of [
+    boundedCount(1, true, true),
+    boundedCount(1, false, false),
+    boundedCount(10_001),
+  ]) {
+    const responses = validResponses()
+    responses.hawkViewSummary = {
+      ...responses.hawkViewSummary,
+      counts: summaryCounts({ openFindings: invalidCount }),
+    }
+    assert.equal(adaptIdentityRiskResponses(responses).hawkView.counts, null)
+  }
+})
+
+test('preserves unavailable evidence and authoritative Microsoft empty as different states', () => {
+  const responses = validResponses()
+  const unavailableMeta = {
+    capability: 'UNAVAILABLE',
+    status: 'UNAVAILABLE',
+    evaluatedAt: null,
+    observedAt: null,
+    freshness: 'UNKNOWN',
+    limitation: 'HawkView identity signal evaluation is not enabled.',
+  }
+  responses.hawkViewSummary = {
+    ...responses.hawkViewSummary,
+    ...unavailableMeta,
+    counts: unavailableSummaryCounts(),
+  }
+  responses.hawkViewFindings = {
+    ...responses.hawkViewFindings,
+    ...unavailableMeta,
+    findings: [],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+  responses.microsoftRiskyUsers = {
+    ...responses.microsoftRiskyUsers,
+    users: [],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+
+  const view = adaptIdentityRiskResponses(responses)
+  assert.equal(view.hawkView.meta.status, 'UNAVAILABLE')
+  assert.deepEqual(view.hawkView.findings, [])
+  assert.equal(view.microsoft.meta.status, 'AVAILABLE')
+  assert.deepEqual(view.microsoft.users, [])
+})
+
+test('rejects non-canonical evaluation time and cursor shapes', () => {
+  const whitespace = validResponses()
+  whitespace.microsoftRiskyUsers = {
+    ...whitespace.microsoftRiskyUsers,
+    evaluatedAt: ` ${now}`,
+  }
+  assert.equal(
+    adaptIdentityRiskResponses(whitespace).microsoft.meta.status,
+    'ERROR'
+  )
+
+  for (const nextCursor of ['one-segment', 'body.signature.extra', 'body.=']) {
+    const responses = validResponses()
+    responses.microsoftRiskyUsers = {
+      ...responses.microsoftRiskyUsers,
+      pageInfo: { hasMore: true, nextCursor },
+    }
+    assert.equal(
+      adaptIdentityRiskResponses(responses).microsoft.meta.status,
+      'ERROR'
+    )
+  }
 })

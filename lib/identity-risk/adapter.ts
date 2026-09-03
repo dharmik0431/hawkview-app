@@ -1,5 +1,6 @@
 import type {
   HawkViewIdentityFinding,
+  HawkViewIdentityRiskCounts,
   HawkViewIdentitySignalsView,
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
@@ -22,9 +23,13 @@ const statuses = [
 ] as const
 const freshnessValues = ['CURRENT', 'STALE', 'UNKNOWN'] as const
 const MAX_PAGE_SIZE = 100
+const MAX_SUMMARY_COUNT = 10_000
 const MAX_FUTURE_SKEW_MS = 5 * 60 * 1_000
 const hawkViewSourceLabel = 'HawkView Identity Signals'
 const microsoftSourceLabel = 'Microsoft Entra Risky Users'
+const hawkViewEngineVersion = 'hawkview-identity-engine/1'
+const hawkViewCatalogVersion = 'hawkview-identity-signals/v1'
+const microsoftCatalogVersion = 'microsoft-entra-risky-users/v1'
 
 const ruleCatalog = new Set([
   'HV-ID-APP-001.v1',
@@ -160,7 +165,12 @@ function boundedString(value: unknown, max = 500): string | null {
 
 function dateTime(value: unknown): string | null {
   const candidate = boundedString(value, 100)
-  if (!candidate || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(candidate)) {
+  if (
+    typeof value !== 'string' ||
+    !candidate ||
+    candidate !== value ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(candidate)
+  ) {
     return null
   }
   const parsed = new Date(candidate)
@@ -214,6 +224,8 @@ function fallbackMeta(
     status,
     freshness: 'UNKNOWN',
     sourceLabel: 'Not reported',
+    engineVersion: null,
+    catalogVersion: null,
     evaluatedAt: null,
     observedAt: null,
     limitation,
@@ -228,7 +240,10 @@ function adaptMeta(
   const status = enumValue(value.status, statuses)
   const freshness = enumValue(value.freshness, freshnessValues)
   const sourceLabel = boundedString(value.sourceLabel, 160)
-  const evaluatedAt = dateTime(value.evaluatedAt)
+  const engineVersion =
+    value.engineVersion === null ? null : boundedString(value.engineVersion, 64)
+  const catalogVersion = boundedString(value.catalogVersion, 64)
+  const evaluatedAt = value.evaluatedAt === null ? null : dateTime(value.evaluatedAt)
   const observedAt =
     value.observedAt === null || !evaluatedAt
       ? null
@@ -244,7 +259,11 @@ function adaptMeta(
     !freshness ||
     !sourceLabel ||
     sourceLabel !== expectedSourceLabel ||
-    !evaluatedAt ||
+    (expectedSourceLabel === hawkViewSourceLabel
+      ? engineVersion !== hawkViewEngineVersion ||
+        catalogVersion !== hawkViewCatalogVersion
+      : engineVersion !== null || catalogVersion !== microsoftCatalogVersion) ||
+    (value.evaluatedAt !== null && !evaluatedAt) ||
     (value.observedAt !== null && !observedAt) ||
     (value.limitation !== null && !limitation)
   ) {
@@ -255,20 +274,24 @@ function adaptMeta(
     (status === 'AVAILABLE' &&
       capability !== 'UNAVAILABLE' &&
       freshness === 'CURRENT' &&
+      evaluatedAt !== null &&
       observedAt !== null &&
       (capability === 'FULL' || limitation !== null)) ||
     (status === 'STALE' &&
       capability !== 'UNAVAILABLE' &&
       freshness === 'STALE' &&
+      evaluatedAt !== null &&
       observedAt !== null &&
       limitation !== null) ||
     (status === 'LEARNING' &&
       capability !== 'UNAVAILABLE' &&
       freshness === 'UNKNOWN' &&
+      evaluatedAt !== null &&
       limitation !== null) ||
     ((status === 'NOT_EVALUATED' || status === 'UNAVAILABLE' || status === 'ERROR') &&
       capability === 'UNAVAILABLE' &&
       freshness === 'UNKNOWN' &&
+      evaluatedAt === null &&
       observedAt === null &&
       limitation !== null)
 
@@ -279,6 +302,8 @@ function adaptMeta(
     status,
     freshness,
     sourceLabel,
+    engineVersion,
+    catalogVersion,
     evaluatedAt,
     observedAt,
     limitation,
@@ -291,6 +316,8 @@ function sameMeta(left: IdentityRiskChannelMeta, right: IdentityRiskChannelMeta)
     left.status === right.status &&
     left.freshness === right.freshness &&
     left.sourceLabel === right.sourceLabel &&
+    left.engineVersion === right.engineVersion &&
+    left.catalogVersion === right.catalogVersion &&
     left.evaluatedAt === right.evaluatedAt &&
     left.observedAt === right.observedAt &&
     left.limitation === right.limitation
@@ -305,13 +332,67 @@ function adaptPageInfo(value: unknown): IdentityRiskPageInfo | null {
     source.nextCursor === null ? null : boundedString(source.nextCursor, 256)
   if (
     (source.nextCursor !== null &&
-      (!nextCursor || !/^[A-Za-z0-9._~+\/=:-]+$/.test(nextCursor))) ||
+      (!nextCursor || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(nextCursor))) ||
     (source.hasMore && nextCursor === null) ||
     (!source.hasMore && nextCursor !== null)
   ) {
     return null
   }
   return { hasMore: source.hasMore, nextCursor }
+}
+
+function adaptBoundedCount(value: unknown) {
+  const source = record(value)
+  if (!source || !exactKeys(source, ['value', 'exact', 'capped'])) return null
+  if (
+    !Number.isSafeInteger(source.value) ||
+    (source.value as number) < 0 ||
+    (source.value as number) > MAX_SUMMARY_COUNT ||
+    typeof source.exact !== 'boolean' ||
+    typeof source.capped !== 'boolean' ||
+    (source.exact && source.capped) ||
+    (!source.exact && !source.capped && source.value !== 0)
+  ) {
+    return null
+  }
+  return {
+    value: source.value as number,
+    exact: source.exact,
+    capped: source.capped,
+  }
+}
+
+function adaptCounts(value: unknown): HawkViewIdentityRiskCounts | null {
+  const source = record(value)
+  const keys = [
+    'identitiesNeedingReview',
+    'openFindings',
+    'evaluatedRules',
+    'matchedResults',
+    'suppressedResults',
+    'notMatchedResults',
+    'notEvaluatedResults',
+  ] as const
+  if (!source || !exactKeys(source, keys)) return null
+
+  const counts = Object.fromEntries(
+    keys.map((key) => [key, adaptBoundedCount(source[key])])
+  ) as Record<(typeof keys)[number], ReturnType<typeof adaptBoundedCount>>
+  return Object.values(counts).every((count) => count !== null)
+    ? (counts as HawkViewIdentityRiskCounts)
+    : null
+}
+
+function countsMatchMeta(
+  counts: HawkViewIdentityRiskCounts,
+  meta: IdentityRiskChannelMeta
+) {
+  const values = Object.values(counts)
+  return meta.capability === 'UNAVAILABLE'
+    ? values.every(
+        (count) => count.value === 0 && !count.exact && !count.capped
+      )
+    : values.every((count) => count.exact || count.capped)
 }
 
 function adaptFinding(
@@ -504,6 +585,7 @@ export function unavailableHawkViewIdentitySignals(
   return {
     channel: 'HAWKVIEW_IDENTITY_SIGNALS',
     meta: fallbackMeta(status, limitation),
+    counts: null,
     findings: null,
     pageInfo: null,
   }
@@ -540,6 +622,8 @@ export function adaptIdentityRiskResponses(input: {
     exactKeys(summary, [
       'version',
       'channel',
+      'engineVersion',
+      'catalogVersion',
       'capability',
       'status',
       'sourceLabel',
@@ -547,15 +631,15 @@ export function adaptIdentityRiskResponses(input: {
       'observedAt',
       'freshness',
       'limitation',
-      'findings',
+      'counts',
     ]) &&
-    Number.isSafeInteger(summary.findings) &&
-    (summary.findings as number) >= 0 &&
     findingEnvelope?.version === 1 &&
     findingEnvelope.channel === 'HAWKVIEW_IDENTITY_SIGNALS' &&
     exactKeys(findingEnvelope, [
       'version',
       'channel',
+      'engineVersion',
+      'catalogVersion',
       'capability',
       'status',
       'sourceLabel',
@@ -569,29 +653,32 @@ export function adaptIdentityRiskResponses(input: {
   ) {
     const meta = adaptMeta(summary, hawkViewSourceLabel)
     const findingMeta = adaptMeta(findingEnvelope, hawkViewSourceLabel)
+    const counts = adaptCounts(summary.counts)
     const rawFindings = findingEnvelope.findings
     const findings =
-      meta?.evaluatedAt &&
       Array.isArray(rawFindings) &&
-      rawFindings.length <= MAX_PAGE_SIZE
-      ? rawFindings.map((finding) => adaptFinding(finding, meta.evaluatedAt!))
+      rawFindings.length <= MAX_PAGE_SIZE &&
+      (meta?.evaluatedAt || rawFindings.length === 0)
+      ? rawFindings.map((finding) =>
+          adaptFinding(finding, meta?.evaluatedAt as string)
+        )
       : null
     const pageInfo = adaptPageInfo(findingEnvelope.pageInfo)
     if (
       meta &&
       findingMeta &&
+      counts &&
+      countsMatchMeta(counts, meta) &&
       sameMeta(meta, findingMeta) &&
       findings &&
       findings.every((finding): finding is HawkViewIdentityFinding => finding !== null) &&
       new Set(findings.map((finding) => finding.id)).size === findings.length &&
-      pageInfo &&
-      (pageInfo.hasMore
-        ? (summary.findings as number) > findings.length
-        : summary.findings === findings.length)
+      pageInfo
     ) {
       hawkView = {
         channel: 'HAWKVIEW_IDENTITY_SIGNALS',
         meta,
+        counts,
         findings,
         pageInfo,
       }
@@ -613,6 +700,8 @@ export function adaptIdentityRiskResponses(input: {
     exactKeys(microsoftEnvelope, [
       'version',
       'channel',
+      'engineVersion',
+      'catalogVersion',
       'capability',
       'status',
       'sourceLabel',
@@ -627,10 +716,12 @@ export function adaptIdentityRiskResponses(input: {
     const meta = adaptMeta(microsoftEnvelope, microsoftSourceLabel)
     const rawUsers = microsoftEnvelope.users
     const users =
-      meta?.evaluatedAt &&
       Array.isArray(rawUsers) &&
-      rawUsers.length <= MAX_PAGE_SIZE
-      ? rawUsers.map((user) => adaptMicrosoftUser(user, meta.evaluatedAt!))
+      rawUsers.length <= MAX_PAGE_SIZE &&
+      (meta?.evaluatedAt || rawUsers.length === 0)
+      ? rawUsers.map((user) =>
+          adaptMicrosoftUser(user, meta?.evaluatedAt as string)
+        )
       : null
     const pageInfo = adaptPageInfo(microsoftEnvelope.pageInfo)
     if (

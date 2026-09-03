@@ -15,6 +15,8 @@ export type IdentityRiskChannelMeta = {
   status: IdentityRiskChannelStatus
   freshness: IdentityRiskFreshness
   sourceLabel: string
+  engineVersion: string | null
+  catalogVersion: string | null
   evaluatedAt: string | null
   observedAt: string | null
   limitation: string | null
@@ -63,9 +65,26 @@ export type IdentityRiskPageInfo = {
   nextCursor: string | null
 }
 
+export type IdentityRiskBoundedCount = {
+  value: number
+  exact: boolean
+  capped: boolean
+}
+
+export type HawkViewIdentityRiskCounts = {
+  identitiesNeedingReview: IdentityRiskBoundedCount
+  openFindings: IdentityRiskBoundedCount
+  evaluatedRules: IdentityRiskBoundedCount
+  matchedResults: IdentityRiskBoundedCount
+  suppressedResults: IdentityRiskBoundedCount
+  notMatchedResults: IdentityRiskBoundedCount
+  notEvaluatedResults: IdentityRiskBoundedCount
+}
+
 export type HawkViewIdentitySignalsView = {
   channel: 'HAWKVIEW_IDENTITY_SIGNALS'
   meta: IdentityRiskChannelMeta
+  counts: HawkViewIdentityRiskCounts | null
   findings: HawkViewIdentityFinding[] | null
   pageInfo: IdentityRiskPageInfo | null
 }

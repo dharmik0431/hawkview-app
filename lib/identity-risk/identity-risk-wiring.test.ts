@@ -51,3 +51,17 @@ test('bounded pages disclose when more records exist', () => {
   assert.match(section, /More Microsoft risky-user records are available/)
   assert.match(section, /must not be treated as a complete result set/)
 })
+
+test('summary counts retain investigation and evaluation semantics', () => {
+  assert.match(section, /Identities needing review/)
+  assert.match(section, /Open findings/)
+  assert.match(section, /Rule evaluation outcomes/)
+  assert.match(section, /not\s+compromised or safe identities/)
+  assert.match(section, /At least/)
+})
+
+test('the UI distinguishes evaluated time and does not claim restricted detail support', () => {
+  assert.match(section, /Channel evaluated/)
+  assert.match(section, /Evidence observed/)
+  assert.doesNotMatch(hook, /identity-signals\/findings\/\$\{/)
+})
