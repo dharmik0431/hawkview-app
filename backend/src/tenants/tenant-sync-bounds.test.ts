@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { parseBoundedGraphCollectionPage } from './tenant-sync.service.js'
+import {
+  assertGraphCollectionBounds,
+  GRAPH_LOG_COLLECTION_DEADLINE_MS,
+  GRAPH_LOG_COLLECTION_MAX_PAGES,
+  GRAPH_LOG_COLLECTION_MAX_ROWS,
+  GRAPH_LOG_PAGE_MAX_BYTES,
+  MAILBOX_USAGE_CSV_MAX_BYTES,
+  MAILBOX_USAGE_CSV_MAX_COLUMNS,
+  MAILBOX_USAGE_CSV_MAX_ROWS,
+  parseBoundedGraphCollectionPage,
+  parseCsvRows,
+} from './tenant-sync.service.js'
 
 test('an eight-megabyte Graph sign-in or audit page is cancelled before JSON parsing', async () => {
   let cancelled = false
@@ -18,4 +29,28 @@ test('an eight-megabyte Graph sign-in or audit page is cancelled before JSON par
 test('a bounded Graph collection page parses only valid value arrays', async () => {
   const page = await parseBoundedGraphCollectionPage(new Response(JSON.stringify({ value: [{ id: 'safe' }] })), 'directory audit logs')
   assert.deepEqual(page.value, [{ id: 'safe' }])
+})
+
+test('Graph collection page, row, repeat and deadline boundaries fail closed only past their limits', () => {
+  const deadline = Date.now() + GRAPH_LOG_COLLECTION_DEADLINE_MS
+  assert.doesNotThrow(() => assertGraphCollectionBounds({ pageCount: GRAPH_LOG_COLLECTION_MAX_PAGES, rowCount: GRAPH_LOG_COLLECTION_MAX_ROWS, url: 'https://graph.microsoft.com/ok', seenUrls: new Set(), deadlineAt: deadline }))
+  for (const input of [
+    { pageCount: GRAPH_LOG_COLLECTION_MAX_PAGES + 1, rowCount: 0, url: 'https://graph.microsoft.com/ok', seenUrls: new Set<string>(), deadlineAt: deadline },
+    { pageCount: 1, rowCount: GRAPH_LOG_COLLECTION_MAX_ROWS + 1, url: 'https://graph.microsoft.com/ok', seenUrls: new Set<string>(), deadlineAt: deadline },
+    { pageCount: 1, rowCount: 0, url: 'https://graph.microsoft.com/repeat', seenUrls: new Set<string>(['https://graph.microsoft.com/repeat']), deadlineAt: deadline },
+    { pageCount: 1, rowCount: 0, url: 'https://graph.microsoft.com/ok', seenUrls: new Set<string>(), deadlineAt: Date.now() - 1 },
+  ]) assert.throws(() => assertGraphCollectionBounds(input), /bounded collection limit/)
+})
+
+test('mailbox CSV byte, row and column limits accept exact values and reject plus one', () => {
+  assert.ok(GRAPH_LOG_PAGE_MAX_BYTES < 8 * 1024 * 1024)
+  assert.doesNotThrow(() => parseCsvRows('a'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES)))
+  assert.throws(() => parseCsvRows('a'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES + 1)), /response-size/)
+  const header = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, i) => `h${i}`).join(',')
+  const row = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, i) => `v${i}`).join(',')
+  assert.doesNotThrow(() => parseCsvRows(`${header}\n${row}`))
+  assert.throws(() => parseCsvRows(`${header},extra\n${row},extra`), /row or column/)
+  const small = 'h\nv'
+  assert.doesNotThrow(() => parseCsvRows([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 2 }, () => 'v')].join('\n')))
+  assert.throws(() => parseCsvRows([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 1 }, () => 'v')].join('\n')), /row or column/)
 })

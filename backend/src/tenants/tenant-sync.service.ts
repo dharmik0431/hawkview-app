@@ -108,13 +108,13 @@ const MANAGEMENT_ACTIVITY_SOURCE = 'MICROSOFT_365_MANAGEMENT_ACTIVITY'
 const MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS = 7
 const DEFAULT_FAST_MAILBOX_RULE_REFRESH_MINUTES = 15
 const DEFAULT_FAST_MAILBOX_RULE_MAX_USERS = 250
-const GRAPH_LOG_COLLECTION_MAX_PAGES = 100
-const GRAPH_LOG_COLLECTION_MAX_ROWS = 100_000
-const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
-const GRAPH_LOG_PAGE_MAX_BYTES = 2 * 1024 * 1024
-const MAILBOX_USAGE_CSV_MAX_BYTES = 5 * 1024 * 1024
-const MAILBOX_USAGE_CSV_MAX_ROWS = 20_000
-const MAILBOX_USAGE_CSV_MAX_COLUMNS = 128
+export const GRAPH_LOG_COLLECTION_MAX_PAGES = 100
+export const GRAPH_LOG_COLLECTION_MAX_ROWS = 100_000
+export const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
+export const GRAPH_LOG_PAGE_MAX_BYTES = 2 * 1024 * 1024
+export const MAILBOX_USAGE_CSV_MAX_BYTES = 5 * 1024 * 1024
+export const MAILBOX_USAGE_CSV_MAX_ROWS = 20_000
+export const MAILBOX_USAGE_CSV_MAX_COLUMNS = 128
 /** Hard ceilings keep a targeted SharePoint retry below the 15 minute USERS lease. */
 export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
   sitePages: 50,
@@ -329,7 +329,7 @@ function summarizeAuthenticationMethodTargets(method: any) {
     : 'No users targeted'
 }
 
-function parseCsvRows(csv: string): Record<string, string>[] {
+export function parseCsvRows(csv: string): Record<string, string>[] {
   if (Buffer.byteLength(csv, 'utf8') > MAILBOX_USAGE_CSV_MAX_BYTES) {
     throw new Error('Microsoft mailbox usage report exceeded the bounded response-size limit.')
   }
@@ -1028,6 +1028,24 @@ export async function parseBoundedGraphCollectionPage(
     return parsed as GraphCollectionPage
   } catch {
     throw new Error(`Microsoft ${resourceLabel} synchronization returned an unreadable bounded response.`)
+  }
+}
+
+export function assertGraphCollectionBounds(input: {
+  pageCount: number
+  rowCount: number
+  url: string
+  seenUrls: ReadonlySet<string>
+  deadlineAt: number
+  now?: number
+}) {
+  if (
+    input.pageCount > GRAPH_LOG_COLLECTION_MAX_PAGES ||
+    input.rowCount > GRAPH_LOG_COLLECTION_MAX_ROWS ||
+    (input.now ?? Date.now()) > input.deadlineAt ||
+    input.seenUrls.has(input.url)
+  ) {
+    throw new Error('Microsoft Graph log synchronization exceeded a bounded collection limit.')
   }
 }
 
@@ -2365,7 +2383,6 @@ export class TenantSyncService {
         failureClass: failure.failureClass,
         reasonCode: failure.reasonCode,
         status: failure.status,
-        microsoftCode: failure.microsoftCode,
       }))
       const state = await this.prisma.syncState.update({
         where: {
@@ -3467,9 +3484,8 @@ export class TenantSyncService {
     const deadlineAt = Date.now() + GRAPH_LOG_COLLECTION_DEADLINE_MS
     let pages = 0
     while (nextUrl) {
-      if (++pages > GRAPH_LOG_COLLECTION_MAX_PAGES || Date.now() > deadlineAt || seen.has(nextUrl)) {
-        throw new Error(`Microsoft ${resourceLabel} synchronization exceeded a bounded collection limit.`)
-      }
+      pages += 1
+      assertGraphCollectionBounds({ pageCount: pages, rowCount: rows.length, url: nextUrl, seenUrls: seen, deadlineAt })
       seen.add(nextUrl)
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error(`Microsoft returned an invalid ${resourceLabel} link.`)
@@ -3477,9 +3493,7 @@ export class TenantSyncService {
       const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel, { deadlineAt })
       const page = await parseBoundedGraphCollectionPage(response, resourceLabel)
       rows.push(...(page.value ?? []))
-      if (rows.length > GRAPH_LOG_COLLECTION_MAX_ROWS) {
-        throw new Error(`Microsoft ${resourceLabel} synchronization exceeded a bounded collection limit.`)
-      }
+      assertGraphCollectionBounds({ pageCount: pages, rowCount: rows.length, url: nextUrl, seenUrls: new Set(), deadlineAt })
       nextUrl = page['@odata.nextLink'] ?? ''
     }
     return rows
