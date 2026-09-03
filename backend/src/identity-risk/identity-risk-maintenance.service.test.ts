@@ -176,6 +176,8 @@ test('failed scheduler authorization prevents retention and tenant work', async 
     runAuthorizedScheduledMaintenance: async () => { maintenanceCalls += 1 },
   } as unknown as IdentityRiskMaintenanceService
   const controller = new ScheduledSyncController(verifier, sync, maintenance)
+  const messages: string[] = []
+  ;(controller as any).logger = { log: (message: string) => messages.push(message) }
 
   await assert.rejects(
     () => controller.syncDueTenants({ headers: {} } as Request),
@@ -183,4 +185,5 @@ test('failed scheduler authorization prevents retention and tenant work', async 
   )
   assert.equal(maintenanceCalls, 0)
   assert.equal(syncCalls, 0)
+  assert.deepEqual(messages, [])
 })

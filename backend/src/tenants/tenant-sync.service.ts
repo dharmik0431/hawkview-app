@@ -43,6 +43,7 @@ import {
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import { logProcessMemoryPhase } from './runtime-telemetry.js'
 import {
   deriveSignInEntitlement,
   type SignInEntitlement,
@@ -2211,6 +2212,10 @@ export class TenantSyncService {
     synchronize: () => Promise<void>
   ) {
     const lastAttemptAt = new Date()
+    const exchangePhase = resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'
+    if (exchangePhase) {
+      logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'STARTED', lastAttemptAt.getTime())
+    }
     const previousState = await this.prisma.syncState.upsert({
       where: {
         customerTenantId_resourceType: {
@@ -2265,7 +2270,13 @@ export class TenantSyncService {
           actionLabel: 'View tenant',
         }
       )
+      if (exchangePhase) {
+        logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'COMPLETED', lastAttemptAt.getTime())
+      }
     } catch (error) {
+      if (exchangePhase) {
+        logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
+      }
       const technicalMessage = safeErrorMessage(
         error,
         `Microsoft ${resourceType.toLowerCase()} synchronization failed.`

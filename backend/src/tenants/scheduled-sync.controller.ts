@@ -21,9 +21,9 @@ export class ScheduledSyncController {
   @Public()
   @Post('due-tenants')
   async syncDueTenants(@Req() request: Request) {
+    await this.schedulerTokenVerifier.verify(request.headers.authorization)
     const startedAt = Date.now()
     logProcessMemoryPhase(this.logger, 'scheduled_sync', 'STARTED', startedAt)
-    await this.schedulerTokenVerifier.verify(request.headers.authorization)
     try {
       await this.identityRiskMaintenance.runAuthorizedScheduledMaintenance()
       logProcessMemoryPhase(this.logger, 'scheduled_sync_maintenance', 'COMPLETED', startedAt)
