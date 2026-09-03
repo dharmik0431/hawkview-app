@@ -7,6 +7,7 @@ import {
   IdentityRiskPlatformClock,
 } from './identity-risk-evaluator.service.js'
 import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
+import { IdentityRiskMaintenanceService } from './identity-risk-maintenance.service.js'
 
 @Module({
   controllers: [IdentityRiskController],
@@ -16,7 +17,12 @@ import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
     IdentityRiskPlatformClock,
     IdentityRiskEvaluatorService,
     IdentityRiskEvaluationScheduler,
+    IdentityRiskMaintenanceService,
   ],
-  exports: [IdentityRiskEvaluationScheduler, IdentityRiskSafetyService],
+  exports: [
+    IdentityRiskEvaluationScheduler,
+    IdentityRiskSafetyService,
+    IdentityRiskMaintenanceService,
+  ],
 })
 export class IdentityRiskModule {}

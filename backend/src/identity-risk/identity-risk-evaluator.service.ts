@@ -181,7 +181,7 @@ function exactResultKeys(value: Record<string, unknown>) {
 function validateResult(
   value: unknown,
   detectorRuleId: IdentityRiskRuleId,
-  evaluationAt: Date,
+  platformNow: Date,
 ): IdentitySignalResult | null {
   if (!isPlainRecord(value) || !exactResultKeys(value)) return null
   if (
@@ -197,7 +197,7 @@ function validateResult(
   if (value.subjectType !== undefined && !subjectTypes.has(value.subjectType as string)) return null
 
   if (value.outcome === 'MATCHED') {
-    const observedAt = parseTimestamp(value.observedAt, evaluationAt)
+    const observedAt = parseTimestamp(value.observedAt, platformNow)
     if (
       value.coverage === 'UNAVAILABLE' ||
       !boundedOpaqueId(value.subjectId, 128) ||
@@ -219,7 +219,7 @@ function validateResult(
 function rejectedResultReason(
   value: unknown,
   detectorRuleId: IdentityRiskRuleId,
-  evaluationAt: Date,
+  platformNow: Date,
 ) {
   if (
     isPlainRecord(value) &&
@@ -235,15 +235,15 @@ function rejectedResultReason(
     if (
       candidate &&
       Number.isFinite(candidate.getTime()) &&
-      candidate.getTime() > evaluationAt.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS
+      candidate.getTime() > platformNow.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS
     ) return 'FUTURE_TIMESTAMP'
   }
   return 'DETECTOR_OUTPUT_INVALID'
 }
 
-function runExpiry(batch: IdentityRiskSourceBatch, windowEnd: Date) {
+function runExpiry(batch: IdentityRiskSourceBatch, platformNow: Date) {
   const policy = new Date(
-    windowEnd.getTime() +
+    platformNow.getTime() +
       (batch.earliestSourceExpiry
         ? IDENTITY_RISK_RUN_RETENTION_MS
         : NO_SOURCE_RUN_RETENTION_MS),
@@ -274,7 +274,7 @@ export class IdentityRiskEvaluatorService {
   async evaluate(
     request: IdentityRiskEvaluationRequest,
   ): Promise<IdentityRiskEvaluationResult> {
-    const platformNow = this.clock.now()
+    const platformNow = new Date(this.clock.now().getTime())
     this.validateRequest(request, platformNow)
     if (mode() === 'OFF') {
       return { status: 'OFF', runKey: null, alertDeliveryDisabled: true }
@@ -290,7 +290,7 @@ export class IdentityRiskEvaluatorService {
           customerTenantId: request.customerTenantId,
           episodeId: safety.hardDisableEpisodeId,
           scopeType: safety.hardDisableScopeType ?? 'TENANT',
-          now: request.evaluationAt,
+          now: platformNow,
         })
       }
       return {
@@ -318,7 +318,7 @@ export class IdentityRiskEvaluatorService {
             },
         reasonCode: 'CROSS_TENANT_SCOPE_FAILURE',
         actorServiceId: 'identity-risk-evaluator',
-        now: request.evaluationAt,
+        now: platformNow,
       })
       return {
         status: 'HARD_DISABLED',
@@ -341,7 +341,7 @@ export class IdentityRiskEvaluatorService {
       request.windowEnd.toISOString(),
       watermarkHash,
     )
-    const expiresAt = runExpiry(batch, request.windowEnd)
+    const expiresAt = runExpiry(batch, platformNow)
     const leaseToken = randomUUID()
     const claim = await this.claimRun({
       request,
@@ -351,6 +351,7 @@ export class IdentityRiskEvaluatorService {
       leaseToken,
       alertDeliveryDisabled: safety.alertDeliveryDisabled,
       capability: batch.capability,
+      platformNow,
     })
     if (claim === 'COMPLETED') {
       return {
@@ -371,7 +372,7 @@ export class IdentityRiskEvaluatorService {
       const evaluated = await this.runDetectors(
         request.detectors,
         batch,
-        request.evaluationAt,
+        platformNow,
         runKey,
         request.organizationId,
         request.customerTenantId,
@@ -384,6 +385,7 @@ export class IdentityRiskEvaluatorService {
         expiresAt,
         alertDeliveryDisabled: safety.alertDeliveryDisabled,
         capability: batch.capability,
+        platformNow,
         ...evaluated,
       })
       return {
@@ -481,8 +483,9 @@ export class IdentityRiskEvaluatorService {
     leaseToken: string
     alertDeliveryDisabled: boolean
     capability: 'FULL' | 'PARTIAL' | 'UNAVAILABLE'
+    platformNow: Date
   }): Promise<'COMPLETED' | 'BUSY' | { id: string }> {
-    const now = input.request.evaluationAt
+    const now = input.platformNow
     try {
       const created = await this.prisma.identityRiskEvaluationRun.create({
         data: {
@@ -501,6 +504,7 @@ export class IdentityRiskEvaluatorService {
           leaseToken: input.leaseToken,
           leaseExpiresAt: new Date(now.getTime() + RUN_LEASE_MS),
           expiresAt: input.expiresAt,
+          createdAt: now,
         },
         select: { id: true },
       })
@@ -550,7 +554,7 @@ export class IdentityRiskEvaluatorService {
   private async runDetectors(
     detectors: readonly IdentitySignalDetector[],
     batch: IdentityRiskSourceBatch,
-    evaluationAt: Date,
+    platformNow: Date,
     runKey: string,
     organizationId: string,
     customerTenantId: string,
@@ -576,9 +580,9 @@ export class IdentityRiskEvaluatorService {
           runKey,
           ruleId,
           reasonCode: 'DETECTOR_FAILED',
-          now: evaluationAt,
+          now: platformNow,
         })
-        continue
+        throw new Error('Identity risk detector output was rejected.')
       }
       if (!Array.isArray(raw) || raw.length > MAX_RESULTS_PER_DETECTOR) {
         add(aggregate.notEvaluated)
@@ -589,16 +593,16 @@ export class IdentityRiskEvaluatorService {
           runKey,
           ruleId,
           reasonCode: 'RESULT_LIMIT_EXCEEDED',
-          now: evaluationAt,
+          now: platformNow,
         })
-        continue
+        throw new Error('Identity risk detector output was rejected.')
       }
       const validated = raw.map((result) =>
-        validateResult(result, ruleId, evaluationAt),
+        validateResult(result, ruleId, platformNow),
       )
       if (validated.some((result) => result === null)) {
         const rejectionReason = raw
-          .map((result) => rejectedResultReason(result, ruleId, evaluationAt))
+          .map((result) => rejectedResultReason(result, ruleId, platformNow))
           .find((reason) => reason === 'FUTURE_TIMESTAMP') ??
           'DETECTOR_OUTPUT_INVALID'
         add(aggregate.notEvaluated)
@@ -609,9 +613,9 @@ export class IdentityRiskEvaluatorService {
           runKey,
           ruleId,
           reasonCode: rejectionReason,
-          now: evaluationAt,
+          now: platformNow,
         })
-        continue
+        throw new Error('Identity risk detector output was rejected.')
       }
       for (const result of validated as IdentitySignalResult[]) {
         if (result.outcome !== 'NOT_EVALUATED') add(aggregate.eligible)
@@ -653,6 +657,7 @@ export class IdentityRiskEvaluatorService {
     capability: 'FULL' | 'PARTIAL' | 'UNAVAILABLE'
     aggregates: readonly RuleAggregate[]
     matches: readonly [string, IdentitySignalResult][]
+    platformNow: Date
   }) {
     await this.prisma.$transaction(async (transaction) => {
       for (const aggregate of input.aggregates) {
@@ -687,6 +692,7 @@ export class IdentityRiskEvaluatorService {
               .map(([code, count]) => ({ code, count: publicCount(count) })),
             samplesTruncated: false,
             expiresAt: input.expiresAt,
+            createdAt: input.platformNow,
           },
           update: {},
         })
@@ -716,6 +722,7 @@ export class IdentityRiskEvaluatorService {
             observedAt,
             evidence: [],
             expiresAt: input.expiresAt,
+            createdAt: input.platformNow,
           },
           update: {},
         })
@@ -751,6 +758,8 @@ export class IdentityRiskEvaluatorService {
             coverage: result.coverage,
             observedAt,
             expiresAt: input.expiresAt,
+            createdAt: input.platformNow,
+            updatedAt: input.platformNow,
           },
           update: {
             matchedResultId: matched.id,
@@ -760,6 +769,7 @@ export class IdentityRiskEvaluatorService {
             coverage: result.coverage,
             observedAt,
             expiresAt: input.expiresAt,
+            updatedAt: input.platformNow,
           },
         })
         if (!identityRiskRulePresentation(ruleId)) {
@@ -783,7 +793,7 @@ export class IdentityRiskEvaluatorService {
               ? 'PARTIAL'
               : input.capability,
           alertDeliveryDisabled: input.alertDeliveryDisabled,
-          completedAt: input.request.evaluationAt,
+          completedAt: input.platformNow,
           leaseToken: null,
           leaseExpiresAt: null,
         },

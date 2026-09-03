@@ -9,9 +9,15 @@ import { IpGeolocationService } from './ip-geolocation.service.js'
 import { NotificationsModule } from '../notifications/notifications.module.js'
 import { ChangesModule } from '../changes/changes.module.js'
 import { M365ManagementActivityService } from './m365-management-activity.service.js'
+import { IdentityRiskModule } from '../identity-risk/identity-risk.module.js'
 
 @Module({
-  imports: [MicrosoftModule, NotificationsModule, ChangesModule],
+  imports: [
+    MicrosoftModule,
+    NotificationsModule,
+    ChangesModule,
+    IdentityRiskModule,
+  ],
   controllers: [TenantsController, ScheduledSyncController],
   providers: [
     TenantsService,

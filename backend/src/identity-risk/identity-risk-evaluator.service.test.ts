@@ -59,8 +59,10 @@ function safety(
 ) {
   const calls = {
     blocked: 0,
+    blockedAt: [] as Date[],
     states: 0,
     rejected: [] as string[],
+    rejectedAt: [] as Date[],
     activated: [] as Array<Record<string, unknown>>,
   }
   const service = {
@@ -73,9 +75,13 @@ function safety(
         hardDisableScopeType: state.hardDisableScopeType ?? null,
       }
     },
-    recordHardStopBlocked: async () => { calls.blocked += 1 },
-    recordDetectorRejection: async (input: { reasonCode: string }) => {
+    recordHardStopBlocked: async (input: { now: Date }) => {
+      calls.blocked += 1
+      calls.blockedAt.push(input.now)
+    },
+    recordDetectorRejection: async (input: { reasonCode: string; now: Date }) => {
       calls.rejected.push(input.reasonCode)
+      calls.rejectedAt.push(input.now)
     },
     activate: async (input: Record<string, unknown>) => {
       calls.activated.push(input)
@@ -87,10 +93,12 @@ function safety(
 function persistence() {
   const calls = {
     runCreates: 0,
+    runCreateData: [] as Array<Record<string, unknown>>,
     coverage: [] as Array<Record<string, unknown>>,
     matches: [] as Array<Record<string, unknown>>,
     findings: [] as Array<Record<string, unknown>>,
     runUpdates: [] as Array<Record<string, unknown>>,
+    runFailureUpdates: [] as Array<Record<string, unknown>>,
     transactions: 0,
   }
   const transaction = {
@@ -121,11 +129,15 @@ function persistence() {
   }
   const prisma = {
     identityRiskEvaluationRun: {
-      create: async () => {
+      create: async ({ data }: { data: Record<string, unknown> }) => {
         calls.runCreates += 1
+        calls.runCreateData.push(data)
         return { id: '33333333-3333-4333-8333-333333333333' }
       },
-      updateMany: async () => ({ count: 1 }),
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => {
+        calls.runFailureUpdates.push(data)
+        return { count: 1 }
+      },
     },
     $transaction: async (callback: (value: typeof transaction) => unknown) => {
       calls.transactions += 1
@@ -368,9 +380,92 @@ test('platform clock rejects future evaluation before safety, source, or risk wr
       earliestSourceExpiry: null,
       capability: 'FULL' as const,
     })
+    const boundaryDetector: IdentitySignalDetector = {
+      ruleId: 'HV-ID-CHG-001.v1',
+      evaluate: () => [{
+        ruleId: 'HV-ID-CHG-001.v1',
+        outcome: 'MATCHED',
+        coverage: 'FULL',
+        subjectType: 'USER',
+        subjectId: 'opaque-user-boundary',
+        severity: 'HIGH',
+        confidence: 'HIGH',
+        observedAt: acceptedAt,
+      }],
+    }
     const accepted = await new IdentityRiskEvaluatorService(
       acceptedStore.prisma,
       acceptedSafety.service,
+      clock,
+    ).evaluate({
+      ...request(boundaryDetector, acceptedLoader),
+      windowStart: platformNow,
+      windowEnd: acceptedAt,
+      evaluationAt: acceptedAt,
+    })
+    assert.equal(accepted.status, 'COMPLETED')
+    assert.equal(acceptedStore.calls.matches.length, 1)
+    assert.deepEqual(acceptedStore.calls.runCreateData[0]?.createdAt, platformNow)
+    assert.deepEqual(
+      acceptedStore.calls.runCreateData[0]?.leaseExpiresAt,
+      acceptedAt,
+    )
+    assert.deepEqual(
+      acceptedStore.calls.runCreateData[0]?.expiresAt,
+      new Date(platformNow.getTime() + 7 * 24 * 60 * 60 * 1_000),
+    )
+    assert.deepEqual(acceptedStore.calls.coverage[0]?.createdAt, platformNow)
+    assert.deepEqual(acceptedStore.calls.matches[0]?.createdAt, platformNow)
+    assert.deepEqual(acceptedStore.calls.findings[0]?.createdAt, platformNow)
+    assert.deepEqual(acceptedStore.calls.findings[0]?.updatedAt, platformNow)
+    assert.deepEqual(acceptedStore.calls.runUpdates[0]?.completedAt, platformNow)
+
+    const futureObservedStore = persistence()
+    const futureObservedSafety = safety()
+    const futureObservedDetector: IdentitySignalDetector = {
+      ...boundaryDetector,
+      evaluate: () => [{
+        ruleId: 'HV-ID-CHG-001.v1',
+        outcome: 'MATCHED',
+        coverage: 'FULL',
+        subjectType: 'USER',
+        subjectId: 'opaque-user-too-future',
+        severity: 'HIGH',
+        confidence: 'HIGH',
+        observedAt: new Date(
+          acceptedAt.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS,
+        ),
+      }],
+    }
+    await assert.rejects(
+      () => new IdentityRiskEvaluatorService(
+        futureObservedStore.prisma,
+        futureObservedSafety.service,
+        clock,
+      ).evaluate({
+        ...request(futureObservedDetector, acceptedLoader),
+        windowStart: platformNow,
+        windowEnd: acceptedAt,
+        evaluationAt: acceptedAt,
+      }),
+      /evaluation failed/,
+    )
+    assert.equal(futureObservedStore.calls.matches.length, 0)
+    assert.equal(futureObservedStore.calls.findings.length, 0)
+    assert.equal(futureObservedStore.calls.coverage.length, 0)
+    assert.equal(futureObservedStore.calls.transactions, 0)
+    assert.equal(futureObservedStore.calls.runFailureUpdates[0]?.status, 'FAILED')
+    assert.deepEqual(futureObservedSafety.calls.rejected, ['FUTURE_TIMESTAMP'])
+    assert.deepEqual(futureObservedSafety.calls.rejectedAt, [platformNow])
+
+    const hardStop = safety({
+      evaluationHardDisabled: true,
+      hardDisableEpisodeId: '44444444-4444-4444-8444-444444444444',
+      hardDisableScopeType: 'TENANT',
+    })
+    await new IdentityRiskEvaluatorService(
+      persistence().prisma,
+      hardStop.service,
       clock,
     ).evaluate({
       ...request(noMatchDetector, acceptedLoader),
@@ -378,7 +473,26 @@ test('platform clock rejects future evaluation before safety, source, or risk wr
       windowEnd: acceptedAt,
       evaluationAt: acceptedAt,
     })
-    assert.equal(accepted.status, 'COMPLETED')
+    assert.deepEqual(hardStop.calls.blockedAt, [platformNow])
+
+    const scopeFailure = safety()
+    await new IdentityRiskEvaluatorService(
+      persistence().prisma,
+      scopeFailure.service,
+      clock,
+    ).evaluate({
+      ...request(noMatchDetector, async () => ({
+        ...(await acceptedLoader()),
+        context: {
+          ...(await acceptedLoader()).context,
+          organizationId: '99999999-9999-4999-8999-999999999999',
+        },
+      })),
+      windowStart: platformNow,
+      windowEnd: acceptedAt,
+      evaluationAt: acceptedAt,
+    })
+    assert.deepEqual(scopeFailure.calls.activated[0]?.now, platformNow)
 
     let sourceReads = 0
     const rejectedStore = persistence()
@@ -401,6 +515,26 @@ test('platform clock rejects future evaluation before safety, source, or risk wr
     assert.equal(sourceReads, 0)
     assert.equal(rejectedStore.calls.runCreates, 0)
     assert.equal(rejectedStore.calls.transactions, 0)
+
+    await assert.rejects(
+      () => new IdentityRiskEvaluatorService(
+        rejectedStore.prisma,
+        rejectedSafety.service,
+        clock,
+      ).evaluate({
+        ...request(noMatchDetector, async () => {
+          sourceReads += 1
+          throw new Error('must not run')
+        }),
+        windowStart: platformNow,
+        windowEnd: new Date(acceptedAt.getTime() + 1),
+        evaluationAt: acceptedAt,
+      }),
+      /evaluation request is invalid/,
+    )
+    assert.equal(rejectedSafety.calls.states, 0)
+    assert.equal(sourceReads, 0)
+    assert.equal(rejectedStore.calls.runCreates, 0)
 
     delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     await assert.rejects(
@@ -442,6 +576,7 @@ test('active lease makes a concurrent duplicate return in progress', async () =>
     const result = await new IdentityRiskEvaluatorService(
       prisma,
       safety().service,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
     ).evaluate(request(noMatchDetector))
     assert.equal(result.status, 'IN_PROGRESS')
   } finally {
@@ -506,7 +641,7 @@ test('failed run retry reclaims one lease and completes through idempotent upser
   }
 })
 
-test('malformed detector output becomes bounded NOT_EVALUATED with no finding', async () => {
+test('malformed detector output fails the run with one safe event and no completion artifacts', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
@@ -526,13 +661,19 @@ test('malformed detector output becomes bounded NOT_EVALUATED with no finding', 
         explanation: 'detector-controlled text is forbidden',
       } as never],
     }
-    await new IdentityRiskEvaluatorService(
-      store.prisma,
-      observedSafety.service,
-    ).evaluate(request(detector))
+    await assert.rejects(
+      () => new IdentityRiskEvaluatorService(
+        store.prisma,
+        observedSafety.service,
+        { now: () => evaluationAt } as IdentityRiskPlatformClock,
+      ).evaluate(request(detector)),
+      /evaluation failed/,
+    )
     assert.equal(store.calls.matches.length, 0)
     assert.equal(store.calls.findings.length, 0)
-    assert.equal(store.calls.coverage[0]?.notEvaluatedCount, 1)
+    assert.equal(store.calls.coverage.length, 0)
+    assert.equal(store.calls.transactions, 0)
+    assert.equal(store.calls.runFailureUpdates[0]?.status, 'FAILED')
     assert.deepEqual(observedSafety.calls.rejected, ['DETECTOR_OUTPUT_INVALID'])
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
@@ -540,7 +681,7 @@ test('malformed detector output becomes bounded NOT_EVALUATED with no finding', 
   }
 })
 
-test('future timestamps beyond five minutes abstain while the exact boundary matches', async () => {
+test('future timestamps beyond five minutes fail while the trusted exact boundary matches', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
@@ -562,6 +703,7 @@ test('future timestamps beyond five minutes abstain while the exact boundary mat
     await new IdentityRiskEvaluatorService(
       atBoundary.prisma,
       safety().service,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
     ).evaluate(request(detectorAtBoundary))
     assert.equal(atBoundary.calls.matches.length, 1)
 
@@ -574,12 +716,18 @@ test('future timestamps beyond five minutes abstain while the exact boundary mat
         observedAt: new Date(evaluationAt.getTime() + 5 * 60 * 1_000 + 1),
       }],
     }
-    await new IdentityRiskEvaluatorService(
-      tooFuture.prisma,
-      futureSafety.service,
-    ).evaluate(request(detectorTooFuture))
+    await assert.rejects(
+      () => new IdentityRiskEvaluatorService(
+        tooFuture.prisma,
+        futureSafety.service,
+        { now: () => evaluationAt } as IdentityRiskPlatformClock,
+      ).evaluate(request(detectorTooFuture)),
+      /evaluation failed/,
+    )
     assert.equal(tooFuture.calls.matches.length, 0)
-    assert.equal(tooFuture.calls.coverage[0]?.notEvaluatedCount, 1)
+    assert.equal(tooFuture.calls.coverage.length, 0)
+    assert.equal(tooFuture.calls.transactions, 0)
+    assert.equal(tooFuture.calls.runFailureUpdates[0]?.status, 'FAILED')
     assert.deepEqual(futureSafety.calls.rejected, ['FUTURE_TIMESTAMP'])
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
