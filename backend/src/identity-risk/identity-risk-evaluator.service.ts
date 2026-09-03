@@ -5,6 +5,7 @@ import {
   IDENTITY_RISK_CATALOG_VERSION,
   IDENTITY_RISK_ENGINE_VERSION,
   IDENTITY_RISK_MAX_FUTURE_SKEW_MS,
+  IDENTITY_RISK_RUN_RETENTION_MS,
   type IdentityRiskBoundedCount,
   type IdentityRiskEvaluationRequest,
   type IdentityRiskSourceBatch,
@@ -32,7 +33,6 @@ const MAX_COUNT = 1_000_000
 const MAX_SOURCE_TYPES = 32
 const MAX_SOURCE_RECORDS_PER_TYPE = 50_000
 const RUN_LEASE_MS = 5 * 60 * 1_000
-const RUN_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000
 const NO_SOURCE_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000
 
 const outcomes = new Set(['MATCHED', 'NOT_MATCHED', 'NOT_EVALUATED', 'SUPPRESSED'])
@@ -96,6 +96,13 @@ function sha256(...parts: readonly string[]) {
 
 function validDate(value: unknown): value is Date {
   return value instanceof Date && Number.isFinite(value.getTime())
+}
+
+@Injectable()
+export class IdentityRiskPlatformClock {
+  now() {
+    return new Date()
+  }
 }
 
 function add(count: MutableCount, increment = 1) {
@@ -237,7 +244,9 @@ function rejectedResultReason(
 function runExpiry(batch: IdentityRiskSourceBatch, windowEnd: Date) {
   const policy = new Date(
     windowEnd.getTime() +
-      (batch.earliestSourceExpiry ? RUN_RETENTION_MS : NO_SOURCE_RUN_RETENTION_MS),
+      (batch.earliestSourceExpiry
+        ? IDENTITY_RISK_RUN_RETENTION_MS
+        : NO_SOURCE_RUN_RETENTION_MS),
   )
   if (
     batch.earliestSourceExpiry &&
@@ -258,15 +267,18 @@ export class IdentityRiskEvaluatorService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(IdentityRiskSafetyService)
     private readonly safety: IdentityRiskSafetyService,
+    @Inject(IdentityRiskPlatformClock)
+    private readonly clock: IdentityRiskPlatformClock = new IdentityRiskPlatformClock(),
   ) {}
 
   async evaluate(
     request: IdentityRiskEvaluationRequest,
   ): Promise<IdentityRiskEvaluationResult> {
+    const platformNow = this.clock.now()
+    this.validateRequest(request, platformNow)
     if (mode() === 'OFF') {
       return { status: 'OFF', runKey: null, alertDeliveryDisabled: true }
     }
-    this.validateRequest(request)
     const safety = await this.safety.stateForTenant(
       request.organizationId,
       request.customerTenantId,
@@ -316,7 +328,10 @@ export class IdentityRiskEvaluatorService {
     }
     this.validateSourceBatch(request, batch)
 
-    const watermarkHash = sha256(...batch.orderedSourceWatermarks)
+    // Watermarks are restricted to bounded ASCII opaque IDs, so the default
+    // code-unit sort is the canonical bytewise order used by the run key.
+    const canonicalSourceWatermarks = [...batch.orderedSourceWatermarks].sort()
+    const watermarkHash = sha256(...canonicalSourceWatermarks)
     const runKey = sha256(
       request.organizationId,
       request.customerTenantId,
@@ -396,14 +411,22 @@ export class IdentityRiskEvaluatorService {
     }
   }
 
-  private validateRequest(request: IdentityRiskEvaluationRequest) {
+  private validateRequest(
+    request: IdentityRiskEvaluationRequest,
+    platformNow: Date,
+  ) {
     if (
+      !validDate(platformNow) ||
       request.engineVersion !== IDENTITY_RISK_ENGINE_VERSION ||
       request.catalogVersion !== IDENTITY_RISK_CATALOG_VERSION ||
       !validDate(request.windowStart) ||
       !validDate(request.windowEnd) ||
       !validDate(request.evaluationAt) ||
       request.windowStart.getTime() >= request.windowEnd.getTime() ||
+      request.evaluationAt.getTime() >
+        platformNow.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS ||
+      request.windowEnd.getTime() >
+        platformNow.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS ||
       request.windowEnd.getTime() >
         request.evaluationAt.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS ||
       request.detectors.length === 0 ||

@@ -365,6 +365,8 @@ An isolation failure, secret exposure, proven source-integrity conflict, or cros
 
 Hard-stop recovery is never automatic or timer-based. An authorized security operator must identify the affected scope, rotate exposed secrets when applicable, quarantine or remove unsafe risk-queue items, validate evidence and tenant boundaries, pass cross-tenant and idempotent-replay canaries, and record an explicit resume operation. New risk work may be accepted only after that operation succeeds. The one operational event contains only control name, scope type and opaque scope ID, safe reason code, incident/correlation ID, activation time, and actor/service ID; it contains no tenant evidence or provider payload.
 
+The initial implementation retains these bounded operational control events for 90 days, matching the maximum evaluation-run retention, and prunes them only by their exact global or organization-plus-customer-tenant opaque scope. This duration remains subject to PM, security, privacy, and legal review; operational events must never be retained indefinitely by default.
+
 ## Baseline design
 
 Every baseline is scoped to `organizationId + customerTenantId`; user baselines add a stable tenant-local subject ID. Never pool behavior across MSPs or customer tenants. Separate baseline classes cover ordinary users, privileged administrators, service accounts, shared accounts, guests/new identities, and designated break-glass accounts.

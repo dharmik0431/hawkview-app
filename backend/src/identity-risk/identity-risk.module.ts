@@ -4,6 +4,7 @@ import { IdentityRiskService } from './identity-risk.service.js'
 import {
   IdentityRiskEvaluationScheduler,
   IdentityRiskEvaluatorService,
+  IdentityRiskPlatformClock,
 } from './identity-risk-evaluator.service.js'
 import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
 
@@ -12,6 +13,7 @@ import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
   providers: [
     IdentityRiskService,
     IdentityRiskSafetyService,
+    IdentityRiskPlatformClock,
     IdentityRiskEvaluatorService,
     IdentityRiskEvaluationScheduler,
   ],

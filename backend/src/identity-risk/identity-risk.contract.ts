@@ -3,6 +3,7 @@ export const IDENTITY_RISK_ENGINE_VERSION = 'hawkview-identity-engine/1' as cons
 export const IDENTITY_RISK_CATALOG_VERSION = 'hawkview-identity-signals/v1' as const
 export const MICROSOFT_RISK_CATALOG_VERSION = 'microsoft-entra-risky-users/v1' as const
 export const IDENTITY_RISK_MAX_FUTURE_SKEW_MS = 5 * 60 * 1_000
+export const IDENTITY_RISK_RUN_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000
 export const IDENTITY_RISK_DEFAULT_PAGE_SIZE = 50
 export const IDENTITY_RISK_MAX_PAGE_SIZE = 100
 export const IDENTITY_RISK_MAX_RULE_IDS = 10

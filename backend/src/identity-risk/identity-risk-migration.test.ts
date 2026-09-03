@@ -37,6 +37,11 @@ test('migration locks safety-control semantics and bounded non-negative counts',
   assert.match(sql, /"eligible_count" BETWEEN 0 AND 1000000/)
   assert.match(sql, /"not_evaluated_count" BETWEEN 0 AND 1000000/)
   assert.match(sql, /identity_risk_operational_events_event_key/)
+  assert.match(
+    sql,
+    /"expires_at" TIMESTAMPTZ NOT NULL,[\s\S]*identity_risk_operational_events_expiry/,
+  )
+  assert.match(sql, /identity_risk_operational_events_scope_expiry/)
   assert.match(sql, /identity_risk_runs_completion_check/)
   assert.match(sql, /identity_risk_finding_state_check/)
   assert.match(sql, /identity_risk_matched_coverage_check/)

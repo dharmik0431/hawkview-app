@@ -114,9 +114,12 @@ CREATE TABLE "identity_risk_operational_events" (
   "id" UUID NOT NULL DEFAULT gen_random_uuid(), "control_id" UUID, "event_key" VARCHAR(128) NOT NULL,
   "event_type" VARCHAR(50) NOT NULL, "control_type" VARCHAR(40), "scope_type" VARCHAR(20) NOT NULL,
   "scope_opaque_id" VARCHAR(128) NOT NULL, "reason_code" VARCHAR(80) NOT NULL, "correlation_id" UUID NOT NULL,
-  "actor_service_id" VARCHAR(128) NOT NULL, "created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "actor_service_id" VARCHAR(128) NOT NULL, "expires_at" TIMESTAMPTZ NOT NULL,
+  "created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY ("id"), FOREIGN KEY ("control_id") REFERENCES "identity_risk_operational_controls"("id") ON DELETE SET NULL
 );
 CREATE UNIQUE INDEX "identity_risk_operational_events_event_key" ON "identity_risk_operational_events"("event_key");
 CREATE INDEX "identity_risk_operational_events_created" ON "identity_risk_operational_events"("created_at" DESC);
 CREATE INDEX "identity_risk_operational_events_control_created" ON "identity_risk_operational_events"("control_id", "created_at");
+CREATE INDEX "identity_risk_operational_events_scope_expiry" ON "identity_risk_operational_events"("scope_type", "scope_opaque_id", "expires_at");
+CREATE INDEX "identity_risk_operational_events_expiry" ON "identity_risk_operational_events"("expires_at");

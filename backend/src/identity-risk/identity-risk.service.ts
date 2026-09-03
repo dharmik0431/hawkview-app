@@ -96,6 +96,14 @@ function mode() {
   return process.env.HAWKVIEW_IDENTITY_RISK_MODE === 'shadow' ? 'SHADOW' : 'OFF'
 }
 
+function microsoftRiskDisplayEnabled() {
+  return (
+    process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+      ?.trim()
+      .toLowerCase() === 'true'
+  )
+}
+
 function zeroCount(exact = false): IdentityRiskBoundedCount {
   return { value: 0, exact, capped: false }
 }
@@ -525,7 +533,7 @@ export class IdentityRiskService {
   ) {
     const tenant = await this.scope(identity, tenantId)
     const limit = parsePageLimit(query.limit)
-    if (mode() === 'OFF') {
+    if (!microsoftRiskDisplayEnabled()) {
       return {
         ...unavailableEnvelope(
           'MICROSOFT_ENTRA_RISKY_USERS',
@@ -558,8 +566,7 @@ export class IdentityRiskService {
     if (
       !snapshot ||
       !syncState?.lastSuccessfulAt ||
-      !Array.isArray(snapshot.payload) ||
-      snapshot.payload.length === 0
+      !Array.isArray(snapshot.payload)
     ) {
       return {
         ...unavailableEnvelope(
@@ -590,6 +597,24 @@ export class IdentityRiskService {
     if (!envelope || snapshot.payload.length > MAX_MICROSOFT_SNAPSHOT_ROWS) {
       return {
         ...projectionError('MICROSOFT_ENTRA_RISKY_USERS'),
+        users: [] as MicrosoftRiskyUserDto[],
+        pageInfo: emptyPage(),
+      }
+    }
+    if (envelope.freshness !== 'CURRENT') {
+      return {
+        ...unavailableEnvelope(
+          'MICROSOFT_ENTRA_RISKY_USERS',
+          'UNAVAILABLE',
+          'Current Microsoft Identity Protection evidence is stale.',
+        ),
+        users: [] as MicrosoftRiskyUserDto[],
+        pageInfo: emptyPage(),
+      }
+    }
+    if (snapshot.payload.length === 0) {
+      return {
+        ...envelope,
         users: [] as MicrosoftRiskyUserDto[],
         pageInfo: emptyPage(),
       }

@@ -55,7 +55,9 @@ function finding(index: number, observedAt: Date) {
 
 test('default OFF returns stable empty envelopes without risk-table reads', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousDisplay = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
   delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
   let riskReads = 0
   try {
     const prisma = scoped({
@@ -78,6 +80,11 @@ test('default OFF returns stable empty envelopes without risk-table reads', asyn
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+    if (previousDisplay === undefined) {
+      delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    } else {
+      process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previousDisplay
+    }
   }
 })
 
@@ -234,8 +241,8 @@ test('summary labels capped database and unique-subject counts explicitly', asyn
 })
 
 test('Microsoft projection stays separate, bounded, tenant-opaque, and exact', async () => {
-  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
-  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const previousDisplay = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+  process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = 'true'
   const now = new Date()
   try {
     const prisma = scoped({
@@ -271,15 +278,18 @@ test('Microsoft projection stays separate, bounded, tenant-opaque, and exact', a
     ])
     assert.equal(JSON.stringify(page).includes('rawSecret'), false)
   } finally {
-    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
-    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+    if (previousDisplay === undefined) {
+      delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    } else {
+      process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previousDisplay
+    }
   }
 })
 
 test('Microsoft results use the same default 50 page and scoped cursor contract', async () => {
-  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousDisplay = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
   const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
-  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = 'true'
   process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET =
     'unit-test-only-cursor-secret-at-least-32-bytes'
   const now = new Date()
@@ -310,25 +320,37 @@ test('Microsoft results use the same default 50 page and scoped cursor contract'
     assert.equal(page.evaluatedAt, now.toISOString())
     assert.equal(page.observedAt, now.toISOString())
   } finally {
-    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
-    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+    if (previousDisplay === undefined) {
+      delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    } else {
+      process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previousDisplay
+    }
     if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
     else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
   }
 })
 
-test('empty or future Microsoft snapshots fail closed and never report zero risk', async () => {
-  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
-  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+test('only a fresh successful Microsoft collection may report an exact empty result', async () => {
+  const previous = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+  process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = 'true'
   try {
+    const emptyNow = new Date()
     const empty = new IdentityRiskService(scoped({
+      syncState: {
+        findFirst: async () => ({
+          status: 'SUCCEEDED',
+          lastSuccessfulAt: emptyNow,
+        }),
+      },
       tenantEntraSnapshot: {
-        findFirst: async () => ({ payload: [], observedAt: new Date() }),
+        findFirst: async () => ({ payload: [], observedAt: emptyNow }),
       },
     }))
     const emptyResult = await empty.microsoftRiskyUsers(identity, tenantId)
-    assert.equal(emptyResult.status, 'UNAVAILABLE')
+    assert.equal(emptyResult.status, 'AVAILABLE')
+    assert.equal(emptyResult.capability, 'FULL')
     assert.deepEqual(emptyResult.users, [])
+    assert.deepEqual(emptyResult.pageInfo, { hasMore: false, nextCursor: null })
 
     const future = new IdentityRiskService(scoped({
       syncState: {
@@ -351,15 +373,31 @@ test('empty or future Microsoft snapshots fail closed and never report zero risk
     const futureResult = await future.microsoftRiskyUsers(identity, tenantId)
     assert.equal(futureResult.status, 'ERROR')
     assert.deepEqual(futureResult.users, [])
+
+    const staleAt = new Date(Date.now() - 37 * 60 * 60 * 1_000)
+    const stale = new IdentityRiskService(scoped({
+      syncState: {
+        findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: staleAt }),
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => ({ payload: [], observedAt: staleAt }),
+      },
+    }))
+    const staleResult = await stale.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(staleResult.status, 'UNAVAILABLE')
+    assert.deepEqual(staleResult.users, [])
   } finally {
-    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
-    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+    if (previous === undefined) {
+      delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    } else {
+      process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previous
+    }
   }
 })
 
 test('failed Microsoft collection and malformed risk detail fail closed', async () => {
-  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
-  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const previous = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+  process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = 'true'
   const now = new Date()
   const payload = [{
     id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
@@ -395,8 +433,68 @@ test('failed Microsoft collection and malformed risk detail fail closed', async 
     assert.equal(malformedResult.status, 'ERROR')
     assert.deepEqual(malformedResult.users, [])
   } finally {
-    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
-    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+    if (previous === undefined) {
+      delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    } else {
+      process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previous
+    }
+  }
+})
+
+test('HawkView evaluation and Microsoft display use independent default-off gates', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousDisplay = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+  let hawkViewReads = 0
+  let microsoftReads = 0
+  try {
+    process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+    delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    const microsoftOff = new IdentityRiskService(scoped({
+      tenantEntraSnapshot: {
+        findFirst: async () => {
+          microsoftReads += 1
+          return null
+        },
+      },
+    }))
+    const microsoftOffResult = await microsoftOff.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(microsoftOffResult.status, 'UNAVAILABLE')
+    assert.equal(microsoftReads, 0)
+
+    delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = 'true'
+    const now = new Date()
+    const microsoftOn = new IdentityRiskService(scoped({
+      identityRiskEvaluationRun: {
+        findFirst: async () => {
+          hawkViewReads += 1
+          return null
+        },
+      },
+      syncState: {
+        findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: now }),
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => {
+          microsoftReads += 1
+          return { payload: [], observedAt: now }
+        },
+      },
+    }))
+    const summary = await microsoftOn.summary(identity, tenantId)
+    const microsoftOnResult = await microsoftOn.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(summary.status, 'UNAVAILABLE')
+    assert.equal(hawkViewReads, 0)
+    assert.equal(microsoftOnResult.status, 'AVAILABLE')
+    assert.equal(microsoftReads, 1)
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+    if (previousDisplay === undefined) {
+      delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    } else {
+      process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previousDisplay
+    }
   }
 })
 

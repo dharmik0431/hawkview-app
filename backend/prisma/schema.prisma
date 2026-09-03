@@ -767,7 +767,7 @@ model IdentityRiskEvaluationRun {
   @@unique([id, organizationId, customerTenantId], map: "identity_risk_evaluation_runs_scope_id")
   @@index([organizationId, customerTenantId, completedAt(sort: Desc)], map: "identity_risk_evaluation_runs_scope_completed")
   @@index([organizationId, customerTenantId, status, leaseExpiresAt], map: "identity_risk_evaluation_runs_scope_lease")
-  @@index([expiresAt])
+  @@index([expiresAt], map: "identity_risk_evaluation_runs_expiry")
   @@map("identity_risk_evaluation_runs")
 }
 
@@ -793,7 +793,7 @@ model IdentityRiskRuleCoverage {
 
   @@unique([organizationId, customerTenantId, evaluationRunId, ruleId], map: "identity_risk_rule_coverage_scope_key")
   @@index([organizationId, customerTenantId, evaluationRunId], map: "identity_risk_rule_coverage_scope_run")
-  @@index([expiresAt])
+  @@index([expiresAt], map: "identity_risk_rule_coverage_expiry")
   @@map("identity_risk_rule_coverage")
 }
 
@@ -821,7 +821,7 @@ model IdentityRiskMatchedResult {
   @@unique([organizationId, customerTenantId, resultKey], map: "identity_risk_matched_results_scope_key")
   @@unique([id, organizationId, customerTenantId], map: "identity_risk_matched_results_scope_id")
   @@index([organizationId, customerTenantId, evaluationRunId], map: "identity_risk_matched_results_scope_run")
-  @@index([expiresAt])
+  @@index([expiresAt], map: "identity_risk_matched_results_expiry")
   @@map("identity_risk_matched_results")
 }
 
@@ -849,7 +849,7 @@ model IdentityRiskFinding {
 
   @@unique([organizationId, customerTenantId, dedupeKey], map: "identity_risk_findings_scope_key")
   @@index([organizationId, customerTenantId, state, observedAt(sort: Desc), id(sort: Desc)], map: "identity_risk_findings_scope_state")
-  @@index([expiresAt])
+  @@index([expiresAt], map: "identity_risk_findings_expiry")
   @@map("identity_risk_findings")
 }
 
@@ -880,7 +880,7 @@ model IdentityRiskOperationalControl {
 model IdentityRiskOperationalEvent {
   id                String                         @id @default(uuid()) @db.Uuid
   controlId         String?                        @map("control_id") @db.Uuid
-  eventKey          String                         @unique @map("event_key") @db.VarChar(128)
+  eventKey          String                         @unique(map: "identity_risk_operational_events_event_key") @map("event_key") @db.VarChar(128)
   eventType         String                         @map("event_type") @db.VarChar(50)
   controlType       String?                        @map("control_type") @db.VarChar(40)
   scopeType         String                         @map("scope_type") @db.VarChar(20)
@@ -888,11 +888,14 @@ model IdentityRiskOperationalEvent {
   reasonCode        String                         @map("reason_code") @db.VarChar(80)
   correlationId     String                         @map("correlation_id") @db.Uuid
   actorServiceId    String                         @map("actor_service_id") @db.VarChar(128)
+  expiresAt         DateTime                       @map("expires_at") @db.Timestamptz(6)
   createdAt         DateTime                       @default(now()) @map("created_at") @db.Timestamptz(6)
   control           IdentityRiskOperationalControl? @relation(fields: [controlId], references: [id], onDelete: SetNull)
 
-  @@index([createdAt(sort: Desc)])
-  @@index([controlId, createdAt])
+  @@index([createdAt(sort: Desc)], map: "identity_risk_operational_events_created")
+  @@index([controlId, createdAt], map: "identity_risk_operational_events_control_created")
+  @@index([scopeType, scopeOpaqueId, expiresAt], map: "identity_risk_operational_events_scope_expiry")
+  @@index([expiresAt], map: "identity_risk_operational_events_expiry")
   @@map("identity_risk_operational_events")
 }
 

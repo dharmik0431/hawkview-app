@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { BadRequestException, Inject, Injectable } from '@nestjs/common'
 import { PrismaService } from '../prisma/prisma.service.js'
-import type {
-  IdentityRiskControlScope,
-  IdentityRiskControlType,
+import {
+  IDENTITY_RISK_RUN_RETENTION_MS,
+  type IdentityRiskControlScope,
+  type IdentityRiskControlType,
 } from './identity-risk.contract.js'
 import { boundedSafeString } from './identity-risk.validation.js'
 
@@ -15,6 +16,11 @@ const CONTROL_REASONS = new Set([
   'ALERT_STORM',
   'MANUAL_SECURITY_CONTROL',
 ])
+
+// Provisional PM-review value. Operational control evidence follows the same
+// 90-day upper bound as identity-risk evaluation runs and never lives forever.
+export const IDENTITY_RISK_OPERATIONAL_EVENT_RETENTION_MS =
+  IDENTITY_RISK_RUN_RETENTION_MS
 
 export type IdentityRiskSafetyState = Readonly<{
   evaluationHardDisabled: boolean
@@ -154,6 +160,9 @@ export class IdentityRiskSafetyService {
           reasonCode,
           correlationId,
           actorServiceId,
+          expiresAt: new Date(
+            now.getTime() + IDENTITY_RISK_OPERATIONAL_EVENT_RETENTION_MS,
+          ),
           createdAt: now,
         },
       })
@@ -219,6 +228,9 @@ export class IdentityRiskSafetyService {
           reasonCode,
           correlationId,
           actorServiceId,
+          expiresAt: new Date(
+            now.getTime() + IDENTITY_RISK_OPERATIONAL_EVENT_RETENTION_MS,
+          ),
           createdAt: now,
         },
       })
@@ -233,6 +245,7 @@ export class IdentityRiskSafetyService {
     scopeType: 'GLOBAL' | 'TENANT'
     now?: Date
   }) {
+    const now = input.now ?? new Date()
     const scope: IdentityRiskControlScope = input.scopeType === 'GLOBAL'
       ? { type: 'GLOBAL' }
       : {
@@ -251,7 +264,10 @@ export class IdentityRiskSafetyService {
           reasonCode: 'EVALUATION_HARD_DISABLED',
           correlationId: input.episodeId,
           actorServiceId: 'identity-risk-evaluator',
-          createdAt: input.now ?? new Date(),
+          expiresAt: new Date(
+            now.getTime() + IDENTITY_RISK_OPERATIONAL_EVENT_RETENTION_MS,
+          ),
+          createdAt: now,
         },
       })
     } catch (error) {
@@ -291,11 +307,28 @@ export class IdentityRiskSafetyService {
           reasonCode: input.reasonCode,
           correlationId,
           actorServiceId: 'identity-risk-evaluator',
+          expiresAt: new Date(
+            input.now.getTime() + IDENTITY_RISK_OPERATIONAL_EVENT_RETENTION_MS,
+          ),
           createdAt: input.now,
         },
       })
     } catch (error) {
       if (!uniqueViolation(error)) throw error
     }
+  }
+
+  async pruneExpiredForScope(input: {
+    scope: IdentityRiskControlScope
+    now?: Date
+  }) {
+    const now = input.now ?? new Date()
+    return this.prisma.identityRiskOperationalEvent.deleteMany({
+      where: {
+        scopeType: input.scope.type,
+        scopeOpaqueId: opaqueScope(input.scope),
+        expiresAt: { lte: now },
+      },
+    })
   }
 }
