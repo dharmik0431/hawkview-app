@@ -405,9 +405,22 @@ function adaptCounts(value: unknown): HawkViewIdentityRiskCounts | null {
   const counts = Object.fromEntries(
     keys.map((key) => [key, adaptBoundedCount(source[key])])
   ) as Record<(typeof keys)[number], ReturnType<typeof adaptBoundedCount>>
-  return Object.values(counts).every((count) => count !== null)
-    ? (counts as HawkViewIdentityRiskCounts)
-    : null
+  if (!Object.values(counts).every((count) => count !== null)) return null
+
+  const adapted = counts as HawkViewIdentityRiskCounts
+  const evaluatedRulesUnavailable =
+    adapted.evaluatedRules.value === 0 &&
+    !adapted.evaluatedRules.exact &&
+    !adapted.evaluatedRules.capped
+  if (
+    !evaluatedRulesUnavailable &&
+    (!adapted.evaluatedRules.exact ||
+      adapted.evaluatedRules.capped ||
+      adapted.evaluatedRules.value > ruleCatalog.size)
+  ) {
+    return null
+  }
+  return adapted
 }
 
 function countsMatchMeta(

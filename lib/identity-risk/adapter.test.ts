@@ -510,6 +510,18 @@ test('validates exact, capped, and unavailable summary count semantics', () => {
     }
     assert.equal(adaptIdentityRiskResponses(responses).hawkView.counts, null)
   }
+
+  for (const evaluatedRules of [
+    boundedCount(10_000, false, true),
+    boundedCount(23),
+  ]) {
+    const responses = validResponses()
+    responses.hawkViewSummary = {
+      ...responses.hawkViewSummary,
+      counts: summaryCounts({ evaluatedRules }),
+    }
+    assert.equal(adaptIdentityRiskResponses(responses).hawkView.counts, null)
+  }
 })
 
 test('preserves a completed evaluation with unavailable source evidence as not evaluated', () => {
