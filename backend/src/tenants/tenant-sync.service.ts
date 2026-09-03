@@ -1200,6 +1200,16 @@ export function organizationConfigurationSnapshotForTenant(
 @Injectable()
 export class TenantSyncService {
   private readonly logger = new Logger(TenantSyncService.name)
+  private static readonly operationalResources = new Set([
+    'M365_AUDIT', 'DOMAIN_DNS_HEALTH', 'GROUPS', 'MFA_REGISTRATION',
+    'CONDITIONAL_ACCESS', 'USERS', 'SIGN_INS', 'AUDIT_LOGS', 'LICENSES',
+    'DOMAINS', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS',
+  ])
+
+  private logOperationalFailure(resource: string, phase: 'INCREMENTAL' | 'SNAPSHOT' | 'RECONCILIATION' | 'RELATIONSHIP' | 'FALLBACK', reasonCode: string) {
+    const safeResource = TenantSyncService.operationalResources.has(resource) ? resource : 'UNKNOWN'
+    this.logger.warn(JSON.stringify({ event: 'microsoft_collection_runtime_failure', resource: safeResource, phase, outcome: 'FAILED', reasonCode }))
+  }
 
   constructor(
     @Inject(PrismaService)
@@ -1706,9 +1716,7 @@ export class TenantSyncService {
           // spot; ingest evidence now and reconcile current state later.
           await this.m365ManagementActivity.syncTenant(tenant)
         } catch (auditError) {
-          this.logger.warn(
-            `Independent Microsoft 365 audit synchronization also failed for tenant ${tenant.id}: ${safeErrorMessage(auditError, 'Microsoft 365 audit synchronization failed.')}`
-          )
+          this.logOperationalFailure('M365_AUDIT', 'INCREMENTAL', 'INDEPENDENT_AUDIT_UNAVAILABLE')
         }
       }
       if (error instanceof ConflictException) throw error
@@ -1778,13 +1786,7 @@ export class TenantSyncService {
       incrementalResults.forEach((result, index) => {
         if (result.status === 'rejected') {
           const resource = incrementalModules[index]?.resource ?? 'UNKNOWN'
-          this.logger.warn(
-            `${resource} incremental synchronization was unavailable for tenant ${tenant.id}: ${
-              result.reason instanceof Error
-                ? result.reason.message
-                : String(result.reason)
-            }`
-          )
+          this.logOperationalFailure(resource, 'INCREMENTAL', 'COLLECTION_UNAVAILABLE')
         }
       })
 
@@ -1904,13 +1906,7 @@ export class TenantSyncService {
     snapshotResults.forEach((result, index) => {
       if (result.status === 'rejected') {
         const resource = snapshotModules[index]?.resource ?? 'UNKNOWN'
-        this.logger.warn(
-          `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
-            result.reason instanceof Error
-              ? result.reason.message
-              : String(result.reason)
-          }`
-        )
+        this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
     })
 
@@ -1919,11 +1915,7 @@ export class TenantSyncService {
     try {
       await this.syncDomainDnsHealth(tenant)
     } catch (error) {
-      this.logger.warn(
-        `DOMAIN_DNS_HEALTH synchronization was unavailable for tenant ${tenant.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      )
+      this.logOperationalFailure('DOMAIN_DNS_HEALTH', 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
     }
 
     const entraModules: Array<Promise<unknown>> = [
@@ -2018,13 +2010,7 @@ export class TenantSyncService {
           'SECURE_SCORES',
           'SECURITY_DEFAULTS',
         ][index]
-        this.logger.warn(
-          `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
-            result.reason instanceof Error
-              ? result.reason.message
-              : String(result.reason)
-          }`
-        )
+        this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
     })
 
@@ -2734,13 +2720,7 @@ export class TenantSyncService {
         group.owners = ownersByGroupId.get(group.id as string) ?? []
       }
       for (const failure of ownerFailures) {
-        const message =
-          failure.error instanceof Error
-            ? failure.error.message
-            : String(failure.error)
-        this.logger.warn(
-          `Skipped owner refresh for Microsoft group ${failure.groupName} (${failure.groupId}) in tenant ${tenant.id}: ${message}`
-        )
+        this.logOperationalFailure('GROUPS', 'RELATIONSHIP', 'OWNER_REFRESH_UNAVAILABLE')
       }
 
       const fetchGroupMemberIds = async (groupId: string) => {
@@ -2773,13 +2753,7 @@ export class TenantSyncService {
           fetchGroupMemberIds(group.id)
         )
       for (const failure of membershipFailures) {
-        const message =
-          failure.error instanceof Error
-            ? failure.error.message
-            : String(failure.error)
-        this.logger.warn(
-          `Skipped membership refresh for Microsoft group ${failure.groupName} (${failure.groupId}) in tenant ${tenant.id}: ${message}`
-        )
+        this.logOperationalFailure('GROUPS', 'RELATIONSHIP', 'MEMBERSHIP_REFRESH_UNAVAILABLE')
       }
 
       const [directoryUsers, directoryGroups] = await Promise.all([
@@ -2933,9 +2907,7 @@ export class TenantSyncService {
         ) {
           throw error
         }
-        this.logger.log(
-          `Tenant ${tenant.id} does not have premium MFA reporting; using the per-user authentication-method fallback.`,
-        )
+        this.logger.log(JSON.stringify({ event: 'microsoft_collection_runtime_state', resource: 'MFA_REGISTRATION', phase: 'FALLBACK', outcome: 'ACTIVE', reasonCode: 'PREMIUM_REPORTING_UNAVAILABLE' }))
         registrations = await this.collectPerUserAuthenticationMethods(
           accessToken,
         )
@@ -3063,12 +3035,7 @@ export class TenantSyncService {
         })
       }
     } catch (error) {
-      this.logger.warn(
-        `Per-user MFA state is unavailable. Registration data remains available. ${safeErrorMessage(
-          error,
-          'Microsoft did not return the per-user MFA requirement state.',
-        )}`,
-      )
+      this.logOperationalFailure('MFA_REGISTRATION', 'FALLBACK', 'PER_USER_STATE_UNAVAILABLE')
       return withoutRequirement()
     }
 
@@ -3211,12 +3178,7 @@ export class TenantSyncService {
         })
       }
     } catch (error) {
-      this.logger.warn(
-        `Conditional Access membership evidence is unavailable. MFA registration and legacy per-user state remain available. ${safeErrorMessage(
-          error,
-          'Microsoft did not return transitive group membership.',
-        )}`,
-      )
+      this.logOperationalFailure('CONDITIONAL_ACCESS', 'FALLBACK', 'MEMBERSHIP_EVIDENCE_UNAVAILABLE')
       return unavailable('COLLECTION_FAILED')
     }
 
@@ -4266,9 +4228,7 @@ export class TenantSyncService {
         result.reason instanceof Error
           ? result.reason.message
           : String(result.reason)
-      this.logger.warn(
-        `Audit-triggered ${resource} reconciliation was unavailable for tenant ${tenant.id}: ${message}`
-      )
+      this.logOperationalFailure(resource, 'RECONCILIATION', 'AUDIT_RECONCILIATION_UNAVAILABLE')
     })
   }
 
@@ -4847,9 +4807,7 @@ export class TenantSyncService {
       if (response.status === 410) {
         const metadata = await readGraphOperationalError(response)
         if (deltaLink && allowDeltaReset) {
-          this.logger.warn(
-            `Microsoft invalidated the users delta checkpoint for tenant ${tenant.id}; rebuilding the users baseline.`,
-          )
+          this.logger.warn(JSON.stringify({ event: 'microsoft_collection_runtime_state', resource: 'USERS', phase: 'SNAPSHOT', outcome: 'REBUILDING', reasonCode: 'DELTA_CHECKPOINT_INVALIDATED' }))
           return this.synchronizeUsers(tenant, accessToken, null, false)
         }
         throw new MicrosoftGraphCollectionError(
