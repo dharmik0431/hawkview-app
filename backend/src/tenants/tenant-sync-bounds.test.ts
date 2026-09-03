@@ -105,7 +105,7 @@ test('Graph streamed body matrix accepts cap boundaries and cancels every unsafe
   for (const size of [GRAPH_LOG_PAGE_MAX_BYTES - 1, GRAPH_LOG_PAGE_MAX_BYTES]) {
     let padding = 'x'.repeat(size - Buffer.byteLength(valid, 'utf8') - 14)
     let padded = JSON.stringify({ value: [], padding })
-    padding = padding.slice(0, padding.length + size - Buffer.byteLength(padded, 'utf8'))
+    padding += 'x'.repeat(Math.max(0, size - Buffer.byteLength(padded, 'utf8')))
     padded = JSON.stringify({ value: [], padding })
     assert.equal(Buffer.byteLength(padded, 'utf8'), size)
     await assert.doesNotReject(() => parseBoundedGraphCollectionPage(new Response(padded), 'sign-in logs'))
