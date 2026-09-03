@@ -56,3 +56,10 @@ test('success output summary is aggregate-only', () => {
     outcome: 'COMPLETED', due: 2, succeeded: 1, partial: 1, failed: 0, skipped: 0,
   })
 })
+
+test('declared oversized cron response is cancelled before the safe failure', async () => {
+  let cancelled = false
+  const body = new ReadableStream({ cancel() { cancelled = true } })
+  await assert.rejects(() => runScheduledSync({ ...options, fetchImpl: async () => new Response(body, { headers: { 'content-length': String(SCHEDULED_SYNC_RESPONSE_MAX_BYTES + 1) } }) }), /SCHEDULER_RESPONSE_TOO_LARGE/)
+  assert.equal(cancelled, true)
+})

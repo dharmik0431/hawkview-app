@@ -9,6 +9,7 @@ export const SCHEDULED_SYNC_RESPONSE_MAX_BYTES = 64 * 1024
 async function readSafeResponse(response) {
   const declared = Number(response.headers.get('content-length') ?? '0')
   if (Number.isFinite(declared) && declared > SCHEDULED_SYNC_RESPONSE_MAX_BYTES) {
+    try { await response.body?.cancel() } catch { /* preserve the fixed safe failure */ }
     throw new Error('SCHEDULER_RESPONSE_TOO_LARGE')
   }
   if (!response.body) throw new Error('SCHEDULER_RESPONSE_UNAVAILABLE')
