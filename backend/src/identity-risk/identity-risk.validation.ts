@@ -13,7 +13,7 @@ const SAFE_OPAQUE_ID = /^[A-Za-z0-9._:-]+$/
 const SAFE_CURSOR = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/
 const IDENTITY_RISK_OPAQUE_REFERENCE =
   /^hvr1_([a-z]{2,24})_[a-f0-9]{64}$/u
-const IDENTITY_RISK_OPAQUE_REFERENCE_KINDS = new Set([
+export const IDENTITY_RISK_OPAQUE_REFERENCE_KINDS = [
   'org',
   'tenant',
   'subject',
@@ -32,7 +32,12 @@ const IDENTITY_RISK_OPAQUE_REFERENCE_KINDS = new Set([
   'audit',
   'checkpoint',
   'observation',
-])
+] as const
+export type IdentityRiskOpaqueReferenceKind =
+  typeof IDENTITY_RISK_OPAQUE_REFERENCE_KINDS[number]
+const identityRiskOpaqueReferenceKinds = new Set<string>(
+  IDENTITY_RISK_OPAQUE_REFERENCE_KINDS,
+)
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
@@ -70,7 +75,19 @@ export function isIdentityRiskOpaqueReference(value: unknown): value is string {
   const normalized = boundedSafeString(value, 160)
   if (!normalized) return false
   const match = IDENTITY_RISK_OPAQUE_REFERENCE.exec(normalized)
-  return Boolean(match && IDENTITY_RISK_OPAQUE_REFERENCE_KINDS.has(match[1]!))
+  return Boolean(match && identityRiskOpaqueReferenceKinds.has(match[1]!))
+}
+
+export function isIdentityRiskOpaqueReferenceKind(
+  value: unknown,
+  kind: IdentityRiskOpaqueReferenceKind | readonly IdentityRiskOpaqueReferenceKind[],
+): value is string {
+  const normalized = boundedSafeString(value, 160)
+  if (!normalized) return false
+  const match = IDENTITY_RISK_OPAQUE_REFERENCE.exec(normalized)
+  if (!match) return false
+  const allowed = Array.isArray(kind) ? kind : [kind]
+  return allowed.includes(match[1] as IdentityRiskOpaqueReferenceKind)
 }
 
 export function parseTimestamp(

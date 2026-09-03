@@ -1,3 +1,9 @@
+import type {
+  ApprovedCatalog as ApprovedIdentitySignalCatalog,
+  IdentitySignalCandidate as ApprovedIdentitySignalCandidate,
+  IdentitySignalRuleId as ApprovedIdentitySignalRuleId,
+} from './identity-signal-contract.js'
+
 export const IDENTITY_RISK_API_VERSION = 1 as const
 export const IDENTITY_RISK_ENGINE_VERSION = 'hawkview-identity-engine/1' as const
 export const IDENTITY_RISK_CATALOG_VERSION = 'hawkview-identity-signals/v1' as const
@@ -10,6 +16,32 @@ export const IDENTITY_RISK_MAX_RULE_IDS = 10
 export const IDENTITY_RISK_MAX_LIST_ITEMS = 10
 export const IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION =
   'hawkview-identity-source/v1' as const
+/**
+ * Closed catalog of normalized, independent HawkView evidence inputs. Microsoft
+ * Identity Protection risk products are deliberately absent because they are
+ * displayed through the separate Microsoft channel and must never feed these
+ * detectors.
+ */
+export const IDENTITY_RISK_APPROVED_SOURCE_TYPES = [
+  'APPLICATIONS',
+  'AUDIT_LOGS',
+  'AUTH_METHOD_POLICIES',
+  'AUTH_REGISTRATIONS',
+  'CONDITIONAL_ACCESS',
+  'DEVICES',
+  'DIRECTORY_AUDIT',
+  'DIRECTORY_ROLES',
+  'EXCHANGE_MAILBOX_RULES',
+  'EXCHANGE_MAILBOX_SETTINGS',
+  'GROUPS',
+  'M365_AUDIT',
+  'SECURITY_DEFAULTS',
+  'SERVICE_PRINCIPALS',
+  'SIGN_INS',
+  'USERS',
+] as const
+export type IdentityRiskApprovedSourceType =
+  typeof IDENTITY_RISK_APPROVED_SOURCE_TYPES[number]
 
 export type IdentitySignalOutcome =
   | 'MATCHED'
@@ -21,23 +53,23 @@ export type IdentitySignalSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
 export type IdentitySignalConfidence = 'LOW' | 'MEDIUM' | 'HIGH'
 export type IdentitySubjectType = 'USER' | 'MAILBOX' | 'APPLICATION' | 'UNKNOWN'
 
-export type IdentityRiskSourceScalar = string | number | boolean | null
-export type IdentityRiskSourceAttribute = Readonly<{
-  name: string
-  value: IdentityRiskSourceScalar | readonly IdentityRiskSourceScalar[]
-}>
-
 /**
- * Versioned, data-only projection boundary for evaluator source records.
- * Provider payloads, principals, credentials, tokens, and arbitrary objects are
- * not valid source payloads. Projectors must emit only approved attributes and
- * HawkView opaque references before the platform receives a batch.
+ * Version-pinned projection boundary for the approved evaluator at commit
+ * 525492313cfb893f03c096bc62c0637f60169e8e. Provider payloads are not valid
+ * here: source projectors must emit one runtime-valid approved candidate whose
+ * subject matches the HawkView opaque subject reference.
  */
 export type IdentityRiskSourcePayload = Readonly<{
   schemaVersion: typeof IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION
   recordReference: string
-  subjectReference?: string
-  attributes: readonly IdentityRiskSourceAttribute[]
+  subjectReference: string
+  candidate: ApprovedIdentitySignalCandidate
+}>
+
+export type IdentityRiskApprovedEvaluatorConfiguration = Readonly<{
+  readiness: 'READY' | 'NOT_READY'
+  featureFlags?: Readonly<Partial<Record<ApprovedIdentitySignalRuleId, boolean>>>
+  catalogs?: readonly ApprovedIdentitySignalCatalog[]
 }>
 
 export type IdentitySignalEvaluationContext = Readonly<{
@@ -46,6 +78,7 @@ export type IdentitySignalEvaluationContext = Readonly<{
   evaluationAt: Date
   engineVersion: string
   catalogVersion: string
+  capability: IdentitySignalCoverage
   sources: Readonly<Record<string, readonly IdentityRiskSourcePayload[]>>
 }>
 
@@ -56,6 +89,8 @@ export type IdentitySignalResult = Readonly<{
   reasonCodes: readonly string[]
   subjectType: IdentitySubjectType
   subjectId: string
+  /** Server-derived identity of the projected candidate, never a provider ID. */
+  candidateReference?: string
   evidenceReferences?: readonly string[]
   sourceLabels?: readonly string[]
   severity?: IdentitySignalSeverity
@@ -92,7 +127,7 @@ export type IdentityRiskSourceEnvelope =
     }>
 
 export type IdentityRiskSourceBatch = Readonly<{
-  context: Omit<IdentitySignalEvaluationContext, 'sources'>
+  context: Omit<IdentitySignalEvaluationContext, 'capability' | 'sources'>
   sourceEnvelopes: readonly IdentityRiskSourceEnvelope[]
   orderedSourceWatermarks: readonly string[]
   earliestSourceExpiry: Date | null
@@ -226,4 +261,11 @@ export type IdentityRiskEvaluationRequest = Readonly<{
   evaluationAt: Date
   loadSources: () => Promise<IdentityRiskSourceBatch>
   detectors: readonly IdentitySignalDetector[]
+}>
+
+export type IdentityRiskApprovedEvaluationRequest = Omit<
+  IdentityRiskEvaluationRequest,
+  'detectors'
+> & Readonly<{
+  approvedEvaluator: IdentityRiskApprovedEvaluatorConfiguration
 }>

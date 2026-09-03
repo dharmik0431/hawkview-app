@@ -24,7 +24,7 @@ import {
   boundedSafeString,
   decodeIdentityRiskCursor,
   encodeIdentityRiskCursor,
-  isIdentityRiskOpaqueReference,
+  isIdentityRiskOpaqueReferenceKind,
   isPlainRecord,
   parsePageLimit,
   parseTimestamp,
@@ -123,10 +123,27 @@ function projectEvidenceReferences(value: unknown): readonly string[] | null {
   if (
     !Array.isArray(value) ||
     value.length > 32 ||
-    value.some((reference) => !isIdentityRiskOpaqueReference(reference)) ||
+    value.some((reference) =>
+      !isIdentityRiskOpaqueReferenceKind(reference, 'evidence')) ||
     new Set(value).size !== value.length
   ) return null
   return Object.freeze([...(value as string[])].sort())
+}
+
+function isProjectedSubjectReference(subjectType: unknown, subjectId: unknown) {
+  if (subjectType === 'USER') {
+    return isIdentityRiskOpaqueReferenceKind(subjectId, 'subject')
+  }
+  if (subjectType === 'APPLICATION') {
+    return isIdentityRiskOpaqueReferenceKind(subjectId, 'application')
+  }
+  if (subjectType === 'MAILBOX') {
+    return isIdentityRiskOpaqueReferenceKind(subjectId, 'mailbox')
+  }
+  if (subjectType === 'UNKNOWN') {
+    return isIdentityRiskOpaqueReferenceKind(subjectId, ['source', 'tenant'])
+  }
+  return false
 }
 
 function emptyPage(): IdentityRiskPageInfo {
@@ -174,6 +191,22 @@ function runEnvelope(
   ) return null
   const evaluatedAt = parseTimestamp(run.completedAt, now)
   if (!evaluatedAt) return null
+  if (run.capability === 'UNAVAILABLE') {
+    return {
+      version: IDENTITY_RISK_API_VERSION,
+      channel: 'HAWKVIEW_IDENTITY_SIGNALS',
+      engineVersion: run.engineVersion,
+      catalogVersion: run.catalogVersion,
+      evaluatedAt: evaluatedAt.toISOString(),
+      capability: 'UNAVAILABLE',
+      status: 'NOT_EVALUATED',
+      sourceLabel: HAWKVIEW_SOURCE_LABEL,
+      observedAt: null,
+      freshness: 'UNKNOWN',
+      limitation:
+        'Approved HawkView identity-signal source evidence is not available for this evaluation.',
+    }
+  }
   const stale = now.getTime() - evaluatedAt.getTime() > CURRENT_RUN_MAX_AGE_MS
   return {
     version: IDENTITY_RISK_API_VERSION,
@@ -401,7 +434,7 @@ export class IdentityRiskService {
           matchedResult: { evaluationRunId: run.id },
         },
         distinct: ['subjectId'],
-        select: { subjectId: true },
+        select: { subjectId: true, subjectType: true },
         take: MAX_SUMMARY_COUNT + 1,
       }),
     ])
@@ -414,7 +447,8 @@ export class IdentityRiskService {
         (row.notMatchedCountCapped && row.notMatchedCount !== 1_000_000) ||
         (row.notEvaluatedCountCapped && row.notEvaluatedCount !== 1_000_000),
       ) ||
-      subjects.some((row) => !isIdentityRiskOpaqueReference(row.subjectId))
+      subjects.some((row) =>
+        !isProjectedSubjectReference(row.subjectType, row.subjectId))
     ) return { ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'), counts: unavailableCounts }
     const currentControls = await this.currentControls(tenant)
     if (currentControls.evaluationHardDisabled) {
@@ -878,7 +912,7 @@ export class IdentityRiskService {
   ): IdentityRiskFindingDto | null {
     const presentation = identityRiskRulePresentation(row.ruleId)
     const id = boundedOpaqueId(row.id, 200)
-    const subjectId = isIdentityRiskOpaqueReference(row.subjectId)
+    const subjectId = isProjectedSubjectReference(row.subjectType, row.subjectId)
       ? row.subjectId
       : null
     const observedAt = parseTimestamp(row.observedAt, platformNow)

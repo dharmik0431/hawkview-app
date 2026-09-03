@@ -4,11 +4,13 @@ import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
+  IDENTITY_RISK_APPROVED_SOURCE_TYPES,
   IDENTITY_RISK_ENGINE_VERSION,
   IDENTITY_RISK_MAX_FUTURE_SKEW_MS,
   IDENTITY_RISK_RUN_RETENTION_MS,
   IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION,
   type IdentityRiskBoundedCount,
+  type IdentityRiskApprovedEvaluationRequest,
   type IdentityRiskEvaluationRequest,
   type IdentityRiskSourceBatch,
   type IdentityRiskSourceEnvelope,
@@ -18,10 +20,15 @@ import {
   type IdentitySignalResult,
 } from './identity-risk.contract.js'
 import {
+  approvedIdentitySignalDetectors,
+  isApprovedIdentitySignalCandidateProjection,
+} from './identity-risk-approved-evaluator.adapter.js'
+import {
   identityRiskRulePresentation,
   isIdentityRiskRuleId,
   type IdentityRiskRuleId,
 } from './identity-risk.catalog.js'
+import { isIdentitySignalCandidateRuntime } from './identity-signal-runtime.js'
 import {
   IdentityRiskSafetyService,
   type IdentityRiskSafetyState,
@@ -29,7 +36,7 @@ import {
 import {
   boundedOpaqueId,
   boundedSafeString,
-  isIdentityRiskOpaqueReference,
+  isIdentityRiskOpaqueReferenceKind,
   isPlainRecord,
   parseTimestamp,
 } from './identity-risk.validation.js'
@@ -57,6 +64,7 @@ const resultKeys = new Set([
   'reasonCodes',
   'subjectType',
   'subjectId',
+  'candidateReference',
   'severity',
   'confidence',
   'evidenceReferences',
@@ -94,65 +102,12 @@ const reasonCodes = new Set([
 ])
 
 const sourcePayloadKeys = new Set([
-  'attributes',
+  'candidate',
   'recordReference',
   'schemaVersion',
   'subjectReference',
 ])
-const sourceAttributeKeys = new Set(['name', 'value'])
-const approvedSourceAttributeNames = new Set([
-  'accountClass',
-  'actionsCompleteness',
-  'activeDays',
-  'actorBaselineEvents',
-  'actorOperationCount',
-  'applicationPermissionIds',
-  'authoritativeComparable',
-  'authoritativeCreatedAt',
-  'baselineActiveDays',
-  'capability',
-  'change',
-  'client',
-  'conditionsCompleteness',
-  'credentialMetadataChanged',
-  'declaredPermissions',
-  'effectiveMfa',
-  'enabled',
-  'eventAt',
-  'evidenceState',
-  'independentSignInAt',
-  'independentSignInRuleId',
-  'lastSuccessfulInteractiveSignInAt',
-  'lifecycle',
-  'lifecycleAt',
-  'mailboxChangeAt',
-  'normalizedMfaDetailComplete',
-  'observedAt',
-  'operation',
-  'outcome',
-  'populatedConditionCount',
-  'populatedExceptionCount',
-  'privilegeAt',
-  'privilegeOperation',
-  'privilegeSucceeded',
-  'privileged',
-  'projectionComplete',
-  'readiness',
-  'recipientAddresses',
-  'requiresFullCapability',
-  'sourceAsn',
-  'succeeded',
-  'successfulInteractive',
-  'successfulInteractiveSignIns',
-  'tenantBaselineEvents',
-  'tenantOperationCount',
-  'tenantWideComplete',
-  'userType',
-  'verifiedAcceptedDomains',
-])
-const hazardousSourceNames = new Set(['__PROTO__', 'CONSTRUCTOR', 'PROTOTYPE'])
-const forbiddenSourceText =
-  /(?:access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|bearer|oauth|password|passwd|secret|api[_-]?key|client[_-]?secret|credential|cookie|session|jwt|supabase|amazonses|amazonaws|resend|https?:\/\/)/iu
+const approvedSourceTypes = new Set<string>(IDENTITY_RISK_APPROVED_SOURCE_TYPES)
 
 type MutableCount = { value: number; exact: boolean; capped: boolean }
 type RuleAggregate = {
@@ -196,83 +151,62 @@ function exactDataKeys(value: Record<string, unknown>, allowed: ReadonlySet<stri
 
 function approvedSourceName(value: unknown): string | null {
   const source = boundedSafeString(value, 80)
-  if (!source || !/^[A-Z][A-Z0-9_]{0,79}$/u.test(source)) return null
-  if (hazardousSourceNames.has(source)) return null
-  const normalized = source.replace(/[^A-Z0-9]/gu, '').toLowerCase()
-  if (
-    normalized.includes('riskyuser') ||
-    normalized.includes('riskdetection') ||
-    normalized.includes('identityprotection') ||
-    normalized.includes('entraidprotection') ||
-    (normalized.includes('risk') &&
-      (normalized.includes('microsoft') ||
-        normalized.includes('entra') ||
-        normalized.includes('aad') ||
-        normalized.includes('user') ||
-        normalized.includes('identity') ||
-        normalized.includes('detection') ||
-        normalized.includes('protection')))
-  ) return null
-  return source
+  return source && approvedSourceTypes.has(source) ? source : null
 }
 
-function approvedSourceScalar(value: unknown): boolean {
-  if (value === null || typeof value === 'boolean') return true
-  if (typeof value === 'number') {
-    return Number.isSafeInteger(value) && Math.abs(value) <= 1_000_000_000
+function validSubjectReference(
+  subjectType: unknown,
+  subjectId: unknown,
+): subjectId is string {
+  if (subjectType === 'USER') {
+    return isIdentityRiskOpaqueReferenceKind(subjectId, 'subject')
   }
-  const text = boundedSafeString(value, 320)
-  return Boolean(text && !forbiddenSourceText.test(text))
+  if (subjectType === 'APPLICATION') {
+    return isIdentityRiskOpaqueReferenceKind(subjectId, 'application')
+  }
+  if (subjectType === 'MAILBOX') {
+    return isIdentityRiskOpaqueReferenceKind(subjectId, 'mailbox')
+  }
+  if (subjectType === 'UNKNOWN') {
+    return isIdentityRiskOpaqueReferenceKind(subjectId, ['source', 'tenant'])
+  }
+  return false
+}
+
+function freezeApprovedCandidate(value: unknown): void {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return
+  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
+    if ('value' in descriptor) freezeApprovedCandidate(descriptor.value)
+  }
+  Object.freeze(value)
 }
 
 function approvedSourcePayload(value: unknown): IdentityRiskSourcePayload | null {
   if (!isPlainRecord(value) || !exactDataKeys(value, sourcePayloadKeys)) return null
   if (
     value.schemaVersion !== IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION ||
-    !isIdentityRiskOpaqueReference(value.recordReference) ||
-    (value.subjectReference !== undefined &&
-      !isIdentityRiskOpaqueReference(value.subjectReference)) ||
-    !Array.isArray(value.attributes) ||
-    value.attributes.length > 256
+    !isIdentityRiskOpaqueReferenceKind(
+      value.recordReference,
+      ['event', 'observation', 'evidence'],
+    ) ||
+    !validSubjectReference(
+      value.candidate && typeof value.candidate === 'object'
+        ? (value.candidate as { subject?: { type?: unknown } }).subject?.type
+        : undefined,
+      value.subjectReference,
+    ) ||
+    !isIdentitySignalCandidateRuntime(value.candidate) ||
+    !isApprovedIdentitySignalCandidateProjection(value.candidate) ||
+    value.candidate.subject.opaqueId !== value.subjectReference
   ) return null
-  const names = new Set<string>()
-  const attributes: Array<IdentityRiskSourcePayload['attributes'][number]> = []
-  for (const attribute of value.attributes) {
-    if (!isPlainRecord(attribute) || !exactDataKeys(attribute, sourceAttributeKeys)) {
-      return null
-    }
-    if (
-      typeof attribute.name !== 'string' ||
-      !approvedSourceAttributeNames.has(attribute.name) ||
-      forbiddenSourceText.test(attribute.name) ||
-      names.has(attribute.name)
-    ) return null
-    names.add(attribute.name)
-    if (Array.isArray(attribute.value)) {
-      if (
-        attribute.value.length > 2_048 ||
-        !attribute.value.every(approvedSourceScalar)
-      ) return null
-      attributes.push(Object.freeze({
-        name: attribute.name,
-        value: Object.freeze([...attribute.value]),
-      }))
-    } else if (!approvedSourceScalar(attribute.value)) {
-      return null
-    } else {
-      attributes.push(Object.freeze({
-        name: attribute.name,
-        value: attribute.value as null | string | number | boolean,
-      }))
-    }
-  }
+  const candidate = structuredClone(value.candidate)
+  if (!isIdentitySignalCandidateRuntime(candidate)) return null
+  freezeApprovedCandidate(candidate)
   return Object.freeze({
     schemaVersion: IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION,
     recordReference: value.recordReference,
-    ...(value.subjectReference === undefined
-      ? {}
-      : { subjectReference: value.subjectReference }),
-    attributes: Object.freeze(attributes),
+    subjectReference: value.subjectReference,
+    candidate,
   })
 }
 
@@ -663,7 +597,8 @@ function normalizedOpaqueReferences(value: unknown): readonly string[] | null {
   if (
     !Array.isArray(value) ||
     value.length > 32 ||
-    value.some((reference) => !isIdentityRiskOpaqueReference(reference)) ||
+    value.some((reference) =>
+      !isIdentityRiskOpaqueReferenceKind(reference, 'evidence')) ||
     new Set(value).size !== value.length
   ) return null
   return Object.freeze([...value].sort())
@@ -694,11 +629,17 @@ function validateResult(
   const normalizedReasons = normalizedReasonCodes(value.reasonCodes)
   const evidenceReferences = normalizedOpaqueReferences(value.evidenceReferences)
   const sourceLabels = normalizedSourceLabels(value.sourceLabels)
+  const candidateReference = value.candidateReference === undefined
+    ? undefined
+    : isIdentityRiskOpaqueReferenceKind(value.candidateReference, 'contribution')
+      ? value.candidateReference
+      : null
   if (
     !normalizedReasons ||
     !evidenceReferences ||
     !sourceLabels ||
-    !isIdentityRiskOpaqueReference(value.subjectId) ||
+    candidateReference === null ||
+    !validSubjectReference(value.subjectType, value.subjectId) ||
     !subjectTypes.has(value.subjectType as string)
   ) return null
 
@@ -715,6 +656,7 @@ function validateResult(
       reasonCodes: normalizedReasons,
       evidenceReferences,
       sourceLabels,
+      ...(candidateReference === undefined ? {} : { candidateReference }),
       observedAt,
     }) as IdentitySignalResult
   }
@@ -728,6 +670,7 @@ function validateResult(
     reasonCodes: normalizedReasons,
     evidenceReferences,
     sourceLabels,
+    ...(candidateReference === undefined ? {} : { candidateReference }),
   }) as IdentitySignalResult
 }
 
@@ -942,6 +885,7 @@ export class IdentityRiskEvaluatorService {
           ...batch,
           context: {
             ...batch.context,
+            capability: batch.capability,
             sources: canonicalSources.sources,
           },
         },
@@ -1244,6 +1188,7 @@ export class IdentityRiskEvaluatorService {
     const trustedContext = Object.freeze({
       ...batch.context,
       evaluationAt: new Date(platformNow.getTime()),
+      capability: batch.capability,
     })
     for (const detector of [...detectors].sort((left, right) =>
       left.ruleId.localeCompare(right.ruleId),
@@ -1303,27 +1248,33 @@ export class IdentityRiskEvaluatorService {
       }
       const distinctResults: IdentitySignalResult[] = []
       const resultSignatures = new Map<string, string>()
-      const subjectOutcomes = new Map<string, string>()
+      // Legacy/internal detectors that do not carry a server-derived candidate
+      // identity keep the stricter one-outcome-per-subject behavior. The
+      // production approved adapter always supplies candidateReference, so two
+      // legitimate candidates for one subject can have different outcomes.
+      const unboundSubjectOutcomes = new Map<string, string>()
       for (const result of validated as IdentitySignalResult[]) {
-        const subjectKey = sha256(ruleId, result.subjectType, result.subjectId)
-        const existingOutcome = subjectOutcomes.get(subjectKey)
-        if (existingOutcome && existingOutcome !== result.outcome) {
-          await this.safety.recordDetectorRejection({
-            organizationId,
-            customerTenantId,
-            runKey,
-            ruleId,
-            reasonCode: 'DETECTOR_OUTPUT_CONFLICT',
-            now: platformNow,
-          })
-          throw new Error('Identity risk detector output was rejected.')
+        if (result.candidateReference === undefined) {
+          const subjectKey = sha256(ruleId, result.subjectType, result.subjectId)
+          const existingOutcome = unboundSubjectOutcomes.get(subjectKey)
+          if (existingOutcome && existingOutcome !== result.outcome) {
+            await this.safety.recordDetectorRejection({
+              organizationId,
+              customerTenantId,
+              runKey,
+              ruleId,
+              reasonCode: 'DETECTOR_OUTPUT_CONFLICT',
+              now: platformNow,
+            })
+            throw new Error('Identity risk detector output was rejected.')
+          }
+          unboundSubjectOutcomes.set(subjectKey, result.outcome)
         }
-        subjectOutcomes.set(subjectKey, result.outcome)
         const duplicateKey = sha256(
           ruleId,
           result.subjectType,
           result.subjectId,
-          result.observedAt?.toISOString() ?? '',
+          result.candidateReference ?? result.observedAt?.toISOString() ?? '',
         )
         const signature = sha256(
           duplicateKey,
@@ -1362,6 +1313,7 @@ export class IdentityRiskEvaluatorService {
             ruleId,
             result.subjectType ?? '',
             result.subjectId ?? '',
+            result.candidateReference ?? '',
             result.observedAt?.toISOString() ?? '',
           )
           matches.set(key, result)
@@ -1421,7 +1373,12 @@ export class IdentityRiskEvaluatorService {
         return { status: 'HARD_DISABLED' as const, safety }
       }
       if (input.matches.some(([, result]) =>
-        !isIdentityRiskOpaqueReference(result.subjectId) ||
+        !validSubjectReference(result.subjectType, result.subjectId) ||
+        (result.candidateReference !== undefined &&
+          !isIdentityRiskOpaqueReferenceKind(
+            result.candidateReference,
+            'contribution',
+          )) ||
         !normalizedOpaqueReferences(result.evidenceReferences),
       )) {
         throw new Error('Identity risk persistence boundary rejected an opaque reference.')
@@ -1570,7 +1527,8 @@ export class IdentityRiskEvaluatorService {
 
 /**
  * Stable internal scheduler boundary. A cron or replay worker supplies only an
- * allowlisted source loader and detector set; this class owns no rule formulas.
+ * allowlisted source loader and approved evaluator configuration. Detector
+ * formulas always come from the version-pinned implementation.
  */
 @Injectable()
 export class IdentityRiskEvaluationScheduler {
@@ -1579,7 +1537,11 @@ export class IdentityRiskEvaluationScheduler {
     private readonly evaluator: IdentityRiskEvaluatorService,
   ) {}
 
-  runTenant(request: IdentityRiskEvaluationRequest) {
-    return this.evaluator.evaluate(request)
+  runTenant(request: IdentityRiskApprovedEvaluationRequest) {
+    const { approvedEvaluator, ...platformRequest } = request
+    return this.evaluator.evaluate({
+      ...platformRequest,
+      detectors: approvedIdentitySignalDetectors(approvedEvaluator),
+    })
   }
 }

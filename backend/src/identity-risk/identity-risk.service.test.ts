@@ -182,7 +182,7 @@ test('a hard-disable activated during reads suppresses every HawkView projection
       identityRiskFinding: {
         count: async () => 1,
         findMany: async (args: { distinct?: unknown }) =>
-          args.distinct ? [{ subjectId: opaqueSubject('identity-001') }] : [finding(1, now)],
+          args.distinct ? [{ subjectId: opaqueSubject('identity-001'), subjectType: 'USER' }] : [finding(1, now)],
         findFirst: async () => finding(1, now),
       },
     }
@@ -241,7 +241,7 @@ test('current alert mute is reflected across HawkView projections without anothe
       identityRiskFinding: {
         count: async () => 1,
         findMany: async (args: { distinct?: unknown }) =>
-          args.distinct ? [{ subjectId: opaqueSubject('identity-001') }] : [finding(1, now)],
+          args.distinct ? [{ subjectId: opaqueSubject('identity-001'), subjectType: 'USER' }] : [finding(1, now)],
         findFirst: async () => finding(1, now),
       },
     })
@@ -287,7 +287,7 @@ test('summary and findings use one completed run and server-owned bounded wordin
       identityRiskFinding: {
         count: async () => 1,
         findMany: async (args: { where: unknown; distinct?: unknown }) => {
-          if (args.distinct) return [{ subjectId: opaqueSubject('identity-001') }]
+          if (args.distinct) return [{ subjectId: opaqueSubject('identity-001'), subjectType: 'USER' }]
           findingsWhere = args.where
           return rows
         },
@@ -325,6 +325,29 @@ test('summary and findings use one completed run and server-owned bounded wordin
   }
 })
 
+test('an unavailable post-sync evaluator run serializes as not evaluated, never available', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  try {
+    const prisma = scoped({
+      identityRiskEvaluationRun: {
+        findFirst: async () => ({ ...currentRun(now), capability: 'UNAVAILABLE' }),
+      },
+      identityRiskFinding: { findMany: async () => [] },
+    })
+    const page = await new IdentityRiskService(prisma).findings(identity, tenantId)
+    assert.equal(page.status, 'NOT_EVALUATED')
+    assert.equal(page.capability, 'UNAVAILABLE')
+    assert.equal(page.freshness, 'UNKNOWN')
+    assert.equal(page.observedAt, null)
+    assert.match(page.limitation ?? '', /source evidence is not available/)
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+  }
+})
+
 test('raw or secret-shaped stored subjects fail closed at every HawkView API projection', async () => {
   const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
@@ -349,7 +372,7 @@ test('raw or secret-shaped stored subjects fail closed at every HawkView API pro
       identityRiskFinding: {
         count: async () => 1,
         findMany: async (args: { distinct?: unknown }) =>
-          args.distinct ? [{ subjectId: 'ARRAYSECRET1' }] : [unsafeFinding],
+          args.distinct ? [{ subjectId: 'ARRAYSECRET1', subjectType: 'USER' }] : [unsafeFinding],
         findFirst: async () => unsafeFinding,
       },
     })
@@ -364,6 +387,61 @@ test('raw or secret-shaped stored subjects fail closed at every HawkView API pro
     assert.equal(detail.status, 'ERROR')
     assert.equal(detail.finding, null)
     assert.ok(!JSON.stringify([summary, findings, detail]).includes('ARRAYSECRET1'))
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+  }
+})
+
+test('API projections reject wrong-kind subject and evidence references', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  const opaque = (kind: string, label: string) =>
+    `hvr1_${kind}_${createHash('sha256').update(label).digest('hex')}`
+  try {
+    const cases = [
+      {
+        row: { ...finding(1, now), subjectId: opaque('evidence', 'wrong-user') },
+        evidence: [],
+        listError: true,
+      },
+      {
+        row: {
+          ...finding(2, now),
+          subjectType: 'APPLICATION',
+          subjectId: opaque('mailbox', 'wrong-application'),
+        },
+        evidence: [],
+        listError: true,
+      },
+      {
+        row: finding(3, now),
+        evidence: [opaque('subject', 'wrong-evidence')],
+        listError: false,
+      },
+    ]
+    for (const entry of cases) {
+      const row = {
+        ...entry.row,
+        matchedResult: { evidence: entry.evidence },
+      }
+      const prisma = scoped({
+        identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+        identityRiskFinding: {
+          findMany: async () => [row],
+          findFirst: async () => row,
+        },
+      })
+      const service = new IdentityRiskService(prisma)
+      const page = await service.findings(identity, tenantId)
+      const detail = await service.findingDetail(identity, tenantId, row.id)
+      assert.equal(page.status, entry.listError ? 'ERROR' : 'AVAILABLE')
+      assert.equal(page.findings.length, entry.listError ? 0 : 1)
+      assert.equal(detail.status, 'ERROR')
+      assert.equal(detail.finding, null)
+      assert.deepEqual(detail.evidenceReferences, [])
+    }
   } finally {
     if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
@@ -458,7 +536,7 @@ test('summary labels capped database and unique-subject counts explicitly', asyn
         count: async () => 10_001,
         findMany: async () => Array.from(
           { length: 10_001 },
-          (_, index) => ({ subjectId: opaqueSubject(`identity-${index}`) }),
+          (_, index) => ({ subjectId: opaqueSubject(`identity-${index}`), subjectType: 'USER' }),
         ),
       },
     })
