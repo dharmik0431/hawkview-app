@@ -63,3 +63,20 @@ test('declared oversized cron response is cancelled before the safe failure', as
   await assert.rejects(() => runScheduledSync({ ...options, fetchImpl: async () => new Response(body, { headers: { 'content-length': String(SCHEDULED_SYNC_RESPONSE_MAX_BYTES + 1) } }) }), /SCHEDULER_RESPONSE_TOO_LARGE/)
   assert.equal(cancelled, true)
 })
+
+test('declared oversized cron response preserves its stable outcome when cancellation throws', async () => {
+  const body = new ReadableStream({ cancel() { throw new Error('access_token=never private.example') } })
+  await assert.rejects(
+    () => runScheduledSync({
+      ...options,
+      fetchImpl: async () => new Response(body, {
+        headers: { 'content-length': String(SCHEDULED_SYNC_RESPONSE_MAX_BYTES + 1) },
+      }),
+    }),
+    (error) => {
+      assert.equal(String(error), 'Error: SCHEDULER_RESPONSE_TOO_LARGE')
+      assert.equal(String(error).includes('access_token'), false)
+      return true
+    },
+  )
+})

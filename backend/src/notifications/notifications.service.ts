@@ -314,10 +314,10 @@ export class NotificationsService {
         },
       })
       await this.prisma.notificationUserState.deleteMany({ where: { notificationId: row.id } })
-      this.logger.log(JSON.stringify({ event: 'notification.published', eventType: row.eventType, outcome: 'COMPLETED', occurrenceCount: Math.min(1000000, Math.max(0, row.occurrenceCount)) }))
+      this.logger.log(JSON.stringify({ event: 'notification.published', outcome: 'COMPLETED', occurrenceCount: Math.min(1000000, Math.max(0, row.occurrenceCount)) }))
       return row
     } catch (error) {
-      this.logger.error(JSON.stringify({ event: 'notification.publish_failed', eventType: input.eventType, outcome: 'FAILED', reasonCode: 'PERSISTENCE_UNAVAILABLE' }))
+      this.logger.error(JSON.stringify({ event: 'notification.publish_failed', outcome: 'FAILED', reasonCode: 'PERSISTENCE_UNAVAILABLE' }))
       return null
     }
   }

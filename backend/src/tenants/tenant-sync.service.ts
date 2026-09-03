@@ -112,6 +112,8 @@ export const GRAPH_LOG_COLLECTION_MAX_PAGES = 100
 export const GRAPH_LOG_COLLECTION_MAX_ROWS = 100_000
 export const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
 export const GRAPH_LOG_PAGE_MAX_BYTES = 2 * 1024 * 1024
+/** Cumulative retained parsed log data. Page and row limits alone permit too much heap. */
+export const GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES = 8 * 1024 * 1024
 export const MAILBOX_USAGE_CSV_MAX_BYTES = 5 * 1024 * 1024
 export const MAILBOX_USAGE_CSV_MAX_ROWS = 20_000
 export const MAILBOX_USAGE_CSV_MAX_COLUMNS = 128
@@ -139,6 +141,42 @@ export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
 
 export const NON_PREMIUM_AUTH_REGISTRATION_ERROR_CODE =
   'Authentication_RequestFromNonPremiumTenantOrB2CTenant'
+
+export type SyncCollectorModule = {
+  resource: string
+  synchronize: () => Promise<unknown>
+}
+
+const isHeavyGraphLogResource = (resource: string) =>
+  resource === 'SIGN_INS' || resource === 'AUDIT_LOGS'
+
+/**
+ * Sign-ins and directory audit logs can each retain a bounded multi-page
+ * result. Run those two collectors one after the other while allowing all
+ * other independent collectors to proceed concurrently. Results preserve the
+ * caller's original order so operational attribution cannot drift.
+ */
+export async function settleSyncCollectorModules(
+  modules: ReadonlyArray<SyncCollectorModule>,
+) {
+  const results = new Array<PromiseSettledResult<unknown>>(modules.length)
+  const heavyIndexes: number[] = []
+  const otherIndexes: number[] = []
+  modules.forEach((module, index) => {
+    ;(isHeavyGraphLogResource(module.resource) ? heavyIndexes : otherIndexes).push(index)
+  })
+
+  const settleOne = async (index: number) => {
+    results[index] = (await Promise.allSettled([modules[index]!.synchronize()]))[0]!
+  }
+  await Promise.all([
+    (async () => {
+      for (const index of heavyIndexes) await settleOne(index)
+    })(),
+    Promise.all(otherIndexes.map(settleOne)),
+  ])
+  return results
+}
 
 /**
  * An upstream dependency is still being provisioned. This is an expected,
@@ -1861,9 +1899,10 @@ export class TenantSyncService {
       // per-mailbox scan must never become an unconditional five-minute poll;
       // future audit-triggered reconciliation needs an exact, bounded event
       // predicate before it can opt this resource back into incremental work.
-      const incrementalResults = await Promise.allSettled(
-        incrementalModules.map((module) => module.synchronize())
-      )
+      // These two collectors can each legitimately retain multi-page Graph
+      // payloads. Never begin both at once on a constrained sync worker, but
+      // keep independent work concurrent and preserve module/result ordering.
+      const incrementalResults = await settleSyncCollectorModules(incrementalModules)
       incrementalResults.forEach((result, index) => {
         if (result.status === 'rejected') {
           const resource = incrementalModules[index]?.resource ?? 'UNKNOWN'
@@ -1999,49 +2038,49 @@ export class TenantSyncService {
       this.logOperationalFailure('DOMAIN_DNS_HEALTH', 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
     }
 
-    const entraModules: Array<Promise<unknown>> = [
-      this.syncAuthenticationRegistrations(tenant, snapshotAccessToken),
-      this.syncAuthenticationMethodPolicy(tenant, snapshotAccessToken),
-      this.syncEntraCollection(
+    const entraModules: SyncCollectorModule[] = [
+      { resource: 'AUTH_REGISTRATIONS', synchronize: () => this.syncAuthenticationRegistrations(tenant, snapshotAccessToken) },
+      { resource: 'AUTH_METHOD_POLICIES', synchronize: () => this.syncAuthenticationMethodPolicy(tenant, snapshotAccessToken) },
+      { resource: 'CONDITIONAL_ACCESS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'CONDITIONAL_ACCESS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'AUTHENTICATION_STRENGTHS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'AUTHENTICATION_STRENGTHS',
         'https://graph.microsoft.com/v1.0/policies/authenticationStrengthPolicies'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'NAMED_LOCATIONS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'NAMED_LOCATIONS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
-      ),
-      this.syncSignInLogs(tenant, snapshotAccessToken),
-      this.syncDirectoryAuditLogs(tenant, snapshotAccessToken, false),
-      this.syncM365AuditActivity(tenant, snapshotAccessToken),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'SIGN_INS', synchronize: () => this.syncSignInLogs(tenant, snapshotAccessToken) },
+      { resource: 'AUDIT_LOGS', synchronize: () => this.syncDirectoryAuditLogs(tenant, snapshotAccessToken, false) },
+      { resource: 'M365_AUDIT', synchronize: () => this.syncM365AuditActivity(tenant, snapshotAccessToken) },
+      { resource: 'DEVICES', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'DEVICES',
         'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'DIRECTORY_ROLES', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'DIRECTORY_ROLES',
         'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'RISKY_USERS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'RISKY_USERS',
         'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'SERVICE_PRINCIPALS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'SERVICE_PRINCIPALS',
@@ -2052,8 +2091,8 @@ export class TenantSyncService {
           'preferredSingleSignOnMode,notificationEmailAddresses,appRoles,' +
           'oauth2PermissionScopes&' +
           '$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'APPLICATIONS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'APPLICATIONS',
@@ -2062,35 +2101,19 @@ export class TenantSyncService {
           'signInAudience,publisherDomain,identifierUris,web,' +
           'passwordCredentials,keyCredentials,requiredResourceAccess&' +
           '$expand=owners($select=id,displayName,userPrincipalName)'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'SECURE_SCORES', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'SECURE_SCORES',
         'https://graph.microsoft.com/v1.0/security/secureScores?$top=25'
-      ),
-      this.syncSecurityDefaults(tenant, snapshotAccessToken),
+      ) },
+      { resource: 'SECURITY_DEFAULTS', synchronize: () => this.syncSecurityDefaults(tenant, snapshotAccessToken) },
     ]
-    const entraResults = await Promise.allSettled(entraModules)
+    const entraResults = await settleSyncCollectorModules(entraModules)
     entraResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const resource = [
-          'AUTH_REGISTRATIONS',
-          'AUTH_METHOD_POLICIES',
-          'CONDITIONAL_ACCESS',
-          'AUTHENTICATION_STRENGTHS',
-          'NAMED_LOCATIONS',
-          'SIGN_INS',
-          'AUDIT_LOGS',
-          'M365_AUDIT',
-          'DEVICES',
-          'DIRECTORY_ROLES',
-          'RISKY_USERS',
-          'SERVICE_PRINCIPALS',
-          'APPLICATIONS',
-          'SECURE_SCORES',
-          'SECURITY_DEFAULTS',
-        ][index]
+        const resource = entraModules[index]?.resource ?? 'UNKNOWN'
         this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
     })
@@ -3519,9 +3542,11 @@ export class TenantSyncService {
   private async fetchGraphCollection(
     initialUrl: string,
     accessToken: string,
-    resourceLabel: string
+    resourceLabel: string,
+    maximumMaterializedBytes = GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES,
   ) {
     const rows: any[] = []
+    let materializedBytes = 0
     let nextUrl = initialUrl
     const seen = new Set<string>()
     const deadlineAt = Date.now() + GRAPH_LOG_COLLECTION_DEADLINE_MS
@@ -3535,7 +3560,17 @@ export class TenantSyncService {
       }
       const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel, { deadlineAt })
       const page = await parseBoundedGraphCollectionPage(response, resourceLabel)
-      rows.push(...(page.value ?? []))
+      for (const value of page.value ?? []) {
+        // Values have already passed the per-page response cap. Account for
+        // their retained representation before appending so a legal sequence
+        // of pages cannot accumulate an unbounded heap.
+        const bytes = Buffer.byteLength(JSON.stringify(value), 'utf8')
+        if (materializedBytes + bytes > maximumMaterializedBytes) {
+          throw new Error('Microsoft returned an unreadable bounded response.')
+        }
+        materializedBytes += bytes
+        rows.push(value)
+      }
       assertGraphCollectionBounds({ pageCount: pages, rowCount: rows.length, url: nextUrl, seenUrls: new Set(), deadlineAt })
       nextUrl = page['@odata.nextLink'] ?? ''
     }

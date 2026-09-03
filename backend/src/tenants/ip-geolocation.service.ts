@@ -13,6 +13,8 @@ export type SignInLocation = {
   source: 'MAXMIND_GEOLITE2'
 }
 
+export const IP_GEOLOCATION_CACHE_MAX_ENTRIES = 5_000
+
 @Injectable()
 export class IpGeolocationService {
   private readonly logger = new Logger(IpGeolocationService.name)
@@ -30,7 +32,7 @@ export class IpGeolocationService {
 
     const result = reader.get(ip)
     if (!result) {
-      this.cache.set(ip, null)
+      this.remember(ip, null)
       return null
     }
 
@@ -53,12 +55,20 @@ export class IpGeolocationService {
       !location.countryOrRegion &&
       !location.geoCoordinates
     ) {
-      this.cache.set(ip, null)
+      this.remember(ip, null)
       return null
     }
 
-    this.cache.set(ip, location)
+    this.remember(ip, location)
     return location
+  }
+
+  private remember(ip: string, location: SignInLocation | null) {
+    if (!this.cache.has(ip) && this.cache.size >= IP_GEOLOCATION_CACHE_MAX_ENTRIES) {
+      const oldest = this.cache.keys().next().value
+      if (typeof oldest === 'string') this.cache.delete(oldest)
+    }
+    this.cache.set(ip, location)
   }
 
   private getReader() {
@@ -71,23 +81,19 @@ export class IpGeolocationService {
   private async openReader(): Promise<Reader<CityResponse> | null> {
     const databasePath = process.env.GEOIP_CITY_DATABASE_PATH?.trim()
     if (!databasePath) {
-      this.warnOnce(
-        'GEOIP_CITY_DATABASE_PATH is not configured; limited-license sign-in locations will remain unavailable.'
-      )
+      this.warnOnce()
       return null
     }
 
     try {
       return await open<CityResponse>(databasePath)
-    } catch (error) {
-      this.warnOnce(
-        `Could not open the GeoLite2 City database at ${databasePath}: ${error instanceof Error ? error.message : String(error)}`
-      )
+    } catch {
+      this.warnOnce()
       return null
     }
   }
 
-  private warnOnce(message: string) {
+  private warnOnce() {
     if (this.warned) return
     this.warned = true
     this.logger.warn(JSON.stringify({ event: 'ip_geolocation_database', phase: 'OPEN', outcome: 'FAILED', reasonCode: 'DATABASE_UNAVAILABLE' }))

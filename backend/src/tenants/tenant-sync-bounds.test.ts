@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import {
   assertGraphCollectionBounds,
   GRAPH_LOG_COLLECTION_DEADLINE_MS,
   GRAPH_LOG_COLLECTION_MAX_PAGES,
   GRAPH_LOG_COLLECTION_MAX_ROWS,
+  GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES,
   GRAPH_LOG_PAGE_MAX_BYTES,
   MAILBOX_USAGE_CSV_MAX_BYTES,
   MAILBOX_USAGE_CSV_MAX_COLUMNS,
@@ -12,6 +14,7 @@ import {
   parseBoundedGraphCollectionPage,
   parseCsvRows,
   parseMailboxUsageCsv,
+  settleSyncCollectorModules,
   TenantSyncService,
 } from './tenant-sync.service.js'
 
@@ -42,6 +45,149 @@ test('Graph collection page, row, repeat and deadline boundaries fail closed onl
     { pageCount: 1, rowCount: 0, url: 'https://graph.microsoft.com/repeat', seenUrls: new Set<string>(['https://graph.microsoft.com/repeat']), deadlineAt: deadline },
     { pageCount: 1, rowCount: 0, url: 'https://graph.microsoft.com/ok', seenUrls: new Set<string>(), deadlineAt: Date.now() - 1 },
   ]) assert.throws(() => assertGraphCollectionBounds(input), /bounded collection limit/)
+})
+
+test('Graph log collection has a cumulative retained-payload ceiling before persistence', async () => {
+  assert.ok(GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES <= 8 * 1024 * 1024)
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const maximum = 32
+  const exactValue = { padding: 'x'.repeat(maximum - Buffer.byteLength(JSON.stringify({ padding: '' }), 'utf8')) }
+  assert.equal(Buffer.byteLength(JSON.stringify(exactValue), 'utf8'), maximum)
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [exactValue] }))
+  await assert.doesNotReject(
+    () => (service as any).fetchGraphCollection('https://graph.microsoft.com/v1.0/start', 'token', 'sign-in logs', maximum),
+  )
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({
+    value: [{ ...exactValue, padding: `${exactValue.padding}x` }],
+  }))
+  await assert.rejects(
+    () => (service as any).fetchGraphCollection('https://graph.microsoft.com/v1.0/start', 'token', 'sign-in logs', maximum),
+    /unreadable bounded response/,
+  )
+})
+
+test('full-sync collector schedule serializes heavy Graph logs while safe work remains concurrent', async () => {
+  let signInActive = false
+  let auditActive = false
+  let safeStartedDuringSignIn = false
+  let releaseSignIn!: () => void
+  const signInCanFinish = new Promise<void>((resolve) => { releaseSignIn = resolve })
+  const order: string[] = []
+  const results = await settleSyncCollectorModules([
+    {
+      resource: 'SIGN_INS',
+      synchronize: async () => {
+        assert.equal(auditActive, false)
+        signInActive = true
+        order.push('sign-in:start')
+        await signInCanFinish
+        signInActive = false
+        order.push('sign-in:end')
+      },
+    },
+    {
+      resource: 'AUDIT_LOGS',
+      synchronize: async () => {
+        assert.equal(signInActive, false)
+        auditActive = true
+        order.push('audit:start')
+        auditActive = false
+      },
+    },
+    {
+      resource: 'M365_AUDIT',
+      synchronize: async () => {
+        safeStartedDuringSignIn = signInActive
+        order.push('safe:start')
+        releaseSignIn()
+      },
+    },
+  ])
+  assert.deepEqual(results.map((result) => result.status), ['fulfilled', 'fulfilled', 'fulfilled'])
+  assert.equal(safeStartedDuringSignIn, true)
+  assert.ok(order.indexOf('sign-in:end') < order.indexOf('audit:start'))
+
+  const afterFailure: string[] = []
+  const failureResults = await settleSyncCollectorModules([
+    { resource: 'SIGN_INS', synchronize: async () => { afterFailure.push('sign-in'); throw new Error('bounded failure') } },
+    { resource: 'AUDIT_LOGS', synchronize: async () => { afterFailure.push('audit') } },
+  ])
+  assert.deepEqual(afterFailure, ['sign-in', 'audit'])
+  assert.deepEqual(failureResults.map((result) => result.status), ['rejected', 'fulfilled'])
+})
+
+test('the actual full tenant sync uses the serialized heavy-collector schedule', async () => {
+  const prisma: any = {
+    syncState: {
+      findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: new Date(), deltaLink: null }),
+      updateMany: async () => ({ count: 1 }),
+      update: async () => ({}),
+      findMany: async () => [],
+    },
+    tenantConnection: { update: async () => ({}) },
+    $transaction: async (operations: Array<Promise<unknown>>) => Promise.all(operations),
+  }
+  const microsoftConsent = { getTenantAccessToken: async () => 'token' }
+  const notifications = { publishIncident: async () => undefined }
+  const service = new TenantSyncService(prisma, microsoftConsent as any, {} as any, notifications as any, {} as any, {} as any)
+  ;(service as any).synchronizeUsers = async () => ({ deltaLink: 'next-delta' })
+  for (const method of [
+    'syncLicenses', 'syncOrganizationConfiguration', 'syncDomains', 'syncGroups',
+    'syncSharePointSites', 'syncSharePointSettings', 'syncSharePointUsage',
+    'syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings',
+    'syncExchangeAcceptedDomains', 'syncExchangeMailboxUsage',
+    'syncExchangeMailboxRules', 'syncDomainDnsHealth',
+    'syncAuthenticationRegistrations', 'syncAuthenticationMethodPolicy',
+    'syncM365AuditActivity', 'syncSecurityDefaults', 'refreshCollectionFieldStates',
+  ]) (service as any)[method] = async () => undefined
+
+  let signInActive = false
+  let safeStartedDuringSignIn = false
+  let releaseSignIn!: () => void
+  const signInCanFinish = new Promise<void>((resolve) => { releaseSignIn = resolve })
+  ;(service as any).syncSignInLogs = async () => {
+    signInActive = true
+    await signInCanFinish
+    signInActive = false
+  }
+  ;(service as any).syncDirectoryAuditLogs = async () => {
+    assert.equal(signInActive, false)
+  }
+  let safeReleased = false
+  ;(service as any).syncEntraCollection = async () => {
+    if (!safeReleased) {
+      safeReleased = true
+      safeStartedDuringSignIn = signInActive
+      releaseSignIn()
+    }
+  }
+  const tenant = {
+    id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
+    displayName: null, primaryDomain: null, status: 'ACTIVE',
+    connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: null },
+  }
+  const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
+  assert.equal(result.status, 'SUCCEEDED')
+  assert.equal(safeStartedDuringSignIn, true)
+})
+
+test('isolated near-limit Graph collectors remain below a constrained Render memory envelope', () => {
+  const result = spawnSync(
+    process.execPath,
+    ['--expose-gc', '--max-old-space-size=320', '--import', 'tsx', 'src/tenants/tenant-sync-memory-probe.ts'],
+    { cwd: process.cwd(), encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 },
+  )
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const marker = result.stdout.split(/\r?\n/).find((line) => line.startsWith('HAWKVIEW_MEMORY_PROBE='))
+  assert.ok(marker, result.stdout)
+  const evidence = JSON.parse(marker.slice('HAWKVIEW_MEMORY_PROBE='.length))
+  assert.equal(evidence.maximumConcurrentHeavyCollectors, 1)
+  assert.equal(evidence.collectorsCompleted, 2)
+  assert.equal(evidence.mailboxRowsProjected, MAILBOX_USAGE_CSV_MAX_ROWS - 1)
+  assert.equal(evidence.mailboxColumnsParsed, MAILBOX_USAGE_CSV_MAX_COLUMNS)
+  assert.ok(evidence.mailboxCsvBytes <= MAILBOX_USAGE_CSV_MAX_BYTES)
+  assert.ok(evidence.peakRssMiB <= 300, JSON.stringify(evidence))
+  assert.ok(evidence.rssGrowthMiB <= 160, JSON.stringify(evidence))
 })
 
 test('mailbox CSV byte, row and column limits accept exact values and reject plus one', () => {
@@ -163,21 +309,23 @@ test('actual sign-in and directory-audit collectors stop before every persistenc
 })
 
 test('the real snapshot wrapper records only its failed operational state when bounded sign-in or audit pages abort', async () => {
-  const writes: string[] = []
-  const incidents: string[] = []
+  const stateUpserts: any[] = []
+  const stateUpdates: any[] = []
+  const forbiddenWrites: string[] = []
+  const incidents: any[] = []
   const prisma = {
     syncState: {
-      upsert: async () => { writes.push('state:running'); return { lastSuccessfulAt: null } },
-      update: async ({ data }: any) => { writes.push(`state:${data.status}`); return { consecutiveFailures: 1 } },
+      upsert: async (args: any) => { stateUpserts.push(args); return { lastSuccessfulAt: null } },
+      update: async (args: any) => { stateUpdates.push(args); return { consecutiveFailures: 1 } },
     },
-    signInLog: { createMany: async () => writes.push('signIn') },
-    directoryAuditLog: { createMany: async () => writes.push('audit') },
-    tenantEntraSnapshot: { upsert: async () => writes.push('snapshot') },
-    changeEvidenceEvent: { createMany: async () => writes.push('evidence') },
+    signInLog: { createMany: async () => forbiddenWrites.push('signIn') },
+    directoryAuditLog: { createMany: async () => forbiddenWrites.push('audit') },
+    tenantEntraSnapshot: { upsert: async () => forbiddenWrites.push('snapshot') },
+    changeEvidenceEvent: { createMany: async () => forbiddenWrites.push('evidence') },
   }
   const notifications = {
-    publishIncident: async () => incidents.push('published'),
-    resolveIncident: async () => incidents.push('resolved'),
+    publishIncident: async (input: any) => { incidents.push(input) },
+    resolveIncident: async () => forbiddenWrites.push('resolved'),
   }
   const service = new TenantSyncService(prisma as any, {} as any, {} as any, notifications as any, {} as any, {} as any)
   const messages: string[] = []
@@ -192,8 +340,48 @@ test('the real snapshot wrapper records only its failed operational state when b
   const tenant = { id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private', displayName: null, primaryDomain: null, status: 'ACTIVE', connection: null }
   await assert.rejects(() => (service as any).syncSignInLogs(tenant, 'token'), /could not safely refresh sign ins/)
   await assert.rejects(() => (service as any).syncDirectoryAuditLogs(tenant, 'token'), /could not safely refresh audit logs/)
-  assert.deepEqual(writes, ['state:running', 'state:FAILED', 'state:running', 'state:FAILED'])
-  assert.deepEqual(incidents, ['published', 'published'])
+  assert.deepEqual(forbiddenWrites, [])
+  assert.equal(stateUpserts.length, 2)
+  assert.equal(stateUpdates.length, 2)
+  for (const [index, resourceType] of ['SIGN_INS', 'AUDIT_LOGS'].entries()) {
+    const upsert = stateUpserts[index]
+    assert.deepEqual(upsert.where, { customerTenantId_resourceType: { customerTenantId: 'tenant-private', resourceType } })
+    assert.deepEqual({ ...upsert.create, lastAttemptAt: 'DATE' }, {
+      organizationId: 'org-private', customerTenantId: 'tenant-private', resourceType,
+      status: 'RUNNING', lastAttemptAt: 'DATE',
+    })
+    assert.ok(upsert.create.lastAttemptAt instanceof Date)
+    assert.deepEqual({ ...upsert.update, lastAttemptAt: 'DATE' }, {
+      status: 'RUNNING', lastAttemptAt: 'DATE', lastErrorCode: null, lastErrorMessage: null,
+    })
+    assert.ok(upsert.update.lastAttemptAt instanceof Date)
+    assert.deepEqual(stateUpdates[index], {
+      where: { customerTenantId_resourceType: { customerTenantId: 'tenant-private', resourceType } },
+      data: {
+        status: 'FAILED',
+        lastErrorCode: 'HAWKVIEW_INTERNAL_FAILURE',
+        lastErrorMessage: `HawkView could not safely refresh ${resourceType === 'SIGN_INS' ? 'sign ins' : 'audit logs'}. HawkView has not completed the first collection yet. HawkView support should investigate if this continues.`,
+        consecutiveFailures: { increment: 1 },
+      },
+    })
+  }
+  assert.deepEqual(incidents.map((incident) => incident.metadata), [
+    { resourceType: 'SIGN_INS', consecutiveFailures: 1, failureClass: 'HAWKVIEW_INTERNAL', reasonCode: 'HAWKVIEW_INTERNAL_FAILURE' },
+    { resourceType: 'AUDIT_LOGS', consecutiveFailures: 1, failureClass: 'HAWKVIEW_INTERNAL', reasonCode: 'HAWKVIEW_INTERNAL_FAILURE' },
+  ])
+  assert.equal(incidents.length, 2)
+  for (const [index, resourceType] of ['SIGN_INS', 'AUDIT_LOGS'].entries()) {
+    assert.deepEqual(Object.keys(incidents[index]).sort(), [
+      'actionLabel', 'actionUrl', 'category', 'customerTenantId', 'dedupeKey',
+      'description', 'eventType', 'metadata', 'organizationId', 'severity', 'source', 'title',
+    ].sort())
+    assert.equal(incidents[index].eventType, 'tenant.sync_failed')
+    assert.equal(incidents[index].organizationId, 'org-private')
+    assert.equal(incidents[index].customerTenantId, 'tenant-private')
+    assert.equal(incidents[index].dedupeKey, `tenant:tenant-private:sync:${resourceType}`)
+    assert.equal(incidents[index].description.includes('token'), false)
+    assert.equal(incidents[index].description.includes('private'), false)
+  }
   assert.equal(messages.length, 2)
   for (const message of messages) {
     assert.equal(message.includes('tenant-private'), false)
