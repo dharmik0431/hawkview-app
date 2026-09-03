@@ -33,9 +33,12 @@ const CATALOG_TYPES = new Set<CatalogType>([
 ])
 const ACCOUNT_CLASSES = new Set(['HUMAN', 'PRIVILEGED_HUMAN', 'SERVICE', 'SHARED', 'BREAK_GLASS', 'UNKNOWN'])
 const NETWORK_CONTEXT_TYPES = new Set(['SHARED_EGRESS', 'SHARED_DEVICE', 'EXPECTED_AUTH_RETRY', 'TRAVEL_EXCEPTION', 'MAINTENANCE'])
-const SUSPICIOUS_REFERENCE = /(?:bearer|password|passwd|secret|token|authorization|cookie|supabase|microsoft|entra|exchange|resend|amazonses|amazonaws|google|https?)/iu
-const JWT_SHAPE = /^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}$/u
-const OPAQUE_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u
+const PLATFORM_OPAQUE_REFERENCE = /^hvr1_([a-z]{2,24})_[a-f0-9]{64}$/u
+const PLATFORM_REFERENCE_KINDS = new Set([
+  'org', 'tenant', 'subject', 'evidence', 'event', 'actor', 'application',
+  'mailbox', 'source', 'context', 'reviewer', 'device', 'property',
+  'contribution', 'baseline', 'audit', 'checkpoint', 'observation',
+])
 const CATALOG_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u
 const CATALOG_VERSION = /^[a-z0-9][a-z0-9._/-]*$/u
 
@@ -82,8 +85,19 @@ function hasOnlyDataKeys(value: unknown, allowed: readonly string[]): value is R
   })
 }
 
+export function parseCanonicalIdentityTimestamp(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value)) return null
+  const parsed = Date.parse(value)
+  if (!Number.isFinite(parsed)) return null
+  try {
+    return new Date(parsed).toISOString() === value ? parsed : null
+  } catch {
+    return null
+  }
+}
+
 function isTimestamp(value: unknown): value is string {
-  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value) && Number.isFinite(Date.parse(value))
+  return parseCanonicalIdentityTimestamp(value) !== null
 }
 
 function isBoolean(value: unknown): value is boolean {
@@ -107,13 +121,14 @@ function isBoundedText(value: unknown, maximum = MAX_GENERAL_STRING_LENGTH): val
 }
 
 export function isOpaqueIdentityReference(value: unknown, maximum: number = IDENTITY_SIGNAL_MAX_EVIDENCE_REFERENCE_LENGTH): value is string {
-  return isBoundedText(value, maximum) && OPAQUE_REFERENCE.test(value) &&
-    !['__proto__', 'prototype', 'constructor'].includes(value.toLowerCase()) &&
-    !SUSPICIOUS_REFERENCE.test(value) && !JWT_SHAPE.test(value)
+  if (!isBoundedText(value, maximum)) return false
+  const match = PLATFORM_OPAQUE_REFERENCE.exec(value)
+  return Boolean(match && PLATFORM_REFERENCE_KINDS.has(match[1]!))
 }
 
 function isCatalogValue(value: unknown): value is string {
-  return isBoundedText(value, 128) && CATALOG_VALUE.test(value) && !SUSPICIOUS_REFERENCE.test(value)
+  return isBoundedText(value, 128) && CATALOG_VALUE.test(value) &&
+    !/(?:bearer|password|passwd|secret|token|signature|sig|oauth|authorization|code|api[_-]?key|credential|cookie|supabase|microsoft|entra|exchange|resend|amazonses|amazonaws|google|https?)/iu.test(value)
 }
 
 export function isIdentitySignalRuleId(value: unknown): value is IdentitySignalRuleId {
@@ -135,6 +150,18 @@ function validEvidence(value: unknown): boolean {
     hasOnlyDataKeys(entry, ['observedAt', 'maxAgeHours']) && isTimestamp(entry.observedAt) && isFiniteNumber(entry.maxAgeHours))
 }
 
+function isBaselineFrequencyKey(value: string): boolean {
+  const separator = value.indexOf(':')
+  if (separator <= 0) return false
+  const group = value.slice(0, separator)
+  const property = value.slice(separator + 1)
+  if (group === 'country') return /^[A-Z]{2}$/u.test(property)
+  if (group === 'asn') return /^\d{1,10}$/u.test(property)
+  if (group === 'client') return isCatalogValue(property)
+  if (group === 'device' || group === 'app') return isOpaqueIdentityReference(property)
+  return false
+}
+
 function validBaseline(value: unknown): value is BehaviorBaseline {
   if (!hasOnlyDataKeys(value, ['status', 'activeDays', 'successfulInteractiveSignIns', 'propertyFrequency'])) return false
   if (!isEnum(value.status, ['LEARNING', 'MATURE', 'UNAVAILABLE']) ||
@@ -143,7 +170,7 @@ function validBaseline(value: unknown): value is BehaviorBaseline {
   if (!isPlainRecord(value.propertyFrequency) || Reflect.ownKeys(value.propertyFrequency).length > 128) return false
   const frequencyRecord = value.propertyFrequency as RecordValue
   return Reflect.ownKeys(frequencyRecord).every((key) => {
-    if (typeof key !== 'string' || !isOpaqueIdentityReference(key, 160)) return false
+    if (typeof key !== 'string' || key.length > 160 || !isBaselineFrequencyKey(key)) return false
     const frequency = frequencyRecord[key]
     return hasOnlyDataKeys(frequency, ['events', 'days']) && isNonNegativeInteger(frequency.events) && isNonNegativeInteger(frequency.days)
   })
@@ -161,8 +188,33 @@ function validAuthEvent(value: unknown): value is AuthEvent {
     (value.deviceFingerprint === undefined || isOpaqueIdentityReference(value.deviceFingerprint))
 }
 
+function duplicateIdsAreIdentical<Entry>(
+  entries: readonly Entry[],
+  id: (entry: Entry) => string,
+  fingerprint: (entry: Entry) => string,
+): boolean {
+  const seen = new Map<string, string>()
+  for (const entry of entries) {
+    const key = id(entry)
+    const canonical = fingerprint(entry)
+    const previous = seen.get(key)
+    if (previous !== undefined && previous !== canonical) return false
+    seen.set(key, canonical)
+  }
+  return true
+}
+
 function validAuthEvents(value: unknown): value is AuthEvent[] {
-  return Array.isArray(value) && value.length <= MAX_CANDIDATE_COLLECTION_ITEMS && value.every(validAuthEvent)
+  if (!Array.isArray(value) || value.length > MAX_CANDIDATE_COLLECTION_ITEMS || !value.every(validAuthEvent)) return false
+  return duplicateIdsAreIdentical(
+    value,
+    (event) => event.id,
+    (event) => JSON.stringify([
+      event.id, event.occurredAt, event.outcome, event.interactive, event.subjectId,
+      event.sourceFingerprint ?? null, event.sourceAsn ?? null, event.appId ?? null,
+      event.client ?? null, event.deviceFingerprint ?? null,
+    ]),
+  )
 }
 
 function validContextEntry(value: unknown): value is NetworkContextEntry {
@@ -179,7 +231,7 @@ function validContextEntry(value: unknown): value is NetworkContextEntry {
 export function isApprovedCatalogRuntime(value: unknown): value is ApprovedCatalog {
   if (!hasOnlyDataKeys(value, ['catalogType', 'version', 'digest', 'status', 'approverIds', 'effectiveAt', 'expiresAt', 'values', 'accountClasses', 'contextEntries'])) return false
   if (typeof value.catalogType !== 'string' || !CATALOG_TYPES.has(value.catalogType as CatalogType) ||
-      !isBoundedText(value.version, MAX_CATALOG_VERSION_LENGTH) || !CATALOG_VERSION.test(value.version) || value.version !== value.version.toLowerCase() || SUSPICIOUS_REFERENCE.test(value.version) ||
+      !isBoundedText(value.version, MAX_CATALOG_VERSION_LENGTH) || !CATALOG_VERSION.test(value.version) || value.version !== value.version.toLowerCase() ||
       typeof value.digest !== 'string' || !/^[a-f0-9]{64}$/u.test(value.digest) ||
       !isEnum(value.status, ['DRAFT', 'APPROVED']) || !isTimestamp(value.effectiveAt) ||
       (value.expiresAt !== undefined && !isTimestamp(value.expiresAt)) ||
@@ -240,8 +292,13 @@ function validRuleCandidate(value: RecordValue, ruleId: IdentitySignalRuleId): b
     case 'HV-ID-CHG-002.v1':
       return isEnum(value.userType, ['MEMBER', 'GUEST', 'UNKNOWN']) && validStringOrNullTimestamp(value.authoritativeCreatedAt) && isTimestamp(value.privilegeAt) && isCatalogValue(value.privilegeOperation) && isBoolean(value.privilegeSucceeded)
     case 'HV-ID-CHG-003.v1':
-      return isTimestamp(value.anchorAt) && isOpaqueIdentityReference(value.actorId) && Array.isArray(value.events) && value.events.length <= MAX_CANDIDATE_COLLECTION_ITEMS && value.events.every((event) =>
-        hasOnlyDataKeys(event, ['id', 'occurredAt', 'actorId', 'operation', 'succeeded']) && isOpaqueIdentityReference(event.id) && isTimestamp(event.occurredAt) && isOpaqueIdentityReference(event.actorId) && isCatalogValue(event.operation) && isBoolean(event.succeeded))
+      if (!isTimestamp(value.anchorAt) || !isOpaqueIdentityReference(value.actorId) || !Array.isArray(value.events) || value.events.length > MAX_CANDIDATE_COLLECTION_ITEMS || !value.events.every((event) =>
+        hasOnlyDataKeys(event, ['id', 'occurredAt', 'actorId', 'operation', 'succeeded']) && isOpaqueIdentityReference(event.id) && isTimestamp(event.occurredAt) && isOpaqueIdentityReference(event.actorId) && isCatalogValue(event.operation) && isBoolean(event.succeeded))) return false
+      return duplicateIdsAreIdentical(
+        value.events as Array<{ id: string; occurredAt: string; actorId: string; operation: string; succeeded: boolean }>,
+        (event) => event.id,
+        (event) => JSON.stringify([event.id, event.occurredAt, event.actorId, event.operation, event.succeeded]),
+      )
     case 'HV-ID-CHG-004.v1':
       return isCatalogValue(value.operation) && ['actorBaselineEvents', 'tenantBaselineEvents', 'actorOperationCount', 'tenantOperationCount', 'baselineActiveDays'].every((field) => isNonNegativeInteger(value[field])) && isBoolean(value.succeeded)
     case 'HV-ID-CHG-005.v1':

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 
 import {
@@ -22,6 +23,11 @@ import { computeIdentitySignalCatalogDigest, evaluateIdentitySignal, evaluateIde
 
 const NOW = '2026-09-02T12:00:00.000Z'
 
+function opaque(kind: string, label: string): string {
+  if (label.startsWith('hvr1_')) return label
+  return `hvr1_${kind}_${createHash('sha256').update(`${kind}:${label}`).digest('hex')}`
+}
+
 function approvedCatalog(
   catalogType: CatalogType,
   options: {
@@ -32,24 +38,35 @@ function approvedCatalog(
     approvers?: string[]
   } = {},
 ): ApprovedCatalog {
+  const accountClasses = options.accountClasses
+    ? Object.fromEntries(Object.entries(options.accountClasses).map(([key, accountClass]) => [opaque('subject', key), accountClass]))
+    : undefined
+  const contextEntries = (options.contextEntries ?? (catalogType === 'NETWORK_CONTEXT' ? [] : undefined))?.map((entry) => ({
+    ...entry,
+    id: opaque('context', entry.id),
+    subjectId: entry.subjectId ? opaque('subject', entry.subjectId) : undefined,
+    appId: entry.appId ? opaque('application', entry.appId) : undefined,
+    deviceFingerprint: entry.deviceFingerprint ? opaque('device', entry.deviceFingerprint) : undefined,
+    sourceFingerprint: entry.sourceFingerprint ? opaque('source', entry.sourceFingerprint) : undefined,
+  }))
   const value = {
     catalogType,
     version: `${catalogType.toLowerCase()}/1`,
     status: options.status ?? 'APPROVED' as const,
-    approverIds: options.approvers ?? ['reviewer-a', 'reviewer-b'],
+    approverIds: (options.approvers ?? ['reviewer-a', 'reviewer-b']).map((value) => opaque('reviewer', value)),
     effectiveAt: '2026-08-01T00:00:00.000Z',
     expiresAt: '2027-08-01T00:00:00.000Z',
     values: options.values ?? [],
-    accountClasses: options.accountClasses,
-    contextEntries: options.contextEntries ?? (catalogType === 'NETWORK_CONTEXT' ? [] : undefined),
+    accountClasses,
+    contextEntries,
   }
   return Object.freeze({ ...value, digest: computeIdentitySignalCatalogDigest(value) })
 }
 
 function context(overrides: Partial<IdentitySignalEvaluationContext> = {}): IdentitySignalEvaluationContext {
   return {
-    organizationId: 'org-a',
-    customerTenantId: 'tenant-a',
+    organizationId: opaque('org', 'org-a'),
+    customerTenantId: opaque('tenant', 'tenant-a'),
     evaluatedAt: NOW,
     engineVersion: IDENTITY_RISK_ENGINE_VERSION,
     catalogVersion: IDENTITY_SIGNAL_CATALOG_VERSION,
@@ -83,8 +100,8 @@ function context(overrides: Partial<IdentitySignalEvaluationContext> = {}): Iden
 function common<RuleId extends IdentitySignalRuleId>(ruleId: RuleId, subjectId = 'user-1'): CandidateBase & { ruleId: RuleId } {
   return {
     ruleId,
-    subject: { type: 'USER' as const, opaqueId: subjectId },
-    evidenceReferences: ['evidence-b', 'evidence-a', 'evidence-a'],
+    subject: { type: 'USER' as const, opaqueId: opaque('subject', subjectId) },
+    evidenceReferences: [opaque('evidence', 'evidence-b'), opaque('evidence', 'evidence-a'), opaque('evidence', 'evidence-a')],
     evidence: [{ observedAt: '2026-09-02T11:30:00.000Z', maxAgeHours: 2 }],
     evidenceState: 'COMPLETE' as const,
   }
@@ -166,9 +183,9 @@ test('lifecycle privilege rules require successful cataloged operations and exac
 })
 
 test('privileged-change burst includes anchor and excludes an event exactly 15 minutes older', () => {
-  const event = (id: string, occurredAt: string) => ({ id, occurredAt, actorId: 'actor-1', operation: 'reset-mfa', succeeded: true })
+  const event = (id: string, occurredAt: string) => ({ id: opaque('event', id), occurredAt, actorId: opaque('actor', 'actor-1'), operation: 'reset-mfa', succeeded: true })
   const candidate = {
-    ...common('HV-ID-CHG-003.v1'), anchorAt: NOW, actorId: 'actor-1',
+    ...common('HV-ID-CHG-003.v1'), anchorAt: NOW, actorId: opaque('actor', 'actor-1'),
     events: [
       event('excluded', '2026-09-02T11:45:00.000Z'), event('1', '2026-09-02T11:45:00.001Z'),
       event('2', '2026-09-02T11:48:00.000Z'), event('3', '2026-09-02T11:50:00.000Z'),
@@ -176,7 +193,7 @@ test('privileged-change burst includes anchor and excludes an event exactly 15 m
     ],
   }
   assert.equal(evaluateIdentitySignal(context(), candidate).status, 'MATCHED')
-  assert.equal(evaluateIdentitySignal(context(), { ...candidate, events: candidate.events.filter((entry) => entry.id !== '4') }).status, 'NOT_MATCHED')
+  assert.equal(evaluateIdentitySignal(context(), { ...candidate, events: candidate.events.filter((entry) => entry.id !== opaque('event', '4')) }).status, 'NOT_MATCHED')
 })
 
 test('administrative rarity and security weakening use locked thresholds and transitions', () => {
@@ -194,22 +211,22 @@ test('administrative rarity and security weakening use locked thresholds and tra
 
 test('application rules distinguish declared permission from credential metadata changes', () => {
   assert.equal(evaluateIdentitySignal(context(), {
-    ...common('HV-ID-APP-001.v1', 'app-1'), subject: { type: 'APPLICATION', opaqueId: 'app-1' },
+    ...common('HV-ID-APP-001.v1', 'app-1'), subject: { type: 'APPLICATION', opaqueId: opaque('application', 'app-1') },
     declaredPermissions: ['Directory.ReadWrite.All'], authoritativeCreatedAt: '2026-09-01T12:00:00.000Z', observedAt: NOW,
   }).status, 'MATCHED')
   assert.equal(evaluateIdentitySignal(context(), {
-    ...common('HV-ID-APP-002.v1', 'app-1'), subject: { type: 'APPLICATION', opaqueId: 'app-1' },
+    ...common('HV-ID-APP-002.v1', 'app-1'), subject: { type: 'APPLICATION', opaqueId: opaque('application', 'app-1') },
     applicationPermissionIds: ['Directory.ReadWrite.All'], credentialMetadataChanged: true, authoritativeComparable: true, succeeded: true,
   }).status, 'MATCHED')
 })
 
 test('mailbox rules normalize accepted domains and fail closed on incomplete projection', () => {
   assert.equal(evaluateIdentitySignal(context(), {
-    ...common('HV-ID-MBX-001.v1', 'mailbox-1'), subject: { type: 'MAILBOX', opaqueId: 'mailbox-1' },
+    ...common('HV-ID-MBX-001.v1', 'mailbox-1'), subject: { type: 'MAILBOX', opaqueId: opaque('mailbox', 'mailbox-1') },
     enabled: true, recipientAddresses: ['safe@tenant.example', 'external@example.net'], verifiedAcceptedDomains: ['tenant.example'],
   }).status, 'MATCHED')
   const concealment = {
-    ...common('HV-ID-MBX-002.v1', 'mailbox-1'), subject: { type: 'MAILBOX' as const, opaqueId: 'mailbox-1' },
+    ...common('HV-ID-MBX-002.v1', 'mailbox-1'), subject: { type: 'MAILBOX' as const, opaqueId: opaque('mailbox', 'mailbox-1') },
     enabled: true, conditionsCompleteness: 'COMPLETE' as const, actionsCompleteness: 'COMPLETE' as const,
     populatedConditionCount: 0, populatedExceptionCount: 0,
     actions: { delete: true, permanentDelete: false, moveTarget: false, markAsRead: true, stopProcessing: false },
@@ -220,7 +237,7 @@ test('mailbox rules normalize accepted domains and fail closed on incomplete pro
 
 test('mailbox correlation requires complete projection, independent auth family, and half-open two-hour window', () => {
   const candidate = {
-    ...common('HV-ID-MBX-003.v1', 'mailbox-1'), subject: { type: 'MAILBOX' as const, opaqueId: 'mailbox-1' },
+    ...common('HV-ID-MBX-003.v1', 'mailbox-1'), subject: { type: 'MAILBOX' as const, opaqueId: opaque('mailbox', 'mailbox-1') },
     projectionComplete: true, mailboxChangeAt: '2026-09-02T11:59:59.999Z', independentSignInAt: '2026-09-02T10:00:00.000Z',
     independentSignInRuleId: 'HV-ID-AUTH-006.v1' as const, baseSeverity: 'HIGH' as const,
   }
@@ -246,9 +263,13 @@ test('unfamiliar-properties rule masks exact shared contexts and never learns ma
   const candidate = {
     ...common('HV-ID-AUTH-003.v1'), baseline: {
       ...matureHumanBaseline,
-      propertyFrequency: { 'device:device-1': { events: 5, days: 3 }, 'client:browser': { events: 5, days: 3 }, 'app:app-1': { events: 5, days: 3 } },
+      propertyFrequency: {
+        [`device:${opaque('device', 'device-1')}`]: { events: 5, days: 3 },
+        'client:browser': { events: 5, days: 3 },
+        [`app:${opaque('application', 'app-1')}`]: { events: 5, days: 3 },
+      },
     },
-    properties: { country: 'CA', asn: 64500, device: 'device-1', client: 'browser', app: 'app-1' }, sourceFingerprint: 'source-1',
+    properties: { country: 'CA', asn: 64500, device: opaque('device', 'device-1'), client: 'browser', app: opaque('application', 'app-1') }, sourceFingerprint: opaque('source', 'source-1'),
   }
   assert.equal(evaluateIdentitySignal(ctx, candidate).status, 'SUPPRESSED')
 })
@@ -257,8 +278,8 @@ test('travel uses strict distance and speed and exact expiring exceptions', () =
   const candidate = {
     ...common('HV-ID-AUTH-004.v1'),
     baseline: matureHumanBaseline,
-    previous: { occurredAt: '2026-09-02T10:00:00.000Z', latitude: 43.6532, longitude: -79.3832, sourceFingerprint: 'toronto' },
-    current: { occurredAt: '2026-09-02T11:00:00.000Z', latitude: 51.5074, longitude: -0.1278, sourceFingerprint: 'london' },
+    previous: { occurredAt: '2026-09-02T10:00:00.000Z', latitude: 43.6532, longitude: -79.3832, sourceFingerprint: opaque('source', 'toronto') },
+    current: { occurredAt: '2026-09-02T11:00:00.000Z', latitude: 51.5074, longitude: -0.1278, sourceFingerprint: opaque('source', 'london') },
   }
   assert.equal(evaluateIdentitySignal(context(), candidate).status, 'MATCHED')
   const network = approvedCatalog('NETWORK_CONTEXT', { contextEntries: [{
@@ -274,17 +295,17 @@ test('broad or malformed network exceptions fail closed instead of suppressing a
   const ctx = context({ catalogs: context().catalogs!.map((entry) => entry.catalogType === 'NETWORK_CONTEXT' ? unsafe : entry) })
   assert.equal(evaluateIdentitySignal(ctx, {
     ...common('HV-ID-AUTH-003.v1'), baseline: matureHumanBaseline,
-    properties: { country: 'CA', asn: 64500, device: 'device-1', client: 'browser', app: 'app-1' }, sourceFingerprint: 'source-1',
+    properties: { country: 'CA', asn: 64500, device: opaque('device', 'device-1'), client: 'browser', app: opaque('application', 'app-1') }, sourceFingerprint: opaque('source', 'source-1'),
   }).reasonCodes[0], 'RULE_CONFIG_UNAPPROVED')
 })
 
 function burstEvents(kind: 'FAILURE' | 'MFA_DENIED', count: number) {
   return [
     ...Array.from({ length: count }, (_, index) => ({
-      id: `failure-${index}`, occurredAt: `2026-09-02T11:0${Math.min(index, 9)}:00.000Z`, outcome: kind,
-      interactive: true, subjectId: 'user-1', appId: 'app-1', client: 'browser', deviceFingerprint: 'device-1', sourceFingerprint: 'source-1',
+      id: opaque('event', `failure-${index}`), occurredAt: `2026-09-02T11:0${Math.min(index, 9)}:00.000Z`, outcome: kind,
+      interactive: true, subjectId: opaque('subject', 'user-1'), appId: opaque('application', 'app-1'), client: 'browser', deviceFingerprint: opaque('device', 'device-1'), sourceFingerprint: opaque('source', 'source-1'),
     } as const)),
-    { id: 'success', occurredAt: '2026-09-02T11:12:00.000Z', outcome: 'SUCCESS' as const, interactive: true, subjectId: 'user-1', appId: 'app-1', client: 'browser', deviceFingerprint: 'device-1', sourceFingerprint: 'source-1' },
+    { id: opaque('event', 'success'), occurredAt: '2026-09-02T11:12:00.000Z', outcome: 'SUCCESS' as const, interactive: true, subjectId: opaque('subject', 'user-1'), appId: opaque('application', 'app-1'), client: 'browser', deviceFingerprint: opaque('device', 'device-1'), sourceFingerprint: opaque('source', 'source-1') },
   ]
 }
 
@@ -298,7 +319,7 @@ test('failure and MFA-denial bursts match exact thresholds; expected retries sup
   const retryContext = context({ catalogs: context().catalogs!.map((entry) => entry.catalogType === 'NETWORK_CONTEXT' ? retry : entry) })
   assert.equal(evaluateIdentitySignal(retryContext, failureCandidate).reasonCodes[0], 'EXPECTED_AUTH_RETRY')
   assert.equal(evaluateIdentitySignal(context(), { ...common('HV-ID-AUTH-006.v1'), events: burstEvents('MFA_DENIED', 3), normalizedMfaDetailComplete: true }).severity, 'HIGH')
-  const mixedSubjects = burstEvents('FAILURE', 10).map((event, index) => event.outcome === 'FAILURE' ? { ...event, subjectId: index % 2 ? 'user-1' : 'user-2' } : event)
+  const mixedSubjects = burstEvents('FAILURE', 10).map((event, index) => event.outcome === 'FAILURE' ? { ...event, subjectId: opaque('subject', index % 2 ? 'user-1' : 'user-2') } : event)
   assert.equal(evaluateIdentitySignal(context(), { ...common('HV-ID-AUTH-005.v1'), events: mixedSubjects }).status, 'NOT_MATCHED')
 })
 
@@ -310,12 +331,12 @@ test('privileged legacy authentication requires exact approved client', () => {
 
 test('password spray excludes unsupported classes, requires completeness, and suppresses shared egress', () => {
   const failures = Array.from({ length: 10 }, (_, index) => ({
-    id: `spray-${index}`, occurredAt: `2026-09-02T11:0${index}:00.000Z`, outcome: 'FAILURE' as const,
-    interactive: true, subjectId: `user-${(index % 5) + 1}`, sourceFingerprint: 'spray-source', deviceFingerprint: 'device-x',
+    id: opaque('event', `spray-${index}`), occurredAt: `2026-09-02T11:0${index}:00.000Z`, outcome: 'FAILURE' as const,
+    interactive: true, subjectId: opaque('subject', `user-${(index % 5) + 1}`), sourceFingerprint: opaque('source', 'spray-source'), deviceFingerprint: opaque('device', 'device-x'),
   }))
   const candidate = {
-    ...common('HV-ID-AUTH-008.v1', 'source-1'), subject: { type: 'SOURCE' as const, opaqueId: 'source-1' }, tenantWideComplete: true,
-    events: [...failures, { id: 'spray-success', occurredAt: '2026-09-02T11:12:00.000Z', outcome: 'SUCCESS' as const, interactive: true, subjectId: 'user-1', sourceFingerprint: 'spray-source', deviceFingerprint: 'device-x' }],
+    ...common('HV-ID-AUTH-008.v1', 'source-1'), subject: { type: 'SOURCE' as const, opaqueId: opaque('source', 'source-1') }, tenantWideComplete: true,
+    events: [...failures, { id: opaque('event', 'spray-success'), occurredAt: '2026-09-02T11:12:00.000Z', outcome: 'SUCCESS' as const, interactive: true, subjectId: opaque('subject', 'user-1'), sourceFingerprint: opaque('source', 'spray-source'), deviceFingerprint: opaque('device', 'device-x') }],
   }
   assert.equal(evaluateIdentitySignal(context(), candidate).status, 'MATCHED')
   const shared = approvedCatalog('NETWORK_CONTEXT', { contextEntries: [{
@@ -341,7 +362,7 @@ test('output is deterministic, sorted, evidence-bounded, and excludes Microsoft 
   const first = evaluateIdentitySignal(context(), candidate)
   const second = evaluateIdentitySignal(context(), candidate)
   assert.deepEqual(first, second)
-  assert.deepEqual(first.evidenceReferences, ['evidence-a', 'evidence-b'])
+  assert.deepEqual(first.evidenceReferences, [opaque('evidence', 'evidence-a'), opaque('evidence', 'evidence-b')].sort())
   const serialized = JSON.stringify(first)
   assert.ok(!serialized.includes('microsoft'))
   assert.equal(first.channel, 'HAWKVIEW_IDENTITY_SIGNALS')
@@ -439,15 +460,34 @@ test('opaque privacy grammar rejects principals, URLs, credentials, JWTs, and pr
     assert.ok(!serialized.includes('secret-value'))
     assert.ok(!serialized.includes(jwt))
   }
+  for (const secretShaped of [
+    'sig=SIGNATURESECRET',
+    'signature:SIGNATURESECRET',
+    'code=OAUTHCODESECRET',
+    'authorization_code=OAUTHCODESECRET',
+    'api_key=APIKEYSECRET',
+    'credential=CREDENTIALSECRET',
+    `jwt:${jwt}`,
+    `Bearer ${jwt}`,
+    `hvr1_token_${'a'.repeat(64)}`,
+    `hvr1_sig_${'b'.repeat(64)}`,
+    `hvr1_code_${'c'.repeat(64)}`,
+    `hvr1_credential_${'d'.repeat(64)}`,
+  ]) {
+    const output = evaluateIdentitySignal(context(), { ...valid, evidenceReferences: [secretShaped] })
+    assert.equal(output.status, 'NOT_EVALUATED')
+    assert.equal(output.ruleId, null)
+    assert.ok(!JSON.stringify(output).includes(secretShaped))
+  }
 
-  const invalidCatalogs = [
-    approvedCatalog('PRIVILEGED_ROLE_GROUP', { approvers: ['reviewer-a', 'owner@example.com'] }),
+  const invalidCatalogs: ApprovedCatalog[] = [
+    { ...approvedCatalog('PRIVILEGED_ROLE_GROUP'), approverIds: [opaque('reviewer', 'reviewer-a'), 'owner@example.com'] },
     approvedCatalog('PRIVILEGED_ROLE_GROUP', { values: ['access-token-secret'] }),
-    approvedCatalog('ACCOUNT_CLASS', { accountClasses: { 'owner@example.com': 'HUMAN' } }),
-    approvedCatalog('NETWORK_CONTEXT', { contextEntries: [{
+    { ...approvedCatalog('ACCOUNT_CLASS', { accountClasses: {} }), accountClasses: { 'owner@example.com': 'HUMAN' } },
+    { ...approvedCatalog('NETWORK_CONTEXT'), contextEntries: [{
       id: 'https://provider.example/context', type: 'SHARED_EGRESS', startsAt: '2026-09-02T11:00:00.000Z',
       expiresAt: '2026-09-02T13:00:00.000Z', sourceFingerprint: 'source-1',
-    }] }),
+    }] },
   ]
   for (const catalog of invalidCatalogs) {
     const output = evaluateIdentitySignal(context({ catalogs: [catalog] }), valid)
@@ -457,6 +497,61 @@ test('opaque privacy grammar rejects principals, URLs, credentials, JWTs, and pr
     assert.ok(!JSON.stringify(output).includes('provider.example'))
     assert.ok(!JSON.stringify(output).includes('access-token-secret'))
   }
+})
+
+test('catalog signatures cover nested fields named digest instead of recursively omitting them', () => {
+  const originalUnsigned = {
+    catalogType: 'ACCOUNT_CLASS' as const,
+    version: 'account_class/1',
+    status: 'APPROVED' as const,
+    approverIds: [opaque('reviewer', 'reviewer-a'), opaque('reviewer', 'reviewer-b')],
+    effectiveAt: '2026-08-01T00:00:00.000Z',
+    expiresAt: '2027-08-01T00:00:00.000Z',
+    values: [] as string[],
+    accountClasses: { digest: 'HUMAN' as const },
+  }
+  const changedUnsigned = {
+    ...originalUnsigned,
+    accountClasses: { digest: 'SERVICE' as const },
+  }
+  assert.notEqual(computeIdentitySignalCatalogDigest(originalUnsigned), computeIdentitySignalCatalogDigest(changedUnsigned))
+  assert.equal(
+    computeIdentitySignalCatalogDigest({ ...originalUnsigned, digest: 'top-level-signature-is-omitted' } as typeof originalUnsigned),
+    computeIdentitySignalCatalogDigest(originalUnsigned),
+  )
+})
+
+test('conflicting duplicate event IDs fail closed in either order while exact duplicates dedupe', () => {
+  const changeEvent = (label: string, operation = 'reset-mfa') => ({
+    id: opaque('event', label), occurredAt: '2026-09-02T11:59:00.000Z', actorId: opaque('actor', 'actor-1'), operation, succeeded: true,
+  })
+  const baseEvents = Array.from({ length: 5 }, (_, index) => changeEvent(`change-${index}`))
+  const changeCandidate = {
+    ...common('HV-ID-CHG-003.v1'), anchorAt: NOW, actorId: opaque('actor', 'actor-1'), events: baseEvents,
+  }
+  assert.equal(evaluateIdentitySignal(context(), { ...changeCandidate, events: [...baseEvents, baseEvents[0]!] }).status, 'MATCHED')
+  const conflictingChange = { ...baseEvents[0]!, operation: 'other-operation' }
+  for (const events of [[...baseEvents, conflictingChange], [conflictingChange, ...baseEvents]]) {
+    assert.deepEqual(evaluateIdentitySignal(context(), { ...changeCandidate, events }).reasonCodes, ['EVIDENCE_MALFORMED'])
+  }
+
+  const authEvents = burstEvents('FAILURE', 10)
+  const conflictingAuth = { ...authEvents[0]!, outcome: 'SUCCESS' as const }
+  const authCandidate = { ...common('HV-ID-AUTH-005.v1'), events: authEvents }
+  assert.equal(evaluateIdentitySignal(context(), { ...authCandidate, events: [...authEvents, authEvents[0]!] }).status, 'MATCHED')
+  for (const events of [[...authEvents, conflictingAuth], [conflictingAuth, ...authEvents]]) {
+    assert.deepEqual(evaluateIdentitySignal(context(), { ...authCandidate, events }).reasonCodes, ['EVIDENCE_MALFORMED'])
+  }
+
+  const sprayDuplicate = {
+    id: opaque('event', 'spray-duplicate'), occurredAt: '2026-09-02T11:00:00.000Z', outcome: 'FAILURE' as const,
+    interactive: true, subjectId: opaque('subject', 'user-1'), sourceFingerprint: opaque('source', 'spray-duplicate'),
+  }
+  const spray = {
+    ...common('HV-ID-AUTH-008.v1', 'spray-source'), subject: { type: 'SOURCE' as const, opaqueId: opaque('source', 'spray-source') },
+    tenantWideComplete: true, events: new Array(10).fill(sprayDuplicate),
+  }
+  assert.equal(evaluateIdentitySignal(context(), spray).status, 'NOT_MATCHED')
 })
 
 test('clock skew is a bounded version-owned policy from zero through five minutes', () => {
@@ -475,6 +570,89 @@ test('clock skew is a bounded version-owned policy from zero through five minute
   assert.deepEqual(rejected.reasonCodes, ['RULE_CONFIG_UNAPPROVED'])
 })
 
+test('rule-specific event and change timestamps accept +5m and reject +5m+1ms', () => {
+  const changeAtBoundary = {
+    ...common('HV-ID-CHG-001.v1'), lifecycle: 'CREATED' as const, lifecycleAt: NOW,
+    privilegeAt: '2026-09-02T12:05:00.000Z', privilegeOperation: 'privileged-op', privilegeSucceeded: true,
+  }
+  assert.equal(evaluateIdentitySignal(context(), changeAtBoundary).status, 'MATCHED')
+  assert.deepEqual(evaluateIdentitySignal(context(), {
+    ...changeAtBoundary,
+    privilegeAt: '2026-09-02T12:05:00.001Z',
+  }).reasonCodes, ['EVIDENCE_FUTURE_DATED'])
+
+  const event = (id: string, occurredAt: string) => ({ id: opaque('event', id), occurredAt, actorId: opaque('actor', 'actor-1'), operation: 'reset-mfa', succeeded: true })
+  const burstAtBoundary = {
+    ...common('HV-ID-CHG-003.v1'), anchorAt: '2026-09-02T12:05:00.000Z', actorId: opaque('actor', 'actor-1'),
+    events: Array.from({ length: 5 }, (_, index) => event(`future-event-${index}`, '2026-09-02T12:05:00.000Z')),
+  }
+  assert.equal(evaluateIdentitySignal(context(), burstAtBoundary).status, 'MATCHED')
+  assert.deepEqual(evaluateIdentitySignal(context(), {
+    ...burstAtBoundary,
+    events: [...burstAtBoundary.events, event('too-future', '2026-09-02T12:05:00.001Z')],
+  }).reasonCodes, ['EVIDENCE_FUTURE_DATED'])
+})
+
+test('authentication, travel, break-glass, and context suppression cannot use evidence beyond +5m', () => {
+  const disabledAtBoundary = {
+    ...common('HV-ID-AUTH-001.v1'), disabledAt: NOW, activityAt: '2026-09-02T12:05:00.000Z', outcome: 'SUCCESS' as const,
+  }
+  assert.equal(evaluateIdentitySignal(context(), disabledAtBoundary).status, 'MATCHED')
+  assert.deepEqual(evaluateIdentitySignal(context(), {
+    ...disabledAtBoundary,
+    activityAt: '2026-09-02T12:05:00.001Z',
+  }).reasonCodes, ['EVIDENCE_FUTURE_DATED'])
+
+  const futureEvents = [
+    ...Array.from({ length: 10 }, (_, index) => ({
+      id: opaque('event', `boundary-failure-${index}`), occurredAt: `2026-09-02T11:5${index}:00.000Z`, outcome: 'FAILURE' as const,
+      interactive: true, subjectId: opaque('subject', 'user-1'), sourceFingerprint: opaque('source', 'source-1'),
+    })),
+    { id: opaque('event', 'boundary-success'), occurredAt: '2026-09-02T12:05:00.000Z', outcome: 'SUCCESS' as const, interactive: true, subjectId: opaque('subject', 'user-1'), sourceFingerprint: opaque('source', 'source-1') },
+  ]
+  const authBurst = { ...common('HV-ID-AUTH-005.v1'), events: futureEvents }
+  assert.equal(evaluateIdentitySignal(context(), authBurst).status, 'MATCHED')
+  assert.deepEqual(evaluateIdentitySignal(context(), {
+    ...authBurst,
+    events: futureEvents.map((event) => event.id === opaque('event', 'boundary-success') ? { ...event, occurredAt: '2026-09-02T12:05:00.001Z' } : event),
+  }).reasonCodes, ['EVIDENCE_FUTURE_DATED'])
+
+  const travelException = approvedCatalog('NETWORK_CONTEXT', { contextEntries: [{
+    id: 'travel-boundary', type: 'TRAVEL_EXCEPTION', startsAt: '2026-09-02T11:00:00.000Z', expiresAt: '2026-09-02T13:00:00.000Z',
+    subjectId: 'user-1', sourceFingerprint: 'london-boundary',
+  }] })
+  const contextual = context({ catalogs: context().catalogs!.map((entry) => entry.catalogType === 'NETWORK_CONTEXT' ? travelException : entry) })
+  const travel = {
+    ...common('HV-ID-AUTH-004.v1'), baseline: matureHumanBaseline,
+    previous: { occurredAt: '2026-09-02T11:05:00.000Z', latitude: 43.6532, longitude: -79.3832, sourceFingerprint: opaque('source', 'toronto-boundary') },
+    current: { occurredAt: '2026-09-02T12:05:00.000Z', latitude: 51.5074, longitude: -0.1278, sourceFingerprint: opaque('source', 'london-boundary') },
+  }
+  assert.equal(evaluateIdentitySignal(contextual, travel).status, 'SUPPRESSED')
+  assert.deepEqual(evaluateIdentitySignal(contextual, {
+    ...travel,
+    current: { ...travel.current, occurredAt: '2026-09-02T12:05:00.001Z' },
+  }).reasonCodes, ['EVIDENCE_FUTURE_DATED'])
+
+  const breakGlass = { ...common('HV-ID-AUTH-009.v1', 'breakglass-1'), successfulInteractive: true, occurredAt: '2026-09-02T12:05:00.000Z' }
+  assert.equal(evaluateIdentitySignal(context(), breakGlass).status, 'MATCHED')
+  assert.deepEqual(evaluateIdentitySignal(context(), {
+    ...breakGlass,
+    occurredAt: '2026-09-02T12:05:00.001Z',
+  }).reasonCodes, ['EVIDENCE_FUTURE_DATED'])
+})
+
+test('canonical timestamp parsing rejects impossible calendar rollovers', () => {
+  const candidate = {
+    ...common('HV-ID-CHG-001.v1'), lifecycle: 'CREATED' as const,
+    lifecycleAt: '2026-02-30T12:00:00.000Z', privilegeAt: NOW,
+    privilegeOperation: 'privileged-op', privilegeSucceeded: true,
+  }
+  const output = evaluateIdentitySignal(context(), candidate)
+  assert.equal(output.status, 'NOT_EVALUATED')
+  assert.deepEqual(output.reasonCodes, ['EVIDENCE_MALFORMED'])
+  assert.equal(output.ruleId, null)
+})
+
 test('candidate count and byte budgets reject adversarial batches with one bounded operational result', () => {
   assert.equal(IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES, 1_000)
   assert.equal(IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES, 2_000_000)
@@ -488,9 +666,9 @@ test('candidate count and byte budgets reject adversarial batches with one bound
   assert.deepEqual(countRejected[0]!.reasonCodes, ['EVALUATION_BUDGET_EXCEEDED'])
   assert.equal(fiftyThousand.length, 50_000)
 
-  const largeReferences = Array.from({ length: 32 }, (_, index) => `r${index}-${'x'.repeat(250)}`)
+  const largeReferences = Array.from({ length: 32 }, (_, index) => opaque('evidence', `large-${index}`))
   const largeValidCandidate = { ...candidate, evidenceReferences: largeReferences }
-  const byteRejected = evaluateIdentitySignals(context(), new Array(150).fill(largeValidCandidate))
+  const byteRejected = evaluateIdentitySignals(context(), new Array(1_000).fill(largeValidCandidate))
   assert.equal(byteRejected.length, 1)
   assert.deepEqual(byteRejected[0]!.reasonCodes, ['EVALUATION_BUDGET_EXCEEDED'])
   assert.ok(Object.isFrozen(byteRejected))
@@ -521,5 +699,7 @@ test('batch result ordering uses canonical bytewise comparison', () => {
     ...common('HV-ID-EXP-001.v1', opaqueId), privileged: true, enabled: true, effectiveMfa: 'NOT_ENFORCED',
   })
   const output = evaluateIdentitySignals(context(), [make('admin-a'), make('admin-Z'), make('admin-A')])
-  assert.deepEqual(output.map((entry) => entry.subject.opaqueId), ['admin-A', 'admin-Z', 'admin-a'])
+  assert.deepEqual(output.map((entry) => entry.subject.opaqueId), [
+    opaque('subject', 'admin-a'), opaque('subject', 'admin-Z'), opaque('subject', 'admin-A'),
+  ].sort())
 })

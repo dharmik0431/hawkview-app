@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto'
+
 import type { AccountClass } from './identity-signal-contract.js'
-import { isOpaqueIdentityReference } from './identity-signal-runtime.js'
+import { isOpaqueIdentityReference, parseCanonicalIdentityTimestamp } from './identity-signal-runtime.js'
 
 export const BASELINE_PERSISTENCE_CONTRACT_VERSION = 'hawkview-identity-baseline-persistence/1' as const
 
@@ -28,6 +30,7 @@ export type BaselineContributionInput = Readonly<{
   propertyKey: string
   accountClass: AccountClass
   evaluatedAt: string
+  futureClockSkewToleranceMs: number
   observations: readonly Readonly<{ id: string; observedAt: string; utcDay: string }>[]
   unresolvedFinding: boolean
   existingContributionKeys: readonly string[]
@@ -51,6 +54,7 @@ export type BaselineContributionDecision = Readonly<{
     | 'BASELINE_DUPLICATE_OR_DAILY_CAP'
     | 'BASELINE_RECURRENCE_REQUIRED'
     | 'BASELINE_INPUT_MALFORMED'
+    | 'BASELINE_INPUT_FUTURE_DATED'
   contributionKey: string | null
 }>
 
@@ -60,7 +64,8 @@ const MAX_EXISTING_CONTRIBUTION_KEYS = 366
 const MAX_REVIEWERS = 16
 
 function validDay(value: string) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+  const timestamp = `${value}T00:00:00.000Z`
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) && parseCanonicalIdentityTimestamp(timestamp) !== null
 }
 
 function reject(reasonCode: BaselineContributionDecision['reasonCode']): BaselineContributionDecision {
@@ -69,7 +74,8 @@ function reject(reasonCode: BaselineContributionDecision['reasonCode']): Baselin
 
 function assessBaselineContributionWithinBoundary(input: BaselineContributionInput): BaselineContributionDecision {
   if (!isOpaqueIdentityReference(input.subjectId, 160) || !isOpaqueIdentityReference(input.propertyKey, 160) ||
-      !Number.isFinite(Date.parse(input.evaluatedAt)) || !Array.isArray(input.observations) ||
+      parseCanonicalIdentityTimestamp(input.evaluatedAt) === null || !Number.isInteger(input.futureClockSkewToleranceMs) ||
+      input.futureClockSkewToleranceMs < 0 || input.futureClockSkewToleranceMs > 300_000 || !Array.isArray(input.observations) ||
       input.observations.length > MAX_BASELINE_OBSERVATIONS || !Array.isArray(input.existingContributionKeys) ||
       input.existingContributionKeys.length > MAX_EXISTING_CONTRIBUTION_KEYS ||
       !input.existingContributionKeys.every((key) => isOpaqueIdentityReference(key, 384)) ||
@@ -81,14 +87,28 @@ function assessBaselineContributionWithinBoundary(input: BaselineContributionInp
   if (input.accountClass === 'UNKNOWN' || input.accountClass === 'BREAK_GLASS' || input.accountClass === 'SERVICE' || input.accountClass === 'SHARED') {
     return reject('BASELINE_ACCOUNT_CLASS_UNSUPPORTED')
   }
-  const observations = [...new Map(input.observations.map((entry) => [entry.id, entry])).values()]
-  if (observations.some((entry) => !isOpaqueIdentityReference(entry.id) || !validDay(entry.utcDay) || !Number.isFinite(Date.parse(entry.observedAt)))) {
+  if (input.observations.some((entry) => !isOpaqueIdentityReference(entry.id) || !validDay(entry.utcDay) ||
+      parseCanonicalIdentityTimestamp(entry.observedAt) === null || entry.observedAt.slice(0, 10) !== entry.utcDay)) {
     return reject('BASELINE_INPUT_MALFORMED')
+  }
+  const observationFingerprints = new Map<string, string>()
+  for (const observation of input.observations) {
+    const fingerprint = JSON.stringify([observation.id, observation.observedAt, observation.utcDay])
+    const previous = observationFingerprints.get(observation.id)
+    if (previous !== undefined && previous !== fingerprint) return reject('BASELINE_INPUT_MALFORMED')
+    observationFingerprints.set(observation.id, fingerprint)
+  }
+  const observations = [...new Map(input.observations.map((entry) => [entry.id, entry])).values()]
+  const evaluatedAt = parseCanonicalIdentityTimestamp(input.evaluatedAt)!
+  if (observations.some((entry) => parseCanonicalIdentityTimestamp(entry.observedAt)! > evaluatedAt + input.futureClockSkewToleranceMs)) {
+    return reject('BASELINE_INPUT_FUTURE_DATED')
   }
   const days = [...new Set(observations.map((entry) => entry.utcDay))].sort()
   if (days.length < 2) return reject('BASELINE_RECURRENCE_REQUIRED')
   const contributionDay = days.at(-1)!
-  const contributionKey = `${input.subjectId}:${input.propertyKey}:${contributionDay}`
+  const contributionKey = `hvr1_contribution_${createHash('sha256')
+    .update(`${input.subjectId}\u0000${input.propertyKey}\u0000${contributionDay}`)
+    .digest('hex')}`
   if (input.existingContributionKeys.includes(contributionKey)) {
     return reject('BASELINE_DUPLICATE_OR_DAILY_CAP')
   }
@@ -104,9 +124,9 @@ function assessBaselineContributionWithinBoundary(input: BaselineContributionInp
   const sensitive = input.accountClass !== 'HUMAN'
   if (sensitive && reviewers.size < 2) return reject('BASELINE_REVIEW_DUAL_APPROVAL_REQUIRED')
   if (!sensitive && reviewers.size < 1) return reject('BASELINE_INPUT_MALFORMED')
-  const decidedAt = Date.parse(input.review.decidedAt)
-  const evaluatedAt = Date.parse(input.evaluatedAt)
-  if (!Number.isFinite(decidedAt) || decidedAt > evaluatedAt) return reject('BASELINE_INPUT_MALFORMED')
+  const decidedAt = parseCanonicalIdentityTimestamp(input.review.decidedAt)
+  if (decidedAt === null) return reject('BASELINE_INPUT_MALFORMED')
+  if (decidedAt > evaluatedAt + input.futureClockSkewToleranceMs) return reject('BASELINE_INPUT_FUTURE_DATED')
   const coolingPeriod = sensitive ? 7 * DAY_MS : DAY_MS
   if (evaluatedAt - decidedAt < coolingPeriod) {
     return Object.freeze({ status: 'PENDING', reasonCode: 'BASELINE_REVIEW_COOLING', contributionKey: null })

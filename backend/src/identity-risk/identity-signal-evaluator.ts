@@ -30,6 +30,7 @@ import {
   isEvaluationContextRuntime,
   isIdentitySignalCandidateRuntime,
   isOpaqueIdentityReference,
+  parseCanonicalIdentityTimestamp,
 } from './identity-signal-runtime.js'
 
 const HOUR_MS = 60 * 60 * 1000
@@ -67,19 +68,18 @@ function canonicalize(value: unknown): unknown {
   if (!value || typeof value !== 'object') return value
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
-      .filter(([key]) => key !== 'digest')
       .sort(([left], [right]) => bytewiseCompare(left, right))
       .map(([key, entry]) => [key, canonicalize(entry)]),
   )
 }
 
 export function computeIdentitySignalCatalogDigest(catalog: Omit<ApprovedCatalog, 'digest'>): string {
-  return createHash('sha256').update(JSON.stringify(canonicalize(catalog))).digest('hex')
+  const { digest: _topLevelSignature, ...unsignedCatalog } = catalog as Omit<ApprovedCatalog, 'digest'> & { digest?: unknown }
+  return createHash('sha256').update(JSON.stringify(canonicalize(unsignedCatalog))).digest('hex')
 }
 
 function parseTime(value: string): number | null {
-  const result = Date.parse(value)
-  return Number.isFinite(result) ? result : null
+  return parseCanonicalIdentityTimestamp(value)
 }
 
 function bytewiseCompare(left: string, right: string): number {
@@ -265,6 +265,45 @@ function contextCoversEvents(entry: NetworkContextEntry, events: readonly AuthEv
   return start !== null && end !== null && times.every((time) => time !== null && start <= time && time < end)
 }
 
+function semanticTimestamps(candidate: IdentitySignalCandidate): readonly string[] {
+  switch (candidate.ruleId) {
+    case 'HV-ID-EXP-001.v1':
+    case 'HV-ID-EXP-002.v1':
+    case 'HV-ID-CHG-004.v1':
+    case 'HV-ID-CHG-005.v1':
+    case 'HV-ID-APP-002.v1':
+    case 'HV-ID-MBX-001.v1':
+    case 'HV-ID-MBX-002.v1':
+    case 'HV-ID-AUTH-003.v1':
+    case 'HV-ID-AUTH-007.v1':
+      return []
+    case 'HV-ID-EXP-003.v1':
+      return candidate.lastSuccessfulInteractiveSignInAt ? [candidate.lastSuccessfulInteractiveSignInAt] : []
+    case 'HV-ID-CHG-001.v1':
+      return [candidate.lifecycleAt, candidate.privilegeAt]
+    case 'HV-ID-CHG-002.v1':
+      return [...(candidate.authoritativeCreatedAt ? [candidate.authoritativeCreatedAt] : []), candidate.privilegeAt]
+    case 'HV-ID-CHG-003.v1':
+      return [candidate.anchorAt, ...candidate.events.map((event) => event.occurredAt)]
+    case 'HV-ID-APP-001.v1':
+      return [...(candidate.authoritativeCreatedAt ? [candidate.authoritativeCreatedAt] : []), candidate.observedAt]
+    case 'HV-ID-MBX-003.v1':
+      return [candidate.mailboxChangeAt, candidate.independentSignInAt]
+    case 'HV-ID-AUTH-001.v1':
+      return [candidate.disabledAt, candidate.activityAt]
+    case 'HV-ID-AUTH-002.v1':
+      return [candidate.eventAt, ...(candidate.lastSuccessfulInteractiveSignInAt ? [candidate.lastSuccessfulInteractiveSignInAt] : [])]
+    case 'HV-ID-AUTH-004.v1':
+      return [candidate.previous.occurredAt, candidate.current.occurredAt]
+    case 'HV-ID-AUTH-005.v1':
+    case 'HV-ID-AUTH-006.v1':
+    case 'HV-ID-AUTH-008.v1':
+      return candidate.events.map((event) => event.occurredAt)
+    case 'HV-ID-AUTH-009.v1':
+      return [candidate.occurredAt]
+  }
+}
+
 function gate(context: IdentitySignalEvaluationContext, candidate: IdentitySignalCandidate): IdentitySignalResult | null {
   if (context.engineVersion !== IDENTITY_RISK_ENGINE_VERSION || context.catalogVersion !== IDENTITY_SIGNAL_CATALOG_VERSION) {
     return notEvaluated(candidate, 'RULE_CONFIG_UNAPPROVED')
@@ -281,6 +320,11 @@ function gate(context: IdentitySignalEvaluationContext, candidate: IdentitySigna
   const now = parseTime(context.evaluatedAt)
   if (now === null || context.futureClockSkewToleranceMs === null || !Number.isInteger(context.futureClockSkewToleranceMs) || context.futureClockSkewToleranceMs < 0 || context.futureClockSkewToleranceMs > 300_000) {
     return notEvaluated(candidate, 'RULE_CONFIG_UNAPPROVED')
+  }
+  for (const timestamp of semanticTimestamps(candidate)) {
+    const parsed = parseTime(timestamp)
+    if (parsed === null) return notEvaluated(candidate, 'EVIDENCE_MALFORMED')
+    if (parsed > now + context.futureClockSkewToleranceMs) return notEvaluated(candidate, 'EVIDENCE_FUTURE_DATED')
   }
   const maximum = RULE_MAX_EVIDENCE_AGE_HOURS[candidate.ruleId]
   if (candidate.evidence.length === 0) return notEvaluated(candidate, 'EVIDENCE_UNAVAILABLE')
@@ -583,7 +627,8 @@ function evaluateValidatedIdentitySignal(
     }
     case 'HV-ID-AUTH-008.v1': {
       if (!candidate.tenantWideComplete) return notEvaluated(candidate, 'EVIDENCE_PARTIAL', 'PARTIAL')
-      const classified = candidate.events.map((event) => ({ event, classification: accountClass(context, event.subjectId) }))
+      const uniqueEvents = [...new Map(candidate.events.map((event) => [event.id, event])).values()]
+      const classified = uniqueEvents.map((event) => ({ event, classification: accountClass(context, event.subjectId) }))
       const eligible = classified.filter(({ classification }) => classification === 'HUMAN' || classification === 'PRIVILEGED_HUMAN')
       const failures = eligible.filter(({ event }) => event.outcome === 'FAILURE')
       const successes = eligible.filter(({ event }) => event.outcome === 'SUCCESS')
