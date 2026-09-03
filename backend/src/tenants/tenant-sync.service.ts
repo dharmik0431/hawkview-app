@@ -111,6 +111,7 @@ const DEFAULT_FAST_MAILBOX_RULE_MAX_USERS = 250
 const GRAPH_LOG_COLLECTION_MAX_PAGES = 100
 const GRAPH_LOG_COLLECTION_MAX_ROWS = 100_000
 const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
+const GRAPH_LOG_PAGE_MAX_BYTES = 2 * 1024 * 1024
 const MAILBOX_USAGE_CSV_MAX_BYTES = 5 * 1024 * 1024
 const MAILBOX_USAGE_CSV_MAX_ROWS = 20_000
 const MAILBOX_USAGE_CSV_MAX_COLUMNS = 128
@@ -977,7 +978,7 @@ export function graphErrorCodeFromBody(body: string) {
   }
 }
 
-async function readBoundedResponseText(
+export async function readBoundedResponseText(
   response: Response,
   maximumBytes: number,
 ) {
@@ -985,13 +986,7 @@ async function readBoundedResponseText(
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
     throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
   }
-  if (!response.body) {
-    const text = await response.text()
-    if (new TextEncoder().encode(text).byteLength > maximumBytes) {
-      throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
-    }
-    return text
-  }
+  if (!response.body) throw new Error('Microsoft Graph response body was unavailable.')
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let total = 0
@@ -1017,6 +1012,23 @@ async function readBoundedResponseText(
     offset += chunk.byteLength
   }
   return new TextDecoder().decode(bytes)
+}
+
+export async function parseBoundedGraphCollectionPage(
+  response: Response,
+  resourceLabel: string,
+) {
+  try {
+    const parsed = JSON.parse(
+      await readBoundedResponseText(response, GRAPH_LOG_PAGE_MAX_BYTES),
+    ) as unknown
+    if (!plainRecord(parsed) || !Array.isArray(parsed.value)) {
+      throw new Error('invalid')
+    }
+    return parsed as GraphCollectionPage
+  } catch {
+    throw new Error(`Microsoft ${resourceLabel} synchronization returned an unreadable bounded response.`)
+  }
 }
 
 export async function readGraphOperationalError(
@@ -2349,14 +2361,11 @@ export class TenantSyncService {
       )
       this.logger.warn(JSON.stringify({
         event: 'microsoft_collection_failed',
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
         resourceType,
         failureClass: failure.failureClass,
         reasonCode: failure.reasonCode,
         status: failure.status,
         microsoftCode: failure.microsoftCode,
-        requestId: failure.requestId,
       }))
       const state = await this.prisma.syncState.update({
         where: {
@@ -3466,7 +3475,7 @@ export class TenantSyncService {
         throw new Error(`Microsoft returned an invalid ${resourceLabel} link.`)
       }
       const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel, { deadlineAt })
-      const page = (await response.json()) as GraphCollectionPage
+      const page = await parseBoundedGraphCollectionPage(response, resourceLabel)
       rows.push(...(page.value ?? []))
       if (rows.length > GRAPH_LOG_COLLECTION_MAX_ROWS) {
         throw new Error(`Microsoft ${resourceLabel} synchronization exceeded a bounded collection limit.`)
