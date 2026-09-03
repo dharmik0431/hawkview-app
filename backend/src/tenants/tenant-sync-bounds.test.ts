@@ -124,3 +124,24 @@ test('Graph streamed body matrix accepts cap boundaries and cancels every unsafe
   assert.equal(declaredCancelled, false)
   await assert.rejects(() => parseBoundedGraphCollectionPage(new Response(new ReadableStream({ pull() { throw new Error('token=never') } })), 'directory audit logs'), /unreadable bounded response/)
 })
+
+test('actual sign-in and directory-audit collectors stop before every persistence boundary on a bounded page failure', async () => {
+  const writes: string[] = []
+  const prisma = {
+    signInLog: { findFirst: async () => null, createMany: async () => writes.push('signIn') },
+    directoryAuditLog: { findFirst: async () => null, createMany: async () => writes.push('audit') },
+    syncState: { update: async () => writes.push('syncState') },
+    tenantEntraSnapshot: { upsert: async () => writes.push('snapshot') },
+    changeEvidenceEvent: { createMany: async () => writes.push('evidence') },
+  }
+  const service = new TenantSyncService(prisma as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: unknown, work: () => Promise<void>) => work()
+  ;(service as any).logSyncStart = async () => new Date()
+  ;(service as any).signInEntitlement = async () => ({ status: 'AVAILABLE' })
+  ;(service as any).fetchGraphCollection = async (_url: string, _token: string, resource: string) =>
+    parseBoundedGraphCollectionPage(new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(GRAPH_LOG_PAGE_MAX_BYTES + 1)) } })), resource)
+  const tenant = { id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private', displayName: null, primaryDomain: null, status: 'ACTIVE', connection: null }
+  await assert.rejects(() => (service as any).syncSignInLogs(tenant, 'token'), /unreadable bounded response/)
+  await assert.rejects(() => (service as any).syncDirectoryAuditLogs(tenant, 'token'), /unreadable bounded response/)
+  assert.deepEqual(writes, [])
+})
