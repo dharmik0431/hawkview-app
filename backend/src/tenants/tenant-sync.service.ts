@@ -111,6 +111,9 @@ const DEFAULT_FAST_MAILBOX_RULE_MAX_USERS = 250
 const GRAPH_LOG_COLLECTION_MAX_PAGES = 100
 const GRAPH_LOG_COLLECTION_MAX_ROWS = 100_000
 const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
+const MAILBOX_USAGE_CSV_MAX_BYTES = 5 * 1024 * 1024
+const MAILBOX_USAGE_CSV_MAX_ROWS = 20_000
+const MAILBOX_USAGE_CSV_MAX_COLUMNS = 128
 /** Hard ceilings keep a targeted SharePoint retry below the 15 minute USERS lease. */
 export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
   sitePages: 50,
@@ -326,6 +329,9 @@ function summarizeAuthenticationMethodTargets(method: any) {
 }
 
 function parseCsvRows(csv: string): Record<string, string>[] {
+  if (Buffer.byteLength(csv, 'utf8') > MAILBOX_USAGE_CSV_MAX_BYTES) {
+    throw new Error('Microsoft mailbox usage report exceeded the bounded response-size limit.')
+  }
   const rows: string[][] = []
   let row: string[] = []
   let field = ''
@@ -346,6 +352,9 @@ function parseCsvRows(csv: string): Record<string, string>[] {
     } else if ((character === '\n' || character === '\r') && !quoted) {
       if (character === '\r' && csv[index + 1] === '\n') index += 1
       row.push(field)
+      if (row.length > MAILBOX_USAGE_CSV_MAX_COLUMNS || rows.length >= MAILBOX_USAGE_CSV_MAX_ROWS) {
+        throw new Error('Microsoft mailbox usage report exceeded a bounded row or column limit.')
+      }
       if (row.some((value) => value.length > 0)) rows.push(row)
       row = []
       field = ''
@@ -354,6 +363,9 @@ function parseCsvRows(csv: string): Record<string, string>[] {
     }
   }
   if (field.length > 0 || row.length > 0) {
+    if (row.length + 1 > MAILBOX_USAGE_CSV_MAX_COLUMNS || rows.length >= MAILBOX_USAGE_CSV_MAX_ROWS) {
+      throw new Error('Microsoft mailbox usage report exceeded a bounded row or column limit.')
+    }
     row.push(field)
     rows.push(row)
   }
@@ -1484,7 +1496,6 @@ export class TenantSyncService {
       partial: results.filter((result) => result.status === 'PARTIAL').length,
       failed: results.filter((result) => result.status === 'FAILED').length,
       skipped: results.filter((result) => result.status === 'SKIPPED').length,
-      results,
     }
     this.logger.log(
       `Scheduled tenant synchronization: ${JSON.stringify({ checkedAt: summary.checkedAt, due: summary.due, succeeded: summary.succeeded, partial: summary.partial, failed: summary.failed, skipped: summary.skipped })}`
@@ -4555,7 +4566,7 @@ export class TenantSyncService {
         },
       )
       let csv = ''
-      if (response.ok) csv = await response.text()
+      if (response.ok) csv = await readBoundedResponseText(response, MAILBOX_USAGE_CSV_MAX_BYTES)
       else if (response.status === 302) {
         const location = response.headers.get('location')
         if (!location?.startsWith('https://'))
@@ -4571,7 +4582,7 @@ export class TenantSyncService {
           throw new Error(
             `Microsoft mailbox usage report download returned ${download.status}.`
           )
-        csv = await download.text()
+        csv = await readBoundedResponseText(download, MAILBOX_USAGE_CSV_MAX_BYTES)
       } else {
         throw new Error(
           `Microsoft mailbox usage synchronization returned ${response.status}.`
