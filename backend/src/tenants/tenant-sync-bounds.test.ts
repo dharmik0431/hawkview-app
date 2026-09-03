@@ -75,3 +75,52 @@ test('Exchange initial sync-state failure closes the anonymous telemetry lifecyc
   assert.equal(messages.join('\n').includes('tenant-private'), false)
   assert.equal(messages.join('\n').includes(hostile), false)
 })
+
+test('scheduler-reachable runtime failure families log only closed identifiers', () => {
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const messages: string[] = []
+  ;(service as any).logger = { warn: (message: string) => messages.push(message) }
+  const hostile = 'org-123 tenant-456 group-name user@example.com contoso.example https://graph.example/request request-id access_token=secret eyJhbGciOiJub25lIn0 postgres://private'
+  for (const [resource, phase] of [
+    ['M365_AUDIT', 'INCREMENTAL'], ['LICENSES', 'INCREMENTAL'], ['DOMAINS', 'SNAPSHOT'],
+    ['DOMAIN_DNS_HEALTH', 'SNAPSHOT'], ['GROUPS', 'RELATIONSHIP'], ['MFA_REGISTRATION', 'FALLBACK'],
+    ['CONDITIONAL_ACCESS', 'FALLBACK'], ['SHAREPOINT_SITES', 'RECONCILIATION'],
+  ] as const) {
+    ;(service as any).logOperationalFailure(resource, phase, hostile)
+    ;(service as any).logOperationalFailure(resource, phase, { hostile })
+  }
+  for (const message of messages) {
+    const event = JSON.parse(message)
+    assert.equal(event.event, 'microsoft_collection_runtime_failure')
+    assert.equal(event.outcome, 'FAILED')
+    assert.equal(message.includes('tenant-456'), false)
+    assert.equal(message.includes('user@example.com'), false)
+    assert.equal(message.includes('access_token'), false)
+    assert.equal(message.includes('postgres://'), false)
+  }
+})
+
+test('Graph streamed body matrix accepts cap boundaries and cancels every unsafe body', async () => {
+  const valid = JSON.stringify({ value: [] })
+  for (const size of [GRAPH_LOG_PAGE_MAX_BYTES - 1, GRAPH_LOG_PAGE_MAX_BYTES]) {
+    const padded = JSON.stringify({ value: [], padding: 'x'.repeat(size - valid.length - 14) })
+    await assert.doesNotReject(() => parseBoundedGraphCollectionPage(new Response(padded), 'sign-in logs'))
+  }
+  for (const kind of ['single', 'multi', 'understated'] as const) {
+    let cancelled = false
+    const stream = new ReadableStream({
+      start(controller) {
+        if (kind === 'multi') { controller.enqueue(new Uint8Array(GRAPH_LOG_PAGE_MAX_BYTES)); controller.enqueue(new Uint8Array(1)) }
+        else controller.enqueue(new Uint8Array(GRAPH_LOG_PAGE_MAX_BYTES + 1))
+      }, cancel() { cancelled = true },
+    })
+    const headers = kind === 'understated' ? { 'content-length': '1' } : undefined
+    await assert.rejects(() => parseBoundedGraphCollectionPage(new Response(stream, { headers }), 'directory audit logs'), /unreadable bounded response/)
+    assert.equal(cancelled, true)
+  }
+  let declaredCancelled = false
+  const declared = new ReadableStream({ cancel() { declaredCancelled = true } })
+  await assert.rejects(() => parseBoundedGraphCollectionPage(new Response(declared, { headers: { 'content-length': String(GRAPH_LOG_PAGE_MAX_BYTES + 1) } }), 'sign-in logs'), /unreadable bounded response/)
+  assert.equal(declaredCancelled, false)
+  await assert.rejects(() => parseBoundedGraphCollectionPage(new Response(new ReadableStream({ pull() { throw new Error('token=never') } })), 'directory audit logs'), /unreadable bounded response/)
+})

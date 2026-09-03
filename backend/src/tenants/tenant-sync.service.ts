@@ -1205,10 +1205,17 @@ export class TenantSyncService {
     'CONDITIONAL_ACCESS', 'USERS', 'SIGN_INS', 'AUDIT_LOGS', 'LICENSES',
     'DOMAINS', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS',
   ])
+  private static readonly operationalReasons = new Set([
+    'INDEPENDENT_AUDIT_UNAVAILABLE', 'COLLECTION_UNAVAILABLE',
+    'OWNER_REFRESH_UNAVAILABLE', 'MEMBERSHIP_REFRESH_UNAVAILABLE',
+    'PER_USER_STATE_UNAVAILABLE', 'MEMBERSHIP_EVIDENCE_UNAVAILABLE',
+    'AUDIT_RECONCILIATION_UNAVAILABLE',
+  ])
 
   private logOperationalFailure(resource: string, phase: 'INCREMENTAL' | 'SNAPSHOT' | 'RECONCILIATION' | 'RELATIONSHIP' | 'FALLBACK', reasonCode: string) {
     const safeResource = TenantSyncService.operationalResources.has(resource) ? resource : 'UNKNOWN'
-    this.logger.warn(JSON.stringify({ event: 'microsoft_collection_runtime_failure', resource: safeResource, phase, outcome: 'FAILED', reasonCode }))
+    const safeReasonCode = TenantSyncService.operationalReasons.has(reasonCode) ? reasonCode : 'UNKNOWN'
+    this.logger.warn(JSON.stringify({ event: 'microsoft_collection_runtime_failure', resource: safeResource, phase, outcome: 'FAILED', reasonCode: safeReasonCode }))
   }
 
   constructor(
