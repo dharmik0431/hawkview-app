@@ -115,6 +115,17 @@ export const GRAPH_LOG_PAGE_MAX_BYTES = 2 * 1024 * 1024
 export const MAILBOX_USAGE_CSV_MAX_BYTES = 5 * 1024 * 1024
 export const MAILBOX_USAGE_CSV_MAX_ROWS = 20_000
 export const MAILBOX_USAGE_CSV_MAX_COLUMNS = 128
+/** Mailbox views only consume these report fields. Do not retain arbitrary CSV columns. */
+const MAILBOX_USAGE_CSV_FIELDS = Object.freeze([
+  'User Principal Name',
+  'User Principal Name (UPN)',
+  'Owner Principal Name',
+  'Email Address',
+  'Storage Used (Byte)',
+  'Storage Used Bytes',
+  'Item Count',
+  'Items Count',
+])
 /** Hard ceilings keep a targeted SharePoint retry below the 15 minute USERS lease. */
 export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
   sitePages: 50,
@@ -1034,6 +1045,64 @@ export async function parseBoundedGraphCollectionPage(
   } catch {
     throw new Error(`Microsoft ${resourceLabel} synchronization returned an unreadable bounded response.`)
   }
+}
+
+/**
+ * Project the mailbox report as it is parsed instead of retaining every one of
+ * its (up to 20k x 128) raw cells. The report remains byte/row/column bounded;
+ * its persisted snapshot is limited to fields the mailbox API actually reads.
+ */
+export function parseMailboxUsageCsv(csv: string): Record<string, string>[] {
+  if (Buffer.byteLength(csv, 'utf8') > MAILBOX_USAGE_CSV_MAX_BYTES) {
+    throw new Error('Microsoft mailbox usage report exceeded the bounded response-size limit.')
+  }
+  const selected = new Set(MAILBOX_USAGE_CSV_FIELDS)
+  const result: Record<string, string>[] = []
+  let headers: string[] | null = null
+  let row: string[] = []
+  let field = ''
+  let quoted = false
+
+  const completeRow = () => {
+    row.push(field)
+    field = ''
+    // Match the generic parser's ceiling: the header counts as one CSV row.
+    if (row.length > MAILBOX_USAGE_CSV_MAX_COLUMNS || (headers && result.length >= MAILBOX_USAGE_CSV_MAX_ROWS - 1)) {
+      throw new Error('Microsoft mailbox usage report exceeded a bounded row or column limit.')
+    }
+    if (!row.some((value) => value.length > 0)) { row = []; return }
+    if (!headers) {
+      headers = row.map((value, index) => (index === 0 ? value.replace(/^\uFEFF/, '') : value).trim())
+      row = []
+      return
+    }
+    const projected: Record<string, string> = {}
+    for (let index = 0; index < headers.length; index += 1) {
+      const header = headers[index]!
+      if (selected.has(header)) projected[header] = row[index]?.trim() ?? ''
+    }
+    // Keep an intentionally empty record only when Microsoft supplied a row;
+    // it preserves a bounded, honest report count without retaining raw fields.
+    result.push(projected)
+    row = []
+  }
+
+  for (let index = 0; index < csv.length; index += 1) {
+    const character = csv[index]!
+    if (character === '"') {
+      if (quoted && csv[index + 1] === '"') { field += '"'; index += 1 } else quoted = !quoted
+    } else if (character === ',' && !quoted) {
+      row.push(field); field = ''
+      if (row.length >= MAILBOX_USAGE_CSV_MAX_COLUMNS) {
+        throw new Error('Microsoft mailbox usage report exceeded a bounded row or column limit.')
+      }
+    } else if ((character === '\n' || character === '\r') && !quoted) {
+      if (character === '\r' && csv[index + 1] === '\n') index += 1
+      completeRow()
+    } else field += character
+  }
+  if (field.length > 0 || row.length > 0) completeRow()
+  return result
 }
 
 export function assertGraphCollectionBounds(input: {
@@ -4586,7 +4655,7 @@ export class TenantSyncService {
       await this.saveSnapshot(
         tenant,
         'EXCHANGE_MAILBOX_USAGE',
-        authoritativeSnapshot(parseCsvRows(csv))
+        authoritativeSnapshot(parseMailboxUsageCsv(csv))
       )
     })
   }

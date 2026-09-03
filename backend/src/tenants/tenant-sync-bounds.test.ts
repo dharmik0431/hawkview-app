@@ -11,6 +11,7 @@ import {
   MAILBOX_USAGE_CSV_MAX_ROWS,
   parseBoundedGraphCollectionPage,
   parseCsvRows,
+  parseMailboxUsageCsv,
   TenantSyncService,
 } from './tenant-sync.service.js'
 
@@ -54,6 +55,17 @@ test('mailbox CSV byte, row and column limits accept exact values and reject plu
   const small = 'h\nv'
   assert.doesNotThrow(() => parseCsvRows([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 2 }, () => 'v')].join('\n')))
   assert.throws(() => parseCsvRows([small, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 1 }, () => 'v')].join('\n')), /row or column/)
+})
+
+test('mailbox usage CSV projects only bounded mailbox fields rather than retaining arbitrary cells', () => {
+  const headers = ['User Principal Name', 'Storage Used (Byte)', 'Item Count', ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS - 3 }, (_, index) => `unused-${index}`)]
+  const row = ['user@example.test', '42', '3', ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS - 3 }, () => 'x')]
+  const projected = parseMailboxUsageCsv([headers.join(','), row.join(',')].join('\n'))
+  assert.deepEqual(projected, [{ 'User Principal Name': 'user@example.test', 'Storage Used (Byte)': '42', 'Item Count': '3' }])
+  assert.throws(
+    () => parseMailboxUsageCsv(['User Principal Name', ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS }, () => 'user@example.test')].join('\n')),
+    /row or column/,
+  )
 })
 
 test('Exchange initial sync-state failure closes the anonymous telemetry lifecycle before collection work', async () => {
@@ -148,4 +160,44 @@ test('actual sign-in and directory-audit collectors stop before every persistenc
   await assert.rejects(() => (service as any).syncSignInLogs(tenant, 'token'), /unreadable bounded response/)
   await assert.rejects(() => (service as any).syncDirectoryAuditLogs(tenant, 'token'), /unreadable bounded response/)
   assert.deepEqual(writes, [])
+})
+
+test('the real snapshot wrapper records only its failed operational state when bounded sign-in or audit pages abort', async () => {
+  const writes: string[] = []
+  const incidents: string[] = []
+  const prisma = {
+    syncState: {
+      upsert: async () => { writes.push('state:running'); return { lastSuccessfulAt: null } },
+      update: async ({ data }: any) => { writes.push(`state:${data.status}`); return { consecutiveFailures: 1 } },
+    },
+    signInLog: { createMany: async () => writes.push('signIn') },
+    directoryAuditLog: { createMany: async () => writes.push('audit') },
+    tenantEntraSnapshot: { upsert: async () => writes.push('snapshot') },
+    changeEvidenceEvent: { createMany: async () => writes.push('evidence') },
+  }
+  const notifications = {
+    publishIncident: async () => incidents.push('published'),
+    resolveIncident: async () => incidents.push('resolved'),
+  }
+  const service = new TenantSyncService(prisma as any, {} as any, {} as any, notifications as any, {} as any, {} as any)
+  const messages: string[] = []
+  ;(service as any).logger = { warn: (message: string) => messages.push(message) }
+  ;(service as any).logSyncStart = async () => new Date()
+  ;(service as any).signInEntitlement = async () => ({ status: 'AVAILABLE' })
+  ;(service as any).fetchGraphCollection = async (_url: string, _token: string, resource: string) =>
+    parseBoundedGraphCollectionPage(
+      new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(GRAPH_LOG_PAGE_MAX_BYTES + 1)) } })),
+      resource,
+    )
+  const tenant = { id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private', displayName: null, primaryDomain: null, status: 'ACTIVE', connection: null }
+  await assert.rejects(() => (service as any).syncSignInLogs(tenant, 'token'), /could not safely refresh sign ins/)
+  await assert.rejects(() => (service as any).syncDirectoryAuditLogs(tenant, 'token'), /could not safely refresh audit logs/)
+  assert.deepEqual(writes, ['state:running', 'state:FAILED', 'state:running', 'state:FAILED'])
+  assert.deepEqual(incidents, ['published', 'published'])
+  assert.equal(messages.length, 2)
+  for (const message of messages) {
+    assert.equal(message.includes('tenant-private'), false)
+    assert.equal(message.includes('token'), false)
+    assert.equal(JSON.parse(message).event, 'microsoft_collection_failed')
+  }
 })
