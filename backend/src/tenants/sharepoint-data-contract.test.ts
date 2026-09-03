@@ -975,9 +975,14 @@ test('materializes tenant-scoped SharePoint and OneDrive projection proof into b
     },
     tenantEntraSnapshot: {
       findMany: async ({ where, select }: any) => {
-        assert.deepEqual(where, scope)
-        assert.deepEqual(select, { resourceType: true, payload: true })
-        return [{ resourceType: 'SHAREPOINT_USAGE', payload }]
+        if (select.resourceType) {
+          assert.deepEqual(where, scope)
+          assert.deepEqual(select, { resourceType: true })
+          return [{ resourceType: 'SHAREPOINT_USAGE' }]
+        }
+        assert.deepEqual(where, { ...scope, resourceType: 'SHAREPOINT_USAGE' })
+        assert.deepEqual(select, { payload: true })
+        return [{ payload }]
       },
     },
     tenantCollectionFieldState: {

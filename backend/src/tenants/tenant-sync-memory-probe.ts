@@ -97,7 +97,7 @@ async function collectGenericNearLimit() {
 const genericResults = await settleSyncCollectorModules([
   { resource: 'DEVICES', synchronize: collectGenericNearLimit },
   { resource: 'APPLICATIONS', synchronize: collectGenericNearLimit },
-  { resource: 'M365_AUDIT', synchronize: async () => {
+  { resource: 'RUNTIME_TELEMETRY', synchronize: async () => {
     safeObservedGenericCollector = activeGenericCollectors === 1
     const genericSafePayload = Buffer.alloc(4 * MIB, 1)
     safeOtherPayloads.push(genericSafePayload)
@@ -164,7 +164,7 @@ const usageResults = await settleSyncCollectorModules([
     },
   },
   {
-    resource: 'M365_AUDIT',
+    resource: 'RUNTIME_TELEMETRY',
     synchronize: async () => {
       safeObservedUsageCollector = usageCollectorActive
       const usageSafePayload = Buffer.alloc(4 * MIB, 1)
@@ -179,6 +179,97 @@ const usagePeakRss = peakRss
 if (sharePointRows.length !== MAILBOX_USAGE_CSV_MAX_ROWS - 1 || oneDriveRows.length !== MAILBOX_USAGE_CSV_MAX_ROWS - 1) {
   throw new Error('USAGE_MEMORY_PROBE_INCOMPLETE')
 }
+const usageReportRowsProjected = sharePointRows.length + oneDriveRows.length
+sharePointRows.length = 0
+oneDriveRows.length = 0
+globalThis.gc?.()
+
+// Exercise the real USERS and Exchange collectors through full sync, an
+// audit-triggered refresh, and the incremental scheduler. Only persistence
+// and unrelated products are stubbed; every body still crosses production
+// streaming, projection, pagination and aggregate bounds.
+const actualRows = 5_000
+const pageRows = 1_000
+let actualActive = 0
+let maximumConcurrentActualMaterializers = 0
+let actualUserWrites = 0
+let actualSnapshots = 0
+let actualMaximumSnapshotBytes = 0
+const actualResources = new Set<string>()
+const actualModes: string[] = []
+async function actualMaterializer<T>(resource: string, work: () => Promise<T>): Promise<T> {
+  actualActive += 1
+  maximumConcurrentActualMaterializers = Math.max(maximumConcurrentActualMaterializers, actualActive)
+  actualResources.add(resource)
+  try { return await work() } finally {
+    peakRss = Math.max(peakRss, process.memoryUsage().rss)
+    actualActive -= 1
+  }
+}
+const databaseUsers = Array.from({ length: actualRows }, (_, index) => ({ microsoftUserId: `user-${index}`, userPrincipalName: `user-${index}@example.invalid` }))
+const actualPrisma: any = {
+  syncState: {
+    findUnique: async () => ({ id: 'state', lastSuccessfulAt: new Date(), deltaLink: 'https://graph.microsoft.com/v1.0/users/delta?probePage=1' }),
+    updateMany: async () => ({ count: 1 }), update: async () => ({}), findMany: async () => [],
+  },
+  directoryUser: {
+    findMany: async ({ skip = 0, take = 250 }: { skip?: number; take?: number }) => databaseUsers.slice(skip, skip + take),
+    upsert: async () => { actualUserWrites += 1 }, updateMany: async () => undefined,
+  },
+  tenantConnection: { update: async () => ({}) },
+  $transaction: async (operations: Promise<unknown>[]) => Promise.all(operations),
+}
+const actualService = new TenantSyncService(actualPrisma, {
+  getTenantAccessToken: async () => 'synthetic-token', getTenantExchangeAccessToken: async () => 'synthetic-token',
+} as any, {} as any, { publishIncident: async () => undefined } as any, {} as any, {} as any)
+;(actualService as any).logger = { warn: () => undefined, log: () => undefined }
+const originalUsers = (actualService as any).synchronizeUsers.bind(actualService)
+;(actualService as any).synchronizeUsers = (...args: unknown[]) => actualMaterializer('USERS', () => originalUsers(...args))
+;(actualService as any).runSnapshotSync = (_tenant: unknown, resource: string, work: () => Promise<void>) => actualMaterializer(resource, work)
+;(actualService as any).saveSnapshot = async (_tenant: unknown, _resource: string, snapshot: { rows: unknown[] }) => {
+  const serialized = JSON.stringify(snapshot.rows)
+  if (serialized.includes('UNSELECTED_CONTENT')) throw new Error('ACTUAL_PATH_PROJECTION_FAILED')
+  actualMaximumSnapshotBytes = Math.max(actualMaximumSnapshotBytes, Buffer.byteLength(serialized, 'utf8'))
+  actualSnapshots += 1
+  peakRss = Math.max(peakRss, process.memoryUsage().rss)
+}
+for (const method of ['syncLicenses', 'syncOrganizationConfiguration', 'syncDomains', 'syncGroups', 'syncSharePointSites', 'syncSharePointSettings', 'syncSharePointUsage', 'syncDomainDnsHealth', 'syncAuthenticationRegistrations', 'syncAuthenticationMethodPolicy', 'syncSecurityDefaults', 'syncSignInLogs', 'syncDirectoryAuditLogs', 'syncM365AuditActivity', 'syncEntraCollection', 'refreshCollectionFieldStates']) {
+  ;(actualService as any)[method] = async () => undefined
+}
+;(actualService as any).fetchGraphPage = async (url: string) => {
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  peakRss = Math.max(peakRss, process.memoryUsage().rss)
+  const parsed = new URL(url)
+  const page = Number(parsed.searchParams.get('probePage') ?? 1)
+  if (url.includes('/mailboxSettings')) return new Response(JSON.stringify({ userPurpose: 'user', timeZone: 'x'.repeat(1_000), unselected: 'UNSELECTED_CONTENT' }))
+  if (url.includes('/messageRules')) return new Response(JSON.stringify({ value: [{ id: 'r', displayName: 'x'.repeat(1_000), isEnabled: true, actions: { delete: true }, unselected: 'UNSELECTED_CONTENT' }] }))
+  if (url.includes('/reports/')) return new Response('User Principal Name,Storage Used (Byte),Item Count\nu@example.invalid,1,1')
+  if (url.includes('/organization')) return new Response(JSON.stringify({ value: [{ verifiedDomains: [{ name: 'example.invalid', isDefault: true }] }], unselected: 'x'.repeat(1_800_000) }))
+  const isConfiguration = url.includes('outlook.office365.com')
+  const isDelta = url.includes('/users/delta')
+  const rows = Array.from({ length: pageRows }, (_, offset) => {
+    const id = (page - 1) * pageRows + offset
+    return isConfiguration
+      ? { UserPrincipalName: `user-${id}@example.invalid`, PrimarySmtpAddress: `user-${id}@example.invalid`, DisplayName: 'x'.repeat(256), RecipientType: 'UserMailbox', unselected: 'UNSELECTED_CONTENT' }
+      : { id: `user-${id}`, userPrincipalName: `user-${id}@example.invalid`, displayName: 'x'.repeat(1_000), mail: `user-${id}@example.invalid`, accountEnabled: true, unselected: 'UNSELECTED_CONTENT' }
+  })
+  const more = page * pageRows < actualRows
+  return new Response(JSON.stringify({ value: rows,
+    '@odata.nextLink': more ? `${parsed.origin}${parsed.pathname}?probePage=${page + 1}` : undefined,
+    '@odata.deltaLink': isDelta && !more ? 'https://graph.microsoft.com/v1.0/users/delta?checkpoint=done' : undefined,
+  }))
+}
+const actualTenant = { id: 'synthetic-tenant', organizationId: 'synthetic-org', microsoftTenantId: 'synthetic-microsoft', status: 'ACTIVE', displayName: null, primaryDomain: null, connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: new Date() } }
+await (actualService as any).syncConnectedTenant(actualTenant, false, { includeBundle: false })
+actualModes.push('full-with-optional-exchange')
+await (actualService as any).reconcileDirectoryAuditChanges(actualTenant, 'token', [{ activityDisplayName: 'Update mailbox' }])
+actualModes.push('audit-reconciliation')
+;(actualService as any).syncSignInLogs = async () => actualMaterializer('SIGN_INS', async () => { await new Promise<void>((resolve) => setImmediate(resolve)) })
+;(actualService as any).syncDirectoryAuditLogs = async () => (actualService as any).reconcileDirectoryAuditChanges(actualTenant, 'token', [{ activityDisplayName: 'Update mailbox' }])
+await (actualService as any).syncConnectedTenant(actualTenant, false, { incrementalOnly: true, includeBundle: false })
+actualModes.push('incremental-with-reconciliation')
+if (maximumConcurrentActualMaterializers !== 1 || actualUserWrites !== 2 * actualRows || actualSnapshots !== 16) throw new Error(`ACTUAL_PATH_MEMORY_PROBE_FAILED:${maximumConcurrentActualMaterializers}:${actualUserWrites}:${actualSnapshots}`)
+const actualPathPeakRss = peakRss
 
 console.log(`HAWKVIEW_MEMORY_PROBE=${JSON.stringify({
   baselineRssMiB: Math.round(baselineRss / MIB * 10) / 10,
@@ -196,8 +287,16 @@ console.log(`HAWKVIEW_MEMORY_PROBE=${JSON.stringify({
   maximumConcurrentGenericCollectors,
   safeObservedGenericCollector,
   safeObservedUsageCollector,
-  usageReportRowsProjected: sharePointRows.length + oneDriveRows.length,
+  usageReportRowsProjected,
   usageReportCsvBytes: Buffer.byteLength(usageCsv, 'utf8'),
   safeOtherPayloadBytes: safeOtherPayloads.reduce((total, value) => total + value.byteLength, 0),
   retainedBudgetMiB: GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES / MIB,
+  actualPathPeakRssMiB: Math.round(actualPathPeakRss / MIB * 10) / 10,
+  maximumConcurrentActualMaterializers,
+  actualRows,
+  actualUserWrites,
+  actualSnapshots,
+  actualMaximumSnapshotBytes,
+  actualModes,
+  actualResources: [...actualResources].sort(),
 })}`)

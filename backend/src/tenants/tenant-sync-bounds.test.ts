@@ -5,6 +5,13 @@ import {
   assertGraphCollectionBounds,
   ENTRA_COLLECTION_LIMITS,
   entraCollectionLimitsForResource,
+  EXCHANGE_JSON_COLLECTION_LIMITS,
+  USER_DELTA_COLLECTION_LIMITS,
+  SINGLETON_JSON_MAX_BYTES,
+  MicrosoftCollectionBudget,
+  collectMailboxRules,
+  projectMailboxRule,
+  runInSyncMemoryLane,
   GRAPH_LOG_COLLECTION_DEADLINE_MS,
   GRAPH_LOG_COLLECTION_MAX_PAGES,
   GRAPH_LOG_COLLECTION_MAX_ROWS,
@@ -21,6 +28,276 @@ import {
   settleSyncCollectorModules,
   TenantSyncService,
 } from './tenant-sync.service.js'
+
+const boundedTenant = {
+  id: 'tenant', organizationId: 'org', microsoftTenantId: 'microsoft', status: 'ACTIVE', displayName: null, primaryDomain: null,
+  connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', exchangeReadOnlyEnabledAt: new Date(), clientId: null, credentialReference: null },
+}
+
+test('post-sync readiness reads metadata and only needed payloads sequentially, not all snapshots', async () => {
+  const payloadReads: string[] = []
+  let active = 0; let maximum = 0
+  const service = new TenantSyncService({
+    syncState: { findMany: async () => [] },
+    tenantEntraSnapshot: { findMany: async ({ where, select, take }: any) => {
+      assert.equal(where.organizationId, boundedTenant.organizationId)
+      assert.equal(where.customerTenantId, boundedTenant.id)
+      if (select.resourceType) {
+        assert.deepEqual(select, { resourceType: true })
+        return ['USERS', 'DEVICES', 'APPLICATIONS', 'EXCHANGE_MAILBOX_RULES', 'SHAREPOINT_USAGE', 'CONDITIONAL_ACCESS'].map((resourceType) => ({ resourceType }))
+      }
+      assert.deepEqual(select, { payload: true }); assert.equal(take, 1)
+      payloadReads.push(where.resourceType)
+      active += 1; maximum = Math.max(maximum, active)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      active -= 1
+      return [{ payload: [] }]
+    } },
+    tenantCollectionFieldState: { upsert: async () => undefined },
+  } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  await (service as any).refreshCollectionFieldStates(boundedTenant)
+  assert.deepEqual(payloadReads, ['SHAREPOINT_USAGE', 'CONDITIONAL_ACCESS'])
+  assert.equal(maximum, 1)
+})
+
+test('DNS materializer bounds legacy database inventory before lookups or snapshot persistence', async () => {
+  let snapshots = 0
+  const service = new TenantSyncService({ tenantDomain: { findMany: async ({ take }: any) => {
+    assert.equal(take, 1001)
+    return Array.from({ length: 1001 }, () => ({ name: 'synthetic.invalid' }))
+  } } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  ;(service as any).runSnapshotSync = (_tenant: unknown, _resource: unknown, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async () => { snapshots += 1 }
+  await assert.rejects(() => (service as any).syncDomainDnsHealth(boundedTenant), /bounded collection limit/)
+  assert.equal(snapshots, 0)
+})
+
+test('mailbox absence cancels throwing or stalled bodies without blocking settings and rules completion', async () => {
+  for (const cancellation of ['throws', 'stalls']) {
+    for (const method of ['syncExchangeMailboxSettings', 'syncExchangeMailboxRules']) {
+      let cancelled = 0; let snapshots = 0
+      const service = new TenantSyncService({ directoryUser: { findMany: async () => [{ microsoftUserId: 'user', userPrincipalName: 'user@example.invalid' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+      ;(service as any).runSnapshotSync = (_tenant: unknown, _resource: unknown, work: () => Promise<void>) => work()
+      ;(service as any).saveSnapshot = async (_tenant: unknown, _resource: unknown, snapshot: any) => { assert.deepEqual(snapshot.rows, []); snapshots += 1 }
+      ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream({ cancel() {
+        cancelled += 1
+        if (cancellation === 'throws') throw new Error('private-provider-error')
+        return new Promise<void>(() => undefined)
+      } }), { status: 404 })
+      await (service as any)[method](boundedTenant, 'token')
+      assert.equal(cancelled, 1); assert.equal(snapshots, 1)
+    }
+  }
+})
+
+test('all scheduler materializers, optional Exchange and unknown future collectors default to one lane', async () => {
+  let active = 0; let maximum = 0
+  const resources = ['USERS', 'GROUPS', 'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_CONFIGURATION', 'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_ACCEPTED_DOMAINS', 'SHAREPOINT_SETTINGS', 'SECURITY_DEFAULTS', 'AUTH_METHOD_POLICIES', 'M365_AUDIT', 'DOMAIN_DNS_HEALTH', 'FUTURE_COLLECTION']
+  const outcomes = await settleSyncCollectorModules(resources.map((resource) => ({ resource, synchronize: async () => {
+    active += 1; maximum = Math.max(maximum, active)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    active -= 1
+  } })))
+  assert.equal(maximum, 1)
+  assert.ok(outcomes.every((outcome) => outcome.status === 'fulfilled'))
+  maximum = 0
+  await Promise.all(Array.from({ length: 3 }, () => settleSyncCollectorModules([{ resource: 'GROUPS', synchronize: async () => {
+    active += 1; maximum = Math.max(maximum, active)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    await runInSyncMemoryLane(async () => undefined)
+    active -= 1
+  } }])))
+  assert.equal(maximum, 1, 'independent caller lanes must share the same process budget and nested work must not deadlock')
+})
+
+test('shared budget accepts exact row/byte/page limits and rejects plus-one, cycle and deadline deterministically', async () => {
+  const row = { id: 'x' }
+  const size = Buffer.byteLength(JSON.stringify(row), 'utf8')
+  const limits = { ...EXCHANGE_JSON_COLLECTION_LIMITS, pages: 1, rows: 1, materializedBytes: size }
+  const budget = new MicrosoftCollectionBudget(limits, 'test')
+  budget.begin('page-1'); budget.retain([row])
+  assert.throws(() => budget.retain([row]), /bounded collection limit/)
+  assert.throws(() => budget.begin('page-2'), /bounded collection limit/)
+  const repeated = new MicrosoftCollectionBudget({ ...limits, pages: 2 }, 'test')
+  repeated.begin('page'); assert.throws(() => repeated.begin('page'), /bounded collection limit/)
+  assert.throws(() => new MicrosoftCollectionBudget({ ...limits, collectorDeadlineMs: 0 }, 'test').begin('page'), /bounded collection limit/)
+  assert.throws(() => new MicrosoftCollectionBudget(limits, 'test').retain([{ id: 'xx' }]), /bounded collection limit/)
+  let cancelled = false
+  await assert.rejects(() => readBoundedResponseText(new Response(new ReadableStream({ cancel() { cancelled = true; throw new Error('hostile cancellation') } })), 1024, 'TOO_LARGE', Date.now() + 5), /bounded collection deadline/)
+  assert.equal(cancelled, true)
+  const wire = new MicrosoftCollectionBudget({ ...limits, pageBytes: 64, materializedBytes: 32 }, 'wire')
+  await wire.read(new Response(JSON.stringify('x'.repeat(62))))
+  await wire.read(new Response(JSON.stringify('x'.repeat(62))))
+  await assert.rejects(() => wire.read(new Response('0')), /bounded collection limit/)
+})
+
+test('actual USERS delta fully validates bounded pages before any directory write or checkpoint', async () => {
+  const writes: unknown[] = []
+  const service = new TenantSyncService({ directoryUser: { upsert: async (value: unknown) => writes.push(value), updateMany: async (value: unknown) => writes.push(value) }, $transaction: async (ops: Promise<unknown>[]) => Promise.all(ops) } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const limits = { ...USER_DELTA_COLLECTION_LIMITS, pages: 2, rows: 2, pageBytes: 1024, materializedBytes: 1024 }
+  const initial = 'https://graph.microsoft.com/v1.0/users/delta?start=1'
+  let calls = 0
+  ;(service as any).fetchGraphPage = async () => { calls += 1; return new Response(JSON.stringify({ value: [{ id: 'user', displayName: 'München\nOps', userPrincipalName: 'u@example.test', unused: 'never-store' }], '@odata.nextLink': initial })) }
+  await assert.rejects(() => (service as any).synchronizeUsers(boundedTenant, 'token', initial, true, limits), /bounded collection limit/)
+  assert.equal(calls, 1); assert.deepEqual(writes, [])
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{ id: 'user', userPrincipalName: 'u@example.test', unused: 'never-store' }], '@odata.deltaLink': 'https://graph.microsoft.com/v1.0/users/delta?checkpoint=2' }))
+  const result = await (service as any).synchronizeUsers(boundedTenant, 'token', initial, true, limits)
+  assert.equal(result.deltaLink, 'https://graph.microsoft.com/v1.0/users/delta?checkpoint=2')
+  assert.equal(writes.length, 1); assert.equal(JSON.stringify(writes).includes('never-store'), false)
+  writes.length = 0
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{ id: 'one' }, { id: 'two' }], '@odata.deltaLink': 'https://graph.microsoft.com/v1.0/users/delta?checkpoint=2' }))
+  await assert.rejects(() => (service as any).synchronizeUsers(boundedTenant, 'token', initial, true, { ...limits, rows: 1 }), /bounded collection limit/)
+  assert.deepEqual(writes, [])
+  let cancelled = false
+  ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(1025)) }, cancel() { cancelled = true; throw new Error('hostile') } }))
+  await assert.rejects(() => (service as any).synchronizeUsers(boundedTenant, 'token', initial, true, limits), /bounded page-size limit/)
+  assert.equal(cancelled, true); assert.deepEqual(writes, [])
+  await assert.rejects(() => (service as any).synchronizeUsers(boundedTenant, 'token', initial, true, { ...limits, collectorDeadlineMs: 0 }), /bounded collection limit/)
+})
+
+test('actual mailbox directory, settings, rules and optional configuration enforce transport and deadline before save', async () => {
+  const methods = ['syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings', 'syncExchangeMailboxRules', 'collectExchangeReadOnlyMailboxes']
+  for (const method of methods) {
+    let saves = 0; let cancelled = false; let fetches = 0
+    const service = new TenantSyncService({ directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
+    ;(service as any).saveSnapshot = async () => { saves += 1 }
+    ;(service as any).fetchGraphPage = async () => { fetches += 1; return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(1025)) }, cancel() { cancelled = true; throw new Error('hostile cancel') } })) }
+    const limits = { ...EXCHANGE_JSON_COLLECTION_LIMITS, pageBytes: 1024 }
+    await assert.rejects(() => (service as any)[method](boundedTenant, 'token', limits), /bounded page-size limit/, method)
+    assert.equal(cancelled, true, method); assert.equal(saves, 0, method); assert.equal(fetches, 1, method)
+    fetches = 0
+    await assert.rejects(() => (service as any)[method](boundedTenant, 'token', { ...limits, collectorDeadlineMs: 0 }), /bounded.*(?:limit|deadline)/, method)
+    assert.equal(fetches, 0, method)
+  }
+})
+
+test('actual Exchange collectors reject repeated continuation links and tenant-wide rule aggregation', async () => {
+  const service = new TenantSyncService({ directoryUser: { findMany: async () => [{ microsoftUserId: 'u1', userPrincipalName: 'one@example.test' }, { microsoftUserId: 'u2', userPrincipalName: 'two@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  let saves = 0; let fetches = 0
+  ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async () => { saves += 1 }
+  ;(service as any).fetchGraphPage = async (url: string) => { fetches += 1; return new Response(JSON.stringify({ value: [], '@odata.nextLink': url })) }
+  for (const method of ['syncExchangeMailboxDirectory', 'syncExchangeMailboxRules', 'collectExchangeReadOnlyMailboxes']) {
+    fetches = 0
+    await assert.rejects(() => (service as any)[method](boundedTenant, 'token'), /(?:bounded collection|repeated)/, method)
+    assert.equal(fetches, 1, method)
+  }
+  fetches = 0
+  ;(service as any).fetchGraphPage = async () => { fetches += 1; return new Response(JSON.stringify({ value: [{ id: 'rule', displayName: 'Forward', isEnabled: true, unused: 'not-retained', actions: { forwardTo: [{ emailAddress: { address: 'a@example.test', extra: 'not-retained' } }], hostile: 'not-retained' } }] })) }
+  await assert.rejects(() => (service as any).syncExchangeMailboxRules(boundedTenant, 'token', { ...EXCHANGE_JSON_COLLECTION_LIMITS, rows: 1 }), /bounded.*(?:collection|aggregate) limit/)
+  assert.equal(fetches, 2); assert.equal(saves, 0)
+  const projected = projectMailboxRule({ id: 'r', displayName: 'Quoted\nMünchen', unused: 'secret', actions: { delete: true, hostile: 'secret' } })
+  assert.deepEqual(projected, { id: 'r', displayName: 'Quoted\nMünchen', actions: { delete: true } })
+  const users = [{ microsoftUserId: 'u1', userPrincipalName: 'one' }, { microsoftUserId: 'u2', userPrincipalName: 'two' }]
+  assert.equal((await collectMailboxRules(users, async () => ({ value: [{ id: 'r' }] }), 5, { maxTotalRecords: 2 })).length, 2)
+  await assert.rejects(() => collectMailboxRules(users, async () => ({ value: [{ id: 'r' }] }), 5, { maxTotalRecords: 1 }), /tenant-wide aggregate/)
+})
+
+test('actual audit reconciliation serializes every mailbox materializer and retains one safe failure outcome', async () => {
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  let active = 0; let maximum = 0
+  const called: string[] = []; const messages: string[] = []
+  for (const method of ['syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings', 'syncExchangeMailboxUsage', 'syncExchangeMailboxRules', 'syncExchangeAcceptedDomains']) {
+    ;(service as any)[method] = async () => {
+      active += 1; maximum = Math.max(maximum, active); called.push(method)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      active -= 1
+      if (method === 'syncExchangeMailboxSettings') throw new Error('user@example.test access_token=secret')
+    }
+  }
+  ;(service as any).logger = { warn: (message: string) => messages.push(message) }
+  await (service as any).reconcileDirectoryAuditChanges(boundedTenant, 'token', [{ activityDisplayName: 'Update mailbox' }])
+  assert.equal(maximum, 1); assert.equal(called.length, 5)
+  assert.deepEqual(messages.map((message) => JSON.parse(message)), [{ event: 'microsoft_collection_runtime_failure', resource: 'EXCHANGE_MAILBOX_SETTINGS', phase: 'RECONCILIATION', outcome: 'FAILED', reasonCode: 'AUDIT_RECONCILIATION_UNAVAILABLE' }])
+})
+
+test('actual full sync stops at a bounded USERS failure without a successful checkpoint or any directory/snapshot writes', async () => {
+  const updates: any[] = []; const forbidden: string[] = []
+  let independentAudit = 0
+  const service = new TenantSyncService({
+    syncState: { findUnique: async () => ({ id: 'state', deltaLink: null, lastSuccessfulAt: null }), updateMany: async () => ({ count: 1 }), update: async (args: any) => updates.push(args) },
+    directoryUser: { upsert: async () => forbidden.push('user'), updateMany: async () => forbidden.push('deletion') },
+    tenantConnection: { update: async () => forbidden.push('verified') },
+    tenantEntraSnapshot: { upsert: async () => forbidden.push('snapshot') },
+    changeEvidenceEvent: { createMany: async () => forbidden.push('evidence') },
+  } as any, { getTenantAccessToken: async () => 'token' } as any, {} as any, {} as any, {} as any, { syncTenant: async () => { independentAudit += 1; return [] } } as any)
+  ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream(), { headers: { 'content-length': String(USER_DELTA_COLLECTION_LIMITS.pageBytes + 1) } })
+  await assert.rejects(() => (service as any).syncConnectedTenant(boundedTenant, false, { includeBundle: false }), /bounded page-size/)
+  assert.deepEqual(forbidden, []); assert.equal(independentAudit, 1)
+  assert.deepEqual(updates, [{ where: { customerTenantId_resourceType: { customerTenantId: 'tenant', resourceType: 'USERS' } }, data: {
+    status: 'FAILED', lastErrorCode: 'HAWKVIEW_CAPACITY_GUARD', lastErrorMessage: 'HawkView stopped the user directory refresh at a safety limit and retained the previous data. Contact HawkView support if this continues.', consecutiveFailures: { increment: 1 },
+  } }])
+})
+
+test('singletons and accepted domains reject oversized streaming bodies before successful evidence', async () => {
+  for (const method of ['syncLicenses', 'syncDomains', 'syncOrganizationConfiguration', 'syncSecurityDefaults', 'syncAuthenticationMethodPolicy', 'syncSharePointSettings', 'syncExchangeAcceptedDomains']) {
+    let saved = 0; let cancelled = false
+    const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
+    ;(service as any).saveSnapshot = async () => { saved += 1 }
+    ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream({ cancel() { cancelled = true; throw new Error('hostile cancellation') } }), { headers: { 'content-length': String(SINGLETON_JSON_MAX_BYTES + 1) } })
+    await assert.rejects(() => (service as any)[method](boundedTenant, 'token'), /bounded response-size limit/, method)
+    assert.equal(cancelled, true, method); assert.equal(saved, 0, method)
+  }
+})
+
+test('actual Exchange JSON paths accept the exact streamed page-byte cap with closed projections', async () => {
+  const fixtures = [
+    ['syncExchangeMailboxDirectory', { value: [{ id: 'u', mail: 'u@example.test', unselected: 'not-retained' }] }],
+    ['syncExchangeMailboxSettings', { userPurpose: 'user', timeZone: 'UTC', unselected: 'not-retained' }],
+    ['syncExchangeMailboxRules', { value: [{ id: 'r', displayName: 'München\nRule', unselected: 'not-retained' }] }],
+    ['collectExchangeReadOnlyMailboxes', { value: [{ UserPrincipalName: 'u@example.test', DisplayName: 'User', unselected: 'not-retained' }] }],
+  ] as const
+  for (const [method, fixture] of fixtures) {
+    const service = new TenantSyncService({ directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    const saved: unknown[] = []
+    ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
+    ;(service as any).saveSnapshot = async (_t: unknown, _r: string, snapshot: unknown) => saved.push(snapshot)
+    const base = JSON.stringify({ ...fixture, padding: '' })
+    const exact = JSON.stringify({ ...fixture, padding: 'x'.repeat(1024 - Buffer.byteLength(base, 'utf8')) })
+    assert.equal(Buffer.byteLength(exact, 'utf8'), 1024)
+    ;(service as any).fetchGraphPage = async () => new Response(exact)
+    const result = await (service as any)[method](boundedTenant, 'token', { ...EXCHANGE_JSON_COLLECTION_LIMITS, pageBytes: 1024 })
+    const evidence = JSON.stringify(method === 'collectExchangeReadOnlyMailboxes' ? result : saved)
+    assert.equal(evidence.includes('not-retained'), false, method)
+    assert.equal(evidence.includes('padding'), false, method)
+    assert.ok(method === 'collectExchangeReadOnlyMailboxes' ? result.length === 1 : saved.length === 1, method)
+  }
+})
+
+test('real Exchange snapshot wrappers permit only RUNNING to FAILED state and one sanitized incident on bounded failure', async () => {
+  const pairs = [
+    ['syncExchangeMailboxDirectory', 'EXCHANGE_MAILBOXES'], ['syncExchangeMailboxSettings', 'EXCHANGE_MAILBOX_SETTINGS'],
+    ['syncExchangeMailboxRules', 'EXCHANGE_MAILBOX_RULES'], ['syncExchangeAcceptedDomains', 'EXCHANGE_ACCEPTED_DOMAINS'],
+    ['syncExchangeMailboxConfiguration', 'EXCHANGE_MAILBOX_CONFIGURATION'],
+  ] as const
+  for (const [method, resourceType] of pairs) {
+    const upserts: any[] = []; const updates: any[] = []; const incidents: any[] = []; const forbidden: string[] = []
+    const service = new TenantSyncService({
+      syncState: { upsert: async (args: any) => { upserts.push(args); return { lastSuccessfulAt: null } }, update: async (args: any) => { updates.push(args); return { consecutiveFailures: 1 } } },
+      directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] },
+      tenantEntraSnapshot: { upsert: async () => forbidden.push('snapshot') },
+      changeEvidenceEvent: { createMany: async () => forbidden.push('evidence') },
+    } as any, { getTenantExchangeAccessToken: async () => 'token' } as any, {} as any, { publishIncident: async (value: unknown) => incidents.push(value), resolveIncident: async () => forbidden.push('resolved') } as any, {} as any, {} as any)
+    ;(service as any).logger = { log: () => undefined, warn: () => undefined }
+    ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream({ cancel() { throw new Error('secret token@example.test') } }), { headers: { 'content-length': String(SINGLETON_JSON_MAX_BYTES + 1) } })
+    await assert.rejects(() => method === 'syncExchangeMailboxConfiguration' ? (service as any)[method](boundedTenant) : (service as any)[method](boundedTenant, 'token'), /refresh at a safety limit/)
+    assert.deepEqual(forbidden, [])
+    assert.equal(upserts.length, 1); assert.equal(upserts[0].create.status, 'RUNNING')
+    assert.deepEqual(upserts[0].update, { status: 'RUNNING', lastAttemptAt: upserts[0].update.lastAttemptAt, lastErrorCode: null, lastErrorMessage: null })
+    assert.equal(updates.length, 1)
+    assert.deepEqual(updates[0], { where: { customerTenantId_resourceType: { customerTenantId: 'tenant', resourceType } }, data: {
+      status: 'FAILED', lastErrorCode: 'HAWKVIEW_CAPACITY_GUARD',
+      lastErrorMessage: `HawkView stopped the ${resourceType.toLowerCase().replaceAll('_', ' ')} refresh at a safety limit and retained the previous data. Contact HawkView support if this continues.`,
+      consecutiveFailures: { increment: 1 },
+    } })
+    assert.equal(incidents.length, 1)
+    assert.deepEqual(incidents[0].metadata, { resourceType, consecutiveFailures: 1, failureClass: 'CAPACITY_GUARD', reasonCode: 'HAWKVIEW_CAPACITY_GUARD' })
+    assert.equal(incidents[0].eventType, 'tenant.sync_failed'); assert.equal(incidents[0].dedupeKey, `tenant:tenant:sync:${resourceType}`)
+    assert.equal(JSON.stringify(incidents).includes('secret'), false)
+  }
+})
 
 test('an eight-megabyte Graph sign-in or audit page is cancelled before JSON parsing', async () => {
   let cancelled = false
@@ -99,7 +376,7 @@ test('full-sync collector schedule serializes all materializing collectors while
       },
     },
     {
-      resource: 'M365_AUDIT',
+      resource: 'RUNTIME_TELEMETRY',
       synchronize: async () => {
         safeStartedDuringSignIn = signInActive
         order.push('safe:start')
@@ -127,7 +404,7 @@ test('full-sync collector schedule serializes all materializing collectors while
   const boundedResults = await settleSyncCollectorModules([
     { resource: 'GROUPS', synchronize: async () => { active += 1; maximumActive = Math.max(maximumActive, active); await firstCanFinish; active -= 1 } },
     { resource: 'APPLICATIONS', synchronize: async () => { active += 1; maximumActive = Math.max(maximumActive, active); active -= 1 } },
-    { resource: 'M365_AUDIT', synchronize: async () => { safeSawActive = active === 1; releaseFirst() } },
+    { resource: 'RUNTIME_TELEMETRY', synchronize: async () => { safeSawActive = active === 1; releaseFirst() } },
   ])
   assert.deepEqual(boundedResults.map((result) => result.status), ['fulfilled', 'fulfilled', 'fulfilled'])
   assert.equal(maximumActive, 1)
@@ -180,23 +457,16 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
 
   let signInActive = false
   let safeStartedDuringSignIn = false
-  let releaseSignIn!: () => void
-  let announceSignIn!: () => void
-  const signInCanFinish = new Promise<void>((resolve) => { releaseSignIn = resolve })
-  const signInStarted = new Promise<void>((resolve) => { announceSignIn = resolve })
   ;(service as any).syncSignInLogs = async () => {
     signInActive = true
-    announceSignIn()
-    await signInCanFinish
+    await new Promise<void>((resolve) => setImmediate(resolve))
     signInActive = false
   }
   ;(service as any).syncDirectoryAuditLogs = async () => {
     assert.equal(signInActive, false)
   }
   ;(service as any).syncM365AuditActivity = async () => {
-    await signInStarted
     safeStartedDuringSignIn = signInActive
-    releaseSignIn()
   }
   const tenant = {
     id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
@@ -205,7 +475,7 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
   }
   const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
   assert.equal(result.status, 'SUCCEEDED')
-  assert.equal(safeStartedDuringSignIn, true)
+  assert.equal(safeStartedDuringSignIn, false)
   assert.equal(maximumGeneric, 1)
   assert.deepEqual(persistedResources, [
     'GROUPS', 'CONDITIONAL_ACCESS', 'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS',
@@ -301,7 +571,14 @@ test('isolated near-limit Graph collectors remain below a constrained Render mem
   assert.ok(evidence.usageReportCsvBytes <= MAILBOX_USAGE_CSV_MAX_BYTES)
   assert.ok(evidence.usageReportCsvBytes >= 4 * 1024 * 1024)
   assert.ok(evidence.peakRssMiB <= 300, JSON.stringify(evidence))
-  assert.ok(evidence.rssGrowthMiB <= 160, JSON.stringify(evidence))
+  assert.ok(evidence.usagePeakRssMiB - evidence.baselineRssMiB <= 160, JSON.stringify(evidence))
+  assert.ok(evidence.rssGrowthMiB <= 192, JSON.stringify(evidence))
+  assert.equal(evidence.maximumConcurrentActualMaterializers, 1)
+  assert.equal(evidence.actualUserWrites, 10_000)
+  assert.equal(evidence.actualSnapshots, 16)
+  assert.ok(evidence.actualMaximumSnapshotBytes >= 5 * 1024 * 1024)
+  assert.deepEqual(evidence.actualModes, ['full-with-optional-exchange', 'audit-reconciliation', 'incremental-with-reconciliation'])
+  assert.deepEqual(evidence.actualResources, ['EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_CONFIGURATION', 'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'SIGN_INS', 'USERS'])
 })
 
 test('mailbox CSV byte, row and column limits accept exact values and reject plus one', () => {
