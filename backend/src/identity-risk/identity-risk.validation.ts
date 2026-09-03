@@ -78,9 +78,10 @@ export type IdentityRiskCursorPosition = Readonly<{
 }>
 
 type CursorPayload = Readonly<{
-  v: 1
+  v: 2
   c: CursorChannel
   s: string
+  d: string
   a: number
   i: string
   f: 1
@@ -101,10 +102,21 @@ function scopeDigest(organizationId: string, customerTenantId: string) {
     .slice(0, 24)
 }
 
+function datasetDigest(datasetIdentity: string) {
+  if (datasetIdentity.length === 0 || datasetIdentity.length > 512) {
+    throw new ServiceUnavailableException('Identity risk pagination is unavailable.')
+  }
+  return createHash('sha256')
+    .update(`v2\u0000${datasetIdentity}`)
+    .digest('hex')
+    .slice(0, 24)
+}
+
 export function encodeIdentityRiskCursor(input: {
   channel: CursorChannel
   organizationId: string
   customerTenantId: string
+  datasetIdentity: string
   position: IdentityRiskCursorPosition
 }): string {
   const id = boundedOpaqueId(input.position.id, 200)
@@ -112,9 +124,10 @@ export function encodeIdentityRiskCursor(input: {
     throw new ServiceUnavailableException('Identity risk pagination is unavailable.')
   }
   const payload: CursorPayload = {
-    v: 1,
+    v: 2,
     c: input.channel,
     s: scopeDigest(input.organizationId, input.customerTenantId),
+    d: datasetDigest(input.datasetIdentity),
     a: input.position.observedAt.getTime(),
     i: id,
     f: 1,
@@ -135,6 +148,7 @@ export function decodeIdentityRiskCursor(input: {
   channel: CursorChannel
   organizationId: string
   customerTenantId: string
+  datasetIdentity: string
   now: Date
 }): IdentityRiskCursorPosition | null {
   if (input.cursor === undefined || input.cursor === null || input.cursor === '') return null
@@ -155,11 +169,12 @@ export function decodeIdentityRiskCursor(input: {
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as unknown
     if (
       !isPlainRecord(payload) ||
-      Object.keys(payload).sort().join(',') !== 'a,c,f,i,s,v' ||
-      payload.v !== 1 ||
+      Object.keys(payload).sort().join(',') !== 'a,c,d,f,i,s,v' ||
+      payload.v !== 2 ||
       payload.c !== input.channel ||
       payload.f !== 1 ||
       payload.s !== scopeDigest(input.organizationId, input.customerTenantId) ||
+      payload.d !== datasetDigest(input.datasetIdentity) ||
       typeof payload.a !== 'number' ||
       !Number.isSafeInteger(payload.a) ||
       !boundedOpaqueId(payload.i, 200)

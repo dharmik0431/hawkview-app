@@ -22,7 +22,7 @@ test('page limits default to 50 and reject requests above 100', () => {
   assert.throws(() => parsePageLimit('-1'), BadRequestException)
 })
 
-test('cursor is opaque, signed, channel-bound, and tenant-bound', () => {
+test('cursor is opaque, signed, channel-, tenant-, and evaluation-run-bound', () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
   process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = 'unit-test-only-cursor-secret-at-least-32-bytes'
   try {
@@ -30,6 +30,7 @@ test('cursor is opaque, signed, channel-bound, and tenant-bound', () => {
       channel: 'h',
       organizationId,
       customerTenantId: tenantId,
+      datasetIdentity: 'evaluation-run-1',
       position: { observedAt: now, id: 'finding_01' },
     })
     assert.ok(cursor.length <= 256)
@@ -40,6 +41,7 @@ test('cursor is opaque, signed, channel-bound, and tenant-bound', () => {
         channel: 'h',
         organizationId,
         customerTenantId: tenantId,
+        datasetIdentity: 'evaluation-run-1',
         now,
       }),
       { observedAt: now, id: 'finding_01' },
@@ -50,6 +52,7 @@ test('cursor is opaque, signed, channel-bound, and tenant-bound', () => {
         channel: 'h',
         organizationId,
         customerTenantId: otherTenantId,
+        datasetIdentity: 'evaluation-run-1',
         now,
       }),
       /Pagination cursor is invalid/,
@@ -60,6 +63,7 @@ test('cursor is opaque, signed, channel-bound, and tenant-bound', () => {
         channel: 'm',
         organizationId,
         customerTenantId: tenantId,
+        datasetIdentity: 'evaluation-run-1',
         now,
       }),
       /Pagination cursor is invalid/,
@@ -70,6 +74,18 @@ test('cursor is opaque, signed, channel-bound, and tenant-bound', () => {
         channel: 'h',
         organizationId,
         customerTenantId: tenantId,
+        datasetIdentity: 'evaluation-run-1',
+        now,
+      }),
+      /Pagination cursor is invalid/,
+    )
+    assert.throws(
+      () => decodeIdentityRiskCursor({
+        cursor,
+        channel: 'h',
+        organizationId,
+        customerTenantId: tenantId,
+        datasetIdentity: 'evaluation-run-2',
         now,
       }),
       /Pagination cursor is invalid/,

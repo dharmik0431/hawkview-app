@@ -749,6 +749,7 @@ model IdentityRiskEvaluationRun {
   windowStart       DateTime       @map("window_start") @db.Timestamptz(6)
   windowEnd         DateTime       @map("window_end") @db.Timestamptz(6)
   sourceWatermarkHash String       @map("source_watermark_hash") @db.VarChar(128)
+  sourceContentHash   String       @map("source_content_hash") @db.VarChar(128)
   capability        String         @default("UNAVAILABLE") @db.VarChar(20)
   aggregate         Json           @default("{}") @db.JsonB
   alertDeliveryDisabled Boolean    @default(false) @map("alert_delivery_disabled")
@@ -782,7 +783,11 @@ model IdentityRiskRuleCoverage {
   suppressedCount     Int                       @default(0) @map("suppressed_count")
   notMatchedCount     Int                       @default(0) @map("not_matched_count")
   notEvaluatedCount   Int                       @default(0) @map("not_evaluated_count")
-  countsCapped        Boolean                   @default(false) @map("counts_capped")
+  eligibleCountCapped     Boolean                   @default(false) @map("eligible_count_capped")
+  matchedCountCapped      Boolean                   @default(false) @map("matched_count_capped")
+  suppressedCountCapped   Boolean                   @default(false) @map("suppressed_count_capped")
+  notMatchedCountCapped   Boolean                   @default(false) @map("not_matched_count_capped")
+  notEvaluatedCountCapped Boolean                   @default(false) @map("not_evaluated_count_capped")
   reasonCounts        Json                      @default("[]") @map("reason_counts") @db.JsonB
   samplesTruncated    Boolean                   @default(false) @map("samples_truncated")
   expiresAt           DateTime                  @map("expires_at") @db.Timestamptz(6)

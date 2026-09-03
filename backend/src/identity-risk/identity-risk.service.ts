@@ -89,6 +89,10 @@ type CompletedRun = Readonly<{
   catalogVersion: string
   capability: string
   completedAt: Date | null
+}>
+
+type HawkViewControlState = Readonly<{
+  evaluationHardDisabled: boolean
   alertDeliveryDisabled: boolean
 }>
 
@@ -147,7 +151,11 @@ function unavailableEnvelope(
   }
 }
 
-function runEnvelope(run: CompletedRun, now: Date): IdentityRiskEnvelope | null {
+function runEnvelope(
+  run: CompletedRun,
+  now: Date,
+  alertDeliveryDisabled: boolean,
+): IdentityRiskEnvelope | null {
   if (
     run.engineVersion !== IDENTITY_RISK_ENGINE_VERSION ||
     run.catalogVersion !== IDENTITY_RISK_CATALOG_VERSION ||
@@ -167,7 +175,7 @@ function runEnvelope(run: CompletedRun, now: Date): IdentityRiskEnvelope | null 
     sourceLabel: HAWKVIEW_SOURCE_LABEL,
     observedAt: evaluatedAt.toISOString(),
     freshness: stale ? 'STALE' : 'CURRENT',
-    limitation: run.alertDeliveryDisabled
+    limitation: alertDeliveryDisabled
       ? 'Shadow-mode findings are investigation leads; customer alert delivery is disabled.'
       : 'Shadow-mode findings are investigation leads, not compromise verdicts.',
   }
@@ -179,9 +187,7 @@ function microsoftEnvelope(
   now: Date,
 ): IdentityRiskEnvelope | null {
   const parsedEvaluation = parseTimestamp(evaluatedAt, now)
-  const parsedObservation = parsedEvaluation
-    ? parseTimestamp(observedAt, parsedEvaluation)
-    : null
+  const parsedObservation = parseTimestamp(observedAt, now)
   if (!parsedEvaluation || !parsedObservation) return null
   const stale = now.getTime() - parsedObservation.getTime() > CURRENT_RUN_MAX_AGE_MS
   return {
@@ -214,6 +220,34 @@ function projectionError(channel: IdentityRiskEnvelope['channel']) {
 @Injectable()
 export class IdentityRiskService {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+
+  private async currentControls(
+    tenant: ScopedTenant,
+  ): Promise<HawkViewControlState> {
+    const controls = await this.prisma.identityRiskOperationalControl.findMany({
+      where: {
+        state: 'ACTIVE',
+        OR: [
+          { scopeType: 'GLOBAL', scopeKey: 'GLOBAL' },
+          {
+            scopeType: 'TENANT',
+            scopeKey: `${tenant.organizationId}:${tenant.id}`,
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+          },
+        ],
+      },
+      select: { controlType: true },
+    })
+    return {
+      evaluationHardDisabled: controls.some(
+        (control) => control.controlType === 'EVALUATION_HARD_DISABLED',
+      ),
+      alertDeliveryDisabled: controls.some(
+        (control) => control.controlType === 'ALERT_DELIVERY_DISABLED',
+      ),
+    }
+  }
 
   private async scope(
     identity: AuthenticatedIdentity,
@@ -269,7 +303,6 @@ export class IdentityRiskService {
         catalogVersion: true,
         capability: true,
         completedAt: true,
-        alertDeliveryDisabled: true,
       },
     })
   }
@@ -295,6 +328,17 @@ export class IdentityRiskService {
         counts: unavailableCounts,
       }
     }
+    const initialControls = await this.currentControls(tenant)
+    if (initialControls.evaluationHardDisabled) {
+      return {
+        ...unavailableEnvelope(
+          'HAWKVIEW_IDENTITY_SIGNALS',
+          'UNAVAILABLE',
+          'HawkView identity signal evaluation is temporarily disabled by an operational safety control.',
+        ),
+        counts: unavailableCounts,
+      }
+    }
     const now = new Date()
     const run = await this.latestRun(tenant, now)
     if (!run) {
@@ -307,8 +351,6 @@ export class IdentityRiskService {
         counts: unavailableCounts,
       }
     }
-    const envelope = runEnvelope(run, now)
-    if (!envelope) return { ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'), counts: unavailableCounts }
     const [coverage, openFindingCount, subjects] = await Promise.all([
       this.prisma.identityRiskRuleCoverage.findMany({
         where: {
@@ -323,7 +365,10 @@ export class IdentityRiskService {
           suppressedCount: true,
           notMatchedCount: true,
           notEvaluatedCount: true,
-          countsCapped: true,
+          matchedCountCapped: true,
+          suppressedCountCapped: true,
+          notMatchedCountCapped: true,
+          notEvaluatedCountCapped: true,
         },
         take: 23,
       }),
@@ -351,15 +396,43 @@ export class IdentityRiskService {
     ])
     if (
       coverage.length > 22 ||
-      coverage.some((row) => !isIdentityRiskRuleId(row.ruleId))
+      coverage.some((row) =>
+        !isIdentityRiskRuleId(row.ruleId) ||
+        (row.matchedCountCapped && row.matchedCount !== 1_000_000) ||
+        (row.suppressedCountCapped && row.suppressedCount !== 1_000_000) ||
+        (row.notMatchedCountCapped && row.notMatchedCount !== 1_000_000) ||
+        (row.notEvaluatedCountCapped && row.notEvaluatedCount !== 1_000_000),
+      )
     ) return { ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'), counts: unavailableCounts }
+    const currentControls = await this.currentControls(tenant)
+    if (currentControls.evaluationHardDisabled) {
+      return {
+        ...unavailableEnvelope(
+          'HAWKVIEW_IDENTITY_SIGNALS',
+          'UNAVAILABLE',
+          'HawkView identity signal evaluation is temporarily disabled by an operational safety control.',
+        ),
+        counts: unavailableCounts,
+      }
+    }
+    const envelope = runEnvelope(
+      run,
+      now,
+      currentControls.alertDeliveryDisabled,
+    )
+    if (!envelope) return { ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'), counts: unavailableCounts }
     const sum = (key: 'matchedCount' | 'suppressedCount' | 'notMatchedCount' | 'notEvaluatedCount') =>
       coverage.reduce((total, row) => total + row[key], 0)
     const countFromCoverage = (
       key: 'matchedCount' | 'suppressedCount' | 'notMatchedCount' | 'notEvaluatedCount',
     ): IdentityRiskBoundedCount => {
       const count = boundedCount(sum(key))
-      return coverage.some((row) => row.countsCapped)
+      const cappedKey = `${key}Capped` as
+        | 'matchedCountCapped'
+        | 'suppressedCountCapped'
+        | 'notMatchedCountCapped'
+        | 'notEvaluatedCountCapped'
+      return coverage.some((row) => row[cappedKey])
         ? { value: count.value, exact: false, capped: true }
         : count
     }
@@ -395,6 +468,18 @@ export class IdentityRiskService {
         pageInfo: emptyPage(),
       }
     }
+    const initialControls = await this.currentControls(tenant)
+    if (initialControls.evaluationHardDisabled) {
+      return {
+        ...unavailableEnvelope(
+          'HAWKVIEW_IDENTITY_SIGNALS',
+          'UNAVAILABLE',
+          'HawkView identity signal evaluation is temporarily disabled by an operational safety control.',
+        ),
+        findings: [] as IdentityRiskFindingDto[],
+        pageInfo: emptyPage(),
+      }
+    }
     const now = new Date()
     const run = await this.latestRun(tenant, now)
     if (!run) {
@@ -408,8 +493,7 @@ export class IdentityRiskService {
         pageInfo: emptyPage(),
       }
     }
-    const envelope = runEnvelope(run, now)
-    if (!envelope) {
+    if (!runEnvelope(run, now, initialControls.alertDeliveryDisabled)) {
       return {
         ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'),
         findings: [] as IdentityRiskFindingDto[],
@@ -421,6 +505,7 @@ export class IdentityRiskService {
       channel: 'h',
       organizationId: tenant.organizationId,
       customerTenantId: tenant.id,
+      datasetIdentity: run.id,
       now,
     })
     const rows = await this.prisma.identityRiskFinding.findMany({
@@ -443,7 +528,31 @@ export class IdentityRiskService {
     })
     const hasMore = rows.length > limit
     const pageRows = rows.slice(0, limit)
-    const projected = pageRows.map((row) => this.projectFinding(row, new Date(envelope.evaluatedAt as string)))
+    const currentControls = await this.currentControls(tenant)
+    if (currentControls.evaluationHardDisabled) {
+      return {
+        ...unavailableEnvelope(
+          'HAWKVIEW_IDENTITY_SIGNALS',
+          'UNAVAILABLE',
+          'HawkView identity signal evaluation is temporarily disabled by an operational safety control.',
+        ),
+        findings: [] as IdentityRiskFindingDto[],
+        pageInfo: emptyPage(),
+      }
+    }
+    const envelope = runEnvelope(
+      run,
+      now,
+      currentControls.alertDeliveryDisabled,
+    )
+    if (!envelope) {
+      return {
+        ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'),
+        findings: [] as IdentityRiskFindingDto[],
+        pageInfo: emptyPage(),
+      }
+    }
+    const projected = pageRows.map((row) => this.projectFinding(row, now))
     if (projected.some((finding) => finding === null)) {
       return {
         ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'),
@@ -463,6 +572,7 @@ export class IdentityRiskService {
                 channel: 'h',
                 organizationId: tenant.organizationId,
                 customerTenantId: tenant.id,
+                datasetIdentity: run.id,
                 position: { observedAt: last.observedAt, id: last.id },
               })
             : null,
@@ -489,9 +599,23 @@ export class IdentityRiskService {
         evidenceReferences: [],
       }
     }
+    const initialControls = await this.currentControls(tenant)
+    if (initialControls.evaluationHardDisabled) {
+      return {
+        ...unavailableEnvelope(
+          'HAWKVIEW_IDENTITY_SIGNALS',
+          'UNAVAILABLE',
+          'HawkView identity signal evaluation is temporarily disabled by an operational safety control.',
+        ),
+        finding: null,
+        evidenceReferences: [],
+      }
+    }
     const run = await this.latestRun(tenant, now)
-    const envelope = run ? runEnvelope(run, now) : null
-    if (!run || !envelope) {
+    const initialEnvelope = run
+      ? runEnvelope(run, now, initialControls.alertDeliveryDisabled)
+      : null
+    if (!run || !initialEnvelope) {
       return {
         ...(run
           ? projectionError('HAWKVIEW_IDENTITY_SIGNALS')
@@ -513,8 +637,32 @@ export class IdentityRiskService {
         matchedResult: { evaluationRunId: run.id },
       },
     })
+    const currentControls = await this.currentControls(tenant)
+    if (currentControls.evaluationHardDisabled) {
+      return {
+        ...unavailableEnvelope(
+          'HAWKVIEW_IDENTITY_SIGNALS',
+          'UNAVAILABLE',
+          'HawkView identity signal evaluation is temporarily disabled by an operational safety control.',
+        ),
+        finding: null,
+        evidenceReferences: [],
+      }
+    }
+    const envelope = runEnvelope(
+      run,
+      now,
+      currentControls.alertDeliveryDisabled,
+    )
+    if (!envelope) {
+      return {
+        ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'),
+        finding: null,
+        evidenceReferences: [],
+      }
+    }
     const finding = row
-      ? this.projectFinding(row, new Date(envelope.evaluatedAt as string))
+      ? this.projectFinding(row, now)
       : null
     if (row && !finding) {
       return {
@@ -624,7 +772,7 @@ export class IdentityRiskService {
         row,
         tenant,
         snapshot.observedAt,
-        new Date(envelope.evaluatedAt as string),
+        now,
       ),
     )
     if (users.some((user) => user === null)) {
@@ -642,6 +790,7 @@ export class IdentityRiskService {
       channel: 'm',
       organizationId: tenant.organizationId,
       customerTenantId: tenant.id,
+      datasetIdentity: `${envelope.observedAt}:${envelope.evaluatedAt}`,
       now,
     })
     const afterCursor = cursor
@@ -664,6 +813,7 @@ export class IdentityRiskService {
                 channel: 'm',
                 organizationId: tenant.organizationId,
                 customerTenantId: tenant.id,
+                datasetIdentity: `${envelope.observedAt}:${envelope.evaluatedAt}`,
                 position: { observedAt: new Date(last.observedAt), id: last.id },
               })
             : null,
@@ -706,12 +856,12 @@ export class IdentityRiskService {
       subjectId: string
       observedAt: Date
     },
-    evaluatedAt: Date,
+    platformNow: Date,
   ): IdentityRiskFindingDto | null {
     const presentation = identityRiskRulePresentation(row.ruleId)
     const id = boundedOpaqueId(row.id, 200)
     const subjectId = boundedOpaqueId(row.subjectId, 128)
-    const observedAt = parseTimestamp(row.observedAt, evaluatedAt)
+    const observedAt = parseTimestamp(row.observedAt, platformNow)
     if (
       !presentation ||
       !isIdentityRiskRuleId(row.ruleId) ||
@@ -751,7 +901,7 @@ export class IdentityRiskService {
     value: unknown,
     tenant: ScopedTenant,
     snapshotObservedAt: Date,
-    evaluatedAt: Date,
+    platformNow: Date,
   ): MicrosoftRiskyUserDto | null {
     if (!isPlainRecord(value)) return null
     const sourceId = boundedOpaqueId(value.id, 128)
@@ -783,7 +933,7 @@ export class IdentityRiskService {
         : null
     const observedAt = parseTimestamp(
       value.riskLastUpdatedDateTime ?? snapshotObservedAt,
-      evaluatedAt,
+      platformNow,
     )
     if (
       !riskLevel ||

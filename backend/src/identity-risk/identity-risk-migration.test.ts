@@ -21,6 +21,7 @@ test('migration enforces compound tenant relationships throughout risk storage',
     /FOREIGN KEY \("matched_result_id", "organization_id", "customer_tenant_id"\) REFERENCES "identity_risk_matched_results"/,
   )
   assert.match(sql, /identity_risk_evaluation_runs_scope_key/)
+  assert.match(sql, /"source_content_hash" VARCHAR\(128\) NOT NULL/)
   assert.match(sql, /identity_risk_matched_results_scope_key/)
   assert.match(sql, /identity_risk_findings_scope_key/)
 })
@@ -36,6 +37,10 @@ test('migration locks safety-control semantics and bounded non-negative counts',
   )
   assert.match(sql, /"eligible_count" BETWEEN 0 AND 1000000/)
   assert.match(sql, /"not_evaluated_count" BETWEEN 0 AND 1000000/)
+  assert.match(sql, /"matched_count_capped" BOOLEAN NOT NULL DEFAULT FALSE/)
+  assert.match(sql, /"not_matched_count_capped" BOOLEAN NOT NULL DEFAULT FALSE/)
+  assert.match(sql, /identity_risk_coverage_cap_truth_check/)
+  assert.doesNotMatch(sql, /"counts_capped"/)
   assert.match(sql, /identity_risk_operational_events_event_key/)
   assert.match(
     sql,

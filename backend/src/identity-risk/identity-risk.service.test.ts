@@ -23,6 +23,9 @@ function scoped(overrides: Record<string, unknown> = {}) {
     syncState: {
       findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: new Date() }),
     },
+    identityRiskOperationalControl: {
+      findMany: async () => [],
+    },
     ...overrides,
   } as unknown as PrismaService
 }
@@ -110,6 +113,147 @@ test('cross-organization tenant access is denied before evidence reads', async (
   }
 })
 
+test('active hard-disable hides prior HawkView summaries, lists, and details before evidence reads', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  let riskReads = 0
+  try {
+    const prisma = scoped({
+      identityRiskOperationalControl: {
+        findMany: async () => [{ controlType: 'EVALUATION_HARD_DISABLED' }],
+      },
+      identityRiskEvaluationRun: {
+        findFirst: async () => { riskReads += 1; return null },
+      },
+      identityRiskFinding: {
+        findMany: async () => { riskReads += 1; return [] },
+        findFirst: async () => { riskReads += 1; return null },
+      },
+    })
+    const service = new IdentityRiskService(prisma)
+    const summary = await service.summary(identity, tenantId)
+    const findings = await service.findings(identity, tenantId)
+    const detail = await service.findingDetail(identity, tenantId, 'finding-001')
+    assert.equal(summary.status, 'UNAVAILABLE')
+    assert.equal(findings.status, 'UNAVAILABLE')
+    assert.equal(detail.status, 'UNAVAILABLE')
+    assert.deepEqual(findings.findings, [])
+    assert.equal(detail.finding, null)
+    assert.equal(riskReads, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('a hard-disable activated during reads suppresses every HawkView projection', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  const controlModel = () => {
+    let reads = 0
+    return {
+      findMany: async () => ++reads === 1
+        ? []
+        : [{ controlType: 'EVALUATION_HARD_DISABLED' }],
+    }
+  }
+  const coverage = [{
+    ruleId: 'HV-ID-CHG-001.v1',
+    matchedCount: 1,
+    suppressedCount: 0,
+    notMatchedCount: 0,
+    notEvaluatedCount: 0,
+    matchedCountCapped: false,
+    suppressedCountCapped: false,
+    notMatchedCountCapped: false,
+    notEvaluatedCountCapped: false,
+  }]
+  try {
+    const base = {
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskRuleCoverage: { findMany: async () => coverage },
+      identityRiskFinding: {
+        count: async () => 1,
+        findMany: async (args: { distinct?: unknown }) =>
+          args.distinct ? [{ subjectId: 'identity-001' }] : [finding(1, now)],
+        findFirst: async () => finding(1, now),
+      },
+    }
+    const summary = await new IdentityRiskService(scoped({
+      ...base,
+      identityRiskOperationalControl: controlModel(),
+    })).summary(identity, tenantId)
+    const findings = await new IdentityRiskService(scoped({
+      ...base,
+      identityRiskOperationalControl: controlModel(),
+    })).findings(identity, tenantId)
+    const detail = await new IdentityRiskService(scoped({
+      ...base,
+      identityRiskOperationalControl: controlModel(),
+    })).findingDetail(identity, tenantId, 'finding-001')
+    assert.equal(summary.status, 'UNAVAILABLE')
+    assert.deepEqual(summary.counts.openFindings, {
+      value: 0, exact: false, capped: false,
+    })
+    assert.equal(findings.status, 'UNAVAILABLE')
+    assert.deepEqual(findings.findings, [])
+    assert.equal(detail.status, 'UNAVAILABLE')
+    assert.equal(detail.finding, null)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('current alert mute is reflected across HawkView projections without another evaluation', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET =
+    'unit-test-only-cursor-secret-at-least-32-bytes'
+  const now = new Date()
+  try {
+    const prisma = scoped({
+      identityRiskOperationalControl: {
+        findMany: async () => [{ controlType: 'ALERT_DELIVERY_DISABLED' }],
+      },
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskRuleCoverage: {
+        findMany: async () => [{
+          ruleId: 'HV-ID-CHG-001.v1',
+          matchedCount: 1,
+          suppressedCount: 0,
+          notMatchedCount: 0,
+          notEvaluatedCount: 0,
+          matchedCountCapped: false,
+          suppressedCountCapped: false,
+          notMatchedCountCapped: false,
+          notEvaluatedCountCapped: false,
+        }],
+      },
+      identityRiskFinding: {
+        count: async () => 1,
+        findMany: async (args: { distinct?: unknown }) =>
+          args.distinct ? [{ subjectId: 'identity-001' }] : [finding(1, now)],
+        findFirst: async () => finding(1, now),
+      },
+    })
+    const service = new IdentityRiskService(prisma)
+    const summary = await service.summary(identity, tenantId)
+    const findings = await service.findings(identity, tenantId)
+    const detail = await service.findingDetail(identity, tenantId, 'finding-001')
+    for (const projection of [summary, findings, detail]) {
+      assert.match(projection.limitation ?? '', /delivery is disabled/)
+    }
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+    if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+    else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
+  }
+})
+
 test('summary and findings use one completed run and server-owned bounded wording', async () => {
   const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
@@ -128,7 +272,10 @@ test('summary and findings use one completed run and server-owned bounded wordin
           suppressedCount: 0,
           notMatchedCount: 25,
           notEvaluatedCount: 0,
-          countsCapped: false,
+          matchedCountCapped: false,
+          suppressedCountCapped: false,
+          notMatchedCountCapped: false,
+          notEvaluatedCountCapped: false,
         }],
       },
       identityRiskFinding: {
@@ -199,6 +346,43 @@ test('findings use default 50 pagination and disclose a scoped cursor', async ()
   }
 })
 
+test('a findings cursor is rejected after the latest evaluation run changes', async () => {
+  const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET =
+    'unit-test-only-cursor-secret-at-least-32-bytes'
+  const now = new Date()
+  try {
+    const rows = Array.from({ length: 51 }, (_, index) =>
+      finding(index, new Date(now.getTime() - index * 1_000)),
+    )
+    const first = await new IdentityRiskService(scoped({
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskFinding: { findMany: async () => rows },
+    })).findings(identity, tenantId)
+    assert.ok(first.pageInfo.nextCursor)
+
+    let findingReads = 0
+    const nextRun = { ...currentRun(now), id: '44444444-4444-4444-8444-444444444444' }
+    await assert.rejects(
+      () => new IdentityRiskService(scoped({
+        identityRiskEvaluationRun: { findFirst: async () => nextRun },
+        identityRiskFinding: {
+          findMany: async () => { findingReads += 1; return [] },
+        },
+      })).findings(identity, tenantId, { cursor: first.pageInfo.nextCursor }),
+      /Pagination cursor is invalid/,
+    )
+    assert.equal(findingReads, 0)
+  } finally {
+    if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
+    if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+    else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
+  }
+})
+
 test('summary labels capped database and unique-subject counts explicitly', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
@@ -209,11 +393,14 @@ test('summary labels capped database and unique-subject counts explicitly', asyn
       identityRiskRuleCoverage: {
         findMany: async () => [{
           ruleId: 'HV-ID-CHG-001.v1',
-          matchedCount: 9,
+          matchedCount: 1_000_000,
           suppressedCount: 0,
           notMatchedCount: 1,
           notEvaluatedCount: 0,
-          countsCapped: true,
+          matchedCountCapped: true,
+          suppressedCountCapped: false,
+          notMatchedCountCapped: false,
+          notEvaluatedCountCapped: false,
         }],
       },
       identityRiskFinding: {
@@ -232,7 +419,45 @@ test('summary labels capped database and unique-subject counts explicitly', asyn
       value: 10_000, exact: false, capped: true,
     })
     assert.deepEqual(summary.counts.matchedResults, {
-      value: 9, exact: false, capped: true,
+      value: 10_000, exact: false, capped: true,
+    })
+    assert.deepEqual(summary.counts.suppressedResults, {
+      value: 0, exact: true, capped: false,
+    })
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('a corrupt capped-zero coverage row fails closed instead of rendering at least zero', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  const now = new Date()
+  try {
+    const summary = await new IdentityRiskService(scoped({
+      identityRiskEvaluationRun: { findFirst: async () => currentRun(now) },
+      identityRiskRuleCoverage: {
+        findMany: async () => [{
+          ruleId: 'HV-ID-CHG-001.v1',
+          matchedCount: 0,
+          suppressedCount: 0,
+          notMatchedCount: 0,
+          notEvaluatedCount: 0,
+          matchedCountCapped: true,
+          suppressedCountCapped: false,
+          notMatchedCountCapped: false,
+          notEvaluatedCountCapped: false,
+        }],
+      },
+      identityRiskFinding: {
+        count: async () => 0,
+        findMany: async () => [],
+      },
+    })).summary(identity, tenantId)
+    assert.equal(summary.status, 'ERROR')
+    assert.deepEqual(summary.counts.matchedResults, {
+      value: 0, exact: false, capped: false,
     })
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
@@ -373,6 +598,32 @@ test('only a fresh successful Microsoft collection may report an exact empty res
     const futureResult = await future.microsoftRiskyUsers(identity, tenantId)
     assert.equal(futureResult.status, 'ERROR')
     assert.deepEqual(futureResult.users, [])
+
+    const reference = new Date()
+    const compounded = new IdentityRiskService(scoped({
+      syncState: {
+        findFirst: async () => ({
+          status: 'SUCCEEDED',
+          lastSuccessfulAt: new Date(reference.getTime() + 4 * 60 * 1_000),
+        }),
+      },
+      tenantEntraSnapshot: {
+        findFirst: async () => ({
+          payload: [{
+            id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            riskLevel: 'none',
+            riskState: 'none',
+            riskLastUpdatedDateTime: new Date(
+              reference.getTime() + 8 * 60 * 1_000,
+            ).toISOString(),
+          }],
+          observedAt: new Date(reference.getTime() + 4 * 60 * 1_000),
+        }),
+      },
+    }))
+    const compoundedResult = await compounded.microsoftRiskyUsers(identity, tenantId)
+    assert.equal(compoundedResult.status, 'ERROR')
+    assert.deepEqual(compoundedResult.users, [])
 
     const staleAt = new Date(Date.now() - 37 * 60 * 60 * 1_000)
     const stale = new IdentityRiskService(scoped({

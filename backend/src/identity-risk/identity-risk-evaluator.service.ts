@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Inject, Injectable } from '@nestjs/common'
+import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
@@ -9,7 +10,9 @@ import {
   type IdentityRiskBoundedCount,
   type IdentityRiskEvaluationRequest,
   type IdentityRiskSourceBatch,
+  type IdentityRiskSourceEnvelope,
   type IdentitySignalDetector,
+  type IdentitySignalEvaluationContext,
   type IdentitySignalResult,
 } from './identity-risk.contract.js'
 import {
@@ -17,7 +20,10 @@ import {
   isIdentityRiskRuleId,
   type IdentityRiskRuleId,
 } from './identity-risk.catalog.js'
-import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
+import {
+  IdentityRiskSafetyService,
+  type IdentityRiskSafetyState,
+} from './identity-risk-safety.service.js'
 import {
   boundedOpaqueId,
   boundedSafeString,
@@ -32,6 +38,7 @@ const MAX_REASON_CODES_PER_RULE = 20
 const MAX_COUNT = 1_000_000
 const MAX_SOURCE_TYPES = 32
 const MAX_SOURCE_RECORDS_PER_TYPE = 50_000
+const MAX_SOURCE_ENVELOPES = MAX_SOURCE_TYPES * MAX_SOURCE_RECORDS_PER_TYPE
 const RUN_LEASE_MS = 5 * 60 * 1_000
 const NO_SOURCE_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000
 
@@ -57,6 +64,7 @@ const reasonCodes = new Set([
   'ACCOUNT_CLASS_UNVERIFIED',
   'BASELINE_LEARNING',
   'DETECTOR_FAILED',
+  'DETECTOR_OUTPUT_CONFLICT',
   'DETECTOR_OUTPUT_INVALID',
   'EVIDENCE_CAPPED',
   'EVIDENCE_MALFORMED',
@@ -96,6 +104,253 @@ function sha256(...parts: readonly string[]) {
 
 function validDate(value: unknown): value is Date {
   return value instanceof Date && Number.isFinite(value.getTime())
+}
+
+const MAX_CANONICAL_SOURCE_NODES = 2_000_000
+const MAX_CANONICAL_SOURCE_BYTES = 64 * 1024 * 1024
+type CanonicalBudget = { nodes: number; bytes: number }
+
+function canonicalToken(
+  hash: ReturnType<typeof createHash>,
+  value: string,
+  budget: CanonicalBudget,
+) {
+  budget.bytes += Buffer.byteLength(value)
+  if (budget.bytes > MAX_CANONICAL_SOURCE_BYTES) return false
+  hash.update(String(Buffer.byteLength(value))).update(':').update(value)
+  return true
+}
+
+function canonicalValue(
+  hash: ReturnType<typeof createHash>,
+  value: unknown,
+  budget: CanonicalBudget,
+  ancestors: Set<object>,
+  depth = 0,
+): boolean {
+  budget.nodes += 1
+  if (budget.nodes > MAX_CANONICAL_SOURCE_NODES || depth > 16) return false
+  if (value === null) return canonicalToken(hash, 'null', budget)
+  if (typeof value === 'boolean') {
+    return canonicalToken(hash, value ? 'boolean:true' : 'boolean:false', budget)
+  }
+  if (typeof value === 'string') {
+    return canonicalToken(hash, `string:${value}`, budget)
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return false
+    return canonicalToken(
+      hash,
+      `number:${Object.is(value, -0) ? '0' : String(value)}`,
+      budget,
+    )
+  }
+  if (value instanceof Date) {
+    return validDate(value) && canonicalToken(hash, `date:${value.toISOString()}`, budget)
+  }
+  if (typeof value !== 'object' || ancestors.has(value)) return false
+  ancestors.add(value)
+  try {
+    if (Array.isArray(value)) {
+      if (!canonicalToken(hash, `array:${value.length}`, budget)) return false
+      return value.every((item) =>
+        canonicalValue(hash, item, budget, ancestors, depth + 1),
+      )
+    }
+    if (!isPlainRecord(value) || Object.getOwnPropertySymbols(value).length > 0) {
+      return false
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    const keys = Object.keys(value).sort()
+    if (
+      Reflect.ownKeys(descriptors).some((key) =>
+        typeof key !== 'string' ||
+        !descriptors[key]?.enumerable ||
+        !('value' in descriptors[key]!),
+      ) ||
+      !canonicalToken(hash, `object:${keys.length}`, budget)
+    ) return false
+    return keys.every((key) =>
+      canonicalToken(hash, `key:${key}`, budget) &&
+      canonicalValue(hash, descriptors[key]!.value, budget, ancestors, depth + 1),
+    )
+  } finally {
+    ancestors.delete(value)
+  }
+}
+
+type CanonicalSourceRecord = Readonly<{
+  identity: string
+  signature: string
+  source: string
+  sortTime: Date
+  payload: Readonly<Record<string, unknown>>
+}>
+
+const immutableEnvelopeKeys = [
+  'authoritativeEventTime',
+  'canonicalEventId',
+  'kind',
+  'payload',
+  'sourceEventVersion',
+  'sourceType',
+].join(',')
+const snapshotEnvelopeKeys = [
+  'authoritativeObservationId',
+  'kind',
+  'objectId',
+  'observedAt',
+  'payload',
+  'projectorSchemaVersion',
+  'resourceType',
+  'sourceWatermark',
+].join(',')
+
+function canonicalPayloadHash(
+  payload: unknown,
+  budget: CanonicalBudget,
+): string | null {
+  const hash = createHash('sha256')
+  return canonicalValue(hash, payload, budget, new Set())
+    ? hash.digest('hex')
+    : null
+}
+
+function canonicalSourceRecord(
+  envelope: IdentityRiskSourceEnvelope,
+  request: IdentityRiskEvaluationRequest,
+  platformNow: Date,
+  watermarks: ReadonlySet<string>,
+  budget: CanonicalBudget,
+): CanonicalSourceRecord | null {
+  if (!isPlainRecord(envelope) || !isPlainRecord(envelope.payload)) return null
+  const payloadHash = canonicalPayloadHash(envelope.payload, budget)
+  if (!payloadHash) return null
+
+  if (envelope.kind === 'IMMUTABLE_EVENT') {
+    if (Object.keys(envelope).sort().join(',') !== immutableEnvelopeKeys) return null
+    const source = boundedOpaqueId(envelope.sourceType, 80)
+    const eventId = boundedOpaqueId(envelope.canonicalEventId, 160)
+    const version = boundedOpaqueId(envelope.sourceEventVersion, 80)
+    const eventTime = parseTimestamp(envelope.authoritativeEventTime, platformNow)
+    if (
+      !source ||
+      !eventId ||
+      !version ||
+      !eventTime ||
+      /RISKY_USERS|RISK_DETECTIONS|MICROSOFT_ENTRA_RISK/i.test(source)
+    ) return null
+    const identity = sha256(
+      request.organizationId,
+      request.customerTenantId,
+      'IMMUTABLE_EVENT',
+      source,
+      eventId,
+    )
+    return {
+      identity,
+      signature: sha256(eventTime.toISOString(), version, payloadHash),
+      source,
+      sortTime: eventTime,
+      payload: envelope.payload,
+    }
+  }
+
+  if (envelope.kind === 'AUTHORITATIVE_SNAPSHOT') {
+    if (Object.keys(envelope).sort().join(',') !== snapshotEnvelopeKeys) return null
+    const source = boundedOpaqueId(envelope.resourceType, 80)
+    const objectId = boundedOpaqueId(envelope.objectId, 160)
+    const observationId = boundedOpaqueId(
+      envelope.authoritativeObservationId,
+      160,
+    )
+    const projectorVersion = boundedOpaqueId(envelope.projectorSchemaVersion, 80)
+    const watermark = boundedOpaqueId(envelope.sourceWatermark, 128)
+    const observedAt = parseTimestamp(envelope.observedAt, platformNow)
+    if (
+      !source ||
+      !objectId ||
+      !observationId ||
+      !projectorVersion ||
+      !watermark ||
+      !watermarks.has(watermark) ||
+      !observedAt ||
+      /RISKY_USERS|RISK_DETECTIONS|MICROSOFT_ENTRA_RISK/i.test(source)
+    ) return null
+    const identity = sha256(
+      request.organizationId,
+      request.customerTenantId,
+      'AUTHORITATIVE_SNAPSHOT',
+      source,
+      objectId,
+      observationId,
+    )
+    return {
+      identity,
+      signature: sha256(
+        observedAt.toISOString(),
+        projectorVersion,
+        watermark,
+        payloadHash,
+      ),
+      source,
+      sortTime: observedAt,
+      payload: envelope.payload,
+    }
+  }
+  return null
+}
+
+function canonicalizeSourceEnvelopes(
+  batch: IdentityRiskSourceBatch,
+  request: IdentityRiskEvaluationRequest,
+  platformNow: Date,
+): Readonly<{
+  sources: IdentitySignalEvaluationContext['sources']
+  sourceContentHash: string
+  integrityConflict: boolean
+}> | null {
+  if (
+    !Array.isArray(batch.sourceEnvelopes) ||
+    batch.sourceEnvelopes.length > MAX_SOURCE_ENVELOPES
+  ) return null
+  const budget: CanonicalBudget = { nodes: 0, bytes: 0 }
+  const watermarks = new Set(batch.orderedSourceWatermarks)
+  const records = new Map<string, CanonicalSourceRecord>()
+  for (const envelope of batch.sourceEnvelopes) {
+    const record = canonicalSourceRecord(
+      envelope,
+      request,
+      platformNow,
+      watermarks,
+      budget,
+    )
+    if (!record) return null
+    const existing = records.get(record.identity)
+    if (existing && existing.signature !== record.signature) {
+      return { sources: {}, sourceContentHash: '', integrityConflict: true }
+    }
+    if (!existing) records.set(record.identity, record)
+  }
+
+  const ordered = [...records.values()].sort((left, right) =>
+    left.sortTime.getTime() - right.sortTime.getTime() ||
+    left.identity.localeCompare(right.identity),
+  )
+  const sources: Record<string, Readonly<Record<string, unknown>>[]> = {}
+  const hash = createHash('sha256')
+  for (const record of ordered) {
+    ;(sources[record.source] ??= []).push(record.payload)
+    if (
+      !canonicalToken(hash, record.identity, budget) ||
+      !canonicalToken(hash, record.signature, budget)
+    ) return null
+  }
+  return {
+    sources,
+    sourceContentHash: hash.digest('hex'),
+    integrityConflict: false,
+  }
 }
 
 @Injectable()
@@ -255,12 +510,6 @@ function runExpiry(batch: IdentityRiskSourceBatch, platformNow: Date) {
   return policy
 }
 
-function uniqueViolation(error: unknown) {
-  return Boolean(
-    error && typeof error === 'object' && 'code' in error && error.code === 'P2002',
-  )
-}
-
 @Injectable()
 export class IdentityRiskEvaluatorService {
   constructor(
@@ -279,25 +528,12 @@ export class IdentityRiskEvaluatorService {
     if (mode() === 'OFF') {
       return { status: 'OFF', runKey: null, alertDeliveryDisabled: true }
     }
-    const safety = await this.safety.stateForTenant(
+    let safety = await this.safety.stateForTenant(
       request.organizationId,
       request.customerTenantId,
     )
     if (safety.evaluationHardDisabled) {
-      if (safety.hardDisableEpisodeId) {
-        await this.safety.recordHardStopBlocked({
-          organizationId: request.organizationId,
-          customerTenantId: request.customerTenantId,
-          episodeId: safety.hardDisableEpisodeId,
-          scopeType: safety.hardDisableScopeType ?? 'TENANT',
-          now: platformNow,
-        })
-      }
-      return {
-        status: 'HARD_DISABLED',
-        runKey: null,
-        alertDeliveryDisabled: true,
-      }
+      return this.hardDisabledResult(request, safety, platformNow)
     }
 
     const batch = await request.loadSources()
@@ -326,12 +562,48 @@ export class IdentityRiskEvaluatorService {
         alertDeliveryDisabled: true,
       }
     }
-    this.validateSourceBatch(request, batch)
+    this.validateSourceBatch(request, batch, platformNow)
+
+    // A control may be activated while the allowlisted loader is in flight.
+    // Re-read it before hashing, claiming, or evaluating any returned source.
+    safety = await this.safety.stateForTenant(
+      request.organizationId,
+      request.customerTenantId,
+    )
+    if (safety.evaluationHardDisabled) {
+      return this.hardDisabledResult(request, safety, platformNow)
+    }
 
     // Watermarks are restricted to bounded ASCII opaque IDs, so the default
     // code-unit sort is the canonical bytewise order used by the run key.
     const canonicalSourceWatermarks = [...batch.orderedSourceWatermarks].sort()
     const watermarkHash = sha256(...canonicalSourceWatermarks)
+    const canonicalSources = canonicalizeSourceEnvelopes(
+      batch,
+      request,
+      platformNow,
+    )
+    if (!canonicalSources) {
+      throw new Error('Identity risk source contract is invalid.')
+    }
+    if (canonicalSources.integrityConflict) {
+      await this.safety.activate({
+        controlType: 'EVALUATION_HARD_DISABLED',
+        scope: {
+          type: 'TENANT',
+          organizationId: request.organizationId,
+          customerTenantId: request.customerTenantId,
+        },
+        reasonCode: 'SOURCE_INTEGRITY_CONFLICT',
+        actorServiceId: 'identity-risk-evaluator',
+        now: platformNow,
+      })
+      return {
+        status: 'HARD_DISABLED',
+        runKey: null,
+        alertDeliveryDisabled: true,
+      }
+    }
     const runKey = sha256(
       request.organizationId,
       request.customerTenantId,
@@ -347,12 +619,47 @@ export class IdentityRiskEvaluatorService {
       request,
       runKey,
       watermarkHash,
+      sourceContentHash: canonicalSources.sourceContentHash,
       expiresAt,
       leaseToken,
-      alertDeliveryDisabled: safety.alertDeliveryDisabled,
       capability: batch.capability,
       platformNow,
     })
+    if (claim === 'SOURCE_INTEGRITY_CONFLICT') {
+      await this.safety.activate({
+        controlType: 'EVALUATION_HARD_DISABLED',
+        scope: {
+          type: 'TENANT',
+          organizationId: request.organizationId,
+          customerTenantId: request.customerTenantId,
+        },
+        reasonCode: 'SOURCE_INTEGRITY_CONFLICT',
+        actorServiceId: 'identity-risk-evaluator',
+        now: platformNow,
+      })
+      return {
+        status: 'HARD_DISABLED',
+        runKey: null,
+        alertDeliveryDisabled: true,
+      }
+    }
+    if (typeof claim === 'object' && 'hardDisabled' in claim) {
+      return this.hardDisabledResult(
+        request,
+        claim.hardDisabled,
+        platformNow,
+      )
+    }
+    safety = await this.safety.stateForTenant(
+      request.organizationId,
+      request.customerTenantId,
+    )
+    if (safety.evaluationHardDisabled) {
+      if (typeof claim === 'object') {
+        await this.failOwnedRun(request, claim.id, leaseToken, 'EVALUATION_HARD_DISABLED')
+      }
+      return this.hardDisabledResult(request, safety, platformNow)
+    }
     if (claim === 'COMPLETED') {
       return {
         status: 'REPLAYED',
@@ -371,46 +678,88 @@ export class IdentityRiskEvaluatorService {
     try {
       const evaluated = await this.runDetectors(
         request.detectors,
-        batch,
+        {
+          ...batch,
+          context: {
+            ...batch.context,
+            sources: canonicalSources.sources,
+          },
+        },
         platformNow,
         runKey,
         request.organizationId,
         request.customerTenantId,
       )
-      await this.persistCompletedRun({
+      const persisted = await this.persistCompletedRun({
         request,
         runId: claim.id,
         runKey,
         leaseToken,
         expiresAt,
-        alertDeliveryDisabled: safety.alertDeliveryDisabled,
         capability: batch.capability,
         platformNow,
         ...evaluated,
       })
+      if (persisted.status === 'HARD_DISABLED') {
+        return this.hardDisabledResult(
+          request,
+          persisted.safety,
+          platformNow,
+        )
+      }
       return {
         status: 'COMPLETED',
         runKey,
-        alertDeliveryDisabled: safety.alertDeliveryDisabled,
+        alertDeliveryDisabled: persisted.safety.alertDeliveryDisabled,
       }
     } catch {
-      await this.prisma.identityRiskEvaluationRun.updateMany({
-        where: {
-          id: claim.id,
-          organizationId: request.organizationId,
-          customerTenantId: request.customerTenantId,
-          leaseToken,
-          status: 'RUNNING',
-        },
-        data: {
-          status: 'FAILED',
-          failureCode: 'EVALUATION_FAILED',
-          leaseToken: null,
-          leaseExpiresAt: null,
-        },
-      })
+      await this.failOwnedRun(request, claim.id, leaseToken, 'EVALUATION_FAILED')
       throw new Error('Identity risk evaluation failed.')
     }
+  }
+
+  private async hardDisabledResult(
+    request: IdentityRiskEvaluationRequest,
+    safety: IdentityRiskSafetyState,
+    platformNow: Date,
+  ): Promise<IdentityRiskEvaluationResult> {
+    if (safety.hardDisableEpisodeId) {
+      await this.safety.recordHardStopBlocked({
+        organizationId: request.organizationId,
+        customerTenantId: request.customerTenantId,
+        episodeId: safety.hardDisableEpisodeId,
+        scopeType: safety.hardDisableScopeType ?? 'TENANT',
+        now: platformNow,
+      })
+    }
+    return {
+      status: 'HARD_DISABLED',
+      runKey: null,
+      alertDeliveryDisabled: true,
+    }
+  }
+
+  private async failOwnedRun(
+    request: IdentityRiskEvaluationRequest,
+    runId: string,
+    leaseToken: string,
+    failureCode: 'EVALUATION_FAILED' | 'EVALUATION_HARD_DISABLED',
+  ) {
+    await this.prisma.identityRiskEvaluationRun.updateMany({
+      where: {
+        id: runId,
+        organizationId: request.organizationId,
+        customerTenantId: request.customerTenantId,
+        leaseToken,
+        status: 'RUNNING',
+      },
+      data: {
+        status: 'FAILED',
+        failureCode,
+        leaseToken: null,
+        leaseExpiresAt: null,
+      },
+    })
   }
 
   private validateRequest(
@@ -442,52 +791,159 @@ export class IdentityRiskEvaluatorService {
   private validateSourceBatch(
     request: IdentityRiskEvaluationRequest,
     batch: IdentityRiskSourceBatch,
+    platformNow: Date,
   ) {
-    const sourceEntries = isPlainRecord(batch.context.sources)
-      ? Object.entries(batch.context.sources)
-      : []
     if (
-      !isPlainRecord(batch.context.sources) ||
+      !isPlainRecord(batch.context) ||
+      Object.keys(batch.context).sort().join(',') !==
+        'catalogVersion,customerTenantId,engineVersion,evaluationAt,organizationId' ||
       batch.context.engineVersion !== request.engineVersion ||
       batch.context.catalogVersion !== request.catalogVersion ||
       !validDate(batch.context.evaluationAt) ||
       batch.context.evaluationAt.getTime() !== request.evaluationAt.getTime() ||
+      batch.context.evaluationAt.getTime() >
+        platformNow.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS ||
       !coverages.has(batch.capability) ||
-      sourceEntries.length > MAX_SOURCE_TYPES ||
-      sourceEntries.some(
-        ([source, rows]) =>
-          !boundedOpaqueId(source, 80) ||
-          !Array.isArray(rows) ||
-          rows.length > MAX_SOURCE_RECORDS_PER_TYPE ||
-          rows.some((row) => !isPlainRecord(row)),
-      ) ||
       batch.orderedSourceWatermarks.length > 100 ||
       batch.orderedSourceWatermarks.some(
         (watermark) => !boundedOpaqueId(watermark, 128),
       ) ||
       new Set(batch.orderedSourceWatermarks).size !==
         batch.orderedSourceWatermarks.length ||
-      sourceEntries.some(([source]) =>
-        /RISKY_USERS|RISK_DETECTIONS|MICROSOFT_ENTRA_RISK/i.test(source),
-      ) ||
       (batch.earliestSourceExpiry !== null &&
         !validDate(batch.earliestSourceExpiry))
     ) throw new Error('Identity risk source contract is invalid.')
+  }
+
+  private async lockedSafetyState(
+    transaction: Prisma.TransactionClient,
+    organizationId: string,
+    customerTenantId: string,
+    includeAlertDelivery: boolean,
+  ): Promise<IdentityRiskSafetyState> {
+    const controlTypes = includeAlertDelivery
+      ? ['ALERT_DELIVERY_DISABLED', 'EVALUATION_HARD_DISABLED'] as const
+      : ['EVALUATION_HARD_DISABLED'] as const
+    const scopeKeys = ['GLOBAL', `${organizationId}:${customerTenantId}`]
+    const lockKeys = controlTypes
+      .flatMap((controlType) => scopeKeys.map((scope) =>
+        `hawkview:identity-risk-control:${controlType}:${scope}`,
+      ))
+      .sort()
+    for (const lockKey of lockKeys) {
+      await transaction.$executeRawUnsafe(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        lockKey,
+      )
+    }
+    const controls = await transaction.identityRiskOperationalControl.findMany({
+      where: {
+        state: 'ACTIVE',
+        controlType: { in: [...controlTypes] },
+        OR: [
+          { scopeType: 'GLOBAL', scopeKey: 'GLOBAL' },
+          {
+            scopeType: 'TENANT',
+            scopeKey: `${organizationId}:${customerTenantId}`,
+            organizationId,
+            customerTenantId,
+          },
+        ],
+      },
+      select: { controlType: true, episodeId: true, scopeType: true },
+    })
+    const hard = controls.find(
+      (control) => control.controlType === 'EVALUATION_HARD_DISABLED',
+    )
+    return {
+      evaluationHardDisabled: Boolean(hard),
+      alertDeliveryDisabled: controls.some(
+        (control) => control.controlType === 'ALERT_DELIVERY_DISABLED',
+      ),
+      hardDisableEpisodeId: hard?.episodeId ?? null,
+      hardDisableScopeType:
+        hard?.scopeType === 'GLOBAL' || hard?.scopeType === 'TENANT'
+          ? hard.scopeType
+          : null,
+    }
   }
 
   private async claimRun(input: {
     request: IdentityRiskEvaluationRequest
     runKey: string
     watermarkHash: string
+    sourceContentHash: string
     expiresAt: Date
     leaseToken: string
-    alertDeliveryDisabled: boolean
     capability: 'FULL' | 'PARTIAL' | 'UNAVAILABLE'
     platformNow: Date
-  }): Promise<'COMPLETED' | 'BUSY' | { id: string }> {
+  }): Promise<
+    | 'COMPLETED'
+    | 'BUSY'
+    | 'SOURCE_INTEGRITY_CONFLICT'
+    | { id: string }
+    | { hardDisabled: IdentityRiskSafetyState }
+  > {
     const now = input.platformNow
-    try {
-      const created = await this.prisma.identityRiskEvaluationRun.create({
+    return this.prisma.$transaction(async (transaction) => {
+      const safety = await this.lockedSafetyState(
+        transaction,
+        input.request.organizationId,
+        input.request.customerTenantId,
+        false,
+      )
+      if (safety.evaluationHardDisabled) return { hardDisabled: safety }
+      await transaction.$executeRawUnsafe(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        `hawkview:identity-risk-run:${input.request.organizationId}:${input.request.customerTenantId}:${input.runKey}`,
+      )
+      const existing = await transaction.identityRiskEvaluationRun.findUnique({
+        where: {
+          organizationId_customerTenantId_runKey: {
+            organizationId: input.request.organizationId,
+            customerTenantId: input.request.customerTenantId,
+            runKey: input.runKey,
+          },
+        },
+        select: {
+          id: true,
+          status: true,
+          leaseExpiresAt: true,
+          sourceContentHash: true,
+        },
+      })
+      if (existing) {
+        if (existing.sourceContentHash !== input.sourceContentHash) {
+          return 'SOURCE_INTEGRITY_CONFLICT'
+        }
+        if (existing.status === 'COMPLETED') return 'COMPLETED'
+        if (
+          existing.status === 'RUNNING' &&
+          existing.leaseExpiresAt &&
+          existing.leaseExpiresAt.getTime() > now.getTime()
+        ) return 'BUSY'
+        const reclaimed = await transaction.identityRiskEvaluationRun.updateMany({
+          where: {
+            id: existing.id,
+            organizationId: input.request.organizationId,
+            customerTenantId: input.request.customerTenantId,
+            OR: [
+              { status: 'FAILED' },
+              { status: 'RUNNING', leaseExpiresAt: { lte: now } },
+            ],
+          },
+          data: {
+            status: 'RUNNING',
+            failureCode: null,
+            leaseToken: input.leaseToken,
+            leaseExpiresAt: new Date(now.getTime() + RUN_LEASE_MS),
+            alertDeliveryDisabled: safety.alertDeliveryDisabled,
+            capability: input.capability,
+          },
+        })
+        return reclaimed.count === 1 ? { id: existing.id } : 'BUSY'
+      }
+      const created = await transaction.identityRiskEvaluationRun.create({
         data: {
           organizationId: input.request.organizationId,
           customerTenantId: input.request.customerTenantId,
@@ -498,9 +954,10 @@ export class IdentityRiskEvaluatorService {
           windowStart: input.request.windowStart,
           windowEnd: input.request.windowEnd,
           sourceWatermarkHash: input.watermarkHash,
+          sourceContentHash: input.sourceContentHash,
           capability: input.capability,
           aggregate: {},
-          alertDeliveryDisabled: input.alertDeliveryDisabled,
+          alertDeliveryDisabled: safety.alertDeliveryDisabled,
           leaseToken: input.leaseToken,
           leaseExpiresAt: new Date(now.getTime() + RUN_LEASE_MS),
           expiresAt: input.expiresAt,
@@ -509,51 +966,14 @@ export class IdentityRiskEvaluatorService {
         select: { id: true },
       })
       return created
-    } catch (error) {
-      if (!uniqueViolation(error)) throw error
-    }
-    const existing = await this.prisma.identityRiskEvaluationRun.findUnique({
-      where: {
-        organizationId_customerTenantId_runKey: {
-          organizationId: input.request.organizationId,
-          customerTenantId: input.request.customerTenantId,
-          runKey: input.runKey,
-        },
-      },
-      select: { id: true, status: true, leaseExpiresAt: true },
     })
-    if (!existing) throw new Error('Identity risk run claim failed.')
-    if (existing.status === 'COMPLETED') return 'COMPLETED'
-    if (
-      existing.status === 'RUNNING' &&
-      existing.leaseExpiresAt &&
-      existing.leaseExpiresAt.getTime() > now.getTime()
-    ) return 'BUSY'
-    const reclaimed = await this.prisma.identityRiskEvaluationRun.updateMany({
-      where: {
-        id: existing.id,
-        organizationId: input.request.organizationId,
-        customerTenantId: input.request.customerTenantId,
-        OR: [
-          { status: 'FAILED' },
-          { status: 'RUNNING', leaseExpiresAt: { lte: now } },
-        ],
-      },
-      data: {
-        status: 'RUNNING',
-        failureCode: null,
-        leaseToken: input.leaseToken,
-        leaseExpiresAt: new Date(now.getTime() + RUN_LEASE_MS),
-        alertDeliveryDisabled: input.alertDeliveryDisabled,
-        capability: input.capability,
-      },
-    })
-    return reclaimed.count === 1 ? { id: existing.id } : 'BUSY'
   }
 
   private async runDetectors(
     detectors: readonly IdentitySignalDetector[],
-    batch: IdentityRiskSourceBatch,
+    batch: Omit<IdentityRiskSourceBatch, 'context'> & {
+      context: IdentitySignalEvaluationContext
+    },
     platformNow: Date,
     runKey: string,
     organizationId: string,
@@ -561,6 +981,10 @@ export class IdentityRiskEvaluatorService {
   ) {
     const aggregates: RuleAggregate[] = []
     const matches = new Map<string, IdentitySignalResult>()
+    const trustedContext = Object.freeze({
+      ...batch.context,
+      evaluationAt: new Date(platformNow.getTime()),
+    })
     for (const detector of [...detectors].sort((left, right) =>
       left.ruleId.localeCompare(right.ruleId),
     )) {
@@ -569,7 +993,7 @@ export class IdentityRiskEvaluatorService {
       aggregates.push(aggregate)
       let raw: readonly IdentitySignalResult[]
       try {
-        raw = await detector.evaluate(batch.context)
+        raw = await detector.evaluate(trustedContext)
       } catch {
         raw = []
         add(aggregate.notEvaluated)
@@ -617,7 +1041,43 @@ export class IdentityRiskEvaluatorService {
         })
         throw new Error('Identity risk detector output was rejected.')
       }
+      const distinctResults: IdentitySignalResult[] = []
+      const matchedSignatures = new Map<string, string>()
       for (const result of validated as IdentitySignalResult[]) {
+        if (result.outcome !== 'MATCHED') {
+          distinctResults.push(result)
+          continue
+        }
+        const duplicateKey = sha256(
+          ruleId,
+          result.subjectType ?? '',
+          result.subjectId ?? '',
+          result.observedAt?.toISOString() ?? '',
+        )
+        const signature = sha256(
+          duplicateKey,
+          result.coverage,
+          result.severity ?? '',
+          result.confidence ?? '',
+          result.reasonCode ?? '',
+        )
+        const existing = matchedSignatures.get(duplicateKey)
+        if (existing === signature) continue
+        if (existing) {
+          await this.safety.recordDetectorRejection({
+            organizationId,
+            customerTenantId,
+            runKey,
+            ruleId,
+            reasonCode: 'DETECTOR_OUTPUT_CONFLICT',
+            now: platformNow,
+          })
+          throw new Error('Identity risk detector output was rejected.')
+        }
+        matchedSignatures.set(duplicateKey, signature)
+        distinctResults.push(result)
+      }
+      for (const result of distinctResults) {
         if (result.outcome !== 'NOT_EVALUATED') add(aggregate.eligible)
         if (result.outcome === 'MATCHED') {
           add(aggregate.matched)
@@ -653,13 +1113,37 @@ export class IdentityRiskEvaluatorService {
     runKey: string
     leaseToken: string
     expiresAt: Date
-    alertDeliveryDisabled: boolean
     capability: 'FULL' | 'PARTIAL' | 'UNAVAILABLE'
     aggregates: readonly RuleAggregate[]
     matches: readonly [string, IdentitySignalResult][]
     platformNow: Date
   }) {
-    await this.prisma.$transaction(async (transaction) => {
+    return this.prisma.$transaction(async (transaction) => {
+      const safety = await this.lockedSafetyState(
+        transaction,
+        input.request.organizationId,
+        input.request.customerTenantId,
+        true,
+      )
+      if (safety.evaluationHardDisabled) {
+        const failed = await transaction.identityRiskEvaluationRun.updateMany({
+          where: {
+            id: input.runId,
+            organizationId: input.request.organizationId,
+            customerTenantId: input.request.customerTenantId,
+            leaseToken: input.leaseToken,
+            status: 'RUNNING',
+          },
+          data: {
+            status: 'FAILED',
+            failureCode: 'EVALUATION_HARD_DISABLED',
+            leaseToken: null,
+            leaseExpiresAt: null,
+          },
+        })
+        if (failed.count !== 1) throw new Error('Identity risk run lease was lost.')
+        return { status: 'HARD_DISABLED' as const, safety }
+      }
       for (const aggregate of input.aggregates) {
         await transaction.identityRiskRuleCoverage.upsert({
           where: {
@@ -680,13 +1164,11 @@ export class IdentityRiskEvaluatorService {
             suppressedCount: aggregate.suppressed.value,
             notMatchedCount: aggregate.notMatched.value,
             notEvaluatedCount: aggregate.notEvaluated.value,
-            countsCapped: [
-              aggregate.eligible,
-              aggregate.matched,
-              aggregate.suppressed,
-              aggregate.notMatched,
-              aggregate.notEvaluated,
-            ].some((count) => count.capped),
+            eligibleCountCapped: aggregate.eligible.capped,
+            matchedCountCapped: aggregate.matched.capped,
+            suppressedCountCapped: aggregate.suppressed.capped,
+            notMatchedCountCapped: aggregate.notMatched.capped,
+            notEvaluatedCountCapped: aggregate.notEvaluated.capped,
             reasonCounts: [...aggregate.reasons]
               .sort(([left], [right]) => left.localeCompare(right))
               .map(([code, count]) => ({ code, count: publicCount(count) })),
@@ -792,13 +1274,14 @@ export class IdentityRiskEvaluatorService {
             input.aggregates.some((aggregate) => aggregate.notEvaluated.value > 0)
               ? 'PARTIAL'
               : input.capability,
-          alertDeliveryDisabled: input.alertDeliveryDisabled,
+          alertDeliveryDisabled: safety.alertDeliveryDisabled,
           completedAt: input.platformNow,
           leaseToken: null,
           leaseExpiresAt: null,
         },
       })
       if (updated.count !== 1) throw new Error('Identity risk run lease was lost.')
+      return { status: 'COMPLETED' as const, safety }
     })
   }
 }

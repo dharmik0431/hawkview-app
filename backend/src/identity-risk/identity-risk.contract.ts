@@ -48,8 +48,29 @@ export interface IdentitySignalDetector {
   ): readonly IdentitySignalResult[] | Promise<readonly IdentitySignalResult[]>
 }
 
+export type IdentityRiskSourceEnvelope =
+  | Readonly<{
+      kind: 'IMMUTABLE_EVENT'
+      sourceType: string
+      canonicalEventId: string
+      authoritativeEventTime: Date
+      sourceEventVersion: string
+      payload: Readonly<Record<string, unknown>>
+    }>
+  | Readonly<{
+      kind: 'AUTHORITATIVE_SNAPSHOT'
+      resourceType: string
+      objectId: string
+      authoritativeObservationId: string
+      observedAt: Date
+      projectorSchemaVersion: string
+      sourceWatermark: string
+      payload: Readonly<Record<string, unknown>>
+    }>
+
 export type IdentityRiskSourceBatch = Readonly<{
-  context: IdentitySignalEvaluationContext
+  context: Omit<IdentitySignalEvaluationContext, 'sources'>
+  sourceEnvelopes: readonly IdentityRiskSourceEnvelope[]
   orderedSourceWatermarks: readonly string[]
   earliestSourceExpiry: Date | null
   capability: IdentitySignalCoverage
