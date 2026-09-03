@@ -1,10 +1,24 @@
 import { Logger } from '@nestjs/common'
 
-const MAX_PHASE_LENGTH = 64
+const PHASES = new Set([
+  'scheduled_sync',
+  'scheduled_sync_maintenance',
+  'exchange_configuration_collection',
+] as const)
+const OUTCOMES = new Set(['STARTED', 'COMPLETED', 'FAILED'] as const)
+export type RuntimeMemoryPhase = typeof PHASES extends Set<infer T> ? T : never
+export type RuntimeMemoryOutcome = typeof OUTCOMES extends Set<infer T> ? T : never
 
-function phaseName(phase: string) {
-  const normalized = phase.trim().replace(/[^a-z0-9_-]/gi, '_').slice(0, MAX_PHASE_LENGTH)
-  return normalized || 'unknown'
+function knownPhase(value: unknown): RuntimeMemoryPhase | 'UNKNOWN' {
+  return typeof value === 'string' && PHASES.has(value as RuntimeMemoryPhase)
+    ? value as RuntimeMemoryPhase
+    : 'UNKNOWN'
+}
+
+function knownOutcome(value: unknown): RuntimeMemoryOutcome | 'UNKNOWN' {
+  return typeof value === 'string' && OUTCOMES.has(value as RuntimeMemoryOutcome)
+    ? value as RuntimeMemoryOutcome
+    : 'UNKNOWN'
 }
 
 /**
@@ -14,16 +28,16 @@ function phaseName(phase: string) {
  */
 export function logProcessMemoryPhase(
   logger: Pick<Logger, 'log'>,
-  phase: string,
-  outcome: 'STARTED' | 'COMPLETED' | 'FAILED',
+  phase: unknown,
+  outcome: unknown,
   startedAt = Date.now(),
 ) {
   const memory = process.memoryUsage()
   const elapsedMs = Math.max(0, Math.min(24 * 60 * 60 * 1_000, Date.now() - startedAt))
   logger.log(JSON.stringify({
     event: 'runtime_memory_phase',
-    phase: phaseName(phase),
-    outcome,
+    phase: knownPhase(phase),
+    outcome: knownOutcome(outcome),
     elapsedMs,
     rssBytes: Math.max(0, Math.floor(memory.rss)),
     heapUsedBytes: Math.max(0, Math.floor(memory.heapUsed)),

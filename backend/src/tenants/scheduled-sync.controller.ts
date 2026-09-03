@@ -4,6 +4,7 @@ import { Public } from '../auth/public.decorator.js'
 import { SchedulerTokenVerifier } from './scheduler-token-verifier.service.js'
 import { TenantSyncService } from './tenant-sync.service.js'
 import { IdentityRiskMaintenanceService } from '../identity-risk/identity-risk-maintenance.service.js'
+import { identityRiskMaintenanceEnabled } from '../identity-risk/identity-risk-maintenance.service.js'
 import { logProcessMemoryPhase } from './runtime-telemetry.js'
 
 @Controller('api/internal/sync')
@@ -25,8 +26,10 @@ export class ScheduledSyncController {
     const startedAt = Date.now()
     logProcessMemoryPhase(this.logger, 'scheduled_sync', 'STARTED', startedAt)
     try {
-      await this.identityRiskMaintenance.runAuthorizedScheduledMaintenance()
-      logProcessMemoryPhase(this.logger, 'scheduled_sync_maintenance', 'COMPLETED', startedAt)
+      if (identityRiskMaintenanceEnabled()) {
+        await this.identityRiskMaintenance.runAuthorizedScheduledMaintenance()
+        logProcessMemoryPhase(this.logger, 'scheduled_sync_maintenance', 'COMPLETED', startedAt)
+      }
       const result = await this.tenantSyncService.syncDueTenants()
       logProcessMemoryPhase(this.logger, 'scheduled_sync', 'COMPLETED', startedAt)
       return result

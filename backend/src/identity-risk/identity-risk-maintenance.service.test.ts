@@ -81,6 +81,8 @@ function maintenanceStore(initial: EventRow[]) {
 }
 
 test('scheduled maintenance is bounded, idempotent, and preserves unexpired rows', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   const now = new Date('2026-09-02T12:00:00.000Z')
   const expired = Array.from(
     { length: IDENTITY_RISK_OPERATIONAL_EVENT_PRUNE_BATCH_SIZE + 2 },
@@ -103,6 +105,7 @@ test('scheduled maintenance is bounded, idempotent, and preserves unexpired rows
     { now: () => now } as IdentityRiskPlatformClock,
   )
 
+  try {
   const first = await service.runAuthorizedScheduledMaintenance()
   assert.deepEqual(first, {
     status: 'COMPLETED',
@@ -133,9 +136,15 @@ test('scheduled maintenance is bounded, idempotent, and preserves unexpired rows
   assert.equal(store.calls.auditCreates[0]?.reasonCode, 'RETENTION_POLICY_APPLIED')
   assert.equal('organizationId' in store.calls.auditCreates[0]!, false)
   assert.equal('customerTenantId' in store.calls.auditCreates[0]!, false)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
 })
 
 test('scheduler authorization succeeds before retention maintenance and tenant sync', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   const order: string[] = []
   const verifier = {
     verify: async () => { order.push('verify') },
@@ -154,6 +163,7 @@ test('scheduler authorization succeeds before retention maintenance and tenant s
   } as unknown as IdentityRiskMaintenanceService
   const controller = new ScheduledSyncController(verifier, sync, maintenance)
 
+  try {
   assert.deepEqual(
     await controller.syncDueTenants({
       headers: { authorization: 'Bearer scheduler-token' },
@@ -161,6 +171,10 @@ test('scheduler authorization succeeds before retention maintenance and tenant s
     { status: 'ok' },
   )
   assert.deepEqual(order, ['verify', 'maintenance', 'sync'])
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
 })
 
 test('failed scheduler authorization prevents retention and tenant work', async () => {
@@ -186,4 +200,20 @@ test('failed scheduler authorization prevents retention and tenant work', async 
   assert.equal(maintenanceCalls, 0)
   assert.equal(syncCalls, 0)
   assert.deepEqual(messages, [])
+})
+
+test('maintenance is a zero-database-operation no-op while identity risk is OFF', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  let reads = 0
+  const service = new IdentityRiskMaintenanceService({
+    $transaction: async () => { reads += 1; throw new Error('must not transact') },
+  } as any, { now: () => new Date() } as any)
+  try {
+    assert.deepEqual(await service.runAuthorizedScheduledMaintenance(), { status: 'SKIPPED_OFF', deletedCount: 0, hasMore: false })
+    assert.equal(reads, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
 })

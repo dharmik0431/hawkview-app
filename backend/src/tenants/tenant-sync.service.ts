@@ -108,6 +108,9 @@ const MANAGEMENT_ACTIVITY_SOURCE = 'MICROSOFT_365_MANAGEMENT_ACTIVITY'
 const MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS = 7
 const DEFAULT_FAST_MAILBOX_RULE_REFRESH_MINUTES = 15
 const DEFAULT_FAST_MAILBOX_RULE_MAX_USERS = 250
+const GRAPH_LOG_COLLECTION_MAX_PAGES = 100
+const GRAPH_LOG_COLLECTION_MAX_ROWS = 100_000
+const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
 /** Hard ceilings keep a targeted SharePoint retry below the 15 minute USERS lease. */
 export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
   sitePages: 50,
@@ -1469,15 +1472,7 @@ export class TenantSyncService {
           failedResources: result.failedResources,
         })
       } catch (error) {
-        results.push({
-          tenantId: tenant.id,
-          microsoftTenantId: tenant.microsoftTenantId,
-          status: 'FAILED',
-          error:
-            error instanceof Error
-              ? error.message.slice(0, 500)
-              : 'Tenant synchronization failed.',
-        })
+      results.push({ status: 'FAILED', failureCode: 'TENANT_SYNC_FAILED' })
       }
     }
 
@@ -1492,7 +1487,7 @@ export class TenantSyncService {
       results,
     }
     this.logger.log(
-      `Scheduled tenant synchronization: ${JSON.stringify(summary)}`
+      `Scheduled tenant synchronization: ${JSON.stringify({ checkedAt: summary.checkedAt, due: summary.due, succeeded: summary.succeeded, partial: summary.partial, failed: summary.failed, skipped: summary.skipped })}`
     )
     return summary
   }
@@ -2216,27 +2211,35 @@ export class TenantSyncService {
     if (exchangePhase) {
       logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'STARTED', lastAttemptAt.getTime())
     }
-    const previousState = await this.prisma.syncState.upsert({
-      where: {
-        customerTenantId_resourceType: {
+    let previousState
+    try {
+      previousState = await this.prisma.syncState.upsert({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType,
+          },
+        },
+        create: {
+          organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
           resourceType,
+          status: 'RUNNING',
+          lastAttemptAt,
         },
-      },
-      create: {
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
-        resourceType,
-        status: 'RUNNING',
-        lastAttemptAt,
-      },
-      update: {
-        status: 'RUNNING',
-        lastAttemptAt,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      },
-    })
+        update: {
+          status: 'RUNNING',
+          lastAttemptAt,
+          lastErrorCode: null,
+          lastErrorMessage: null,
+        },
+      })
+    } catch (error) {
+      if (exchangePhase) {
+        logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
+      }
+      throw error
+    }
 
     try {
       await synchronize()
@@ -3440,13 +3443,23 @@ export class TenantSyncService {
   ) {
     const rows: any[] = []
     let nextUrl = initialUrl
+    const seen = new Set<string>()
+    const deadlineAt = Date.now() + GRAPH_LOG_COLLECTION_DEADLINE_MS
+    let pages = 0
     while (nextUrl) {
+      if (++pages > GRAPH_LOG_COLLECTION_MAX_PAGES || Date.now() > deadlineAt || seen.has(nextUrl)) {
+        throw new Error(`Microsoft ${resourceLabel} synchronization exceeded a bounded collection limit.`)
+      }
+      seen.add(nextUrl)
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error(`Microsoft returned an invalid ${resourceLabel} link.`)
       }
-      const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel)
+      const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel, { deadlineAt })
       const page = (await response.json()) as GraphCollectionPage
       rows.push(...(page.value ?? []))
+      if (rows.length > GRAPH_LOG_COLLECTION_MAX_ROWS) {
+        throw new Error(`Microsoft ${resourceLabel} synchronization exceeded a bounded collection limit.`)
+      }
       nextUrl = page['@odata.nextLink'] ?? ''
     }
     return rows

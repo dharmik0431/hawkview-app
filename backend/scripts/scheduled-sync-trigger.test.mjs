@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { runScheduledSync } from './scheduled-sync-trigger.mjs'
+import { runScheduledSync, SCHEDULED_SYNC_RESPONSE_MAX_BYTES, summarizeScheduledSyncResult } from './scheduled-sync-trigger.mjs'
 
 const options = { targetUrl: 'https://api.example.test/api/internal/sync/due-tenants', sharedSecret: 'x'.repeat(32), timeoutMs: 100 }
 
@@ -33,5 +33,26 @@ test('failure text never includes the response body or scheduler secret', async 
     assert.equal(String(error).includes('access_token=never'), false)
     assert.equal(String(error).includes(options.sharedSecret), false)
     return true
+  })
+})
+
+test('bounds streamed responses and maps body failures to fixed safe codes', async () => {
+  let cancelled = false
+  const stream = new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(SCHEDULED_SYNC_RESPONSE_MAX_BYTES + 1)) },
+    cancel() { cancelled = true },
+  })
+  await assert.rejects(() => runScheduledSync({ ...options, fetchImpl: async () => new Response(stream) }), /SCHEDULER_RESPONSE_(TOO_LARGE|READ_FAILED)/)
+  assert.equal(cancelled, true)
+  await assert.rejects(() => runScheduledSync({ ...options, fetchImpl: async () => new Response(new ReadableStream({ pull() { throw new Error('access_token=never') } })) }), (error) => {
+    assert.equal(String(error).includes('access_token=never'), false)
+    assert.match(String(error), /SCHEDULER_RESPONSE_READ_FAILED/)
+    return true
+  })
+})
+
+test('success output summary is aggregate-only', () => {
+  assert.deepEqual(summarizeScheduledSyncResult({ due: 2, succeeded: 1, partial: 1, results: [{ tenantId: 'private', microsoftTenantId: 'private' }], error: 'private' }), {
+    outcome: 'COMPLETED', due: 2, succeeded: 1, partial: 1, failed: 0, skipped: 0,
   })
 })
