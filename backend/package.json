@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json --noEmit && esbuild ./src/main.ts --bundle --platform=node --format=esm --outfile=dist/main.js --packages=external --sourcemap",
+    "build": "tsc -p tsconfig.json --noEmit && esbuild ./src/main.ts ./src/provision-risk-key.ts --bundle --platform=node --format=esm --outdir=dist --packages=external --sourcemap",
     "dev": "tsx watch src/main.ts",
     "start": "node dist/main.js",
     "db:format": "prisma format",
