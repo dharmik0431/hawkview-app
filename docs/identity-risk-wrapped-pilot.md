@@ -137,3 +137,12 @@ Explicit new-provider lint passed. A broader explicit backend lint invocation
 also reports three pre-existing `no-assign-module-variable` errors in the tenant
 sync module and change-evidence test; they are not new findings or a claimed clean
 full-backend lint gate.
+
+Independent source review of the initial local candidate found no P0/P1 and one
+P2 test-fixture issue: the UTC matrix combined normally separate evaluator claim
+and persist transactions, retaining locks unrealistically during concurrent tests.
+The test-only repair uses actual per-operation transactions and narrowly scoped
+synthetic cleanup. All nine timezone combinations and commit/rollback restoration
+checks remain. The previously failing concurrent pair passed three consecutive
+runs after repair. No production locks/timeouts were weakened; a PostgreSQL
+deadlock SQLSTATE was not captured and is not claimed as observed evidence.
