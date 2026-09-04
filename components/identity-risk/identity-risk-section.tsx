@@ -14,6 +14,7 @@ import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { useIdentityRiskChannels, useIdentityRiskInvestigationAccess } from '@/lib/api/identity-risk-hooks'
 import { MailboxInvestigation } from './mailbox-investigation'
+import { benignAlternativeLabel, hawkViewEmptyPresentation, microsoftHasConfirmedEmptySnapshot, missingEvidenceLabel } from '@/lib/identity-risk/presentation'
 import type {
   HawkViewIdentityFinding,
   HawkViewIdentityRiskCounts,
@@ -35,7 +36,7 @@ function formatTimestamp(value: string | null) {
 }
 
 function capabilityLabel(capability: IdentityRiskCapability) {
-  if (capability === 'FULL') return 'Full coverage'
+  if (capability === 'FULL') return 'Full reported coverage'
   if (capability === 'PARTIAL') return 'Partial coverage'
   return 'Unavailable'
 }
@@ -44,16 +45,17 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
   switch (meta.status) {
     case 'AVAILABLE':
       return {
-        label: 'Available',
-        detail: meta.limitation ?? 'Current evidence is available for this channel.',
+        label: meta.capability === 'PARTIAL' ? 'Partial evidence' : 'Evidence available',
+        detail: meta.capability === 'PARTIAL'
+          ? 'Only part of the evidence could be evaluated. Missing coverage must not be treated as a zero or a safe result.'
+          : 'Current evidence is available for this channel. Availability is not a risk verdict.',
         className:
-          'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200',
+          'border-blue-200 bg-blue-50 text-blue-950 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200',
       }
     case 'STALE':
       return {
         label: 'Stale evidence',
         detail:
-          meta.limitation ??
           'The latest evidence is outside its freshness window and must not be treated as current.',
         className:
           'border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200',
@@ -62,8 +64,7 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
       return {
         label: 'Learning',
         detail:
-          meta.limitation ??
-          'Behavioral baselines are still learning. Rules that need mature baselines were not evaluated.',
+          'The server reports a learning state. This is not a complete evaluation or a no-findings result.',
         className:
           'border-blue-200 bg-blue-50 text-blue-950 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200',
       }
@@ -71,7 +72,6 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
       return {
         label: 'Not evaluated',
         detail:
-          meta.limitation ??
           'Required evidence or approved configuration was not available for evaluation.',
         className:
           'border-slate-200 bg-slate-50 text-slate-800 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-200',
@@ -80,7 +80,6 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
       return {
         label: 'Unavailable',
         detail:
-          meta.limitation ??
           'This evidence is unavailable. A missing result must not be interpreted as zero.',
         className:
           'border-slate-200 bg-slate-50 text-slate-800 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-200',
@@ -89,7 +88,6 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
       return {
         label: 'Unable to load',
         detail:
-          meta.limitation ??
           'This channel could not be loaded. Retry without assuming that no findings exist.',
         className:
           'border-red-200 bg-red-50 text-red-950 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200',
@@ -151,7 +149,7 @@ function HawkViewCounts({ counts }: { counts: HawkViewIdentityRiskCounts }) {
   const primary = [
     ['Identities needing review', counts.identitiesNeedingReview],
     ['Open findings', counts.openFindings],
-    ['Evaluated rules', counts.evaluatedRules],
+    ['Rules with reported outcomes', counts.evaluatedRules],
   ] as const
   const outcomes = [
     ['Matched', counts.matchedResults],
@@ -189,6 +187,7 @@ function HawkViewCounts({ counts }: { counts: HawkViewIdentityRiskCounts }) {
         <p className="mt-2 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
           Counts describe rule evaluation coverage and open investigation leads—not
           compromised or safe identities.
+          {' '}A rule with only not-evaluated outcomes is not a completed check.
         </p>
       </div>
     </div>
@@ -204,6 +203,9 @@ function ChannelState({ meta }: { meta: IdentityRiskChannelMeta }) {
     >
       <div className="font-semibold">{state.label}</div>
       <p className="mt-0.5 text-xs leading-relaxed opacity-90">{state.detail}</p>
+      {meta.limitation && (
+        <p className="mt-2 text-xs leading-relaxed"><span className="font-semibold">Reported context: </span>{meta.limitation}</p>
+      )}
     </div>
   )
 }
@@ -289,9 +291,6 @@ function FindingRow({ finding, tenantId, investigationAllowed }: { finding: Hawk
             <p className="mt-0.5 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
               {finding.investigationGuidance}
             </p>
-            <div className="mt-1 font-mono text-[11px] text-slate-500 dark:text-slate-400">
-              {finding.investigationGuidanceCode}
-            </div>
           </div>
         </div>
       </div>
@@ -310,7 +309,7 @@ function FindingRow({ finding, tenantId, investigationAllowed }: { finding: Hawk
           <dt className="text-slate-500 dark:text-slate-400">Evidence limitations</dt>
           <dd className="mt-1 text-slate-700 dark:text-slate-300">
             {finding.missingEvidenceLabels.length > 0
-              ? finding.missingEvidenceLabels.join(' · ')
+              ? finding.missingEvidenceLabels.map(missingEvidenceLabel).join(' · ')
               : 'None reported for this finding'}
           </dd>
         </div>
@@ -320,7 +319,7 @@ function FindingRow({ finding, tenantId, investigationAllowed }: { finding: Hawk
           <span className="font-semibold text-slate-800 dark:text-slate-200">
             Benign alternatives to consider:{' '}
           </span>
-          <span className="font-mono">{finding.benignAlternativeCodes.join(' · ')}</span>
+          <span>{finding.benignAlternativeCodes.map(benignAlternativeLabel).join(' · ')}</span>
         </div>
       )}
       {investigationAllowed && finding.affectedIdentity.type === 'MAILBOX' &&
@@ -343,11 +342,7 @@ function HawkViewCard({
   tenantId: string
   investigationAllowed: boolean
 }) {
-  const confirmedEmpty =
-    view.meta.status === 'AVAILABLE' &&
-    view.meta.capability === 'FULL' &&
-    view.meta.freshness === 'CURRENT' &&
-    view.findings?.length === 0
+  const emptyPresentation = hawkViewEmptyPresentation(view)
 
   return (
     <section
@@ -379,8 +374,14 @@ function HawkViewCard({
       <p className="mt-3 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
         Explainable HawkView rule findings are investigation leads. They are not
         Microsoft Identity Protection determinations and do not prove that an
-        account is compromised.
+        account is compromised, that mail was delivered, or that data was exfiltrated.
       </p>
+
+      <div className="mt-3 rounded-lg border border-slate-200 p-3 text-xs leading-relaxed text-slate-600 dark:border-slate-800 dark:text-slate-300">
+        <p className="font-semibold text-slate-800 dark:text-slate-200">Current implemented check: mailbox forwarding</p>
+        <p className="mt-1">Checks enabled mailbox forwarding rules for destinations outside the tenant’s verified domains reported by Microsoft Graph, using exact normalized domain matching. This domain list is not the Exchange transport accepted-domain configuration.</p>
+        <p className="mt-1">Coverage describes the reported evidence only. Broader behavioral detection and scoring remain incomplete; availability here does not mean every identity or risk was assessed.</p>
+      </div>
 
       <div className="mt-4 space-y-4">
         <ChannelState meta={view.meta} />
@@ -408,23 +409,15 @@ function HawkViewCard({
           </div>
         )}
 
-        {confirmedEmpty && (
+        {emptyPresentation && (
           <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-800/50">
             <div className="flex items-center gap-2 font-semibold text-slate-900 dark:text-slate-100">
-              <BookOpenCheck className="h-4 w-4 text-emerald-600" aria-hidden="true" />
-              No current indicators
+              <BookOpenCheck className="h-4 w-4 text-slate-500" aria-hidden="true" />
+              {emptyPresentation.label}
             </div>
             <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-              No enabled HawkView rule matched in the latest complete, current
-              evaluation. This does not establish that any identity is safe.
+              {emptyPresentation.detail}
             </p>
-          </div>
-        )}
-
-        {view.findings?.length === 0 && !confirmedEmpty && view.meta.status === 'AVAILABLE' && (
-          <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-800/50 dark:text-slate-300">
-            No findings were returned from the evidence that could be evaluated.
-            Limited coverage prevents a broader conclusion.
           </div>
         )}
 
@@ -491,11 +484,7 @@ function MicrosoftCard({
   view: MicrosoftEntraRiskyUsersView
   onRetry: () => void
 }) {
-  const confirmedEmpty =
-    view.meta.status === 'AVAILABLE' &&
-    view.meta.capability === 'FULL' &&
-    view.meta.freshness === 'CURRENT' &&
-    view.users?.length === 0
+  const confirmedEmpty = microsoftHasConfirmedEmptySnapshot(view)
 
   return (
     <section
@@ -528,6 +517,7 @@ function MicrosoftCard({
         This channel preserves Microsoft Entra ID Protection attribution and
         state. It never changes HawkView finding severity, confidence, or
         lifecycle.
+        {' '}Unavailable Microsoft licensing or collection evidence does not erase independent HawkView findings.
       </p>
 
       <div className="mt-4 space-y-4">

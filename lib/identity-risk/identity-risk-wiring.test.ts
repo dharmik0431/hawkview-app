@@ -13,6 +13,7 @@ const section = readFileSync(
   'utf8'
 )
 const hook = readFileSync(`${root}/lib/api/identity-risk-hooks.ts`, 'utf8')
+const presentation = readFileSync(`${root}/lib/identity-risk/presentation.ts`, 'utf8')
 
 test('identity-risk UI is gated by one server-only default-off flag', () => {
   assert.match(layout, /process\.env\.HAWKVIEW_IDENTITY_RISK_UI_ENABLED/)
@@ -33,7 +34,7 @@ test('the UI keeps HawkView and Microsoft evidence visibly separate', () => {
 test('the UI states its investigation-only and no-safe-verdict boundaries', () => {
   assert.match(section, /Recommended human investigation/)
   assert.match(section, /does not take autonomous remediation actions/)
-  assert.match(section, /does not establish that any identity is safe/)
+  assert.match(presentation, /does not establish that any identity is safe/)
   assert.match(section, /an empty snapshot is not a safe verdict/)
   assert.doesNotMatch(section, /compromise probability/i)
 })
