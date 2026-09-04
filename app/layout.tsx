@@ -25,6 +25,8 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   const featureFlags = resolveServerFeatureFlags({
+    // Global UI exposure only, independent of backend evaluation/availability.
+    // Unset is visible; explicit false (or invalid config) is an emergency hide.
     identityRiskUi: process.env.HAWKVIEW_IDENTITY_RISK_UI_ENABLED,
   })
 
