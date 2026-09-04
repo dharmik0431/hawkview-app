@@ -219,6 +219,7 @@ model Organization {
   m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
   identityRiskEvaluationRuns IdentityRiskEvaluationRun[]
+  identityRiskPseudonymKeys IdentityRiskPseudonymKeyVersion[]
   identityRiskRuleCoverage IdentityRiskRuleCoverage[]
   identityRiskMatchedResults IdentityRiskMatchedResult[]
   identityRiskFindings IdentityRiskFinding[]
@@ -307,6 +308,7 @@ model CustomerTenant {
   m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
   identityRiskEvaluationRuns IdentityRiskEvaluationRun[]
+  identityRiskPseudonymKeys IdentityRiskPseudonymKeyVersion[]
   identityRiskRuleCoverage IdentityRiskRuleCoverage[]
   identityRiskMatchedResults IdentityRiskMatchedResult[]
   identityRiskFindings IdentityRiskFinding[]
@@ -738,6 +740,27 @@ model ChangeEvidenceEvent {
 
 // The identity-risk platform stores only matched evidence and bounded run
 // aggregates. It deliberately does not retain a row per user/rule abstention.
+model IdentityRiskPseudonymKeyVersion {
+  id               String @id @default(uuid()) @db.Uuid
+  organizationId   String @map("organization_id") @db.Uuid
+  customerTenantId String @map("customer_tenant_id") @db.Uuid
+  environment      String @db.VarChar(40)
+  provider         String @db.VarChar(40)
+  immutableKeyId   String @map("immutable_key_id") @db.VarChar(2048)
+  status           String @db.VarChar(20)
+  activatedAt      DateTime? @map("activated_at") @db.Timestamptz(6)
+  retiredAt        DateTime? @map("retired_at") @db.Timestamptz(6)
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant   CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  evaluationRuns   IdentityRiskEvaluationRun[]
+
+  @@unique([id, organizationId, customerTenantId], map: "identity_risk_keys_scope_id")
+  @@unique([provider, immutableKeyId], map: "identity_risk_keys_physical_key")
+  @@index([organizationId, customerTenantId, environment, status], map: "identity_risk_keys_scope_status")
+  @@map("identity_risk_pseudonym_key_versions")
+}
+
 model IdentityRiskEvaluationRun {
   id                String         @id @default(uuid()) @db.Uuid
   organizationId    String         @map("organization_id") @db.Uuid
@@ -763,12 +786,16 @@ model IdentityRiskEvaluationRun {
   customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
   ruleCoverage      IdentityRiskRuleCoverage[]
   matchedResults    IdentityRiskMatchedResult[]
+  pseudonymKeyVersionId String? @map("pseudonym_key_version_id") @db.Uuid
+  sourceObservedAt DateTime? @map("source_observed_at") @db.Timestamptz(6)
+  pseudonymKeyVersion IdentityRiskPseudonymKeyVersion? @relation(fields: [pseudonymKeyVersionId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: NoAction)
 
   @@unique([organizationId, customerTenantId, runKey], map: "identity_risk_evaluation_runs_scope_key")
   @@unique([id, organizationId, customerTenantId], map: "identity_risk_evaluation_runs_scope_id")
   @@index([organizationId, customerTenantId, completedAt(sort: Desc)], map: "identity_risk_evaluation_runs_scope_completed")
   @@index([organizationId, customerTenantId, status, leaseExpiresAt], map: "identity_risk_evaluation_runs_scope_lease")
   @@index([expiresAt], map: "identity_risk_evaluation_runs_expiry")
+  @@index([pseudonymKeyVersionId, organizationId, customerTenantId], map: "identity_risk_runs_key_version")
   @@map("identity_risk_evaluation_runs")
 }
 

@@ -68,12 +68,15 @@ const guidanceCatalog = Object.freeze({
 const benignAlternativeCodes = new Set([
   'APPROVED_ACCOUNT_PROVISIONING',
   'APPROVED_SHARED_CONTEXT',
+  'APPROVED_EXTERNAL_FORWARDING',
 ])
 const sourceLabelCatalog = new Set([
   'Microsoft Entra directory audit',
   'Microsoft Entra sign-in activity',
   'Microsoft 365 Unified Audit',
   'Exchange Online mailbox audit',
+  'Microsoft Graph mailbox-rule snapshot',
+  'Microsoft Graph verified tenant domains',
 ])
 const missingEvidenceCatalog = new Set([
   'ACCOUNT_CLASS_COVERAGE_INCOMPLETE',

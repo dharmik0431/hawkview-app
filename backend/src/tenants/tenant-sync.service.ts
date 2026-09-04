@@ -10,6 +10,8 @@ import {
 } from '@nestjs/common'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { isIP } from 'node:net'
+import { MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS } from '../identity-risk/mailbox-risk-projector.service.js'
+import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION, verifiedOrganizationDomains } from '../identity-risk/mailbox-source-attestation.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import {
@@ -1579,23 +1581,24 @@ export class TenantSyncService {
     private readonly m365ManagementActivity: M365ManagementActivityService,
     @Inject(IdentityRiskEvaluationScheduler)
     private readonly identityRiskEvaluationScheduler: IdentityRiskEvaluationScheduler | null = null,
+    @Inject(MailboxRiskProjector)
+    private readonly mailboxRiskProjector: MailboxRiskProjector | null = null,
   ) {}
 
   /**
-   * Production scheduler hand-off for the version-pinned evaluator. Until the
-   * normalized projectors are enabled, it deliberately supplies no candidates
-   * and reports UNAVAILABLE capability. With the default OFF mode, the loader
-   * is never called and no risk rows are written.
+   * Bounded first-slice hand-off. The evaluator checks OFF/hard-stop before the
+   * lazy source loader; the loader requires a managed key and fresh attestation.
+   * The shared memory lane remains held throughout source reads and evaluation.
    */
   private async runPostSyncIdentityRiskEvaluation(tenant: {
     id: string
     organizationId: string
   }) {
-    if (!this.identityRiskEvaluationScheduler) return
+    if (!this.identityRiskEvaluationScheduler || !this.mailboxRiskProjector) return
     const evaluationAt = new Date()
     const windowStart = new Date(evaluationAt.getTime() - 24 * 60 * 60 * 1_000)
     try {
-      await this.identityRiskEvaluationScheduler.runTenant({
+      await runInSyncMemoryLane(() => this.identityRiskEvaluationScheduler!.runTenant({
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         engineVersion: IDENTITY_RISK_ENGINE_VERSION,
@@ -1603,21 +1606,9 @@ export class TenantSyncService {
         windowStart,
         windowEnd: evaluationAt,
         evaluationAt,
-        loadSources: async () => ({
-          context: {
-            organizationId: tenant.organizationId,
-            customerTenantId: tenant.id,
-            evaluationAt,
-            engineVersion: IDENTITY_RISK_ENGINE_VERSION,
-            catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
-          },
-          sourceEnvelopes: [],
-          orderedSourceWatermarks: [],
-          earliestSourceExpiry: null,
-          capability: 'UNAVAILABLE',
-        }),
-        approvedEvaluator: { readiness: 'NOT_READY' },
-      })
+        loadSources: () => this.mailboxRiskProjector!.load({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, evaluationAt),
+        approvedEvaluator: { readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS },
+      }))
     } catch {
       // Identity-risk shadow evaluation is isolated from tenant collection.
       this.logger.warn('Post-sync identity-risk evaluation failed.')
@@ -4822,6 +4813,7 @@ export class TenantSyncService {
     result: SnapshotCollectionResult,
     /** Resource inventory writes which must become visible with this baseline. */
     persistWithSnapshot?: (transaction: Prisma.TransactionClient) => Promise<void>,
+    riskAttestable = false,
   ) {
     if (result.completeness !== 'authoritative_complete') {
       throw new Error(
@@ -4878,6 +4870,18 @@ export class TenantSyncService {
         },
         update: { payload: rows as never, observedAt },
       })
+      if (resourceType === 'EXCHANGE_MAILBOX_RULES' || resourceType === 'EXCHANGE_ACCEPTED_DOMAINS') {
+        const digest = riskAttestable ? mailboxSourceDigest({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, resourceType, observedAt, rows) : null
+        const fieldKey = sourceAttestationKey(resourceType)
+        const data = { organizationId: tenant.organizationId, customerTenantId: tenant.id, fieldKey,
+          state: digest ? 'COMPLETE' : 'UNAVAILABLE', source: MAILBOX_SOURCE_VERSION,
+          correlationId: digest, reasonCode: digest ? 'ATTESTED_COMPLETE' : 'SOURCE_NOT_ATTESTED',
+          message: null, endpoint: null, lastAttemptAt: observedAt,
+          lastSuccessfulAt: digest ? observedAt : null, isStale: !digest }
+        await transaction.tenantCollectionFieldState.upsert({
+          where: { customerTenantId_fieldKey: { customerTenantId: tenant.id, fieldKey } }, create: data, update: data,
+        })
+      }
     })
   }
 
@@ -5090,36 +5094,20 @@ export class TenantSyncService {
       'EXCHANGE_ACCEPTED_DOMAINS',
       async () => {
         const response = await this.fetchGraphPage(
-          'https://graph.microsoft.com/v1.0/organization?$select=verifiedDomains',
+          'https://graph.microsoft.com/v1.0/organization?$select=id,verifiedDomains',
           accessToken,
           'accepted-domain',
           { timeoutMs: 30_000 },
         )
-        const page = await readBoundedSingleton(response) as { value?: GraphOrganization[] }
+        const page = await readBoundedSingleton(response)
         // Organization.Read.All returns tenant-associated verifiedDomains.
         // These are not Exchange accepted-domain objects, so do not invent an
         // Authoritative/InternalRelay type. Preserve only the fields Graph
         // actually returned and label the customer contract accordingly.
-        const domains = (page.value?.[0]?.verifiedDomains ?? [])
-          .filter(
-            (domain: any) => typeof domain?.name === 'string' && domain.name.trim()
-          )
-          .map((domain: any) => ({
-            id: domain.name,
-            domain: domain.name,
-            associationType:
-              typeof domain.type === 'string' && domain.type.trim()
-                ? domain.type.trim()
-                : null,
-            capabilities:
-              typeof domain.capabilities === 'string' && domain.capabilities.trim()
-                ? domain.capabilities.trim()
-                : null,
-            isDefault: Boolean(domain.isDefault),
-            isInitial: Boolean(domain.isInitial),
-          }))
-        if (domains.length > 1_000) throw new Error('Microsoft accepted domains exceeded the bounded record limit.')
-        await this.saveSnapshot(tenant, 'EXCHANGE_ACCEPTED_DOMAINS', authoritativeSnapshot(domains))
+        const connection = await this.prisma.customerTenant.findFirst({ where: { id: tenant.id, organizationId: tenant.organizationId }, select: { microsoftTenantId: true } })
+        if (!connection) throw new Error('Microsoft verified-domain scope is unavailable.')
+        const domains = verifiedOrganizationDomains(page, connection.microsoftTenantId)
+        await this.saveSnapshot(tenant, 'EXCHANGE_ACCEPTED_DOMAINS', authoritativeSnapshot(domains), undefined, true)
       }
     )
   }
@@ -5178,9 +5166,14 @@ export class TenantSyncService {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_RULES', async () => {
       const budget = new MicrosoftCollectionBudget(limits, 'inbox rules')
       const users = await collectMailboxRuleUsers((skip, take) => this.prisma.directoryUser.findMany({
-        where: { customerTenantId: tenant.id, deletedAt: null },
+        where: { customerTenantId: tenant.id, organizationId: tenant.organizationId, deletedAt: null },
         select: { microsoftUserId: true, userPrincipalName: true }, orderBy: { microsoftUserId: 'asc' }, skip, take,
       }), { deadlineAt: budget.deadlineAt })
+      let riskAttestable = true
+      const directoryState = await this.prisma.syncState.findFirst({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'USERS' }, select: { status: true, lastSuccessfulAt: true, lastAttemptAt: true } })
+      if (!directoryState || directoryState.status !== 'SUCCEEDED' || !directoryState.lastSuccessfulAt ||
+        Date.now() - directoryState.lastSuccessfulAt.getTime() > 36 * 60 * 60 * 1000 ||
+        (directoryState.lastAttemptAt && directoryState.lastAttemptAt > directoryState.lastSuccessfulAt)) riskAttestable = false
       const rows = await collectMailboxRules(users, async (user, continuation) => {
         const url = continuation ?? `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.microsoftUserId)}/mailFolders/inbox/messageRules?$top=100`
         if (!url.startsWith('https://graph.microsoft.com/')) throw new Error('Microsoft returned an invalid inbox-rules pagination link.')
@@ -5188,14 +5181,14 @@ export class TenantSyncService {
         const response = await this.fetchGraphPage(
           url, accessToken, 'inbox rules', { timeoutMs: limits.requestTimeoutMs, deadlineAt: budget.deadlineAt, acceptedStatuses: [404] },
         )
-        if (response.status === 404) { await cancelBoundedStream(() => response.body?.cancel()); return { value: [] } }
+        if (response.status === 404) { riskAttestable = false; await cancelBoundedStream(() => response.body?.cancel()); return { value: [] } }
         const page = await budget.read(response)
         if (!plainRecord(page) || !Array.isArray(page.value)) throw new Error('Microsoft returned an invalid bounded inbox-rules page.')
         const projected = page.value.map(projectMailboxRule)
         budget.retain(projected)
         return { value: projected, '@odata.nextLink': page['@odata.nextLink'] } as GraphCollectionPage
       }, 1, { maxTotalRecords: limits.rows, maxMaterializedBytes: limits.materializedBytes, deadlineAt: budget.deadlineAt })
-      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows))
+      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows), undefined, riskAttestable)
     })
   }
 

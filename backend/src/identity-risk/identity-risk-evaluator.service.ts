@@ -780,7 +780,8 @@ export class IdentityRiskEvaluatorService {
     // Watermarks are restricted to bounded ASCII opaque IDs, so the default
     // code-unit sort is the canonical bytewise order used by the run key.
     const canonicalSourceWatermarks = [...batch.orderedSourceWatermarks].sort()
-    const watermarkHash = sha256(...canonicalSourceWatermarks)
+    const watermarkHash = sha256(...canonicalSourceWatermarks,
+      ...(batch.pseudonymKeyVersionId ? [batch.pseudonymKeyVersionId] : []))
     const canonicalSources = canonicalizeSourceEnvelopes(
       batch,
       request,
@@ -827,6 +828,8 @@ export class IdentityRiskEvaluatorService {
       leaseToken,
       capability: batch.capability,
       platformNow,
+      pseudonymKeyVersionId: batch.pseudonymKeyVersionId,
+      sourceObservedAt: batch.sourceObservedAt,
     })
     if (claim === 'SOURCE_INTEGRITY_CONFLICT') {
       await this.safety.activate({
@@ -895,6 +898,7 @@ export class IdentityRiskEvaluatorService {
         request.customerTenantId,
       )
       const persisted = await this.persistCompletedRun({
+        pseudonymKeyVersionId: batch.pseudonymKeyVersionId,
         request,
         runId: claim.id,
         runKey,
@@ -998,6 +1002,10 @@ export class IdentityRiskEvaluatorService {
     platformNow: Date,
   ) {
     if (
+      (batch.pseudonymKeyVersionId !== undefined &&
+        (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(batch.pseudonymKeyVersionId) || !validDate(batch.sourceObservedAt))) ||
+      (batch.sourceObservedAt !== undefined && (!validDate(batch.sourceObservedAt) ||
+        batch.sourceObservedAt.getTime() > platformNow.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS)) ||
       !isPlainRecord(batch.context) ||
       Object.keys(batch.context).sort().join(',') !==
         'catalogVersion,customerTenantId,engineVersion,evaluationAt,organizationId' ||
@@ -1073,6 +1081,8 @@ export class IdentityRiskEvaluatorService {
   }
 
   private async claimRun(input: {
+    pseudonymKeyVersionId?: string
+    sourceObservedAt?: Date
     request: IdentityRiskEvaluationRequest
     runKey: string
     watermarkHash: string
@@ -1097,6 +1107,17 @@ export class IdentityRiskEvaluatorService {
         false,
       )
       if (safety.evaluationHardDisabled) return { hardDisabled: safety }
+      if (input.pseudonymKeyVersionId) {
+        // Lock the pinned version through persistence claim; revoked/foreign versions cannot start a run.
+        const keys = await transaction.$queryRaw<Array<{ id: string }>>`
+          SELECT id FROM identity_risk_pseudonym_key_versions
+          WHERE id=${input.pseudonymKeyVersionId}::uuid
+            AND organization_id=${input.request.organizationId}::uuid
+            AND customer_tenant_id=${input.request.customerTenantId}::uuid
+            AND status='ACTIVE' AND retired_at IS NULL AND activated_at <= ${now}
+          FOR SHARE`
+        if (keys.length !== 1) throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
+      }
       await transaction.$executeRawUnsafe(
         'SELECT pg_advisory_xact_lock(hashtext($1))',
         `hawkview:identity-risk-run:${input.request.organizationId}:${input.request.customerTenantId}:${input.runKey}`,
@@ -1159,6 +1180,8 @@ export class IdentityRiskEvaluatorService {
           windowEnd: input.request.windowEnd,
           sourceWatermarkHash: input.watermarkHash,
           sourceContentHash: input.sourceContentHash,
+          pseudonymKeyVersionId: input.pseudonymKeyVersionId ?? null,
+          sourceObservedAt: input.sourceObservedAt ?? null,
           capability: input.capability,
           aggregate: {},
           alertDeliveryDisabled: safety.alertDeliveryDisabled,
@@ -1336,6 +1359,7 @@ export class IdentityRiskEvaluatorService {
   }
 
   private async persistCompletedRun(input: {
+    pseudonymKeyVersionId?: string
     request: IdentityRiskEvaluationRequest
     runId: string
     runKey: string
@@ -1371,6 +1395,14 @@ export class IdentityRiskEvaluatorService {
         })
         if (failed.count !== 1) throw new Error('Identity risk run lease was lost.')
         return { status: 'HARD_DISABLED' as const, safety }
+      }
+      if (input.pseudonymKeyVersionId) {
+        const keys = await transaction.$queryRaw<Array<{ id: string }>>`
+          SELECT id FROM identity_risk_pseudonym_key_versions
+          WHERE id=${input.pseudonymKeyVersionId}::uuid AND organization_id=${input.request.organizationId}::uuid
+            AND customer_tenant_id=${input.request.customerTenantId}::uuid AND status='ACTIVE' AND retired_at IS NULL
+          FOR SHARE`
+        if (keys.length !== 1) throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
       }
       if (input.matches.some(([, result]) =>
         !validSubjectReference(result.subjectType, result.subjectId) ||

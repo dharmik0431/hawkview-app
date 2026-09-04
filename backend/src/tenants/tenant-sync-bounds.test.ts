@@ -76,7 +76,7 @@ test('mailbox absence cancels throwing or stalled bodies without blocking settin
   for (const cancellation of ['throws', 'stalls']) {
     for (const method of ['syncExchangeMailboxSettings', 'syncExchangeMailboxRules']) {
       let cancelled = 0; let snapshots = 0
-      const service = new TenantSyncService({ directoryUser: { findMany: async () => [{ microsoftUserId: 'user', userPrincipalName: 'user@example.invalid' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+      const service = new TenantSyncService({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'user', userPrincipalName: 'user@example.invalid' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
       ;(service as any).runSnapshotSync = (_tenant: unknown, _resource: unknown, work: () => Promise<void>) => work()
       ;(service as any).saveSnapshot = async (_tenant: unknown, _resource: unknown, snapshot: any) => { assert.deepEqual(snapshot.rows, []); snapshots += 1 }
       ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream({ cancel() {
@@ -159,7 +159,7 @@ test('actual mailbox directory, settings, rules and optional configuration enfor
   const methods = ['syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings', 'syncExchangeMailboxRules', 'collectExchangeReadOnlyMailboxes']
   for (const method of methods) {
     let saves = 0; let cancelled = false; let fetches = 0
-    const service = new TenantSyncService({ directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    const service = new TenantSyncService({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
     ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
     ;(service as any).saveSnapshot = async () => { saves += 1 }
     ;(service as any).fetchGraphPage = async () => { fetches += 1; return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(1025)) }, cancel() { cancelled = true; throw new Error('hostile cancel') } })) }
@@ -173,7 +173,7 @@ test('actual mailbox directory, settings, rules and optional configuration enfor
 })
 
 test('actual Exchange collectors reject repeated continuation links and tenant-wide rule aggregation', async () => {
-  const service = new TenantSyncService({ directoryUser: { findMany: async () => [{ microsoftUserId: 'u1', userPrincipalName: 'one@example.test' }, { microsoftUserId: 'u2', userPrincipalName: 'two@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const service = new TenantSyncService({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u1', userPrincipalName: 'one@example.test' }, { microsoftUserId: 'u2', userPrincipalName: 'two@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
   let saves = 0; let fetches = 0
   ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
   ;(service as any).saveSnapshot = async () => { saves += 1 }
@@ -250,7 +250,7 @@ test('actual Exchange JSON paths accept the exact streamed page-byte cap with cl
     ['collectExchangeReadOnlyMailboxes', { value: [{ UserPrincipalName: 'u@example.test', DisplayName: 'User', unselected: 'not-retained' }] }],
   ] as const
   for (const [method, fixture] of fixtures) {
-    const service = new TenantSyncService({ directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    const service = new TenantSyncService({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
     const saved: unknown[] = []
     ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
     ;(service as any).saveSnapshot = async (_t: unknown, _r: string, snapshot: unknown) => saved.push(snapshot)
@@ -275,7 +275,7 @@ test('real Exchange snapshot wrappers permit only RUNNING to FAILED state and on
   for (const [method, resourceType] of pairs) {
     const upserts: any[] = []; const updates: any[] = []; const incidents: any[] = []; const forbidden: string[] = []
     const service = new TenantSyncService({
-      syncState: { upsert: async (args: any) => { upserts.push(args); return { lastSuccessfulAt: null } }, update: async (args: any) => { updates.push(args); return { consecutiveFailures: 1 } } },
+      syncState: { findFirst: async () => null, upsert: async (args: any) => { upserts.push(args); return { lastSuccessfulAt: null } }, update: async (args: any) => { updates.push(args); return { consecutiveFailures: 1 } } },
       directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] },
       tenantEntraSnapshot: { upsert: async () => forbidden.push('snapshot') },
       changeEvidenceEvent: { createMany: async () => forbidden.push('evidence') },

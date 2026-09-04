@@ -20,6 +20,8 @@ import {
 } from './identity-risk-evaluator.service.js'
 import type { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
 import { IdentityRiskService } from './identity-risk.service.js'
+import { projectMailboxEvidence, MAILBOX_FIRST_SLICE_FLAGS } from './mailbox-risk-projector.service.js'
+import { mailboxScope, mailboxKey, mailboxNow, syntheticManagedProvider, mailboxRule, mailboxSnapshots, boundedMailboxSnapshots } from './mailbox-risk.test-fixtures.js'
 
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const tenantId = '22222222-2222-4222-8222-222222222222'
@@ -139,6 +141,7 @@ function persistence(activeControls: Array<Record<string, unknown>> = []) {
     transactions: 0,
   }
   const transaction = {
+    $queryRaw: async () => [{ id: mailboxKey.id }],
     $executeRawUnsafe: async () => [{ pg_advisory_xact_lock: '' }],
     identityRiskOperationalControl: {
       findMany: async () => activeControls,
@@ -200,6 +203,60 @@ const noMatchDetector: IdentitySignalDetector = {
     subjectId: platformSubjectId,
   }],
 }
+
+test('attested mailbox projection flows through actual evaluator, durable records and v1 API with pinned key provenance', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: mailboxNow })
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    for (const [rows, expectedMatches, capability] of [
+      [mailboxSnapshots([mailboxRule(), mailboxRule(undefined, { id: 'rule-2' })]), 2, 'FULL'],
+      [mailboxSnapshots([]), 0, 'FULL'],
+      [[], 0, 'UNAVAILABLE'],
+      [boundedMailboxSnapshots(1, 257), 0, 'UNAVAILABLE'],
+      [boundedMailboxSnapshots(1001, 1), 0, 'UNAVAILABLE'],
+      [boundedMailboxSnapshots(200, 256), 0, 'UNAVAILABLE'],
+      [mailboxSnapshots([mailboxRule(`${'a'.repeat(300)}@bücher.invalid`)]), 0, 'UNAVAILABLE'],
+    ] as const) {
+      const store = persistence()
+      const batch = await projectMailboxEvidence(mailboxScope, mailboxNow, rows,
+        await syntheticManagedProvider().pin(mailboxKey, Date.now() + 30000))
+      const observedSafety = safety()
+      const scheduler = new IdentityRiskEvaluationScheduler(new IdentityRiskEvaluatorService(store.prisma, observedSafety.service,
+        { now: () => mailboxNow } as IdentityRiskPlatformClock))
+      const result = await scheduler.runTenant({ ...mailboxScope, windowStart: new Date(mailboxNow.getTime() - 86400000), windowEnd: mailboxNow,
+        evaluationAt: mailboxNow, engineVersion: IDENTITY_RISK_ENGINE_VERSION, catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+        loadSources: async () => batch, approvedEvaluator: { readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS } })
+      assert.equal(result.status, 'COMPLETED')
+      assert.equal(observedSafety.calls.activated.length, 0, 'source bounds must never trigger SECRET_EXPOSURE/hard disable')
+      assert.equal(store.calls.matches.length, expectedMatches)
+      assert.equal(store.calls.coverage.length, 1)
+      assert.equal(store.calls.coverage[0]?.ruleId, 'HV-ID-MBX-001.v1')
+      assert.equal(store.calls.runCreateData[0]?.capability, capability)
+      assert.equal(store.calls.runCreateData[0]?.pseudonymKeyVersionId, capability === 'FULL' ? mailboxKey.id : null)
+      assert.doesNotMatch(JSON.stringify(store.calls), /private@|partner@|mailbox-1|outside\.invalid|tenant\.invalid/)
+      const api = new IdentityRiskService({
+        user: { findUnique: async () => ({ disabledAt: null, memberships: [{ organizationId, role: 'MSP_OWNER' }] }) },
+        customerTenant: { findFirst: async () => ({ id: tenantId, organizationId }) },
+        identityRiskOperationalControl: { findMany: async () => [] },
+        identityRiskEvaluationRun: { findFirst: async () => ({ ...store.calls.runCreateData[0], id: 'run', completedAt: mailboxNow }) },
+        identityRiskFinding: { findMany: async () => store.calls.findings.map((findingRow, index) => ({ id: `finding-${index}`, state: 'OPEN', ...findingRow })) },
+      } as unknown as PrismaService)
+      const page = await api.findings({ subject: 'synthetic-owner', email: 'owner@example.invalid' }, tenantId)
+      assert.equal(page.status, capability === 'FULL' ? 'AVAILABLE' : 'NOT_EVALUATED')
+      if (expectedMatches) {
+        assert.deepEqual(page.findings[0]?.sourceLabels, ['Microsoft Graph mailbox-rule snapshot', 'Microsoft Graph verified tenant domains'])
+        assert.deepEqual(page.findings[0]?.benignAlternativeCodes, ['APPROVED_EXTERNAL_FORWARDING'])
+        assert.equal(page.observedAt, batch.sourceObservedAt?.toISOString())
+        assert.match(page.findings[0]?.explanation ?? '', /not proof of message delivery or compromise/)
+        assert.equal(store.calls.runCreateData[0]?.expiresAt, batch.earliestSourceExpiry)
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
 
 test('scheduler wires the complete approved evaluator detector set at its explicit boundary', async () => {
   const captured: { request?: IdentityRiskEvaluationRequest } = {}

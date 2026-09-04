@@ -127,6 +127,9 @@ export type IdentityRiskSourceEnvelope =
     }>
 
 export type IdentityRiskSourceBatch = Readonly<{
+  /** Internal only: recoverable immutable managed-key version for every reference in this run. */
+  pseudonymKeyVersionId?: string
+  sourceObservedAt?: Date
   context: Omit<IdentitySignalEvaluationContext, 'capability' | 'sources'>
   sourceEnvelopes: readonly IdentityRiskSourceEnvelope[]
   orderedSourceWatermarks: readonly string[]

@@ -209,7 +209,9 @@ async function actualMaterializer<T>(resource: string, work: () => Promise<T>): 
 }
 const databaseUsers = Array.from({ length: actualRows }, (_, index) => ({ microsoftUserId: `user-${index}`, userPrincipalName: `user-${index}@example.invalid` }))
 const actualPrisma: any = {
+  customerTenant: { findFirst: async () => ({ microsoftTenantId: 'synthetic-microsoft' }) },
   syncState: {
+    findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: new Date(), lastAttemptAt: null }),
     findUnique: async () => ({ id: 'state', lastSuccessfulAt: new Date(), deltaLink: 'https://graph.microsoft.com/v1.0/users/delta?probePage=1' }),
     updateMany: async () => ({ count: 1 }), update: async () => ({}), findMany: async () => [],
   },
@@ -245,7 +247,7 @@ for (const method of ['syncLicenses', 'syncOrganizationConfiguration', 'syncDoma
   if (url.includes('/mailboxSettings')) return new Response(JSON.stringify({ userPurpose: 'user', timeZone: 'x'.repeat(1_000), unselected: 'UNSELECTED_CONTENT' }))
   if (url.includes('/messageRules')) return new Response(JSON.stringify({ value: [{ id: 'r', displayName: 'x'.repeat(1_000), isEnabled: true, actions: { delete: true }, unselected: 'UNSELECTED_CONTENT' }] }))
   if (url.includes('/reports/')) return new Response('User Principal Name,Storage Used (Byte),Item Count\nu@example.invalid,1,1')
-  if (url.includes('/organization')) return new Response(JSON.stringify({ value: [{ verifiedDomains: [{ name: 'example.invalid', isDefault: true }] }], unselected: 'x'.repeat(1_800_000) }))
+  if (url.includes('/organization')) return new Response(JSON.stringify({ value: [{ id: 'synthetic-microsoft', verifiedDomains: [{ name: 'example.invalid', isDefault: true }] }], unselected: 'x'.repeat(1_800_000) }))
   const isConfiguration = url.includes('outlook.office365.com')
   const isDelta = url.includes('/users/delta')
   const rows = Array.from({ length: pageRows }, (_, offset) => {
