@@ -80,3 +80,12 @@ jobs:
           test "${#tests[@]}" -gt 0
           ./node_modules/.bin/tsx --test "${tests[@]}"
       - run: npm run build
+      - name: Backend standalone script tests
+        run: node --test scripts/*.test.mjs
+      - name: Build production runtime image for cron smoke
+        run: docker build --tag hawkview-cron-smoke:ci .
+      - name: Network-isolated production cron entrypoint smoke
+        env:
+          HAWKVIEW_RUN_CRON_IMAGE_TESTS: '1'
+          HAWKVIEW_CRON_TEST_IMAGE: hawkview-cron-smoke:ci
+        run: node --test scripts/cron-runtime-image.test.mjs

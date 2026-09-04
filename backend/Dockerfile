@@ -33,6 +33,7 @@ COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 COPY --from=builder /app/dist ./dist
 COPY scripts/trigger-scheduled-sync.mjs ./scripts/trigger-scheduled-sync.mjs
+COPY scripts/scheduled-sync-trigger.mjs ./scripts/scheduled-sync-trigger.mjs
 COPY scripts/prepare-geolite.mjs ./scripts/prepare-geolite.mjs
 
 EXPOSE 8080
