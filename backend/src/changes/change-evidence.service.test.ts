@@ -1157,13 +1157,13 @@ test('bounds Graph mailbox directory pagination before a baseline can advance', 
 
 test('enforces the SharePoint response byte ceiling from the actual stream, not Content-Length', async () => {
   const encoder = new TextEncoder()
-  const streamResponse = (chunks: string[], contentLength?: string) => {
+  const streamResponse = (chunks: string[], contentLength?: string, keepOpen = false) => {
     let index = 0
     let cancelled = false
     const stream = new ReadableStream<Uint8Array>({
       pull(controller) {
         const next = chunks[index++]
-        if (next === undefined) return controller.close()
+        if (next === undefined) return keepOpen ? undefined : controller.close()
         controller.enqueue(encoder.encode(next))
       },
       cancel() { cancelled = true },
@@ -1175,10 +1175,12 @@ test('enforces the SharePoint response byte ceiling from the actual stream, not 
   }
   const exact = streamResponse(['{"x":', '"1234"}'])
   assert.deepEqual(await readBoundedSharePointJson(exact.response, 12), { x: '1234' })
-  const missingHeader = streamResponse(['{"x":', '"12345"}'])
+  // Keep oversized streams open so cancellation is observable independently
+  // of the stream implementation's read-ahead/auto-close scheduling.
+  const missingHeader = streamResponse(['{"x":', '"12345"}'], undefined, true)
   await assert.rejects(() => readBoundedSharePointJson(missingHeader.response, 12), /response-size limit/)
   assert.equal(missingHeader.cancelled(), true)
-  const understatedHeader = streamResponse(['{"x":', '"12345"}'], '1')
+  const understatedHeader = streamResponse(['{"x":', '"12345"}'], '1', true)
   await assert.rejects(() => readBoundedSharePointJson(understatedHeader.response, 12), /response-size limit/)
   const declaredTooLarge = streamResponse(['{}'], '99')
   await assert.rejects(() => readBoundedSharePointJson(declaredTooLarge.response, 12), /response-size limit/)
@@ -1305,10 +1307,10 @@ test('real syncSharePointSites streams root responses with byte limits and never
           }) },
         } as Response
       }
-      return new Response('[]')
+      return new Response('{"value":[]}')
     }) as typeof fetch
     try {
-      await (service as any).syncSharePointSites(tenant, 'graph', { ...SHAREPOINT_COLLECTION_LIMITS, responseBytes: 2, sitePages: 1, sites: 1, siteUserPages: 1, siteUserRecords: 1 })
+      await (service as any).syncSharePointSites(tenant, 'graph', { ...SHAREPOINT_COLLECTION_LIMITS, responseBytes: 12, sitePages: 1, sites: 1, siteUserPages: 1, siteUserRecords: 1 })
     } finally {
       observed.saves = saves
       observed.cancelled = cancelled || observed.cancelled
@@ -1316,13 +1318,13 @@ test('real syncSharePointSites streams root responses with byte limits and never
     }
     return { cancelled, saves }
   }
-  assert.deepEqual(await runRoot(['{}']), { cancelled: false, saves: 1 }, 'exact byte limit succeeds')
+  assert.deepEqual(await runRoot(['{"id":"r"}  ']), { cancelled: false, saves: 1 }, 'exact byte limit succeeds')
   const chunkedOverflow: { cancelled?: boolean; saves?: number } = {}
-  await assert.rejects(() => runRoot(['{', '}', 'x'], undefined, chunkedOverflow), /response-size limit/)
+  await assert.rejects(() => runRoot(['{"id":"r"}', '  ', 'x'], undefined, chunkedOverflow), /bounded page-size limit/)
   assert.deepEqual(chunkedOverflow, { cancelled: true, saves: 0 }, 'the actual collector cancels an overflowing chunked response before saving')
-  await assert.rejects(() => runRoot(['{}'], '999'), /response-size limit/)
+  await assert.rejects(() => runRoot(['{"id":"r"}  '], '999'), /bounded page-size limit/)
   const understatedOverflow: { cancelled?: boolean; saves?: number } = {}
-  await assert.rejects(() => runRoot(['{', '}', 'x'], '1', understatedOverflow), /response-size limit/)
+  await assert.rejects(() => runRoot(['{"id":"r"}', '  ', 'x'], '1', understatedOverflow), /bounded page-size limit/)
   assert.deepEqual(understatedOverflow, { cancelled: true, saves: 0 })
 })
 

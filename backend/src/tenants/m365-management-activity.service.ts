@@ -1261,10 +1261,10 @@ export class M365ManagementActivityService {
       })
       if (error instanceof ManagementActivityHttpError && [401, 403].includes(error.status)) throw error
       if (permanent) {
-        this.logger.error(`Microsoft 365 activity blob ${content.microsoftContentId} is unavailable: ${safeMessage(error)}`)
+        this.logger.error(JSON.stringify({ event: 'm365_activity_content', phase: 'INGESTION', outcome: 'FAILED', reasonCode: 'CONTENT_UNAVAILABLE' }))
         return []
       }
-      this.logger.warn(`Microsoft 365 activity blob ${content.microsoftContentId} will be retried: ${safeMessage(error)}`)
+      this.logger.warn(JSON.stringify({ event: 'm365_activity_content', phase: 'INGESTION', outcome: 'RETRY_PENDING', reasonCode: 'CONTENT_UNAVAILABLE' }))
       return []
     }
   }

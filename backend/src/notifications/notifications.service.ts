@@ -314,10 +314,10 @@ export class NotificationsService {
         },
       })
       await this.prisma.notificationUserState.deleteMany({ where: { notificationId: row.id } })
-      this.logger.log(JSON.stringify({ event: 'notification.published', notificationId: row.id, eventType: row.eventType, organizationId: row.organizationId, occurrenceCount: row.occurrenceCount }))
+      this.logger.log(JSON.stringify({ event: 'notification.published', outcome: 'COMPLETED', occurrenceCount: Math.min(1000000, Math.max(0, row.occurrenceCount)) }))
       return row
     } catch (error) {
-      this.logger.error(JSON.stringify({ event: 'notification.publish_failed', eventType: input.eventType, organizationId: input.organizationId, error: error instanceof Error ? error.message : String(error) }))
+      this.logger.error(JSON.stringify({ event: 'notification.publish_failed', outcome: 'FAILED', reasonCode: 'PERSISTENCE_UNAVAILABLE' }))
       return null
     }
   }
@@ -328,10 +328,10 @@ export class NotificationsService {
       if (!incident || incident.resolvedAt) return null
       await this.prisma.notification.update({ where: { id: incident.id }, data: { resolvedAt: new Date() } })
       if (recovery) await this.publishIncident({ ...recovery, organizationId, dedupeKey: `${dedupeKey}:recovered:${incident.occurrenceCount}` })
-      this.logger.log(JSON.stringify({ event: 'notification.resolved', notificationId: incident.id, organizationId }))
+      this.logger.log(JSON.stringify({ event: 'notification.resolved', outcome: 'COMPLETED' }))
       return incident
     } catch (error) {
-      this.logger.error(JSON.stringify({ event: 'notification.resolve_failed', organizationId, dedupeKey, error: error instanceof Error ? error.message : String(error) }))
+      this.logger.error(JSON.stringify({ event: 'notification.resolve_failed', outcome: 'FAILED', reasonCode: 'PERSISTENCE_UNAVAILABLE' }))
       return null
     }
   }

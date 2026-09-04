@@ -4,6 +4,7 @@ import {
   M365ManagementActivityService,
   M365AuditBudgetError,
   M365_ACTIVITY_CONTENT_TYPES,
+  ManagementActivityHttpError,
   compactManagementEvidence,
   classifyManagementActivity,
   isPrimaryManagementActivity,
@@ -528,6 +529,50 @@ test('does not mark a blob complete when the evidence transaction fails', async 
     assert.deepEqual(states, ['PROCESSING', 'RETRY'])
   } finally {
     globalThis.fetch = originalFetch
+  }
+})
+
+test('content ingestion operational logs never include provider identifiers or hostile errors', async () => {
+  const hostile = 'user@example.test access_token=never password=never https://private.example tenant-private provider-private content-private'
+  const messages: string[] = []
+  for (const failure of [
+    new ManagementActivityHttpError(hostile, 404),
+    new Error(hostile),
+  ]) {
+    const prisma: any = {
+      m365ActivityContent: {
+        updateMany: async ({ data }: any) => data.status === 'PROCESSING'
+          ? { count: 1 }
+          : { count: 1 },
+      },
+    }
+    const service = new M365ManagementActivityService(prisma, {} as never)
+    ;(service as any).request = async () => { throw failure }
+    ;(service as any).logger = {
+      error: (message: string) => messages.push(message),
+      warn: (message: string) => messages.push(message),
+    }
+    assert.deepEqual(
+      await (service as any).processContent(
+        tenant,
+        hostile,
+        publisherIdentifier,
+        { remainingBytes: 1024 },
+        { ...content, id: 'content-private', microsoftContentId: 'provider-private' },
+      ),
+      [],
+    )
+  }
+
+  assert.deepEqual(messages.map((message) => JSON.parse(message)), [
+    { event: 'm365_activity_content', phase: 'INGESTION', outcome: 'FAILED', reasonCode: 'CONTENT_UNAVAILABLE' },
+    { event: 'm365_activity_content', phase: 'INGESTION', outcome: 'RETRY_PENDING', reasonCode: 'CONTENT_UNAVAILABLE' },
+  ])
+  for (const message of messages) {
+    for (const forbidden of [
+      'user@example.test', 'access_token', 'password', 'private.example',
+      'tenant-private', 'provider-private', 'content-private',
+    ]) assert.equal(message.includes(forbidden), false)
   }
 })
 

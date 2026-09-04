@@ -8,6 +8,8 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { isIP } from 'node:net'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import {
@@ -43,6 +45,7 @@ import {
 import { ChangeEvidenceService, redactSensitiveValues } from '../changes/change-evidence.service.js'
 import { bytesToGigabytes, deriveCollectionFieldState } from './collection-field-state.js'
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import { logProcessMemoryPhase } from './runtime-telemetry.js'
 import {
   deriveSignInEntitlement,
   type SignInEntitlement,
@@ -107,6 +110,110 @@ const MANAGEMENT_ACTIVITY_SOURCE = 'MICROSOFT_365_MANAGEMENT_ACTIVITY'
 const MANAGEMENT_ACTIVITY_MAX_LOOKBACK_DAYS = 7
 const DEFAULT_FAST_MAILBOX_RULE_REFRESH_MINUTES = 15
 const DEFAULT_FAST_MAILBOX_RULE_MAX_USERS = 250
+export const GRAPH_LOG_COLLECTION_MAX_PAGES = 100
+export const GRAPH_LOG_COLLECTION_MAX_ROWS = 100_000
+export const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
+export const GRAPH_LOG_PAGE_MAX_BYTES = 2 * 1024 * 1024
+/** Cumulative retained parsed log data. Page and row limits alone permit too much heap. */
+export const GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES = 8 * 1024 * 1024
+export type EntraCollectionLimits = {
+  pages: number
+  rows: number
+  pageBytes: number
+  materializedBytes: number
+  requestTimeoutMs: number
+  collectorDeadlineMs: number
+}
+
+export const ENTRA_COLLECTION_LIMITS: Readonly<EntraCollectionLimits> = Object.freeze({
+  pages: 50,
+  rows: 25_000,
+  pageBytes: 2 * 1024 * 1024,
+  materializedBytes: 8 * 1024 * 1024,
+  requestTimeoutMs: 30_000,
+  collectorDeadlineMs: 10 * 60_000,
+})
+export const USER_DELTA_COLLECTION_LIMITS = Object.freeze({
+  pages: 100,
+  rows: 100_000,
+  pageBytes: 2 * 1024 * 1024,
+  cumulativeBytes: 32 * 1024 * 1024,
+  materializedBytes: 8 * 1024 * 1024,
+  requestTimeoutMs: 20_000,
+  collectorDeadlineMs: 10 * 60_000,
+})
+export const EXCHANGE_JSON_COLLECTION_LIMITS = Object.freeze({
+  pages: 50,
+  rows: 20_000,
+  pageBytes: 2 * 1024 * 1024,
+  materializedBytes: 8 * 1024 * 1024,
+  requestTimeoutMs: 30_000,
+  collectorDeadlineMs: 4 * 60_000,
+  tenantRules: 50_000,
+})
+export const SINGLETON_JSON_MAX_BYTES = 2 * 1024 * 1024
+const ENTRA_SMALL_COLLECTION_RESOURCES = new Set<EntraSnapshotResource>([
+  'AUTH_METHOD_POLICIES',
+  'CONDITIONAL_ACCESS',
+  'AUTHENTICATION_STRENGTHS',
+  'NAMED_LOCATIONS',
+  'DIRECTORY_ROLES',
+  'SECURE_SCORES',
+  'SECURITY_DEFAULTS',
+])
+
+export function entraCollectionLimitsForResource(
+  resourceType: EntraSnapshotResource,
+): Readonly<EntraCollectionLimits> {
+  if (!ENTRA_SMALL_COLLECTION_RESOURCES.has(resourceType)) return ENTRA_COLLECTION_LIMITS
+  return {
+    ...ENTRA_COLLECTION_LIMITS,
+    pages: resourceType === 'SECURE_SCORES' ? 2 : 10,
+    rows: resourceType === 'SECURE_SCORES' ? 100 : 5_000,
+    materializedBytes: resourceType === 'SECURE_SCORES' ? 1024 * 1024 : 4 * 1024 * 1024,
+  }
+}
+export const GROUP_RELATIONSHIP_LIMITS = Object.freeze({
+  rows: 100_000,
+  materializedBytes: 8 * 1024 * 1024,
+  collectorDeadlineMs: 10 * 60_000,
+})
+export const MAILBOX_USAGE_CSV_MAX_BYTES = 5 * 1024 * 1024
+export const MAILBOX_USAGE_CSV_MAX_ROWS = 20_000
+export const MAILBOX_USAGE_CSV_MAX_COLUMNS = 128
+export const MICROSOFT_USAGE_REPORT_CSV_MAX_BYTES = MAILBOX_USAGE_CSV_MAX_BYTES
+export const MICROSOFT_USAGE_REPORT_CSV_MAX_ROWS = MAILBOX_USAGE_CSV_MAX_ROWS
+export const MICROSOFT_USAGE_REPORT_CSV_MAX_COLUMNS = MAILBOX_USAGE_CSV_MAX_COLUMNS
+/** Mailbox views only consume these report fields. Do not retain arbitrary CSV columns. */
+const MAILBOX_USAGE_CSV_FIELDS = Object.freeze([
+  'User Principal Name',
+  'User Principal Name (UPN)',
+  'Owner Principal Name',
+  'Email Address',
+  'Storage Used (Byte)',
+  'Storage Used Bytes',
+  'Item Count',
+  'Items Count',
+])
+/** Fields consumed by the SharePoint/OneDrive usage contract. */
+export const MICROSOFT_USAGE_REPORT_CSV_FIELDS = Object.freeze([
+  'Report Refresh Date',
+  'Site Id',
+  'Site URL',
+  'Site Name',
+  'Is Deleted',
+  'Last Activity Date',
+  'Storage Used (Byte)',
+  'Storage Allocated (Byte)',
+  'Report Period',
+  'Owner Display Name',
+  'Owner Principal Name',
+  'Root Web Template',
+  'File Count',
+  'Active File Count',
+  'Page View Count',
+  'Visited Page Count',
+])
 /** Hard ceilings keep a targeted SharePoint retry below the 15 minute USERS lease. */
 export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
   sitePages: 50,
@@ -120,6 +227,71 @@ export const SHAREPOINT_COLLECTION_LIMITS = Object.freeze({
 
 export const NON_PREMIUM_AUTH_REGISTRATION_ERROR_CODE =
   'Authentication_RequestFromNonPremiumTenantOrB2CTenant'
+
+export type SyncCollectorModule = {
+  resource: string
+  synchronize: () => Promise<unknown>
+}
+
+// Fail safe: every Microsoft collector is a materializer unless it is
+// explicitly proven not to retain a remote response. This keeps newly added
+// resources from silently bypassing the one-heavy-collector lane.
+const NON_MATERIALIZING_COLLECTION_RESOURCES = new Set(['RUNTIME_TELEMETRY'])
+
+const isBoundedMemoryCollectionResource = (resource: string) =>
+  !NON_MATERIALIZING_COLLECTION_RESOURCES.has(resource)
+
+const memoryLaneContext = new AsyncLocalStorage<boolean>()
+let memoryLaneBusy = false
+const memoryLaneWaiters: Array<() => void> = []
+
+/** Process-wide and reentrant so independent tenant/API requests cannot
+ * multiply the heap budget. Nested audit reconciliation stays in its owning
+ * lane; only closed resource names survive into that secondary phase. */
+export async function runInSyncMemoryLane<T>(work: () => Promise<T>): Promise<T> {
+  if (memoryLaneContext.getStore()) return work()
+  if (memoryLaneBusy) {
+    if (memoryLaneWaiters.length >= 16) throw new Error('Tenant synchronization reached its bounded collection queue capacity.')
+    await new Promise<void>((resolve) => memoryLaneWaiters.push(resolve))
+  } else memoryLaneBusy = true
+  try { return await memoryLaneContext.run(true, work) } finally {
+    const next = memoryLaneWaiters.shift()
+    if (next) next()
+    else memoryLaneBusy = false
+  }
+}
+
+/**
+ * All materializing collectors share one bounded-memory lane. Small,
+ * independently bounded collectors may still run concurrently. Results
+ * preserve caller order so operational attribution cannot drift.
+ */
+export async function settleSyncCollectorModules(
+  modules: ReadonlyArray<SyncCollectorModule>,
+) {
+  const results = new Array<PromiseSettledResult<unknown>>(modules.length)
+  const heavyIndexes: number[] = []
+  const otherIndexes: number[] = []
+  modules.forEach((module, index) => {
+    ;(isBoundedMemoryCollectionResource(module.resource) ? heavyIndexes : otherIndexes).push(index)
+  })
+
+  const settleOne = async (index: number) => {
+    const module = modules[index]!
+    results[index] = (await Promise.allSettled([
+      isBoundedMemoryCollectionResource(module.resource)
+        ? runInSyncMemoryLane(module.synchronize)
+        : module.synchronize(),
+    ]))[0]!
+  }
+  await Promise.all([
+    (async () => {
+      for (const index of heavyIndexes) await settleOne(index)
+    })(),
+    Promise.all(otherIndexes.map(settleOne)),
+  ])
+  return results
+}
 
 /**
  * An upstream dependency is still being provisioned. This is an expected,
@@ -319,51 +491,6 @@ function summarizeAuthenticationMethodTargets(method: any) {
   return ids.length > 0
     ? `${ids.length} selected group(s)`
     : 'No users targeted'
-}
-
-function parseCsvRows(csv: string): Record<string, string>[] {
-  const rows: string[][] = []
-  let row: string[] = []
-  let field = ''
-  let quoted = false
-
-  for (let index = 0; index < csv.length; index += 1) {
-    const character = csv[index]
-    if (character === '"') {
-      if (quoted && csv[index + 1] === '"') {
-        field += '"'
-        index += 1
-      } else {
-        quoted = !quoted
-      }
-    } else if (character === ',' && !quoted) {
-      row.push(field)
-      field = ''
-    } else if ((character === '\n' || character === '\r') && !quoted) {
-      if (character === '\r' && csv[index + 1] === '\n') index += 1
-      row.push(field)
-      if (row.some((value) => value.length > 0)) rows.push(row)
-      row = []
-      field = ''
-    } else {
-      field += character
-    }
-  }
-  if (field.length > 0 || row.length > 0) {
-    row.push(field)
-    rows.push(row)
-  }
-
-  const [rawHeaders, ...values] = rows
-  if (!rawHeaders) return []
-  const headers = rawHeaders.map((header, index) =>
-    (index === 0 ? header.replace(/^\uFEFF/, '') : header).trim()
-  )
-  return values.map((columns) =>
-    Object.fromEntries(
-      headers.map((header, index) => [header, columns[index]?.trim() ?? ''])
-    )
-  )
 }
 
 /**
@@ -597,11 +724,51 @@ export type MailboxPaginationBounds = {
   pageSize?: number
   maxPages?: number
   maxRecords?: number
+  maxTotalRecords?: number
+  maxMaterializedBytes?: number
+  deadlineAt?: number
+}
+
+export const LIMITED_SIGN_IN_ENRICHMENT_LIMITS = Object.freeze({
+  uniqueIps: 1000,
+  lookupWorkers: 8,
+  locationBytes: 256 * 1024,
+  addedRowBytes: 2 * 1024 * 1024,
+  historyPageRows: 250,
+  historyRows: 5000,
+  historyBytes: 2 * 1024 * 1024,
+  historyLocationBytes: 1024,
+  deadlineMs: 20_000,
+  statementTimeoutMs: 1000,
+})
+type LimitedSignInEnrichmentLimits = { [K in keyof typeof LIMITED_SIGN_IN_ENRICHMENT_LIMITS]: number }
+// GeoIP is local and its initial file-open promise cannot be cancelled. Keep a
+// process-wide ceiling even if an open stalls across multiple scheduled runs.
+let optionalLocationLookupsInFlight = 0
+
+function projectInferredLocation(value: unknown): SignInLocation | null {
+  if (!plainRecord(value)) return null
+  const label = (item: unknown) => typeof item === 'string' && item.length <= 128 ? item : null
+  const coordinates = plainRecord(value.geoCoordinates) ? value.geoCoordinates : {}
+  const latitude = coordinates.latitude; const longitude = coordinates.longitude
+  const geoCoordinates = typeof latitude === 'number' && Number.isFinite(latitude) && Math.abs(latitude) <= 90 &&
+    typeof longitude === 'number' && Number.isFinite(longitude) && Math.abs(longitude) <= 180 ? { latitude, longitude } : null
+  const location: SignInLocation = {
+    city: label(value.city), state: label(value.state), countryOrRegion: label(value.countryOrRegion),
+    geoCoordinates, source: 'MAXMIND_GEOLITE2',
+  }
+  return location.city || location.state || location.countryOrRegion || geoCoordinates ? location : null
+}
+
+/** Only diagnostic codes, never arbitrary provider prose or identifiers. */
+function safeLoginDiagnosticCode(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > 64) return null
+  return /^(?:AccountLocked|InvalidUserNameOrPassword|InvalidPassword|UserAccountNotFound|UserAccountDisabled|UserNotFound|PasswordExpired|InvalidGrant|MfaRequired|MFARequired|StrongAuthenticationRequired|InteractionRequired|ConditionalAccessBlocked|[0-9]{1,12})$/.test(value) ? value : null
 }
 
 const DEFAULT_MAILBOX_USER_PAGE_SIZE = 250
 const DEFAULT_MAX_MAILBOX_USER_PAGES = 1_000
-const DEFAULT_MAX_MAILBOX_USERS = 100_000
+const DEFAULT_MAX_MAILBOX_USERS = EXCHANGE_JSON_COLLECTION_LIMITS.rows
 const DEFAULT_MAX_RULE_PAGES_PER_MAILBOX = 100
 const DEFAULT_MAX_RULES_PER_MAILBOX = 10_000
 
@@ -648,6 +815,7 @@ export async function collectMailboxDirectoryPages(
       typeof page['@odata.nextLink'] === 'string'
         ? page['@odata.nextLink']
         : null
+    if (page['@odata.nextLink'] !== undefined && typeof page['@odata.nextLink'] !== 'string') throw new Error('Microsoft returned an invalid mailbox directory pagination link; baseline was not advanced.')
   }
 
   return rows
@@ -662,11 +830,15 @@ export async function collectMailboxRuleUsers(
   const maxPages = bounds.maxPages ?? DEFAULT_MAX_MAILBOX_USER_PAGES
   const maxRecords = bounds.maxRecords ?? DEFAULT_MAX_MAILBOX_USERS
   const users: MailboxRuleUser[] = []
+  let retainedBytes = 0
   for (let pageNumber = 0, skip = 0; ; pageNumber += 1, skip += pageSize) {
+    if (bounds.deadlineAt !== undefined && Date.now() >= bounds.deadlineAt) throw new Error('Mailbox recipient inventory exceeded its bounded deadline; baseline was not advanced.')
     if (pageNumber >= maxPages) {
       throw new Error(`Mailbox recipient inventory exceeded the ${maxPages}-page safety limit; baseline was not advanced.`)
     }
     const page = await loadPage(skip, pageSize)
+    retainedBytes += Buffer.byteLength(JSON.stringify(page), 'utf8')
+    if (retainedBytes > (bounds.maxMaterializedBytes ?? EXCHANGE_JSON_COLLECTION_LIMITS.materializedBytes)) throw new Error('Mailbox recipient inventory exceeded its bounded memory limit; baseline was not advanced.')
     users.push(...page)
     if (users.length > maxRecords) {
       throw new Error(`Mailbox recipient inventory exceeded the ${maxRecords}-record safety limit; baseline was not advanced.`)
@@ -679,40 +851,50 @@ export async function collectMailboxRuleUsers(
 export async function collectMailboxRules(
   users: MailboxRuleUser[],
   loadPage: (user: MailboxRuleUser, nextUrl: string | null) => Promise<GraphCollectionPage>,
-  batchSize = 5,
+  _batchSize = 1,
   bounds: MailboxPaginationBounds = {}
 ) {
   const maxPages = bounds.maxPages ?? DEFAULT_MAX_RULE_PAGES_PER_MAILBOX
   const maxRecords = bounds.maxRecords ?? DEFAULT_MAX_RULES_PER_MAILBOX
+  const maxTotalRecords = bounds.maxTotalRecords ?? EXCHANGE_JSON_COLLECTION_LIMITS.tenantRules
+  const maxBytes = bounds.maxMaterializedBytes ?? EXCHANGE_JSON_COLLECTION_LIMITS.materializedBytes
   const rows: unknown[] = []
-  for (let index = 0; index < users.length; index += batchSize) {
-    const results = await Promise.all(users.slice(index, index + batchSize).map(async (user) => {
-      const mailboxRows: unknown[] = []
+  let totalBytes = 0
+  // Per-mailbox parallelism defeats the tenant-wide memory lane. Never keep
+  // several arbitrary rule pages alive while waiting for their peers.
+  for (const user of users) {
+      let mailboxRows = 0
       let nextUrl: string | null = null
       const seen = new Set<string>()
       let pageNumber = 0
       do {
+        if (bounds.deadlineAt !== undefined && Date.now() >= bounds.deadlineAt) throw new Error('Inbox rules exceeded the bounded tenant deadline; baseline was not advanced.')
         if (pageNumber >= maxPages) {
-          throw new Error(`Inbox rules for ${user.userPrincipalName} exceeded the ${maxPages}-page safety limit; baseline was not advanced.`)
+          throw new Error(`Inbox rules exceeded the ${maxPages}-page safety limit; baseline was not advanced.`)
         }
         const page = await loadPage(user, nextUrl)
         pageNumber += 1
-        mailboxRows.push(...(page.value ?? []).map((rule: any) => ({
-          ...rule,
+        const projected = (page.value ?? []).map((rule: any) => ({
+          ...projectMailboxRule(rule),
           mailboxUserId: user.microsoftUserId,
           mailboxUpn: user.userPrincipalName,
-        })))
-        if (mailboxRows.length > maxRecords) {
-          throw new Error(`Inbox rules for ${user.userPrincipalName} exceeded the ${maxRecords}-record safety limit; baseline was not advanced.`)
+        }))
+        mailboxRows += projected.length
+        if (mailboxRows > maxRecords) {
+          throw new Error(`Inbox rules exceeded the ${maxRecords}-record safety limit; baseline was not advanced.`)
+        }
+        for (const row of projected) {
+          const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8')
+          if (rows.length + 1 > maxTotalRecords || totalBytes + bytes > maxBytes) throw new Error('Inbox rules exceeded the bounded tenant-wide aggregate limit; baseline was not advanced.')
+          totalBytes += bytes
+          rows.push(row)
         }
         const candidate = typeof page['@odata.nextLink'] === 'string' ? page['@odata.nextLink'] : null
+        if (page['@odata.nextLink'] !== undefined && typeof page['@odata.nextLink'] !== 'string') throw new Error('Microsoft returned an invalid inbox-rules pagination link.')
         if (candidate && seen.has(candidate)) throw new Error('Microsoft returned a repeated inbox-rules pagination link.')
         if (candidate) seen.add(candidate)
         nextUrl = candidate
       } while (nextUrl)
-      return mailboxRows
-    }))
-    rows.push(...results.flat())
   }
   return rows
 }
@@ -733,16 +915,6 @@ interface GraphGroup {
     displayName?: string | null
     userPrincipalName?: string | null
   }>
-}
-
-interface GraphGroupsPage {
-  value?: GraphGroup[]
-  '@odata.nextLink'?: string
-}
-
-interface GraphGroupMembersPage {
-  value?: Array<{ id?: string }>
-  '@odata.nextLink'?: string
 }
 
 type EntraSnapshotResource =
@@ -961,33 +1133,62 @@ export function graphErrorCodeFromBody(body: string) {
   }
 }
 
-async function readBoundedResponseText(
+async function cancelBoundedStream(cancel: () => Promise<unknown> | undefined) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      Promise.resolve().then(cancel).catch(() => undefined),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, 100) }),
+    ])
+  } finally { if (timer) clearTimeout(timer) }
+}
+
+export async function readBoundedResponseText(
   response: Response,
   maximumBytes: number,
+  failureMessage = 'Microsoft Graph response exceeded the bounded response-size limit.',
+  deadlineAt = Date.now() + 30_000,
 ) {
   const declaredLength = Number(response.headers.get('content-length') ?? '0')
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
-    throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
-  }
-  if (!response.body) {
-    const text = await response.text()
-    if (new TextEncoder().encode(text).byteLength > maximumBytes) {
-      throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
+    try {
+      await cancelBoundedStream(() => response.body?.cancel())
+    } catch {
+      // A hostile/corrupt stream must not replace the safe bounded failure.
     }
-    return text
+    throw new Error(failureMessage)
   }
+  if (!response.body) throw new Error('Microsoft Graph response body was unavailable.')
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let total = 0
   try {
     while (true) {
-      const { done, value } = await reader.read()
+      const remainingMs = deadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        await cancelBoundedStream(() => reader.cancel())
+        throw new Error('Microsoft response exceeded its bounded collection deadline.')
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error('Microsoft response exceeded its bounded collection deadline.'))
+            void cancelBoundedStream(() => reader.cancel())
+          }, remainingMs)
+        }),
+      ]).finally(() => { if (timer) clearTimeout(timer) })
       if (done) break
       if (!value) continue
       total += value.byteLength
       if (total > maximumBytes) {
-        await reader.cancel('Microsoft Graph error response exceeded bounded limit')
-        throw new Error('Microsoft Graph error response exceeded the bounded response-size limit.')
+        try {
+          await cancelBoundedStream(() => reader.cancel('Microsoft response exceeded bounded limit'))
+        } catch {
+          // A hostile/corrupt stream must not replace the stable bounded error.
+        }
+        throw new Error(failureMessage)
       }
       chunks.push(value)
     }
@@ -1001,6 +1202,214 @@ async function readBoundedResponseText(
     offset += chunk.byteLength
   }
   return new TextDecoder().decode(bytes)
+}
+
+export async function parseBoundedGraphCollectionPage(
+  response: Response,
+  resourceLabel: string,
+) {
+  try {
+    const parsed = JSON.parse(
+      await readBoundedResponseText(response, GRAPH_LOG_PAGE_MAX_BYTES),
+    ) as unknown
+    if (!plainRecord(parsed) || !Array.isArray(parsed.value)) {
+      throw new Error('invalid')
+    }
+    return parsed as GraphCollectionPage
+  } catch {
+    throw new Error(`Microsoft ${resourceLabel} synchronization returned an unreadable bounded response.`)
+  }
+}
+
+function closedFields(value: unknown, fields: readonly string[]): Record<string, any> {
+  if (!plainRecord(value)) throw new Error('Microsoft returned an invalid bounded record.')
+  return Object.fromEntries(fields.filter((key) => Object.hasOwn(value, key)).map((key) => [key, value[key]]))
+}
+
+function projectDirectoryUser(value: unknown): GraphUser {
+  const row = closedFields(value, ['id', 'displayName', 'userPrincipalName', 'mail', 'accountEnabled', 'userType', '@removed'])
+  if (plainRecord(value) && Array.isArray(value.assignedLicenses)) {
+    row.assignedLicenses = value.assignedLicenses.map((license) => closedFields(license, ['skuId']))
+  }
+  if (row['@removed']) row['@removed'] = closedFields(row['@removed'], ['reason'])
+  return row
+}
+
+function projectMailboxDirectoryUser(value: unknown) {
+  const row = { ...projectDirectoryUser(value), ...closedFields(value, ['proxyAddresses']) }
+  return row
+}
+
+const ENTRA_SNAPSHOT_FIELDS: Partial<Record<EntraSnapshotResource, readonly string[]>> = {
+  GROUPS: ['id', 'displayName', 'description', 'mail', 'mailNickname', 'mailEnabled', 'securityEnabled', 'groupTypes', 'visibility', 'onPremisesSyncEnabled', 'userPrincipalName'],
+  AUTH_REGISTRATIONS: ['id', 'userPrincipalName', 'userDisplayName', 'isAdmin', 'isSsprRegistered', 'isSsprEnabled', 'isSsprCapable', 'isMfaRegistered', 'isMfaCapable', 'isPasswordlessCapable', 'methodsRegistered', 'defaultMfaMethod', 'lastUpdatedDateTime', 'userType'],
+  CONDITIONAL_ACCESS: ['id', 'displayName', 'state', 'createdDateTime', 'modifiedDateTime', 'conditions', 'grantControls', 'sessionControls'],
+  AUTHENTICATION_STRENGTHS: ['id', 'displayName', 'description', 'policyType', 'requirementsSatisfied', 'allowedCombinations', 'createdDateTime', 'modifiedDateTime'],
+  NAMED_LOCATIONS: ['id', 'displayName', '@odata.type', 'createdDateTime', 'modifiedDateTime', 'isTrusted', 'ipRanges', 'countriesAndRegions', 'includeUnknownCountriesAndRegions', 'countryLookupMethod'],
+  DEVICES: ['id', 'deviceId', 'displayName', 'operatingSystem', 'operatingSystemVersion', 'trustType', 'isCompliant', 'isManaged', 'accountEnabled', 'approximateLastSignInDateTime', 'registeredOwners'],
+  DIRECTORY_ROLES: ['id', 'principalId', 'roleDefinitionId', 'directoryScopeId', 'appScopeId', 'roleDefinition'],
+  RISKY_USERS: ['id', 'userPrincipalName', 'riskLevel', 'riskState', 'riskDetail', 'riskLastUpdatedDateTime'],
+  SERVICE_PRINCIPALS: ['id', 'appId', 'displayName', 'description', 'servicePrincipalType', 'accountEnabled', 'appRoleAssignmentRequired', 'createdDateTime', 'homepage', 'loginUrl', 'publisherName', 'verifiedPublisher', 'tags', 'preferredSingleSignOnMode', 'notificationEmailAddresses', 'appRoles', 'oauth2PermissionScopes', 'appRoleAssignedTo'],
+  APPLICATIONS: ['id', 'appId', 'displayName', 'description', 'createdDateTime', 'signInAudience', 'publisherDomain', 'identifierUris', 'web', 'passwordCredentials', 'keyCredentials', 'requiredResourceAccess', 'owners'],
+  SECURE_SCORES: ['id', 'createdDateTime', 'currentScore', 'maxScore', 'activeUserCount', 'licensedUserCount', 'enabledServices', 'controlScores', 'averageComparativeScores'],
+}
+
+function projectEntraRecord(value: unknown, resource: EntraSnapshotResource) {
+  const fields = ENTRA_SNAPSHOT_FIELDS[resource]
+  if (!fields) throw new Error('Microsoft collector has no closed snapshot projection.')
+  return closedFields(value, fields)
+}
+
+const MAILBOX_RULE_CONDITION_FIELDS = ['bodyContains', 'bodyOrSubjectContains', 'categories', 'fromAddresses', 'hasAttachments', 'headerContains', 'importance', 'isApprovalRequest', 'isAutomaticForward', 'isAutomaticReply', 'isEncrypted', 'isMeetingRequest', 'isMeetingResponse', 'isNonDeliveryReport', 'isPermissionControlled', 'isReadReceipt', 'isSigned', 'isVoicemail', 'messageActionFlag', 'notSentToMe', 'recipientContains', 'senderContains', 'sensitivity', 'sentCcMe', 'sentOnlyToMe', 'sentToAddresses', 'sentToMe', 'sentToOrCcMe', 'subjectContains', 'withinSizeRange']
+const MAILBOX_RULE_ACTION_FIELDS = ['assignCategories', 'copyToFolder', 'delete', 'forwardAsAttachmentTo', 'forwardTo', 'markAsRead', 'markImportance', 'moveToFolder', 'permanentDelete', 'redirectTo', 'stopProcessingRules']
+
+export function projectMailboxRule(value: unknown) {
+  const row = closedFields(value, ['id', 'displayName', 'isEnabled', 'hasError', 'isReadOnly', 'sequence'])
+  for (const [key, fields] of [['conditions', MAILBOX_RULE_CONDITION_FIELDS], ['exceptions', MAILBOX_RULE_CONDITION_FIELDS], ['actions', MAILBOX_RULE_ACTION_FIELDS]] as const) {
+    if (!plainRecord(value) || !plainRecord(value[key])) continue
+    const facts = closedFields(value[key], fields)
+    for (const recipientKey of ['fromAddresses', 'sentToAddresses', 'forwardAsAttachmentTo', 'forwardTo', 'redirectTo']) {
+      if (Array.isArray(facts[recipientKey])) facts[recipientKey] = facts[recipientKey].map((recipient: unknown) => {
+        const item = closedFields(recipient, ['emailAddress'])
+        return { emailAddress: closedFields(item.emailAddress, ['address', 'name']) }
+      })
+    }
+    if (facts.withinSizeRange) facts.withinSizeRange = closedFields(facts.withinSizeRange, ['minimumSize', 'maximumSize'])
+    row[key] = facts
+  }
+  return row
+}
+
+/** Shared whole-collector budget. It is checked before requests and retention. */
+export class MicrosoftCollectionBudget {
+  readonly deadlineAt: number
+  private pages = 0
+  private rows = 0
+  private retainedBytes = 0
+  private wireBytes = 0
+  private readonly seen = new Set<string>()
+  constructor(readonly limits: Readonly<EntraCollectionLimits>, readonly label: string) {
+    this.deadlineAt = Date.now() + limits.collectorDeadlineMs
+  }
+  assertTime() {
+    if (Date.now() >= this.deadlineAt) throw new Error(`Microsoft ${this.label} synchronization exceeded a bounded collection limit.`)
+  }
+  begin(url: string) {
+    this.assertTime()
+    if (++this.pages > this.limits.pages || this.seen.has(url)) throw new Error(`Microsoft ${this.label} synchronization exceeded a bounded collection limit.`)
+    this.seen.add(url)
+  }
+  retain(values: readonly unknown[]) {
+    this.assertTime()
+    for (const value of values) {
+      const bytes = Buffer.byteLength(JSON.stringify(value), 'utf8')
+      if (++this.rows > this.limits.rows || this.retainedBytes + bytes > this.limits.materializedBytes) throw new Error(`Microsoft ${this.label} synchronization exceeded a bounded collection limit.`)
+      this.retainedBytes += bytes
+    }
+  }
+  async read(response: Response): Promise<unknown> {
+    const text = await readBoundedResponseText(response, this.limits.pageBytes, `Microsoft ${this.label} synchronization exceeded a bounded page-size limit (capacity guard).`, this.deadlineAt)
+    this.assertTime()
+    this.wireBytes += Buffer.byteLength(text, 'utf8')
+    if (this.wireBytes > this.limits.materializedBytes * 4) throw new Error(`Microsoft ${this.label} synchronization exceeded a bounded collection limit.`)
+    try { return JSON.parse(text) as unknown } catch { throw new Error(`Microsoft ${this.label} synchronization returned an unreadable bounded response.`) }
+  }
+}
+
+async function readBoundedSingleton(response: Response): Promise<Record<string, any>> {
+  const parsed = JSON.parse(await readBoundedResponseText(response, SINGLETON_JSON_MAX_BYTES)) as unknown
+  if (!plainRecord(parsed)) throw new Error('Microsoft returned an invalid bounded singleton response.')
+  if (parsed['@odata.nextLink'] !== undefined) throw new Error('Microsoft returned an incomplete bounded singleton response; baseline was not advanced.')
+  return parsed
+}
+
+/**
+ * Project a Microsoft usage report as it is parsed instead of retaining every
+ * one of its (up to 20k x 128) raw cells. The report remains byte/row/column
+ * bounded and its persisted snapshot is limited to an explicit field set.
+ */
+export function parseProjectedUsageCsv(
+  csv: string,
+  fields: ReadonlyArray<string>,
+  label: string,
+): Record<string, string>[] {
+  if (Buffer.byteLength(csv, 'utf8') > MICROSOFT_USAGE_REPORT_CSV_MAX_BYTES) {
+    throw new Error(`Microsoft ${label} usage report exceeded the bounded response-size limit.`)
+  }
+  const selected = new Set(fields)
+  const result: Record<string, string>[] = []
+  let headers: string[] | null = null
+  let row: string[] = []
+  let field = ''
+  let quoted = false
+
+  const completeRow = () => {
+    row.push(field)
+    field = ''
+    // Match the generic parser's ceiling: the header counts as one CSV row.
+    if (row.length > MICROSOFT_USAGE_REPORT_CSV_MAX_COLUMNS || (headers && result.length >= MICROSOFT_USAGE_REPORT_CSV_MAX_ROWS - 1)) {
+      throw new Error(`Microsoft ${label} usage report exceeded a bounded row or column limit.`)
+    }
+    if (!row.some((value) => value.length > 0)) { row = []; return }
+    if (!headers) {
+      headers = row.map((value, index) => (index === 0 ? value.replace(/^\uFEFF/, '') : value).trim())
+      row = []
+      return
+    }
+    const projected: Record<string, string> = {}
+    for (let index = 0; index < headers.length; index += 1) {
+      const header = headers[index]!
+      if (selected.has(header)) projected[header] = row[index]?.trim() ?? ''
+    }
+    // Keep an intentionally empty record only when Microsoft supplied a row;
+    // it preserves a bounded, honest report count without retaining raw fields.
+    result.push(projected)
+    row = []
+  }
+
+  for (let index = 0; index < csv.length; index += 1) {
+    const character = csv[index]!
+    if (character === '"') {
+      if (quoted && csv[index + 1] === '"') { field += '"'; index += 1 } else quoted = !quoted
+    } else if (character === ',' && !quoted) {
+      row.push(field); field = ''
+      if (row.length >= MICROSOFT_USAGE_REPORT_CSV_MAX_COLUMNS) {
+        throw new Error(`Microsoft ${label} usage report exceeded a bounded row or column limit.`)
+      }
+    } else if ((character === '\n' || character === '\r') && !quoted) {
+      if (character === '\r' && csv[index + 1] === '\n') index += 1
+      completeRow()
+    } else field += character
+  }
+  if (quoted) throw new Error(`Microsoft ${label} usage report returned invalid quoted CSV.`)
+  if (field.length > 0 || row.length > 0) completeRow()
+  return result
+}
+
+export function parseMailboxUsageCsv(csv: string): Record<string, string>[] {
+  return parseProjectedUsageCsv(csv, MAILBOX_USAGE_CSV_FIELDS, 'mailbox')
+}
+
+export function parseMicrosoftUsageReportCsv(csv: string): Record<string, string>[] {
+  return parseProjectedUsageCsv(csv, MICROSOFT_USAGE_REPORT_CSV_FIELDS, 'SharePoint or OneDrive')
+}
+
+export function assertGraphCollectionBounds(input: {
+  pageCount: number
+  rowCount: number
+  url: string
+  seenUrls: ReadonlySet<string>
+  deadlineAt: number
+  now?: number
+}) {
+  if (
+    input.pageCount > GRAPH_LOG_COLLECTION_MAX_PAGES ||
+    input.rowCount > GRAPH_LOG_COLLECTION_MAX_ROWS ||
+    (input.now ?? Date.now()) > input.deadlineAt ||
+    input.seenUrls.has(input.url)
+  ) {
+    throw new Error('Microsoft Graph log synchronization exceeded a bounded collection limit.')
+  }
 }
 
 export async function readGraphOperationalError(
@@ -1055,30 +1464,7 @@ export async function readBoundedSharePointJson(
   response: Response,
   maximumBytes = SHAREPOINT_COLLECTION_LIMITS.responseBytes,
 ): Promise<unknown> {
-  assertSharePointResponseSize(response, maximumBytes)
-  if (!response.body) return response.json()
-  const reader = response.body.getReader()
-  const chunks: Uint8Array[] = []
-  let total = 0
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (!value) continue
-      total += value.byteLength
-      if (total > maximumBytes) {
-        await reader.cancel('SharePoint response exceeded bounded limit')
-        throw new Error('SharePoint response exceeded the bounded collection response-size limit.')
-      }
-      chunks.push(value)
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  const bytes = new Uint8Array(total)
-  let offset = 0
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
-  return JSON.parse(new TextDecoder().decode(bytes))
+  return JSON.parse(await readBoundedResponseText(response, maximumBytes, 'SharePoint response exceeded the bounded collection response-size limit.')) as unknown
 }
 
 function sharePointRequestTimeout(
@@ -1154,6 +1540,29 @@ export function organizationConfigurationSnapshotForTenant(
 @Injectable()
 export class TenantSyncService {
   private readonly logger = new Logger(TenantSyncService.name)
+  private static readonly operationalResources = new Set([
+    'M365_AUDIT', 'DOMAIN_DNS_HEALTH', 'GROUPS', 'MFA_REGISTRATION',
+    'CONDITIONAL_ACCESS', 'USERS', 'SIGN_INS', 'AUDIT_LOGS', 'LICENSES',
+    'DOMAINS', 'SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS',
+    'ORGANIZATION_CONFIGURATION', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES',
+    'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS', 'DEVICES', 'DIRECTORY_ROLES',
+    'RISKY_USERS', 'SERVICE_PRINCIPALS', 'APPLICATIONS', 'SECURE_SCORES',
+    'SECURITY_DEFAULTS', 'SHAREPOINT_USAGE', 'EXCHANGE_MAILBOXES',
+    'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_CONFIGURATION',
+    'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_ACCEPTED_DOMAINS',
+  ])
+  private static readonly operationalReasons = new Set([
+    'INDEPENDENT_AUDIT_UNAVAILABLE', 'COLLECTION_UNAVAILABLE',
+    'OWNER_REFRESH_UNAVAILABLE', 'MEMBERSHIP_REFRESH_UNAVAILABLE',
+    'PER_USER_STATE_UNAVAILABLE', 'MEMBERSHIP_EVIDENCE_UNAVAILABLE',
+    'AUDIT_RECONCILIATION_UNAVAILABLE',
+  ])
+
+  private logOperationalFailure(resource: string, phase: 'INCREMENTAL' | 'SNAPSHOT' | 'RECONCILIATION' | 'RELATIONSHIP' | 'FALLBACK', reasonCode: string) {
+    const safeResource = TenantSyncService.operationalResources.has(resource) ? resource : 'UNKNOWN'
+    const safeReasonCode = TenantSyncService.operationalReasons.has(reasonCode) ? reasonCode : 'UNKNOWN'
+    this.logger.warn(JSON.stringify({ event: 'microsoft_collection_runtime_failure', resource: safeResource, phase, outcome: 'FAILED', reasonCode: safeReasonCode }))
+  }
 
   constructor(
     @Inject(PrismaService)
@@ -1337,6 +1746,13 @@ export class TenantSyncService {
     identity: AuthenticatedIdentity,
     customerTenantId: string,
   ) {
+    return runInSyncMemoryLane(() => this.verifyExchangeReadOnlyWithinMemoryLane(identity, customerTenantId))
+  }
+
+  private async verifyExchangeReadOnlyWithinMemoryLane(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string,
+  ) {
     const tenant = await this.getReadableTenant(identity, customerTenantId)
     if (!tenant.connection) throw new BadRequestException('The Microsoft tenant connection is incomplete.')
     const accessToken = await this.microsoftConsent.getTenantExchangeAccessToken({
@@ -1468,15 +1884,7 @@ export class TenantSyncService {
           failedResources: result.failedResources,
         })
       } catch (error) {
-        results.push({
-          tenantId: tenant.id,
-          microsoftTenantId: tenant.microsoftTenantId,
-          status: 'FAILED',
-          error:
-            error instanceof Error
-              ? error.message.slice(0, 500)
-              : 'Tenant synchronization failed.',
-        })
+      results.push({ status: 'FAILED', failureCode: 'TENANT_SYNC_FAILED' })
       }
     }
 
@@ -1488,10 +1896,9 @@ export class TenantSyncService {
       partial: results.filter((result) => result.status === 'PARTIAL').length,
       failed: results.filter((result) => result.status === 'FAILED').length,
       skipped: results.filter((result) => result.status === 'SKIPPED').length,
-      results,
     }
     this.logger.log(
-      `Scheduled tenant synchronization: ${JSON.stringify(summary)}`
+      `Scheduled tenant synchronization: ${JSON.stringify({ checkedAt: summary.checkedAt, due: summary.due, succeeded: summary.succeeded, partial: summary.partial, failed: summary.failed, skipped: summary.skipped })}`
     )
     return summary
   }
@@ -1554,6 +1961,16 @@ export class TenantSyncService {
   }
 
   private async syncConnectedTenant(
+    tenant: TenantSyncTarget,
+    throwWhenBusy: boolean,
+    options: { incrementalOnly?: boolean; includeBundle?: boolean } = {}
+  ) {
+    // Acquire before the durable USERS lease, so queued tenants are not
+    // reported RUNNING and cannot have their lease expire while waiting.
+    return runInSyncMemoryLane(() => this.syncConnectedTenantWithinMemoryLane(tenant, throwWhenBusy, options))
+  }
+
+  private async syncConnectedTenantWithinMemoryLane(
     tenant: TenantSyncTarget,
     throwWhenBusy: boolean,
     options: { incrementalOnly?: boolean; includeBundle?: boolean } = {}
@@ -1669,9 +2086,7 @@ export class TenantSyncService {
           // spot; ingest evidence now and reconcile current state later.
           await this.m365ManagementActivity.syncTenant(tenant)
         } catch (auditError) {
-          this.logger.warn(
-            `Independent Microsoft 365 audit synchronization also failed for tenant ${tenant.id}: ${safeErrorMessage(auditError, 'Microsoft 365 audit synchronization failed.')}`
-          )
+          this.logOperationalFailure('M365_AUDIT', 'INCREMENTAL', 'INDEPENDENT_AUDIT_UNAVAILABLE')
         }
       }
       if (error instanceof ConflictException) throw error
@@ -1735,19 +2150,14 @@ export class TenantSyncService {
       // per-mailbox scan must never become an unconditional five-minute poll;
       // future audit-triggered reconciliation needs an exact, bounded event
       // predicate before it can opt this resource back into incremental work.
-      const incrementalResults = await Promise.allSettled(
-        incrementalModules.map((module) => module.synchronize())
-      )
+      // These two collectors can each legitimately retain multi-page Graph
+      // payloads. Never begin both at once on a constrained sync worker, but
+      // keep independent work concurrent and preserve module/result ordering.
+      const incrementalResults = await settleSyncCollectorModules(incrementalModules)
       incrementalResults.forEach((result, index) => {
         if (result.status === 'rejected') {
           const resource = incrementalModules[index]?.resource ?? 'UNKNOWN'
-          this.logger.warn(
-            `${resource} incremental synchronization was unavailable for tenant ${tenant.id}: ${
-              result.reason instanceof Error
-                ? result.reason.message
-                : String(result.reason)
-            }`
-          )
+          this.logOperationalFailure(resource, 'INCREMENTAL', 'COLLECTION_UNAVAILABLE')
         }
       })
 
@@ -1861,19 +2271,11 @@ export class TenantSyncService {
         synchronize: () => this.syncExchangeMailboxConfiguration(tenant),
       })
     }
-    const snapshotResults = await Promise.allSettled(
-      snapshotModules.map((module) => module.synchronize())
-    )
+    const snapshotResults = await settleSyncCollectorModules(snapshotModules)
     snapshotResults.forEach((result, index) => {
       if (result.status === 'rejected') {
         const resource = snapshotModules[index]?.resource ?? 'UNKNOWN'
-        this.logger.warn(
-          `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
-            result.reason instanceof Error
-              ? result.reason.message
-              : String(result.reason)
-          }`
-        )
+        this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
     })
 
@@ -1882,56 +2284,52 @@ export class TenantSyncService {
     try {
       await this.syncDomainDnsHealth(tenant)
     } catch (error) {
-      this.logger.warn(
-        `DOMAIN_DNS_HEALTH synchronization was unavailable for tenant ${tenant.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      )
+      this.logOperationalFailure('DOMAIN_DNS_HEALTH', 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
     }
 
-    const entraModules: Array<Promise<unknown>> = [
-      this.syncAuthenticationRegistrations(tenant, snapshotAccessToken),
-      this.syncAuthenticationMethodPolicy(tenant, snapshotAccessToken),
-      this.syncEntraCollection(
+    const entraModules: SyncCollectorModule[] = [
+      { resource: 'AUTH_REGISTRATIONS', synchronize: () => this.syncAuthenticationRegistrations(tenant, snapshotAccessToken) },
+      { resource: 'AUTH_METHOD_POLICIES', synchronize: () => this.syncAuthenticationMethodPolicy(tenant, snapshotAccessToken) },
+      { resource: 'CONDITIONAL_ACCESS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'CONDITIONAL_ACCESS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'AUTHENTICATION_STRENGTHS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'AUTHENTICATION_STRENGTHS',
         'https://graph.microsoft.com/v1.0/policies/authenticationStrengthPolicies'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'NAMED_LOCATIONS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'NAMED_LOCATIONS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
-      ),
-      this.syncSignInLogs(tenant, snapshotAccessToken),
-      this.syncDirectoryAuditLogs(tenant, snapshotAccessToken, false),
-      this.syncM365AuditActivity(tenant, snapshotAccessToken),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'SIGN_INS', synchronize: () => this.syncSignInLogs(tenant, snapshotAccessToken) },
+      { resource: 'AUDIT_LOGS', synchronize: () => this.syncDirectoryAuditLogs(tenant, snapshotAccessToken, false) },
+      { resource: 'M365_AUDIT', synchronize: () => this.syncM365AuditActivity(tenant, snapshotAccessToken) },
+      { resource: 'DEVICES', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'DEVICES',
         'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'DIRECTORY_ROLES', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'DIRECTORY_ROLES',
         'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'RISKY_USERS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'RISKY_USERS',
         'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'SERVICE_PRINCIPALS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'SERVICE_PRINCIPALS',
@@ -1942,8 +2340,8 @@ export class TenantSyncService {
           'preferredSingleSignOnMode,notificationEmailAddresses,appRoles,' +
           'oauth2PermissionScopes&' +
           '$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'APPLICATIONS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'APPLICATIONS',
@@ -1952,42 +2350,20 @@ export class TenantSyncService {
           'signInAudience,publisherDomain,identifierUris,web,' +
           'passwordCredentials,keyCredentials,requiredResourceAccess&' +
           '$expand=owners($select=id,displayName,userPrincipalName)'
-      ),
-      this.syncEntraCollection(
+      ) },
+      { resource: 'SECURE_SCORES', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'SECURE_SCORES',
         'https://graph.microsoft.com/v1.0/security/secureScores?$top=25'
-      ),
-      this.syncSecurityDefaults(tenant, snapshotAccessToken),
+      ) },
+      { resource: 'SECURITY_DEFAULTS', synchronize: () => this.syncSecurityDefaults(tenant, snapshotAccessToken) },
     ]
-    const entraResults = await Promise.allSettled(entraModules)
+    const entraResults = await settleSyncCollectorModules(entraModules)
     entraResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const resource = [
-          'AUTH_REGISTRATIONS',
-          'AUTH_METHOD_POLICIES',
-          'CONDITIONAL_ACCESS',
-          'AUTHENTICATION_STRENGTHS',
-          'NAMED_LOCATIONS',
-          'SIGN_INS',
-          'AUDIT_LOGS',
-          'M365_AUDIT',
-          'DEVICES',
-          'DIRECTORY_ROLES',
-          'RISKY_USERS',
-          'SERVICE_PRINCIPALS',
-          'APPLICATIONS',
-          'SECURE_SCORES',
-          'SECURITY_DEFAULTS',
-        ][index]
-        this.logger.warn(
-          `${resource} synchronization was unavailable for tenant ${tenant.id}: ${
-            result.reason instanceof Error
-              ? result.reason.message
-              : String(result.reason)
-          }`
-        )
+        const resource = entraModules[index]?.resource ?? 'UNKNOWN'
+        this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
     })
 
@@ -2082,19 +2458,28 @@ export class TenantSyncService {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
         },
-        select: { resourceType: true, payload: true },
+        select: { resourceType: true },
       }),
     ])
     const syncByResource = new Map(syncStates.map((state) => [state.resourceType, state]))
-    const snapshotByResource = new Map(snapshots.map((snapshot) => [snapshot.resourceType, snapshot.payload]))
-    const snapshotFor = (resource: string) =>
-      snapshotByResource.get(resource as any)
+    const snapshotResources = new Set(snapshots.map((snapshot) => snapshot.resourceType))
     // A deliberately empty snapshot is still a successful, useful result. It
     // must survive a later refresh failure as a stale zero rather than vanish.
-    const hasSnapshot = (resource: string) => snapshotByResource.has(resource as any)
+    const hasSnapshot = (resource: string) => snapshotResources.has(resource as any)
     const correlationId = (message: string | null) =>
       message?.match(/(?:request|correlation)[^0-9a-f]*([0-9a-f]{8}-[0-9a-f-]{27,})/i)?.[1] ?? null
-    const usageProjection = inspectMicrosoftUsageProjectionEvidence(snapshotFor('SHAREPOINT_USAGE'))
+    // Read only the two payloads whose contents affect readiness, one at a
+    // time. Loading every persisted collector payload together defeats the
+    // collection memory lane even after all downloads have completed.
+    const inspectSnapshot = async <T>(resourceType: string, inspect: (payload: unknown) => T): Promise<T> => {
+      const rows = hasSnapshot(resourceType) ? await this.prisma.tenantEntraSnapshot.findMany({
+        where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: resourceType as any },
+        select: { payload: true }, take: 1,
+      }) : []
+      return inspect(rows[0]?.payload)
+    }
+    const usageProjection = await inspectSnapshot('SHAREPOINT_USAGE', inspectMicrosoftUsageProjectionEvidence)
+    const conditionalAccessIsEmpty = await inspectSnapshot('CONDITIONAL_ACCESS', (payload) => Array.isArray(payload) && payload.length === 0)
     const resources: Array<{ key: string; resource: string; source: string; endpoint: string; unsupported?: boolean; capability?: 'NOT_COLLECTED_LEAST_PRIVILEGE'; projectionEvidence?: MicrosoftUsageSourceProjectionEvidence }> = [
       { key: 'exchange.mailboxes.inventory', resource: 'EXCHANGE_MAILBOXES', source: 'Microsoft Graph', endpoint: '/users' },
       { key: 'exchange.mailboxes.settings', resource: 'EXCHANGE_MAILBOX_SETTINGS', source: 'Microsoft Graph', endpoint: '/users/{id}/mailboxSettings' },
@@ -2112,12 +2497,10 @@ export class TenantSyncService {
     ]
     await Promise.all(resources.map(async (definition) => {
       const sync = syncByResource.get(definition.resource as any)
-      const conditionalAccessPayload = snapshotFor('CONDITIONAL_ACCESS')
       const hasNoConditionalAccessPolicies =
         definition.key === 'entra.conditional-access' &&
         sync?.status === 'SUCCEEDED' &&
-        Array.isArray(conditionalAccessPayload) &&
-        conditionalAccessPayload.length === 0
+        conditionalAccessIsEmpty
       const resourceResult = deriveCollectionFieldState({
         syncStatus: sync?.status,
         lastErrorMessage: sync?.lastErrorMessage,
@@ -2211,27 +2594,39 @@ export class TenantSyncService {
     synchronize: () => Promise<void>
   ) {
     const lastAttemptAt = new Date()
-    const previousState = await this.prisma.syncState.upsert({
-      where: {
-        customerTenantId_resourceType: {
+    const exchangePhase = resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'
+    if (exchangePhase) {
+      logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'STARTED', lastAttemptAt.getTime())
+    }
+    let previousState
+    try {
+      previousState = await this.prisma.syncState.upsert({
+        where: {
+          customerTenantId_resourceType: {
+            customerTenantId: tenant.id,
+            resourceType,
+          },
+        },
+        create: {
+          organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
           resourceType,
+          status: 'RUNNING',
+          lastAttemptAt,
         },
-      },
-      create: {
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
-        resourceType,
-        status: 'RUNNING',
-        lastAttemptAt,
-      },
-      update: {
-        status: 'RUNNING',
-        lastAttemptAt,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      },
-    })
+        update: {
+          status: 'RUNNING',
+          lastAttemptAt,
+          lastErrorCode: null,
+          lastErrorMessage: null,
+        },
+      })
+    } catch (error) {
+      if (exchangePhase) {
+        logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
+      }
+      throw error
+    }
 
     try {
       await synchronize()
@@ -2265,7 +2660,13 @@ export class TenantSyncService {
           actionLabel: 'View tenant',
         }
       )
+      if (exchangePhase) {
+        logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'COMPLETED', lastAttemptAt.getTime())
+      }
     } catch (error) {
+      if (exchangePhase) {
+        logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
+      }
       const technicalMessage = safeErrorMessage(
         error,
         `Microsoft ${resourceType.toLowerCase()} synchronization failed.`
@@ -2324,14 +2725,10 @@ export class TenantSyncService {
       )
       this.logger.warn(JSON.stringify({
         event: 'microsoft_collection_failed',
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
         resourceType,
         failureClass: failure.failureClass,
         reasonCode: failure.reasonCode,
         status: failure.status,
-        microsoftCode: failure.microsoftCode,
-        requestId: failure.requestId,
       }))
       const state = await this.prisma.syncState.update({
         where: {
@@ -2396,9 +2793,14 @@ export class TenantSyncService {
         'https://graph.microsoft.com/v1.0/subscribedSkus', accessToken, 'license',
         { timeoutMs: 20_000 },
       )
-      const body = (await response.json()) as { value?: GraphSubscribedSku[] }
+      const body = await readBoundedSingleton(response) as { value?: GraphSubscribedSku[] }
+      if (!Array.isArray(body.value) || body.value.length > 1_000) throw new Error('Microsoft licenses exceeded the bounded record limit.')
       const observedAt = new Date()
-      const rows = (body.value ?? []).filter(
+      const rows = body.value.map((value) => ({
+        ...closedFields(value, ['skuId', 'skuPartNumber', 'consumedUnits', 'capabilityStatus']),
+        prepaidUnits: value.prepaidUnits ? closedFields(value.prepaidUnits, ['enabled', 'warning', 'suspended', 'lockedOut']) : null,
+        servicePlans: boundedServicePlans(value.servicePlans),
+      }) as GraphSubscribedSku).filter(
         (sku) =>
           typeof sku.skuId === 'string' && typeof sku.skuPartNumber === 'string'
       )
@@ -2460,7 +2862,7 @@ export class TenantSyncService {
         'domain',
         { timeoutMs: 20_000 },
       )
-      const body = (await response.json()) as { value?: GraphOrganization[] }
+      const body = await readBoundedSingleton(response) as { value?: GraphOrganization[] }
       const organization = body.value?.[0]
       if (!organization) {
         throw new Error('Microsoft did not return organization information.')
@@ -2468,7 +2870,8 @@ export class TenantSyncService {
       const observedAt = new Date()
       const domains = (organization.verifiedDomains ?? []).filter(
         (domain) => typeof domain.name === 'string' && domain.name.trim()
-      )
+      ).map((domain) => closedFields(domain, ['name', 'isDefault', 'isInitial', 'capabilities', 'type']) as NonNullable<GraphOrganization['verifiedDomains']>[number])
+      if (domains.length > 1_000) throw new Error('Microsoft domains exceeded the bounded record limit.')
       const primaryDomain =
         domains.find((domain) => domain.isDefault)?.name?.trim() ??
         domains.find((domain) => domain.isInitial)?.name?.trim() ??
@@ -2534,7 +2937,7 @@ export class TenantSyncService {
         'organization configuration',
         { timeoutMs: 20_000 },
       )
-      const body = (await response.json()) as GraphOrganizationConfigurationResponse
+      const body = await readBoundedSingleton(response) as GraphOrganizationConfigurationResponse
       const organization = organizationConfigurationSnapshotForTenant(tenant.microsoftTenantId, body)
       await this.saveSnapshot(tenant, 'ORGANIZATION_CONFIGURATION', authoritativeSnapshot([organization]))
     })
@@ -2552,15 +2955,22 @@ export class TenantSyncService {
         },
         orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
         select: { name: true },
+        take: 1001,
       })
       if (domains.length === 0) {
         throw new Error(
           'No synchronized Microsoft domains are available for DNS checks.'
         )
       }
-      const results = await Promise.all(
-        domains.map(({ name }) => resolveDomainDnsHealth(name))
-      )
+      if (domains.length > 1000) throw new Error('Domain DNS synchronization exceeded a bounded collection limit.')
+      const budget = new MicrosoftCollectionBudget({ ...ENTRA_COLLECTION_LIMITS, pages: 100, rows: 1000 }, 'domain DNS')
+      const results = []
+      for (let index = 0; index < domains.length; index += 10) {
+        budget.begin(`dns-batch-${index}`)
+        const batch = await Promise.all(domains.slice(index, index + 10).map(({ name }) => resolveDomainDnsHealth(name)))
+        budget.retain(batch)
+        results.push(...batch)
+      }
       await this.saveSnapshot(tenant, 'DOMAIN_DNS_HEALTH', authoritativeSnapshot(results))
     })
   }
@@ -2570,30 +2980,24 @@ export class TenantSyncService {
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'GROUPS', async () => {
-      const groups: GraphGroup[] = []
-      let groupsUrl =
+      const groupsUrl =
         'https://graph.microsoft.com/v1.0/groups?' +
         '$select=id,displayName,description,mail,mailNickname,mailEnabled,' +
         'securityEnabled,groupTypes,visibility,onPremisesSyncEnabled&' +
         '$top=999'
 
-      while (groupsUrl) {
-        if (!groupsUrl.startsWith('https://graph.microsoft.com/')) {
-          throw new Error('Microsoft returned an invalid groups link.')
-        }
-        const response = await this.fetchGraphPage(
-          groupsUrl, accessToken, 'groups', { timeoutMs: 20_000 },
-        )
-        const page = (await response.json()) as GraphGroupsPage
-        groups.push(
-          ...(page.value ?? []).filter(
-            (group) =>
-              typeof group.id === 'string' &&
-              typeof group.displayName === 'string'
-          )
-        )
-        groupsUrl = page['@odata.nextLink'] ?? ''
-      }
+      const groups = (await this.collectEntraCollection(
+        accessToken,
+        'GROUPS',
+        groupsUrl,
+        ENTRA_COLLECTION_LIMITS,
+        (value) => projectEntraRecord(value, 'GROUPS'),
+      )).filter(
+        (group): group is GraphGroup =>
+          plainRecord(group) &&
+          typeof group.id === 'string' &&
+          typeof group.displayName === 'string',
+      )
 
       const groupTargets = groups.map((group) => ({
         id: group.id as string,
@@ -2653,82 +3057,98 @@ export class TenantSyncService {
 
       await this.saveSnapshot(tenant, 'GROUPS', authoritativeSnapshot(groups))
 
+      const relationshipDeadlineAt = Date.now() + GROUP_RELATIONSHIP_LIMITS.collectorDeadlineMs
+      let ownerRows = 0
+      let ownerBytes = 0
       const fetchGroupOwners = async (groupId: string) => {
-        const owners: NonNullable<GraphGroup['owners']> = []
-        let ownersUrl =
+        const remainingRows = GROUP_RELATIONSHIP_LIMITS.rows - ownerRows
+        const remainingBytes = GROUP_RELATIONSHIP_LIMITS.materializedBytes - ownerBytes
+        const remainingMs = relationshipDeadlineAt - Date.now()
+        if (remainingRows <= 0 || remainingBytes <= 0 || remainingMs <= 0) {
+          throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
+        }
+        const ownersUrl =
           `https://graph.microsoft.com/v1.0/groups/${encodeURIComponent(groupId)}` +
           '/owners?$select=id,displayName,userPrincipalName&$top=999'
-        while (ownersUrl) {
-          if (!ownersUrl.startsWith('https://graph.microsoft.com/')) {
-            throw new Error('Microsoft returned an invalid group-owners link.')
-          }
-          const response = await this.fetchGraphPage(
-            ownersUrl, accessToken, 'group owner', { timeoutMs: 20_000 },
-          )
-          const page = (await response.json()) as {
-            value?: NonNullable<GraphGroup['owners']>
-            '@odata.nextLink'?: string
-          }
-          owners.push(...(page.value ?? []))
-          ownersUrl = page['@odata.nextLink'] ?? ''
+        const owners = (await this.collectEntraCollection(
+          accessToken,
+          'GROUPS',
+          ownersUrl,
+          {
+            ...ENTRA_COLLECTION_LIMITS,
+            rows: remainingRows,
+            materializedBytes: remainingBytes,
+            collectorDeadlineMs: remainingMs,
+          },
+          (value) => closedFields(value, ['id', 'displayName', 'userPrincipalName']),
+        )).filter(plainRecord) as NonNullable<GraphGroup['owners']>
+        const bytes = Buffer.byteLength(JSON.stringify(owners), 'utf8')
+        if (ownerRows + owners.length > GROUP_RELATIONSHIP_LIMITS.rows || ownerBytes + bytes > GROUP_RELATIONSHIP_LIMITS.materializedBytes) {
+          throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
         }
+        ownerRows += owners.length
+        ownerBytes += bytes
         return owners
       }
 
       const { ownersByGroupId, failures: ownerFailures } =
-        await collectGroupOwners(groupTargets, (group) =>
-          fetchGroupOwners(group.id)
+        await collectGroupOwners(
+          groupTargets,
+          (group) => fetchGroupOwners(group.id),
+          1,
         )
       for (const group of groups) {
         group.owners = ownersByGroupId.get(group.id as string) ?? []
       }
+      ownersByGroupId.clear()
       for (const failure of ownerFailures) {
-        const message =
-          failure.error instanceof Error
-            ? failure.error.message
-            : String(failure.error)
-        this.logger.warn(
-          `Skipped owner refresh for Microsoft group ${failure.groupName} (${failure.groupId}) in tenant ${tenant.id}: ${message}`
-        )
+        this.logOperationalFailure('GROUPS', 'RELATIONSHIP', 'OWNER_REFRESH_UNAVAILABLE')
       }
 
+      let memberRows = 0
+      let memberBytes = 0
       const fetchGroupMemberIds = async (groupId: string) => {
-        const memberIds: string[] = []
-        let membersUrl =
+        const remainingRows = GROUP_RELATIONSHIP_LIMITS.rows - memberRows
+        const remainingBytes = GROUP_RELATIONSHIP_LIMITS.materializedBytes - memberBytes
+        const remainingMs = relationshipDeadlineAt - Date.now()
+        if (remainingRows <= 0 || remainingBytes <= 0 || remainingMs <= 0) {
+          throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
+        }
+        const membersUrl =
           `https://graph.microsoft.com/v1.0/groups/${encodeURIComponent(groupId)}` +
           '/members?$select=id&$top=999'
-        while (membersUrl) {
-          if (!membersUrl.startsWith('https://graph.microsoft.com/')) {
-            throw new Error('Microsoft returned an invalid group-members link.')
-          }
-          const response = await this.fetchGraphPage(
-            membersUrl, accessToken, 'group membership', { timeoutMs: 20_000 },
-          )
-          const page = (await response.json()) as GraphGroupMembersPage
-          memberIds.push(
-            ...(page.value ?? [])
-              .map((member) => member.id)
-              .filter((id): id is string => typeof id === 'string')
-          )
-          membersUrl = page['@odata.nextLink'] ?? ''
+        const memberIds = (await this.collectEntraCollection(
+          accessToken,
+          'GROUPS',
+          membersUrl,
+          {
+            ...ENTRA_COLLECTION_LIMITS,
+            rows: remainingRows,
+            materializedBytes: remainingBytes,
+            collectorDeadlineMs: remainingMs,
+          },
+          (value) => closedFields(value, ['id']),
+        )).map((member) => plainRecord(member) ? member.id : null)
+          .filter((id): id is string => typeof id === 'string')
+        const bytes = Buffer.byteLength(JSON.stringify(memberIds), 'utf8')
+        if (memberRows + memberIds.length > GROUP_RELATIONSHIP_LIMITS.rows || memberBytes + bytes > GROUP_RELATIONSHIP_LIMITS.materializedBytes) {
+          throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
         }
+        memberRows += memberIds.length
+        memberBytes += bytes
         return memberIds
       }
 
       // Keep concurrency bounded to avoid overwhelming Microsoft Graph while
       // still making the initial snapshot practical for tenants with many groups.
       const { memberIdsByGroupId, failures: membershipFailures } =
-        await collectGroupMemberships(groupTargets, (group) =>
-          fetchGroupMemberIds(group.id)
+        await collectGroupMemberships(
+          groupTargets,
+          (group) => fetchGroupMemberIds(group.id),
+          1,
         )
       for (const failure of membershipFailures) {
-        const message =
-          failure.error instanceof Error
-            ? failure.error.message
-            : String(failure.error)
-        this.logger.warn(
-          `Skipped membership refresh for Microsoft group ${failure.groupName} (${failure.groupId}) in tenant ${tenant.id}: ${message}`
-        )
+        this.logOperationalFailure('GROUPS', 'RELATIONSHIP', 'MEMBERSHIP_REFRESH_UNAVAILABLE')
       }
 
       const [directoryUsers, directoryGroups] = await Promise.all([
@@ -2812,6 +3232,8 @@ export class TenantSyncService {
         accessToken,
         resourceType,
         initialUrl,
+        entraCollectionLimitsForResource(resourceType),
+        (value) => projectEntraRecord(value, resourceType),
       )
       await this.saveSnapshot(tenant, resourceType, authoritativeSnapshot(rows))
     })
@@ -2821,10 +3243,15 @@ export class TenantSyncService {
     accessToken: string,
     resourceType: EntraSnapshotResource,
     initialUrl: string,
+    limits: Readonly<EntraCollectionLimits> = entraCollectionLimitsForResource(resourceType),
+    project: (value: unknown) => unknown = (value) => value,
   ) {
     const rows: unknown[] = []
+    const budget = new MicrosoftCollectionBudget(limits, resourceType)
+    const deadlineAt = budget.deadlineAt
     let nextUrl = initialUrl
     while (nextUrl) {
+      budget.begin(nextUrl)
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
       }
@@ -2832,10 +3259,28 @@ export class TenantSyncService {
         nextUrl,
         accessToken,
         resourceType.toLowerCase(),
+        {
+          timeoutMs: Math.max(1, Math.min(limits.requestTimeoutMs, deadlineAt - Date.now())),
+          deadlineAt,
+        },
       )
-      const page = (await response.json()) as GraphCollectionPage
-      rows.push(...(page.value ?? []))
-      nextUrl = page['@odata.nextLink'] ?? ''
+      let page: GraphCollectionPage
+      try {
+        const parsed = await budget.read(response)
+        if (!plainRecord(parsed) || !Array.isArray(parsed.value)) throw new Error('invalid')
+        page = parsed as GraphCollectionPage
+      } catch (error) {
+        if (error instanceof Error && /bounded (?:page-size|collection) limit/.test(error.message)) throw error
+        throw new Error(`Microsoft ${resourceType} synchronization returned an unreadable bounded response.`)
+      }
+      const projected = (page.value ?? []).map(project)
+      budget.retain(projected)
+      rows.push(...projected)
+      const candidate = page['@odata.nextLink']
+      if (candidate !== undefined && typeof candidate !== 'string') {
+        throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
+      }
+      nextUrl = candidate ?? ''
     }
     return rows
   }
@@ -2850,7 +3295,7 @@ export class TenantSyncService {
         accessToken,
         'security defaults',
       )
-      const policy = (await response.json()) as Record<string, unknown>
+      const policy = closedFields(await readBoundedSingleton(response), ['id', 'displayName', 'description', 'isEnabled'])
       await this.saveEntraSnapshot(tenant, 'SECURITY_DEFAULTS', [policy])
     })
   }
@@ -2874,6 +3319,8 @@ export class TenantSyncService {
           accessToken,
           'AUTH_REGISTRATIONS',
           'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails',
+          ENTRA_COLLECTION_LIMITS,
+          (value) => projectEntraRecord(value, 'AUTH_REGISTRATIONS'),
         )
       } catch (error) {
         if (
@@ -2882,9 +3329,7 @@ export class TenantSyncService {
         ) {
           throw error
         }
-        this.logger.log(
-          `Tenant ${tenant.id} does not have premium MFA reporting; using the per-user authentication-method fallback.`,
-        )
+        this.logger.log(JSON.stringify({ event: 'microsoft_collection_runtime_state', resource: 'MFA_REGISTRATION', phase: 'FALLBACK', outcome: 'ACTIVE', reasonCode: 'PREMIUM_REPORTING_UNAVAILABLE' }))
         registrations = await this.collectPerUserAuthenticationMethods(
           accessToken,
         )
@@ -2897,6 +3342,7 @@ export class TenantSyncService {
         accessToken,
         registrations,
       )
+      new MicrosoftCollectionBudget(ENTRA_COLLECTION_LIMITS, 'authentication registrations').retain(registrations)
       await this.saveEntraSnapshot(tenant, 'AUTH_REGISTRATIONS', registrations)
     })
   }
@@ -3012,12 +3458,7 @@ export class TenantSyncService {
         })
       }
     } catch (error) {
-      this.logger.warn(
-        `Per-user MFA state is unavailable. Registration data remains available. ${safeErrorMessage(
-          error,
-          'Microsoft did not return the per-user MFA requirement state.',
-        )}`,
-      )
+      this.logOperationalFailure('MFA_REGISTRATION', 'FALLBACK', 'PER_USER_STATE_UNAVAILABLE')
       return withoutRequirement()
     }
 
@@ -3084,6 +3525,7 @@ export class TenantSyncService {
     }
 
     const deadline = Date.now() + limits.collectorDeadlineMs
+    let contextBytes = 0
     try {
       for (let offset = 0; offset < ids.length; offset += limits.batchSize) {
         const remainingMs = deadline - Date.now()
@@ -3132,7 +3574,7 @@ export class TenantSyncService {
             item?.status === 200 &&
             values !== null &&
             typeof body?.['@odata.nextLink'] !== 'string'
-          contexts.set(userId, {
+          const context = {
             transitiveGroupIds: complete
               ? [
                   ...new Set(
@@ -3156,16 +3598,14 @@ export class TenantSyncService {
                       : 'INCOMPLETE_GRAPH_RESPONSE',
                 }
               : {}),
-          })
+          }
+          contextBytes += Buffer.byteLength(JSON.stringify(context), 'utf8')
+          if (contextBytes > 4 * 1024 * 1024) throw new Error('Conditional Access membership exceeded a bounded aggregate limit.')
+          contexts.set(userId, context)
         })
       }
     } catch (error) {
-      this.logger.warn(
-        `Conditional Access membership evidence is unavailable. MFA registration and legacy per-user state remain available. ${safeErrorMessage(
-          error,
-          'Microsoft did not return transitive group membership.',
-        )}`,
-      )
+      this.logOperationalFailure('CONDITIONAL_ACCESS', 'FALLBACK', 'MEMBERSHIP_EVIDENCE_UNAVAILABLE')
       return unavailable('COLLECTION_FAILED')
     }
 
@@ -3325,6 +3765,7 @@ export class TenantSyncService {
     }> = []
     const visited = new Set<string>()
     let pageCount = 0
+    let retainedBytes = 0
     let nextUrl =
       'https://graph.microsoft.com/v1.0/users?$select=id,userPrincipalName&$top=999'
     while (nextUrl) {
@@ -3377,10 +3818,13 @@ export class TenantSyncService {
             'Microsoft authentication-registration user discovery returned an invalid user; baseline was not advanced.',
           )
         }
-        users.push({
+        const projected = {
           microsoftUserId: row.id,
           userPrincipalName: row.userPrincipalName,
-        })
+        }
+        retainedBytes += Buffer.byteLength(JSON.stringify(projected), 'utf8')
+        if (retainedBytes > 4 * 1024 * 1024) throw new Error('Microsoft authentication user discovery exceeded a bounded aggregate limit; baseline was not advanced.')
+        users.push(projected)
         if (users.length > limits.maxUsers) {
           throw new Error(
             `Microsoft per-user authentication-method synchronization exceeded the bounded ${limits.maxUsers}-user limit; baseline was not advanced.`,
@@ -3411,13 +3855,21 @@ export class TenantSyncService {
         accessToken,
         'authentication-method policy',
       )
-      const policy = (await response.json()) as {
+      const policy = await readBoundedSingleton(response) as {
         authenticationMethodConfigurations?: unknown[]
       }
+      if (!Array.isArray(policy.authenticationMethodConfigurations) || policy.authenticationMethodConfigurations.length > 100) throw new Error('Microsoft authentication policies exceeded the bounded record limit.')
+      const rows = policy.authenticationMethodConfigurations.map((value) => {
+        const row = closedFields(value, ['id', 'state'])
+        for (const key of ['includeTargets', 'excludeTargets']) {
+          if (plainRecord(value) && Array.isArray(value[key])) row[key] = value[key].map((target) => closedFields(target, ['id', 'targetType', 'isRegistrationRequired', 'authenticationMode']))
+        }
+        return row
+      })
       await this.saveEntraSnapshot(
         tenant,
         'AUTH_METHOD_POLICIES',
-        policy.authenticationMethodConfigurations ?? []
+        rows
       )
     })
   }
@@ -3425,18 +3877,42 @@ export class TenantSyncService {
   private async fetchGraphCollection(
     initialUrl: string,
     accessToken: string,
-    resourceLabel: string
+    resourceLabel: string,
+    maximumMaterializedBytes = GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES,
   ) {
     const rows: any[] = []
+    let materializedBytes = 0
     let nextUrl = initialUrl
+    const seen = new Set<string>()
+    const deadlineAt = Date.now() + GRAPH_LOG_COLLECTION_DEADLINE_MS
+    let pages = 0
     while (nextUrl) {
+      pages += 1
+      assertGraphCollectionBounds({ pageCount: pages, rowCount: rows.length, url: nextUrl, seenUrls: seen, deadlineAt })
+      seen.add(nextUrl)
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error(`Microsoft returned an invalid ${resourceLabel} link.`)
       }
-      const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel)
-      const page = (await response.json()) as GraphCollectionPage
-      rows.push(...(page.value ?? []))
-      nextUrl = page['@odata.nextLink'] ?? ''
+      const response = await this.fetchGraphPage(nextUrl, accessToken, resourceLabel, { deadlineAt })
+      const page = await parseBoundedGraphCollectionPage(response, resourceLabel)
+      const continuation = page['@odata.nextLink']
+      if (continuation !== undefined && continuation !== null &&
+          (typeof continuation !== 'string' || !continuation.trim())) {
+        throw new Error('Microsoft returned an invalid bounded collection pagination link.')
+      }
+      for (const value of page.value ?? []) {
+        // Values have already passed the per-page response cap. Account for
+        // their retained representation before appending so a legal sequence
+        // of pages cannot accumulate an unbounded heap.
+        const bytes = Buffer.byteLength(JSON.stringify(value), 'utf8')
+        if (materializedBytes + bytes > maximumMaterializedBytes) {
+          throw new Error('Microsoft returned an unreadable bounded response.')
+        }
+        materializedBytes += bytes
+        rows.push(value)
+      }
+      assertGraphCollectionBounds({ pageCount: pages, rowCount: rows.length, url: nextUrl, seenUrls: new Set(), deadlineAt })
+      nextUrl = continuation ?? ''
     }
     return rows
   }
@@ -3503,7 +3979,7 @@ export class TenantSyncService {
       : new Date(Date.now() - INITIAL_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
   }
 
-  private async syncSignInLogs(tenant: TenantSyncTarget, accessToken: string) {
+  private async syncSignInLogs(tenant: TenantSyncTarget, accessToken: string, enrichmentLimits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS) {
     return this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
       const start = await this.logSyncStart(tenant.id, 'SIGN_INS')
       const end = new Date()
@@ -3534,9 +4010,10 @@ export class TenantSyncService {
         limited = true
         limitedReason = this.signInFallbackReason(entitlement)
       }
-      const inferredLocations = limited
-        ? await this.enrichLimitedSignInLocations(rows)
-        : new Map<string, SignInLocation>()
+      const enrichmentDeadline = Date.now() + enrichmentLimits.deadlineMs
+      const enrichment = limited
+        ? await this.enrichLimitedSignInLocations(rows, enrichmentLimits, enrichmentDeadline)
+        : { locations: new Map<string, SignInLocation>(), partial: false }
       const ingestedAt = new Date()
       const expiresAt = logExpirationDate(ingestedAt)
       const records = rows
@@ -3608,17 +4085,25 @@ export class TenantSyncService {
           skipDuplicates: true,
         })
       }
-      if (limited && inferredLocations.size > 0) {
-        await this.backfillLimitedSignInLocations(
-          tenant.id,
-          inferredLocations
-        )
+      if (limited && enrichment.locations.size > 0) {
+        const history = await this.backfillLimitedSignInLocations(tenant, enrichment.locations, enrichmentLimits, enrichmentDeadline)
+        enrichment.partial ||= history.partial
       }
       await this.prisma.signInLog.deleteMany({
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
-      if (limitedReason) throw limitedReason
+      if (limitedReason) {
+        // Primary limited-source ingestion succeeded. Its freshness stamp may
+        // advance, but RUNNING + the partial code must never imply complete
+        // Graph coverage or complete optional geographic enrichment. Primary
+        // collection/persistence failures never reach this partial outcome.
+        if (enrichment.partial) throw new CollectionPartialError(
+          `${limitedReason.code}-geolocation-partial`,
+          `${limitedReason.message} Optional geographic enrichment is incomplete and will be retried within bounded limits; some locations may remain unknown.`,
+        )
+        throw limitedReason
+      }
     })
   }
 
@@ -3664,26 +4149,52 @@ export class TenantSyncService {
     )
   }
 
-  private async enrichLimitedSignInLocations(rows: any[]) {
+  private async enrichLimitedSignInLocations(
+    rows: any[],
+    limits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS,
+    deadlineAt = Date.now() + limits.deadlineMs,
+  ) {
     const locations = new Map<string, SignInLocation>()
-    const uniqueIps = [
-      ...new Set(
-        rows
-          .filter((row) => !this.hasCompleteSignInLocation(row?.location))
-          .map((row) =>
-            typeof row?.ipAddress === 'string' ? row.ipAddress.trim() : ''
-          )
-          .filter(Boolean)
-      ),
-    ]
-
-    await Promise.all(
-      uniqueIps.map(async (ipAddress) => {
-        const location = await this.ipGeolocation.lookup(ipAddress)
-        if (location) locations.set(ipAddress, location)
-      })
-    )
-
+    const ips = new Set<string>()
+    let partial = false
+    for (const row of rows) {
+      if (this.hasCompleteSignInLocation(row?.location)) continue
+      const ip = typeof row?.ipAddress === 'string' ? row.ipAddress.trim() : ''
+      if (!isIP(ip) || ips.has(ip)) continue
+      if (ips.size >= limits.uniqueIps) { partial = true; continue }
+      ips.add(ip)
+    }
+    const uniqueIps = [...ips]
+    let index = 0; let retainedBytes = 0
+    const workers = Math.min(limits.lookupWorkers, LIMITED_SIGN_IN_ENRICHMENT_LIMITS.lookupWorkers, uniqueIps.length)
+    await Promise.all(Array.from({ length: workers }, async () => {
+      while (index < uniqueIps.length) {
+        if (Date.now() >= deadlineAt || optionalLocationLookupsInFlight >= LIMITED_SIGN_IN_ENRICHMENT_LIMITS.lookupWorkers) { partial = true; return }
+        const ip = uniqueIps[index++]!
+        optionalLocationLookupsInFlight += 1
+        // Only the local lookup may outlive its caller. Its global slot is
+        // released when it settles, so repeated timeouts cannot fan out.
+        const request = Promise.resolve().then(() => this.ipGeolocation.lookup(ip))
+        const location = await new Promise<SignInLocation | null>((resolve) => {
+          const timer = setTimeout(() => { partial = true; resolve(null) }, Math.max(1, deadlineAt - Date.now()))
+          void request.then((value) => {
+            optionalLocationLookupsInFlight -= 1
+            clearTimeout(timer)
+            resolve(Date.now() < deadlineAt ? projectInferredLocation(value) : null)
+          }, () => {
+            optionalLocationLookupsInFlight -= 1
+            clearTimeout(timer)
+            resolve(null)
+          })
+        })
+        if (!location) { partial = true; continue }
+        const bytes = Buffer.byteLength(JSON.stringify([ip, location]), 'utf8')
+        if (retainedBytes + bytes > limits.locationBytes) { partial = true; return }
+        retainedBytes += bytes
+        locations.set(ip, location)
+      }
+    }))
+    let addedBytes = 0
     for (const row of rows) {
       if (
         this.hasCompleteSignInLocation(row?.location) ||
@@ -3692,10 +4203,14 @@ export class TenantSyncService {
         continue
       }
       const location = locations.get(row.ipAddress.trim())
-      if (location) row.location = this.mergeSignInLocations(row.location, location)
+      if (!location) continue
+      const merged = projectInferredLocation(this.mergeSignInLocations(row.location, location))
+      const bytes = Buffer.byteLength(JSON.stringify(merged), 'utf8')
+      if (addedBytes + bytes > limits.addedRowBytes || Date.now() >= deadlineAt) { partial = true; break }
+      addedBytes += bytes
+      row.location = merged
     }
-
-    return locations
+    return { locations, partial }
   }
 
   private hasCompleteSignInLocation(location: unknown) {
@@ -3758,34 +4273,82 @@ export class TenantSyncService {
   }
 
   private async backfillLimitedSignInLocations(
-    customerTenantId: string,
-    inferredLocations: Map<string, SignInLocation>
+    tenant: { id: string; organizationId: string },
+    inferredLocations: Map<string, SignInLocation>,
+    limits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS,
+    deadlineAt = Date.now() + limits.deadlineMs,
   ) {
-    const existing = await this.prisma.signInLog.findMany({
-      where: {
-        customerTenantId,
-        microsoftSignInId: { startsWith: 'management:' },
-        ipAddress: { in: [...inferredLocations.keys()] },
-      },
-      select: { id: true, ipAddress: true, location: true },
-    })
-
-    await Promise.all(
-      existing.map((record) => {
-        const inferred = record.ipAddress
-          ? inferredLocations.get(record.ipAddress.trim())
-          : undefined
-        if (!inferred || this.hasCompleteSignInLocation(record.location)) {
-          return Promise.resolve()
-        }
-        return this.prisma.signInLog.update({
-          where: { id: record.id },
-          data: {
-            location: this.mergeSignInLocations(record.location, inferred),
-          } as never,
-        })
-      })
-    )
+    const ips = [...inferredLocations.keys()]
+    if (!ips.length) return { partial: false, updatedRows: 0 }
+    if (ips.length > limits.uniqueIps || ips.some((ip) => !isIP(ip))) return { partial: true, updatedRows: 0 }
+    let cursor = '00000000-0000-0000-0000-000000000000'
+    let scannedRows = 0; let retainedBytes = 0; let updatedRows = 0; let partial = false
+    type HistoricalLocation = { id: string; ipAddress: string; location: unknown; locationOversized: boolean }
+    // Each committed enrichment marks its source. Subsequent runs exclude
+    // those rows and resume remaining work without a schema/cursor migration.
+    // One transaction/page and one awaited update at a time bound DB work.
+    while (scannedRows < limits.historyRows) {
+      if (Date.now() >= deadlineAt) return { partial: true, updatedRows }
+      const take = Math.min(limits.historyPageRows, limits.historyRows - scannedRows)
+      if (take < 1) return { partial: true, updatedRows }
+      try {
+        const page = await this.prisma.$transaction(async (transaction) => {
+          const setDeadline = async () => {
+            const remaining = deadlineAt - Date.now()
+            if (remaining <= 0) throw new Error('Optional sign-in enrichment deadline reached.')
+            // Database-enforced cancellation, scoped to this transaction. Do
+            // not race/abandon a Prisma promise or change connection defaults.
+            await transaction.$queryRaw(Prisma.sql`SELECT set_config('statement_timeout', ${String(Math.min(limits.statementTimeoutMs, remaining))}, true)`)
+          }
+          await setDeadline()
+          const rows = await transaction.$queryRaw<HistoricalLocation[]>(Prisma.sql`
+            SELECT id, ip_address AS "ipAddress",
+              CASE WHEN octet_length(location::text) <= ${limits.historyLocationBytes} THEN location ELSE NULL END AS location,
+              COALESCE(octet_length(location::text) > ${limits.historyLocationBytes}, false) AS "locationOversized"
+            FROM sign_in_logs
+            WHERE organization_id = ${tenant.organizationId}::uuid AND customer_tenant_id = ${tenant.id}::uuid
+              AND expires_at > ${new Date()} AND microsoft_sign_in_id LIKE 'management:%'
+              AND ip_address IN (${Prisma.join(ips)}) AND id > ${cursor}::uuid
+              AND NOT COALESCE(location->>'source' = 'MAXMIND_GEOLITE2', false)
+              AND NOT COALESCE(
+                lower(btrim(location->>'city')) NOT IN ('', 'unknown', 'undefined', 'null')
+                AND lower(btrim(COALESCE(location->>'countryOrRegion', location->>'country'))) NOT IN ('', 'unknown', 'undefined', 'null')
+                AND jsonb_typeof(location->'geoCoordinates'->'latitude') = 'number'
+                AND jsonb_typeof(location->'geoCoordinates'->'longitude') = 'number', false)
+            ORDER BY id ASC LIMIT ${take + 1}`)
+          if (rows.length > take + 1) throw new Error('Optional sign-in enrichment returned an oversized page.')
+          let pageBytes = 0; let pageUpdated = 0; let pagePartial = false
+          for (const record of rows.slice(0, take)) {
+            pageBytes += Buffer.byteLength(JSON.stringify(record), 'utf8')
+            if (retainedBytes + pageBytes > limits.historyBytes) throw new Error('Optional sign-in enrichment byte limit reached.')
+            if (record.locationOversized) { pagePartial = true; continue }
+            const inferred = inferredLocations.get(record.ipAddress)
+            if (!inferred || this.hasCompleteSignInLocation(record.location)) continue
+            const merged = projectInferredLocation(this.mergeSignInLocations(record.location, inferred))
+            await setDeadline()
+            const result = await transaction.signInLog.updateMany({
+              where: { id: record.id, organizationId: tenant.organizationId, customerTenantId: tenant.id,
+                expiresAt: { gt: new Date() }, location: { equals: record.location === null ? Prisma.AnyNull : record.location as Prisma.InputJsonValue } },
+              data: { location: merged as Prisma.InputJsonValue },
+            })
+            pageUpdated += result.count
+            if (result.count !== 1) pagePartial = true
+          }
+          return { rows: rows.slice(0, take), more: rows.length > take, pageBytes, pageUpdated, pagePartial }
+        }, { maxWait: Math.max(1, Math.min(1000, deadlineAt - Date.now())), timeout: Math.max(1, deadlineAt - Date.now()) })
+        scannedRows += page.rows.length; retainedBytes += page.pageBytes; updatedRows += page.pageUpdated
+        partial ||= page.pagePartial
+        if (!page.more) return { partial, updatedRows }
+        const next = page.rows.at(-1)?.id
+        if (!next || next <= cursor) return { partial: true, updatedRows }
+        cursor = next
+      } catch {
+        // A failed/timed-out page rolls back; prior pages and primary sign-in
+        // evidence remain valid. The next scheduled run retries missing rows.
+        return { partial: true, updatedRows }
+      }
+    }
+    return { partial: true, updatedRows }
   }
 
   private async fetchLimitedLoginActivity(
@@ -3817,17 +4380,20 @@ export class TenantSyncService {
       Accept: 'application/json',
     }
     const contentType = 'Audit.AzureActiveDirectory'
+    const budget = new MicrosoftCollectionBudget({ ...ENTRA_COLLECTION_LIMITS, pages: 100, rows: 100_000 }, 'limited login activity')
     const subscriptionIsEnabled = async () => {
+      budget.begin(activityUrl(`${baseUrl}/subscriptions/list`))
       const response = await this.fetchGraphPage(
         activityUrl(`${baseUrl}/subscriptions/list`),
         token,
         '365 activity subscription verification',
-        { timeoutMs: 20_000, init: { headers } },
+        { timeoutMs: 20_000, deadlineAt: budget.deadlineAt, init: { headers } },
       )
-      const subscriptions = (await response.json()) as Array<{
+      const subscriptions = (await budget.read(response)) as Array<{
         contentType?: string
         status?: string
       }>
+      if (!Array.isArray(subscriptions) || subscriptions.length > 100) throw new Error('Microsoft activity subscriptions exceeded a bounded record limit.')
       return subscriptions.some(
         (subscription) =>
           subscription.contentType === contentType &&
@@ -3856,16 +4422,21 @@ export class TenantSyncService {
       )
       let pageUrl = `${baseUrl}/subscriptions/content?contentType=${encodeURIComponent(contentType)}&startTime=${encodeURIComponent(windowStart.toISOString())}&endTime=${encodeURIComponent(windowEnd.toISOString())}`
       while (pageUrl) {
+        budget.begin(activityUrl(pageUrl))
         const response = await this.fetchGraphPage(
           activityUrl(pageUrl),
           token,
           '365 limited login activity',
-          { timeoutMs: 30_000, init: { headers } },
+          { timeoutMs: 30_000, deadlineAt: budget.deadlineAt, init: { headers } },
         )
-        const items = (await response.json()) as Array<{ contentUri?: string }>
+        const items = (await budget.read(response)) as Array<{ contentUri?: string }>
+        if (!Array.isArray(items)) throw new Error('Microsoft activity listing returned an invalid bounded response.')
         for (const item of items) {
-          if (typeof item.contentUri === 'string')
+          if (typeof item.contentUri === 'string') {
+            if (contentUris.length >= 1_000) throw new Error('Microsoft activity listing exceeded a bounded record limit.')
+            budget.retain([item.contentUri])
             contentUris.push(item.contentUri)
+          }
         }
         pageUrl = response.headers.get('NextPageUri') ?? ''
         if (pageUrl) validateManagementUrl(pageUrl, tenant.microsoftTenantId)
@@ -3875,14 +4446,32 @@ export class TenantSyncService {
 
     const records: any[] = []
     for (const contentUri of [...new Set(contentUris)]) {
+      budget.begin(activityUrl(contentUri))
       const response = await this.fetchGraphPage(
         activityUrl(contentUri),
         token,
         '365 limited login activity content',
-        { timeoutMs: 30_000, init: { headers } },
+        { timeoutMs: 30_000, deadlineAt: budget.deadlineAt, init: { headers } },
       )
-      const content = (await response.json()) as any[]
-      records.push(...content)
+      const content = await budget.read(response)
+      if (!Array.isArray(content)) throw new Error('Microsoft activity content returned an invalid bounded response.')
+      const projected = content.map((value) => {
+        const row = closedFields(value, ['RecordType', 'Operation', 'LoginStatus', 'ErrorCode', 'ResultStatus', 'Id', 'CreationTime', 'UserId', 'ObjectId', 'UserKey', 'UserDisplayName', 'Country', 'CountryOrRegion', 'City', 'Application', 'Workload', 'ClientIP'])
+        if (plainRecord(value)) {
+          const diagnostic = safeLoginDiagnosticCode(value.LogonError)
+          if (diagnostic) row.LogonError = diagnostic
+          if (Array.isArray(value.ExtendedProperties)) row.ExtendedProperties = value.ExtendedProperties.flatMap((item) => {
+            if (!plainRecord(item) || typeof item.Name !== 'string') return []
+            const name = item.Name.toLowerCase()
+            if (['loginstatus', 'errorcode'].includes(name)) return [closedFields(item, ['Name', 'Value'])]
+            const code = ['loginerror', 'logonerror'].includes(name) ? safeLoginDiagnosticCode(item.Value) : null
+            return code ? [{ Name: item.Name, Value: code }] : []
+          })
+        }
+        return row
+      })
+      budget.retain(projected)
+      records.push(...projected)
     }
 
     return records
@@ -3958,7 +4547,8 @@ export class TenantSyncService {
     accessToken: string,
     reconcileChanges = true
   ) {
-    return this.runSnapshotSync(tenant, 'AUDIT_LOGS', async () => {
+    let reconciliationResources: AuditReconciliationResource[] = []
+    await this.runSnapshotSync(tenant, 'AUDIT_LOGS', async () => {
       const start = await this.logSyncStart(tenant.id, 'AUDIT_LOGS')
       const end = new Date()
       const filter = encodeURIComponent(
@@ -4035,7 +4625,7 @@ export class TenantSyncService {
       // lightweight trigger for its own collection instead of waiting for the
       // daily inventory pass or re-reading the entire tenant.
       if (reconcileChanges) {
-        await this.reconcileDirectoryAuditChanges(tenant, accessToken, newRecords)
+        reconciliationResources = deriveAuditReconciliationResources(newRecords)
       }
       for (const record of newRecords) {
         const activity = record.activityDisplayName.toLowerCase()
@@ -4090,6 +4680,9 @@ export class TenantSyncService {
       })
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
     })
+    // The audit page/record arrays are out of scope before another collector
+    // starts. Only a closed resource-name list crosses this boundary.
+    await this.reconcileDirectoryAuditResources(tenant, accessToken, reconciliationResources)
   }
 
   private async syncM365AuditActivity(
@@ -4097,16 +4690,19 @@ export class TenantSyncService {
     graphAccessToken: string
   ) {
     const changes = await this.m365ManagementActivity.syncTenant(tenant)
+    const collectedChanges = changes.length
     if (changes.length > 0) {
       // The activity feed is evidence. Coalesce all records in this polling
       // run into the smallest set of authoritative current-state refreshes.
-      await this.reconcileDirectoryAuditChanges(
+      const resources = deriveAuditReconciliationResources(changes)
+      changes.length = 0
+      await this.reconcileDirectoryAuditResources(
         tenant,
         graphAccessToken,
-        changes
+        resources
       )
     }
-    return { collectedChanges: changes.length }
+    return { collectedChanges }
   }
 
   /**
@@ -4126,6 +4722,14 @@ export class TenantSyncService {
     }>
   ) {
     const resources = deriveAuditReconciliationResources(records)
+    return this.reconcileDirectoryAuditResources(tenant, accessToken, resources)
+  }
+
+  private async reconcileDirectoryAuditResources(
+    tenant: TenantSyncTarget,
+    accessToken: string,
+    resources: AuditReconciliationResource[],
+  ) {
     if (resources.length === 0) return
 
     const synchronizers: Record<AuditReconciliationResource, () => Promise<unknown>> = {
@@ -4198,8 +4802,8 @@ export class TenantSyncService {
       SHAREPOINT_USAGE: () => this.syncSharePointUsage(tenant, accessToken),
     }
 
-    const results = await Promise.allSettled(
-      resources.map((resource) => synchronizers[resource]())
+    const results = await settleSyncCollectorModules(
+      resources.map((resource) => ({ resource, synchronize: synchronizers[resource] }))
     )
     results.forEach((result, index) => {
       if (result.status !== 'rejected') return
@@ -4208,9 +4812,7 @@ export class TenantSyncService {
         result.reason instanceof Error
           ? result.reason.message
           : String(result.reason)
-      this.logger.warn(
-        `Audit-triggered ${resource} reconciliation was unavailable for tenant ${tenant.id}: ${message}`
-      )
+      this.logOperationalFailure(resource, 'RECONCILIATION', 'AUDIT_RECONCILIATION_UNAVAILABLE')
     })
   }
 
@@ -4281,27 +4883,35 @@ export class TenantSyncService {
 
   private async syncExchangeMailboxDirectory(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    limits: Readonly<EntraCollectionLimits> = EXCHANGE_JSON_COLLECTION_LIMITS,
   ) {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOXES', async () => {
+      const budget = new MicrosoftCollectionBudget(limits, 'mailbox directory')
       const initialUrl =
         'https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,proxyAddresses,accountEnabled,assignedLicenses&$top=999'
       const directoryUsers = await collectMailboxDirectoryPages(
         initialUrl,
         async (nextUrl) => {
-        if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
-          throw new Error(
-            'Microsoft returned an invalid users pagination link.'
+          budget.begin(nextUrl)
+          if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
+            throw new Error(
+              'Microsoft returned an invalid users pagination link.'
+            )
+          }
+          const response = await this.fetchGraphPage(
+            nextUrl,
+            accessToken,
+            'mailbox directory',
+            { timeoutMs: limits.requestTimeoutMs, deadlineAt: budget.deadlineAt },
           )
-        }
-        const response = await this.fetchGraphPage(
-          nextUrl,
-          accessToken,
-          'mailbox directory',
-          { timeoutMs: 30_000 },
-        )
-          return (await response.json()) as GraphCollectionPage
-        }
+          const page = await budget.read(response)
+          if (!plainRecord(page) || !Array.isArray(page.value)) throw new Error('Microsoft returned an invalid bounded mailbox directory page.')
+          const projected = page.value.map(projectMailboxDirectoryUser)
+          budget.retain(projected)
+          return { value: projected, '@odata.nextLink': page['@odata.nextLink'] } as GraphCollectionPage
+        },
+        { maxPages: limits.pages, maxRecords: limits.rows },
       )
       const rows = directoryUsers
         .filter(
@@ -4330,9 +4940,11 @@ export class TenantSyncService {
    */
   private async syncExchangeMailboxSettings(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    limits: Readonly<EntraCollectionLimits> = { ...EXCHANGE_JSON_COLLECTION_LIMITS, pages: EXCHANGE_JSON_COLLECTION_LIMITS.rows },
   ) {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_SETTINGS', async () => {
+      const budget = new MicrosoftCollectionBudget(limits, 'mailbox settings')
       const users = await collectMailboxRuleUsers((skip, take) =>
         this.prisma.directoryUser.findMany({
           where: { customerTenantId: tenant.id, deletedAt: null },
@@ -4340,36 +4952,35 @@ export class TenantSyncService {
           orderBy: { microsoftUserId: 'asc' },
           skip,
           take,
-        })
+        }),
+        { maxRecords: limits.rows, deadlineAt: budget.deadlineAt },
       )
       const rows: unknown[] = []
-      for (let index = 0; index < users.length; index += 5) {
-        const batch = users.slice(index, index + 5)
-        const results = await Promise.all(
-          batch.map(async (user) => {
-            const response = await this.fetchGraphPage(
-              `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.microsoftUserId)}/mailboxSettings?$select=userPurpose,timeZone`,
-              accessToken,
-              'mailbox settings',
-              { timeoutMs: 20_000, acceptedStatuses: [404] },
-            )
-            // Not every directory user has an Exchange mailbox.  That is a
-            // valid empty result rather than an Exchange synchronization error.
-            if (response.status === 404) return null
-            if (!response.ok) {
-              throw new Error(
-                `Microsoft mailbox settings synchronization returned ${response.status}. Confirm MailboxSettings.Read application permission.`
-              )
-            }
-            const settings = (await response.json()) as Record<string, unknown>
-            return {
-              ...settings,
-              mailboxUserId: user.microsoftUserId,
-              mailboxUpn: user.userPrincipalName,
-            }
-          })
+      for (const user of users) {
+        const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.microsoftUserId)}/mailboxSettings?$select=userPurpose,timeZone`
+        budget.begin(url)
+        const response = await this.fetchGraphPage(
+          url,
+          accessToken,
+          'mailbox settings',
+          { timeoutMs: limits.requestTimeoutMs, deadlineAt: budget.deadlineAt, acceptedStatuses: [404] },
         )
-        rows.push(...results.filter((row) => row !== null))
+        // Not every directory user has an Exchange mailbox. That is a
+        // valid empty result rather than an Exchange synchronization error.
+        if (response.status === 404) { await cancelBoundedStream(() => response.body?.cancel()); continue }
+        if (!response.ok) {
+          throw new Error(
+            `Microsoft mailbox settings synchronization returned ${response.status}. Confirm MailboxSettings.Read application permission.`
+          )
+        }
+        const settings = closedFields(await budget.read(response), ['userPurpose', 'timeZone'])
+        const row = {
+          ...settings,
+          mailboxUserId: user.microsoftUserId,
+          mailboxUpn: user.userPrincipalName,
+        }
+        budget.retain([row])
+        rows.push(row)
       }
       await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_SETTINGS', authoritativeSnapshot(rows))
     })
@@ -4378,6 +4989,7 @@ export class TenantSyncService {
   private async collectExchangeReadOnlyMailboxes(
     tenant: TenantSyncTarget,
     accessToken: string,
+    limits: Readonly<EntraCollectionLimits> = EXCHANGE_JSON_COLLECTION_LIMITS,
   ): Promise<ExchangeReadOnlyMailbox[]> {
     const select = [
       'ExternalDirectoryObjectId',
@@ -4400,17 +5012,14 @@ export class TenantSyncService {
       },
     }
     const rows: ExchangeReadOnlyMailbox[] = []
-    const visited = new Set<string>()
-    const deadlineAt = Date.now() + 4 * 60 * 1_000
+    const budget = new MicrosoftCollectionBudget(limits, 'Exchange read-only mailbox configuration')
+    const deadlineAt = budget.deadlineAt
     let nextUrl = `https://outlook.office365.com/adminapi/v2.0/${encodeURIComponent(tenant.microsoftTenantId)}/Mailbox?$select=${encodeURIComponent(select)}`
     while (nextUrl) {
       if (!nextUrl.startsWith('https://outlook.office365.com/')) {
         throw new Error('Microsoft returned an invalid Exchange pagination link.')
       }
-      if (visited.size >= 50 || visited.has(nextUrl)) {
-        throw new Error('Microsoft Exchange pagination exceeded the read-only collection safety limit.')
-      }
-      visited.add(nextUrl)
+      budget.begin(nextUrl)
       const remainingMs = deadlineAt - Date.now()
       if (remainingMs <= 0) {
         throw new Error('Microsoft Exchange read-only collection exceeded its four-minute safety limit.')
@@ -4434,16 +5043,15 @@ export class TenantSyncService {
           },
         },
       )
-      const page = await response.json() as unknown
+      const page = await budget.read(response)
       const pageRecord = page && typeof page === 'object' && !Array.isArray(page)
         ? page as Record<string, unknown>
         : null
-      rows.push(...projectExchangeReadOnlyPage(
-        Array.isArray(page) ? page : pageRecord?.value ?? [],
-      ))
-      if (rows.length > 20_000) {
-        throw new Error('Microsoft Exchange returned more than 20,000 mailboxes; the baseline was not advanced.')
-      }
+      const values = Array.isArray(page) ? page : pageRecord?.value
+      const projected = projectExchangeReadOnlyPage(values, limits.rows)
+      budget.retain(projected)
+      rows.push(...projected)
+      if (pageRecord?.['@odata.nextLink'] !== undefined && typeof pageRecord['@odata.nextLink'] !== 'string') throw new Error('Microsoft returned an invalid Exchange pagination link.')
       nextUrl = typeof pageRecord?.['@odata.nextLink'] === 'string'
         ? pageRecord['@odata.nextLink']
         : ''
@@ -4487,7 +5095,7 @@ export class TenantSyncService {
           'accepted-domain',
           { timeoutMs: 30_000 },
         )
-        const page = (await response.json()) as { value?: GraphOrganization[] }
+        const page = await readBoundedSingleton(response) as { value?: GraphOrganization[] }
         // Organization.Read.All returns tenant-associated verifiedDomains.
         // These are not Exchange accepted-domain objects, so do not invent an
         // Authoritative/InternalRelay type. Preserve only the fields Graph
@@ -4510,6 +5118,7 @@ export class TenantSyncService {
             isDefault: Boolean(domain.isDefault),
             isInitial: Boolean(domain.isInitial),
           }))
+        if (domains.length > 1_000) throw new Error('Microsoft accepted domains exceeded the bounded record limit.')
         await this.saveSnapshot(tenant, 'EXCHANGE_ACCEPTED_DOMAINS', authoritativeSnapshot(domains))
       }
     )
@@ -4531,7 +5140,7 @@ export class TenantSyncService {
         },
       )
       let csv = ''
-      if (response.ok) csv = await response.text()
+      if (response.ok) csv = await readBoundedResponseText(response, MAILBOX_USAGE_CSV_MAX_BYTES)
       else if (response.status === 302) {
         const location = response.headers.get('location')
         if (!location?.startsWith('https://'))
@@ -4547,7 +5156,7 @@ export class TenantSyncService {
           throw new Error(
             `Microsoft mailbox usage report download returned ${download.status}.`
           )
-        csv = await download.text()
+        csv = await readBoundedResponseText(download, MAILBOX_USAGE_CSV_MAX_BYTES)
       } else {
         throw new Error(
           `Microsoft mailbox usage synchronization returned ${response.status}.`
@@ -4556,29 +5165,36 @@ export class TenantSyncService {
       await this.saveSnapshot(
         tenant,
         'EXCHANGE_MAILBOX_USAGE',
-        authoritativeSnapshot(parseCsvRows(csv))
+        authoritativeSnapshot(parseMailboxUsageCsv(csv))
       )
     })
   }
 
   private async syncExchangeMailboxRules(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    limits: Readonly<EntraCollectionLimits> = { ...EXCHANGE_JSON_COLLECTION_LIMITS, pages: 50_000, rows: EXCHANGE_JSON_COLLECTION_LIMITS.tenantRules },
   ) {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_RULES', async () => {
+      const budget = new MicrosoftCollectionBudget(limits, 'inbox rules')
       const users = await collectMailboxRuleUsers((skip, take) => this.prisma.directoryUser.findMany({
         where: { customerTenantId: tenant.id, deletedAt: null },
         select: { microsoftUserId: true, userPrincipalName: true }, orderBy: { microsoftUserId: 'asc' }, skip, take,
-      }))
+      }), { deadlineAt: budget.deadlineAt })
       const rows = await collectMailboxRules(users, async (user, continuation) => {
         const url = continuation ?? `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.microsoftUserId)}/mailFolders/inbox/messageRules?$top=100`
         if (!url.startsWith('https://graph.microsoft.com/')) throw new Error('Microsoft returned an invalid inbox-rules pagination link.')
+        budget.begin(url)
         const response = await this.fetchGraphPage(
-          url, accessToken, 'inbox rules', { timeoutMs: 20_000, acceptedStatuses: [404] },
+          url, accessToken, 'inbox rules', { timeoutMs: limits.requestTimeoutMs, deadlineAt: budget.deadlineAt, acceptedStatuses: [404] },
         )
-        if (response.status === 404) return { value: [] }
-        return (await response.json()) as GraphCollectionPage
-      })
+        if (response.status === 404) { await cancelBoundedStream(() => response.body?.cancel()); return { value: [] } }
+        const page = await budget.read(response)
+        if (!plainRecord(page) || !Array.isArray(page.value)) throw new Error('Microsoft returned an invalid bounded inbox-rules page.')
+        const projected = page.value.map(projectMailboxRule)
+        budget.retain(projected)
+        return { value: projected, '@odata.nextLink': page['@odata.nextLink'] } as GraphCollectionPage
+      }, 1, { maxTotalRecords: limits.rows, maxMaterializedBytes: limits.materializedBytes, deadlineAt: budget.deadlineAt })
       await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows))
     })
   }
@@ -4593,14 +5209,23 @@ export class TenantSyncService {
       const maxSitePages = limits.sitePages
       const maxSites = limits.sites
       const sites: any[] = []
+      const budget = new MicrosoftCollectionBudget({ ...ENTRA_COLLECTION_LIMITS, pages: limits.sitePages + 1, rows: limits.sites, pageBytes: limits.responseBytes, collectorDeadlineMs: limits.collectorDeadlineMs }, 'SharePoint sites')
+      const projectSite = (value: unknown) => {
+        const site = closedFields(value, ['id', 'name', 'displayName', 'webUrl', 'createdDateTime', 'lastModifiedDateTime'])
+        if (plainRecord(value) && plainRecord(value.root)) site.root = {}
+        if (plainRecord(value) && plainRecord(value.siteCollection)) site.siteCollection = closedFields(value.siteCollection, ['hostname', 'dataLocationCode'])
+        return site
+      }
       const siteFields =
         'id,name,displayName,webUrl,createdDateTime,lastModifiedDateTime,root,siteCollection'
 
       // Microsoft Graph site search can return an empty collection even when
       // the tenant's root SharePoint site exists. Fetch the root explicitly so
       // a provisioned tenant never appears as an empty SharePoint environment.
+      const rootUrl = `https://graph.microsoft.com/v1.0/sites/root?$select=${siteFields}`
+      budget.begin(rootUrl)
       const rootResponse = await this.fetchGraphPage(
-        `https://graph.microsoft.com/v1.0/sites/root?$select=${siteFields}`,
+        rootUrl,
         accessToken,
         'SharePoint root site',
         {
@@ -4610,7 +5235,9 @@ export class TenantSyncService {
         },
       )
       if (rootResponse.ok) {
-        sites.push((await readBoundedSharePointJson(rootResponse, limits.responseBytes)) as any)
+        const root = projectSite(await budget.read(rootResponse))
+        budget.retain([root])
+        sites.push(root)
       } else if (rootResponse.status !== 404) {
         throw new Error(
           `Microsoft SharePoint root site synchronization returned ${rootResponse.status}.`
@@ -4631,16 +5258,21 @@ export class TenantSyncService {
           throw new Error('SharePoint site inventory returned a repeated pagination link.')
         }
         seenSitePages.add(nextUrl)
+        budget.begin(nextUrl)
         const response = await this.fetchGraphPage(
           nextUrl,
           accessToken,
           'SharePoint sites',
           { timeoutMs: sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs), deadlineAt },
         )
-        const page = (await readBoundedSharePointJson(response, limits.responseBytes)) as GraphCollectionPage
-        sites.push(...((page.value ?? []) as any[]))
+        const page = await budget.read(response)
+        if (!plainRecord(page) || !Array.isArray(page.value)) throw new Error('Microsoft returned an invalid bounded SharePoint sites page.')
+        const projected = page.value.map(projectSite)
+        budget.retain(projected)
+        sites.push(...projected)
         if (sites.length > maxSites) throw new Error('SharePoint site inventory reached a bounded record limit before completion.')
-        nextUrl = page['@odata.nextLink'] ?? ''
+        if (page['@odata.nextLink'] !== undefined && typeof page['@odata.nextLink'] !== 'string') throw new Error('Microsoft returned an invalid SharePoint sites link.')
+        nextUrl = page['@odata.nextLink'] as string ?? ''
       }
 
       const uniqueSites = Array.from(
@@ -4684,7 +5316,7 @@ export class TenantSyncService {
         accessToken,
         'SharePoint settings',
       )
-      const body = (await response.json()) as any
+      const body = await readBoundedSingleton(response)
       // Microsoft documentation has shown both the resource directly and a
       // single resource under `value`; normalize either response shape.
       const settings = Array.isArray(body?.value)
@@ -4699,7 +5331,16 @@ export class TenantSyncService {
         )
       }
 
-      await this.saveSnapshot(tenant, 'SHAREPOINT_SETTINGS', authoritativeSnapshot([settings]))
+      const projected = closedFields(settings, [
+        'sharingAllowedDomainList', 'sharingBlockedDomainList', 'availableManagedPathsForSiteCreation', 'allowedDomainGuidsForSyncApp', 'excludedFileExtensionsForSyncApp',
+        'sharingCapability', 'sharingDomainRestrictionMode', 'isRequireAcceptingUserToMatchInvitedUserEnabled', 'isResharingByExternalUsersEnabled', 'isLegacyAuthProtocolsEnabled',
+        'isSitesStorageLimitAutomatic', 'siteCreationDefaultStorageLimitInMB', 'personalSiteDefaultStorageLimitInMB', 'deletedUserPersonalSiteRetentionPeriodInDays',
+        'isSiteCreationEnabled', 'isSiteCreationUIEnabled', 'isSitePagesCreationEnabled', 'siteCreationDefaultManagedPath', 'isCommentingOnSitePagesEnabled', 'isLoopEnabled',
+        'imageTaggingOption', 'isMacSyncAppEnabled', 'isSyncButtonHiddenOnPersonalSite', 'isUnmanagedSyncAppForTenantRestricted', 'isFileActivityNotificationEnabled',
+        'isSharePointMobileNotificationEnabled', 'isSharePointNewsfeedEnabled', 'tenantDefaultTimezone',
+      ])
+      if (plainRecord(settings.idleSessionSignOut)) projected.idleSessionSignOut = closedFields(settings.idleSessionSignOut, ['isEnabled', 'warnAfterInSeconds', 'signOutAfterInSeconds'])
+      await this.saveSnapshot(tenant, 'SHAREPOINT_SETTINGS', authoritativeSnapshot([projected]))
     })
   }
 
@@ -4719,7 +5360,12 @@ export class TenantSyncService {
             init: { headers: { Accept: 'text/csv' }, redirect: 'manual' },
           },
         )
-        if (reportResponse.ok) return reportResponse.text()
+        const boundedUsageText = (response: Response) => readBoundedResponseText(
+          response,
+          MICROSOFT_USAGE_REPORT_CSV_MAX_BYTES,
+          `Microsoft ${label} usage report exceeded the bounded response-size limit.`,
+        )
+        if (reportResponse.ok) return boundedUsageText(reportResponse)
         if (reportResponse.status !== 302) {
           const graphRequestId = reportResponse.headers.get('request-id')
           throw new Error(
@@ -4742,22 +5388,22 @@ export class TenantSyncService {
             `Microsoft ${label} report download returned ${downloadResponse.status}.`
           )
         }
-        return downloadResponse.text()
+        return boundedUsageText(downloadResponse)
       }
 
-      const [sharePointReport, oneDriveReport] = await Promise.all([
-        downloadReport(
+      // Download and project one report at a time. Only the small allowlisted
+      // row projection remains live when the second report is collected.
+      const sharePointUsage = parseMicrosoftUsageReportCsv(await downloadReport(
           "https://graph.microsoft.com/v1.0/reports/getSharePointSiteUsageDetail(period='D180')",
           'SharePoint'
-        ),
-        downloadReport(
+        ))
+      const oneDriveUsage = parseMicrosoftUsageReportCsv(await downloadReport(
           "https://graph.microsoft.com/v1.0/reports/getOneDriveUsageAccountDetail(period='D30')",
           'OneDrive'
-        ),
-      ])
+        ))
       const payload = buildMicrosoftUsageReportSnapshot(
-        parseCsvRows(sharePointReport),
-        parseCsvRows(oneDriveReport),
+        sharePointUsage,
+        oneDriveUsage,
       )
       await this.saveSnapshot(tenant, 'SHAREPOINT_USAGE', authoritativeSnapshot(payload))
     })
@@ -4771,28 +5417,32 @@ export class TenantSyncService {
     accessToken: string,
     deltaLink: string | null,
     allowDeltaReset = true,
+    limits: Readonly<EntraCollectionLimits> = USER_DELTA_COLLECTION_LIMITS,
   ): Promise<{ deltaLink: string }> {
     const fullSyncStartedAt = deltaLink ? null : new Date()
     let nextUrl =
       deltaLink ??
       `https://graph.microsoft.com/v1.0/users/delta?$select=${USER_SELECT}`
     let finalDeltaLink: string | null = null
+    const users: GraphUser[] = []
+    const budget = new MicrosoftCollectionBudget(limits, 'users')
 
     while (nextUrl) {
+      budget.begin(nextUrl)
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
         throw new Error('Microsoft returned an invalid synchronization link.')
       }
       const response = await this.fetchGraphPage(nextUrl, accessToken, 'users', {
-        timeoutMs: 20_000,
+        timeoutMs: limits.requestTimeoutMs,
+        deadlineAt: budget.deadlineAt,
         acceptedStatuses: [410],
       })
       if (response.status === 410) {
         const metadata = await readGraphOperationalError(response)
         if (deltaLink && allowDeltaReset) {
-          this.logger.warn(
-            `Microsoft invalidated the users delta checkpoint for tenant ${tenant.id}; rebuilding the users baseline.`,
-          )
-          return this.synchronizeUsers(tenant, accessToken, null, false)
+          this.logger.warn(JSON.stringify({ event: 'microsoft_collection_runtime_state', resource: 'USERS', phase: 'SNAPSHOT', outcome: 'REBUILDING', reasonCode: 'DELTA_CHECKPOINT_INVALIDATED' }))
+          users.length = 0
+          return this.synchronizeUsers(tenant, accessToken, null, false, limits)
         }
         throw new MicrosoftGraphCollectionError(
           `Microsoft users synchronization returned 410${metadata.suffix}.`,
@@ -4801,9 +5451,26 @@ export class TenantSyncService {
           response.headers.get('request-id'),
         )
       }
-      const page = (await response.json()) as GraphUsersPage
+      const parsed = await budget.read(response)
+      if (!plainRecord(parsed) || !Array.isArray(parsed.value)) throw new Error('Microsoft returned an invalid bounded users page.')
+      const page = parsed as GraphUsersPage
+      const projected = page.value!.map(projectDirectoryUser)
+      budget.retain(projected)
+      users.push(...projected)
+      for (const link of [page['@odata.nextLink'], page['@odata.deltaLink']]) {
+        if (link !== undefined && (typeof link !== 'string' || !link.startsWith('https://graph.microsoft.com/'))) throw new Error('Microsoft returned an invalid synchronization link.')
+      }
+      nextUrl = page['@odata.nextLink'] ?? ''
+      finalDeltaLink = nextUrl ? null : page['@odata.deltaLink'] ?? null
+    }
+    if (!finalDeltaLink) throw new Error('Microsoft did not return a users delta checkpoint.')
+    // A later overflow, cycle, malformed page or expired deadline must not
+    // leave a partially applied user inventory. Collect a bounded projection
+    // completely, then persist small batches without retaining DB promises
+    // for the entire tenant.
+    for (let offset = 0; offset < users.length; offset += 250) {
       const observedAt = new Date()
-      const operations = (page.value ?? [])
+      const operations = users.slice(offset, offset + 250)
         .filter((user) => typeof user.id === 'string')
         .map((user) => {
           const microsoftUserId = user.id as string
@@ -4858,13 +5525,6 @@ export class TenantSyncService {
       if (operations.length > 0) {
         await this.prisma.$transaction(operations)
       }
-
-      nextUrl = page['@odata.nextLink'] ?? ''
-      finalDeltaLink = page['@odata.deltaLink'] ?? finalDeltaLink
-    }
-
-    if (!finalDeltaLink) {
-      throw new Error('Microsoft did not return a users delta checkpoint.')
     }
     if (fullSyncStartedAt) {
       await this.prisma.directoryUser.updateMany({
