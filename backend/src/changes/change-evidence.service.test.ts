@@ -1552,6 +1552,7 @@ test('production scheduled sync invokes the approved identity-risk scheduler con
     new ChangeEvidenceService({} as never),
     {} as never,
     identityRiskScheduler as never,
+    { load: async () => ({ capability: 'UNAVAILABLE', sourceEnvelopes: [] }) } as never,
   )
   ;(service as any).syncConnectedTenant = async () => ({
     status: 'SUCCEEDED',
@@ -1567,7 +1568,9 @@ test('production scheduled sync invokes the approved identity-risk scheduler con
     assert.equal(requests[0]?.customerTenantId, tenant.id)
     assert.equal(requests[0]?.engineVersion, 'hawkview-identity-engine/1')
     assert.equal(requests[0]?.catalogVersion, 'hawkview-identity-signals/v1')
-    assert.deepEqual(requests[0]?.approvedEvaluator, { readiness: 'NOT_READY' })
+    assert.equal(requests[0]?.approvedEvaluator.readiness, 'READY')
+    assert.equal(requests[0]?.approvedEvaluator.featureFlags['HV-ID-MBX-001.v1'], true)
+    assert.equal(Object.values(requests[0]?.approvedEvaluator.featureFlags).filter(Boolean).length, 1)
     const batch = await requests[0]?.loadSources()
     assert.equal(batch.capability, 'UNAVAILABLE')
     assert.deepEqual(batch.sourceEnvelopes, [])

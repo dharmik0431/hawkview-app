@@ -131,6 +131,23 @@ test('adapts the two channels without merging their records', () => {
   assert.equal(view.microsoft.users?.[0]?.riskState, 'atRisk')
 })
 
+test('mailbox provenance and approved forwarding alternative do not alter authoritative Microsoft risk', () => {
+  const responses = validResponses()
+  responses.hawkViewFindings.findings = [finding({ ruleIds: ['HV-ID-MBX-001.v1'],
+    sourceLabels: ['Microsoft Graph mailbox-rule snapshot', 'Microsoft Graph verified tenant domains'],
+    benignAlternativeCodes: ['APPROVED_EXTERNAL_FORWARDING'],
+    investigationGuidanceCode: 'REVIEW_MAILBOX_RULE',
+    investigationGuidance: 'Review the mailbox rule and confirm the destination is authorized.',
+    affectedIdentity: { id: 'opaque-mailbox', label: 'Mailbox', type: 'MAILBOX' } })]
+  const view = adaptIdentityRiskResponses(responses)
+  assert.equal(view.hawkView.findings?.length, 1)
+  assert.deepEqual(view.hawkView.findings?.[0]?.sourceLabels, ['Microsoft Graph mailbox-rule snapshot', 'Microsoft Graph verified tenant domains'])
+  assert.equal(view.microsoft.users?.[0]?.riskLevel, 'high')
+  assert.equal(view.microsoft.users?.[0]?.riskState, 'atRisk')
+  responses.hawkViewFindings.findings = [finding({ sourceLabels: ['Unapproved source'] })]
+  assert.equal(adaptIdentityRiskResponses(responses).hawkView.findings, null)
+})
+
 test('preserves stale, learning, and not-evaluated capability states', () => {
   for (const status of ['STALE', 'LEARNING', 'NOT_EVALUATED'] as const) {
     const responses = validResponses()

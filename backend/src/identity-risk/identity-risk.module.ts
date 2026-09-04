@@ -8,10 +8,14 @@ import {
 } from './identity-risk-evaluator.service.js'
 import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
 import { IdentityRiskMaintenanceService } from './identity-risk-maintenance.service.js'
+import { IdentityRiskPseudonymProvider } from './identity-risk-pseudonym.js'
+import { MailboxRiskProjector } from './mailbox-risk-projector.service.js'
 
 @Module({
   controllers: [IdentityRiskController],
   providers: [
+    IdentityRiskPseudonymProvider,
+    MailboxRiskProjector,
     IdentityRiskService,
     IdentityRiskSafetyService,
     IdentityRiskPlatformClock,
@@ -20,6 +24,7 @@ import { IdentityRiskMaintenanceService } from './identity-risk-maintenance.serv
     IdentityRiskMaintenanceService,
   ],
   exports: [
+    MailboxRiskProjector,
     IdentityRiskEvaluationScheduler,
     IdentityRiskSafetyService,
     IdentityRiskMaintenanceService,

@@ -470,7 +470,7 @@ export function adaptApprovedIdentitySignalDetector(input: Readonly<{
 export function approvedIdentitySignalDetectors(
   configuration: IdentityRiskApprovedEvaluatorConfiguration,
 ): readonly IdentitySignalDetector[] {
-  return Object.freeze(approvedRuleIds.map((ruleId) =>
+  return Object.freeze(approvedRuleIds.filter((ruleId) => configuration.featureFlags?.[ruleId as IdentityRiskRuleId] !== false).map((ruleId) =>
     adaptApprovedIdentitySignalDetector({
       ruleId: ruleId as IdentityRiskRuleId,
       configuration,

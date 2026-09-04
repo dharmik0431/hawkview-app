@@ -90,6 +90,7 @@ type CompletedRun = Readonly<{
   catalogVersion: string
   capability: string
   completedAt: Date | null
+  sourceObservedAt?: Date | null
 }>
 
 type HawkViewControlState = Readonly<{
@@ -207,7 +208,9 @@ function runEnvelope(
         'Approved HawkView identity-signal source evidence is not available for this evaluation.',
     }
   }
-  const stale = now.getTime() - evaluatedAt.getTime() > CURRENT_RUN_MAX_AGE_MS
+  const observedAt = run.sourceObservedAt ? parseTimestamp(run.sourceObservedAt, now) : evaluatedAt
+  if (!observedAt) return null
+  const stale = now.getTime() - observedAt.getTime() > CURRENT_RUN_MAX_AGE_MS
   return {
     version: IDENTITY_RISK_API_VERSION,
     channel: 'HAWKVIEW_IDENTITY_SIGNALS',
@@ -217,7 +220,7 @@ function runEnvelope(
     capability: run.capability as IdentityRiskEnvelope['capability'],
     status: stale ? 'STALE' : 'AVAILABLE',
     sourceLabel: HAWKVIEW_SOURCE_LABEL,
-    observedAt: evaluatedAt.toISOString(),
+    observedAt: observedAt.toISOString(),
     freshness: stale ? 'STALE' : 'CURRENT',
     limitation: alertDeliveryDisabled
       ? 'Shadow-mode findings are investigation leads; customer alert delivery is disabled.'
@@ -347,6 +350,7 @@ export class IdentityRiskService {
         catalogVersion: true,
         capability: true,
         completedAt: true,
+        sourceObservedAt: true,
       },
     })
   }

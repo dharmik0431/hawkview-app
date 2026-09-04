@@ -106,10 +106,12 @@ export const IDENTITY_RISK_RULE_CATALOG = Object.freeze({
     'Application credential metadata changed',
     'Authoritative evidence showed credential metadata added or replaced for an application covered by the approved catalog.',
   ),
-  'HV-ID-MBX-001.v1': mailbox(
-    'External mailbox forwarding requires investigation',
-    'An enabled mailbox rule forwards or redirects messages to a domain outside the current verified tenant-domain set.',
-  ),
+  'HV-ID-MBX-001.v1': Object.freeze({
+    ...mailbox('Mailbox forwarding outside verified domains requires review',
+      'An enabled rule targets a domain outside the current Microsoft Graph verified tenant-domain set. This is an investigation lead, not proof of message delivery or compromise.'),
+    sourceLabels: ['Microsoft Graph mailbox-rule snapshot', 'Microsoft Graph verified tenant domains'],
+    benignAlternativeCodes: ['APPROVED_EXTERNAL_FORWARDING'],
+  }),
   'HV-ID-MBX-002.v1': mailbox(
     'Mailbox concealment rule requires investigation',
     'A complete authoritative rule projection matched the versioned concealment-rule condition.',
