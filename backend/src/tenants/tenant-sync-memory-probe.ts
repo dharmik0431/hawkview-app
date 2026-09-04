@@ -1,3 +1,4 @@
+import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
 import {
   ENTRA_COLLECTION_LIMITS,
   GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES,
@@ -222,7 +223,7 @@ const actualPrisma: any = {
   tenantConnection: { update: async () => ({}) },
   $transaction: async (operations: Promise<unknown>[]) => Promise.all(operations),
 }
-const actualService = new TenantSyncService(actualPrisma, {
+const actualService = new TenantSyncService(utcTestDatabase(actualPrisma), {
   getTenantAccessToken: async () => 'synthetic-token', getTenantExchangeAccessToken: async () => 'synthetic-token',
 } as any, {} as any, { publishIncident: async () => undefined } as any, {} as any, {} as any)
 ;(actualService as any).logger = { warn: () => undefined, log: () => undefined }

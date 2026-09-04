@@ -117,13 +117,15 @@ export class MailboxRiskProjector {
   async load(scope: MailboxSourceScope, evaluationAt: Date): Promise<IdentityRiskSourceBatch> {
     // No tenant source reads, registry lookups, or evaluation writes when unconfigured.
     const environment = process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT
-    if (!this.provider.configured || !environment || !/^[a-z][a-z0-9-]{0,39}$/.test(environment)) throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
+    if (!this.provider.configured || !environment || !/^[a-z][a-z0-9-]{0,39}$/.test(environment) ||
+      !this.provider.allowsScope({ ...scope, environment })) throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
     const deadlineAt = Date.now() + 30000
     const keys = await readActiveMailboxKeys(scope, environment, evaluationAt, deadlineAt)
     const key = keys[0]
     if (keys.length !== 1 || !key || key.organizationId !== scope.organizationId || key.customerTenantId !== scope.customerTenantId ||
-      key.environment !== environment || key.provider !== 'AWS_KMS_HMAC_256') throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
+      key.environment !== environment || !['AWS_KMS_HMAC_256', 'WRAPPED_AES_GCM_V1'].includes(key.provider)) throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
     const session = await this.provider.pin(key as PseudonymKeyVersion, deadlineAt)
+    try {
     const snapshots = await withMailboxReadTransaction(deadlineAt, 12000, async (client, transactionDeadlineAt) => {
       const result: AttestedMailboxSnapshot[] = []
       for (const resource of MAILBOX_SOURCE_RESOURCES) {
@@ -152,6 +154,9 @@ export class MailboxRiskProjector {
     })
     if (Date.now() >= deadlineAt) throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE')
     // A provider outage aborts before the existing evaluator claims or writes a run.
-    return projectMailboxEvidence(scope, evaluationAt, snapshots, session)
+    const batch = await projectMailboxEvidence(scope, evaluationAt, snapshots, session)
+    if (!this.provider.allowsScope({ ...scope, environment })) throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
+    return batch
+    } finally { session.close?.() }
   }
 }

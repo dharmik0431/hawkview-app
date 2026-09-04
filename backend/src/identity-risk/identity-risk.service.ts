@@ -1,4 +1,8 @@
-import { ForbiddenException, Inject, Injectable } from '@nestjs/common'
+import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common'
+import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
+import { pilotRiskConfig, pilotScopeAllowed } from './pilot-risk-config.js'
+import { enforceRiskUtcTransaction } from './risk-utc-session.js'
+import type { Prisma } from '../generated/prisma/client.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
@@ -10,6 +14,7 @@ import {
   type IdentityRiskEnvelope,
   type IdentityRiskFindingDto,
   type IdentityRiskPageInfo,
+  type MailboxInvestigationDto,
   type MicrosoftRiskDetail,
   type MicrosoftRiskLevel,
   type MicrosoftRiskState,
@@ -98,8 +103,13 @@ type HawkViewControlState = Readonly<{
   alertDeliveryDisabled: boolean
 }>
 
-function mode() {
-  return process.env.HAWKVIEW_IDENTITY_RISK_MODE === 'shadow' ? 'SHADOW' : 'OFF'
+function pilotReadAllowed(tenant: ScopedTenant) {
+  const config = pilotRiskConfig()
+  return Boolean(config && pilotScopeAllowed({
+    organizationId: tenant.organizationId,
+    customerTenantId: tenant.id,
+    environment: config.environment,
+  }, config))
 }
 
 function microsoftRiskDisplayEnabled() {
@@ -266,7 +276,18 @@ function projectionError(channel: IdentityRiskEnvelope['channel']) {
 
 @Injectable()
 export class IdentityRiskService {
-  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Optional() @Inject(MailboxInvestigationResolver)
+    private readonly mailboxResolver?: MailboxInvestigationResolver,
+  ) {}
+
+  private async utcRead<T>(read: (transaction: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return this.prisma.$transaction(async (transaction) => {
+      await enforceRiskUtcTransaction(transaction)
+      return read(transaction)
+    }, { timeout: 10_000 })
+  }
 
   private async currentControls(
     tenant: ScopedTenant,
@@ -336,7 +357,7 @@ export class IdentityRiskService {
   }
 
   private async latestRun(tenant: ScopedTenant, now: Date) {
-    return this.prisma.identityRiskEvaluationRun.findFirst({
+    return this.utcRead((transaction) => transaction.identityRiskEvaluationRun.findFirst({
       where: {
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
@@ -351,8 +372,9 @@ export class IdentityRiskService {
         capability: true,
         completedAt: true,
         sourceObservedAt: true,
+        pseudonymKeyVersionId: true,
       },
-    })
+    }))
   }
 
   async summary(identity: AuthenticatedIdentity, tenantId: string) {
@@ -366,7 +388,7 @@ export class IdentityRiskService {
       notMatchedResults: zeroCount(),
       notEvaluatedResults: zeroCount(),
     }
-    if (mode() === 'OFF') {
+    if (!pilotReadAllowed(tenant)) {
       return {
         ...unavailableEnvelope(
           'HAWKVIEW_IDENTITY_SIGNALS',
@@ -455,7 +477,7 @@ export class IdentityRiskService {
         !isProjectedSubjectReference(row.subjectType, row.subjectId))
     ) return { ...projectionError('HAWKVIEW_IDENTITY_SIGNALS'), counts: unavailableCounts }
     const currentControls = await this.currentControls(tenant)
-    if (currentControls.evaluationHardDisabled) {
+    if (!pilotReadAllowed(tenant) || currentControls.evaluationHardDisabled) {
       return {
         ...unavailableEnvelope(
           'HAWKVIEW_IDENTITY_SIGNALS',
@@ -507,7 +529,7 @@ export class IdentityRiskService {
   ) {
     const tenant = await this.scope(identity, tenantId)
     const limit = parsePageLimit(query.limit)
-    if (mode() === 'OFF') {
+    if (!pilotReadAllowed(tenant)) {
       return {
         ...unavailableEnvelope(
           'HAWKVIEW_IDENTITY_SIGNALS',
@@ -558,7 +580,7 @@ export class IdentityRiskService {
       datasetIdentity: run.id,
       now,
     })
-    const rows = await this.prisma.identityRiskFinding.findMany({
+    const rows = await this.utcRead((transaction) => transaction.identityRiskFinding.findMany({
       where: {
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
@@ -575,11 +597,11 @@ export class IdentityRiskService {
       },
       orderBy: [{ observedAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
-    })
+    }))
     const hasMore = rows.length > limit
     const pageRows = rows.slice(0, limit)
     const currentControls = await this.currentControls(tenant)
-    if (currentControls.evaluationHardDisabled) {
+    if (!pilotReadAllowed(tenant) || currentControls.evaluationHardDisabled) {
       return {
         ...unavailableEnvelope(
           'HAWKVIEW_IDENTITY_SIGNALS',
@@ -638,7 +660,7 @@ export class IdentityRiskService {
     const tenant = await this.scope(identity, tenantId)
     if (!tenant.evidenceDetailAllowed) throw new ForbiddenException('Tenant access denied')
     const now = new Date()
-    if (mode() === 'OFF') {
+    if (!pilotReadAllowed(tenant)) {
       return {
         ...unavailableEnvelope(
           'HAWKVIEW_IDENTITY_SIGNALS',
@@ -678,7 +700,7 @@ export class IdentityRiskService {
         evidenceReferences: [],
       }
     }
-    const row = await this.prisma.identityRiskFinding.findFirst({
+    const row = await this.utcRead((transaction) => transaction.identityRiskFinding.findFirst({
       where: {
         id: findingId,
         organizationId: tenant.organizationId,
@@ -689,9 +711,9 @@ export class IdentityRiskService {
       include: {
         matchedResult: { select: { evidence: true } },
       },
-    })
+    }))
     const currentControls = await this.currentControls(tenant)
-    if (currentControls.evaluationHardDisabled) {
+    if (!pilotReadAllowed(tenant) || currentControls.evaluationHardDisabled) {
       return {
         ...unavailableEnvelope(
           'HAWKVIEW_IDENTITY_SIGNALS',
@@ -728,6 +750,75 @@ export class IdentityRiskService {
       }
     }
     return { ...envelope, finding, evidenceReferences }
+  }
+
+  async investigationAccess(identity: AuthenticatedIdentity, tenantId: string) {
+    const tenant = await this.scope(identity, tenantId)
+    const allowed = tenant.evidenceDetailAllowed && pilotReadAllowed(tenant) &&
+      !(await this.currentControls(tenant)).evaluationHardDisabled && pilotReadAllowed(tenant)
+    return { version: IDENTITY_RISK_API_VERSION, allowed }
+  }
+
+  /** Explicit privileged lookup only. Lists and ordinary finding detail stay opaque. */
+  async mailboxInvestigation(
+    identity: AuthenticatedIdentity,
+    tenantId: string,
+    findingId: string,
+  ): Promise<MailboxInvestigationDto> {
+    const tenant = await this.scope(identity, tenantId)
+    if (!tenant.evidenceDetailAllowed) throw new ForbiddenException('Tenant access denied')
+    const unavailable: MailboxInvestigationDto = { version: 1, status: 'UNAVAILABLE', mailbox: null }
+    if (!pilotReadAllowed(tenant) || !this.mailboxResolver || !boundedOpaqueId(findingId, 200)) return unavailable
+    if ((await this.currentControls(tenant)).evaluationHardDisabled) return unavailable
+    const now = new Date()
+    const run = await this.latestRun(tenant, now)
+    if (!run || !run.pseudonymKeyVersionId ||
+      !boundedOpaqueId(run.pseudonymKeyVersionId, 128) || !run.sourceObservedAt ||
+      runEnvelope(run, now, true)?.freshness !== 'CURRENT' || run.capability !== 'FULL') return unavailable
+    const observedAt = parseTimestamp(run.sourceObservedAt, now)
+    if (!observedAt || now.getTime() - observedAt.getTime() > CURRENT_RUN_MAX_AGE_MS) return unavailable
+    const row = await this.utcRead((transaction) => transaction.identityRiskFinding.findFirst({
+      where: {
+        id: findingId, organizationId: tenant.organizationId, customerTenantId: tenant.id,
+        ruleId: 'HV-ID-MBX-001.v1', subjectType: 'MAILBOX',
+        state: { in: ['OPEN', 'UPDATED'] }, coverage: 'FULL', expiresAt: { gt: now },
+        matchedResult: {
+          organizationId: tenant.organizationId, customerTenantId: tenant.id,
+          evaluationRunId: run.id, ruleId: 'HV-ID-MBX-001.v1', subjectType: 'MAILBOX',
+          coverage: 'FULL', expiresAt: { gt: now },
+        },
+      },
+      select: {
+        subjectId: true, observedAt: true,
+        matchedResult: { select: { subjectId: true, evaluationRunId: true } },
+      },
+    }))
+    if (!row || !isIdentityRiskOpaqueReferenceKind(row.subjectId, 'mailbox') ||
+      row.subjectId !== row.matchedResult.subjectId || row.matchedResult.evaluationRunId !== run.id ||
+      !parseTimestamp(row.observedAt, now) || now.getTime() - row.observedAt.getTime() > CURRENT_RUN_MAX_AGE_MS ||
+      !pilotReadAllowed(tenant) || (await this.currentControls(tenant)).evaluationHardDisabled || !pilotReadAllowed(tenant)) return unavailable
+    try {
+      const resolved = await this.mailboxResolver.resolve(
+        { organizationId: tenant.organizationId, customerTenantId: tenant.id },
+        { subjectId: row.subjectId, pseudonymKeyVersionId: run.pseudonymKeyVersionId, sourceObservedAt: observedAt },
+        now,
+      )
+      // Recheck authority after async inventory lookup. Never echo provider errors/payloads.
+      const currentScope = await this.scope(identity, tenantId)
+      if (!currentScope.evidenceDetailAllowed || currentScope.organizationId !== tenant.organizationId ||
+        !pilotReadAllowed(tenant) || (await this.currentControls(tenant)).evaluationHardDisabled || !pilotReadAllowed(tenant)) return unavailable
+      const id = boundedOpaqueId(resolved.mailboxId, 128)
+      const label = boundedSafeString(resolved.label, 160)
+      const resolvedAt = parseTimestamp(resolved.observedAt, new Date())
+      if (resolved.status !== 'AVAILABLE' || !id || !label || /[<>\[\]{}\\]/u.test(label) ||
+        !resolvedAt || new Date().getTime() - resolvedAt.getTime() > CURRENT_RUN_MAX_AGE_MS) return unavailable
+      return {
+        version: 1, status: 'AVAILABLE',
+        mailbox: { id, label, observedAt: resolvedAt.toISOString(), inventoryPath: `/tenants/${encodeURIComponent(tenant.id)}/exchange` },
+      }
+    } catch {
+      return unavailable
+    }
   }
 
   async microsoftRiskyUsers(
@@ -942,7 +1033,7 @@ export class IdentityRiskService {
       explanation: presentation.explanation,
       affectedIdentity: {
         id: subjectId,
-        label: 'Tenant identity',
+        label: row.subjectType === 'MAILBOX' ? 'Affected mailbox (restricted details)' : 'Tenant identity',
         type: row.subjectType as IdentityRiskFindingDto['affectedIdentity']['type'],
       },
       investigationGuidanceCode: presentation.investigationGuidanceCode,

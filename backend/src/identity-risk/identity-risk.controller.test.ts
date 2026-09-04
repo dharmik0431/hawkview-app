@@ -26,6 +26,8 @@ test('read routes forward only authenticated scope, tenant, and bounded paginati
       calls.push({ method: 'microsoftRiskyUsers', args })
       return { ok: true }
     },
+    investigationAccess: async (...args: unknown[]) => { calls.push({ method: 'investigationAccess', args }); return { version: 1, allowed: true } },
+    mailboxInvestigation: async (...args: unknown[]) => { calls.push({ method: 'mailboxInvestigation', args }); return { version: 1, status: 'UNAVAILABLE', mailbox: null } },
   } as unknown as IdentityRiskService
   const controller = new IdentityRiskController(service)
 
@@ -33,6 +35,8 @@ test('read routes forward only authenticated scope, tenant, and bounded paginati
   await controller.findings(request, 'tenant-1', '50', 'cursor-1')
   await controller.findingDetail(request, 'tenant-1', 'finding-1')
   await controller.riskyUsers(request, 'tenant-1', '25', 'cursor-2')
+  await controller.investigationAccess(request, 'tenant-1')
+  await controller.mailboxInvestigation(request, 'tenant-1', 'finding-1')
 
   assert.deepEqual(calls, [
     { method: 'summary', args: [auth, 'tenant-1'] },
@@ -45,5 +49,7 @@ test('read routes forward only authenticated scope, tenant, and bounded paginati
       method: 'microsoftRiskyUsers',
       args: [auth, 'tenant-1', { limit: '25', cursor: 'cursor-2' }],
     },
+    { method: 'investigationAccess', args: [auth, 'tenant-1'] },
+    { method: 'mailboxInvestigation', args: [auth, 'tenant-1', 'finding-1'] },
   ])
 })

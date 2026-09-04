@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
 import { ChangeEvidenceService, redactSensitiveValues } from './change-evidence.service.js'
 import { classifyEvidence, isPrimaryChange } from './change-classification.js'
 import { classifyEvidenceTrust, EVIDENCE_TRUST_CATALOG_VERSION } from './evidence-trust-catalog.js'
@@ -1664,6 +1665,7 @@ test('production USERS lease compare-and-set permits one concurrent claimant, re
     },
   }
   const tenant = { id: 'tenant-1', organizationId: 'org-1' }
+  utcTestDatabase(prisma)
   const [left, right] = await Promise.all([claimTenantUsersLease(prisma, tenant, now), claimTenantUsersLease(prisma, tenant, now)])
   assert.deepEqual([left.claimed, right.claimed].sort(), [false, true])
   assert.equal(row.status, 'RUNNING')

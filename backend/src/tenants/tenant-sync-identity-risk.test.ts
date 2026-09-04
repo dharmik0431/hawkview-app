@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
 import { TenantSyncService, runInSyncMemoryLane } from './tenant-sync.service.js'
 import { mailboxScope, mailboxRule } from '../identity-risk/mailbox-risk.test-fixtures.js'
 import { MAILBOX_SOURCE_VERSION } from '../identity-risk/mailbox-source-attestation.js'
@@ -7,7 +8,7 @@ import { MAILBOX_SOURCE_VERSION } from '../identity-risk/mailbox-source-attestat
 const tenant = { id: mailboxScope.customerTenantId, organizationId: mailboxScope.organizationId }
 test('snapshot and attestation are atomic; legacy/incomplete observations cannot silently retain COMPLETE metadata', async () => {
   let snapshot: any; let attestation: any
-  const tx = { $executeRawUnsafe: async () => undefined,
+  const tx = { $queryRawUnsafe: async () => [{ timezone: 'UTC' }], $executeRawUnsafe: async () => undefined,
     tenantEntraSnapshot: { findUnique: async () => null, upsert: async ({ create }: any) => { snapshot = create } },
     tenantCollectionFieldState: { upsert: async ({ create }: any) => { attestation = create } } }
   const service = new TenantSyncService({ $transaction: async (work: any) => work(tx) } as any,
@@ -46,9 +47,9 @@ test('actual existing Graph domain request validates tenant identity before atte
 test('404 and missing directory success retain ordinary collector behavior but cannot attest full risk coverage', async () => {
   for (const [status, directoryCurrent, expected] of [[200, true, true], [404, true, false], [200, false, false]] as const) {
     let riskAttestable: boolean | undefined
-    const service = new TenantSyncService({ directoryUser: { findMany: async ({ where }: any) => {
+    const service = new TenantSyncService(utcTestDatabase({ directoryUser: { findMany: async ({ where }: any) => {
       assert.equal(where.organizationId, tenant.organizationId); return [{ microsoftUserId: 'm', userPrincipalName: 'm@tenant.invalid' }]
-    } }, syncState: { findFirst: async () => directoryCurrent ? { status: 'SUCCEEDED', lastSuccessfulAt: new Date(), lastAttemptAt: null } : null } } as any,
+    } }, syncState: { findFirst: async () => directoryCurrent ? { status: 'SUCCEEDED', lastSuccessfulAt: new Date(), lastAttemptAt: null } : null } }) as any,
       {} as any, {} as any, {} as any, {} as any, {} as any)
     ;(service as any).runSnapshotSync = (_t: unknown, _r: unknown, work: () => unknown) => work()
     ;(service as any).saveSnapshot = async (_t: unknown, _r: unknown, _rows: unknown, _persist: unknown, attest: boolean) => { riskAttestable = attest }

@@ -234,7 +234,10 @@ test('real scoped snapshot reader -> managed test MAC -> approved evaluator -> P
     const scope = { organizationId, customerTenantId }; const keyId = randomUUID()
     const now = new Date(); const observedAt = new Date(now.getTime() - 1000)
     const previousMode = process.env.HAWKVIEW_IDENTITY_RISK_MODE; const previousEnvironment = process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT
+    const previousProvider = process.env.HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER; const previousPilot = process.env.HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE
     process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'; process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT = 'test'
+    process.env.HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER = 'managed-kms'
+    process.env.HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE = JSON.stringify({ ...scope, expiresAt: new Date(now.getTime() + 86400000).toISOString() })
     try {
       await prisma.organization.create({ data: { id: organizationId, name: 'Synthetic risk test', slug: `risk-${organizationId}` } })
       await prisma.customerTenant.create({ data: { id: customerTenantId, organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE' } })
@@ -328,5 +331,7 @@ test('real scoped snapshot reader -> managed test MAC -> approved evaluator -> P
       await prisma.$disconnect()
       if (previousMode === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE; else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previousMode
       if (previousEnvironment === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT; else process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT = previousEnvironment
+      if (previousProvider === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER; else process.env.HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER = previousProvider
+      if (previousPilot === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE; else process.env.HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE = previousPilot
     }
   })

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
+import { utcTestDatabase } from './risk-utc.test-fixtures.js'
 import type { PrismaService } from '../prisma/prisma.service.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
@@ -28,6 +29,20 @@ const tenantId = '22222222-2222-4222-8222-222222222222'
 const evaluationAt = new Date('2026-09-02T12:00:00.000Z')
 const windowStart = new Date('2026-09-02T10:00:00.000Z')
 const windowEnd = new Date('2026-09-02T12:00:00.000Z')
+
+function enableReadPilot() {
+  const values = {
+    HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER: 'managed-kms',
+    HAWKVIEW_IDENTITY_RISK_ENVIRONMENT: 'test',
+    HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE: JSON.stringify({ organizationId, customerTenantId: tenantId,
+      expiresAt: new Date(Date.now() + 3 * 86400000).toISOString() }),
+  }
+  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]))
+  Object.assign(process.env, values)
+  return () => { for (const [key, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value
+  } }
+}
 
 function opaqueReference(kind: string, label: string) {
   return `hvr1_${kind}_${createHash('sha256').update(label).digest('hex')}`
@@ -142,6 +157,7 @@ function persistence(activeControls: Array<Record<string, unknown>> = []) {
   }
   const transaction = {
     $queryRaw: async () => [{ id: mailboxKey.id }],
+    $queryRawUnsafe: async () => [{ timezone: 'UTC' }],
     $executeRawUnsafe: async () => [{ pg_advisory_xact_lock: '' }],
     identityRiskOperationalControl: {
       findMany: async () => activeControls,
@@ -206,6 +222,7 @@ const noMatchDetector: IdentitySignalDetector = {
 
 test('attested mailbox projection flows through actual evaluator, durable records and v1 API with pinned key provenance', async (context) => {
   context.mock.timers.enable({ apis: ['Date'], now: mailboxNow })
+  context.after(enableReadPilot())
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
@@ -235,13 +252,13 @@ test('attested mailbox projection flows through actual evaluator, durable record
       assert.equal(store.calls.runCreateData[0]?.capability, capability)
       assert.equal(store.calls.runCreateData[0]?.pseudonymKeyVersionId, capability === 'FULL' ? mailboxKey.id : null)
       assert.doesNotMatch(JSON.stringify(store.calls), /private@|partner@|mailbox-1|outside\.invalid|tenant\.invalid/)
-      const api = new IdentityRiskService({
+      const api = new IdentityRiskService(utcTestDatabase({
         user: { findUnique: async () => ({ disabledAt: null, memberships: [{ organizationId, role: 'MSP_OWNER' }] }) },
         customerTenant: { findFirst: async () => ({ id: tenantId, organizationId }) },
         identityRiskOperationalControl: { findMany: async () => [] },
         identityRiskEvaluationRun: { findFirst: async () => ({ ...store.calls.runCreateData[0], id: 'run', completedAt: mailboxNow }) },
         identityRiskFinding: { findMany: async () => store.calls.findings.map((findingRow, index) => ({ id: `finding-${index}`, state: 'OPEN', ...findingRow })) },
-      } as unknown as PrismaService)
+      }) as unknown as PrismaService)
       const page = await api.findings({ subject: 'synthetic-owner', email: 'owner@example.invalid' }, tenantId)
       assert.equal(page.status, capability === 'FULL' ? 'AVAILABLE' : 'NOT_EVALUATED')
       if (expectedMatches) {
@@ -284,6 +301,7 @@ test('scheduler runs the actual approved evaluator through platform persistence'
   // uses Date. Keep both in the same time domain so the fixture cannot age
   // into STALE merely because CI runs more than 36 hours after September 2.
   context.mock.timers.enable({ apis: ['Date'], now: evaluationAt })
+  context.after(enableReadPilot())
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
@@ -326,7 +344,7 @@ test('scheduler runs the actual approved evaluator through platform persistence'
     )
     assert.equal(store.calls.findings.length, 1)
 
-    const api = new IdentityRiskService({
+    const api = new IdentityRiskService(utcTestDatabase({
       user: {
         findUnique: async () => ({
           disabledAt: null,
@@ -354,7 +372,7 @@ test('scheduler runs the actual approved evaluator through platform persistence'
           ...findingRow,
         })),
       },
-    } as unknown as PrismaService)
+    }) as unknown as PrismaService)
     const page = await api.findings(
       { subject: 'approved-evaluator-test', email: 'owner@example.test' },
       tenantId,
@@ -586,6 +604,7 @@ test('same completed run is replayed without detectors or persistence', async ()
   let detectorCalls = 0
   try {
     const transaction = {
+      $queryRawUnsafe: async () => [{ timezone: 'UTC' }],
       $executeRawUnsafe: async () => [],
       identityRiskOperationalControl: { findMany: async () => [] },
       identityRiskEvaluationRun: {
@@ -633,6 +652,7 @@ test('watermark order is canonical and duplicates are rejected', async () => {
   let transactionCalls = 0
   const runKeys: string[] = []
   const transaction = {
+    $queryRawUnsafe: async () => [{ timezone: 'UTC' }],
     $executeRawUnsafe: async () => [],
     identityRiskOperationalControl: { findMany: async () => [] },
     identityRiskRuleCoverage: { upsert: async () => ({}) },
@@ -726,6 +746,7 @@ test('canonical source identities dedupe exact events and hard-stop same-waterma
   let projectedRows = 0
   const calls = { coverage: 0, matches: 0, findings: 0 }
   const transaction = {
+    $queryRawUnsafe: async () => [{ timezone: 'UTC' }],
     $executeRawUnsafe: async () => [],
     identityRiskOperationalControl: { findMany: async () => [] },
     identityRiskEvaluationRun: {
@@ -1655,6 +1676,7 @@ test('active lease makes a concurrent duplicate return in progress', async () =>
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
     const transaction = {
+      $queryRawUnsafe: async () => [{ timezone: 'UTC' }],
       $executeRawUnsafe: async () => [],
       identityRiskOperationalControl: { findMany: async () => [] },
       identityRiskEvaluationRun: {
@@ -1692,6 +1714,7 @@ test('failed run retry reclaims one lease and completes through idempotent upser
     runCompletions: 0,
   }
   const transaction = {
+    $queryRawUnsafe: async () => [{ timezone: 'UTC' }],
     $executeRawUnsafe: async () => [],
     identityRiskOperationalControl: { findMany: async () => [] },
     identityRiskRuleCoverage: {

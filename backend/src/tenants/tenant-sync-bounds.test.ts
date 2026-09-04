@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import test from 'node:test'
+import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
 import {
   assertGraphCollectionBounds,
   ENTRA_COLLECTION_LIMITS,
@@ -76,7 +77,7 @@ test('mailbox absence cancels throwing or stalled bodies without blocking settin
   for (const cancellation of ['throws', 'stalls']) {
     for (const method of ['syncExchangeMailboxSettings', 'syncExchangeMailboxRules']) {
       let cancelled = 0; let snapshots = 0
-      const service = new TenantSyncService({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'user', userPrincipalName: 'user@example.invalid' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+      const service = new TenantSyncService(utcTestDatabase({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'user', userPrincipalName: 'user@example.invalid' }] } }) as any, {} as any, {} as any, {} as any, {} as any, {} as any)
       ;(service as any).runSnapshotSync = (_tenant: unknown, _resource: unknown, work: () => Promise<void>) => work()
       ;(service as any).saveSnapshot = async (_tenant: unknown, _resource: unknown, snapshot: any) => { assert.deepEqual(snapshot.rows, []); snapshots += 1 }
       ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream({ cancel() {
@@ -159,7 +160,7 @@ test('actual mailbox directory, settings, rules and optional configuration enfor
   const methods = ['syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings', 'syncExchangeMailboxRules', 'collectExchangeReadOnlyMailboxes']
   for (const method of methods) {
     let saves = 0; let cancelled = false; let fetches = 0
-    const service = new TenantSyncService({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    const service = new TenantSyncService(utcTestDatabase({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } }) as any, {} as any, {} as any, {} as any, {} as any, {} as any)
     ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
     ;(service as any).saveSnapshot = async () => { saves += 1 }
     ;(service as any).fetchGraphPage = async () => { fetches += 1; return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(1025)) }, cancel() { cancelled = true; throw new Error('hostile cancel') } })) }
@@ -173,7 +174,7 @@ test('actual mailbox directory, settings, rules and optional configuration enfor
 })
 
 test('actual Exchange collectors reject repeated continuation links and tenant-wide rule aggregation', async () => {
-  const service = new TenantSyncService({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u1', userPrincipalName: 'one@example.test' }, { microsoftUserId: 'u2', userPrincipalName: 'two@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const service = new TenantSyncService(utcTestDatabase({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u1', userPrincipalName: 'one@example.test' }, { microsoftUserId: 'u2', userPrincipalName: 'two@example.test' }] } }) as any, {} as any, {} as any, {} as any, {} as any, {} as any)
   let saves = 0; let fetches = 0
   ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
   ;(service as any).saveSnapshot = async () => { saves += 1 }
@@ -215,13 +216,13 @@ test('actual audit reconciliation serializes every mailbox materializer and reta
 test('actual full sync stops at a bounded USERS failure without a successful checkpoint or any directory/snapshot writes', async () => {
   const updates: any[] = []; const forbidden: string[] = []
   let independentAudit = 0
-  const service = new TenantSyncService({
+  const service = new TenantSyncService(utcTestDatabase({
     syncState: { findUnique: async () => ({ id: 'state', deltaLink: null, lastSuccessfulAt: null }), updateMany: async () => ({ count: 1 }), update: async (args: any) => updates.push(args) },
     directoryUser: { upsert: async () => forbidden.push('user'), updateMany: async () => forbidden.push('deletion') },
     tenantConnection: { update: async () => forbidden.push('verified') },
     tenantEntraSnapshot: { upsert: async () => forbidden.push('snapshot') },
     changeEvidenceEvent: { createMany: async () => forbidden.push('evidence') },
-  } as any, { getTenantAccessToken: async () => 'token' } as any, {} as any, {} as any, {} as any, { syncTenant: async () => { independentAudit += 1; return [] } } as any)
+  }) as any, { getTenantAccessToken: async () => 'token' } as any, {} as any, {} as any, {} as any, { syncTenant: async () => { independentAudit += 1; return [] } } as any)
   ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream(), { headers: { 'content-length': String(USER_DELTA_COLLECTION_LIMITS.pageBytes + 1) } })
   await assert.rejects(() => (service as any).syncConnectedTenant(boundedTenant, false, { includeBundle: false }), /bounded page-size/)
   assert.deepEqual(forbidden, []); assert.equal(independentAudit, 1)
@@ -250,7 +251,7 @@ test('actual Exchange JSON paths accept the exact streamed page-byte cap with cl
     ['collectExchangeReadOnlyMailboxes', { value: [{ UserPrincipalName: 'u@example.test', DisplayName: 'User', unselected: 'not-retained' }] }],
   ] as const
   for (const [method, fixture] of fixtures) {
-    const service = new TenantSyncService({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    const service = new TenantSyncService(utcTestDatabase({ syncState: { findFirst: async () => null }, directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] } }) as any, {} as any, {} as any, {} as any, {} as any, {} as any)
     const saved: unknown[] = []
     ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
     ;(service as any).saveSnapshot = async (_t: unknown, _r: string, snapshot: unknown) => saved.push(snapshot)
@@ -274,12 +275,12 @@ test('real Exchange snapshot wrappers permit only RUNNING to FAILED state and on
   ] as const
   for (const [method, resourceType] of pairs) {
     const upserts: any[] = []; const updates: any[] = []; const incidents: any[] = []; const forbidden: string[] = []
-    const service = new TenantSyncService({
+    const service = new TenantSyncService(utcTestDatabase({
       syncState: { findFirst: async () => null, upsert: async (args: any) => { upserts.push(args); return { lastSuccessfulAt: null } }, update: async (args: any) => { updates.push(args); return { consecutiveFailures: 1 } } },
       directoryUser: { findMany: async () => [{ microsoftUserId: 'u', userPrincipalName: 'u@example.test' }] },
       tenantEntraSnapshot: { upsert: async () => forbidden.push('snapshot') },
       changeEvidenceEvent: { createMany: async () => forbidden.push('evidence') },
-    } as any, { getTenantExchangeAccessToken: async () => 'token' } as any, {} as any, { publishIncident: async (value: unknown) => incidents.push(value), resolveIncident: async () => forbidden.push('resolved') } as any, {} as any, {} as any)
+    }) as any, { getTenantExchangeAccessToken: async () => 'token' } as any, {} as any, { publishIncident: async (value: unknown) => incidents.push(value), resolveIncident: async () => forbidden.push('resolved') } as any, {} as any, {} as any)
     ;(service as any).logger = { log: () => undefined, warn: () => undefined }
     ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream({ cancel() { throw new Error('secret token@example.test') } }), { headers: { 'content-length': String(SINGLETON_JSON_MAX_BYTES + 1) } })
     await assert.rejects(() => method === 'syncExchangeMailboxConfiguration' ? (service as any)[method](boundedTenant) : (service as any)[method](boundedTenant, 'token'), /refresh at a safety limit/)
@@ -424,7 +425,7 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
   }
   const microsoftConsent = { getTenantAccessToken: async () => 'token' }
   const notifications = { publishIncident: async () => undefined }
-  const service = new TenantSyncService(prisma, microsoftConsent as any, {} as any, notifications as any, {} as any, {} as any)
+  const service = new TenantSyncService(utcTestDatabase(prisma), microsoftConsent as any, {} as any, notifications as any, {} as any, {} as any)
   ;(service as any).synchronizeUsers = async () => ({ deltaLink: 'next-delta' })
   for (const method of [
     'syncLicenses', 'syncOrganizationConfiguration', 'syncDomains',
@@ -494,7 +495,7 @@ test('actual full sync continues from a failed sign-in collector to audit withou
     $transaction: async (operations: Array<Promise<unknown>>) => Promise.all(operations),
   }
   const service = new TenantSyncService(
-    prisma,
+    utcTestDatabase(prisma),
     { getTenantAccessToken: async () => 'token' } as any,
     {} as any,
     { publishIncident: async () => undefined } as any,

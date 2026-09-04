@@ -12,6 +12,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { isIP } from 'node:net'
 import { MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS } from '../identity-risk/mailbox-risk-projector.service.js'
 import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION, verifiedOrganizationDomains } from '../identity-risk/mailbox-source-attestation.js'
+import { enforceRiskUtcTransaction, requiresRiskUtcSnapshot } from '../identity-risk/risk-utc-session.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import {
@@ -263,6 +264,13 @@ export async function runInSyncMemoryLane<T>(work: () => Promise<T>): Promise<T>
   }
 }
 
+/** Interactive investigation never joins the background collection queue. */
+export async function tryInSyncMemoryLane<T>(work: () => Promise<T>): Promise<T | undefined> {
+  if (memoryLaneContext.getStore()) return work()
+  if (memoryLaneBusy) return undefined
+  return runInSyncMemoryLane(work)
+}
+
 /**
  * All materializing collectors share one bounded-memory lane. Small,
  * independently bounded collectors may still run concurrently. Results
@@ -385,12 +393,19 @@ export async function claimTenantUsersLease(
   tenant: { id: string; organizationId: string },
   now = new Date(),
 ) {
-  const existingState = await prisma.syncState.findUnique({
+  // Each statement is transaction-local UTC. A unique-create loser rolls back
+  // before the follow-up lookup, preserving the existing compare-and-set race.
+  const inUtc = <T>(work: (transaction: Prisma.TransactionClient) => Promise<T>): Promise<T> =>
+    prisma.$transaction(async (transaction: Prisma.TransactionClient) => {
+      await enforceRiskUtcTransaction(transaction)
+      return work(transaction)
+    })
+  const existingState = await inUtc((transaction) => transaction.syncState.findUnique({
     where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'USERS' } },
-  })
+  }))
   const staleLeaseBefore = new Date(now.getTime() - TENANT_SYNC_LEASE_MS)
   if (existingState) {
-    const claim = await prisma.syncState.updateMany({
+    const claim = await inUtc((transaction) => transaction.syncState.updateMany({
       where: {
         id: existingState.id,
         OR: [
@@ -400,19 +415,19 @@ export async function claimTenantUsersLease(
         ],
       },
       data: { status: 'RUNNING', lastAttemptAt: now, lastErrorCode: null, lastErrorMessage: null },
-    })
+    }))
     return { claimed: claim.count === 1, existingState }
   }
   try {
-    await prisma.syncState.create({
+    await inUtc((transaction) => transaction.syncState.create({
       data: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'USERS', status: 'RUNNING', lastAttemptAt: now },
-    })
+    }))
     return { claimed: true, existingState: null }
   } catch (error) {
-    const competingClaim = await prisma.syncState.findUnique({
+    const competingClaim = await inUtc((transaction) => transaction.syncState.findUnique({
       where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'USERS' } },
       select: { id: true },
-    })
+    }))
     if (!competingClaim) throw error
     return { claimed: false, existingState: null }
   }
@@ -2012,8 +2027,9 @@ export class TenantSyncService {
       )
       const completedAt = new Date()
 
-      await this.prisma.$transaction([
-        this.prisma.syncState.update({
+      await this.prisma.$transaction(async (transaction) => {
+        await enforceRiskUtcTransaction(transaction)
+        await transaction.syncState.update({
           where: {
             customerTenantId_resourceType: {
               customerTenantId: tenant.id,
@@ -2028,8 +2044,8 @@ export class TenantSyncService {
             lastErrorMessage: null,
             consecutiveFailures: 0,
           },
-        }),
-        this.prisma.tenantConnection.update({
+        })
+        await transaction.tenantConnection.update({
           where: {
             customerTenantId_organizationId: {
               customerTenantId: tenant.id,
@@ -2037,8 +2053,8 @@ export class TenantSyncService {
             },
           },
           data: { lastVerifiedAt: completedAt },
-        }),
-      ])
+        })
+      })
     } catch (error) {
       const technicalMessage = safeErrorMessage(
         error,
@@ -2056,7 +2072,7 @@ export class TenantSyncService {
         failure,
         Boolean(existingState?.lastSuccessfulAt),
       )
-      await this.prisma.syncState.update({
+      await this.withSnapshotUtc('USERS', (transaction) => transaction.syncState.update({
         where: {
           customerTenantId_resourceType: {
             customerTenantId: tenant.id,
@@ -2069,7 +2085,7 @@ export class TenantSyncService {
           lastErrorMessage: message,
           consecutiveFailures: { increment: 1 },
         },
-      })
+      }))
       if (graphTokenAcquired) {
         try {
           // The Management Activity API is a separate Microsoft resource.
@@ -2573,6 +2589,17 @@ export class TenantSyncService {
     })
   }
 
+  private async withSnapshotUtc<T>(
+    resourceType: string,
+    operation: (transaction: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    if (resourceType !== 'USERS' && !requiresRiskUtcSnapshot(resourceType)) return operation(this.prisma)
+    return this.prisma.$transaction(async (transaction) => {
+      await enforceRiskUtcTransaction(transaction)
+      return operation(transaction)
+    })
+  }
+
   private async runSnapshotSync(
     tenant: { id: string; organizationId: string },
     resourceType:
@@ -2591,7 +2618,7 @@ export class TenantSyncService {
     }
     let previousState
     try {
-      previousState = await this.prisma.syncState.upsert({
+      previousState = await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.upsert({
         where: {
           customerTenantId_resourceType: {
             customerTenantId: tenant.id,
@@ -2611,7 +2638,7 @@ export class TenantSyncService {
           lastErrorCode: null,
           lastErrorMessage: null,
         },
-      })
+      }))
     } catch (error) {
       if (exchangePhase) {
         logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
@@ -2621,7 +2648,7 @@ export class TenantSyncService {
 
     try {
       await synchronize()
-      await this.prisma.syncState.update({
+      await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.update({
         where: {
           customerTenantId_resourceType: {
             customerTenantId: tenant.id,
@@ -2635,7 +2662,7 @@ export class TenantSyncService {
           lastErrorMessage: null,
           consecutiveFailures: 0,
         },
-      })
+      }))
       await this.notifications.resolveIncident(
         tenant.organizationId,
         `tenant:${tenant.id}:sync:${resourceType}`,
@@ -2663,7 +2690,7 @@ export class TenantSyncService {
         `Microsoft ${resourceType.toLowerCase()} synchronization failed.`
       )
       if (error instanceof CollectionInitializingError) {
-        await this.prisma.syncState.update({
+        await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.update({
           where: {
             customerTenantId_resourceType: {
               customerTenantId: tenant.id,
@@ -2676,7 +2703,7 @@ export class TenantSyncService {
             lastErrorMessage: technicalMessage,
             consecutiveFailures: 0,
           },
-        })
+        }))
         // A previous deployment could have published an incident for this
         // normal provisioning state. Retire it without claiming collection
         // success; readiness will continue to report INITIALIZING.
@@ -2687,7 +2714,7 @@ export class TenantSyncService {
         return
       }
       if (error instanceof CollectionPartialError) {
-        await this.prisma.syncState.update({
+        await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.update({
           where: {
             customerTenantId_resourceType: {
               customerTenantId: tenant.id,
@@ -2701,7 +2728,7 @@ export class TenantSyncService {
             lastErrorMessage: technicalMessage,
             consecutiveFailures: 0,
           },
-        })
+        }))
         await this.notifications.resolveIncident(
           tenant.organizationId,
           `tenant:${tenant.id}:sync:${resourceType}`,
@@ -2721,7 +2748,7 @@ export class TenantSyncService {
         reasonCode: failure.reasonCode,
         status: failure.status,
       }))
-      const state = await this.prisma.syncState.update({
+      const state = await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.update({
         where: {
           customerTenantId_resourceType: {
             customerTenantId: tenant.id,
@@ -2734,7 +2761,7 @@ export class TenantSyncService {
           lastErrorMessage: message,
           consecutiveFailures: { increment: 1 },
         },
-      })
+      }))
       const shouldNotify = failure.retryable
         ? state.consecutiveFailures >= 3
         : state.consecutiveFailures >= 1
@@ -4827,6 +4854,7 @@ export class TenantSyncService {
     // PostgreSQL transaction advisory lock serializes this resource across
     // concurrent workers so they cannot compare against one stale baseline.
     await this.prisma.$transaction(async (transaction) => {
+      if (requiresRiskUtcSnapshot(resourceType)) await enforceRiskUtcTransaction(transaction)
       await transaction.$executeRawUnsafe(
         'SELECT pg_advisory_xact_lock(hashtext($1))',
         `hawkview:snapshot:${tenant.id}:${resourceType}`
@@ -5170,7 +5198,7 @@ export class TenantSyncService {
         select: { microsoftUserId: true, userPrincipalName: true }, orderBy: { microsoftUserId: 'asc' }, skip, take,
       }), { deadlineAt: budget.deadlineAt })
       let riskAttestable = true
-      const directoryState = await this.prisma.syncState.findFirst({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'USERS' }, select: { status: true, lastSuccessfulAt: true, lastAttemptAt: true } })
+      const directoryState = await this.withSnapshotUtc('USERS', (transaction) => transaction.syncState.findFirst({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'USERS' }, select: { status: true, lastSuccessfulAt: true, lastAttemptAt: true } }))
       if (!directoryState || directoryState.status !== 'SUCCEEDED' || !directoryState.lastSuccessfulAt ||
         Date.now() - directoryState.lastSuccessfulAt.getTime() > 36 * 60 * 60 * 1000 ||
         (directoryState.lastAttemptAt && directoryState.lastAttemptAt > directoryState.lastSuccessfulAt)) riskAttestable = false

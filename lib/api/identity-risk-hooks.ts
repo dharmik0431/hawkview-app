@@ -4,6 +4,7 @@ import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useAuth } from '@/components/providers/auth-provider'
 import { apiClient } from './client'
+import { parseInvestigationAccess } from './mailbox-investigation'
 import {
   adaptIdentityRiskResponses,
   unavailableHawkViewIdentitySignals,
@@ -74,4 +75,17 @@ export function useIdentityRiskChannels(tenantId: string, enabled: boolean) {
     retryHawkView: () => Promise.all([summary.refetch(), findings.refetch()]),
     retryMicrosoft: () => microsoft.refetch(),
   }
+}
+
+export function useIdentityRiskInvestigationAccess(tenantId: string) {
+  const { cacheScope } = useAuth()
+  const access = useQuery<unknown>({
+    queryKey: ['identity-risk', cacheScope, tenantId, 'investigation-access'],
+    queryFn: ({ signal }) => apiClient.get(`/api/tenants/${encodeURIComponent(tenantId)}/identity-signals/investigation-access`, { signal, cache: 'no-store' }),
+    enabled: Boolean(tenantId),
+    retry: false,
+    staleTime: 0,
+    gcTime: 0,
+  })
+  return { allowed: !access.isError && parseInvestigationAccess(access.data), cacheScope }
 }

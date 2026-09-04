@@ -754,11 +754,36 @@ model IdentityRiskPseudonymKeyVersion {
   organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   customerTenant   CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
   evaluationRuns   IdentityRiskEvaluationRun[]
+  destroyedAt      DateTime? @map("destroyed_at") @db.Timestamptz(6)
+  wrappedKey       IdentityRiskWrappedKey?
+  keyEvents        IdentityRiskKeyEvent[]
 
   @@unique([id, organizationId, customerTenantId], map: "identity_risk_keys_scope_id")
   @@unique([provider, immutableKeyId], map: "identity_risk_keys_physical_key")
   @@index([organizationId, customerTenantId, environment, status], map: "identity_risk_keys_scope_status")
   @@map("identity_risk_pseudonym_key_versions")
+}
+
+model IdentityRiskWrappedKey {
+  keyVersionId String @id @map("key_version_id") @db.Uuid
+  name String @unique @db.VarChar(256)
+  ciphertext Bytes
+  iv Bytes
+  tag Bytes
+  keyVersion IdentityRiskPseudonymKeyVersion @relation(fields: [keyVersionId], references: [id], onDelete: Cascade)
+  @@map("identity_risk_wrapped_keys")
+}
+
+model IdentityRiskKeyEvent {
+  keyVersionId String @map("key_version_id") @db.Uuid
+  kind String @db.VarChar(20)
+  bucket DateTime @db.Timestamptz(6)
+  correlationId String @map("correlation_id") @db.Uuid
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  keyVersion IdentityRiskPseudonymKeyVersion @relation(fields: [keyVersionId], references: [id], onDelete: Cascade)
+  @@id([keyVersionId, kind, bucket])
+  @@index([expiresAt], map: "identity_risk_key_events_expiry")
+  @@map("identity_risk_key_events")
 }
 
 model IdentityRiskEvaluationRun {
