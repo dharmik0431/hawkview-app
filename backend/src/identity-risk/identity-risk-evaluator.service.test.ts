@@ -222,7 +222,11 @@ test('scheduler wires the complete approved evaluator detector set at its explic
   ))
 })
 
-test('scheduler runs the actual approved evaluator through platform persistence', async () => {
+test('scheduler runs the actual approved evaluator through platform persistence', async (context) => {
+  // The evaluator already uses this fixture clock; the downstream read API
+  // uses Date. Keep both in the same time domain so the fixture cannot age
+  // into STALE merely because CI runs more than 36 hours after September 2.
+  context.mock.timers.enable({ apis: ['Date'], now: evaluationAt })
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
@@ -303,6 +307,26 @@ test('scheduler runs the actual approved evaluator through platform persistence'
     assert.equal(page.findings[0]?.affectedIdentity.id, platformSubjectId)
     assert.equal(page.findings[0]?.ruleIds[0], 'HV-ID-CHG-005.v1')
     assert.equal(JSON.stringify(page).includes('candidateReference'), false)
+
+    // Exercise the real read-path boundary without widening production
+    // freshness or masking stale evidence: exactly 36 hours is current;
+    // one millisecond later the same persisted evaluation is stale.
+    const freshnessBoundary = evaluationAt.getTime() + 36 * 60 * 60 * 1_000
+    context.mock.timers.setTime(freshnessBoundary)
+    const boundary = await api.findings(
+      { subject: 'approved-evaluator-test', email: 'owner@example.test' },
+      tenantId,
+    )
+    assert.equal(boundary.status, 'AVAILABLE')
+    assert.equal(boundary.freshness, 'CURRENT')
+    context.mock.timers.setTime(freshnessBoundary + 1)
+    const stale = await api.findings(
+      { subject: 'approved-evaluator-test', email: 'owner@example.test' },
+      tenantId,
+    )
+    assert.equal(stale.status, 'STALE')
+    assert.equal(stale.freshness, 'STALE')
+    assert.equal(stale.evaluatedAt, evaluationAt.toISOString())
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
