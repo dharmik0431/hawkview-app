@@ -73,4 +73,17 @@ test('final production image runs its own cron entrypoint safely without network
     ], { encoding: 'utf8', timeout: 40_000, maxBuffer: 1024 * 1024 })
     assertDispatchResult(result, scenario) // Docker/daemon absence FAILS when enabled.
   }
+  // Execute the actual operator bundle from this same final image. With no
+  // network/config, both help and the default dry-run must exit without writes.
+  for (const args of [['--help'], ['--environment', 'synthetic', '--organization', '00000000-0000-0000-0000-000000000001',
+    '--tenant', '00000000-0000-0000-0000-000000000002', '--version', '00000000-0000-0000-0000-000000000003']]) {
+    const result = spawnSync('docker', ['run', '--rm', '--pull=never', '--network=none', '--read-only',
+      '--cap-drop=ALL', '--security-opt=no-new-privileges', image, 'node', '/app/dist/provision-risk-key.js', ...args],
+    { encoding:'utf8', timeout:10000, maxBuffer:65536 })
+    assert.ifError(result.error); assert.equal(result.signal, null); assert.equal(result.stderr, '')
+    const body = JSON.parse(result.stdout)
+    assert.equal(result.status, args[0] === '--help' ? 0 : 1)
+    assert.equal(body.outcome, args[0] === '--help' ? 'HELP' : 'FAILED')
+    if (args[0] !== '--help') assert.equal(body.code, 'CONFIG_UNAVAILABLE')
+  }
 })
