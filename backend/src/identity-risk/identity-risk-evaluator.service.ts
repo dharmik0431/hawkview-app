@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 import { assertGlobalRiskCommitScope, assertRiskExecutionBudget, configureRiskStatementBudget } from './risk-global-commit-guard.js'
 import { runRiskTransaction } from './risk-bounded-prisma-transaction.js'
+import { completeGlobalRiskAttempt } from './risk-attempt-causality.js'
 import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
@@ -1178,7 +1179,10 @@ export class IdentityRiskEvaluatorService {
         if (existing.sourceContentHash !== input.sourceContentHash) {
           return 'SOURCE_INTEGRITY_CONFLICT'
         }
-        if (existing.status === 'COMPLETED') return 'COMPLETED'
+        if (existing.status === 'COMPLETED') {
+          await completeGlobalRiskAttempt(transaction, input.request, existing.id)
+          return 'COMPLETED'
+        }
         if (
           existing.status === 'RUNNING' &&
           existing.leaseExpiresAt &&
@@ -1603,6 +1607,7 @@ export class IdentityRiskEvaluatorService {
         },
       })
       if (updated.count !== 1) throw new Error('Identity risk run lease was lost.')
+      await completeGlobalRiskAttempt(transaction, input.request, input.runId)
       return { status: 'COMPLETED' as const, safety }
     })
   }

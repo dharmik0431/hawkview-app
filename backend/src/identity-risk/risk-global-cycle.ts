@@ -10,9 +10,9 @@ type Dependencies = {
   claimCycle: (deadline: number) => Promise<RiskCycleLease | null>
   nextScope: (lease: RiskCycleLease, deadline: number) => Promise<PseudonymScope | null>
   releaseCycle: (lease: RiskCycleLease, deadline: number) => Promise<void>
-  recordAttempt: (scope: PseudonymScope, lease: RiskCycleLease, deadline: number) => Promise<void>
+  recordAttempt: (scope: PseudonymScope, lease: RiskCycleLease, deadline: number) => Promise<string>
   ensure: (scope: PseudonymScope, deadline: number) => Promise<unknown>
-  evaluate: (scope: PseudonymScope, deadline: number) => Promise<unknown>
+  evaluate: (scope: PseudonymScope, deadline: number, attemptId: string) => Promise<unknown>
   now?: () => number
 }
 
@@ -35,11 +35,11 @@ export async function runGlobalRiskCycle(deps: Dependencies, requestDeadlineAt: 
       if (!scope) break
       attempted++
       try {
-        await deps.recordAttempt(scope, lease, Math.min(deadline, now() + 2_000))
+        const attemptId = await deps.recordAttempt(scope, lease, Math.min(deadline, now() + 2_000))
         await deps.ensure(scope, Math.min(deadline, now() + 4_000))
         // Reserve transaction/cleanup time after bounded source materialization.
         if (deadline - now() < 15_000) break
-        await deps.evaluate(scope, deadline - 2_000)
+        await deps.evaluate(scope, deadline - 2_000, attemptId)
         completed++
       } catch { failed++ }
     }

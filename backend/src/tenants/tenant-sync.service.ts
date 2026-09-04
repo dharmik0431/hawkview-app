@@ -1612,7 +1612,7 @@ export class TenantSyncService {
   private async runPostSyncIdentityRiskEvaluation(tenant: {
     id: string
     organizationId: string
-  }, executionDeadlineAt?: number) {
+  }, executionDeadlineAt?: number, globalAttemptId?: string) {
     if (!this.identityRiskEvaluationScheduler || !this.mailboxRiskProjector) return
     const evaluationAt = new Date()
     const windowStart = new Date(evaluationAt.getTime() - 24 * 60 * 60 * 1_000)
@@ -1626,6 +1626,7 @@ export class TenantSyncService {
         windowEnd: evaluationAt,
         evaluationAt,
         executionDeadlineAt,
+        globalAttemptId,
         loadSources: () => this.mailboxRiskProjector!.load({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, evaluationAt,
           executionDeadlineAt === undefined ? undefined : executionDeadlineAt - 12_000),
         approvedEvaluator: { readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS },
@@ -1650,7 +1651,7 @@ export class TenantSyncService {
       releaseCycle: (lease, deadline) => store.releaseCycle(lease, deadline),
       recordAttempt: (scope, lease, deadline) => store.recordAttempt(scope, lease, deadline),
       ensure: (scope, deadline) => keys.ensureVersion(scope, deadline),
-      evaluate: (scope, deadline) => this.runPostSyncIdentityRiskEvaluation({ id: scope.customerTenantId, organizationId: scope.organizationId }, deadline),
+      evaluate: (scope, deadline, attemptId) => this.runPostSyncIdentityRiskEvaluation({ id: scope.customerTenantId, organizationId: scope.organizationId }, deadline, attemptId),
     }, requestDeadlineAt))
   }
 

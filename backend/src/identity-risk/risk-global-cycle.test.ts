@@ -18,7 +18,7 @@ function fixture() {
     claimCycle: async (_deadline: number) => { claim++; return { environment: scope.environment, id: scope.organizationId } },
     nextScope: async () => { scanned++; return scope },
     releaseCycle: async () => { released++ },
-    recordAttempt: async () => undefined,
+    recordAttempt: async () => scope.organizationId,
     ensure: async () => { ensure++ },
     evaluate: async () => { evaluated++ },
   }

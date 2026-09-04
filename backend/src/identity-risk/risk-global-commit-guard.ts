@@ -2,6 +2,7 @@ import type { Prisma } from '../generated/prisma/client.js'
 import type { IdentityRiskEvaluationRequest, IdentityRiskSourceBatch } from './identity-risk.contract.js'
 import { isGlobalRiskConfig, riskRuntimeConfig, riskScopeAllowed } from './risk-runtime-config.js'
 import { MAILBOX_SOURCE_VERSION, sourceAttestationKey } from './mailbox-source-attestation.js'
+import { lockGlobalRiskAttempt } from './risk-attempt-causality.js'
 
 export function assertRiskExecutionBudget(request: Pick<IdentityRiskEvaluationRequest, 'executionDeadlineAt'>) {
   if (request.executionDeadlineAt !== undefined &&
@@ -37,6 +38,7 @@ export async function assertGlobalRiskCommitScope(transaction: Prisma.Transactio
   const connections = await transaction.$queryRawUnsafe<Array<{ id: string }>>(`SELECT id FROM tenant_connections
     WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND status='CONNECTED' FOR SHARE`, request.customerTenantId, request.organizationId)
   if (connections.length !== 1) throw new Error('IDENTITY_RISK_SCOPE_UNAVAILABLE')
+  await lockGlobalRiskAttempt(transaction, request)
   if (capability !== 'FULL') return
   if (!Array.isArray(attestations) || attestations.length !== 2) throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE')
   for (const resource of ['EXCHANGE_MAILBOX_RULES', 'EXCHANGE_ACCEPTED_DOMAINS'] as const) {

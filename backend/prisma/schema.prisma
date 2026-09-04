@@ -318,6 +318,7 @@ model CustomerTenant {
   microsoftConsentAttempts MicrosoftConsentAttempt[]
 
   @@unique([id, organizationId])
+  identityRiskAttemptHeads IdentityRiskAttemptHead[]
   @@index([organizationId, status])
   @@map("customer_tenants")
 }
@@ -747,6 +748,17 @@ model IdentityRiskSchedulerCursor {
   leaseExpiresAt DateTime? @map("lease_expires_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
   @@map("identity_risk_scheduler_cursors")
+}
+
+model IdentityRiskAttemptHead {
+  organizationId String @map("organization_id") @db.Uuid
+  customerTenantId String @map("customer_tenant_id") @db.Uuid
+  environment String @db.VarChar(40)
+  attemptId String @map("attempt_id") @db.Uuid
+  completedRunId String? @map("completed_run_id") @db.Uuid
+  customerTenant CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  @@id([organizationId, customerTenantId, environment])
+  @@map("identity_risk_attempt_heads")
 }
 
 model IdentityRiskPseudonymKeyVersion {

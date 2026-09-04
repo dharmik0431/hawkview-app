@@ -21,15 +21,30 @@ export class RiskGlobalWorkStore {
       throw new Error('IDENTITY_RISK_CYCLE_UNAVAILABLE')
     const opaque = riskTenantScopeOpaqueId(scope)
     const eventKey = createHash('sha256').update(`GLOBAL_RISK_ATTEMPT\u0000${lease.id}\u0000${opaque}`).digest('hex')
-    await withRiskKeyTransaction(deadlineAt, async client => {
+    return withRiskKeyTransaction(deadlineAt, async client => {
+      // Linearize with the lease before publishing a new causal head. Recheck
+      // lease after any wait so stale workers cannot reset a successor's head.
+      const owned = await client.query(`SELECT environment FROM identity_risk_scheduler_cursors
+        WHERE environment=$1 AND lease_id=$2::uuid AND lease_expires_at>statement_timestamp() FOR UPDATE`,
+      [lease.environment, lease.id])
+      if (owned.rowCount !== 1) throw new Error('IDENTITY_RISK_CYCLE_UNAVAILABLE')
       const result = await client.query(`INSERT INTO identity_risk_operational_events
         (id,event_key,event_type,scope_type,scope_opaque_id,reason_code,correlation_id,actor_service_id,expires_at,created_at)
         SELECT $1::uuid,$2,'GLOBAL_RISK_ATTEMPT','TENANT',$3,'EVALUATION_REQUESTED',$4::uuid,
           'identity-risk-scheduler',CURRENT_TIMESTAMP+INTERVAL '90 days',CURRENT_TIMESTAMP
-        FROM identity_risk_scheduler_cursors WHERE environment=$5 AND lease_id=$4::uuid AND lease_expires_at>CURRENT_TIMESTAMP
+        FROM identity_risk_scheduler_cursors WHERE environment=$5 AND lease_id=$4::uuid AND lease_expires_at>statement_timestamp()
         ON CONFLICT(event_key) DO UPDATE SET event_key=EXCLUDED.event_key RETURNING id`,
       [randomUUID(), eventKey, opaque, lease.id, lease.environment])
       if (result.rowCount !== 1) throw new Error('IDENTITY_RISK_CYCLE_UNAVAILABLE')
+      const attemptId = result.rows[0].id as string
+      await client.query(`INSERT INTO identity_risk_attempt_heads
+        (organization_id,customer_tenant_id,environment,attempt_id,completed_run_id)
+        VALUES ($1::uuid,$2::uuid,$3,$4::uuid,NULL)
+        ON CONFLICT(organization_id,customer_tenant_id,environment) DO UPDATE
+        SET attempt_id=EXCLUDED.attempt_id,completed_run_id=NULL
+        WHERE identity_risk_attempt_heads.attempt_id<>EXCLUDED.attempt_id`,
+      [scope.organizationId, scope.customerTenantId, scope.environment, attemptId])
+      return attemptId
     })
   }
 

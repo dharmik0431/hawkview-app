@@ -12,20 +12,27 @@ async function globalTest(work:()=>Promise<void>) {
   for(const[k,v]of Object.entries(config)){if(v===undefined)delete process.env[k];else process.env[k]=v}
   try{await work()}finally{for(const[k,v]of Object.entries(previous)){if(v===undefined)delete process.env[k];else process.env[k]=v}}
 }
-function serviceFixture(options:{ failedAttempt?:boolean; revoked?:boolean; noRun?:boolean; capability?:string; stale?:boolean }={}) {
+function serviceFixture(options:{ failedAttempt?:boolean; revoked?:boolean; noRun?:boolean; noHead?:boolean; capability?:string; stale?:boolean }={}) {
   const now=new Date();let reads=0
   const models={
-    $executeRawUnsafe:async()=>0,$queryRawUnsafe:async()=>[{timezone:'UTC'}],
+    $executeRawUnsafe:async()=>0,$queryRawUnsafe:async(sql:string,organizationId:string,customerTenantId:string,environment:string)=>{
+      if(sql.includes('identity_risk_attempt_heads')){
+        assert.equal(organizationId,customerTenantId===tenantA?orgA:orgB);assert.equal(environment,'synthetic')
+        return options.noHead?[]:[{completedRunId:options.failedAttempt?null:'run'}]
+      }
+      return [{timezone:'UTC'}]
+    },
     user:{findUnique:async({where}:any)=>({disabledAt:null,memberships:[{organizationId:where.authProviderUserId==='a'?orgA:orgB,role:'MSP_OWNER'}]})},
     customerTenant:{findFirst:async({where}:any)=>{
       const organizationId=where.id===tenantA?orgA:orgB
       return where.organizationId.in.includes(organizationId)?{id:where.id,organizationId}:null
     }},
     identityRiskOperationalControl:{findMany:async()=>[]},
-    identityRiskOperationalEvent:{findFirst:async({where}:any)=>{assert.equal(where.scopeType,'TENANT');assert.equal(where.scopeOpaqueId.length,32);return options.failedAttempt?{createdAt:new Date(now.getTime()+1)}:null}},
+    identityRiskOperationalEvent:{findFirst:async()=>{throw new Error('Attempt timestamps must never order success')}},
     identityRiskPseudonymKeyVersion:{findFirst:async({where}:any)=>{assert.equal(where.environment,'synthetic');assert.equal(where.status,'ACTIVE');assert.equal(where.destroyedAt,null);return options.revoked?null:{id:'key'}}},
     identityRiskEvaluationRun:{findFirst:async({where}:any)=>{
       reads++;assert.equal(where.organizationId,where.customerTenantId===tenantA?orgA:orgB)
+      if(!options.failedAttempt)assert.equal(where.id,'run','success must select the causally linked run')
       return options.noRun?null:{id:'run',engineVersion:IDENTITY_RISK_ENGINE_VERSION,catalogVersion:IDENTITY_RISK_CATALOG_VERSION,
         capability:options.capability??'FULL',completedAt:now,sourceObservedAt:new Date(now.getTime()-(options.stale?37*3_600_000:1_000)),pseudonymKeyVersionId:'key'}
     }},
@@ -52,6 +59,7 @@ test('new failed/pending attempt or revoked key cannot leave an old zero-match r
 }))
 test('missing evidence, stale evidence, and OFF remain truthful with no manual pilot scope',()=>globalTest(async()=>{
   assert.equal((await serviceFixture({noRun:true}).service.summary(identity('a'),tenantA)).status,'NOT_EVALUATED')
+  const unlinked=serviceFixture({noHead:true});assert.equal((await unlinked.service.summary(identity('a'),tenantA)).status,'NOT_EVALUATED');assert.equal(unlinked.reads(),0)
   assert.equal((await serviceFixture({stale:true}).service.summary(identity('a'),tenantA)).status,'STALE')
   assert.equal((await serviceFixture({capability:'UNAVAILABLE'}).service.summary(identity('a'),tenantA)).status,'NOT_EVALUATED')
   process.env.HAWKVIEW_IDENTITY_RISK_MODE='off'

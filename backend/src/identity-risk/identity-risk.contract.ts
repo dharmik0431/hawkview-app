@@ -278,6 +278,8 @@ export type IdentityRiskEvaluationRequest = Readonly<{
   loadSources: () => Promise<IdentityRiskSourceBatch>
   /** Internal scheduler wall-clock budget; not customer-controllable. */
   executionDeadlineAt?: number
+  /** Internal durable scheduler attempt; never supplied by a customer route. */
+  globalAttemptId?: string
   detectors: readonly IdentitySignalDetector[]
 }>
 

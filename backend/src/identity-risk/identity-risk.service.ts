@@ -2,7 +2,6 @@ import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
 import { riskRuntimeConfig, riskScopeAllowed } from './risk-runtime-config.js'
 import { isGlobalRiskConfig } from './risk-runtime-config.js'
-import { riskTenantScopeOpaqueId } from './risk-global-work-store.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
@@ -360,8 +359,18 @@ export class IdentityRiskService {
 
   private async latestRun(tenant: ScopedTenant, now: Date) {
     return this.utcRead(async (transaction) => {
+    const config = riskRuntimeConfig()
+    let head: { completedRunId: string | null } | undefined
+    if (isGlobalRiskConfig(config)) {
+      const heads = await transaction.$queryRawUnsafe<Array<{ completedRunId: string | null }>>(`SELECT completed_run_id AS "completedRunId"
+        FROM identity_risk_attempt_heads WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid
+        AND environment=$3 FOR SHARE`, tenant.organizationId, tenant.id, config.environment)
+      if (heads.length !== 1) return null
+      head = heads[0]
+    }
     const run = await transaction.identityRiskEvaluationRun.findFirst({
       where: {
+        ...(head?.completedRunId ? { id: head.completedRunId } : {}),
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         status: 'COMPLETED',
@@ -378,14 +387,11 @@ export class IdentityRiskService {
         pseudonymKeyVersionId: true,
       },
     })
-    const config = riskRuntimeConfig()
     if (run && isGlobalRiskConfig(config)) {
-      const attempt = await transaction.identityRiskOperationalEvent.findFirst({
-        where: { scopeType: 'TENANT', scopeOpaqueId: riskTenantScopeOpaqueId({ organizationId: tenant.organizationId, customerTenantId: tenant.id }),
-          eventType: 'GLOBAL_RISK_ATTEMPT', expiresAt: { gt: now } },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], select: { createdAt: true },
-      })
-      if (attempt && (!run.completedAt || attempt.createdAt > run.completedAt)) return { ...run, completedAt: null }
+      // Pending/failed attempt: prior metadata may explain ERROR, but it cannot
+      // supply current clean counts. Successful attempts select their linked
+      // run by ID, never by app/DB timestamp comparison or completion order.
+      if (!head?.completedRunId) return { ...run, completedAt: null }
       if (run.pseudonymKeyVersionId) {
         const key = await transaction.identityRiskPseudonymKeyVersion.findFirst({ where: {
           id: run.pseudonymKeyVersionId, organizationId: tenant.organizationId, customerTenantId: tenant.id,

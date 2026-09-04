@@ -212,7 +212,12 @@ test('global projector/commit preserves actual source evidence; changed or stale
   const batch = await projector.load(sourceScope, now)
   assert.equal(batch.capability, 'FULL'); assert.equal(batch.pseudonymKeyVersionId, key.id)
   const evaluator = new IdentityRiskEvaluatorService(prisma, new IdentityRiskSafetyService(prisma), { now: () => new Date() })
+  const attemptStore = new RiskGlobalWorkStore()
+  const attemptLease = await attemptStore.claimCycle(deadline()); assert.ok(attemptLease)
+  const globalAttemptId = await attemptStore.recordAttempt(scope, attemptLease, deadline())
+  await attemptStore.releaseCycle(attemptLease, deadline())
   const request = { ...scope, evaluationAt: now, windowStart: new Date(now.getTime()-86_400_000), windowEnd: now,
+    globalAttemptId,
     engineVersion: IDENTITY_RISK_ENGINE_VERSION, catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
     loadSources: async () => batch, detectors: approvedIdentitySignalDetectors({ readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS }) }
   await prisma.tenantCollectionFieldState.updateMany({ where: { customerTenantId: scope.customerTenantId, fieldKey: sourceAttestationKey('EXCHANGE_MAILBOX_RULES') }, data: { state: 'UNAVAILABLE' } })

@@ -58,6 +58,31 @@ prevents that work. A newer pending/failed attempt prevents a prior completed
 zero-match run from looking like the latest successful check. No tokens, email
 content, source payloads, raw error messages or user identifiers enter this event.
 
+### Causal attempt/run binding (not wall-clock ordering)
+
+The additive `identity_risk_attempt_heads` table stores one current attempt UUID
+and optional completed-run UUID per organization/tenant/environment. Publication
+of the event and replacement of this head is one transaction under the current
+cycle lease lock. A retry of the same event preserves its successful binding.
+There is no chronological comparison between event `createdAt` (DB clock) and
+run `completedAt` (application clock), no grace window, and no timestamp tie-break.
+
+Claim and final persistence lock the exact scoped head and require the request's
+internal `globalAttemptId`. Completion links a scoped COMPLETED run in that same
+transaction; authoritative replay may also link its already-completed run. An
+older attempt cannot complete against a newer head. If completion wins the lock
+first, a later attempt replaces the head and clears success; if the new attempt
+wins first, old completion fails closed. Reads share-lock the head and select its
+linked run by ID, irrespective of completion timestamp order. Pending/failed heads
+cannot expose a prior clean verdict. Source freshness/expiry still use timestamps.
+
+Migration has no success backfill: pre-existing unlinked runs require a fresh
+attempt. It adds no existing-row deletion, root/key change, or public DTO field.
+The tenant ownership FK protects scope and removes only this new current-state
+row on tenant deletion. Run/event IDs intentionally have no retention-blocking
+FK; a missing or expired linked run is unavailable. This does not implement or
+authorize the held global retention sweep.
+
 Automatic ensure acquires the evaluator's sorted control-lock namespace, then
 rechecks global/tenant hard stop and locks ACTIVE organization/tenant plus
 CONNECTED ownership rows inside the transaction. The key-scope lock serializes
