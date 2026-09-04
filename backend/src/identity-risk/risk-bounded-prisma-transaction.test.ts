@@ -60,8 +60,7 @@ test('risk-owned Prisma transport drains startup, BEGIN, query and rollback stal
         assert.ok(Date.now() - start < 2_000, `Unbounded ${stall}`)
         assert.equal(callbacks, ['SELECT', 'ROLLBACK'].includes(stall) ? 1 : 0)
         if (callbacks) assert.equal(callbackSettled, true, 'callback must settle before boundary returns')
-        for (let i = 0; i < 100 && sockets.size; i++) await new Promise(resolve => setTimeout(resolve, 5))
-        assert.equal(sockets.size, 0, `Actual socket still open after ${stall}`)
+        assert.equal(sockets.size, 0, `Actual socket still open when ${stall} boundary returns`)
         const count = queries.length
         await new Promise(resolve => setTimeout(resolve, 50))
         assert.equal(queries.length, count, 'No late query/write after return')

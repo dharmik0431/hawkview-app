@@ -36,13 +36,14 @@ export async function runRiskTransaction<T>(shared: PrismaService,
   // unhandled when transport destruction races release. Never log payloads.
   pool.on('error', () => undefined)
   const client = new PrismaClient({ adapter: new PrismaPg(pool) })
-  let ending: Promise<void> | undefined
-  const stop = () => {
+  const destroySockets = () => {
     for (const socket of sockets) socket.destroy()
-    ending ??= pool.end()
-    return ending
   }
-  const timer = setTimeout(() => { expired = true; void stop() }, Math.max(1, deadlineAt - Date.now()))
+  // Expiry must interrupt the blocked statement immediately, but ending the
+  // pool here races Prisma's transaction cleanup: a queued rollback may acquire
+  // a replacement connection after pool.end() has begun. Keep the pool alive
+  // until the transaction settles, then disconnect Prisma before ending it.
+  const timer = setTimeout(() => { expired = true; destroySockets() }, Math.max(1, deadlineAt - Date.now()))
   try {
     const result = await client.$transaction(async tx => {
       if (Date.now() >= deadlineAt) throw new Error('IDENTITY_RISK_CYCLE_DEFERRED')
@@ -57,8 +58,9 @@ export async function runRiskTransaction<T>(shared: PrismaService,
     throw error
   } finally {
     clearTimeout(timer)
-    await stop()
+    destroySockets()
     await client.$disconnect()
+    await pool.end()
     await Promise.all(closed)
   }
 }
