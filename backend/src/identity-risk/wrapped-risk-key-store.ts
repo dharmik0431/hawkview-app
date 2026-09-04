@@ -29,10 +29,13 @@ export class WrappedRiskKeyStore {
   private async lockKey(client: pg.Client, key: PseudonymKeyVersion, active = true) {
     this.allowed(key)
     if (key.immutableKeyId !== wrappedRiskName(key)) throw keyUnavailable()
+    // A waiting transaction can begin before the committed winner it later
+    // reads. Validate not-before at this statement, after the scope-lock wait,
+    // rather than at the older transaction-start CURRENT_TIMESTAMP.
     const rows = await client.query(`SELECT id FROM identity_risk_pseudonym_key_versions
       WHERE id=$1::uuid AND organization_id=$2::uuid AND customer_tenant_id=$3::uuid AND environment=$4
       AND provider=$5 AND immutable_key_id=$6 AND destroyed_at IS NULL
-      AND (${active ? "status='ACTIVE' AND retired_at IS NULL AND activated_at<=CURRENT_TIMESTAMP" : "status IN ('ACTIVE','RETIRED','DISABLED')"}) FOR SHARE`,
+      AND (${active ? "status='ACTIVE' AND retired_at IS NULL AND activated_at<=statement_timestamp()" : "status IN ('ACTIVE','RETIRED','DISABLED')"}) FOR SHARE`,
     [key.id, key.organizationId, key.customerTenantId, key.environment, key.provider, key.immutableKeyId])
     if (rows.rowCount !== 1) throw keyUnavailable()
   }
