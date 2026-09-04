@@ -12,7 +12,8 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import { useIdentityRiskChannels } from '@/lib/api/identity-risk-hooks'
+import { useIdentityRiskChannels, useIdentityRiskInvestigationAccess } from '@/lib/api/identity-risk-hooks'
+import { MailboxInvestigation } from './mailbox-investigation'
 import type {
   HawkViewIdentityFinding,
   HawkViewIdentityRiskCounts,
@@ -233,7 +234,7 @@ function severityClass(severity: HawkViewIdentityFinding['severity']) {
   return 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300'
 }
 
-function FindingRow({ finding }: { finding: HawkViewIdentityFinding }) {
+function FindingRow({ finding, tenantId, investigationAllowed }: { finding: HawkViewIdentityFinding; tenantId: string; investigationAllowed: boolean }) {
   return (
     <article className="rounded-lg border border-slate-200 p-3.5 dark:border-slate-800">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -322,6 +323,11 @@ function FindingRow({ finding }: { finding: HawkViewIdentityFinding }) {
           <span className="font-mono">{finding.benignAlternativeCodes.join(' · ')}</span>
         </div>
       )}
+      {investigationAllowed && finding.affectedIdentity.type === 'MAILBOX' &&
+        finding.ruleIds.includes('HV-ID-MBX-001.v1') &&
+        (finding.state === 'OPEN' || finding.state === 'UPDATED') && finding.coverage === 'FULL' && (
+          <MailboxInvestigation tenantId={tenantId} findingId={finding.id} />
+        )}
     </article>
   )
 }
@@ -329,9 +335,13 @@ function FindingRow({ finding }: { finding: HawkViewIdentityFinding }) {
 function HawkViewCard({
   view,
   onRetry,
+  tenantId,
+  investigationAllowed,
 }: {
   view: HawkViewIdentitySignalsView
   onRetry: () => void
+  tenantId: string
+  investigationAllowed: boolean
 }) {
   const confirmedEmpty =
     view.meta.status === 'AVAILABLE' &&
@@ -383,7 +393,7 @@ function HawkViewCard({
         {view.findings && view.findings.length > 0 && (
           <div className="space-y-2.5" aria-label="HawkView findings">
             {view.findings.map((finding) => (
-              <FindingRow key={finding.id} finding={finding} />
+              <FindingRow key={`${finding.id}:${finding.observedAt}`} finding={finding} tenantId={tenantId} investigationAllowed={investigationAllowed && view.meta.status === 'AVAILABLE' && view.meta.freshness === 'CURRENT'} />
             ))}
           </div>
         )}
@@ -575,6 +585,7 @@ function MicrosoftCard({
 }
 
 export default function IdentityRiskSection({ tenantId }: { tenantId: string }) {
+  const investigation = useIdentityRiskInvestigationAccess(tenantId)
   const {
     viewModel,
     hawkViewLoading,
@@ -604,8 +615,11 @@ export default function IdentityRiskSection({ tenantId }: { tenantId: string }) 
           <LoadingChannel label="HawkView Identity Signals" />
         ) : (
           <HawkViewCard
+            key={`${investigation.cacheScope}:${tenantId}`}
             view={viewModel.hawkView}
             onRetry={() => void retryHawkView()}
+            tenantId={tenantId}
+            investigationAllowed={investigation.allowed}
           />
         )}
         {microsoftLoading ? (

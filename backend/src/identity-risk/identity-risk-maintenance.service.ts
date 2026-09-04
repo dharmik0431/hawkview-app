@@ -5,6 +5,8 @@ import {
   IDENTITY_RISK_OPERATIONAL_EVENT_RETENTION_MS,
 } from './identity-risk-safety.service.js'
 import { IdentityRiskPlatformClock } from './identity-risk-evaluator.service.js'
+import { pilotRiskConfig } from './pilot-risk-config.js'
+import { WrappedRiskKeyStore } from './wrapped-risk-key-store.js'
 
 export const IDENTITY_RISK_OPERATIONAL_EVENT_PRUNE_BATCH_SIZE = 500
 const MAINTENANCE_BUCKET_MS = 5 * 60 * 1_000
@@ -43,6 +45,10 @@ export class IdentityRiskMaintenanceService {
   async runAuthorizedScheduledMaintenance() {
     if (!identityRiskMaintenanceEnabled()) {
       return { status: 'SKIPPED_OFF' as const, deletedCount: 0, hasMore: false }
+    }
+    const pilot = pilotRiskConfig()
+    if (pilot?.provider === 'wrapped-pilot-v1') {
+      await new WrappedRiskKeyStore().pruneExpired(pilot, Date.now() + 6000)
     }
     const now = new Date(this.clock.now().getTime())
     if (!Number.isFinite(now.getTime())) {

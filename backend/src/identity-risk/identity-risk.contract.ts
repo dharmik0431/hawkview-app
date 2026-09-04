@@ -200,6 +200,13 @@ export type IdentityRiskFindingDto = Readonly<{
   ruleIds: readonly string[]
 }>
 
+/** Separate explicit privileged response; never embedded in finding lists. */
+export type MailboxInvestigationDto = Readonly<{
+  version: 1
+  status: 'AVAILABLE' | 'UNAVAILABLE'
+  mailbox: Readonly<{ id: string; label: string; observedAt: string; inventoryPath: string }> | null
+}>
+
 export type MicrosoftRiskLevel =
   | 'none'
   | 'low'

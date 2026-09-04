@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import test from 'node:test'
+import test, { beforeEach, afterEach } from 'node:test'
 import { ForbiddenException } from '@nestjs/common'
 import type { PrismaService } from '../prisma/prisma.service.js'
 import { IdentityRiskService } from './identity-risk.service.js'
@@ -10,12 +10,27 @@ const organizationId = '11111111-1111-4111-8111-111111111111'
 const tenantId = '22222222-2222-4222-8222-222222222222'
 const runId = '33333333-3333-4333-8333-333333333333'
 
+const pilotKeys = ['HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER', 'HAWKVIEW_IDENTITY_RISK_ENVIRONMENT', 'HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE'] as const
+let previousPilot: Array<string | undefined> = []
+beforeEach(() => {
+  previousPilot = pilotKeys.map((key) => process.env[key])
+  process.env.HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER = 'wrapped-pilot-v1'
+  process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT = 'test'
+  process.env.HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE = JSON.stringify({ organizationId, customerTenantId: tenantId, expiresAt: new Date(Date.now() + 86400000).toISOString() })
+})
+afterEach(() => pilotKeys.forEach((key, index) => {
+  if (previousPilot[index] === undefined) delete process.env[key]
+  else process.env[key] = previousPilot[index]
+}))
+
 function opaqueSubject(label: string) {
   return `hvr1_subject_${createHash('sha256').update(label).digest('hex')}`
 }
 
 function scoped(overrides: Record<string, unknown> = {}) {
-  return {
+  const models = {
+    $executeRawUnsafe: async () => 0,
+    $queryRawUnsafe: async () => [{ timezone: 'UTC' }],
     user: {
       findUnique: async () => ({
         disabledAt: null,
@@ -32,7 +47,8 @@ function scoped(overrides: Record<string, unknown> = {}) {
       findMany: async () => [],
     },
     ...overrides,
-  } as unknown as PrismaService
+  }
+  return { ...models, $transaction: overrides.$transaction ?? (async (callback: (transaction: typeof models) => unknown) => callback(models)) } as unknown as PrismaService
 }
 
 function currentRun(now: Date) {

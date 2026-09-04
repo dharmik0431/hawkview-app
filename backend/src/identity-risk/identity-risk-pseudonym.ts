@@ -3,18 +3,20 @@ import { isIdentityRiskOpaqueReferenceKind } from './identity-risk.validation.js
 
 export type PseudonymScope = Readonly<{ organizationId: string; customerTenantId: string; environment: string }>
 export type PseudonymKeyVersion = PseudonymScope & Readonly<{
-  id: string; provider: 'AWS_KMS_HMAC_256'; immutableKeyId: string
+  id: string; provider: 'AWS_KMS_HMAC_256' | 'WRAPPED_AES_GCM_V1'; immutableKeyId: string
 }>
 export type PseudonymPurpose = 'mailbox' | 'evidence' | 'observation'
 export interface PinnedPseudonymSession {
   readonly keyVersion: PseudonymKeyVersion
   reference(purpose: PseudonymPurpose, identifiers: readonly string[]): Promise<string>
+  close?(): void
 }
 
 /** No runtime fake, app-secret fallback, or implicit provisioning. */
 @Injectable()
 export class IdentityRiskPseudonymProvider {
   readonly configured: boolean = false
+  allowsScope(_scope: PseudonymScope): boolean { return this.configured }
   async pin(_key: PseudonymKeyVersion, _deadlineAt: number): Promise<PinnedPseudonymSession> {
     throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
   }

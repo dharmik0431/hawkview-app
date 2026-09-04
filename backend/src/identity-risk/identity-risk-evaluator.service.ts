@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { Inject, Injectable } from '@nestjs/common'
 import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
   IDENTITY_RISK_APPROVED_SOURCE_TYPES,
@@ -1100,6 +1101,7 @@ export class IdentityRiskEvaluatorService {
   > {
     const now = input.platformNow
     return this.prisma.$transaction(async (transaction) => {
+      await enforceRiskUtcTransaction(transaction)
       const safety = await this.lockedSafetyState(
         transaction,
         input.request.organizationId,
@@ -1371,6 +1373,7 @@ export class IdentityRiskEvaluatorService {
     platformNow: Date
   }) {
     return this.prisma.$transaction(async (transaction) => {
+      await enforceRiskUtcTransaction(transaction)
       const safety = await this.lockedSafetyState(
         transaction,
         input.request.organizationId,

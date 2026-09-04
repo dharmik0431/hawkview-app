@@ -1,5 +1,10 @@
 # First mailbox investigation slice — local implementation, not live activation
 
+This records the PR #222 slice and its managed-MAC baseline. The subsequent,
+separate code-only [wrapped-key pilot candidate](identity-risk-wrapped-pilot.md)
+adds optional runtime wiring, scoped UTC enforcement and privileged mailbox
+investigation. Its weaker key-custody boundary is not approved for live activation.
+
 This slice connects the existing version-1 identity-risk evaluator, durable platform,
 API and UI. Only `HV-ID-MBX-001.v1` is selected. No new Microsoft requests,
 permissions, collection schedules, other detectors, probabilities, or automated

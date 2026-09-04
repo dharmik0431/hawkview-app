@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query, Req } from '@nestjs/common'
+import { Controller, Get, Header, Param, Query, Req } from '@nestjs/common'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { IdentityRiskService } from './identity-risk.service.js'
 
@@ -31,5 +31,15 @@ export class IdentityRiskController {
     @Query('cursor') cursor: string | undefined,
   ) {
     return this.service.microsoftRiskyUsers(req.auth, id, { limit, cursor })
+  }
+  @Get('identity-signals/investigation-access')
+  @Header('Cache-Control', 'no-store')
+  investigationAccess(@Req() req: AuthenticatedRequest, @Param('tenantId') id: string) {
+    return this.service.investigationAccess(req.auth, id)
+  }
+  @Get('identity-signals/findings/:findingId/mailbox-investigation')
+  @Header('Cache-Control', 'no-store')
+  mailboxInvestigation(@Req() req: AuthenticatedRequest, @Param('tenantId') id: string, @Param('findingId') findingId: string) {
+    return this.service.mailboxInvestigation(req.auth, id, findingId)
   }
 }
