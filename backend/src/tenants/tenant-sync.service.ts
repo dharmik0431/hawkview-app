@@ -11,6 +11,10 @@ import {
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { isIP } from 'node:net'
 import { MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS } from '../identity-risk/mailbox-risk-projector.service.js'
+import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-runtime-config.js'
+import { RiskGlobalWorkStore } from '../identity-risk/risk-global-work-store.js'
+import { WrappedRiskKeyStore } from '../identity-risk/wrapped-risk-key-store.js'
+import { runGlobalRiskCycle } from '../identity-risk/risk-global-cycle.js'
 import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION, verifiedOrganizationDomains } from '../identity-risk/mailbox-source-attestation.js'
 import { enforceRiskUtcTransaction, requiresRiskUtcSnapshot } from '../identity-risk/risk-utc-session.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
@@ -1608,7 +1612,7 @@ export class TenantSyncService {
   private async runPostSyncIdentityRiskEvaluation(tenant: {
     id: string
     organizationId: string
-  }) {
+  }, executionDeadlineAt?: number) {
     if (!this.identityRiskEvaluationScheduler || !this.mailboxRiskProjector) return
     const evaluationAt = new Date()
     const windowStart = new Date(evaluationAt.getTime() - 24 * 60 * 60 * 1_000)
@@ -1621,13 +1625,33 @@ export class TenantSyncService {
         windowStart,
         windowEnd: evaluationAt,
         evaluationAt,
-        loadSources: () => this.mailboxRiskProjector!.load({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, evaluationAt),
+        executionDeadlineAt,
+        loadSources: () => this.mailboxRiskProjector!.load({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, evaluationAt,
+          executionDeadlineAt === undefined ? undefined : executionDeadlineAt - 12_000),
         approvedEvaluator: { readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS },
       }))
     } catch {
       // Identity-risk shadow evaluation is isolated from tenant collection.
       this.logger.warn('Post-sync identity-risk evaluation failed.')
+      if (executionDeadlineAt !== undefined) throw new Error('IDENTITY_RISK_CYCLE_UNAVAILABLE')
     }
+  }
+
+  /** Exactly one global risk path, independent of collector selection. No
+   * enqueue behind interactive work: busy lane defers with cursor unchanged. */
+  async runScheduledGlobalRiskCycle(requestDeadlineAt: number) {
+    if (!this.identityRiskEvaluationScheduler || !this.mailboxRiskProjector ||
+      !isGlobalRiskConfig(riskRuntimeConfig())) return
+    const store = new RiskGlobalWorkStore()
+    const keys = new WrappedRiskKeyStore()
+    return tryInSyncMemoryLane(() => runGlobalRiskCycle({
+      claimCycle: deadline => store.claimCycle(deadline),
+      nextScope: (lease, deadline) => store.nextScope(lease, deadline),
+      releaseCycle: (lease, deadline) => store.releaseCycle(lease, deadline),
+      recordAttempt: (scope, lease, deadline) => store.recordAttempt(scope, lease, deadline),
+      ensure: (scope, deadline) => keys.ensureVersion(scope, deadline),
+      evaluate: (scope, deadline) => this.runPostSyncIdentityRiskEvaluation({ id: scope.customerTenantId, organizationId: scope.organizationId }, deadline),
+    }, requestDeadlineAt))
   }
 
   private async getReadableTenant(
@@ -1798,7 +1822,13 @@ export class TenantSyncService {
     }
   }
 
-  async syncDueTenants() {
+  async syncDueTenants(admissionDeadlineAt?: number) {
+    const canAdmit = () => admissionDeadlineAt === undefined ||
+      (Number.isSafeInteger(admissionDeadlineAt) && Date.now() < admissionDeadlineAt)
+    if (!canAdmit()) return {
+      checkedAt: new Date().toISOString(), due: 0, succeeded: 0, partial: 0,
+      failed: 0, skipped: 0, admissionDeferred: true,
+    }
     const now = new Date()
     const limit = Math.max(
       1,
@@ -1868,6 +1898,9 @@ export class TenantSyncService {
     // A lock loser is not useful work. Continue through the fair candidate
     // window so another due tenant can use this run's bounded capacity.
     for (const tenant of tenants) {
+      // Do not admit another tenant after budget expiry. Never abandon/cancel
+      // the preceding collector, whose own inherited timeout can exceed this.
+      if (!canAdmit()) break
       if (results.filter((result) => result.status !== 'SKIPPED').length >= limit) break
       try {
         // Keep the five-minute run lightweight, but run a full inventory once
@@ -1879,7 +1912,7 @@ export class TenantSyncService {
           incrementalOnly: !fullInventoryDue,
           includeBundle: false,
         })
-        if (result.status !== 'SKIPPED') {
+        if (result.status !== 'SKIPPED' && process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT === undefined) {
           await this.runPostSyncIdentityRiskEvaluation(tenant)
         }
         results.push({

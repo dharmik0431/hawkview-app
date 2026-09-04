@@ -1,6 +1,8 @@
 import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common'
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
-import { pilotRiskConfig, pilotScopeAllowed } from './pilot-risk-config.js'
+import { riskRuntimeConfig, riskScopeAllowed } from './risk-runtime-config.js'
+import { isGlobalRiskConfig } from './risk-runtime-config.js'
+import { riskTenantScopeOpaqueId } from './risk-global-work-store.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
@@ -104,8 +106,8 @@ type HawkViewControlState = Readonly<{
 }>
 
 function pilotReadAllowed(tenant: ScopedTenant) {
-  const config = pilotRiskConfig()
-  return Boolean(config && pilotScopeAllowed({
+  const config = riskRuntimeConfig()
+  return Boolean(config && riskScopeAllowed({
     organizationId: tenant.organizationId,
     customerTenantId: tenant.id,
     environment: config.environment,
@@ -357,7 +359,8 @@ export class IdentityRiskService {
   }
 
   private async latestRun(tenant: ScopedTenant, now: Date) {
-    return this.utcRead((transaction) => transaction.identityRiskEvaluationRun.findFirst({
+    return this.utcRead(async (transaction) => {
+    const run = await transaction.identityRiskEvaluationRun.findFirst({
       where: {
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
@@ -374,7 +377,26 @@ export class IdentityRiskService {
         sourceObservedAt: true,
         pseudonymKeyVersionId: true,
       },
-    }))
+    })
+    const config = riskRuntimeConfig()
+    if (run && isGlobalRiskConfig(config)) {
+      const attempt = await transaction.identityRiskOperationalEvent.findFirst({
+        where: { scopeType: 'TENANT', scopeOpaqueId: riskTenantScopeOpaqueId({ organizationId: tenant.organizationId, customerTenantId: tenant.id }),
+          eventType: 'GLOBAL_RISK_ATTEMPT', expiresAt: { gt: now } },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], select: { createdAt: true },
+      })
+      if (attempt && (!run.completedAt || attempt.createdAt > run.completedAt)) return { ...run, completedAt: null }
+      if (run.pseudonymKeyVersionId) {
+        const key = await transaction.identityRiskPseudonymKeyVersion.findFirst({ where: {
+          id: run.pseudonymKeyVersionId, organizationId: tenant.organizationId, customerTenantId: tenant.id,
+          environment: config.environment, status: 'ACTIVE', retiredAt: null, destroyedAt: null,
+          provider: 'WRAPPED_AES_GCM_V1', wrappedKey: { isNot: null },
+        }, select: { id: true } })
+        if (!key) return { ...run, completedAt: null }
+      }
+    }
+    return run
+    })
   }
 
   async summary(identity: AuthenticatedIdentity, tenantId: string) {

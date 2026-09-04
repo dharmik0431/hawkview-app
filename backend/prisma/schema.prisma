@@ -740,6 +740,15 @@ model ChangeEvidenceEvent {
 
 // The identity-risk platform stores only matched evidence and bounded run
 // aggregates. It deliberately does not retain a row per user/rule abstention.
+model IdentityRiskSchedulerCursor {
+  environment String @id @db.VarChar(40)
+  afterTenantId String? @map("after_tenant_id") @db.Uuid
+  leaseId String? @map("lease_id") @db.Uuid
+  leaseExpiresAt DateTime? @map("lease_expires_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  @@map("identity_risk_scheduler_cursors")
+}
+
 model IdentityRiskPseudonymKeyVersion {
   id               String @id @default(uuid()) @db.Uuid
   organizationId   String @map("organization_id") @db.Uuid

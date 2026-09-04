@@ -1,5 +1,11 @@
 # Optional wrapped-key mailbox pilot (code candidate, not activated)
 
+Historical pilot design. The global product policy and current release gates are
+in [Global mailbox-risk availability](identity-risk-global-availability.md).
+Its global path supersedes per-tenant/seven-day product restrictions; the legacy
+parser below remains only for compatibility. This historical release status is
+not evidence of the current deployed revision or configuration.
+
 This change is separate from PR #222 / reviewed `00912323`. #222 remains open
 because its production-triggering merge requires direct owner confirmation.
 This document is not authorization to merge, deploy, provision, or enable anything.

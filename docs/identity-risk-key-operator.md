@@ -86,3 +86,11 @@ actual final-image execution and Node22/PostgreSQL16 CI are **not yet proven** f
 this candidate. No timeout, test, safety lock or default startup was weakened.
 The independent reviewer must retain this validation limitation; the earlier
 merged image's success is not evidence for this new operator bundle.
+# Global lifecycle note
+
+Global automatic enrollment is specified in
+[Global mailbox-risk availability](identity-risk-global-availability.md).
+Routine tenant setup must not require this manual operator. Explicit operator
+reconciliation/rotation remains a controlled action; automatic ensure never
+recreates revoked, destroyed, or damaged keys. Keep restore reconciliation and
+the global retention release HOLD separate from an operator preflight result.

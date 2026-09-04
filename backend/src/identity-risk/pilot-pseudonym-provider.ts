@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto'
 import { IdentityRiskPseudonymProvider, ManagedHmacPseudonymProvider, type ManagedMacTransport, type PseudonymKeyVersion, type PseudonymPurpose, type PseudonymScope, type PinnedPseudonymSession } from './identity-risk-pseudonym.js'
-import { pilotRiskConfig, pilotScopeAllowed } from './pilot-risk-config.js'
+import { riskRuntimeConfig, riskScopeAllowed, isWrappedRiskConfig } from './risk-runtime-config.js'
 import { keyUnavailable, readRiskWrappingRoot, unwrapRiskKey, wrappedRiskName, WRAPPED_RISK_PROVIDER } from './wrapped-risk-crypto.js'
 import { WrappedRiskKeyStore } from './wrapped-risk-key-store.js'
 
@@ -10,7 +10,7 @@ export class WrappedRiskPseudonymProvider extends IdentityRiskPseudonymProvider 
   override readonly configured = true
   constructor(private readonly store: Pick<WrappedRiskKeyStore, 'ciphertext' | 'recordFailure'> = new WrappedRiskKeyStore()) { super() }
   override allowsScope(scope: PseudonymScope) {
-    return pilotRiskConfig()?.provider === 'wrapped-pilot-v1' && pilotScopeAllowed(scope)
+    return isWrappedRiskConfig(riskRuntimeConfig()) && riskScopeAllowed(scope)
   }
   override async pin(key: PseudonymKeyVersion, requestedDeadline: number): Promise<PinnedPseudonymSession> {
     if (wrappedRiskName(key) !== key.immutableKeyId) throw keyUnavailable()
@@ -53,9 +53,9 @@ export class WrappedRiskPseudonymProvider extends IdentityRiskPseudonymProvider 
  * Managed transport stays available through explicit DI, not an implicit SDK credential chain.
  */
 export function createPilotPseudonymProvider(transport: ManagedMacTransport | null = null): IdentityRiskPseudonymProvider {
-  const config = pilotRiskConfig()
+  const config = riskRuntimeConfig()
   let delegate: IdentityRiskPseudonymProvider | undefined
-  if (config?.provider === 'wrapped-pilot-v1') {
+  if (isWrappedRiskConfig(config)) {
     try { const root = readRiskWrappingRoot(); root.fill(0); delegate = new WrappedRiskPseudonymProvider() } catch { /* Fail closed. */ }
   } else if (config?.provider === 'managed-kms' && transport) delegate = new ManagedHmacPseudonymProvider(transport)
   if (!delegate || !config) return new IdentityRiskPseudonymProvider()
@@ -63,8 +63,8 @@ export function createPilotPseudonymProvider(transport: ManagedMacTransport | nu
   return new class extends IdentityRiskPseudonymProvider {
     override readonly configured = true
     override allowsScope(scope: PseudonymScope) {
-      const current = pilotRiskConfig()
-      return current?.provider === config.provider && pilotScopeAllowed(scope, current)
+      const current = riskRuntimeConfig()
+      return current?.provider === config.provider && riskScopeAllowed(scope, current)
     }
     override pin(key: PseudonymKeyVersion, deadline: number) {
       if (!this.allowsScope(key)) return Promise.reject(keyUnavailable())

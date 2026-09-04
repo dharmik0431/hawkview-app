@@ -107,19 +107,20 @@ export async function projectMailboxEvidence(scope: MailboxSourceScope, evaluati
   const sourceObservedAt = new Date(Math.min(rules.observedAt.getTime(), domains.observedAt.getTime()))
   return { context, sourceEnvelopes, orderedSourceWatermarks: [observation],
     earliestSourceExpiry: new Date(sourceObservedAt.getTime() + MAILBOX_SOURCE_MAX_AGE_MS), capability: 'FULL',
-    pseudonymKeyVersionId: session.keyVersion.id, sourceObservedAt }
+    pseudonymKeyVersionId: session.keyVersion.id, sourceObservedAt,
+    mailboxAttestations: snapshots.map(row => ({ resourceType: row.resourceType, observedAt: row.observedAt, digest: row.digest! })) }
 }
 
 @Injectable()
 export class MailboxRiskProjector {
   constructor(@Inject(IdentityRiskPseudonymProvider) private readonly provider: IdentityRiskPseudonymProvider) {}
 
-  async load(scope: MailboxSourceScope, evaluationAt: Date): Promise<IdentityRiskSourceBatch> {
+  async load(scope: MailboxSourceScope, evaluationAt: Date, executionDeadlineAt = Date.now() + 30_000): Promise<IdentityRiskSourceBatch> {
     // No tenant source reads, registry lookups, or evaluation writes when unconfigured.
     const environment = process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT
     if (!this.provider.configured || !environment || !/^[a-z][a-z0-9-]{0,39}$/.test(environment) ||
       !this.provider.allowsScope({ ...scope, environment })) throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
-    const deadlineAt = Date.now() + 30000
+    const deadlineAt = Math.min(Date.now() + 30000, executionDeadlineAt)
     const keys = await readActiveMailboxKeys(scope, environment, evaluationAt, deadlineAt)
     const key = keys[0]
     if (keys.length !== 1 || !key || key.organizationId !== scope.organizationId || key.customerTenantId !== scope.customerTenantId ||

@@ -7,6 +7,7 @@ import {
 import { IdentityRiskPlatformClock } from './identity-risk-evaluator.service.js'
 import { pilotRiskConfig } from './pilot-risk-config.js'
 import { WrappedRiskKeyStore } from './wrapped-risk-key-store.js'
+import { runRiskTransaction } from './risk-bounded-prisma-transaction.js'
 
 export const IDENTITY_RISK_OPERATIONAL_EVENT_PRUNE_BATCH_SIZE = 500
 const MAINTENANCE_BUCKET_MS = 5 * 60 * 1_000
@@ -42,20 +43,22 @@ export class IdentityRiskMaintenanceService {
     private readonly clock: IdentityRiskPlatformClock,
   ) {}
 
-  async runAuthorizedScheduledMaintenance() {
+  async runAuthorizedScheduledMaintenance(executionDeadlineAt?: number) {
     if (!identityRiskMaintenanceEnabled()) {
       return { status: 'SKIPPED_OFF' as const, deletedCount: 0, hasMore: false }
     }
     const pilot = pilotRiskConfig()
     if (pilot?.provider === 'wrapped-pilot-v1') {
-      await new WrappedRiskKeyStore().pruneExpired(pilot, Date.now() + 6000)
+      await new WrappedRiskKeyStore().pruneExpired(pilot, Math.min(executionDeadlineAt ?? Infinity, Date.now() + 6000))
     }
     const now = new Date(this.clock.now().getTime())
     if (!Number.isFinite(now.getTime())) {
       throw new Error('Identity risk maintenance clock is invalid.')
     }
 
-    return this.prisma.$transaction(async (transaction) => {
+    // Existing operational-event retention scope/batch only, not global risk
+    // evidence pruning. The scheduler supplies a physical transport deadline.
+    return runRiskTransaction(this.prisma, { executionDeadlineAt }, async (transaction) => {
       const candidates = await transaction.identityRiskOperationalEvent.findMany({
         where: { expiresAt: { lte: now } },
         orderBy: [{ expiresAt: 'asc' }, { id: 'asc' }],
