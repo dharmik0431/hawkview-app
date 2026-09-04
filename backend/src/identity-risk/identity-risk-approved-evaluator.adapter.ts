@@ -272,7 +272,7 @@ function subjectType(
   return 'UNKNOWN'
 }
 
-function projectApprovedContext(
+export function projectApprovedContext(
   context: IdentitySignalEvaluationContext,
   configuration: IdentityRiskApprovedEvaluatorConfiguration,
 ): ApprovedIdentitySignalContext {

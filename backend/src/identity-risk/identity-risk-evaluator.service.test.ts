@@ -21,7 +21,7 @@ import {
 import type { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
 import { IdentityRiskService } from './identity-risk.service.js'
 import { projectMailboxEvidence, MAILBOX_FIRST_SLICE_FLAGS } from './mailbox-risk-projector.service.js'
-import { mailboxScope, mailboxKey, mailboxNow, syntheticManagedProvider, mailboxRule, mailboxSnapshots } from './mailbox-risk.test-fixtures.js'
+import { mailboxScope, mailboxKey, mailboxNow, syntheticManagedProvider, mailboxRule, mailboxSnapshots, boundedMailboxSnapshots } from './mailbox-risk.test-fixtures.js'
 
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const tenantId = '22222222-2222-4222-8222-222222222222'
@@ -213,16 +213,22 @@ test('attested mailbox projection flows through actual evaluator, durable record
       [mailboxSnapshots([mailboxRule(), mailboxRule(undefined, { id: 'rule-2' })]), 2, 'FULL'],
       [mailboxSnapshots([]), 0, 'FULL'],
       [[], 0, 'UNAVAILABLE'],
+      [boundedMailboxSnapshots(1, 257), 0, 'UNAVAILABLE'],
+      [boundedMailboxSnapshots(1001, 1), 0, 'UNAVAILABLE'],
+      [boundedMailboxSnapshots(200, 256), 0, 'UNAVAILABLE'],
+      [mailboxSnapshots([mailboxRule(`${'a'.repeat(300)}@bücher.invalid`)]), 0, 'UNAVAILABLE'],
     ] as const) {
       const store = persistence()
       const batch = await projectMailboxEvidence(mailboxScope, mailboxNow, rows,
         await syntheticManagedProvider().pin(mailboxKey, Date.now() + 30000))
-      const scheduler = new IdentityRiskEvaluationScheduler(new IdentityRiskEvaluatorService(store.prisma, safety().service,
+      const observedSafety = safety()
+      const scheduler = new IdentityRiskEvaluationScheduler(new IdentityRiskEvaluatorService(store.prisma, observedSafety.service,
         { now: () => mailboxNow } as IdentityRiskPlatformClock))
       const result = await scheduler.runTenant({ ...mailboxScope, windowStart: new Date(mailboxNow.getTime() - 86400000), windowEnd: mailboxNow,
         evaluationAt: mailboxNow, engineVersion: IDENTITY_RISK_ENGINE_VERSION, catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
         loadSources: async () => batch, approvedEvaluator: { readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS } })
       assert.equal(result.status, 'COMPLETED')
+      assert.equal(observedSafety.calls.activated.length, 0, 'source bounds must never trigger SECRET_EXPOSURE/hard disable')
       assert.equal(store.calls.matches.length, expectedMatches)
       assert.equal(store.calls.coverage.length, 1)
       assert.equal(store.calls.coverage[0]?.ruleId, 'HV-ID-MBX-001.v1')

@@ -795,6 +795,7 @@ model IdentityRiskEvaluationRun {
   @@index([organizationId, customerTenantId, completedAt(sort: Desc)], map: "identity_risk_evaluation_runs_scope_completed")
   @@index([organizationId, customerTenantId, status, leaseExpiresAt], map: "identity_risk_evaluation_runs_scope_lease")
   @@index([expiresAt], map: "identity_risk_evaluation_runs_expiry")
+  @@index([pseudonymKeyVersionId, organizationId, customerTenantId], map: "identity_risk_runs_key_version")
   @@map("identity_risk_evaluation_runs")
 }
 

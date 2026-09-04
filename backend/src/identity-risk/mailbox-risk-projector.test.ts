@@ -1,14 +1,96 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
-import { projectMailboxEvidence, MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS } from './mailbox-risk-projector.service.js'
+import { projectMailboxEvidence, MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS, readActiveMailboxKeys } from './mailbox-risk-projector.service.js'
+import { mailboxReadTransactionBudget } from './mailbox-read-transaction.js'
 import { mailboxSourceDigest, verifiedOrganizationDomains, MAILBOX_SOURCE_MAX_AGE_MS, MAILBOX_PROJECTOR_MAX_RULES } from './mailbox-source-attestation.js'
 import { IdentityRiskPseudonymProvider } from './identity-risk-pseudonym.js'
-import { approvedIdentitySignalDetectors } from './identity-risk-approved-evaluator.adapter.js'
-import { mailboxScope, mailboxKey, mailboxNow, syntheticManagedProvider, mailboxRule, mailboxSnapshots, attested } from './mailbox-risk.test-fixtures.js'
-import type { PrismaService } from '../prisma/prisma.service.js'
+import { approvedIdentitySignalDetectors, projectApprovedContext } from './identity-risk-approved-evaluator.adapter.js'
+import { boundedInputBytes, isIdentitySignalCandidateRuntime } from './identity-signal-runtime.js'
+import { IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES, IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES } from './identity-signal-contract.js'
+import { mailboxScope, mailboxKey, mailboxNow, syntheticManagedProvider, mailboxRule, mailboxSnapshots, attested, boundedMailboxSnapshots } from './mailbox-risk.test-fixtures.js'
 
 const session = () => syntheticManagedProvider().pin(mailboxKey, Date.now() + 30000)
+
+test('database acquisition plus execution fit the remaining deadline; expired loaders perform no registry read', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: mailboxNow })
+  for (const remaining of [100, 101, 400, 1000, 30000]) {
+    const options = mailboxReadTransactionBudget(Date.now() + remaining, 6000)
+    assert.ok(options.maxWait > 0 && options.timeout > 0)
+    assert.ok(options.maxWait + options.timeout <= remaining)
+    assert.ok(options.timeout <= 6000)
+  }
+  await assert.rejects(() => readActiveMailboxKeys(mailboxScope, 'test', mailboxNow, Date.now() - 1), /KEY_UNAVAILABLE/)
+})
+
+test('oversized closed candidates and cross-product batches abstain before any MAC generation', async () => {
+  const longDomains = Array.from({ length: 256 }, (_, index) => ({ domain: `${'a'.repeat(60)}.${'b'.repeat(30)}.${index}.invalid` }))
+  const crossProduct = boundedMailboxSnapshots(70, 256)
+  crossProduct[1] = attested('EXCHANGE_ACCEPTED_DOMAINS', longDomains)
+  for (const rows of [boundedMailboxSnapshots(1, 257), boundedMailboxSnapshots(1001, 1), boundedMailboxSnapshots(200, 256), crossProduct,
+    mailboxSnapshots([mailboxRule(`${'a'.repeat(300)}@bücher.invalid`)])]) {
+    assert.ok(rows.every((row) => row.digest))
+    let macCalls = 0
+    const batch = await projectMailboxEvidence(mailboxScope, mailboxNow, rows,
+      { keyVersion: mailboxKey, reference: async () => { macCalls++; throw new Error('Unexpected MAC generation') } })
+    assert.equal(batch.capability, 'UNAVAILABLE')
+    assert.equal(macCalls, 0)
+    assert.deepEqual(batch.sourceEnvelopes, [])
+  }
+})
+
+test('attested 257 domains and 1001 candidates abstain; established 256/1000 limits remain unchanged', async () => {
+  for (const [ruleCount, domainCount, expected] of [[1, 256, 'FULL'], [1, 257, 'UNAVAILABLE'],
+    [IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES, 1, 'FULL'], [IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES + 1, 1, 'UNAVAILABLE']] as const) {
+    const rows = boundedMailboxSnapshots(ruleCount, domainCount)
+    assert.ok(rows.every((row) => row.digest), 'oversized inputs are valid complete source attestations')
+    const batch = await projectMailboxEvidence(mailboxScope, mailboxNow, rows, await session())
+    assert.equal(batch.capability, expected)
+    if (expected === 'UNAVAILABLE') {
+      assert.deepEqual(batch.sourceEnvelopes, [])
+      assert.deepEqual(batch.orderedSourceWatermarks, [])
+      assert.equal(batch.earliestSourceExpiry, null)
+    } else {
+      assert.ok(batch.sourceEnvelopes.every((row) => isIdentitySignalCandidateRuntime(row.payload.candidate)))
+      const detector = approvedIdentitySignalDetectors({ readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS })[0]!
+      const outputs = await detector.evaluate({ ...batch.context, capability: batch.capability,
+        sources: { EXCHANGE_MAILBOX_RULES: batch.sourceEnvelopes.map((row) => row.payload) } })
+      assert.equal(outputs.length, ruleCount)
+      assert.ok(outputs.every((result) => result.outcome === 'MATCHED'))
+    }
+  }
+})
+
+test('valid source addresses exceeding candidate length after IDNA normalization abstain safely', async () => {
+  const rows = mailboxSnapshots([mailboxRule(`${'a'.repeat(300)}@bücher.invalid`)])
+  assert.ok(rows[0]!.digest)
+  const batch = await projectMailboxEvidence(mailboxScope, mailboxNow, rows, await session())
+  assert.equal(batch.capability, 'UNAVAILABLE')
+  assert.deepEqual(batch.sourceEnvelopes, [])
+})
+
+test('aggregate preflight counts repeated domains and the actual approved context at the exact candidate boundary', async () => {
+  const one = await projectMailboxEvidence(mailboxScope, mailboxNow, boundedMailboxSnapshots(1, 256), await session())
+  const approvedContext = projectApprovedContext({ ...one.context, capability: 'FULL', sources: {} },
+    { readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS })
+  const contextBytes = boundedInputBytes(approvedContext, IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES)!
+  const candidateBytes = boundedInputBytes(one.sourceEnvelopes[0]!.payload.candidate, IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES)!
+  const fits = Math.floor((IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES - contextBytes) / candidateBytes)
+  assert.ok(fits > 1 && fits < IDENTITY_SIGNAL_MAX_BATCH_CANDIDATES)
+  for (const count of [fits, fits + 1]) {
+    const batch = await projectMailboxEvidence(mailboxScope, mailboxNow, boundedMailboxSnapshots(count, 256), await session())
+    assert.equal(batch.capability, count === fits ? 'FULL' : 'UNAVAILABLE')
+    if (count === fits) {
+      assert.equal(batch.sourceEnvelopes.length, count)
+      assert.equal(contextBytes + batch.sourceEnvelopes.reduce((sum, row) => sum + boundedInputBytes(row.payload.candidate, IDENTITY_SIGNAL_MAX_BATCH_INPUT_BYTES)!, 0), contextBytes + count * candidateBytes)
+      const detector = approvedIdentitySignalDetectors({ readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS })[0]!
+      const outputs = await detector.evaluate({ ...batch.context, capability: batch.capability,
+        sources: { EXCHANGE_MAILBOX_RULES: batch.sourceEnvelopes.map((row) => row.payload) } })
+      assert.equal(outputs.length, count)
+      assert.ok(outputs.every((result) => result.outcome === 'MATCHED'))
+    } else assert.deepEqual(batch.sourceEnvelopes, [])
+  }
+})
 async function evaluate(rules: unknown[]) {
   const batch = await projectMailboxEvidence(mailboxScope, mailboxNow, mailboxSnapshots(rules), await session())
   const detectors = approvedIdentitySignalDetectors({ readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS })
@@ -92,11 +174,10 @@ test('organization response rejects missing/foreign/multiple organizations and m
 })
 
 test('unconfigured provider prevents even registry/source reads; no hidden fake or fallback', async () => {
-  const prisma = new Proxy({}, { get: () => { throw new Error('Unexpected database read') } }) as PrismaService
-  await assert.rejects(() => new MailboxRiskProjector(prisma, new IdentityRiskPseudonymProvider()).load(mailboxScope, mailboxNow), /KEY_UNAVAILABLE/)
+  await assert.rejects(() => new MailboxRiskProjector(new IdentityRiskPseudonymProvider()).load(mailboxScope, mailboxNow), /KEY_UNAVAILABLE/)
   const source = readFileSync(new URL('./mailbox-risk-projector.service.ts', import.meta.url), 'utf8')
   assert.match(source, /octet_length\(s\.payload::text\)/)
-  assert.match(source, /isolationLevel: 'RepeatableRead'/)
-  assert.match(source, /s\.organization_id=\$\{scope.organizationId\}/)
+  assert.match(source, /withMailboxReadTransaction\(deadlineAt, 12000/)
+  assert.match(source, /s\.organization_id=\$4::uuid AND s\.customer_tenant_id=\$5::uuid/)
   assert.doesNotMatch(source, /fetch\(|accessToken|signInLog|riskyUser/)
 })

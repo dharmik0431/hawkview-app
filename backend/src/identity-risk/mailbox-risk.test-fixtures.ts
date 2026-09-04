@@ -25,3 +25,8 @@ export function attested(resourceType: MailboxSourceResource, payload: unknown, 
 export function mailboxSnapshots(rules: unknown[] = [mailboxRule()]) {
   return [attested('EXCHANGE_MAILBOX_RULES', rules), attested('EXCHANGE_ACCEPTED_DOMAINS', [{ domain: 'tenant.invalid' }])]
 }
+
+export function boundedMailboxSnapshots(ruleCount: number, domainCount: number) {
+  return [attested('EXCHANGE_MAILBOX_RULES', Array.from({ length: ruleCount }, (_, index) => mailboxRule(undefined, { id: `rule-${index}` }))),
+    attested('EXCHANGE_ACCEPTED_DOMAINS', Array.from({ length: domainCount }, (_, index) => ({ domain: `domain-${index}.tenant.invalid` })))]
+}
