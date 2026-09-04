@@ -14,10 +14,17 @@ const section = readFileSync(
 )
 const hook = readFileSync(`${root}/lib/api/identity-risk-hooks.ts`, 'utf8')
 const presentation = readFileSync(`${root}/lib/identity-risk/presentation.ts`, 'utf8')
+const flagProvider = readFileSync(`${root}/components/providers/feature-flag-provider.tsx`, 'utf8')
+const flagPolicy = readFileSync(`${root}/lib/features/feature-flags.ts`, 'utf8')
 
-test('identity-risk UI is gated by one server-only default-off flag', () => {
+test('identity-risk UI uses one global server exposure policy with an emergency hide', () => {
   assert.match(layout, /process\.env\.HAWKVIEW_IDENTITY_RISK_UI_ENABLED/)
   assert.doesNotMatch(layout, /NEXT_PUBLIC_.*IDENTITY_RISK/)
+  assert.match(layout, /resolveServerFeatureFlags\(/)
+  assert.match(layout, /<FeatureFlagProvider flags=\{featureFlags\}>/)
+  assert.match(flagProvider, /React\.createContext<HawkViewFeatureFlags>\(\s*DEFAULT_HAWKVIEW_FEATURE_FLAGS/)
+  assert.doesNotMatch(flagPolicy, /tenantId|organizationId|subscription|premium|localStorage|sessionStorage/)
+  assert.doesNotMatch(flagProvider, /process\.env|localStorage|sessionStorage/)
   assert.match(tenantPage, /identityRiskUi\s*\?\s*\[\{ id: 'identity-risk'/)
   assert.match(tenantPage, /identityRiskUi && securityView === 'identity-risk'/)
   assert.match(hook, /enabled: enabled && Boolean\(tenantId\)/g)
