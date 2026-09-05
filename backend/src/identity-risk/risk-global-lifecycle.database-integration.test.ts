@@ -44,7 +44,14 @@ async function fixture(work: (f: { prisma: PrismaService; client: pg.Client; sco
 }
 const deadline = () => Date.now() + 6_000
 
-test('global claim and commit blocked locks cancel actual transport, settle and cannot write after lock release', { skip: !enabled, timeout: 15_000 }, () => fixture(async ({ scope, prisma, client }) => {
+test('global claim and commit blocked locks cancel actual transport, settle and cannot write after lock release', { skip: !enabled, timeout: 15_000 }, t => fixture(async ({ scope, prisma, client }) => {
+  // Deliberately keep an unrelated same-name backend alive: parallel test files
+  // also use this application name. It is not an operation ownership identifier.
+  await client.query("SELECT set_config('application_name', 'hawkview-risk-bounded-transaction', false)")
+  const unrelated = (await client.query<BackendIdentity>(
+    'SELECT pid, backend_start::text AS backend_start FROM pg_stat_activity WHERE pid=pg_backend_pid()')).rows[0]!
+  await assert.rejects(() => observeBackendGone(client, unrelated, 75), /Owned backend remains/,
+    'The observer must reject a genuinely live backend, not just ignore all sessions')
   const evaluator = new IdentityRiskEvaluatorService(prisma, new IdentityRiskSafetyService(prisma))
   const lockKey = `hawkview:identity-risk-control:EVALUATION_HARD_DISABLED:${scope.organizationId}:${scope.customerTenantId}`
   const now = new Date()
@@ -60,11 +67,17 @@ test('global claim and commit blocked locks cancel actual transport, settle and 
       watermarkHash: 'a'.repeat(64), sourceContentHash: 'b'.repeat(64), expiresAt: new Date(now.getTime()+3_600_000),
       aggregates: [], matches: [] }).then(() => ({ rejected: false }), () => ({ rejected: true }))
     try {
-      await waitForAdvisoryWait(client, lockKey)
+      const owned = await waitForAdvisoryWait(client, lockKey, 'hawkview-risk-bounded-transaction')
+      assert.notEqual(owned.pid, unrelated.pid)
       assert.equal((await pending).rejected, true)
       assert.ok(Date.now() - start < 3_000)
-      const active = await client.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name='hawkview-risk-bounded-transaction'")
-      assert.equal(active.rows[0].n, 0, `${method} must not leave a connection or queued rollback`)
+      // TCP close and server-side observation are not distributed instantaneous
+      // events. Allow at most 300ms, entirely before releasing the blocker and
+      // within the existing three-second settlement bound. Never inspect a
+      // cached statistics snapshot or another operation's connection.
+      const observation = await observeBackendGone(client, owned, 300)
+      t.diagnostic(JSON.stringify({ method, ...owned, ...observation }))
+      assert.ok(Date.now() - start < 3_000, 'Cancellation and server observation remain bounded')
     } finally { await client.query('ROLLBACK'); await pending }
     await new Promise(resolve => setTimeout(resolve, 50))
     assert.equal(await prisma.identityRiskEvaluationRun.count({ where: { customerTenantId: scope.customerTenantId } }), 0)
@@ -72,11 +85,40 @@ test('global claim and commit blocked locks cancel actual transport, settle and 
   }
 }))
 
-async function waitForAdvisoryWait(client: pg.Client, key: string) {
+type BackendIdentity = { pid: number; backend_start: string }
+
+async function observeBackendGone(client: pg.Client, owned: BackendIdentity, allowanceMs: number) {
+  const started = Date.now()
+  let reads = 0
+  for (;;) {
+    await client.query('SELECT pg_stat_clear_snapshot()')
+    const active = await client.query(`SELECT pid, backend_start::text AS backend_start, state, wait_event_type, wait_event
+      FROM pg_stat_activity WHERE pid=$1 AND backend_start=$2::timestamptz`, [owned.pid, owned.backend_start])
+    reads++
+    if (!active.rowCount) {
+      assert.ok(Date.now() - started <= allowanceMs, 'Backend disappearance observation exceeded its bound')
+      return { firstReadAbsent: reads === 1, observationMs: Date.now() - started, reads }
+    }
+    assert.ok(Date.now() - started < allowanceMs,
+      `Owned backend remains before blocker release: ${JSON.stringify(active.rows)}`)
+    await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.min(10, allowanceMs - (Date.now() - started)))))
+  }
+}
+
+async function waitForAdvisoryWait(client: pg.Client, key: string, applicationName?: string): Promise<BackendIdentity> {
   for (let attempt=0; attempt<100; attempt++) {
-    const waiting = await client.query(`SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted
-      AND objid=(hashtext($1)::bigint & 4294967295) LIMIT 1`, [key])
-    if (waiting.rowCount) return
+    await client.query('SELECT pg_stat_clear_snapshot()')
+    const waiting = await client.query<BackendIdentity>(`SELECT a.pid, a.backend_start::text AS backend_start
+      FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid
+      WHERE l.locktype='advisory' AND NOT l.granted AND l.objsubid=1
+      AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+      AND l.classid=((hashtext($1)::bigint >> 32) & 4294967295)
+      AND l.objid=(hashtext($1)::bigint & 4294967295)
+      AND ($2::text IS NULL OR a.application_name=$2)`, [key, applicationName ?? null])
+    if (waiting.rowCount) {
+      assert.equal(waiting.rowCount, 1, 'Synthetic advisory lock must uniquely identify its waiter')
+      return waiting.rows[0]!
+    }
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   throw new Error('Synthetic lock ordering was not observed')
