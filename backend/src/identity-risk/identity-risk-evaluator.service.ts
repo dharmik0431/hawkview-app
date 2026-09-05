@@ -55,7 +55,6 @@ const MAX_SOURCE_TYPES = 32
 const MAX_SOURCE_RECORDS_PER_TYPE = 50_000
 const MAX_SOURCE_ENVELOPES = MAX_SOURCE_TYPES * MAX_SOURCE_RECORDS_PER_TYPE
 const RUN_LEASE_MS = 5 * 60 * 1_000
-const NO_SOURCE_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000
 
 const outcomes = new Set(['MATCHED', 'NOT_MATCHED', 'NOT_EVALUATED', 'SUPPRESSED'])
 const coverages = new Set(['FULL', 'PARTIAL', 'UNAVAILABLE'])
@@ -705,12 +704,7 @@ function rejectedResultReason(
 }
 
 function runExpiry(batch: IdentityRiskSourceBatch, platformNow: Date) {
-  const policy = new Date(
-    platformNow.getTime() +
-      (batch.earliestSourceExpiry
-        ? IDENTITY_RISK_RUN_RETENTION_MS
-        : NO_SOURCE_RUN_RETENTION_MS),
-  )
+  const policy = new Date(platformNow.getTime() + IDENTITY_RISK_RUN_RETENTION_MS)
   if (
     batch.earliestSourceExpiry &&
     batch.earliestSourceExpiry.getTime() < policy.getTime()

@@ -8,6 +8,7 @@ import { IdentityRiskPlatformClock } from './identity-risk-evaluator.service.js'
 import { pilotRiskConfig } from './pilot-risk-config.js'
 import { WrappedRiskKeyStore } from './wrapped-risk-key-store.js'
 import { runRiskTransaction } from './risk-bounded-prisma-transaction.js'
+import { RiskHistoryRetention } from './risk-history-retention.js'
 
 export const IDENTITY_RISK_OPERATIONAL_EVENT_PRUNE_BATCH_SIZE = 500
 const MAINTENANCE_BUCKET_MS = 5 * 60 * 1_000
@@ -37,6 +38,9 @@ function maintenanceEventKey(now: Date) {
  */
 @Injectable()
 export class IdentityRiskMaintenanceService {
+  async runAuthorizedRiskHistoryMaintenance(deadlineAt: number) {
+    return new RiskHistoryRetention().run(deadlineAt)
+  }
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(IdentityRiskPlatformClock)
