@@ -1,6 +1,7 @@
 import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common'
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
-import { pilotRiskConfig, pilotScopeAllowed } from './pilot-risk-config.js'
+import { riskRuntimeConfig, riskScopeAllowed } from './risk-runtime-config.js'
+import { isGlobalRiskConfig } from './risk-runtime-config.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
@@ -104,8 +105,8 @@ type HawkViewControlState = Readonly<{
 }>
 
 function pilotReadAllowed(tenant: ScopedTenant) {
-  const config = pilotRiskConfig()
-  return Boolean(config && pilotScopeAllowed({
+  const config = riskRuntimeConfig()
+  return Boolean(config && riskScopeAllowed({
     organizationId: tenant.organizationId,
     customerTenantId: tenant.id,
     environment: config.environment,
@@ -357,8 +358,19 @@ export class IdentityRiskService {
   }
 
   private async latestRun(tenant: ScopedTenant, now: Date) {
-    return this.utcRead((transaction) => transaction.identityRiskEvaluationRun.findFirst({
+    return this.utcRead(async (transaction) => {
+    const config = riskRuntimeConfig()
+    let head: { completedRunId: string | null } | undefined
+    if (isGlobalRiskConfig(config)) {
+      const heads = await transaction.$queryRawUnsafe<Array<{ completedRunId: string | null }>>(`SELECT completed_run_id AS "completedRunId"
+        FROM identity_risk_attempt_heads WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid
+        AND environment=$3 FOR SHARE`, tenant.organizationId, tenant.id, config.environment)
+      if (heads.length !== 1) return null
+      head = heads[0]
+    }
+    const run = await transaction.identityRiskEvaluationRun.findFirst({
       where: {
+        ...(head?.completedRunId ? { id: head.completedRunId } : {}),
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         status: 'COMPLETED',
@@ -374,7 +386,23 @@ export class IdentityRiskService {
         sourceObservedAt: true,
         pseudonymKeyVersionId: true,
       },
-    }))
+    })
+    if (run && isGlobalRiskConfig(config)) {
+      // Pending/failed attempt: prior metadata may explain ERROR, but it cannot
+      // supply current clean counts. Successful attempts select their linked
+      // run by ID, never by app/DB timestamp comparison or completion order.
+      if (!head?.completedRunId) return { ...run, completedAt: null }
+      if (run.pseudonymKeyVersionId) {
+        const key = await transaction.identityRiskPseudonymKeyVersion.findFirst({ where: {
+          id: run.pseudonymKeyVersionId, organizationId: tenant.organizationId, customerTenantId: tenant.id,
+          environment: config.environment, status: 'ACTIVE', retiredAt: null, destroyedAt: null,
+          provider: 'WRAPPED_AES_GCM_V1', wrappedKey: { isNot: null },
+        }, select: { id: true } })
+        if (!key) return { ...run, completedAt: null }
+      }
+    }
+    return run
+    })
   }
 
   async summary(identity: AuthenticatedIdentity, tenantId: string) {

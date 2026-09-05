@@ -130,6 +130,12 @@ export type IdentityRiskSourceBatch = Readonly<{
   /** Internal only: recoverable immutable managed-key version for every reference in this run. */
   pseudonymKeyVersionId?: string
   sourceObservedAt?: Date
+  /** Internal commit-time freshness proof; never exposed in the version-1 DTO. */
+  mailboxAttestations?: readonly Readonly<{
+    resourceType: 'EXCHANGE_MAILBOX_RULES' | 'EXCHANGE_ACCEPTED_DOMAINS'
+    observedAt: Date
+    digest: string
+  }>[]
   context: Omit<IdentitySignalEvaluationContext, 'capability' | 'sources'>
   sourceEnvelopes: readonly IdentityRiskSourceEnvelope[]
   orderedSourceWatermarks: readonly string[]
@@ -270,6 +276,10 @@ export type IdentityRiskEvaluationRequest = Readonly<{
   windowEnd: Date
   evaluationAt: Date
   loadSources: () => Promise<IdentityRiskSourceBatch>
+  /** Internal scheduler wall-clock budget; not customer-controllable. */
+  executionDeadlineAt?: number
+  /** Internal durable scheduler attempt; never supplied by a customer route. */
+  globalAttemptId?: string
   detectors: readonly IdentitySignalDetector[]
 }>
 

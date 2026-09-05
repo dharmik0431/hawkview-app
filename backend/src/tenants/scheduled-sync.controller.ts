@@ -6,6 +6,7 @@ import { TenantSyncService } from './tenant-sync.service.js'
 import { IdentityRiskMaintenanceService } from '../identity-risk/identity-risk-maintenance.service.js'
 import { identityRiskMaintenanceEnabled } from '../identity-risk/identity-risk-maintenance.service.js'
 import { logProcessMemoryPhase } from './runtime-telemetry.js'
+import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-runtime-config.js'
 
 @Controller('api/internal/sync')
 export class ScheduledSyncController {
@@ -22,15 +23,38 @@ export class ScheduledSyncController {
   @Public()
   @Post('due-tenants')
   async syncDueTenants(@Req() request: Request) {
-    await this.schedulerTokenVerifier.verify(request.headers.authorization)
     const startedAt = Date.now()
+    // Admission only: already-running collectors retain their existing limits.
+    // Authentication, maintenance and risk all consume this same request clock.
+    const admissionDeadlineAt = startedAt + 240_000
+    await this.schedulerTokenVerifier.verify(request.headers.authorization)
     logProcessMemoryPhase(this.logger, 'scheduled_sync', 'STARTED', startedAt)
     try {
-      if (identityRiskMaintenanceEnabled()) {
-        await this.identityRiskMaintenance.runAuthorizedScheduledMaintenance()
-        logProcessMemoryPhase(this.logger, 'scheduled_sync_maintenance', 'COMPLETED', startedAt)
+      // Missing the maintenance admission window is not proof the backlog is
+      // drained. Defer risk (but still permit collectors) in that case too.
+      let riskMaintenanceReady = !identityRiskMaintenanceEnabled()
+      if (identityRiskMaintenanceEnabled() && Date.now() < startedAt + 15_000) {
+        try {
+          const maintenance = await this.identityRiskMaintenance.runAuthorizedScheduledMaintenance(startedAt + 15_000)
+          riskMaintenanceReady = !maintenance.hasMore
+          logProcessMemoryPhase(this.logger, 'scheduled_sync_maintenance', 'COMPLETED', startedAt)
+        } catch {
+          riskMaintenanceReady = false
+          // A settled maintenance failure does not suppress ordinary collectors.
+          // Only a closed diagnostic is logged; no DB/provider payloads.
+          this.logger.warn('Identity-risk maintenance unavailable; collection continues.')
+          logProcessMemoryPhase(this.logger, 'scheduled_sync_maintenance', 'FAILED', startedAt)
+        }
       }
-      const result = await this.tenantSyncService.syncDueTenants()
+      if (riskMaintenanceReady && Date.now() < startedAt + 45_000 && isGlobalRiskConfig(riskRuntimeConfig())) {
+        try {
+          // Reserve collector admission opportunity; this is not a whole-request SLA.
+          await this.tenantSyncService.runScheduledGlobalRiskCycle(startedAt + 45_000)
+        } catch {
+          this.logger.warn('Identity-risk cycle unavailable; collection continues.')
+        }
+      }
+      const result = await this.tenantSyncService.syncDueTenants(admissionDeadlineAt)
       logProcessMemoryPhase(this.logger, 'scheduled_sync', 'COMPLETED', startedAt)
       return result
     } catch (error) {

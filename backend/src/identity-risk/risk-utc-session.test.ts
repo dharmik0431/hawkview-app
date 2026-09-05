@@ -62,8 +62,9 @@ test('failed UTC assertion blocks evaluator claim and persistence before safety 
     },
   })
   const evaluator = new IdentityRiskEvaluatorService({ $transaction: (work: any) => work(transaction) } as any, {} as any)
-  await assert.rejects((evaluator as any).claimRun({ platformNow: new Date() }), /IDENTITY_RISK_UTC_UNAVAILABLE/)
-  await assert.rejects((evaluator as any).persistCompletedRun({}), /IDENTITY_RISK_UTC_UNAVAILABLE/)
+  const request = { organizationId: 'synthetic-org', customerTenantId: 'synthetic-tenant' }
+  await assert.rejects((evaluator as any).claimRun({ request, platformNow: new Date() }), /IDENTITY_RISK_UTC_UNAVAILABLE/)
+  await assert.rejects((evaluator as any).persistCompletedRun({ request }), /IDENTITY_RISK_UTC_UNAVAILABLE/)
 })
 
 test('mailbox snapshot/attestation and SyncState fail closed before any write if UTC cannot be verified', async () => {

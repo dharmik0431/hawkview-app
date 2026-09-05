@@ -1,4 +1,5 @@
-import { pilotRiskConfig, pilotScopeAllowed, RISK_ENVIRONMENT, RISK_UUID } from './pilot-risk-config.js'
+import { RISK_ENVIRONMENT, RISK_UUID } from './pilot-risk-config.js'
+import { riskRuntimeConfig, riskScopeAllowed, isWrappedRiskConfig } from './risk-runtime-config.js'
 import type { PseudonymKeyVersion, PseudonymScope } from './identity-risk-pseudonym.js'
 import { readRiskWrappingRoot, wrappedRiskName, WRAPPED_RISK_PROVIDER } from './wrapped-risk-crypto.js'
 import { withMailboxReadTransaction } from './mailbox-read-transaction.js'
@@ -39,9 +40,9 @@ function parse(argv: readonly string[]): Request | null {
 }
 
 function validatedConfig(request: Request) {
-  const config = pilotRiskConfig()
-  if (!config || config.provider !== 'wrapped-pilot-v1' || !process.env.DATABASE_URL) throw new OperatorError('CONFIG_UNAVAILABLE')
-  if (!pilotScopeAllowed(request, config)) throw new OperatorError('SCOPE_MISMATCH')
+  const config = riskRuntimeConfig()
+  if (!isWrappedRiskConfig(config) || !process.env.DATABASE_URL) throw new OperatorError('CONFIG_UNAVAILABLE')
+  if (!riskScopeAllowed(request, config)) throw new OperatorError('SCOPE_MISMATCH')
   try { const root = readRiskWrappingRoot(); root.fill(0) } catch { throw new OperatorError('CONFIG_UNAVAILABLE') }
 }
 
@@ -61,7 +62,7 @@ async function preflight(request: Request, deadline: number): Promise<Preflight>
     for (const row of rows.rows) {
       const key: PseudonymKeyVersion = { id: row.id, organizationId: row.organizationId, customerTenantId: row.customerTenantId,
         environment: row.environment, provider: row.provider, immutableKeyId: row.immutableKeyId }
-      if (!pilotScopeAllowed(key) || row.status !== 'ACTIVE' || !row.usable || key.provider !== WRAPPED_RISK_PROVIDER ||
+      if (!riskScopeAllowed(key) || row.status !== 'ACTIVE' || !row.usable || key.provider !== WRAPPED_RISK_PROVIDER ||
         wrappedRiskName(key) !== key.immutableKeyId || row.cipherName !== key.immutableKeyId || activeVersionId !== null) throw new OperatorError('VERSION_UNAVAILABLE')
       activeVersionId = key.id
     }
@@ -90,7 +91,7 @@ export async function runRiskKeyOperator(argv: readonly string[], dependencies: 
     if (apply) {
       const { environment, organizationId, customerTenantId, versionId } = request
       const key = await dependencies.create({ environment, organizationId, customerTenantId }, versionId, deadline)
-      if (!pilotScopeAllowed(key) || key.provider !== WRAPPED_RISK_PROVIDER || key.immutableKeyId !== wrappedRiskName(key)) throw new Error('unavailable')
+      if (!riskScopeAllowed(key) || key.provider !== WRAPPED_RISK_PROVIDER || key.immutableKeyId !== wrappedRiskName(key)) throw new Error('unavailable')
       activeVersionId = key.id
     }
     return { exitCode: 0, output: JSON.stringify({ schemaVersion: 1, outcome: apply ? 'ENSURED' : 'PREFLIGHT_OK',

@@ -202,6 +202,21 @@ test('failed scheduler authorization prevents retention and tenant work', async 
   assert.deepEqual(messages, [])
 })
 
+test('risk maintenance failure cannot prevent normal collection or leak provider diagnostics', async () => {
+  const before = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  let collections = 0; const logs: string[] = []
+  const controller = new ScheduledSyncController({ verify: async () => undefined } as any,
+    { syncDueTenants: async () => { collections++; return { status: 'ok' } } } as any,
+    { runAuthorizedScheduledMaintenance: async () => { throw new Error('password=synthetic-only') } } as any)
+  ;(controller as any).logger = { log: (message: string) => logs.push(message), warn: (message: string) => logs.push(message) }
+  try {
+    assert.deepEqual(await controller.syncDueTenants({ headers: {} } as Request), { status: 'ok' })
+    assert.equal(collections, 1)
+    assert.doesNotMatch(JSON.stringify(logs), /password|synthetic-only/)
+  } finally { if (before === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE; else process.env.HAWKVIEW_IDENTITY_RISK_MODE = before }
+})
+
 test('maintenance is a zero-database-operation no-op while identity risk is OFF', async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   delete process.env.HAWKVIEW_IDENTITY_RISK_MODE

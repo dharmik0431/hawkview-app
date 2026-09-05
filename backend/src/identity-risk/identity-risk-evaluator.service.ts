@@ -3,6 +3,10 @@ import { Inject, Injectable } from '@nestjs/common'
 import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
+import { assertGlobalRiskCommitScope, assertRiskExecutionBudget, configureRiskStatementBudget } from './risk-global-commit-guard.js'
+import { runRiskTransaction } from './risk-bounded-prisma-transaction.js'
+import { completeGlobalRiskAttempt } from './risk-attempt-causality.js'
+import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
   IDENTITY_RISK_APPROVED_SOURCE_TYPES,
@@ -729,18 +733,17 @@ export class IdentityRiskEvaluatorService {
   ): Promise<IdentityRiskEvaluationResult> {
     const platformNow = new Date(this.clock.now().getTime())
     this.validateRequest(request, platformNow)
+    assertRiskExecutionBudget(request)
     if (mode() === 'OFF') {
       return { status: 'OFF', runKey: null, alertDeliveryDisabled: true }
     }
-    let safety = await this.safety.stateForTenant(
-      request.organizationId,
-      request.customerTenantId,
-    )
+    let safety = await this.safetyForRequest(request)
     if (safety.evaluationHardDisabled) {
       return this.hardDisabledResult(request, safety, platformNow)
     }
 
     const batch = await request.loadSources()
+    assertRiskExecutionBudget(request)
     if (
       batch.context.organizationId !== request.organizationId ||
       batch.context.customerTenantId !== request.customerTenantId
@@ -748,6 +751,7 @@ export class IdentityRiskEvaluatorService {
       const crossOrganization =
         batch.context.organizationId !== request.organizationId
       await this.safety.activate({
+        executionDeadlineAt: request.executionDeadlineAt,
         controlType: 'EVALUATION_HARD_DISABLED',
         scope: crossOrganization
           ? { type: 'GLOBAL' }
@@ -770,10 +774,7 @@ export class IdentityRiskEvaluatorService {
 
     // A control may be activated while the allowlisted loader is in flight.
     // Re-read it before hashing, claiming, or evaluating any returned source.
-    safety = await this.safety.stateForTenant(
-      request.organizationId,
-      request.customerTenantId,
-    )
+    safety = await this.safetyForRequest(request)
     if (safety.evaluationHardDisabled) {
       return this.hardDisabledResult(request, safety, platformNow)
     }
@@ -793,6 +794,7 @@ export class IdentityRiskEvaluatorService {
         ? 'SOURCE_INTEGRITY_CONFLICT'
         : 'SECRET_EXPOSURE'
       await this.safety.activate({
+        executionDeadlineAt: request.executionDeadlineAt,
         controlType: 'EVALUATION_HARD_DISABLED',
         scope: {
           type: 'TENANT',
@@ -831,9 +833,11 @@ export class IdentityRiskEvaluatorService {
       platformNow,
       pseudonymKeyVersionId: batch.pseudonymKeyVersionId,
       sourceObservedAt: batch.sourceObservedAt,
+      mailboxAttestations: batch.mailboxAttestations,
     })
     if (claim === 'SOURCE_INTEGRITY_CONFLICT') {
       await this.safety.activate({
+        executionDeadlineAt: request.executionDeadlineAt,
         controlType: 'EVALUATION_HARD_DISABLED',
         scope: {
           type: 'TENANT',
@@ -857,10 +861,7 @@ export class IdentityRiskEvaluatorService {
         platformNow,
       )
     }
-    safety = await this.safety.stateForTenant(
-      request.organizationId,
-      request.customerTenantId,
-    )
+    safety = await this.safetyForRequest(request)
     if (safety.evaluationHardDisabled) {
       if (typeof claim === 'object') {
         await this.failOwnedRun(request, claim.id, leaseToken, 'EVALUATION_HARD_DISABLED')
@@ -897,9 +898,11 @@ export class IdentityRiskEvaluatorService {
         runKey,
         request.organizationId,
         request.customerTenantId,
+        request.executionDeadlineAt,
       )
       const persisted = await this.persistCompletedRun({
         pseudonymKeyVersionId: batch.pseudonymKeyVersionId,
+        mailboxAttestations: batch.mailboxAttestations,
         request,
         runId: claim.id,
         runKey,
@@ -927,6 +930,20 @@ export class IdentityRiskEvaluatorService {
     }
   }
 
+  private async safetyForRequest(request: IdentityRiskEvaluationRequest): Promise<IdentityRiskSafetyState> {
+    if (request.executionDeadlineAt === undefined) return this.safety.stateForTenant(request.organizationId, request.customerTenantId)
+    return withRiskKeyTransaction(request.executionDeadlineAt, async client => {
+      const rows = await client.query<{ control_type: string; episode_id: string; scope_type: 'GLOBAL' | 'TENANT' }>(`
+        SELECT control_type,episode_id,scope_type FROM identity_risk_operational_controls WHERE state='ACTIVE'
+        AND ((scope_type='GLOBAL' AND scope_key='GLOBAL') OR
+          (scope_type='TENANT' AND scope_key=$3 AND organization_id=$1::uuid AND customer_tenant_id=$2::uuid)) LIMIT 4`,
+      [request.organizationId, request.customerTenantId, `${request.organizationId}:${request.customerTenantId}`])
+      const hard = rows.rows.find(row => row.control_type === 'EVALUATION_HARD_DISABLED')
+      return { evaluationHardDisabled: Boolean(hard), alertDeliveryDisabled: rows.rows.some(row => row.control_type === 'ALERT_DELIVERY_DISABLED'),
+        hardDisableEpisodeId: hard?.episode_id ?? null, hardDisableScopeType: hard?.scope_type ?? null }
+    })
+  }
+
   private async hardDisabledResult(
     request: IdentityRiskEvaluationRequest,
     safety: IdentityRiskSafetyState,
@@ -934,6 +951,7 @@ export class IdentityRiskEvaluatorService {
   ): Promise<IdentityRiskEvaluationResult> {
     if (safety.hardDisableEpisodeId) {
       await this.safety.recordHardStopBlocked({
+        executionDeadlineAt: request.executionDeadlineAt,
         organizationId: request.organizationId,
         customerTenantId: request.customerTenantId,
         episodeId: safety.hardDisableEpisodeId,
@@ -954,6 +972,20 @@ export class IdentityRiskEvaluatorService {
     leaseToken: string,
     failureCode: 'EVALUATION_FAILED' | 'EVALUATION_HARD_DISABLED',
   ) {
+    if (request.executionDeadlineAt !== undefined) {
+      // No abandoned write after deadline: an unmarked run retains its bounded
+      // lease and the durable attempt suppresses any prior healthy-looking run.
+      if (request.executionDeadlineAt - Date.now() < 100) return
+      try {
+        await withRiskKeyTransaction(request.executionDeadlineAt, async client => {
+          await client.query(`UPDATE identity_risk_evaluation_runs SET status='FAILED',failure_code=$5,
+            lease_token=NULL,lease_expires_at=NULL WHERE id=$1::uuid AND organization_id=$2::uuid
+            AND customer_tenant_id=$3::uuid AND lease_token=$4::uuid AND status='RUNNING'`,
+          [runId, request.organizationId, request.customerTenantId, leaseToken, failureCode])
+        })
+      } catch { /* The bounded lease is the fail-closed recovery mechanism. */ }
+      return
+    }
     await this.prisma.identityRiskEvaluationRun.updateMany({
       where: {
         id: runId,
@@ -1082,6 +1114,7 @@ export class IdentityRiskEvaluatorService {
   }
 
   private async claimRun(input: {
+    mailboxAttestations?: IdentityRiskSourceBatch['mailboxAttestations']
     pseudonymKeyVersionId?: string
     sourceObservedAt?: Date
     request: IdentityRiskEvaluationRequest
@@ -1100,8 +1133,10 @@ export class IdentityRiskEvaluatorService {
     | { hardDisabled: IdentityRiskSafetyState }
   > {
     const now = input.platformNow
-    return this.prisma.$transaction(async (transaction) => {
+    return runRiskTransaction(this.prisma, input.request, async (transaction) => {
+      await configureRiskStatementBudget(transaction, input.request)
       await enforceRiskUtcTransaction(transaction)
+      assertRiskExecutionBudget(input.request)
       const safety = await this.lockedSafetyState(
         transaction,
         input.request.organizationId,
@@ -1109,6 +1144,7 @@ export class IdentityRiskEvaluatorService {
         false,
       )
       if (safety.evaluationHardDisabled) return { hardDisabled: safety }
+      await assertGlobalRiskCommitScope(transaction, input.request, input.capability, input.mailboxAttestations)
       if (input.pseudonymKeyVersionId) {
         // Lock the pinned version through persistence claim; revoked/foreign versions cannot start a run.
         const keys = await transaction.$queryRaw<Array<{ id: string }>>`
@@ -1143,7 +1179,10 @@ export class IdentityRiskEvaluatorService {
         if (existing.sourceContentHash !== input.sourceContentHash) {
           return 'SOURCE_INTEGRITY_CONFLICT'
         }
-        if (existing.status === 'COMPLETED') return 'COMPLETED'
+        if (existing.status === 'COMPLETED') {
+          await completeGlobalRiskAttempt(transaction, input.request, existing.id)
+          return 'COMPLETED'
+        }
         if (
           existing.status === 'RUNNING' &&
           existing.leaseExpiresAt &&
@@ -1207,6 +1246,7 @@ export class IdentityRiskEvaluatorService {
     runKey: string,
     organizationId: string,
     customerTenantId: string,
+    executionDeadlineAt?: number,
   ) {
     const aggregates: RuleAggregate[] = []
     const matches = new Map<string, IdentitySignalResult>()
@@ -1218,6 +1258,7 @@ export class IdentityRiskEvaluatorService {
     for (const detector of [...detectors].sort((left, right) =>
       left.ruleId.localeCompare(right.ruleId),
     )) {
+      assertRiskExecutionBudget({ executionDeadlineAt })
       const ruleId = detector.ruleId as IdentityRiskRuleId
       const aggregate = emptyAggregate(ruleId)
       aggregates.push(aggregate)
@@ -1229,6 +1270,7 @@ export class IdentityRiskEvaluatorService {
         add(aggregate.notEvaluated)
         addReason(aggregate, 'DETECTOR_FAILED')
         await this.safety.recordDetectorRejection({
+          executionDeadlineAt,
           organizationId,
           customerTenantId,
           runKey,
@@ -1242,6 +1284,7 @@ export class IdentityRiskEvaluatorService {
         add(aggregate.notEvaluated)
         addReason(aggregate, 'RESULT_LIMIT_EXCEEDED')
         await this.safety.recordDetectorRejection({
+          executionDeadlineAt,
           organizationId,
           customerTenantId,
           runKey,
@@ -1262,6 +1305,7 @@ export class IdentityRiskEvaluatorService {
         add(aggregate.notEvaluated)
         addReason(aggregate, rejectionReason)
         await this.safety.recordDetectorRejection({
+          executionDeadlineAt,
           organizationId,
           customerTenantId,
           runKey,
@@ -1284,6 +1328,7 @@ export class IdentityRiskEvaluatorService {
           const existingOutcome = unboundSubjectOutcomes.get(subjectKey)
           if (existingOutcome && existingOutcome !== result.outcome) {
             await this.safety.recordDetectorRejection({
+              executionDeadlineAt,
               organizationId,
               customerTenantId,
               runKey,
@@ -1315,6 +1360,7 @@ export class IdentityRiskEvaluatorService {
         if (existing === signature) continue
         if (existing) {
           await this.safety.recordDetectorRejection({
+            executionDeadlineAt,
             organizationId,
             customerTenantId,
             runKey,
@@ -1361,6 +1407,7 @@ export class IdentityRiskEvaluatorService {
   }
 
   private async persistCompletedRun(input: {
+    mailboxAttestations?: IdentityRiskSourceBatch['mailboxAttestations']
     pseudonymKeyVersionId?: string
     request: IdentityRiskEvaluationRequest
     runId: string
@@ -1372,7 +1419,8 @@ export class IdentityRiskEvaluatorService {
     matches: readonly [string, IdentitySignalResult][]
     platformNow: Date
   }) {
-    return this.prisma.$transaction(async (transaction) => {
+    return runRiskTransaction(this.prisma, input.request, async (transaction) => {
+      await configureRiskStatementBudget(transaction, input.request)
       await enforceRiskUtcTransaction(transaction)
       const safety = await this.lockedSafetyState(
         transaction,
@@ -1399,6 +1447,7 @@ export class IdentityRiskEvaluatorService {
         if (failed.count !== 1) throw new Error('Identity risk run lease was lost.')
         return { status: 'HARD_DISABLED' as const, safety }
       }
+      await assertGlobalRiskCommitScope(transaction, input.request, input.capability, input.mailboxAttestations)
       if (input.pseudonymKeyVersionId) {
         const keys = await transaction.$queryRaw<Array<{ id: string }>>`
           SELECT id FROM identity_risk_pseudonym_key_versions
@@ -1419,6 +1468,7 @@ export class IdentityRiskEvaluatorService {
         throw new Error('Identity risk persistence boundary rejected an opaque reference.')
       }
       for (const aggregate of input.aggregates) {
+        assertRiskExecutionBudget(input.request)
         await transaction.identityRiskRuleCoverage.upsert({
           where: {
             organizationId_customerTenantId_evaluationRunId_ruleId: {
@@ -1454,6 +1504,7 @@ export class IdentityRiskEvaluatorService {
         })
       }
       for (const [resultKey, result] of input.matches) {
+        assertRiskExecutionBudget(input.request)
         const ruleId = result.ruleId as IdentityRiskRuleId
         const observedAt = result.observedAt as Date
         const matched = await transaction.identityRiskMatchedResult.upsert({
@@ -1532,6 +1583,7 @@ export class IdentityRiskEvaluatorService {
           throw new Error('Identity risk catalog projection is unavailable.')
         }
       }
+      assertRiskExecutionBudget(input.request)
       const updated = await transaction.identityRiskEvaluationRun.updateMany({
         where: {
           id: input.runId,
@@ -1555,6 +1607,7 @@ export class IdentityRiskEvaluatorService {
         },
       })
       if (updated.count !== 1) throw new Error('Identity risk run lease was lost.')
+      await completeGlobalRiskAttempt(transaction, input.request, input.runId)
       return { status: 'COMPLETED' as const, safety }
     })
   }

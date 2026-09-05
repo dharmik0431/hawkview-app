@@ -7,6 +7,8 @@ import {
   type IdentityRiskControlType,
 } from './identity-risk.contract.js'
 import { boundedSafeString } from './identity-risk.validation.js'
+import { configureRiskStatementBudget } from './risk-global-commit-guard.js'
+import { runRiskTransaction } from './risk-bounded-prisma-transaction.js'
 
 const CONTROL_REASONS = new Set([
   'ISOLATION_FAILURE',
@@ -108,6 +110,7 @@ export class IdentityRiskSafetyService {
     actorServiceId: string
     correlationId?: string
     now?: Date
+    executionDeadlineAt?: number
   }) {
     const reasonCode = boundedSafeString(input.reasonCode, 80)
     const actorServiceId = boundedSafeString(input.actorServiceId, 128)
@@ -118,7 +121,8 @@ export class IdentityRiskSafetyService {
     const episodeId = randomUUID()
     const correlationId = input.correlationId ?? randomUUID()
     const key = scopeKey(input.scope)
-    return this.prisma.$transaction(async (transaction) => {
+    return runRiskTransaction(this.prisma, input, async (transaction) => {
+      await configureRiskStatementBudget(transaction, input)
       await transaction.$executeRawUnsafe(
         'SELECT pg_advisory_xact_lock(hashtext($1))',
         `hawkview:identity-risk-control:${input.controlType}:${key}`,
@@ -244,6 +248,7 @@ export class IdentityRiskSafetyService {
     episodeId: string
     scopeType: 'GLOBAL' | 'TENANT'
     now?: Date
+    executionDeadlineAt?: number
   }) {
     const now = input.now ?? new Date()
     const scope: IdentityRiskControlScope = input.scopeType === 'GLOBAL'
@@ -254,7 +259,7 @@ export class IdentityRiskSafetyService {
           customerTenantId: input.customerTenantId,
         }
     try {
-      await this.prisma.identityRiskOperationalEvent.create({
+      const data = {
         data: {
           eventKey: eventKey('HARD_STOP_BLOCKED', input.episodeId),
           eventType: 'EVALUATION_BLOCKED',
@@ -269,6 +274,11 @@ export class IdentityRiskSafetyService {
           ),
           createdAt: now,
         },
+      }
+      if (input.executionDeadlineAt === undefined) await this.prisma.identityRiskOperationalEvent.create(data)
+      else await runRiskTransaction(this.prisma, input, async transaction => {
+        await configureRiskStatementBudget(transaction, input)
+        await transaction.identityRiskOperationalEvent.create(data)
       })
     } catch (error) {
       if (!uniqueViolation(error)) throw error
@@ -282,6 +292,7 @@ export class IdentityRiskSafetyService {
     ruleId: string
     reasonCode: string
     now: Date
+    executionDeadlineAt?: number
   }) {
     const scope: IdentityRiskControlScope = {
       type: 'TENANT',
@@ -290,7 +301,7 @@ export class IdentityRiskSafetyService {
     }
     const correlationId = randomUUID()
     try {
-      await this.prisma.identityRiskOperationalEvent.create({
+      const data = {
         data: {
           eventKey: eventKey(
             'DETECTOR_REJECTED',
@@ -312,6 +323,11 @@ export class IdentityRiskSafetyService {
           ),
           createdAt: input.now,
         },
+      }
+      if (input.executionDeadlineAt === undefined) await this.prisma.identityRiskOperationalEvent.create(data)
+      else await runRiskTransaction(this.prisma, input, async transaction => {
+        await configureRiskStatementBudget(transaction, input)
+        await transaction.identityRiskOperationalEvent.create(data)
       })
     } catch (error) {
       if (!uniqueViolation(error)) throw error
