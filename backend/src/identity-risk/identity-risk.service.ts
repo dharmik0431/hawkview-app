@@ -996,29 +996,6 @@ export class IdentityRiskService {
     }
   }
 
-  async pruneExpired(organizationId: string, customerTenantId: string, now = new Date()) {
-    return this.prisma.$transaction(async (transaction) => {
-      const finding = await transaction.identityRiskFinding.deleteMany({
-        where: { organizationId, customerTenantId, expiresAt: { lte: now } },
-      })
-      const matched = await transaction.identityRiskMatchedResult.deleteMany({
-        where: { organizationId, customerTenantId, expiresAt: { lte: now } },
-      })
-      const coverage = await transaction.identityRiskRuleCoverage.deleteMany({
-        where: { organizationId, customerTenantId, expiresAt: { lte: now } },
-      })
-      const runs = await transaction.identityRiskEvaluationRun.deleteMany({
-        where: { organizationId, customerTenantId, expiresAt: { lte: now } },
-      })
-      return {
-        findings: finding.count,
-        matchedResults: matched.count,
-        coverage: coverage.count,
-        runs: runs.count,
-      }
-    })
-  }
-
   private projectFinding(
     row: {
       id: string

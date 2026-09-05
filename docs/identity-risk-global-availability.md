@@ -124,16 +124,16 @@ are not mathematically exact wall-clock guarantees. A lost commit acknowledgemen
 must be handled through the existing durable idempotency/lease keys, not by
 assuming that every client-side timeout proves the transaction never committed.
 
-## Retention decision — RELEASE HOLD
+## Retention decision — approved policy, staged implementation
 
-Existing operational/scoped retention behavior is preserved. Inventory found
-that runs/coverage/results/findings lack an active global physical-prune caller.
-A newly proposed cross-organization destructive sweep is **NOT authorized**.
-The local untracked `risk-global-retention.ts` draft is unwired, unexecuted,
-excluded from release, and must not be imported/staged as a workaround.
+The owner approved 90-day physical retention for derived assessment history.
+See [the retention policy/runbook](identity-risk-history-retention.md) for the
+independent validity contract, original-age legacy handling, bounded cleanup,
+excluded data classes, backup limits and staged default-OFF enablement.
+The old unreviewed retention draft remains excluded; it is not this implementation.
 
-Before global production activation, the owner must resolve the retention scope
-decision and independent QA must verify the approved implementation. Required
+Before global production activation, independent QA must verify the approved
+implementation and its separately staged rollout. Required
 design evidence: finite expiry, leaf-first bounds, no live-child cascade, backlog
 progress, drain capacity exceeding admitted creation, tenant/privacy isolation,
 and cleanup behavior while evaluation is OFF. Do not claim this gate complete
@@ -141,7 +141,7 @@ from expiry filters alone, and do not silently extend retention indefinitely.
 
 ## Controlled release prerequisites
 
-1. Resolve the retention HOLD. Independently review exact integrated source,
+1. Complete the approved staged retention gates. Independently review exact integrated source,
    concurrency/not-before repair, migration, threat/resource/isolation matrix.
 2. Pass protected Node 22/PostgreSQL 16 CI and the final runtime-image checks.
    Local Node 24/PostgreSQL 15 tests are preliminary, not image/CI equivalence.
@@ -159,4 +159,6 @@ from expiry filters alone, and do not silently extend retention indefinitely.
    Microsoft risk values independent. Stop on unsafe evidence or scope failure.
 
 Rollback disables evaluation/UI without deleting tenant data or key material.
-Do not automatically replace failed/revoked keys or run a destructive cleanup.
+Do not automatically replace failed/revoked keys or run unapproved destructive
+cleanup. The separately approved history worker follows its staged retention
+runbook; rollback is not permission for an ad hoc deletion script.

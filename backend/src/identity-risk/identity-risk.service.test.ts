@@ -995,36 +995,6 @@ test('finding detail rejects stored evidence that is raw, secret-shaped, duplica
   }
 })
 
-test('retention pruning is ordered and scoped by both organization and tenant', async () => {
-  const calls: Array<{ model: string; where: unknown }> = []
-  const deleteModel = (model: string) => ({
-    deleteMany: async ({ where }: { where: unknown }) => {
-      calls.push({ model, where })
-      return { count: 1 }
-    },
-  })
-  const transaction = {
-    identityRiskFinding: deleteModel('finding'),
-    identityRiskMatchedResult: deleteModel('matched'),
-    identityRiskRuleCoverage: deleteModel('coverage'),
-    identityRiskEvaluationRun: deleteModel('run'),
-  }
-  const prisma = {
-    $transaction: async (callback: (value: typeof transaction) => unknown) => callback(transaction),
-  } as unknown as PrismaService
-  const result = await new IdentityRiskService(prisma).pruneExpired(
-    organizationId,
-    tenantId,
-    new Date(),
-  )
-  assert.deepEqual(result, {
-    findings: 1, matchedResults: 1, coverage: 1, runs: 1,
-  })
-  assert.deepEqual(calls.map((call) => call.model), [
-    'finding', 'matched', 'coverage', 'run',
-  ])
-  for (const call of calls) {
-    assert.equal((call.where as { organizationId?: unknown }).organizationId, organizationId)
-    assert.equal((call.where as { customerTenantId?: unknown }).customerTenantId, tenantId)
-  }
+test('customer read service exposes no legacy unbounded pruning method', () => {
+  assert.equal('pruneExpired' in IdentityRiskService.prototype, false)
 })

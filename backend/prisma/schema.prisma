@@ -319,6 +319,7 @@ model CustomerTenant {
 
   @@unique([id, organizationId])
   identityRiskAttemptHeads IdentityRiskAttemptHead[]
+  identityRiskHistoryCursors IdentityRiskHistoryTenantCursor[]
   @@index([organizationId, status])
   @@map("customer_tenants")
 }
@@ -741,6 +742,25 @@ model ChangeEvidenceEvent {
 
 // The identity-risk platform stores only matched evidence and bounded run
 // aggregates. It deliberately does not retain a row per user/rule abstention.
+model IdentityRiskHistoryCursor {
+  scopeKey String @id @map("scope_key") @db.VarChar(64)
+  afterTenantId String? @map("after_tenant_id") @db.Uuid
+  leaseId String? @map("lease_id") @db.Uuid
+  leaseExpiresAt DateTime? @map("lease_expires_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  @@map("identity_risk_history_cursors")
+}
+
+model IdentityRiskHistoryTenantCursor {
+  organizationId String @map("organization_id") @db.Uuid
+  customerTenantId String @map("customer_tenant_id") @db.Uuid
+  afterCreatedAt DateTime? @map("after_created_at") @db.Timestamptz(6)
+  afterRunId String? @map("after_run_id") @db.Uuid
+  customerTenant CustomerTenant @relation(fields: [customerTenantId,organizationId], references: [id,organizationId], onDelete: Cascade)
+  @@id([organizationId,customerTenantId])
+  @@map("identity_risk_history_tenant_cursors")
+}
+
 model IdentityRiskSchedulerCursor {
   environment String @id @db.VarChar(40)
   afterTenantId String? @map("after_tenant_id") @db.Uuid
@@ -841,6 +861,8 @@ model IdentityRiskEvaluationRun {
   @@index([organizationId, customerTenantId, completedAt(sort: Desc)], map: "identity_risk_evaluation_runs_scope_completed")
   @@index([organizationId, customerTenantId, status, leaseExpiresAt], map: "identity_risk_evaluation_runs_scope_lease")
   @@index([expiresAt], map: "identity_risk_evaluation_runs_expiry")
+  @@index([organizationId,customerTenantId,createdAt,id], map: "identity_risk_runs_history_scope")
+  @@index([createdAt,id], map: "identity_risk_runs_history_scan")
   @@index([pseudonymKeyVersionId, organizationId, customerTenantId], map: "identity_risk_runs_key_version")
   @@map("identity_risk_evaluation_runs")
 }
@@ -867,7 +889,7 @@ model IdentityRiskRuleCoverage {
   createdAt           DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
   organization        Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   customerTenant      CustomerTenant            @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
-  evaluationRun       IdentityRiskEvaluationRun @relation(fields: [evaluationRunId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: Cascade)
+  evaluationRun       IdentityRiskEvaluationRun @relation(fields: [evaluationRunId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: NoAction)
 
   @@unique([organizationId, customerTenantId, evaluationRunId, ruleId], map: "identity_risk_rule_coverage_scope_key")
   @@index([organizationId, customerTenantId, evaluationRunId], map: "identity_risk_rule_coverage_scope_run")
@@ -893,7 +915,7 @@ model IdentityRiskMatchedResult {
   createdAt         DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
   organization      Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   customerTenant    CustomerTenant            @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
-  evaluationRun     IdentityRiskEvaluationRun @relation(fields: [evaluationRunId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: Cascade)
+  evaluationRun     IdentityRiskEvaluationRun @relation(fields: [evaluationRunId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: NoAction)
   findings          IdentityRiskFinding[]
 
   @@unique([organizationId, customerTenantId, resultKey], map: "identity_risk_matched_results_scope_key")
@@ -923,11 +945,12 @@ model IdentityRiskFinding {
   updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
   organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   customerTenant    CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
-  matchedResult     IdentityRiskMatchedResult @relation(fields: [matchedResultId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: Cascade)
+  matchedResult     IdentityRiskMatchedResult @relation(fields: [matchedResultId, organizationId, customerTenantId], references: [id, organizationId, customerTenantId], onDelete: NoAction)
 
   @@unique([organizationId, customerTenantId, dedupeKey], map: "identity_risk_findings_scope_key")
   @@index([organizationId, customerTenantId, state, observedAt(sort: Desc), id(sort: Desc)], map: "identity_risk_findings_scope_state")
   @@index([expiresAt], map: "identity_risk_findings_expiry")
+  @@index([matchedResultId,id], map: "identity_risk_findings_matched_parent")
   @@map("identity_risk_findings")
 }
 

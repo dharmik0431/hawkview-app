@@ -261,6 +261,11 @@ test('attested mailbox projection flows through actual evaluator, durable record
       }) as unknown as PrismaService)
       const page = await api.findings({ subject: 'synthetic-owner', email: 'owner@example.invalid' }, tenantId)
       assert.equal(page.status, capability === 'FULL' ? 'AVAILABLE' : 'NOT_EVALUATED')
+      if (!batch.earliestSourceExpiry) {
+        assert.equal(page.capability, 'UNAVAILABLE')
+        assert.deepEqual(store.calls.runCreateData[0]?.expiresAt, new Date(mailboxNow.getTime()+90*24*60*60*1_000))
+        assert.equal(page.findings.length,0)
+      }
       if (expectedMatches) {
         assert.deepEqual(page.findings[0]?.sourceLabels, ['Microsoft Graph mailbox-rule snapshot', 'Microsoft Graph verified tenant domains'])
         assert.deepEqual(page.findings[0]?.benignAlternativeCodes, ['APPROVED_EXTERNAL_FORWARDING'])
@@ -1524,7 +1529,7 @@ test('platform clock rejects future evaluation before safety, source, or risk wr
     )
     assert.deepEqual(
       acceptedStore.calls.runCreateData[0]?.expiresAt,
-      new Date(platformNow.getTime() + 7 * 24 * 60 * 60 * 1_000),
+      new Date(platformNow.getTime() + 90 * 24 * 60 * 60 * 1_000),
     )
     assert.deepEqual(acceptedStore.calls.coverage[0]?.createdAt, platformNow)
     assert.deepEqual(acceptedStore.calls.matches[0]?.createdAt, platformNow)
