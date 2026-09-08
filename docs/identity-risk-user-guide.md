@@ -101,15 +101,22 @@ MFA registration by itself is not suspicious behavior and is not equivalent to
 enforcement. Each protection statement has its own source, observation time,
 freshness, and safe reason. Stale or incomplete evidence remains unverified.
 
-HawkView creates user and mailbox rows only for authorized, resolved directory
-subjects. It does not merge people because their labels look alike or guess that
-an unresolved event belongs to a human.
+HawkView creates a `USER` row only for an authorized, resolved directory subject.
+Mailbox and user reasons merge only when they share the exact fresh directory
+identifier for that tenant. HawkView does not join by name, email-style label, or
+similar-looking text. An unresolved mailbox remains a `MAILBOX` row rather than
+being guessed to be a person.
 
 Application context is either a resolved authorized label or **Not reported**.
 Device context is **Not reported** or **Insufficient fields** in this release;
 HawkView does not display an unverified device name. Client source is shown only
 as qualification state and an opaque tenant-scoped reference when qualified,
 never as a raw IP address or unverified provider description.
+
+The source window shows the captured evidence period. The evaluated lookback can
+be a smaller bounded period within it. Read both before interpreting “no
+findings.” Collection delay, incomplete evidence, and capacity limits are
+different states and must not be treated as equivalent.
 
 ## Information to give support
 

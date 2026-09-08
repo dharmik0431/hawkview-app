@@ -39,8 +39,9 @@ verify an authenticated risk route or usable source evaluation.
   unsupported failures, and inconsistent success/error fields.
 - Duplicate, conflicting, late, future, malformed, app-only, and unresolved-user
   events cannot inflate counts or bind to a human by guesswork.
-- Only resolved directory subjects form user/mailbox rows. Display labels never
-  merge subjects; evidence references are opaque and tenant-scoped.
+- Only exact fresh tenant-scoped directory GUIDs merge mailbox and user reasons
+  into one `USER` row. UPNs, names, and display labels never merge subjects. An
+  unresolved mailbox remains a `MAILBOX` row; evidence references stay opaque.
 - Finding context enforces structured application, device, and client-source
   states. Persisted application labels are null pending authorized resolution;
   device labels are always null; client sources are opaque references. Raw IPs,
@@ -83,14 +84,13 @@ or create synthetic positive events in customer accounts.
 
 ## Database and read-path gate
 
-The release requires an additive database migration before the new backend
-revision starts. The final migration count is intentionally omitted until the
-integrated SHA is frozen. Connected PostgreSQL validation must prove that the
-existing lifecycle values remain valid while adding only the required unknown
-lifecycle state and exact `HV-ID-AUTH-005.v2` rule/version tuple. The confidence
-check permits Low, Medium, and High to match the existing evaluator and DTO
-contract; it does not rewrite an existing rule's priority or confidence. Do not
-loosen checks to accept arbitrary rule versions.
+The release requires two additive database migrations before the new backend
+revision starts. Migration 44 adds the required unknown lifecycle state.
+Migration 45 adds only the exact `HV-ID-AUTH-005.v2` rule/version tuple and makes
+the confidence check permit Low, Medium, and High to match the existing evaluator
+and DTO contract. It does not rewrite an existing rule's priority or confidence.
+Do not loosen checks to accept arbitrary rule versions. The resulting expected
+total is 45 migrations for this frozen backend.
 
 Apply and verify the migration through the ordinary protected release path before
 starting the dependent backend. A migration file in source is not evidence that
@@ -106,6 +106,13 @@ managed key pin/reference handling may record bounded operational key-audit
 events; that is not source-rule evaluation or a customer-state mutation. Reading
 or replaying an incident does not renew the existing 90-day derived-risk
 retention age.
+
+For the mailbox rule, the bounded GET validates the exact two mailbox source
+snapshot/attestation generation pins recorded by the assessment. Missing or
+changed proof yields unknown current mailbox state while authentication rules
+remain independent. For authentication rules, verify that the evaluated lookback
+is a bounded subset of the retained captured source window. Normal collection
+delay must not be labeled as capacity exhaustion.
 
 ## Support triage
 

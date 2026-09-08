@@ -170,10 +170,12 @@ registration each carry their own state, source, observation time, freshness,
 and reason code. Unknown, stale, failed, missing-permission, or incomplete
 evidence must remain explicit; one protection source cannot fill another's gap.
 
-Only an authorized, resolved directory subject can form a user or mailbox row.
-Do not merge rows by display label, guess a human from an unresolved identifier,
-or expose a raw provider identifier. Evidence references remain opaque and
-tenant-scoped.
+Only an authorized, resolved directory subject can form a public `USER` row.
+When a mailbox and directory user share the exact fresh, tenant-scoped directory
+GUID, their reasons merge into one `USER` row whose summary is the highest
+current priority. Never join by UPN, name, or display label. A mailbox without
+that exact resolution remains a `MAILBOX` row; it is not guessed to be a human.
+Evidence references remain opaque and tenant-scoped.
 
 Each finding has structured context. Application state is `RESOLVED` or
 `NOT_REPORTED`; a label is allowed only after an authorized resolved lookup, and
@@ -191,6 +193,16 @@ it must not change the persisted rule result or priority.
 
 The existing 90-day derived-risk retention remains unchanged. Replaying or
 reading an old incident does not renew its retention age or make it current.
+
+The persisted GET contract pins the exact pair of mailbox snapshot/attestation
+generations used by the mailbox result. Missing or changed proof makes the
+current mailbox rule state unknown; it does not block or clear either
+authentication rule.
+
+For authentication rules, the displayed evaluated lookback is a bounded subset
+of the captured source window. Retain both. A normal ingestion delay must not be
+misreported as a capacity limit, and a partial evaluated lookback must not imply
+the complete captured window was assessed.
 
 ## Final reconciliation gate
 
