@@ -183,6 +183,15 @@ always null in this release. Client source is an opaque reference with
 `QUALIFIED`, `NOT_REPORTED`, or `INSUFFICIENT_FIELDS`. Never copy a raw IP,
 unverified device name, or provider description into the finding.
 
+Persisted derived findings keep opaque scoped references and bounded evidence,
+not private display labels or a copied protection snapshot. Authorized directory
+labels and current protection context are resolved conservatively at read time.
+Failure, staleness, or ambiguity during that lookup stays unknown or not reported;
+it must not change the persisted rule result or priority.
+
+The existing 90-day derived-risk retention remains unchanged. Replaying or
+reading an old incident does not renew its retention age or make it current.
+
 ## Final reconciliation gate
 
 Before release, verify every field, reason, priority, explanation, action,
