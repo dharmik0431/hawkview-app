@@ -12,6 +12,9 @@ const ids = {
 const tokenA = `a.${'x'.repeat(120)}.a`
 const tokenB = `b.${'x'.repeat(120)}.b`
 const boundedZero = { value: 0, exact: false, capped: false }
+const exactCount = value => ({ value, exact: true, capped: false })
+const completedAt = '2026-09-02T13:00:00.000Z'
+const observedAt = '2026-09-02T12:00:00.000Z'
 const hawkViewUnavailable = {
   version: 1,
   channel: 'HAWKVIEW_IDENTITY_SIGNALS',
@@ -63,6 +66,81 @@ function riskFixture(route) {
   }
   return {
     ...microsoftUnavailable,
+    users: [],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+}
+
+function completedUnavailableFixture(route) {
+  const meta = {
+    ...hawkViewUnavailable,
+    evaluatedAt: completedAt,
+    limitation:
+      'Approved HawkView identity-signal source evidence is not available for this evaluation.',
+  }
+  if (route === 'summary') {
+    return {
+      ...meta,
+      counts: {
+        identitiesNeedingReview: exactCount(0),
+        openFindings: exactCount(0),
+        evaluatedRules: exactCount(22),
+        matchedResults: exactCount(0),
+        suppressedResults: exactCount(0),
+        notMatchedResults: exactCount(0),
+        notEvaluatedResults: exactCount(22),
+      },
+    }
+  }
+  return {
+    ...meta,
+    findings: [],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+}
+
+function availableFixture(route) {
+  if (route === 'summary') {
+    return {
+      ...hawkViewUnavailable,
+      capability: 'FULL',
+      status: 'AVAILABLE',
+      evaluatedAt: completedAt,
+      observedAt,
+      freshness: 'CURRENT',
+      limitation: null,
+      counts: {
+        identitiesNeedingReview: exactCount(0),
+        openFindings: exactCount(0),
+        evaluatedRules: exactCount(1),
+        matchedResults: exactCount(0),
+        suppressedResults: exactCount(0),
+        notMatchedResults: exactCount(1),
+        notEvaluatedResults: exactCount(0),
+      },
+    }
+  }
+  if (route === 'findings') {
+    return {
+      ...hawkViewUnavailable,
+      capability: 'FULL',
+      status: 'AVAILABLE',
+      evaluatedAt: completedAt,
+      observedAt,
+      freshness: 'CURRENT',
+      limitation: null,
+      findings: [],
+      pageInfo: { hasMore: false, nextCursor: null },
+    }
+  }
+  return {
+    ...microsoftUnavailable,
+    capability: 'FULL',
+    status: 'STALE',
+    evaluatedAt: completedAt,
+    observedAt,
+    freshness: 'STALE',
+    limitation: 'Microsoft Entra risky-user evidence is stale.',
     users: [],
     pageInfo: { hasMore: false, nextCursor: null },
   }
@@ -170,6 +248,38 @@ test('accepts truthful no-source and unavailable v1 risk envelopes for two isola
   assert.ok(calls.every(call => call.url.origin === API_ORIGIN || call.url.origin === 'https://oidc.example.test'))
 })
 
+test('accepts a completed HawkView evaluation with unavailable source evidence', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ relationship, route }) =>
+      relationship === 'own' && route !== 'microsoft'
+        ? jsonResponse(completedUnavailableFixture(route))
+        : null,
+  })
+  await runAuthenticatedCanary({
+    fetchImpl,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  })
+})
+
+test('accepts coherent bounded available and stale v1 envelopes', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ relationship, route }) =>
+      relationship === 'own' ? jsonResponse(availableFixture(route)) : null,
+  })
+  await runAuthenticatedCanary({
+    fetchImpl,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  })
+})
+
 test('rejects a 500 from an own-tenant identity-risk route', async () => {
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ authorization, relationship, route }) =>
@@ -253,15 +363,15 @@ test('rejects an exact zero count in a no-data summary', async () => {
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
       },
     }),
-    /openFindings no-data count was not a non-exact bounded zero/,
+    /identity risk summary counts did not match evaluation availability/,
   )
 })
 
-test('rejects rows in a no-data findings response', async () => {
+test('rejects an invalid row in an available findings response', async () => {
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ authorization, relationship, route }) =>
       authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'findings'
-        ? jsonResponse({ ...riskFixture('findings'), findings: [null] })
+        ? jsonResponse({ ...availableFixture('findings'), findings: [null] })
         : null,
   })
   await assert.rejects(
@@ -273,7 +383,7 @@ test('rejects rows in a no-data findings response', async () => {
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
       },
     }),
-    /identity risk findings synthetic baseline collection was not empty/,
+    /identity risk findings row 1 row was invalid/,
   )
 })
 
@@ -293,7 +403,53 @@ test('rejects current freshness with null no-data timestamps', async () => {
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
       },
     }),
-    /Microsoft Entra risky users no-data state was contradictory/,
+    /Microsoft Entra risky users state was contradictory/,
+  )
+})
+
+test('rejects a future evaluated timestamp', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'summary'
+        ? jsonResponse({
+            ...completedUnavailableFixture('summary'),
+            evaluatedAt: '2999-01-01T00:00:00.000Z',
+          })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /identity risk summary timestamp was in the future/,
+  )
+})
+
+test('rejects an empty collection that claims another page', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'findings'
+        ? jsonResponse({
+            ...riskFixture('findings'),
+            pageInfo: { hasMore: true, nextCursor: 'opaque.cursor' },
+          })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /identity risk findings empty page claimed more results/,
   )
 })
 
@@ -303,7 +459,7 @@ test('rejects a 200 risk response without a JSON content type', async () => {
       authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'summary'
         ? new Response(JSON.stringify(riskFixture('summary')), {
             status: 200,
-            headers: { 'content-type': 'text/plain' },
+            headers: { 'content-type': 'application/json-seq' },
           })
         : null,
   })
