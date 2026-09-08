@@ -10,6 +10,22 @@ export const MAILBOX_SOURCE_RESOURCES = ['EXCHANGE_MAILBOX_RULES', 'EXCHANGE_ACC
 export type MailboxSourceResource = typeof MAILBOX_SOURCE_RESOURCES[number]
 export type MailboxSourceScope = { organizationId: string; customerTenantId: string }
 
+// Collection-time provenance only; these codes never grant source eligibility.
+export const MAILBOX_ATTESTATION_FAILURE_REASONS = [
+  'DIRECTORY_SYNC_MISSING', 'DIRECTORY_SYNC_NOT_SUCCEEDED', 'DIRECTORY_SYNC_UNDATED',
+  'DIRECTORY_SYNC_STALE', 'DIRECTORY_SYNC_NEWER_ATTEMPT', 'RULE_ENDPOINT_NOT_FOUND',
+] as const
+export type MailboxAttestationFailureReason = typeof MAILBOX_ATTESTATION_FAILURE_REASONS[number]
+
+export function mailboxAttestationReason(digest: string | null, riskAttestable: boolean,
+  failureReason?: MailboxAttestationFailureReason) {
+  if (digest) return 'ATTESTED_COMPLETE'
+  if (riskAttestable) return 'RULE_VALIDATION_UNATTESTABLE'
+  // Runtime allowlist also protects legacy/untyped callers; never persist input text.
+  return MAILBOX_ATTESTATION_FAILURE_REASONS.some(reason => reason === failureReason)
+    ? failureReason! : 'SOURCE_NOT_ATTESTED'
+}
+
 export function sourceAttestationKey(resource: MailboxSourceResource) {
   return `identity-risk/v1/${resource}`
 }
