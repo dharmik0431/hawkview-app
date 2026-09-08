@@ -70,6 +70,10 @@ fresh scoped evidence, backend configuration and frontend/GAS publication remain
 separate activation work. See [wrapped pilot limits](identity-risk-wrapped-pilot.md).
 This does not impose a KMS requirement or add a platform/subscription.
 
+The [recovery inventory and synthetic drill](identity-risk-recovery.md) provide
+a non-secret ownership template and isolated ordering/reconciliation exercise.
+They do not attest a real protected backup or authorize production key access.
+
 ## Local candidate evidence (not deployment evidence)
 
 Node 24/PostgreSQL 15 disposable fixture: backend 646 passed, zero failed, two
