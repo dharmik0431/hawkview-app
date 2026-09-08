@@ -20,6 +20,7 @@ const activeUser = {
 
 const tenant = (overrides: Record<string, unknown> = {}) => ({
   id: tenantId,
+  organizationId,
   displayName: 'Contoso',
   primaryDomain: 'contoso.com',
   microsoftTenantId: '44444444-4444-4444-8444-444444444444',
@@ -84,6 +85,10 @@ test('report verification persists only the read result and never mutates Micros
         updateData = data
         current = tenant({ ...current.connection, ...data })
       },
+    },
+    workspaceAdminAuditLog: { create: async () => ({}) },
+    async $transaction(work: (transaction: unknown) => Promise<unknown>) {
+      return work(this)
     },
   } as unknown as PrismaService
   const service = new TenantsService(prisma, {

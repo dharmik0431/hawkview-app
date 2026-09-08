@@ -26,12 +26,10 @@ import {
 } from './organization-onboarding.js'
 import {
   createWorkspaceAuditOperation,
-  safeWorkspaceAuditMetadata,
   type WorkspaceAuditMetadata,
   type WorkspaceAuditOperation,
-  WORKSPACE_AUDIT_EVENT_VERSION,
   workspaceAuditErrorCode,
-  workspaceAuditExpiration,
+  writeWorkspaceAudit,
 } from './workspace-audit.js'
 
 const ROLE_VALUES = new Set(Object.values(MembershipRole))
@@ -226,30 +224,7 @@ export class WorkspaceService {
     },
     client: Pick<PrismaService, 'workspaceAdminAuditLog'> = this.prisma
   ) {
-    await client.workspaceAdminAuditLog.create({
-      data: {
-        organizationId: actor.organizationId,
-        actorUserId: actor.userId,
-        // Actor and target emails are intentionally not duplicated into new
-        // audit rows. Internal IDs remain enough to resolve authorized views.
-        actorEmail: null,
-        targetUserId: evidence.targetUserId ?? null,
-        targetEmail: null,
-        targetType: evidence.targetType,
-        targetOpaqueId: evidence.targetOpaqueId.slice(0, 128),
-        action: evidence.
-        action,
-        outcome: evidence.outcome,
-        stage: evidence.stage,
-        errorCode: evidence.errorCode ?? null,
-        requestId: evidence.requestId,
-        operationId: evidence.operationId,
-        eventVersion: WORKSPACE_AUDIT_EVENT_VERSION,
-        metadata: safeWorkspaceAuditMetadata(evidence. metadata) as
-          | Prisma.InputJsonObject | undefined,
-        expiresAt: workspaceAuditExpiration(),
-      },
-    })
+    await writeWorkspaceAudit(client, actor, evidence)
   }
 
   private operation(requestId?: string) {
