@@ -1,10 +1,10 @@
-import { Controller, Get, Header, Param, Query, Req } from '@nestjs/common'
+import { Controller, Get, Header, Inject, Param, Query, Req } from '@nestjs/common'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { IdentityRiskService } from './identity-risk.service.js'
 
 @Controller('api/tenants/:tenantId')
 export class IdentityRiskController {
-  constructor(private readonly service: IdentityRiskService) {}
+  constructor(@Inject(IdentityRiskService) private readonly service: IdentityRiskService) {}
   @Get('identity-signals/summary') summary(@Req() req: AuthenticatedRequest, @Param('tenantId') id: string) { return this.service.summary(req.auth, id) }
   @Get('identity-signals/findings')
   findings(
