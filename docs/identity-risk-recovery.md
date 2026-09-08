@@ -3,32 +3,35 @@
 ## Status and boundary
 
 This is a **procedure/template and local synthetic drill**, not a production
-backup, custody attestation, restore command, or activation approval. No real
+backup, custody attestation, restore command, restore test, or activation
+approval. No real
 root, tenant identifier, customer data, or backup location belongs in this file.
-The production risk-environment label is **UNCONFIRMED**. `production` in
-`backend/.env.example` is an example, not evidence of the live namespace.
+An environment label in source or an example file is not proof of the live
+namespace. Confirm the exact approved label through the restricted operator
+process without exposing key material.
 
 The existing API uses a protected Render `SECRET_ENCRYPTION_KEY` variable and
 PostgreSQL wrapped ciphertext. A runtime variable is not an independent recovery
 copy. The same root also protects Microsoft credentials: replacing it to repair
 risk keys can break unrelated credentials. Preserve the current root.
 
-Actual protected production backup: **NOT CONFIRMED / blocked on an exact
-owner-approved destination and access**. Global detector/UI activation is
-unchanged. Existing single-canary history retention is unchanged.
+Backup, custody, point-in-time recovery, and restore-test status are restricted
+operational facts and are not attested in this repository.
+Database recovery plus the correct root and current revocation/deletion state
+are all required; none alone proves recoverability.
 
 ## Non-secret inventory (owner/platform completes)
 
 | Field | Required record; current status |
 | --- | --- |
-| Accountable owner / recovery operator | Named individual or group; unconfirmed |
-| Production risk namespace | Exact existing approved label and evidence reference; unconfirmed |
+| Accountable owner / recovery operator | Record the permitted operator at execution; do not publish identity here |
+| Production risk namespace | Confirm the exact approved label privately at execution |
 | Development namespace and custody | Separate root, database and destination/access boundary; unconfirmed |
-| Protected key-backup destination | Existing approved system plus exact record path/ID; unconfirmed |
+| Protected key-backup destination | Confirm an approved private destination through the custody process |
 | Access and audit | Who can recover, least-privilege roles, access-log location; unconfirmed |
 | Version protection | Version/immutability/deletion protection and retention facts; unconfirmed |
-| Backup verification | Operator, UTC creation/verification times, safe evidence reference; unconfirmed |
-| Database recovery dependency | Database backup/PITR system, restore point and tested availability; unconfirmed |
+| Backup verification | Record creation and verification evidence privately; repository status unconfirmed |
+| Database recovery dependency | Confirm backup/PITR and restore-test evidence privately; repository status unconfirmed |
 | Independent revocation inventory | Location/checkpoint of revoke/destroy/deletion records that survives database rollback; unconfirmed |
 | Restore reconciliation | Operator sign-off and verification evidence before resume; unconfirmed |
 
@@ -37,13 +40,12 @@ raw provider responses, or customer records in the inventory, tickets, CI output
 Git, chat, command arguments or shell history. A synthetic digest is used only
 inside the drill; this procedure does not publish a real-root fingerprint.
 
-Known infrastructure metadata: Render hosts the protected runtime configuration;
-Supabase/PostgreSQL hosts the database. The reviewed records identify **no
-approved independent secret-backup record**. Neither the same Render variable,
-a duplicate variable/environment group, nor an unverified database backup should
-be presented as independent key recovery. PM must name an exact existing
-protected destination and authorize its access before a real-key operation.
-Do not search password managers, secret files, or provision a new paid service.
+The repository does not identify the live secret host, database provider,
+recovery-copy location, or their current operational status. A duplicate runtime
+variable or database backup alone is not independent key recovery. Authorize
+destination access through the private custody process before a real-key
+operation. Do not search password managers or secret files from this runbook,
+and do not provision a new paid service as a workaround.
 
 ## Fail-closed recovery order (future controlled operation)
 
@@ -106,7 +108,8 @@ Synthetic buffers are cleared on fixture teardown on a best-effort basis;
 JavaScript garbage collection is not a secure-erasure guarantee. TAP output has
 only static test names and counts, never fixture material.
 
-Record separately in the delivery handoff: procedure prepared; exact commit and
-test command/result; production backup NOT confirmed; destination/access still
-required; activation unchanged. Passing this drill closes only the synthetic
-procedure gate, not actual key custody or production restore readiness.
+Record the exact commit and test result in the restricted delivery handoff.
+Record backup custody, recoverability, access control, version protection,
+revocation inventory, and restore evidence there—not in this repository.
+Passing this drill closes only the synthetic procedure gate, not actual key
+custody or production restore readiness.

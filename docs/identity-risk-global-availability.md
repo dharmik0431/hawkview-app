@@ -1,5 +1,38 @@
 # Global mailbox-risk availability — implementation and rollout gates
 
+## Rollout evidence boundary
+
+This repository describes the supported configuration contract and verification
+procedure. It does not publish current production configuration, deployment
+identifiers, tenant counts, backup records, or private operator attestations.
+Confirm those facts through the restricted operator handoff.
+
+Only `HV-ID-MBX-001.v1` is supported by this rollout guide. A source change,
+approval, configured environment, successful deployment, backend verification,
+frontend publication, and user verification are different states. Never collapse
+them into “live.” A completed run with unavailable source capability means not
+evaluated from usable evidence; it is not a clean or zero-risk result. An unbound
+head also remains unavailable and cannot preserve an older clean verdict.
+
+After backend verification, the owner separately publishes the frontend from
+reviewed source with the server/build variable
+`HAWKVIEW_IDENTITY_RISK_UI_ENABLED=true`. It is not a `NEXT_PUBLIC_*` value,
+and changing only `.env.example` does nothing to an existing published build.
+Record exact build/publication evidence privately and complete a user-visible
+check before saying the UI is published or user-verified.
+
+Use these distinct states in every handoff:
+
+1. approved;
+2. configured;
+3. deployed;
+4. backend-verified;
+5. UI-published; and
+6. user-verified.
+
+This document intentionally does not state which stage the current production
+system has reached.
+
 ## Product boundary
 
 All current and future connected tenants are eligible regardless of Microsoft

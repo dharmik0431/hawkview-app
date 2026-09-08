@@ -4,7 +4,22 @@ Base: `92cb239afebc73fe5a61a28476e49b728ff7d68f` (PR224).
 
 This change is presentation and synthetic tests only. It changes no API, detector,
 permissions, flags, dependencies, or lookup authorization. No live tenant data was
-used. The existing server-only default-off UI gate remains unchanged.
+used. The server/build gate treats an absent or null value as enabled for backward
+compatibility. Explicit `false`, blank, or invalid values disable the UI; a missing
+React provider also disables it independently. Operators must use explicit values
+instead of assuming that unsetting the variable hides the UI.
+
+## Publication verification
+
+Frontend source and backend verification do not prove that a user-facing build
+has been published. The owner must publish from the reviewed source with the
+server/build variable `HAWKVIEW_IDENTITY_RISK_UI_ENABLED=true`. Do not rename it
+to `NEXT_PUBLIC_*` or treat `.env.example` as deployed configuration.
+
+Publication is complete only after the exact build is recorded privately and an authorized
+user verifies the two separate cards and the states available, partial, stale,
+unavailable, not evaluated, and evaluated empty. Do not expose operator, Swagger,
+admin, or debug routes as part of this user verification.
 
 ## Acceptance behavior
 
