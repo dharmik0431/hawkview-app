@@ -114,7 +114,7 @@ export async function projectAuthenticationAssessment(
       ruleId: incident.ruleId, ruleVersion: tuple.version, priority: tuple.priority, confidence: 'MEDIUM',
       activityState: incident.activity === 'UNKNOWN' ? 'UNKNOWN' : Date.parse(incident.expiresAt) < now ? 'HISTORICAL' : 'CURRENT',
       title: ASSESSMENT_COPY[incident.ruleId].title, explanation: ASSESSMENT_COPY[incident.ruleId].explanation,
-      firstSeen: incident.firstSeen, lastSeen: incident.lastSeen, evaluatedAt: new Date(now).toISOString(),
+      firstSeen: incident.firstSeen, lastSeen: incident.lastSeen, evaluatedAt: new Date(now).toISOString(), activityWindowEndsAt: incident.expiresAt,
       window: { start: incident.firstSeen, end: incident.lastSeen }, evidenceCount: incident.evidenceCount,
       evidenceCountCapped: incident.evidenceCount > refs.length || incident.caveats.includes('EVIDENCE_CAP_REACHED'), selectedSource: input.source,
       application: { id: incident.applicationRef, state: 'RESOLVED', label: null }, device: { state: 'NOT_REPORTED', label: null },

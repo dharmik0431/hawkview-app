@@ -50,6 +50,19 @@ export function projectAuthenticationAuditRecord(value: unknown): Record<string,
   return row
 }
 
+/** Validate applicable login envelopes BEFORE filtering/projecting a mixed
+ * audit page. A malformed login candidate is a collection gap, not no activity. */
+export function projectAuthenticationAuditPageRow(value: unknown): Record<string, unknown> {
+  const projected = projectAuthenticationAuditRecord(value)
+  const raw = value as Record<string, unknown>
+  const applicable = raw.RecordType === 15 || raw.RecordType === '15' ||
+    ['UserLoggedIn','UserLoginFailed'].includes(raw.Operation as string)
+  if (applicable && (typeof projected.Id !== 'string' || !projected.Id ||
+    typeof projected.CreationTime !== 'string' || !Number.isFinite(Date.parse(projected.CreationTime))))
+    throw new Error('IDENTITY_AUTH_APPLICABLE_RECORD_INVALID')
+  return projected
+}
+
 /** Display projection only. The strict rule normalizer independently validates
  * operation, all conflicting error fields and source identity before detection. */
 export function reportedAuthenticationErrorCode(row: Record<string, unknown>): number | null {

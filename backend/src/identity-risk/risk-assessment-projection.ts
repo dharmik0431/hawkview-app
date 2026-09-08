@@ -74,6 +74,16 @@ export type StoredRiskAssessment = Readonly<{
 const STATES = new Set(['READY', 'PARTIAL', 'WAITING', 'MISSING_PERMISSION', 'LICENSE_REQUIRED', 'STALE', 'FAILED', 'INSUFFICIENT_FIELDS', 'UNSUPPORTED', 'DISABLED'])
 const REASONS = new Set(['READY', 'WAITING_FOR_COLLECTION', 'MISSING_PERMISSION', 'LICENSE_REQUIRED', 'COLLECTION_FAILED', 'COLLECTION_STALE', 'INCOMPLETE_WINDOW', 'SOURCE_UNAVAILABLE', 'INSUFFICIENT_FIELDS', 'USER_BINDING_UNRESOLVED', 'APPLICATION_BINDING_UNRESOLVED', 'CLIENT_SOURCE_UNQUALIFIED', 'UNSUPPORTED_RECORD', 'CONFLICTING_EVIDENCE', 'CAPACITY_LIMIT', 'EVALUATION_FAILED', 'EVALUATION_DISABLED', 'KEY_UNAVAILABLE', 'DIRECTORY_SYNC_MISSING', 'DIRECTORY_SYNC_NOT_SUCCEEDED', 'DIRECTORY_SYNC_UNDATED', 'DIRECTORY_SYNC_STALE', 'DIRECTORY_SYNC_NEWER_ATTEMPT', 'RULE_ENDPOINT_NOT_FOUND', 'RULE_VALIDATION_UNATTESTABLE', 'SOURCE_NOT_ATTESTED', 'ATTESTED_COMPLETE'])
 const SOURCES = new Set(['M365_AUDIT_STS', 'GRAPH_SIGN_INS', 'MAILBOX_RULES'])
+const STATUS_REASONS: Readonly<Record<string, readonly string[]>> = {
+  READY: ['READY', 'ATTESTED_COMPLETE'],
+  PARTIAL: ['INCOMPLETE_WINDOW', 'CAPACITY_LIMIT', 'CONFLICTING_EVIDENCE', 'INSUFFICIENT_FIELDS', 'USER_BINDING_UNRESOLVED', 'APPLICATION_BINDING_UNRESOLVED'],
+  WAITING: ['WAITING_FOR_COLLECTION', 'SOURCE_UNAVAILABLE', 'SOURCE_NOT_ATTESTED', 'DIRECTORY_SYNC_MISSING', 'RULE_ENDPOINT_NOT_FOUND', 'RULE_VALIDATION_UNATTESTABLE'],
+  MISSING_PERMISSION: ['MISSING_PERMISSION'], LICENSE_REQUIRED: ['LICENSE_REQUIRED'],
+  STALE: ['COLLECTION_STALE', 'DIRECTORY_SYNC_STALE'],
+  FAILED: ['COLLECTION_FAILED', 'EVALUATION_FAILED', 'KEY_UNAVAILABLE', 'DIRECTORY_SYNC_NOT_SUCCEEDED', 'DIRECTORY_SYNC_UNDATED', 'DIRECTORY_SYNC_NEWER_ATTEMPT'],
+  INSUFFICIENT_FIELDS: ['INSUFFICIENT_FIELDS', 'USER_BINDING_UNRESOLVED', 'APPLICATION_BINDING_UNRESOLVED', 'CLIENT_SOURCE_UNQUALIFIED'],
+  UNSUPPORTED: ['UNSUPPORTED_RECORD'], DISABLED: ['EVALUATION_DISABLED'],
+}
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) &&
     [Object.prototype, null].includes(Object.getPrototypeOf(value))
@@ -107,7 +117,7 @@ function reference(value: unknown, kind: string): value is string {
 }
 const count = (value: unknown): boolean => Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 1_000_000
 
-export function projectStoredRiskAssessment(value: unknown, now: Date): StoredRiskAssessment | null {
+export function projectStoredRiskAssessment(value: unknown, now: Date, mode: 'CURRENT' | 'PERSISTED_HISTORY' = 'CURRENT'): StoredRiskAssessment | null {
   try {
     if (!safeTree(value) || Buffer.byteLength(JSON.stringify(value)) > ASSESSMENT_MAX_BYTES || !record(value) ||
       !keys(value, 'schemaVersion,sources,rules,subjects') || value.schemaVersion !== RISK_ASSESSMENT_SCHEMA ||
@@ -116,6 +126,7 @@ export function projectStoredRiskAssessment(value: unknown, now: Date): StoredRi
     for (const source of value.sources) {
       if (!record(source) || !keys(source, 'source,status,reasonCode,explanation,window,lastSuccessfulCollectionAt,latestEventAt,latestIngestionAt,freshness') ||
         !SOURCES.has(source.source as string) || !STATES.has(source.status as string) || !REASONS.has(source.reasonCode as string) ||
+        !STATUS_REASONS[source.status as string]?.includes(source.reasonCode as string) ||
         !['CURRENT', 'STALE', 'UNKNOWN'].includes(source.freshness as string) || !window(source.window, now) ||
         ['lastSuccessfulCollectionAt', 'latestEventAt', 'latestIngestionAt'].some(key => source[key] !== null && !time(source[key], now))) return null
       if (source.status === 'READY' && (source.freshness !== 'CURRENT' || source.lastSuccessfulCollectionAt === null ||
@@ -127,6 +138,7 @@ export function projectStoredRiskAssessment(value: unknown, now: Date): StoredRi
         !RISK_ASSESSMENT_RULE_IDS.includes(rule.ruleId as RiskAssessmentRuleId)) return null
       const tuple = RISK_ASSESSMENT_RULE_TUPLES[rule.ruleId as RiskAssessmentRuleId]
       if (rule.ruleVersion !== tuple.version || !STATES.has(rule.status as string) || !REASONS.has(rule.reasonCode as string) ||
+        !STATUS_REASONS[rule.status as string]?.includes(rule.reasonCode as string) ||
         (rule.selectedSource !== null && !(tuple.sources as readonly string[]).includes(rule.selectedSource as string)) ||
         !window(rule.window, now) || (rule.evaluatedAt !== null && !time(rule.evaluatedAt, now)) ||
         [rule.assessedIdentities, rule.matchedIdentities].some(n => n !== null && !count(n)) || typeof rule.countsCapped !== 'boolean') return null
@@ -144,7 +156,7 @@ export function projectStoredRiskAssessment(value: unknown, now: Date): StoredRi
         !Array.isArray(subject.findings) || !subject.findings.length) return null
       subjectIds.add(subject.id)
       for (const finding of subject.findings) {
-        if (++findings > ASSESSMENT_MAX_FINDINGS || !record(finding) || !keys(finding, 'id,ruleId,ruleVersion,priority,confidence,activityState,title,explanation,firstSeen,lastSeen,evaluatedAt,window,evidenceCount,evidenceCountCapped,selectedSource,application,device,clientSource,evidenceReferences,eventProtection,caveats,recommendedActions') ||
+        if (++findings > ASSESSMENT_MAX_FINDINGS || !record(finding) || !keys(finding, 'id,ruleId,ruleVersion,priority,confidence,activityState,title,explanation,firstSeen,lastSeen,evaluatedAt,activityWindowEndsAt,window,evidenceCount,evidenceCountCapped,selectedSource,application,device,clientSource,evidenceReferences,eventProtection,caveats,recommendedActions') ||
           !RISK_ASSESSMENT_RULE_IDS.includes(finding.ruleId as RiskAssessmentRuleId) || !reference(finding.id, 'contribution') || findingIds.has(finding.id)) return null
         findingIds.add(finding.id)
         if (!record(finding.application) || !keys(finding.application, 'id,state,label') ||
@@ -158,6 +170,20 @@ export function projectStoredRiskAssessment(value: unknown, now: Date): StoredRi
           !['QUALIFIED', 'NOT_REPORTED', 'INSUFFICIENT_FIELDS'].includes(finding.clientSource.qualification as string) ||
           (finding.clientSource.qualification === 'QUALIFIED' && finding.clientSource.reference === null)) return null
         const tuple = RISK_ASSESSMENT_RULE_TUPLES[finding.ruleId as RiskAssessmentRuleId]
+        if (!time(finding.activityWindowEndsAt, new Date(now.getTime() + 36 * 60 * 60_000)) ||
+          !time(finding.lastSeen, now) || finding.activityWindowEndsAt < finding.lastSeen ||
+          Date.parse(finding.activityWindowEndsAt) - Date.parse(finding.lastSeen) >
+            (finding.ruleId === 'HV-ID-MBX-001.v1' ? 36 * 60 * 60_000 : finding.ruleId === 'HV-ID-AUTH-005.v2' ? 10 * 60_000 : 15 * 60_000)) return null
+        // Stored history is shape-validated here, then MUST be aged/reconciled
+        // against current metadata before the ordinary CURRENT projection.
+        if (finding.activityState === 'CURRENT' && mode === 'CURRENT') {
+          if (Date.parse(finding.activityWindowEndsAt) < now.getTime()) return null
+          const rule = value.rules.find(rule => rule.ruleId === finding.ruleId)
+          const source = value.sources.find(source => source.source === finding.selectedSource)
+          if (!rule || !source || rule.selectedSource !== finding.selectedSource || !['READY', 'PARTIAL'].includes(rule.status) || !['READY', 'PARTIAL'].includes(source.status) ||
+            source.freshness !== 'CURRENT' || !time(source.lastSuccessfulCollectionAt, now) ||
+            now.getTime() - Date.parse(source.lastSuccessfulCollectionAt) > (source.source === 'MAILBOX_RULES' ? 36 * 60 * 60_000 : AUTH_COLLECTION_MAX_AGE_MS)) return null
+        }
         if (finding.ruleVersion !== tuple.version || finding.priority !== tuple.priority || !(tuple.sources as readonly string[]).includes(finding.selectedSource as string) ||
           (finding.ruleId === 'HV-ID-MBX-001.v1') !== (subject.subjectType === 'MAILBOX') ||
           !['LOW', 'MEDIUM', 'HIGH'].includes(finding.confidence as string) || !['CURRENT', 'HISTORICAL', 'UNKNOWN'].includes(finding.activityState as string) ||
@@ -177,11 +203,12 @@ export function projectStoredRiskAssessment(value: unknown, now: Date): StoredRi
     const source = value as unknown as StoredRiskAssessment
     return {
       schemaVersion: RISK_ASSESSMENT_SCHEMA,
-      sources: source.sources.map(row => ({ ...row, explanation: assessmentReason(row.reasonCode) })),
-      rules: source.rules.map(row => ({ ...row, title: ASSESSMENT_COPY[row.ruleId].title, explanation: assessmentReason(row.reasonCode) })),
+      sources: source.sources.map(row => ({ ...row, explanation: assessmentReason(row.reasonCode) })).sort((a, b) => a.source.localeCompare(b.source)),
+      rules: source.rules.map(row => ({ ...row, title: ASSESSMENT_COPY[row.ruleId].title, explanation: assessmentReason(row.reasonCode) })).sort((a, b) => a.ruleId.localeCompare(b.ruleId)),
       subjects: source.subjects.map(row => ({ ...row, findings: row.findings.map(finding => ({ ...finding,
         ...ASSESSMENT_COPY[finding.ruleId], recommendedActions: assessmentActions(finding.ruleId),
-      })) })),
+        evidenceReferences: [...finding.evidenceReferences].sort((a, b) => a.recordedAt.localeCompare(b.recordedAt) || a.id.localeCompare(b.id)),
+      })).sort((a, b) => a.id.localeCompare(b.id)) })).sort((a, b) => a.subjectType.localeCompare(b.subjectType) || a.id.localeCompare(b.id)),
     }
   } catch { return null }
 }
@@ -195,13 +222,15 @@ export function unknownRiskProtection(): RiskProtectionDto {
   }
 }
 export function assessmentMeta(data: StoredRiskAssessment, evaluatedAt: string | null, now: Date): IdentityRiskEnvelope {
-  const usable = data.rules.filter(rule => rule.status === 'READY' || rule.status === 'PARTIAL')
+  const usable = data.rules.filter(rule => (rule.status === 'READY' || rule.status === 'PARTIAL') &&
+    rule.selectedSource !== null && rule.evaluatedAt !== null && data.sources.some(source =>
+      source.source === rule.selectedSource && ['READY', 'PARTIAL'].includes(source.status)))
   const full = data.rules.every(rule => rule.status === 'READY' && !rule.countsCapped && data.sources.some(source =>
     source.source === rule.selectedSource && source.status === 'READY' && source.freshness === 'CURRENT'))
   const current = evaluatedAt !== null && time(evaluatedAt, now) && now.getTime() - new Date(evaluatedAt).getTime() <= AUTH_COLLECTION_MAX_AGE_MS
   return { version: 1, channel: 'HAWKVIEW_IDENTITY_SIGNALS', engineVersion: 'hawkview-identity-engine/1', catalogVersion: 'hawkview-identity-signals/v1',
     evaluatedAt, capability: !current || !usable.length ? 'UNAVAILABLE' : full ? 'FULL' : 'PARTIAL',
-    status: !current ? 'STALE' : !usable.length ? 'NOT_EVALUATED' : 'AVAILABLE',
+    status: evaluatedAt === null ? 'NOT_EVALUATED' : !current ? 'STALE' : !usable.length ? 'NOT_EVALUATED' : 'AVAILABLE',
     sourceLabel: 'HawkView independent identity evidence', observedAt: null,
     freshness: current && full ? 'CURRENT' : current && usable.length ? 'UNKNOWN' : evaluatedAt ? 'STALE' : 'UNKNOWN',
     limitation: current && full ? null : 'Coverage is limited to the individually reported source and rule evidence; missing results do not establish safety.',

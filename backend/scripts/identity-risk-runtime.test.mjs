@@ -26,6 +26,10 @@ async function runRuntimeProbe(removeInjection) {
     import { APP_GUARD, NestFactory } from '@nestjs/core';
     import { IdentityRiskController } from './src/identity-risk/identity-risk.controller.ts';
     import { IdentityRiskService } from './src/identity-risk/identity-risk.service.ts';
+    import { RiskAssessmentReader } from './src/identity-risk/risk-assessment-reader.service.ts';
+    import { RiskAssessmentProjector } from './src/identity-risk/risk-assessment-projector.service.ts';
+    import { MailboxRiskProjector } from './src/identity-risk/mailbox-risk-projector.service.ts';
+    import { IdentityRiskPseudonymProvider } from './src/identity-risk/identity-risk-pseudonym.ts';
     import { IdentityAuthGuard } from './src/auth/identity-auth.guard.ts';
     import { IdentityTokenVerifier } from './src/auth/identity-token-verifier.service.ts';
     import { PrismaService } from './src/prisma/prisma.service.ts';
@@ -68,6 +72,8 @@ async function runRuntimeProbe(removeInjection) {
       controllers: [IdentityRiskController],
       providers: [
         IdentityRiskService,
+        RiskAssessmentReader, RiskAssessmentProjector, MailboxRiskProjector,
+        { provide: IdentityRiskPseudonymProvider, useValue: { configured: false, allowsScope: () => false } },
         { provide: PrismaService, useValue: database },
         { provide: IdentityTokenVerifier, useValue: {
           verify: async (token) => {
@@ -93,16 +99,25 @@ async function runRuntimeProbe(removeInjection) {
         console.log(JSON.stringify({ missingInjectionReproduced: true, failingMethods: 3 }));
       } else {
         assert.equal(controller.service, app.get(IdentityRiskService));
+        assert.equal(app.get(IdentityRiskService).assessmentReader, app.get(RiskAssessmentReader));
+        assert.equal(app.get(RiskAssessmentProjector).mailbox, app.get(MailboxRiskProjector));
         await app.listen(0, '127.0.0.1');
         const base = await app.getUrl();
-        const routes = ['identity-signals/summary', 'identity-signals/findings', 'microsoft-entra-risky-users'];
+        const routes = ['identity-signals/summary', 'identity-signals/findings', 'microsoft-entra-risky-users', 'identity-signals/assessment'];
         const results = [];
         for (const route of routes) {
           const url = base + '/api/tenants/' + tenantId + '/' + route;
           const response = await fetch(url, { headers: { Authorization: 'Bearer synthetic-valid' } });
           assert.equal(response.status, 200);
           assert.match(response.headers.get('content-type'), /^application\\/json/);
-          const body = await response.json();
+          const payload = await response.json();
+          const body = route.endsWith('/assessment') ? payload.meta : payload;
+          if (route.endsWith('/assessment')) {
+            assert.equal(payload.schemaVersion, 'hawkview-risk-assessment/v1');
+            assert.deepEqual(payload.users, []);
+            assert.equal(payload.rules.length, 3);
+            assert.match(response.headers.get('cache-control'), /no-store/);
+          }
           assert.equal(body.version, 1);
           assert.equal(body.capability, 'UNAVAILABLE');
           assert.equal(body.freshness, 'UNKNOWN');
@@ -113,7 +128,7 @@ async function runRuntimeProbe(removeInjection) {
           assert.equal(body.status, route === 'microsoft-entra-risky-users' ? 'UNAVAILABLE' : 'NOT_EVALUATED');
           if (route.endsWith('/summary')) {
             for (const count of Object.values(body.counts)) assert.deepEqual(count, { value: 0, exact: false, capped: false });
-          } else {
+          } else if (!route.endsWith('/assessment')) {
             assert.deepEqual(body.pageInfo, { hasMore: false, nextCursor: null });
             assert.deepEqual(route.endsWith('/findings') ? body.findings : body.users, []);
           }
@@ -183,6 +198,6 @@ test('production esbuild negative control reproduces missing controller injectio
 test('production esbuild Nest DI serves guarded identity-risk HTTP envelopes with isolated scope', { timeout: 45_000 }, async () => {
   const result = await runRuntimeProbe(false)
   assert.equal(result.serviceInjected, true)
-  assert.equal(result.results.length, 3)
-  assert.deepEqual(result.results.map((entry) => entry.status), ['NOT_EVALUATED', 'NOT_EVALUATED', 'UNAVAILABLE'])
+  assert.equal(result.results.length, 4)
+  assert.deepEqual(result.results.map((entry) => entry.status), ['NOT_EVALUATED', 'NOT_EVALUATED', 'UNAVAILABLE', 'NOT_EVALUATED'])
 })

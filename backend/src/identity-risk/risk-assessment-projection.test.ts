@@ -16,7 +16,7 @@ function fixture(): StoredRiskAssessment {
       window, evaluatedAt: now.toISOString(), assessedIdentities: 1, matchedIdentities: 1, countsCapped: false })),
     subjects: [{ id: ref('subject'), subjectType: 'USER', findings: [{
       id: ref('contribution'), ruleId: 'HV-ID-AUTH-010.v1', ruleVersion: 'v1', priority: 'LOW', confidence: 'MEDIUM', activityState: 'CURRENT',
-      title: 'PRIVATE', explanation: 'password=PRIVATE', firstSeen: window.start, lastSeen: now.toISOString(), evaluatedAt: now.toISOString(), window,
+      title: 'PRIVATE', explanation: 'password=PRIVATE', firstSeen: window.start, lastSeen: now.toISOString(), evaluatedAt: now.toISOString(), activityWindowEndsAt: now.toISOString(), window,
       evidenceCount: 10, evidenceCountCapped: true, selectedSource: 'M365_AUDIT_STS',
       application: { id: ref('application'), state: 'RESOLVED', label: null }, device: { state: 'NOT_REPORTED', label: null }, clientSource: { reference: null, qualification: 'NOT_REPORTED' },
       evidenceReferences: [{ id: ref('evidence'), recordedAt: now.toISOString(), ingestedAt: now.toISOString() }], eventProtection: 'NOT_REPORTED',
@@ -62,4 +62,12 @@ test('unknown protection carries uncertainty; partial or stale source cannot pro
   assert.equal(assessmentMeta(partial, now.toISOString(), now).capability, 'PARTIAL')
   assert.notEqual(assessmentMeta(partial, now.toISOString(), now).freshness, 'CURRENT')
   assert.equal(assessmentMeta(input, now.toISOString(), new Date(now.getTime() + 3_600_001)).capability, 'UNAVAILABLE')
+})
+
+test('capacity-limited unevaluated sources cannot advertise usable assessment capability', () => {
+  const base=fixture()
+  const input:StoredRiskAssessment={...base,rules:base.rules.map(rule=>({...rule,status:'PARTIAL',reasonCode:'CAPACITY_LIMIT',selectedSource:null,evaluatedAt:null,assessedIdentities:null,matchedIdentities:null,countsCapped:true}))}
+  const meta=assessmentMeta(input,now.toISOString(),now)
+  assert.equal(meta.capability,'UNAVAILABLE');assert.equal(meta.status,'NOT_EVALUATED')
+  assert.equal(assessmentMeta(input,null,now).status,'NOT_EVALUATED')
 })

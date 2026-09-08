@@ -97,6 +97,8 @@ export type RiskAssessmentFindingDto = Readonly<{
   firstSeen: string
   lastSeen: string
   evaluatedAt: string
+  /** Exact detector activity-window boundary, distinct from data retention. */
+  activityWindowEndsAt: string
   window: RiskEvidenceWindow
   evidenceCount: number
   evidenceCountCapped: boolean

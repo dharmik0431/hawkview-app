@@ -134,6 +134,10 @@ export type IdentityRiskSourceBatch = Readonly<{
   authenticationProof?: Readonly<{
     resourceType: 'SIGN_INS'; lastSuccessfulAt: Date; lastAttemptAt: Date | null
     status: string; lastErrorCode: string | null
+    selectedSource: 'GRAPH_SIGN_INS' | 'M365_AUDIT_STS'
+    window: import('./authentication-source-readiness.js').AuthenticationWindow
+    observedAt: Date | null; rowDigest: string
+    directory: { status: string; lastSuccessfulAt: Date; lastAttemptAt: Date | null; lastErrorCode: string | null }
   }>
   /** Internal only: recoverable immutable managed-key version for every reference in this run. */
   pseudonymKeyVersionId?: string

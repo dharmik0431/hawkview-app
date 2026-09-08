@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { authenticationCollectorTransaction } from './authentication-collector.test-fixtures.js'
 import test from 'node:test'
 import { BadGatewayException } from '@nestjs/common'
 import { deriveCollectionReadiness } from './collection-readiness.js'
@@ -23,6 +24,7 @@ function locationFixture(count = 6) {
       assert.ok(options.maxWait > 0 && options.maxWait <= 1000); assert.ok(options.timeout > 0)
       const pending: Array<() => void> = []
       const result = await work({
+        ...authenticationCollectorTransaction(prisma.signInLog.createMany),
         $queryRaw: async (query: any) => {
           const text = query.strings.join('?')
           if (text.includes('set_config')) {
@@ -42,7 +44,7 @@ function locationFixture(count = 6) {
             return { id: row.id, ipAddress: row.ipAddress, location: locationOversized ? null : row.location, locationOversized }
           })
         },
-        signInLog: { updateMany: async ({ where, data }: any) => {
+        signInLog: { ...authenticationCollectorTransaction(prisma.signInLog.createMany).signInLog, updateMany: async ({ where, data }: any) => {
           assert.equal(where.organizationId, 'org-1'); assert.equal(where.customerTenantId, 'tenant-1'); assert.ok(where.expiresAt.gt instanceof Date); assert.ok(where.location)
           observations.active++; observations.maximum = Math.max(observations.maximum, observations.active)
           await new Promise<void>(resolve => setImmediate(resolve)); observations.active--
@@ -218,8 +220,8 @@ test('actual limited-login projection retains only safe diagnostic codes from al
       let calls = 0
       ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify(payloads[calls++]))
       const rows = await (service as any).fetchLimitedLoginActivity(signInTenant, new Date(Date.now() - 60000), new Date())
-      assert.equal(rows[0].status.errorCode, '1')
-      assert.equal(rows[0].status.failureReason, diagnostic === 'AccountLocked' ? diagnostic : 'UserLoginFailed')
+      assert.equal(rows[0].status.errorCode, null, 'No numeric authentication code may be invented from audit ResultStatus or diagnostic text')
+      assert.equal(rows[0].status.failureReason, diagnostic === 'AccountLocked' ? diagnostic : 'UnclassifiedAuthenticationError')
       assert.equal(JSON.stringify(rows).includes('private@'), false); assert.equal(JSON.stringify(rows).includes('NEVER_RETAIN'), false)
     }
   }
@@ -383,6 +385,7 @@ function signInCollectorFixture(servicePlans: unknown) {
   const updates: Array<Record<string, unknown>> = []
   const scopes: Array<Record<string, unknown>> = []
   const prisma: any = {
+    $transaction: async(work:any)=>work(authenticationCollectorTransaction(prisma.signInLog.createMany)),
     syncState: {
       upsert: async () => undefined,
       update: async ({ data }: any) => {

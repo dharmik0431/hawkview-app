@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { projectAuthenticationAuditRecord as project, reportedAuthenticationErrorCode as code } from './authentication-audit-projection.js'
+import { projectAuthenticationAuditRecord as project, projectAuthenticationAuditPageRow, reportedAuthenticationErrorCode as code } from './authentication-audit-projection.js'
+
+test('malformed applicable STS page records cannot disappear into a clean empty collection',()=>{
+  const valid={RecordType:15,Operation:'UserLoginFailed',Id:'synthetic',CreationTime:'2026-09-08T21:00:00Z'}
+  for(const change of [{Id:null},{Id:''},{CreationTime:null},{CreationTime:'invalid'},{CreationTime:{access_token:'SYNTHETIC'}}]) {
+    assert.throws(()=>[valid,{...valid,...change}].map(projectAuthenticationAuditPageRow),/IDENTITY_AUTH_APPLICABLE_RECORD_INVALID/)
+  }
+  assert.equal([valid,{RecordType:1,Operation:'Unrelated'}].map(projectAuthenticationAuditPageRow).length,2)
+})
 
 test('audit compaction retains qualified source bindings but not arbitrary private fields', () => {
   const source = { RecordType: 15, ApplicationId: 'app-id', ActorIpAddress: '192.0.2.1',

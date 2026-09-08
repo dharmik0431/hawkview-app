@@ -18,7 +18,9 @@ export function riskAssessmentDetectors(): readonly IdentitySignalDetector[] {
         outcomes.push({ ruleId, subjectId: subject.id, subjectType: subject.subjectType,
           outcome: 'MATCHED', coverage: rule.status === 'READY' ? 'FULL' : 'PARTIAL',
           reasonCodes: ['RULE_MATCHED'], candidateReference: finding.id,
-          evidenceReferences: finding.evidenceReferences.map(ref => ref.id),
+          // Legacy detector envelope is limited to32 references. The validated
+          // persisted assessment retains its independently bounded50 references.
+          evidenceReferences: finding.evidenceReferences.slice(0,32).map(ref => ref.id),
           severity: finding.priority, confidence: finding.confidence, observedAt: new Date(finding.lastSeen),
         })
       }

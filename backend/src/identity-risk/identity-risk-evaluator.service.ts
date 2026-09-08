@@ -9,6 +9,7 @@ import { completeGlobalRiskAttempt } from './risk-attempt-causality.js'
 import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
 import { projectStoredRiskAssessment, type StoredRiskAssessment } from './risk-assessment-projection.js'
 import { riskAssessmentDetectors } from './risk-assessment-detectors.js'
+import { findingRetentionExpiry } from './risk-assessment-history.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
   IDENTITY_RISK_APPROVED_SOURCE_TYPES,
@@ -1045,7 +1046,8 @@ export class IdentityRiskEvaluatorService {
   ) {
     if (
       (batch.pseudonymKeyVersionId !== undefined &&
-        (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(batch.pseudonymKeyVersionId) || !validDate(batch.sourceObservedAt))) ||
+        (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(batch.pseudonymKeyVersionId) ||
+          (!validDate(batch.sourceObservedAt) && !(batch.assessment && batch.capability === 'UNAVAILABLE' && batch.sourceObservedAt === undefined)))) ||
       (batch.sourceObservedAt !== undefined && (!validDate(batch.sourceObservedAt) ||
         batch.sourceObservedAt.getTime() > platformNow.getTime() + IDENTITY_RISK_MAX_FUTURE_SKEW_MS)) ||
       !isPlainRecord(batch.context) ||
@@ -1518,7 +1520,7 @@ export class IdentityRiskEvaluatorService {
       }
       // Historical evidence is an archive entry, never a current detector match.
       const historical: Array<[string, IdentitySignalResult]> = input.assessment?.subjects.flatMap(subject =>
-        subject.findings.filter(finding => finding.activityState === 'HISTORICAL').map(finding => [
+        subject.findings.filter(finding => finding.activityState !== 'CURRENT').map(finding => [
           sha256(input.runKey, 'historical', subject.id, finding.id),
           { ruleId: finding.ruleId, outcome: 'NOT_MATCHED' as const, coverage: 'PARTIAL' as const,
             reasonCodes: ['NO_MATCH'], subjectType: subject.subjectType, subjectId: subject.id,
@@ -1533,9 +1535,10 @@ export class IdentityRiskEvaluatorService {
         const assessmentFinding = assessmentSubject?.findings.find(finding => finding.id === result.candidateReference && finding.ruleId === ruleId)
         if (input.assessment && !assessmentFinding) throw new Error('IDENTITY_RISK_ASSESSMENT_INVALID')
         const evidenceExpiresAt = assessmentFinding
-          ? new Date(new Date(assessmentFinding.firstSeen).getTime() + IDENTITY_RISK_RUN_RETENTION_MS) : input.expiresAt
+          ? findingRetentionExpiry(assessmentFinding) : input.expiresAt
         if (evidenceExpiresAt <= input.platformNow) continue
         const historicalFinding = assessmentFinding?.activityState === 'HISTORICAL'
+        const unknownFinding = assessmentFinding?.activityState === 'UNKNOWN'
         const matched = await transaction.identityRiskMatchedResult.upsert({
           where: {
             organizationId_customerTenantId_resultKey: {
@@ -1591,7 +1594,7 @@ export class IdentityRiskEvaluatorService {
             dedupeKey,
             ruleId,
             ruleVersion: ruleId.endsWith('.v2') ? 'v2' : 'v1',
-            state: historicalFinding ? 'EXPIRED' : 'OPEN',
+            state: unknownFinding ? 'UNKNOWN' : historicalFinding ? 'EXPIRED' : 'OPEN',
             subjectType: result.subjectType as string,
             subjectId: result.subjectId as string,
             severity: result.severity as string,
@@ -1604,7 +1607,7 @@ export class IdentityRiskEvaluatorService {
           },
           update: {
             matchedResultId: matched.id,
-            state: historicalFinding ? 'EXPIRED' : 'UPDATED',
+            state: unknownFinding ? 'UNKNOWN' : historicalFinding ? 'EXPIRED' : 'UPDATED',
             severity: result.severity as string,
             confidence: result.confidence as string,
             coverage: result.coverage,
@@ -1630,6 +1633,10 @@ export class IdentityRiskEvaluatorService {
           status: 'COMPLETED',
           aggregate: { ...aggregateJson(input.aggregates), ...(input.assessment ? {
             assessment: { ...input.assessment, subjects: [] } as unknown as Prisma.InputJsonValue,
+            // Private, bounded generation pins; never included in the public DTO.
+            assessmentMailboxGenerations: (input.mailboxAttestations ?? []).map(proof => ({
+              resourceType: proof.resourceType, observedAt: proof.observedAt.toISOString(), digest: proof.digest,
+            })),
           } : {}) },
           capability:
             input.capability === 'FULL' &&
