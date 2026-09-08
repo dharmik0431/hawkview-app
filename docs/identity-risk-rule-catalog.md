@@ -175,6 +175,14 @@ Do not merge rows by display label, guess a human from an unresolved identifier,
 or expose a raw provider identifier. Evidence references remain opaque and
 tenant-scoped.
 
+Each finding has structured context. Application state is `RESOLVED` or
+`NOT_REPORTED`; a label is allowed only after an authorized resolved lookup, and
+the derived persisted document stores the opaque application ID with a null
+label. Device state is `NOT_REPORTED` or `INSUFFICIENT_FIELDS` and its label is
+always null in this release. Client source is an opaque reference with
+`QUALIFIED`, `NOT_REPORTED`, or `INSUFFICIENT_FIELDS`. Never copy a raw IP,
+unverified device name, or provider description into the finding.
+
 ## Final reconciliation gate
 
 Before release, verify every field, reason, priority, explanation, action,

@@ -41,6 +41,10 @@ verify an authenticated risk route or usable source evaluation.
   events cannot inflate counts or bind to a human by guesswork.
 - Only resolved directory subjects form user/mailbox rows. Display labels never
   merge subjects; evidence references are opaque and tenant-scoped.
+- Finding context enforces structured application, device, and client-source
+  states. Persisted application labels are null pending authorized resolution;
+  device labels are always null; client sources are opaque references. Raw IPs,
+  unverified device names, and provider descriptions never enter the finding.
 - Missing mailbox evidence does not block authentication rules; missing auth
   evidence does not erase a mailbox finding.
 - Protection states cover enforced, conditional, report-only, excluded, stale,
@@ -82,6 +86,8 @@ or create synthetic positive events in customer accounts.
 1. Confirm the MSP session and organization/tenant scope before reading details.
 2. Record the rule ID/version, channel, readiness state, source, evidence window,
    collection/evaluation times, and safe correlation.
+   Treat absent application/device/client fields as **Not reported** or
+   **Insufficient fields** exactly as returned; do not enrich them from logs.
 3. Determine whether the issue is collection, permission, licensing, unsupported
    fields, staleness, evaluation, authorization, or frontend presentation.
 4. Confirm the other channel and unrelated rules remain independent.

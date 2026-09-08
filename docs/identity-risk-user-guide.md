@@ -26,7 +26,7 @@ Each reason should tell you:
 3. why it matters and what the evidence cannot prove;
 4. the investigation priority and evidence confidence;
 5. which source and time window were evaluated;
-6. what protection was verified; and
+6. what the protection context verifies or cannot verify; and
 7. what to do next.
 
 Low, Medium, and High are the only investigation priorities in this release.
@@ -39,13 +39,15 @@ For repeated invalid credentials:
 
 - confirm whether the user and application were expected;
 - compare event and application timing;
-- check for stale saved credentials on known devices or services;
+- check for stale saved credentials on devices or services the MSP verifies
+  through an authorized source;
 - verify current MFA enforcement and relevant exclusions; and
 - follow the MSP incident process if the activity is unexplained.
 
 For failures followed by a successful sign-in:
 
-- validate the successful event, application, device, and source context;
+- validate the successful event and any reported application or source context;
+  use the authorized Microsoft experience when device detail is not reported;
 - determine whether the user corrected an expected password problem;
 - check event-specific MFA or policy evidence without assuming current policy
   applied historically; and
@@ -83,7 +85,7 @@ Event time, ingestion time, and evaluation time are different. Microsoft deliver
 delay is not HawkView processing delay. Historical findings retain last-seen time
 and must not reappear as fresh merely because data was evaluated again.
 
-## Protection labels
+## Protection context
 
 - **MFA required by Conditional Access — [policy]** means fresh evidence proves
   the named enforced policy applies.
@@ -102,6 +104,12 @@ freshness, and safe reason. Stale or incomplete evidence remains unverified.
 HawkView creates user and mailbox rows only for authorized, resolved directory
 subjects. It does not merge people because their labels look alike or guess that
 an unresolved event belongs to a human.
+
+Application context is either a resolved authorized label or **Not reported**.
+Device context is **Not reported** or **Insufficient fields** in this release;
+HawkView does not display an unverified device name. Client source is shown only
+as qualification state and an opaque tenant-scoped reference when qualified,
+never as a raw IP address or unverified provider description.
 
 ## Information to give support
 
