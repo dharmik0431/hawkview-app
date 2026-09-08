@@ -7,6 +7,129 @@ const FULL_GIT_REVISION = /^[0-9a-f]{40}$/i
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+const IDENTITY_RISK_CURRENT_MAX_AGE_MS = 36 * 60 * 60 * 1_000
+const IDENTITY_RISK_MAX_FUTURE_SKEW_MS = 5 * 60 * 1_000
+const IDENTITY_RISK_API_VERSION = 1
+const IDENTITY_RISK_STATUSES = new Set([
+  'AVAILABLE',
+  'STALE',
+  'LEARNING',
+  'NOT_EVALUATED',
+  'UNAVAILABLE',
+  'ERROR',
+])
+const IDENTITY_RISK_CAPABILITIES = new Set(['FULL', 'PARTIAL', 'UNAVAILABLE'])
+const IDENTITY_RISK_FRESHNESS = new Set(['CURRENT', 'STALE', 'UNKNOWN'])
+const FINDING_STATES = new Set(['OPEN', 'UPDATED', 'RESOLVED', 'EXPIRED'])
+const FINDING_SEVERITIES = new Set(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'])
+const FINDING_CONFIDENCES = new Set(['LOW', 'MEDIUM', 'HIGH'])
+const IDENTITY_TYPES = new Set(['USER', 'MAILBOX', 'APPLICATION', 'UNKNOWN'])
+const INVESTIGATION_GUIDANCE_CODES = new Set([
+  'REVIEW_ACTIVITY',
+  'REVIEW_ACCESS',
+  'REVIEW_MAILBOX_RULE',
+  'REVIEW_CONFIGURATION',
+])
+const MICROSOFT_RISK_LEVELS = new Set([
+  'none', 'low', 'medium', 'high', 'hidden', 'unknownFutureValue',
+])
+const MICROSOFT_RISK_STATES = new Set([
+  'none', 'atRisk', 'remediated', 'dismissed', 'confirmedSafe',
+  'confirmedCompromised', 'unknownFutureValue',
+])
+const MICROSOFT_RISK_DETAILS = new Set([
+  'none',
+  'adminGeneratedTemporaryPassword',
+  'userPerformedSecuredPasswordChange',
+  'userPerformedSecuredPasswordReset',
+  'adminConfirmedSigninSafe',
+  'aiConfirmedSigninSafe',
+  'userPassedMFADrivenByRiskBasedPolicy',
+  'adminDismissedAllRiskForUser',
+  'adminConfirmedSigninCompromised',
+  'hidden',
+  'adminConfirmedUserCompromised',
+  'm365DAdminDismissedDetection',
+  'userChangedPasswordOnPremises',
+  'adminDismissedRiskForSignIn',
+  'adminConfirmedAccountSafe',
+  'unknownFutureValue',
+])
+const HAWKVIEW_RULE_SOURCE_LABELS = new Map([
+  ...[
+    'HV-ID-EXP-001.v1',
+    'HV-ID-EXP-002.v1',
+    'HV-ID-CHG-001.v1',
+    'HV-ID-CHG-002.v1',
+    'HV-ID-CHG-003.v1',
+    'HV-ID-CHG-004.v1',
+    'HV-ID-CHG-005.v1',
+    'HV-ID-APP-001.v1',
+    'HV-ID-APP-002.v1',
+  ].map(ruleId => [ruleId, ['Microsoft Entra directory audit']]),
+  ['HV-ID-EXP-003.v1', ['Microsoft Entra sign-in activity']],
+  ['HV-ID-MBX-001.v1', [
+    'Microsoft Graph mailbox-rule snapshot',
+    'Microsoft Graph verified tenant domains',
+  ]],
+  ['HV-ID-MBX-002.v1', ['Exchange Online mailbox audit']],
+  ['HV-ID-MBX-003.v1', ['Exchange Online mailbox audit']],
+  ...[
+    'HV-ID-AUTH-001.v1',
+    'HV-ID-AUTH-002.v1',
+    'HV-ID-AUTH-003.v1',
+    'HV-ID-AUTH-004.v1',
+    'HV-ID-AUTH-005.v1',
+    'HV-ID-AUTH-006.v1',
+    'HV-ID-AUTH-007.v1',
+    'HV-ID-AUTH-008.v1',
+    'HV-ID-AUTH-009.v1',
+  ].map(ruleId => [ruleId, ['Microsoft Entra sign-in activity']]),
+])
+const HAWKVIEW_IDENTITY_REFERENCE_KIND = new Map([
+  ['USER', ['subject']],
+  ['MAILBOX', ['mailbox']],
+  ['APPLICATION', ['application']],
+  ['UNKNOWN', ['source', 'tenant']],
+])
+const IDENTITY_RISK_COUNT_KEYS = [
+  'identitiesNeedingReview',
+  'openFindings',
+  'evaluatedRules',
+  'matchedResults',
+  'suppressedResults',
+  'notMatchedResults',
+  'notEvaluatedResults',
+]
+const IDENTITY_RISK_ROUTES = [
+  {
+    label: 'identity risk summary',
+    suffix: 'identity-signals/summary',
+    channel: 'HAWKVIEW_IDENTITY_SIGNALS',
+    catalogVersion: 'hawkview-identity-signals/v1',
+    engineVersion: 'hawkview-identity-engine/1',
+    sourceLabel: 'HawkView Identity Signals',
+    collection: 'counts',
+  },
+  {
+    label: 'identity risk findings',
+    suffix: 'identity-signals/findings',
+    channel: 'HAWKVIEW_IDENTITY_SIGNALS',
+    catalogVersion: 'hawkview-identity-signals/v1',
+    engineVersion: 'hawkview-identity-engine/1',
+    sourceLabel: 'HawkView Identity Signals',
+    collection: 'findings',
+  },
+  {
+    label: 'Microsoft Entra risky users',
+    suffix: 'microsoft-entra-risky-users',
+    channel: 'MICROSOFT_ENTRA_RISKY_USERS',
+    catalogVersion: 'microsoft-entra-risky-users/v1',
+    engineVersion: null,
+    sourceLabel: 'Microsoft Entra Risky Users',
+    collection: 'users',
+  },
+]
 
 function record(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -42,16 +165,37 @@ async function boundedJson(response, maxBytes = MAX_RESPONSE_BYTES) {
   }
 }
 
-async function requestJson(fetchImpl, url, init, expectedStatuses = [200]) {
-  const response = await fetchImpl(url, {
-    ...init,
-    headers: { accept: 'application/json', ...init?.headers },
-    signal: AbortSignal.timeout(10_000),
-  })
-  const body = await boundedJson(response)
+async function requestJson(
+  fetchImpl,
+  url,
+  init,
+  expectedStatuses = [200],
+  label = 'canary request',
+) {
+  let response
+  try {
+    response = await fetchImpl(url, {
+      ...init,
+      headers: { accept: 'application/json', ...init?.headers },
+      signal: AbortSignal.timeout(10_000),
+    })
+  } catch {
+    throw new Error(`${label} failed`)
+  }
+  const mediaType = response.headers.get('content-type')
+    ?.split(';', 1)[0]
+    ?.trim()
+    .toLowerCase() ?? ''
+  assert(mediaType === 'application/json', `${label} response was not JSON`)
+  let body
+  try {
+    body = await boundedJson(response)
+  } catch {
+    throw new Error(`${label} response was not usable`)
+  }
   assert(
     expectedStatuses.includes(response.status),
-    `Unexpected ${response.status} response from ${new URL(url).pathname}`,
+    `${label} returned an unexpected status`,
   )
   return { response, body }
 }
@@ -65,7 +209,7 @@ async function githubOidcToken(fetchImpl, environment) {
   url.searchParams.set('audience', CANARY_AUDIENCE)
   const { body } = await requestJson(fetchImpl, url, {
     headers: { Authorization: `Bearer ${requestToken}` },
-  })
+  }, [200], 'GitHub OIDC request')
   const token = record(body)?.value
   assert(typeof token === 'string' && token.length > 100, 'GitHub OIDC response was invalid')
   return token
@@ -93,7 +237,13 @@ function normalizedSession(value, expectedSlot) {
   return candidate
 }
 
-async function authenticatedJson(fetchImpl, token, path, expectedStatuses = [200]) {
+async function authenticatedJson(
+  fetchImpl,
+  token,
+  path,
+  expectedStatuses = [200],
+  label = 'authenticated canary request',
+) {
   return requestJson(
     fetchImpl,
     `${API_ORIGIN}${path}`,
@@ -102,7 +252,385 @@ async function authenticatedJson(fetchImpl, token, path, expectedStatuses = [200
       cache: 'no-store',
     },
     expectedStatuses,
+    label,
   )
+}
+
+function canonicalTimestamp(value) {
+  if (
+    typeof value !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+  ) return null
+  const parsed = new Date(value)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value
+    ? value
+    : null
+}
+
+function assertNullableTimestamp(value, label, trustedNowMs) {
+  const timestamp = value === null ? null : canonicalTimestamp(value)
+  assert(value === null || timestamp !== null, `${label} timestamp contract was invalid`)
+  assert(
+    timestamp === null ||
+      Date.parse(timestamp) <= trustedNowMs + IDENTITY_RISK_MAX_FUTURE_SKEW_MS,
+    `${label} timestamp was in the future`,
+  )
+  return timestamp
+}
+
+function exactKeys(value, expected) {
+  const keys = Object.keys(value)
+  return keys.length === expected.length &&
+    expected.every(key => Object.prototype.hasOwnProperty.call(value, key))
+}
+
+function boundedString(value, max, label, pattern = null) {
+  assert(
+    typeof value === 'string' &&
+      value.length > 0 &&
+      value.length <= max &&
+      !/[\u0000-\u001f\u007f]/.test(value) &&
+      (!pattern || pattern.test(value)),
+    `${label} was invalid`,
+  )
+}
+
+function assertStringList(value, label, { maxItems = 10, requireItem = false } = {}) {
+  assert(
+    Array.isArray(value) &&
+      value.length <= maxItems &&
+      (!requireItem || value.length > 0),
+    `${label} was invalid`,
+  )
+  for (const item of value) boundedString(item, 160, label)
+  assert(new Set(value).size === value.length, `${label} contained duplicates`)
+}
+
+function assertIdentityRiskEnvelope(body, route, requestWindow) {
+  const trustedNowMs = requestWindow.completedAt
+  const envelope = record(body)
+  assert(envelope?.version === IDENTITY_RISK_API_VERSION, `${route.label} version was invalid`)
+  assert(envelope.channel === route.channel, `${route.label} channel was invalid`)
+  assert(envelope.catalogVersion === route.catalogVersion, `${route.label} catalog was invalid`)
+  assert(envelope.engineVersion === route.engineVersion, `${route.label} engine was invalid`)
+  assert(IDENTITY_RISK_STATUSES.has(envelope.status), `${route.label} status was invalid`)
+  assert(
+    IDENTITY_RISK_CAPABILITIES.has(envelope.capability),
+    `${route.label} capability was invalid`,
+  )
+  assert(
+    IDENTITY_RISK_FRESHNESS.has(envelope.freshness),
+    `${route.label} freshness was invalid`,
+  )
+  assert(envelope.sourceLabel === route.sourceLabel, `${route.label} source label was invalid`)
+  const evaluatedAt = assertNullableTimestamp(
+    envelope.evaluatedAt,
+    route.label,
+    trustedNowMs,
+  )
+  const observedAt = assertNullableTimestamp(
+    envelope.observedAt,
+    route.label,
+    trustedNowMs,
+  )
+  assert(
+    observedAt === null ||
+      (evaluatedAt !== null &&
+        Date.parse(observedAt) <=
+          Date.parse(evaluatedAt) + IDENTITY_RISK_MAX_FUTURE_SKEW_MS),
+    `${route.label} observation timestamp was invalid`,
+  )
+  assert(
+    envelope.limitation === null ||
+      (typeof envelope.limitation === 'string' &&
+        envelope.limitation.length > 0 &&
+        envelope.limitation.length <= 500),
+    `${route.label} limitation was invalid`,
+  )
+  assert(envelope.status !== 'ERROR', `${route.label} reported an error state`)
+  const observedAgeAtEndMs = observedAt === null
+    ? null
+    : trustedNowMs - Date.parse(observedAt)
+  const observedAgeAtStartMs = observedAt === null
+    ? null
+    : requestWindow.startedAt - Date.parse(observedAt)
+  // The server may evaluate anywhere within this read's timing window. At the
+  // 36h crossing, either classification can be valid; outside it, fail closed.
+  const hawkViewCoherent =
+    ((envelope.status === 'AVAILABLE' || envelope.status === 'STALE') &&
+      (envelope.capability === 'FULL' || envelope.capability === 'PARTIAL') &&
+      envelope.freshness === (envelope.status === 'AVAILABLE' ? 'CURRENT' : 'STALE') &&
+      evaluatedAt !== null &&
+      observedAt !== null &&
+      (envelope.status === 'AVAILABLE'
+        ? observedAgeAtStartMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS
+        : observedAgeAtEndMs > IDENTITY_RISK_CURRENT_MAX_AGE_MS) &&
+      envelope.limitation !== null) ||
+    (envelope.status === 'NOT_EVALUATED' &&
+      envelope.capability === 'UNAVAILABLE' &&
+      envelope.freshness === 'UNKNOWN' &&
+      observedAt === null &&
+      envelope.limitation !== null) ||
+    (envelope.status === 'UNAVAILABLE' &&
+      envelope.capability === 'UNAVAILABLE' &&
+      envelope.freshness === 'UNKNOWN' &&
+      evaluatedAt === null &&
+      observedAt === null &&
+      envelope.limitation !== null)
+  const microsoftCoherent =
+    (envelope.status === 'AVAILABLE' &&
+      envelope.capability === 'FULL' &&
+      envelope.freshness === 'CURRENT' &&
+      evaluatedAt !== null &&
+      observedAt !== null &&
+      observedAgeAtStartMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
+      envelope.limitation === null) ||
+    (envelope.status === 'UNAVAILABLE' &&
+      envelope.capability === 'UNAVAILABLE' &&
+      envelope.freshness === 'UNKNOWN' &&
+      evaluatedAt === null &&
+      observedAt === null &&
+      envelope.limitation !== null)
+  const coherent = route.channel === 'HAWKVIEW_IDENTITY_SIGNALS'
+    ? hawkViewCoherent
+    : microsoftCoherent
+  assert(coherent, `${route.label} state was contradictory`)
+  return envelope
+}
+
+function assertBoundedCount(value, label) {
+  const count = record(value)
+  assert(
+    Number.isInteger(count?.value) && count.value >= 0 && count.value <= 10_000,
+    `${label} value was invalid`,
+  )
+  assert(typeof count.exact === 'boolean', `${label} exact marker was invalid`)
+  assert(typeof count.capped === 'boolean', `${label} capped marker was invalid`)
+  assert(!(count.exact && count.capped), `${label} exact and capped markers conflicted`)
+  assert(
+    (!count.capped || count.value === 10_000) &&
+      (count.exact || count.capped || count.value === 0),
+    `${label} bounded-count markers were invalid`,
+  )
+  return count
+}
+
+function assertPageInfo(value, label, collectionLength) {
+  const pageInfo = record(value)
+  assert(
+    pageInfo && exactKeys(pageInfo, ['hasMore', 'nextCursor']) &&
+      typeof pageInfo.hasMore === 'boolean',
+    `${label} pagination was invalid`,
+  )
+  assert(
+    pageInfo.hasMore
+      ? typeof pageInfo.nextCursor === 'string' &&
+          pageInfo.nextCursor.length > 0 &&
+          pageInfo.nextCursor.length <= 256 &&
+          /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(pageInfo.nextCursor)
+      : pageInfo.nextCursor === null,
+    `${label} cursor contract was invalid`,
+  )
+  assert(collectionLength > 0 || !pageInfo.hasMore, `${label} empty page claimed more results`)
+}
+
+function assertFinding(value, envelope, label, trustedNowMs) {
+  const finding = record(value)
+  const keys = [
+    'id', 'state', 'severity', 'confidence', 'coverage', 'title', 'explanation',
+    'affectedIdentity', 'investigationGuidanceCode', 'investigationGuidance',
+    'benignAlternativeCodes', 'sourceLabels', 'missingEvidenceLabels',
+    'observedAt', 'ruleIds',
+  ]
+  assert(finding && exactKeys(finding, keys), `${label} row was invalid`)
+  boundedString(finding.id, 200, `${label} id`, /^[A-Za-z0-9._:-]+$/)
+  assert(FINDING_STATES.has(finding.state), `${label} state was invalid`)
+  assert(FINDING_SEVERITIES.has(finding.severity), `${label} severity was invalid`)
+  assert(FINDING_CONFIDENCES.has(finding.confidence), `${label} confidence was invalid`)
+  assert(IDENTITY_RISK_CAPABILITIES.has(finding.coverage), `${label} coverage was invalid`)
+  boundedString(finding.title, 160, `${label} title`)
+  boundedString(finding.explanation, 1_000, `${label} explanation`)
+  const identity = record(finding.affectedIdentity)
+  assert(identity && exactKeys(identity, ['id', 'label', 'type']), `${label} identity was invalid`)
+  assert(IDENTITY_TYPES.has(identity.type), `${label} identity type was invalid`)
+  const allowedKinds = HAWKVIEW_IDENTITY_REFERENCE_KIND.get(identity.type) ?? []
+  assert(
+    typeof identity.id === 'string' &&
+      allowedKinds.some(kind =>
+        new RegExp(`^hvr1_${kind}_[a-f0-9]{64}$`).test(identity.id)),
+    `${label} identity projection was invalid`,
+  )
+  assert(
+    identity.label === (identity.type === 'MAILBOX'
+      ? 'Affected mailbox (restricted details)'
+      : 'Tenant identity'),
+    `${label} identity label was invalid`,
+  )
+  assert(
+    INVESTIGATION_GUIDANCE_CODES.has(finding.investigationGuidanceCode),
+    `${label} guidance code was invalid`,
+  )
+  boundedString(finding.investigationGuidance, 300, `${label} guidance`)
+  assertStringList(finding.benignAlternativeCodes, `${label} alternatives`)
+  assertStringList(finding.sourceLabels, `${label} sources`)
+  assertStringList(finding.missingEvidenceLabels, `${label} missing evidence`)
+  assertStringList(finding.ruleIds, `${label} rules`, { requireItem: true })
+  const expectedSources = finding.ruleIds.length === 1
+    ? HAWKVIEW_RULE_SOURCE_LABELS.get(finding.ruleIds[0])
+    : null
+  assert(expectedSources, `${label} rules were invalid`)
+  assert(
+    finding.sourceLabels.length === expectedSources.length &&
+      finding.sourceLabels.every((source, index) => source === expectedSources[index]),
+    `${label} sources did not match the registered rule`,
+  )
+  const observedAt = assertNullableTimestamp(
+    finding.observedAt,
+    `${label} observed`,
+    trustedNowMs,
+  )
+  assert(
+    observedAt && envelope.evaluatedAt &&
+      Date.parse(observedAt) <= Date.parse(envelope.evaluatedAt) + 5 * 60 * 1_000,
+    `${label} observed timestamp was invalid`,
+  )
+}
+
+function assertMicrosoftUser(value, envelope, label, trustedNowMs) {
+  const user = record(value)
+  assert(
+    user && exactKeys(user, [
+      'id', 'identityLabel', 'riskLevel', 'riskState', 'riskDetail', 'observedAt',
+    ]),
+    `${label} row was invalid`,
+  )
+  boundedString(user.id, 37, `${label} id`, /^msru_[a-f0-9]{32}$/)
+  boundedString(user.identityLabel, 160, `${label} identity label`)
+  assert(MICROSOFT_RISK_LEVELS.has(user.riskLevel), `${label} risk level was invalid`)
+  assert(MICROSOFT_RISK_STATES.has(user.riskState), `${label} risk state was invalid`)
+  assert(
+    user.riskDetail === null || MICROSOFT_RISK_DETAILS.has(user.riskDetail),
+    `${label} risk detail was invalid`,
+  )
+  const observedAt = assertNullableTimestamp(
+    user.observedAt,
+    `${label} observed`,
+    trustedNowMs,
+  )
+  assert(
+    observedAt && envelope.evaluatedAt &&
+      Date.parse(observedAt) <= Date.parse(envelope.evaluatedAt) + 5 * 60 * 1_000,
+    `${label} observed timestamp was invalid`,
+  )
+}
+
+function assertIdentityRiskResponse(body, route, requestWindow) {
+  const trustedNowMs = requestWindow.completedAt
+  const candidate = record(body)
+  const commonKeys = [
+    'version', 'channel', 'engineVersion', 'catalogVersion', 'evaluatedAt',
+    'capability', 'status', 'sourceLabel', 'observedAt', 'freshness', 'limitation',
+  ]
+  assert(
+    candidate && exactKeys(
+      candidate,
+      route.collection === 'counts'
+        ? [...commonKeys, 'counts']
+        : [...commonKeys, route.collection, 'pageInfo'],
+    ),
+    `${route.label} envelope keys were invalid`,
+  )
+  const envelope = assertIdentityRiskEnvelope(body, route, requestWindow)
+  if (route.collection === 'counts') {
+    const counts = record(envelope.counts)
+    assert(
+      counts && exactKeys(counts, IDENTITY_RISK_COUNT_KEYS),
+      `${route.label} counts were invalid`,
+    )
+    const validatedCounts = []
+    for (const key of IDENTITY_RISK_COUNT_KEYS) {
+      validatedCounts.push(assertBoundedCount(counts[key], `${route.label} ${key}`))
+    }
+    assert(
+      envelope.evaluatedAt === null
+        ? validatedCounts.every(count =>
+            count.value === 0 && !count.exact && !count.capped)
+        : validatedCounts.every(count => count.exact || count.capped),
+      `${route.label} counts did not match evaluation availability`,
+    )
+    const evaluatedRules = counts.evaluatedRules
+    const evaluatedRulesUnavailable =
+      evaluatedRules.value === 0 && !evaluatedRules.exact && !evaluatedRules.capped
+    assert(
+      evaluatedRulesUnavailable ||
+        (evaluatedRules.exact && !evaluatedRules.capped && evaluatedRules.value <= 22),
+      `${route.label} evaluated-rules count was invalid`,
+    )
+    return
+  }
+  const collection = envelope[route.collection]
+  assert(
+    Array.isArray(collection) && collection.length <= 100,
+    `${route.label} collection was invalid`,
+  )
+  if (envelope.capability === 'UNAVAILABLE') {
+    assert(collection.length === 0, `${route.label} unavailable collection was not empty`)
+  }
+  collection.forEach((value, index) => {
+    if (route.collection === 'findings') {
+      assertFinding(value, envelope, `${route.label} row ${index + 1}`, trustedNowMs)
+    } else {
+      assertMicrosoftUser(value, envelope, `${route.label} row ${index + 1}`, trustedNowMs)
+    }
+  })
+  const rowIds = collection.map(value => record(value)?.id)
+  assert(new Set(rowIds).size === rowIds.length, `${route.label} row IDs were duplicated`)
+  assertPageInfo(envelope.pageInfo, route.label, collection.length)
+}
+
+async function verifyIdentityRiskRoutes(
+  fetchImpl,
+  session,
+  foreignSession,
+  verifyUnauthenticated,
+  now,
+) {
+  for (const route of IDENTITY_RISK_ROUTES) {
+    const ownPath = `/api/tenants/${encodeURIComponent(session.expectedTenantId)}/${route.suffix}`
+    const startedAt = now()
+    assert(Number.isFinite(startedAt), 'Canary clock was invalid')
+    const own = await authenticatedJson(
+      fetchImpl,
+      session.accessToken,
+      ownPath,
+      [200],
+      `${route.label} own tenant`,
+    )
+    const completedAt = now()
+    assert(
+      Number.isFinite(completedAt) && completedAt >= startedAt,
+      'Canary request timing window was invalid',
+    )
+    assertIdentityRiskResponse(own.body, route, { startedAt, completedAt })
+    const foreignPath = `/api/tenants/${encodeURIComponent(foreignSession.expectedTenantId)}/${route.suffix}`
+    await authenticatedJson(
+      fetchImpl,
+      session.accessToken,
+      foreignPath,
+      [403, 404],
+      `${route.label} foreign tenant denial`,
+    )
+
+    if (verifyUnauthenticated) {
+      await requestJson(
+        fetchImpl,
+        `${API_ORIGIN}${ownPath}`,
+        { cache: 'no-store' },
+        [401],
+        `${route.label} unauthenticated denial`,
+      )
+    }
+  }
 }
 
 async function verifyIdentityBoundary(fetchImpl, session, foreignSession) {
@@ -154,16 +682,22 @@ async function verifyIdentityBoundary(fetchImpl, session, foreignSession) {
 export async function runAuthenticatedCanary({
   fetchImpl = fetch,
   environment = process.env,
+  now = Date.now,
 } = {}) {
+  assert(Number.isFinite(now()), 'Canary clock was invalid')
   const revision = environment.EXPECTED_REVISION?.trim().toLowerCase() ?? ''
   assert(FULL_GIT_REVISION.test(revision), 'Expected deployment revision is invalid')
 
-  const health = (await requestJson(fetchImpl, `${API_ORIGIN}/health`, {})).body
+  const health = (
+    await requestJson(fetchImpl, `${API_ORIGIN}/health`, {}, [200], 'API health')
+  ).body
   assert(
     record(health)?.status === 'ok' && record(health)?.revision === revision,
     'The expected API revision is not live',
   )
-  const database = (await requestJson(fetchImpl, `${API_ORIGIN}/health/database`, {})).body
+  const database = (
+    await requestJson(fetchImpl, `${API_ORIGIN}/health/database`, {}, [200], 'database health')
+  ).body
   assert(
     record(database)?.status === 'ok' &&
       record(database)?.database === 'connected' &&
@@ -193,7 +727,9 @@ export async function runAuthenticatedCanary({
 
   await verifyIdentityBoundary(fetchImpl, sessionA, sessionB)
   await verifyIdentityBoundary(fetchImpl, sessionB, sessionA)
-  console.log('Authenticated two-MSP canary passed for the exact deployed revision.')
+  await verifyIdentityRiskRoutes(fetchImpl, sessionA, sessionB, true, now)
+  await verifyIdentityRiskRoutes(fetchImpl, sessionB, sessionA, false, now)
+  console.log('Authenticated two-MSP canary and identity-risk route checks passed.')
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
