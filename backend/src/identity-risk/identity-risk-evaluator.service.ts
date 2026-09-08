@@ -7,6 +7,8 @@ import { assertGlobalRiskCommitScope, assertRiskExecutionBudget, configureRiskSt
 import { runRiskTransaction } from './risk-bounded-prisma-transaction.js'
 import { completeGlobalRiskAttempt } from './risk-attempt-causality.js'
 import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
+import { projectStoredRiskAssessment, type StoredRiskAssessment } from './risk-assessment-projection.js'
+import { riskAssessmentDetectors } from './risk-assessment-detectors.js'
 import {
   IDENTITY_RISK_CATALOG_VERSION,
   IDENTITY_RISK_APPROVED_SOURCE_TYPES,
@@ -705,6 +707,11 @@ function rejectedResultReason(
 
 function runExpiry(batch: IdentityRiskSourceBatch, platformNow: Date) {
   const policy = new Date(platformNow.getTime() + IDENTITY_RISK_RUN_RETENTION_MS)
+  if (batch.assessment) {
+    // Run metadata has its own lifetime. Subject evidence is persisted separately
+    // with per-finding expiry and is deliberately excluded from run.aggregate.
+    return policy
+  }
   if (
     batch.earliestSourceExpiry &&
     batch.earliestSourceExpiry.getTime() < policy.getTime()
@@ -765,6 +772,8 @@ export class IdentityRiskEvaluatorService {
       }
     }
     this.validateSourceBatch(request, batch, platformNow)
+    const assessment = batch.assessment === undefined ? undefined : projectStoredRiskAssessment(batch.assessment, platformNow)
+    if (batch.assessment !== undefined && !assessment) throw new Error('IDENTITY_RISK_ASSESSMENT_INVALID')
 
     // A control may be activated while the allowlisted loader is in flight.
     // Re-read it before hashing, claiming, or evaluating any returned source.
@@ -777,6 +786,7 @@ export class IdentityRiskEvaluatorService {
     // code-unit sort is the canonical bytewise order used by the run key.
     const canonicalSourceWatermarks = [...batch.orderedSourceWatermarks].sort()
     const watermarkHash = sha256(...canonicalSourceWatermarks,
+      ...(assessment ? [JSON.stringify(assessment)] : []),
       ...(batch.pseudonymKeyVersionId ? [batch.pseudonymKeyVersionId] : []))
     const canonicalSources = canonicalizeSourceEnvelopes(
       batch,
@@ -828,6 +838,8 @@ export class IdentityRiskEvaluatorService {
       pseudonymKeyVersionId: batch.pseudonymKeyVersionId,
       sourceObservedAt: batch.sourceObservedAt,
       mailboxAttestations: batch.mailboxAttestations,
+      authenticationProof: batch.authenticationProof,
+      assessment: assessment ?? undefined,
     })
     if (claim === 'SOURCE_INTEGRITY_CONFLICT') {
       await this.safety.activate({
@@ -886,6 +898,7 @@ export class IdentityRiskEvaluatorService {
             ...batch.context,
             capability: batch.capability,
             sources: canonicalSources.sources,
+            ...(assessment ? { assessment } : {}),
           },
         },
         platformNow,
@@ -897,6 +910,8 @@ export class IdentityRiskEvaluatorService {
       const persisted = await this.persistCompletedRun({
         pseudonymKeyVersionId: batch.pseudonymKeyVersionId,
         mailboxAttestations: batch.mailboxAttestations,
+        authenticationProof: batch.authenticationProof,
+        assessment: assessment ?? undefined,
         request,
         runId: claim.id,
         runKey,
@@ -1108,6 +1123,8 @@ export class IdentityRiskEvaluatorService {
   }
 
   private async claimRun(input: {
+    assessment?: StoredRiskAssessment
+    authenticationProof?: IdentityRiskSourceBatch['authenticationProof']
     mailboxAttestations?: IdentityRiskSourceBatch['mailboxAttestations']
     pseudonymKeyVersionId?: string
     sourceObservedAt?: Date
@@ -1138,7 +1155,7 @@ export class IdentityRiskEvaluatorService {
         false,
       )
       if (safety.evaluationHardDisabled) return { hardDisabled: safety }
-      await assertGlobalRiskCommitScope(transaction, input.request, input.capability, input.mailboxAttestations)
+      await assertGlobalRiskCommitScope(transaction, input.request, input.capability, input.mailboxAttestations, input.authenticationProof, input.assessment)
       if (input.pseudonymKeyVersionId) {
         // Lock the pinned version through persistence claim; revoked/foreign versions cannot start a run.
         const keys = await transaction.$queryRaw<Array<{ id: string }>>`
@@ -1401,6 +1418,8 @@ export class IdentityRiskEvaluatorService {
   }
 
   private async persistCompletedRun(input: {
+    assessment?: StoredRiskAssessment
+    authenticationProof?: IdentityRiskSourceBatch['authenticationProof']
     mailboxAttestations?: IdentityRiskSourceBatch['mailboxAttestations']
     pseudonymKeyVersionId?: string
     request: IdentityRiskEvaluationRequest
@@ -1441,7 +1460,7 @@ export class IdentityRiskEvaluatorService {
         if (failed.count !== 1) throw new Error('Identity risk run lease was lost.')
         return { status: 'HARD_DISABLED' as const, safety }
       }
-      await assertGlobalRiskCommitScope(transaction, input.request, input.capability, input.mailboxAttestations)
+      await assertGlobalRiskCommitScope(transaction, input.request, input.capability, input.mailboxAttestations, input.authenticationProof, input.assessment)
       if (input.pseudonymKeyVersionId) {
         const keys = await transaction.$queryRaw<Array<{ id: string }>>`
           SELECT id FROM identity_risk_pseudonym_key_versions
@@ -1497,10 +1516,26 @@ export class IdentityRiskEvaluatorService {
           update: {},
         })
       }
-      for (const [resultKey, result] of input.matches) {
+      // Historical evidence is an archive entry, never a current detector match.
+      const historical: Array<[string, IdentitySignalResult]> = input.assessment?.subjects.flatMap(subject =>
+        subject.findings.filter(finding => finding.activityState === 'HISTORICAL').map(finding => [
+          sha256(input.runKey, 'historical', subject.id, finding.id),
+          { ruleId: finding.ruleId, outcome: 'NOT_MATCHED' as const, coverage: 'PARTIAL' as const,
+            reasonCodes: ['NO_MATCH'], subjectType: subject.subjectType, subjectId: subject.id,
+            candidateReference: finding.id, evidenceReferences: finding.evidenceReferences.map(ref => ref.id),
+            severity: finding.priority, confidence: finding.confidence, observedAt: new Date(finding.lastSeen) },
+        ] as [string, IdentitySignalResult])) ?? []
+      for (const [resultKey, result] of [...input.matches, ...historical]) {
         assertRiskExecutionBudget(input.request)
         const ruleId = result.ruleId as IdentityRiskRuleId
         const observedAt = result.observedAt as Date
+        const assessmentSubject = input.assessment?.subjects.find(subject => subject.id === result.subjectId && subject.subjectType === result.subjectType)
+        const assessmentFinding = assessmentSubject?.findings.find(finding => finding.id === result.candidateReference && finding.ruleId === ruleId)
+        if (input.assessment && !assessmentFinding) throw new Error('IDENTITY_RISK_ASSESSMENT_INVALID')
+        const evidenceExpiresAt = assessmentFinding
+          ? new Date(new Date(assessmentFinding.firstSeen).getTime() + IDENTITY_RISK_RUN_RETENTION_MS) : input.expiresAt
+        if (evidenceExpiresAt <= input.platformNow) continue
+        const historicalFinding = assessmentFinding?.activityState === 'HISTORICAL'
         const matched = await transaction.identityRiskMatchedResult.upsert({
           where: {
             organizationId_customerTenantId_resultKey: {
@@ -1521,13 +1556,17 @@ export class IdentityRiskEvaluatorService {
             confidence: result.confidence as string,
             coverage: result.coverage,
             observedAt,
-            evidence: result.evidenceReferences ?? [],
-            expiresAt: input.expiresAt,
+            evidence: assessmentFinding ? {
+              schemaVersion: 'hawkview-risk-assessment/v1',
+              subject: { id: assessmentSubject!.id, subjectType: assessmentSubject!.subjectType, findings: [assessmentFinding] },
+            } as unknown as Prisma.InputJsonValue : result.evidenceReferences ?? [],
+            expiresAt: evidenceExpiresAt,
             createdAt: input.platformNow,
           },
           update: {},
         })
-        const bucket = observedAt.toISOString().slice(0, 13)
+        const bucket = input.assessment && result.candidateReference
+          ? result.candidateReference : observedAt.toISOString().slice(0, 13)
         const dedupeKey = sha256(
           input.request.organizationId,
           input.request.customerTenantId,
@@ -1551,25 +1590,26 @@ export class IdentityRiskEvaluatorService {
             matchedResultId: matched.id,
             dedupeKey,
             ruleId,
-            ruleVersion: 'v1',
+            ruleVersion: ruleId.endsWith('.v2') ? 'v2' : 'v1',
+            state: historicalFinding ? 'EXPIRED' : 'OPEN',
             subjectType: result.subjectType as string,
             subjectId: result.subjectId as string,
             severity: result.severity as string,
             confidence: result.confidence as string,
             coverage: result.coverage,
             observedAt,
-            expiresAt: input.expiresAt,
+            expiresAt: evidenceExpiresAt,
             createdAt: input.platformNow,
             updatedAt: input.platformNow,
           },
           update: {
             matchedResultId: matched.id,
-            state: 'UPDATED',
+            state: historicalFinding ? 'EXPIRED' : 'UPDATED',
             severity: result.severity as string,
             confidence: result.confidence as string,
             coverage: result.coverage,
             observedAt,
-            expiresAt: input.expiresAt,
+            expiresAt: evidenceExpiresAt,
             updatedAt: input.platformNow,
           },
         })
@@ -1588,7 +1628,9 @@ export class IdentityRiskEvaluatorService {
         },
         data: {
           status: 'COMPLETED',
-          aggregate: aggregateJson(input.aggregates),
+          aggregate: { ...aggregateJson(input.aggregates), ...(input.assessment ? {
+            assessment: { ...input.assessment, subjects: [] } as unknown as Prisma.InputJsonValue,
+          } : {}) },
           capability:
             input.capability === 'FULL' &&
             input.aggregates.some((aggregate) => aggregate.notEvaluated.value > 0)
@@ -1625,5 +1667,9 @@ export class IdentityRiskEvaluationScheduler {
       ...platformRequest,
       detectors: approvedIdentitySignalDetectors(approvedEvaluator),
     })
+  }
+
+  runAssessmentTenant(request: Omit<IdentityRiskEvaluationRequest, 'detectors'>) {
+    return this.evaluator.evaluate({ ...request, detectors: riskAssessmentDetectors() })
   }
 }

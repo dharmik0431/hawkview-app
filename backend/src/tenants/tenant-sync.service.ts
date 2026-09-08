@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { isIP } from 'node:net'
+import { projectAuthenticationAuditRecord, reportedAuthenticationErrorCode } from './authentication-audit-projection.js'
 import { MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS } from '../identity-risk/mailbox-risk-projector.service.js'
 import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-runtime-config.js'
 import { RiskGlobalWorkStore } from '../identity-risk/risk-global-work-store.js'
@@ -617,24 +618,6 @@ function isManagementActivityLogin(record: any) {
   return /(login|logon|sign.?in)/.test(operation)
 }
 
-function managementActivityLoginSucceeded(record: any) {
-  const loginStatus =
-    record?.LoginStatus ??
-    managementActivityExtendedProperty(record, 'LoginStatus')
-  if (loginStatus !== undefined && loginStatus !== null && loginStatus !== '') {
-    return Number(loginStatus) === 0
-  }
-  const errorCode =
-    record?.ErrorCode ?? managementActivityExtendedProperty(record, 'ErrorCode')
-  if (errorCode !== undefined && errorCode !== null && errorCode !== '') {
-    return Number(errorCode) === 0
-  }
-  if (String(record?.Operation ?? '') === 'UserLoggedIn') return true
-  return ['success', 'succeeded'].includes(
-    String(record?.ResultStatus ?? '').toLowerCase()
-  )
-}
-
 interface GraphUser {
   id?: string
   displayName?: string | null
@@ -780,12 +763,6 @@ function projectInferredLocation(value: unknown): SignInLocation | null {
     geoCoordinates, source: 'MAXMIND_GEOLITE2',
   }
   return location.city || location.state || location.countryOrRegion || geoCoordinates ? location : null
-}
-
-/** Only diagnostic codes, never arbitrary provider prose or identifiers. */
-function safeLoginDiagnosticCode(value: unknown): string | null {
-  if (typeof value !== 'string' || value.length > 64) return null
-  return /^(?:AccountLocked|InvalidUserNameOrPassword|InvalidPassword|UserAccountNotFound|UserAccountDisabled|UserNotFound|PasswordExpired|InvalidGrant|MfaRequired|MFARequired|StrongAuthenticationRequired|InteractionRequired|ConditionalAccessBlocked|[0-9]{1,12})$/.test(value) ? value : null
 }
 
 const DEFAULT_MAILBOX_USER_PAGE_SIZE = 250
@@ -4508,21 +4485,7 @@ export class TenantSyncService {
       )
       const content = await budget.read(response)
       if (!Array.isArray(content)) throw new Error('Microsoft activity content returned an invalid bounded response.')
-      const projected = content.map((value) => {
-        const row = closedFields(value, ['RecordType', 'Operation', 'LoginStatus', 'ErrorCode', 'ResultStatus', 'Id', 'CreationTime', 'UserId', 'ObjectId', 'UserKey', 'UserDisplayName', 'Country', 'CountryOrRegion', 'City', 'Application', 'Workload', 'ClientIP'])
-        if (plainRecord(value)) {
-          const diagnostic = safeLoginDiagnosticCode(value.LogonError)
-          if (diagnostic) row.LogonError = diagnostic
-          if (Array.isArray(value.ExtendedProperties)) row.ExtendedProperties = value.ExtendedProperties.flatMap((item) => {
-            if (!plainRecord(item) || typeof item.Name !== 'string') return []
-            const name = item.Name.toLowerCase()
-            if (['loginstatus', 'errorcode'].includes(name)) return [closedFields(item, ['Name', 'Value'])]
-            const code = ['loginerror', 'logonerror'].includes(name) ? safeLoginDiagnosticCode(item.Value) : null
-            return code ? [{ Name: item.Name, Value: code }] : []
-          })
-        }
-        return row
-      })
+      const projected = content.map(projectAuthenticationAuditRecord)
       budget.retain(projected)
       records.push(...projected)
     }
@@ -4536,7 +4499,8 @@ export class TenantSyncService {
           Number.isFinite(new Date(record.CreationTime).getTime())
       )
       .map((record) => {
-        const succeeded = managementActivityLoginSucceeded(record)
+        const reportedErrorCode = reportedAuthenticationErrorCode(record)
+        const succeeded = reportedErrorCode === 0
         const userPrincipalName =
           typeof record.UserId === 'string' ? record.UserId.toLowerCase() : null
         const countryOrRegion =
@@ -4560,11 +4524,11 @@ export class TenantSyncService {
               ? record.UserDisplayName
               : null,
           userPrincipalName,
-          appId: null,
+          appId: typeof record.ApplicationId === 'string' ? record.ApplicationId : null,
           appDisplayName:
             typeof record.Application === 'string'
               ? record.Application
-              : 'Microsoft 365',
+              : null,
           resourceDisplayName: record.Workload ?? null,
           ipAddress:
             typeof record.ClientIP === 'string' ? record.ClientIP : null,
@@ -4573,9 +4537,7 @@ export class TenantSyncService {
           isInteractive: null,
           riskLevelAggregated: null,
           status: {
-            errorCode: succeeded
-              ? 0
-              : String(record.LoginStatus ?? record.ErrorCode ?? 1),
+            errorCode: reportedErrorCode,
             failureReason: succeeded
               ? null
               : String(

@@ -66,7 +66,7 @@ const CATALOG_VERSION_COMPATIBILITY: typeof IDENTITY_RISK_CATALOG_VERSION =
   APPROVED_CATALOG_VERSION
 type RuleIdCompatibility =
   Exclude<ApprovedIdentitySignalRuleId, IdentityRiskRuleId> extends never
-    ? Exclude<IdentityRiskRuleId, ApprovedIdentitySignalRuleId> extends never
+    ? Exclude<IdentityRiskRuleId, ApprovedIdentitySignalRuleId | 'HV-ID-AUTH-010.v1' | 'HV-ID-AUTH-005.v2'> extends never
       ? true
       : never
     : never
@@ -75,7 +75,8 @@ void ENGINE_VERSION_COMPATIBILITY
 void CATALOG_VERSION_COMPATIBILITY
 void RULE_ID_COMPATIBILITY
 
-const platformRuleIds = Object.keys(IDENTITY_RISK_RULE_CATALOG).sort()
+const platformRuleIds = Object.keys(IDENTITY_RISK_RULE_CATALOG)
+  .filter(id => id !== 'HV-ID-AUTH-010.v1' && id !== 'HV-ID-AUTH-005.v2').sort()
 const approvedRuleIds = [...IDENTITY_SIGNAL_RULE_IDS].sort()
 if (platformRuleIds.join('\u0000') !== approvedRuleIds.join('\u0000')) {
   throw new Error('Approved identity evaluator rule catalog is incompatible.')
@@ -470,7 +471,7 @@ export function adaptApprovedIdentitySignalDetector(input: Readonly<{
 export function approvedIdentitySignalDetectors(
   configuration: IdentityRiskApprovedEvaluatorConfiguration,
 ): readonly IdentitySignalDetector[] {
-  return Object.freeze(approvedRuleIds.filter((ruleId) => configuration.featureFlags?.[ruleId as IdentityRiskRuleId] !== false).map((ruleId) =>
+  return Object.freeze(approvedRuleIds.filter((ruleId) => configuration.featureFlags?.[ruleId as ApprovedIdentitySignalRuleId] !== false).map((ruleId) =>
     adaptApprovedIdentitySignalDetector({
       ruleId: ruleId as IdentityRiskRuleId,
       configuration,

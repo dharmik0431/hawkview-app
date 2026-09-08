@@ -3,6 +3,7 @@ import type { IdentityRiskEvaluationRequest, IdentityRiskSourceBatch } from './i
 import { isGlobalRiskConfig, riskRuntimeConfig, riskScopeAllowed } from './risk-runtime-config.js'
 import { MAILBOX_SOURCE_VERSION, sourceAttestationKey } from './mailbox-source-attestation.js'
 import { lockGlobalRiskAttempt } from './risk-attempt-causality.js'
+import type { StoredRiskAssessment } from './risk-assessment-projection.js'
 
 export function assertRiskExecutionBudget(request: Pick<IdentityRiskEvaluationRequest, 'executionDeadlineAt'>) {
   if (request.executionDeadlineAt !== undefined &&
@@ -22,7 +23,9 @@ export async function configureRiskStatementBudget(transaction: Prisma.Transacti
  * source payload reload, new Graph call, provisioning, or customer API change. */
 export async function assertGlobalRiskCommitScope(transaction: Prisma.TransactionClient,
   request: IdentityRiskEvaluationRequest, capability: IdentityRiskSourceBatch['capability'],
-  attestations: IdentityRiskSourceBatch['mailboxAttestations']) {
+  attestations: IdentityRiskSourceBatch['mailboxAttestations'],
+  authenticationProof?: IdentityRiskSourceBatch['authenticationProof'],
+  assessment?: StoredRiskAssessment) {
   assertRiskExecutionBudget(request)
   await configureRiskStatementBudget(transaction, request)
   if (process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT !== 'global' && request.executionDeadlineAt === undefined) return
@@ -39,7 +42,27 @@ export async function assertGlobalRiskCommitScope(transaction: Prisma.Transactio
     WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND status='CONNECTED' FOR SHARE`, request.customerTenantId, request.organizationId)
   if (connections.length !== 1) throw new Error('IDENTITY_RISK_SCOPE_UNAVAILABLE')
   await lockGlobalRiskAttempt(transaction, request)
-  if (capability !== 'FULL') return
+  if (assessment) {
+    const authenticationUsed = assessment.rules.some(rule => rule.ruleId !== 'HV-ID-MBX-001.v1' &&
+      (rule.status === 'READY' || rule.status === 'PARTIAL'))
+    if (authenticationUsed) {
+      const proof = authenticationProof
+      if (!proof || proof.resourceType !== 'SIGN_INS' || !(proof.lastSuccessfulAt instanceof Date) ||
+        !Number.isFinite(proof.lastSuccessfulAt.getTime()) || proof.lastSuccessfulAt > request.evaluationAt)
+        throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE')
+      // Preserve exact collection generation, including known limited-feed
+      // outcomes. No Graph request and no assumption that all feeds succeeded.
+      const rows = await transaction.$queryRawUnsafe<Array<{ id: string }>>(`SELECT id FROM sync_states
+        WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND resource_type='SIGN_INS'
+          AND status::text=$3 AND last_successful_at=$4
+          AND last_attempt_at IS NOT DISTINCT FROM $5::timestamptz
+          AND last_error_code IS NOT DISTINCT FROM $6::text FOR SHARE`,
+      request.organizationId, request.customerTenantId, proof.status, proof.lastSuccessfulAt, proof.lastAttemptAt, proof.lastErrorCode)
+      if (rows.length !== 1) throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE')
+    }
+    const mailboxUsed = assessment.rules.some(rule => rule.ruleId === 'HV-ID-MBX-001.v1' && rule.status === 'READY')
+    if (!mailboxUsed) return
+  } else if (capability !== 'FULL') return
   if (!Array.isArray(attestations) || attestations.length !== 2) throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE')
   for (const resource of ['EXCHANGE_MAILBOX_RULES', 'EXCHANGE_ACCEPTED_DOMAINS'] as const) {
     const proofs = attestations.filter(row => row.resourceType === resource)

@@ -3,6 +3,7 @@ import type {
   IdentitySignalCandidate as ApprovedIdentitySignalCandidate,
   IdentitySignalRuleId as ApprovedIdentitySignalRuleId,
 } from './identity-signal-contract.js'
+import type { StoredRiskAssessment } from './risk-assessment-projection.js'
 
 export const IDENTITY_RISK_API_VERSION = 1 as const
 export const IDENTITY_RISK_ENGINE_VERSION = 'hawkview-identity-engine/1' as const
@@ -80,6 +81,7 @@ export type IdentitySignalEvaluationContext = Readonly<{
   catalogVersion: string
   capability: IdentitySignalCoverage
   sources: Readonly<Record<string, readonly IdentityRiskSourcePayload[]>>
+  assessment?: StoredRiskAssessment
 }>
 
 export type IdentitySignalResult = Readonly<{
@@ -127,6 +129,12 @@ export type IdentityRiskSourceEnvelope =
     }>
 
 export type IdentityRiskSourceBatch = Readonly<{
+  /** Strictly projected source-independent derived evidence, never raw events. */
+  assessment?: StoredRiskAssessment
+  authenticationProof?: Readonly<{
+    resourceType: 'SIGN_INS'; lastSuccessfulAt: Date; lastAttemptAt: Date | null
+    status: string; lastErrorCode: string | null
+  }>
   /** Internal only: recoverable immutable managed-key version for every reference in this run. */
   pseudonymKeyVersionId?: string
   sourceObservedAt?: Date
