@@ -39,11 +39,16 @@ verify an authenticated risk route or usable source evaluation.
   unsupported failures, and inconsistent success/error fields.
 - Duplicate, conflicting, late, future, malformed, app-only, and unresolved-user
   events cannot inflate counts or bind to a human by guesswork.
+- Only resolved directory subjects form user/mailbox rows. Display labels never
+  merge subjects; evidence references are opaque and tenant-scoped.
 - Missing mailbox evidence does not block authentication rules; missing auth
   evidence does not erase a mailbox finding.
 - Protection states cover enforced, conditional, report-only, excluded, stale,
   ambiguous assignment, alternative grants, registration-only, and missing
   event-MFA evidence.
+- Conditional Access, Security Defaults, legacy per-user MFA, and registration
+  retain separate source, observation, freshness, and reason evidence. One source
+  cannot silently fill another's gap.
 - Findings, evaluated-empty, partial, stale, and unavailable are visibly distinct.
 - Reprocessing is idempotent and historical findings do not become fresh alerts.
 - Two synthetic MSP organizations cannot read each other's findings, reasons,
@@ -52,6 +57,8 @@ verify an authenticated risk route or usable source evaluation.
   routes pass. No GET request performs heavy evaluation.
 - Logs and handoffs contain no customer events, identities, addresses, tokens,
   content, or keys. No Microsoft write or unrelated retention/key change occurs.
+- Response metadata is full/current only when every selected rule source and its
+  rule evidence are ready/current. Unselected alternatives add no coverage.
 
 ## Source readiness checks
 

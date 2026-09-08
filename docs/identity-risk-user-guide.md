@@ -29,8 +29,9 @@ Each reason should tell you:
 6. what protection was verified; and
 7. what to do next.
 
-Low, Medium, and High are investigation priorities, not probabilities of account
-compromise. Protection is displayed beside risk; it is not subtracted from it.
+Low, Medium, and High are the only investigation priorities in this release.
+They are not probabilities of account compromise. Protection is displayed
+beside risk; it is not subtracted from it and cannot change a rule's priority.
 
 ## Recommended MSP steps
 
@@ -95,7 +96,12 @@ and must not reappear as fresh merely because data was evaluated again.
   that event.
 
 MFA registration by itself is not suspicious behavior and is not equivalent to
-enforcement.
+enforcement. Each protection statement has its own source, observation time,
+freshness, and safe reason. Stale or incomplete evidence remains unverified.
+
+HawkView creates user and mailbox rows only for authorized, resolved directory
+subjects. It does not merge people because their labels look alike or guess that
+an unresolved event belongs to a human.
 
 ## Information to give support
 

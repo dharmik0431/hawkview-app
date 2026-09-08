@@ -7,7 +7,16 @@ Owner: HawkView engineering and product documentation
 Update this document when a rule version, threshold, evidence requirement,
 reason code, priority, or source adapter changes. The delivery lead has frozen
 the public schema as `hawkview-risk-assessment/v1`; implementation and deployment
-remain pending.
+remain pending. The closed rule tuples are:
+
+| Rule | Version | Priority | Permitted source |
+| --- | --- | --- | --- |
+| `HV-ID-AUTH-009.v1` | `v1` | Low | Microsoft 365 audit STS or Graph sign-ins |
+| `HV-ID-AUTH-005.v2` | `v2` | Medium | Microsoft 365 audit STS or Graph sign-ins |
+| `HV-ID-MBX-001.v1` | `v1` | High | Mailbox rules |
+
+Aggregation and protection do not change those priorities. The v1 response has
+only Low, Medium, and High priorities; it does not define Critical.
 
 ## Product boundary
 
@@ -119,6 +128,11 @@ For one tenant/user/window, select one qualified authentication source and retai
 its attribution. Do not count duplicate audit and Graph representations twice or
 increase severity because two feeds describe the same activity.
 
+The response-level coverage and freshness summary is conservative. It is full
+and current only when every selected rule source and its rule evidence are ready
+and current. An unused alternative feed adds no coverage. Any required missing
+or stale source prevents a complete/current claim.
+
 ## Frozen readiness and action vocabulary
 
 Source and rule readiness values are `READY`, `PARTIAL`, `WAITING`,
@@ -149,6 +163,17 @@ Protection labels must come from the existing effective-MFA evaluator:
 - report-only/disabled policies and unresolved assignments are not coverage;
 - event-specific “blocked by policy” or “MFA satisfied” requires event evidence;
 - missing or stale evidence is **Protection not verified**.
+
+Conditional Access evidence includes its source, freshness, observation and
+evaluation times, and reason codes. Security Defaults, legacy per-user MFA, and
+registration each carry their own state, source, observation time, freshness,
+and reason code. Unknown, stale, failed, missing-permission, or incomplete
+evidence must remain explicit; one protection source cannot fill another's gap.
+
+Only an authorized, resolved directory subject can form a user or mailbox row.
+Do not merge rows by display label, guess a human from an unresolved identifier,
+or expose a raw provider identifier. Evidence references remain opaque and
+tenant-scoped.
 
 ## Final reconciliation gate
 
