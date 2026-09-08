@@ -7,6 +7,8 @@ const FULL_GIT_REVISION = /^[0-9a-f]{40}$/i
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+const IDENTITY_RISK_CURRENT_MAX_AGE_MS = 36 * 60 * 60 * 1_000
+const IDENTITY_RISK_MAX_FUTURE_SKEW_MS = 5 * 60 * 1_000
 const IDENTITY_RISK_API_VERSION = 1
 const IDENTITY_RISK_STATUSES = new Set([
   'AVAILABLE',
@@ -228,11 +230,12 @@ function canonicalTimestamp(value) {
     : null
 }
 
-function assertNullableTimestamp(value, label) {
+function assertNullableTimestamp(value, label, trustedNowMs) {
   const timestamp = value === null ? null : canonicalTimestamp(value)
   assert(value === null || timestamp !== null, `${label} timestamp contract was invalid`)
   assert(
-    timestamp === null || Date.parse(timestamp) <= Date.now() + 5 * 60 * 1_000,
+    timestamp === null ||
+      Date.parse(timestamp) <= trustedNowMs + IDENTITY_RISK_MAX_FUTURE_SKEW_MS,
     `${label} timestamp was in the future`,
   )
   return timestamp
@@ -266,7 +269,7 @@ function assertStringList(value, label, { maxItems = 10, requireItem = false } =
   assert(new Set(value).size === value.length, `${label} contained duplicates`)
 }
 
-function assertIdentityRiskEnvelope(body, route) {
+function assertIdentityRiskEnvelope(body, route, trustedNowMs) {
   const envelope = record(body)
   assert(envelope?.version === IDENTITY_RISK_API_VERSION, `${route.label} version was invalid`)
   assert(envelope.channel === route.channel, `${route.label} channel was invalid`)
@@ -282,11 +285,21 @@ function assertIdentityRiskEnvelope(body, route) {
     `${route.label} freshness was invalid`,
   )
   assert(envelope.sourceLabel === route.sourceLabel, `${route.label} source label was invalid`)
-  const evaluatedAt = assertNullableTimestamp(envelope.evaluatedAt, route.label)
-  const observedAt = assertNullableTimestamp(envelope.observedAt, route.label)
+  const evaluatedAt = assertNullableTimestamp(
+    envelope.evaluatedAt,
+    route.label,
+    trustedNowMs,
+  )
+  const observedAt = assertNullableTimestamp(
+    envelope.observedAt,
+    route.label,
+    trustedNowMs,
+  )
   assert(
     observedAt === null ||
-      (evaluatedAt !== null && Date.parse(observedAt) <= Date.parse(evaluatedAt) + 5 * 60 * 1_000),
+      (evaluatedAt !== null &&
+        Date.parse(observedAt) <=
+          Date.parse(evaluatedAt) + IDENTITY_RISK_MAX_FUTURE_SKEW_MS),
     `${route.label} observation timestamp was invalid`,
   )
   assert(
@@ -297,18 +310,23 @@ function assertIdentityRiskEnvelope(body, route) {
     `${route.label} limitation was invalid`,
   )
   assert(envelope.status !== 'ERROR', `${route.label} reported an error state`)
+  const observedAgeMs = observedAt === null
+    ? null
+    : trustedNowMs - Date.parse(observedAt)
   const coherent =
     (envelope.status === 'AVAILABLE' &&
       envelope.capability !== 'UNAVAILABLE' &&
       envelope.freshness === 'CURRENT' &&
       evaluatedAt !== null &&
       observedAt !== null &&
+      observedAgeMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
       (envelope.capability === 'FULL' || envelope.limitation !== null)) ||
     (envelope.status === 'STALE' &&
       envelope.capability !== 'UNAVAILABLE' &&
       envelope.freshness === 'STALE' &&
       evaluatedAt !== null &&
       observedAt !== null &&
+      observedAgeMs > IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
       envelope.limitation !== null) ||
     (envelope.status === 'LEARNING' &&
       envelope.capability !== 'UNAVAILABLE' &&
@@ -366,7 +384,7 @@ function assertPageInfo(value, label, collectionLength) {
   assert(collectionLength > 0 || !pageInfo.hasMore, `${label} empty page claimed more results`)
 }
 
-function assertFinding(value, envelope, label) {
+function assertFinding(value, envelope, label, trustedNowMs) {
   const finding = record(value)
   const keys = [
     'id', 'state', 'severity', 'confidence', 'coverage', 'title', 'explanation',
@@ -396,7 +414,11 @@ function assertFinding(value, envelope, label) {
   assertStringList(finding.sourceLabels, `${label} sources`)
   assertStringList(finding.missingEvidenceLabels, `${label} missing evidence`)
   assertStringList(finding.ruleIds, `${label} rules`, { requireItem: true })
-  const observedAt = assertNullableTimestamp(finding.observedAt, `${label} observed`)
+  const observedAt = assertNullableTimestamp(
+    finding.observedAt,
+    `${label} observed`,
+    trustedNowMs,
+  )
   assert(
     observedAt && envelope.evaluatedAt &&
       Date.parse(observedAt) <= Date.parse(envelope.evaluatedAt) + 5 * 60 * 1_000,
@@ -404,7 +426,7 @@ function assertFinding(value, envelope, label) {
   )
 }
 
-function assertMicrosoftUser(value, envelope, label) {
+function assertMicrosoftUser(value, envelope, label, trustedNowMs) {
   const user = record(value)
   assert(
     user && exactKeys(user, [
@@ -420,7 +442,11 @@ function assertMicrosoftUser(value, envelope, label) {
     user.riskDetail === null || MICROSOFT_RISK_DETAILS.has(user.riskDetail),
     `${label} risk detail was invalid`,
   )
-  const observedAt = assertNullableTimestamp(user.observedAt, `${label} observed`)
+  const observedAt = assertNullableTimestamp(
+    user.observedAt,
+    `${label} observed`,
+    trustedNowMs,
+  )
   assert(
     observedAt && envelope.evaluatedAt &&
       Date.parse(observedAt) <= Date.parse(envelope.evaluatedAt) + 5 * 60 * 1_000,
@@ -428,7 +454,7 @@ function assertMicrosoftUser(value, envelope, label) {
   )
 }
 
-function assertIdentityRiskResponse(body, route) {
+function assertIdentityRiskResponse(body, route, trustedNowMs) {
   const candidate = record(body)
   const commonKeys = [
     'version', 'channel', 'engineVersion', 'catalogVersion', 'evaluatedAt',
@@ -443,7 +469,7 @@ function assertIdentityRiskResponse(body, route) {
     ),
     `${route.label} envelope keys were invalid`,
   )
-  const envelope = assertIdentityRiskEnvelope(body, route)
+  const envelope = assertIdentityRiskEnvelope(body, route, trustedNowMs)
   if (route.collection === 'counts') {
     const counts = record(envelope.counts)
     assert(
@@ -481,9 +507,9 @@ function assertIdentityRiskResponse(body, route) {
   }
   collection.forEach((value, index) => {
     if (route.collection === 'findings') {
-      assertFinding(value, envelope, `${route.label} row ${index + 1}`)
+      assertFinding(value, envelope, `${route.label} row ${index + 1}`, trustedNowMs)
     } else {
-      assertMicrosoftUser(value, envelope, `${route.label} row ${index + 1}`)
+      assertMicrosoftUser(value, envelope, `${route.label} row ${index + 1}`, trustedNowMs)
     }
   })
   const rowIds = collection.map(value => record(value)?.id)
@@ -505,6 +531,7 @@ async function verifyIdentityRiskRoutes(
   session,
   foreignSession,
   verifyUnauthenticated,
+  trustedNowMs,
 ) {
   const hawkViewResponses = []
   for (const route of IDENTITY_RISK_ROUTES) {
@@ -516,7 +543,7 @@ async function verifyIdentityRiskRoutes(
       [200],
       `${route.label} own tenant`,
     )
-    assertIdentityRiskResponse(own.body, route)
+    assertIdentityRiskResponse(own.body, route, trustedNowMs)
     if (route.channel === 'HAWKVIEW_IDENTITY_SIGNALS') {
       hawkViewResponses.push(own.body)
     }
@@ -592,7 +619,10 @@ async function verifyIdentityBoundary(fetchImpl, session, foreignSession) {
 export async function runAuthenticatedCanary({
   fetchImpl = fetch,
   environment = process.env,
+  now = Date.now,
 } = {}) {
+  const trustedNowMs = now()
+  assert(Number.isFinite(trustedNowMs), 'Canary clock was invalid')
   const revision = environment.EXPECTED_REVISION?.trim().toLowerCase() ?? ''
   assert(FULL_GIT_REVISION.test(revision), 'Expected deployment revision is invalid')
 
@@ -635,8 +665,8 @@ export async function runAuthenticatedCanary({
 
   await verifyIdentityBoundary(fetchImpl, sessionA, sessionB)
   await verifyIdentityBoundary(fetchImpl, sessionB, sessionA)
-  await verifyIdentityRiskRoutes(fetchImpl, sessionA, sessionB, true)
-  await verifyIdentityRiskRoutes(fetchImpl, sessionB, sessionA, false)
+  await verifyIdentityRiskRoutes(fetchImpl, sessionA, sessionB, true, trustedNowMs)
+  await verifyIdentityRiskRoutes(fetchImpl, sessionB, sessionA, false, trustedNowMs)
   console.log('Authenticated two-MSP canary and identity-risk route checks passed.')
 }
 

@@ -14,7 +14,7 @@ const tokenB = `b.${'x'.repeat(120)}.b`
 const boundedZero = { value: 0, exact: false, capped: false }
 const exactCount = value => ({ value, exact: true, capped: false })
 const completedAt = '2026-09-02T13:00:00.000Z'
-const observedAt = '2026-09-02T12:00:00.000Z'
+const freshnessNow = Date.parse('2026-09-08T12:00:00.000Z')
 const hawkViewUnavailable = {
   version: 1,
   channel: 'HAWKVIEW_IDENTITY_SIGNALS',
@@ -99,14 +99,17 @@ function completedUnavailableFixture(route) {
   }
 }
 
-function availableFixture(route) {
+function availableFixture(route, nowMs = freshnessNow) {
+  const evaluatedAt = new Date(nowMs - 30 * 60 * 1_000).toISOString()
+  const currentObservedAt = new Date(nowMs - 60 * 60 * 1_000).toISOString()
+  const staleObservedAt = new Date(nowMs - 37 * 60 * 60 * 1_000).toISOString()
   if (route === 'summary') {
     return {
       ...hawkViewUnavailable,
       capability: 'FULL',
       status: 'AVAILABLE',
-      evaluatedAt: completedAt,
-      observedAt,
+      evaluatedAt,
+      observedAt: currentObservedAt,
       freshness: 'CURRENT',
       limitation: null,
       counts: {
@@ -125,8 +128,8 @@ function availableFixture(route) {
       ...hawkViewUnavailable,
       capability: 'FULL',
       status: 'AVAILABLE',
-      evaluatedAt: completedAt,
-      observedAt,
+      evaluatedAt,
+      observedAt: currentObservedAt,
       freshness: 'CURRENT',
       limitation: null,
       findings: [],
@@ -137,8 +140,8 @@ function availableFixture(route) {
     ...microsoftUnavailable,
     capability: 'FULL',
     status: 'STALE',
-    evaluatedAt: completedAt,
-    observedAt,
+    evaluatedAt,
+    observedAt: staleObservedAt,
     freshness: 'STALE',
     limitation: 'Microsoft Entra risky-user evidence is stale.',
     users: [],
@@ -268,10 +271,11 @@ test('accepts a completed HawkView evaluation with unavailable source evidence',
 test('accepts coherent bounded available and stale v1 envelopes', async () => {
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ relationship, route }) =>
-      relationship === 'own' ? jsonResponse(availableFixture(route)) : null,
+      relationship === 'own' ? jsonResponse(availableFixture(route, freshnessNow)) : null,
   })
   await runAuthenticatedCanary({
     fetchImpl,
+    now: () => freshnessNow,
     environment: {
       EXPECTED_REVISION: revision,
       ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
@@ -371,12 +375,13 @@ test('rejects an invalid row in an available findings response', async () => {
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ authorization, relationship, route }) =>
       authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'findings'
-        ? jsonResponse({ ...availableFixture('findings'), findings: [null] })
+        ? jsonResponse({ ...availableFixture('findings', freshnessNow), findings: [null] })
         : null,
   })
   await assert.rejects(
     runAuthenticatedCanary({
       fetchImpl,
+      now: () => freshnessNow,
       environment: {
         EXPECTED_REVISION: revision,
         ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
@@ -420,6 +425,7 @@ test('rejects a future evaluated timestamp', async () => {
   await assert.rejects(
     runAuthenticatedCanary({
       fetchImpl,
+      now: () => freshnessNow,
       environment: {
         EXPECTED_REVISION: revision,
         ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
@@ -428,6 +434,78 @@ test('rejects a future evaluated timestamp', async () => {
     }),
     /identity risk summary timestamp was in the future/,
   )
+})
+
+test('rejects CURRENT evidence older than the 36-hour freshness boundary', async () => {
+  const staleObservedAt = new Date(freshnessNow - 37 * 60 * 60 * 1_000).toISOString()
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'summary'
+        ? jsonResponse({
+            ...availableFixture('summary', freshnessNow),
+            observedAt: staleObservedAt,
+          })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      now: () => freshnessNow,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /identity risk summary state was contradictory/,
+  )
+})
+
+test('rejects STALE evidence within the 36-hour freshness boundary', async () => {
+  const freshObservedAt = new Date(freshnessNow - 35 * 60 * 60 * 1_000).toISOString()
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'microsoft'
+        ? jsonResponse({
+            ...availableFixture('microsoft', freshnessNow),
+            observedAt: freshObservedAt,
+          })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      now: () => freshnessNow,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /Microsoft Entra risky users state was contradictory/,
+  )
+})
+
+test('accepts CURRENT evidence exactly at the 36-hour freshness boundary', async () => {
+  const boundaryObservedAt = new Date(freshnessNow - 36 * 60 * 60 * 1_000).toISOString()
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ relationship, route }) =>
+      relationship === 'own' && route !== 'microsoft'
+        ? jsonResponse({
+            ...availableFixture(route, freshnessNow),
+            observedAt: boundaryObservedAt,
+          })
+        : null,
+  })
+  await runAuthenticatedCanary({
+    fetchImpl,
+    now: () => freshnessNow,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  })
 })
 
 test('rejects an empty collection that claims another page', async () => {
