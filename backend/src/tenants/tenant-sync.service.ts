@@ -15,7 +15,8 @@ import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-run
 import { RiskGlobalWorkStore } from '../identity-risk/risk-global-work-store.js'
 import { WrappedRiskKeyStore } from '../identity-risk/wrapped-risk-key-store.js'
 import { runGlobalRiskCycle } from '../identity-risk/risk-global-cycle.js'
-import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION, verifiedOrganizationDomains } from '../identity-risk/mailbox-source-attestation.js'
+import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION, verifiedOrganizationDomains,
+  mailboxAttestationReason, type MailboxAttestationFailureReason } from '../identity-risk/mailbox-source-attestation.js'
 import { enforceRiskUtcTransaction, requiresRiskUtcSnapshot } from '../identity-risk/risk-utc-session.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
@@ -4875,6 +4876,7 @@ export class TenantSyncService {
     /** Resource inventory writes which must become visible with this baseline. */
     persistWithSnapshot?: (transaction: Prisma.TransactionClient) => Promise<void>,
     riskAttestable = false,
+    riskFailureReason?: MailboxAttestationFailureReason,
   ) {
     if (result.completeness !== 'authoritative_complete') {
       throw new Error(
@@ -4937,7 +4939,9 @@ export class TenantSyncService {
         const fieldKey = sourceAttestationKey(resourceType)
         const data = { organizationId: tenant.organizationId, customerTenantId: tenant.id, fieldKey,
           state: digest ? 'COMPLETE' : 'UNAVAILABLE', source: MAILBOX_SOURCE_VERSION,
-          correlationId: digest, reasonCode: digest ? 'ATTESTED_COMPLETE' : 'SOURCE_NOT_ATTESTED',
+          correlationId: digest, reasonCode: resourceType === 'EXCHANGE_MAILBOX_RULES'
+            ? mailboxAttestationReason(digest, riskAttestable, riskFailureReason)
+            : digest ? 'ATTESTED_COMPLETE' : 'SOURCE_NOT_ATTESTED',
           message: null, endpoint: null, lastAttemptAt: observedAt,
           lastSuccessfulAt: digest ? observedAt : null, isStale: !digest }
         await transaction.tenantCollectionFieldState.upsert({
@@ -5232,10 +5236,16 @@ export class TenantSyncService {
         select: { microsoftUserId: true, userPrincipalName: true }, orderBy: { microsoftUserId: 'asc' }, skip, take,
       }), { deadlineAt: budget.deadlineAt })
       let riskAttestable = true
+      let riskFailureReason: MailboxAttestationFailureReason | undefined
       const directoryState = await this.withSnapshotUtc('USERS', (transaction) => transaction.syncState.findFirst({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'USERS' }, select: { status: true, lastSuccessfulAt: true, lastAttemptAt: true } }))
-      if (!directoryState || directoryState.status !== 'SUCCEEDED' || !directoryState.lastSuccessfulAt ||
-        Date.now() - directoryState.lastSuccessfulAt.getTime() > 36 * 60 * 60 * 1000 ||
-        (directoryState.lastAttemptAt && directoryState.lastAttemptAt > directoryState.lastSuccessfulAt)) riskAttestable = false
+      // Preserve the existing predicate and its left-to-right priority. Directory
+      // prerequisites outrank any later 404; neither permits validation/coverage.
+      if (!directoryState) riskFailureReason = 'DIRECTORY_SYNC_MISSING'
+      else if (directoryState.status !== 'SUCCEEDED') riskFailureReason = 'DIRECTORY_SYNC_NOT_SUCCEEDED'
+      else if (!directoryState.lastSuccessfulAt) riskFailureReason = 'DIRECTORY_SYNC_UNDATED'
+      else if (Date.now() - directoryState.lastSuccessfulAt.getTime() > 36 * 60 * 60 * 1000) riskFailureReason = 'DIRECTORY_SYNC_STALE'
+      else if (directoryState.lastAttemptAt && directoryState.lastAttemptAt > directoryState.lastSuccessfulAt) riskFailureReason = 'DIRECTORY_SYNC_NEWER_ATTEMPT'
+      if (riskFailureReason) riskAttestable = false
       const rows = await collectMailboxRules(users, async (user, continuation) => {
         const url = continuation ?? `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.microsoftUserId)}/mailFolders/inbox/messageRules?$top=100`
         if (!url.startsWith('https://graph.microsoft.com/')) throw new Error('Microsoft returned an invalid inbox-rules pagination link.')
@@ -5243,14 +5253,19 @@ export class TenantSyncService {
         const response = await this.fetchGraphPage(
           url, accessToken, 'inbox rules', { timeoutMs: limits.requestTimeoutMs, deadlineAt: budget.deadlineAt, acceptedStatuses: [404] },
         )
-        if (response.status === 404) { riskAttestable = false; await cancelBoundedStream(() => response.body?.cancel()); return { value: [] } }
+        if (response.status === 404) {
+          riskAttestable = false
+          riskFailureReason ??= 'RULE_ENDPOINT_NOT_FOUND'
+          await cancelBoundedStream(() => response.body?.cancel())
+          return { value: [] }
+        }
         const page = await budget.read(response)
         if (!plainRecord(page) || !Array.isArray(page.value)) throw new Error('Microsoft returned an invalid bounded inbox-rules page.')
         const projected = page.value.map(projectMailboxRule)
         budget.retain(projected)
         return { value: projected, '@odata.nextLink': page['@odata.nextLink'] } as GraphCollectionPage
       }, 1, { maxTotalRecords: limits.rows, maxMaterializedBytes: limits.materializedBytes, deadlineAt: budget.deadlineAt })
-      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows), undefined, riskAttestable)
+      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows), undefined, riskAttestable, riskFailureReason)
     })
   }
 
