@@ -87,9 +87,10 @@ The release requires an additive database migration before the new backend
 revision starts. The final migration count is intentionally omitted until the
 integrated SHA is frozen. Connected PostgreSQL validation must prove that the
 existing lifecycle values remain valid while adding only the required unknown
-lifecycle state, exact `HV-ID-AUTH-005.v2` rule/version tuple, and Medium
-authentication confidence. Do not loosen checks to accept arbitrary versions or
-change the existing mailbox priority.
+lifecycle state and exact `HV-ID-AUTH-005.v2` rule/version tuple. The confidence
+check permits Low, Medium, and High to match the existing evaluator and DTO
+contract; it does not rewrite an existing rule's priority or confidence. Do not
+loosen checks to accept arbitrary rule versions.
 
 Apply and verify the migration through the ordinary protected release path before
 starting the dependent backend. A migration file in source is not evidence that
@@ -97,11 +98,14 @@ the database is ready.
 
 The assessment GET route performs a bounded read of persisted derived results.
 It must not parse or evaluate raw sign-in/audit events, scan history without a
-bound, or create risk rows. Authorized private labels and current protection
-context are resolved at read time with organization/tenant scope; lookup failure
-stays unknown or not reported. The persisted document retains opaque scoped
-references. Reading or replaying an incident does not renew the existing 90-day
-derived-risk retention age.
+bound, provision customer data, create risk rows, or write customer state.
+Authorized private labels and current protection context are resolved at read
+time with organization/tenant scope; lookup failure stays unknown or not
+reported. The persisted document retains opaque scoped references. Existing
+managed key pin/reference handling may record bounded operational key-audit
+events; that is not source-rule evaluation or a customer-state mutation. Reading
+or replaying an incident does not renew the existing 90-day derived-risk
+retention age.
 
 ## Support triage
 
