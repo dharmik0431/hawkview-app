@@ -102,7 +102,6 @@ function completedUnavailableFixture(route) {
 function availableFixture(route, nowMs = freshnessNow) {
   const evaluatedAt = new Date(nowMs - 30 * 60 * 1_000).toISOString()
   const currentObservedAt = new Date(nowMs - 60 * 60 * 1_000).toISOString()
-  const staleObservedAt = new Date(nowMs - 37 * 60 * 60 * 1_000).toISOString()
   if (route === 'summary') {
     return {
       ...hawkViewUnavailable,
@@ -111,7 +110,7 @@ function availableFixture(route, nowMs = freshnessNow) {
       evaluatedAt,
       observedAt: currentObservedAt,
       freshness: 'CURRENT',
-      limitation: null,
+      limitation: 'Shadow-mode findings are investigation leads, not compromise verdicts.',
       counts: {
         identitiesNeedingReview: exactCount(0),
         openFindings: exactCount(0),
@@ -131,7 +130,7 @@ function availableFixture(route, nowMs = freshnessNow) {
       evaluatedAt,
       observedAt: currentObservedAt,
       freshness: 'CURRENT',
-      limitation: null,
+      limitation: 'Shadow-mode findings are investigation leads, not compromise verdicts.',
       findings: [],
       pageInfo: { hasMore: false, nextCursor: null },
     }
@@ -139,13 +138,58 @@ function availableFixture(route, nowMs = freshnessNow) {
   return {
     ...microsoftUnavailable,
     capability: 'FULL',
-    status: 'STALE',
+    status: 'AVAILABLE',
     evaluatedAt,
-    observedAt: staleObservedAt,
-    freshness: 'STALE',
-    limitation: 'Microsoft Entra risky-user evidence is stale.',
+    observedAt: currentObservedAt,
+    freshness: 'CURRENT',
+    limitation: null,
     users: [],
     pageInfo: { hasMore: false, nextCursor: null },
+  }
+}
+
+function staleHawkViewFixture(route, nowMs = freshnessNow) {
+  return {
+    ...availableFixture(route, nowMs),
+    status: 'STALE',
+    observedAt: new Date(nowMs - 37 * 60 * 60 * 1_000).toISOString(),
+    freshness: 'STALE',
+    limitation: 'Shadow-mode findings are investigation leads, not compromise verdicts.',
+  }
+}
+
+function findingFixture(nowMs = freshnessNow) {
+  return {
+    id: 'finding-1',
+    state: 'OPEN',
+    severity: 'HIGH',
+    confidence: 'HIGH',
+    coverage: 'FULL',
+    title: 'Identity protection configuration was weakened',
+    explanation: 'Authoritative evidence showed a security control moving to a weaker state.',
+    affectedIdentity: {
+      id: `hvr1_subject_${'a'.repeat(64)}`,
+      label: 'Tenant identity',
+      type: 'USER',
+    },
+    investigationGuidanceCode: 'REVIEW_CONFIGURATION',
+    investigationGuidance: 'Review the configuration and confirm the change is authorized.',
+    benignAlternativeCodes: [],
+    sourceLabels: ['Microsoft Entra directory audit'],
+    missingEvidenceLabels: [],
+    observedAt: new Date(nowMs - 60 * 60 * 1_000).toISOString(),
+    ruleIds: ['HV-ID-CHG-005.v1'],
+  }
+}
+
+function microsoftUserFixture(nowMs = freshnessNow) {
+  return {
+    id: `msru_${'b'.repeat(32)}`,
+    identityLabel: 'Canary identity',
+    riskLevel: 'low',
+    riskState: 'atRisk',
+    riskDetail: null,
+    observedAt: new Date(nowMs - 60 * 60 * 1_000).toISOString(),
   }
 }
 
@@ -268,10 +312,71 @@ test('accepts a completed HawkView evaluation with unavailable source evidence',
   })
 })
 
-test('accepts coherent bounded available and stale v1 envelopes', async () => {
+test('accepts coherent bounded AVAILABLE v1 envelopes', async () => {
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ relationship, route }) =>
       relationship === 'own' ? jsonResponse(availableFixture(route, freshnessNow)) : null,
+  })
+  await runAuthenticatedCanary({
+    fetchImpl,
+    now: () => freshnessNow,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  })
+})
+
+test('accepts a genuinely stale HawkView evaluation', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ relationship, route }) =>
+      relationship === 'own' && route !== 'microsoft'
+        ? jsonResponse(staleHawkViewFixture(route, freshnessNow))
+        : relationship === 'own'
+          ? jsonResponse(availableFixture(route, freshnessNow))
+          : null,
+  })
+  await runAuthenticatedCanary({
+    fetchImpl,
+    now: () => freshnessNow,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  })
+})
+
+test('accepts valid projected nonempty HawkView and Microsoft rows', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ relationship, route }) => {
+      if (relationship !== 'own') return null
+      const response = availableFixture(route, freshnessNow)
+      if (route === 'findings') response.findings = [findingFixture(freshnessNow)]
+      if (route === 'microsoft') response.users = [microsoftUserFixture(freshnessNow)]
+      return jsonResponse(response)
+    },
+  })
+  await runAuthenticatedCanary({
+    fetchImpl,
+    now: () => freshnessNow,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  })
+})
+
+test('accepts independently valid HawkView responses across a run transition', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ relationship, route }) =>
+      relationship === 'own' && route === 'findings'
+        ? jsonResponse(availableFixture(route, freshnessNow))
+        : relationship === 'own' && route === 'microsoft'
+          ? jsonResponse(availableFixture(route, freshnessNow))
+          : null,
   })
   await runAuthenticatedCanary({
     fetchImpl,
@@ -392,6 +497,94 @@ test('rejects an invalid row in an available findings response', async () => {
   )
 })
 
+test('rejects unprojected HawkView finding identities and catalog drift', async () => {
+  const base = findingFixture(freshnessNow)
+  const cases = [
+    {
+      name: 'raw identity UUID',
+      finding: { ...base, affectedIdentity: { ...base.affectedIdentity, id: ids.tenantA } },
+      expected: /identity projection was invalid/,
+    },
+    {
+      name: 'wrong-kind opaque reference',
+      finding: {
+        ...base,
+        affectedIdentity: {
+          ...base.affectedIdentity,
+          id: `hvr1_evidence_${'c'.repeat(64)}`,
+        },
+      },
+      expected: /identity projection was invalid/,
+    },
+    {
+      name: 'arbitrary identity label',
+      finding: {
+        ...base,
+        affectedIdentity: { ...base.affectedIdentity, label: 'Provider user label' },
+      },
+      expected: /identity label was invalid/,
+    },
+    {
+      name: 'unregistered rule',
+      finding: { ...base, ruleIds: ['HV-ID-FAKE-999.v1'] },
+      expected: /rules were invalid/,
+    },
+    {
+      name: 'unregistered provider source',
+      finding: { ...base, sourceLabels: ['Unregistered provider source'] },
+      expected: /sources did not match the registered rule/,
+    },
+  ]
+  for (const invalidCase of cases) {
+    const { fetchImpl } = successfulFetch({
+      riskResponseOverride: ({ authorization, relationship, route }) =>
+        authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'findings'
+          ? jsonResponse({
+              ...availableFixture('findings', freshnessNow),
+              findings: [invalidCase.finding],
+            })
+          : null,
+    })
+    await assert.rejects(
+      runAuthenticatedCanary({
+        fetchImpl,
+        now: () => freshnessNow,
+        environment: {
+          EXPECTED_REVISION: revision,
+          ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+        },
+      }),
+      invalidCase.expected,
+      invalidCase.name,
+    )
+  }
+})
+
+test('rejects a raw Microsoft provider identity ID', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'microsoft'
+        ? jsonResponse({
+            ...availableFixture('microsoft', freshnessNow),
+            users: [{ ...microsoftUserFixture(freshnessNow), id: ids.tenantA }],
+          })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      now: () => freshnessNow,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /Microsoft Entra risky users row 1 id was invalid/,
+  )
+})
+
 test('rejects current freshness with null no-data timestamps', async () => {
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ authorization, relationship, route }) =>
@@ -461,13 +654,13 @@ test('rejects CURRENT evidence older than the 36-hour freshness boundary', async
   )
 })
 
-test('rejects STALE evidence within the 36-hour freshness boundary', async () => {
+test('rejects HawkView STALE evidence within the 36-hour freshness boundary', async () => {
   const freshObservedAt = new Date(freshnessNow - 35 * 60 * 60 * 1_000).toISOString()
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ authorization, relationship, route }) =>
-      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'microsoft'
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'summary'
         ? jsonResponse({
-            ...availableFixture('microsoft', freshnessNow),
+            ...staleHawkViewFixture('summary', freshnessNow),
             observedAt: freshObservedAt,
           })
         : null,
@@ -482,8 +675,56 @@ test('rejects STALE evidence within the 36-hour freshness boundary', async () =>
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
       },
     }),
-    /Microsoft Entra risky users state was contradictory/,
+    /identity risk summary state was contradictory/,
   )
+})
+
+test('rejects Microsoft envelope states the service does not emit', async () => {
+  const invalidStates = [
+    {
+      name: 'stale',
+      response: {
+        ...availableFixture('microsoft', freshnessNow),
+        status: 'STALE',
+        observedAt: new Date(freshnessNow - 37 * 60 * 60 * 1_000).toISOString(),
+        freshness: 'STALE',
+        limitation: 'Microsoft Entra risky-user evidence is stale.',
+      },
+    },
+    {
+      name: 'partial available',
+      response: {
+        ...availableFixture('microsoft', freshnessNow),
+        capability: 'PARTIAL',
+        limitation: 'Partial Microsoft evidence.',
+      },
+    },
+    {
+      name: 'not evaluated',
+      response: { ...riskFixture('microsoft'), status: 'NOT_EVALUATED' },
+    },
+  ]
+  for (const invalidState of invalidStates) {
+    const { fetchImpl } = successfulFetch({
+      riskResponseOverride: ({ authorization, relationship, route }) =>
+        authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'microsoft'
+          ? jsonResponse(invalidState.response)
+          : null,
+    })
+    await assert.rejects(
+      runAuthenticatedCanary({
+        fetchImpl,
+        now: () => freshnessNow,
+        environment: {
+          EXPECTED_REVISION: revision,
+          ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+        },
+      }),
+      /Microsoft Entra risky users state was contradictory/,
+      invalidState.name,
+    )
+  }
 })
 
 test('accepts CURRENT evidence exactly at the 36-hour freshness boundary', async () => {

@@ -55,6 +55,43 @@ const MICROSOFT_RISK_DETAILS = new Set([
   'adminConfirmedAccountSafe',
   'unknownFutureValue',
 ])
+const HAWKVIEW_RULE_SOURCE_LABELS = new Map([
+  ...[
+    'HV-ID-EXP-001.v1',
+    'HV-ID-EXP-002.v1',
+    'HV-ID-CHG-001.v1',
+    'HV-ID-CHG-002.v1',
+    'HV-ID-CHG-003.v1',
+    'HV-ID-CHG-004.v1',
+    'HV-ID-CHG-005.v1',
+    'HV-ID-APP-001.v1',
+    'HV-ID-APP-002.v1',
+  ].map(ruleId => [ruleId, ['Microsoft Entra directory audit']]),
+  ['HV-ID-EXP-003.v1', ['Microsoft Entra sign-in activity']],
+  ['HV-ID-MBX-001.v1', [
+    'Microsoft Graph mailbox-rule snapshot',
+    'Microsoft Graph verified tenant domains',
+  ]],
+  ['HV-ID-MBX-002.v1', ['Exchange Online mailbox audit']],
+  ['HV-ID-MBX-003.v1', ['Exchange Online mailbox audit']],
+  ...[
+    'HV-ID-AUTH-001.v1',
+    'HV-ID-AUTH-002.v1',
+    'HV-ID-AUTH-003.v1',
+    'HV-ID-AUTH-004.v1',
+    'HV-ID-AUTH-005.v1',
+    'HV-ID-AUTH-006.v1',
+    'HV-ID-AUTH-007.v1',
+    'HV-ID-AUTH-008.v1',
+    'HV-ID-AUTH-009.v1',
+  ].map(ruleId => [ruleId, ['Microsoft Entra sign-in activity']]),
+])
+const HAWKVIEW_IDENTITY_REFERENCE_KIND = new Map([
+  ['USER', ['subject']],
+  ['MAILBOX', ['mailbox']],
+  ['APPLICATION', ['application']],
+  ['UNKNOWN', ['source', 'tenant']],
+])
 const IDENTITY_RISK_COUNT_KEYS = [
   'identitiesNeedingReview',
   'openFindings',
@@ -313,25 +350,15 @@ function assertIdentityRiskEnvelope(body, route, trustedNowMs) {
   const observedAgeMs = observedAt === null
     ? null
     : trustedNowMs - Date.parse(observedAt)
-  const coherent =
-    (envelope.status === 'AVAILABLE' &&
-      envelope.capability !== 'UNAVAILABLE' &&
-      envelope.freshness === 'CURRENT' &&
+  const hawkViewCoherent =
+    ((envelope.status === 'AVAILABLE' || envelope.status === 'STALE') &&
+      (envelope.capability === 'FULL' || envelope.capability === 'PARTIAL') &&
+      envelope.freshness === (envelope.status === 'AVAILABLE' ? 'CURRENT' : 'STALE') &&
       evaluatedAt !== null &&
       observedAt !== null &&
-      observedAgeMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
-      (envelope.capability === 'FULL' || envelope.limitation !== null)) ||
-    (envelope.status === 'STALE' &&
-      envelope.capability !== 'UNAVAILABLE' &&
-      envelope.freshness === 'STALE' &&
-      evaluatedAt !== null &&
-      observedAt !== null &&
-      observedAgeMs > IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
-      envelope.limitation !== null) ||
-    (envelope.status === 'LEARNING' &&
-      envelope.capability !== 'UNAVAILABLE' &&
-      envelope.freshness === 'UNKNOWN' &&
-      evaluatedAt !== null &&
+      (envelope.status === 'AVAILABLE'
+        ? observedAgeMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS
+        : observedAgeMs > IDENTITY_RISK_CURRENT_MAX_AGE_MS) &&
       envelope.limitation !== null) ||
     (envelope.status === 'NOT_EVALUATED' &&
       envelope.capability === 'UNAVAILABLE' &&
@@ -344,6 +371,23 @@ function assertIdentityRiskEnvelope(body, route, trustedNowMs) {
       evaluatedAt === null &&
       observedAt === null &&
       envelope.limitation !== null)
+  const microsoftCoherent =
+    (envelope.status === 'AVAILABLE' &&
+      envelope.capability === 'FULL' &&
+      envelope.freshness === 'CURRENT' &&
+      evaluatedAt !== null &&
+      observedAt !== null &&
+      observedAgeMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
+      envelope.limitation === null) ||
+    (envelope.status === 'UNAVAILABLE' &&
+      envelope.capability === 'UNAVAILABLE' &&
+      envelope.freshness === 'UNKNOWN' &&
+      evaluatedAt === null &&
+      observedAt === null &&
+      envelope.limitation !== null)
+  const coherent = route.channel === 'HAWKVIEW_IDENTITY_SIGNALS'
+    ? hawkViewCoherent
+    : microsoftCoherent
   assert(coherent, `${route.label} state was contradictory`)
   return envelope
 }
@@ -402,9 +446,19 @@ function assertFinding(value, envelope, label, trustedNowMs) {
   boundedString(finding.explanation, 1_000, `${label} explanation`)
   const identity = record(finding.affectedIdentity)
   assert(identity && exactKeys(identity, ['id', 'label', 'type']), `${label} identity was invalid`)
-  boundedString(identity.id, 128, `${label} identity id`, /^[A-Za-z0-9._:-]+$/)
-  boundedString(identity.label, 160, `${label} identity label`)
   assert(IDENTITY_TYPES.has(identity.type), `${label} identity type was invalid`)
+  const allowedKinds = HAWKVIEW_IDENTITY_REFERENCE_KIND.get(identity.type) ?? []
+  assert(
+    allowedKinds.some(kind =>
+      new RegExp(`^hvr1_${kind}_[a-f0-9]{64}$`).test(identity.id)),
+    `${label} identity projection was invalid`,
+  )
+  assert(
+    identity.label === (identity.type === 'MAILBOX'
+      ? 'Affected mailbox (restricted details)'
+      : 'Tenant identity'),
+    `${label} identity label was invalid`,
+  )
   assert(
     INVESTIGATION_GUIDANCE_CODES.has(finding.investigationGuidanceCode),
     `${label} guidance code was invalid`,
@@ -414,6 +468,15 @@ function assertFinding(value, envelope, label, trustedNowMs) {
   assertStringList(finding.sourceLabels, `${label} sources`)
   assertStringList(finding.missingEvidenceLabels, `${label} missing evidence`)
   assertStringList(finding.ruleIds, `${label} rules`, { requireItem: true })
+  const expectedSources = finding.ruleIds.length === 1
+    ? HAWKVIEW_RULE_SOURCE_LABELS.get(finding.ruleIds[0])
+    : null
+  assert(expectedSources, `${label} rules were invalid`)
+  assert(
+    finding.sourceLabels.length === expectedSources.length &&
+      finding.sourceLabels.every((source, index) => source === expectedSources[index]),
+    `${label} sources did not match the registered rule`,
+  )
   const observedAt = assertNullableTimestamp(
     finding.observedAt,
     `${label} observed`,
@@ -434,7 +497,7 @@ function assertMicrosoftUser(value, envelope, label, trustedNowMs) {
     ]),
     `${label} row was invalid`,
   )
-  boundedString(user.id, 200, `${label} id`, /^[A-Za-z0-9._:-]+$/)
+  boundedString(user.id, 37, `${label} id`, /^msru_[a-f0-9]{32}$/)
   boundedString(user.identityLabel, 160, `${label} identity label`)
   assert(MICROSOFT_RISK_LEVELS.has(user.riskLevel), `${label} risk level was invalid`)
   assert(MICROSOFT_RISK_STATES.has(user.riskState), `${label} risk state was invalid`)
@@ -517,15 +580,6 @@ function assertIdentityRiskResponse(body, route, trustedNowMs) {
   assertPageInfo(envelope.pageInfo, route.label, collection.length)
 }
 
-function assertMatchingHawkViewMeta(summary, findings) {
-  for (const key of [
-    'version', 'channel', 'engineVersion', 'catalogVersion', 'evaluatedAt',
-    'capability', 'status', 'sourceLabel', 'observedAt', 'freshness', 'limitation',
-  ]) {
-    assert(summary[key] === findings[key], 'HawkView risk route metadata did not match')
-  }
-}
-
 async function verifyIdentityRiskRoutes(
   fetchImpl,
   session,
@@ -533,7 +587,6 @@ async function verifyIdentityRiskRoutes(
   verifyUnauthenticated,
   trustedNowMs,
 ) {
-  const hawkViewResponses = []
   for (const route of IDENTITY_RISK_ROUTES) {
     const ownPath = `/api/tenants/${encodeURIComponent(session.expectedTenantId)}/${route.suffix}`
     const own = await authenticatedJson(
@@ -544,10 +597,6 @@ async function verifyIdentityRiskRoutes(
       `${route.label} own tenant`,
     )
     assertIdentityRiskResponse(own.body, route, trustedNowMs)
-    if (route.channel === 'HAWKVIEW_IDENTITY_SIGNALS') {
-      hawkViewResponses.push(own.body)
-    }
-
     const foreignPath = `/api/tenants/${encodeURIComponent(foreignSession.expectedTenantId)}/${route.suffix}`
     await authenticatedJson(
       fetchImpl,
@@ -567,7 +616,6 @@ async function verifyIdentityRiskRoutes(
       )
     }
   }
-  assertMatchingHawkViewMeta(hawkViewResponses[0], hawkViewResponses[1])
 }
 
 async function verifyIdentityBoundary(fetchImpl, session, foreignSession) {
