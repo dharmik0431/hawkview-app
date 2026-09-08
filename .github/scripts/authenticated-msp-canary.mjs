@@ -306,7 +306,8 @@ function assertStringList(value, label, { maxItems = 10, requireItem = false } =
   assert(new Set(value).size === value.length, `${label} contained duplicates`)
 }
 
-function assertIdentityRiskEnvelope(body, route, trustedNowMs) {
+function assertIdentityRiskEnvelope(body, route, requestWindow) {
+  const trustedNowMs = requestWindow.completedAt
   const envelope = record(body)
   assert(envelope?.version === IDENTITY_RISK_API_VERSION, `${route.label} version was invalid`)
   assert(envelope.channel === route.channel, `${route.label} channel was invalid`)
@@ -347,9 +348,14 @@ function assertIdentityRiskEnvelope(body, route, trustedNowMs) {
     `${route.label} limitation was invalid`,
   )
   assert(envelope.status !== 'ERROR', `${route.label} reported an error state`)
-  const observedAgeMs = observedAt === null
+  const observedAgeAtEndMs = observedAt === null
     ? null
     : trustedNowMs - Date.parse(observedAt)
+  const observedAgeAtStartMs = observedAt === null
+    ? null
+    : requestWindow.startedAt - Date.parse(observedAt)
+  // The server may evaluate anywhere within this read's timing window. At the
+  // 36h crossing, either classification can be valid; outside it, fail closed.
   const hawkViewCoherent =
     ((envelope.status === 'AVAILABLE' || envelope.status === 'STALE') &&
       (envelope.capability === 'FULL' || envelope.capability === 'PARTIAL') &&
@@ -357,8 +363,8 @@ function assertIdentityRiskEnvelope(body, route, trustedNowMs) {
       evaluatedAt !== null &&
       observedAt !== null &&
       (envelope.status === 'AVAILABLE'
-        ? observedAgeMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS
-        : observedAgeMs > IDENTITY_RISK_CURRENT_MAX_AGE_MS) &&
+        ? observedAgeAtStartMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS
+        : observedAgeAtEndMs > IDENTITY_RISK_CURRENT_MAX_AGE_MS) &&
       envelope.limitation !== null) ||
     (envelope.status === 'NOT_EVALUATED' &&
       envelope.capability === 'UNAVAILABLE' &&
@@ -377,7 +383,7 @@ function assertIdentityRiskEnvelope(body, route, trustedNowMs) {
       envelope.freshness === 'CURRENT' &&
       evaluatedAt !== null &&
       observedAt !== null &&
-      observedAgeMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
+      observedAgeAtStartMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
       envelope.limitation === null) ||
     (envelope.status === 'UNAVAILABLE' &&
       envelope.capability === 'UNAVAILABLE' &&
@@ -449,8 +455,9 @@ function assertFinding(value, envelope, label, trustedNowMs) {
   assert(IDENTITY_TYPES.has(identity.type), `${label} identity type was invalid`)
   const allowedKinds = HAWKVIEW_IDENTITY_REFERENCE_KIND.get(identity.type) ?? []
   assert(
-    allowedKinds.some(kind =>
-      new RegExp(`^hvr1_${kind}_[a-f0-9]{64}$`).test(identity.id)),
+    typeof identity.id === 'string' &&
+      allowedKinds.some(kind =>
+        new RegExp(`^hvr1_${kind}_[a-f0-9]{64}$`).test(identity.id)),
     `${label} identity projection was invalid`,
   )
   assert(
@@ -517,7 +524,8 @@ function assertMicrosoftUser(value, envelope, label, trustedNowMs) {
   )
 }
 
-function assertIdentityRiskResponse(body, route, trustedNowMs) {
+function assertIdentityRiskResponse(body, route, requestWindow) {
+  const trustedNowMs = requestWindow.completedAt
   const candidate = record(body)
   const commonKeys = [
     'version', 'channel', 'engineVersion', 'catalogVersion', 'evaluatedAt',
@@ -532,7 +540,7 @@ function assertIdentityRiskResponse(body, route, trustedNowMs) {
     ),
     `${route.label} envelope keys were invalid`,
   )
-  const envelope = assertIdentityRiskEnvelope(body, route, trustedNowMs)
+  const envelope = assertIdentityRiskEnvelope(body, route, requestWindow)
   if (route.collection === 'counts') {
     const counts = record(envelope.counts)
     assert(
@@ -585,10 +593,12 @@ async function verifyIdentityRiskRoutes(
   session,
   foreignSession,
   verifyUnauthenticated,
-  trustedNowMs,
+  now,
 ) {
   for (const route of IDENTITY_RISK_ROUTES) {
     const ownPath = `/api/tenants/${encodeURIComponent(session.expectedTenantId)}/${route.suffix}`
+    const startedAt = now()
+    assert(Number.isFinite(startedAt), 'Canary clock was invalid')
     const own = await authenticatedJson(
       fetchImpl,
       session.accessToken,
@@ -596,7 +606,12 @@ async function verifyIdentityRiskRoutes(
       [200],
       `${route.label} own tenant`,
     )
-    assertIdentityRiskResponse(own.body, route, trustedNowMs)
+    const completedAt = now()
+    assert(
+      Number.isFinite(completedAt) && completedAt >= startedAt,
+      'Canary request timing window was invalid',
+    )
+    assertIdentityRiskResponse(own.body, route, { startedAt, completedAt })
     const foreignPath = `/api/tenants/${encodeURIComponent(foreignSession.expectedTenantId)}/${route.suffix}`
     await authenticatedJson(
       fetchImpl,
@@ -669,8 +684,7 @@ export async function runAuthenticatedCanary({
   environment = process.env,
   now = Date.now,
 } = {}) {
-  const trustedNowMs = now()
-  assert(Number.isFinite(trustedNowMs), 'Canary clock was invalid')
+  assert(Number.isFinite(now()), 'Canary clock was invalid')
   const revision = environment.EXPECTED_REVISION?.trim().toLowerCase() ?? ''
   assert(FULL_GIT_REVISION.test(revision), 'Expected deployment revision is invalid')
 
@@ -713,8 +727,8 @@ export async function runAuthenticatedCanary({
 
   await verifyIdentityBoundary(fetchImpl, sessionA, sessionB)
   await verifyIdentityBoundary(fetchImpl, sessionB, sessionA)
-  await verifyIdentityRiskRoutes(fetchImpl, sessionA, sessionB, true, trustedNowMs)
-  await verifyIdentityRiskRoutes(fetchImpl, sessionB, sessionA, false, trustedNowMs)
+  await verifyIdentityRiskRoutes(fetchImpl, sessionA, sessionB, true, now)
+  await verifyIdentityRiskRoutes(fetchImpl, sessionB, sessionA, false, now)
   console.log('Authenticated two-MSP canary and identity-risk route checks passed.')
 }
 

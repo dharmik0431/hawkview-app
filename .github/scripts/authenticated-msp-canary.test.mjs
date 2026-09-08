@@ -585,6 +585,59 @@ test('rejects a raw Microsoft provider identity ID', async () => {
   )
 })
 
+test('rejects an array containing an otherwise valid HawkView identity reference', async () => {
+  const finding = findingFixture(freshnessNow)
+  finding.affectedIdentity.id = [finding.affectedIdentity.id]
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ relationship, route }) =>
+      relationship === 'own' && route === 'findings'
+        ? jsonResponse({ ...availableFixture(route), findings: [finding] })
+        : null,
+  })
+  await assert.rejects(runAuthenticatedCanary({
+    fetchImpl,
+    now: () => freshnessNow,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  }), /identity projection was invalid/)
+})
+
+test('accepts a freshness boundary crossing within each own request timing window', async () => {
+  for (const status of ['AVAILABLE', 'STALE']) {
+    let clock = freshnessNow
+    const { fetchImpl: baseFetch } = successfulFetch({
+      riskResponseOverride: ({ authorization, relationship, route }) => {
+        if (authorization !== `Bearer ${tokenA}` || relationship !== 'own' || route !== 'summary') return null
+        const startedAt = clock
+        clock += 2_000
+        return jsonResponse({
+          ...availableFixture(route, startedAt),
+          status,
+          freshness: status === 'AVAILABLE' ? 'CURRENT' : 'STALE',
+          observedAt: new Date(startedAt - 36 * 60 * 60 * 1_000 + 1_000).toISOString(),
+        })
+      },
+    })
+    const fetchImpl = async (input, init) => {
+      // Setup time cannot be reused as the observation time of later requests.
+      if (new URL(String(input)).pathname === '/health') clock += 60_000
+      return baseFetch(input, init)
+    }
+    await runAuthenticatedCanary({
+      fetchImpl,
+      now: () => clock,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    })
+  }
+})
+
 test('rejects current freshness with null no-data timestamps', async () => {
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ authorization, relationship, route }) =>
