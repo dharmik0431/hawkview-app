@@ -9,6 +9,15 @@ const normalized = (result: AuthNormalizationResult): AuthNormalizedEvent => { i
 const status = (events: readonly AuthNormalizedEvent[], rule = AUTH_RULE_A as string): string => evaluateAuthenticationRules(evaluation(events)).rules.find(value => value.ruleId === rule)!.status;
 const context = { ...SYNTHETIC_SCOPE, source: 'GRAPH_SIGN_INS' as const, asOf: SYNTHETIC_NOW };
 
+test('new authentication rule tuples never reuse the published break-glass identity', () => {
+  assert.equal(AUTH_RULE_A, 'HV-ID-AUTH-010.v1');
+  assert.equal(AUTH_RULE_B, 'HV-ID-AUTH-005.v2');
+  const result = evaluateAuthenticationRules(evaluation([...failures(10), success()]));
+  assert.ok(result.findings.some(finding => finding.ruleId === 'HV-ID-AUTH-010.v1' && finding.priority === 'LOW'));
+  assert.ok(result.findings.some(finding => finding.ruleId === 'HV-ID-AUTH-005.v2' && finding.priority === 'MEDIUM'));
+  assert.ok(result.findings.every(finding => String(finding.ruleId) !== 'HV-ID-AUTH-009.v1'));
+});
+
 test('A requires ten distinct invalid-credential events; duplicates do not count', () => {
   assert.equal(status(failures(9)), 'NOT_MATCHED');
   assert.equal(status(failures(10)), 'MATCHED');
