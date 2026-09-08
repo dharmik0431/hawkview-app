@@ -104,6 +104,8 @@ async function requestJson(
   } catch {
     throw new Error(`${label} failed`)
   }
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+  assert(contentType.includes('application/json'), `${label} response was not JSON`)
   let body
   try {
     body = await boundedJson(response)
@@ -211,6 +213,20 @@ function assertIdentityRiskEnvelope(body, route) {
       (typeof envelope.limitation === 'string' && envelope.limitation.length <= 1_000),
     `${route.label} limitation was invalid`,
   )
+  assert(envelope.status !== 'ERROR', `${route.label} reported an error state`)
+  assert(
+    envelope.status === 'NOT_EVALUATED' || envelope.status === 'UNAVAILABLE',
+    `${route.label} synthetic baseline status was unexpected`,
+  )
+  assert(
+    envelope.capability === 'UNAVAILABLE' &&
+      envelope.freshness === 'UNKNOWN' &&
+      envelope.evaluatedAt === null &&
+      envelope.observedAt === null &&
+      typeof envelope.limitation === 'string' &&
+      envelope.limitation.length > 0,
+    `${route.label} no-data state was contradictory`,
+  )
   return envelope
 }
 
@@ -223,6 +239,10 @@ function assertBoundedCount(value, label) {
   assert(typeof count.exact === 'boolean', `${label} exact marker was invalid`)
   assert(typeof count.capped === 'boolean', `${label} capped marker was invalid`)
   assert(!(count.exact && count.capped), `${label} exact and capped markers conflicted`)
+  assert(
+    count.value === 0 && count.exact === false && count.capped === false,
+    `${label} no-data count was not a non-exact bounded zero`,
+  )
 }
 
 function assertPageInfo(value, label) {
@@ -249,8 +269,8 @@ function assertIdentityRiskResponse(body, route) {
     return
   }
   assert(
-    Array.isArray(envelope[route.collection]) && envelope[route.collection].length <= 100,
-    `${route.label} collection was invalid`,
+    Array.isArray(envelope[route.collection]) && envelope[route.collection].length === 0,
+    `${route.label} synthetic baseline collection was not empty`,
   )
   assertPageInfo(envelope.pageInfo, route.label)
 }

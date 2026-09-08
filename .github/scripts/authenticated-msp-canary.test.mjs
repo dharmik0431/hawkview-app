@@ -215,6 +215,111 @@ test('rejects a malformed 200 identity-risk envelope without exposing tenant IDs
   )
 })
 
+test('rejects an own-tenant 200 identity-risk ERROR envelope', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'summary'
+        ? jsonResponse({ ...riskFixture('summary'), status: 'ERROR' })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /identity risk summary reported an error state/,
+  )
+})
+
+test('rejects an exact zero count in a no-data summary', async () => {
+  const invalid = riskFixture('summary')
+  invalid.counts.openFindings = { value: 0, exact: true, capped: false }
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'summary'
+        ? jsonResponse(invalid)
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /openFindings no-data count was not a non-exact bounded zero/,
+  )
+})
+
+test('rejects rows in a no-data findings response', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'findings'
+        ? jsonResponse({ ...riskFixture('findings'), findings: [null] })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /identity risk findings synthetic baseline collection was not empty/,
+  )
+})
+
+test('rejects current freshness with null no-data timestamps', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'microsoft'
+        ? jsonResponse({ ...riskFixture('microsoft'), freshness: 'CURRENT' })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /Microsoft Entra risky users no-data state was contradictory/,
+  )
+})
+
+test('rejects a 200 risk response without a JSON content type', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'summary'
+        ? new Response(JSON.stringify(riskFixture('summary')), {
+            status: 200,
+            headers: { 'content-type': 'text/plain' },
+          })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /identity risk summary own tenant response was not JSON/,
+  )
+})
+
 test('rejects a 200 response for a foreign identity-risk route', async () => {
   const { fetchImpl } = successfulFetch({
     riskResponseOverride: ({ authorization, relationship, route }) =>
