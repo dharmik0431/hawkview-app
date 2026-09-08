@@ -63,6 +63,46 @@ currently returns the newest 100 unexpired rows. That bounded view is adequate
 for the P0 evidence slice but pagination and a dedicated operational search
 surface remain follow-up work.
 
+## Tenant onboarding decisions and report checks
+
+The existing owner-authorized Audit History also includes these app-only
+tenant onboarding actions, using the internal customer-tenant ID as an opaque
+target. Actor and organization IDs, server-generated request and operation IDs,
+stage, status, creation time, and the existing expiration remain available.
+
+| Action | Evidence |
+| --- | --- |
+| `TENANT_EXCHANGE_SETUP_DEFERRED` | The optional Exchange setup was explicitly deferred. |
+| `TENANT_REPORT_VISIBILITY_DEFERRED` | Report visibility setup was explicitly deferred. |
+| `TENANT_REPORT_VISIBILITY_CHECKED` | A read-only check returned `READY`, `IDENTIFIERS_CONCEALED`, or an allowlisted failure status. |
+| `TENANT_ONBOARDING_COMPLETED` | The existing required and optional-step completion conditions were satisfied and completion was persisted. |
+
+Each local transition and its audit event commit in the same transaction.
+Repeated deferral and completion requests preserve the original timestamp and
+do not append another successful transition. A later deferral after the prior
+deferral has been cleared is a new decision. Each report verification performs
+a new read and records a new observation, including unchanged results; it does
+not claim that HawkView changed Microsoft's setting or completed onboarding.
+`SUCCEEDED` with `IDENTIFIERS_CONCEALED` means the read succeeded, not that
+identifiers are visible. Optional steps remain optional and explicitly deferrable.
+
+Report-check metadata contains only an allowlisted status. Expected failures
+use bounded `REPORT_VISIBILITY_*` codes; unexpected exceptions use the existing
+safe workspace error mapping and `CHECK_FAILED`. No Microsoft tenant ID,
+customer name, domain, email, credential, URL, or provider payload is copied
+into these events.
+
+If local state or evidence persistence fails, the transaction rolls back and
+the request fails. When the audit store remains available, a separate failed
+event uses the same correlation IDs and `LOCAL_PERSISTENCE` stage. If the audit
+store itself is unavailable, durable failure evidence cannot be guaranteed;
+the request still fails rather than reporting success. Unauthorized or
+foreign-workspace requests are rejected before tenant or audit writes.
+
+These rows use the existing 365-day workspace audit retention and the existing
+newest-100 owner view. This slice adds no new public endpoint, log store,
+permission rule, pagination, or product-wide audit guarantee.
+
 ## Current boundary
 
 This P0 covers material workspace administrative operations. Tenant sync job

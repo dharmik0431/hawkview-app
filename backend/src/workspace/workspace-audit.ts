@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { HttpException, HttpStatus } from '@nestjs/common'
+import type { Prisma } from '../generated/prisma/client.js'
+import type { PrismaService } from '../prisma/prisma.service.js'
 
 export const WORKSPACE_AUDIT_EVENT_VERSION = 2
 export const WORKSPACE_AUDIT_RETENTION_DAYS = 365
@@ -31,6 +33,45 @@ export type WorkspaceAuditMetadata = Record<
 export type WorkspaceAuditOperation = {
   requestId: string
   operationId: string
+}
+
+export type WorkspaceAuditEvidence = WorkspaceAuditOperation & {
+  action: string
+  outcome: 'STARTED' | 'SUCCEEDED' | 'FAILED'
+  stage: string
+  errorCode?: string | null
+  targetType: 'ORGANIZATION' | 'WORKSPACE_MEMBER' | 'CUSTOMER_TENANT'
+  targetUserId?: string | null
+  targetOpaqueId: string
+  metadata?: WorkspaceAuditMetadata
+}
+
+// Callers supply their transaction client when evidence accompanies local state.
+export async function writeWorkspaceAudit(
+  client: Pick<PrismaService, 'workspaceAdminAuditLog'>,
+  actor: { organizationId: string; userId: string },
+  evidence: WorkspaceAuditEvidence,
+) {
+  await client.workspaceAdminAuditLog.create({
+    data: {
+      organizationId: actor.organizationId,
+      actorUserId: actor.userId,
+      actorEmail: null,
+      targetUserId: evidence.targetUserId ?? null,
+      targetEmail: null,
+      targetType: evidence.targetType,
+      targetOpaqueId: evidence.targetOpaqueId.slice(0, 128),
+      action: evidence.action,
+      outcome: evidence.outcome,
+      stage: evidence.stage,
+      errorCode: evidence.errorCode ?? null,
+      requestId: evidence.requestId,
+      operationId: evidence.operationId,
+      eventVersion: WORKSPACE_AUDIT_EVENT_VERSION,
+      metadata: safeWorkspaceAuditMetadata(evidence.metadata) as Prisma.InputJsonObject | undefined,
+      expiresAt: workspaceAuditExpiration(),
+    },
+  })
 }
 
 export function createWorkspaceAuditOperation(

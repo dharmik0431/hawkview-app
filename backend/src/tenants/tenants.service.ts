@@ -29,6 +29,30 @@ import {
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 import { buildExchangeReadOnlyRbacSetup } from './exchange-rbac-setup.js'
 import type { MicrosoftUsageSourceProjectionEvidence } from './sharepoint-data-contract.js'
+import {
+  createWorkspaceAuditOperation,
+  workspaceAuditErrorCode,
+  writeWorkspaceAudit,
+  type WorkspaceAuditEvidence,
+} from '../workspace/workspace-audit.js'
+
+function reportVisibilityAuditResult(status: string) {
+  switch (status) {
+    case 'READY':
+    case 'IDENTIFIERS_CONCEALED':
+      return { outcome: 'SUCCEEDED' as const, errorCode: null, metadata: { status } }
+    case 'CONNECTION_INCOMPLETE':
+    case 'TOKEN_UNAVAILABLE':
+    case 'MISSING_PERMISSION':
+    case 'MICROSOFT_DENIED':
+    case 'MICROSOFT_UNAVAILABLE':
+    case 'INVALID_RESPONSE':
+    case 'NETWORK_ERROR':
+      return { outcome: 'FAILED' as const, errorCode: `REPORT_VISIBILITY_${status}`, metadata: { status } }
+    default:
+      return { outcome: 'FAILED' as const, errorCode: 'REPORT_VISIBILITY_INVALID_RESPONSE', metadata: { status: 'INVALID_RESPONSE' } }
+  }
+}
 
 const TENANT_DELETION_ROLES = [
   MembershipRole.MSP_OWNER,
@@ -1194,16 +1218,57 @@ export class TenantsService {
     }
   }
 
+  private async persistOnboardingAudit(
+    actor: { organizationId: string; userId: string },
+    evidence: WorkspaceAuditEvidence,
+    change: (transaction: Prisma.TransactionClient) => Promise<boolean>,
+  ) {
+    try {
+      await this.prisma.$transaction(async (transaction) => {
+        if (await change(transaction)) {
+          await writeWorkspaceAudit(transaction, actor, evidence)
+        }
+      })
+    } catch (error) {
+      // The state and success evidence have rolled back. Record only a failure
+      // outside that transaction if the audit store is still available.
+      try {
+        await writeWorkspaceAudit(this.prisma, actor, {
+          ...evidence,
+          outcome: 'FAILED',
+          stage: 'LOCAL_PERSISTENCE',
+          errorCode: workspaceAuditErrorCode(error),
+          metadata: { status: 'NOT_PERSISTED' },
+        })
+      } catch {
+        throw new BadGatewayException('Onboarding audit evidence could not be saved. Please retry.')
+      }
+      throw new BadGatewayException('Onboarding changes could not be saved. Please retry.')
+    }
+  }
+
   async skipExchangeReadOnlyForIdentity(identity: AuthenticatedIdentity, customerTenantId: string) {
     const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
     const tenant = await this.prisma.customerTenant.findFirst({
       where: { id: customerTenantId, organizationId: { in: organizationIds } },
-      select: { id: true, organizationId: true },
+      select: { id: true, organizationId: true, connection: { select: { exchangeReadOnlySkippedAt: true } } },
     })
-    if (!tenant) throw new NotFoundException('Customer tenant was not found.')
-    await this.prisma.tenantConnection.update({
-      where: { customerTenantId_organizationId: { customerTenantId: tenant.id, organizationId: tenant.organizationId } },
-      data: { exchangeReadOnlySkippedAt: new Date() },
+    if (!tenant?.connection) throw new NotFoundException('Customer tenant was not found.')
+    const userId = await this.getTenantOnboardingActor(identity)
+    await this.persistOnboardingAudit({ organizationId: tenant.organizationId, userId }, {
+      ...createWorkspaceAuditOperation(),
+      action: 'TENANT_EXCHANGE_SETUP_DEFERRED',
+      outcome: 'SUCCEEDED',
+      stage: 'EXCHANGE_SETUP',
+      targetType: 'CUSTOMER_TENANT',
+      targetOpaqueId: tenant.id,
+      metadata: { status: 'DEFERRED' },
+    }, async (transaction) => {
+      const changed = await transaction.tenantConnection.updateMany({
+        where: { customerTenantId: tenant.id, organizationId: tenant.organizationId, exchangeReadOnlySkippedAt: null },
+        data: { exchangeReadOnlySkippedAt: new Date() },
+      })
+      return changed.count > 0
     })
     return this.getTenantOnboardingForIdentity(identity, customerTenantId)
   }
@@ -1212,12 +1277,24 @@ export class TenantsService {
     const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
     const tenant = await this.prisma.customerTenant.findFirst({
       where: { id: customerTenantId, organizationId: { in: organizationIds } },
-      select: { id: true, organizationId: true },
+      select: { id: true, organizationId: true, connection: { select: { reportVisibilityDeferredAt: true } } },
     })
-    if (!tenant) throw new NotFoundException('Customer tenant was not found.')
-    await this.prisma.tenantConnection.update({
-      where: { customerTenantId_organizationId: { customerTenantId: tenant.id, organizationId: tenant.organizationId } },
-      data: { reportVisibilityDeferredAt: new Date() },
+    if (!tenant?.connection) throw new NotFoundException('Customer tenant was not found.')
+    const userId = await this.getTenantOnboardingActor(identity)
+    await this.persistOnboardingAudit({ organizationId: tenant.organizationId, userId }, {
+      ...createWorkspaceAuditOperation(),
+      action: 'TENANT_REPORT_VISIBILITY_DEFERRED',
+      outcome: 'SUCCEEDED',
+      stage: 'REPORT_VISIBILITY',
+      targetType: 'CUSTOMER_TENANT',
+      targetOpaqueId: tenant.id,
+      metadata: { status: 'DEFERRED' },
+    }, async (transaction) => {
+      const changed = await transaction.tenantConnection.updateMany({
+        where: { customerTenantId: tenant.id, organizationId: tenant.organizationId, reportVisibilityDeferredAt: null },
+        data: { reportVisibilityDeferredAt: new Date() },
+      })
+      return changed.count > 0
     })
     return this.getTenantOnboardingForIdentity(identity, customerTenantId)
   }
@@ -1234,20 +1311,45 @@ export class TenantsService {
       },
     })
     if (!tenant?.connection) throw new NotFoundException('Customer tenant was not found.')
-    const result = await this.microsoftConsent.readTenantReportPrivacySetting({
-      microsoftTenantId: tenant.microsoftTenantId,
-      connectionMode: tenant.connection.connectionMode === 'CUSTOMER_MANAGED' ? 'CUSTOMER_MANAGED' : 'HAWKVIEW_MANAGED',
-      clientId: tenant.connection.clientId,
-      credentialReference: tenant.connection.credentialReference,
-    })
+    const actor = { organizationId: tenant.organizationId, userId: await this.getTenantOnboardingActor(identity) }
+    const evidence = {
+      ...createWorkspaceAuditOperation(),
+      action: 'TENANT_REPORT_VISIBILITY_CHECKED',
+      stage: 'REPORT_VISIBILITY_VERIFICATION',
+      targetType: 'CUSTOMER_TENANT' as const,
+      targetOpaqueId: tenant.id,
+    }
+    let result: Awaited<ReturnType<MicrosoftConsentService['readTenantReportPrivacySetting']>>
+    try {
+      result = await this.microsoftConsent.readTenantReportPrivacySetting({
+        microsoftTenantId: tenant.microsoftTenantId,
+        connectionMode: tenant.connection.connectionMode === 'CUSTOMER_MANAGED' ? 'CUSTOMER_MANAGED' : 'HAWKVIEW_MANAGED',
+        clientId: tenant.connection.clientId,
+        credentialReference: tenant.connection.credentialReference,
+      })
+    } catch (error) {
+      await this.persistOnboardingAudit(actor, {
+        ...evidence,
+        outcome: 'FAILED',
+        errorCode: workspaceAuditErrorCode(error),
+        metadata: { status: 'CHECK_FAILED' },
+      }, async () => true)
+      throw new BadGatewayException('Report visibility could not be verified. Please retry.')
+    }
     const checkedAt = new Date()
-    await this.prisma.tenantConnection.update({
-      where: { customerTenantId_organizationId: { customerTenantId: tenant.id, organizationId: tenant.organizationId } },
-      data: {
-        reportSettingsLastCheckedAt: checkedAt,
-        reportIdentifiersVisible: result.identifiersVisible,
-        reportVisibilityDeferredAt: result.identifiersVisible ? null : undefined,
-      },
+    await this.persistOnboardingAudit(actor, {
+      ...evidence,
+      ...reportVisibilityAuditResult(result.status),
+    }, async (transaction) => {
+      await transaction.tenantConnection.update({
+        where: { customerTenantId_organizationId: { customerTenantId: tenant.id, organizationId: tenant.organizationId } },
+        data: {
+          reportSettingsLastCheckedAt: checkedAt,
+          reportIdentifiersVisible: result.identifiersVisible,
+          reportVisibilityDeferredAt: result.identifiersVisible ? null : undefined,
+        },
+      })
+      return true
     })
     return {
       verification: { ...result, checkedAt: checkedAt.toISOString() },
@@ -1267,15 +1369,36 @@ export class TenantsService {
       select: { id: true, organizationId: true },
     })
     if (!tenant) throw new NotFoundException('Customer tenant was not found.')
-    await this.prisma.tenantConnection.updateMany({
-      where: {
-        customerTenantId: tenant.id,
-        organizationId: tenant.organizationId,
-        onboardingCompletedAt: null,
-      },
-      data: { onboardingCompletedAt: new Date() },
+    const userId = await this.getTenantOnboardingActor(identity)
+    await this.persistOnboardingAudit({ organizationId: tenant.organizationId, userId }, {
+      ...createWorkspaceAuditOperation(),
+      action: 'TENANT_ONBOARDING_COMPLETED',
+      outcome: 'SUCCEEDED',
+      stage: 'ONBOARDING_COMPLETION',
+      targetType: 'CUSTOMER_TENANT',
+      targetOpaqueId: tenant.id,
+      metadata: { status: 'COMPLETED' },
+    }, async (transaction) => {
+      const changed = await transaction.tenantConnection.updateMany({
+        where: {
+          customerTenantId: tenant.id,
+          organizationId: tenant.organizationId,
+          onboardingCompletedAt: null,
+          status: 'CONNECTED',
+          AND: [
+            { OR: [{ exchangeReadOnlyEnabledAt: { not: null } }, { exchangeReadOnlySkippedAt: { not: null } }] },
+            { OR: [{ reportIdentifiersVisible: true }, { reportVisibilityDeferredAt: { not: null } }] },
+          ],
+        },
+        data: { onboardingCompletedAt: new Date() },
+      })
+      return changed.count > 0
     })
-    return this.getTenantOnboardingForIdentity(identity, customerTenantId)
+    const completed = await this.getTenantOnboardingForIdentity(identity, customerTenantId)
+    if (!completed.completedAt) {
+      throw new ConflictException('Resolve or explicitly defer each optional setup step before finishing onboarding.')
+    }
+    return completed
   }
 
   async assertCanConfigureExchangeReadOnly(
