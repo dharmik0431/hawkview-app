@@ -170,12 +170,15 @@ registration each carry their own state, source, observation time, freshness,
 and reason code. Unknown, stale, failed, missing-permission, or incomplete
 evidence must remain explicit; one protection source cannot fill another's gap.
 
-Only an authorized, resolved directory subject can form a public `USER` row.
-When a mailbox and directory user share the exact fresh, tenant-scoped directory
-GUID, their reasons merge into one `USER` row whose summary is the highest
-current priority. Never join by UPN, name, or display label. A mailbox without
-that exact resolution remains a `MAILBOX` row; it is not guessed to be a human.
-Evidence references remain opaque and tenant-scoped.
+Only an authorized, resolved human directory subject can form a public `USER`
+row. A directory GUID alone is insufficient because shared mailboxes can also
+have one. Merging mailbox and user reasons requires fresh scoped
+`EXCHANGE_MAILBOX_SETTINGS`, an exact mailbox-user-directory GUID binding, and
+exactly one matching record with `userPurpose='user'`. Shared, room, equipment,
+missing, stale, failed, duplicate, or ambiguous-purpose mailboxes remain
+`MAILBOX` rows. Never join by UPN, name, or display label. Independent
+authentication reasons and the High mailbox finding stay visible. Evidence
+references remain opaque and tenant-scoped.
 
 Each finding has structured context. Application state is `RESOLVED` or
 `NOT_REPORTED`; a label is allowed only after an authorized resolved lookup, and

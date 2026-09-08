@@ -39,9 +39,12 @@ verify an authenticated risk route or usable source evaluation.
   unsupported failures, and inconsistent success/error fields.
 - Duplicate, conflicting, late, future, malformed, app-only, and unresolved-user
   events cannot inflate counts or bind to a human by guesswork.
-- Only exact fresh tenant-scoped directory GUIDs merge mailbox and user reasons
-  into one `USER` row. UPNs, names, and display labels never merge subjects. An
-  unresolved mailbox remains a `MAILBOX` row; evidence references stay opaque.
+- Mailbox/user roll-up requires fresh scoped `EXCHANGE_MAILBOX_SETTINGS`, an
+  exact mailbox-user-directory GUID binding, and exactly one matching
+  `userPurpose='user'` record. A GUID alone is insufficient. Shared, room,
+  equipment, missing, stale, failed, duplicate, or ambiguous-purpose cases stay
+  `MAILBOX`; independent findings remain visible. UPNs, names, and labels never
+  merge subjects, and evidence references stay opaque.
 - Finding context enforces structured application, device, and client-source
   states. Persisted application labels are null pending authorized resolution;
   device labels are always null; client sources are opaque references. Raw IPs,
