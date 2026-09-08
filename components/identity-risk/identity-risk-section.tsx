@@ -1,24 +1,13 @@
 'use client'
 
-import {
-  AlertTriangle,
-  BookOpenCheck,
-  Clock3,
-  Info,
-  RefreshCw,
-  SearchCheck,
-  ShieldAlert,
-} from 'lucide-react'
+import { AlertTriangle, Clock3, RefreshCw, ShieldAlert } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import { useIdentityRiskChannels, useIdentityRiskInvestigationAccess } from '@/lib/api/identity-risk-hooks'
-import { MailboxInvestigation } from './mailbox-investigation'
-import { benignAlternativeLabel, hawkViewEmptyPresentation, microsoftHasConfirmedEmptySnapshot, missingEvidenceLabel } from '@/lib/identity-risk/presentation'
+import { useIdentityRiskChannels } from '@/lib/api/identity-risk-hooks'
+import { RiskAssessmentCard } from './risk-assessment-card'
+import { microsoftHasConfirmedEmptySnapshot } from '@/lib/identity-risk/presentation'
 import type {
-  HawkViewIdentityFinding,
-  HawkViewIdentityRiskCounts,
-  HawkViewIdentitySignalsView,
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
   MicrosoftEntraRiskyUser,
@@ -45,10 +34,14 @@ export function identityRiskStatusPresentation(meta: IdentityRiskChannelMeta) {
   switch (meta.status) {
     case 'AVAILABLE':
       return {
-        label: meta.capability === 'PARTIAL' ? 'Partial evidence' : 'Evidence available',
-        detail: meta.capability === 'PARTIAL'
-          ? 'Only part of the evidence could be evaluated. Missing coverage must not be treated as a zero or a safe result.'
-          : 'Current evidence is available for this channel. Availability is not a risk verdict.',
+        label:
+          meta.capability === 'PARTIAL'
+            ? 'Partial evidence'
+            : 'Evidence available',
+        detail:
+          meta.capability === 'PARTIAL'
+            ? 'Only part of the evidence could be evaluated. Missing coverage must not be treated as a zero or a safe result.'
+            : 'Current evidence is available for this channel. Availability is not a risk verdict.',
         className:
           'border-blue-200 bg-blue-50 text-blue-950 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200',
       }
@@ -105,13 +98,17 @@ function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
         </dd>
       </div>
       <div>
-        <dt className="text-slate-500 dark:text-slate-400">Channel evaluated</dt>
+        <dt className="text-slate-500 dark:text-slate-400">
+          Channel evaluated
+        </dt>
         <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
           {formatTimestamp(meta.evaluatedAt)}
         </dd>
       </div>
       <div>
-        <dt className="text-slate-500 dark:text-slate-400">Evidence observed</dt>
+        <dt className="text-slate-500 dark:text-slate-400">
+          Evidence observed
+        </dt>
         <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
           {formatTimestamp(meta.observedAt)}
         </dd>
@@ -125,7 +122,8 @@ function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
       <div>
         <dt className="text-slate-500 dark:text-slate-400">Engine version</dt>
         <dd className="mt-0.5 break-words font-mono text-[11px] font-medium text-slate-800 dark:text-slate-200">
-          {meta.engineVersion ?? (meta.catalogVersion ? 'Not applicable' : 'Not reported')}
+          {meta.engineVersion ??
+            (meta.catalogVersion ? 'Not applicable' : 'Not reported')}
         </dd>
       </div>
       <div>
@@ -138,62 +136,6 @@ function ChannelMeta({ meta }: { meta: IdentityRiskChannelMeta }) {
   )
 }
 
-function formatBoundedCount(count: { value: number; exact: boolean; capped: boolean }) {
-  if (count.capped && count.value > 0) {
-    return `At least ${count.value.toLocaleString()}`
-  }
-  return count.exact ? count.value.toLocaleString() : 'Not available'
-}
-
-function HawkViewCounts({ counts }: { counts: HawkViewIdentityRiskCounts }) {
-  const primary = [
-    ['Identities needing review', counts.identitiesNeedingReview],
-    ['Open findings', counts.openFindings],
-    ['Rules with reported outcomes', counts.evaluatedRules],
-  ] as const
-  const outcomes = [
-    ['Matched', counts.matchedResults],
-    ['Suppressed', counts.suppressedResults],
-    ['Not matched', counts.notMatchedResults],
-    ['Not evaluated', counts.notEvaluatedResults],
-  ] as const
-
-  return (
-    <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/40">
-      <dl className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        {primary.map(([label, count]) => (
-          <div key={label}>
-            <dt className="text-xs text-slate-500 dark:text-slate-400">{label}</dt>
-            <dd className="mt-0.5 text-lg font-semibold text-slate-950 dark:text-slate-50">
-              {formatBoundedCount(count)}
-            </dd>
-          </div>
-        ))}
-      </dl>
-      <div className="mt-3 border-t border-slate-200 pt-2 dark:border-slate-700">
-        <div className="text-xs font-medium text-slate-700 dark:text-slate-300">
-          Rule evaluation outcomes
-        </div>
-        <dl className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs">
-          {outcomes.map(([label, count]) => (
-            <div key={label} className="flex gap-1">
-              <dt className="text-slate-500 dark:text-slate-400">{label}</dt>
-              <dd className="font-semibold text-slate-800 dark:text-slate-200">
-                {formatBoundedCount(count)}
-              </dd>
-            </div>
-          ))}
-        </dl>
-        <p className="mt-2 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
-          Counts describe rule evaluation coverage and open investigation leads—not
-          compromised or safe identities.
-          {' '}A rule with only not-evaluated outcomes is not a completed check.
-        </p>
-      </div>
-    </div>
-  )
-}
-
 function ChannelState({ meta }: { meta: IdentityRiskChannelMeta }) {
   const state = identityRiskStatusPresentation(meta)
   return (
@@ -202,9 +144,14 @@ function ChannelState({ meta }: { meta: IdentityRiskChannelMeta }) {
       role={meta.status === 'ERROR' ? 'alert' : 'status'}
     >
       <div className="font-semibold">{state.label}</div>
-      <p className="mt-0.5 text-xs leading-relaxed opacity-90">{state.detail}</p>
+      <p className="mt-0.5 text-xs leading-relaxed opacity-90">
+        {state.detail}
+      </p>
       {meta.limitation && (
-        <p className="mt-2 text-xs leading-relaxed"><span className="font-semibold">Reported context: </span>{meta.limitation}</p>
+        <p className="mt-2 text-xs leading-relaxed">
+          <span className="font-semibold">Reported context: </span>
+          {meta.limitation}
+        </p>
       )}
     </div>
   )
@@ -226,215 +173,6 @@ function LoadingChannel({ label }: { label: string }) {
         <div className="h-16 rounded-lg bg-slate-100 dark:bg-slate-800" />
       </div>
     </div>
-  )
-}
-
-function severityClass(severity: HawkViewIdentityFinding['severity']) {
-  if (severity === 'CRITICAL') return 'border-red-200 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300'
-  if (severity === 'HIGH') return 'border-orange-200 bg-orange-50 text-orange-800 dark:border-orange-900 dark:bg-orange-950/40 dark:text-orange-300'
-  if (severity === 'MEDIUM') return 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300'
-  return 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300'
-}
-
-function FindingRow({ finding, tenantId, investigationAllowed }: { finding: HawkViewIdentityFinding; tenantId: string; investigationAllowed: boolean }) {
-  return (
-    <article className="rounded-lg border border-slate-200 p-3.5 dark:border-slate-800">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <div>
-          <h4 className="text-sm font-semibold text-slate-950 dark:text-slate-50">
-            {finding.title}
-          </h4>
-          <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            {finding.affectedIdentity.label} · {finding.affectedIdentity.type.toLowerCase()}
-          </div>
-          <p className="mt-1.5 text-sm leading-relaxed text-slate-800 dark:text-slate-200">
-            {finding.explanation}
-          </p>
-        </div>
-        <Badge variant="outline" className={cn('shrink-0', severityClass(finding.severity))}>
-          {finding.severity.toLowerCase()} priority
-        </Badge>
-      </div>
-      <dl className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-        <div>
-          <dt className="text-slate-500 dark:text-slate-400">Observed</dt>
-          <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
-            {formatTimestamp(finding.observedAt)}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-slate-500 dark:text-slate-400">Confidence</dt>
-          <dd className="mt-0.5 font-medium capitalize text-slate-800 dark:text-slate-200">
-            {finding.confidence.toLowerCase()}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-slate-500 dark:text-slate-400">Coverage</dt>
-          <dd className="mt-0.5 font-medium capitalize text-slate-800 dark:text-slate-200">
-            {finding.coverage.toLowerCase()}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-slate-500 dark:text-slate-400">State</dt>
-          <dd className="mt-0.5 font-medium capitalize text-slate-800 dark:text-slate-200">
-            {finding.state.toLowerCase()}
-          </dd>
-        </div>
-      </dl>
-      <div className="mt-3 border-t border-slate-200 pt-3 dark:border-slate-800">
-        <div className="flex items-start gap-2">
-          <SearchCheck className="mt-0.5 h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" aria-hidden="true" />
-          <div>
-            <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-              Recommended human investigation
-            </div>
-            <p className="mt-0.5 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-              {finding.investigationGuidance}
-            </p>
-          </div>
-        </div>
-      </div>
-      <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
-        <div>
-          <dt className="text-slate-500 dark:text-slate-400">Rules and sources</dt>
-          <dd className="mt-1 flex flex-wrap gap-1">
-            {[...finding.ruleIds, ...finding.sourceLabels].map((label) => (
-              <span key={label} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-300">
-                {label}
-              </span>
-            ))}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-slate-500 dark:text-slate-400">Evidence limitations</dt>
-          <dd className="mt-1 text-slate-700 dark:text-slate-300">
-            {finding.missingEvidenceLabels.length > 0
-              ? finding.missingEvidenceLabels.map(missingEvidenceLabel).join(' · ')
-              : 'None reported for this finding'}
-          </dd>
-        </div>
-      </dl>
-      {finding.benignAlternativeCodes.length > 0 && (
-        <div className="mt-3 text-xs text-slate-600 dark:text-slate-300">
-          <span className="font-semibold text-slate-800 dark:text-slate-200">
-            Benign alternatives to consider:{' '}
-          </span>
-          <span>{finding.benignAlternativeCodes.map(benignAlternativeLabel).join(' · ')}</span>
-        </div>
-      )}
-      {investigationAllowed && finding.affectedIdentity.type === 'MAILBOX' &&
-        finding.ruleIds.includes('HV-ID-MBX-001.v1') &&
-        (finding.state === 'OPEN' || finding.state === 'UPDATED') && finding.coverage === 'FULL' && (
-          <MailboxInvestigation tenantId={tenantId} findingId={finding.id} />
-        )}
-    </article>
-  )
-}
-
-function HawkViewCard({
-  view,
-  onRetry,
-  tenantId,
-  investigationAllowed,
-}: {
-  view: HawkViewIdentitySignalsView
-  onRetry: () => void
-  tenantId: string
-  investigationAllowed: boolean
-}) {
-  const emptyPresentation = hawkViewEmptyPresentation(view)
-
-  return (
-    <section
-      aria-labelledby="hawkview-identity-signals-heading"
-      className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900"
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 gap-3">
-          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">
-            <SearchCheck className="h-5 w-5" aria-hidden="true" />
-          </span>
-          <div>
-            <p className="text-xs font-medium text-blue-700 dark:text-blue-300">
-              HawkView identity risk indicators
-            </p>
-            <h3
-              id="hawkview-identity-signals-heading"
-              className="mt-0.5 text-lg font-semibold text-slate-950 dark:text-slate-50"
-            >
-              HawkView Identity Signals
-            </h3>
-          </div>
-        </div>
-        <Badge variant="outline" className="shrink-0">
-          {capabilityLabel(view.meta.capability)}
-        </Badge>
-      </div>
-
-      <p className="mt-3 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-        Explainable HawkView rule findings are investigation leads. They are not
-        Microsoft Identity Protection determinations and do not prove that an
-        account is compromised, that mail was delivered, or that data was exfiltrated.
-      </p>
-
-      <div className="mt-3 rounded-lg border border-slate-200 p-3 text-xs leading-relaxed text-slate-600 dark:border-slate-800 dark:text-slate-300">
-        <p className="font-semibold text-slate-800 dark:text-slate-200">Current implemented check: mailbox forwarding</p>
-        <p className="mt-1">Checks enabled mailbox forwarding rules for destinations outside the tenant’s verified domains reported by Microsoft Graph, using exact normalized domain matching. This domain list is not the Exchange transport accepted-domain configuration.</p>
-        <p className="mt-1">Coverage describes the reported evidence only. Broader behavioral detection and scoring remain incomplete; availability here does not mean every identity or risk was assessed.</p>
-      </div>
-
-      <div className="mt-4 space-y-4">
-        <ChannelState meta={view.meta} />
-
-        {view.counts &&
-          (view.meta.status === 'AVAILABLE' || view.meta.status === 'STALE') && (
-            <HawkViewCounts counts={view.counts} />
-          )}
-
-        {view.findings && view.findings.length > 0 && (
-          <div className="space-y-2.5" aria-label="HawkView findings">
-            {view.findings.map((finding) => (
-              <FindingRow key={`${finding.id}:${finding.observedAt}`} finding={finding} tenantId={tenantId} investigationAllowed={investigationAllowed && view.meta.status === 'AVAILABLE' && view.meta.freshness === 'CURRENT'} />
-            ))}
-          </div>
-        )}
-
-        {view.pageInfo?.hasMore && (
-          <div
-            role="status"
-            className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-xs leading-relaxed text-blue-900 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200"
-          >
-            More HawkView findings are available. This preview shows only the
-            current bounded page and must not be treated as a complete result set.
-          </div>
-        )}
-
-        {emptyPresentation && (
-          <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-800/50">
-            <div className="flex items-center gap-2 font-semibold text-slate-900 dark:text-slate-100">
-              <BookOpenCheck className="h-4 w-4 text-slate-500" aria-hidden="true" />
-              {emptyPresentation.label}
-            </div>
-            <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-              {emptyPresentation.detail}
-            </p>
-          </div>
-        )}
-
-        {view.meta.status === 'ERROR' && (
-          <Button type="button" variant="outline" size="sm" onClick={onRetry}>
-            <RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-            Retry HawkView signals
-          </Button>
-        )}
-
-        <ChannelMeta meta={view.meta} />
-        <div className="flex items-start gap-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
-          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-          <span>Human investigation only. HawkView does not take autonomous remediation actions.</span>
-        </div>
-      </div>
-    </section>
   )
 }
 
@@ -461,13 +199,17 @@ function MicrosoftUserRow({ user }: { user: MicrosoftEntraRiskyUser }) {
       </div>
       <dl className="mt-3 grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
         <div>
-          <dt className="text-slate-500 dark:text-slate-400">Microsoft state</dt>
+          <dt className="text-slate-500 dark:text-slate-400">
+            Microsoft state
+          </dt>
           <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
             {user.riskState}
           </dd>
         </div>
         <div>
-          <dt className="text-slate-500 dark:text-slate-400">Microsoft detail</dt>
+          <dt className="text-slate-500 dark:text-slate-400">
+            Microsoft detail
+          </dt>
           <dd className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
             {user.riskDetail ?? 'Not reported'}
           </dd>
@@ -516,8 +258,8 @@ function MicrosoftCard({
       <p className="mt-3 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
         This channel preserves Microsoft Entra ID Protection attribution and
         state. It never changes HawkView finding severity, confidence, or
-        lifecycle.
-        {' '}Unavailable Microsoft licensing or collection evidence does not erase independent HawkView findings.
+        lifecycle. Unavailable Microsoft licensing or collection evidence does
+        not erase independent HawkView findings.
       </p>
 
       <div className="mt-4 space-y-4">
@@ -537,7 +279,8 @@ function MicrosoftCard({
             className="rounded-lg border border-violet-200 bg-violet-50 px-4 py-3 text-xs leading-relaxed text-violet-900 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-200"
           >
             More Microsoft risky-user records are available. This preview shows
-            only the current bounded page and is not a complete Microsoft result set.
+            only the current bounded page and is not a complete Microsoft result
+            set.
           </div>
         )}
 
@@ -549,17 +292,20 @@ function MicrosoftCard({
             </div>
             <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
               The latest authoritative Microsoft snapshot was empty. Microsoft
-              evidence can be delayed, and an empty snapshot is not a safe verdict.
+              evidence can be delayed, and an empty snapshot is not a safe
+              verdict.
             </p>
           </div>
         )}
 
-        {view.users?.length === 0 && !confirmedEmpty && view.meta.status === 'AVAILABLE' && (
-          <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-800/50 dark:text-slate-300">
-            Microsoft returned no rows within the available evidence. Partial or
-            stale coverage prevents a zero-risk conclusion.
-          </div>
-        )}
+        {view.users?.length === 0 &&
+          !confirmedEmpty &&
+          view.meta.status === 'AVAILABLE' && (
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-800/50 dark:text-slate-300">
+              Microsoft returned no rows within the available evidence. Partial
+              or stale coverage prevents a zero-risk conclusion.
+            </div>
+          )}
 
         {view.meta.status === 'ERROR' && (
           <Button type="button" variant="outline" size="sm" onClick={onRetry}>
@@ -574,20 +320,30 @@ function MicrosoftCard({
   )
 }
 
-export default function IdentityRiskSection({ tenantId }: { tenantId: string }) {
-  const investigation = useIdentityRiskInvestigationAccess(tenantId)
+export default function IdentityRiskSection({
+  tenantId,
+}: {
+  tenantId: string
+}) {
   const {
-    viewModel,
-    hawkViewLoading,
+    assessmentView,
+    assessmentLoading,
+    assessmentRequestError,
+    assessmentContractError,
+    microsoftView,
+    cacheScope,
     microsoftLoading,
-    retryHawkView,
+    retryAssessment,
     retryMicrosoft,
   } = useIdentityRiskChannels(tenantId, true)
 
   return (
     <div className="space-y-4">
       <header className="flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/60">
-        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden="true" />
+        <AlertTriangle
+          className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400"
+          aria-hidden="true"
+        />
         <div>
           <h2 className="text-base font-semibold text-slate-950 dark:text-slate-50">
             Identity risk evidence
@@ -601,22 +357,22 @@ export default function IdentityRiskSection({ tenantId }: { tenantId: string }) 
       </header>
 
       <div className="grid items-start gap-4 xl:grid-cols-2">
-        {hawkViewLoading ? (
-          <LoadingChannel label="HawkView Identity Signals" />
+        {assessmentLoading ? (
+          <LoadingChannel label="HawkView Risky Users" />
         ) : (
-          <HawkViewCard
-            key={`${investigation.cacheScope}:${tenantId}`}
-            view={viewModel.hawkView}
-            onRetry={() => void retryHawkView()}
-            tenantId={tenantId}
-            investigationAllowed={investigation.allowed}
+          <RiskAssessmentCard
+            key={`${cacheScope}:${tenantId}`}
+            assessment={assessmentView}
+            requestError={assessmentRequestError}
+            contractError={assessmentContractError}
+            onRetry={() => void retryAssessment()}
           />
         )}
         {microsoftLoading ? (
           <LoadingChannel label="Microsoft Entra Risky Users" />
         ) : (
           <MicrosoftCard
-            view={viewModel.microsoft}
+            view={microsoftView}
             onRetry={() => void retryMicrosoft()}
           />
         )}

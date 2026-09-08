@@ -27,14 +27,23 @@ test('cross-tenant and external routes, unsafe labels, stale/future/missing evid
   for (const bad of [{ ...good(), raw: { secret: 'private' } }, { ...good(), mailbox: { ...good().mailbox, token: 'private' } }, { version: 1, status: 'UNAVAILABLE', mailbox: good().mailbox }]) assert.equal(parseMailboxInvestigation(bad, tenantId, now).mailbox, null)
 })
 
-test('UI offers explicit owner/admin-authorized current mailbox investigation and no raw-list identity inference', () => {
+test('assessment contribution details stay separate from the independently authorized legacy mailbox lookup', () => {
   const section = readFileSync(new URL('../../components/identity-risk/identity-risk-section.tsx', import.meta.url), 'utf8')
+  const card = readFileSync(new URL('../../components/identity-risk/risk-assessment-card.tsx', import.meta.url), 'utf8')
+  const drawer = readFileSync(new URL('../../components/identity-risk/risk-assessment-drawer.tsx', import.meta.url), 'utf8')
   const action = readFileSync(new URL('../../components/identity-risk/mailbox-investigation.tsx', import.meta.url), 'utf8')
   const hook = readFileSync(new URL('./identity-risk-hooks.ts', import.meta.url), 'utf8')
-  assert.match(section, /investigationAllowed && finding\.affectedIdentity\.type === 'MAILBOX'/)
-  assert.match(section, /finding\.ruleIds\.includes\('HV-ID-MBX-001\.v1'\)/)
-  assert.match(section, /view\.meta\.freshness === 'CURRENT'/)
-  assert.match(section, /key=\{`\$\{investigation\.cacheScope\}:\$\{tenantId\}`\}/)
+  // Assessment identities are resolved by the authorized server projection. Its
+  // contribution IDs are not IDs for the separate legacy mailbox lookup.
+  assert.match(hook, /identity-signals\/assessment/)
+  assert.match(section, /key=\{`\$\{cacheScope\}:\$\{tenantId\}`\}/)
+  assert.match(card, /setSelectedId\(user\.id\)/)
+  assert.match(card, /key=\{user\.id\}/)
+  assert.doesNotMatch(section + card + drawer, /MailboxInvestigation|identity-signals\/findings/)
+  assert.doesNotMatch(hook, /identity-signals\/findings/)
+  assert.doesNotMatch(card, /(?:find|filter)\([^\n]*user\.label|user\.label\s*===/)
+  // The independent legacy action still requires explicit invocation, checked
+  // access, request cancellation and safe rendering; its behavioral test remains.
   assert.match(hook, /parseInvestigationAccess\(access\.data\)/)
   assert.match(action, /onClick=\{\(\) => void investigate\(\)\}/)
   assert.match(action, /aria-live="polite"/)

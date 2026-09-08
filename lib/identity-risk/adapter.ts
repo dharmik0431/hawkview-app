@@ -10,7 +10,22 @@ import type {
   IdentityRiskViewModel,
   MicrosoftEntraRiskyUser,
   MicrosoftEntraRiskyUsersView,
+  RiskAssessment,
+  RiskAssessmentFinding,
+  RiskAssessmentReadiness,
+  RiskAssessmentReason,
+  RiskAssessmentRuleId,
+  RiskAssessmentSource,
+  RiskAssessmentUser,
+  RiskConditionalAccessPolicy,
+  RiskEvidenceWindow,
+  RiskProtection,
+  RiskProtectionEvidence,
+  RiskRecommendedAction,
+  RiskRuleReadiness,
+  RiskSourceReadiness,
 } from './types'
+import { RISK_ASSESSMENT_RULE_TUPLES } from './types.ts'
 
 const capabilities = ['FULL', 'PARTIAL', 'UNAVAILABLE'] as const
 const statuses = [
@@ -24,12 +39,73 @@ const statuses = [
 const freshnessValues = ['CURRENT', 'STALE', 'UNKNOWN'] as const
 const MAX_PAGE_SIZE = 100
 const MAX_SUMMARY_COUNT = 10_000
+const MAX_ASSESSMENT_COUNT = 1_000_000
 const MAX_FUTURE_SKEW_MS = 5 * 60 * 1_000
 const hawkViewSourceLabel = 'HawkView Identity Signals'
 const microsoftSourceLabel = 'Microsoft Entra Risky Users'
 const hawkViewEngineVersion = 'hawkview-identity-engine/1'
 const hawkViewCatalogVersion = 'hawkview-identity-signals/v1'
 const microsoftCatalogVersion = 'microsoft-entra-risky-users/v1'
+const assessmentSchema = 'hawkview-risk-assessment/v1'
+const assessmentRuleIds = [
+  'HV-ID-AUTH-010.v1',
+  'HV-ID-AUTH-005.v2',
+  'HV-ID-MBX-001.v1',
+] as const
+const assessmentSources = [
+  'M365_AUDIT_STS',
+  'GRAPH_SIGN_INS',
+  'MAILBOX_RULES',
+] as const
+const assessmentReadiness = [
+  'READY',
+  'PARTIAL',
+  'WAITING',
+  'MISSING_PERMISSION',
+  'LICENSE_REQUIRED',
+  'STALE',
+  'FAILED',
+  'INSUFFICIENT_FIELDS',
+  'UNSUPPORTED',
+  'DISABLED',
+] as const
+const assessmentReasons = [
+  'READY',
+  'WAITING_FOR_COLLECTION',
+  'MISSING_PERMISSION',
+  'LICENSE_REQUIRED',
+  'COLLECTION_FAILED',
+  'COLLECTION_STALE',
+  'INCOMPLETE_WINDOW',
+  'SOURCE_UNAVAILABLE',
+  'INSUFFICIENT_FIELDS',
+  'USER_BINDING_UNRESOLVED',
+  'APPLICATION_BINDING_UNRESOLVED',
+  'CLIENT_SOURCE_UNQUALIFIED',
+  'UNSUPPORTED_RECORD',
+  'CONFLICTING_EVIDENCE',
+  'CAPACITY_LIMIT',
+  'EVALUATION_FAILED',
+  'EVALUATION_DISABLED',
+  'KEY_UNAVAILABLE',
+  'DIRECTORY_SYNC_MISSING',
+  'DIRECTORY_SYNC_NOT_SUCCEEDED',
+  'DIRECTORY_SYNC_UNDATED',
+  'DIRECTORY_SYNC_STALE',
+  'DIRECTORY_SYNC_NEWER_ATTEMPT',
+  'RULE_ENDPOINT_NOT_FOUND',
+  'RULE_VALIDATION_UNATTESTABLE',
+  'SOURCE_NOT_ATTESTED',
+  'ATTESTED_COMPLETE',
+] as const
+const recommendationCodes = [
+  'CONFIRM_EXPECTED_ACTIVITY',
+  'REVIEW_SIGN_INS',
+  'CHECK_SAVED_CREDENTIALS',
+  'VERIFY_MFA_ENFORCEMENT',
+  'REVIEW_MAILBOX_FORWARDING',
+  'FOLLOW_INCIDENT_PROCEDURE',
+] as const
 
 const ruleCatalog = new Set([
   'HV-ID-APP-001.v1',
@@ -108,7 +184,8 @@ const microsoftRiskDetailCatalog = new Set([
 type RecordValue = Record<string, unknown>
 
 function record(value: unknown): RecordValue | null {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (value === null || typeof value !== 'object' || Array.isArray(value))
+    return null
   const prototype = Object.getPrototypeOf(value)
   return prototype === Object.prototype || prototype === null
     ? (value as RecordValue)
@@ -141,13 +218,21 @@ function containsSecret(value: string) {
     const trimmed = candidate.trim()
     return (
       /^[\[{]/.test(trimmed) ||
-      /\b(?:password|passwd|pwd|secret|token|access[-_ ]?token|refresh[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|authorization|authorization[-_ ]?code|private[-_ ]?key|session[-_ ]?id|oauth[-_ ]?code|account[-_ ]?key|signature|sig|code|credential|cookie)\b[\s"'\[\]{}:,=%]+\S+/i.test(candidate) ||
+      /\b(?:password|passwd|pwd|secret|token|access[-_ ]?token|refresh[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|authorization|authorization[-_ ]?code|private[-_ ]?key|session[-_ ]?id|oauth[-_ ]?code|account[-_ ]?key|signature|sig|code|credential|cookie)\b[\s"'\[\]{}:,=%]+\S+/i.test(
+        candidate
+      ) ||
       /\bbearer\s+[A-Za-z0-9._~+\/=:-]{8,}/i.test(candidate) ||
       /-----BEGIN [A-Z ]*PRIVATE KEY-----/i.test(candidate) ||
-      /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{20,})\b/.test(candidate) ||
-      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(candidate) ||
+      /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{20,})\b/.test(
+        candidate
+      ) ||
+      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(
+        candidate
+      ) ||
       /\bhttps?:\/\/[^\s/:@]+:[^\s/@]+@/i.test(candidate) ||
-      /[?&](?:access_token|refresh_token|token|code|key|sig|password|secret)=/i.test(candidate)
+      /[?&](?:access_token|refresh_token|token|code|key|sig|password|secret)=/i.test(
+        candidate
+      )
     )
   })
 }
@@ -190,7 +275,8 @@ function observedDateTime(
   const candidate = dateTime(value)
   if (!candidate) return null
   const candidateTime = new Date(candidate).getTime()
-  return candidateTime <= new Date(evaluatedAt).getTime() + MAX_FUTURE_SKEW_MS &&
+  return candidateTime <=
+    new Date(evaluatedAt).getTime() + MAX_FUTURE_SKEW_MS &&
     candidateTime <= trustedCurrentTimeMs + MAX_FUTURE_SKEW_MS
     ? candidate
     : null
@@ -260,19 +346,14 @@ function adaptMeta(
   const engineVersion =
     value.engineVersion === null ? null : boundedString(value.engineVersion, 64)
   const catalogVersion = boundedString(value.catalogVersion, 64)
-  const evaluatedAt = value.evaluatedAt === null ? null : dateTime(value.evaluatedAt)
+  const evaluatedAt =
+    value.evaluatedAt === null ? null : dateTime(value.evaluatedAt)
   const observedAt =
     value.observedAt === null || !evaluatedAt
       ? null
-      : observedDateTime(
-          value.observedAt,
-          evaluatedAt,
-          trustedCurrentTimeMs
-        )
+      : observedDateTime(value.observedAt, evaluatedAt, trustedCurrentTimeMs)
   const limitation =
-    value.limitation === null
-      ? null
-      : boundedString(value.limitation, 500)
+    value.limitation === null ? null : boundedString(value.limitation, 500)
 
   if (
     !capability ||
@@ -339,7 +420,10 @@ function adaptMeta(
   }
 }
 
-function sameMeta(left: IdentityRiskChannelMeta, right: IdentityRiskChannelMeta) {
+function sameMeta(
+  left: IdentityRiskChannelMeta,
+  right: IdentityRiskChannelMeta
+) {
   return (
     left.capability === right.capability &&
     left.status === right.status &&
@@ -467,9 +551,23 @@ function adaptFinding(
     return null
   }
   const id = boundedString(source.id, 200)
-  const state = enumValue(source.state, ['OPEN', 'UPDATED', 'RESOLVED', 'EXPIRED'] as const)
-  const severity = enumValue(source.severity, ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] as const)
-  const confidence = enumValue(source.confidence, ['LOW', 'MEDIUM', 'HIGH'] as const)
+  const state = enumValue(source.state, [
+    'OPEN',
+    'UPDATED',
+    'RESOLVED',
+    'EXPIRED',
+  ] as const)
+  const severity = enumValue(source.severity, [
+    'LOW',
+    'MEDIUM',
+    'HIGH',
+    'CRITICAL',
+  ] as const)
+  const confidence = enumValue(source.confidence, [
+    'LOW',
+    'MEDIUM',
+    'HIGH',
+  ] as const)
   const coverage = enumValue(source.coverage, capabilities)
   const title = boundedString(source.title, 160)
   const explanation = boundedString(source.explanation, 1_000)
@@ -494,7 +592,12 @@ function adaptFinding(
     trustedCurrentTimeMs
   )
   const ruleIds = catalogList(source.ruleIds, ruleCatalog, 10, 150)
-  const sourceLabels = catalogList(source.sourceLabels, sourceLabelCatalog, 10, 120)
+  const sourceLabels = catalogList(
+    source.sourceLabels,
+    sourceLabelCatalog,
+    10,
+    120
+  )
   const missingEvidenceLabels = catalogList(
     source.missingEvidenceLabels,
     missingEvidenceCatalog,
@@ -507,12 +610,13 @@ function adaptFinding(
     10,
     120
   )
-  const investigationGuidanceCode = boundedString(source.investigationGuidanceCode, 120)
+  const investigationGuidanceCode = boundedString(
+    source.investigationGuidanceCode,
+    120
+  )
   const investigationGuidance = boundedString(source.investigationGuidance, 300)
   const catalogGuidance = investigationGuidanceCode
-    ? guidanceCatalog[
-        investigationGuidanceCode as keyof typeof guidanceCatalog
-      ]
+    ? guidanceCatalog[investigationGuidanceCode as keyof typeof guidanceCatalog]
     : null
 
   if (
@@ -621,7 +725,8 @@ function adaptMicrosoftUser(
     /[<>\[\]{}\\]/.test(identityLabel) ||
     !riskLevel ||
     !riskState ||
-    (source.riskDetail !== null && source.riskDetail !== undefined &&
+    (source.riskDetail !== null &&
+      source.riskDetail !== undefined &&
       (!riskDetail || !microsoftRiskDetailCatalog.has(riskDetail))) ||
     !observedAt
   ) {
@@ -719,14 +824,14 @@ export function adaptIdentityRiskResponses(input: {
       Array.isArray(rawFindings) &&
       rawFindings.length <= MAX_PAGE_SIZE &&
       (meta?.evaluatedAt || rawFindings.length === 0)
-      ? rawFindings.map((finding) =>
-          adaptFinding(
-            finding,
-            meta?.evaluatedAt as string,
-            trustedCurrentTimeMs
+        ? rawFindings.map((finding) =>
+            adaptFinding(
+              finding,
+              meta?.evaluatedAt as string,
+              trustedCurrentTimeMs
+            )
           )
-        )
-      : null
+        : null
     const pageInfo = adaptPageInfo(findingEnvelope.pageInfo)
     if (
       meta &&
@@ -735,7 +840,9 @@ export function adaptIdentityRiskResponses(input: {
       countsMatchMeta(counts, meta) &&
       sameMeta(meta, findingMeta) &&
       findings &&
-      findings.every((finding): finding is HawkViewIdentityFinding => finding !== null) &&
+      findings.every(
+        (finding): finding is HawkViewIdentityFinding => finding !== null
+      ) &&
       new Set(findings.map((finding) => finding.id)).size === findings.length &&
       pageInfo
     ) {
@@ -792,14 +899,14 @@ export function adaptIdentityRiskResponses(input: {
       Array.isArray(rawUsers) &&
       rawUsers.length <= MAX_PAGE_SIZE &&
       (meta?.evaluatedAt || rawUsers.length === 0)
-      ? rawUsers.map((user) =>
-          adaptMicrosoftUser(
-            user,
-            meta?.evaluatedAt as string,
-            trustedCurrentTimeMs
+        ? rawUsers.map((user) =>
+            adaptMicrosoftUser(
+              user,
+              meta?.evaluatedAt as string,
+              trustedCurrentTimeMs
+            )
           )
-        )
-      : null
+        : null
     const pageInfo = adaptPageInfo(microsoftEnvelope.pageInfo)
     if (
       meta &&
@@ -829,4 +936,920 @@ export function adaptIdentityRiskResponses(input: {
   }
 
   return { hawkView, microsoft }
+}
+
+const assessmentMetaKeys = [
+  'version',
+  'channel',
+  'engineVersion',
+  'catalogVersion',
+  'evaluatedAt',
+  'capability',
+  'status',
+  'sourceLabel',
+  'observedAt',
+  'freshness',
+  'limitation',
+] as const
+
+function nullableDateTime(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): string | null | undefined {
+  if (value === null) return null
+  const parsed = dateTime(value)
+  if (
+    !parsed ||
+    new Date(parsed).getTime() > trustedCurrentTimeMs + MAX_FUTURE_SKEW_MS
+  ) {
+    return undefined
+  }
+  return parsed
+}
+
+function adaptEvidenceWindow(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): RiskEvidenceWindow | null {
+  const source = record(value)
+  if (!source || !exactKeys(source, ['start', 'end'])) return null
+  const start = nullableDateTime(source.start, trustedCurrentTimeMs)
+  const end = nullableDateTime(source.end, trustedCurrentTimeMs)
+  if (
+    start === undefined ||
+    end === undefined ||
+    (start !== null &&
+      end !== null &&
+      new Date(start).getTime() > new Date(end).getTime())
+  ) {
+    return null
+  }
+  return { start, end }
+}
+
+function boundedStringList(
+  value: unknown,
+  maximumItems: number,
+  maximumLength: number,
+  pattern?: RegExp
+): string[] | null {
+  if (!Array.isArray(value) || value.length > maximumItems) return null
+  const values = value.map((item) => boundedString(item, maximumLength))
+  if (
+    !values.every((item): item is string => item !== null) ||
+    (pattern && values.some((item) => !pattern.test(item))) ||
+    new Set(values).size !== values.length
+  ) {
+    return null
+  }
+  return values
+}
+
+function adaptSourceReadiness(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): RiskSourceReadiness | null {
+  const source = record(value)
+  if (
+    !source ||
+    !exactKeys(source, [
+      'source',
+      'status',
+      'reasonCode',
+      'explanation',
+      'window',
+      'lastSuccessfulCollectionAt',
+      'latestEventAt',
+      'latestIngestionAt',
+      'freshness',
+    ])
+  ) {
+    return null
+  }
+  const selectedSource = enumValue(source.source, assessmentSources)
+  const status = enumValue(source.status, assessmentReadiness)
+  const reasonCode = enumValue(source.reasonCode, assessmentReasons)
+  const explanation = boundedString(source.explanation, 600)
+  const window = adaptEvidenceWindow(source.window, trustedCurrentTimeMs)
+  const lastSuccessfulCollectionAt = nullableDateTime(
+    source.lastSuccessfulCollectionAt,
+    trustedCurrentTimeMs
+  )
+  const latestEventAt = nullableDateTime(
+    source.latestEventAt,
+    trustedCurrentTimeMs
+  )
+  const latestIngestionAt = nullableDateTime(
+    source.latestIngestionAt,
+    trustedCurrentTimeMs
+  )
+  const freshness = enumValue(source.freshness, freshnessValues)
+  if (
+    !selectedSource ||
+    !status ||
+    !reasonCode ||
+    !explanation ||
+    !window ||
+    lastSuccessfulCollectionAt === undefined ||
+    latestEventAt === undefined ||
+    latestIngestionAt === undefined ||
+    !freshness
+  ) {
+    return null
+  }
+  return {
+    source: selectedSource,
+    status,
+    reasonCode,
+    explanation,
+    window,
+    lastSuccessfulCollectionAt,
+    latestEventAt,
+    latestIngestionAt,
+    freshness,
+  }
+}
+
+function nullableCount(value: unknown): number | null | undefined {
+  if (value === null) return null
+  return Number.isSafeInteger(value) &&
+    (value as number) >= 0 &&
+    (value as number) <= MAX_ASSESSMENT_COUNT
+    ? (value as number)
+    : undefined
+}
+
+function adaptRuleReadiness(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): RiskRuleReadiness | null {
+  const source = record(value)
+  if (
+    !source ||
+    !exactKeys(source, [
+      'ruleId',
+      'ruleVersion',
+      'title',
+      'status',
+      'reasonCode',
+      'explanation',
+      'selectedSource',
+      'window',
+      'evaluatedAt',
+      'assessedIdentities',
+      'matchedIdentities',
+      'countsCapped',
+    ])
+  ) {
+    return null
+  }
+  const ruleId = enumValue(source.ruleId, assessmentRuleIds)
+  const ruleVersion = boundedString(source.ruleVersion, 40)
+  const title = assessmentText(source.title, 180)
+  const status = enumValue(source.status, assessmentReadiness)
+  const reasonCode = enumValue(source.reasonCode, assessmentReasons)
+  const explanation = boundedString(source.explanation, 600)
+  const selectedSource =
+    source.selectedSource === null
+      ? null
+      : enumValue(source.selectedSource, assessmentSources)
+  const window = adaptEvidenceWindow(source.window, trustedCurrentTimeMs)
+  const evaluatedAt = nullableDateTime(source.evaluatedAt, trustedCurrentTimeMs)
+  const assessedIdentities = nullableCount(source.assessedIdentities)
+  const matchedIdentities = nullableCount(source.matchedIdentities)
+  if (
+    !ruleId ||
+    !ruleVersion ||
+    ruleVersion !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].version ||
+    !title ||
+    !status ||
+    !reasonCode ||
+    !explanation ||
+    (source.selectedSource !== null && !selectedSource) ||
+    (selectedSource !== null &&
+      !(
+        RISK_ASSESSMENT_RULE_TUPLES[ruleId].sources as readonly string[]
+      ).includes(selectedSource)) ||
+    !window ||
+    evaluatedAt === undefined ||
+    assessedIdentities === undefined ||
+    matchedIdentities === undefined ||
+    (assessedIdentities !== null &&
+      matchedIdentities !== null &&
+      matchedIdentities > assessedIdentities) ||
+    typeof source.countsCapped !== 'boolean'
+  ) {
+    return null
+  }
+  return {
+    ruleId,
+    ruleVersion,
+    title,
+    status,
+    reasonCode,
+    explanation,
+    selectedSource,
+    window,
+    evaluatedAt,
+    assessedIdentities,
+    matchedIdentities,
+    countsCapped: source.countsCapped,
+  }
+}
+
+function adaptConditionalAccessPolicy(
+  value: unknown
+): RiskConditionalAccessPolicy | null {
+  const source = record(value)
+  if (
+    !source ||
+    !exactKeys(source, ['id', 'name', 'state', 'outcome', 'materialConditions'])
+  ) {
+    return null
+  }
+  const id = boundedString(source.id, 160)
+  const name = authorizedLabel(source.name, 256)
+  const state = enumValue(source.state, [
+    'ENABLED',
+    'REPORT_ONLY',
+    'DISABLED',
+  ] as const)
+  const outcome = enumValue(source.outcome, [
+    'UNIVERSAL',
+    'CONDITIONAL',
+    'NOT_ENFORCED',
+  ] as const)
+  const materialConditions = boundedStringList(
+    source.materialConditions,
+    20,
+    180
+  )
+  if (
+    !id ||
+    !/^[A-Za-z0-9._:-]+$/.test(id) ||
+    !name ||
+    !state ||
+    !outcome ||
+    !materialConditions
+  ) {
+    return null
+  }
+  return { id, name, state, outcome, materialConditions }
+}
+
+function adaptProtection(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): RiskProtection | null {
+  const source = record(value)
+  if (
+    !source ||
+    !exactKeys(source, [
+      'conditionalAccess',
+      'securityDefaults',
+      'legacyPerUserMfa',
+      'registration',
+      'explanation',
+    ])
+  )
+    return null
+  const conditionalAccess = record(source.conditionalAccess)
+  if (
+    !conditionalAccess ||
+    !exactKeys(conditionalAccess, [
+      'contractVersion',
+      'status',
+      'policies',
+      'observedAt',
+      'evaluatedAt',
+      'source',
+      'freshness',
+      'reasonCodes',
+    ])
+  )
+    return null
+  const caStatus = enumValue(conditionalAccess.status, [
+    'COVERED_BY_CONDITIONAL_ACCESS',
+    'CONDITIONALLY_COVERED',
+    'REPORT_ONLY',
+    'NOT_COVERED',
+    'UNKNOWN',
+  ] as const)
+  const rawPolicies = conditionalAccess.policies
+  const policies =
+    Array.isArray(rawPolicies) && rawPolicies.length <= 100
+      ? rawPolicies.map(adaptConditionalAccessPolicy)
+      : null
+  const caObservedAt = nullableDateTime(
+    conditionalAccess.observedAt,
+    trustedCurrentTimeMs
+  )
+  const caEvaluatedAt = nullableDateTime(
+    conditionalAccess.evaluatedAt,
+    trustedCurrentTimeMs
+  )
+  const reasonCodes = boundedStringList(
+    conditionalAccess.reasonCodes,
+    32,
+    120,
+    /^[A-Z0-9_:-]+$/
+  )
+  const caFreshness = enumValue(conditionalAccess.freshness, freshnessValues)
+  const securityDefaults = adaptProtectionEvidence(
+    source.securityDefaults,
+    ['ENABLED', 'DISABLED'],
+    trustedCurrentTimeMs
+  )
+  const legacyPerUserMfa = adaptProtectionEvidence(
+    source.legacyPerUserMfa,
+    ['ENFORCED', 'ENABLED', 'DISABLED'],
+    trustedCurrentTimeMs
+  )
+  const registration = adaptProtectionEvidence(
+    source.registration,
+    ['REGISTERED', 'NOT_REGISTERED'],
+    trustedCurrentTimeMs
+  )
+  const explanation = boundedString(source.explanation, 800)
+  if (
+    conditionalAccess.contractVersion !== 1 ||
+    !caStatus ||
+    !policies ||
+    policies.some((policy) => policy === null) ||
+    new Set(policies.map((policy) => policy?.id)).size !== policies.length ||
+    caObservedAt === undefined ||
+    caEvaluatedAt === undefined ||
+    !reasonCodes ||
+    conditionalAccess.source !== 'EFFECTIVE_MFA_V1' ||
+    !caFreshness ||
+    !securityDefaults ||
+    !legacyPerUserMfa ||
+    !registration ||
+    !explanation
+  )
+    return null
+  return {
+    conditionalAccess: {
+      contractVersion: 1,
+      status: caStatus,
+      policies: policies as RiskConditionalAccessPolicy[],
+      observedAt: caObservedAt,
+      evaluatedAt: caEvaluatedAt,
+      source: 'EFFECTIVE_MFA_V1',
+      freshness: caFreshness,
+      reasonCodes,
+    },
+    securityDefaults,
+    legacyPerUserMfa,
+    registration,
+    explanation,
+  }
+}
+
+function adaptProtectionEvidence<const State extends string>(
+  value: unknown,
+  states: readonly State[],
+  trustedCurrentTimeMs: number
+): RiskProtectionEvidence<State> | null {
+  const item = record(value)
+  if (
+    !item ||
+    !exactKeys(item, [
+      'state',
+      'source',
+      'observedAt',
+      'freshness',
+      'reasonCode',
+    ])
+  )
+    return null
+  const state = enumValue(item.state, [...states, 'UNKNOWN'] as const)
+  const source = enumValue(item.source, [
+    'MICROSOFT_GRAPH',
+    'EFFECTIVE_MFA_V1',
+    'NOT_REPORTED',
+  ] as const)
+  const observedAt = nullableDateTime(item.observedAt, trustedCurrentTimeMs)
+  const freshness = enumValue(item.freshness, freshnessValues)
+  const reasonCode = enumValue(item.reasonCode, [
+    'VERIFIED',
+    'NOT_REPORTED',
+    'STALE',
+    'FAILED',
+    'MISSING_PERMISSION',
+    'INCOMPLETE',
+  ] as const)
+  if (
+    !state ||
+    !source ||
+    observedAt === undefined ||
+    !freshness ||
+    !reasonCode
+  )
+    return null
+  return { state, source, observedAt, freshness, reasonCode }
+}
+
+function adaptRecommendedAction(value: unknown): RiskRecommendedAction | null {
+  const source = record(value)
+  if (!source || !exactKeys(source, ['code', 'text'])) return null
+  const code = enumValue(source.code, recommendationCodes)
+  const text = boundedString(source.text, 400)
+  return code && text ? { code, text } : null
+}
+
+function adaptAssessmentFinding(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): RiskAssessmentFinding | null {
+  const source = record(value)
+  if (
+    !source ||
+    !exactKeys(source, [
+      'id',
+      'ruleId',
+      'ruleVersion',
+      'priority',
+      'confidence',
+      'activityState',
+      'title',
+      'explanation',
+      'firstSeen',
+      'lastSeen',
+      'evaluatedAt',
+      'activityWindowEndsAt',
+      'window',
+      'evidenceCount',
+      'evidenceCountCapped',
+      'selectedSource',
+      'application',
+      'device',
+      'clientSource',
+      'evidenceReferences',
+      'eventProtection',
+      'caveats',
+      'recommendedActions',
+    ])
+  )
+    return null
+  const id = boundedString(source.id, 200)
+  const ruleId = enumValue(source.ruleId, assessmentRuleIds)
+  const ruleVersion = boundedString(source.ruleVersion, 40)
+  const priority = enumValue(source.priority, [
+    'LOW',
+    'MEDIUM',
+    'HIGH',
+  ] as const)
+  const confidence = enumValue(source.confidence, [
+    'LOW',
+    'MEDIUM',
+    'HIGH',
+  ] as const)
+  const activityState = enumValue(source.activityState, [
+    'CURRENT',
+    'HISTORICAL',
+    'UNKNOWN',
+  ] as const)
+  const title = assessmentText(source.title, 180)
+  const explanation = assessmentText(source.explanation, 1_200)
+  const firstSeen = nullableDateTime(source.firstSeen, trustedCurrentTimeMs)
+  const lastSeen = nullableDateTime(source.lastSeen, trustedCurrentTimeMs)
+  const evaluatedAt = nullableDateTime(source.evaluatedAt, trustedCurrentTimeMs)
+  // This is a detector window end, allowed to be after receipt time.
+  const activityWindowEndsAt = dateTime(source.activityWindowEndsAt)
+  const window = adaptEvidenceWindow(source.window, trustedCurrentTimeMs)
+  const selectedSource = enumValue(source.selectedSource, assessmentSources)
+  const application = record(source.application)
+  const applicationState = enumValue(application?.state, [
+    'RESOLVED',
+    'NOT_REPORTED',
+  ] as const)
+  const applicationLabel =
+    application?.label === null
+      ? null
+      : authorizedLabel(application?.label, 256)
+  const device = record(source.device)
+  const deviceState = enumValue(device?.state, [
+    'NOT_REPORTED',
+    'INSUFFICIENT_FIELDS',
+  ] as const)
+  const client = record(source.clientSource)
+  const qualification = enumValue(client?.qualification, [
+    'QUALIFIED',
+    'NOT_REPORTED',
+    'INSUFFICIENT_FIELDS',
+  ] as const)
+  const rawReferences = source.evidenceReferences
+  const references =
+    Array.isArray(rawReferences) && rawReferences.length <= 50
+      ? rawReferences.map((reference) => {
+          const item = record(reference)
+          if (!item || !exactKeys(item, ['id', 'recordedAt', 'ingestedAt']))
+            return null
+          const referenceId = boundedString(item.id, 160)
+          const recordedAt = nullableDateTime(
+            item.recordedAt,
+            trustedCurrentTimeMs
+          )
+          const ingestedAt = nullableDateTime(
+            item.ingestedAt,
+            trustedCurrentTimeMs
+          )
+          if (
+            !referenceId ||
+            !/^hvr1_evidence_[a-f0-9]{64}$/.test(referenceId) ||
+            !recordedAt ||
+            ingestedAt === undefined
+          )
+            return null
+          return { id: referenceId, recordedAt, ingestedAt }
+        })
+      : null
+  const eventProtection = enumValue(source.eventProtection, [
+    'MFA_SATISFIED',
+    'BLOCKED_BY_POLICY',
+    'NOT_REPORTED',
+  ] as const)
+  const caveats = boundedStringList(source.caveats, 20, 500)
+  const rawActions = source.recommendedActions
+  const actions =
+    Array.isArray(rawActions) && rawActions.length <= recommendationCodes.length
+      ? rawActions.map(adaptRecommendedAction)
+      : null
+  if (
+    !id ||
+    !/^hvr1_contribution_[a-f0-9]{64}$/.test(id) ||
+    !ruleId ||
+    !ruleVersion ||
+    ruleVersion !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].version ||
+    !priority ||
+    priority !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].priority ||
+    !confidence ||
+    !activityState ||
+    !title ||
+    !explanation ||
+    !firstSeen ||
+    !lastSeen ||
+    !evaluatedAt ||
+    !activityWindowEndsAt ||
+    Date.parse(activityWindowEndsAt) < Date.parse(lastSeen) ||
+    Date.parse(activityWindowEndsAt) - Date.parse(lastSeen) >
+      (ruleId === 'HV-ID-MBX-001.v1'
+        ? 36 * 60 * 60_000
+        : ruleId === 'HV-ID-AUTH-005.v2'
+          ? 10 * 60_000
+          : 15 * 60_000) ||
+    new Date(firstSeen).getTime() > new Date(lastSeen).getTime() ||
+    new Date(lastSeen).getTime() >
+      new Date(evaluatedAt).getTime() + MAX_FUTURE_SKEW_MS ||
+    !window ||
+    !Number.isSafeInteger(source.evidenceCount) ||
+    (source.evidenceCount as number) < 1 ||
+    (source.evidenceCount as number) > MAX_ASSESSMENT_COUNT ||
+    typeof source.evidenceCountCapped !== 'boolean' ||
+    !selectedSource ||
+    !(
+      RISK_ASSESSMENT_RULE_TUPLES[ruleId].sources as readonly string[]
+    ).includes(selectedSource) ||
+    !application ||
+    !exactKeys(application, ['id', 'state', 'label']) ||
+    !applicationState ||
+    (application.label !== null && !applicationLabel) ||
+    (applicationState === 'RESOLVED'
+      ? typeof application.id !== 'string' ||
+        !/^hvr1_application_[a-f0-9]{64}$/.test(application.id)
+      : application.id !== null || application.label !== null) ||
+    !device ||
+    !exactKeys(device, ['state', 'label']) ||
+    !deviceState ||
+    device.label !== null ||
+    !client ||
+    !exactKeys(client, ['reference', 'qualification']) ||
+    !qualification ||
+    (client.reference !== null &&
+      (typeof client.reference !== 'string' ||
+        !/^hvr1_context_[a-f0-9]{64}$/.test(client.reference))) ||
+    (qualification === 'QUALIFIED' && client.reference === null) ||
+    (ruleId !== 'HV-ID-MBX-001.v1' && applicationState !== 'RESOLVED') ||
+    (ruleId === 'HV-ID-AUTH-005.v2' && qualification !== 'QUALIFIED') ||
+    !references ||
+    references.some((reference) => reference === null) ||
+    new Set(references.map((reference) => reference?.id)).size !==
+      references.length ||
+    !eventProtection ||
+    !caveats ||
+    !actions ||
+    actions.some((action) => action === null) ||
+    new Set(actions.map((action) => action?.code)).size !== actions.length
+  )
+    return null
+  return {
+    id,
+    ruleId,
+    ruleVersion,
+    priority,
+    confidence,
+    activityState,
+    title,
+    explanation,
+    firstSeen,
+    lastSeen,
+    evaluatedAt,
+    activityWindowEndsAt,
+    window,
+    evidenceCount: source.evidenceCount as number,
+    evidenceCountCapped: source.evidenceCountCapped,
+    selectedSource,
+    application: {
+      id: application.id as string | null,
+      state: applicationState,
+      label: applicationLabel,
+    },
+    device: { state: deviceState, label: null },
+    clientSource: {
+      reference: client.reference as string | null,
+      qualification,
+    },
+    evidenceReferences:
+      references as RiskAssessmentFinding['evidenceReferences'],
+    eventProtection,
+    caveats,
+    recommendedActions: actions as RiskRecommendedAction[],
+  }
+}
+
+/** The approved detector copy uses these exact phrases, not credential values. */
+function assessmentText(value: unknown, maximum: number): string | null {
+  if (typeof value !== 'string' || value.length > maximum) return null
+  const probe = value.replace(
+    /invalid-credential (?=attempts|failures)/g,
+    'invalid-authentication '
+  )
+  return boundedString(probe, maximum + 20) ? value.trim() : null
+}
+
+const priorityRank = { LOW: 1, MEDIUM: 2, HIGH: 3 } as const
+
+/** Resolved directory/policy labels may legitimately mention password or token policy. */
+function authorizedLabel(value: unknown, maximum: number): string | null {
+  if (typeof value !== 'string') return null
+  const label = value.trim()
+  if (
+    !label ||
+    label.length > maximum ||
+    /[\u0000-\u001f\u007f]/.test(label) ||
+    /\b(?:password|passwd|pwd|secret|token|access_token|refresh_token|authorization|cookie)\s*[:=]\s*\S+/i.test(
+      label
+    ) ||
+    /\bbearer\s+[A-Za-z0-9._~+\/=:-]{8,}/i.test(label) ||
+    /-----BEGIN .*PRIVATE KEY-----/.test(label) ||
+    /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk_(?:live|test)_[A-Za-z0-9]{16,})\b/.test(
+      label
+    )
+  )
+    return null
+  return label
+}
+
+function adaptAssessmentUser(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): RiskAssessmentUser | null {
+  const source = record(value)
+  if (
+    !source ||
+    !exactKeys(source, [
+      'id',
+      'label',
+      'subjectType',
+      'priority',
+      'protection',
+      'findings',
+    ])
+  )
+    return null
+  const subjectType = enumValue(source.subjectType, [
+    'USER',
+    'MAILBOX',
+  ] as const)
+  const id = boundedString(source.id, 160)
+  const label = authorizedLabel(source.label, 320)
+  const priority =
+    source.priority === null
+      ? null
+      : enumValue(source.priority, ['LOW', 'MEDIUM', 'HIGH'] as const)
+  const protection = adaptProtection(source.protection, trustedCurrentTimeMs)
+  const rawFindings = source.findings
+  const findings =
+    Array.isArray(rawFindings) && rawFindings.length <= 200
+      ? rawFindings.map((finding) =>
+          adaptAssessmentFinding(finding, trustedCurrentTimeMs)
+        )
+      : null
+  const idPattern =
+    subjectType === 'MAILBOX'
+      ? /^hvr1_mailbox_[a-f0-9]{64}$/
+      : /^hvr1_subject_[a-f0-9]{64}$/
+  if (
+    !subjectType ||
+    !id ||
+    !idPattern.test(id) ||
+    !label ||
+    /[<>{}\[\]\\]/.test(label) ||
+    (source.priority !== null && !priority) ||
+    !protection ||
+    !findings ||
+    findings.some((finding) => finding === null) ||
+    findings.some(
+      (finding) =>
+        subjectType === 'MAILBOX' && finding?.ruleId !== 'HV-ID-MBX-001.v1'
+    ) ||
+    new Set(findings.map((finding) => finding?.id)).size !== findings.length
+  )
+    return null
+  const currentPriorities = (findings as RiskAssessmentFinding[])
+    .filter((finding) => finding.activityState === 'CURRENT')
+    .map((finding) => finding.priority)
+  const highestCurrent =
+    currentPriorities.length > 0
+      ? currentPriorities.reduce((highest, candidate) =>
+          priorityRank[candidate] > priorityRank[highest] ? candidate : highest
+        )
+      : null
+  if (priority !== highestCurrent) return null
+  return {
+    id,
+    label,
+    subjectType,
+    priority,
+    protection,
+    findings: findings as RiskAssessmentFinding[],
+  }
+}
+
+export function adaptRiskAssessmentResponse(
+  value: unknown,
+  trustedCurrentTimeMs = Date.now()
+): RiskAssessment | null {
+  const source = record(value)
+  if (
+    !source ||
+    !exactKeys(source, [
+      'version',
+      'schemaVersion',
+      'meta',
+      'sources',
+      'rules',
+      'users',
+      'page',
+    ])
+  )
+    return null
+  const rawMeta = record(source.meta)
+  if (
+    source.version !== 1 ||
+    source.schemaVersion !== assessmentSchema ||
+    !rawMeta ||
+    !exactKeys(rawMeta, assessmentMetaKeys) ||
+    rawMeta.version !== 1 ||
+    rawMeta.channel !== 'HAWKVIEW_IDENTITY_SIGNALS'
+  )
+    return null
+  const meta = adaptAssessmentMeta(rawMeta, trustedCurrentTimeMs)
+  const sources =
+    Array.isArray(source.sources) &&
+    source.sources.length <= assessmentSources.length
+      ? source.sources.map((item) =>
+          adaptSourceReadiness(item, trustedCurrentTimeMs)
+        )
+      : null
+  const rules =
+    Array.isArray(source.rules) &&
+    source.rules.length === assessmentRuleIds.length
+      ? source.rules.map((item) =>
+          adaptRuleReadiness(item, trustedCurrentTimeMs)
+        )
+      : null
+  const users =
+    Array.isArray(source.users) && source.users.length <= MAX_PAGE_SIZE
+      ? source.users.map((item) =>
+          adaptAssessmentUser(item, trustedCurrentTimeMs)
+        )
+      : null
+  const page = adaptPageInfo(source.page)
+  if (
+    !meta ||
+    !sources ||
+    sources.some((item) => item === null) ||
+    new Set(sources.map((item) => item?.source)).size !== sources.length ||
+    !rules ||
+    rules.some((item) => item === null) ||
+    new Set(rules.map((item) => item?.ruleId)).size !== rules.length ||
+    !users ||
+    users.some((item) => item === null) ||
+    new Set(users.map((item) => item?.id)).size !== users.length ||
+    !page
+  )
+    return null
+  const sourceSet = new Set(
+    (sources as RiskSourceReadiness[]).map((item) => item.source)
+  )
+  const ruleSet = new Set(
+    (rules as RiskRuleReadiness[]).map((item) => item.ruleId)
+  )
+  const findings = (users as RiskAssessmentUser[]).flatMap(
+    (user) => user.findings
+  )
+  if (
+    findings.length > 200 ||
+    (rules as RiskRuleReadiness[]).some(
+      (rule) =>
+        rule.selectedSource !== null && !sourceSet.has(rule.selectedSource)
+    ) ||
+    findings.some(
+      (finding) =>
+        !ruleSet.has(finding.ruleId) || !sourceSet.has(finding.selectedSource)
+    ) ||
+    new Set(findings.map((finding) => finding.id)).size !== findings.length
+  )
+    return null
+  // Never let an optimistic aggregate override individual source/rule coverage.
+  const complete = (rules as RiskRuleReadiness[]).every(
+    (rule) =>
+      rule.status === 'READY' &&
+      !rule.countsCapped &&
+      rule.evaluatedAt !== null &&
+      rule.window.start !== null &&
+      rule.window.end !== null &&
+      (sources as RiskSourceReadiness[]).some(
+        (item) =>
+          item.source === rule.selectedSource &&
+          item.status === 'READY' &&
+          item.freshness === 'CURRENT' &&
+          item.lastSuccessfulCollectionAt !== null
+      )
+  )
+  if (meta.capability === 'FULL' && !complete) {
+    meta.capability = 'PARTIAL'
+    meta.freshness = 'UNKNOWN'
+    meta.limitation =
+      'Some checks lack complete current evidence. Review individual source and rule readiness.'
+  }
+  return {
+    version: 1,
+    schemaVersion: assessmentSchema,
+    meta,
+    sources: sources as RiskSourceReadiness[],
+    rules: rules as RiskRuleReadiness[],
+    users: users as RiskAssessmentUser[],
+    page,
+  }
+}
+
+function adaptAssessmentMeta(
+  value: RecordValue,
+  now: number
+): IdentityRiskChannelMeta | null {
+  const capability = enumValue(value.capability, capabilities)
+  const status = enumValue(value.status, statuses)
+  const freshness = enumValue(value.freshness, freshnessValues)
+  const evaluatedAt = nullableDateTime(value.evaluatedAt, now)
+  const observedAt = nullableDateTime(value.observedAt, now)
+  const limitation =
+    value.limitation === null ? null : boundedString(value.limitation, 600)
+  if (
+    !capability ||
+    !status ||
+    !freshness ||
+    evaluatedAt === undefined ||
+    observedAt === undefined ||
+    value.sourceLabel !== 'HawkView independent identity evidence' ||
+    value.engineVersion !== hawkViewEngineVersion ||
+    value.catalogVersion !== hawkViewCatalogVersion ||
+    (value.limitation !== null && !limitation) ||
+    (status === 'AVAILABLE' &&
+      (!evaluatedAt || capability === 'UNAVAILABLE')) ||
+    (capability === 'FULL' &&
+      (status !== 'AVAILABLE' || freshness !== 'CURRENT'))
+  )
+    return null
+  return {
+    capability,
+    status,
+    freshness,
+    sourceLabel: value.sourceLabel,
+    engineVersion: hawkViewEngineVersion,
+    catalogVersion: hawkViewCatalogVersion,
+    evaluatedAt,
+    observedAt,
+    limitation,
+  }
+}
+
+export function adaptMicrosoftRiskyUsersResponse(value: unknown) {
+  return adaptIdentityRiskResponses({
+    hawkViewSummary: null,
+    hawkViewFindings: null,
+    microsoftRiskyUsers: value,
+  }).microsoft
 }
