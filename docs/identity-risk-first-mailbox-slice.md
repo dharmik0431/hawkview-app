@@ -1,9 +1,9 @@
-# First mailbox investigation slice — local implementation, not live activation
+# First mailbox investigation slice — implemented source and rollout contract
 
-This records the PR #222 slice and its managed-MAC baseline. The subsequent,
-separate code-only [wrapped-key pilot candidate](identity-risk-wrapped-pilot.md)
-adds optional runtime wiring, scoped UTC enforcement and privileged mailbox
-investigation. Its weaker key-custody boundary is not approved for live activation.
+This began with PR #222 and is now integrated with the global wrapped-key runtime
+on current main. Source availability is not proof of deployment, activation,
+frontend publication, or user verification. See [global rollout stages and
+evidence requirements](identity-risk-global-availability.md).
 
 This slice connects the existing version-1 identity-risk evaluator, durable platform,
 API and UI. Only `HV-ID-MBX-001.v1` is selected. No new Microsoft requests,
@@ -24,8 +24,11 @@ For the two already collected resources it atomically writes a companion
 - lastSuccessfulAt: exactly the snapshot's observedAt;
 - no raw names, identifiers, provider diagnostics, tokens or content in metadata.
 
-This digest checks integrity; it is **not** an identity pseudonym. Identity
-references use only the managed-MAC provider. Missing legacy metadata, bad digest,
+This digest checks integrity; it is **not** an identity pseudonym. Current
+identity references use the versioned provider selected by the supported
+[global wrapped-key contract](identity-risk-global-availability.md). The original
+PR #222 validation used only the managed-MAC provider; that historical test
+boundary is not a current KMS requirement. Missing legacy metadata, bad digest,
 wrong scope/version/time, failed or newer-in-progress sync, malformed data, limits,
 staleness and any mailbox 404 abstain. Existing legacy arrays are never backfilled
 with invented authority. New metadata requires a subsequent natural successful
@@ -121,7 +124,12 @@ is blocked while dependent runs exist. Organization deletion cascades scoped
 derived records; physical cloud-key disable/deletion is a separate authorized
 operator process. Registry retention does not authorize extending source expiry.
 
-## Activation prerequisites — NOT completed by this change
+## Historical PR #222 activation design
+
+The next two paragraphs preserve the original managed-MAC/KMS candidate design
+for review history. They are not requirements for the current `wrapped-v1`
+contract. Current activation does not require an additional KMS account, paid
+service, workload identity, or manually provisioned per-tenant cloud keys.
 
 AWS direct GenerateMac is a candidate design, not proof of an existing account,
 region, role, key or approved budget. Runtime Nest wiring deliberately retains the
@@ -138,10 +146,11 @@ the migration/client wiring. Direct per-tenant keys have ongoing per-key/request
 costs; obtain a current region/tier-specific quote before provisioning. Never reuse
 existing encryption/cursor secrets to avoid that decision.
 
-Only after independently reviewed deployment, new natural source attestation,
-key configuration and exact-SHA verification may an owner authorize scoped shadow
-activation. Synthetic success means local integration readiness, **not live risk
-coverage**. No feature flag or production setting is changed here.
+For the current contract, use the configuration and verification stages in
+[global availability](identity-risk-global-availability.md). Independently review
+deployment, natural source attestation, wrapped-key configuration, and exact
+revision evidence before authorizing shadow activation. Synthetic success means
+implementation readiness, **not live risk coverage**.
 
 ## Local validation
 

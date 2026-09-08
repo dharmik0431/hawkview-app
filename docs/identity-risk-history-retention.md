@@ -1,5 +1,24 @@
 # Derived risk history: 90-day physical retention
 
+## Cleanup policy and activation boundary
+
+The 90-day policy applies to minimized derived evaluation runs, coverage,
+matches, and findings, including no-data outcomes. It is independent of whether
+source evidence remains visible or fresh.
+
+Physical cleanup has separate `off`, `observe`, and bounded `delete` stages.
+Repository source does not attest which stage is active in production. Observe
+mode performs no deletion. A global delete stage requires separate approval and
+verified operator evidence; this guide does not claim that approval or activation.
+Do not claim the cleanup worker covers every 90-day data class or that a
+retention SLA is met.
+
+Raw Microsoft/source records, audit records, accounts, pseudonym keys, key and
+revocation history, operational controls/events, and backups are outside this
+cleanup worker. Broader cleanup coverage must be reviewed and delivered before
+the first global derived data reaches 90 days. Do not silently change the
+90-day policy, enlarge deletion scope, or use an ad hoc script.
+
 ## Policy and validity are separate
 
 The owner approved **90 x 24 hours** of physical retention for HawkView-derived

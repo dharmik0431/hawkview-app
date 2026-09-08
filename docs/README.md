@@ -1,6 +1,23 @@
 # HawkView documentation roadmap
 
-This directory supplements the engineer-facing [root README](../README.md). The table proposes documents; it does not claim they exist or that deferred behavior is implemented. `P0` means pilot safety/release blocking, `P1` pilot operations/onboarding, and `P2` later readiness.
+This directory supplements the engineer-facing [root README](../README.md). Linked documents below exist in the repository. A document can describe implemented, proposed, or staged behavior; read its status before treating anything as deployed or enabled.
+
+## Identity-risk documentation
+
+| Document | Audience | Purpose |
+| --- | --- | --- |
+| [First mailbox detector](identity-risk-first-mailbox-slice.md) | Engineering and reviewers | Exact `HV-ID-MBX-001.v1` evidence and safety boundary |
+| [Global availability](identity-risk-global-availability.md) | Release and backend operators | Global rollout stages and evidence requirements |
+| [Frontend acceptance](identity-risk-frontend-acceptance.md) | Frontend, product, and QA | User-visible truthfulness and publication checks |
+| [Derived-history retention](identity-risk-history-retention.md) | Database, privacy, and release operators | 90-day policy, limited physical-cleanup coverage, and staged controls |
+| [Key recovery](identity-risk-recovery.md) | Security and recovery operators | Recovery order, custody limitations, and synthetic drill |
+| [Engine specification](hawkview-identity-risk-engine-v1.md) | Product and engineering | Broader design; only implemented slices may be described as current |
+
+Operator procedures are restricted internal material. Do not expose Swagger, debug/admin endpoints, secret-bearing commands, database connections, private custody locations, or internal state through customer-facing UI or public help content.
+
+## Proposed documentation roadmap
+
+`P0` means pilot safety/release blocking, `P1` pilot operations/onboarding, and `P2` later readiness.
 
 | Proposed document | Audience | Priority | Owner role | Screenshots required? |
 | --- | --- | --- | --- | --- |

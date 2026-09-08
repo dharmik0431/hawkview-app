@@ -25,6 +25,19 @@ HawkView does **not** currently:
 - provide a complete product-wide audit trail for every HawkView action; or
 - provide a supported broad-production service level. The operating model is pilot-grade.
 
+## Risky Users: first detector
+
+HawkView's first supported identity-risk detector is `HV-ID-MBX-001.v1`. It identifies an enabled mailbox rule that forwards or redirects messages to a domain outside the Microsoft Graph verified-domain set collected for that tenant. This is an investigation lead. It does not prove that forwarding succeeded, data left the tenant, or an account is compromised. Legitimate partner forwarding is one possible explanation.
+
+The page keeps two sources separate:
+
+- **HawkView Identity Signals** contains HawkView's deterministic mailbox-forwarding findings.
+- **Microsoft Entra Risky Users** contains Microsoft-reported identity-risk evidence when available.
+
+One source never replaces, clears, or changes the other. HawkView does not provide full behavioral risk scoring, Microsoft parity, a zero-risk statement, or automatic remediation. A tenant can be eligible regardless of Microsoft license, but eligibility is not evidence coverage. Missing, partial, stale, failed, oversized, or integrity-invalid telemetry is unavailable or not evaluated—never clean or zero.
+
+Backend configuration, deployment, runtime verification, frontend publication, and user verification are separate release stages. Record each stage through the restricted operator process; source code or a passing local test proves none of them. This repository guide does not attest the current production stage. Missing or unavailable source evidence must remain unavailable or not evaluated—never clean or zero-risk.
+
 ## Glossary
 
 | Term | Meaning in HawkView |
