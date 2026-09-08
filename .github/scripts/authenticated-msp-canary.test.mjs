@@ -11,6 +11,62 @@ const ids = {
 }
 const tokenA = `a.${'x'.repeat(120)}.a`
 const tokenB = `b.${'x'.repeat(120)}.b`
+const boundedZero = { value: 0, exact: false, capped: false }
+const hawkViewUnavailable = {
+  version: 1,
+  channel: 'HAWKVIEW_IDENTITY_SIGNALS',
+  engineVersion: 'hawkview-identity-engine/1',
+  catalogVersion: 'hawkview-identity-signals/v1',
+  evaluatedAt: null,
+  capability: 'UNAVAILABLE',
+  status: 'NOT_EVALUATED',
+  sourceLabel: 'HawkView Identity Signals',
+  observedAt: null,
+  freshness: 'UNKNOWN',
+  limitation: 'No completed shadow evaluation is available.',
+}
+const microsoftUnavailable = {
+  version: 1,
+  channel: 'MICROSOFT_ENTRA_RISKY_USERS',
+  engineVersion: null,
+  catalogVersion: 'microsoft-entra-risky-users/v1',
+  evaluatedAt: null,
+  capability: 'UNAVAILABLE',
+  status: 'UNAVAILABLE',
+  sourceLabel: 'Microsoft Entra Risky Users',
+  observedAt: null,
+  freshness: 'UNKNOWN',
+  limitation: 'Microsoft Entra risky-user display is not enabled.',
+}
+
+function riskFixture(route) {
+  if (route === 'summary') {
+    return {
+      ...hawkViewUnavailable,
+      counts: {
+        identitiesNeedingReview: { ...boundedZero },
+        openFindings: { ...boundedZero },
+        evaluatedRules: { ...boundedZero },
+        matchedResults: { ...boundedZero },
+        suppressedResults: { ...boundedZero },
+        notMatchedResults: { ...boundedZero },
+        notEvaluatedResults: { ...boundedZero },
+      },
+    }
+  }
+  if (route === 'findings') {
+    return {
+      ...hawkViewUnavailable,
+      findings: [],
+      pageInfo: { hasMore: false, nextCursor: null },
+    }
+  }
+  return {
+    ...microsoftUnavailable,
+    users: [],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+}
 
 test('targets only the branded production API', () => {
   assert.equal(API_ORIGIN, 'https://api.hawkviewapp.com')
@@ -27,7 +83,7 @@ function jsonResponse(body, status = 200) {
   })
 }
 
-function successfulFetch() {
+function successfulFetch({ riskResponseOverride } = {}) {
   const calls = []
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(String(input))
@@ -52,9 +108,34 @@ function successfulFetch() {
       }, 201)
     }
     const authorization = init.headers?.Authorization
+    const riskRoute = url.pathname.endsWith('/identity-signals/summary')
+      ? 'summary'
+      : url.pathname.endsWith('/identity-signals/findings')
+        ? 'findings'
+        : url.pathname.endsWith('/microsoft-entra-risky-users')
+          ? 'microsoft'
+          : null
+    if (riskRoute && !authorization) {
+      return jsonResponse({ message: 'Unauthorized' }, 401)
+    }
     const own = authorization === `Bearer ${tokenA}`
       ? { email: 'canary-a@example.test', org: ids.orgA, tenant: ids.tenantA, foreign: ids.tenantB }
       : { email: 'canary-b@example.test', org: ids.orgB, tenant: ids.tenantB, foreign: ids.tenantA }
+    if (riskRoute) {
+      const relationship = url.pathname.includes(`/api/tenants/${own.tenant}/`)
+        ? 'own'
+        : url.pathname.includes(`/api/tenants/${own.foreign}/`)
+          ? 'foreign'
+          : 'unknown'
+      const overridden = riskResponseOverride?.({
+        authorization,
+        relationship,
+        route: riskRoute,
+      })
+      if (overridden) return overridden
+      if (relationship === 'foreign') return jsonResponse({ message: 'Not found' }, 404)
+      if (relationship === 'own') return jsonResponse(riskFixture(riskRoute))
+    }
     if (url.pathname === '/auth/bootstrap') {
       return jsonResponse({ user: { email: own.email, memberships: [{ organization: { id: own.org } }] } }, 201)
     }
@@ -66,7 +147,7 @@ function successfulFetch() {
   return { calls, fetchImpl }
 }
 
-test('checks two exact MSP identities, own tenants, and foreign denial', async () => {
+test('accepts truthful no-source and unavailable v1 risk envelopes for two isolated MSPs', async () => {
   const { calls, fetchImpl } = successfulFetch()
   await runAuthenticatedCanary({
     fetchImpl,
@@ -78,7 +159,80 @@ test('checks two exact MSP identities, own tenants, and foreign denial', async (
   })
   assert.equal(calls.filter(call => call.url.pathname === '/api/tenants').length, 2)
   assert.equal(calls.filter(call => call.url.pathname.endsWith('/onboarding')).length, 4)
+  assert.equal(calls.filter(call =>
+    call.url.pathname.includes('/identity-signals/') ||
+    call.url.pathname.endsWith('/microsoft-entra-risky-users')
+  ).length, 15)
+  assert.equal(calls.filter(call =>
+    !call.init.headers?.Authorization &&
+    (call.url.pathname.includes('/identity-signals/') ||
+      call.url.pathname.endsWith('/microsoft-entra-risky-users'))).length, 3)
   assert.ok(calls.every(call => call.url.origin === API_ORIGIN || call.url.origin === 'https://oidc.example.test'))
+})
+
+test('rejects a 500 from an own-tenant identity-risk route', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'summary'
+        ? jsonResponse({ message: 'Unavailable' }, 500)
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /identity risk summary own tenant returned an unexpected status/,
+  )
+})
+
+test('rejects a malformed 200 identity-risk envelope without exposing tenant IDs', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'findings'
+        ? jsonResponse({ ...riskFixture('findings'), version: 2 })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    (error) => {
+      assert.match(error.message, /identity risk findings version was invalid/)
+      assert.doesNotMatch(error.message, new RegExp(ids.tenantA, 'i'))
+      assert.doesNotMatch(error.message, new RegExp(ids.tenantB, 'i'))
+      return true
+    },
+  )
+})
+
+test('rejects a 200 response for a foreign identity-risk route', async () => {
+  const { fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'foreign' && route === 'summary'
+        ? jsonResponse(riskFixture('summary'))
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({
+      fetchImpl,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }),
+    /identity risk summary foreign tenant denial returned an unexpected status/,
+  )
 })
 
 test('fails closed when an MSP receives the foreign tenant', async () => {
