@@ -11,7 +11,7 @@ remain pending. The closed rule tuples are:
 
 | Rule | Version | Priority | Permitted source |
 | --- | --- | --- | --- |
-| `HV-ID-AUTH-009.v1` | `v1` | Low | Microsoft 365 audit STS or Graph sign-ins |
+| `HV-ID-AUTH-010.v1` | `v1` | Low | Microsoft 365 audit STS or Graph sign-ins |
 | `HV-ID-AUTH-005.v2` | `v2` | Medium | Microsoft 365 audit STS or Graph sign-ins |
 | `HV-ID-MBX-001.v1` | `v1` | High | Mailbox rules |
 
@@ -34,7 +34,7 @@ erase observed activity.
 
 ## Target rules
 
-### `HV-ID-AUTH-009.v1` — repeated invalid credentials
+### `HV-ID-AUTH-010.v1` — repeated invalid credentials
 
 Target priority: **Low**
 
@@ -75,7 +75,7 @@ failure is no more than two minutes before that success.
 All counted events must have the same organization, customer tenant, resolved
 human user, application, and qualified client-source address. Four failures do
 not match. A missing, ambiguous, or proxy-only source does not qualify for this
-rule; `HV-ID-AUTH-009.v1` can still be evaluated independently.
+rule; `HV-ID-AUTH-010.v1` can still be evaluated independently.
 
 The explanation must state the failure count, time window, verified success,
 selected source, and uncertainty. It must not claim the same person or attacker
@@ -107,7 +107,7 @@ continue when their own evidence is usable.
 - Show the highest current priority as the summary and retain every independent
   reason.
 - Never add points for duplicate events or repeated versions of one incident.
-- `HV-ID-AUTH-009.v1` and `HV-ID-AUTH-005.v2` can describe the same sequence;
+- `HV-ID-AUTH-010.v1` and `HV-ID-AUTH-005.v2` can describe the same sequence;
   their combination does not create a High result.
 - Group repeated detections of one incident and show first seen, last seen, and
   evidence count.
@@ -119,7 +119,7 @@ continue when their own evidence is usable.
 
 | Source | HawkView use | Requirement and limitation | When unavailable |
 | --- | --- | --- | --- |
-| Microsoft 365 Unified Audit / Management Activity, including qualified STS logon records | Target non-P2 authentication route for `HV-ID-AUTH-009.v1` and `HV-ID-AUTH-005.v2` | Appropriate Microsoft 365 audit entitlement, existing consent, enabled collection, and valid event fields. Audit is not a complete substitute for Graph sign-ins. | Only affected authentication evaluations are unavailable or partial. Do not diagnose licensing from a missing permission alone. |
+| Microsoft 365 Unified Audit / Management Activity, including qualified STS logon records | Target non-P2 authentication route for `HV-ID-AUTH-010.v1` and `HV-ID-AUTH-005.v2` | Appropriate Microsoft 365 audit entitlement, existing consent, enabled collection, and valid event fields. Audit is not a complete substitute for Graph sign-ins. | Only affected authentication evaluations are unavailable or partial. Do not diagnose licensing from a missing permission alone. |
 | Microsoft Graph sign-in logs | Authentication rules for appropriately licensed and authorized tenants | Graph sign-in download requires Entra ID P1 or P2 and suitable permission. | Authentication rules can use another independently qualified source; otherwise they are unavailable. |
 | Qualified mailbox-rule evidence and Graph verified domains | `HV-ID-MBX-001.v1` | Requires current, bounded, authoritative evidence. The verified-domain set is not the complete Exchange transport-domain inventory. | Mailbox rule is unavailable; authentication rules continue. |
 | Microsoft Graph `riskyUsers` | Separate Microsoft channel only | Requires Entra ID P2 and appropriate read permission. | Show Microsoft channel unavailable. HawkView rules continue. |
@@ -140,7 +140,7 @@ Source and rule readiness values are `READY`, `PARTIAL`, `WAITING`,
 `INSUFFICIENT_FIELDS`, `UNSUPPORTED`, and `DISABLED`. `INSUFFICIENT_FIELDS`
 means records exist but cannot safely qualify the rule. In particular,
 `HV-ID-AUTH-005.v2` requires a qualified client source;
-`HV-ID-AUTH-009.v1` does not require an IP address.
+`HV-ID-AUTH-010.v1` does not require an IP address.
 
 The frozen recommended-action codes are `CONFIRM_EXPECTED_ACTIVITY`,
 `REVIEW_SIGN_INS`, `CHECK_SAVED_CREDENTIALS`, `VERIFY_MFA_ENFORCEMENT`,

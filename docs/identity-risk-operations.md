@@ -27,7 +27,7 @@ verify an authenticated risk route or usable source evaluation.
 ## Required acceptance matrix
 
 - A non-P2 synthetic fixture with qualified audit STS events produces
-  `HV-ID-AUTH-009.v1` and `HV-ID-AUTH-005.v2`
+  `HV-ID-AUTH-010.v1` and `HV-ID-AUTH-005.v2`
   without calling Graph sign-ins or `riskyUsers`.
 - A real existing non-P2 audit path is demonstrated before non-P2 production
   coverage is called verified.
