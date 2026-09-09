@@ -150,9 +150,10 @@ plain-language text with these codes; HawkView does not execute the action.
 ## Evidence and protection interpretation
 
 “No findings” means no rule matched within the explicitly named evaluated scope
-and time window. It does not mean the account is safe. Missing, partial, stale,
-malformed, capped, unsupported, or licensing-restricted evidence is not evaluated
-or unavailable—never zero.
+and time window. It does not mean the account is safe. Partial or capped coverage
+can retain findings from qualified evaluated evidence, but cannot establish
+complete counts or safety. Missing or unusable evidence remains not evaluated
+or unavailable, never an inferred zero.
 
 Protection labels must come from the existing effective-MFA evaluator:
 
