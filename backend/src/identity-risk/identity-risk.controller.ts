@@ -1,13 +1,23 @@
-import { Controller, Get, Header, Inject, Param, Query, Req } from '@nestjs/common'
+import { BadRequestException, Controller, Get, Header, Inject, Param, Query, Req } from '@nestjs/common'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { IdentityRiskService } from './identity-risk.service.js'
+import { riskAssessmentSummary } from './risk-assessment-count-summary.js'
 
 @Controller('api/tenants/:tenantId')
 export class IdentityRiskController {
   constructor(@Inject(IdentityRiskService) private readonly service: IdentityRiskService) {}
   @Get('identity-signals/assessment')
   @Header('Cache-Control', 'no-store')
-  assessment(@Req() req: AuthenticatedRequest, @Param('tenantId') id: string) { return this.service.assessment(req.auth,id) }
+  async assessment(@Req() req: AuthenticatedRequest, @Param('tenantId') id: string,
+    @Query('includeSummary') includeSummary?: unknown) {
+    if (includeSummary !== undefined && includeSummary !== 'true' && includeSummary !== 'false')
+      throw new BadRequestException('includeSummary must be true or false')
+    const assessment = await this.service.assessment(req.auth, id)
+    // Deployed v1 clients reject additional root keys. Only explicit opt-in adds this field.
+    return includeSummary === 'true'
+      ? { ...assessment, summary: riskAssessmentSummary(assessment) }
+      : assessment
+  }
   @Get('identity-signals/summary') summary(@Req() req: AuthenticatedRequest, @Param('tenantId') id: string) { return this.service.summary(req.auth, id) }
   @Get('identity-signals/findings')
   findings(

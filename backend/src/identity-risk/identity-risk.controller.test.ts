@@ -3,6 +3,7 @@ import test from 'node:test'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { IdentityRiskController } from './identity-risk.controller.js'
 import type { IdentityRiskService } from './identity-risk.service.js'
+import type { RiskAssessmentDto } from './identity-risk-assessment.contract.js'
 
 const auth = { subject: 'auth-user', email: 'owner@example.com' }
 const request = { auth } as AuthenticatedRequest
@@ -52,4 +53,30 @@ test('read routes forward only authenticated scope, tenant, and bounded paginati
     { method: 'investigationAccess', args: [auth, 'tenant-1'] },
     { method: 'mailboxInvestigation', args: [auth, 'tenant-1', 'finding-1'] },
   ])
+})
+
+test('assessment summary is explicit opt-in; old v1 root shape and authenticated arguments remain unchanged', async () => {
+  const dto = { version: 1, schemaVersion: 'hawkview-risk-assessment/v1', meta: { evaluatedAt: null, status: 'NOT_EVALUATED' }, sources: [], rules: [], users: [], page: { hasMore: false, nextCursor: null } } as unknown as RiskAssessmentDto
+  const calls: unknown[][] = []
+  const service = { assessment: async (...args: unknown[]) => { calls.push(args); return dto } } as unknown as IdentityRiskService
+  const controller = new IdentityRiskController(service)
+  assert.equal(await controller.assessment(request, 'tenant-1'), dto)
+  assert.equal(await controller.assessment(request, 'tenant-1', 'false'), dto)
+  const result = await controller.assessment(request, 'tenant-1', 'true')
+  assert.deepEqual(result, { ...dto, summary: { scope: 'TENANT', asOf: null, currentUsers: { value: null, accuracy: 'UNKNOWN' } } })
+  assert.equal('summary' in dto, false)
+  assert.deepEqual(calls, Array.from({ length: 3 }, () => [auth, 'tenant-1']))
+  for (const value of ['', 'TRUE', '1', true, null, ['true', 'false'], { value: 'true' }])
+    await assert.rejects(() => controller.assessment(request, 'tenant-1', value), /includeSummary must be true or false/)
+  assert.equal(calls.length, 3, 'invalid options must not initiate an assessment read')
+})
+
+test('opt-in summary cannot bypass failed authorization or share a previous tenant response', async () => {
+  const service = { assessment: async (_identity: unknown, tenant: string) => {
+    if (tenant !== 'authorized-tenant') throw new Error('Tenant access denied')
+    return { version: 1, meta: { evaluatedAt: null } } as RiskAssessmentDto
+  } } as unknown as IdentityRiskService
+  const controller = new IdentityRiskController(service)
+  assert.ok('summary' in await controller.assessment(request, 'authorized-tenant', 'true'))
+  await assert.rejects(() => controller.assessment(request, 'foreign-tenant', 'true'), /Tenant access denied/)
 })
