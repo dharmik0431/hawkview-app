@@ -47,15 +47,15 @@ The original September 8 target acceptance time was missed. The feature is not a
 full Microsoft-equivalent risk product and does not have universal telemetry.
 Independent source QA found the type-declaration move semantically equivalent and
 build-neutral under the unchanged recursive TypeScript configuration. The full
-hosted `bun.lock` was captured: 35 direct comparison entries match, while its
-Supabase client family resolves to 2.116.0 and the reviewed npm lock resolves to
-2.112.0. The hosted installer and effective served Supabase version remain
-unproven. If the published build used npm with `package-lock`, the Bun difference
-is non-operative and can remain a P2 provenance item. If it used Bun resolution,
-exact-artifact acceptance still requires full lock resolution, source, and
-integrity comparison. This version difference is not evidence of a vulnerability.
-Successful cloud builds alone do not establish installer identity or a clean
-exact frontend SHA. No additional routine publication is requested by this
+hosted `bun.lock` was captured: 35 direct comparison entries match. QA and the
+delivery lead also confirmed that deployed browser modules identify Supabase
+2.116.0, while the reviewed npm lock and CI production artifact use 2.112.0.
+This is confirmed runtime dependency drift and a P1 release-provenance issue,
+not merely an unused alternative-lock difference. No vulnerability or
+authentication regression has been demonstrated. A minimal exact-version and
+both-lock correction is pending Lead and QA review. Until that correction is
+merged and deployed, overall acceptance and a clean exact frontend SHA remain
+unproven. No additional routine documentation publication is requested by this
 handoff.
 
 ## Required acceptance matrix
