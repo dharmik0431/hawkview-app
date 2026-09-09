@@ -8,6 +8,7 @@ import { assessmentMeta, assessmentReason, projectStoredRiskAssessment, unknownR
 import { RISK_ASSESSMENT_SCHEMA, type RiskAssessmentDto, type RiskAssessmentReason, type RiskAssessmentUserDto } from './identity-risk-assessment.contract.js'
 import { loadAssessmentProtection } from './risk-assessment-protection-loader.js'
 import { MAILBOX_SOURCE_VERSION, sourceAttestationKey } from './mailbox-source-attestation.js'
+import { recordRiskReader, type ReaderReason } from './risk-operational-diagnostics.js'
 
 type Scope={organizationId:string;customerTenantId:string}
 export function unavailableAssessment(reason:RiskAssessmentReason='WAITING_FOR_COLLECTION',now=new Date()):RiskAssessmentDto{
@@ -23,13 +24,28 @@ const uuid=(value:unknown):value is string=>typeof value==='string'&&/^[a-f0-9]{
 export class RiskAssessmentReader{
   constructor(@Inject(IdentityRiskPseudonymProvider)private readonly provider:IdentityRiskPseudonymProvider){}
   async read(scope:Scope,run:{id:string;pseudonymKeyVersionId:string|null;completedAt:Date|null},now:Date,_evidenceDetailAllowed:boolean):Promise<RiskAssessmentDto>{
+    let reason: ReaderReason = 'SUCCESS'
+    try {
+      const result = await this.readAssessment(scope,run,now,_evidenceDetailAllowed,next => { reason = next })
+      recordRiskReader(reason)
+      return result
+    } catch (error) {
+      recordRiskReader('READ_FAILED')
+      throw error
+    }
+  }
+  private async readAssessment(scope:Scope,run:{id:string;pseudonymKeyVersionId:string|null;completedAt:Date|null},now:Date,_evidenceDetailAllowed:boolean,observe:(reason:ReaderReason)=>void):Promise<RiskAssessmentDto>{
+    const unavailable = (reason: RiskAssessmentReason, diagnostic: ReaderReason) => {
+      observe(diagnostic)
+      return unavailableAssessment(reason, now)
+    }
     const environment=process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT
-    if(!environment||!run.pseudonymKeyVersionId||!this.provider.configured||!this.provider.allowsScope({...scope,environment}))return unavailableAssessment('KEY_UNAVAILABLE',now)
+    if(!environment||!run.pseudonymKeyVersionId||!this.provider.configured||!this.provider.allowsScope({...scope,environment}))return unavailable('KEY_UNAVAILABLE','KEY_UNAVAILABLE')
     const {tryInSyncMemoryLane}=await import('../tenants/tenant-sync.service.js')
-    return await tryInSyncMemoryLane(async()=>{
+    const result = await tryInSyncMemoryLane(async()=>{
       const deadline=Date.now()+15_000
       const keys=await readActiveMailboxKeys(scope,environment,now,deadline)
-      if(keys.length!==1||keys[0]!.id!==run.pseudonymKeyVersionId)return unavailableAssessment('KEY_UNAVAILABLE',now)
+      if(keys.length!==1||keys[0]!.id!==run.pseudonymKeyVersionId)return unavailable('KEY_UNAVAILABLE','KEY_UNAVAILABLE')
       const session=await this.provider.pin(keys[0]!,deadline)
       try{
         const loaded=await withMailboxReadTransaction(deadline,4000,async client=>{
@@ -74,9 +90,9 @@ export class RiskAssessmentReader{
           }
           return {raw:runs[0]?.assessment,tenant,users,sources,states,mailboxCurrent}
         })
-        if(!loaded.tenant)return unavailableAssessment('SOURCE_UNAVAILABLE',now)
+        if(!loaded.tenant)return unavailable('SOURCE_UNAVAILABLE','SCOPED_SOURCE_UNAVAILABLE')
         const parsed=projectStoredRiskAssessment(loaded.raw,now,'PERSISTED_HISTORY')
-        if(!parsed)return unavailableAssessment('WAITING_FOR_COLLECTION',now)
+        if(!parsed)return unavailable('WAITING_FOR_COLLECTION','STORED_ASSESSMENT_INVALID')
         let metadata:StoredRiskAssessment={...parsed,subjects:[],sources:parsed.sources.map(source=>{
           const resources=source.source==='MAILBOX_RULES'?['EXCHANGE_MAILBOX_RULES','EXCHANGE_ACCEPTED_DOMAINS']:['SIGN_INS']
           const failed=!run.completedAt||(source.source==='MAILBOX_RULES'&&!loaded.mailboxCurrent)||resources.some(resource=>{
@@ -95,7 +111,7 @@ export class RiskAssessmentReader{
         })}
         const history=await readAssessmentHistory(scope,session.keyVersion.id,metadata,now,deadline)
         const assessment=projectStoredRiskAssessment(reconcileAssessmentHistory(metadata,history.subjects,now),now)
-        if(!assessment)return unavailableAssessment('EVALUATION_FAILED',now)
+        if(!assessment)return unavailable('EVALUATION_FAILED','STORED_ASSESSMENT_INVALID')
         const reference=assessmentManagedReference(session)
         const labels=new Map<string,{label:string;userId:string|null;canonicalId:string}>()
         const directoryIds=new Map<string,{label:string;userId:string;canonicalId:string}>()
@@ -162,6 +178,7 @@ export class RiskAssessmentReader{
           explanation:assessmentReason('CAPACITY_LIMIT'),countsCapped:true,assessedIdentities:null,matchedIdentities:null}:rule):assessment.rules
         return {version:1 as const,schemaVersion:RISK_ASSESSMENT_SCHEMA,meta:assessmentMeta({...assessment,rules},run.completedAt?.toISOString()??null,now),sources:assessment.sources,rules,users,page:{hasMore:false,nextCursor:null}}
       }finally{session.close?.()}
-    })??unavailableAssessment('SOURCE_UNAVAILABLE',now)
+    })
+    return result ?? unavailable('SOURCE_UNAVAILABLE','MEMORY_LANE_BUSY')
   }
 }

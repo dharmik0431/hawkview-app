@@ -9,6 +9,7 @@ import {
   NotFoundException,
 } from '@nestjs/common'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { observeCycle, type CycleReason } from '../identity-risk/risk-operational-diagnostics.js'
 import { isIP } from 'node:net'
 import { projectAuthenticationAuditPageRow, reportedAuthenticationErrorCode } from './authentication-audit-projection.js'
 import { persistCompletedAuthenticationWindow } from '../identity-risk/authentication-window-collector.js'
@@ -1596,13 +1597,13 @@ export class TenantSyncService {
   private async runPostSyncIdentityRiskEvaluation(tenant: {
     id: string
     organizationId: string
-  }, executionDeadlineAt?: number, globalAttemptId?: string) {
+  }, executionDeadlineAt?: number, globalAttemptId?: string, diagnostic?: (reason: CycleReason) => void) {
     if (!this.identityRiskEvaluationScheduler || (!this.riskAssessmentProjector && !this.mailboxRiskProjector)) return
     if (isGlobalRiskConfig(riskRuntimeConfig()) && !globalAttemptId) return this.runScopedPostSyncRisk(tenant)
     const evaluationAt = new Date()
     const windowStart = new Date(evaluationAt.getTime() - 24 * 60 * 60 * 1_000)
     try {
-      await runInSyncMemoryLane(() => {
+      const outcome = await runInSyncMemoryLane(() => {
       const request = {
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
@@ -1619,6 +1620,9 @@ export class TenantSyncService {
       return this.riskAssessmentProjector ? this.identityRiskEvaluationScheduler!.runAssessmentTenant(request)
         : this.identityRiskEvaluationScheduler!.runTenant({...request,approvedEvaluator:{readiness:'READY',featureFlags:MAILBOX_FIRST_SLICE_FLAGS}})
       })
+      // COMPLETED is returned only after persistCompletedRun's transaction
+      // resolves. OFF/HARD_DISABLED/IN_PROGRESS/REPLAYED are not a new commit.
+      observeCycle(diagnostic, this.riskAssessmentProjector && outcome?.status === 'COMPLETED' ? 'COMMITTED' : 'RETURNED_UNCOMMITTED')
     } catch {
       // Identity-risk shadow evaluation is isolated from tenant collection.
       this.logger.warn('Post-sync identity-risk evaluation failed.')
@@ -1647,19 +1651,25 @@ export class TenantSyncService {
 
   /** Exactly one global risk path, independent of collector selection. No
    * enqueue behind interactive work: busy lane defers with cursor unchanged. */
-  async runScheduledGlobalRiskCycle(requestDeadlineAt: number) {
+  async runScheduledGlobalRiskCycle(requestDeadlineAt: number, diagnostic?: (reason: CycleReason) => void) {
     if (!this.identityRiskEvaluationScheduler || (!this.riskAssessmentProjector && !this.mailboxRiskProjector) ||
-      !isGlobalRiskConfig(riskRuntimeConfig())) return
+      !isGlobalRiskConfig(riskRuntimeConfig())) {
+      observeCycle(diagnostic, !isGlobalRiskConfig(riskRuntimeConfig()) ? 'CONFIG_UNAVAILABLE' : 'DEPENDENCY_UNAVAILABLE')
+      return
+    }
     const store = new RiskGlobalWorkStore()
     const keys = new WrappedRiskKeyStore()
-    return tryInSyncMemoryLane(() => runGlobalRiskCycle({
+    const result = await tryInSyncMemoryLane(() => runGlobalRiskCycle({
+      observe: diagnostic,
       claimCycle: deadline => store.claimCycle(deadline),
       nextScope: (lease, deadline) => store.nextScope(lease, deadline),
       releaseCycle: (lease, deadline) => store.releaseCycle(lease, deadline),
       recordAttempt: (scope, lease, deadline) => store.recordAttempt(scope, lease, deadline),
       ensure: (scope, deadline) => keys.ensureVersion(scope, deadline),
-      evaluate: (scope, deadline, attemptId) => this.runPostSyncIdentityRiskEvaluation({ id: scope.customerTenantId, organizationId: scope.organizationId }, deadline, attemptId),
+      evaluate: (scope, deadline, attemptId) => this.runPostSyncIdentityRiskEvaluation({ id: scope.customerTenantId, organizationId: scope.organizationId }, deadline, attemptId, diagnostic),
     }, requestDeadlineAt))
+    if (result === undefined) observeCycle(diagnostic, 'MEMORY_LANE_BUSY')
+    return result
   }
 
   private async getReadableTenant(

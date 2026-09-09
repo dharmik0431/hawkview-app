@@ -1,6 +1,7 @@
 import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common'
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
 import { RiskAssessmentReader, unavailableAssessment } from './risk-assessment-reader.service.js'
+import { recordRiskReader } from './risk-operational-diagnostics.js'
 import { riskRuntimeConfig, riskScopeAllowed } from './risk-runtime-config.js'
 import { isGlobalRiskConfig } from './risk-runtime-config.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
@@ -412,7 +413,10 @@ export class IdentityRiskService {
     const now=new Date()
     if(!pilotReadAllowed(tenant)||(await this.currentControls(tenant)).evaluationHardDisabled)return unavailableAssessment('EVALUATION_DISABLED',now)
     const run=await this.latestRun(tenant,now)
-    if(!run||!this.assessmentReader)return unavailableAssessment('WAITING_FOR_COLLECTION',now)
+    if(!run||!this.assessmentReader){
+      recordRiskReader(!run ? 'NO_COMPLETED_RUN' : 'READ_FAILED')
+      return unavailableAssessment('WAITING_FOR_COLLECTION',now)
+    }
     let result
     try{result=await this.assessmentReader.read({organizationId:tenant.organizationId,customerTenantId:tenant.id},run,now,tenant.evidenceDetailAllowed)}
     catch{return unavailableAssessment('EVALUATION_FAILED',now)}
