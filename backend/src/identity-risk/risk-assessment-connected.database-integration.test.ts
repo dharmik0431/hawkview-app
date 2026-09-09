@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import pg from 'pg'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { IdentityRiskService } from './identity-risk.service.js'
+import { IdentityRiskController } from './identity-risk.controller.js'
 import { IdentityRiskEvaluatorService, IdentityRiskEvaluationScheduler } from './identity-risk-evaluator.service.js'
 import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
 import { RiskGlobalWorkStore } from './risk-global-work-store.js'
@@ -19,10 +21,11 @@ import { TenantSyncService } from '../tenants/tenant-sync.service.js'
 import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION } from './mailbox-source-attestation.js'
 import { mailboxRule } from './mailbox-risk.test-fixtures.js'
 import { IDENTITY_RISK_ENGINE_VERSION, IDENTITY_RISK_CATALOG_VERSION } from './identity-risk.contract.js'
+import { ASSESSMENT_COPY } from './risk-assessment-projection.js'
 
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 const deadline = () => Date.now()+6000
-async function fixture(work:(f:any)=>Promise<void>, audit=false, complete=true) {
+async function fixture(work:(f:any)=>Promise<void>, audit=false, complete=true, activity:'POSITIVE'|'ZERO'='POSITIVE') {
   const url=new URL(process.env.DATABASE_URL??'')
   assert.ok(['127.0.0.1','localhost','[::1]'].includes(url.hostname),'Disposable loopback DB only')
   assert.match(url.pathname,/test|qa|^\/hawkview_ci$/i,'Explicit test/QA or repository CI database only')
@@ -66,7 +69,9 @@ async function fixture(work:(f:any)=>Promise<void>, audit=false, complete=true) 
         raw:audit?{hawkviewSource:'MICROSOFT_365_MANAGEMENT_ACTIVITY',managementActivityRecord:{...sts,...overrides}}:{...graph,...overrides},
         riskLevel:'high',ingestedAt:base,expiresAt:new Date(base.getTime()+90*86_400_000)}
     }
-    const records=Array.from({length:10},(_,i)=>record(`failure-${i}`,i));records.push(record('success',0,true))
+    // The zero case is genuinely evaluated, qualified activity below both
+    // thresholds, not an empty DTO or a forced READY rule outcome.
+    const records=activity==='ZERO'?[record('below-threshold',9)]:Array.from({length:10},(_,i)=>record(`failure-${i}`,i));records.push(record('success',0,true))
     await persistAuthenticationRecords(prisma,scope,records)
     if(complete)await persistCompletedAuthenticationWindow(prisma,scope,audit?'M365_AUDIT_STS':'GRAPH_SIGN_INS',new Date(base.getTime()-86_400_000),base,true)
     const collectedAt=new Date()
@@ -237,10 +242,10 @@ test('real protection SQL proves named applicable CA separately from unregistere
   assert.equal(unavailable.users[0].protection.conditionalAccess.status,'UNKNOWN');assert.equal(unavailable.users[0].priority,'MEDIUM')
 }))
 
-async function seedMailbox(f:any, mailboxId=f.scope.humanId, purpose:string|null='user') {
+async function seedMailbox(f:any, mailboxId=f.scope.humanId, purpose:string|null='user', destination='forward@outside.invalid') {
   const stamp=f.base
   for(const resourceType of ['EXCHANGE_MAILBOX_RULES','EXCHANGE_ACCEPTED_DOMAINS'] as const){
-    const payload=resourceType==='EXCHANGE_MAILBOX_RULES'?[mailboxRule('forward@outside.invalid',{mailboxUserId:mailboxId,mailboxUpn:f.scope.upn})]:[{domain:'fixture.invalid'}]
+    const payload=resourceType==='EXCHANGE_MAILBOX_RULES'?[mailboxRule(destination,{mailboxUserId:mailboxId,mailboxUpn:f.scope.upn})]:[{domain:'fixture.invalid'}]
     await f.prisma.tenantEntraSnapshot.create({data:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId,resourceType,payload,observedAt:stamp}})
     await f.prisma.tenantCollectionFieldState.create({data:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId,fieldKey:sourceAttestationKey(resourceType),
       state:'COMPLETE',source:MAILBOX_SOURCE_VERSION,correlationId:mailboxSourceDigest(f.scope,resourceType,stamp,payload),lastSuccessfulAt:stamp}})
@@ -358,3 +363,110 @@ test('authorization is rechecked after private enrichment and before returning a
   }
   await assert.rejects(()=>f.service.assessment(f.scope.identity,f.scope.customerTenantId),/Tenant access denied|active organization|workspace/i)
 }))
+
+// One connected matrix, not independent fixtures that manufacture the controller
+// response. CI enables this file against its disposable migrated PostgreSQL.
+// Presentation assertions use production helpers consumed by the card; this is
+// not a browser/React DOM rendering test and does not require new dependencies.
+for(const scenario of ['FULL_POSITIVE','FULL_ZERO','UNAVAILABLE'] as const)
+test(`connected count acceptance ${scenario}: PostgreSQL -> controller -> production frontend`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
+  if(scenario!=='UNAVAILABLE') {
+    // An internal-domain forwarding rule is a real, fully assessed non-match.
+    // Preserve the existing source digest, generation and human-purpose proof.
+    await seedMailbox(f,f.scope.humanId,'user',scenario==='FULL_ZERO'?'internal@fixture.invalid':'forward@outside.invalid')
+  } else {
+    // Exercise the existing persisted-source byte-cap refusal, not a mocked
+    // evaluator, fabricated unavailable DTO, or suppressed test expectation.
+    await f.prisma.signInLog.updateMany({where:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId,microsoftSignInId:'failure-0'},
+      data:{raw:{...f.records[0].raw,oversized:'x'.repeat(17000)}}})
+  }
+  const {result,batch}=await f.evaluate()
+  assert.equal(result.status,'COMPLETED','The actual durable evaluator transaction must complete')
+  const scope={organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId}
+  const run=await f.prisma.identityRiskEvaluationRun.findFirst({where:{...scope,status:'COMPLETED'},orderBy:{completedAt:'desc'}})
+  assert.ok(run?.completedAt)
+  assert.equal(run.aggregate.assessment.schemaVersion,'hawkview-risk-assessment/v1')
+  const heads=await f.client.query('SELECT completed_run_id FROM identity_risk_attempt_heads WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND environment=$3',
+    [scope.organizationId,scope.customerTenantId,f.scope.environment])
+  assert.equal(heads.rows.length,1)
+  assert.equal(heads.rows[0].completed_run_id,run.id,'The causal head must point to the committed assessment')
+
+  const controller=new IdentityRiskController(f.service)
+  const request={auth:f.scope.identity} as any
+  const dto=await controller.assessment(request,f.scope.customerTenantId,'true')
+  assert.ok('summary' in dto)
+  assert.equal(dto.summary.scope,'TENANT')
+  assert.equal(dto.summary.asOf,dto.meta.evaluatedAt)
+  assert.equal(dto.meta.evaluatedAt,run.completedAt.toISOString(),'Public time comes from durable evaluation, not the request clock')
+  const {adaptRiskAssessmentResponse}=await import(new URL('../../../lib/identity-risk/adapter.ts',import.meta.url).href)
+  const {hawkViewRiskyUserCountPresentation,currentRiskAssessmentUsers,riskAssessmentEmptyPresentation}=await import(new URL('../../../lib/identity-risk/presentation.ts',import.meta.url).href)
+  const view=adaptRiskAssessmentResponse(dto,Date.now())
+  assert.ok(view,'The actual opt-in controller payload must satisfy the production frontend contract')
+  const headline=hawkViewRiskyUserCountPresentation(view)
+  const current=currentRiskAssessmentUsers(view)
+  const stored=await f.prisma.identityRiskMatchedResult.findMany({where:scope})
+  for(const rawIdentity of [f.scope.humanId,f.scope.appId,'192.0.2.10']) {
+    assert.ok(!JSON.stringify(stored.map((row:any)=>row.evidence)).includes(rawIdentity))
+    assert.ok(!JSON.stringify(dto).includes(rawIdentity))
+  }
+  assert.ok((await f.prisma.signInLog.findMany({where:scope})).every((row:any)=>row.riskLevel==='high'),'HawkView never changes the independent Microsoft-reported source value')
+
+  if(scenario==='UNAVAILABLE') {
+    assert.equal(batch.capability,'UNAVAILABLE')
+    assert.equal(dto.meta.capability,'UNAVAILABLE');assert.equal(dto.meta.status,'NOT_EVALUATED')
+    assert.deepEqual(dto.summary.currentUsers,{value:null,accuracy:'UNKNOWN'})
+    assert.equal(dto.users.length,0);assert.equal(stored.length,0)
+    assert.ok(dto.rules.filter((rule:any)=>rule.ruleId!=='HV-ID-MBX-001.v1').every((rule:any)=>rule.reasonCode==='CAPACITY_LIMIT'&&rule.matchedIdentities===null))
+    assert.equal(headline.accessibleValue,'Not available');assert.equal(headline.exact,false)
+    assert.notEqual(headline.value,'0');assert.match(headline.detail,/not zero/i)
+    assert.equal(riskAssessmentEmptyPresentation(view)?.label,'No findings can be confirmed yet')
+  } else {
+    assert.equal(dto.meta.capability,'FULL');assert.equal(dto.meta.status,'AVAILABLE');assert.equal(dto.meta.freshness,'CURRENT')
+    assert.equal(dto.rules.length,3)
+    for(const rule of dto.rules) {
+      assert.equal(rule.status,'READY');assert.equal(rule.countsCapped,false)
+      assert.ok(rule.assessedIdentities!==null&&rule.assessedIdentities>0,'Each rule must actually assess qualified identities')
+      assert.ok(rule.window.start&&rule.window.end&&rule.evaluatedAt)
+      const source:{status:string;freshness:string;lastSuccessfulCollectionAt:string|null;window:{start:string|null;end:string|null}}|undefined=
+        dto.sources.find((candidate:any)=>candidate.source===rule.selectedSource)
+      assert.equal(source?.status,'READY');assert.equal(source?.freshness,'CURRENT')
+      assert.ok(source?.lastSuccessfulCollectionAt&&source.window.start&&source.window.end)
+    }
+    const expected=scenario==='FULL_POSITIVE'?1:0
+    assert.deepEqual(dto.summary.currentUsers,{value:expected,accuracy:'EXACT'})
+    assert.equal(headline.value,String(expected));assert.equal(headline.accessibleValue,String(expected));assert.equal(headline.exact,true)
+    assert.equal(new Set(current.map((user:any)=>user.id)).size,expected)
+    assert.equal(headline.asOf,run.completedAt.toISOString())
+    if(scenario==='FULL_POSITIVE') {
+      assert.equal(dto.users.length,1);assert.equal(current[0].subjectType,'USER')
+      assert.equal(current[0].findings.length,3,'Qualified mailbox and both authentication rules roll up to one canonical person')
+      assert.equal(current[0].protection.securityDefaults.state,'ENABLED')
+      for(const finding of current[0].findings) {
+        assert.equal(finding.activityState,'CURRENT')
+        assert.equal(finding.explanation,ASSESSMENT_COPY[finding.ruleId as keyof typeof ASSESSMENT_COPY].explanation)
+      }
+      assert.equal(stored.length,3)
+    } else {
+      assert.equal(dto.users.length,0);assert.equal(stored.length,0)
+      assert.ok(dto.rules.every((rule:any)=>rule.matchedIdentities===0))
+      const empty=riskAssessmentEmptyPresentation(view)
+      assert.equal(empty?.label,'No findings in evaluated evidence')
+      assert.match(empty!.detail,/All three supported checks/)
+      assert.match(empty!.detail,/does not establish that an identity is safe/)
+    }
+  }
+  const oldDto=await controller.assessment(request,f.scope.customerTenantId)
+  assert.equal(Object.hasOwn(oldDto,'summary'),false)
+  assert.deepEqual(Object.keys(oldDto).sort(),Object.keys(dto).filter(key=>key!=='summary').sort())
+  const oldView=adaptRiskAssessmentResponse(oldDto,Date.now());assert.ok(oldView)
+  assert.equal(hawkViewRiskyUserCountPresentation(oldView).accessibleValue,'Not available','Old payload must not synthesize a tenant total from loaded rows')
+  assert.equal(adaptRiskAssessmentResponse({...dto,summary:{...dto.summary,currentUsers:{value:-1,accuracy:'EXACT'}}},Date.now()),null)
+  await assert.rejects(()=>controller.assessment({auth:f.scopes[1].identity} as any,f.scope.customerTenantId,'true'),/Tenant access denied/)
+  await f.prisma.user.update({where:{id:f.scope.identity.subject},data:{disabledAt:new Date()}})
+  await assert.rejects(()=>controller.assessment(request,f.scope.customerTenantId,'true'),/Tenant access denied/)
+  const card=await readFile(new URL('../../../components/identity-risk/risk-assessment-card.tsx',import.meta.url),'utf8')
+  const technical=/<details\b([^>]*)>\s*<summary\b[^>]*>\s*Technical details\s*<\/summary>/.exec(card)
+  assert.ok(technical,'The production card retains its keyboard-native Technical details disclosure')
+  assert.doesNotMatch(technical[1]!,/\bopen(?:\s|=|$)/,'Technical details must be collapsed by default')
+  assert.match(card,/hawkViewRiskyUserCountPresentation\(assessment\)/,'The production card consumes the tested count presentation')
+},false,true,scenario==='FULL_ZERO'?'ZERO':'POSITIVE'))
