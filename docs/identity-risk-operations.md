@@ -170,7 +170,7 @@ delay must not be labeled as capacity exhaustion.
 The count-first change is a release candidate, not a deployed-feature claim.
 `GET /api/tenants/:tenantId/identity-signals/assessment` preserves its exact v1
 response when `includeSummary` is missing or `false`. Only the explicit query
-`includeSummary=true` adds:
+`includeSummary=true` adds a root `summary` object containing:
 
 - `scope: TENANT`;
 - `asOf`, using the completed assessment time or null, never request time; and
@@ -196,15 +196,16 @@ user count. This is a supported reported scope, not a tenant directory census.
   unsupported, contract-invalid, incompletely paged, or has no qualified current
   user under partial/capped evidence. Missing evidence never becomes zero.
 
-The visible list can be smaller than the tenant summary. The backend owns the
-summary; the UI does not count the current page. On a request or contract error,
-withhold the current count and label cached rows as previously reported rather
-than current evidence.
+The backend owns the summary; the UI does not derive it from the currently loaded
+rows. If future presentation filters hide rows, the visible list can be smaller
+than the tenant summary. On a request or contract error, withhold the current
+count and label cached rows as previously reported rather than current evidence.
 
 Microsoft Entra Risky Users remains independent. A returned or paginated
 Microsoft list is not fabricated into an active-user total and never changes the
-HawkView count. Keep rule readiness, source windows, evaluation times, protection
-context, and investigation evidence available under **Technical details**.
+HawkView count. Keep collapsed rule, source-window, and engine diagnostics under
+**Technical details**. Retain each row's protection context and investigation
+evidence in **Review findings**.
 
 ## Support triage
 
