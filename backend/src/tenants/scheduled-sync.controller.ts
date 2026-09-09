@@ -8,6 +8,7 @@ import { identityRiskMaintenanceEnabled } from '../identity-risk/identity-risk-m
 import { logProcessMemoryPhase } from './runtime-telemetry.js'
 import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-runtime-config.js'
 import { riskHistoryRetentionConfig } from '../identity-risk/risk-history-retention.js'
+import { RiskCycleDiagnostic } from '../identity-risk/risk-operational-diagnostics.js'
 
 @Controller('api/internal/sync')
 export class ScheduledSyncController {
@@ -29,6 +30,7 @@ export class ScheduledSyncController {
     // Authentication, maintenance and risk all consume this same request clock.
     const admissionDeadlineAt = startedAt + 240_000
     await this.schedulerTokenVerifier.verify(request.headers.authorization)
+    const riskDiagnostic = new RiskCycleDiagnostic()
     logProcessMemoryPhase(this.logger, 'scheduled_sync', 'STARTED', startedAt)
     try {
       // Separate opt-in physical history policy also runs with evaluation OFF.
@@ -61,17 +63,23 @@ export class ScheduledSyncController {
       if (riskMaintenanceReady && Date.now() < startedAt + 45_000 && isGlobalRiskConfig(riskRuntimeConfig())) {
         try {
           // Reserve collector admission opportunity; this is not a whole-request SLA.
-          await this.tenantSyncService.runScheduledGlobalRiskCycle(startedAt + 45_000)
+          await this.tenantSyncService.runScheduledGlobalRiskCycle(startedAt + 45_000, reason => riskDiagnostic.record(reason))
         } catch {
+          riskDiagnostic.record('ATTEMPT_FAILED')
           this.logger.warn('Identity-risk cycle unavailable; collection continues.')
         }
-      }
+      } else riskDiagnostic.record(!isGlobalRiskConfig(riskRuntimeConfig()) ? 'CONFIG_UNAVAILABLE' :
+        !riskMaintenanceReady ? 'MAINTENANCE_DEFERRED' : 'ADMISSION_BUDGET_EXHAUSTED')
+      riskDiagnostic.finish()
       const result = await this.tenantSyncService.syncDueTenants(admissionDeadlineAt)
       logProcessMemoryPhase(this.logger, 'scheduled_sync', 'COMPLETED', startedAt)
       return result
     } catch (error) {
       logProcessMemoryPhase(this.logger, 'scheduled_sync', 'FAILED', startedAt)
       throw error
+    } finally {
+      // Once per authenticated natural invocation, including exceptional exits.
+      riskDiagnostic.finish()
     }
   }
 }
