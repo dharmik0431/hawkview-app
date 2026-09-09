@@ -32,7 +32,7 @@ Keep the four evidence layers separate:
 | --- | --- | --- |
 | Source and tests | Reviewed PR #236 head `39eb90965c61e6edfcb4f6d29d2f5872099163c3` is an ancestor of protected merge `8e3a94c01b68175c92ce4f4fdd379c20c2aa8455`. Required-quality run [34298951213](https://github.com/dharmik0431/hawkview-app/actions/runs/34298951213) passed for the reviewed head. | Automated and isolated evidence does not prove usable evidence in a real tenant. |
 | Infrastructure deployment | API and scheduler were verified at the merge revision; both audit-risk migrations were applied, and the natural scheduled run succeeded. API smoke [34300213203](https://github.com/dharmik0431/hawkview-app/actions/runs/34300213203) and authenticated two-MSP canary [34300213250](https://github.com/dharmik0431/hawkview-app/actions/runs/34300213250) passed for the merge. | Infrastructure success does not establish per-rule source readiness or a tenant finding. |
-| Public route and UI | After an owner publication correction, independent public QA observed `GET /api/tenants/:tenantId/identity-signals/assessment` through the app and the new **HawkView Risky Users** card. | The exact clean frontend source SHA is not proven. Do not use a shared static literal or chunk filename/hash as substitute evidence. |
+| Public route and UI | After an owner publication correction, independent public QA confirmed that the active public bundle references `GET /api/tenants/:tenantId/identity-signals/assessment` and implements the new **HawkView Risky Users** card. | This is not an authenticated tenant API call. The exact clean frontend source SHA is not proven. Do not use a shared static literal or chunk filename/hash as substitute evidence. |
 | Real tenant acceptance | **Unverified.** | No independent privacy-authorized non-P2 tenant inspection has established audit-source usability, rule readiness, findings, or full tenant coverage. |
 
 Rule delivery status:
@@ -47,9 +47,11 @@ The original September 8 target acceptance time was missed. The feature is not a
 full Microsoft-equivalent risk product and does not have universal telemetry.
 Independent source QA found the type-declaration move semantically equivalent and
 build-neutral under the unchanged recursive TypeScript configuration. The full
-hosted `bun.lock` was captured: 35 direct comparison entries match. QA and the
-delivery lead also confirmed that deployed browser modules identify Supabase
-2.116.0, while the reviewed npm lock and CI production artifact use 2.112.0.
+hosted `bun.lock` was captured and compared across 35 direct dependencies: 34
+resolved versions match the canonical npm lock, while the Supabase family is the
+one mismatch. QA and the delivery lead also confirmed that deployed browser
+modules identify Supabase 2.116.0, while the reviewed npm lock and CI production
+artifact use 2.112.0.
 This is confirmed runtime dependency drift and a P1 release-provenance issue,
 not merely an unused alternative-lock difference. No vulnerability or
 authentication regression has been demonstrated. A minimal exact-version and
