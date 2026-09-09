@@ -48,12 +48,16 @@ export class WrappedRiskKeyStore {
   /** Scheduler only. A missing ACTIVE row is not permission to recreate a key.
    * Existing history, including damaged ciphertext and revocation tombstones,
    * requires controlled operator reconciliation, never automatic rotation. */
-  async ensureVersion(scope: PseudonymScope, deadlineAt: number): Promise<PseudonymKeyVersion> {
+  async ensureVersion(scope: PseudonymScope, deadlineAt: number, ineligible?: () => void): Promise<PseudonymKeyVersion> {
     if (!isGlobalRiskConfig(riskRuntimeConfig())) throw keyUnavailable()
-    return this.createOrLoad(scope, randomUUID(), deadlineAt, true)
+    return this.createOrLoad(scope, randomUUID(), deadlineAt, true, ineligible)
   }
 
-  private async assertAutomaticScope(client: pg.Client, scope: PseudonymScope) {
+  private async assertAutomaticScope(client: pg.Client, scope: PseudonymScope, ineligible?: () => void) {
+    const rejectIneligible = () => {
+      try { ineligible?.() } catch { /* Diagnostic observers cannot affect admission. */ }
+      throw keyUnavailable()
+    }
     // Same exclusive advisory namespace AND ordering as evaluator/stop controls.
     const keys = ['GLOBAL', `${scope.organizationId}:${scope.customerTenantId}`]
       .map(key => `hawkview:identity-risk-control:EVALUATION_HARD_DISABLED:${key}`).sort()
@@ -69,23 +73,23 @@ export class WrappedRiskKeyStore {
     // Row locks linearize suspension/disconnect/deletion with enrollment. All
     // ownership predicates remain inside this transaction, not a stale page DTO.
     const owner = await client.query("SELECT id FROM organizations WHERE id=$1::uuid AND status='ACTIVE' FOR SHARE", [scope.organizationId])
-    if (owner.rowCount !== 1) throw keyUnavailable()
+    if (owner.rowCount !== 1) rejectIneligible()
     const tenant = await client.query(`SELECT id FROM customer_tenants
       WHERE id=$1::uuid AND organization_id=$2::uuid AND status='ACTIVE' FOR SHARE`, [scope.customerTenantId, scope.organizationId])
-    if (tenant.rowCount !== 1) throw keyUnavailable()
+    if (tenant.rowCount !== 1) rejectIneligible()
     const connection = await client.query(`SELECT id FROM tenant_connections
       WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND status='CONNECTED' FOR SHARE`, [scope.customerTenantId, scope.organizationId])
-    if (connection.rowCount !== 1) throw keyUnavailable()
+    if (connection.rowCount !== 1) rejectIneligible()
   }
 
-  private async createOrLoad(scope: PseudonymScope, versionId: string, deadlineAt: number, automatic: boolean): Promise<PseudonymKeyVersion> {
+  private async createOrLoad(scope: PseudonymScope, versionId: string, deadlineAt: number, automatic: boolean, ineligible?: () => void): Promise<PseudonymKeyVersion> {
     this.allowed(scope)
     if (!RISK_UUID.test(versionId)) throw keyUnavailable()
     const root = readRiskWrappingRoot()
     let material: Buffer | undefined
     try {
       return await withRiskKeyTransaction(deadlineAt, async (client) => {
-        if (automatic) await this.assertAutomaticScope(client, scope)
+        if (automatic) await this.assertAutomaticScope(client, scope, ineligible)
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`risk-key:${scope.environment}:${scope.organizationId}:${scope.customerTenantId}`])
         const existing = await client.query<PseudonymKeyVersion>(`SELECT ${columns} FROM identity_risk_pseudonym_key_versions
           WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND environment=$3 AND status='ACTIVE'`,
