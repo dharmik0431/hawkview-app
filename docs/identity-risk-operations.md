@@ -55,13 +55,17 @@ constructs the Supabase client marker at 2.116.0, including its realtime/storage
 family. The canonical reviewed production route instead loads
 `1421-45e195a2ff83baab.js` with 2.112.0, matching the reviewed npm lock and CI
 production artifact.
-This is confirmed runtime dependency drift and a P1 release-provenance issue,
+This September 9 observation is confirmed runtime dependency drift and a P1 release-provenance issue,
 not merely an unused alternative-lock difference. No vulnerability or
-authentication regression has been demonstrated. A minimal exact-version and
-both-lock correction is pending Lead and QA review. Until that correction is
-merged and deployed, overall acceptance and a clean exact frontend SHA remain
-unproven. Do not perform a blind or routine republish. The reviewed dependency
-correction requires controlled publication followed by a public version check.
+authentication regression has been demonstrated. The scoped source correction
+pins `@supabase/supabase-js` to exactly `2.112.0` and reconciles both locks with
+the reviewed npm resolutions. Source correction and its test/QA approval do not
+prove that the hosted workspace or deployed client has changed. Until the
+correction passes protected checks, is merged, and is published through the
+controlled frontend workflow, runtime closure and a clean exact frontend SHA
+remain unproven. Do not perform a blind or routine republish. Verify the active
+public client version after controlled publication, and record that result
+separately from real-tenant acceptance. Preserve the dated drift evidence above.
 
 ## Required acceptance matrix
 
