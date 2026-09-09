@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { once } from 'node:events'
+import net from 'node:net'
 import test from 'node:test'
 import pg from 'pg'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { RiskHistoryRetention, riskHistoryRetentionConfig, HISTORY_BATCH_ROWS, HISTORY_BATCH_RUNS } from './risk-history-retention.js'
+import { withRiskKeyTransaction, withRiskRetentionTransaction } from './mailbox-read-transaction.js'
 
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 type Scope = { organizationId: string; customerTenantId: string }
@@ -209,27 +212,234 @@ test('history: overlapping leases, stale CAS, RUNNING row lock and new-head lock
 test('history: real blocked SQL is cancelled before lock release, no late deletion or cursor progress', { skip: !enabled,timeout:10000 }, () => fixture(async f => {
   const s=f.scopes[0]!, id=await run(f.c,s); await graph(f.c,s,id)
   await f.c.query('BEGIN'); await f.c.query('SELECT scope_key FROM identity_risk_history_cursors WHERE scope_key=$1 FOR UPDATE',[f.lease.key])
+  // A separate autocommit observer cannot retain the blocking transaction's
+  // pg_stat_activity snapshot. Prepare it before the unchanged 400ms clock.
+  const observer=new pg.Client({connectionString:process.env.DATABASE_URL})
+  await observer.connect()
+  try {
+  const blockerPid=(await f.c.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
   const start=Date.now()
-  let ownedPid=0
+  let ownedPid=0,observedLock=false,settled=false
   const original=(f.worker as any).tx.bind(f.worker)
   ;(f.worker as any).tx=(d:number,w:any)=>original(d,async(c:pg.Client)=>{
     ownedPid=(await c.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
     return w(c)
   })
-  await assert.rejects(()=>f.worker.prune(s,f.config,f.lease,start+400),/SOURCE_UNAVAILABLE/)
+  const outcome=f.worker.prune(s,f.config,f.lease,start+400).then(
+    ()=>({error:null}),error=>({error})).finally(()=>{settled=true})
+  while(!settled && Date.now()-start<1500) {
+    if(ownedPid){
+      const state=await observer.query('SELECT wait_event_type,$2::int=ANY(pg_blocking_pids(pid)) AS blocked FROM pg_stat_activity WHERE pid=$1',[ownedPid,blockerPid])
+      if(state.rows[0]?.wait_event_type==='Lock'&&state.rows[0]?.blocked) observedLock=true
+    }
+    if(!settled)await new Promise(r=>setTimeout(r,5))
+  }
+  assert.match(String((await outcome).error),/SOURCE_UNAVAILABLE/)
   assert.ok(Date.now()-start<1500)
-  assert.ok(ownedPid>0)
+  assert.ok(ownedPid>0,'transaction callback and PID query must be reached')
+  assert.ok(observedLock,'exact worker PID must be observed waiting on the fixture blocker')
   // Prove the actual owned backend disappeared while the blocker still holds,
   // rather than merely timing out the awaiting Promise.
   for(let i=0;i<20;i++) {
-    const active=await f.c.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[ownedPid])
+    const active=await observer.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[ownedPid])
     if(!active.rowCount) break
     await new Promise(r=>setTimeout(r,10))
   }
-  assert.equal((await f.c.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[ownedPid])).rowCount,0)
+  assert.equal((await observer.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[ownedPid])).rowCount,0)
   assert.deepEqual(await count(f.c,s),{runs:1,findings:1,matches:1,coverage:1})
   await f.c.query('ROLLBACK'); await new Promise(r=>setTimeout(r,50))
   assert.deepEqual(await count(f.c,s),{runs:1,findings:1,matches:1,coverage:1})
+  } finally {await observer.end()}
+}))
+
+// Delay only synthetic loopback PostgreSQL startup, not query/commit responses.
+// This makes the old 250ms acquisition slice fail deterministically without
+// extending any operation deadline or touching shared connection settings.
+async function delayedStartup(delay:number,work:()=>Promise<void>){
+  const original=process.env.DATABASE_URL!
+  const target=new URL(original)
+  assert.equal(target.hostname,'127.0.0.1')
+  const upstreamPort=Number(target.port)
+  const sockets=new Set<net.Socket>()
+  const server=net.createServer(socket=>{
+    sockets.add(socket);socket.pause();socket.on('error',()=>undefined)
+    let upstream:net.Socket|undefined
+    const timer=setTimeout(()=>{
+      if(socket.destroyed)return
+      upstream=net.createConnection({host:target.hostname,port:upstreamPort},()=>{
+        if(socket.destroyed){upstream?.destroy();return}
+        socket.pipe(upstream!);upstream!.pipe(socket);socket.resume()
+      })
+      sockets.add(upstream);upstream.on('error',()=>socket.destroy())
+      upstream.on('close',()=>{sockets.delete(upstream!);socket.destroy()})
+    },delay)
+    socket.on('close',()=>{clearTimeout(timer);sockets.delete(socket);upstream?.destroy()})
+  })
+  server.listen(0,'127.0.0.1');await once(server,'listening')
+  target.port=String((server.address() as net.AddressInfo).port)
+  process.env.DATABASE_URL=target.toString()
+  try{await work()}finally{
+    process.env.DATABASE_URL=original
+    for(const socket of sockets)socket.destroy()
+    await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()))
+  }
+}
+
+test('history: slow acquisition borrows only unused retention budget; key defaults and shorter absolute deadlines remain enforced', {skip:!enabled,timeout:15000},()=>fixture(async f=>{
+  for(const scope of f.scopes)await run(f.c,scope)
+  await delayedStartup(350,async()=>{
+    const started=Date.now()
+    const next=await f.worker.next(f.config,f.lease,started+3000)
+    assert.ok(next);assert.ok(Date.now()-started<1000,'retention total ceiling is still 1s')
+    // General key/mailbox allocation is NOT changed by retention's opt-in.
+    let keyCallbacks=0
+    await assert.rejects(()=>withRiskKeyTransaction(Date.now()+1000,async()=>{keyCallbacks++}),/SOURCE_UNAVAILABLE/)
+    assert.equal(keyCallbacks,0)
+  })
+  const cursor=async()=>(await f.c.query('SELECT after_tenant_id FROM identity_risk_history_cursors WHERE scope_key=$1',[f.lease.key])).rows[0].after_tenant_id
+  const before=await cursor()
+  for(const [delay,budget] of [[1100,3000],[600,400]]){
+    await delayedStartup(delay,async()=>{
+      const started=Date.now()
+      let callbacks=0
+      await assert.rejects(()=>withRiskRetentionTransaction(started+budget,async c=>{
+        callbacks++
+        await c.query('UPDATE identity_risk_history_cursors SET after_tenant_id=NULL WHERE scope_key=$1',[f.lease.key])
+      }),/SOURCE_UNAVAILABLE/)
+      assert.equal(callbacks,0,'startup exhaustion must not enter the transaction callback')
+      assert.ok(Date.now()-started<1500)
+      await new Promise(r=>setTimeout(r,delay+50))
+      assert.equal(await cursor(),before,'no late cursor advancement after startup exhaustion')
+    })
+  }
+  const started=Date.now()
+  await assert.rejects(()=>withRiskRetentionTransaction(started+3000,async c=>{
+    await c.query('SELECT pg_sleep(2)')
+    await c.query('UPDATE identity_risk_history_cursors SET after_tenant_id=NULL WHERE scope_key=$1',[f.lease.key])
+  }),/SOURCE_UNAVAILABLE/)
+  assert.ok(Date.now()-started<1500)
+  await new Promise(r=>setTimeout(r,1100))
+  assert.equal(await cursor(),before,'SQL exhaustion cannot advance the cursor after cancellation')
+}))
+
+test('history: late connect still cancels an observed lock within the original 1s ceiling without late writes', {skip:!enabled,timeout:10000},()=>fixture(async f=>{
+  const observer=new pg.Client({connectionString:process.env.DATABASE_URL})
+  await observer.connect()
+  await f.c.query('BEGIN')
+  await f.c.query('SELECT scope_key FROM identity_risk_history_cursors WHERE scope_key=$1 FOR UPDATE',[f.lease.key])
+  const blocker=(await f.c.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+  let pid=0,seen=false,settled=false
+  try{
+    await delayedStartup(350,async()=>{
+      const start=Date.now()
+      const pending=withRiskRetentionTransaction(start+3000,async c=>{
+        pid=(await c.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+        await c.query('UPDATE identity_risk_history_cursors SET after_tenant_id=$2 WHERE scope_key=$1',[f.lease.key,f.scopes[0]!.customerTenantId])
+      }).then(()=>({error:null}),error=>({error})).finally(()=>{settled=true})
+      while(!settled&&Date.now()-start<1500){
+        if(pid){
+          const row=(await observer.query('SELECT wait_event_type,$2::int=ANY(pg_blocking_pids(pid)) AS blocked FROM pg_stat_activity WHERE pid=$1',[pid,blocker])).rows[0]
+          if(row?.wait_event_type==='Lock'&&row.blocked)seen=true
+        }
+        if(!settled)await new Promise(r=>setTimeout(r,5))
+      }
+      assert.match(String((await pending).error),/SOURCE_UNAVAILABLE/)
+      assert.ok(Date.now()-start<1500)
+      assert.ok(pid>0&&seen,'late-started exact worker must actually wait on the fixture lock')
+      for(let i=0;i<20;i++){
+        if(!(await observer.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[pid])).rowCount)break
+        await new Promise(r=>setTimeout(r,10))
+      }
+      assert.equal((await observer.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[pid])).rowCount,0)
+      assert.equal((await f.c.query('SELECT after_tenant_id FROM identity_risk_history_cursors WHERE scope_key=$1',[f.lease.key])).rows[0].after_tenant_id,null)
+    })
+    await f.c.query('ROLLBACK');await new Promise(r=>setTimeout(r,100))
+    assert.equal((await observer.query('SELECT after_tenant_id FROM identity_risk_history_cursors WHERE scope_key=$1',[f.lease.key])).rows[0].after_tenant_id,null)
+  }finally{await f.c.query('ROLLBACK');await observer.end()}
+}))
+
+test('history: callback timeout rolls back, lost commit acknowledgement stays unavailable, and close failure cannot leak an owned backend', {skip:!enabled,timeout:15000},()=>fixture(async f=>{
+  const cursor=async()=>(await f.c.query('SELECT after_tenant_id FROM identity_risk_history_cursors WHERE scope_key=$1',[f.lease.key])).rows[0].after_tenant_id
+  let pid=0
+  await assert.rejects(()=>withRiskRetentionTransaction(Date.now()+600,async c=>{
+    pid=(await c.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+    await c.query('UPDATE identity_risk_history_cursors SET after_tenant_id=$2 WHERE scope_key=$1',[f.lease.key,f.scopes[0]!.customerTenantId])
+    await new Promise(r=>setTimeout(r,700))
+  }),/SOURCE_UNAVAILABLE/)
+  assert.ok(pid>0)
+  assert.equal(await cursor(),null,'socket cancellation rolls back uncommitted callback writes')
+  assert.equal((await f.c.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[pid])).rowCount,0)
+  let commits=0
+  await assert.rejects(()=>withRiskRetentionTransaction(Date.now()+600,async c=>{
+    const original=c.query.bind(c)
+    // Model a successful durable COMMIT whose acknowledgement arrives too late.
+    // There must be no retry and no invented claim that the write rolled back.
+    c.query=(async(...args:any[])=>{
+      const result=await (original as any)(...args)
+      if(args[0]==='COMMIT'){commits++;await new Promise(r=>setTimeout(r,700))}
+      return result
+    }) as typeof c.query
+    await c.query('UPDATE identity_risk_history_cursors SET after_tenant_id=$2 WHERE scope_key=$1',[f.lease.key,f.scopes[0]!.customerTenantId])
+  }),/SOURCE_UNAVAILABLE/)
+  assert.equal(commits,1)
+  assert.equal(await cursor(),f.scopes[0]!.customerTenantId,'read durable state after ambiguous acknowledgement instead of retrying')
+  await assert.rejects(()=>withRiskRetentionTransaction(Date.now()+1000,async c=>{
+    pid=(await c.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+    c.end=(()=>{throw new Error('synthetic close failure')}) as typeof c.end
+    await c.query('UPDATE identity_risk_history_cursors SET after_tenant_id=NULL WHERE scope_key=$1',[f.lease.key])
+    throw new Error('synthetic callback failure')
+  }),error=>error instanceof Error&&error.message==='IDENTITY_RISK_SOURCE_UNAVAILABLE')
+  for(let i=0;i<20;i++){
+    if(!(await f.c.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[pid])).rowCount)break
+    await new Promise(r=>setTimeout(r,10))
+  }
+  assert.equal((await f.c.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[pid])).rowCount,0)
+  assert.equal(await cursor(),f.scopes[0]!.customerTenantId,'close failure still rolls back the failed callback')
+}))
+
+test('history: parameterized retention setup is ordered, bounded and fail-closed before callback', {skip:!enabled,timeout:15000},()=>fixture(async f=>{
+  await withRiskRetentionTransaction(Date.now()+1000,async(c,deadline)=>{
+    const settings=(await c.query("SELECT current_setting('TimeZone') AS zone,current_setting('statement_timeout') AS timeout")).rows[0]
+    assert.equal(settings.zone,'UTC')
+    assert.match(settings.timeout,/^\d+ms$/)
+    const ms=Number(settings.timeout.slice(0,-2))
+    assert.ok(ms>0&&ms<=deadline-Date.now(),'SQL timeout cannot renew the absolute operation budget')
+  })
+  for(const kind of ['middle-error','bad-zone','missing-zone','late-setup']){
+    const original=pg.Client.prototype.query
+    let callbacks=0,pid=0,setups=0
+    try{
+      pg.Client.prototype.query=(async function(this:pg.Client,...args:any[]){
+        if(typeof args[0]!=='string'||!args[0].startsWith('WITH retention_settings'))return (original as any).apply(this,args)
+        setups++;pid=(this as any).processID
+        assert.equal(args.length,2)
+        assert.match(args[1][0],/^\d+$/)
+        assert.ok(Number(args[1][0])>0&&Number(args[1][0])<1000)
+        if(kind==='middle-error')args[0]=args[0].replace("set_config('TimeZone', 'UTC', true)",'(1/0)::text')
+        const result=await (original as any).apply(this,args)
+        if(kind==='bad-zone')result.rows=[{timezone:'unknown'}]
+        if(kind==='missing-zone')result.rows=[]
+        if(kind==='late-setup')await new Promise(r=>setTimeout(r,1100))
+        return result
+      }) as typeof original
+      await assert.rejects(()=>withRiskRetentionTransaction(Date.now()+1000,async()=>{callbacks++}),error=>error instanceof Error&&error.message==='IDENTITY_RISK_SOURCE_UNAVAILABLE')
+    }finally{pg.Client.prototype.query=original}
+    assert.equal(setups,1);assert.equal(callbacks,0);assert.ok(pid>0)
+    for(let i=0;i<20;i++){
+      if(!(await f.c.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[pid])).rowCount)break
+      await new Promise(r=>setTimeout(r,10))
+    }
+    assert.equal((await f.c.query('SELECT pid FROM pg_stat_activity WHERE pid=$1',[pid])).rowCount,0)
+    assert.equal((await f.c.query('SELECT after_tenant_id FROM identity_risk_history_cursors WHERE scope_key=$1',[f.lease.key])).rows[0].after_tenant_id,null)
+  }
+  const originalConnect=pg.Client.prototype.connect
+  let connects=0
+  try{
+    pg.Client.prototype.connect=(()=>{connects++;throw new Error('must not connect')}) as typeof originalConnect
+    for(const deadline of [NaN,Infinity,-Infinity,-1,Date.now()-1000])
+      await assert.rejects(()=>withRiskRetentionTransaction(deadline,async()=>undefined),/SOURCE_UNAVAILABLE/)
+    assert.equal(connects,0)
+  }finally{pg.Client.prototype.connect=originalConnect}
 }))
 
 test('history: observe performs no writes and OFF configuration performs no DB work', { skip: !enabled }, () => fixture(async f => {

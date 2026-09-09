@@ -44,10 +44,10 @@ export class RiskAssessmentReader{
             WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND deleted_at IS NULL ORDER BY id LIMIT 2001`,[scope.organizationId,scope.customerTenantId])).rows
           const sources=(await client.query<{resource:string;observedAt:Date;status:string;lastSuccess:Date|null;lastAttempt:Date|null;payload:unknown}>(`SELECT s.resource_type AS resource,s.observed_at AS "observedAt",y.status,y.last_successful_at AS "lastSuccess",y.last_attempt_at AS "lastAttempt",
             CASE WHEN jsonb_typeof(s.payload)='array' THEN CASE WHEN jsonb_array_length(s.payload)<=1000 AND octet_length(s.payload::text)<=1000000 THEN
-              (SELECT coalesce(jsonb_agg(jsonb_build_object('id',x->'id','appId',x->'appId','displayName',x->'displayName','mail',x->'mail','userPrincipalName',x->'userPrincipalName')),'[]'::jsonb) FROM jsonb_array_elements(s.payload)x)
+              (SELECT coalesce(jsonb_agg(jsonb_build_object('id',x->'id','appId',x->'appId','displayName',x->'displayName','mail',x->'mail','userPrincipalName',x->'userPrincipalName','mailboxUserId',x->'mailboxUserId','userPurpose',x->'userPurpose')),'[]'::jsonb) FROM jsonb_array_elements(s.payload)x)
               ELSE NULL END ELSE NULL END AS payload
             FROM tenant_entra_snapshots s JOIN sync_states y ON y.organization_id=s.organization_id AND y.customer_tenant_id=s.customer_tenant_id AND y.resource_type=s.resource_type
-            WHERE s.organization_id=$1::uuid AND s.customer_tenant_id=$2::uuid AND s.resource_type IN('EXCHANGE_MAILBOXES','APPLICATIONS','SERVICE_PRINCIPALS') LIMIT 3`,[scope.organizationId,scope.customerTenantId])).rows
+            WHERE s.organization_id=$1::uuid AND s.customer_tenant_id=$2::uuid AND s.resource_type IN('EXCHANGE_MAILBOXES','EXCHANGE_MAILBOX_SETTINGS','APPLICATIONS','SERVICE_PRINCIPALS') LIMIT 4`,[scope.organizationId,scope.customerTenantId])).rows
           const states=(await client.query<{resource:string;status:string;lastSuccess:Date|null;lastAttempt:Date|null}>(`SELECT resource_type AS resource,status,last_successful_at AS "lastSuccess",last_attempt_at AS "lastAttempt"
             FROM sync_states WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND resource_type IN('SIGN_INS','USERS','EXCHANGE_MAILBOX_RULES','EXCHANGE_ACCEPTED_DOMAINS') LIMIT 4`,[scope.organizationId,scope.customerTenantId])).rows
           // Check the exact two attested generations used by the persisted run.
@@ -108,18 +108,33 @@ export class RiskAssessmentReader{
           labels.set(id,label);directoryIds.set(user.id.toLowerCase(),label)
         }
         const apps=new Map<string,string|null>()
+        const currentPayload=(source:typeof loaded.sources[number])=>source.status==='SUCCEEDED'&&!!source.lastSuccess&&source.lastSuccess>=source.observedAt&&
+          source.lastSuccess<=now&&source.observedAt<=now&&now.getTime()-source.observedAt.getTime()<=26*60*60_000&&
+          (!source.lastAttempt||source.lastAttempt<=source.lastSuccess)&&Array.isArray(source.payload)
+        const purposes=new Map<string,string|null>()
         for(const source of loaded.sources){
-          if(source.status!=='SUCCEEDED'||!source.lastSuccess||source.lastSuccess<source.observedAt||source.observedAt>now||now.getTime()-source.observedAt.getTime()>26*60*60_000||
-            (source.lastAttempt&&source.lastAttempt>source.lastSuccess)||!Array.isArray(source.payload))continue
-          for(const value of source.payload){
+          if(source.resource!=='EXCHANGE_MAILBOX_SETTINGS'||!currentPayload(source))continue
+          for(const value of source.payload as unknown[]){
+            if(!value||typeof value!=='object'||!('mailboxUserId' in value)||!uuid(value.mailboxUserId))continue
+            const id=value.mailboxUserId.toLowerCase()
+            // Duplicate rows are ambiguous even when they agree. A shared or
+            // resource mailbox also has a directory GUID; that is not evidence
+            // of human mailbox purpose. Only the explicit qualified value wins.
+            purposes.set(id,purposes.has(id)?null:('userPurpose' in value&&value.userPurpose==='user'?'user':null))
+          }
+        }
+        for(const source of loaded.sources){
+          if(source.resource==='EXCHANGE_MAILBOX_SETTINGS'||!currentPayload(source))continue
+          for(const value of source.payload as any[]){
             if(!value||typeof value!=='object')continue
             if(source.resource==='EXCHANGE_MAILBOXES'){
               const label=value.mail??value.userPrincipalName
               if(uuid(value.id)&&safeLabel(label)){
                 const id=await session.reference('mailbox',[value.id])
-                // Exact current directory GUID only. Never join by UPN/display
-                // name; an unresolved/shared mailbox remains a mailbox row.
-                labels.set(id,directoryIds.get(value.id.toLowerCase())??{label,userId:null,canonicalId:id})
+                // Require BOTH exact current directory identity and explicit
+                // fresh user-mailbox purpose. Never infer from UPN or enabled.
+                const human=purposes.get(value.id.toLowerCase())==='user'?directoryIds.get(value.id.toLowerCase()):undefined
+                labels.set(id,human??{label,userId:null,canonicalId:id})
               }
             }else if(uuid(value.appId)&&safeLabel(value.displayName,256)){
               const id=await reference('application',[scope.organizationId,scope.customerTenantId,loaded.tenant.microsoftTenantId,value.appId.toLowerCase()])

@@ -74,6 +74,16 @@ async function fixture(work:(f:any)=>Promise<void>, audit=false, complete=true) 
       status:audit?'RUNNING':'SUCCEEDED',lastErrorCode:audit?'sign-ins-non-premium-fallback-active':null,lastAttemptAt:base,lastSuccessfulAt:collectedAt}})
     const provider=new WrappedRiskPseudonymProvider(keys),projector=new RiskAssessmentProjector(provider,new MailboxRiskProjector(provider))
     const reader=new RiskAssessmentReader(provider),service=new IdentityRiskService(prisma,undefined,reader)
+    // Integration gate uses the actual browser adapter, not a second synthetic
+    // DTO fixture. Dynamic test-only import keeps frontend outside backend tsc.
+    const adapterUrl=new URL('../../../lib/identity-risk/adapter.ts',import.meta.url).href
+    const {adaptRiskAssessmentResponse}=await import(adapterUrl)
+    const readAssessment=reader.read.bind(reader)
+    reader.read=async(...args:Parameters<typeof reader.read>)=>{
+      const value=await readAssessment(...args)
+      assert.ok(adaptRiskAssessmentResponse(value,args[2].getTime()),'Real persisted assessment must pass the production frontend contract')
+      return value
+    }
     const begin=async()=>{const lease=await store.claimCycle(deadline());assert.ok(lease);try{return await store.recordAttempt(scope,lease,deadline())}finally{await store.releaseCycle(lease,deadline())}}
     const evaluate=async(mutate?:(batch:any)=>Promise<void>, evaluationAt=new Date())=>{
       const globalAttemptId=await begin()
@@ -227,7 +237,7 @@ test('real protection SQL proves named applicable CA separately from unregistere
   assert.equal(unavailable.users[0].protection.conditionalAccess.status,'UNKNOWN');assert.equal(unavailable.users[0].priority,'MEDIUM')
 }))
 
-async function seedMailbox(f:any, mailboxId=f.scope.humanId) {
+async function seedMailbox(f:any, mailboxId=f.scope.humanId, purpose:string|null='user') {
   const stamp=f.base
   for(const resourceType of ['EXCHANGE_MAILBOX_RULES','EXCHANGE_ACCEPTED_DOMAINS'] as const){
     const payload=resourceType==='EXCHANGE_MAILBOX_RULES'?[mailboxRule('forward@outside.invalid',{mailboxUserId:mailboxId,mailboxUpn:f.scope.upn})]:[{domain:'fixture.invalid'}]
@@ -238,6 +248,12 @@ async function seedMailbox(f:any, mailboxId=f.scope.humanId) {
   }
   await f.prisma.tenantEntraSnapshot.create({data:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId,resourceType:'EXCHANGE_MAILBOXES',payload:[{id:mailboxId,mail:f.scope.upn}],observedAt:stamp}})
   await f.prisma.syncState.create({data:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId,resourceType:'EXCHANGE_MAILBOXES',status:'SUCCEEDED',lastSuccessfulAt:stamp}})
+  if(purpose!==null)await seedPurpose(f,f.scope,[{mailboxUserId:mailboxId,userPurpose:purpose}])
+}
+
+async function seedPurpose(f:any, scope:any, payload:unknown, stamp=f.base, status='SUCCEEDED') {
+  await f.prisma.tenantEntraSnapshot.create({data:{organizationId:scope.organizationId,customerTenantId:scope.customerTenantId,resourceType:'EXCHANGE_MAILBOX_SETTINGS',payload,observedAt:stamp}})
+  await f.prisma.syncState.create({data:{organizationId:scope.organizationId,customerTenantId:scope.customerTenantId,resourceType:'EXCHANGE_MAILBOX_SETTINGS',status,lastSuccessfulAt:stamp}})
 }
 
 test('current mailbox HIGH remains independently evaluable when authentication collection fails',{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
@@ -249,7 +265,7 @@ test('current mailbox HIGH remains independently evaluable when authentication c
   assert.equal(mailbox?.priority,'HIGH');assert.equal(mailbox?.activityState,'CURRENT');assert.notEqual(dto.meta.capability,'FULL')
 }))
 
-for(const sameGuid of [true,false])test(`authorized rollup binds mailbox to user by exact GUID only: ${sameGuid}`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
+for(const sameGuid of [true,false])test(`authorized rollup requires explicit user purpose and exact GUID, never matching UPN: ${sameGuid}`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
   await seedMailbox(f,sameGuid?f.scope.humanId:randomUUID())
   await f.evaluate()
   const dto=await f.service.assessment(f.scope.identity,f.scope.customerTenantId)
@@ -261,6 +277,41 @@ for(const sameGuid of [true,false])test(`authorized rollup binds mailbox to user
   assert.equal(dto.meta.capability,'FULL','Exact rollup does not masquerade as truncated evidence')
   if(!sameGuid)assert.equal(dto.users.find((user:any)=>user.subjectType==='MAILBOX').protection.securityDefaults.state,'UNKNOWN')
   assert.ok(!JSON.stringify(dto).includes('assessmentMailboxGenerations'))
+}))
+
+for(const purpose of ['shared','room','equipment','unknownFutureValue','missing','stale','failed','duplicate','conflicting','wrong-guid','oversized','future','newer-attempt'] as const)
+test(`mailbox purpose ${purpose} never becomes a human finding or suppresses independent sources`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
+  await seedMailbox(f,f.scope.humanId,null)
+  if(purpose!=='missing'){
+    const row={mailboxUserId:purpose==='wrong-guid'?randomUUID():f.scope.humanId,userPurpose:['shared','room','equipment','unknownFutureValue'].includes(purpose)?purpose:'user'}
+    const payload=purpose==='duplicate'?[row,{...row,mailboxUserId:row.mailboxUserId.toUpperCase()}]:purpose==='conflicting'?[row,{...row,userPurpose:'shared'}]:purpose==='oversized'?Array.from({length:1001},()=>row):[row]
+    const stamp=purpose==='stale'?new Date(f.base.getTime()-27*3600_000):purpose==='future'?new Date(Date.now()+60_000):f.base
+    await seedPurpose(f,f.scope,payload,stamp,purpose==='failed'?'FAILED':'SUCCEEDED')
+    if(purpose==='newer-attempt')await f.prisma.syncState.updateMany({where:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId,resourceType:'EXCHANGE_MAILBOX_SETTINGS'},data:{lastAttemptAt:new Date()}})
+  }
+  await f.evaluate()
+  const dto=await f.service.assessment(f.scope.identity,f.scope.customerTenantId)
+  assert.equal(dto.users.length,2)
+  const human=dto.users.find((user:any)=>user.subjectType==='USER'),mailbox=dto.users.find((user:any)=>user.subjectType==='MAILBOX')
+  assert.equal(human.priority,'MEDIUM');assert.equal(human.findings.length,2)
+  assert.equal(mailbox.priority,'HIGH');assert.equal(mailbox.findings.length,1)
+  assert.equal(mailbox.findings[0].ruleId,'HV-ID-MBX-001.v1');assert.equal(mailbox.findings[0].selectedSource,'MAILBOX_RULES')
+  assert.equal(mailbox.findings[0].activityState,'CURRENT');assert.equal(mailbox.protection.securityDefaults.state,'UNKNOWN')
+  assert.equal(new Set(dto.users.flatMap((user:any)=>user.findings.map((finding:any)=>finding.id))).size,3)
+}))
+
+for(const foreignOrganization of [true,false])test(`mailbox purpose cannot leak across ${foreignOrganization?'organization':'tenant'} scope`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
+  await seedMailbox(f,f.scope.humanId,null)
+  let foreign=f.scopes[1]
+  if(!foreignOrganization){
+    foreign={organizationId:f.scope.organizationId,customerTenantId:randomUUID()}
+    await f.prisma.customerTenant.create({data:{id:foreign.customerTenantId,organizationId:foreign.organizationId,microsoftTenantId:randomUUID(),displayName:'Synthetic different tenant',status:'ACTIVE'}})
+  }
+  await seedPurpose(f,foreign,[{mailboxUserId:f.scope.humanId,userPurpose:'user'}])
+  await f.evaluate()
+  const dto=await f.service.assessment(f.scope.identity,f.scope.customerTenantId)
+  assert.equal(dto.users.length,2);assert.equal(dto.users.find((user:any)=>user.subjectType==='USER').priority,'MEDIUM')
+  assert.equal(dto.users.find((user:any)=>user.subjectType==='MAILBOX').priority,'HIGH')
 }))
 
 for(const change of ['snapshot-generation','attestation-digest','attestation-state','legacy-no-pins'] as const)test(`persisted GET fails closed after mailbox ${change}`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
