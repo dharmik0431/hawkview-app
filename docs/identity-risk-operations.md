@@ -1,6 +1,6 @@
 # Risky Users operational acceptance and support runbook
 
-Status: **release target; implementation and production acceptance pending**
+Status: **merged and publicly routed; real-tenant source acceptance pending**
 
 Audience: release engineers, support, security reviewers, and on-call operators
 
@@ -23,6 +23,40 @@ Record these independently for an exact revision:
 
 Never summarize incomplete evidence as “live.” A health endpoint alone does not
 verify an authenticated risk route or usable source evaluation.
+
+## Sanitized release record
+
+Keep the four evidence layers separate:
+
+| Layer | Established evidence | Remaining limit |
+| --- | --- | --- |
+| Source and tests | Reviewed PR #236 head `39eb90965c61e6edfcb4f6d29d2f5872099163c3` is an ancestor of protected merge `8e3a94c01b68175c92ce4f4fdd379c20c2aa8455`. Required-quality run [34298951213](https://github.com/dharmik0431/hawkview-app/actions/runs/34298951213) passed for the reviewed head. | Automated and isolated evidence does not prove usable evidence in a real tenant. |
+| Infrastructure deployment | API and scheduler were verified at the merge revision; both audit-risk migrations were applied, and the natural scheduled run succeeded. API smoke [34300213203](https://github.com/dharmik0431/hawkview-app/actions/runs/34300213203) and authenticated two-MSP canary [34300213250](https://github.com/dharmik0431/hawkview-app/actions/runs/34300213250) passed for the merge. | Infrastructure success does not establish per-rule source readiness or a tenant finding. |
+| Public route and UI | After an owner publication correction, independent public QA observed `GET /api/tenants/:tenantId/identity-signals/assessment` through the app and the new **HawkView Risky Users** card. | The exact clean frontend source SHA is not proven. Do not use a shared static literal or chunk filename/hash as substitute evidence. |
+| Real tenant acceptance | **Unverified.** | No independent privacy-authorized non-P2 tenant inspection has established audit-source usability, rule readiness, findings, or full tenant coverage. |
+
+Rule delivery status:
+
+| Rule | Source status | Real-tenant status |
+| --- | --- | --- |
+| `HV-ID-AUTH-010.v1` — repeated invalid credentials, Low | Implemented and tested with qualified synthetic/isolated audit and sign-in evidence. | Unverified on independent real-tenant evidence. |
+| `HV-ID-AUTH-005.v2` — failures followed by verified success, Medium | Implemented and tested with its exact application/client-source qualification. | Unverified on independent real-tenant evidence. |
+| `HV-ID-MBX-001.v1` — external forwarding, retained High | Existing rule integrated and tested with pinned mailbox evidence. | Current independent real-tenant readiness/finding status unverified. |
+
+The original September 8 target acceptance time was missed. The feature is not a
+full Microsoft-equivalent risk product and does not have universal telemetry.
+Independent source QA found the type-declaration move semantically equivalent and
+build-neutral under the unchanged recursive TypeScript configuration. The full
+hosted `bun.lock` was captured: 35 direct comparison entries match, while its
+Supabase client family resolves to 2.116.0 and the reviewed npm lock resolves to
+2.112.0. The hosted installer and effective served Supabase version remain
+unproven. If the published build used npm with `package-lock`, the Bun difference
+is non-operative and can remain a P2 provenance item. If it used Bun resolution,
+exact-artifact acceptance still requires full lock resolution, source, and
+integrity comparison. This version difference is not evidence of a vulnerability.
+Successful cloud builds alone do not establish installer identity or a clean
+exact frontend SHA. No additional routine publication is requested by this
+handoff.
 
 ## Required acceptance matrix
 
@@ -147,6 +181,9 @@ bypass. After ordinary deployment:
 - confirm the exact backend revision and current database schema;
 - run bounded health, fresh smoke, authenticated two-MSP isolation, and exact
   risk-route checks;
+- verify the actual authenticated assessment endpoint and the new assessment
+  component; shared static literals, generic page HTML, or a chunk hash alone are
+  insufficient;
 - verify a natural or explicitly authorized bounded evaluation path;
 - verify findings, evaluated-empty, and unavailable behavior using isolated test
   or staging data;

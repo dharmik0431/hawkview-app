@@ -1,13 +1,15 @@
 # Risky Users rule catalog
 
-Status: **target contract; implementation and deployment not yet verified**
+Status: **implemented and source-tested; independent real-tenant source acceptance unverified**
 
 Owner: HawkView engineering and product documentation
 
 Update this document when a rule version, threshold, evidence requirement,
 reason code, priority, or source adapter changes. The delivery lead has frozen
-the public schema as `hawkview-risk-assessment/v1`; implementation and deployment
-remain pending. The closed rule tuples are:
+the public schema as `hawkview-risk-assessment/v1`. PR #236 shipped the closed
+rule tuples below. Automated and isolated tests passed, but no independent
+privacy-authorized real-tenant source acceptance has established runtime
+readiness or findings for any tenant.
 
 | Rule | Version | Priority | Permitted source |
 | --- | --- | --- | --- |
@@ -32,11 +34,11 @@ Priority, evidence confidence, and verified protection are separate fields. A
 protection control can reduce concern or guide the next step, but it does not
 erase observed activity.
 
-## Target rules
+## Implemented rules
 
 ### `HV-ID-AUTH-010.v1` — repeated invalid credentials
 
-Target priority: **Low**
+Priority: **Low**
 
 Match only when at least 10 distinct qualified invalid-credential failures occur
 within a rolling 15-minute window for the same organization, customer tenant,
@@ -53,7 +55,7 @@ Qualification and bounds:
 - Reject malformed, inconsistent, unsupported, or future-dated records.
 - A generic successful audit result alone does not prove authentication success.
 
-Target explanation:
+Explanation contract:
 
 > 10 invalid-credential attempts were recorded for this account in 15 minutes.
 > This may reflect mistyped or outdated credentials or attempted unauthorized
@@ -66,7 +68,7 @@ access. Ask the MSP to validate the application and timing before escalating.
 
 ### `HV-ID-AUTH-005.v2` — invalid credentials followed by verified success
 
-Target priority: **Medium**
+Priority: **Medium**
 
 Match only when at least five distinct qualified invalid-credential failures
 occur during the 10 minutes before a verified successful sign-in, and the final
@@ -208,9 +210,10 @@ of the captured source window. Retain both. A normal ingestion delay must not be
 misreported as a capacity limit, and a partial evaluated lookback must not imply
 the complete captured window was assessed.
 
-## Final reconciliation gate
+## Post-release acceptance gate
 
-Before release, verify every field, reason, priority, explanation, action,
-source state, and edge
-against integrated code and independent tests. Record separately whether each
-rule is implemented, staged, deployed, and verified on usable evidence.
+The merged source and automated tests verify the fields, reasons, priorities,
+explanations, actions, source states, and edge cases. Record separately whether
+each rule has been exercised with privacy-authorized usable tenant evidence.
+Until that acceptance exists, do not claim real-tenant readiness, a finding,
+full source coverage, or a completed non-P2 route.

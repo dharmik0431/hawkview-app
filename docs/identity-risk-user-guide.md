@@ -1,6 +1,6 @@
 # Risky Users user guide
 
-Status: **target user experience; not a deployment claim**
+Status: **published user experience; independent real-tenant acceptance pending**
 
 Audience: MSP owners, administrators, and technicians
 
@@ -16,6 +16,12 @@ The Identity Risk screen has two independent channels:
 One channel does not replace or change the other. A missing Microsoft result does
 not make a HawkView result disappear. A HawkView result does not change
 Microsoft's severity or lifecycle.
+
+The public assessment route and new HawkView card have been independently
+observed after owner publication. The exact clean frontend source revision was
+not proven by that publication evidence. No independent privacy-authorized
+real-tenant review has established source readiness or findings, so examples in
+this guide remain interpretation guidance rather than tenant results.
 
 ## Read a HawkView reason
 
