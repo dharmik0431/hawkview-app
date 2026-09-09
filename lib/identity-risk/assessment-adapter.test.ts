@@ -83,6 +83,7 @@ test('qualified positives remain visible with partial coverage or unavailable ma
     freshness: 'UNKNOWN',
     limitation: 'Only qualified authentication findings are available.',
   })
+  value.summary.currentUsers = { value: 1, accuracy: 'AT_LEAST' }
   const result = adaptRiskAssessmentResponse(value, assessmentNow)
   assert.ok(result)
   assert.equal(result.users.length, 1)
@@ -99,6 +100,7 @@ test('outage and old historical findings do not become resolved or disappear', (
   })
   value.users[0].priority = null
   value.users[0].findings[0].activityState = 'HISTORICAL'
+  value.summary.currentUsers = { value: null, accuracy: 'UNKNOWN' }
   const result = adaptRiskAssessmentResponse(value, assessmentNow)
   assert.ok(result)
   assert.equal(result.users[0].findings[0].activityState, 'HISTORICAL')
@@ -147,6 +149,7 @@ test('empty success requires all current assessed rules, complete windows and a 
 test('exact identity references remain distinct despite identical display labels', () => {
   const value = assessmentFixture(true)
   value.users.push(assessmentUser('HV-ID-AUTH-010.v1', 'b'))
+  value.summary.currentUsers.value = 2
   assert.equal(
     adaptRiskAssessmentResponse(value, assessmentNow)?.users.length,
     2
@@ -255,4 +258,132 @@ test('normal authorized policy vocabulary is not mistaken for a secret value', (
       'password=synthetic-secret'
     assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
   }
+})
+
+test('accepts old assessment responses without a summary but never invents one', () => {
+  const value = assessmentFixture(true)
+  delete value.summary
+  const result = adaptRiskAssessmentResponse(value, assessmentNow)
+  assert.ok(result)
+  assert.equal(result.summary, null)
+  assert.equal(result.users.length, 1)
+})
+
+test('accepts backend-realistic lower bounds and conservative unknown summaries', () => {
+  const partial = assessmentFixture(true)
+  Object.assign(partial.meta, {
+    capability: 'PARTIAL',
+    freshness: 'UNKNOWN',
+    limitation: 'Coverage is limited to individually reported evidence.',
+  })
+  Object.assign(partial.rules[2], {
+    status: 'PARTIAL',
+    reasonCode: 'INCOMPLETE_WINDOW',
+    countsCapped: true,
+  })
+  partial.summary.currentUsers = { value: 1, accuracy: 'AT_LEAST' }
+  assert.equal(
+    adaptRiskAssessmentResponse(partial, assessmentNow)?.summary?.currentUsers
+      .accuracy,
+    'AT_LEAST'
+  )
+
+  const conservative = assessmentFixture(true)
+  conservative.summary.currentUsers = { value: null, accuracy: 'UNKNOWN' }
+  assert.equal(
+    adaptRiskAssessmentResponse(conservative, assessmentNow)?.summary
+      ?.currentUsers.accuracy,
+    'UNKNOWN'
+  )
+})
+
+test('rejects malformed or contradictory tenant count summaries', () => {
+  class UnsafeSummary {
+    scope = 'TENANT'
+    asOf = at()
+    currentUsers = { value: 1, accuracy: 'EXACT' }
+  }
+  const malformed = [
+    {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: { value: 1, accuracy: 'EXACT' },
+      extra: true,
+    },
+    new UnsafeSummary(),
+    {
+      scope: 'WORKSPACE',
+      asOf: at(),
+      currentUsers: { value: 1, accuracy: 'EXACT' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(30),
+      currentUsers: { value: 1, accuracy: 'EXACT' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(-1),
+      currentUsers: { value: 1, accuracy: 'EXACT' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: { value: -1, accuracy: 'EXACT' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: { value: 1.5, accuracy: 'EXACT' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: { value: 1_000_001, accuracy: 'EXACT' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: { value: 1, accuracy: 'UNKNOWN' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: { value: null, accuracy: 'EXACT' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: { value: null, accuracy: 'AT_LEAST' },
+    },
+    {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: { value: 0, accuracy: 'AT_LEAST' },
+    },
+  ]
+  for (const summary of malformed) {
+    const value = assessmentFixture(true)
+    value.summary = summary
+    assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
+  }
+
+  const belowReturned = assessmentFixture(true)
+  belowReturned.users.push(assessmentUser('HV-ID-AUTH-010.v1', 'b'))
+  belowReturned.summary.currentUsers.value = 1
+  assert.equal(adaptRiskAssessmentResponse(belowReturned, assessmentNow), null)
+})
+
+test('summary counts distinct current USER identities and excludes mailbox context', () => {
+  const value = assessmentFixture(true)
+  value.users[0].findings.push(
+    assessmentUser('HV-ID-AUTH-005.v2', 'b').findings[0]
+  )
+  value.users[0].priority = 'MEDIUM'
+  value.users.push(assessmentUser('HV-ID-MBX-001.v1', 'c'))
+  value.summary.currentUsers.value = 1
+  const result = adaptRiskAssessmentResponse(value, assessmentNow)
+  assert.ok(result)
+  assert.equal(result.summary?.currentUsers.value, 1)
+  assert.equal(result.users.length, 2)
 })

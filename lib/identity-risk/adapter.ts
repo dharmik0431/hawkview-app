@@ -16,6 +16,7 @@ import type {
   RiskAssessmentReason,
   RiskAssessmentRuleId,
   RiskAssessmentSource,
+  RiskAssessmentSummary,
   RiskAssessmentUser,
   RiskConditionalAccessPolicy,
   RiskEvidenceWindow,
@@ -1692,17 +1693,22 @@ export function adaptRiskAssessmentResponse(
   trustedCurrentTimeMs = Date.now()
 ): RiskAssessment | null {
   const source = record(value)
+  const rootKeys = [
+    'version',
+    'schemaVersion',
+    'meta',
+    'sources',
+    'rules',
+    'users',
+    'page',
+  ] as const
+  const hasSummary = Boolean(
+    source && Object.prototype.hasOwnProperty.call(source, 'summary')
+  )
   if (
     !source ||
-    !exactKeys(source, [
-      'version',
-      'schemaVersion',
-      'meta',
-      'sources',
-      'rules',
-      'users',
-      'page',
-    ])
+    (!exactKeys(source, rootKeys) &&
+      !exactKeys(source, [...rootKeys, 'summary']))
   )
     return null
   const rawMeta = record(source.meta)
@@ -1737,6 +1743,9 @@ export function adaptRiskAssessmentResponse(
         )
       : null
   const page = adaptPageInfo(source.page)
+  const summary = hasSummary
+    ? adaptAssessmentSummary(source.summary, trustedCurrentTimeMs)
+    : null
   if (
     !meta ||
     !sources ||
@@ -1748,7 +1757,8 @@ export function adaptRiskAssessmentResponse(
     !users ||
     users.some((item) => item === null) ||
     new Set(users.map((item) => item?.id)).size !== users.length ||
-    !page
+    !page ||
+    (hasSummary && !summary)
   )
     return null
   const sourceSet = new Set(
@@ -1795,6 +1805,29 @@ export function adaptRiskAssessmentResponse(
     meta.limitation =
       'Some checks lack complete current evidence. Review individual source and rule readiness.'
   }
+  const returnedCurrentUsers = new Set(
+    (users as RiskAssessmentUser[])
+      .filter(
+        (user) =>
+          user.subjectType === 'USER' &&
+          user.findings.some((finding) => finding.activityState === 'CURRENT')
+      )
+      .map((user) => user.id)
+  ).size
+  if (
+    summary &&
+    (summary.asOf !== meta.evaluatedAt ||
+      (summary.currentUsers.value !== null &&
+        summary.currentUsers.value < returnedCurrentUsers) ||
+      (summary.currentUsers.accuracy === 'EXACT' &&
+        (meta.status !== 'AVAILABLE' ||
+          meta.capability !== 'FULL' ||
+          meta.freshness !== 'CURRENT')) ||
+      (summary.currentUsers.accuracy === 'AT_LEAST' &&
+        (meta.status !== 'AVAILABLE' || meta.capability !== 'PARTIAL')))
+  ) {
+    return null
+  }
   return {
     version: 1,
     schemaVersion: assessmentSchema,
@@ -1803,6 +1836,47 @@ export function adaptRiskAssessmentResponse(
     rules: rules as RiskRuleReadiness[],
     users: users as RiskAssessmentUser[],
     page,
+    summary,
+  }
+}
+
+function adaptAssessmentSummary(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): RiskAssessmentSummary | null {
+  const source = record(value)
+  if (!source || !exactKeys(source, ['scope', 'asOf', 'currentUsers'])) {
+    return null
+  }
+  const currentUsers = record(source.currentUsers)
+  if (
+    source.scope !== 'TENANT' ||
+    !currentUsers ||
+    !exactKeys(currentUsers, ['value', 'accuracy'])
+  ) {
+    return null
+  }
+  const asOf = nullableDateTime(source.asOf, trustedCurrentTimeMs)
+  const count = nullableCount(currentUsers.value)
+  const accuracy = enumValue(currentUsers.accuracy, [
+    'EXACT',
+    'AT_LEAST',
+    'UNKNOWN',
+  ] as const)
+  if (
+    asOf === undefined ||
+    count === undefined ||
+    !accuracy ||
+    (accuracy === 'UNKNOWN' && count !== null) ||
+    (accuracy !== 'UNKNOWN' && (count === null || asOf === null)) ||
+    (accuracy === 'AT_LEAST' && count === 0)
+  ) {
+    return null
+  }
+  return {
+    scope: 'TENANT',
+    asOf,
+    currentUsers: { value: count, accuracy },
   }
 }
 
