@@ -10,7 +10,12 @@ import {
 } from '@nestjs/common'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { isIP } from 'node:net'
+import { projectAuthenticationAuditPageRow, reportedAuthenticationErrorCode } from './authentication-audit-projection.js'
+import { persistCompletedAuthenticationWindow } from '../identity-risk/authentication-window-collector.js'
+import { persistAuthenticationRecords } from '../identity-risk/authentication-ingestion-integrity.js'
 import { MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS } from '../identity-risk/mailbox-risk-projector.service.js'
+import { RiskAssessmentProjector } from '../identity-risk/risk-assessment-projector.service.js'
+import { selectedAuthenticationSource } from '../identity-risk/authentication-source-readiness.js'
 import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-runtime-config.js'
 import { RiskGlobalWorkStore } from '../identity-risk/risk-global-work-store.js'
 import { WrappedRiskKeyStore } from '../identity-risk/wrapped-risk-key-store.js'
@@ -617,24 +622,6 @@ function isManagementActivityLogin(record: any) {
   return /(login|logon|sign.?in)/.test(operation)
 }
 
-function managementActivityLoginSucceeded(record: any) {
-  const loginStatus =
-    record?.LoginStatus ??
-    managementActivityExtendedProperty(record, 'LoginStatus')
-  if (loginStatus !== undefined && loginStatus !== null && loginStatus !== '') {
-    return Number(loginStatus) === 0
-  }
-  const errorCode =
-    record?.ErrorCode ?? managementActivityExtendedProperty(record, 'ErrorCode')
-  if (errorCode !== undefined && errorCode !== null && errorCode !== '') {
-    return Number(errorCode) === 0
-  }
-  if (String(record?.Operation ?? '') === 'UserLoggedIn') return true
-  return ['success', 'succeeded'].includes(
-    String(record?.ResultStatus ?? '').toLowerCase()
-  )
-}
-
 interface GraphUser {
   id?: string
   displayName?: string | null
@@ -780,12 +767,6 @@ function projectInferredLocation(value: unknown): SignInLocation | null {
     geoCoordinates, source: 'MAXMIND_GEOLITE2',
   }
   return location.city || location.state || location.countryOrRegion || geoCoordinates ? location : null
-}
-
-/** Only diagnostic codes, never arbitrary provider prose or identifiers. */
-function safeLoginDiagnosticCode(value: unknown): string | null {
-  if (typeof value !== 'string' || value.length > 64) return null
-  return /^(?:AccountLocked|InvalidUserNameOrPassword|InvalidPassword|UserAccountNotFound|UserAccountDisabled|UserNotFound|PasswordExpired|InvalidGrant|MfaRequired|MFARequired|StrongAuthenticationRequired|InteractionRequired|ConditionalAccessBlocked|[0-9]{1,12})$/.test(value) ? value : null
 }
 
 const DEFAULT_MAILBOX_USER_PAGE_SIZE = 250
@@ -1603,6 +1584,8 @@ export class TenantSyncService {
     private readonly identityRiskEvaluationScheduler: IdentityRiskEvaluationScheduler | null = null,
     @Inject(MailboxRiskProjector)
     private readonly mailboxRiskProjector: MailboxRiskProjector | null = null,
+    @Inject(RiskAssessmentProjector)
+    private readonly riskAssessmentProjector: RiskAssessmentProjector | null = null,
   ) {}
 
   /**
@@ -1614,11 +1597,13 @@ export class TenantSyncService {
     id: string
     organizationId: string
   }, executionDeadlineAt?: number, globalAttemptId?: string) {
-    if (!this.identityRiskEvaluationScheduler || !this.mailboxRiskProjector) return
+    if (!this.identityRiskEvaluationScheduler || (!this.riskAssessmentProjector && !this.mailboxRiskProjector)) return
+    if (isGlobalRiskConfig(riskRuntimeConfig()) && !globalAttemptId) return this.runScopedPostSyncRisk(tenant)
     const evaluationAt = new Date()
     const windowStart = new Date(evaluationAt.getTime() - 24 * 60 * 60 * 1_000)
     try {
-      await runInSyncMemoryLane(() => this.identityRiskEvaluationScheduler!.runTenant({
+      await runInSyncMemoryLane(() => {
+      const request = {
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         engineVersion: IDENTITY_RISK_ENGINE_VERSION,
@@ -1628,10 +1613,12 @@ export class TenantSyncService {
         evaluationAt,
         executionDeadlineAt,
         globalAttemptId,
-        loadSources: () => this.mailboxRiskProjector!.load({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, evaluationAt,
+        loadSources: () => (this.riskAssessmentProjector ?? this.mailboxRiskProjector)!.load({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, evaluationAt,
           executionDeadlineAt === undefined ? undefined : executionDeadlineAt - 12_000),
-        approvedEvaluator: { readiness: 'READY', featureFlags: MAILBOX_FIRST_SLICE_FLAGS },
-      }))
+      }
+      return this.riskAssessmentProjector ? this.identityRiskEvaluationScheduler!.runAssessmentTenant(request)
+        : this.identityRiskEvaluationScheduler!.runTenant({...request,approvedEvaluator:{readiness:'READY',featureFlags:MAILBOX_FIRST_SLICE_FLAGS}})
+      })
     } catch {
       // Identity-risk shadow evaluation is isolated from tenant collection.
       this.logger.warn('Post-sync identity-risk evaluation failed.')
@@ -1639,10 +1626,29 @@ export class TenantSyncService {
     }
   }
 
+  /** Reuse the global lease/causal-head/key lifecycle for one completed source
+   * ingestion. No all-tenant scan, backfill, duplicate background task or GET work. */
+  private async runScopedPostSyncRisk(tenant:{id:string;organizationId:string}) {
+    const config=riskRuntimeConfig()
+    if(!isGlobalRiskConfig(config)||!this.riskAssessmentProjector)return
+    try { await tryInSyncMemoryLane(async()=>{
+      const deadline=Date.now()+45_000, store=new RiskGlobalWorkStore()
+      const lease=await store.claimCycle(Math.min(deadline,Date.now()+2000))
+      if(!lease)return
+      try{
+        const scope={organizationId:tenant.organizationId,customerTenantId:tenant.id,environment:config.environment}
+        const attemptId=await store.recordAttempt(scope,lease,Math.min(deadline,Date.now()+2000))
+        await new WrappedRiskKeyStore().ensureVersion(scope,Math.min(deadline,Date.now()+4000))
+        await this.runPostSyncIdentityRiskEvaluation(tenant,deadline-2000,attemptId)
+      }catch{this.logger.warn('Post-ingestion identity-risk evaluation unavailable.')}
+      finally{if(deadline-Date.now()>100)try{await store.releaseCycle(lease,Math.min(deadline,Date.now()+1000))}catch{/* Existing lease expiry provides recovery. */}}
+    }) } catch { this.logger.warn('Post-ingestion identity-risk evaluation unavailable.') }
+  }
+
   /** Exactly one global risk path, independent of collector selection. No
    * enqueue behind interactive work: busy lane defers with cursor unchanged. */
   async runScheduledGlobalRiskCycle(requestDeadlineAt: number) {
-    if (!this.identityRiskEvaluationScheduler || !this.mailboxRiskProjector ||
+    if (!this.identityRiskEvaluationScheduler || (!this.riskAssessmentProjector && !this.mailboxRiskProjector) ||
       !isGlobalRiskConfig(riskRuntimeConfig())) return
     const store = new RiskGlobalWorkStore()
     const keys = new WrappedRiskKeyStore()
@@ -4033,7 +4039,7 @@ export class TenantSyncService {
   }
 
   private async syncSignInLogs(tenant: TenantSyncTarget, accessToken: string, enrichmentLimits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS) {
-    return this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
+    await this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
       const start = await this.logSyncStart(tenant.id, 'SIGN_INS')
       const end = new Date()
       const entitlement = await this.signInEntitlement(tenant)
@@ -4133,10 +4139,7 @@ export class TenantSyncService {
           expiresAt,
         }))
       if (records.length > 0) {
-        await this.prisma.signInLog.createMany({
-          data: records as never,
-          skipDuplicates: true,
-        })
+        await persistAuthenticationRecords(this.prisma, {organizationId:tenant.organizationId,customerTenantId:tenant.id}, records as never)
       }
       if (limited && enrichment.locations.size > 0) {
         const history = await this.backfillLimitedSignInLocations(tenant, enrichment.locations, enrichmentLimits, enrichmentDeadline)
@@ -4146,6 +4149,10 @@ export class TenantSyncService {
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
+      if (records.length !== rows.length) throw new CollectionPartialError('sign-ins-record-validation-partial',
+        'Some Microsoft authentication records could not be validated. Authentication evidence coverage remains incomplete.')
+      await persistCompletedAuthenticationWindow(this.prisma, { organizationId: tenant.organizationId, customerTenantId: tenant.id },
+        limited ? 'M365_AUDIT_STS' : 'GRAPH_SIGN_INS', start, end, true)
       if (limitedReason) {
         // Primary limited-source ingestion succeeded. Its freshness stamp may
         // advance, but RUNNING + the partial code must never imply complete
@@ -4158,6 +4165,11 @@ export class TenantSyncService {
         throw limitedReason
       }
     })
+    try { if (this.riskAssessmentProjector && isGlobalRiskConfig(riskRuntimeConfig())) {
+      const proof=await this.prisma.syncState.findFirst({where:{organizationId:tenant.organizationId,customerTenantId:tenant.id,resourceType:'SIGN_INS'},
+        select:{status:true,lastSuccessfulAt:true,lastAttemptAt:true,lastErrorCode:true}})
+      if(selectedAuthenticationSource(proof))await this.runScopedPostSyncRisk(tenant)
+    } } catch { this.logger.warn('Post-ingestion identity-risk evaluation unavailable.') }
   }
 
   private async signInEntitlement(
@@ -4508,21 +4520,7 @@ export class TenantSyncService {
       )
       const content = await budget.read(response)
       if (!Array.isArray(content)) throw new Error('Microsoft activity content returned an invalid bounded response.')
-      const projected = content.map((value) => {
-        const row = closedFields(value, ['RecordType', 'Operation', 'LoginStatus', 'ErrorCode', 'ResultStatus', 'Id', 'CreationTime', 'UserId', 'ObjectId', 'UserKey', 'UserDisplayName', 'Country', 'CountryOrRegion', 'City', 'Application', 'Workload', 'ClientIP'])
-        if (plainRecord(value)) {
-          const diagnostic = safeLoginDiagnosticCode(value.LogonError)
-          if (diagnostic) row.LogonError = diagnostic
-          if (Array.isArray(value.ExtendedProperties)) row.ExtendedProperties = value.ExtendedProperties.flatMap((item) => {
-            if (!plainRecord(item) || typeof item.Name !== 'string') return []
-            const name = item.Name.toLowerCase()
-            if (['loginstatus', 'errorcode'].includes(name)) return [closedFields(item, ['Name', 'Value'])]
-            const code = ['loginerror', 'logonerror'].includes(name) ? safeLoginDiagnosticCode(item.Value) : null
-            return code ? [{ Name: item.Name, Value: code }] : []
-          })
-        }
-        return row
-      })
+      const projected = content.map(projectAuthenticationAuditPageRow)
       budget.retain(projected)
       records.push(...projected)
     }
@@ -4536,7 +4534,8 @@ export class TenantSyncService {
           Number.isFinite(new Date(record.CreationTime).getTime())
       )
       .map((record) => {
-        const succeeded = managementActivityLoginSucceeded(record)
+        const reportedErrorCode = reportedAuthenticationErrorCode(record)
+        const succeeded = reportedErrorCode === 0
         const userPrincipalName =
           typeof record.UserId === 'string' ? record.UserId.toLowerCase() : null
         const countryOrRegion =
@@ -4560,11 +4559,11 @@ export class TenantSyncService {
               ? record.UserDisplayName
               : null,
           userPrincipalName,
-          appId: null,
+          appId: typeof record.ApplicationId === 'string' ? record.ApplicationId : null,
           appDisplayName:
             typeof record.Application === 'string'
               ? record.Application
-              : 'Microsoft 365',
+              : null,
           resourceDisplayName: record.Workload ?? null,
           ipAddress:
             typeof record.ClientIP === 'string' ? record.ClientIP : null,
@@ -4573,9 +4572,7 @@ export class TenantSyncService {
           isInteractive: null,
           riskLevelAggregated: null,
           status: {
-            errorCode: succeeded
-              ? 0
-              : String(record.LoginStatus ?? record.ErrorCode ?? 1),
+            errorCode: reportedErrorCode,
             failureReason: succeeded
               ? null
               : String(

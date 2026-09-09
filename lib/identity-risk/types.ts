@@ -47,7 +47,13 @@ export type HawkViewIdentityFinding = {
 export type MicrosoftEntraRiskyUser = {
   id: string
   identityLabel: string
-  riskLevel: 'none' | 'low' | 'medium' | 'high' | 'hidden' | 'unknownFutureValue'
+  riskLevel:
+    | 'none'
+    | 'low'
+    | 'medium'
+    | 'high'
+    | 'hidden'
+    | 'unknownFutureValue'
   riskState:
     | 'none'
     | 'atRisk'
@@ -99,4 +105,217 @@ export type MicrosoftEntraRiskyUsersView = {
 export type IdentityRiskViewModel = {
   hawkView: HawkViewIdentitySignalsView
   microsoft: MicrosoftEntraRiskyUsersView
+}
+
+export const RISK_ASSESSMENT_SCHEMA = 'hawkview-risk-assessment/v1' as const
+export const RISK_ASSESSMENT_RULE_IDS = [
+  'HV-ID-AUTH-010.v1',
+  'HV-ID-AUTH-005.v2',
+  'HV-ID-MBX-001.v1',
+] as const
+
+export const RISK_ASSESSMENT_RULE_TUPLES = {
+  'HV-ID-AUTH-010.v1': {
+    version: 'v1',
+    priority: 'LOW',
+    sources: ['M365_AUDIT_STS', 'GRAPH_SIGN_INS'],
+  },
+  'HV-ID-AUTH-005.v2': {
+    version: 'v2',
+    priority: 'MEDIUM',
+    sources: ['M365_AUDIT_STS', 'GRAPH_SIGN_INS'],
+  },
+  'HV-ID-MBX-001.v1': {
+    version: 'v1',
+    priority: 'HIGH',
+    sources: ['MAILBOX_RULES'],
+  },
+} as const
+
+export type RiskAssessmentRuleId = (typeof RISK_ASSESSMENT_RULE_IDS)[number]
+export type RiskAssessmentSource =
+  | 'M365_AUDIT_STS'
+  | 'GRAPH_SIGN_INS'
+  | 'MAILBOX_RULES'
+export type RiskAssessmentReadiness =
+  | 'READY'
+  | 'PARTIAL'
+  | 'WAITING'
+  | 'MISSING_PERMISSION'
+  | 'LICENSE_REQUIRED'
+  | 'STALE'
+  | 'FAILED'
+  | 'INSUFFICIENT_FIELDS'
+  | 'UNSUPPORTED'
+  | 'DISABLED'
+export type RiskAssessmentReason =
+  | 'READY'
+  | 'WAITING_FOR_COLLECTION'
+  | 'MISSING_PERMISSION'
+  | 'LICENSE_REQUIRED'
+  | 'COLLECTION_FAILED'
+  | 'COLLECTION_STALE'
+  | 'INCOMPLETE_WINDOW'
+  | 'SOURCE_UNAVAILABLE'
+  | 'INSUFFICIENT_FIELDS'
+  | 'USER_BINDING_UNRESOLVED'
+  | 'APPLICATION_BINDING_UNRESOLVED'
+  | 'CLIENT_SOURCE_UNQUALIFIED'
+  | 'UNSUPPORTED_RECORD'
+  | 'CONFLICTING_EVIDENCE'
+  | 'CAPACITY_LIMIT'
+  | 'EVALUATION_FAILED'
+  | 'EVALUATION_DISABLED'
+  | 'KEY_UNAVAILABLE'
+  | 'DIRECTORY_SYNC_MISSING'
+  | 'DIRECTORY_SYNC_NOT_SUCCEEDED'
+  | 'DIRECTORY_SYNC_UNDATED'
+  | 'DIRECTORY_SYNC_STALE'
+  | 'DIRECTORY_SYNC_NEWER_ATTEMPT'
+  | 'RULE_ENDPOINT_NOT_FOUND'
+  | 'RULE_VALIDATION_UNATTESTABLE'
+  | 'SOURCE_NOT_ATTESTED'
+  | 'ATTESTED_COMPLETE'
+
+export type RiskEvidenceWindow = {
+  start: string | null
+  end: string | null
+}
+
+export type RiskSourceReadiness = {
+  source: RiskAssessmentSource
+  status: RiskAssessmentReadiness
+  reasonCode: RiskAssessmentReason
+  explanation: string
+  window: RiskEvidenceWindow
+  lastSuccessfulCollectionAt: string | null
+  latestEventAt: string | null
+  latestIngestionAt: string | null
+  freshness: IdentityRiskFreshness
+}
+
+export type RiskRuleReadiness = {
+  ruleId: RiskAssessmentRuleId
+  ruleVersion: string
+  title: string
+  status: RiskAssessmentReadiness
+  reasonCode: RiskAssessmentReason
+  explanation: string
+  selectedSource: RiskAssessmentSource | null
+  window: RiskEvidenceWindow
+  evaluatedAt: string | null
+  assessedIdentities: number | null
+  matchedIdentities: number | null
+  countsCapped: boolean
+}
+
+export type RiskConditionalAccessPolicy = {
+  id: string
+  name: string
+  state: 'ENABLED' | 'REPORT_ONLY' | 'DISABLED'
+  outcome: 'UNIVERSAL' | 'CONDITIONAL' | 'NOT_ENFORCED'
+  materialConditions: string[]
+}
+
+export type RiskProtection = {
+  conditionalAccess: {
+    contractVersion: 1
+    status:
+      | 'COVERED_BY_CONDITIONAL_ACCESS'
+      | 'CONDITIONALLY_COVERED'
+      | 'REPORT_ONLY'
+      | 'NOT_COVERED'
+      | 'UNKNOWN'
+    policies: RiskConditionalAccessPolicy[]
+    observedAt: string | null
+    evaluatedAt: string | null
+    source: 'EFFECTIVE_MFA_V1'
+    freshness: IdentityRiskFreshness
+    reasonCodes: string[]
+  }
+  securityDefaults: RiskProtectionEvidence<'ENABLED' | 'DISABLED'>
+  legacyPerUserMfa: RiskProtectionEvidence<'ENFORCED' | 'ENABLED' | 'DISABLED'>
+  registration: RiskProtectionEvidence<'REGISTERED' | 'NOT_REGISTERED'>
+  explanation: string
+}
+
+export type RiskProtectionEvidence<State extends string> = {
+  state: State | 'UNKNOWN'
+  source: 'MICROSOFT_GRAPH' | 'EFFECTIVE_MFA_V1' | 'NOT_REPORTED'
+  observedAt: string | null
+  freshness: IdentityRiskFreshness
+  reasonCode:
+    | 'VERIFIED'
+    | 'NOT_REPORTED'
+    | 'STALE'
+    | 'FAILED'
+    | 'MISSING_PERMISSION'
+    | 'INCOMPLETE'
+}
+
+export type RiskRecommendedAction = {
+  code:
+    | 'CONFIRM_EXPECTED_ACTIVITY'
+    | 'REVIEW_SIGN_INS'
+    | 'CHECK_SAVED_CREDENTIALS'
+    | 'VERIFY_MFA_ENFORCEMENT'
+    | 'REVIEW_MAILBOX_FORWARDING'
+    | 'FOLLOW_INCIDENT_PROCEDURE'
+  text: string
+}
+
+export type RiskAssessmentFinding = {
+  id: string
+  ruleId: RiskAssessmentRuleId
+  ruleVersion: string
+  priority: 'LOW' | 'MEDIUM' | 'HIGH'
+  confidence: 'LOW' | 'MEDIUM' | 'HIGH'
+  activityState: 'CURRENT' | 'HISTORICAL' | 'UNKNOWN'
+  title: string
+  explanation: string
+  firstSeen: string
+  lastSeen: string
+  evaluatedAt: string
+  activityWindowEndsAt: string
+  window: RiskEvidenceWindow
+  evidenceCount: number
+  evidenceCountCapped: boolean
+  selectedSource: RiskAssessmentSource
+  application: {
+    id: string | null
+    state: 'RESOLVED' | 'NOT_REPORTED'
+    label: string | null
+  }
+  device: { state: 'NOT_REPORTED' | 'INSUFFICIENT_FIELDS'; label: null }
+  clientSource: {
+    reference: string | null
+    qualification: 'QUALIFIED' | 'NOT_REPORTED' | 'INSUFFICIENT_FIELDS'
+  }
+  evidenceReferences: Array<{
+    id: string
+    recordedAt: string
+    ingestedAt: string | null
+  }>
+  eventProtection: 'MFA_SATISFIED' | 'BLOCKED_BY_POLICY' | 'NOT_REPORTED'
+  caveats: string[]
+  recommendedActions: RiskRecommendedAction[]
+}
+
+export type RiskAssessmentUser = {
+  id: string
+  label: string
+  subjectType: 'USER' | 'MAILBOX'
+  priority: 'LOW' | 'MEDIUM' | 'HIGH' | null
+  protection: RiskProtection
+  findings: RiskAssessmentFinding[]
+}
+
+export type RiskAssessment = {
+  version: 1
+  schemaVersion: typeof RISK_ASSESSMENT_SCHEMA
+  meta: IdentityRiskChannelMeta
+  sources: RiskSourceReadiness[]
+  rules: RiskRuleReadiness[]
+  users: RiskAssessmentUser[]
+  page: IdentityRiskPageInfo
 }

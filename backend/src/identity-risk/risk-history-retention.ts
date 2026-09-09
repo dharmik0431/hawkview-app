@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type pg from 'pg'
-import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
+import { withRiskRetentionTransaction } from './mailbox-read-transaction.js'
 import { RISK_UUID } from './pilot-risk-config.js'
 
 // Fixed limits, not operator-tunable. Only IDs/counts cross the SQL boundary.
@@ -49,7 +49,7 @@ const eligible = `r.status IN ('COMPLETED','FAILED')
 
 export class RiskHistoryRetention {
   private tx<T>(deadline: number, work: (client: pg.Client) => Promise<T>) {
-    return withRiskKeyTransaction(Math.min(deadline, Date.now() + HISTORY_TRANSACTION_MS), work)
+    return withRiskRetentionTransaction(Math.min(deadline, Date.now() + HISTORY_TRANSACTION_MS), work)
   }
 
   async claim(config: Config, deadline: number): Promise<Lease | null> {

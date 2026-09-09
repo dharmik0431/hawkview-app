@@ -65,6 +65,14 @@ const mailbox = (
 })
 
 export const IDENTITY_RISK_RULE_CATALOG = Object.freeze({
+  'HV-ID-AUTH-010.v1': activity(
+    'Repeated invalid-credential attempts',
+    'At least 10 distinct invalid-credential attempts were recorded for one resolved account and application within 15 minutes. No successful access is established.',
+  ),
+  'HV-ID-AUTH-005.v2': activity(
+    'Invalid credentials followed by successful sign-in',
+    'At least 5 distinct invalid-credential failures preceded verified success within 10 minutes for the same resolved account, application and qualified client address; the last failure was within 2 minutes.',
+  ),
   'HV-ID-EXP-001.v1': access(
     'Privileged identity has an MFA enforcement gap',
     'Current evidence did not verify effective MFA enforcement for a privileged identity. This is an exposure finding, not proof of compromise.',

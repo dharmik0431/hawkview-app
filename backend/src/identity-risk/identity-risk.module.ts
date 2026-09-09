@@ -12,6 +12,8 @@ import { IdentityRiskPseudonymProvider } from './identity-risk-pseudonym.js'
 import { MailboxRiskProjector } from './mailbox-risk-projector.service.js'
 import { createPilotPseudonymProvider, IDENTITY_RISK_MANAGED_MAC_TRANSPORT } from './pilot-pseudonym-provider.js'
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
+import { RiskAssessmentProjector } from './risk-assessment-projector.service.js'
+import { RiskAssessmentReader } from './risk-assessment-reader.service.js'
 
 @Module({
   controllers: [IdentityRiskController],
@@ -20,6 +22,8 @@ import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.j
     { provide: IdentityRiskPseudonymProvider, useFactory: createPilotPseudonymProvider, inject: [IDENTITY_RISK_MANAGED_MAC_TRANSPORT] },
     MailboxInvestigationResolver,
     MailboxRiskProjector,
+    RiskAssessmentProjector,
+    RiskAssessmentReader,
     IdentityRiskService,
     IdentityRiskSafetyService,
     IdentityRiskPlatformClock,
@@ -29,6 +33,7 @@ import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.j
   ],
   exports: [
     MailboxRiskProjector,
+    RiskAssessmentProjector,
     IdentityRiskEvaluationScheduler,
     IdentityRiskSafetyService,
     IdentityRiskMaintenanceService,

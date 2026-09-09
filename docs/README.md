@@ -12,6 +12,9 @@ This directory supplements the engineer-facing [root README](../README.md). Link
 | [Derived-history retention](identity-risk-history-retention.md) | Database, privacy, and release operators | 90-day policy, limited physical-cleanup coverage, and staged controls |
 | [Key recovery](identity-risk-recovery.md) | Security and recovery operators | Recovery order, custody limitations, and synthetic drill |
 | [Engine specification](hawkview-identity-risk-engine-v1.md) | Product and engineering | Broader design; only implemented slices may be described as current |
+| [Risky Users rule catalog](identity-risk-rule-catalog.md) | Product, engineering, QA, and support | Target rules, thresholds, evidence requirements, and false-positive limits |
+| [Risky Users user guide](identity-risk-user-guide.md) | MSP owners, administrators, and technicians | How to interpret reasons, coverage, protection, and next steps |
+| [Risky Users operations](identity-risk-operations.md) | Release, support, security, and on-call | Acceptance, troubleshooting, release verification, and stop conditions |
 
 Operator procedures are restricted internal material. Do not expose Swagger, debug/admin endpoints, secret-bearing commands, database connections, private custody locations, or internal state through customer-facing UI or public help content.
 

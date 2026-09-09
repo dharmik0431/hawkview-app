@@ -5,6 +5,9 @@ import { IdentityRiskService } from './identity-risk.service.js'
 @Controller('api/tenants/:tenantId')
 export class IdentityRiskController {
   constructor(@Inject(IdentityRiskService) private readonly service: IdentityRiskService) {}
+  @Get('identity-signals/assessment')
+  @Header('Cache-Control', 'no-store')
+  assessment(@Req() req: AuthenticatedRequest, @Param('tenantId') id: string) { return this.service.assessment(req.auth,id) }
   @Get('identity-signals/summary') summary(@Req() req: AuthenticatedRequest, @Param('tenantId') id: string) { return this.service.summary(req.auth, id) }
   @Get('identity-signals/findings')
   findings(

@@ -1,5 +1,6 @@
 import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common'
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
+import { RiskAssessmentReader, unavailableAssessment } from './risk-assessment-reader.service.js'
 import { riskRuntimeConfig, riskScopeAllowed } from './risk-runtime-config.js'
 import { isGlobalRiskConfig } from './risk-runtime-config.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
@@ -281,6 +282,7 @@ export class IdentityRiskService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Optional() @Inject(MailboxInvestigationResolver)
     private readonly mailboxResolver?: MailboxInvestigationResolver,
+    @Optional() @Inject(RiskAssessmentReader) private readonly assessmentReader?: RiskAssessmentReader,
   ) {}
 
   private async utcRead<T>(read: (transaction: Prisma.TransactionClient) => Promise<T>): Promise<T> {
@@ -403,6 +405,23 @@ export class IdentityRiskService {
     }
     return run
     })
+  }
+
+  async assessment(identity:AuthenticatedIdentity,tenantId:string) {
+    const tenant=await this.scope(identity,tenantId)
+    const now=new Date()
+    if(!pilotReadAllowed(tenant)||(await this.currentControls(tenant)).evaluationHardDisabled)return unavailableAssessment('EVALUATION_DISABLED',now)
+    const run=await this.latestRun(tenant,now)
+    if(!run||!this.assessmentReader)return unavailableAssessment('WAITING_FOR_COLLECTION',now)
+    let result
+    try{result=await this.assessmentReader.read({organizationId:tenant.organizationId,customerTenantId:tenant.id},run,now,tenant.evidenceDetailAllowed)}
+    catch{return unavailableAssessment('EVALUATION_FAILED',now)}
+    const refreshed=await this.scope(identity,tenantId)
+    if(refreshed.organizationId!==tenant.organizationId||refreshed.evidenceDetailAllowed!==tenant.evidenceDetailAllowed||!pilotReadAllowed(refreshed)||
+      (await this.currentControls(refreshed)).evaluationHardDisabled)return unavailableAssessment('EVALUATION_DISABLED',now)
+    const latest=await this.latestRun(refreshed,now)
+    if(latest?.id!==run.id||latest?.completedAt?.getTime()!==run.completedAt?.getTime())return unavailableAssessment('EVALUATION_FAILED',now)
+    return result
   }
 
   async summary(identity: AuthenticatedIdentity, tenantId: string) {
@@ -610,6 +629,7 @@ export class IdentityRiskService {
     })
     const rows = await this.utcRead((transaction) => transaction.identityRiskFinding.findMany({
       where: {
+        state: { not: 'UNKNOWN' },
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         expiresAt: { gt: now },
@@ -730,6 +750,7 @@ export class IdentityRiskService {
     }
     const row = await this.utcRead((transaction) => transaction.identityRiskFinding.findFirst({
       where: {
+        state: { not: 'UNKNOWN' },
         id: findingId,
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,

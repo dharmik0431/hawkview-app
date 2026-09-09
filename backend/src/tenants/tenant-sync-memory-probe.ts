@@ -289,6 +289,7 @@ const nonpremiumPrisma: any = {
   syncState: { upsert: async () => ({ lastSuccessfulAt: new Date('2026-01-01') }), update: async ({ data }: any) => { nonpremiumFinalState = data; return { consecutiveFailures: 0 } } },
   signInLog: { findFirst: async () => null, createMany: async ({ data }: any) => { nonpremiumCreates += data.length }, deleteMany: async () => undefined, findMany: async () => { throw new Error('UNBOUNDED_HISTORY_READ') } },
   $transaction: async (work: (transaction: any) => Promise<unknown>) => work({
+    ...authenticationCollectorTransaction(nonpremiumPrisma.signInLog.createMany),
     $queryRaw: async (query: any) => {
       if (query.strings.join('').includes('set_config')) {
         if (!(Number(query.values[0]) > 0 && Number(query.values[0]) <= LIMITED_SIGN_IN_ENRICHMENT_LIMITS.statementTimeoutMs)) throw new Error('INVALID_STATEMENT_TIMEOUT')
@@ -306,7 +307,7 @@ const nonpremiumPrisma: any = {
       peakRss = Math.max(peakRss, process.memoryUsage().rss)
       return page
     },
-    signInLog: { updateMany: async ({ where }: any) => {
+    signInLog: { ...authenticationCollectorTransaction(nonpremiumPrisma.signInLog.createMany).signInLog, updateMany: async ({ where }: any) => {
       if (where.organizationId !== 'synthetic-org' || where.customerTenantId !== 'synthetic-tenant' || !where.expiresAt.gt || !where.location) throw new Error('HISTORY_UPDATE_SCOPE_MISSING')
       activeHistoryUpdates++; maximumHistoryUpdates = Math.max(maximumHistoryUpdates, activeHistoryUpdates)
       await new Promise<void>(resolve => setImmediate(resolve))
@@ -372,3 +373,4 @@ console.log(`HAWKVIEW_MEMORY_PROBE=${JSON.stringify({
   nonpremiumPrimaryEvidenceTimestamp: nonpremiumFinalState.lastSuccessfulAt instanceof Date,
   nonpremiumAdvancedCompleteBaseline: nonpremiumFinalState.status === 'SUCCEEDED' || Object.hasOwn(nonpremiumFinalState, 'deltaLink'),
 })}`)
+import { authenticationCollectorTransaction } from './authentication-collector.test-fixtures.js'
