@@ -99,10 +99,10 @@ test('future server-paged input is never mistaken for a generation total', () =>
   assert.deepEqual(count({ ...data, page: { hasMore: false, nextCursor: 'synthetic' } }), unknown)
 })
 test('existing 100-subject/200-finding caps fail closed without raising limits or hydrating more rows', () => {
-  assert.deepEqual(count(fixture(Array.from({ length: 100 }, (_, n) => user(n + 1)))), { value: 100, accuracy: 'EXACT' })
-  assert.deepEqual(count(fixture([user(1, Array.from({ length: 200 }, () => finding()))])), { value: 1, accuracy: 'EXACT' })
-  assert.deepEqual(count(fixture(Array.from({ length: 101 }, (_, n) => user(n + 1)))), unknown)
-  assert.deepEqual(count(fixture([user(1, Array.from({ length: 201 }, () => finding()))])), unknown)
+  assert.deepEqual(count(fixture(Array.from({ length: 100 }, (_, n) => user(n + 1, [{ ...finding(), id: ref(n + 1, 'contribution') }])))), { value: 100, accuracy: 'EXACT' })
+  assert.deepEqual(count(fixture([user(1, Array.from({ length: 200 }, (_, n) => ({ ...finding(), id: ref(n + 1, 'contribution') })))])), { value: 1, accuracy: 'EXACT' })
+  assert.deepEqual(count(fixture(Array.from({ length: 101 }, (_, n) => user(n + 1, [{ ...finding(), id: ref(n + 1, 'contribution') }])))), unknown)
+  assert.deepEqual(count(fixture([user(1, Array.from({ length: 201 }, (_, n) => ({ ...finding(), id: ref(n + 1, 'contribution') })))])), unknown)
 })
 
 test('any unqualified returned CURRENT user finding makes the whole count unknown rather than subtracting it', () => {
