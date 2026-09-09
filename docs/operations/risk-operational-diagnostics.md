@@ -32,7 +32,30 @@ collection admission, source evidence or memory protections.
 Cycle reasons: `CONFIG_UNAVAILABLE`, `MAINTENANCE_DEFERRED`,
 `ADMISSION_BUDGET_EXHAUSTED`, `DEPENDENCY_UNAVAILABLE`, `MEMORY_LANE_BUSY`,
 `LEASE_BUSY`, `NO_ELIGIBLE_WORK`, `ATTEMPT_FAILED`, `RETURNED_UNCOMMITTED`,
-`COMMITTED`.
+`COMMITTED`, `CANDIDATE_INELIGIBLE`, `CYCLE_CLAIM_FAILED`,
+`SCOPE_SELECTION_FAILED`, `ATTEMPT_RECORD_FAILED`, `KEY_ENSURE_FAILED`,
+`EVALUATION_FAILED`.
+
+The five specific failure reasons identify the existing await boundary, never
+the thrown error or an affected tenant. They outrank generic `ATTEMPT_FAILED`
+(retained as controller/unknown fallback) and commits. Equal-priority specific
+failures preserve the first observed stage; a single record is not an exhaustive
+account of a mixed cycle.
+
+`CANDIDATE_INELIGIBLE` is observed only at the existing locked active-owner,
+active-tenant, or connected-connection rejection branches. It preserves the
+original rejection, cursor advancement and internal failed counter, with no new
+query or eligibility inference. It ranks below commits and all failures, so an
+expected skip cannot hide useful work or an unexpected failure. Hard-disable,
+configuration, wrapping root, key-history, ciphertext and query failures remain
+`KEY_ENSURE_FAILED`; that label is not evidence of a broken key. Observer failure
+does not change admission, transaction cleanup, key zeroization or throws.
+
+One next natural closed cycle record after independently verified deployment can
+distinguish expected eligibility rejection from an unexpected execution stage.
+It cannot identify a tenant, prove the backlog healthy, establish a root cause
+within a stage, or establish source/risky-user count correctness. Do not change
+keys, permissions or capacity on this stage label alone.
 
 `COMMITTED` is emitted only following the assessment evaluator's `COMPLETED`
 return, which follows successful resolution of its persistence transaction.

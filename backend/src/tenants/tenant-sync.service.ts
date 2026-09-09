@@ -1665,7 +1665,7 @@ export class TenantSyncService {
       nextScope: (lease, deadline) => store.nextScope(lease, deadline),
       releaseCycle: (lease, deadline) => store.releaseCycle(lease, deadline),
       recordAttempt: (scope, lease, deadline) => store.recordAttempt(scope, lease, deadline),
-      ensure: (scope, deadline) => keys.ensureVersion(scope, deadline),
+      ensure: (scope, deadline, ineligible) => keys.ensureVersion(scope, deadline, ineligible),
       evaluate: (scope, deadline, attemptId) => this.runPostSyncIdentityRiskEvaluation({ id: scope.customerTenantId, organizationId: scope.organizationId }, deadline, attemptId, diagnostic),
     }, requestDeadlineAt))
     if (result === undefined) observeCycle(diagnostic, 'MEMORY_LANE_BUSY')

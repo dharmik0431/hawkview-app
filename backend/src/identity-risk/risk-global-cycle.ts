@@ -12,7 +12,7 @@ type Dependencies = {
   nextScope: (lease: RiskCycleLease, deadline: number) => Promise<PseudonymScope | null>
   releaseCycle: (lease: RiskCycleLease, deadline: number) => Promise<void>
   recordAttempt: (scope: PseudonymScope, lease: RiskCycleLease, deadline: number) => Promise<string>
-  ensure: (scope: PseudonymScope, deadline: number) => Promise<unknown>
+  ensure: (scope: PseudonymScope, deadline: number, ineligible?: () => void) => Promise<unknown>
   evaluate: (scope: PseudonymScope, deadline: number, attemptId: string) => Promise<unknown>
   now?: () => number
   observe?: (reason: CycleReason) => void
@@ -29,7 +29,9 @@ export async function runGlobalRiskCycle(deps: Dependencies, requestDeadlineAt: 
     observeCycle(deps.observe, !isGlobalRiskConfig(riskRuntimeConfig()) ? 'CONFIG_UNAVAILABLE' : 'ADMISSION_BUDGET_EXHAUSTED')
     return { status: 'DEFERRED' as const, attempted: 0, completed: 0, failed: 0 }
   }
-  const lease = await deps.claimCycle(Math.min(deadline, now() + 2_000))
+  let lease: RiskCycleLease | null
+  try { lease = await deps.claimCycle(Math.min(deadline, now() + 2_000)) }
+  catch (error) { observeCycle(deps.observe, 'CYCLE_CLAIM_FAILED'); throw error }
   if (!lease) {
     observeCycle(deps.observe, 'LEASE_BUSY')
     return { status: 'BUSY' as const, attempted: 0, completed: 0, failed: 0 }
@@ -38,17 +40,23 @@ export async function runGlobalRiskCycle(deps: Dependencies, requestDeadlineAt: 
   try {
     while (attempted < RISK_GLOBAL_CANDIDATE_LIMIT && deadline - now() >= RISK_GLOBAL_ADMISSION_MS &&
       isGlobalRiskConfig(riskRuntimeConfig())) {
-      const scope = await deps.nextScope(lease, Math.min(deadline, now() + 2_000))
+      let scope: PseudonymScope | null
+      try { scope = await deps.nextScope(lease, Math.min(deadline, now() + 2_000)) }
+      catch (error) { observeCycle(deps.observe, 'SCOPE_SELECTION_FAILED'); throw error }
       if (!scope) { if (attempted === 0) observeCycle(deps.observe, 'NO_ELIGIBLE_WORK'); break }
       attempted++
+      let stage: CycleReason = 'ATTEMPT_RECORD_FAILED'
+      let ineligible = false
       try {
         const attemptId = await deps.recordAttempt(scope, lease, Math.min(deadline, now() + 2_000))
-        await deps.ensure(scope, Math.min(deadline, now() + 4_000))
+        stage = 'KEY_ENSURE_FAILED'
+        await deps.ensure(scope, Math.min(deadline, now() + 4_000), () => { ineligible = true })
         // Reserve transaction/cleanup time after bounded source materialization.
         if (deadline - now() < 15_000) { observeCycle(deps.observe, 'ADMISSION_BUDGET_EXHAUSTED'); break }
+        stage = 'EVALUATION_FAILED'
         await deps.evaluate(scope, deadline - 2_000, attemptId)
         completed++
-      } catch { failed++; observeCycle(deps.observe, 'ATTEMPT_FAILED') }
+      } catch { failed++; observeCycle(deps.observe, stage === 'KEY_ENSURE_FAILED' && ineligible ? 'CANDIDATE_INELIGIBLE' : stage) }
     }
     if (!isGlobalRiskConfig(riskRuntimeConfig())) observeCycle(deps.observe, 'CONFIG_UNAVAILABLE')
     else if (deadline - now() < RISK_GLOBAL_ADMISSION_MS) observeCycle(deps.observe, 'ADMISSION_BUDGET_EXHAUSTED')
