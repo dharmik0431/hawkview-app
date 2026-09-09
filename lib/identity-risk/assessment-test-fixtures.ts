@@ -89,6 +89,14 @@ export function assessmentFixture(withFinding = false): Record<string, any> {
     rules,
     users: withFinding ? [assessmentUser()] : [],
     page: { hasMore: false, nextCursor: null },
+    summary: {
+      scope: 'TENANT',
+      asOf: at(),
+      currentUsers: {
+        value: withFinding ? 1 : 0,
+        accuracy: 'EXACT',
+      },
+    },
   }
 }
 
@@ -100,7 +108,7 @@ export function assessmentUser(
   const mailbox = ruleId === 'HV-ID-MBX-001.v1'
   return {
     id: opaque(mailbox ? 'mailbox' : 'subject', character),
-    label: 'Synthetic resolved identity',
+    label: 'Synthetic identity',
     subjectType: mailbox ? 'MAILBOX' : 'USER',
     priority: tuple.priority,
     protection: unknownProtection(),

@@ -84,6 +84,87 @@ export function microsoftHasConfirmedEmptySnapshot(
   )
 }
 
+export function currentRiskAssessmentUsers(assessment: RiskAssessment) {
+  return assessment.users.filter(
+    (user) =>
+      user.subjectType === 'USER' &&
+      user.findings.some((finding) => finding.activityState === 'CURRENT')
+  )
+}
+
+export function hawkViewRiskyUserCountPresentation(assessment: RiskAssessment) {
+  const count = assessment.summary?.currentUsers
+  if (!count || count.accuracy === 'UNKNOWN' || count.value === null) {
+    return {
+      value: '—',
+      accessibleValue: 'Not available',
+      label: 'Risky user count unavailable',
+      detail:
+        'HawkView has not reported an authoritative distinct current-user total. This is not zero; available user findings remain listed below.',
+      exact: false,
+      asOf: assessment.summary?.asOf ?? null,
+    }
+  }
+  if (count.accuracy === 'AT_LEAST') {
+    return {
+      value: `≥${count.value.toLocaleString()}`,
+      accessibleValue: `At least ${count.value.toLocaleString()}`,
+      label: 'Risky users identified',
+      detail:
+        'This is a distinct-user lower bound from current findings. Partial coverage or capacity limits prevent a complete tenant count.',
+      exact: false,
+      asOf: assessment.summary?.asOf ?? null,
+    }
+  }
+  return {
+    value: count.value.toLocaleString(),
+    accessibleValue: count.value.toLocaleString(),
+    label: 'Risky users identified',
+    detail:
+      'Distinct users with at least one current HawkView finding in the reported tenant assessment. Multiple findings for one user count once.',
+    exact: true,
+    asOf: assessment.summary?.asOf ?? null,
+  }
+}
+
+export function microsoftRiskyUserCountPresentation(
+  view: MicrosoftEntraRiskyUsersView
+) {
+  if (microsoftHasConfirmedEmptySnapshot(view)) {
+    return {
+      value: '0',
+      accessibleValue: '0',
+      label: 'Microsoft records reported',
+      detail:
+        'The latest complete, current Microsoft snapshot is empty. This is not a HawkView safety verdict.',
+      exact: true,
+    }
+  }
+  if (!view.users || view.meta.status !== 'AVAILABLE') {
+    return {
+      value: '—',
+      accessibleValue: 'Not available',
+      label: 'Microsoft count unavailable',
+      detail:
+        'Microsoft has not reported a current count. Missing evidence must not be interpreted as zero.',
+      exact: false,
+    }
+  }
+  const returned = new Set(view.users.map((user) => user.id)).size
+  return {
+    value: view.pageInfo?.hasMore
+      ? `≥${returned.toLocaleString()}`
+      : returned.toLocaleString(),
+    accessibleValue: view.pageInfo?.hasMore
+      ? `At least ${returned.toLocaleString()}`
+      : returned.toLocaleString(),
+    label: 'Microsoft records shown',
+    detail:
+      'This is the returned Microsoft record count, not an active-risk total. Microsoft states such as at risk, remediated, dismissed, or confirmed safe remain distinct in the list.',
+    exact: view.pageInfo?.hasMore === false,
+  }
+}
+
 const missingEvidenceLabels: Readonly<Record<string, string>> = {
   ACCOUNT_CLASS_COVERAGE_INCOMPLETE:
     'Account classification coverage is incomplete',

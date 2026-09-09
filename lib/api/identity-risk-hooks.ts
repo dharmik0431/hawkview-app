@@ -19,7 +19,7 @@ export function useIdentityRiskChannels(tenantId: string, enabled: boolean) {
     queryKey: ['identity-risk', cacheScope, tenantId, 'hawkview-assessment'],
     queryFn: ({ signal }) =>
       apiClient.get(
-        `/api/tenants/${encodedTenantId}/identity-signals/assessment`,
+        `/api/tenants/${encodedTenantId}/identity-signals/assessment?includeSummary=true`,
         {
           signal,
         }

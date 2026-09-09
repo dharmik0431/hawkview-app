@@ -6,7 +6,10 @@ import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { useIdentityRiskChannels } from '@/lib/api/identity-risk-hooks'
 import { RiskAssessmentCard } from './risk-assessment-card'
-import { microsoftHasConfirmedEmptySnapshot } from '@/lib/identity-risk/presentation'
+import {
+  microsoftHasConfirmedEmptySnapshot,
+  microsoftRiskyUserCountPresentation,
+} from '@/lib/identity-risk/presentation'
 import type {
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
@@ -227,6 +230,7 @@ function MicrosoftCard({
   onRetry: () => void
 }) {
   const confirmedEmpty = microsoftHasConfirmedEmptySnapshot(view)
+  const count = microsoftRiskyUserCountPresentation(view)
 
   return (
     <section
@@ -263,6 +267,21 @@ function MicrosoftCard({
       </p>
 
       <div className="mt-4 space-y-4">
+        <div className="rounded-lg border border-violet-200 bg-violet-50/70 p-4 dark:border-violet-900 dark:bg-violet-950/30">
+          <p
+            className="text-4xl font-semibold tracking-tight text-slate-950 dark:text-slate-50"
+            aria-label={count.accessibleValue}
+          >
+            {count.value}
+          </p>
+          <p className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
+            {count.label}
+          </p>
+          <p className="mt-2 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+            {count.detail}
+          </p>
+        </div>
+
         <ChannelState meta={view.meta} />
 
         {view.users && view.users.length > 0 && (
@@ -314,7 +333,14 @@ function MicrosoftCard({
           </Button>
         )}
 
-        <ChannelMeta meta={view.meta} />
+        <details className="border-t border-slate-200 pt-4 dark:border-slate-800">
+          <summary className="cursor-pointer text-sm font-semibold">
+            Technical details
+          </summary>
+          <div className="mt-3">
+            <ChannelMeta meta={view.meta} />
+          </div>
+        </details>
       </div>
     </section>
   )
