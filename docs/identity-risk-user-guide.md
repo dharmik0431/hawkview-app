@@ -23,6 +23,38 @@ not proven by that publication evidence. No independent privacy-authorized
 real-tenant review has established source readiness or findings, so examples in
 this guide remain interpretation guidance rather than tenant results.
 
+## Read the user count
+
+The count-first presentation is a release candidate until its frontend and
+backend rollout are verified. It uses a backend-owned summary of the selected
+tenant's reported assessment, not the length of a displayed page or a sum of
+rule matches.
+
+- An **exact count** is the supported number of distinct resolved users with
+  current qualifying findings in the stated evaluated scope. One user with
+  several findings counts once. It does not mean all possible risks were checked.
+- **At least N** is a proven positive lower bound when coverage or retained
+  results are incomplete. More users may be affected.
+- **Not available** means a current count cannot be confirmed. Missing,
+  failed, stale, not-evaluated, or empty partial evidence is not zero.
+- **Zero** is valid only for a complete, current, uncapped assessment within
+  the stated scope. It is not a safety verdict.
+
+Historical and unknown-state findings do not contribute to the current count.
+Mailbox-only findings remain visible separately; they count toward a user only
+when the existing qualified mailbox-to-directory-user binding proves that
+association. Protection context does not subtract users from the count.
+
+Keep the assessment time and coverage qualification alongside the count.
+Rule and source diagnostics remain available in expandable details. A smaller
+displayed list must not be mistaken for the total; a missing summary from an
+older backend remains unavailable rather than falling back to counting rows.
+
+Microsoft's channel is independent. A paginated list containing dismissed,
+remediated, or other provider states is not an authoritative active-risk user
+total. Where that total is unavailable, disclose the limitation rather than
+adding Microsoft rows to the HawkView count.
+
 ## Read a HawkView reason
 
 Each reason should tell you:

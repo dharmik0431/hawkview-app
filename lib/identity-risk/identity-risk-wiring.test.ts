@@ -79,15 +79,18 @@ test('the Security tabs implement complete keyboard tab semantics', () => {
 test('bounded pages disclose when more records exist', () => {
   assert.match(section, /More HawkView findings are available/)
   assert.match(section, /More Microsoft risky-user records are available/)
-  assert.match(section, /must not be treated as a complete result set/)
+  assert.match(section, /incomplete result set/)
 })
 
 test('summary counts retain investigation and evaluation semantics', () => {
-  assert.match(section, /Identities with reported current findings/)
-  assert.match(section, /Findings in this page/)
-  assert.match(section, /Assessed \/ matched identities/)
+  assert.match(presentation, /Risky users identified/)
+  assert.match(presentation, /Risky user count unavailable/)
+  assert.match(presentation, /Multiple findings for one user count once/)
+  assert.match(section, /headline count comes from the tenant summary/)
   assert.match(section, /investigation priority/)
   assert.match(section, /Counts capped; scope incomplete/)
+  assert.match(section, /Technical details/)
+  assert.doesNotMatch(section, /Findings in this page/)
 })
 
 test('the UI distinguishes evaluated time and does not claim restricted detail support', () => {

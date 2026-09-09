@@ -124,6 +124,19 @@ export type RiskAssessmentUserDto = Readonly<{
   findings: readonly RiskAssessmentFindingDto[]
 }>
 
+/** Opt-in public summary of the authorized, bounded assessment, not all possible risk. */
+export type RiskAssessmentSummaryDto = Readonly<{
+  scope: 'TENANT'
+  asOf: string | null // Completed assessment timestamp, never request time.
+  currentUsers:
+    | Readonly<{ value: number; accuracy: 'EXACT' | 'AT_LEAST' }>
+    | Readonly<{ value: null; accuracy: 'UNKNOWN' }>
+}>
+
+export type RiskAssessmentWithSummaryDto = RiskAssessmentDto & Readonly<{
+  summary: RiskAssessmentSummaryDto
+}>
+
 /** GET /api/tenants/:tenantId/identity-signals/assessment; bounded persisted read.
  * Never evaluate source rules in GET. Microsoft remains its independent existing
  * /microsoft-entra-risky-users endpoint/DTO and cannot influence this response.

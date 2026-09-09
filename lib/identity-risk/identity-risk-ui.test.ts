@@ -4,7 +4,11 @@ import { createRequire } from 'node:module'
 import test from 'node:test'
 import * as adapter from './adapter.ts'
 import * as presentation from './presentation.ts'
-import { assessmentFixture, assessmentNow } from './assessment-test-fixtures.ts'
+import {
+  assessmentFixture,
+  assessmentNow,
+  assessmentUser,
+} from './assessment-test-fixtures.ts'
 import { syntheticRiskResponses, unavailableMeta } from './test-fixtures.ts'
 const require = createRequire(import.meta.url)
 const React = require('react')
@@ -115,9 +119,149 @@ function renderRisk(
     hawkView,
     microsoft,
     Component: section.default,
+    CardComponent: card.RiskAssessmentCard,
     text: document.body.textContent ?? '',
   }
 }
+
+test('old servers keep findings visible but never derive a headline count from rows', (t) => {
+  t.mock.method(Date, 'now', () => assessmentNow)
+  const value = assessmentFixture(true)
+  delete value.summary
+  const rendered = renderRisk(value)
+  const text = rendered.hawkView?.textContent ?? ''
+  assert.match(text, /Risky user count unavailable/)
+  assert.ok(rendered.hawkView?.querySelector('[aria-label="Not available"]'))
+  assert.match(text, /Repeated invalid credentials/)
+  assert.doesNotMatch(text, /1Risky users identified/)
+  rendered.dom.window.close()
+})
+
+test('partial tenant summaries lead with a distinct-user lower bound', (t) => {
+  t.mock.method(Date, 'now', () => assessmentNow)
+  const value = assessmentFixture(true)
+  Object.assign(value.meta, {
+    capability: 'PARTIAL',
+    freshness: 'UNKNOWN',
+    limitation: 'Coverage is limited to individually reported evidence.',
+  })
+  Object.assign(value.rules[2], {
+    status: 'PARTIAL',
+    reasonCode: 'INCOMPLETE_WINDOW',
+    countsCapped: true,
+  })
+  value.summary.currentUsers = { value: 1, accuracy: 'AT_LEAST' }
+  const rendered = renderRisk(value)
+  assert.ok(rendered.hawkView?.querySelector('[aria-label="At least 1"]'))
+  assert.match(
+    rendered.hawkView?.textContent ?? '',
+    /distinct-user lower bound/
+  )
+  rendered.dom.window.close()
+})
+
+test('one user with multiple findings counts once and mailbox-only rows stay supporting context', (t) => {
+  t.mock.method(Date, 'now', () => assessmentNow)
+  const value = assessmentFixture(true)
+  value.users[0].findings.push({
+    ...value.users[0].findings[0],
+    id: 'hvr1_contribution_' + 'b'.repeat(64),
+  })
+  const mailbox = assessmentUser('HV-ID-MBX-001.v1', 'c')
+  mailbox.label = 'Synthetic mailbox context'
+  value.users.push(mailbox)
+  const rendered = renderRisk(value)
+  assert.ok(rendered.hawkView?.querySelector('[aria-label="1"]'))
+  const primary = rendered.hawkView?.querySelector(
+    '[aria-label="HawkView identified risky users"]'
+  )
+  assert.doesNotMatch(primary?.textContent ?? '', /Synthetic mailbox context/)
+  assert.match(
+    rendered.hawkView?.textContent ?? '',
+    /Mailbox and historical context/
+  )
+  assert.equal(
+    rendered.hawkView?.querySelectorAll('button[aria-haspopup="dialog"]')
+      .length,
+    2
+  )
+  rendered.dom.window.close()
+})
+
+test('failed refresh and invalid cached contracts withhold the count but preserve explicitly previous evidence', (t) => {
+  t.mock.method(Date, 'now', () => assessmentNow)
+  const seed = renderRisk(assessmentFixture(true))
+  const exact = assessmentFixture(true)
+  const partial = assessmentFixture(true)
+  Object.assign(partial.meta, {
+    capability: 'PARTIAL',
+    freshness: 'UNKNOWN',
+    limitation: 'Coverage is limited to individually reported evidence.',
+  })
+  Object.assign(partial.rules[2], {
+    status: 'PARTIAL',
+    reasonCode: 'INCOMPLETE_WINDOW',
+    countsCapped: true,
+  })
+  partial.summary.currentUsers = { value: 1, accuracy: 'AT_LEAST' }
+  for (const value of [exact, partial]) {
+    const adapted = adapter.adaptRiskAssessmentResponse(value, assessmentNow)
+    assert.ok(adapted)
+    for (const flags of [
+      { requestError: true, contractError: false },
+      { requestError: false, contractError: true },
+    ]) {
+      const markup = renderToStaticMarkup(
+        React.createElement(seed.CardComponent, {
+          assessment: adapted,
+          ...flags,
+          onRetry: () => undefined,
+        })
+      )
+      const dom = new JSDOM(markup)
+      const text = dom.window.document.body.textContent ?? ''
+      assert.ok(
+        dom.window.document.querySelector('[aria-label="Not available"]')
+      )
+      assert.match(text, /Previously reported user evidence/)
+      assert.match(text, /current count withheld/)
+      assert.match(text, /Repeated invalid credentials/)
+      assert.doesNotMatch(
+        text,
+        /Current user finding|1Risky users identified|≥1/
+      )
+      assert.ok(
+        dom.window.document.querySelector('button[aria-haspopup="dialog"]')
+      )
+      dom.window.close()
+    }
+  }
+  seed.dom.window.close()
+})
+
+test('Microsoft channel count remains separate and never claims an active-risk total', (t) => {
+  t.mock.method(Date, 'now', () => assessmentNow)
+  const microsoft = syntheticRiskResponses().microsoftRiskyUsers
+  microsoft.users = [
+    {
+      id: 'microsoft-risk-1',
+      identityLabel: 'Microsoft-reported user',
+      riskLevel: 'high',
+      riskState: 'atRisk',
+      riskDetail: 'adminConfirmedUserCompromised',
+      observedAt: '2026-09-02T12:00:00.000Z',
+    },
+  ]
+  const rendered = renderRisk(assessmentFixture(), { microsoft })
+  const text = rendered.microsoft?.textContent ?? ''
+  assert.match(text, /1Microsoft records shown/)
+  assert.match(text, /not an active-risk total/)
+  assert.doesNotMatch(
+    rendered.hawkView?.textContent ?? '',
+    /Microsoft records shown/
+  )
+  rendered.dom.window.close()
+})
 
 test('real screen/hooks/adapter render independent HawkView positives when Microsoft cannot load', (t) => {
   t.mock.method(Date, 'now', () => assessmentNow)
@@ -171,6 +315,7 @@ test('partial coverage and each unavailable readiness remain distinct while supp
       freshness: 'UNKNOWN',
       limitation: 'One source is unavailable.',
     })
+    value.summary.currentUsers = { value: 1, accuracy: 'AT_LEAST' }
     value.rules[2].status = status
     value.sources[2].status = status
     const rendered = renderRisk(value)
@@ -237,6 +382,7 @@ test('outage preserves historical findings without calling them remediated or cu
   const value = assessmentFixture(true)
   value.users[0].priority = null
   value.users[0].findings[0].activityState = 'HISTORICAL'
+  value.summary.currentUsers = { value: null, accuracy: 'UNKNOWN' }
   Object.assign(value.meta, {
     capability: 'UNAVAILABLE',
     status: 'STALE',
@@ -301,7 +447,7 @@ test('real drawer opens, traps keyboard focus, closes with Escape and restores t
     await React.act(async () => trigger.click())
     const dialog = rendered.document.querySelector('[role="dialog"]')!
     assert.ok(dialog)
-    assert.match(dialog.textContent ?? '', /Synthetic resolved identity/)
+    assert.match(dialog.textContent ?? '', /Synthetic identity/)
     const close = dialog.querySelector(
       'button[aria-label="Close investigation details"]'
     ) as HTMLButtonElement

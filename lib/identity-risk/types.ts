@@ -310,6 +310,17 @@ export type RiskAssessmentUser = {
   findings: RiskAssessmentFinding[]
 }
 
+export type RiskAssessmentCountAccuracy = 'EXACT' | 'AT_LEAST' | 'UNKNOWN'
+
+export type RiskAssessmentSummary = {
+  scope: 'TENANT'
+  asOf: string | null
+  currentUsers: {
+    value: number | null
+    accuracy: RiskAssessmentCountAccuracy
+  }
+}
+
 export type RiskAssessment = {
   version: 1
   schemaVersion: typeof RISK_ASSESSMENT_SCHEMA
@@ -318,4 +329,10 @@ export type RiskAssessment = {
   rules: RiskRuleReadiness[]
   users: RiskAssessmentUser[]
   page: IdentityRiskPageInfo
+  /**
+   * Present only when the caller opts into the additive count summary. Older
+   * servers intentionally omit it; absence is unknown, never a list-derived
+   * tenant total.
+   */
+  summary: RiskAssessmentSummary | null
 }
