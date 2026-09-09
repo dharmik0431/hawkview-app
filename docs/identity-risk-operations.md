@@ -1,6 +1,6 @@
 # Risky Users operational acceptance and support runbook
 
-Status: **release target; implementation and production acceptance pending**
+Status: **merged and publicly routed; real-tenant source acceptance pending**
 
 Audience: release engineers, support, security reviewers, and on-call operators
 
@@ -23,6 +23,49 @@ Record these independently for an exact revision:
 
 Never summarize incomplete evidence as “live.” A health endpoint alone does not
 verify an authenticated risk route or usable source evaluation.
+
+## Sanitized release record
+
+Keep the four evidence layers separate:
+
+| Layer | Established evidence | Remaining limit |
+| --- | --- | --- |
+| Source and tests | Reviewed PR #236 head `39eb90965c61e6edfcb4f6d29d2f5872099163c3` is an ancestor of protected merge `8e3a94c01b68175c92ce4f4fdd379c20c2aa8455`. Required-quality run [34298951213](https://github.com/dharmik0431/hawkview-app/actions/runs/34298951213) passed for the reviewed head. | Automated and isolated evidence does not prove usable evidence in a real tenant. |
+| Infrastructure deployment | API and scheduler were verified at the merge revision; both audit-risk migrations were applied, and the natural scheduled run succeeded. API smoke [34300213203](https://github.com/dharmik0431/hawkview-app/actions/runs/34300213203) and authenticated two-MSP canary [34300213250](https://github.com/dharmik0431/hawkview-app/actions/runs/34300213250) passed for the merge. | Infrastructure success does not establish per-rule source readiness or a tenant finding. |
+| Public route and UI | After an owner publication correction, independent public QA confirmed that the active public bundle references `GET /api/tenants/:tenantId/identity-signals/assessment` and implements the new **HawkView Risky Users** card. | This is not an authenticated tenant API call. The exact clean frontend source SHA is not proven. Do not use a shared static literal or chunk filename/hash as substitute evidence. |
+| Real tenant acceptance | **Unverified.** | No independent privacy-authorized non-P2 tenant inspection has established audit-source usability, rule readiness, findings, or full tenant coverage. |
+
+Rule delivery status:
+
+| Rule | Source status | Real-tenant status |
+| --- | --- | --- |
+| `HV-ID-AUTH-010.v1` — repeated invalid credentials, Low | Implemented and tested with qualified synthetic/isolated audit and sign-in evidence. | Unverified on independent real-tenant evidence. |
+| `HV-ID-AUTH-005.v2` — failures followed by verified success, Medium | Implemented and tested with its exact application/client-source qualification. | Unverified on independent real-tenant evidence. |
+| `HV-ID-MBX-001.v1` — external forwarding, retained High | Existing rule integrated and tested with pinned mailbox evidence. | Current independent real-tenant readiness/finding status unverified. |
+
+The original September 8 target acceptance time was missed. The feature is not a
+full Microsoft-equivalent risk product and does not have universal telemetry.
+Independent source QA found the type-declaration move semantically equivalent and
+build-neutral under the unchanged recursive TypeScript configuration. The full
+hosted `bun.lock` was captured. Among the compared direct dependencies, Supabase
+is the differing dependency. QA and the delivery lead confirmed the operative
+public evidence chain: the active tenant route loads startup chunk
+`8369-11283d63063e2047.js` and new assessment chunk `453`, and chunk `8369`
+constructs the Supabase client marker at 2.116.0, including its realtime/storage
+family. The canonical reviewed production route instead loads
+`1421-45e195a2ff83baab.js` with 2.112.0, matching the reviewed npm lock and CI
+production artifact.
+This September 9 observation is confirmed runtime dependency drift and a P1 release-provenance issue,
+not merely an unused alternative-lock difference. No vulnerability or
+authentication regression has been demonstrated. The scoped source correction
+pins `@supabase/supabase-js` to exactly `2.112.0` and reconciles both locks with
+the reviewed npm resolutions. Source correction and its test/QA approval do not
+prove that the hosted workspace or deployed client has changed. Until the
+correction passes protected checks, is merged, and is published through the
+controlled frontend workflow, runtime closure and a clean exact frontend SHA
+remain unproven. Do not perform a blind or routine republish. Verify the active
+public client version after controlled publication, and record that result
+separately from real-tenant acceptance. Preserve the dated drift evidence above.
 
 ## Required acceptance matrix
 
@@ -147,6 +190,9 @@ bypass. After ordinary deployment:
 - confirm the exact backend revision and current database schema;
 - run bounded health, fresh smoke, authenticated two-MSP isolation, and exact
   risk-route checks;
+- verify the actual authenticated assessment endpoint and the new assessment
+  component; shared static literals, generic page HTML, or a chunk hash alone are
+  insufficient;
 - verify a natural or explicitly authorized bounded evaluation path;
 - verify findings, evaluated-empty, and unavailable behavior using isolated test
   or staging data;
