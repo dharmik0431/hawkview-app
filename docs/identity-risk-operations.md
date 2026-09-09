@@ -110,6 +110,11 @@ events; that is not source-rule evaluation or a customer-state mutation. Reading
 or replaying an incident does not renew the existing 90-day derived-risk
 retention age.
 
+The retention reliability repair keeps the fixed 1,000 ms absolute monotonic
+ceiling, or a shorter caller deadline. Only the retention allocation may lend
+unused SQL time to connection acquisition within that same ceiling. It does not
+change pool size, retries, or any global timeout.
+
 For the mailbox rule, the bounded GET validates the exact two mailbox source
 snapshot/attestation generation pins recorded by the assessment. Missing or
 changed proof yields unknown current mailbox state while authentication rules

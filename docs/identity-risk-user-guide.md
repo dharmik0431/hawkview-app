@@ -101,13 +101,15 @@ MFA registration by itself is not suspicious behavior and is not equivalent to
 enforcement. Each protection statement has its own source, observation time,
 freshness, and safe reason. Stale or incomplete evidence remains unverified.
 
-HawkView creates a `USER` row only for an authorized, resolved human directory
-subject. A matching directory identifier alone is not enough: fresh mailbox
-settings must also identify exactly one ordinary-user mailbox for the same scoped
-mailbox and directory user. Shared, room, equipment, missing, stale, failed,
-duplicate, or ambiguous-purpose mailboxes remain `MAILBOX` rows. HawkView does
-not join by name, email-style label, or similar-looking text. Authentication and
-mailbox reasons remain visible even when their rows cannot safely merge.
+Authentication evidence can create a `USER` row for an authorized, resolved
+human directory subject without mailbox settings. The stricter mailbox-purpose
+gate applies only when merging a `MAILBOX` finding into that `USER` row: fresh
+mailbox settings must identify exactly one ordinary-user mailbox for the same
+scoped mailbox and directory user. Shared, room, equipment, missing, stale,
+failed, duplicate, or ambiguous-purpose mailboxes remain `MAILBOX` rows.
+HawkView does not join by name, email-style label, or similar-looking text.
+Authentication and mailbox reasons remain visible even when their rows cannot
+safely merge.
 
 Application context is either a resolved authorized label or **Not reported**.
 Device context is **Not reported** or **Insufficient fields** in this release;
