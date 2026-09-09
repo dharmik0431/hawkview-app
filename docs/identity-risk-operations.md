@@ -165,6 +165,47 @@ remain independent. For authentication rules, verify that the evaluated lookback
 is a bounded subset of the retained captured source window. Normal collection
 delay must not be labeled as capacity exhaustion.
 
+## Count-summary API contract
+
+The count-first change is a release candidate, not a deployed-feature claim.
+`GET /api/tenants/:tenantId/identity-signals/assessment` preserves its exact v1
+response when `includeSummary` is missing or `false`. Only the explicit query
+`includeSummary=true` adds:
+
+- `scope: TENANT`;
+- `asOf`, using the completed assessment time or null, never request time; and
+- `currentUsers`, with `value` plus `accuracy` of `EXACT`, `AT_LEAST`, or
+  `UNKNOWN`.
+
+Any other `includeSummary` value is a bad request. Older servers or responses
+without `summary` remain unknown; clients must not derive a tenant total from
+the loaded rows.
+
+Count distinct, current `USER` subjects only. Multiple current reasons for one
+user count once. Historical and unknown findings do not count. A mailbox finding
+joins a user only through the existing fresh, unique, purpose-qualified binding;
+otherwise its `MAILBOX` row stays visible in supporting context and outside the
+user count. This is a supported reported scope, not a tenant directory census.
+
+- `EXACT` requires full, current, uncapped assessment and rule/source evidence
+  throughout the bounded projection.
+- `AT_LEAST` requires one or more qualified current users under supported partial
+  or count-capped evidence, with every other summary gate satisfied. It is a
+  proven lower bound, not a complete total; aggregate freshness remains unknown.
+- `UNKNOWN` carries a null value when the assessment is missing, stale, failed,
+  unsupported, contract-invalid, incompletely paged, or has no qualified current
+  user under partial/capped evidence. Missing evidence never becomes zero.
+
+The visible list can be smaller than the tenant summary. The backend owns the
+summary; the UI does not count the current page. On a request or contract error,
+withhold the current count and label cached rows as previously reported rather
+than current evidence.
+
+Microsoft Entra Risky Users remains independent. A returned or paginated
+Microsoft list is not fabricated into an active-user total and never changes the
+HawkView count. Keep rule readiness, source windows, evaluation times, protection
+context, and investigation evidence available under **Technical details**.
+
 ## Support triage
 
 1. Confirm the MSP session and organization/tenant scope before reading details.
