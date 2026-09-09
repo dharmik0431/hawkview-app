@@ -7,7 +7,8 @@ export const READER_REASONS = ['NO_COMPLETED_RUN', 'MEMORY_LANE_BUSY', 'SCOPED_S
 export type ReaderReason = typeof READER_REASONS[number]
 export const CYCLE_REASONS = ['CONFIG_UNAVAILABLE', 'MAINTENANCE_DEFERRED', 'ADMISSION_BUDGET_EXHAUSTED',
   'DEPENDENCY_UNAVAILABLE', 'MEMORY_LANE_BUSY', 'LEASE_BUSY', 'NO_ELIGIBLE_WORK', 'ATTEMPT_FAILED',
-  'RETURNED_UNCOMMITTED', 'COMMITTED'] as const
+  'RETURNED_UNCOMMITTED', 'COMMITTED', 'CANDIDATE_INELIGIBLE', 'CYCLE_CLAIM_FAILED',
+  'SCOPE_SELECTION_FAILED', 'ATTEMPT_RECORD_FAILED', 'KEY_ENSURE_FAILED', 'EVALUATION_FAILED'] as const
 export type CycleReason = typeof CYCLE_REASONS[number]
 export type DiagnosticSink = (line: string) => void
 export const READER_FLUSH_MS = 60_000
@@ -24,9 +25,11 @@ function emit(sink: DiagnosticSink, record: object) {
 // Priority preserves partial/failing cycle truth: one committed attempt cannot
 // hide another failure, skipped budget, or noncommitted evaluator return.
 const priority: Record<CycleReason, number> = {
-  NO_ELIGIBLE_WORK: 0, COMMITTED: 1, RETURNED_UNCOMMITTED: 2, LEASE_BUSY: 3,
+  NO_ELIGIBLE_WORK: 0, CANDIDATE_INELIGIBLE: 0.5, COMMITTED: 1, RETURNED_UNCOMMITTED: 2, LEASE_BUSY: 3,
   MEMORY_LANE_BUSY: 4, DEPENDENCY_UNAVAILABLE: 5, ADMISSION_BUDGET_EXHAUSTED: 6,
   MAINTENANCE_DEFERRED: 7, CONFIG_UNAVAILABLE: 8, ATTEMPT_FAILED: 9,
+  CYCLE_CLAIM_FAILED: 10, SCOPE_SELECTION_FAILED: 10, ATTEMPT_RECORD_FAILED: 10,
+  KEY_ENSURE_FAILED: 10, EVALUATION_FAILED: 10,
 }
 export class RiskCycleDiagnostic {
   private reason: CycleReason | null = null
