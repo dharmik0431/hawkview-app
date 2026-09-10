@@ -402,3 +402,37 @@ in it is keyed on an absence. The declaration is earned.
 
 `Readonly<Record<NormalizationSource, CollectorSyncStatus>>` rather than one
 status. The five database gates pass both feeds explicitly.
+
+### `qa-gate-collector-mapping.ts` — acceptance test for the `COLLECTOR_FOR` fix
+
+| commit | `COLLECTOR_FOR.M365_AUDIT_STS` | applies | verdict |
+| --- | --- | --- | --- |
+| `265e61f` | `M365_AUDIT` | 0 of 15 | **VETO** |
+| `10d1116` | `SIGN_INS` | 15 of 15 | **PASS** |
+| `1bf4a1f` | `SIGN_INS` | 15 of 15 | **PASS** |
+
+The fix is verified independently. The PASS is accounted for: the same gate
+reports VETO one commit earlier, with integrity clean and the guard satisfied
+in both runs, so the difference is the mapping and nothing else.
+
+**The first attempt at this gate was testing the wrong level.**
+`qa-gate-freshness-asks-the-right-collector.ts` calls `readTenantAssessment` and
+*injects* `syncStatus` itself. The mapping lives one level above it, in
+`syncStatusPerFeed`. So that gate reproduces the consequence of a wrong status
+and is blind to which collector was asked — it would have reported the veto
+unchanged after a correct fix and blocked it. **A test that injects the value
+under test cannot check how that value is chosen.** Both are kept: one shows
+the harm, one tests the fix.
+
+**And the first run of the corrected gate was also wrong.** It reported VETO
+because the fixture stamped `ingestedAt` before the events, so all fifteen rows
+came back `UNPROCESSABLE / INGESTION_PRECEDES_EVENT` — `applies: 0` with the
+evidence read perfectly well, which looks exactly like the veto. Caught by
+dumping the raw persisted coverage instead of trusting the verdict line. The
+gate now guards on it: rows fetched is not enough when every row can fail
+integrity.
+
+One honest limitation: the `UNREADABLE_NOW` / `NEVER_COLLECTED` marker check
+never fires in either run, so the discrimination rests entirely on `applies`.
+That is demonstrated rather than assumed, but the marker check is currently
+inert and should not be read as contributing.
