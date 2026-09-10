@@ -354,7 +354,7 @@ test('every out-of-scope code carries a documented citation', () => {
   // 50058 and 50140 on Microsoft's own "expected part of the flow" statements;
   // 53004 on the owner's channel-separation rule, since ProofUpBlockedDueToRisk
   // is a block Microsoft's intelligence decided on.
-  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50058, 50140, 53004]);
+  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50011, 50058, 50133, 50140, 50173, 53004, 70044]);
   for (const entry of excluded) {
     assert.ok(
       entry.exclusionCitation && entry.exclusionCitation.text.length > 15,
@@ -419,7 +419,7 @@ test('the post-password interrupt family is expressible and groupable', async ()
 });
 
 test('codes with no exclusion citation are held, not excluded and not called unreadable', async () => {
-  for (const code of [50055, 50144, 50056, 50133, 50173, 65001]) {
+  for (const code of [50055, 50144, 50056, 65001, 90094]) {
     const batch = await run([graphRow({ status: { errorCode: code } })]);
     assert.deepEqual(
       only(batch).classification,
@@ -448,7 +448,12 @@ test('the two expected-flow codes are out of scope', async () => {
 test('the enumeration codes are recorded as a known blind spot rather than mapped', () => {
   // Requiring a resolved directory user means these can never be classified:
   // by definition their subject is not in the directory.
-  assert.deepEqual(UNREACHABLE_BY_SUBJECT_RESOLUTION.map(entry => entry.code).sort((a, b) => a - b), [50034, 51004]);
+  assert.deepEqual(UNREACHABLE_BY_SUBJECT_RESOLUTION.map(entry => entry.code).sort((a, b) => a - b), [16003, 50020, 50034, 51004]);
+  // The blind spot is no longer theoretical: two of the fourteen OBSERVED
+  // codes fall into it, so real rows are being discarded before classification.
+  const observedBlind = UNREACHABLE_BY_SUBJECT_RESOLUTION.filter(e => e.graphObservation === 'OBSERVED');
+  assert.deepEqual(observedBlind.map(e => e.code).sort((a, b) => a - b), [16003, 50020]);
+  for (const entry of observedBlind) assert.ok((entry.citation ?? '').length > 40, String(entry.code));
   for (const entry of UNREACHABLE_BY_SUBJECT_RESOLUTION) {
     assert.equal(dispositionForCode(entry.code).kind, 'UNKNOWN', 'must not be silently mapped');
   }
@@ -1089,7 +1094,11 @@ test('every collection scope has a label, and the partial ones say what is missi
   for (const scope of scopes) assert.ok(describeCollectionScope(scope).length > 20, scope);
   // The two scopes that mean "you are not seeing everything" have to say so,
   // or the field is decoration.
-  assert.match(describeCollectionScope('GRAPH_INTERACTIVE_ONLY'), /not requested|outside this assessment/i);
+  // Asserting the intent rather than a phrasing: the label must say that
+  // something was not asked for, AND that it may be the larger share. Saying
+  // only the first reads as a triviality.
+  assert.match(describeCollectionScope('GRAPH_INTERACTIVE_ONLY'), /requested/i);
+  assert.match(describeCollectionScope('GRAPH_INTERACTIVE_ONLY'), /smaller part|outnumber/i);
   assert.match(describeCollectionScope('UNDECLARED'), /cannot state/i);
 });
 
@@ -1275,14 +1284,16 @@ test('every mapped code declares whether we have actually seen it', () => {
     );
   }
   const seen = RESULT_CODES.filter(entry => entry.graphObservation === 'OBSERVED');
-  assert.equal(seen.length, 9, 'nine of the fourteen observed codes are mapped');
+  assert.equal(seen.length, 12, 'twelve of the fourteen observed codes are mapped');
 });
 
 test('observed codes we do not map are recorded, and cost coverage rather than being invented', async () => {
   // The reverse problem from an anticipated mapping: real rows with no
   // mapping. Mapping them from a half-remembered meaning is the error this
   // module exists to prevent, so they stay unrecognized and visible.
-  assert.deepEqual([...OBSERVED_BUT_UNMAPPED_GRAPH_CODES], [16003, 50011, 50020, 70044, 90094]);
+  // Every observed code is now either mapped or recorded as structurally
+  // unreachable, so nothing observed is unaccounted for.
+  assert.deepEqual([...OBSERVED_BUT_UNMAPPED_GRAPH_CODES], []);
   for (const code of OBSERVED_BUT_UNMAPPED_GRAPH_CODES) {
     const batch = await run([graphRow({ status: { errorCode: code } })]);
     assert.deepEqual(

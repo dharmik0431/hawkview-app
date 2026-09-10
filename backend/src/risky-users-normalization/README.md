@@ -553,3 +553,63 @@ re-verification; the treatment is unaffected either way, since `1` is not an Azu
 error code and is used neither as a key nor as corroboration. The observation was renamed
 from `HAWKVIEW_SYNTHETIC_ERROR_CODE` to `RESULT_CODE_NOT_AN_AZURE_CODE`, which is true
 under both accounts.
+
+## Addendum: every observed code is now accounted for
+
+Eleven citations arrived in one pass, with Microsoft's verbatim text. The result:
+`OBSERVED_BUT_UNMAPPED_GRAPH_CODES` is now **empty** — all fourteen observed codes are
+either mapped or recorded as structurally unreachable. The tally moved from 9 observed
+codes mapped to 12, with the other two accounted for below.
+
+Newly out of scope, each on quoted provider text:
+
+| Code | Reason | Grounds |
+| --- | --- | --- |
+| 50011 | `APPLICATION_CONFIGURATION_ERROR` | Microsoft locates the fault in the app's reply-address configuration, making no claim about the user. |
+| 70044 | `SIGN_IN_FREQUENCY_POLICY_EXPIRY` | A CA sign-in-frequency policy lapsing. Same trap as 50140/50058: a control working as configured. **Sourcing caveat** — CA troubleshooting docs, not the canonical error reference, so carried like 500121. Volume unknown, and if it is high then a non-canonical citation is doing a lot of exclusion work. |
+| 50133, 50173 | `SESSION_INVALIDATED_BY_REMEDIATION` | Microsoft attributes both to a password change or a revoked grant — remediation having taken effect, the opposite of an attack signal. 50173 carries the remediation timestamp, which makes it useful to a different surface as corroboration. |
+
+**Two codes were recommended as "Neither" and are still held rather than excluded.**
+90094 (`AdminConsentRequired`) joins 65001, because the same recommendation also noted
+that repeated admin-consent-required against one user is adjacent to the illicit-consent-grant
+gap Microsoft names in its own remediation guidance. *A reason something might be evidence
+is not a citation that it can never be*, so both stay in `NOT_YET_CITED` and become
+relevant if consent-grant collection lands.
+
+**And one held code has a question behind it that would move it a long way.** 50055 /
+50144 are cited as password-expiry hygiene. But to be told a password is expired, was the
+password *verified* first? If so these are post-password interrupts — "the credential was
+correct" — which is the highest-signal family we have, and excluding them would discard
+exactly what that family exists to find. Microsoft's quoted text does not say either way,
+so they are neither claimed nor excluded. This is a documentation question, not a data one.
+
+## Addendum: the enumeration blind spot is no longer theoretical
+
+`UNREACHABLE_BY_SUBJECT_RESOLUTION` has grown from two codes to four, and **two of them
+are observed**: 16003 (`SsoUserAccountNotFoundInResourceTenant`) and 50020
+(`UserUnauthorized`, specifically an identity from *another* identity provider — so
+cross-tenant or guest enumeration, a different story to tell a technician than same-tenant
+enumeration).
+
+Both describe a subject that is by definition not in the tenant, so subject resolution
+discards the row before classification and the code is lost. Previously this gap was a
+documented hypothetical; it now has real rows flowing through it, which is what
+`shapeObservations.enumerationCodesOnUnresolvedSubjects` counts. Detecting enumeration
+still needs a tenant-level finding where this model is user-scoped — a different detector
+shape, and out of scope — but the counter is no longer measuring zero.
+
+## Addendum: the interrupt detector is rare, not weak
+
+An earlier addendum here read the interrupt family's volume as a thin evidence base. That
+was the wrong conclusion from the right number, and the correction is worth keeping.
+
+A **successfully completed** MFA does not emit 50074 or 50076 at all — it emits errorCode 0
+with `authenticationRequirement: multiFactorAuthentication`. The interrupt codes appear
+only when MFA was required and *not* completed. So 50074 at three rows and
+50076/50072/50079 at zero is not evidence the detector is weak; it is evidence that almost
+nobody in these tenants is failing MFA, which is the healthy case.
+
+Three rows in 2,645 events is a **rare, high-signal** event: each one is "somebody had the
+password and could not pass the second factor". The mapping stays, and what changes is
+what it promises — a rare alarm, not a steady stream. Nothing user-facing should depend on
+it for volume.

@@ -266,7 +266,42 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     note: 'Microsoft: "Could indicate someone trying to access an account after they left."',
   },
 
-  // ---- The only two codes that clear the exclusion standard. ----
+  {
+    code: 50011,
+    graphObservation: 'OBSERVED',
+    microsoftName: 'InvalidReplyTo',
+    claimClass: 'NEITHER',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'APPLICATION_CONFIGURATION_ERROR' },
+    exclusionCitation: {
+      kind: 'PROVIDER_STATEMENT',
+      text:
+        'Microsoft: "InvalidReplyTo - The reply address is missing, misconfigured, or doesn\'t match reply ' +
+        'addresses configured for the app." The text locates the failure in the application\'s ' +
+        'configuration, making no claim about the user in either direction.',
+    },
+  },
+  {
+    code: 70044,
+    graphObservation: 'OBSERVED',
+    microsoftName: 'The session has expired or is invalid (sign-in frequency)',
+    claimClass: 'NEITHER',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'SIGN_IN_FREQUENCY_POLICY_EXPIRY' },
+    exclusionCitation: {
+      kind: 'PROVIDER_STATEMENT',
+      text:
+        'Microsoft (Conditional Access troubleshooting guidance): the session has expired or is invalid due ' +
+        'to sign-in frequency checks by Conditional Access. Same trap as 50140 and 50058 — a control ' +
+        'working exactly as configured, which a naive implementation counts as failures. SOURCING CAVEAT: ' +
+        'this is the CA troubleshooting documentation, NOT the canonical error reference, so it is carried ' +
+        'with the same caveat as 500121.',
+    },
+    note:
+      'VOLUME UNKNOWN, and it matters here more than elsewhere: if this code is high-volume then a ' +
+      'non-canonical citation is doing a lot of exclusion work. Worth a row count before anyone relies on ' +
+      'the exclusion. Whatever the volume is, it is a property of the tenant’s sign-in-frequency setting ' +
+      'rather than of any attacker.',
+  },
+  // ---- The codes that clear the exclusion standard. ----
   {
     code: 50140,
     graphObservation: 'OBSERVED',
@@ -306,7 +341,14 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     microsoftName: 'InvalidPasswordExpiredPassword',
     claimClass: 'NEITHER',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
-    note: 'Password hygiene. No citation establishes it can never be attack evidence, so it is not excluded.',
+    note:
+      'Microsoft: "InvalidPasswordExpiredPassword - The password is expired." Cited as hygiene, and still ' +
+      'HELD rather than excluded, because of an unresolved question that would move it a long way: to be ' +
+      'told a password is expired, was the password VERIFIED first? If so this is a post-password ' +
+      'interrupt — "the credential was correct" — which is the highest-signal family we have, and ' +
+      'excluding it would discard exactly the evidence that family exists to find. Microsoft\'s quoted ' +
+      'text does not say either way, so it is neither claimed nor excluded. This is a documentation ' +
+      'question, not a data one.',
   },
   {
     code: 50144,
@@ -321,21 +363,43 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     microsoftName: 'InvalidOrNullPassword',
     claimClass: 'NEITHER',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    note:
+      'Microsoft: "Invalid or null password: password doesn\'t exist in the directory for this user." ' +
+      'Stronger than plain hygiene: it suggests a password authentication attempt against a federated or ' +
+      'passwordless account, which is mildly attack-adjacent. Held, not excluded.',
   },
   {
     code: 50133,
     graphObservation: 'NOT_OBSERVED',
     microsoftName: 'SsoArtifactInvalidOrExpired (password change)',
     claimClass: 'NEITHER',
-    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'SESSION_INVALIDATED_BY_REMEDIATION' },
+    exclusionCitation: {
+      kind: 'PROVIDER_STATEMENT',
+      text:
+        'Microsoft: "SsoArtifactRevoked - The session isn\'t valid due to password expiration or recent ' +
+        'password change." The text attributes the failure to remediation having happened, which is the ' +
+        'opposite of an attack signal.',
+    },
     note: 'Useful as remediation-took-effect confirmation, which is a different product surface.',
   },
   {
     code: 50173,
     graphObservation: 'NOT_OBSERVED',
-    microsoftName: 'FreshTokenNeeded (grant expired)',
+    microsoftName: 'FreshTokenNeeded (grant revoked)',
     claimClass: 'NEITHER',
-    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'SESSION_INVALIDATED_BY_REMEDIATION' },
+    exclusionCitation: {
+      kind: 'PROVIDER_STATEMENT',
+      text:
+        'Microsoft: "The provided grant has expired due to it being revoked... The grant was issued on ' +
+        '\'{authTime}\' and the TokensValidFrom date is \'{validDate}\'." Attributes the failure to a ' +
+        'revocation, and carries the remediation timestamp with it.',
+    },
+    note:
+      'The strongest of the remediation-confirmation codes, because the message carries an actual ' +
+      'timestamp — so it can corroborate that a session revocation genuinely took effect rather than ' +
+      'being asserted. Out of scope for detection, valuable to a different surface.',
   },
   {
     code: 65001,
@@ -349,6 +413,20 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
       'either way is worth having.',
   },
 
+  {
+    code: 90094,
+    graphObservation: 'OBSERVED',
+    microsoftName: 'AdminConsentRequired',
+    claimClass: 'NEITHER',
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    note:
+      'Microsoft: "AdminConsentRequired - Administrator consent is required." Recommended to me as ' +
+      '"Neither", and NOT excluded on that basis — the same recommendation also noted that repeated ' +
+      'admin-consent-required against one user is adjacent to the illicit-consent-grant gap Microsoft ' +
+      'names in its own compromised-account remediation. A reason it MIGHT be evidence is not a citation ' +
+      'that it can never be, so it is held rather than excluded. Same treatment and same pointer as 65001; ' +
+      'both become relevant if consent-grant collection lands.',
+  },
   // ---- Meaning lives in free text. ----
   {
     code: 50053,
@@ -395,9 +473,34 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
  * with the code discarded. Detecting enumeration needs a path for unresolved
  * subjects, which is a scope decision and not this layer's to make.
  */
-export const UNREACHABLE_BY_SUBJECT_RESOLUTION: readonly { readonly code: number; readonly microsoftName: string }[] = [
-  { code: 50034, microsoftName: 'UserAccountNotFound' },
-  { code: 51004, microsoftName: 'UserAccountNotInDirectory' },
+export const UNREACHABLE_BY_SUBJECT_RESOLUTION: readonly {
+  readonly code: number;
+  readonly microsoftName: string;
+  /** Whether this code actually occurs in our data. */
+  readonly graphObservation: 'OBSERVED' | 'NOT_OBSERVED';
+  readonly citation?: string;
+}[] = [
+  { code: 50034, microsoftName: 'UserAccountNotFound', graphObservation: 'NOT_OBSERVED' },
+  { code: 51004, microsoftName: 'UserAccountNotInDirectory', graphObservation: 'NOT_OBSERVED' },
+  {
+    code: 16003,
+    microsoftName: 'SsoUserAccountNotFoundInResourceTenant',
+    graphObservation: 'OBSERVED',
+    citation:
+      'Microsoft: "SsoUserAccountNotFoundInResourceTenant - Indicates that the user hasn\'t been ' +
+      'explicitly added to the tenant." Same family as 50034/51004: clusters from one source are ' +
+      'enumeration.',
+  },
+  {
+    code: 50020,
+    microsoftName: 'UserUnauthorized',
+    graphObservation: 'OBSERVED',
+    citation:
+      'Microsoft: "UserUnauthorized - Users are unauthorized to call this endpoint. User account from ' +
+      'identity provider does not exist in tenant and cannot access the application." Specifically an ' +
+      'identity from ANOTHER identity provider, which makes it cross-tenant or guest enumeration — a ' +
+      'different story to tell a technician than same-tenant enumeration.',
+  },
 ];
 
 const BY_CODE: ReadonlyMap<number, ResultCodeEntry> = new Map(
@@ -416,7 +519,8 @@ const BY_CODE: ReadonlyMap<number, ResultCodeEntry> = new Map(
  * than mappings with no rows.
  */
 export const OBSERVED_BUT_UNMAPPED_GRAPH_CODES: readonly number[] = OBSERVED_GRAPH_ERROR_CODES
-  .filter(code => !BY_CODE.has(code))
+  .filter(code =>
+    !BY_CODE.has(code) && !UNREACHABLE_BY_SUBJECT_RESOLUTION.some(entry => entry.code === code))
   .sort((left, right) => left - right);
 
 /**
@@ -926,6 +1030,32 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'bucketed by riskDetail value, with the ordinary-human-success rows as the cohort that must NOT ' +
         'carry a verdict-shaped value. Until then this predicate has NO effect and ' +
         'MICROSOFT_SAFETY_VERDICT is unreachable.',
+    },
+  },
+  {
+    id: 'graph.authentication-details',
+    reads: ['raw.authenticationDetails', 'raw.authenticationRequirement'],
+    claim:
+      'raw.authenticationDetails carries per-step outcomes, so "the password step succeeded and the ' +
+      'second-factor step did not" is readable WITHIN a single event rather than inferred from the ' +
+      'presence of an interrupt error code.',
+    verification: {
+      state: 'PENDING_DISTRIBUTION_CHECK',
+      cohort:
+        'HYPOTHESIS, nothing built on it. The sign-in request issues no $select, so Graph returns the ' +
+        'full default signIn payload and the collector stores it whole — which should include ' +
+        'authenticationDetails. If it is populated, the post-password interrupt detector stops depending ' +
+        'on sparse error codes and would also work on successful-looking rows where no interrupt code was ' +
+        'ever emitted. REDACTION IS NOT THE OBSTACLE: redactSensitiveValues matches KEY names against ' +
+        '/password|secret|token|authorization|credential|private.?key|client.?secret|assertion|certificate/i, ' +
+        'and none of the documented keys inside authenticationDetails matches, so the array survives ' +
+        'storage intact. (Sibling fields DO get redacted — tokenIssuerName, tokenIssuerType and ' +
+        'incomingTokenType all contain "token" — which is a separate fact about what we retain.)',
+      controlCohort:
+        'Ordinary SINGLE-FACTOR successes must look DIFFERENT from multi-factor ones. What would kill the ' +
+        'hypothesis: the array absent or empty on rows we know required MFA, which Microsoft documents as ' +
+        'possible. No row has been looked at, so this is unverified in the strongest sense and has no ' +
+        'effect on classification.',
     },
   },
   {

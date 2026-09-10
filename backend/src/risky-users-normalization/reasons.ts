@@ -77,6 +77,25 @@ export type OutOfScopeReason =
    */
   | 'MICROSOFT_SAFETY_VERDICT'
   /**
+   * 70044. Microsoft (Conditional Access troubleshooting guidance): the session
+   * expired or is invalid due to sign-in frequency checks by Conditional
+   * Access. SOURCING CAVEAT: not in the canonical error reference.
+   */
+  | 'SIGN_IN_FREQUENCY_POLICY_EXPIRY'
+  /**
+   * 50011. Microsoft: "InvalidReplyTo - The reply address is missing,
+   * misconfigured, or doesn't match reply addresses configured for the app."
+   * A statement locating the fault in the application, not the user.
+   */
+  | 'APPLICATION_CONFIGURATION_ERROR'
+  /**
+   * 50133, 50173. Microsoft attributes both to a password change or a revoked
+   * grant. This is remediation taking effect rather than a sign-in attempt —
+   * and 50173 carries the remediation timestamp, which makes it useful
+   * elsewhere as corroboration that a revocation genuinely happened.
+   */
+  | 'SESSION_INVALIDATED_BY_REMEDIATION'
+  /**
    * RESERVED, currently unreachable. No confirmed field marks a non-interactive
    * sign-in: `isInteractive` is true on 100% of collected Graph rows, so the
    * predicate discriminates nothing. See provider-facts.
@@ -212,7 +231,7 @@ export type CollectionScope =
 
 export const COLLECTION_SCOPE_LABELS: Readonly<Record<CollectionScope, string>> = {
   GRAPH_INTERACTIVE_ONLY:
-    'Interactive sign-ins only. Background and token-refresh sign-ins were not requested from Microsoft, so they are outside this assessment entirely',
+    'Interactive sign-ins only. Background and token-refresh sign-ins were never requested from Microsoft, which documents them as usually outnumbering interactive sign-ins, so this assessment may cover the smaller part of the traffic',
   GRAPH_INTERACTIVE_AND_NON_INTERACTIVE:
     'Interactive and background sign-ins were both requested from Microsoft',
   AUDIT_STS_LOGON_EVENTS:
@@ -246,6 +265,9 @@ export const OUT_OF_SCOPE_LABELS: Readonly<Record<OutOfScopeReason, string>> = {
   INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN: 'Existing session was insufficient for silent sign-in, which Microsoft documents as expected',
   MICROSOFT_RISK_VERDICT: 'Microsoft judged this sign-in risky; shown under Microsoft-reported risk, not as a HawkView finding',
   MICROSOFT_SAFETY_VERDICT: 'Microsoft assessed this sign-in and judged it safe; shown under Microsoft-reported risk as a dismissal, never as a HawkView finding',
+  SIGN_IN_FREQUENCY_POLICY_EXPIRY: 'A session lapsed under the tenant’s own sign-in-frequency policy, which Microsoft documents as the expected result of configuring one',
+  APPLICATION_CONFIGURATION_ERROR: 'The application’s reply address is misconfigured, which Microsoft documents as a fault in the application rather than anything about the user',
+  SESSION_INVALIDATED_BY_REMEDIATION: 'A session stopped working because a password was changed or a grant was revoked, which is remediation taking effect rather than a sign-in attempt',
   NON_INTERACTIVE_SIGN_IN: 'Background sign-in rather than a person entering a credential',
   APPLICATION_ACTOR: 'The actor was an application or service principal, not a person',
 };
