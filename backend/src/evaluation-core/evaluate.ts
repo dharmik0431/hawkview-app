@@ -217,7 +217,12 @@ function mostRecent<Event>(
   return ranked.map(index => applies[index]!)
 }
 
-export function withheldExplanation(reason: WithheldReason): string {
+/** Not exported. QA grepped every caller: outside this file, nothing used it,
+ * so the convenient wrong call — withheldExplanation(claim.because[0]) — had no
+ * legitimate user and could be deleted rather than discouraged. Reaching for one
+ * reason where there may be four is now a compile error in the wiring instead of
+ * a style question, which is what withheld[0]! taught us twice. */
+function withheldExplanation(reason: WithheldReason): string {
   switch (reason) {
     case 'NEVER_COLLECTED': return 'This evidence has not been collected yet, so nothing has been assessed.'
     case 'UNREADABLE_NOW': return 'This evidence could not be read just now. It has not been reported as clear.'
@@ -408,11 +413,10 @@ export function findingSet(
 
 /** Every sentence a withheld claim needs to say, in one call.
  *
- * `withheldExplanation` takes a single reason, so the natural way to use it is
- * `withheldExplanation(claim.because[0])` — which silently re-creates, in the
- * presentation layer, the one-reason collapse this module removed twice inside
- * itself. The core cannot compel a surface to render four sentences; what it
- * can do is make the convenient call the correct one.
+ * The per-reason function is deliberately not exported, so this is the only way
+ * to ask. A caller reaching for one sentence where there may be four would
+ * silently re-create, in the presentation layer, the one-reason collapse this
+ * module removed twice inside itself — and that call now does not exist.
  *
  * Returns an array, and is named plural, because a field called `reason` is an
  * invitation and a field called `reasons` is a hint. That is a mitigation, not

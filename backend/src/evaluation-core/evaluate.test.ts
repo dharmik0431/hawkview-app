@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  countOf, declined, evaluate, uninterpreted, withheldExplanation, withheldExplanations, zeroClaim,
+  countOf, declined, evaluate, uninterpreted, withheldExplanations, zeroClaim,
 } from './evaluate.js'
 import type { Coverage, Detector, Finding, WithheldReason } from './contract.js'
 import { figure } from './test-support.js'
+
+/** The per-reason sentence, reached through the plural because the singular is
+ * no longer exported. Clunkier here, and the clunkiness is the point: asking for
+ * one reason should require saying you have exactly one. */
+const sentenceFor = (reason: WithheldReason): string =>
+  withheldExplanations({ permitted: false, because: [reason] })[0]!
 
 type Event = Readonly<{ id: string; subject: string; match?: boolean; at?: number }>
 
@@ -161,7 +167,7 @@ test('the four states stay distinct, and each withholds as its own sentence', ()
 
   // Every reason reaches a reader as its own sentence — no two share wording.
   const everyReason: readonly WithheldReason[] = [...new Set(reasons.flat())]
-  assert.equal(new Set(everyReason.map(withheldExplanation)).size, everyReason.length)
+  assert.equal(new Set(everyReason.map(sentenceFor)).size, everyReason.length)
 })
 
 test('unread evidence cannot produce a finding, because it cannot carry an event', () => {
@@ -416,7 +422,7 @@ test('every reason that applies is reported, so there is no precedence to get wr
     ['CAPACITY_EXCEEDED', 'DETECTOR_FAILED', 'UNINTERPRETED_EVENTS', 'UNRESOLVED_SUBJECT_IDENTITY'])
 
   // Each reason still reaches the reader as its own sentence.
-  const sentences = three.claim.permitted === false ? three.claim.because.map(withheldExplanation) : []
+  const sentences = three.claim.permitted === false ? three.claim.because.map(sentenceFor) : []
   assert.equal(new Set(sentences).size, 4)
 })
 
@@ -625,7 +631,7 @@ test('what was asked of the provider travels with the count, and an unrecorded a
 
   // It is its own sentence, not folded into "we could not read the evidence" —
   // evidence we may never have requested is not evidence we failed to read.
-  assert.notEqual(withheldExplanation('COLLECTION_SCOPE_UNDECLARED'), withheldExplanation('UNINTERPRETED_EVENTS'))
+  assert.notEqual(sentenceFor('COLLECTION_SCOPE_UNDECLARED'), sentenceFor('UNINTERPRETED_EVENTS'))
 })
 
 test('a detector that silently narrows its own input is rejected, which a range check missed', () => {
