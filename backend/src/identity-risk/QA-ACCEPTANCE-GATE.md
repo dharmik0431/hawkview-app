@@ -370,3 +370,35 @@ Mutation-verified against the product source, then restored (diff-clean):
 The second row is why the probe goes past the label. That mutation is the
 original defect exactly — the label stays honest and only the value is wrong —
 and a check that read `kind` alone would have passed it.
+
+### Added: `qa-run-harness-credential-failure.ts` — the blocking precondition
+
+The stale-evidence ruling gates on `monotonic`, and that flag had never been
+checked for `repeated-credential-failure`, the detector that carries it. This is
+that run. `held: true` is not the result; three things hold together:
+
+| | |
+| --- | --- |
+| lockout branch (`lockouts > 0`) | held, **1448** findings surviving |
+| threshold branch (`rejections >= 5`) | held, **1450** findings surviving |
+| mixed, with successes and an excluded code | held, **1362** findings surviving |
+| absence-keyed counterexample, same pool | **caught at trial 2**, `LOST_WHILE_RAN` |
+
+Both firing branches get their own pool. A pool that only ever trips the lockout
+branch leaves the threshold branch unverified while the summary line still says
+the detector holds — findings seen, but all from one arm.
+
+The counterexample is the part that makes `held: true` mean anything. A quiet
+instrument and a correct detector produce identical output, so the run includes
+a deliberately absence-keyed rule over the same events with the same
+declaration. The harness catches it at trial 2, which is what licenses reading
+the three green rows as a result rather than as silence.
+
+Reading the detector first: it fires on `lockouts > 0 || rejections >= threshold`
+and always emits both signals, including one the subject never produced. Nothing
+in it is keyed on an absence. The declaration is earned.
+
+### Fourth reconciliation (`265e61f`): `syncStatus` is now per feed
+
+`Readonly<Record<NormalizationSource, CollectorSyncStatus>>` rather than one
+status. The five database gates pass both feeds explicitly.

@@ -50,7 +50,7 @@ try {
 
   const read = await readTenantAssessment(prisma, {
     organizationId, customerTenantId, feedIfNoRows: 'GRAPH_SIGN_INS',
-    collectionScope: { GRAPH_SIGN_INS: 'GRAPH_INTERACTIVE_ONLY', M365_AUDIT_STS: 'AUDIT_STS_LOGON_EVENTS' } as any, syncStatus: 'SUCCESS',
+    collectionScope: { GRAPH_SIGN_INS: 'GRAPH_INTERACTIVE_ONLY', M365_AUDIT_STS: 'AUDIT_STS_LOGON_EVENTS' } as any, syncStatus: { GRAPH_SIGN_INS: 'SUCCESS', M365_AUDIT_STS: 'SUCCESS' },
     detectors: [credentialFailureDetector({ rejectionThreshold: 5 })],
     windowStart, windowEnd, maxEvents: 5000,
   })
