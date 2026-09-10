@@ -139,3 +139,25 @@ test('the second evaluation is skipped rather than truncated when the window is 
     assert.equal(result.failed, 0)
   })
 })
+
+test('a write that fails — the production state until the migration lands — still leaves the old engine complete', async () => {
+  await configured(async () => {
+    // The step now WRITES, and none of the tests above covered that. Until the
+    // evaluation_findings migration ships, `persistRun` against production
+    // raises an undefined-column error on every tenant of every cycle.
+    //
+    // The container ordering means that cannot actually happen — the web service
+    // migrates before it starts serving, and the cron only reaches the cycle
+    // through an HTTP call to that service. But "cannot happen" is an argument
+    // about deployment, and this is the assertion about the code: if it does
+    // happen, the old engine still completes and is still counted.
+    const dbError = Object.assign(new Error('column "evaluation_findings" does not exist'), { code: '42703' })
+    const { deps, evaluated, outcomes } = fixture(async () => { throw dbError })
+
+    const result = await runGlobalRiskCycle(deps as never, 100_000)
+
+    assert.deepEqual(evaluated, ['old-engine-run-written'])
+    assert.deepEqual(result, { status: 'COMPLETED', attempted: 1, completed: 1, failed: 0 })
+    assert.deepEqual(outcomes, ['FAILED'])
+  })
+})
