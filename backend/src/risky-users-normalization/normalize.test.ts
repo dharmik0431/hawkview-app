@@ -2514,40 +2514,55 @@ test('an audit CreationTime with no designator is read as UTC', async () => {
   // The fix belongs here rather than in collection because every STORED row
   // already lacks the designator — changing the collector would leave three
   // tenants broken while looking fixed.
-  const bare = await run(
-    [auditRow({ CreationTime: '2026-09-10T10:00:00' })],
-    { source: 'M365_AUDIT_STS' },
-  );
-  assert.equal(bare.counts.applies, 1, 'a designator-less audit timestamp must not cost the row');
-  assert.equal(only(bare).eventAt, '2026-09-10T10:00:00.000Z', 'read as UTC, not as local time');
-  // THE LIMIT OF THAT SECOND ASSERTION, stated because it is a real one. It
-  // distinguishes appending a Z from letting Date.parse treat the string as
-  // LOCAL time only when the host is not on UTC — this one is America/Toronto,
-  // so the mutation that removes the append fails here by four hours. On a
-  // UTC-configured runner the two are indistinguishable and the assertion
-  // would pass either way.
+  // THE HOST TIMEZONE IS PINNED, AND THE PRECONDITION IS ASSERTED. An earlier
+  // version of this test recorded the limitation instead of removing it: the
+  // assertion below distinguishes appending a Z from letting Date.parse read
+  // the string as LOCAL time only when the host is not on UTC. CI is
+  // ubuntu-latest with no TZ set, which is UTC — so on CI it passed while
+  // proving nothing. Inert material, in the one test whose entire subject is
+  // timezone handling.
   //
-  // Not worked around, because the alternatives are worse than the gap: pinning
-  // process.env.TZ inside a test makes the suite depend on where it is run in a
-  // way the next reader has to discover, and asserting on an internal is not
-  // asserting on behaviour. Recorded instead — if this ever runs on a UTC box,
-  // this test's coverage of the local-time trap silently drops to nothing, and
-  // the comment is what tells whoever notices.
+  // I argued against pinning on the grounds that it makes the suite depend on
+  // where it runs in a way the next reader has to discover. That was wrong in
+  // the trade: a test that silently stops discriminating is worse than a
+  // dependency stated in the open. What makes it safe is the SECOND line —
+  // asserting that the pin took effect. If the timezone cannot be set, or a
+  // future runtime stops honouring it mid-process, this FAILS rather than
+  // reverting to passing-for-no-reason.
+  const originalTz = process.env.TZ;
+  process.env.TZ = 'America/Toronto';
+  try {
+    assert.notEqual(
+      new Date('2026-09-10T10:00:00').getTime(),
+      Date.parse('2026-09-10T10:00:00Z'),
+      'the host reads a designator-less string as UTC, so nothing below can tell the two apart',
+    );
 
-  // Fractional seconds, still no designator.
-  const fractional = await run(
-    [auditRow({ CreationTime: '2026-09-10T10:00:00.123' })],
-    { source: 'M365_AUDIT_STS' },
-  );
-  assert.equal(only(fractional).eventAt, '2026-09-10T10:00:00.123Z');
+    const bare = await run(
+      [auditRow({ CreationTime: '2026-09-10T10:00:00' })],
+      { source: 'M365_AUDIT_STS' },
+    );
+    assert.equal(bare.counts.applies, 1, 'a designator-less audit timestamp must not cost the row');
+    assert.equal(only(bare).eventAt, '2026-09-10T10:00:00.000Z', 'read as UTC, not as local time');
 
-  // And the designator is still ACCEPTED where it appears, since the claim is
-  // that it may be absent rather than that it must be.
-  const withZ = await run(
-    [auditRow({ CreationTime: '2026-09-10T10:00:00Z' })],
-    { source: 'M365_AUDIT_STS' },
-  );
-  assert.equal(only(withZ).eventAt, '2026-09-10T10:00:00.000Z');
+    // Fractional seconds, still no designator.
+    const fractional = await run(
+      [auditRow({ CreationTime: '2026-09-10T10:00:00.123' })],
+      { source: 'M365_AUDIT_STS' },
+    );
+    assert.equal(only(fractional).eventAt, '2026-09-10T10:00:00.123Z');
+
+    // And the designator is still ACCEPTED where it appears, since the claim is
+    // that it may be absent rather than that it must be.
+    const withZ = await run(
+      [auditRow({ CreationTime: '2026-09-10T10:00:00Z' })],
+      { source: 'M365_AUDIT_STS' },
+    );
+    assert.equal(only(withZ).eventAt, '2026-09-10T10:00:00.000Z');
+  } finally {
+    if (originalTz === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTz;
+  }
 });
 
 test('the designator leniency is scoped to the feed that needs it', async () => {

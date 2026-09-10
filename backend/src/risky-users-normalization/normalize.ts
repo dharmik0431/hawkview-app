@@ -67,6 +67,12 @@ function textValue(value: unknown): value is string {
 /**
  * Parse a provider timestamp to epoch millis, or null.
  *
+ * DELIBERATELY NOT A BLANKET RELAXATION, and Engineer 1's phrasing of why is
+ * better than mine: Graph sends a designator on every row, and there a MISSING
+ * designator would mean something is wrong. The tolerance must not be
+ * reachable from a feed where it would hide a fault. A widening that documents
+ * why it is not a widening.
+ *
  * `designator` says whether a trailing `Z` is REQUIRED or may be ABSENT, and
  * it is per-feed rather than global. See the `audit.creation-time-designator`
  * shape predicate: Microsoft's Management Activity API documents CreationTime
