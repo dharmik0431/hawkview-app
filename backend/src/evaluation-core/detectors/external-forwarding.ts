@@ -92,7 +92,8 @@ export function externalForwardingDetector(
           })
         }
       }
-      return { status: 'RAN', considered: applicable.length, findings }
+      // Every mailbox handed over is examined, so nothing is set aside.
+      return { status: 'RAN', considered: applicable.length, declined: {}, findings }
     },
   }
 }

@@ -14,7 +14,7 @@ const matching: Detector<Event> = {
   id: 'matches-flagged',
   monotonic: true,
   run: applicable => ({
-    status: 'RAN', considered: applicable.length,
+    status: 'RAN', considered: applicable.length, declined: {},
     findings: applicable.filter(item => item.match).map(item => ({
       detectorId: 'matches-flagged',
       subject: { kind: 'DIRECTORY_USER', userRef: item.subject } as const,
@@ -177,7 +177,7 @@ test('mailbox findings cross streams without ever becoming people', () => {
         id: 'external-mailbox-forwarding',
         monotonic: true,
         run: applicable => ({
-          status: 'RAN', considered: applicable.length,
+          status: 'RAN', considered: applicable.length, declined: {},
           findings: applicable.map(item => ({
             detectorId: 'external-mailbox-forwarding',
             subject: { kind: 'MAILBOX', mailboxRef: item.subject, binding: 'RESOLVED_NEGATIVE' } as const,

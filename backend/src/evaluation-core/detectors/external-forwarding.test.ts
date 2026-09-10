@@ -87,7 +87,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
       id: 'user-side',
       monotonic: true,
       run: () => ({
-        status: 'RAN' as const, considered: 1,
+        status: 'RAN' as const, considered: 1, declined: {},
         findings: [{
           detectorId: 'user-side',
           subject: { kind: 'DIRECTORY_USER', userRef: 'alice' } as const,
@@ -123,6 +123,7 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
     run: (applicable: readonly MailboxForwardingArtefact[]) => ({
       status: 'RAN' as const,
       considered: applicable.length,
+      declined: {},
       findings: [{
         detectorId: `user-${userRef}`,
         subject: { kind: 'DIRECTORY_USER', userRef } as const,
@@ -171,7 +172,7 @@ test('a disabled rule is configuration, not exfiltration', () => {
   const result = assess([mailbox('a', { rules: [rule({ enabled: false, forwardTo: ['exfil@evil.example'] })] })])
   assert.deepEqual(result.findings.items, [])
   // Considered and cleared, which is what lets this read as a genuine zero.
-  assert.deepEqual(result.detectors, [{ detectorId: 'external-mailbox-forwarding', status: 'RAN', considered: 1, matched: 0 }])
+  assert.deepEqual(result.detectors, [{ detectorId: 'external-mailbox-forwarding', status: 'RAN', considered: 1, declined: {}, matched: 0 }])
   assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
 })
 

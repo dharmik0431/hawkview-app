@@ -265,18 +265,39 @@ export function evaluate<Event>(input: Readonly<{
       // counter was wrong would be the veto pattern in its smallest costume.
       findings.push(...result.findings)
 
-      // `considered` is self-reported, and it is the number that makes "ran and
-      // found nothing" believable rather than merely silent — the whole point
-      // of per-detector accounting. A detector cannot have looked at fewer than
-      // none, or at more events than it was handed, so a figure outside that
-      // range means its account of itself cannot be trusted. An untrustworthy
-      // account of a clean result is worth less than no account, so this gates,
-      // the same resolution as a blank inapplicability reason.
-      if (!Number.isInteger(result.considered) || result.considered < 0 || result.considered > applicable.length) {
+      // The detector must account for every event it was handed: what it
+      // assessed, plus where the rest went, in its own words.
+      //
+      // A range check would only have caught a detector claiming MORE than it
+      // was given — the harmless direction, an embarrassing counter on a
+      // detector that still looked at everything. Claiming FEWER passes a range
+      // check happily, and that is the dangerous one: a detector that narrows
+      // its own input and tells nobody has silently discarded evidence and then
+      // supported a confident zero with the remainder. That is this project's
+      // headline defect, and the detector interior was the one level with no
+      // accounting at all.
+      //
+      // Filtering internally is legitimate — the interrupt rule acts only on
+      // the post-password family. Failing to say where the rest went is not.
+      const declinedTotal = total(result.declined)
+      const accountsForItself =
+        Number.isInteger(result.considered) && result.considered >= 0
+        && Object.values(result.declined).every(count => Number.isInteger(count) && count >= 0)
+        // A blank reason is a silent opt-out wearing a number, same as a blank
+        // inapplicability reason.
+        && Object.keys(result.declined).every(reason => reason.trim() !== '')
+        && result.considered + declinedTotal === applicable.length
+      if (!accountsForItself) {
         reports.push({ detectorId: detector.id, status: 'FAILED' })
         continue
       }
-      reports.push({ detectorId: detector.id, status: 'RAN', considered: result.considered, matched: result.findings.length })
+      reports.push({
+        detectorId: detector.id,
+        status: 'RAN',
+        considered: result.considered,
+        declined: result.declined,
+        matched: result.findings.length,
+      })
     } catch {
       reports.push({ detectorId: detector.id, status: 'FAILED' })
     }

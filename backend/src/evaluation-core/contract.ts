@@ -220,7 +220,25 @@ export type CollectionScope =
   | Readonly<{ declared: false }>
 
 export type DetectorResult =
-  | Readonly<{ status: 'RAN'; considered: number; findings: readonly Finding[] }>
+  | Readonly<{
+    status: 'RAN'
+    /** How many of the events it was handed it actually assessed. */
+    considered: number
+    /** Where the rest went, by the detector's own reason vocabulary.
+     *
+     * A detector may absolutely assess fewer events than it was handed — the
+     * interrupt rule acts only on the post-password family — but it may not
+     * fail to say where the others went. `considered` plus these must equal
+     * what it was given, and the core rejects a result where they do not.
+     *
+     * A range check on a self-reported number can only catch incoherence. A sum
+     * forces the detector to account for its own filtering, which is the thing
+     * actually worth knowing: silently narrowing the input and then supporting a
+     * confident zero with what is left is this project's headline defect, and
+     * the detector interior is the one level that had no accounting at all. */
+    declined: Readonly<Record<string, number>>
+    findings: readonly Finding[]
+  }>
   /** This evidence source cannot answer this detector's question at all — the
    * audit feed carries no conditional-access status, say. Requires a reason in
    * the detector's own words, held to the same standard as an exclusion
@@ -258,7 +276,17 @@ export type Detector<Event> = Readonly<{
  * inapplicable or broken, and only this tells them apart. A failed detector
  * reports no counts, because what it would have considered is unknown. */
 export type DetectorReport =
-  | Readonly<{ detectorId: string; status: 'RAN'; considered: number; matched: number }>
+  | Readonly<{
+    detectorId: string
+    status: 'RAN'
+    considered: number
+    /** Where the events it did not assess went, in its own words. Without this a
+     * detector could narrow its own input to almost nothing and still read as
+     * healthy — the same silent narrowing we removed at tenant and stream level,
+     * one layer further down. */
+    declined: Readonly<Record<string, number>>
+    matched: number
+  }>
   | Readonly<{ detectorId: string; status: 'FAILED' }>
   /** Did not run, and should not have. Distinct from FAILED: a detector that
    * crashed might have found something, so it withholds the clean claim; one
