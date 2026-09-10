@@ -12,12 +12,12 @@ const t = (n: number) => new Date(Date.UTC(2026, 8, 10, 0, 0, n)).toISOString()
 const ev = (id: string, kind: string, ip: string, n: number): Ev => ({ id, kind, user: 'alice', ip, at: t(n) })
 
 const accuse = (id: string): Finding => ({
-  detectorId: id, subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: false, because: 'probe' } },
-  observedAt: t(0),
+  detectorId: id, subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: false as const, because: 'probe' } },
+  signals: [{ signal: 'ACCUSATION', count: 1, latest: t(0), capped: false }],
 })
 const det = (id: string, fires: (e: readonly Ev[]) => boolean): Detector<Ev> => ({
   id, monotonic: true, // deliberately mis-declared for every shape
-  run: (applicable): DetectorResult => ({ status: 'RAN', considered: applicable.length, findings: fires(applicable) ? [accuse(id)] : [] }),
+  run: (applicable): DetectorResult => ({ status: 'RAN', assessed: applicable.length, declined: {}, findings: fires(applicable) ? [accuse(id)] : [] }),
 })
 
 // Oldest -> newest. Keep-newest truncation drops from the FRONT.
@@ -41,7 +41,7 @@ const shapes: readonly (readonly [string, string, Detector<Ev>])[] = [
 
 const run = (d: Detector<Ev>, maxEvents: number) => evaluate({
   evidence: { availability: 'READ', applies: pool,
-    coverage: { collectionScope: { declared: true, asked: 'ALL' }, applies: pool.length, doesNotApply: {}, unknown: {}, unprocessable: {} }, timeOf: (e: Ev) => e.at },
+    coverage: { collectionScope: { declared: true, asked: 'ALL' }, applies: pool.length, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {} }, timeOf: (e: Ev) => e.at },
   detectors: [d], budget: { maxEvents },
 })
 

@@ -5,20 +5,39 @@
 // Monotonic means: adding events never removes a finding. An absence-keyed rule
 // is not monotonic, and declaring it so is the dangerous direction — truncation
 // then FABRICATES a finding rather than losing one.
-import type { Detector, Finding } from './contract.js'
+import type { Detector, DetectorFinding } from './contract.js'
 
-const key = (finding: Finding): string =>
+/** Identity must be STABLE under adding events, or the harness reports growth
+ * as loss.
+ *
+ * This used to include `observedAt`, which the per-signal contract removed. Its
+ * replacement is not `max(signals.latest)`: that value MOVES as events are
+ * added, so keying on it would make every monotonic detector look broken the
+ * moment a newer event arrived. A finding is identified by whom it is about. */
+const identity = (finding: DetectorFinding): string =>
   `${finding.detectorId}|${finding.subject.kind}|${
     finding.subject.kind === 'DIRECTORY_USER' ? finding.subject.userRef : finding.subject.mailboxRef
-  }|${finding.observedAt}`
+  }`
+
+/** Dropping `observedAt` from the identity removes a distinction, and a harness
+ * that draws fewer distinctions catches fewer faults. This puts the strength
+ * back where it now belongs: a finding may gain signals as events arrive, but
+ * losing one is a basis disappearing under a claim that survived — which the
+ * identity check alone cannot see, because the finding is still there. */
+const signalNames = (finding: DetectorFinding): readonly string[] => finding.signals.map(s => s.signal)
 
 /** Deterministic so a failure is reproducible from its seed alone. */
 const rng = (seed: number) => () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff
 
-/** Two ways a finding can vanish, kept apart because they mean different things.
+/** Three ways a finding can vanish, kept apart because they mean different things.
  *
  * LOST_WHILE_RAN is unambiguous: the larger run answered and dropped a finding
  * the smaller run made. That is non-monotonicity.
+ *
+ * SIGNAL_LOST_WHILE_RAN is the same fault one level in: the finding survived
+ * but a signal it rested on did not. The count is unchanged, so nothing above
+ * this notices, and the finding now cites a narrower basis than the smaller
+ * window did.
  *
  * LOST_TO_DECLINE is a judgement call: the larger run returned INAPPLICABLE, so
  * the finding is gone but the detector never claimed to have looked. Some
@@ -30,7 +49,7 @@ export type MonotonicityResult =
   | Readonly<{ held: true; trials: number; findingsSeen: number; declines: number }>
   | Readonly<{
       held: false
-      kind: 'LOST_WHILE_RAN' | 'LOST_TO_DECLINE'
+      kind: 'LOST_WHILE_RAN' | 'SIGNAL_LOST_WHILE_RAN' | 'LOST_TO_DECLINE'
       seed: number; trial: number; lost: readonly string[]
       subsetSize: number; supersetSize: number
     }>
@@ -74,12 +93,22 @@ export function checkMonotonic<Event>(
       declines++
       if (!declineIsViolation) continue
       return { held: false, kind: 'LOST_TO_DECLINE', seed, trial,
-        lost: small.findings.map(key), subsetSize: subset.length, supersetSize: superset.length }
+        lost: small.findings.map(identity), subsetSize: subset.length, supersetSize: superset.length }
     }
-    const survived = new Set(large.findings.map(key))
-    const lost = small.findings.map(key).filter(k => !survived.has(k))
+
+    const survived = new Map(large.findings.map(f => [identity(f), signalNames(f)] as const))
+    const lost = small.findings.map(identity).filter(k => !survived.has(k))
     if (lost.length > 0) {
       return { held: false, kind: 'LOST_WHILE_RAN', seed, trial, lost,
+        subsetSize: subset.length, supersetSize: superset.length }
+    }
+
+    const signalsLost = small.findings.flatMap(f => {
+      const after = survived.get(identity(f)) ?? []
+      return signalNames(f).filter(s => !after.includes(s)).map(s => `${identity(f)}|${s}`)
+    })
+    if (signalsLost.length > 0) {
+      return { held: false, kind: 'SIGNAL_LOST_WHILE_RAN', seed, trial, lost: signalsLost,
         subsetSize: subset.length, supersetSize: superset.length }
     }
   }

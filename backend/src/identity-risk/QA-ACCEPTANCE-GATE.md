@@ -188,3 +188,147 @@ counterexample, and a declining detector is reported as `LOST_TO_DECLINE`.
 Like the probes, these import the rebuild's `evaluation-core` contract and will
 not compile on this branch. Kept here because a QA instrument is stronger when
 it is not maintained by the author whose declarations it checks.
+
+---
+
+## Re-verified against `main` (`1142232`)
+
+An earlier pass of this section was written against `4250a27`, the integration
+tip PM named. `main` is 47 commits beyond it and carries both PM's revert of
+this gate and a further contract change, so that pass was measuring a commit
+nobody is shipping. Everything below is `main`.
+
+`tsc --noEmit` is clean. The cleanliness is accounted for: all 14 QA files are
+in the compiler's program (`--listFiles`), an injected type error is caught,
+and it disappears again when removed.
+
+### Repaired, and this gate can show it
+
+| Scenario | Result on `main` |
+| --- | --- |
+| CONTROL — 20 successes, nothing excluded | EXACT 0, scope supports it |
+| MIXED — 4 assessed / 8 `KEEP_ME_SIGNED_IN` | EXACT 0, exclusions travel with the count |
+| FULLY EXCLUDED — 0 applied / 12 excluded | NOT_AVAILABLE / `NOTHING_APPLICABLE` |
+| AUDIT, `Z` and bare timestamps | accepted, EXACT 0 |
+| AUDIT, `+05:00` offset | rejected, count NOT_AVAILABLE — not a zero |
+| TIMESTAMP COHERENCE | **COHERENT** |
+
+Three findings this gate raised are closed:
+
+- **Timestamp incoherence.** A finding no longer carries one `observedAt`.
+  Each signal carries its own count and `latest`, and the gate now reads
+  `LOCKED_OUT_AFTER_REPEATED_FAILURES` count 6 latest 10:05 alongside
+  `PASSWORD_REJECTED` count 1 latest 20:00 — ten hours apart, each stamped
+  from its own evidence. The gate identifies which signal is which **by count**
+  (six lockouts, one rejection) rather than by name, so it does not pass
+  silently the day the vocabulary changes.
+- **Under-reporting.** `assessed + declined === handed` is now enforced
+  (`evaluate.ts:373`). A detector claiming it assessed 5 of 1000 is rejected;
+  the probe moved from `GAP` to `CLOSED`.
+- **The zero-assessed veto.** A detector may report `assessed: 0` with
+  everything declined and still support a claim. CONTROL shows `assessed: 0,
+  declined: {NOT_A_CREDENTIAL_FAILURE_OUTCOME: 20}` reaching EXACT 0. The
+  earlier version of this guard told every clean tenant "we cannot tell you."
+
+### Not repaired: none of it is reachable
+
+**Nothing outside `risky-users-wiring/`, `risky-users-normalization/` and
+`evaluation-core/` imports any of them.** Checked repo-wide across
+`backend/src`, `app`, `lib` and `components`; the only reference anywhere is a
+test script in `backend/package.json`. `app.module.ts` still registers
+`IdentityRiskModule`, and `identity-risk.controller.ts` still serves
+`identity-signals/assessment` and `identity-signals/summary` from the old
+engine.
+
+Driven through that old engine — the path a customer actually reaches — this
+gate still fails PRE_EXISTING and MIXED: a confident exact zero over 12
+security-relevant events, with nothing disclosing they fell outside the
+assessed scope. Reproduced on `4250a27` and again on `main`, same two scenarios
+both times, with CONTROL passing in the same run.
+
+The repair is real, it is well built, and at `1142232` it is dead code. A
+customer loading Risky Users today sees exactly what they saw before.
+
+### The harness was retargeted without being weakened
+
+Removing `observedAt` removed part of the finding identity `checkMonotonic` was
+keying on. The replacement is NOT `max(signals.latest)` — that value moves as
+events are added, so keying on it would make every monotonic detector look
+broken the moment a newer event arrived. Identity narrowed to the subject.
+
+Narrowing an identity key means drawing fewer distinctions, and a quieter
+harness reads as a greener product. So signal survival became its own check
+(`SIGNAL_LOST_WHILE_RAN`): a finding may gain signals, but losing one is a
+basis vanishing under a claim that survived, which the identity check cannot
+see because the finding is still there.
+
+That check is proved able to fail. A detector that keeps the same finding and
+drops a signal as the window grows is caught; the same detector with its
+signals held constant is not. The original discrimination still holds too —
+519 findings survive for the presence-keyed detector, the mis-declared
+absence-keyed one fails at trial 1, and a decline is still reported as
+`LOST_TO_DECLINE` rather than as a violation.
+
+### Two probes of mine were wrong, and the guards caught both
+
+`qa-mixed-decision-layer.ts` excluded rows using code `53004`. In the merged
+provider facts that code is `NOT_OBSERVED` and classifies as RISK, so every row
+applied, nothing was excluded, and the probe went inert. The `inputCanFail`
+guard reported INCONCLUSIVE rather than a pass.
+
+Retargeted at `50140`, it then reported `BARE ZERO` — also wrong. Its `totalOn`
+summed only top-level numbers, and `setAside` is an array of
+`{vocabulary, reason, count}` records, so the probe read 0 from a layer that was
+disclosing all eight exclusions. Fixed with a deep sum, and confirmed to still
+discriminate: deleting `setAside` from the inspected scope flips it back to
+`BARE ZERO`.
+
+Both have one root. `provider-facts.ts:74` names `53004` as one of two past
+errors in this workstream — sound readings of Microsoft's documentation for
+events nobody has ever seen. A fixture built on a code the provider does not
+emit tests the documentation, not the product.
+
+### Deleted
+
+`qa-probe-{read-lane-race,early-reject,lane-boundary,lane-test-specificity}.ts`
+and `qa-reader-lane-contention.database-integration.test.ts` targeted
+`runInReadMemoryLane`, which does not exist in this lineage.
+`qa-zero-truthfulness.database-integration.test.ts` targeted the v1 assessment
+`summary`. They could not be ported, only rewritten against a different design.
+
+`qa-security-events-never-zero.database-integration.test.ts` was NOT deleted.
+It is the only thing here that tests the path a customer actually reaches, and
+it is the only thing here that still fails.
+
+### Added: `qa-probe-signal-truthfulness.ts`
+
+Two claims the per-signal contract makes that nothing else here checked.
+
+**`capped`.** Over budget, `evaluate` truncates to the most recent slice before
+any detector sees it, so every count from that window is a floor. Pool of 40,
+budget 10: every signal comes back `capped: true` and the claim is `AT_LEAST`,
+not `EXACT`. The same detector over the whole window is `capped: false` and
+`EXACT`.
+
+**Evaluated-and-none vs never-evaluated.** `latest: null` means the signal was
+evaluated and none occurred; a signal absent from the array was never
+evaluated. A core that dropped zero-count signals would collapse the two while
+every count stayed correct. It does not: the zero-count signal survives and the
+absent one stays absent.
+
+Both verified by mutating the product source and restoring it:
+
+| Mutation to `evaluate.ts` | Result |
+| --- | --- |
+| `cappedWhenTruncated(finding, false)` | capped check FAILS, other check unaffected |
+| drop signals with `count === 0` | looked-vs-didn't check FAILS, capped check unaffected |
+
+Each mutation fails the check that should catch it and no others, so neither
+PASS is a check that cannot fail.
+
+One thing checked and found sound rather than defective: `capped` is stamped
+from the `evaluate` budget alone, so a count truncated further upstream would
+carry `capped: false`. In this path it cannot happen — `read-tenant.ts` puts no
+`take` on the query, `rowsFetched` is the true fetched count, and
+`assertAccountsForEveryRow` holds it against the classifier. Worth re-checking
+if a query limit is ever added.

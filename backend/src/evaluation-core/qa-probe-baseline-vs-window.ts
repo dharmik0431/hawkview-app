@@ -16,7 +16,8 @@ const pool: readonly Ev[] = [
   { id: 'e', ip: '10.0.0.1', at: t(5) },
 ]
 const accuse = (id: string): Finding => ({ detectorId: id,
-  subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: false, because: 'probe' } }, observedAt: t(0) })
+  subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: false as const, because: 'probe' } },
+  signals: [{ signal: 'NEW_IP', count: 1, latest: t(0), capped: false }] })
 
 // WINDOW-DERIVED history: "an IP with no earlier event in this window".
 const windowDerived: Detector<Ev> = { id: 'window-derived', monotonic: true,
@@ -24,7 +25,7 @@ const windowDerived: Detector<Ev> = { id: 'window-derived', monotonic: true,
     const seen = new Set<string>(); const novel: string[] = []
     for (const e of applicable) { if (!seen.has(e.ip)) novel.push(e.ip); seen.add(e.ip) }
     // Fires when the FIRST event of the window introduces an IP -- i.e. no history.
-    return { status: 'RAN', considered: applicable.length,
+    return { status: 'RAN', assessed: applicable.length, declined: {},
       findings: applicable.length > 0 && novel.length > 0 && applicable.length < 3 ? [accuse('window-derived')] : [] }
   } }
 
@@ -32,12 +33,12 @@ const windowDerived: Detector<Ev> = { id: 'window-derived', monotonic: true,
 // that truncation cannot reach.
 const baseline = new Set(['10.0.0.1'])
 const baselineBacked: Detector<Ev> = { id: 'baseline-backed', monotonic: true,
-  run: (applicable): DetectorResult => ({ status: 'RAN', considered: applicable.length,
+  run: (applicable): DetectorResult => ({ status: 'RAN', assessed: applicable.length, declined: {},
     findings: applicable.some(e => !baseline.has(e.ip)) ? [accuse('baseline-backed')] : [] }) }
 
 const run = (d: Detector<Ev>, maxEvents: number) => evaluate({
   evidence: { availability: 'READ', applies: pool,
-    coverage: { collectionScope: { declared: true, asked: 'ALL' }, applies: pool.length, doesNotApply: {}, unknown: {}, unprocessable: {} },
+    coverage: { collectionScope: { declared: true, asked: 'ALL' }, applies: pool.length, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {} },
     timeOf: (e: Ev) => e.at },
   detectors: [d], budget: { maxEvents } })
 

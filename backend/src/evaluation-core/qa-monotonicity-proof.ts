@@ -12,14 +12,14 @@ const pool: readonly Ev[] = [
   { id: 'f5', kind: 'FAILURE', user: 'carol' }, { id: 's3', kind: 'SUCCESS', user: 'carol' },
 ]
 const finding = (id: string, user: string) => ({
-  detectorId: id, subject: { kind: 'DIRECTORY_USER' as const, userRef: user }, observedAt: '2026-09-10T00:00:00.000Z',
+  detectorId: id, subject: { kind: 'DIRECTORY_USER' as const, userRef: user, correlation: { available: false as const, because: 'qa probe' } }, signals: [{ signal: 'FAILURE', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const,
 })
 
 // PRESENCE-keyed: "this user had a failure". Adding events can only add findings.
 const monotonic: Detector<Ev> = {
   id: 'presence', monotonic: true,
   run: (events): DetectorResult => ({
-    status: 'RAN', considered: events.length,
+    status: 'RAN', assessed: events.length, declined: {},
     findings: [...new Set(events.filter(e => e.kind === 'FAILURE').map(e => e.user))].map(u => finding('presence', u)),
   }),
 }
@@ -31,7 +31,7 @@ const notMonotonic: Detector<Ev> = {
   run: (events): DetectorResult => {
     const succeeded = new Set(events.filter(e => e.kind === 'SUCCESS').map(e => e.user))
     return {
-      status: 'RAN', considered: events.length,
+      status: 'RAN', assessed: events.length, declined: {},
       findings: [...new Set(events.filter(e => e.kind === 'FAILURE' && !succeeded.has(e.user)).map(e => e.user))]
         .map(u => finding('absence', u)),
     }
@@ -62,7 +62,7 @@ const declines: Detector<Ev> = {
   id: 'declines', monotonic: true,
   run: (events): DetectorResult => events.length > 4
     ? { status: 'INAPPLICABLE', because: 'this evidence cannot answer at this size' }
-    : { status: 'RAN', considered: events.length,
+    : { status: 'RAN', assessed: events.length, declined: {},
         findings: [...new Set(events.filter(e => e.kind === 'FAILURE').map(e => e.user))].map(u => finding('declines', u)) },
 }
 const strict = checkMonotonic(declines, pool, { trials: 300 })
@@ -75,5 +75,53 @@ console.log(JSON.stringify({
     verdict: !strict.held && strict.kind === 'LOST_TO_DECLINE' && lenient.held
       ? 'PASS: a decline is reported as its own kind, not as a monotonicity violation, and is tolerable on request'
       : 'FAIL: the harness cannot tell a decline from a real loss',
+  },
+}, null, 2))
+
+// SIGNAL_LOST_WHILE_RAN. The per-signal contract removed `observedAt`, which
+// this harness had been using as part of a finding's identity. Dropping it
+// without replacement would have left the harness drawing fewer distinctions
+// than before -- a quieter harness reads as a greener product.
+//
+// So identity narrowed to the subject, and signal survival became its own
+// check. That check has to be shown capable of failing, or narrowing the
+// identity was simply a weakening with a comment attached.
+//
+// This detector keeps the SAME finding for the same user as events are added,
+// and drops a signal from it once the window grows. Nothing above the signal
+// level can see that: the finding is still there and the count is unchanged.
+const dropsASignal: Detector<Ev> = {
+  id: 'drops-a-signal', monotonic: true,
+  run: (events): DetectorResult => {
+    const users = [...new Set(events.filter(e => e.kind === 'FAILURE').map(e => e.user))]
+    return {
+      status: 'RAN', assessed: events.length, declined: {},
+      findings: users.map(u => ({
+        detectorId: 'drops-a-signal',
+        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false as const, because: 'qa probe' } },
+        signals: (events.length > 4
+          ? [{ signal: 'FAILURE', count: 1, latest: '2026-09-10T00:00:00.000Z' }]
+          : [{ signal: 'FAILURE', count: 1, latest: '2026-09-10T00:00:00.000Z' },
+             { signal: 'CORROBORATING_DETAIL', count: 1, latest: '2026-09-10T00:00:00.000Z' }]
+        ) as unknown as readonly [{ signal: string; count: number; latest: string | null }],
+      })),
+    }
+  },
+}
+const signalLoss = checkMonotonic(dropsASignal, pool, { trials: 300 })
+const findingsHeld = checkMonotonic(
+  { ...dropsASignal, run: events => {
+    const r = dropsASignal.run(events)
+    return r.status === 'RAN'
+      ? { ...r, findings: r.findings.map(f => ({ ...f, signals: [f.signals[0]] as const })) }
+      : r
+  } }, pool, { trials: 300 })
+console.log(JSON.stringify({
+  QA_SIGNAL_SURVIVAL: {
+    signalDropped: signalLoss.held ? { held: true } : { held: false, kind: signalLoss.kind, lost: signalLoss.lost.slice(0, 3) },
+    sameDetectorWithSignalsHeldConstant: findingsHeld.held,
+    verdict: !signalLoss.held && signalLoss.kind === 'SIGNAL_LOST_WHILE_RAN' && findingsHeld.held
+      ? 'PASS: a signal disappearing under a surviving finding is caught, and is not reported for a detector that keeps its signals'
+      : 'FAIL: the signal-survival check cannot fail, so narrowing the identity key weakened the harness',
   },
 }, null, 2))
