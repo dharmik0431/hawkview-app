@@ -655,6 +655,11 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
         event.classification.kind === 'DOES_NOT_APPLY' &&
         event.classification.reason === 'MICROSOFT_RISK_VERDICT',
     ),
+    microsoftSafetyVerdicts: ordered.filter(
+      event =>
+        event.classification.kind === 'DOES_NOT_APPLY' &&
+        event.classification.reason === 'MICROSOFT_SAFETY_VERDICT',
+    ),
     resolvedSubjects: [...resolvedSubjects].map(([subjectRef, entry]) => ({ subjectRef, ...entry })),
     counts: {
       rows: rows.length,

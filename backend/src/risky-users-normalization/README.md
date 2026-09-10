@@ -431,3 +431,67 @@ Concretely, the ~921 malicious-IP rows now routed to `MICROSOFT_RISK_VERDICT` ha
 sitting in the sign-in log misfiled as HawkView findings, for a tenant whose
 Microsoft-risk channel was empty. Moving them fills that channel today. Worth knowing
 before anyone plans work around the risk API being the only route to Microsoft's verdicts.
+
+## Addendum: observation versus anticipation
+
+Every entry in `RESULT_CODES` now carries `graphObservation`. Fourteen distinct
+`status.errorCode` values have ever been seen on the Graph feed
+(`OBSERVED_GRAPH_ERROR_CODES`); anything mapped outside that list is **anticipation from
+documentation, not observation**, and is exercised only by synthetic fixture.
+
+That distinction has already caught two mistakes, both of which were sound readings of
+Microsoft's documentation for events we have never once seen: the third 50053 text
+variant, and code **53004** — authorized into the Microsoft channel before anyone checked
+whether it occurs. It does not. The branch stays, because `ProofUpBlockedDueToRisk`
+naming a risk-driven block is reasonable anticipation, but it is marked
+`NO_PRODUCTION_EVIDENCE`.
+
+The tally: 26 codes mapped, of which **9 are observed and 17 are anticipated**.
+
+And the reverse problem, which is a genuine coverage gap rather than a dead branch:
+**five of the fourteen observed codes are not mapped at all** —
+`OBSERVED_BUT_UNMAPPED_GRAPH_CODES` is 16003, 50011, 50020, 70044, 90094. They classify
+as `UNRECOGNIZED_ERROR_CODE` and cost stated coverage. Mapping them from a
+half-remembered meaning is exactly the error this module exists to prevent, so each wants
+a documented meaning and a volume first.
+
+**A volume caveat worth having before anyone promises the interrupt detector.** The
+post-password interrupt family is the highest-value detector the research identifies, and
+in our data it is almost empty: 50074 is observed at 3 rows, 500121 is observed, and
+50076, 50072 and 50079 have **never appeared**. The mapping is right and documentation-
+grounded — 50076 must not go back to being "not a credential event" — but the evidence
+base for that detector is currently three rows plus whatever 500121 volume exists. Do not
+promise what it will find.
+
+## Addendum: whose judgement *generated* it
+
+The attribution rule, in its sharpened form: **attribute by whose judgement GENERATED the
+finding, not by whose machinery responded to it.**
+
+The case that forced the sharpening: 55 rows carry both a Microsoft risk verdict and a
+Conditional Access *success* — risk-based CA, where Microsoft's engine judged the sign-in
+risky, which triggered a policy the tenant configured, which required MFA, which passed.
+The policy is the tenant's; the trigger is Microsoft's; one row carries both. The finding
+is "Microsoft judged this risky", and the MFA challenge that followed is **remediation** —
+context on that finding, not a separate finding of ours.
+
+### Risk and safety verdicts are different things
+
+Microsoft's channel carries both, and conflating them fails in one specific and actively
+misleading direction. `aiConfirmedSigninSafe` is Microsoft's AI concluding a sign-in was
+**safe** — a dismissal, not a detection. Rendered in a "risky users" view it would say
+"this user is at risk" when Microsoft said the opposite.
+
+So there are two reasons and **two separate lists**, `batch.microsoftRiskVerdicts` and
+`batch.microsoftSafetyVerdicts`, rather than one list and a flag — a test asserts no event
+appears in both. The state is modelled, not the mere presence of a risk field.
+
+`MICROSOFT_SAFETY_VERDICT` is currently **unreachable**, and so is the risk-based-CA case
+above, because reaching either means reading `raw.riskDetail` — a payload-shape predicate
+with **no control cohort**. The gap is live rather than hypothetical: those 55 rows
+classify today as ordinary successes and sit in `applies`, which is the channel mixing the
+predicate would fix. But routing on an unconfirmed field would remove 55 real successes
+from evaluation if it means something other than we think, so it is registered as
+`graph.risk-detail` / `PENDING_DISTRIBUTION_CHECK` and has no effect until the control
+cohort lands: every Graph row bucketed by `riskDetail` value, with ordinary human
+successes as the cohort that must NOT carry a verdict-shaped value.

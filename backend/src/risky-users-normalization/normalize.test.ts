@@ -18,6 +18,8 @@ import {
   FAILURE_REASON_MEANINGS,
   RESULT_CODES,
   SHAPE_PREDICATES,
+  OBSERVED_BUT_UNMAPPED_GRAPH_CODES,
+  OBSERVED_GRAPH_ERROR_CODES,
   UNREACHABLE_BY_SUBJECT_RESOLUTION,
   UNVALIDATED_FAILURE_REASON_MEANINGS,
   dispositionForCode,
@@ -185,7 +187,7 @@ test('a batch that is entirely unrecognized still returns events and no gate', a
   // the evaluation core could branch on to skip a rule.
   assert.deepEqual(Object.keys(batch).sort(), [
     'applies', 'counts', 'coverage', 'events', 'microsoftRiskVerdicts',
-    'resolvedSubjects', 'scope', 'shapeObservations', 'source',
+    'microsoftSafetyVerdicts', 'resolvedSubjects', 'scope', 'shapeObservations', 'source',
   ]);
   assert.deepEqual(Object.keys(batch.coverage).sort(), [
     'collectionScope', 'consideredRows', 'normalizedRows', 'recognizedRows',
@@ -1229,4 +1231,95 @@ test('53004 is in Microsoft’s channel and shows up in that list', async () => 
   assert.deepEqual(batch.microsoftRiskVerdicts.map(event => event.eventId), ['evt-1']);
   assert.equal(batch.applies.length, 0);
   assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_RISK_VERDICT, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Observation versus anticipation, and the two Microsoft verdict kinds.
+// ---------------------------------------------------------------------------
+
+test('every mapped code declares whether we have actually seen it', () => {
+  // Two mistakes in this workstream were sound readings of Microsoft's
+  // documentation for events we have never once seen: the third 50053 text
+  // variant, and code 53004. The marker is what keeps anticipation from
+  // reading as a working path.
+  assert.equal(OBSERVED_GRAPH_ERROR_CODES.length, 14);
+  for (const entry of RESULT_CODES) {
+    const observed = OBSERVED_GRAPH_ERROR_CODES.includes(entry.code);
+    assert.equal(
+      entry.graphObservation,
+      observed ? 'OBSERVED' : 'NOT_OBSERVED',
+      `code ${entry.code} claims ${entry.graphObservation}`,
+    );
+  }
+  const seen = RESULT_CODES.filter(entry => entry.graphObservation === 'OBSERVED');
+  assert.equal(seen.length, 9, 'nine of the fourteen observed codes are mapped');
+});
+
+test('observed codes we do not map are recorded, and cost coverage rather than being invented', async () => {
+  // The reverse problem from an anticipated mapping: real rows with no
+  // mapping. Mapping them from a half-remembered meaning is the error this
+  // module exists to prevent, so they stay unrecognized and visible.
+  assert.deepEqual([...OBSERVED_BUT_UNMAPPED_GRAPH_CODES], [16003, 50011, 50020, 70044, 90094]);
+  for (const code of OBSERVED_BUT_UNMAPPED_GRAPH_CODES) {
+    const batch = await run([graphRow({ status: { errorCode: code } })]);
+    assert.deepEqual(
+      only(batch).classification,
+      { kind: 'UNKNOWN', observation: 'UNRECOGNIZED_ERROR_CODE' },
+      `code ${code}`,
+    );
+  }
+});
+
+test('53004 stays in Microsoft’s channel but is marked as never observed', () => {
+  const entry = resultCodeEntry(53004)!;
+  assert.deepEqual(entry.disposition, { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' });
+  assert.equal(entry.graphObservation, 'NOT_OBSERVED');
+  assert.match(entry.note ?? '', /NO PRODUCTION EVIDENCE/);
+  assert.ok((entry.exclusionCitation ?? '').length > 15);
+});
+
+test('a Microsoft risk verdict and a Microsoft safety verdict can never be the same thing', async () => {
+  // Microsoft's channel carries both. A safety verdict rendered in a "risky
+  // users" view would say "this user is at risk" when Microsoft said the
+  // opposite, so the two are separate lists rather than one list and a flag.
+  const batch = await run([
+    graphRow({ id: 'risky', status: { errorCode: 53004 } }),
+    graphRow({ id: 'ordinary', status: { errorCode: 50126 } }),
+  ]);
+  assert.deepEqual(batch.microsoftRiskVerdicts.map(event => event.eventId), ['risky']);
+  const riskIds = new Set(batch.microsoftRiskVerdicts.map(event => event.eventId));
+  for (const event of batch.microsoftSafetyVerdicts) {
+    assert.equal(riskIds.has(event.eventId), false, 'an event must never be in both lists');
+  }
+  // Asserted last: node:assert narrows the type, which would make the loop above vacuous.
+  assert.equal(batch.microsoftSafetyVerdicts.length, 0, 'unreachable until riskDetail has a control cohort');
+  assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_SAFETY_VERDICT, 0);
+});
+
+test('riskDetail has no control cohort yet, so it changes nothing', async () => {
+  // 55 measured rows carry a riskDetail alongside a Conditional Access
+  // success, and they currently classify as ordinary successes. Routing them
+  // on an unconfirmed field would remove 55 real successes from evaluation if
+  // the field means something other than we think.
+  assert.equal(mayExclude('graph.risk-detail'), false);
+
+  const withRiskDetail = await run([graphRow({
+    riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
+    conditionalAccessStatus: 'success',
+    status: { errorCode: 0, failureReason: 'Other.' },
+  })]);
+  const withSafeDetail = await run([graphRow({
+    riskDetail: 'aiConfirmedSigninSafe',
+    conditionalAccessStatus: 'success',
+    status: { errorCode: 0, failureReason: 'Other.' },
+  })]);
+  const without = await run([graphRow({ status: { errorCode: 0, failureReason: 'Other.' } })]);
+
+  const expected = { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' };
+  assert.deepEqual(only(withRiskDetail).classification, expected);
+  assert.deepEqual(only(withSafeDetail).classification, expected);
+  assert.deepEqual(only(without).classification, expected);
+  // And neither reaches Microsoft's channel on an unverified field.
+  assert.deepEqual(withRiskDetail.microsoftRiskVerdicts, []);
+  assert.deepEqual(withSafeDetail.microsoftSafetyVerdicts, []);
 });

@@ -45,8 +45,7 @@ export type OutOfScopeReason =
   /** 50058. Microsoft: "a common error that's expected." */
   | 'INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN'
   /**
-   * Microsoft's own risk judgement, reached by Microsoft's intelligence rather
-   * than by a control the tenant configured.
+   * Microsoft judged the sign-in RISKY.
    *
    * Excluded from HawkView's findings on the owner's product rule, not on a
    * Microsoft citation: our findings and Microsoft's reported risk are two
@@ -54,8 +53,29 @@ export type OutOfScopeReason =
    * never be presented as our own. A doc says what a code means; the brief
    * says what we are permitted to assert, which is the stronger citation here.
    * Surfaced via `batch.microsoftRiskVerdicts` so the signal is not lost.
+   *
+   * ATTRIBUTION RULE, in its sharpened form: attribute by whose judgement
+   * GENERATED the finding, not by whose machinery responded to it. A
+   * risk-based Conditional Access policy is the tenant's machinery responding
+   * to Microsoft's judgement — the finding is still "Microsoft judged this
+   * risky", and the MFA challenge that followed is remediation, which is
+   * context on that finding rather than a finding of ours.
    */
   | 'MICROSOFT_RISK_VERDICT'
+  /**
+   * Microsoft judged the sign-in SAFE. A dismissal, not a detection.
+   *
+   * Separate from MICROSOFT_RISK_VERDICT because conflating them is actively
+   * misleading in the one direction that matters: Microsoft's AI concluding
+   * "we looked and this is fine" must never render as "this user is at risk".
+   * Microsoft's channel carries both verdict kinds, so the state is modelled
+   * rather than the mere presence of a risk field.
+   *
+   * RESERVED and currently unreachable: reaching it means reading `riskDetail`,
+   * which is a payload-shape predicate with no control cohort yet. See
+   * provider-facts.
+   */
+  | 'MICROSOFT_SAFETY_VERDICT'
   /**
    * RESERVED, currently unreachable. No confirmed field marks a non-interactive
    * sign-in: `isInteractive` is true on 100% of collected Graph rows, so the
@@ -205,7 +225,8 @@ export const SUBJECT_RESOLUTION_FAILURES: readonly UnprocessableReason[] = [
 export const OUT_OF_SCOPE_LABELS: Readonly<Record<OutOfScopeReason, string>> = {
   KEEP_ME_SIGNED_IN: 'Keep-me-signed-in prompt, which Microsoft documents as an expected part of the sign-in flow',
   INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN: 'Existing session was insufficient for silent sign-in, which Microsoft documents as expected',
-  MICROSOFT_RISK_VERDICT: 'Microsoft judged this sign-in risky and blocked it; shown under Microsoft-reported risk, not as a HawkView finding',
+  MICROSOFT_RISK_VERDICT: 'Microsoft judged this sign-in risky; shown under Microsoft-reported risk, not as a HawkView finding',
+  MICROSOFT_SAFETY_VERDICT: 'Microsoft assessed this sign-in and judged it safe; shown under Microsoft-reported risk as a dismissal, never as a HawkView finding',
   NON_INTERACTIVE_SIGN_IN: 'Background sign-in rather than a person entering a credential',
   APPLICATION_ACTOR: 'The actor was an application or service principal, not a person',
 };

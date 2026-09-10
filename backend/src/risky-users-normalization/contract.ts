@@ -11,7 +11,7 @@ import type {
  * The seam between collection/storage and the Risky Users evaluation core.
  *
  * In:  raw `sign_in_logs` rows plus `directory_users` rows, and one selected feed.
- * Out: normalized events, each classified into exactly one of three buckets,
+ * Out: normalized events, each classified into exactly one of four buckets,
  *      plus independent tallies and a coverage statement.
  *
  * Two invariants are expressed in the types rather than in comments:
@@ -290,17 +290,31 @@ export interface NormalizationBatch {
   /** The subset HawkView's own detectors act on. Same ordering. */
   readonly applies: readonly NormalizedEvent[];
   /**
-   * Events carrying Microsoft's own high-confidence risk verdict, kept OUT of
-   * `applies` and surfaced separately.
+   * Events where Microsoft judged the sign-in RISKY, kept OUT of `applies` and
+   * surfaced separately.
    *
-   * These are classified DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT, because the
-   * owner's product rule is that HawkView's own findings and Microsoft's
-   * reported risk are two evidence channels that are never merged or summed.
-   * A verdict Microsoft reached is not a HawkView finding. It is still the
-   * only Microsoft risk signal an unlicensed tenant will ever see, so it is
-   * exposed here rather than buried in a counter.
+   * Classified DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT, because the owner's
+   * product rule is that HawkView's own findings and Microsoft's reported risk
+   * are two evidence channels that are never merged or summed. A verdict
+   * Microsoft reached is not a HawkView finding. It is still the only
+   * Microsoft risk signal an unlicensed tenant will ever see, so it is exposed
+   * here rather than buried in a counter.
    */
   readonly microsoftRiskVerdicts: readonly NormalizedEvent[];
+  /**
+   * Events where Microsoft judged the sign-in SAFE — a dismissal, not a
+   * detection.
+   *
+   * A SEPARATE list rather than a flag on the one above, because the failure
+   * mode is specific and one-directional: a safety verdict rendered in a
+   * "risky users" view says "this user is at risk" when Microsoft said the
+   * opposite. Two lists make that impossible to do by accident, and a test
+   * asserts nothing appears in both.
+   *
+   * Empty today: populating it means reading `riskDetail`, which has no
+   * control cohort yet.
+   */
+  readonly microsoftSafetyVerdicts: readonly NormalizedEvent[];
   /** Reference-to-identifier mapping for subjects that resolved, kept off the events. */
   readonly resolvedSubjects: readonly {
     readonly subjectRef: string;

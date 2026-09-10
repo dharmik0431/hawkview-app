@@ -36,6 +36,21 @@ import type { OutOfScopeReason, UncitedReason, UnknownObservation } from './reas
  *     coverage, blocks nothing, and is recoverable the moment one exists.
  */
 
+/**
+ * The complete set of Graph `status.errorCode` values ever observed, across
+ * all tenants and all history. Fourteen values.
+ *
+ * A code mapped in RESULT_CODES but absent from here is ANTICIPATION from
+ * documentation, not observation, and carries `graphObservation: 'NOT_OBSERVED'`
+ * so it cannot read as a working path. That distinction has already caught two
+ * mistakes in this workstream — the third 50053 text variant and code 53004 —
+ * both of which were sound readings of Microsoft's documentation for events we
+ * have never once seen.
+ */
+export const OBSERVED_GRAPH_ERROR_CODES: readonly number[] = [
+  0, 16003, 50011, 50020, 50053, 50074, 50126, 50140, 53000, 53003, 65001, 70044, 90094, 500121,
+];
+
 export type CodeDisposition =
   | { readonly kind: 'APPLIES'; readonly outcome: EventOutcome }
   | { readonly kind: 'DOES_NOT_APPLY'; readonly reason: OutOfScopeReason }
@@ -56,6 +71,13 @@ export type ClaimClass =
 export interface ResultCodeEntry {
   readonly code: number;
   readonly microsoftName: string;
+  /**
+   * Whether this code has ever been seen on the Graph feed. `NOT_OBSERVED`
+   * means the mapping is anticipation from documentation: keep it, because a
+   * documented meaning is worth anticipating, but it is exercised only by
+   * synthetic fixture and must not read as a working path.
+   */
+  readonly graphObservation: 'OBSERVED' | 'NOT_OBSERVED';
   readonly claimClass: ClaimClass;
   readonly disposition: CodeDisposition;
   /**
@@ -88,6 +110,7 @@ export interface ResultCodeEntry {
 export const RESULT_CODES: readonly ResultCodeEntry[] = [
   {
     code: 0,
+    graphObservation: 'OBSERVED',
     microsoftName: 'None (success)',
     claimClass: 'NEITHER',
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' },
@@ -98,6 +121,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50126,
+    graphObservation: 'OBSERVED',
     microsoftName: 'InvalidUserNameOrPassword',
     claimClass: 'ATTACK_IN_AGGREGATE',
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' },
@@ -108,6 +132,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50074,
+    graphObservation: 'OBSERVED',
     microsoftName: 'UserStrongAuthClientAuthNRequired (did not pass MFA)',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED' },
@@ -117,6 +142,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50076,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'UserStrongAuthClientAuthNRequiredInterrupt (challenge issued)',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED' },
@@ -127,6 +153,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 500121,
+    graphObservation: 'OBSERVED',
     microsoftName: 'Authentication failed during strong authentication request',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED' },
@@ -136,6 +163,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50072,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'UserStrongAuthEnrollmentRequiredInterrupt',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED' },
@@ -143,6 +171,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50079,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'UserStrongAuthEnrollmentRequired (security info registration)',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED' },
@@ -150,6 +179,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 53003,
+    graphObservation: 'OBSERVED',
     microsoftName: 'BlockedByConditionalAccess',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
@@ -157,30 +187,35 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 530032,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'BlockedByConditionalAccessOnSecurityPolicy',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
   },
   {
     code: 53000,
+    graphObservation: 'OBSERVED',
     microsoftName: 'DeviceNotCompliant',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
   },
   {
     code: 53001,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'DeviceNotDomainJoined',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
   },
   {
     code: 50097,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'DeviceAuthenticationRequired',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
   },
   {
     code: 53004,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'ProofUpBlockedDueToRisk',
     claimClass: 'ATTACK_AND_CONTROL',
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
@@ -189,10 +224,16 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
       'Microsoft-reported risk are two channels that are never merged or summed. Microsoft’s own name for ' +
       'this code is ProofUpBlockedDueToRisk — a block Microsoft’s intelligence decided on, not a control ' +
       'the tenant configured.',
-    note: 'Cannot configure MFA due to suspicious activity. Moved to the Microsoft channel on the standing whose-judgement test.',
+    note:
+      'Cannot configure MFA due to suspicious activity. Placed in the Microsoft channel on the standing ' +
+      'whose-judgement test, which is sound — but NO PRODUCTION EVIDENCE: zero rows, all tenants, all ' +
+      'history. Same shape as the third 50053 text variant. The branch is kept because ' +
+      'ProofUpBlockedDueToRisk naming a risk-driven block is reasonable anticipation from documentation, ' +
+      'and it is exercised by synthetic fixture only.',
   },
   {
     code: 50131,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'ConditionalAccessFailed',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
@@ -206,6 +247,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50057,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'UserDisabled',
     claimClass: 'ATTACK_IN_AGGREGATE',
     disposition: { kind: 'APPLIES', outcome: 'DISABLED_ACCOUNT_ATTEMPT' },
@@ -215,6 +257,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   // ---- The only two codes that clear the exclusion standard. ----
   {
     code: 50140,
+    graphObservation: 'OBSERVED',
     microsoftName: 'InterruptedKMSI',
     claimClass: 'NEITHER',
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'KEEP_ME_SIGNED_IN' },
@@ -223,6 +266,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50058,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'UserUnauthenticated (session insufficient for SSO)',
     claimClass: 'NEITHER',
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN' },
@@ -232,6 +276,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   // ---- Recognized, but no citation supports excluding them. ----
   {
     code: 50158,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'ExternalSecurityChallengeNotSatisfied',
     claimClass: 'NEITHER',
     disposition: { kind: 'UNKNOWN', observation: 'AMBIGUOUS_BY_PROVIDER_STATEMENT' },
@@ -239,6 +284,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50055,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'InvalidPasswordExpiredPassword',
     claimClass: 'NEITHER',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
@@ -246,18 +292,21 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50144,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'InvalidPasswordExpiredOnPremPassword',
     claimClass: 'NEITHER',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
   },
   {
     code: 50056,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'InvalidOrNullPassword',
     claimClass: 'NEITHER',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
   },
   {
     code: 50133,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'SsoArtifactInvalidOrExpired (password change)',
     claimClass: 'NEITHER',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
@@ -265,12 +314,14 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   },
   {
     code: 50173,
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: 'FreshTokenNeeded (grant expired)',
     claimClass: 'NEITHER',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
   },
   {
     code: 65001,
+    graphObservation: 'OBSERVED',
     microsoftName: 'ConsentRequired',
     claimClass: 'NEITHER',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
@@ -283,6 +334,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   // ---- Meaning lives in free text. ----
   {
     code: 50053,
+    graphObservation: 'OBSERVED',
     microsoftName: 'IdsLocked / IP blocked / built-in protection block',
     claimClass: 'ATTACK_AND_CONTROL',
     disposition: { kind: 'UNKNOWN', observation: 'AMBIGUOUS_FAILURE_REASON_TEXT' },
@@ -295,6 +347,9 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   // ---- Not a Microsoft code at all. ----
   {
     code: 1,
+    // Observed on the AUDIT feed, never on Graph. This marker describes the
+    // Graph feed, so NOT_OBSERVED is correct and is not a claim it is unseen.
+    graphObservation: 'NOT_OBSERVED',
     microsoftName: '(not a Microsoft code)',
     claimClass: 'NEITHER',
     disposition: { kind: 'UNKNOWN', observation: 'HAWKVIEW_SYNTHETIC_ERROR_CODE' },
@@ -324,6 +379,21 @@ export const UNREACHABLE_BY_SUBJECT_RESOLUTION: readonly { readonly code: number
 const BY_CODE: ReadonlyMap<number, ResultCodeEntry> = new Map(
   RESULT_CODES.map(entry => [entry.code, entry]),
 );
+
+/**
+ * Codes that DO occur in our data and that this table does not map, so they
+ * classify as UNRECOGNIZED_ERROR_CODE and cost stated coverage.
+ *
+ * Five of the fourteen observed codes. That is the honest state, not a bug —
+ * mapping them from a half-remembered meaning is exactly the error this module
+ * exists to prevent — but it is a real coverage gap and each wants a documented
+ * meaning plus a volume before it moves anywhere. Unlike the anticipated
+ * entries above, these are the reverse problem: rows with no mapping rather
+ * than mappings with no rows.
+ */
+export const OBSERVED_BUT_UNMAPPED_GRAPH_CODES: readonly number[] = OBSERVED_GRAPH_ERROR_CODES
+  .filter(code => !BY_CODE.has(code))
+  .sort((left, right) => left - right);
 
 /**
  * Disposition for a result code, before any description-text refinement.
@@ -535,7 +605,10 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' },
     note:
       'Microsoft’s documented name for 50126. Observed under errorCode "1" AND with the code absent, in ' +
-      'both audit tenants — 51 rows that a code-keyed classifier loses entirely.',
+      'both audit tenants — 51 rows that a code-keyed classifier loses entirely. The inversion is not ' +
+      'specific to this reason or to one tenant: reason|code PAIRS outnumber distinct reasons in BOTH ' +
+      'audit tenants (11 pairs from 9 reasons, and 7 from 5), so multiple reason strings appear under ' +
+      'more than one code, systematically.',
   },
   {
     name: 'IdsLocked',
@@ -685,6 +758,9 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     verification: {
       state: 'PRODUCTION_VERIFIED',
       evidence:
+        'Holding as one tenant backfills: UPN resolution 97.0% at 1,773 rows against the other tenant’s ' +
+        '97.1%, essentially unmoved as volume grew from 1,385 rows. Two-tenant agreement surviving contact ' +
+        'with more data is the test that matters. ' +
         'Audit rows resolving against directory_users, deleted excluded: 96.8% / 97.1% / 77.8% by UPN ' +
         'across the three fallback-path tenants, versus 15.2% / 0.0% / 0.0% by GUID. Re-measured across ' +
         'two INDEPENDENT tenants with separate MSPs and separate directories — 97.2% vs 12.0% and 97.1% ' +
@@ -801,6 +877,31 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'present on 60/60 rows of the tenant someone wanted to exclude; the query nobody ran was whether ' +
         'it was also present on humans, and it was, on all of them. The control is not optional and it is ' +
         'not the same query.',
+    },
+  },
+  {
+    id: 'graph.risk-detail',
+    reads: ['raw.riskDetail', 'raw.conditionalAccessStatus', 'raw.appliedConditionalAccessPolicies'],
+    claim:
+      'raw.riskDetail carries Microsoft’s own verdict about a sign-in, so a row bearing one belongs in ' +
+      'the Microsoft channel rather than in HawkView’s findings — and the verdict KIND (risky versus ' +
+      'safe) can be read from its value.',
+    verification: {
+      state: 'PENDING_DISTRIBUTION_CHECK',
+      cohort:
+        'Measured on one tenant: 55 rows carry a riskDetail alongside conditionalAccessStatus success and ' +
+        'grant controls ["Mfa"] — 54 userPassedMFADrivenByRiskBasedPolicy and 1 aiConfirmedSigninSafe. ' +
+        'Those 55 rows currently classify as ordinary successes (errorCode 0, description "Other.") and ' +
+        'therefore sit in the applies list, so the channel mixing this predicate would fix is live rather than ' +
+        'hypothetical.',
+      controlCohort:
+        'MISSING, and it is the whole question: what does riskDetail contain on rows that are NOT ' +
+        'risk-driven? Documentation says it is P2-only and otherwise hidden, so plausible values include ' +
+        '"none", "hidden", or absent — but reading a verdict out of an unconfirmed field would remove 55 ' +
+        'real successes from evaluation if the field means something else. Needed: every Graph row ' +
+        'bucketed by riskDetail value, with the ordinary-human-success rows as the cohort that must NOT ' +
+        'carry a verdict-shaped value. Until then this predicate has NO effect and ' +
+        'MICROSOFT_SAFETY_VERDICT is unreachable.',
     },
   },
   {
