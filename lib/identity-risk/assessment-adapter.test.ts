@@ -560,3 +560,49 @@ test('summary counts distinct current USER identities and excludes mailbox conte
   assert.equal(result.summary?.currentUsers.value, 1)
   assert.equal(result.users.length, 2)
 })
+
+test('a claim of full coverage is checked against the evidence, not taken', () => {
+  // The client recomputes completeness from the per-rule and per-source fields
+  // and downgrades a FULL claim the evidence does not support. An exact count
+  // then cannot stand, because EXACT is only accepted on a payload that is
+  // still FULL after that check.
+  //
+  // This chain is the reason a server cannot assert an exact tenant total on
+  // stale or incomplete evidence -- and until this test it was entirely
+  // unguarded. Both halves of it could be deleted with the suite staying green,
+  // which is how it was found: mutating it changed nothing, and a guard nothing
+  // depends on is indistinguishable from one that was already broken.
+  const stale = assessmentFixture(true)
+  stale.sources[0].freshness = 'STALE'
+  assert.equal(
+    adaptRiskAssessmentResponse(stale, assessmentNow),
+    null,
+    'an exact count was accepted over evidence that cannot support it'
+  )
+
+  // The downgrade itself, observed where the count is not exact so the payload
+  // survives to be inspected: the server says FULL, the evidence says
+  // otherwise, and the client does not repeat the server's word.
+  const withheld = assessmentFixture(true)
+  withheld.sources[0].freshness = 'STALE'
+  withheld.summary.currentUsers = { value: null, accuracy: 'UNKNOWN' }
+  const downgraded = adaptRiskAssessmentResponse(withheld, assessmentNow)
+  assert.ok(downgraded)
+  assert.equal(downgraded!.meta.capability, 'PARTIAL')
+  assert.equal(downgraded!.meta.freshness, 'UNKNOWN')
+  assert.match(
+    downgraded!.meta.limitation ?? '',
+    /lack complete current evidence/
+  )
+
+  // Control: complete evidence keeps the claim. Without this half the guard
+  // passes just as well if the downgrade were unconditional, which would make
+  // every tenant permanently partial and the state meaningless.
+  const complete = adaptRiskAssessmentResponse(
+    assessmentFixture(true),
+    assessmentNow
+  )
+  assert.ok(complete)
+  assert.equal(complete!.meta.capability, 'FULL')
+  assert.equal(complete!.summary?.currentUsers.accuracy, 'EXACT')
+})
