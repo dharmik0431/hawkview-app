@@ -163,4 +163,14 @@ export type Budget = Readonly<{ maxEvents: number }>
 export type Evidence<Event> =
   | Readonly<{ availability: 'NEVER_COLLECTED' }>
   | Readonly<{ availability: 'UNREADABLE_NOW' }>
-  | Readonly<{ availability: 'READ'; applies: readonly Event[]; coverage: Coverage }>
+  | Readonly<{ availability: 'READ'; applies: readonly Event[]; coverage: Coverage; order: EventOrder }>
+
+/** How `applies` is sorted in time.
+ *
+ * The core is generic over the event type and so cannot read a timestamp, let
+ * alone verify an ordering. But truncation has to keep the most recent events,
+ * which is meaningless without knowing which end that is — so the caller states
+ * it rather than the core assuming it. A caller that hands newest-first events
+ * to a core assuming oldest-first would silently discard exactly the events a
+ * technician most needs, with nothing in the output to show it happened. */
+export type EventOrder = 'OLDEST_FIRST' | 'NEWEST_FIRST'

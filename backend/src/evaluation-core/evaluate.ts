@@ -79,9 +79,17 @@ export const distinctUsers = (findings: readonly Finding[]): number =>
     finding.subject.kind === 'DIRECTORY_USER' ? [finding.subject.userRef] : [])).size
 
 /** Zero only ever arrives through the exact branch. A lower bound of zero is
- * unrepresentable here rather than merely discouraged. */
-export function countOf(distinctSubjects: number, claim: ZeroClaim): Count {
-  if (claim.permitted) return { accuracy: 'EXACT', value: distinctSubjects }
+ * unrepresentable here rather than merely discouraged.
+ *
+ * Takes a boolean rather than a claim on purpose. It needs only whether a clean
+ * result was permitted, and accepting a whole claim meant callers had to supply
+ * a `because` it then ignored — so a caller composing several withheld streams
+ * had to pick one reason and discard the rest to satisfy the type, in a place
+ * no assertion could observe. QA found exactly that by mutation: substituting a
+ * wrong reason changed nothing and every test still passed. Narrowing the
+ * parameter deletes the opportunity instead of testing for it. */
+export function countOf(distinctSubjects: number, permitted: boolean): Count {
+  if (permitted) return { accuracy: 'EXACT', value: distinctSubjects }
   return distinctSubjects > 0
     ? { accuracy: 'AT_LEAST', value: distinctSubjects }
     : { accuracy: 'NOT_AVAILABLE', value: null }
@@ -121,12 +129,23 @@ export function evaluate<Event>(input: Readonly<{
     // report — not a list of detectors credited with having considered zero
     // events, which reads like a healthy silent detector.
     const claim = zeroClaim(state, NO_COVERAGE, true, true)
-    return { state, coverage: NO_COVERAGE, detectors: [], findings: [], count: countOf(0, claim), claim }
+    return { state, coverage: NO_COVERAGE, detectors: [], findings: [], count: countOf(0, claim.permitted), claim }
   }
 
-  const { applies, coverage } = input.evidence
+  const { applies, coverage, order } = input.evidence
   const withinBudget = applies.length <= input.budget.maxEvents
-  const applicable = withinBudget ? applies : applies.slice(0, input.budget.maxEvents)
+  // Over budget, keep the most recent. Truncation is safe in one direction —
+  // fewer events can break a window and miss a real pattern, but cannot invent
+  // one — so this only decides which subset a technician sees, and a tool that
+  // shows last month's attack while hiding today's is the worse choice. The
+  // claim is withheld as CAPACITY_EXCEEDED either way, so nobody is misled
+  // about completeness. Which end is recent comes from the caller's declared
+  // order, because the core cannot read a timestamp off a generic event.
+  const applicable = withinBudget
+    ? applies
+    : order === 'OLDEST_FIRST'
+      ? applies.slice(applies.length - input.budget.maxEvents)
+      : applies.slice(0, input.budget.maxEvents)
 
   const findings: Finding[] = []
   const reports: DetectorReport[] = []
@@ -149,7 +168,7 @@ export function evaluate<Event>(input: Readonly<{
     coverage,
     detectors: reports,
     findings,
-    count: countOf(distinctUsers(findings), claim),
+    count: countOf(distinctUsers(findings), claim.permitted),
     claim,
   }
 }

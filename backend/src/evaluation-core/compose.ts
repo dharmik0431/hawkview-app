@@ -1,5 +1,5 @@
 import { countOf, distinctUsers } from './evaluate.js'
-import type { Assessment, Count, Finding, WithheldReason, ZeroClaim } from './contract.js'
+import type { Assessment, Count, Finding, WithheldReason } from './contract.js'
 
 /** Composing several evidence streams into one tenant answer.
  *
@@ -61,18 +61,18 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
   // withholds the exact claim without discarding what they found.
   const claim: TenantClaim = withheld.length === 0 ? { permitted: true } : { permitted: false, withheld }
 
-  // The per-stream count rule, unchanged. Because it is unchanged, the corollary
-  // holds without being coded: a lower bound is never zero, so a tenant with one
-  // unreadable stream and nothing found in the others reports not-available
-  // rather than the nonsense of "at least none".
-  const forCount: ZeroClaim = claim.permitted
-    ? { permitted: true }
-    : { permitted: false, because: withheld[0]!.because }
-
   return {
     streams,
     findings,
-    count: countOf(distinctUsers(findings), forCount),
+    // The per-stream count rule, unchanged. Because it is unchanged, the
+    // corollary holds without being coded: a lower bound is never zero, so a
+    // tenant with one unreadable stream and nothing found in the others reports
+    // not-available rather than the nonsense of "at least none".
+    //
+    // It takes only whether a claim was permitted. Every withheld stream's
+    // reason stays in `claim.withheld`, so there is no longer a place where one
+    // reason has to stand in for several.
+    count: countOf(distinctUsers(findings), claim.permitted),
     claim,
   }
 }

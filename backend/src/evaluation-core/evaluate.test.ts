@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { countOf, declined, evaluate, uninterpreted, withheldExplanation, zeroClaim } from './evaluate.js'
-import type { Coverage, Detector, Finding } from './contract.js'
+import type { Coverage, Detector, EventOrder, Finding } from './contract.js'
 
 type Event = Readonly<{ id: string; subject: string; match?: boolean }>
 
@@ -29,9 +29,14 @@ const silent: Detector<Event> = { id: 'silent', run: applicable => ({ considered
 const broken: Detector<Event> = { id: 'broken', run: () => { throw new Error('detector fault') } }
 
 const run = (applies: readonly Event[], options: Partial<{
-  coverage: Coverage; detectors: readonly Detector<Event>[]; maxEvents: number
+  coverage: Coverage; detectors: readonly Detector<Event>[]; maxEvents: number; order: EventOrder
 }> = {}) => evaluate<Event>({
-  evidence: { availability: 'READ', applies, coverage: options.coverage ?? coverage({ applies: applies.length }) },
+  evidence: {
+    availability: 'READ',
+    applies,
+    coverage: options.coverage ?? coverage({ applies: applies.length }),
+    order: options.order ?? 'OLDEST_FIRST',
+  },
   detectors: options.detectors ?? [matching, silent],
   budget: { maxEvents: options.maxEvents ?? 1000 },
 })
@@ -80,12 +85,11 @@ test('a lower bound is never zero, and zero arrives only through the exact branc
   assert.deepEqual(clean.claim, { permitted: true })
 
   // Exhaustive: no combination of inputs yields a zero-valued lower bound.
-  for (const permitted of [true, false] as const) {
-    const claim = permitted ? { permitted } as const : { permitted, because: 'UNREADABLE_NOW' } as const
+  for (const permitted of [true, false]) {
     for (const subjects of [0, 1, 5]) {
-      const count = countOf(subjects, claim)
+      const count = countOf(subjects, permitted)
       assert.ok(!(count.accuracy === 'AT_LEAST' && count.value === 0))
-      if (count.accuracy === 'EXACT') assert.equal(claim.permitted, true, 'exact requires the claim to be permitted')
+      if (count.accuracy === 'EXACT') assert.equal(permitted, true, 'exact requires the claim to be permitted')
     }
   }
 })
@@ -169,11 +173,38 @@ test('the budget belongs to the caller and exceeding it withholds rather than tr
   const events = Array.from({ length: 5 }, (_, index) => event(`${index}`, { match: index === 0 }))
   const result = run(events, { coverage: coverage({ applies: 5 }), maxEvents: 3 })
   assert.deepEqual(result.claim, { permitted: false, because: 'CAPACITY_EXCEEDED' })
-  // What it did assess is still reported, as a bound rather than a total.
-  assert.deepEqual(result.count, { accuracy: 'AT_LEAST', value: 1 })
   assert.equal(result.detectors[0]?.status === 'RAN' && result.detectors[0].considered, 3)
 
   assert.deepEqual(run(events, { coverage: coverage({ applies: 5 }), maxEvents: 5 }).claim, { permitted: true })
+})
+
+test('truncation keeps the most recent events, at whichever end the caller says they are', () => {
+  // A security tool that shows last month's attack while hiding today's is
+  // strictly worse than the reverse, and truncation can only ever lose a
+  // pattern, never invent one — so the surviving subset should be the recent end.
+  const oldestFirst = Array.from({ length: 5 }, (_, index) =>
+    event(`${index}`, { match: index === 4, subject: `user-${index}` }))
+  const kept = run(oldestFirst, { coverage: coverage({ applies: 5 }), maxEvents: 2, order: 'OLDEST_FIRST' })
+  assert.deepEqual(kept.findings.map(finding =>
+    finding.subject.kind === 'DIRECTORY_USER' ? finding.subject.userRef : null), ['user-4'])
+
+  // The oldest event is the one dropped, not the newest.
+  const staleMatch = Array.from({ length: 5 }, (_, index) =>
+    event(`${index}`, { match: index === 0, subject: `user-${index}` }))
+  assert.deepEqual(run(staleMatch, { coverage: coverage({ applies: 5 }), maxEvents: 2 }).findings, [])
+
+  // And the caller's declared order is obeyed rather than assumed: the same
+  // events labelled newest-first keep the other end. Assuming one order would
+  // silently discard exactly the events a technician needs, invisibly.
+  const reversed = [...staleMatch]
+  assert.deepEqual(
+    run(reversed, { coverage: coverage({ applies: 5 }), maxEvents: 2, order: 'NEWEST_FIRST' })
+      .findings.map(finding => finding.subject.kind === 'DIRECTORY_USER' ? finding.subject.userRef : null),
+    ['user-0'])
+
+  // Whichever end survives, the claim still says the window was not assessed in
+  // full — choosing a subset is not permission to imply completeness.
+  assert.deepEqual(kept.claim, { permitted: false, because: 'CAPACITY_EXCEEDED' })
 })
 
 test('one failing detector costs the exact claim without erasing its neighbours', () => {

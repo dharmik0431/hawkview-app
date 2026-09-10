@@ -34,6 +34,7 @@ const stream = (name: string, events: readonly Event[], options: Partial<{ cover
       availability: 'READ',
       applies: events,
       coverage: options.coverage ?? coverage({ applies: events.length }),
+      order: 'OLDEST_FIRST',
     },
     detectors: [matching],
     budget: { maxEvents: 1000 },
@@ -169,7 +170,7 @@ test('mailbox findings cross streams without ever becoming people', () => {
   const mailboxStream: StreamAssessment = {
     stream: 'mailbox-forwarding',
     assessment: evaluate<Event>({
-      evidence: { availability: 'READ', applies: [{ subject: 'shared-billing' }], coverage: coverage({ applies: 1 }) },
+      evidence: { availability: 'READ', applies: [{ subject: 'shared-billing' }], coverage: coverage({ applies: 1 }), order: 'OLDEST_FIRST' },
       detectors: [{
         id: 'external-mailbox-forwarding',
         run: applicable => ({

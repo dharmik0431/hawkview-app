@@ -24,7 +24,7 @@ const coverage = (applies: number, parts: Partial<Coverage> = {}): Coverage =>
 
 const assess = (mailboxes: readonly MailboxForwardingArtefact[], detectors = [detector]) =>
   evaluate<MailboxForwardingArtefact>({
-    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(mailboxes.length) },
+    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(mailboxes.length), order: 'OLDEST_FIRST' },
     detectors, budget: { maxEvents: 500 },
   })
 
@@ -76,7 +76,7 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
     }),
   })
   const withMailboxes = (mailboxes: readonly MailboxForwardingArtefact[]) => evaluate<MailboxForwardingArtefact>({
-    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(Math.max(mailboxes.length, 1)) },
+    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(Math.max(mailboxes.length, 1)), order: 'OLDEST_FIRST' },
     detectors: [detector, userSide('shared-billing')],
     budget: { maxEvents: 500 },
   })
@@ -140,6 +140,7 @@ test('the detector plugs into the core without the core knowing anything about m
       availability: 'READ',
       applies: [mailbox('a', { forwardingSmtpAddress: 'exfil@evil.example' })],
       coverage: coverage(1, { unprocessable: { MAILBOX_UNREADABLE: 1 } }),
+      order: 'OLDEST_FIRST',
     },
     detectors: [detector], budget: { maxEvents: 500 },
   })
