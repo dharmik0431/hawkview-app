@@ -549,6 +549,14 @@ test('actual full sync continues from a failed sign-in collector to audit withou
   assert.equal(messages[0]!.includes('secret'), false)
 })
 
+// MUST RUN FROM `backend/`. This spawns a child process with a RELATIVE probe
+// path (`src/tenants/tenant-sync-memory-probe.ts`) and `cwd: process.cwd()`, so
+// invoking the suite from the repository root fails here in ~200ms with a
+// non-zero spawn status — long before any memory is measured.
+//
+// That failure looks like a memory regression and is not one. If this goes red,
+// check the working directory before investigating the envelope: a genuine
+// breach takes seconds and reports its evidence, an empty one fails instantly.
 test('isolated near-limit Graph collectors remain below a constrained Render memory envelope', () => {
   const result = spawnSync(
     process.execPath,

@@ -1,0 +1,662 @@
+{
+  "README": [
+    "Generated fixture from normalizeSignInBatch, not hand-written.",
+    "evt-04 and evt-07 are in BOTH applies and microsoftRiskVerdicts: two channels reading one log line.",
+    "ALICE holds a SAFE verdict (evt-06) and a RISK verdict (evt-07) at once. The three lists are",
+    "disjoint per EVENT, never per user, so a per-user grouping has to decide this case itself.",
+    "evt-08 carries a known riskDetail with an unobserved riskState: UNRECOGNIZED, no list, and the",
+    "observation still applies.",
+    "counts.microsoftVerdicts is NOT summable with the four classification tallies."
+  ],
+  "batch": {
+    "scope": {
+      "organizationId": "22222222-2222-4222-8222-222222222222",
+      "customerTenantId": "11111111-1111-4111-8111-111111111111",
+      "microsoftTenantId": "11111111-1111-4111-8111-111111111111"
+    },
+    "source": "GRAPH_SIGN_INS",
+    "events": [
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-01",
+        "eventAt": "2026-09-08T09:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50126,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_REJECTED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-02",
+        "eventAt": "2026-09-08T09:01:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50126,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_REJECTED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-03",
+        "eventAt": "2026-09-08T09:05:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50053,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "LOCKED_OUT_AFTER_REPEATED_FAILURES"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-04",
+        "eventAt": "2026-09-08T10:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50053,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "BLOCKED_BY_CONTROL"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-05",
+        "eventAt": "2026-09-08T11:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-06",
+        "eventAt": "2026-09-08T12:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-07",
+        "eventAt": "2026-09-08T13:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 53004,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "BLOCKED_BY_CONTROL"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-08",
+        "eventAt": "2026-09-08T14:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-09",
+        "eventAt": "2026-09-08T15:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-10",
+        "eventAt": "2026-09-08T16:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50140,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "DOES_NOT_APPLY",
+          "reason": "KEEP_ME_SIGNED_IN"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-11",
+        "eventAt": "2026-09-08T17:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 90094,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "NOT_YET_CITED",
+          "reason": "EXCLUSION_NOT_YET_CITED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-12",
+        "eventAt": "2026-09-08T18:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 99999,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "UNKNOWN",
+          "observation": "UNRECOGNIZED_ERROR_CODE"
+        }
+      }
+    ],
+    "applies": [
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-01",
+        "eventAt": "2026-09-08T09:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50126,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_REJECTED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-02",
+        "eventAt": "2026-09-08T09:01:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50126,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_REJECTED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-03",
+        "eventAt": "2026-09-08T09:05:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50053,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "LOCKED_OUT_AFTER_REPEATED_FAILURES"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-04",
+        "eventAt": "2026-09-08T10:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50053,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "BLOCKED_BY_CONTROL"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-05",
+        "eventAt": "2026-09-08T11:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-06",
+        "eventAt": "2026-09-08T12:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-07",
+        "eventAt": "2026-09-08T13:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 53004,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "BLOCKED_BY_CONTROL"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-08",
+        "eventAt": "2026-09-08T14:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-09",
+        "eventAt": "2026-09-08T15:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      }
+    ],
+    "microsoftRiskVerdicts": [
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-04",
+        "eventAt": "2026-09-08T10:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 50053,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "BLOCKED_BY_CONTROL"
+        }
+      },
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-07",
+        "eventAt": "2026-09-08T13:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 53004,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "BLOCKED_BY_CONTROL"
+        }
+      }
+    ],
+    "microsoftRemediatedVerdicts": [
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-05",
+        "eventAt": "2026-09-08T11:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_44444444",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      }
+    ],
+    "microsoftSafetyVerdicts": [
+      {
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "customerTenantId": "11111111-1111-4111-8111-111111111111",
+        "microsoftTenantId": "11111111-1111-4111-8111-111111111111",
+        "source": "GRAPH_SIGN_INS",
+        "eventId": "evt-06",
+        "eventAt": "2026-09-08T12:00:00.000Z",
+        "ingestedAt": "2026-09-09T00:00:00.000Z",
+        "subjectRef": "sub_33333333",
+        "subjectBinding": "DIRECTORY_OBJECT_ID",
+        "applicationRef": "app_55555555",
+        "errorCode": 0,
+        "clientSource": {
+          "qualification": "QUALIFIED",
+          "address": "203.0.113.10"
+        },
+        "classification": {
+          "kind": "APPLIES",
+          "outcome": "PASSWORD_ACCEPTED_COMPLETED"
+        }
+      }
+    ],
+    "resolvedSubjects": [
+      {
+        "subjectRef": "sub_33333333",
+        "microsoftUserId": "33333333-3333-4333-8333-333333333333",
+        "binding": "DIRECTORY_OBJECT_ID"
+      },
+      {
+        "subjectRef": "sub_44444444",
+        "microsoftUserId": "44444444-4444-4444-8444-444444444444",
+        "binding": "DIRECTORY_OBJECT_ID"
+      }
+    ],
+    "counts": {
+      "rows": 13,
+      "applies": 9,
+      "doesNotApplyByReason": {
+        "KEEP_ME_SIGNED_IN": 1,
+        "INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN": 0,
+        "SIGN_IN_FREQUENCY_POLICY_EXPIRY": 0,
+        "APPLICATION_CONFIGURATION_ERROR": 0,
+        "SESSION_INVALIDATED_BY_REMEDIATION": 0,
+        "NON_INTERACTIVE_SIGN_IN": 0,
+        "APPLICATION_ACTOR": 0
+      },
+      "notYetCitedByReason": {
+        "EXCLUSION_NOT_YET_CITED": 1
+      },
+      "unknownByObservation": {
+        "ERROR_CODE_ABSENT": 0,
+        "ERROR_CODE_SHAPE_UNRECOGNIZED": 0,
+        "UNRECOGNIZED_ERROR_CODE": 1,
+        "AMBIGUOUS_BY_PROVIDER_STATEMENT": 0,
+        "AMBIGUOUS_FAILURE_REASON_TEXT": 0,
+        "RESULT_CODE_NOT_AN_AZURE_CODE": 0,
+        "FAILURE_REASON_NOT_REPORTED": 0,
+        "SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON": 0,
+        "PROVIDER_DECLARED_UNCLASSIFIED": 0,
+        "UNRECOGNIZED_REASON_NAME": 0,
+        "INCONSISTENT_OPERATION_AND_CODE": 0
+      },
+      "unprocessableByReason": {
+        "RAW_PAYLOAD_MALFORMED": 0,
+        "SCOPE_MISMATCH": 0,
+        "SOURCE_UNRECOGNIZED": 0,
+        "TENANT_BINDING_MISMATCH": 0,
+        "EVENT_ID_ABSENT_OR_MALFORMED": 0,
+        "EVENT_TIMESTAMP_INVALID": 0,
+        "INGESTION_TIMESTAMP_INVALID": 0,
+        "INGESTION_PRECEDES_EVENT": 0,
+        "INTEGRITY_DISPUTED": 0,
+        "UNSUPPORTED_AUDIT_OPERATION": 0,
+        "SUBJECT_ID_ABSENT_OR_MALFORMED": 0,
+        "SUBJECT_NOT_IN_DIRECTORY": 1,
+        "SUBJECT_AMBIGUOUS_IN_DIRECTORY": 0,
+        "SUBJECT_UPN_ABSENT_OR_MALFORMED": 0,
+        "SUBJECT_UPN_NOT_IN_DIRECTORY": 0,
+        "SUBJECT_UPN_AMBIGUOUS_IN_DIRECTORY": 0,
+        "APPLICATION_ID_ABSENT_OR_MALFORMED": 0,
+        "REFERENCE_UNAVAILABLE": 0,
+        "REFERENCE_BUDGET_EXCEEDED": 0,
+        "BATCH_LIMIT_EXCEEDED": 0
+      },
+      "bindingMethods": {
+        "DIRECTORY_OBJECT_ID": 12,
+        "NORMALIZED_UPN": 0
+      },
+      "microsoftVerdicts": {
+        "RISK": 2,
+        "REMEDIATED": 1,
+        "SAFE": 1,
+        "UNRECOGNIZED": 1
+      },
+      "unselectedRowsByReason": {
+        "ROW_FROM_OTHER_FEED": 0
+      }
+    },
+    "coverage": {
+      "collectionScope": "GRAPH_INTERACTIVE_ONLY",
+      "consideredRows": 13,
+      "normalizedRows": 12,
+      "recognizedRows": 11,
+      "subjectNotInTenantRows": 1,
+      "enumerationCodedRows": 0
+    },
+    "shapeObservations": {
+      "graphErrorCodeShape": {
+        "NUMBER": 13,
+        "NUMERIC_STRING": 0,
+        "OTHER_STRING": 0,
+        "NULL": 0,
+        "ABSENT": 0,
+        "OTHER_TYPE": 0
+      },
+      "graphIsInteractive": {
+        "TRUE": 0,
+        "FALSE": 0,
+        "NULL": 0,
+        "ABSENT": 13,
+        "OTHER_TYPE": 0
+      },
+      "graphIsInteractiveAmongCredentialFailures": {
+        "TRUE": 0,
+        "FALSE": 0,
+        "NULL": 0,
+        "ABSENT": 3,
+        "OTHER_TYPE": 0
+      }
+    }
+  }
+}
