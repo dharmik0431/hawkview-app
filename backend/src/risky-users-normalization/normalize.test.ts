@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   MAX_ROWS_PER_RUN,
+  coverageForEvaluation,
   isPostPasswordInterrupt,
   passwordWasAccepted,
   type DirectoryUserRow,
@@ -18,6 +19,7 @@ import {
   RESULT_CODES,
   SHAPE_PREDICATES,
   UNREACHABLE_BY_SUBJECT_RESOLUTION,
+  UNVALIDATED_FAILURE_REASON_MEANINGS,
   dispositionForCode,
   failureReasonMeaning,
   mayExclude,
@@ -27,9 +29,13 @@ import {
   OUT_OF_SCOPE_LABELS,
   UNKNOWN_LABELS,
   UNPROCESSABLE_LABELS,
+  UNCITED_POLICY_OBSERVATIONS,
+  UNINTERPRETABLE_OBSERVATIONS,
+  UNSELECTED_ROW_LABELS,
   describeOutOfScope,
   describeUnknown,
   describeUnprocessable,
+  describeUnselectedRow,
   type OutOfScopeReason,
   type UnknownObservation,
   type UnprocessableReason,
@@ -202,13 +208,56 @@ test('a malformed row and an expected-flow interrupt land in different counters'
   assert.equal(batch.coverage.normalizedRows, 1);
 });
 
-test('the three reason vocabularies share no key, so no counter can be double-read', () => {
+test('the reason vocabularies share no key, so no counter can be double-read', () => {
   const all = [
     ...Object.keys(OUT_OF_SCOPE_LABELS),
     ...Object.keys(UNKNOWN_LABELS),
     ...Object.keys(UNPROCESSABLE_LABELS),
+    ...Object.keys(UNSELECTED_ROW_LABELS),
   ];
   assert.equal(new Set(all).size, all.length, 'a reason key appears in more than one vocabulary');
+});
+
+test('"we never looked" is reported by reason, not as a bare number', () => {
+  // A consumer has to be able to tell a feed boundary, which is harmless, from
+  // a scope narrowing, which by the verification rule should not exist. One
+  // member is the answer, and a second appearing is visible rather than
+  // absorbed into a total.
+  assert.deepEqual(Object.keys(UNSELECTED_ROW_LABELS), ['ROW_FROM_OTHER_FEED']);
+  assert.ok(describeUnselectedRow('ROW_FROM_OTHER_FEED').length > 12);
+});
+
+test('unknown observations split into "could not read" and "no policy yet"', () => {
+  // Gating a clean claim on anything unknown would let eighteen rows of a
+  // well-understood consent prompt withhold a tenant's claim indefinitely.
+  const partition = [...UNINTERPRETABLE_OBSERVATIONS, ...UNCITED_POLICY_OBSERVATIONS];
+  assert.deepEqual([...partition].sort(), Object.keys(UNKNOWN_LABELS).sort(), 'every observation must be in exactly one half');
+  assert.equal(new Set(partition).size, partition.length, 'an observation appears in both halves');
+  assert.deepEqual([...UNCITED_POLICY_OBSERVATIONS].sort(), [
+    'AMBIGUOUS_BY_PROVIDER_STATEMENT',
+    'RECOGNIZED_BUT_EXCLUSION_UNCITED',
+  ]);
+});
+
+test('the evaluation coverage view separates what we could not read from what we lack a citation for', async () => {
+  const batch = await run([
+    graphRow({ id: 'applies', status: { errorCode: 50126 } }),
+    graphRow({ id: 'consent', status: { errorCode: 65001 } }),
+    graphRow({ id: 'unreadable', status: { errorCode: 424242 } }),
+    graphRow({ id: 'kmsi', status: { errorCode: 50140 } }),
+    graphRow({}, { raw: null }),
+  ]);
+  const coverage = coverageForEvaluation(batch);
+
+  assert.equal(coverage.applies, 1);
+  assert.equal(coverage.doesNotApply.KEEP_ME_SIGNED_IN, 1);
+  // 65001 is understood; only our basis for excluding it is missing. It is
+  // disclosed, but it is not a limit on what we read.
+  assert.equal(coverage.uncitedPolicyEvents, 1);
+  assert.equal(coverage.uninterpretedEvents, 2, 'the unrecognized code and the malformed row');
+  assert.deepEqual(Object.keys(coverage).sort(), [
+    'applies', 'doesNotApply', 'uncitedPolicyEvents', 'uninterpretedEvents', 'unknown', 'unprocessable',
+  ]);
 });
 
 test('every reason is reported with a zero, so a reporting layer cannot omit one', async () => {
@@ -231,14 +280,14 @@ test('the tallies plus the unselected feed account for every row handed in', asy
     total(batch.counts.doesNotApplyByReason) +
     total(batch.counts.unknownByObservation) +
     total(batch.counts.unprocessableByReason) +
-    batch.counts.unselectedSourceRows;
+    batch.counts.unselectedRowsByReason.ROW_FROM_OTHER_FEED;
   assert.equal(accounted, batch.counts.rows);
-  assert.equal(batch.counts.unselectedSourceRows, 1);
+  assert.equal(batch.counts.unselectedRowsByReason.ROW_FROM_OTHER_FEED, 1);
 });
 
 test('rows from the feed that was not selected are counted separately, not as a defect', async () => {
   const batch = await run([auditRow()]);
-  assert.equal(batch.counts.unselectedSourceRows, 1);
+  assert.equal(batch.counts.unselectedRowsByReason.ROW_FROM_OTHER_FEED, 1);
   assert.equal(batch.coverage.consideredRows, 0, 'the unselected feed is not part of the assessed scope');
   assert.equal(total(batch.counts.unprocessableByReason), 0);
   assert.equal(total(batch.counts.doesNotApplyByReason), 0);
@@ -422,7 +471,7 @@ test('50053 text that matches nothing, or more than one meaning, stays unknown',
   assert.equal(failureReasonMeaning('nothing familiar here'), null);
 });
 
-test('the description-text meanings are a closed set with distinct dispositions', () => {
+test('the description-text meanings are a closed set and each records its evidence', () => {
   assert.deepEqual(
     FAILURE_REASON_MEANINGS.map(pattern => pattern.meaning).sort(),
     ['HIGH_CONFIDENCE_RISK_BLOCK', 'MALICIOUS_IP_BLOCK', 'SMART_LOCKOUT'],
@@ -433,6 +482,48 @@ test('the description-text meanings are a closed set with distinct dispositions'
       assert.equal(fragment, fragment.toLowerCase(), 'fragments are matched against lowercased text');
     }
   }
+  // The risk-verdict branch has zero occurrences across all 1,479 rows of
+  // 50053 in all history: it is present in code, exercised only synthetically,
+  // and must not read as a working path.
+  assert.deepEqual(UNVALIDATED_FAILURE_REASON_MEANINGS, ['HIGH_CONFIDENCE_RISK_BLOCK']);
+});
+
+test('the one branch that removes an event from evaluation has the narrowest fragment', () => {
+  // Every other branch keeps the event in `applies`, so a too-broad fragment
+  // there costs an outcome label. The risk-verdict branch diverts the event
+  // into Microsoft's channel and out of our findings entirely, so it is held
+  // to a single distinctive phrase — and the two texts that DO occur in
+  // production must not reach it.
+  const risk = FAILURE_REASON_MEANINGS.find(pattern => pattern.meaning === 'HIGH_CONFIDENCE_RISK_BLOCK')!;
+  assert.equal(risk.disposition.kind, 'DOES_NOT_APPLY');
+  assert.deepEqual(risk.fragments, ['high confidence of risk']);
+
+  for (const text of [
+    'You’ve tried to sign in too many times with an incorrect user ID or password.',
+    'Sign-in was blocked because it came from an IP address with malicious activity.',
+    'The account is locked by built-in protections.',
+  ]) {
+    assert.notEqual(
+      failureReasonMeaning(text)?.meaning,
+      'HIGH_CONFIDENCE_RISK_BLOCK',
+      `"${text}" must not be diverted out of our findings`,
+    );
+  }
+});
+
+test('the lockout gets its own outcome rather than being called an invalid credential', async () => {
+  // It carries unique weight: for 94.8% of lockout rows there is no 50126 for
+  // the same user within ±15 minutes, so at the moment of lockout this is the
+  // only signal present. But a lockout is a refusal, not a credential that was
+  // validated and found wrong, so it is not PASSWORD_REJECTED either.
+  const batch = await run([graphRow({ status: {
+    errorCode: 50053,
+    failureReason: 'You’ve tried to sign in too many times with an incorrect user ID or password.',
+  } })]);
+  const classification = only(batch).classification;
+  assert.deepEqual(classification, { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' });
+  assert.equal(passwordWasAccepted('LOCKED_OUT_AFTER_REPEATED_FAILURES'), false);
+  assert.equal(isPostPasswordInterrupt('LOCKED_OUT_AFTER_REPEATED_FAILURES'), false);
 });
 
 test('Microsoft’s risk verdict is surfaced separately and kept out of our findings', async () => {

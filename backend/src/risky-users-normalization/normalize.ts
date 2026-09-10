@@ -19,11 +19,13 @@ import {
   OUT_OF_SCOPE_LABELS,
   UNKNOWN_LABELS,
   UNPROCESSABLE_LABELS,
+  UNSELECTED_ROW_LABELS,
   unreachable,
   zeroCounts,
   type OutOfScopeReason,
   type UnknownObservation,
   type UnprocessableReason,
+  type UnselectedRowReason,
 } from './reasons.js';
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -479,6 +481,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
   const doesNotApplyByReason = zeroCounts<OutOfScopeReason>(OUT_OF_SCOPE_LABELS);
   const unknownByObservation = zeroCounts<UnknownObservation>(UNKNOWN_LABELS);
   const unprocessableByReason = zeroCounts<UnprocessableReason>(UNPROCESSABLE_LABELS);
+  const unselectedRowsByReason = zeroCounts<UnselectedRowReason>(UNSELECTED_ROW_LABELS);
   const bindingMethods: Record<SubjectBindingMethod, number> = { DIRECTORY_OBJECT_ID: 0, NORMALIZED_UPN: 0 };
   const graphErrorCodeShape: Record<ErrorCodeShape, number> = {
     NUMBER: 0, NUMERIC_STRING: 0, OTHER_STRING: 0, NULL: 0, ABSENT: 0, OTHER_TYPE: 0,
@@ -489,7 +492,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
   };
 
   let applies = 0;
-  let unselectedSourceRows = 0;
+
   let consideredRows = 0;
   const events: NormalizedEvent[] = [];
   const resolvedSubjects = new Map<string, { microsoftUserId: string; binding: SubjectBindingMethod }>();
@@ -539,7 +542,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       continue;
     }
     if (rowFeed !== source) {
-      unselectedSourceRows += 1;
+      unselectedRowsByReason.ROW_FROM_OTHER_FEED += 1;
       continue;
     }
     consideredRows += 1;
@@ -614,7 +617,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       unknownByObservation,
       unprocessableByReason,
       bindingMethods,
-      unselectedSourceRows,
+      unselectedRowsByReason,
     },
     coverage: {
       consideredRows,

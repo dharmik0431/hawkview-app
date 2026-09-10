@@ -353,14 +353,38 @@ export interface FailureReasonPattern {
   /** Distinctive lowercase fragments. Deliberately punctuation-light. */
   readonly fragments: readonly string[];
   readonly disposition: CodeDisposition;
+  /**
+   * Whether this branch has ever been seen in real data. A branch with no
+   * production evidence is present in code and exercised only by a synthetic
+   * fixture; it must not read as a working path.
+   */
+  readonly verification:
+    | { readonly state: 'OBSERVED_IN_PRODUCTION'; readonly evidence: string }
+    | { readonly state: 'NO_PRODUCTION_EVIDENCE'; readonly why: string };
   readonly note: string;
 }
 
 export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
   {
     meaning: 'HIGH_CONFIDENCE_RISK_BLOCK',
-    fragments: ['high confidence of risk', 'built-in protections'],
+    // ONE fragment, and the most distinctive one available. This is the only
+    // branch here that moves an event OUT of `applies`, so a fragment broad
+    // enough to catch a neighbouring meaning would divert real evidence into
+    // the Microsoft channel. 'built-in protections' was dropped for that
+    // reason: it is not distinctive enough to carry that consequence.
+    fragments: ['high confidence of risk'],
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
+    verification: {
+      state: 'NO_PRODUCTION_EVIDENCE',
+      why:
+        'Zero occurrences. Across all 1,479 rows of code 50053 in all history and all tenants there are ' +
+        'exactly TWO distinct description values — lockout and malicious-IP — and this is neither of them. ' +
+        'It is a documented Microsoft string and anticipating it is reasonable, but it is exercised only by ' +
+        'a synthetic fixture, exactly like the Graph subject-binding failure path. Present in code, no data ' +
+        'behind it. Its practical value is also lower than it first appeared: the code only has volume in ' +
+        'one tenant, and that tenant is the one that holds Entra ID P2 and can already see Microsoft’s risk ' +
+        'signal directly. The tenants that would need this string are the ones where the code does not appear.',
+    },
     note:
       'Microsoft’s own verdict, not ours. Held out of HawkView findings because our findings and ' +
       'Microsoft-reported risk are two channels that are never merged or summed, and surfaced separately ' +
@@ -370,19 +394,42 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
     meaning: 'MALICIOUS_IP_BLOCK',
     fragments: ['malicious activity'],
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
+    verification: {
+      state: 'OBSERVED_IN_PRODUCTION',
+      evidence: 'One of exactly two description values observed on code 50053, in one tenant over six weeks.',
+    },
     note: 'Microsoft blocked the sign-in because the address had known malicious activity. A control that worked.',
   },
   {
     meaning: 'SMART_LOCKOUT',
     fragments: ['too many times with an incorrect user id or password', 'idslocked'],
     disposition: { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' },
+    verification: {
+      state: 'OBSERVED_IN_PRODUCTION',
+      evidence:
+        'The other of exactly two description values observed on code 50053. It carries unique detection ' +
+        'weight: for 94.8% of lockout rows there is NO 50126 for the same user within ±15 minutes, so ' +
+        'Microsoft emits the lockout without the individual attempts alongside it and at the moment of ' +
+        'lockout this is the ONLY signal present. A 50126-only detector eventually surfaces the affected ' +
+        'users — 100% of them appear in 50126 rows at some point — but misses the lockout events, and ' +
+        'misses them when they happen. CAVEAT: one tenant, at most four users, one locale, six weeks, and ' +
+        '1,479 blocks against four accounts is not obviously normal traffic, so the 94.8% informs the ' +
+        'mapping and does not settle the general case.',
+    },
     note:
       'Smart lockout "tracks the last three bad password hashes to avoid incrementing the lockout counter ' +
       'for the same password", so a lockout implies VARIED password attempts. A misconfigured client ' +
       'replaying one stale credential will NOT lock out, which removes the main false-positive objection ' +
-      'to treating a lockout as attack evidence.',
+      'to treating a lockout as attack evidence. It gets its OWN outcome rather than being folded into ' +
+      'PASSWORD_REJECTED: a lockout is a refusal, not a credential that was validated and found wrong, and ' +
+      'calling it an invalid-credential attempt would assert something that did not happen on that event.',
   },
 ];
+
+/** Description-text branches with no production evidence behind them. */
+export const UNVALIDATED_FAILURE_REASON_MEANINGS: readonly FailureReasonMeaning[] = FAILURE_REASON_MEANINGS
+  .filter(pattern => pattern.verification.state === 'NO_PRODUCTION_EVIDENCE')
+  .map(pattern => pattern.meaning);
 
 /** Lowercase, curly apostrophes folded, whitespace collapsed. Never fuzzy. */
 export function normalizeFailureReason(value: string): string {
@@ -501,6 +548,28 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'recording the binding method on the event so a UPN binding is visibly weaker than a GUID one. ' +
         'A UPN can be reassigned after a user is deleted, so a historical event can bind to the wrong ' +
         'person; that residual risk is disclosed rather than hidden.',
+    },
+  },
+  {
+    id: 'graph.failure-reason-fragments',
+    reads: ['raw.status.failureReason', 'managementActivityRecord.LogonError'],
+    claim:
+      'The literal fragments in FAILURE_REASON_MEANINGS are the text Microsoft actually emits for code ' +
+      '50053, so a matching row is correctly resolved to that meaning.',
+    verification: {
+      state: 'PENDING_DISTRIBUTION_CHECK',
+      cohort:
+        'This is now the highest-volume predicate in the layer: code 50053 is 1,477 of 2,635 Graph rows, ' +
+        '56% of everything collected. The two production description values are known to EXIST but their ' +
+        'literal text has not been supplied, so the fragments here are rendered from Microsoft’s ' +
+        'documented phrasing rather than from our rows. If they do not match, 56% of traffic lands in ' +
+        'UNKNOWN — safe, but a large and avoidable coverage loss.',
+      controlCohort:
+        'The two values must match one fragment set EACH and not the other, and neither may match the ' +
+        'risk-verdict fragment. Multi-match already routes to UNKNOWN rather than picking, so a ' +
+        'too-broad fragment costs coverage rather than misclassifying — except for the risk-verdict ' +
+        'branch, which is the one disposition that removes an event from `applies`, and which is ' +
+        'therefore held to a single distinctive fragment.',
     },
   },
   {

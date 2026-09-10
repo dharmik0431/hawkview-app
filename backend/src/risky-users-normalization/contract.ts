@@ -1,7 +1,9 @@
-import type {
-  OutOfScopeReason,
-  UnknownObservation,
-  UnprocessableReason,
+import {
+  UNCITED_POLICY_OBSERVATIONS,
+  type OutOfScopeReason,
+  type UnknownObservation,
+  type UnprocessableReason,
+  type UnselectedRowReason,
 } from './reasons.js';
 
 /**
@@ -208,13 +210,20 @@ export interface NormalizationCounts {
   /** How the events that did bind were bound, so weaker bindings are visible. */
   readonly bindingMethods: Readonly<Record<SubjectBindingMethod, number>>;
   /**
-   * Rows belonging to the feed that was not selected for this evaluation.
-   * Independent feeds are never pooled, so these rows are not evaluated — but
+   * Rows that were never part of the assessed scope, BY REASON.
+   *
+   * Independent feeds are never pooled, so these rows are not evaluated — and
    * they are neither a defect nor a scope decision, so they get their own
-   * counter instead of being silently skipped (the predecessor's `continue`)
-   * or folded into either reason vocabulary.
+   * vocabulary rather than being silently skipped (the predecessor's
+   * `continue`) or folded into one of the three above.
+   *
+   * A reason map rather than a bare number because "we never looked" needs to
+   * be distinguishable from "we looked and declined": a consumer must be able
+   * to tell a feed boundary (harmless) from a scope narrowing (which, by the
+   * verification rule, should not be happening at all). There is exactly one
+   * member, and that is the answer.
    */
-  readonly unselectedSourceRows: number;
+  readonly unselectedRowsByReason: Readonly<Record<UnselectedRowReason, number>>;
 }
 
 /**
@@ -261,6 +270,44 @@ export interface NormalizationBatch {
   readonly counts: NormalizationCounts;
   readonly coverage: NormalizationCoverage;
   readonly shapeObservations: ShapeObservations;
+}
+
+/**
+ * The batch's tallies in the shape the evaluation core consumes, plus the
+ * split it needs to gate honestly.
+ *
+ * One mapping in one place, for the same reason the sort lives here: two
+ * mappings drift. `uninterpretedEvents` is the subset of unknown observations
+ * that genuinely could not be read, and is the number a consumer should gate a
+ * clean claim on. `uncitedPolicyEvents` is the rest — events we interpreted
+ * fine, where only our own basis for excluding them is missing. Gating on the
+ * latter would let a handful of well-understood consent prompts withhold a
+ * tenant's claim indefinitely, which is the veto pattern in a better label.
+ * Both are still disclosed; only one is a limit on what we read.
+ */
+export function coverageForEvaluation(batch: NormalizationBatch): {
+  readonly applies: number;
+  readonly doesNotApply: Readonly<Record<OutOfScopeReason, number>>;
+  readonly unknown: Readonly<Record<UnknownObservation, number>>;
+  readonly unprocessable: Readonly<Record<UnprocessableReason, number>>;
+  readonly uninterpretedEvents: number;
+  readonly uncitedPolicyEvents: number;
+} {
+  const { counts } = batch;
+  const uncited = UNCITED_POLICY_OBSERVATIONS.reduce(
+    (sum, observation) => sum + counts.unknownByObservation[observation],
+    0,
+  );
+  const unknownTotal = Object.values(counts.unknownByObservation).reduce((sum, value) => sum + value, 0);
+  const unprocessableTotal = Object.values(counts.unprocessableByReason).reduce((sum, value) => sum + value, 0);
+  return {
+    applies: counts.applies,
+    doesNotApply: counts.doesNotApplyByReason,
+    unknown: counts.unknownByObservation,
+    unprocessable: counts.unprocessableByReason,
+    uninterpretedEvents: unknownTotal - uncited + unprocessableTotal,
+    uncitedPolicyEvents: uncited,
+  };
 }
 
 /** Per-run bounds. Exceeding one costs the excess rows, never the run. */

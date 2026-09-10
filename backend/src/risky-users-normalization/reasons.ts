@@ -81,6 +81,50 @@ export type UnknownObservation =
   /** Audit path: the operation and the result code describe different outcomes. */
   | 'INCONSISTENT_OPERATION_AND_CODE';
 
+/**
+ * Observations meaning we genuinely could not interpret the event. These are
+ * the ones that reduce what HawkView can claim about a window.
+ */
+export const UNINTERPRETABLE_OBSERVATIONS: readonly UnknownObservation[] = [
+  'ERROR_CODE_ABSENT',
+  'ERROR_CODE_SHAPE_UNRECOGNIZED',
+  'UNRECOGNIZED_ERROR_CODE',
+  'AMBIGUOUS_FAILURE_REASON_TEXT',
+  'HAWKVIEW_SYNTHETIC_ERROR_CODE',
+  'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON',
+  'INCONSISTENT_OPERATION_AND_CODE',
+];
+
+/**
+ * Observations where the event IS interpreted and only OUR policy is missing.
+ *
+ * This distinction is load-bearing, and it exists because a consumer that
+ * gates a clean claim on "anything unknown" would otherwise let eighteen rows
+ * of a well-understood consent prompt withhold a tenant's claim permanently —
+ * not until someone researches it, but for as long as the mapping stands.
+ * That is the veto pattern again, wearing a better label.
+ *
+ * We know exactly what these events are. What is absent is a documented basis
+ * for ruling them out of scope, which is a gap in our own policy rather than a
+ * limit on our reading of the data. They must still be DISCLOSED in the
+ * coverage statement — out-of-scope evidence is never silently dropped — but a
+ * consumer should not treat them as uninterpreted window.
+ */
+export const UNCITED_POLICY_OBSERVATIONS: readonly UnknownObservation[] = [
+  'RECOGNIZED_BUT_EXCLUSION_UNCITED',
+  'AMBIGUOUS_BY_PROVIDER_STATEMENT',
+];
+
+/**
+ * Why a row was not part of the assessed scope at all.
+ *
+ * Its own vocabulary rather than a bare number, so a consumer can decide per
+ * reason instead of guessing whether "we never looked" was a feed boundary or
+ * a scope narrowing. There is exactly one member today, and that is the
+ * answer: nothing is excluded from the covered feed by a predicate.
+ */
+export type UnselectedRowReason = 'ROW_FROM_OTHER_FEED';
+
 /** The row could not be read. Never merged with OutOfScopeReason. */
 export type UnprocessableReason =
   | 'RAW_PAYLOAD_MALFORMED'
@@ -162,6 +206,11 @@ export const UNPROCESSABLE_LABELS: Readonly<Record<UnprocessableReason, string>>
   BATCH_LIMIT_EXCEEDED: 'This evaluation reached its per-run row limit before reaching this row',
 };
 
+export const UNSELECTED_ROW_LABELS: Readonly<Record<UnselectedRowReason, string>> = {
+  ROW_FROM_OTHER_FEED:
+    'Collected by the other sign-in feed, which is not the one this assessment reads; the two are never pooled',
+};
+
 /**
  * Zero-filled counters keyed by every reason in a vocabulary.
  *
@@ -186,4 +235,7 @@ export function describeUnknown(observation: UnknownObservation): string {
 }
 export function describeUnprocessable(reason: UnprocessableReason): string {
   return UNPROCESSABLE_LABELS[reason];
+}
+export function describeUnselectedRow(reason: UnselectedRowReason): string {
+  return UNSELECTED_ROW_LABELS[reason];
 }

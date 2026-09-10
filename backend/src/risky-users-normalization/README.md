@@ -234,3 +234,54 @@ to fail exactly the intended tests, with the rest of the suite still passing: a
 routed into our own findings, the audit `ResultStatus` read as logon success, and
 ambiguity resolved by best-match. A green suite that has not been mutation-checked is
 not evidence.
+
+---
+
+## Addendum: what the code distribution changed
+
+The observed Graph distribution (14 distinct codes in all history) reframes two things.
+
+**Code 50053 is 1,477 of 2,635 rows — 56% of everything collected.** The
+description-text match is therefore the highest-volume predicate in this layer, not an
+edge case. Its literal fragments are rendered from Microsoft's documented phrasing, not
+from our own rows, and are registered as `graph.failure-reason-fragments`
+(`PENDING_DISTRIBUTION_CHECK`). If they do not match the two values production actually
+carries, 56% of traffic lands in UNKNOWN — safe, but a large and avoidable coverage loss.
+The two literal strings are the most valuable outstanding request.
+
+**The lockout branch carries unique detection weight.** For 94.8% of lockout rows there
+is no 50126 for the same user within ±15 minutes: Microsoft emits the lockout without the
+individual attempts alongside it, so at the moment of lockout it is the only signal
+present. A 50126-only detector eventually surfaces the affected users — 100% of them
+appear in 50126 rows at some point — but misses the events, and misses them when they
+happen. Caveat: one tenant, at most four users, one locale, six weeks, and 1,479 blocks
+against four accounts is not obviously normal traffic.
+
+**The risk-verdict branch has no production evidence at all.** Across all 1,479 rows of
+50053 there are exactly two distinct description values, and it is neither. It stays in
+the closed set — it is a documented Microsoft string and unmatched text is safe — but it
+is exercised only by a synthetic fixture and is recorded `NO_PRODUCTION_EVIDENCE`. Its
+practical value is also lower than it first appeared: the code has volume in one tenant,
+and that tenant holds Entra ID P2 and can already see Microsoft's risk signal directly.
+It is also the only branch here whose disposition removes an event from `applies`, so it
+is held to a single distinctive fragment; `built-in protections` was dropped as too broad
+to carry that consequence.
+
+## Addendum: unknown is not one thing
+
+A consumer that gates a clean claim on "anything unknown" would let eighteen rows of a
+well-understood consent prompt withhold a tenant's claim indefinitely — the veto pattern
+in a better label. So `UnknownObservation` is partitioned, exhaustively and with a test:
+
+- `UNINTERPRETABLE_OBSERVATIONS` — we could not read the event. A real limit on what we
+  can claim, and the number to gate on.
+- `UNCITED_POLICY_OBSERVATIONS` — we read the event fine; only our own basis for
+  excluding it is missing. Disclosed, never gating.
+
+`coverageForEvaluation(batch)` returns the tallies in the shape the evaluation core
+consumes, with `uninterpretedEvents` and `uncitedPolicyEvents` already split. One mapping
+in one place, for the same reason the sort lives here.
+
+`counts.unselectedRowsByReason` replaces the earlier bare number, so "we never looked"
+can be told apart from "we looked and declined". One member, `ROW_FROM_OTHER_FEED`, and
+that is the answer: nothing is excluded from the covered feed by a predicate.
