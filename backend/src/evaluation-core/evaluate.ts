@@ -83,7 +83,7 @@ export function zeroClaim(basis: ClaimBasis): ZeroClaim {
   if (!allDetectorsRan) reasons.push('DETECTOR_FAILED')
   if (!allSubjectsResolved) reasons.push('UNRESOLVED_SUBJECT_IDENTITY')
   // The sum invariant proves a detector's accounting is COMPLETE. It proves
-  // nothing was EXAMINED: considered 0 with 1,000 declined balances perfectly.
+  // nothing was EXAMINED: assessed 0 with 1,000 declined balances perfectly.
   // So the same guard as coverage.applies > 0, one layer further in.
   if (!anyCheckExaminedEvidence) reasons.push('NO_CHECK_EXAMINED_EVIDENCE')
   // A narrower request is a DIFFERENT QUESTION, not an incomplete answer to the
@@ -153,15 +153,6 @@ export function countOf(distinctSubjects: number, permitted: boolean, scope: Cou
 
 /** Derived from the reports once, so the scope and the detector list cannot
  * drift into telling different stories about the same run. */
-/** A check that examined nothing covers nothing.
- *
- * `considered: 0` with everything declined is an honest report — the
- * fully-excluded case, complete accounting, nothing to look at — but it is not
- * a question that was answered, so it belongs beside the checks that could not
- * run rather than among the checks a zero rests on. Listing it as covered is
- * how "ran and found nothing" stayed believable over events nobody looked at. */
-const examinedSomething = (report: DetectorReport): boolean =>
-  report.status === 'RAN' && report.considered > 0
 
 /** Whether this detector's silence is trustworthy — it either answered, or
  * declined for a stated reason. Only a crash leaves what it would have found
@@ -200,19 +191,27 @@ export function setAsideOf(coverage: Coverage): CountScope['setAside'] {
   take('UNPROCESSABLE', coverage.unprocessable)
   return entries
 }
+/** Whether this check actually ran and answered its question.
+ *
+ * NOT "did it assess a non-zero number of events". A detector handed twenty
+ * successes that declines all twenty as not its kind HAS asked its question and
+ * answered it — that is a healthy tenant, and the correct output is a confident
+ * zero. Gating on the assessed count instead told every clean tenant "we cannot
+ * tell you", which reads as caution rather than failure, so nobody investigates.
+ *
+ * The case that genuinely warrants withholding is nothing REACHING a detector:
+ * no events in scope (already caught by `coverage.applies === 0`), or no check
+ * able to run at all. Those are different from a check that ran and found its
+ * kind absent.
+ */
+const answeredItsQuestion = (report: DetectorReport): boolean => report.status === 'RAN'
 export function scopeOf(reports: readonly DetectorReport[], coverage: Coverage): CountScope {
   return {
     evidenceRequested: coverage.collectionScope.declared ? [coverage.collectionScope.asked] : [],
     setAside: setAsideOf(coverage),
-    covered: reports.flatMap(report => examinedSomething(report) ? [report.detectorId] : []),
+    covered: reports.flatMap(report => answeredItsQuestion(report) ? [report.detectorId] : []),
     notCovered: reports.flatMap(report => {
       if (report.status === 'INAPPLICABLE') return [{ detectorId: report.detectorId, because: report.because }]
-      if (report.status === 'RAN' && report.considered === 0) {
-        return [{
-          detectorId: report.detectorId,
-          because: 'This check assessed none of the events it was given, so it has not cleared any of them.',
-        }]
-      }
       return []
     }),
   }
@@ -277,7 +276,7 @@ export function evaluate<Event>(input: Readonly<{
   const state = evidenceState(input.evidence)
   if (input.evidence.availability !== 'READ') {
     // Nothing was read, so nothing ran. An empty detector list is the honest
-    // report — not a list of detectors credited with having considered zero
+    // report — not a list of detectors credited with having assessed zero
     // events, which reads like a healthy silent detector.
     const claim = zeroClaim({ read: false, because: input.evidence.availability })
     return {
@@ -361,12 +360,12 @@ export function evaluate<Event>(input: Readonly<{
       // the post-password family. Failing to say where the rest went is not.
       const declinedTotal = total(result.declined)
       const accountsForItself =
-        Number.isInteger(result.considered) && result.considered >= 0
+        Number.isInteger(result.assessed) && result.assessed >= 0
         && Object.values(result.declined).every(count => Number.isInteger(count) && count >= 0)
         // A blank reason is a silent opt-out wearing a number, same as a blank
         // inapplicability reason.
         && Object.keys(result.declined).every(reason => reason.trim() !== '')
-        && result.considered + declinedTotal === applicable.length
+        && result.assessed + declinedTotal === applicable.length
       if (!accountsForItself) {
         reports.push({ detectorId: detector.id, status: 'FAILED' })
         continue
@@ -374,7 +373,7 @@ export function evaluate<Event>(input: Readonly<{
       reports.push({
         detectorId: detector.id,
         status: 'RAN',
-        considered: result.considered,
+        assessed: result.assessed,
         declined: result.declined,
         matched: result.findings.length,
       })
@@ -393,7 +392,7 @@ export function evaluate<Event>(input: Readonly<{
     // boolean.
     allDetectorsRan: reports.every(answeredOrDeclined),
     allSubjectsResolved: unattributedFindings(findings) === 0,
-    anyCheckExaminedEvidence: reports.some(examinedSomething),
+    anyCheckExaminedEvidence: reports.some(answeredItsQuestion),
   })
   return {
     state,

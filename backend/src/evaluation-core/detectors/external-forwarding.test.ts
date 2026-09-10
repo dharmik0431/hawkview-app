@@ -87,7 +87,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
       id: 'user-side',
       monotonic: true,
       run: () => ({
-        status: 'RAN' as const, considered: 1, declined: {},
+        status: 'RAN' as const, assessed: 1, declined: {},
         findings: [{
           detectorId: 'user-side',
           subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-alice' } } as const,
@@ -161,11 +161,11 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
     id: `user-${userRef}`,
     monotonic: true,
     // Reports what it was actually handed. An earlier version claimed to have
-    // considered one event even when given none, which the core now rejects as
+    // assessed one event even when given none, which the core now rejects as
     // an account it cannot trust — it caught this fixture immediately.
     run: (applicable: readonly MailboxForwardingArtefact[]) => ({
       status: 'RAN' as const,
-      considered: applicable.length,
+      assessed: applicable.length,
       declined: {},
       findings: [{
         detectorId: `user-${userRef}`,
@@ -215,14 +215,14 @@ test('a disabled rule is configuration, not exfiltration', () => {
   const result = assess([mailbox('a', { rules: [rule({ enabled: false, forwardTo: ['exfil@evil.example'] })] })])
   assert.deepEqual(result.findings.items, [])
   // Considered and cleared, which is what lets this read as a genuine zero.
-  assert.deepEqual(result.detectors, [{ detectorId: 'external-mailbox-forwarding', status: 'RAN', considered: 1, declined: {}, matched: 0 }])
+  assert.deepEqual(result.detectors, [{ detectorId: 'external-mailbox-forwarding', status: 'RAN', assessed: 1, declined: {}, matched: 0 }])
   assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
 })
 
 test('without verified domains it declares itself inapplicable rather than flagging everyone', () => {
   // Every address would look external, so the honest answer is that this check
   // cannot be asked here — not a page of findings asserting the whole tenant is
-  // exfiltrating, and not a run that "considered nothing", which is
+  // exfiltrating, and not a run that "assessed nothing", which is
   // indistinguishable from a dead detector.
   const blind = externalForwardingDetector({ verifiedDomains: [] })
   const result = assess([mailbox('a', { forwardingSmtpAddress: 'colleague@contoso.com' })], [blind])
@@ -248,7 +248,7 @@ test('without verified domains it declares itself inapplicable rather than flagg
     {
       id: 'looked-at-it',
       monotonic: true,
-      run: applicable => ({ status: 'RAN' as const, considered: applicable.length, declined: {}, findings: [] }),
+      run: applicable => ({ status: 'RAN' as const, assessed: applicable.length, declined: {}, findings: [] }),
     },
   ])
   assert.deepEqual(alongside.claim, { permitted: true })

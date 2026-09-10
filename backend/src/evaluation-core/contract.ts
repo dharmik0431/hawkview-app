@@ -286,13 +286,20 @@ export type CollectionScope =
 export type DetectorResult =
   | Readonly<{
     status: 'RAN'
-    /** How many of the events it was handed it actually assessed. */
-    considered: number
+    /** How many of the events it was handed were this check's KIND.
+     *
+     * Renamed from , which read as "how many did you look at" to
+     * one person and "how many were yours" to another. It is the second: a
+     * check handed twenty successes it does not read reports assessed 0 and
+     * declined 20, and that is a healthy answer rather than a check that did
+     * nothing. Gating a claim on this being non-zero told every clean tenant
+     * "we cannot tell you". */
+    assessed: number
     /** Where the rest went, by the detector's own reason vocabulary.
      *
      * A detector may absolutely assess fewer events than it was handed — the
      * interrupt rule acts only on the post-password family — but it may not
-     * fail to say where the others went. `considered` plus these must equal
+     * fail to say where the others went. `assessed` plus these must equal
      * what it was given, and the core rejects a result where they do not.
      *
      * A range check on a self-reported number can only catch incoherence. A sum
@@ -335,15 +342,15 @@ export type Detector<Event> = Readonly<{
   run: (applicable: readonly Event[]) => DetectorResult
 }>
 
-/** Diagnostic, deliberately separate from coverage. A detector that considered
- * 500 events and matched none is healthy; one that considered none is either
+/** Diagnostic, deliberately separate from coverage. A detector that assessed
+ * 500 events and matched none is healthy; one that assessed none is either
  * inapplicable or broken, and only this tells them apart. A failed detector
- * reports no counts, because what it would have considered is unknown. */
+ * reports no counts, because what it would have assessed is unknown. */
 export type DetectorReport =
   | Readonly<{
     detectorId: string
     status: 'RAN'
-    considered: number
+    assessed: number
     /** Where the events it did not assess went, in its own words. Without this a
      * detector could narrow its own input to almost nothing and still read as
      * healthy — the same silent narrowing we removed at tenant and stream level,

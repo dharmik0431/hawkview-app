@@ -12,7 +12,7 @@ const failuresThenSuccess: FeedBoundDetector = {
   detector: {
     id: 'invalid-attempts-then-success',
     monotonic: true,
-    run: applicable => ({ status: 'RAN', considered: applicable.length, declined: {}, findings: [] }),
+    run: applicable => ({ status: 'RAN', assessed: applicable.length, declined: {}, findings: [] }),
   },
   requires: ['PASSWORD_REJECTED', 'PASSWORD_ACCEPTED_COMPLETED'],
 }
@@ -36,7 +36,7 @@ test('a feed that cannot produce half the pattern is identified before the rule 
 })
 
 test('an inert rule reports that it cannot run, rather than that it found nothing', () => {
-  // Without this the detector reports considered: N, matched: 0 — a healthy
+  // Without this the detector reports assessed: N, matched: 0 — a healthy
   // silent detector — and nothing anywhere distinguishes "no compromise
   // happened" from "this rule could never have fired here".
   const bound = bindToFeed(failuresThenSuccess, feed('audit', ['PASSWORD_REJECTED']))
@@ -136,7 +136,7 @@ test('a rule reading an outcome it did not declare is caught, in the dangerous d
       monotonic: true,
       run: applicable => ({
         status: 'RAN',
-        considered: applicable.length,
+        assessed: applicable.length,
         declined: {},
         findings: applicable.some(item => item.classification.kind === 'APPLIES' && item.classification.outcome === 'PASSWORD_ACCEPTED_COMPLETED') ? [] : [],
       }),
@@ -155,7 +155,7 @@ test('an honest declaration has no gaps in either direction', () => {
       monotonic: true,
       run: applicable => ({
         status: 'RAN',
-        considered: applicable.length,
+        assessed: applicable.length,
         declined: {},
         findings: applicable.some(item =>
           item.classification.kind === 'APPLIES' && item.classification.outcome === 'PASSWORD_REJECTED' || item.classification.kind === 'APPLIES' && item.classification.outcome === 'PASSWORD_ACCEPTED_COMPLETED') ? [] : [],
@@ -176,7 +176,7 @@ test('a mention that is not a read can be explained, per detector and not global
       monotonic: true,
       run: applicable => ({
         status: 'RAN',
-        considered: applicable.length,
+        assessed: applicable.length,
         declined: {},
         // Mentioned in order to be skipped, not read for its meaning.
         findings: applicable.filter(item => item.classification.kind !== 'APPLIES' || item.classification.outcome !== 'BLOCKED_BY_CONTROL').length >= 0 ? [] : [],
@@ -195,7 +195,7 @@ test('a mention that is not a read can be explained, per detector and not global
       ...guarded.detector,
       run: applicable => ({
         status: 'RAN',
-        considered: applicable.length,
+        assessed: applicable.length,
         declined: {},
         findings: applicable.filter(item =>
           item.classification.kind !== 'APPLIES' || item.classification.outcome !== 'BLOCKED_BY_CONTROL' && item.classification.kind === 'APPLIES' && item.classification.outcome === 'PASSWORD_REJECTED').length >= 0 ? [] : [],

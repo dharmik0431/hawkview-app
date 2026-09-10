@@ -32,12 +32,12 @@ const matching: Detector<Event> = {
   id: 'matches-flagged',
   monotonic: true,
   run: applicable => ({
-    status: 'RAN', considered: applicable.length, declined: {},
+    status: 'RAN', assessed: applicable.length, declined: {},
     findings: applicable.filter(item => item.match)
       .map(item => ({ detectorId: 'matches-flagged', subject: user(item.subject), observedAt: '2026-09-10T00:00:00.000Z' })),
   }),
 }
-const silent: Detector<Event> = { id: 'silent', monotonic: true, run: applicable => ({ status: 'RAN', considered: applicable.length, declined: {}, findings: [] }) }
+const silent: Detector<Event> = { id: 'silent', monotonic: true, run: applicable => ({ status: 'RAN', assessed: applicable.length, declined: {}, findings: [] }) }
 const broken: Detector<Event> = { id: 'broken', monotonic: true, run: () => { throw new Error('detector fault') } }
 
 const run = (applies: readonly Event[], options: Partial<{
@@ -124,10 +124,9 @@ test('a window where nothing applied cannot report a confident zero', () => {
   // The live production defect: everything set aside, nothing assessed, and a
   // headline zero captioned as though the evidence had been examined.
   const result = run([], { coverage: coverage({ applies: 0, doesNotApply: { NOT_A_CREDENTIAL_EVENT: 12 } }) })
-  // Two reasons now, and both are true: no event applied, and no check assessed
-  // anything. Reporting only the first would answer a question nobody asked.
-  assert.deepEqual([...(result.claim.permitted === false ? result.claim.because : [])].sort(),
-    ['NOTHING_APPLICABLE', 'NO_CHECK_EXAMINED_EVIDENCE'])
+  // One reason: no event applied. The checks DID run — over an empty window —
+  // so they answered their question and the second reason does not hold.
+  assert.deepEqual(result.claim.permitted === false && result.claim.because, ['NOTHING_APPLICABLE'])
   assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
 })
 
@@ -179,8 +178,8 @@ test('unread evidence cannot produce a finding, because it cannot carry an event
   for (const availability of ['NEVER_COLLECTED', 'UNREADABLE_NOW'] as const) {
     const result = unread(availability, [matching, silent])
     assert.deepEqual(result.findings.items, [])
-    // No detector is credited with having considered anything, because none ran.
-    // Reporting them as RAN with considered:0 would read like healthy silence.
+    // No detector is credited with having assessed anything, because none ran.
+    // Reporting them as RAN with assessed:0 would read like healthy silence.
     assert.deepEqual(result.detectors, [])
     assert.deepEqual(result.coverage.applies, 0)
     assert.deepEqual(result.coverage.unknown, {})
@@ -198,7 +197,7 @@ test('the budget belongs to the caller and exceeding it withholds rather than tr
   const events = Array.from({ length: 5 }, (_, index) => event(`${index}`, { match: index === 0 }))
   const result = run(events, { coverage: coverage({ applies: 5 }), maxEvents: 3 })
   assert.deepEqual(result.claim, { permitted: false, because: ['CAPACITY_EXCEEDED'] })
-  assert.equal(result.detectors[0]?.status === 'RAN' && result.detectors[0].considered, 3)
+  assert.equal(result.detectors[0]?.status === 'RAN' && result.detectors[0].assessed, 3)
 
   assert.deepEqual(run(events, { coverage: coverage({ applies: 5 }), maxEvents: 5 }).claim, { permitted: true })
 })
@@ -240,7 +239,7 @@ test('the survivors keep the order they arrived in, not the order recency picked
     monotonic: true,
     run: applicable => {
       seen.push(...applicable.map(item => item.id))
-      return { status: 'RAN', considered: applicable.length, declined: {}, findings: [] }
+      return { status: 'RAN', assessed: applicable.length, declined: {}, findings: [] }
     },
   }
   run([0, 1, 2, 3].map(index => event(`${index}`, { at: index })),
@@ -274,7 +273,7 @@ test('per-detector accounting separates a healthy silent detector, a filtering o
     // legitimate; failing to account for what was set aside is not.
     run: applicable => ({
       status: 'RAN',
-      considered: 1,
+      assessed: 1,
       declined: { NOT_THE_FAMILY_THIS_RULE_READS: applicable.length - 1 },
       findings: [],
     }),
@@ -283,13 +282,13 @@ test('per-detector accounting separates a healthy silent detector, a filtering o
     id: 'unaccounted', monotonic: true,
     // Claims to have assessed nothing and does not say what happened to the
     // events. Under a range check this passed as a healthy-looking zero.
-    run: () => ({ status: 'RAN', considered: 0, declined: {}, findings: [] }),
+    run: () => ({ status: 'RAN', assessed: 0, declined: {}, findings: [] }),
   }
   const result = run([event('1'), event('2')], { detectors: [silent, filtering, unaccounted] })
 
   assert.deepEqual(result.detectors, [
-    { detectorId: 'silent', status: 'RAN', considered: 2, declined: {}, matched: 0 },
-    { detectorId: 'filtering', status: 'RAN', considered: 1, declined: { NOT_THE_FAMILY_THIS_RULE_READS: 1 }, matched: 0 },
+    { detectorId: 'silent', status: 'RAN', assessed: 2, declined: {}, matched: 0 },
+    { detectorId: 'filtering', status: 'RAN', assessed: 1, declined: { NOT_THE_FAMILY_THIS_RULE_READS: 1 }, matched: 0 },
     { detectorId: 'unaccounted', status: 'FAILED' },
   ])
   assert.equal(result.findings.items.length, 0)
@@ -360,7 +359,7 @@ test('distinct subjects are counted once however many findings they carry', () =
     id: 'twice',
     monotonic: true,
     run: applicable => ({
-      status: 'RAN', considered: applicable.length, declined: {},
+      status: 'RAN', assessed: applicable.length, declined: {},
       findings: applicable.flatMap((item): Finding[] => [0, 1].map(() =>
         ({ detectorId: 'twice', subject: user(item.subject), observedAt: '2026-09-10T00:00:00.000Z' }))),
     }),
@@ -404,7 +403,7 @@ test('every reason that applies is reported, so there is no precedence to get wr
   const mailbox: Detector<Event> = {
     id: 'mailbox',
     monotonic: true,
-    run: applicable => ({ status: 'RAN', considered: applicable.length, declined: {}, findings: applicable.map(item => unattributed(item.id)) }),
+    run: applicable => ({ status: 'RAN', assessed: applicable.length, declined: {}, findings: applicable.map(item => unattributed(item.id)) }),
   }
 
   // Uninterpretable events AND an unattributed finding: an ordinary Tuesday.
@@ -470,7 +469,7 @@ test('a non-monotonic detector never sees a truncated window, because it would i
     monotonic: false,
     run: applicable => ({
       status: 'RAN',
-      considered: applicable.length,
+      assessed: applicable.length,
       declined: {},
       findings: applicable.some(item => item.match)
         ? []
@@ -540,18 +539,18 @@ test('findings say they are partial when a detector crashed, and complete when n
 })
 
 test('a detector whose account of itself is impossible is not trusted to have run', () => {
-  // `considered` is what makes "ran and found nothing" believable rather than
+  // `assessed` is what makes "ran and found nothing" believable rather than
   // merely silent, and it is self-reported. A detector cannot have looked at
   // more events than it was handed, so a figure outside that range means the
   // account is untrustworthy — and an untrustworthy account of a clean result
   // is worth less than no account at all.
   const overclaims: Detector<Event> = {
     id: 'overclaims', monotonic: true,
-    run: () => ({ status: 'RAN', considered: 1000, declined: {}, findings: [] }),
+    run: () => ({ status: 'RAN', assessed: 1000, declined: {}, findings: [] }),
   }
   const negative: Detector<Event> = {
     id: 'negative', monotonic: true,
-    run: () => ({ status: 'RAN', considered: -1, declined: {}, findings: [] }),
+    run: () => ({ status: 'RAN', assessed: -1, declined: {}, findings: [] }),
   }
   for (const bad of [overclaims, negative]) {
     const result = run([event('1')], { detectors: [bad] })
@@ -565,7 +564,7 @@ test('a detector whose account of itself is impossible is not trusted to have ru
     id: 'miscounts', monotonic: true,
     run: applicable => ({
       status: 'RAN',
-      considered: applicable.length + 5,
+      assessed: applicable.length + 5,
       declined: {},
       findings: [{ detectorId: 'miscounts', subject: user('user-1'), observedAt: '2026-09-10T00:00:00.000Z' }],
     }),
@@ -574,13 +573,13 @@ test('a detector whose account of itself is impossible is not trusted to have ru
   assert.equal(kept.findings.items.length, 1)
   assert.deepEqual(figure(kept.count), { accuracy: 'AT_LEAST', value: 1 })
 
-  // A detector reporting more findings than events considered is NOT impossible
+  // A detector reporting more findings than events assessed is NOT impossible
   // — one event can support several findings — so that stays permitted.
   const many: Detector<Event> = {
     id: 'many', monotonic: true,
     run: applicable => ({
       status: 'RAN',
-      considered: applicable.length,
+      assessed: applicable.length,
       declined: {},
       findings: [0, 1, 2].map(() => ({ detectorId: 'many', subject: user('user-1'), observedAt: '2026-09-10T00:00:00.000Z' })),
     }),
@@ -644,7 +643,7 @@ test('a detector that silently narrows its own input is rejected, which a range 
   // with the remainder.
   const silentlyNarrows: Detector<Event> = {
     id: 'narrows', monotonic: true,
-    run: () => ({ status: 'RAN', considered: 5, declined: {}, findings: [] }),
+    run: () => ({ status: 'RAN', assessed: 5, declined: {}, findings: [] }),
   }
   const thousand = Array.from({ length: 1000 }, (_, index) => event(`${index}`, { at: index }))
   const narrowed = run(thousand, { coverage: coverage({ applies: 1000 }), detectors: [silentlyNarrows] })
@@ -662,7 +661,7 @@ test('a detector that silently narrows its own input is rejected, which a range 
     id: 'narrows', monotonic: true,
     run: applicable => ({
       status: 'RAN',
-      considered: 5,
+      assessed: 5,
       declined: { NOT_THE_FAMILY_THIS_RULE_READS: applicable.length - 5 },
       findings: [],
     }),
@@ -670,58 +669,54 @@ test('a detector that silently narrows its own input is rejected, which a range 
   const honest = run(thousand, { coverage: coverage({ applies: 1000 }), detectors: [accountsForIt] })
   assert.deepEqual(honest.claim, { permitted: true })
   assert.deepEqual(honest.detectors[0],
-    { detectorId: 'narrows', status: 'RAN', considered: 5, declined: { NOT_THE_FAMILY_THIS_RULE_READS: 995 }, matched: 0 })
+    { detectorId: 'narrows', status: 'RAN', assessed: 5, declined: { NOT_THE_FAMILY_THIS_RULE_READS: 995 }, matched: 0 })
 })
 
 test('setting events aside under a blank reason is a silent opt-out wearing a number', () => {
   const blankReason: Detector<Event> = {
     id: 'blank', monotonic: true,
-    run: applicable => ({ status: 'RAN', considered: 1, declined: { '  ': applicable.length - 1 }, findings: [] }),
+    run: applicable => ({ status: 'RAN', assessed: 1, declined: { '  ': applicable.length - 1 }, findings: [] }),
   }
   const result = run([event('1'), event('2')], { detectors: [blankReason] })
   assert.deepEqual(result.detectors, [{ detectorId: 'blank', status: 'FAILED' }])
 })
 
-test('a detector that balanced its books without examining anything cannot support a zero', () => {
-  // QA's hole in the sum invariant. `considered: 0, declined: 1000` balances
-  // perfectly, accounts for every event, and looked at none of them — and a
-  // legitimate reason attached makes it more plausible rather than less. The
-  // sum proves the accounting is COMPLETE; it proves nothing was EXAMINED.
+test('a check handed events it does not read is healthy, not silent', () => {
+  // THE CONTROL CASE, and this test previously asserted the opposite.
+  //
+  // A detector handed a thousand events that declines all of them as not its
+  // kind HAS asked its question and answered it. That is a clean tenant, and
+  // the correct output is a confident zero. Gating on the assessed count told
+  // every healthy tenant "we cannot tell you" — which reads as caution rather
+  // than failure, so nobody investigates it.
+  //
+  // The case that warrants withholding is nothing REACHING a detector, which
+  // is `coverage.applies === 0` and is caught by NOTHING_APPLICABLE.
   const declinesEverything: Detector<Event> = {
     id: 'declines-all', monotonic: true,
     run: applicable => ({
       status: 'RAN',
-      considered: 0,
+      assessed: 0,
       declined: { NOT_THE_FAMILY_THIS_RULE_READS: applicable.length },
       findings: [],
     }),
   }
-  const thousand = Array.from({ length: 1000 }, (_, index) => event(`${index}`, { at: index }))
+  const thousand = Array.from({ length: 1000 }, (_, index) => event(String(index), { at: index }))
   const result = run(thousand, { coverage: coverage({ applies: 1000 }), detectors: [declinesEverything] })
 
-  // The report is honest and stays RAN — this is the fully-excluded case, not a
-  // broken detector, and its accounting is complete.
   assert.deepEqual(result.detectors, [{
-    detectorId: 'declines-all', status: 'RAN', considered: 0,
+    detectorId: 'declines-all', status: 'RAN', assessed: 0,
     declined: { NOT_THE_FAMILY_THIS_RULE_READS: 1000 }, matched: 0,
   }])
-  // But it cannot be one of the checks a confident zero rests on.
-  assert.deepEqual(result.claim.permitted === false && result.claim.because, ['NO_CHECK_EXAMINED_EVIDENCE'])
-  assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
-  // And it is absent from `covered`, so it is not credited with clearing
-  // anything — which is how "ran and found nothing" stayed believable over
-  // events nobody looked at.
-  assert.deepEqual(result.count.scope.covered, [])
-  assert.equal(result.count.scope.notCovered.length, 1)
+  // Permitted, and exact. The check covered those thousand events by declining
+  // them with a stated reason.
+  assert.deepEqual(result.claim, { permitted: true })
+  assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
+  assert.deepEqual(result.count.scope.covered, ['declines-all'])
 
-  // One check that did examine something is enough to carry the claim, and the
-  // abstaining one still shows as not covering anything.
-  const alongside = run(thousand, {
-    coverage: coverage({ applies: 1000 }), detectors: [declinesEverything, silent],
-  })
-  assert.deepEqual(alongside.claim, { permitted: true })
-  assert.deepEqual(alongside.count.scope.covered, ['silent'])
-  assert.equal(alongside.count.scope.notCovered.length, 1)
+  // And the withholding case still withholds: no check able to run at all.
+  const noChecks = run(thousand, { coverage: coverage({ applies: 1000 }), detectors: [] })
+  assert.deepEqual(noChecks.claim.permitted === false && noChecks.claim.because, ['NO_CHECK_EXAMINED_EVIDENCE'])
 })
 
 test('a withheld claim explains itself in as many sentences as it has reasons', () => {
@@ -731,7 +726,7 @@ test('a withheld claim explains itself in as many sentences as it has reasons', 
   const unattributedMailbox: Detector<Event> = {
     id: 'mailbox', monotonic: true,
     run: applicable => ({
-      status: 'RAN', considered: applicable.length, declined: {},
+      status: 'RAN', assessed: applicable.length, declined: {},
       findings: applicable.map(item => ({
         detectorId: 'mailbox',
         subject: { kind: 'MAILBOX', mailboxRef: item.id, binding: 'UNRESOLVED' } as const,

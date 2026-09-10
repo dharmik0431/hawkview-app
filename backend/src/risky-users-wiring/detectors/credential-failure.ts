@@ -50,7 +50,7 @@ export function credentialFailureDetector(
       monotonic: true,
       run: applicable => {
         const bySubject = new Map<string, { lockouts: number; rejections: number; latest: NormalizedEvent }>()
-        let considered = 0
+        let assessed = 0
         let otherOutcome = 0
 
         for (const event of applicable) {
@@ -62,7 +62,7 @@ export function credentialFailureDetector(
             otherOutcome += 1
             continue
           }
-          considered += 1
+          assessed += 1
           const running = bySubject.get(event.subjectRef)
             ?? { lockouts: 0, rejections: 0, latest: event }
           bySubject.set(event.subjectRef, {
@@ -90,7 +90,7 @@ export function credentialFailureDetector(
 
         return {
           status: 'RAN',
-          considered,
+          assessed,
           declined: (otherOutcome > 0 ? { NOT_A_CREDENTIAL_FAILURE_OUTCOME: otherOutcome } : {}) as Readonly<Record<string, number>>,
           findings,
         }

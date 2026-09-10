@@ -25,7 +25,7 @@ const emptyGraphBatch = () => normalizeSignInBatch({
 const silent: Detector<NormalizedEvent> = {
   id: 'silent',
   monotonic: true,
-  run: applicable => ({ status: 'RAN', considered: applicable.length, declined: {}, findings: [] }),
+  run: applicable => ({ status: 'RAN', assessed: applicable.length, declined: {}, findings: [] }),
 }
 
 test('a classified batch reaches a tenant assessment without the core learning Microsoft', async () => {

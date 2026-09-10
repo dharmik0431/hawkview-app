@@ -64,7 +64,7 @@ export function externalForwardingDetector(
     monotonic: true,
     run: applicable => {
       // Reported as inapplicable rather than as a run considering nothing:
-      // "considered 0" is indistinguishable from a dead detector, which is the
+      // "assessed 0" is indistinguishable from a dead detector, which is the
       // ambiguity the per-detector accounting exists to remove. Saying why also
       // makes the count's scope name the gap.
       if (!usable) {
@@ -93,7 +93,7 @@ export function externalForwardingDetector(
         }
       }
       // Every mailbox handed over is examined, so nothing is set aside.
-      return { status: 'RAN', considered: applicable.length, declined: {}, findings }
+      return { status: 'RAN', assessed: applicable.length, declined: {}, findings }
     },
   }
 }

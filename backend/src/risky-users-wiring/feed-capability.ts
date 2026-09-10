@@ -6,7 +6,7 @@ import type { Detector } from '../evaluation-core/contract.js'
  *
  * The question nobody was asking. A rule of the form "failures, then a
  * success" run against a feed that produces no successes cannot fire — and it
- * reports `considered: N, matched: 0`, which is indistinguishable from a
+ * reports `assessed: N, matched: 0`, which is indistinguishable from a
  * healthy detector that looked at everything and found nothing. Every piece of
  * accounting built into the core reads green, because the events forming the
  * other half of the pattern were never there to count.

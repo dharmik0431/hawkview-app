@@ -19,7 +19,7 @@ const coverage = (parts: Partial<Coverage> = {}): Coverage => ({
 
 const silent: Detector<Event> = {
   id: 'silent', monotonic: true,
-  run: applicable => ({ status: 'RAN', considered: applicable.length, declined: {}, findings: [] }),
+  run: applicable => ({ status: 'RAN', assessed: applicable.length, declined: {}, findings: [] }),
 }
 
 const stream = (name: string, parts: Partial<Coverage> = {}) => ({
