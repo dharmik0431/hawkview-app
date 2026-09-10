@@ -2103,6 +2103,40 @@ test('no predicate cites evidence about a field it does not declare', () => {
 // A figure must carry what it rests on, or the number gets quoted without it.
 // ---------------------------------------------------------------------------
 
+// A THIRD CHECK WAS WRITTEN AND THROWN AWAY, and the reason is worth keeping
+// next to the two that survived.
+//
+// A figure needs three things: a denominator, an as-of, and the field it was
+// read from. The denominator is enforced below. Having found that the first two
+// were missing across the registry, the obvious next move was to sweep for the
+// third — every count should name its source, because a borrowed measurement
+// becomes the borrowing code's own claim once it sits in a comment with no date
+// and no source.
+//
+// The sweep flagged nineteen entries. TWO were real. The other seventeen were
+// Microsoft ERROR CODES — 50126, 65001, 53003 — which are four- and five-digit
+// identifiers indistinguishable from row counts by any regex. Telling a count
+// from an identifier reliably would mean marking every figure in the registry,
+// which is a third registry to keep in step: the same reason the field-role
+// distinction was left in a comment rather than added as data.
+//
+// So it was not shipped, and that is a decision rather than an omission. A
+// check that flags nineteen things of which two are real teaches whoever reads
+// the next failure to skip it — and this module already holds the rule that
+// marking a healthy test as noise is worse than having no test, because it
+// decays the suite permanently and in the file.
+//
+// The two checks that DID ship earned it on the same criterion, which is worth
+// stating because it is not obvious: their false positives were INFORMATIVE.
+// The reads-versus-evidence diff's five non-findings revealed that evidence
+// prose does three different jobs under one name. The percentage check's window
+// tuning revealed that proximity is not attribution. This one's false positives
+// revealed only that error codes have four digits.
+//
+// The two real hits were fixed by hand, and provenance is now stated once at
+// the top of provider-facts.ts — every figure there came from the owner's side,
+// because this layer has no production access. One statement covering the file
+// beats an annotation per figure and a test nobody trusts.
 test('no percentage in the registry is stated without its denominator', () => {
   // THE INSTANCE THAT MOTIVATED THIS. Audit UPN binding was recorded as
   // "96.8% / 97.1% / 77.8%" — three percentages in a row. The third is 7 of 9

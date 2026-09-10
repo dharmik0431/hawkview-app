@@ -1,4 +1,32 @@
 import type { EventOutcome, MicrosoftVerdict, NormalizationSource, OutcomeReachability } from './contract.js';
+
+/*
+ * WHERE EVERY NUMBER IN THIS FILE CAME FROM, stated once rather than per
+ * figure.
+ *
+ * No row count here was computed by this layer. All of them come from
+ * measurements run against production by the owner's side and relayed to this
+ * module; this session has no production access by design. That matters for
+ * two reasons a reader cannot otherwise recover:
+ *
+ *  - A BORROWED MEASUREMENT BECOMES THE BORROWING CODE'S OWN CLAIM once it
+ *    sits in a comment with no date and no source. The next reader has no way
+ *    to tell it was true on one afternoon, and no way to tell it was ever
+ *    someone else's. Both facts are load-bearing when a figure turns out to
+ *    be wrong, because they say who can re-check it.
+ *  - THIS FILE HAS ALREADY CARRIED FIGURES THAT WERE NOT WHAT THEY CLAIMED.
+ *    An earlier set of audit volumes was computed from raw.status.failureReason
+ *    — a field HawkView synthesizes, whose final arm is `?? record.Operation` —
+ *    and presented as Microsoft's data. They were withdrawn and re-derived
+ *    from managementActivityRecord.LogonError, Microsoft's own field. Entries
+ *    that survived that episode say which field they were computed from; that
+ *    is not decoration.
+ *
+ * So: a figure load-bearing enough to argue from carries its denominator, its
+ * as-of, and the field it was read from. A test enforces the denominator. The
+ * other two are conventions, deliberately not tested — see the note in
+ * normalize.test.ts on the check that was written and thrown away.
+ */
 import type { OutOfScopeReason, UncitedReason, UnknownObservation } from './reasons.js';
 
 /**
@@ -878,7 +906,9 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
     name: 'DelegationDoesNotExist',
     graphCode: 65001,
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
-    note: 'Matches 65001 on the Graph side, including the consent-grant pointer. 9 rows.',
+    note:
+      'Matches 65001 on the Graph side, including the consent-grant pointer. 9 rows, from ' +
+      'managementActivityRecord.LogonError as of 2026-09-10T16:36Z.',
   },
   {
     name: 'InvalidReplyTo',
@@ -1159,8 +1189,11 @@ export const RISK_DETAIL_VALUES: readonly RiskDetailEntry[] = [
     value: 'none',
     riskState: 'none',
     note:
-      'The benign value, and the control cohort: 2,593 of 2,648 rows including 958 ordinary successes. ' +
-      'Explicitly the string "none" rather than absent or hidden.',
+      'The benign value, and the control cohort: 2,593 of 2,648 rows including 958 ordinary successes, ' +
+      'read from raw.riskDetail paired with raw.riskState. Explicitly the string "none" rather than ' +
+      'absent or hidden. NOTE the Graph total has since moved to ~2,645+; the pair split was not ' +
+      're-measured at 16:36Z, so these three are an earlier snapshot and must not be compared with the ' +
+      'stamped figures elsewhere in this file.',
   },
   {
     value: 'userPassedMFADrivenByRiskBasedPolicy',
