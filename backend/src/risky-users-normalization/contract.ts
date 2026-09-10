@@ -389,8 +389,14 @@ export interface NormalizationCounts {
    *
    * An ORTHOGONAL dimension rather than a fifth bucket: every event counted
    * here is also counted in one of the four vocabularies, because the verdict
-   * does not decide whether our detectors act. Summing this with the four
-   * double-counts.
+   * does not decide whether our detectors act.
+   *
+   * DO NOT SUM THIS WITH THE FOUR, and the concrete failure is worth naming
+   * because a summary card is exactly where it happens: on a tenant where
+   * ~921 rows carry a RISK verdict, a total built by adding all five reads
+   * about 35% higher than the number of rows handed in, and it would look
+   * plausible. The four vocabularies account for every row exactly once and a
+   * test asserts it; this is a second reading of some of those same rows.
    */
   readonly microsoftVerdicts: Readonly<Record<MicrosoftVerdict | 'UNRECOGNIZED', number>>;
   /**
@@ -514,6 +520,21 @@ export interface NormalizationBatch {
    * Populated from `riskDetail`, whose control cohort now passes.
    */
   readonly microsoftSafetyVerdicts: readonly NormalizedEvent[];
+  //
+  // THE THREE LISTS ARE DISJOINT PER EVENT, NOT PER SUBJECT.
+  //
+  // One verdict per event, and a test asserts no event reaches two lists. But
+  // a subject has many events, and nothing stops one person having a RISK
+  // verdict on Tuesday and a SAFE verdict on Thursday — both true, about
+  // different sign-ins.
+  //
+  // So a surface that groups BY USER has a case this layer does not decide
+  // for it: a user who belongs in two groups at once. Picking the worst
+  // verdict, the latest, or showing the user twice are all defensible, and
+  // they are rendering decisions rather than facts about the data — which is
+  // why this says the shape rather than choosing. What is NOT defensible is
+  // reaching for one of them without noticing the case exists, because the
+  // failure is silent and lands in the direction that reads as reassurance.
   /** Reference-to-identifier mapping for subjects that resolved, kept off the events. */
   readonly resolvedSubjects: readonly {
     readonly subjectRef: string;
