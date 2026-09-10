@@ -1,4 +1,4 @@
-import type { Detector, Finding, Subject } from '../contract.js'
+import type { Detector, DetectorFinding, Subject } from '../contract.js'
 
 /** PLACEHOLDER. Ported to prove the detector seam swaps, not because this is
  * the specification. The detection design is being derived from Microsoft's
@@ -73,7 +73,7 @@ export function externalForwardingDetector(
           because: "The tenant's verified domains are unknown, so internal and external recipients cannot be told apart.",
         }
       }
-      const findings: Finding[] = []
+      const findings: DetectorFinding[] = []
       for (const mailbox of applicable) {
         const destinations = [
           mailbox.forwardingSmtpAddress,
@@ -81,14 +81,26 @@ export function externalForwardingDetector(
           ...mailbox.rules.filter(rule => rule.enabled)
             .flatMap(rule => [...rule.redirectTo, ...rule.forwardTo, ...rule.forwardAsAttachmentTo]),
         ]
-        if (destinations.some(isExternal)) {
+        const external = destinations.filter(isExternal)
+        if (external.length > 0) {
           // Passes the resolved subject straight through. A detector that
           // decided identity here would be guessing at directory state it cannot
           // see, and would inflate a count of people with meeting rooms.
           findings.push({
             detectorId: 'external-mailbox-forwarding',
             subject: mailbox.subject,
-            observedAt: mailbox.observedAt,
+            // A CONFIGURATION rather than a stream of events, so the count is
+            // how many external destinations this mailbox forwards to, and the
+            // recency is when that configuration was read. One destination and
+            // four are different situations and `observedAt` alone said
+            // neither — the same count-separated-from-its-recency pairing that
+            // put 467 lockouts beside a rejection's date, in this detector's
+            // shape.
+            signals: [{
+              signal: 'EXTERNAL_FORWARDING_CONFIGURED',
+              count: external.length,
+              latest: mailbox.observedAt,
+            }],
           })
         }
       }

@@ -233,10 +233,67 @@ export type CorrelationRef =
  * distinction is enforced here rather than left to the classifier to remember. */
 export type MailboxBinding = 'RESOLVED_NEGATIVE' | 'UNRESOLVED'
 
+/** One signal a finding rests on, as the detector measured it.
+ *
+ * COUNT AND RECENCY IN ONE OBJECT, and that is the entire point. The field this
+ * replaces was a single `observedAt` holding the latest event of ANY signal, so
+ * a subject with 467 lockouts and a later password rejection reported the
+ * rejection's timestamp beside the lockout count — two true facts about
+ * different events, rendered as one. Measured across the nine live findings, it
+ * overstated the causing signal's recency by up to eighteen days, and it was
+ * accurate on exactly the tenants where the attack was still running and wrong
+ * on the ones where it had stopped. That is the only case where the field
+ * changes what anyone does.
+ *
+ * Separating a count from its recency is a decision a surface then has to make
+ * correctly every time, from a doc comment. This makes it unmakeable. */
+export type DetectorSignal = Readonly<{
+  /** The detector's own vocabulary. The core never interprets it — same
+   * arrangement as `declined` and `notCovered.because`, and the reason a
+   * generic core can carry a Microsoft-shaped fact without learning it. */
+  signal: string
+  count: number
+  /** `null` means EVALUATED AND NONE OCCURRED. That is a different fact from
+   * the signal being absent from `signals` entirely, which means it was never
+   * evaluated — "we looked and found none" versus "we did not look" is this
+   * feature's signature defect, and it is as wrong per signal as it was per
+   * tenant. */
+  latest: string | null
+}>
+
+/** A signal as it reaches a reader: what the detector measured, plus whether
+ * the window let it be a total. */
+export type FindingSignal = DetectorSignal & Readonly<{
+  /** The window was truncated, so `count` is a FLOOR, not a total.
+   *
+   * Stamped by the core rather than the detector, because a detector is handed
+   * an already-truncated slice and cannot tell. Rendering a floor as a total is
+   * the count-vocabulary defect one level down: `AT_LEAST 467` and `467` are
+   * different claims and only one of them is safe to say. */
+  capped: boolean
+}>
+
+/** What a detector emits. Non-empty: a finding resting on nothing is a finding
+ * whose basis nobody recorded, and the count would then have no denominator to
+ * be quoted against. */
+export type DetectorFinding = Readonly<{
+  detectorId: string
+  subject: Subject
+  signals: readonly [DetectorSignal, ...DetectorSignal[]]
+}>
+
+/** What the core returns.
+ *
+ * There is deliberately NO single `observedAt`. It was derivable as
+ * `max(signals.latest)`, which made it a second source for one fact — the
+ * defect removed three times elsewhere in this design — and it carried a name
+ * that invited pairing it with a count it did not describe. A surface needing
+ * one date computes it and names it in its own vocabulary ("latest of any
+ * reason"), which reads as an aggregate because it was written to. */
 export type Finding = Readonly<{
   detectorId: string
   subject: Subject
-  observedAt: string
+  signals: readonly [FindingSignal, ...FindingSignal[]]
 }>
 
 /** A detector reports how many events it actually looked at after its own
@@ -317,7 +374,7 @@ export type DetectorResult =
      * confident zero with what is left is this project's headline defect, and
      * the detector interior is the one level that had no accounting at all. */
     declined: Readonly<Record<string, number>>
-    findings: readonly Finding[]
+    findings: readonly DetectorFinding[]
   }>
   /** This evidence source cannot answer this detector's question at all — the
    * audit feed carries no conditional-access status, say. Requires a reason in

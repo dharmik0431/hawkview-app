@@ -91,7 +91,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
         findings: [{
           detectorId: 'user-side',
           subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-alice' } } as const,
-          observedAt: '2026-09-10T00:00:00.000Z',
+          signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const,
         }],
       }),
     }],
@@ -170,7 +170,7 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
       findings: [{
         detectorId: `user-${userRef}`,
         subject: { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const,
-        observedAt: '2026-09-10T00:00:00.000Z',
+        signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const,
       }],
     }),
   })

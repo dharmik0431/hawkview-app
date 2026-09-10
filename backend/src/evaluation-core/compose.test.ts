@@ -18,7 +18,7 @@ const matching: Detector<Event> = {
     findings: applicable.filter(item => item.match).map(item => ({
       detectorId: 'matches-flagged',
       subject: { kind: 'DIRECTORY_USER', userRef: item.subject, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + item.subject } } as const,
-      observedAt: '2026-09-10T00:00:00.000Z',
+      signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const,
     })),
   }),
 }
@@ -181,7 +181,7 @@ test('mailbox findings cross streams without ever becoming people', () => {
           findings: applicable.map(item => ({
             detectorId: 'external-mailbox-forwarding',
             subject: { kind: 'MAILBOX', mailboxRef: item.subject, binding: 'RESOLVED_NEGATIVE' } as const,
-            observedAt: '2026-09-10T00:00:00.000Z',
+            signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const,
           })),
         }),
       }],
