@@ -9,6 +9,7 @@ import {
   type NormalizationBatch,
   type NormalizationScope,
   type NormalizationSource,
+  type NormalizeBatchOptions,
   type NormalizedEvent,
   type ReferenceResolver,
   type SignInRow,
@@ -16,6 +17,7 @@ import {
 } from './contract.js';
 import {
   UNREACHABLE_BY_SUBJECT_RESOLUTION,
+  auditReasonEntry,
   dispositionForCode,
   failureReasonMeaning,
   resultCodeEntry,
@@ -218,42 +220,71 @@ function readAuditLogonErrors(record: Record<string, unknown>): unknown[] {
 const emptyLogonError = (value: unknown): boolean =>
   value === undefined || value === null || value === '' || value === 'None';
 
+/**
+ * Classify one audit-STS record, REASON-NAME FIRST.
+ *
+ * The two feeds invert on which field is trustworthy, so classifying them
+ * symmetrically is wrong. On Graph the result code is a clean number on 100%
+ * of rows and the description is free prose. On AUDIT the code is unreliable
+ * and the reason NAME is the stable identifier: `InvalidUserNameOrPassword`
+ * appears with errorCode "1" AND with the code entirely absent, in both audit
+ * tenants. Same event, same meaning, different code — and a classifier keyed
+ * on the code drops half of them while catching the other half, invisibly.
+ *
+ * Error code "1" is HawkView's own invention on this feed rather than an Azure
+ * code, so it carries no provider information: it is used neither as a key nor
+ * as corroboration. That is the second time its instability has bitten.
+ *
+ * The code still CORROBORATES and never overrides. A contradiction between the
+ * name, the operation and a real Microsoft code is reported as a contradiction
+ * rather than resolved by preferring one field.
+ */
 export function classifyAuditRecord(record: Record<string, unknown>): {
   classification: EventClassification;
   errorCode: number | null;
 } {
   const { code, present } = readAuditErrorCode(record);
-  if (code === null) {
-    return {
-      classification: {
-        kind: 'UNKNOWN',
-        observation: present ? 'ERROR_CODE_SHAPE_UNRECOGNIZED' : 'ERROR_CODE_ABSENT',
-      },
-      errorCode: null,
-    };
+  const providerCode = code === 1 ? null : code;
+  const succeeded = record.Operation === 'UserLoggedIn';
+  const inconsistent = {
+    classification: { kind: 'UNKNOWN', observation: 'INCONSISTENT_OPERATION_AND_CODE' } as const,
+    errorCode: code,
+  };
+  const reasonName = readAuditLogonErrors(record).find(
+    value => textValue(value) && !emptyLogonError(value),
+  );
+
+  if (reasonName === undefined) {
+    // No reason name to go on. The code is only trustworthy here for a clean
+    // success, and code "1" is not a provider code at all.
+    if (providerCode === 0) {
+      return succeeded
+        ? { classification: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' }, errorCode: code }
+        : inconsistent;
+    }
+    if (providerCode === null) {
+      const observation: UnknownObservation =
+        code === 1 ? 'HAWKVIEW_SYNTHETIC_ERROR_CODE'
+          : present ? 'ERROR_CODE_SHAPE_UNRECOGNIZED'
+            : 'ERROR_CODE_ABSENT';
+      return { classification: { kind: 'UNKNOWN', observation }, errorCode: code };
+    }
+    if (succeeded) return inconsistent;
+    return { classification: dispositionForCode(providerCode), errorCode: code };
   }
 
-  const operation = record.Operation;
-  const logonErrors = readAuditLogonErrors(record);
-  // The audit feed has no failureReason; its description text is the logon
-  // error, so that is what a text-dependent code is refined from.
-  const description = logonErrors.find(value => textValue(value));
-  const disposition = refineByDescription(code, dispositionForCode(code), description);
-
-  // Operation and code must describe the same outcome. Disagreement is not
-  // resolved by preferring one of them.
-  const succeeded = operation === 'UserLoggedIn';
-  const failed = operation === 'UserLoginFailed';
-  const inconsistent: EventClassification = { kind: 'UNKNOWN', observation: 'INCONSISTENT_OPERATION_AND_CODE' };
-  if (code === 0 && !succeeded) return { classification: inconsistent, errorCode: code };
-  if (code !== 0 && !failed) return { classification: inconsistent, errorCode: code };
-
-  if (disposition.kind === 'APPLIES' && disposition.outcome === 'PASSWORD_ACCEPTED_COMPLETED') {
-    if (!logonErrors.every(emptyLogonError)) {
-      return {
-        classification: { kind: 'UNKNOWN', observation: 'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON' },
-        errorCode: code,
-      };
+  const entry = auditReasonEntry(reasonName as string);
+  if (!entry) {
+    return { classification: { kind: 'UNKNOWN', observation: 'UNRECOGNIZED_REASON_NAME' }, errorCode: code };
+  }
+  const { disposition } = entry;
+  if (disposition.kind === 'APPLIES') {
+    const wantsSuccess = disposition.outcome === 'PASSWORD_ACCEPTED_COMPLETED';
+    if (wantsSuccess !== succeeded) return inconsistent;
+    if (providerCode === 0 && !wantsSuccess) return inconsistent;
+    if (providerCode !== null && providerCode !== 0) {
+      const byCode = dispositionForCode(providerCode);
+      if (byCode.kind === 'APPLIES' && byCode.outcome !== disposition.outcome) return inconsistent;
     }
   }
   return { classification: disposition, errorCode: code };
@@ -473,17 +504,8 @@ async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, contex
   return { kind: 'NORMALIZED', event, microsoftUserId: binding.user.microsoftUserId };
 }
 
-export interface NormalizeBatchOptions {
-  readonly scope: NormalizationScope;
-  /** Exactly one selected feed. Independent feeds are never pooled. */
-  readonly source: NormalizationSource;
-  readonly rows: readonly SignInRow[];
-  readonly directory: readonly DirectoryUserRow[];
-  readonly reference: ReferenceResolver;
-}
-
 export async function normalizeSignInBatch(options: NormalizeBatchOptions): Promise<NormalizationBatch> {
-  const { scope, source, rows, directory, reference } = options;
+  const { scope, source, rows, directory, reference, collectionScope } = options;
   const index = indexDirectory(scope, directory);
 
   const doesNotApplyByReason = zeroCounts<OutOfScopeReason>(OUT_OF_SCOPE_LABELS);
@@ -645,6 +667,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       unselectedRowsByReason,
     },
     coverage: {
+      collectionScope,
       consideredRows,
       normalizedRows: ordered.length,
       recognizedRows: applies + outOfScopeTotal + notYetCitedTotal,

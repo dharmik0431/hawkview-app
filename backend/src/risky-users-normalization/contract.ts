@@ -1,4 +1,5 @@
 import type {
+  CollectionScope,
   OutOfScopeReason,
   UncitedReason,
   UnknownObservation,
@@ -259,7 +260,16 @@ export interface NormalizationCounts {
  * finding count is only honest when reported against this scope.
  */
 export interface NormalizationCoverage {
-  /** Rows from the selected feed. Excludes `unselectedSourceRows`. */
+  /**
+   * What the collector asked the provider for.
+   *
+   * First field on purpose: every other number here is a share of what was
+   * collected, and that is only meaningful alongside what was requested. A
+   * consumer rendering coverage always has it, because it cannot obtain the
+   * rest without it.
+   */
+  readonly collectionScope: CollectionScope;
+  /** Rows from the selected feed. Excludes `unselectedRowsByReason`. */
   readonly consideredRows: number;
   /** Rows that produced an event, in any classification. */
   readonly normalizedRows: number;
@@ -338,6 +348,21 @@ export function coverageForEvaluation(batch: NormalizationBatch): {
     uninterpretedEvents: sum(counts.unknownByObservation) + sum(counts.unprocessableByReason),
     notYetCitedEvents: sum(counts.notYetCitedByReason),
   };
+}
+
+export interface NormalizeBatchOptions {
+  readonly scope: NormalizationScope;
+  /** Exactly one selected feed. Independent feeds are never pooled. */
+  readonly source: NormalizationSource;
+  readonly rows: readonly SignInRow[];
+  readonly directory: readonly DirectoryUserRow[];
+  readonly reference: ReferenceResolver;
+  /**
+   * REQUIRED. What the collector asked the provider for — see CollectionScope.
+   * Required rather than defaulted so that a caller which does not know has to
+   * say `UNDECLARED` out loud instead of having a default assert on its behalf.
+   */
+  readonly collectionScope: CollectionScope;
 }
 
 /** Per-run bounds. Exceeding one costs the excess rows, never the run. */

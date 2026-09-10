@@ -183,13 +183,13 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     code: 53004,
     microsoftName: 'ProofUpBlockedDueToRisk',
     claimClass: 'ATTACK_AND_CONTROL',
-    disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
-    note:
-      'Cannot configure MFA due to suspicious activity. FLAGGED, NOT DECIDED: the "DueToRisk" naming means ' +
-      'this is Microsoft’s own risk judgement, which by the channel-separation rule would put it in ' +
-      'MICROSOFT_RISK_VERDICT alongside 50053’s risk text and 50131’s suspicious-activity variant. It is ' +
-      'left as a control block pending that decision, because further variants are to be flagged rather ' +
-      'than settled case by case here.',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
+    exclusionCitation:
+      'The owner’s product rule, which is a stronger citation here than a Microsoft doc: our findings and ' +
+      'Microsoft-reported risk are two channels that are never merged or summed. Microsoft’s own name for ' +
+      'this code is ProofUpBlockedDueToRisk — a block Microsoft’s intelligence decided on, not a control ' +
+      'the tenant configured.',
+    note: 'Cannot configure MFA due to suspicious activity. Moved to the Microsoft channel on the standing whose-judgement test.',
   },
   {
     code: 50131,
@@ -425,21 +425,36 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
   {
     meaning: 'MALICIOUS_IP_BLOCK',
     fragments: ['malicious activity'],
-    disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
     verification: {
       state: 'OBSERVED_IN_PRODUCTION',
-      evidence: 'One of exactly two description values observed on code 50053, in one tenant over six weeks.',
+      evidence:
+        'One of exactly two description values observed on code 50053, at 921 of 1,479 rows (62.3%) in a ' +
+        'single-instant query. Literal, measured with terminal characters checked: ' +
+        '"Sign-in was blocked because it came from an IP address with malicious activity" — 78 characters, ' +
+        'no trailing period, all ASCII.',
     },
-    note: 'Microsoft blocked the sign-in because the address had known malicious activity. A control that worked.',
+    note:
+      'Microsoft blocked the sign-in because ITS OWN threat intelligence flagged the address. That is ' +
+      'Microsoft’s judgement, not a control the tenant configured, so it goes to the Microsoft channel on ' +
+      'the standing whose-judgement test. These 921 rows were misfiled as HawkView findings the whole time ' +
+      'they sat in the sign-in log; moving them fills that tenant’s Microsoft-risk channel with no API ' +
+      'call, no consent grant and no purchase.',
   },
   {
     meaning: 'SMART_LOCKOUT',
-    fragments: ['too many times with an incorrect user id or password', 'idslocked'],
+    fragments: ['too many times with an incorrect user id or password'],
     disposition: { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' },
     verification: {
       state: 'OBSERVED_IN_PRODUCTION',
       evidence:
-        'The other of exactly two description values observed on code 50053. It carries unique detection ' +
+        'The other of exactly two description values observed on code 50053, at 558 of 1,479 rows (37.7%) ' +
+        'in a single-instant query. Literal, measured with terminal characters checked: "The account is ' +
+        'locked, you\'ve tried to sign in too many times with an incorrect user ID or password." — 100 ' +
+        'characters, TRAILING PERIOD PRESENT, and the apostrophe is ASCII 0x27 rather than a Unicode right ' +
+        'single quote. The two literals differ in terminal punctuation and that difference survives a paste ' +
+        'and fails a comparison, which is why this matcher is substring-based on a distinctive fragment ' +
+        'rather than an equality test. It carries unique detection ' +
         'weight: for 94.8% of lockout rows there is NO 50126 for the same user within ±15 minutes, so ' +
         'Microsoft emits the lockout without the individual attempts alongside it and at the moment of ' +
         'lockout this is the ONLY signal present. A 50126-only detector eventually surfaces the affected ' +
@@ -490,6 +505,100 @@ export function failureReasonMeaning(
   const matched = candidates.filter(pattern => pattern.fragments.some(fragment => text.includes(fragment)));
   return matched.length === 1 ? matched[0]! : null;
 }
+
+/**
+ * Audit-path reason names, matched exactly (case-insensitively, trimmed).
+ *
+ * THE TWO FEEDS INVERT ON WHICH FIELD IS TRUSTWORTHY, and treating them
+ * symmetrically is wrong. On Graph the result code is a clean number on 100%
+ * of rows and the description is free prose. On the AUDIT feed the code is
+ * unreliable and the reason NAME is the stable identifier: measured across two
+ * independent tenants, `InvalidUserNameOrPassword` appears with errorCode "1"
+ * (29 rows) AND with the code entirely absent (22 rows). Same event, same
+ * meaning, two different codes — so a classifier keyed on the code silently
+ * drops half of them while catching the other half, invisibly.
+ *
+ * These names are Microsoft error identifiers rather than prose, which is why
+ * exact matching is appropriate here and substring matching is appropriate for
+ * Graph's descriptions. A name absent from this table is
+ * UNRECOGNIZED_REASON_NAME, which costs stated coverage and blocks nothing.
+ */
+export interface AuditReasonEntry {
+  readonly name: string;
+  readonly disposition: CodeDisposition;
+  readonly note?: string;
+}
+
+export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
+  {
+    name: 'InvalidUserNameOrPassword',
+    disposition: { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' },
+    note:
+      'Microsoft’s documented name for 50126. Observed under errorCode "1" AND with the code absent, in ' +
+      'both audit tenants — 51 rows that a code-keyed classifier loses entirely.',
+  },
+  {
+    name: 'IdsLocked',
+    disposition: { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' },
+    note:
+      'Microsoft’s documented name for the smart-lockout meaning of 50053 specifically. A useful ' +
+      'consequence of keying on the name: on this feed the name disambiguates what the code cannot, so ' +
+      'the three-way ambiguity that needs text parsing on Graph does not arise here. 578 rows.',
+  },
+  {
+    name: 'UserStrongAuthClientAuthNRequiredInterrupt',
+    disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED' },
+    note: 'Microsoft’s documented name for 50076. Post-password challenge issued.',
+  },
+  {
+    name: 'UnclassifiedAuthenticationError',
+    disposition: { kind: 'UNKNOWN', observation: 'PROVIDER_DECLARED_UNCLASSIFIED' },
+    note:
+      'Microsoft’s own name says it is unclassified, so there is nothing to read. High volume and ' +
+      'genuinely unknown: 45% of one audit tenant’s rows and 6% of another’s. An honest coverage cost.',
+  },
+  // Recognised names with no documented basis for excluding them. Each is a
+  // singleton in observed data, and each is held rather than guessed at.
+  { name: 'UserUnauthorized', disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' } },
+  { name: 'DelegationDoesNotExist', disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' } },
+  { name: 'InvalidReplyTo', disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' } },
+  {
+    name: 'MisconfiguredApplicationWithGraphErrorMessage',
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+  },
+  {
+    name: 'PasswordResetRegistrationRequiredInterrupt',
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    note:
+      'Probably a post-password registration interrupt by analogy with 50072/50079, which would make it ' +
+      'APPLIES. Not claimed: asserting a credential outcome from an analogy is the riskier direction, and ' +
+      'a wrong APPLIES asserts something about a password that may not have happened.',
+  },
+];
+
+const BY_AUDIT_REASON: ReadonlyMap<string, AuditReasonEntry> = new Map(
+  AUDIT_REASON_NAMES.map(entry => [entry.name.toLowerCase(), entry]),
+);
+
+export function auditReasonEntry(name: string): AuditReasonEntry | undefined {
+  return BY_AUDIT_REASON.get(name.trim().toLowerCase());
+}
+
+/**
+ * Reason names seen in production and deliberately NOT mapped, with why.
+ * Recorded so the gap is a decision on the record rather than an oversight.
+ */
+export const AUDIT_REASON_NAMES_OBSERVED_UNMAPPED: readonly { readonly name: string; readonly why: string }[] = [
+  {
+    name: 'UserLoggedIn',
+    why:
+      'Appears as a reason VALUE with the error code absent — 260 rows in one tenant, 15% of it. That is ' +
+      'the Operation name leaking into the error field, not a documented reason value, so reading a ' +
+      'success out of it would be a guess about an artefact. Needs one query: for those rows, what are ' +
+      'Operation and ResultStatus? Until then it is UNRECOGNIZED_REASON_NAME, which costs coverage and ' +
+      'claims nothing.',
+  },
+];
 
 export type ShapePredicateVerification
   = | {
@@ -577,7 +686,11 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       state: 'PRODUCTION_VERIFIED',
       evidence:
         'Audit rows resolving against directory_users, deleted excluded: 96.8% / 97.1% / 77.8% by UPN ' +
-        'across the three fallback-path tenants, versus 15.2% / 0.0% / 0.0% by GUID.',
+        'across the three fallback-path tenants, versus 15.2% / 0.0% / 0.0% by GUID. Re-measured across ' +
+        'two INDEPENDENT tenants with separate MSPs and separate directories — 97.2% vs 12.0% and 97.1% ' +
+        'vs 0.0% — agreeing within 0.1 percentage points. The UPN-in-record / GUID-in-column split holds ' +
+        'in all three audit tenants. Previously labelled thin evidence; it is now the best-corroborated ' +
+        'finding in the workstream.',
       control:
         'The hazard is AMBIGUITY, not naming: two directory users normalizing to one UPN. Handled by ' +
         'requiring EXACTLY ONE non-deleted match, with zero and multiple both unprocessable, and by ' +
@@ -593,19 +706,21 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       'The literal fragments in FAILURE_REASON_MEANINGS are the text Microsoft actually emits for code ' +
       '50053, so a matching row is correctly resolved to that meaning.',
     verification: {
-      state: 'PENDING_DISTRIBUTION_CHECK',
-      cohort:
-        'This is now the highest-volume predicate in the layer: code 50053 is 1,477 of 2,635 Graph rows, ' +
-        '56% of everything collected. The two production description values are known to EXIST but their ' +
-        'literal text has not been supplied, so the fragments here are rendered from Microsoft’s ' +
-        'documented phrasing rather than from our rows. If they do not match, 56% of traffic lands in ' +
-        'UNKNOWN — safe, but a large and avoidable coverage loss.',
-      controlCohort:
-        'The two values must match one fragment set EACH and not the other, and neither may match the ' +
-        'risk-verdict fragment. Multi-match already routes to UNKNOWN rather than picking, so a ' +
-        'too-broad fragment costs coverage rather than misclassifying — except for the risk-verdict ' +
-        'branch, which is the one disposition that removes an event from `applies`, and which is ' +
-        'therefore held to a single distinctive fragment.',
+      state: 'PRODUCTION_VERIFIED',
+      evidence:
+        'The highest-volume predicate in the layer: code 50053 is 1,479 of 2,645 Graph rows, 55.9% of ' +
+        'everything collected. Both literals were measured with terminal characters checked explicitly, ' +
+        'and the closed set accounts for 100.0% of observed 50053 rows — 921 malicious-IP, 558 lockout, ' +
+        'ZERO matching neither.',
+      control:
+        'Each literal matches exactly ONE fragment set and not the other, and neither reaches the ' +
+        'risk-verdict fragment — asserted against the byte-exact strings in normalize.test.ts. THE LIMIT ' +
+        'OF THE CLAIM: 100% is true of OBSERVED data, one tenant, one locale, six weeks. It does NOT ' +
+        'establish that Microsoft emits no third string, and we know it does, because the documented ' +
+        'high-confidence-risk variant appears zero times here. The honest claim is "these two literals ' +
+        'account for every 50053 row we have ever collected", never "these are the only values 50053 ' +
+        'takes" — and unmatched-text-to-UNKNOWN is what makes that distinction safe rather than merely ' +
+        'stated.',
     },
   },
   {

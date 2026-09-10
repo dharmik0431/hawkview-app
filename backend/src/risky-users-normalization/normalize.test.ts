@@ -21,6 +21,9 @@ import {
   UNREACHABLE_BY_SUBJECT_RESOLUTION,
   UNVALIDATED_FAILURE_REASON_MEANINGS,
   dispositionForCode,
+  AUDIT_REASON_NAMES,
+  AUDIT_REASON_NAMES_OBSERVED_UNMAPPED,
+  auditReasonEntry,
   failureReasonMeaning,
   mayExclude,
   resultCodeEntry,
@@ -29,14 +32,17 @@ import { normalizeSignInBatch } from './normalize.js';
 import {
   OUT_OF_SCOPE_LABELS,
   UNKNOWN_LABELS,
+  COLLECTION_SCOPE_LABELS,
   UNCITED_LABELS,
   UNPROCESSABLE_LABELS,
   UNSELECTED_ROW_LABELS,
+  describeCollectionScope,
   describeOutOfScope,
   describeUncited,
   describeUnknown,
   describeUnprocessable,
   describeUnselectedRow,
+  type CollectionScope,
   type OutOfScopeReason,
   type UncitedReason,
   type UnknownObservation,
@@ -132,14 +138,18 @@ async function run(
     directory?: readonly DirectoryUserRow[];
     source?: NormalizationSource;
     reference?: ReferenceResolver;
+    collectionScope?: CollectionScope;
   } = {},
 ): Promise<NormalizationBatch> {
+  const source = options.source ?? 'GRAPH_SIGN_INS';
   return normalizeSignInBatch({
     scope: SCOPE,
-    source: options.source ?? 'GRAPH_SIGN_INS',
+    source,
     rows,
     directory: options.directory ?? DIRECTORY,
     reference: options.reference ?? makeReference(),
+    collectionScope:
+      options.collectionScope ?? (source === 'GRAPH_SIGN_INS' ? 'GRAPH_INTERACTIVE_ONLY' : 'AUDIT_STS_LOGON_EVENTS'),
   });
 }
 
@@ -177,7 +187,9 @@ test('a batch that is entirely unrecognized still returns events and no gate', a
     'applies', 'counts', 'coverage', 'events', 'microsoftRiskVerdicts',
     'resolvedSubjects', 'scope', 'shapeObservations', 'source',
   ]);
-  assert.deepEqual(Object.keys(batch.coverage).sort(), ['consideredRows', 'normalizedRows', 'recognizedRows']);
+  assert.deepEqual(Object.keys(batch.coverage).sort(), [
+    'collectionScope', 'consideredRows', 'normalizedRows', 'recognizedRows',
+  ]);
 });
 
 test('unprocessable rows never remove a recognized credential failure from evaluation', async () => {
@@ -335,9 +347,12 @@ test('out-of-scope and unknown labels never point at collection', () => {
 // The exclusion standard: excluding a code needs a positive citation.
 // ---------------------------------------------------------------------------
 
-test('only two codes are mapped out of scope, and both carry a documented citation', () => {
+test('every out-of-scope code carries a documented citation', () => {
   const excluded = RESULT_CODES.filter(entry => entry.disposition.kind === 'DOES_NOT_APPLY');
-  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50058, 50140]);
+  // 50058 and 50140 on Microsoft's own "expected part of the flow" statements;
+  // 53004 on the owner's channel-separation rule, since ProofUpBlockedDueToRisk
+  // is a block Microsoft's intelligence decided on.
+  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50058, 50140, 53004]);
   for (const entry of excluded) {
     assert.ok(
       entry.exclusionCitation && entry.exclusionCitation.length > 15,
@@ -441,11 +456,16 @@ test('50053 resolves its three documented meanings from the description text', a
     outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
   });
 
+  // Microsoft's own threat intelligence made this call, so it is Microsoft's
+  // channel rather than a control the tenant configured.
   const malicious = await run([graphRow({ status: {
     errorCode: 50053,
     failureReason: 'Sign-in was blocked because it came from an IP address with malicious activity.',
   } })]);
-  assert.deepEqual(only(malicious).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
+  assert.deepEqual(only(malicious).classification, {
+    kind: 'DOES_NOT_APPLY',
+    reason: 'MICROSOFT_RISK_VERDICT',
+  });
 
   const risk = await run([graphRow({ status: {
     errorCode: 50053,
@@ -852,14 +872,14 @@ test('the audit feed keys off operation and code together', async () => {
   });
 });
 
-test('an audit success carrying a logon error is not called a success', async () => {
+test('an audit success carrying a failure reason name is a contradiction, not a success', async () => {
   const batch = await run(
     [auditRow({ Operation: 'UserLoggedIn', ErrorCode: '0', LogonError: 'InvalidUserNameOrPassword' })],
     { source: 'M365_AUDIT_STS' },
   );
   assert.deepEqual(only(batch).classification, {
     kind: 'UNKNOWN',
-    observation: 'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON',
+    observation: 'INCONSISTENT_OPERATION_AND_CODE',
   });
 });
 
@@ -1001,15 +1021,6 @@ test('50131’s suspicious-activity variant is Microsoft’s judgement, not our 
   assert.deepEqual(only(plain).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
 });
 
-test('53004 is flagged as the next channel candidate rather than reclassified here', () => {
-  // Its "DueToRisk" naming means it is probably Microsoft's judgement too, but
-  // further variants are to be flagged rather than settled case by case.
-  const entry = resultCodeEntry(53004)!;
-  assert.deepEqual(entry.disposition, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
-  assert.match(entry.note ?? '', /FLAGGED, NOT DECIDED/);
-  assert.equal(entry.textMeanings, undefined);
-});
-
 test('the enumeration blind spot is counted, not left as a comment', async () => {
   // 50034 and 51004 describe a subject that is by definition absent from the
   // directory, so subject resolution discards the row before classification
@@ -1024,4 +1035,198 @@ test('the enumeration blind spot is counted, not left as a comment', async () =>
   assert.equal(batch.shapeObservations.enumerationCodesOnUnresolvedSubjects, 2);
   assert.equal(batch.counts.unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY, 3);
   assert.equal(batch.counts.applies, 1, 'the resolvable row is unaffected');
+});
+
+test('coverage cannot be read without knowing what was requested', async () => {
+  // Coverage is a share of what was COLLECTED. Without the requested scope
+  // beside it, a full-coverage number is compatible with never having asked
+  // for most of the tenant's traffic — true, and misleading.
+  const batch = await run([graphRow()]);
+  assert.equal(batch.coverage.collectionScope, 'GRAPH_INTERACTIVE_ONLY');
+  assert.equal(batch.coverage.consideredRows, 1);
+  assert.equal(batch.coverage.recognizedRows, 1);
+
+  const undeclared = await run([graphRow()], { collectionScope: 'UNDECLARED' });
+  assert.equal(undeclared.coverage.collectionScope, 'UNDECLARED');
+
+  const audit = await run([auditRow()], { source: 'M365_AUDIT_STS' });
+  assert.equal(audit.coverage.collectionScope, 'AUDIT_STS_LOGON_EVENTS');
+});
+
+test('every collection scope has a label, and the partial ones say what is missing', () => {
+  const scopes = (Object.keys(COLLECTION_SCOPE_LABELS) as CollectionScope[]).sort();
+  assert.deepEqual(scopes, [
+    'AUDIT_STS_LOGON_EVENTS',
+    'GRAPH_INTERACTIVE_AND_NON_INTERACTIVE',
+    'GRAPH_INTERACTIVE_ONLY',
+    'UNDECLARED',
+  ]);
+  for (const scope of scopes) assert.ok(describeCollectionScope(scope).length > 20, scope);
+  // The two scopes that mean "you are not seeing everything" have to say so,
+  // or the field is decoration.
+  assert.match(describeCollectionScope('GRAPH_INTERACTIVE_ONLY'), /not requested|outside this assessment/i);
+  assert.match(describeCollectionScope('UNDECLARED'), /cannot state/i);
+});
+
+// ---------------------------------------------------------------------------
+// The two 50053 literals, byte-exact as measured from production rows.
+// This is the highest-volume predicate in the layer: 50053 is ~56% of all
+// collected Graph rows, so if these fragments stop matching, most of the
+// traffic silently costs coverage.
+// ---------------------------------------------------------------------------
+
+// Double-quoted deliberately: the lockout literal contains an ASCII apostrophe
+// (0x27, NOT a Unicode right single quote), and that is exactly the class of
+// difference that survives a paste and fails a comparison.
+const MALICIOUS_IP_LITERAL = "Sign-in was blocked because it came from an IP address with malicious activity";
+const LOCKOUT_LITERAL = "The account is locked, you've tried to sign in too many times with an incorrect user ID or password.";
+
+test('the measured 50053 literals are byte-exact in this test', () => {
+  // If these drift, the assertions below stop testing what they claim to.
+  assert.equal(MALICIOUS_IP_LITERAL.length, 78);
+  assert.equal(Buffer.byteLength(MALICIOUS_IP_LITERAL, 'utf8'), 78, 'must be pure ASCII');
+  assert.equal(MALICIOUS_IP_LITERAL.at(-1), 'y', 'no trailing period on this one');
+
+  assert.equal(LOCKOUT_LITERAL.length, 100);
+  assert.equal(Buffer.byteLength(LOCKOUT_LITERAL, 'utf8'), 100, 'must be pure ASCII');
+  assert.equal(LOCKOUT_LITERAL.at(-1), '.', 'trailing period IS present on this one');
+  assert.ok(LOCKOUT_LITERAL.includes(String.fromCharCode(0x27)), 'apostrophe must be ASCII 0x27');
+});
+
+test('each measured literal resolves to exactly its own meaning', async () => {
+  const malicious = await run([graphRow({ status: { errorCode: 50053, failureReason: MALICIOUS_IP_LITERAL } })]);
+  assert.deepEqual(only(malicious).classification, {
+    kind: 'DOES_NOT_APPLY',
+    reason: 'MICROSOFT_RISK_VERDICT',
+  });
+
+  const lockout = await run([graphRow({ status: { errorCode: 50053, failureReason: LOCKOUT_LITERAL } })]);
+  assert.deepEqual(only(lockout).classification, {
+    kind: 'APPLIES',
+    outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+  });
+
+  // Control: each literal matches ONE fragment set and not the other, and
+  // neither reaches the risk-verdict branch that has no production evidence.
+  assert.equal(failureReasonMeaning(MALICIOUS_IP_LITERAL)?.meaning, 'MALICIOUS_IP_BLOCK');
+  assert.equal(failureReasonMeaning(LOCKOUT_LITERAL)?.meaning, 'SMART_LOCKOUT');
+  for (const literal of [MALICIOUS_IP_LITERAL, LOCKOUT_LITERAL]) {
+    assert.notEqual(failureReasonMeaning(literal)?.meaning, 'HIGH_CONFIDENCE_RISK_BLOCK');
+    assert.notEqual(failureReasonMeaning(literal)?.meaning, 'SUSPICIOUS_ACTIVITY_BLOCK');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The audit feed keys on the reason NAME, because its code is unreliable.
+// ---------------------------------------------------------------------------
+
+test('the same audit reason name classifies the same way under either code', async () => {
+  // Measured across two tenants: InvalidUserNameOrPassword appears with
+  // errorCode "1" AND with the code absent. Same event, same meaning. A
+  // classifier keyed on the code drops half of them, invisibly.
+  const withSyntheticCode = await run([auditRow({ ErrorCode: '1', LogonError: 'InvalidUserNameOrPassword' })], {
+    source: 'M365_AUDIT_STS',
+  });
+  const withNoCode = await run([auditRow({ ErrorCode: undefined, LogonError: 'InvalidUserNameOrPassword' })], {
+    source: 'M365_AUDIT_STS',
+  });
+
+  const expected = { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' };
+  assert.deepEqual(only(withSyntheticCode).classification, expected);
+  assert.deepEqual(only(withNoCode).classification, expected, 'an absent code must not change the meaning');
+  assert.equal(withSyntheticCode.counts.applies, 1);
+  assert.equal(withNoCode.counts.applies, 1);
+});
+
+test('the audit reason name disambiguates what the code cannot', async () => {
+  // On Graph, 50053 needs text parsing for its three meanings. On audit the
+  // name IS the lockout meaning, so no ambiguity arises.
+  const batch = await run([auditRow({ ErrorCode: '1', LogonError: 'IdsLocked' })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(batch).classification, {
+    kind: 'APPLIES',
+    outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+  });
+});
+
+test('audit reason names map to the same outcomes as their Graph codes', async () => {
+  const challenge = await run(
+    [auditRow({ ErrorCode: '1', LogonError: 'UserStrongAuthClientAuthNRequiredInterrupt' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(challenge).classification, {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED',
+  });
+  assert.deepEqual(dispositionForCode(50076), only(challenge).classification);
+});
+
+test('an audit reason Microsoft calls unclassified is unknown, and an unlisted one is named as such', async () => {
+  const unclassified = await run(
+    [auditRow({ ErrorCode: undefined, LogonError: 'UnclassifiedAuthenticationError' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(unclassified).classification, {
+    kind: 'UNKNOWN',
+    observation: 'PROVIDER_DECLARED_UNCLASSIFIED',
+  });
+
+  // 'UserLoggedIn' appears as a reason VALUE with no code — the operation name
+  // leaking into the error field. Deliberately unmapped: reading a success out
+  // of an artefact would be a guess.
+  const leaked = await run([auditRow({ ErrorCode: undefined, LogonError: 'UserLoggedIn' })], {
+    source: 'M365_AUDIT_STS',
+  });
+  assert.deepEqual(only(leaked).classification, {
+    kind: 'UNKNOWN',
+    observation: 'UNRECOGNIZED_REASON_NAME',
+  });
+  assert.deepEqual(AUDIT_REASON_NAMES_OBSERVED_UNMAPPED.map(entry => entry.name), ['UserLoggedIn']);
+  for (const entry of AUDIT_REASON_NAMES_OBSERVED_UNMAPPED) assert.ok(entry.why.length > 40, entry.name);
+});
+
+test('an audit reason with no exclusion citation is held, not claimed', async () => {
+  for (const name of ['UserUnauthorized', 'DelegationDoesNotExist', 'InvalidReplyTo',
+    'MisconfiguredApplicationWithGraphErrorMessage', 'PasswordResetRegistrationRequiredInterrupt']) {
+    const batch = await run([auditRow({ ErrorCode: '1', LogonError: name })], { source: 'M365_AUDIT_STS' });
+    assert.deepEqual(
+      only(batch).classification,
+      { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+      name,
+    );
+  }
+});
+
+test('audit reason names match case-insensitively and are trimmed', () => {
+  assert.equal(auditReasonEntry('  invalidusernameorpassword ')?.name, 'InvalidUserNameOrPassword');
+  assert.equal(auditReasonEntry('IdsLocked')?.name, 'IdsLocked');
+  assert.equal(auditReasonEntry('NoSuchReason'), undefined);
+  assert.equal(new Set(AUDIT_REASON_NAMES.map(entry => entry.name.toLowerCase())).size, AUDIT_REASON_NAMES.length);
+});
+
+test('the audit code corroborates and never overrides the reason name', async () => {
+  // A real Microsoft code disagreeing with the name is a contradiction, not a
+  // vote to be won by whichever field we looked at first.
+  const contradiction = await run(
+    [auditRow({ ErrorCode: '50076', LogonError: 'InvalidUserNameOrPassword' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(contradiction).classification, {
+    kind: 'UNKNOWN',
+    observation: 'INCONSISTENT_OPERATION_AND_CODE',
+  });
+
+  // But HawkView's own synthetic "1" carries no provider information at all,
+  // so it never contradicts anything.
+  const synthetic = await run([auditRow({ ErrorCode: '1', LogonError: 'InvalidUserNameOrPassword' })], {
+    source: 'M365_AUDIT_STS',
+  });
+  assert.deepEqual(only(synthetic).classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
+});
+
+test('53004 is in Microsoft’s channel and shows up in that list', async () => {
+  const batch = await run([graphRow({ status: { errorCode: 53004 } })]);
+  assert.deepEqual(only(batch).classification, { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' });
+  assert.deepEqual(batch.microsoftRiskVerdicts.map(event => event.eventId), ['evt-1']);
+  assert.equal(batch.applies.length, 0);
+  assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_RISK_VERDICT, 1);
 });

@@ -12,5 +12,4 @@ export {
   readGraphErrorCode,
   rowSource,
   type DirectoryIndex,
-  type NormalizeBatchOptions,
 } from './normalize.js';

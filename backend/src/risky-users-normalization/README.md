@@ -4,11 +4,14 @@ The seam between collection/storage and the Risky Users evaluation core.
 
 **In:** raw `sign_in_logs` rows plus `directory_users` rows for one tenant, and one
 selected feed.
-**Out:** normalized events, each classified into exactly one of three buckets, plus
+**Out:** normalized events, each classified into exactly one of four buckets, plus
 independent tallies and a coverage statement.
 
 ```ts
-const batch = await normalizeSignInBatch({ scope, source, rows, directory, reference });
+const batch = await normalizeSignInBatch({
+  scope, source, rows, directory, reference,
+  collectionScope: 'GRAPH_INTERACTIVE_ONLY', // required: what we asked Microsoft for
+});
 for (const event of batch.applies) { /* HawkView's own detectors act on these */ }
 for (const event of batch.microsoftRiskVerdicts) { /* Microsoft's channel, never merged */ }
 ```
@@ -16,15 +19,18 @@ for (const event of batch.microsoftRiskVerdicts) { /* Microsoft's channel, never
 Collection and storage are unchanged. This module replaces the classification half of
 `identity-risk/authentication-source-readiness.ts` and `risky-users-auth/normalize.ts`.
 
-## The three buckets
+## The four buckets
 
-| Bucket | Meaning | Stated coverage | Evaluation |
+| Bucket | Meaning | Stated coverage | Gates a claim? |
 | --- | --- | --- | --- |
-| `APPLIES` | A credential event the detectors act on. Carries `outcome`. | Recognized | Evaluated |
-| `DOES_NOT_APPLY` | Out of scope **on a documented citation**. Carries a `reason`, counted by reason. | Recognized | Not evaluated |
-| `UNKNOWN` | We cannot interpret it, or cannot defend excluding it. Counted by observation. | Reduces coverage | Not evaluated |
+| `APPLIES` | A credential event the detectors act on. Carries `outcome`. | Recognized | — |
+| `DOES_NOT_APPLY` | Out of scope **on a documented citation**. Carries a `reason`. | Recognized | No |
+| `NOT_YET_CITED` | Understood; our own basis for excluding it is missing. | Recognized | **No** |
+| `UNKNOWN` | We cannot interpret it. Counted by observation. | Reduces coverage | Yes |
 
-A fourth outcome is possible per *row* rather than per event: a row that could not be
+See the addendum "four classifications, not three" for why the last two are separate.
+
+A further outcome is possible per *row* rather than per event: a row that could not be
 read is `unprocessableByReason`, which is **never** summed with `doesNotApplyByReason`.
 A malformed row and an expected keep-me-signed-in interrupt are different claims about
 what the result is worth.
@@ -60,10 +66,13 @@ PASSWORD_ACCEPTED_COMPLETED                0
 PASSWORD_ACCEPTED_CHALLENGE_ISSUED         50076
 PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED     50074, 500121
 PASSWORD_ACCEPTED_REGISTRATION_REQUIRED    50072, 50079
-BLOCKED_BY_CONTROL                         53003, 530032, 53000, 53001, 50097, 53004, 50131
+BLOCKED_BY_CONTROL                         53003, 530032, 53000, 53001, 50097, 50131*
 LOCKED_OUT_AFTER_REPEATED_FAILURES         50053 (smart-lockout text)
 DISABLED_ACCOUNT_ATTEMPT                   50057
 ```
+
+\* 50131 only when its description text does not name suspicious activity; 53004 is not
+here at all. Both are covered in the addendum "whose control blocked it".
 
 The interrupt family is split three ways rather than collapsed, because 50076 (challenge
 issued) and 50074 (challenge **not** passed) are one digit apart and mean different
@@ -94,13 +103,14 @@ citation for why it can never be credential-attack evidence.** Rule 1 does not r
 this case, because a wrong exclusion is a *confident* classification and walks straight
 past a guard that checks whether a predicate was validated. The predecessor confidently
 classified 50076 as "not a credential event". **Absence of a reason to include is not a
-reason to exclude.** Exactly two codes clear the standard today — 50140 and 50058, both
-of which Microsoft explicitly calls expected parts of normal flow — and a test asserts
-that no third one appears without a citation.
+reason to exclude.** Three codes clear the standard today: 50140 and 50058, which
+Microsoft explicitly calls expected parts of normal flow, and 53004, which clears it on
+the owner's channel-separation rule rather than a Microsoft doc. A test asserts that no
+fourth one appears without a citation.
 
 Codes we recognize but cannot defend excluding land in
-`UNKNOWN / RECOGNIZED_BUT_EXCLUSION_UNCITED`: 50055, 50144, 50056, 50133, 50173, 65001.
-That costs coverage, blocks nothing, and is recoverable the moment a citation exists.
+`NOT_YET_CITED / EXCLUSION_NOT_YET_CITED`: 50055, 50144, 50056, 50133, 50173, 65001.
+That is disclosed, gates nothing, and is recoverable the moment a citation exists.
 
 ## Disproved predicates
 
@@ -112,7 +122,7 @@ tests assert *behaviourally* that classification is unchanged by the fields they
 | --- | --- |
 | `raw.signInEventTypes` | Absent from every row. Matches nothing; would have shipped as a verified fix that changed nothing. |
 | `raw.servicePrincipalId` | Non-empty on 100% of Graph rows **including ordinary human sign-ins**. Would have excluded all human traffic while reporting tenants clean. |
-| `raw.isInteractive` | `true` on 100% of 2,635 rows. Inert — a predicate true on every row discriminates nothing. |
+| `raw.isInteractive` | `true` on 100% of rows. Inert — a predicate true on every row discriminates nothing. Root cause is a collection gap, not a classification one. |
 | `managementActivityRecord.ResultStatus` | On an STS logon event "Succeeded" means **HTTP** success, not logon success. Fails silently toward calling failures successes. |
 | `sign_in_logs.user_id` (column) | GUID-shaped, matches no directory user on any row, and more granular than the real user (6 column GUIDs vs 2 real users across 950 rows). Synthesized, not an identity. |
 
@@ -345,3 +355,79 @@ definition absent from the directory, so resolution discards the row before clas
 and the code is lost. Detecting directory probing needs a tenant-level finding where this
 whole model is user-scoped, which is a different detector shape and out of scope. The
 counter exists so the gap is visible in coverage rather than living in a comment.
+
+## Addendum: coverage now states what was requested
+
+`coverage.collectionScope` is a **required input**, not a derived one. Coverage is
+computed over rows handed to this layer, so a feed that was never requested is
+indistinguishable from one that was requested and came back empty — the layer would
+otherwise report full coverage of a partial view and be unable to tell the difference.
+`UNDECLARED` is a real option: a caller that does not know has to say so out loud rather
+than have a default assert on its behalf.
+
+Today the honest value for the Graph feed is `GRAPH_INTERACTIVE_ONLY`, and its label says
+plainly that background sign-ins were never requested from Microsoft.
+
+## Addendum: the two feeds invert on which field to trust
+
+**Do not classify them symmetrically.** This was a real bug, caught by measurement across
+two independent tenants.
+
+| | Graph | Audit STS |
+| --- | --- | --- |
+| Result code | `number` on 100% of rows, trustworthy | unreliable; often absent, often HawkView's synthetic `"1"` |
+| Description | free prose, the risky part | a Microsoft error **name**, the stable identifier |
+
+`InvalidUserNameOrPassword` appears on the audit feed with errorCode `"1"` **and** with
+the code entirely absent, in both audit tenants. Same event, same meaning, different
+code, so a classifier keyed on the code catches one half and silently drops the other.
+Audit classification is therefore **reason-name-primary**, matched exactly against
+`AUDIT_REASON_NAMES`, with the code as corroboration that can contradict but never
+override. Error code `"1"` is HawkView's own invention on that feed and carries no
+provider information at all, so it is neither a key nor corroboration; that is the second
+time its instability has bitten.
+
+Recovered by the change: ~51 rows of `InvalidUserNameOrPassword` and ~578 of `IdsLocked`
+that were previously UNKNOWN. A useful side effect: on the audit feed the *name*
+disambiguates the lockout meaning, so the three-way 50053 ambiguity that needs text
+parsing on Graph does not arise there at all.
+
+`UserLoggedIn` appears as a reason *value* with no code (260 rows, 15% of one tenant).
+That is the operation name leaking into the error field, so it is deliberately unmapped
+and recorded in `AUDIT_REASON_NAMES_OBSERVED_UNMAPPED` with the query that would settle
+it. Reading a success out of an artefact would be a guess.
+
+## Addendum: structure transfers between tenants, proportions do not
+
+Field shapes and identifier spaces hold across audit tenants. The UPN-in-record /
+GUID-in-column split is confirmed in all three, and UPN resolution agrees within 0.1
+percentage points across two independent MSPs with separate directories (97.2% vs 12.0%,
+97.1% vs 0.0%). **Traffic composition does not transfer.**
+`UnclassifiedAuthenticationError` is 45% of one audit tenant's rows and 6% of another's;
+`UserLoggedIn` is 15% of one and 0.6% of the other. **Any coverage estimate derived from
+one tenant will be wrong for another** — do not generalise from whichever tenant you
+looked at first.
+
+Two further cautions on every number in this file:
+
+- **The data is live.** Figures moved within minutes during measurement (919 to 921
+  malicious-IP, 553 to 558 lockout, 2,635 to 2,645 total Graph rows) and one tenant is
+  backfilling. Only single-query comparisons are safe; any figure quoted across
+  separately-timed queries will drift.
+- **100% of observed is not 100% of possible.** The two 50053 literals account for every
+  50053 row we have ever collected, which is *not* the same claim as "these are the only
+  values 50053 takes" — and we know they are not, because the documented
+  high-confidence-risk variant appears zero times here. Unmatched-text-to-UNKNOWN is what
+  makes that distinction safe rather than merely stated.
+
+## Addendum: the sign-in log is a richer Microsoft-risk source than assumed
+
+Twice now, Microsoft risk output has reached us through sign-in logs rather than the risk
+API. 50053's high-confidence-risk text, 50053's malicious-IP block, 50131's
+suspicious-activity variant and 53004 are all Microsoft's own judgements, and all arrive
+in a feed we already collect: no risk API, no consent grant, no licence.
+
+Concretely, the ~921 malicious-IP rows now routed to `MICROSOFT_RISK_VERDICT` had been
+sitting in the sign-in log misfiled as HawkView findings, for a tenant whose
+Microsoft-risk channel was empty. Moving them fills that channel today. Worth knowing
+before anyone plans work around the risk API being the only route to Microsoft's verdicts.
