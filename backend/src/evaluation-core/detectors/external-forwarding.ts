@@ -1,4 +1,4 @@
-import type { Detector, Finding } from '../contract.js'
+import type { Detector, Finding, Subject } from '../contract.js'
 
 /** PLACEHOLDER. Ported to prove the detector seam swaps, not because this is
  * the specification. The detection design is being derived from Microsoft's
@@ -15,7 +15,12 @@ import type { Detector, Finding } from '../contract.js'
  * detector never talks to Exchange; hidden-rule collection is the collector's
  * problem and a real evasion route, per Microsoft's own remediation guidance. */
 export type MailboxForwardingArtefact = Readonly<{
-  mailboxRef: string
+  /** Already resolved by the layer that can query the directory. Whether this
+   * mailbox belongs to a person needs an exact GUID match and a stated
+   * `userPurpose`, which this detector cannot check and must not guess — so it
+   * carries the answer rather than inventing one. A mailbox that resolved to a
+   * human arrives here as a DIRECTORY_USER and counts as one. */
+  subject: Subject
   observedAt: string
   /** Mailbox-level forwarding, as reported by Exchange. */
   forwardingSmtpAddress: string | null
@@ -67,14 +72,12 @@ export function externalForwardingDetector(
             .flatMap(rule => [...rule.redirectTo, ...rule.forwardTo, ...rule.forwardAsAttachmentTo]),
         ]
         if (destinations.some(isExternal)) {
-          // Mailbox-scoped, always. This detector reads Exchange artefacts and
-          // has no directory binding to offer, so it cannot assert a human. The
-          // classifier promotes a mailbox to a directory user on proven binding
-          // — exact GUID with userPurpose 'user' — and a detector that guessed
-          // here would inflate a count of people with room and shared mailboxes.
+          // Passes the resolved subject straight through. A detector that
+          // decided identity here would be guessing at directory state it cannot
+          // see, and would inflate a count of people with meeting rooms.
           findings.push({
             detectorId: 'external-mailbox-forwarding',
-            subject: { kind: 'MAILBOX', mailboxRef: mailbox.mailboxRef },
+            subject: mailbox.subject,
             observedAt: mailbox.observedAt,
           })
         }

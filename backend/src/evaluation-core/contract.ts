@@ -66,6 +66,10 @@ export type WithheldReason =
   | 'NOTHING_APPLICABLE'
   | 'CAPACITY_EXCEEDED'
   | 'DETECTOR_FAILED'
+  /** We found something and could not tell whose it is. Kept apart from
+   * UNINTERPRETED_EVENTS because that one is about evidence we could not read,
+   * and this is about evidence we read perfectly well and could not attribute. */
+  | 'UNRESOLVED_SUBJECT_IDENTITY'
 
 /** Decided once. Every surface reads this rather than re-deriving it, because
  * two surfaces answering the same question against different bars is how a
@@ -89,7 +93,24 @@ export type ZeroClaim =
  */
 export type Subject =
   | Readonly<{ kind: 'DIRECTORY_USER'; userRef: string }>
-  | Readonly<{ kind: 'MAILBOX'; mailboxRef: string }>
+  | Readonly<{ kind: 'MAILBOX'; mailboxRef: string; binding: MailboxBinding }>
+
+/** Why a mailbox is not a user — and these are not the same answer.
+ *
+ * `RESOLVED_NEGATIVE`: binding succeeded and said this is a shared, room, or
+ * equipment mailbox. It is genuinely not a person, so a finding on it leaves the
+ * user total at zero and that zero is exactly true.
+ *
+ * `UNRESOLVED`: binding was attempted and failed — stale, missing, duplicate, or
+ * ambiguous. We found something and cannot tell whether a person is behind it.
+ * The honest user count is not zero, it is unknown: somewhere between zero and
+ * the number of such findings.
+ *
+ * Collapsing these two into a bare "not a user" is what let a count of zero mean
+ * both "no one is affected" and "we could not tell who is affected". The core
+ * refuses an exact user total whenever an unresolved one is present, so that
+ * distinction is enforced here rather than left to the classifier to remember. */
+export type MailboxBinding = 'RESOLVED_NEGATIVE' | 'UNRESOLVED'
 
 export type Finding = Readonly<{
   detectorId: string

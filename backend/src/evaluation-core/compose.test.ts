@@ -177,7 +177,7 @@ test('mailbox findings cross streams without ever becoming people', () => {
           considered: applicable.length,
           findings: applicable.map(item => ({
             detectorId: 'external-mailbox-forwarding',
-            subject: { kind: 'MAILBOX', mailboxRef: item.subject } as const,
+            subject: { kind: 'MAILBOX', mailboxRef: item.subject, binding: 'RESOLVED_NEGATIVE' } as const,
             observedAt: '2026-09-10T00:00:00.000Z',
           })),
         }),

@@ -260,7 +260,15 @@ test('the claim is computed once and the count cannot disagree with it', () => {
     const result = run([event('1')], { coverage: supplied })
     assert.equal(result.count.accuracy === 'EXACT', result.claim.permitted,
       'an exact count is available exactly when the claim is permitted')
-    assert.deepEqual(zeroClaim(result.state, result.coverage, true, true), result.claim,
+    assert.deepEqual(
+      zeroClaim({
+        state: result.state,
+        coverage: result.coverage,
+        withinBudget: true,
+        allDetectorsRan: true,
+        allSubjectsResolved: true,
+      }),
+      result.claim,
       'recomputing from the reported state and coverage gives the same answer')
   }
 })

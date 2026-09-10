@@ -47,11 +47,19 @@ export function evidenceState(evidence: Evidence<unknown>): EvidenceState {
  * A failed detector is partial evidence about findings, so it withholds the
  * clean claim for the same reason partial evidence does: what it would have
  * found is unknown. It never erases what its neighbours found. */
-export function zeroClaim(
-  state: EvidenceState, coverage: Coverage, withinBudget: boolean, allDetectorsRan: boolean,
-): ZeroClaim {
+export function zeroClaim(input: Readonly<{
+  state: EvidenceState
+  coverage: Coverage
+  withinBudget: boolean
+  allDetectorsRan: boolean
+  /** False when any finding names a subject we could not attribute. A count of
+   * people cannot be exact while we hold a finding and cannot say whose it is. */
+  allSubjectsResolved: boolean
+}>): ZeroClaim {
+  const { state, coverage, withinBudget, allDetectorsRan, allSubjectsResolved } = input
   if (!withinBudget) return { permitted: false, because: 'CAPACITY_EXCEEDED' }
   if (!allDetectorsRan) return { permitted: false, because: 'DETECTOR_FAILED' }
+  if (!allSubjectsResolved) return { permitted: false, because: 'UNRESOLVED_SUBJECT_IDENTITY' }
   switch (state) {
     case 'NEVER_COLLECTED': return { permitted: false, because: 'NEVER_COLLECTED' }
     case 'UNREADABLE_NOW': return { permitted: false, because: 'UNREADABLE_NOW' }
@@ -78,6 +86,16 @@ export const distinctUsers = (findings: readonly Finding[]): number =>
   new Set(findings.flatMap(finding =>
     finding.subject.kind === 'DIRECTORY_USER' ? [finding.subject.userRef] : [])).size
 
+/** Findings we hold but cannot attribute to anyone.
+ *
+ * A mailbox whose binding failed might belong to a person or might be a meeting
+ * room; nothing in the evidence says which. So while one of these is present the
+ * user total is a range, not a number, and the exact claim is refused. This is
+ * the structural half of the two-namespace rule: without it, "we could not tell
+ * whose this is" and "nobody is affected" both render as a confident zero. */
+export const unattributedFindings = (findings: readonly Finding[]): number =>
+  findings.filter(finding => finding.subject.kind === 'MAILBOX' && finding.subject.binding === 'UNRESOLVED').length
+
 /** Zero only ever arrives through the exact branch. A lower bound of zero is
  * unrepresentable here rather than merely discouraged.
  *
@@ -103,6 +121,7 @@ export function withheldExplanation(reason: WithheldReason): string {
     case 'NOTHING_APPLICABLE': return 'No event in this window was one these checks assess, so there was nothing to find.'
     case 'CAPACITY_EXCEEDED': return 'This window held more events than can be assessed at once, so it was not assessed in full.'
     case 'DETECTOR_FAILED': return 'One of the checks could not complete, so anything it would have found is unknown. The other checks reported normally.'
+    case 'UNRESOLVED_SUBJECT_IDENTITY': return 'Something was found on a mailbox we could not match to a person, so the number of people affected cannot be stated exactly. The findings themselves are listed.'
     default: return unreachable(reason)
   }
 }
@@ -128,7 +147,9 @@ export function evaluate<Event>(input: Readonly<{
     // Nothing was read, so nothing ran. An empty detector list is the honest
     // report — not a list of detectors credited with having considered zero
     // events, which reads like a healthy silent detector.
-    const claim = zeroClaim(state, NO_COVERAGE, true, true)
+    const claim = zeroClaim({
+      state, coverage: NO_COVERAGE, withinBudget: true, allDetectorsRan: true, allSubjectsResolved: true,
+    })
     return { state, coverage: NO_COVERAGE, detectors: [], findings: [], count: countOf(0, claim.permitted), claim }
   }
 
@@ -162,7 +183,13 @@ export function evaluate<Event>(input: Readonly<{
     }
   }
 
-  const claim = zeroClaim(state, coverage, withinBudget, reports.every(report => report.status === 'RAN'))
+  const claim = zeroClaim({
+    state,
+    coverage,
+    withinBudget,
+    allDetectorsRan: reports.every(report => report.status === 'RAN'),
+    allSubjectsResolved: unattributedFindings(findings) === 0,
+  })
   return {
     state,
     coverage,

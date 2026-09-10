@@ -4,8 +4,12 @@ import { evaluate } from '../evaluate.js'
 import { externalForwardingDetector, type MailboxForwardingArtefact } from './external-forwarding.js'
 import type { Coverage } from '../contract.js'
 
+/** Defaults to a mailbox whose binding RESOLVED and said "not a person" — a
+ * proven shared or resource mailbox. That is the case where a user count of zero
+ * is exactly true. The unresolved case is written out explicitly where it is
+ * meant, so no test asserts a confident zero by accident. */
 const mailbox = (ref: string, parts: Partial<MailboxForwardingArtefact> = {}): MailboxForwardingArtefact => ({
-  mailboxRef: ref,
+  subject: { kind: 'MAILBOX', mailboxRef: ref, binding: 'RESOLVED_NEGATIVE' },
   observedAt: '2026-09-10T00:00:00.000Z',
   forwardingSmtpAddress: null,
   forwardingAddress: null,
@@ -48,14 +52,58 @@ test('forwarding outside the tenant is found wherever Exchange reports it', () =
   assert.equal(result.findings.length, 5)
 })
 
-test('a zero user count beside real findings is coherent, not a contradiction', () => {
-  // The trap this rule creates, pinned deliberately. A surface that reads
-  // `count` as "nothing found" would render five exfiltrating mailboxes as a
-  // clean tenant. The count answers "how many people", the findings answer
-  // "what did we find", and they are not the same question.
-  const result = assess([mailbox('a', { forwardingSmtpAddress: 'exfil@evil.example' })])
+test('a zero user count beside real findings is coherent when the mailbox is provably not a person', () => {
+  // Binding resolved and said "resource mailbox". Zero people really are
+  // affected, and the finding is still reported. The count answers "how many
+  // people", the findings answer "what did we find" — different questions.
+  const result = assess([mailbox('reception-room', { forwardingSmtpAddress: 'exfil@evil.example' })])
   assert.deepEqual(result.count, { accuracy: 'EXACT', value: 0 })
   assert.equal(result.findings.length, 1)
+  assert.equal(result.claim.permitted, true)
+})
+
+test('a mailbox we could not attribute refuses the exact zero rather than implying nobody', () => {
+  // The other half, and the one that was a real defect before this. Binding was
+  // attempted and failed, so we found something and cannot say whether a person
+  // is behind it. The honest answer is not zero — it is unknown, between zero
+  // and one — so the exact claim is refused instead of reading as "nobody".
+  const unattributed = mailbox('orphan', { forwardingSmtpAddress: 'exfil@evil.example' })
+  const result = assess([{ ...unattributed, subject: { kind: 'MAILBOX', mailboxRef: 'orphan', binding: 'UNRESOLVED' } }])
+  assert.equal(result.findings.length, 1, 'still found, still reported')
+  assert.deepEqual(result.claim, { permitted: false, because: 'UNRESOLVED_SUBJECT_IDENTITY' })
+  assert.deepEqual(result.count, { accuracy: 'NOT_AVAILABLE', value: null })
+
+  // And it does not erase what we could attribute: a known user still yields a
+  // floor. One person for certain, possibly two — never "exactly one".
+  const withKnownUser = evaluate<MailboxForwardingArtefact>({
+    evidence: {
+      availability: 'READ',
+      applies: [{ ...unattributed, subject: { kind: 'MAILBOX', mailboxRef: 'orphan', binding: 'UNRESOLVED' } }],
+      coverage: coverage(1),
+      order: 'OLDEST_FIRST',
+    },
+    detectors: [detector, {
+      id: 'user-side',
+      run: () => ({
+        considered: 1,
+        findings: [{
+          detectorId: 'user-side',
+          subject: { kind: 'DIRECTORY_USER', userRef: 'alice' } as const,
+          observedAt: '2026-09-10T00:00:00.000Z',
+        }],
+      }),
+    }],
+    budget: { maxEvents: 500 },
+  })
+  assert.deepEqual(withKnownUser.count, { accuracy: 'AT_LEAST', value: 1 })
+})
+
+test('a mailbox that resolved to a real person counts as that person', () => {
+  // Promotion happens in the layer that can query the directory; the detector
+  // passes the resolved subject through untouched.
+  const bound = mailbox('alice-mailbox', { forwardingSmtpAddress: 'exfil@evil.example' })
+  const result = assess([{ ...bound, subject: { kind: 'DIRECTORY_USER', userRef: 'alice' } }])
+  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 1 })
   assert.equal(result.claim.permitted, true)
 })
 
