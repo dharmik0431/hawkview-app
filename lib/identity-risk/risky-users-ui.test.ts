@@ -167,6 +167,21 @@ test('the list gives a technician the four things they triage on', () => {
   )
 })
 
+test('the opaque subject reference is shortened but stays available', () => {
+  const { document } = render()
+  const cell = document.querySelector('tbody tr td')
+  assert.ok(cell)
+  const reference = cell!.querySelectorAll('p')[1]
+  assert.ok(reference)
+  // Shown short, so it does not crowd out the name and the reasons.
+  assert.match(reference!.textContent ?? '', /^hvr1_subject_[0-9a-f]{10}…$/)
+  // The full value is still there to copy or search on.
+  assert.match(
+    reference!.getAttribute('title') ?? '',
+    /^hvr1_subject_[0-9a-f]{64}$/
+  )
+})
+
 test('the P2 gap is shown once as a first-class state, not as an empty column', () => {
   const { document, text } = render()
   const panel = document.querySelector(

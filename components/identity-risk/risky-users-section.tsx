@@ -29,6 +29,17 @@ function time(value: string | null) {
   return value ? new Date(value).toLocaleString() : 'Not reported'
 }
 
+/**
+ * HawkView identifies a subject by a 64-character tenant-keyed pseudonym. Shown
+ * in full it takes three lines and crowds out the name and the reasons, which
+ * are what a technician actually reads. Shown short it still distinguishes two
+ * users with the same display name, and the full value stays available to copy.
+ */
+function shortReference(reference: string) {
+  const match = reference.match(/^(hvr1_[a-z]+_)([0-9a-f]{64})$/)
+  return match ? `${match[1]}${match[2].slice(0, 10)}…` : reference
+}
+
 /* -------------------------------------------------------------------------- */
 
 /**
@@ -191,8 +202,11 @@ function UserRows({
                 <p className="break-words text-sm font-semibold text-slate-900 dark:text-slate-50">
                   {row.name}
                 </p>
-                <p className="mt-0.5 break-all text-xs text-slate-500 dark:text-slate-400">
-                  {row.email ?? row.reference}
+                <p
+                  className="mt-0.5 break-all font-mono text-xs text-slate-500 dark:text-slate-400"
+                  title={row.email ?? row.reference}
+                >
+                  {row.email ?? shortReference(row.reference)}
                 </p>
                 <ul className="mt-1.5 space-y-0.5">
                   {row.reasons.map((reason) => (
