@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { bindToFeed, unreachableRequirements, type FeedBoundDetector } from './feed-capability.js'
+import { bindToFeed, capabilityOf, unreachableRequirements, type FeedBoundDetector } from './feed-capability.js'
 import { evaluate } from '../evaluation-core/evaluate.js'
 import type { EventOutcome, NormalizedEvent } from '../risky-users-normalization/contract.js'
 import type { Coverage } from '../evaluation-core/contract.js'
@@ -68,4 +68,57 @@ test('the rule is replaced, never dropped', () => {
 test('a feed that supports the pattern gets the real detector, untouched', () => {
   const bound = bindToFeed(failuresThenSuccess, feed('graph', ['PASSWORD_REJECTED', 'PASSWORD_ACCEPTED_COMPLETED']))
   assert.equal(bound, failuresThenSuccess.detector, 'not a wrapper — the detector itself')
+})
+
+test('the real capability sets come from the classifier, not from deriving its tables', () => {
+  // Engineer 3's warning, pinned. Deriving the audit set from the reason-name
+  // table yields a feed with NO successes — audit successes come from
+  // `Operation`, where no logon error exists — which would declare every
+  // failures-then-success rule inapplicable on that feed. The original
+  // inert-detector bug, re-created by the machinery built to detect it, and
+  // worse because it would be stated confidently rather than passing silently.
+  const audit = capabilityOf('M365_AUDIT_STS')
+  assert.ok(audit.reachable.has('PASSWORD_ACCEPTED_COMPLETED'),
+    'the audit feed reaches successes; a derived set would say it does not')
+  assert.ok(audit.reachable.has('PASSWORD_REJECTED'))
+
+  // So the rule that could never fire there now runs there.
+  assert.deepEqual(unreachableRequirements(failuresThenSuccess, audit), [])
+  assert.equal(bindToFeed(failuresThenSuccess, audit), failuresThenSuccess.detector)
+})
+
+test('a rule needing an outcome the audit feed cannot express is inapplicable there, and runs on Graph', () => {
+  const needsChallengeNotPassed: FeedBoundDetector = {
+    detector: failuresThenSuccess.detector,
+    requires: ['PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED'],
+  }
+  const audit = capabilityOf('M365_AUDIT_STS')
+  const graph = capabilityOf('GRAPH_SIGN_INS')
+
+  // Unreachable on audit: no reason name maps to it, so no audit row can
+  // produce one however the tenant behaves.
+  assert.deepEqual(unreachableRequirements(needsChallengeNotPassed, audit),
+    ['PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED'])
+  assert.notEqual(bindToFeed(needsChallengeNotPassed, audit), needsChallengeNotPassed.detector)
+
+  // Reachable on Graph, so it runs there.
+  assert.deepEqual(unreachableRequirements(needsChallengeNotPassed, graph), [])
+})
+
+test('a mapped-but-never-observed outcome must not make a rule inapplicable', () => {
+  // The mirror falsifier, and the direction that bites: a check that only ever
+  // verifies the INAPPLICABLE path would pass a capability set that declares
+  // everything inapplicable. A quiet window is not an incapable feed.
+  //
+  // The post-password interrupt family has never been observed on Graph — zero
+  // rows, all tenants, all history — but it is mapped, so a rule reading it
+  // must still RUN there and be allowed to find nothing.
+  const interrupt: FeedBoundDetector = {
+    detector: failuresThenSuccess.detector,
+    requires: ['PASSWORD_ACCEPTED_CHALLENGE_ISSUED', 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'],
+  }
+  const graph = capabilityOf('GRAPH_SIGN_INS')
+  assert.deepEqual(unreachableRequirements(interrupt, graph), [],
+    'mapped-not-observed is reachable: the tenant had a good month, the feed is not incapable')
+  assert.equal(bindToFeed(interrupt, graph), interrupt.detector, 'so it runs, and may honestly find nothing')
 })

@@ -1,4 +1,5 @@
-import type { EventOutcome, NormalizedEvent } from '../risky-users-normalization/contract.js'
+import { reachableOutcomes } from '../risky-users-normalization/index.js'
+import type { EventOutcome, NormalizationSource, NormalizedEvent } from '../risky-users-normalization/contract.js'
 import type { Detector } from '../evaluation-core/contract.js'
 
 /** Whether a feed can supply every part of a rule's pattern.
@@ -70,4 +71,24 @@ export function bindToFeed(
         + `(${[...missing].sort().join(', ')}), so it could never report a finding here.`,
     }),
   }
+}
+
+/** The capability of a real feed, from the classifier's own table.
+ *
+ * CALLS the classifier rather than deriving from its mapping tables, and that
+ * is load-bearing rather than stylistic. Engineer 3's warning: deriving the
+ * audit set from the reason-name table yields a feed with NO successes, because
+ * audit successes come from `Operation` where no logon error exists at all —
+ * which would declare every failures-then-success rule inapplicable on the
+ * audit feed. That is the original inert-detector bug re-created by the
+ * machinery built to detect it, and worse, because it would be stated
+ * confidently rather than passing in silence.
+ *
+ * Uses REACHABLE rather than OBSERVED deliberately. A quiet window is not an
+ * incapable feed: an outcome that is mapped but has not occurred yet means the
+ * tenant had a good month, and marking a rule inapplicable for that would be a
+ * worse lie than the silence this mechanism exists to remove.
+ */
+export function capabilityOf(source: NormalizationSource): FeedCapability {
+  return { feed: source, reachable: reachableOutcomes(source) }
 }

@@ -1,5 +1,6 @@
 import type {
   Assessment, Budget, CollectionScope, Count, CountScope, Coverage, Detector, DetectorReport, Evidence, EvidenceState, Finding,
+  SetAsideVocabulary,
   FindingGap, FindingSet,
   WithheldReason, ZeroClaim,
 } from './contract.js'
@@ -180,11 +181,29 @@ const answeredOrDeclined = (report: DetectorReport): boolean => {
   }
 }
 
+
+/** Flattens the classifier's four counters into one list that carries which
+ * counter each entry came from.
+ *
+ * Derived here rather than assembled by callers, so the projection and the
+ * coverage it projects cannot drift — and derived from the vocabularies the
+ * classifier already keeps rather than a second scheme of our own, which is
+ * the thing that would drift. */
+export function setAsideOf(coverage: Coverage): CountScope['setAside'] {
+  const entries: { vocabulary: SetAsideVocabulary; reason: string; count: number }[] = []
+  const take = (vocabulary: SetAsideVocabulary, counts: Readonly<Record<string, number>>) => {
+    for (const [reason, count] of Object.entries(counts)) entries.push({ vocabulary, reason, count })
+  }
+  take('DOES_NOT_APPLY', coverage.doesNotApply)
+  take('NOT_YET_CITED', coverage.notYetCited)
+  take('UNKNOWN', coverage.unknown)
+  take('UNPROCESSABLE', coverage.unprocessable)
+  return entries
+}
 export function scopeOf(reports: readonly DetectorReport[], coverage: Coverage): CountScope {
   return {
     evidenceRequested: coverage.collectionScope.declared ? [coverage.collectionScope.asked] : [],
-    scopeUnsettled: { ...coverage.notYetCited },
-    excluded: { ...coverage.doesNotApply },
+    setAside: setAsideOf(coverage),
     covered: reports.flatMap(report => examinedSomething(report) ? [report.detectorId] : []),
     notCovered: reports.flatMap(report => {
       if (report.status === 'INAPPLICABLE') return [{ detectorId: report.detectorId, because: report.because }]
@@ -269,7 +288,7 @@ export function evaluate<Event>(input: Readonly<{
       // Nothing ran, so nothing is covered. An empty scope beside a
       // not-available count says exactly that, without implying a check
       // was skipped for a reason of its own.
-      count: countOf(0, claim.permitted, { evidenceRequested: [], scopeUnsettled: {}, excluded: {}, covered: [], notCovered: [] }),
+      count: countOf(0, claim.permitted, { evidenceRequested: [], setAside: [], covered: [], notCovered: [] }),
       claim,
     }
   }

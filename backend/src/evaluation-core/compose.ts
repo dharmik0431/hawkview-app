@@ -1,5 +1,5 @@
 import { countOf, distinctUsers } from './evaluate.js'
-import type { Assessment, Count, FindingSet, WithheldReason } from './contract.js'
+import type { Assessment, Count, CountScope, FindingSet, WithheldReason } from './contract.js'
 
 /** Composing several evidence streams into one tenant answer.
  *
@@ -87,23 +87,20 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
     // has. A tenant-level zero has to name the same gaps its parts named.
     count: countOf(distinctUsers(findings), claim.permitted, {
       evidenceRequested: [...new Set(streams.flatMap(entry => entry.assessment.count.scope.evidenceRequested))],
-      // Unsettled anywhere leaves the tenant boundary provisional: a stream that
-      // settled its own scope cannot make another stream's undecided events
-      // decided, so these accumulate rather than being cancelled by agreement.
-      scopeUnsettled: streams.reduce<Record<string, number>>((merged, entry) => {
-        for (const [reason, count] of Object.entries(entry.assessment.count.scope.scopeUnsettled)) {
-          merged[reason] = (merged[reason] ?? 0) + count
-        }
-        return merged
-      }, {}),
-      // Exclusions accumulate the same way: a stream that declined nothing does
-      // not make another stream's declined events un-declined.
-      excluded: streams.reduce<Record<string, number>>((merged, entry) => {
-        for (const [reason, count] of Object.entries(entry.assessment.count.scope.excluded)) {
-          merged[reason] = (merged[reason] ?? 0) + count
-        }
-        return merged
-      }, {}),
+      // Accumulates across streams: a stream that settled its own scope cannot
+      // make another stream's undecided events decided, and one that declined
+      // nothing cannot un-decline another's. Merged on the PAIR, so two streams
+      // setting events aside under the same reason in different vocabularies
+      // stay apart — which is the whole reason the vocabulary travels.
+      setAside: [...streams
+        .flatMap(entry => entry.assessment.count.scope.setAside)
+        .reduce((merged, entry) => {
+          const key = `${entry.vocabulary}\u0000${entry.reason}`
+          const running = merged.get(key)
+          merged.set(key, running === undefined ? entry : { ...entry, count: running.count + entry.count })
+          return merged
+        }, new Map<string, CountScope['setAside'][number]>())
+        .values()],
       covered: streams.flatMap(entry => entry.assessment.count.scope.covered),
       notCovered: streams.flatMap(entry => entry.assessment.count.scope.notCovered),
     }),

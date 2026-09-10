@@ -88,44 +88,32 @@ export type CountScope = Readonly<{
    * true about its rows and misleading about the tenant. An unrecorded request
    * appears nowhere here — it withholds the claim instead. */
   evidenceRequested: readonly string[]
+  /** Everything not assessed, each entry saying which vocabulary decided it.
+   *
+   * One field rather than a map per vocabulary, and that is the point.
+   * `scopeUnsettled` and `excluded` were both event counts keyed by reason, and
+   * a reader who did not know better could sum them into a plausible "events
+   * not assessed" — merging *we decided not to* with *we haven't decided yet*,
+   * which is the distinction the count depends on. Field names do not carry a
+   * distinction; shape does.
+   *
+   * The grouping is the classifier's own four-way split rather than a second
+   * classification invented here. Engineer 3's argument for that over the
+   * `kind` I proposed: a second scheme over the same vocabulary is a second
+   * thing to keep in step, and every serious defect on this feature has been
+   * one fact in two places that drifted. Adding a reason to any of their
+   * vocabularies now needs no change here at all.
+   *
+   * DOES_NOT_APPLY and NOT_YET_CITED do not gate a clean claim; UNKNOWN and
+   * UNPROCESSABLE do. The vocabulary is what tells them apart, so a renderer
+   * groups correctly without knowing a single reason name. */
+  setAside: readonly Readonly<{ vocabulary: SetAsideVocabulary; reason: string; count: number }>[]
   /** Detectors whose verdict this count includes. */
   covered: readonly string[]
   /** Detectors this evidence could not support, each saying why in its own
    * words. Non-empty means the count answers a narrower question than the
    * product claims to ask. */
   notCovered: readonly Readonly<{ detectorId: string; because: string }>[]
-  /** Events we understand and have NOT yet decided are in or out of scope.
-   *
-   * Non-empty means the boundary this count is exact over is PROVISIONAL. That
-   * is a different statement from `notCovered`, which names a known limitation:
-   * "one further check cannot run on this evidence" tells a technician where the
-   * boundary is, and "N events are not yet classified as in or out of scope"
-   * tells them the boundary is not settled. Rendered as one thing, a provisional
-   * zero reads as a settled one.
-   *
-   * So an exact count here is exact over "the evidence we have decided how to
-   * treat", not over "this tenant's evidence". It does not gate — an uncited
-   * exclusion must never veto a finding — and there is deliberately no
-   * threshold at which it flips, because a threshold hides the thing it
-   * measures. Any non-zero value belongs in the sentence. */
-  scopeUnsettled: Readonly<Record<string, number>>
-  /** Events the rules correctly declined, by reason — the SETTLED exclusions.
-   *
-   * Here for the reason everything else in this object is here: a qualification
-   * one object away from the number is a qualification a renderer will not
-   * reach for. These were recorded on `coverage.doesNotApply` and honestly so,
-   * but a surface built from `count` and `count.scope` — the natural thing to
-   * build, since scope is where the qualifications live — rendered a bare zero
-   * while the excluded events sat on a per-stream path it had to seek out.
-   *
-   * That is the live production defect exactly: a zero over a window whose
-   * exclusions were recorded somewhere nobody looked.
-   *
-   * The boundary here is KNOWN, unlike `scopeUnsettled` — the zero really is
-   * exact over it. That is an argument for stating the boundary, not for
-   * omitting it. I had reasoned that a settled scope needs no qualification and
-   * QA was right that this was inherited rather than decided. */
-  excluded: Readonly<Record<string, number>>
 }>
 
 /** The four states kept distinct, because collapsing any pair of them is how
@@ -435,3 +423,10 @@ export type Evidence<Event> =
      * compares the values and never inspects them. */
     timeOf: (event: Event) => number | string
   }>
+
+/** Which of the classifier's vocabularies set an event aside.
+ *
+ * Mirrors the four counters the classification layer already keeps, rather than
+ * being a second scheme over the same facts. Two of these gate a clean claim
+ * and two do not, and that is exactly what a renderer needs to group by. */
+export type SetAsideVocabulary = 'DOES_NOT_APPLY' | 'NOT_YET_CITED' | 'UNKNOWN' | 'UNPROCESSABLE'
