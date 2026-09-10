@@ -458,7 +458,10 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
       'invention. That distinction matters: an invented value is unstable and ours to fix, whereas ' +
       'Microsoft’s LoginStatus in a mislabelled field is stable data we are reading wrongly. Flagged for ' +
       're-verification. Either way the treatment is the same and is not affected by the answer: 1 is not ' +
-      'an Azure sign-in error code, so it is used neither as a key nor as corroboration.',
+      'an Azure sign-in error code, so it is used neither as a key nor as corroboration. If the ' +
+      'LoginStatus reading holds, the defect is in our STORAGE SCHEMA rather than in Microsoft\'s data — ' +
+      'a success/failure flag and an AADSTS code space merged into one column — and the fix is to stop ' +
+      'merging them, which is a schema change and not a classifier change. Logged separately.',
   },
 ];
 
@@ -709,12 +712,28 @@ export function failureReasonMeaning(
  *
  * THE TWO FEEDS INVERT ON WHICH FIELD IS TRUSTWORTHY, and treating them
  * symmetrically is wrong. On Graph the result code is a clean number on 100%
- * of rows and the description is free prose. On the AUDIT feed the code is
- * unreliable and the reason NAME is the stable identifier: measured across two
- * independent tenants, `InvalidUserNameOrPassword` appears with errorCode "1"
- * (29 rows) AND with the code entirely absent (22 rows). Same event, same
- * meaning, two different codes — so a classifier keyed on the code silently
- * drops half of them while catching the other half, invisibly.
+ * of rows and the description is free prose. On the AUDIT feed the code is the
+ * unreliable half and the reason NAME is the stable identifier.
+ *
+ * GROUNDS, all from reading the collector rather than from volumes. An earlier
+ * version of this comment cited row counts across two tenants; those were
+ * computed from `raw.status.failureReason`, a field HawkView synthesizes with
+ * `?? record.Operation` as its final arm, so they described our own fallback
+ * expression rather than Microsoft's data and have been withdrawn. What stands:
+ *
+ *  1. The audit outcome is a UNION OF TWO VOCABULARIES with no discriminator.
+ *     `reportedAuthenticationErrorCode()` pools `LoginStatus` and `ErrorCode`
+ *     into one numeric space, and those are not the same kind of value — a
+ *     LoginStatus flag and an AADSTS error code cannot share a field and stay
+ *     readable. Keying on the name sidesteps that entirely.
+ *  2. On this feed the NAME disambiguates what the code cannot: `IdsLocked` is
+ *     Microsoft's own name for the smart-lockout meaning of 50053
+ *     specifically, so the three-way ambiguity that requires text parsing on
+ *     Graph does not arise here at all.
+ *  3. The outcome can appear in at least four places — `LoginStatus`,
+ *     `ErrorCode`, and extended properties of either name, case-insensitively.
+ *     A reader that checks fewer than all of them disagrees with the collector
+ *     about where the outcome lives.
  *
  * These names are Microsoft error identifiers rather than prose, which is why
  * exact matching is appropriate here and substring matching is appropriate for
@@ -732,11 +751,10 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
     name: 'InvalidUserNameOrPassword',
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' },
     note:
-      'Microsoft’s documented name for 50126. Observed under errorCode "1" AND with the code absent, in ' +
-      'both audit tenants — 51 rows that a code-keyed classifier loses entirely. The inversion is not ' +
-      'specific to this reason or to one tenant: reason|code PAIRS outnumber distinct reasons in BOTH ' +
-      'audit tenants (11 pairs from 9 reasons, and 7 from 5), so multiple reason strings appear under ' +
-      'more than one code, systematically.',
+      'Microsoft’s documented name for 50126. VOLUMES WITHDRAWN: the row counts previously cited here ' +
+      'were computed from a HawkView-synthesized field and described our own fallback expression rather ' +
+      'than Microsoft’s data. The grounds for reading this feed by name are in the comment above and rest ' +
+      'on the collector source, not on counts.',
   },
   {
     name: 'IdsLocked',
@@ -744,7 +762,7 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
     note:
       'Microsoft’s documented name for the smart-lockout meaning of 50053 specifically. A useful ' +
       'consequence of keying on the name: on this feed the name disambiguates what the code cannot, so ' +
-      'the three-way ambiguity that needs text parsing on Graph does not arise here. 578 rows.',
+      'the three-way ambiguity that needs text parsing on Graph does not arise here.',
   },
   {
     name: 'UserStrongAuthClientAuthNRequiredInterrupt',
@@ -755,8 +773,9 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
     name: 'UnclassifiedAuthenticationError',
     disposition: { kind: 'UNKNOWN', observation: 'PROVIDER_DECLARED_UNCLASSIFIED' },
     note:
-      'Microsoft’s own name says it is unclassified, so there is nothing to read. High volume and ' +
-      'genuinely unknown: 45% of one audit tenant’s rows and 6% of another’s. An honest coverage cost.',
+      'Microsoft’s own name says it is unclassified, so there is nothing to read — an honest coverage ' +
+      'cost rather than a gap in this table. Share-of-traffic figures previously noted here were computed ' +
+      'from a synthesized field and are withdrawn.',
   },
   // Recognised names with no documented basis for excluding them. Each is a
   // singleton in observed data, and each is held rather than guessed at.
@@ -793,11 +812,13 @@ export const AUDIT_REASON_NAMES_OBSERVED_UNMAPPED: readonly { readonly name: str
   {
     name: 'UserLoggedIn',
     why:
-      'Appears as a reason VALUE with the error code absent — 260 rows in one tenant, 15% of it. That is ' +
-      'the Operation name leaking into the error field, not a documented reason value, so reading a ' +
-      'success out of it would be a guess about an artefact. Needs one query: for those rows, what are ' +
-      'Operation and ResultStatus? Until then it is UNRECOGNIZED_REASON_NAME, which costs coverage and ' +
-      'claims nothing.',
+      'CONFIRMED AN ARTEFACT, not a provider value. It appears as a "reason" only in the synthesized ' +
+      '`raw.status.failureReason`, whose final arm is `?? record.Operation` — so every audit record with ' +
+      'no logon error of any kind contributes its own Operation name there. It is not a Microsoft reason ' +
+      'value at all, and nothing should ever map it. This layer reads the original record, where it does ' +
+      'not appear; the guard in classifyAuditRecord exists for any reader that is pointed at the ' +
+      'projected field instead. Volumes previously cited here came from that same synthesized field and ' +
+      'are withdrawn.',
   },
 ];
 
@@ -886,6 +907,10 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     verification: {
       state: 'PRODUCTION_VERIFIED',
       evidence:
+        'PROVENANCE CHECKED, and this is the audit figure that survives: it was computed from ' +
+        'lower(raw->\'managementActivityRecord\'->>\'UserId\') — Microsoft’s own field in Microsoft’s own ' +
+        'record — unlike the reason|code counts that were withdrawn for being computed from a field we ' +
+        'synthesize. ' +
         'Holding as one tenant backfills: UPN resolution 97.0% at 1,773 rows against the other tenant’s ' +
         '97.1%, essentially unmoved as volume grew from 1,385 rows. Two-tenant agreement surviving contact ' +
         'with more data is the test that matters. ' +
@@ -1030,6 +1055,30 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'bucketed by riskDetail value, with the ordinary-human-success rows as the cohort that must NOT ' +
         'carry a verdict-shaped value. Until then this predicate has NO effect and ' +
         'MICROSOFT_SAFETY_VERDICT is unreachable.',
+    },
+  },
+  {
+    id: 'audit.result-code-vocabulary',
+    reads: ['managementActivityRecord.LoginStatus', 'managementActivityRecord.ErrorCode'],
+    claim:
+      'The audit result code is a single vocabulary, so pooling LoginStatus and ErrorCode into one ' +
+      'numeric space and requiring them to agree is a sound reading.',
+    verification: {
+      state: 'PENDING_DISTRIBUTION_CHECK',
+      cohort:
+        'SUSPECTED FALSE, and this is the ground for reading the feed by name instead. If LoginStatus is ' +
+        'a success/failure flag while ErrorCode carries AADSTS codes, then the two are different ' +
+        'vocabularies sharing one field, a 1 and a 50126 are not comparable numbers, and requiring them ' +
+        'to agree numerically would discard rows that agree semantically (LoginStatus 1 and ErrorCode ' +
+        '50126 both mean failure). Nothing is built on the hypothesis: this layer keys on the reason name ' +
+        'and uses the code only as corroboration, and disagreement routes to UNKNOWN, which is the ' +
+        'conservative direction either way.',
+      controlCohort:
+        'Needed: LoginStatus values paired with ErrorCode values on the same records. Rows where ONLY ' +
+        'LoginStatus is present must be distinguishable from rows where only ErrorCode is. If the two ' +
+        'fields draw from disjoint value ranges, that settles it. NOTE FOR STORAGE, separate from ' +
+        'classification: two vocabularies in one column is a schema defect whose fix is to stop merging ' +
+        'them, not to read them more cleverly.',
     },
   },
   {

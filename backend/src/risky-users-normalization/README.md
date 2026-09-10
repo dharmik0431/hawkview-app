@@ -378,24 +378,38 @@ two independent tenants.
 | Result code | `number` on 100% of rows, trustworthy | unreliable; often absent, often HawkView's synthetic `"1"` |
 | Description | free prose, the risky part | a Microsoft error **name**, the stable identifier |
 
-`InvalidUserNameOrPassword` appears on the audit feed with errorCode `"1"` **and** with
-the code entirely absent, in both audit tenants. Same event, same meaning, different
-code, so a classifier keyed on the code catches one half and silently drops the other.
+**The grounds here are source, not volumes.** An earlier version of this section cited
+row counts across two tenants. Those were computed from `raw.status.failureReason`, a
+field HawkView synthesizes with `?? record.Operation` as its final arm, so they described
+our own fallback expression rather than Microsoft’s data, and they are withdrawn.
+
+What stands, all from reading the collector rather than from counts:
+
+1. The audit outcome pools `LoginStatus` and `ErrorCode` into one numeric space. A status
+   flag and an AADSTS error code cannot share a field and stay readable, so the code
+   cannot be the key.
+2. On this feed the *name* disambiguates what the code cannot — `IdsLocked` is Microsoft’s
+   own name for the smart-lockout meaning of 50053 specifically, so the three-way
+   ambiguity that needs text parsing on Graph does not arise here.
+3. The outcome can appear in at least four places, so a reader checking fewer than all of
+   them disagrees with the collector about where it lives.
+
 Audit classification is therefore **reason-name-primary**, matched exactly against
 `AUDIT_REASON_NAMES`, with the code as corroboration that can contradict but never
 override. Error code `"1"` is HawkView's own invention on that feed and carries no
 provider information at all, so it is neither a key nor corroboration; that is the second
 time its instability has bitten.
 
-Recovered by the change: ~51 rows of `InvalidUserNameOrPassword` and ~578 of `IdsLocked`
-that were previously UNKNOWN. A useful side effect: on the audit feed the *name*
-disambiguates the lockout meaning, so the three-way 50053 ambiguity that needs text
-parsing on Graph does not arise there at all.
+The change recovers `InvalidUserNameOrPassword` and `IdsLocked` rows that were previously
+UNKNOWN. Row counts are deliberately not quoted: the only figures available for them came
+from the synthesized field and are withdrawn. The honest statement is that the recovery is
+real and its size is unmeasured.
 
-`UserLoggedIn` appears as a reason *value* with no code (260 rows, 15% of one tenant).
-That is the operation name leaking into the error field, so it is deliberately unmapped
-and recorded in `AUDIT_REASON_NAMES_OBSERVED_UNMAPPED` with the query that would settle
-it. Reading a success out of an artefact would be a guess.
+`UserLoggedIn` appears as a reason *value* only in the synthesized field, because that
+field falls back to the record’s own `Operation` name when no logon error exists. It is
+**confirmed an artefact** rather than a Microsoft reason value, so nothing should ever map
+it — recorded in `AUDIT_REASON_NAMES_OBSERVED_UNMAPPED` on those grounds. This layer reads
+the original record, where it does not appear at all.
 
 ## Addendum: structure transfers between tenants, proportions do not
 
@@ -403,10 +417,10 @@ Field shapes and identifier spaces hold across audit tenants. The UPN-in-record 
 GUID-in-column split is confirmed in all three, and UPN resolution agrees within 0.1
 percentage points across two independent MSPs with separate directories (97.2% vs 12.0%,
 97.1% vs 0.0%). **Traffic composition does not transfer.**
-`UnclassifiedAuthenticationError` is 45% of one audit tenant's rows and 6% of another's;
-`UserLoggedIn` is 15% of one and 0.6% of the other. **Any coverage estimate derived from
-one tenant will be wrong for another** — do not generalise from whichever tenant you
-looked at first.
+**Any coverage estimate derived from one tenant will be wrong for another** — do not
+generalise from whichever tenant you looked at first. The per-reason share figures that
+illustrated this were computed from a synthesized field and are withdrawn; the structural
+point does not depend on them.
 
 Two further cautions on every number in this file:
 

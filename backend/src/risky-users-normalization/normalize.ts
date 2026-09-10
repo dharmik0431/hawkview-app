@@ -275,15 +275,16 @@ const emptyLogonError = (value: unknown): boolean =>
  *
  * The two feeds invert on which field is trustworthy, so classifying them
  * symmetrically is wrong. On Graph the result code is a clean number on 100%
- * of rows and the description is free prose. On AUDIT the code is unreliable
- * and the reason NAME is the stable identifier: `InvalidUserNameOrPassword`
- * appears with errorCode "1" AND with the code entirely absent, in both audit
- * tenants. Same event, same meaning, different code — and a classifier keyed
- * on the code drops half of them while catching the other half, invisibly.
+ * of rows and the description is free prose. On AUDIT the code is the
+ * unreliable half and the reason NAME is the stable identifier — see
+ * AUDIT_REASON_NAMES for the grounds, which come from reading the collector.
+ * The short version: the audit code pools `LoginStatus` and `ErrorCode` into
+ * one numeric space, and a status flag and an AADSTS code cannot share a field
+ * and stay readable.
  *
- * Error code "1" is HawkView's own invention on this feed rather than an Azure
- * code, so it carries no provider information: it is used neither as a key nor
- * as corroboration. That is the second time its instability has bitten.
+ * Error code "1" is not an Azure sign-in error code, so it is used neither as a
+ * key nor as corroboration. Its provenance is an open question — see the code-1
+ * entry in provider-facts — and the treatment does not depend on the answer.
  *
  * The code still CORROBORATES and never overrides. A contradiction between the
  * name, the operation and a real Microsoft code is reported as a contradiction

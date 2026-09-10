@@ -1155,9 +1155,11 @@ test('each measured literal resolves to exactly its own meaning', async () => {
 // ---------------------------------------------------------------------------
 
 test('the same audit reason name classifies the same way under either code', async () => {
-  // Measured across two tenants: InvalidUserNameOrPassword appears with
-  // errorCode "1" AND with the code absent. Same event, same meaning. A
-  // classifier keyed on the code drops half of them, invisibly.
+  // A required design property rather than an observation: the audit code
+  // pools LoginStatus and ErrorCode into one numeric space, so it cannot be
+  // the key. The row counts once cited here were computed from a
+  // HawkView-synthesized field and are withdrawn; this test never rested on
+  // them.
   const withSyntheticCode = await run([auditRow({ ErrorCode: '1', LogonError: 'InvalidUserNameOrPassword' })], {
     source: 'M365_AUDIT_STS',
   });

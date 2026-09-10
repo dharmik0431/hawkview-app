@@ -147,6 +147,20 @@ export interface NormalizedEvent extends NormalizationScope {
   readonly subjectRef: string;
   readonly subjectBinding: SubjectBindingMethod;
   readonly applicationRef: string;
+  /**
+   * Microsoft's result code, as reported, or null.
+   *
+   * DO NOT RENDER GRAPH AND AUDIT CODES AS ONE CODE SPACE. On the Graph feed
+   * this is an AADSTS sign-in error code. On the audit feed it is whatever the
+   * record carried in `LoginStatus` or `ErrorCode`, and whether those are one
+   * vocabulary or two is an open question — see the `audit.result-code-vocabulary`
+   * predicate. Until it is settled, `source` is the field that tells a consumer
+   * which reading applies, and a "1" beside a "50126" may not be the same kind
+   * of number.
+   *
+   * Classification does not depend on this: the audit path keys on the reason
+   * name and uses the code only as corroboration.
+   */
   readonly errorCode: number | null;
   readonly clientSource: {
     readonly qualification: ClientQualification;
