@@ -7,6 +7,7 @@ const coverage = (parts: Partial<Coverage> = {}): Coverage => ({
   collectionScope: { declared: true, asked: 'GRAPH_INTERACTIVE_ONLY' },
   applies: 4,
   doesNotApply: { NOT_A_CREDENTIAL_EVENT: 8 },
+  notYetCited: {},
   unknown: {},
   unprocessable: {},
   ...parts,

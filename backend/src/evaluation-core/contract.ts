@@ -41,6 +41,21 @@ export type Coverage = Readonly<{
   applies: number
   /** Correctly out of scope. The rules worked; these do not reduce coverage. */
   doesNotApply: Readonly<Record<string, number>>
+  /** Understood perfectly well, and set aside because OUR OWN basis for
+   * excluding them is not yet written down.
+   *
+   * A fourth bucket rather than a corner of an existing one, and the
+   * integration branch is what surfaced the need: the classifier reports these
+   * separately and this contract had nowhere to put them, so the mapping would
+   * have dropped them and quietly stopped accounting for every row — the
+   * accounting defect one level up from the detector one.
+   *
+   * Not `doesNotApply`, which asserts the rules correctly declined it; here
+   * nothing has been decided. Not `unknown`, which is evidence we could not
+   * read; this we read fine. It does not gate — eighteen consent prompts must
+   * not withhold a tenant's claim indefinitely — but it has to be disclosed, or
+   * a zero is scoped to a smaller set than its reader believes. */
+  notYetCited: Readonly<Record<string, number>>
   /** Processed, but the outcome could not be interpreted. */
   unknown: Readonly<Record<string, number>>
   /** Could not be processed into an event at all. Distinct from `unknown`,

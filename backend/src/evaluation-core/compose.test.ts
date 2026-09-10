@@ -8,7 +8,7 @@ import { figure } from './test-support.js'
 type Event = Readonly<{ subject: string; match?: boolean }>
 
 const coverage = (parts: Partial<Coverage> = {}): Coverage =>
-  ({ collectionScope: { declared: true, asked: 'test fixture: all rows' }, applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {}, ...parts })
+  ({ collectionScope: { declared: true, asked: 'test fixture: all rows' }, applies: 0, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {}, ...parts })
 
 const matching: Detector<Event> = {
   id: 'matches-flagged',

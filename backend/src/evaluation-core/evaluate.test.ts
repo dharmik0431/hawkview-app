@@ -14,7 +14,7 @@ const event = (id: string, extra: Partial<Event> = {}): Event => ({ id, subject:
  * one of these, which is the point — it cannot classify, only consume. */
 const coverage = (parts: Partial<Coverage> = {}): Coverage => ({
   collectionScope: { declared: true, asked: 'test fixture: all rows' },
-  applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {}, ...parts,
+  applies: 0, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {}, ...parts,
 })
 
 /** Sign-in events carry a directory user, so this detector's findings are about

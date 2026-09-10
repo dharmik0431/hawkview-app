@@ -50,6 +50,7 @@ export function encodeCoverage(coverage: Coverage): Record<string, unknown> {
       : { declared: false },
     applies: coverage.applies,
     doesNotApply: { ...coverage.doesNotApply },
+    notYetCited: { ...coverage.notYetCited },
     unknown: { ...coverage.unknown },
     unprocessable: { ...coverage.unprocessable },
   }
@@ -87,13 +88,14 @@ export function decodeCoverage(raw: unknown): DecodedCoverage {
 
   const scope = collectionScope(raw.collectionScope)
   const doesNotApply = reasonCounts(raw.doesNotApply)
+  const notYetCited = reasonCounts(raw.notYetCited)
   const unknown = reasonCounts(raw.unknown)
   const unprocessable = reasonCounts(raw.unprocessable)
   const applies = raw.applies
-  if (scope === null || doesNotApply === null || unknown === null || unprocessable === null
+  if (scope === null || doesNotApply === null || notYetCited === null || unknown === null || unprocessable === null
     || typeof applies !== 'number' || !Number.isInteger(applies) || applies < 0) {
     return { present: false, because: 'MALFORMED' }
   }
 
-  return { present: true, coverage: { collectionScope: scope, applies, doesNotApply, unknown, unprocessable } }
+  return { present: true, coverage: { collectionScope: scope, applies, doesNotApply, notYetCited, unknown, unprocessable } }
 }

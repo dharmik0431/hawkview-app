@@ -31,7 +31,7 @@ export const NO_COVERAGE: Coverage = Object.freeze({
   // withheld for never-collected or unreadable, and adding a second reason about
   // an unrecorded request would be noise rather than information.
   collectionScope: { declared: true, asked: 'none — no evidence was read' },
-  applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {},
+  applies: 0, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {},
 })
 
 /** Read straight off the evidence, so the state cannot disagree with what the
