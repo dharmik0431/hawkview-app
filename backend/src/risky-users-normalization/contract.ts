@@ -134,6 +134,35 @@ export function isPostPasswordInterrupt(outcome: EventOutcome): boolean {
 export type SubjectBindingMethod = 'DIRECTORY_OBJECT_ID' | 'NORMALIZED_UPN';
 
 /**
+ * Whether a feed can produce an outcome at all, and whether it ever has.
+ *
+ * TWO CLAIMS, kept apart, because collapsing them is this workstream's
+ * recurring defect in a new place. "No mapping exists on this feed" and
+ * "a mapping exists and no row has matched it" are different facts, and a
+ * consumer deciding whether a rule can run needs the first while a consumer
+ * asking what the data has shown needs the second.
+ */
+export type OutcomeReachability =
+  /**
+   * A mapping exists on this feed AND rows have been measured producing it.
+   */
+  | 'MAPPED_AND_OBSERVED'
+  /**
+   * A mapping exists on this feed and zero rows have been measured producing
+   * it. A rule needing this outcome is APPLICABLE — a quiet window is not an
+   * incapable feed — but a zero result over this evidence says less than the
+   * same zero over an observed outcome.
+   */
+  | 'MAPPED_NOT_OBSERVED'
+  /**
+   * NO route to this outcome exists on this feed. Not rare: impossible. A
+   * rule whose pattern needs it cannot fire here no matter what the tenant
+   * does, and reporting a clean zero for it is the failure this exists to
+   * prevent.
+   */
+  | 'UNREACHABLE';
+
+/**
  * Microsoft's own judgement about a sign-in, as a dimension ORTHOGONAL to
  * classification.
  *
@@ -165,11 +194,40 @@ export type SubjectBindingMethod = 'DIRECTORY_OBJECT_ID' | 'NORMALIZED_UPN';
  * detected-by-both structurally rarest exactly where it is most valuable.
  */
 export type MicrosoftVerdict =
-  /** Microsoft judged the sign-in risky. */
+  /**
+   * Microsoft judged the sign-in risky.
+   *
+   * Reaches us three ways without the risk API: sign-in log failure reasons,
+   * code 53004, and riskDetail.
+   */
   | 'RISK'
-  /** Microsoft detected risk, a control the tenant configured held, closed. */
+  /**
+   * Microsoft detected risk, a control the tenant configured responded, and
+   * the sign-in completed. Detected, handled, closed.
+   *
+   * A third value rather than a shade of the other two, because it is
+   * neither: RISK would overstate it as live, SAFE would understate it as
+   * never-risky. Measured shape: riskDetail
+   * `userPassedMFADrivenByRiskBasedPolicy` with riskState `remediated`.
+   *
+   * Still Microsoft's judgement under the attribution rule — attribute by
+   * whose judgement GENERATED the assessment, not whose machinery responded
+   * to it. A risk-based Conditional Access policy is the tenant's machinery
+   * responding to Microsoft's judgement.
+   */
   | 'REMEDIATED'
-  /** Microsoft assessed the sign-in and judged it safe. A dismissal. */
+  /**
+   * Microsoft assessed the sign-in and judged it SAFE. A dismissal, not a
+   * detection.
+   *
+   * Separate from RISK because conflating them is misleading in the one
+   * direction that matters: Microsoft's AI concluding "we looked and this is
+   * fine" must never render as "this user is at risk". Measured shape:
+   * riskDetail `aiConfirmedSigninSafe` with riskState `dismissed` — and note
+   * the trap Microsoft's own vocabulary sets, since system auto-remediation
+   * also lands on `dismissed`, so this is a machine assessment rather than a
+   * human waving something away.
+   */
   | 'SAFE';
 
 /**
@@ -423,12 +481,13 @@ export interface NormalizationBatch {
    * carry no verdict field, so reading this list is the only way to learn
    * what Microsoft concluded.
    *
-   * Classified DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT, because the owner's
-   * product rule is that HawkView's own findings and Microsoft's reported risk
-   * are two evidence channels that are never merged or summed. A verdict
-   * Microsoft reached is not a HawkView finding. It is still the only
-   * Microsoft risk signal an unlicensed tenant will ever see, so it is exposed
-   * here rather than buried in a counter.
+   * The owner's product rule — HawkView's own findings and Microsoft's
+   * reported risk are two evidence channels that are never merged or summed —
+   * is honoured by keeping the verdict off the event rather than by removing
+   * the event from evaluation. Microsoft's conclusion cannot enter a HawkView
+   * finding because no detector can read it; and it is the only Microsoft risk
+   * signal an unlicensed tenant will ever see, so it is exposed here rather
+   * than buried in a counter.
    */
   readonly microsoftRiskVerdicts: readonly NormalizedEvent[];
   /**

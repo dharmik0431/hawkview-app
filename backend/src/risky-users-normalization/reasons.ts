@@ -45,56 +45,6 @@ export type OutOfScopeReason =
   /** 50058. Microsoft: "a common error that's expected." */
   | 'INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN'
   /**
-   * Microsoft judged the sign-in RISKY.
-   *
-   * Excluded from HawkView's findings on the owner's product rule, not on a
-   * Microsoft citation: our findings and Microsoft's reported risk are two
-   * channels that are never merged or summed, and Microsoft's detections must
-   * never be presented as our own. A doc says what a code means; the brief
-   * says what we are permitted to assert, which is the stronger citation here.
-   * Surfaced via `batch.microsoftRiskVerdicts` so the signal is not lost.
-   *
-   * ATTRIBUTION RULE, in its sharpened form: attribute by whose judgement
-   * GENERATED the finding, not by whose machinery responded to it. A
-   * risk-based Conditional Access policy is the tenant's machinery responding
-   * to Microsoft's judgement — the finding is still "Microsoft judged this
-   * risky", and the MFA challenge that followed is remediation, which is
-   * context on that finding rather than a finding of ours.
-   */
-  | 'MICROSOFT_RISK_VERDICT'
-  /**
-   * RETIRED as a classification. Microsoft-detected-and-closed is now carried
-   * by MicrosoftVerdict 'REMEDIATED' rather than by removing the event from
-   * evaluation, so nothing maps here. Kept only as documentation of what the
-   * verdict means.
-   *
-   * The third kind, and it is neither of the other two: MICROSOFT_RISK_VERDICT
-   * would overstate it as live risk, MICROSOFT_SAFETY_VERDICT would understate
-   * it as never-risky. Measured shape: riskDetail
-   * `userPassedMFADrivenByRiskBasedPolicy` with riskState `remediated` — risk
-   * assessed, a risk-based Conditional Access policy challenged the user, MFA
-   * passed. Microsoft detecting and a control working, on a tenant with no P2.
-   *
-   * Still Microsoft's channel under the attribution rule: whose judgement
-   * GENERATED the finding, not whose machinery responded.
-   */
-  | 'MICROSOFT_RISK_REMEDIATED'
-  /**
-   * Microsoft judged the sign-in SAFE. A dismissal, not a detection.
-   *
-   * Separate from MICROSOFT_RISK_VERDICT because conflating them is actively
-   * misleading in the one direction that matters: Microsoft's AI concluding
-   * "we looked and this is fine" must never render as "this user is at risk".
-   * Microsoft's channel carries both verdict kinds, so the state is modelled
-   * rather than the mere presence of a risk field.
-   *
-   * Measured shape: riskDetail `aiConfirmedSigninSafe` with riskState
-   * `dismissed`. Note the trap Microsoft's own vocabulary sets — system
-   * auto-remediation lands on `dismissed`, so this is a machine assessment
-   * rather than a human waving something away.
-   */
-  | 'MICROSOFT_SAFETY_VERDICT'
-  /**
    * 70044. Microsoft (Conditional Access troubleshooting guidance): the session
    * expired or is invalid due to sign-in frequency checks by Conditional
    * Access. SOURCING CAVEAT: not in the canonical error reference.
@@ -286,9 +236,6 @@ export const SUBJECT_RESOLUTION_FAILURES: readonly UnprocessableReason[] = [
 export const OUT_OF_SCOPE_LABELS: Readonly<Record<OutOfScopeReason, string>> = {
   KEEP_ME_SIGNED_IN: 'Keep-me-signed-in prompt, which Microsoft documents as an expected part of the sign-in flow',
   INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN: 'Existing session was insufficient for silent sign-in, which Microsoft documents as expected',
-  MICROSOFT_RISK_VERDICT: 'Microsoft judged this sign-in risky; shown under Microsoft-reported risk, not as a HawkView finding',
-  MICROSOFT_SAFETY_VERDICT: 'Microsoft assessed this sign-in and judged it safe; shown under Microsoft-reported risk as a dismissal, never as a HawkView finding',
-  MICROSOFT_RISK_REMEDIATED: 'Microsoft judged this sign-in risky and the tenant’s own policy required multi-factor authentication, which the user passed; shown under Microsoft-reported risk as closed',
   SIGN_IN_FREQUENCY_POLICY_EXPIRY: 'A session lapsed under the tenant’s own sign-in-frequency policy, which Microsoft documents as the expected result of configuring one',
   APPLICATION_CONFIGURATION_ERROR: 'The application’s reply address is misconfigured, which Microsoft documents as a fault in the application rather than anything about the user',
   SESSION_INVALIDATED_BY_REMEDIATION: 'A session stopped working because a password was changed or a grant was revoked, which is remediation taking effect rather than a sign-in attempt',

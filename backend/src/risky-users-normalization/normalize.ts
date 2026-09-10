@@ -191,7 +191,7 @@ export function classifyGraphRecord(record: Record<string, unknown>): {
   // observation is ours and classifies on its own terms; the verdict travels
   // separately and never reaches a detector. An unrecognised value is safe to
   // classify normally for exactly that reason.
-  const fromField = riskDetailVerdict(record.riskDetail);
+  const fromField = riskDetailVerdict(record.riskDetail, record.riskState);
   let verdict: MicrosoftVerdict | 'UNRECOGNIZED' | null =
     fromField.kind === 'VERDICT' ? fromField.verdict
       : fromField.kind === 'UNRECOGNIZED' ? 'UNRECOGNIZED'
