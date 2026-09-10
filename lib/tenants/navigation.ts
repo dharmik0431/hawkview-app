@@ -2,6 +2,7 @@ export type TenantRouteSection =
   | 'overview'
   | 'home'
   | 'entra'
+  | 'risky-users'
   | 'exchange'
   | 'teams'
   | 'sharepoint'
@@ -21,7 +22,6 @@ export type TenantRouteSecurityView =
   | 'sign-ins'
   | 'auth'
   | 'locations'
-  | 'identity-risk'
 
 export type TenantRouteState = {
   section: TenantRouteSection
@@ -47,6 +47,8 @@ export function tenantSectionPath(
       return `${root}/office-365/licenses`
     case 'entra':
       return `${root}/entra/overview`
+    case 'risky-users':
+      return `${root}/risky-users`
     case 'exchange':
       return `${root}/exchange`
     case 'sharepoint':
@@ -82,7 +84,6 @@ const securitySegment: Record<TenantRouteSecurityView, string> = {
   'sign-ins': 'sign-ins',
   auth: 'authentication',
   locations: 'named-locations',
-  'identity-risk': 'identity-risk',
 }
 
 export function tenantEntraPath(
@@ -95,6 +96,27 @@ export function tenantEntraPath(
     return `${root}/security/${securitySegment[securityView]}`
   }
   return `${root}/${entraSegment[tab]}`
+}
+
+export const tenantRiskyUsersPath = (tenantId: string) =>
+  `${tenantRoot(tenantId)}/risky-users`
+
+/**
+ * Risky Users was previously at /entra/security/identity-risk, framed as a
+ * Microsoft Entra feature when the analysis is HawkView's own. It now sits at
+ * tenant top level. Existing links keep working by redirecting there.
+ */
+export function legacyRiskyUsersRedirect(
+  pathname: string,
+  tenantId: string
+): string | null {
+  const root = tenantRoot(tenantId)
+  const relative = pathname.startsWith(root)
+    ? pathname.slice(root.length).split('/').filter(Boolean).join('/')
+    : ''
+  return relative === 'entra/security/identity-risk'
+    ? tenantRiskyUsersPath(tenantId)
+    : null
 }
 
 export function parseTenantPath(
@@ -134,7 +156,6 @@ export function parseTenantPath(
       'sign-ins': 'sign-ins',
       authentication: 'auth',
       'named-locations': 'locations',
-      'identity-risk': 'identity-risk',
     }
     const entraTab = tabBySegment[parts[1]] || 'overview'
     const securityView =
@@ -152,6 +173,7 @@ export function parseTenantPath(
 
   const simpleSections: Record<string, TenantRouteSection> = {
     overview: 'overview',
+    'risky-users': 'risky-users',
     exchange: 'exchange',
     sharepoint: 'sharepoint',
     teams: 'teams',

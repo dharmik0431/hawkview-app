@@ -23,6 +23,11 @@ const sectionSource =
   )
 const section = sectionSource.replace(/\s+/g, ' ')
 const hook = readFileSync(`${root}/lib/api/identity-risk-hooks.ts`, 'utf8')
+const navigation = readFileSync(`${root}/lib/tenants/navigation.ts`, 'utf8')
+const blade = readFileSync(
+  `${root}/app/(protected)/tenants/[id]/components/tenant-blade.tsx`,
+  'utf8'
+)
 const presentation = readFileSync(
   `${root}/lib/identity-risk/presentation.ts`,
   'utf8'
@@ -47,9 +52,35 @@ test('identity-risk UI uses one global server exposure policy with an emergency 
     /tenantId|organizationId|subscription|premium|localStorage|sessionStorage/
   )
   assert.doesNotMatch(flagProvider, /process\.env|localStorage|sessionStorage/)
-  assert.match(tenantPage, /identityRiskUi\s*\?\s*\[\{ id: 'identity-risk'/)
-  assert.match(tenantPage, /identityRiskUi && securityView === 'identity-risk'/)
   assert.match(hook, /enabled: enabled && Boolean\(tenantId\)/g)
+
+  // Risky Users now sits at tenant top level rather than four levels down
+  // inside Microsoft Entra. The same server flag is still the single switch
+  // that exposes or hides it.
+  assert.ok(navigation.includes("'risky-users'"))
+  assert.ok(tenantPage.includes("section === 'risky-users'"))
+  assert.ok(
+    tenantPage.includes('<RiskyUsersSection tenantId={resolvedTenantId} />')
+  )
+  assert.ok(
+    tenantPage.includes(
+      "routeState.section === 'risky-users' && !identityRiskUi"
+    )
+  )
+  assert.ok(
+    tenantPage.includes(
+      "hiddenSections={identityRiskUi ? undefined : ['risky-users']}"
+    )
+  )
+  assert.ok(blade.includes("key: 'risky-users', label: 'Risky Users'"))
+
+  // It is no longer framed as a Microsoft Entra feature, and the address it
+  // used to live at redirects instead of dying.
+  assert.ok(!tenantPage.includes("securityView === 'identity-risk'"))
+  assert.ok(navigation.includes('legacyRiskyUsersRedirect'))
+  assert.ok(
+    tenantPage.includes('legacyRiskyUsersRedirect(pathname, resolvedTenantId)')
+  )
 })
 
 test('the UI keeps HawkView and Microsoft evidence visibly separate', () => {

@@ -110,6 +110,9 @@ function user(): RiskAssessmentUser {
   return {
     id: 'opaque.subject.1',
     label: 'Authorized directory identity',
+    displayName: null,
+    userPrincipalName: null,
+    correlation: null,
     subjectType: 'USER',
     priority: 'LOW',
     protection: protection(),
@@ -559,5 +562,55 @@ test('closed drawer renders no subject or finding content', () => {
   const rendered = renderDrawer(null)
   assert.equal(rendered.document.querySelector('[role="dialog"]'), null)
   assert.equal(rendered.text, '')
+  rendered.dom.window.close()
+})
+
+test('containment guidance is conditional, attributed, and does nothing', () => {
+  const rendered = renderDrawer(user())
+  const text = rendered.document.body.textContent ?? ''
+
+  // The requirement is "what do I do", and it is answered.
+  assert.match(text, /Disable the account/)
+  assert.match(text, /Revoke the account/)
+  assert.match(text, /registered MFA methods/)
+  assert.match(text, /consented to/)
+  assert.match(text, /administrative roles/)
+  assert.match(text, /mail forwarding and inbox rules/)
+
+  // The two most commonly missed in real incidents.
+  assert.match(text, /Get-InboxRule -IncludeHidden/)
+  assert.match(text, /Do not send a new password to the user by email/)
+  assert.match(text, /reset twice/)
+  assert.match(text, /App passwords are not revoked/)
+
+  // Conditional throughout: it never tells a technician the account IS
+  // compromised, which is the boundary the whole surface rests on.
+  assert.match(text, /If you confirm this account is compromised/)
+  assert.match(text, /Nothing above establishes compromise/)
+  assert.match(text, /not HawkView recommending that you act/)
+  assert.match(text, /Microsoft.s documented response procedure/)
+  assert.match(text, /HawkView makes no changes to Microsoft/)
+
+  // And nothing here is actionable from HawkView.
+  const panel = rendered.document.querySelector('details:last-of-type')
+  assert.ok(panel)
+  assert.equal(panel!.querySelectorAll('button').length, 0)
+  assert.equal(panel!.querySelectorAll('a').length, 0)
+  assert.equal(panel!.querySelectorAll('form, input').length, 0)
+  rendered.dom.window.close()
+})
+
+test('a mailbox subject gets only the guidance that applies to a mailbox', () => {
+  const mailbox = user()
+  ;(mailbox as { subjectType: string }).subjectType = 'MAILBOX'
+  const rendered = renderDrawer(mailbox as never)
+  const text = rendered.document.body.textContent ?? ''
+
+  assert.match(text, /If you confirm this mailbox has been tampered with/)
+  assert.match(text, /Get-InboxRule -IncludeHidden/)
+  // Account containment does not apply to a mailbox with no proven owner, and
+  // offering it would imply a person this finding has not identified.
+  assert.doesNotMatch(text, /Disable the account/)
+  assert.doesNotMatch(text, /reset twice/)
   rendered.dom.window.close()
 })

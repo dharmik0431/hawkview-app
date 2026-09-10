@@ -151,6 +151,20 @@ export function microsoftRiskyUserCountPresentation(
     }
   }
   const returned = new Set(view.users.map((user) => user.id)).size
+  // A page that returned nothing while reporting more pages cannot be stated
+  // as a bound. "At least 0" is the one reading this product forbids
+  // everywhere else — the assessment adapter refuses a zero lower bound
+  // outright — and it would arrive here as a confident-looking glyph.
+  if (returned === 0 && view.pageInfo?.hasMore) {
+    return {
+      value: '—',
+      accessibleValue: 'Not available',
+      label: 'Microsoft count unavailable',
+      detail:
+        'This page of Microsoft records was empty while Microsoft reported further pages, so no count can be stated. It is not zero.',
+      exact: false,
+    }
+  }
   return {
     value: view.pageInfo?.hasMore
       ? `≥${returned.toLocaleString()}`
@@ -196,6 +210,7 @@ export function benignAlternativeLabel(code: string) {
 const readinessLabels: Record<RiskAssessmentReadiness, string> = {
   READY: 'Ready',
   PARTIAL: 'Partial coverage',
+  INAPPLICABLE: 'Cannot run on this tenant',
   WAITING: 'Waiting for first collection',
   MISSING_PERMISSION: 'Permission required',
   LICENSE_REQUIRED: 'License required',
@@ -415,10 +430,18 @@ function evaluatedRuleScope(
       ? rule.selectedSource === 'MAILBOX_RULES'
       : rule.selectedSource === 'M365_AUDIT_STS' ||
         rule.selectedSource === 'GRAPH_SIGN_INS'
+  // For a rule this client carries metadata for, the published version and
+  // permitted sources are an extra cross-check. A rule it does not recognise
+  // still has to clear every evidence requirement below — a complete, current,
+  // uncapped window over a READY source that assessed identities and matched
+  // none. Those are the facts the claim rests on; whether this client happens
+  // to know the rule's name is not one of them, and requiring it would make
+  // "genuinely clean" unreachable for good the moment the rule set changes.
+  const catalogueConsistent = Object.hasOwn(assessmentRuleVersions, rule.ruleId)
+    ? assessmentRuleVersions[rule.ruleId] === rule.ruleVersion && sourceAllowed
+    : true
   return (
-    Object.hasOwn(assessmentRuleVersions, rule.ruleId) &&
-    assessmentRuleVersions[rule.ruleId] === rule.ruleVersion &&
-    sourceAllowed &&
+    catalogueConsistent &&
     source?.status === 'READY' &&
     source.freshness === 'CURRENT' &&
     evidenceTimestamp(source.lastSuccessfulCollectionAt) !== null &&
@@ -457,26 +480,36 @@ export function riskAssessmentEmptyPresentation(assessment: RiskAssessment) {
       (rule.status === 'READY' || rule.status === 'PARTIAL') &&
       evaluatedRuleScope(assessment, rule)
   )
+  // A check that cannot run on this tenant's evidence is not a coverage
+  // failure — it is a bound on what any result here can claim. It is excluded
+  // from what has to be assessed, and named in the claim instead.
+  const applicable = assessment.rules.filter(
+    (rule) => rule.status !== 'INAPPLICABLE'
+  )
+  const inapplicable = assessment.rules.length - applicable.length
+  const scopeNote = inapplicable
+    ? ` ${inapplicable} further ${inapplicable === 1 ? 'check cannot' : 'checks cannot'} run on this tenant’s evidence, so nothing here covers ${inapplicable === 1 ? 'it' : 'them'}.`
+    : ''
   const completeEvaluation =
     assessment.meta.status === 'AVAILABLE' &&
     assessment.meta.capability === 'FULL' &&
     assessment.meta.freshness === 'CURRENT' &&
     evidenceTimestamp(assessment.meta.evaluatedAt) !== null &&
-    assessment.rules.length === 3 &&
-    new Set(assessment.rules.map((rule) => rule.ruleId)).size === 3 &&
-    assessed.length === 3 &&
+    applicable.length > 0 &&
+    new Set(assessment.rules.map((rule) => rule.ruleId)).size ===
+      assessment.rules.length &&
+    assessed.length === applicable.length &&
     assessed.every((rule) => rule.status === 'READY')
   if (completeEvaluation) {
     return {
       label: 'No findings in evaluated evidence',
-      detail:
-        'All three supported checks assessed identities in complete, current evidence windows and reported no matches. This applies only to these checks and their reported windows; it does not establish that an identity is safe.',
+      detail: `${applicable.length === 1 ? 'The single check this tenant’s evidence supports' : `All ${applicable.length} checks this tenant’s evidence supports`} assessed identities in complete, current evidence windows and reported no matches.${scopeNote} This applies only to those checks and their reported windows; it does not establish that an identity is safe.`,
     }
   }
   if (assessed.length > 0) {
     return {
       label: 'No findings in partially evaluated evidence',
-      detail: `${assessed.length} of 3 supported checks reported evaluated identities without matches. The overall assessment is incomplete or not current; unavailable checks, capped counts, and uncovered windows cannot support a complete no-findings conclusion.`,
+      detail: `${assessed.length} of ${applicable.length} applicable checks evaluated identities without matches.${scopeNote} The overall assessment is incomplete or not current; unavailable checks, capped counts, and uncovered windows cannot support a complete no-findings conclusion.`,
     }
   }
   return {

@@ -58,7 +58,8 @@ function finding(overrides: Record<string, unknown> = {}) {
     confidence: 'HIGH',
     coverage: 'FULL',
     title: 'New identity received a privileged role',
-    explanation: 'A new identity received privilege within the evaluated window.',
+    explanation:
+      'A new identity received privilege within the evaluated window.',
     affectedIdentity: {
       id: 'opaque-identity-1',
       label: 'Reported administrator',
@@ -133,18 +134,35 @@ test('adapts the two channels without merging their records', () => {
 
 test('mailbox provenance and approved forwarding alternative do not alter authoritative Microsoft risk', () => {
   const responses = validResponses()
-  responses.hawkViewFindings.findings = [finding({ ruleIds: ['HV-ID-MBX-001.v1'],
-    sourceLabels: ['Microsoft Graph mailbox-rule snapshot', 'Microsoft Graph verified tenant domains'],
-    benignAlternativeCodes: ['APPROVED_EXTERNAL_FORWARDING'],
-    investigationGuidanceCode: 'REVIEW_MAILBOX_RULE',
-    investigationGuidance: 'Review the mailbox rule and confirm the destination is authorized.',
-    affectedIdentity: { id: 'opaque-mailbox', label: 'Mailbox', type: 'MAILBOX' } })]
+  responses.hawkViewFindings.findings = [
+    finding({
+      ruleIds: ['HV-ID-MBX-001.v1'],
+      sourceLabels: [
+        'Microsoft Graph mailbox-rule snapshot',
+        'Microsoft Graph verified tenant domains',
+      ],
+      benignAlternativeCodes: ['APPROVED_EXTERNAL_FORWARDING'],
+      investigationGuidanceCode: 'REVIEW_MAILBOX_RULE',
+      investigationGuidance:
+        'Review the mailbox rule and confirm the destination is authorized.',
+      affectedIdentity: {
+        id: 'opaque-mailbox',
+        label: 'Mailbox',
+        type: 'MAILBOX',
+      },
+    }),
+  ]
   const view = adaptIdentityRiskResponses(responses)
   assert.equal(view.hawkView.findings?.length, 1)
-  assert.deepEqual(view.hawkView.findings?.[0]?.sourceLabels, ['Microsoft Graph mailbox-rule snapshot', 'Microsoft Graph verified tenant domains'])
+  assert.deepEqual(view.hawkView.findings?.[0]?.sourceLabels, [
+    'Microsoft Graph mailbox-rule snapshot',
+    'Microsoft Graph verified tenant domains',
+  ])
   assert.equal(view.microsoft.users?.[0]?.riskLevel, 'high')
   assert.equal(view.microsoft.users?.[0]?.riskState, 'atRisk')
-  responses.hawkViewFindings.findings = [finding({ sourceLabels: ['Unapproved source'] })]
+  responses.hawkViewFindings.findings = [
+    finding({ sourceLabels: ['Unapproved source'] }),
+  ]
   assert.equal(adaptIdentityRiskResponses(responses).hawkView.findings, null)
 })
 
@@ -231,7 +249,9 @@ test('rejects mixed channels and unknown contract versions', () => {
 test('fails closed when required finding fields or enums are malformed', () => {
   for (const malformedFinding of [
     finding({ title: undefined }),
-    finding({ affectedIdentity: { id: 'opaque', label: 'User', type: 'DEVICE' } }),
+    finding({
+      affectedIdentity: { id: 'opaque', label: 'User', type: 'DEVICE' },
+    }),
     finding({ severity: 'PROBABLE' }),
     finding({ ruleIds: [] }),
     finding({ investigationGuidance: '' }),
@@ -260,7 +280,7 @@ test('does not convert missing channel payloads into empty success', () => {
   assert.equal(view.microsoft.users, null)
 })
 
-test('rejects inherited properties and unknown fields instead of projecting them', () => {
+test('rejects inherited properties instead of projecting them', () => {
   const inherited = validResponses()
   const ownSummary = { ...inherited.hawkViewSummary }
   delete ownSummary.version
@@ -272,26 +292,34 @@ test('rejects inherited properties and unknown fields instead of projecting them
     adaptIdentityRiskResponses(inherited).hawkView.meta.status,
     'NOT_EVALUATED'
   )
+})
 
+test('ignores unknown server fields without projecting them or losing a channel', () => {
+  // Both sides ship from this repository, so the server will run ahead of the
+  // client. A field the client has not learned about yet must not blank a
+  // channel a technician is relying on.
   const unknownEnvelope = validResponses()
   unknownEnvelope.microsoftRiskyUsers = {
     ...unknownEnvelope.microsoftRiskyUsers,
     debugPayload: 'not contracted',
   }
-  assert.equal(
-    adaptIdentityRiskResponses(unknownEnvelope).microsoft.meta.status,
-    'NOT_EVALUATED'
-  )
+  const envelope = adaptIdentityRiskResponses(unknownEnvelope).microsoft
+  assert.equal(envelope.meta.status, 'AVAILABLE')
+  assert.ok(!Object.hasOwn(envelope, 'debugPayload'))
+  assert.ok(!Object.hasOwn(envelope.meta, 'debugPayload'))
 
+  // A HawkView-only field arriving inside a Microsoft record is dropped rather
+  // than rendered. Dropping it is what keeps the two channels unmixed; blanking
+  // Microsoft's channel would instead hide that Microsoft reported at all.
   const crossChannelField = validResponses()
   crossChannelField.microsoftRiskyUsers = {
     ...crossChannelField.microsoftRiskyUsers,
     users: [microsoftUser({ investigationGuidance: 'Review activity.' })],
   }
-  assert.equal(
-    adaptIdentityRiskResponses(crossChannelField).microsoft.meta.status,
-    'ERROR'
-  )
+  const crossChannel = adaptIdentityRiskResponses(crossChannelField).microsoft
+  assert.equal(crossChannel.meta.status, 'AVAILABLE')
+  assert.equal(crossChannel.users?.length, 1)
+  assert.ok(!Object.hasOwn(crossChannel.users![0], 'investigationGuidance'))
 })
 
 test('rejects secret-shaped strings and autonomous instructions', () => {
@@ -312,14 +340,19 @@ test('rejects secret-shaped strings and autonomous instructions', () => {
     finding({ title: 'authorization_code=OAUTHCODESECRET' }),
     finding({ title: 'sig=SIGNATURESECRET' }),
     finding({ title: 'password%3DENCODEDSECRET' }),
-    finding({ investigationGuidance: 'Review and wipe this mailbox immediately.' }),
+    finding({
+      investigationGuidance: 'Review and wipe this mailbox immediately.',
+    }),
   ]) {
     const responses = validResponses()
     responses.hawkViewFindings = {
       ...responses.hawkViewFindings,
       findings: [unsafeFinding],
     }
-    assert.equal(adaptIdentityRiskResponses(responses).hawkView.meta.status, 'ERROR')
+    assert.equal(
+      adaptIdentityRiskResponses(responses).hawkView.meta.status,
+      'ERROR'
+    )
   }
 
   const unsafeLimitation = validResponses()
@@ -350,7 +383,10 @@ test('rejects oversized pages and invalid cursor state', () => {
     findings: new Array(50_000).fill(finding()),
     pageInfo: { hasMore: false, nextCursor: null },
   }
-  assert.equal(adaptIdentityRiskResponses(oversized).hawkView.meta.status, 'ERROR')
+  assert.equal(
+    adaptIdentityRiskResponses(oversized).hawkView.meta.status,
+    'ERROR'
+  )
 
   const unsafeCursor = validResponses()
   unsafeCursor.microsoftRiskyUsers = {
@@ -403,7 +439,10 @@ test('rejects duplicate row identifiers', () => {
     ...responses.hawkViewFindings,
     findings: [finding(), finding()],
   }
-  assert.equal(adaptIdentityRiskResponses(responses).hawkView.meta.status, 'ERROR')
+  assert.equal(
+    adaptIdentityRiskResponses(responses).hawkView.meta.status,
+    'ERROR'
+  )
 })
 
 test('rejects contradictory metadata and future evidence timestamps', () => {
@@ -418,7 +457,10 @@ test('rejects contradictory metadata and future evidence timestamps', () => {
       ...responses.hawkViewFindings,
       ...findingsMeta,
     }
-    assert.equal(adaptIdentityRiskResponses(responses).hawkView.meta.status, 'ERROR')
+    assert.equal(
+      adaptIdentityRiskResponses(responses).hawkView.meta.status,
+      'ERROR'
+    )
   }
 
   const futureEvidence = validResponses()
@@ -458,7 +500,7 @@ test('rejects contradictory metadata and future evidence timestamps', () => {
   assert.equal(errorView.users, null)
 })
 
-test('requires the final actionable contract rather than weakening for the backend foundation', () => {
+test('keeps required finding fields required, and reports their absence as an error', () => {
   const foundation = validResponses()
   const foundationFinding: Record<string, unknown> = finding()
   delete foundationFinding.explanation
@@ -467,16 +509,25 @@ test('requires the final actionable contract rather than weakening for the backe
     mode: 'SHADOW',
     findings: [foundationFinding],
   }
+  // `mode` is an unknown envelope field and is ignored. A finding with no
+  // `explanation` is still refused: tolerating unknown fields does not
+  // tolerate a missing one. The channel reports ERROR rather than
+  // NOT_EVALUATED, because evidence that arrived and could not be read is a
+  // different state from evidence that was never evaluated, and a technician
+  // must be able to tell those two apart.
   assert.equal(
     adaptIdentityRiskResponses(foundation).hawkView.meta.status,
-    'NOT_EVALUATED'
+    'ERROR'
   )
 })
 
 test('accepts the final engine and catalog versions and rejects version drift', () => {
   const valid = adaptIdentityRiskResponses(validResponses())
   assert.equal(valid.hawkView.meta.engineVersion, 'hawkview-identity-engine/1')
-  assert.equal(valid.hawkView.meta.catalogVersion, 'hawkview-identity-signals/v1')
+  assert.equal(
+    valid.hawkView.meta.catalogVersion,
+    'hawkview-identity-signals/v1'
+  )
   assert.equal(
     valid.microsoft.meta.catalogVersion,
     'microsoft-entra-risky-users/v1'
@@ -652,7 +703,10 @@ test('rejects evaluation envelopes beyond the independent current-time ceiling',
   assert.equal(rejectedHawkView.meta.status, 'ERROR')
   assert.equal(rejectedHawkView.counts, null)
   assert.match(rejectedHawkView.meta.limitation ?? '', /in the future/)
-  assert.match(rejectedHawkView.meta.limitation ?? '', /must not be treated as current/)
+  assert.match(
+    rejectedHawkView.meta.limitation ?? '',
+    /must not be treated as current/
+  )
 
   const microsoft = validResponses()
   microsoft.microsoftRiskyUsers = {

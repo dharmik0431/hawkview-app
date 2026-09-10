@@ -172,7 +172,7 @@ test('accepts server-resolved exact GUID mailbox rollup under a USER without wea
   assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
 })
 
-test('rejects malformed provenance, future event evidence, unknown fields and unsupported schema', () => {
+test('rejects malformed provenance, future event evidence and unsupported schema', () => {
   for (const mutate of [
     (v: any) => {
       v.users[0].protection.legacyPerUserMfa = 'ENFORCED'
@@ -183,16 +183,195 @@ test('rejects malformed provenance, future event evidence, unknown fields and un
     (v: any) => {
       v.schemaVersion = 'future/v2'
     },
+  ]) {
+    const value = assessmentFixture(true)
+    mutate(value)
+    assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
+  }
+})
+
+test('tolerates unknown fields at every level without projecting them', () => {
+  // The backend and this client ship from the same repository and there is no
+  // external consumer, so the server adding a field must never cost the
+  // technician the whole assessment. Unknown fields are ignored, and because
+  // every adapter names the fields it reads, none of them can reach the screen.
+  const root = assessmentFixture(true)
+  root.rawEvent = {}
+  root.evaluationTrace = ['ignored']
+  const adaptedRoot = adaptRiskAssessmentResponse(root, assessmentNow)
+  assert.ok(adaptedRoot)
+  assert.ok(!Object.hasOwn(adaptedRoot!, 'rawEvent'))
+  assert.ok(!Object.hasOwn(adaptedRoot!, 'evaluationTrace'))
+
+  const nested = assessmentFixture(true)
+  nested.meta.experimentArm = 'B'
+  nested.sources[0].collectorBuild = 'abc123'
+  nested.rules[0].debugCounters = { skipped: 4 }
+  nested.users[0].tenantHint = 'ignored'
+  nested.users[0].findings[0].rawScore = 0.91
+  nested.users[0].protection.experimentalSignal = 'ignored'
+  const adaptedNested = adaptRiskAssessmentResponse(nested, assessmentNow)
+  assert.ok(adaptedNested)
+  assert.ok(!Object.hasOwn(adaptedNested!.meta, 'experimentArm'))
+  assert.ok(!Object.hasOwn(adaptedNested!.sources[0], 'collectorBuild'))
+  assert.ok(!Object.hasOwn(adaptedNested!.rules[0], 'debugCounters'))
+  assert.ok(!Object.hasOwn(adaptedNested!.users[0], 'tenantHint'))
+  assert.ok(!Object.hasOwn(adaptedNested!.users[0].findings[0], 'rawScore'))
+  assert.ok(
+    !Object.hasOwn(adaptedNested!.users[0].protection, 'experimentalSignal')
+  )
+
+  const summary = assessmentFixture(true)
+  summary.summary.extra = true
+  summary.summary.currentUsers.derivation = 'ignored'
+  const adaptedSummary = adaptRiskAssessmentResponse(summary, assessmentNow)
+  assert.ok(adaptedSummary)
+  assert.ok(!Object.hasOwn(adaptedSummary!.summary!, 'extra'))
+  assert.ok(!Object.hasOwn(adaptedSummary!.summary!.currentUsers, 'derivation'))
+  // The tolerated fields changed nothing about what the count claims.
+  assert.equal(adaptedSummary!.summary!.currentUsers.accuracy, 'EXACT')
+})
+
+test('still requires every contracted field to be present', () => {
+  // Tolerating an unknown field is not the same as tolerating a missing one.
+  for (const mutate of [
+    (v: any) => delete v.meta,
+    (v: any) => delete v.rules,
+    (v: any) => delete v.page,
+    (v: any) => delete v.meta.freshness,
+    (v: any) => delete v.sources[0].window,
+    (v: any) => delete v.users[0].findings[0].explanation,
+    (v: any) => delete v.summary.currentUsers.accuracy,
+  ]) {
+    const value = assessmentFixture(true)
+    mutate(value)
+    assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
+  }
+})
+
+function unknownRule(overrides: Record<string, unknown> = {}) {
+  return {
+    ruleId: 'HV-ID-NEW-042.v1',
+    ruleVersion: 'v1',
+    title: 'A check this client has no metadata for',
+    status: 'READY',
+    reasonCode: 'READY',
+    explanation: 'This check evaluated its reported evidence window.',
+    selectedSource: 'GRAPH_SIGN_INS',
+    window: { start: at(-15), end: at() },
+    evaluatedAt: at(),
+    assessedIdentities: 2,
+    matchedIdentities: 0,
+    countsCapped: false,
+    ...overrides,
+  }
+}
+
+test('accepts a rule the client carries no metadata for', () => {
+  // The backend rule catalogue changes on its own schedule. A new check must
+  // not cost the technician the rest of the assessment.
+  const value = assessmentFixture(true)
+  value.rules.push(unknownRule())
+  const adapted = adaptRiskAssessmentResponse(value, assessmentNow)
+  assert.ok(adapted)
+  assert.equal(adapted!.rules.length, 4)
+  const added = adapted!.rules.find(
+    (rule) => rule.ruleId === 'HV-ID-NEW-042.v1'
+  )
+  assert.ok(added)
+  assert.equal(added!.title, 'A check this client has no metadata for')
+  assert.equal(added!.status, 'READY')
+
+  // A shorter reported rule set is equally acceptable.
+  const fewer = assessmentFixture(false)
+  fewer.rules.pop()
+  assert.ok(adaptRiskAssessmentResponse(fewer, assessmentNow))
+})
+
+test('never drops a finding because it cites an unrecognised rule', () => {
+  // Losing a finding is the worst outcome this surface has: it is an
+  // investigation lead disappearing with no trace that it existed.
+  const value = assessmentFixture(true)
+  value.rules.push(unknownRule({ matchedIdentities: 1 }))
+  value.users[0].findings[0].ruleId = 'HV-ID-NEW-042.v1'
+  value.users[0].findings[0].ruleVersion = 'v1'
+  value.users[0].findings[0].selectedSource = 'GRAPH_SIGN_INS'
+  const adapted = adaptRiskAssessmentResponse(value, assessmentNow)
+  assert.ok(adapted)
+  assert.equal(adapted!.users[0].findings.length, 1)
+  assert.equal(adapted!.users[0].findings[0].ruleId, 'HV-ID-NEW-042.v1')
+})
+
+test('holds a rule the client does know to its published metadata', () => {
+  for (const mutate of [
     (v: any) => {
-      v.rawEvent = {}
+      v.rules[0].ruleVersion = 'v9'
     },
     (v: any) => {
-      v.rules.pop()
+      v.rules[2].selectedSource = 'GRAPH_SIGN_INS'
+    },
+    (v: any) => {
+      v.users[0].findings[0].priority = 'HIGH'
     },
   ]) {
     const value = assessmentFixture(true)
     mutate(value)
     assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
+  }
+})
+
+test('still rejects a malformed rule identifier', () => {
+  for (const ruleId of [
+    'not a rule id',
+    'HV-ID-NEW-042',
+    'hv-id-new-042.v1',
+    '<script>.v1',
+    `${'H'.repeat(80)}.v1`,
+    '',
+    null,
+    42,
+  ]) {
+    const value = assessmentFixture(false)
+    value.rules[0].ruleId = ruleId
+    assert.equal(
+      adaptRiskAssessmentResponse(value, assessmentNow),
+      null,
+      String(ruleId)
+    )
+  }
+})
+
+test('an unrecognised rule clears the same evidence bar before it counts as clean', () => {
+  const clean = assessmentFixture(false)
+  clean.rules.push(unknownRule())
+  const adapted = adaptRiskAssessmentResponse(clean, assessmentNow)
+  assert.ok(adapted)
+  const presentation = riskAssessmentEmptyPresentation(adapted!)
+  assert.equal(presentation?.label, 'No findings in evaluated evidence')
+  // The copy states what was actually evaluated rather than a fixed number.
+  assert.match(presentation!.detail, /All 4 checks this tenant/)
+
+  // The same unknown rule without a complete evaluated scope withdraws the
+  // clean claim for the whole assessment, exactly as a known rule would. The
+  // optional summary is dropped here because an incomplete check also forces
+  // capability down to PARTIAL, which an EXACT tenant count would contradict.
+  for (const overrides of [
+    { status: 'PARTIAL', reasonCode: 'INCOMPLETE_WINDOW' },
+    { assessedIdentities: 0 },
+    { countsCapped: true },
+    { evaluatedAt: null },
+    { selectedSource: null },
+  ]) {
+    const degraded = assessmentFixture(false)
+    delete degraded.summary
+    degraded.rules.push(unknownRule(overrides))
+    const view = adaptRiskAssessmentResponse(degraded, assessmentNow)
+    assert.ok(view, JSON.stringify(overrides))
+    assert.notEqual(
+      riskAssessmentEmptyPresentation(view!)?.label,
+      'No findings in evaluated evidence',
+      JSON.stringify(overrides)
+    )
   }
 })
 
@@ -304,12 +483,6 @@ test('rejects malformed or contradictory tenant count summaries', () => {
     currentUsers = { value: 1, accuracy: 'EXACT' }
   }
   const malformed = [
-    {
-      scope: 'TENANT',
-      asOf: at(),
-      currentUsers: { value: 1, accuracy: 'EXACT' },
-      extra: true,
-    },
     new UnsafeSummary(),
     {
       scope: 'WORKSPACE',

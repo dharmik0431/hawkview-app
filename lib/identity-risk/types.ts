@@ -10,6 +10,23 @@ export type IdentityRiskChannelStatus =
 
 export type IdentityRiskFreshness = 'CURRENT' | 'STALE' | 'UNKNOWN'
 
+/**
+ * Why a channel is not reporting. `limitation` carries the server's prose; this
+ * is the machine-readable cause the UI needs in order to say something specific
+ * and actionable instead of "unavailable".
+ *
+ * Optional on the wire. A server that does not send it yields null, and the UI
+ * says it does not know the reason rather than guessing one.
+ */
+export type IdentityRiskChannelReason =
+  | 'LICENSE_REQUIRED'
+  | 'MISSING_PERMISSION'
+  | 'WAITING_FOR_COLLECTION'
+  | 'COLLECTION_FAILED'
+  | 'COLLECTION_STALE'
+  | 'SOURCE_UNAVAILABLE'
+  | 'EVALUATION_DISABLED'
+
 export type IdentityRiskChannelMeta = {
   capability: IdentityRiskCapability
   status: IdentityRiskChannelStatus
@@ -20,6 +37,7 @@ export type IdentityRiskChannelMeta = {
   evaluatedAt: string | null
   observedAt: string | null
   limitation: string | null
+  reasonCode: IdentityRiskChannelReason | null
 }
 
 export type HawkViewIdentityFinding = {
@@ -44,9 +62,34 @@ export type HawkViewIdentityFinding = {
   investigationGuidance: string
 }
 
+/**
+ * The key that makes it possible to say whether HawkView and Microsoft reported
+ * the same person. Both channels supply one; a match requires the same shape on
+ * both sides and identical refs, because the ref may be wrapped and a wrapped
+ * value only matches another wrapped identically.
+ *
+ * The shape varies by tenant: Graph tenants carry a directory object GUID,
+ * audit-fallback tenants have no GUID at all and resolve by user principal
+ * name. A join that assumed GUIDs would silently return nothing on most of the
+ * estate, so nothing here compares refs across shapes.
+ *
+ * `available: false` is a statement about capability, not a failure — it
+ * carries the reason, so the row can say "Microsoft's channel requires Entra ID
+ * P2" rather than shrugging.
+ */
+export type CorrelationRef =
+  | {
+      available: true
+      shape: 'DIRECTORY_OBJECT_ID' | 'USER_PRINCIPAL_NAME'
+      ref: string
+    }
+  | { available: false; because: string }
+
 export type MicrosoftEntraRiskyUser = {
   id: string
   identityLabel: string
+  /** Optional on the wire; null from a server that does not send one. */
+  correlation: CorrelationRef | null
   riskLevel:
     | 'none'
     | 'low'
@@ -132,7 +175,15 @@ export const RISK_ASSESSMENT_RULE_TUPLES = {
   },
 } as const
 
+/** A rule the client carries published metadata for. */
 export type RiskAssessmentRuleId = (typeof RISK_ASSESSMENT_RULE_IDS)[number]
+
+/**
+ * A rule identifier as reported by the server. Server rule catalogues change on
+ * their own schedule, so this is any well-formed identifier, not only the ones
+ * this client knows. Nothing treats an unrecognised rule as evaluated.
+ */
+export type ReportedRuleId = RiskAssessmentRuleId | (string & {})
 export type RiskAssessmentSource =
   | 'M365_AUDIT_STS'
   | 'GRAPH_SIGN_INS'
@@ -140,6 +191,16 @@ export type RiskAssessmentSource =
 export type RiskAssessmentReadiness =
   | 'READY'
   | 'PARTIAL'
+  /**
+   * The check cannot run on this tenant's evidence at all — the audit-log
+   * fallback carries no conditional-access status, device detail or risk
+   * fields, so some checks have nothing to execute against.
+   *
+   * This is not incomplete evidence and not a failure. It bounds what any
+   * result from this tenant can claim, so it travels with the count as scope
+   * rather than being reported as a gap in collection.
+   */
+  | 'INAPPLICABLE'
   | 'WAITING'
   | 'MISSING_PERMISSION'
   | 'LICENSE_REQUIRED'
@@ -176,6 +237,12 @@ export type RiskAssessmentReason =
   | 'RULE_VALIDATION_UNATTESTABLE'
   | 'SOURCE_NOT_ATTESTED'
   | 'ATTESTED_COMPLETE'
+  /** The tenant's evidence does not carry the fields this check needs. */
+  | 'CHECK_NOT_APPLICABLE'
+  /** Findings exist but cannot be attributed to a person. */
+  | 'UNRESOLVED_SUBJECT_IDENTITY'
+  /** Evidence carries codes or events outside HawkView's vocabulary. */
+  | 'UNINTERPRETABLE_EVIDENCE'
 
 export type RiskEvidenceWindow = {
   start: string | null
@@ -195,7 +262,7 @@ export type RiskSourceReadiness = {
 }
 
 export type RiskRuleReadiness = {
-  ruleId: RiskAssessmentRuleId
+  ruleId: ReportedRuleId
   ruleVersion: string
   title: string
   status: RiskAssessmentReadiness
@@ -266,7 +333,7 @@ export type RiskRecommendedAction = {
 
 export type RiskAssessmentFinding = {
   id: string
-  ruleId: RiskAssessmentRuleId
+  ruleId: ReportedRuleId
   ruleVersion: string
   priority: 'LOW' | 'MEDIUM' | 'HIGH'
   confidence: 'LOW' | 'MEDIUM' | 'HIGH'
@@ -304,6 +371,14 @@ export type RiskAssessmentFinding = {
 export type RiskAssessmentUser = {
   id: string
   label: string
+  /**
+   * Resolved at read time for authorised callers and never persisted in the
+   * finding row. Null when the server does not supply it, in which case the
+   * list shows the opaque reference rather than inventing an identity.
+   */
+  displayName: string | null
+  userPrincipalName: string | null
+  correlation: CorrelationRef | null
   subjectType: 'USER' | 'MAILBOX'
   priority: 'LOW' | 'MEDIUM' | 'HIGH' | null
   protection: RiskProtection
@@ -312,12 +387,39 @@ export type RiskAssessmentUser = {
 
 export type RiskAssessmentCountAccuracy = 'EXACT' | 'AT_LEAST' | 'UNKNOWN'
 
+/**
+ * Why an exact tenant total was not claimed. Optional on the wire; a server
+ * that omits it yields null, and the UI says the cause was not reported rather
+ * than inventing one. These must never be collapsed into a single generic
+ * string: "we could not confirm whether these mailboxes belong to people" and
+ * "we could not interpret some sign-in events" send a technician to different
+ * places.
+ */
+export type RiskAssessmentCountReason =
+  | 'UNRESOLVED_SUBJECT_IDENTITY'
+  | 'UNINTERPRETABLE_EVIDENCE'
+  | 'CAPACITY_LIMIT'
+  | 'INCOMPLETE_WINDOW'
+  | 'COLLECTION_STALE'
+  | 'SOURCE_UNAVAILABLE'
+
 export type RiskAssessmentSummary = {
   scope: 'TENANT'
   asOf: string | null
   currentUsers: {
     value: number | null
     accuracy: RiskAssessmentCountAccuracy
+    /**
+     * Every reason the exact claim was withheld, not the first one. Several can
+     * hold at once — unresolved mailbox bindings and uninterpretable sign-in
+     * codes are independent problems and a tenant can have both. Rendering one
+     * of four reads as "this is the reason", which is the same defect as
+     * rendering one true sentence where another belongs.
+     *
+     * Empty means no reason was reported, which the UI admits rather than
+     * filling in.
+     */
+    reasons: RiskAssessmentCountReason[]
   }
 }
 

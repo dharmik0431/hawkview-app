@@ -4,6 +4,9 @@ import type {
   HawkViewIdentitySignalsView,
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
+  CorrelationRef,
+  RiskAssessmentCountReason,
+  IdentityRiskChannelReason,
   IdentityRiskChannelStatus,
   IdentityRiskFreshness,
   IdentityRiskPageInfo,
@@ -38,6 +41,15 @@ const statuses = [
   'ERROR',
 ] as const
 const freshnessValues = ['CURRENT', 'STALE', 'UNKNOWN'] as const
+const channelReasons = [
+  'LICENSE_REQUIRED',
+  'MISSING_PERMISSION',
+  'WAITING_FOR_COLLECTION',
+  'COLLECTION_FAILED',
+  'COLLECTION_STALE',
+  'SOURCE_UNAVAILABLE',
+  'EVALUATION_DISABLED',
+] as const
 const MAX_PAGE_SIZE = 100
 const MAX_SUMMARY_COUNT = 10_000
 const MAX_ASSESSMENT_COUNT = 1_000_000
@@ -53,6 +65,37 @@ const assessmentRuleIds = [
   'HV-ID-AUTH-005.v2',
   'HV-ID-MBX-001.v1',
 ] as const
+
+const MAX_REPORTED_RULES = 64
+/** Widest activity-window tolerance in the known catalogue. */
+const DEFAULT_ACTIVITY_WINDOW_TOLERANCE_MS = 36 * 60 * 60_000
+const RULE_ID_PATTERN = /^[A-Z0-9]+(?:-[A-Z0-9]+)*.v[0-9]{1,3}$/
+
+/**
+ * The client keeps a catalogue of the rules it knows, and holds those to their
+ * published version, priority, evidence sources and activity-window tolerance.
+ *
+ * A rule the client does not know is accepted on generic validation rather than
+ * discarding the assessment. Backend rule catalogues change on their own
+ * schedule, and a technician losing every finding in a tenant because one new
+ * check appeared is a far worse failure than showing that check without the
+ * client's own metadata for it.
+ *
+ * An unrecognised rule is still held to every evidence requirement that a known
+ * one is — see evaluatedRuleScope in presentation.ts. What it loses is only the
+ * client-side cross-check that the rule's version and evidence sources match
+ * this table, which detects a stale table rather than bad evidence.
+ */
+function knownRule(ruleId: string) {
+  return Object.hasOwn(RISK_ASSESSMENT_RULE_TUPLES, ruleId)
+    ? RISK_ASSESSMENT_RULE_TUPLES[ruleId as RiskAssessmentRuleId]
+    : null
+}
+
+function reportedRuleId(value: unknown): string | null {
+  const ruleId = boundedString(value, 64)
+  return ruleId && RULE_ID_PATTERN.test(ruleId) ? ruleId : null
+}
 const assessmentSources = [
   'M365_AUDIT_STS',
   'GRAPH_SIGN_INS',
@@ -61,6 +104,7 @@ const assessmentSources = [
 const assessmentReadiness = [
   'READY',
   'PARTIAL',
+  'INAPPLICABLE',
   'WAITING',
   'MISSING_PERMISSION',
   'LICENSE_REQUIRED',
@@ -98,6 +142,17 @@ const assessmentReasons = [
   'RULE_VALIDATION_UNATTESTABLE',
   'SOURCE_NOT_ATTESTED',
   'ATTESTED_COMPLETE',
+  'CHECK_NOT_APPLICABLE',
+  'UNRESOLVED_SUBJECT_IDENTITY',
+  'UNINTERPRETABLE_EVIDENCE',
+] as const
+const assessmentCountReasons = [
+  'UNRESOLVED_SUBJECT_IDENTITY',
+  'UNINTERPRETABLE_EVIDENCE',
+  'CAPACITY_LIMIT',
+  'INCOMPLETE_WINDOW',
+  'COLLECTION_STALE',
+  'SOURCE_UNAVAILABLE',
 ] as const
 const recommendationCodes = [
   'CONFIRM_EXPECTED_ACTIVITY',
@@ -184,6 +239,30 @@ const microsoftRiskDetailCatalog = new Set([
 
 type RecordValue = Record<string, unknown>
 
+/**
+ * Optional on the wire. A server that does not send one yields null, which the
+ * view treats as "cannot be compared" rather than as "Microsoft found nothing".
+ * An unavailable ref still carries its reason, so a row can state a capability
+ * rather than shrug.
+ */
+function adaptCorrelation(value: unknown): CorrelationRef | null | undefined {
+  if (value === undefined || value === null) return null
+  const source = record(value)
+  if (!source || typeof source.available !== 'boolean') return undefined
+  if (source.available === false) {
+    if (!hasKeys(source, ['available', 'because'])) return undefined
+    const because = boundedString(source.because, 300)
+    return because ? { available: false, because } : undefined
+  }
+  if (!hasKeys(source, ['available', 'shape', 'ref'])) return undefined
+  const shape = enumValue(source.shape, [
+    'DIRECTORY_OBJECT_ID',
+    'USER_PRINCIPAL_NAME',
+  ] as const)
+  const ref = boundedString(source.ref, 320)
+  return shape && ref ? { available: true, shape, ref } : undefined
+}
+
 function record(value: unknown): RecordValue | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value))
     return null
@@ -193,12 +272,22 @@ function record(value: unknown): RecordValue | null {
     : null
 }
 
-function exactKeys(value: RecordValue, keys: readonly string[]) {
-  const actual = Object.keys(value)
-  return (
-    actual.length === keys.length &&
-    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
-  )
+/**
+ * Required-key check: every listed key must be present, and any additional key
+ * the server sends is ignored.
+ *
+ * Unknown fields are safe to ignore here because every adapter below builds its
+ * result from explicitly named fields — nothing is spread or passed through, so
+ * an unrecognised field cannot reach the view model or the screen.
+ *
+ * This replaces an exact-key check that rejected the entire response whenever a
+ * single unrecognised field appeared. That made the wire format unchangeable
+ * while both sides ship from this repository, and a rejected response reached
+ * the technician as an unevaluated tenant — the state collapse this surface
+ * exists to prevent.
+ */
+function hasKeys(value: RecordValue, keys: readonly string[]) {
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
 }
 
 function containsSecret(value: string) {
@@ -320,7 +409,8 @@ function catalogList(
 
 function fallbackMeta(
   status: IdentityRiskChannelStatus,
-  limitation: string
+  limitation: string,
+  reasonCode: IdentityRiskChannelReason | null = null
 ): IdentityRiskChannelMeta {
   return {
     capability: 'UNAVAILABLE',
@@ -332,6 +422,7 @@ function fallbackMeta(
     evaluatedAt: null,
     observedAt: null,
     limitation,
+    reasonCode,
   }
 }
 
@@ -355,6 +446,12 @@ function adaptMeta(
       : observedDateTime(value.observedAt, evaluatedAt, trustedCurrentTimeMs)
   const limitation =
     value.limitation === null ? null : boundedString(value.limitation, 500)
+  // Optional, and additive. Absent means the cause was not reported, which the
+  // UI states plainly rather than inventing a cause for.
+  const reasonCode =
+    value.reasonCode === undefined || value.reasonCode === null
+      ? null
+      : enumValue(value.reasonCode, channelReasons)
 
   if (
     !capability ||
@@ -371,7 +468,8 @@ function adaptMeta(
         trustedCurrentTimeMs + MAX_FUTURE_SKEW_MS) ||
     (value.evaluatedAt !== null && !evaluatedAt) ||
     (value.observedAt !== null && !observedAt) ||
-    (value.limitation !== null && !limitation)
+    (value.limitation !== null && !limitation) ||
+    (value.reasonCode !== undefined && value.reasonCode !== null && !reasonCode)
   ) {
     return null
   }
@@ -418,6 +516,7 @@ function adaptMeta(
     evaluatedAt,
     observedAt,
     limitation,
+    reasonCode,
   }
 }
 
@@ -434,13 +533,14 @@ function sameMeta(
     left.catalogVersion === right.catalogVersion &&
     left.evaluatedAt === right.evaluatedAt &&
     left.observedAt === right.observedAt &&
-    left.limitation === right.limitation
+    left.limitation === right.limitation &&
+    left.reasonCode === right.reasonCode
   )
 }
 
 function adaptPageInfo(value: unknown): IdentityRiskPageInfo | null {
   const source = record(value)
-  if (!source || !exactKeys(source, ['hasMore', 'nextCursor'])) return null
+  if (!source || !hasKeys(source, ['hasMore', 'nextCursor'])) return null
   if (typeof source.hasMore !== 'boolean') return null
   const nextCursor =
     source.nextCursor === null ? null : boundedString(source.nextCursor, 256)
@@ -457,7 +557,7 @@ function adaptPageInfo(value: unknown): IdentityRiskPageInfo | null {
 
 function adaptBoundedCount(value: unknown) {
   const source = record(value)
-  if (!source || !exactKeys(source, ['value', 'exact', 'capped'])) return null
+  if (!source || !hasKeys(source, ['value', 'exact', 'capped'])) return null
   if (
     !Number.isSafeInteger(source.value) ||
     (source.value as number) < 0 ||
@@ -488,7 +588,7 @@ function adaptCounts(value: unknown): HawkViewIdentityRiskCounts | null {
     'notMatchedResults',
     'notEvaluatedResults',
   ] as const
-  if (!source || !exactKeys(source, keys)) return null
+  if (!source || !hasKeys(source, keys)) return null
 
   const counts = Object.fromEntries(
     keys.map((key) => [key, adaptBoundedCount(source[key])])
@@ -531,7 +631,7 @@ function adaptFinding(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'id',
       'state',
       'severity',
@@ -575,7 +675,7 @@ function adaptFinding(
   const affectedIdentitySource = record(source.affectedIdentity)
   if (
     !affectedIdentitySource ||
-    !exactKeys(affectedIdentitySource, ['id', 'label', 'type'])
+    !hasKeys(affectedIdentitySource, ['id', 'label', 'type'])
   ) {
     return null
   }
@@ -679,7 +779,7 @@ function adaptMicrosoftUser(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'id',
       'identityLabel',
       'riskLevel',
@@ -734,7 +834,18 @@ function adaptMicrosoftUser(
     return null
   }
 
-  return { id, identityLabel, riskLevel, riskState, riskDetail, observedAt }
+  const correlation = adaptCorrelation(source.correlation)
+  if (correlation === undefined) return null
+
+  return {
+    id,
+    identityLabel,
+    correlation,
+    riskLevel,
+    riskState,
+    riskDetail,
+    observedAt,
+  }
 }
 
 export function unavailableHawkViewIdentitySignals(
@@ -752,11 +863,12 @@ export function unavailableHawkViewIdentitySignals(
 
 export function unavailableMicrosoftEntraRiskyUsers(
   status: IdentityRiskChannelStatus,
-  limitation: string
+  limitation: string,
+  reasonCode: IdentityRiskChannelReason | null = null
 ): MicrosoftEntraRiskyUsersView {
   return {
     channel: 'MICROSOFT_ENTRA_RISKY_USERS',
-    meta: fallbackMeta(status, limitation),
+    meta: fallbackMeta(status, limitation, reasonCode),
     users: null,
     pageInfo: null,
   }
@@ -781,7 +893,7 @@ export function adaptIdentityRiskResponses(input: {
   if (
     summary?.version === 1 &&
     summary.channel === 'HAWKVIEW_IDENTITY_SIGNALS' &&
-    exactKeys(summary, [
+    hasKeys(summary, [
       'version',
       'channel',
       'engineVersion',
@@ -797,7 +909,7 @@ export function adaptIdentityRiskResponses(input: {
     ]) &&
     findingEnvelope?.version === 1 &&
     findingEnvelope.channel === 'HAWKVIEW_IDENTITY_SIGNALS' &&
-    exactKeys(findingEnvelope, [
+    hasKeys(findingEnvelope, [
       'version',
       'channel',
       'engineVersion',
@@ -874,7 +986,7 @@ export function adaptIdentityRiskResponses(input: {
   if (
     microsoftEnvelope?.version === 1 &&
     microsoftEnvelope.channel === 'MICROSOFT_ENTRA_RISKY_USERS' &&
-    exactKeys(microsoftEnvelope, [
+    hasKeys(microsoftEnvelope, [
       'version',
       'channel',
       'engineVersion',
@@ -973,7 +1085,7 @@ function adaptEvidenceWindow(
   trustedCurrentTimeMs: number
 ): RiskEvidenceWindow | null {
   const source = record(value)
-  if (!source || !exactKeys(source, ['start', 'end'])) return null
+  if (!source || !hasKeys(source, ['start', 'end'])) return null
   const start = nullableDateTime(source.start, trustedCurrentTimeMs)
   const end = nullableDateTime(source.end, trustedCurrentTimeMs)
   if (
@@ -1013,7 +1125,7 @@ function adaptSourceReadiness(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'source',
       'status',
       'reasonCode',
@@ -1087,7 +1199,7 @@ function adaptRuleReadiness(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'ruleId',
       'ruleVersion',
       'title',
@@ -1104,7 +1216,8 @@ function adaptRuleReadiness(
   ) {
     return null
   }
-  const ruleId = enumValue(source.ruleId, assessmentRuleIds)
+  const ruleId = reportedRuleId(source.ruleId)
+  const catalogued = ruleId ? knownRule(ruleId) : null
   const ruleVersion = boundedString(source.ruleVersion, 40)
   const title = assessmentText(source.title, 180)
   const status = enumValue(source.status, assessmentReadiness)
@@ -1121,16 +1234,15 @@ function adaptRuleReadiness(
   if (
     !ruleId ||
     !ruleVersion ||
-    ruleVersion !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].version ||
+    (catalogued && ruleVersion !== catalogued.version) ||
     !title ||
     !status ||
     !reasonCode ||
     !explanation ||
     (source.selectedSource !== null && !selectedSource) ||
-    (selectedSource !== null &&
-      !(
-        RISK_ASSESSMENT_RULE_TUPLES[ruleId].sources as readonly string[]
-      ).includes(selectedSource)) ||
+    (catalogued &&
+      selectedSource !== null &&
+      !(catalogued.sources as readonly string[]).includes(selectedSource)) ||
     !window ||
     evaluatedAt === undefined ||
     assessedIdentities === undefined ||
@@ -1164,7 +1276,7 @@ function adaptConditionalAccessPolicy(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, ['id', 'name', 'state', 'outcome', 'materialConditions'])
+    !hasKeys(source, ['id', 'name', 'state', 'outcome', 'materialConditions'])
   ) {
     return null
   }
@@ -1205,7 +1317,7 @@ function adaptProtection(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'conditionalAccess',
       'securityDefaults',
       'legacyPerUserMfa',
@@ -1217,7 +1329,7 @@ function adaptProtection(
   const conditionalAccess = record(source.conditionalAccess)
   if (
     !conditionalAccess ||
-    !exactKeys(conditionalAccess, [
+    !hasKeys(conditionalAccess, [
       'contractVersion',
       'status',
       'policies',
@@ -1315,13 +1427,7 @@ function adaptProtectionEvidence<const State extends string>(
   const item = record(value)
   if (
     !item ||
-    !exactKeys(item, [
-      'state',
-      'source',
-      'observedAt',
-      'freshness',
-      'reasonCode',
-    ])
+    !hasKeys(item, ['state', 'source', 'observedAt', 'freshness', 'reasonCode'])
   )
     return null
   const state = enumValue(item.state, [...states, 'UNKNOWN'] as const)
@@ -1353,7 +1459,7 @@ function adaptProtectionEvidence<const State extends string>(
 
 function adaptRecommendedAction(value: unknown): RiskRecommendedAction | null {
   const source = record(value)
-  if (!source || !exactKeys(source, ['code', 'text'])) return null
+  if (!source || !hasKeys(source, ['code', 'text'])) return null
   const code = enumValue(source.code, recommendationCodes)
   const text = boundedString(source.text, 400)
   return code && text ? { code, text } : null
@@ -1366,7 +1472,7 @@ function adaptAssessmentFinding(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'id',
       'ruleId',
       'ruleVersion',
@@ -1394,7 +1500,8 @@ function adaptAssessmentFinding(
   )
     return null
   const id = boundedString(source.id, 200)
-  const ruleId = enumValue(source.ruleId, assessmentRuleIds)
+  const ruleId = reportedRuleId(source.ruleId)
+  const catalogued = ruleId ? knownRule(ruleId) : null
   const ruleVersion = boundedString(source.ruleVersion, 40)
   const priority = enumValue(source.priority, [
     'LOW',
@@ -1445,7 +1552,7 @@ function adaptAssessmentFinding(
     Array.isArray(rawReferences) && rawReferences.length <= 50
       ? rawReferences.map((reference) => {
           const item = record(reference)
-          if (!item || !exactKeys(item, ['id', 'recordedAt', 'ingestedAt']))
+          if (!item || !hasKeys(item, ['id', 'recordedAt', 'ingestedAt']))
             return null
           const referenceId = boundedString(item.id, 160)
           const recordedAt = nullableDateTime(
@@ -1482,9 +1589,9 @@ function adaptAssessmentFinding(
     !/^hvr1_contribution_[a-f0-9]{64}$/.test(id) ||
     !ruleId ||
     !ruleVersion ||
-    ruleVersion !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].version ||
+    (catalogued && ruleVersion !== catalogued.version) ||
     !priority ||
-    priority !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].priority ||
+    (catalogued && priority !== catalogued.priority) ||
     !confidence ||
     !activityState ||
     !title ||
@@ -1499,7 +1606,9 @@ function adaptAssessmentFinding(
         ? 36 * 60 * 60_000
         : ruleId === 'HV-ID-AUTH-005.v2'
           ? 10 * 60_000
-          : 15 * 60_000) ||
+          : catalogued
+            ? 15 * 60_000
+            : DEFAULT_ACTIVITY_WINDOW_TOLERANCE_MS) ||
     new Date(firstSeen).getTime() > new Date(lastSeen).getTime() ||
     new Date(lastSeen).getTime() >
       new Date(evaluatedAt).getTime() + MAX_FUTURE_SKEW_MS ||
@@ -1509,11 +1618,10 @@ function adaptAssessmentFinding(
     (source.evidenceCount as number) > MAX_ASSESSMENT_COUNT ||
     typeof source.evidenceCountCapped !== 'boolean' ||
     !selectedSource ||
-    !(
-      RISK_ASSESSMENT_RULE_TUPLES[ruleId].sources as readonly string[]
-    ).includes(selectedSource) ||
+    (catalogued &&
+      !(catalogued.sources as readonly string[]).includes(selectedSource)) ||
     !application ||
-    !exactKeys(application, ['id', 'state', 'label']) ||
+    !hasKeys(application, ['id', 'state', 'label']) ||
     !applicationState ||
     (application.label !== null && !applicationLabel) ||
     (applicationState === 'RESOLVED'
@@ -1521,11 +1629,11 @@ function adaptAssessmentFinding(
         !/^hvr1_application_[a-f0-9]{64}$/.test(application.id)
       : application.id !== null || application.label !== null) ||
     !device ||
-    !exactKeys(device, ['state', 'label']) ||
+    !hasKeys(device, ['state', 'label']) ||
     !deviceState ||
     device.label !== null ||
     !client ||
-    !exactKeys(client, ['reference', 'qualification']) ||
+    !hasKeys(client, ['reference', 'qualification']) ||
     !qualification ||
     (client.reference !== null &&
       (typeof client.reference !== 'string' ||
@@ -1619,7 +1727,7 @@ function adaptAssessmentUser(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'id',
       'label',
       'subjectType',
@@ -1635,6 +1743,18 @@ function adaptAssessmentUser(
   ] as const)
   const id = boundedString(source.id, 160)
   const label = authorizedLabel(source.label, 320)
+  // Resolved for authorised callers at read time; never persisted in the
+  // finding row. Absent on servers that do not resolve it, and absent is shown
+  // as the opaque reference rather than as a blank identity.
+  const displayName =
+    source.displayName === undefined || source.displayName === null
+      ? null
+      : authorizedLabel(source.displayName, 320)
+  const userPrincipalName =
+    source.userPrincipalName === undefined || source.userPrincipalName === null
+      ? null
+      : authorizedLabel(source.userPrincipalName, 320)
+  const correlation = adaptCorrelation(source.correlation)
   const priority =
     source.priority === null
       ? null
@@ -1678,9 +1798,23 @@ function adaptAssessmentUser(
         )
       : null
   if (priority !== highestCurrent) return null
+  if (
+    correlation === undefined ||
+    (source.displayName !== undefined &&
+      source.displayName !== null &&
+      !displayName) ||
+    (source.userPrincipalName !== undefined &&
+      source.userPrincipalName !== null &&
+      !userPrincipalName)
+  ) {
+    return null
+  }
   return {
     id,
     label,
+    displayName,
+    userPrincipalName,
+    correlation,
     subjectType,
     priority,
     protection,
@@ -1705,18 +1839,13 @@ export function adaptRiskAssessmentResponse(
   const hasSummary = Boolean(
     source && Object.prototype.hasOwnProperty.call(source, 'summary')
   )
-  if (
-    !source ||
-    (!exactKeys(source, rootKeys) &&
-      !exactKeys(source, [...rootKeys, 'summary']))
-  )
-    return null
+  if (!source || !hasKeys(source, rootKeys)) return null
   const rawMeta = record(source.meta)
   if (
     source.version !== 1 ||
     source.schemaVersion !== assessmentSchema ||
     !rawMeta ||
-    !exactKeys(rawMeta, assessmentMetaKeys) ||
+    !hasKeys(rawMeta, assessmentMetaKeys) ||
     rawMeta.version !== 1 ||
     rawMeta.channel !== 'HAWKVIEW_IDENTITY_SIGNALS'
   )
@@ -1730,8 +1859,7 @@ export function adaptRiskAssessmentResponse(
         )
       : null
   const rules =
-    Array.isArray(source.rules) &&
-    source.rules.length === assessmentRuleIds.length
+    Array.isArray(source.rules) && source.rules.length <= MAX_REPORTED_RULES
       ? source.rules.map((item) =>
           adaptRuleReadiness(item, trustedCurrentTimeMs)
         )
@@ -1784,20 +1912,26 @@ export function adaptRiskAssessmentResponse(
   )
     return null
   // Never let an optimistic aggregate override individual source/rule coverage.
+  // INAPPLICABLE is excluded deliberately: a check that cannot run on this
+  // tenant's evidence is not incomplete collection, and treating it as such
+  // would make an exact count unreachable on every audit-log-fallback tenant.
+  // What it does instead is bound the claim, which travels with the count as
+  // scope rather than as a coverage gap.
   const complete = (rules as RiskRuleReadiness[]).every(
     (rule) =>
-      rule.status === 'READY' &&
-      !rule.countsCapped &&
-      rule.evaluatedAt !== null &&
-      rule.window.start !== null &&
-      rule.window.end !== null &&
-      (sources as RiskSourceReadiness[]).some(
-        (item) =>
-          item.source === rule.selectedSource &&
-          item.status === 'READY' &&
-          item.freshness === 'CURRENT' &&
-          item.lastSuccessfulCollectionAt !== null
-      )
+      rule.status === 'INAPPLICABLE' ||
+      (rule.status === 'READY' &&
+        !rule.countsCapped &&
+        rule.evaluatedAt !== null &&
+        rule.window.start !== null &&
+        rule.window.end !== null &&
+        (sources as RiskSourceReadiness[]).some(
+          (item) =>
+            item.source === rule.selectedSource &&
+            item.status === 'READY' &&
+            item.freshness === 'CURRENT' &&
+            item.lastSuccessfulCollectionAt !== null
+        ))
   )
   if (meta.capability === 'FULL' && !complete) {
     meta.capability = 'PARTIAL'
@@ -1845,14 +1979,14 @@ function adaptAssessmentSummary(
   trustedCurrentTimeMs: number
 ): RiskAssessmentSummary | null {
   const source = record(value)
-  if (!source || !exactKeys(source, ['scope', 'asOf', 'currentUsers'])) {
+  if (!source || !hasKeys(source, ['scope', 'asOf', 'currentUsers'])) {
     return null
   }
   const currentUsers = record(source.currentUsers)
   if (
     source.scope !== 'TENANT' ||
     !currentUsers ||
-    !exactKeys(currentUsers, ['value', 'accuracy'])
+    !hasKeys(currentUsers, ['value', 'accuracy'])
   ) {
     return null
   }
@@ -1863,10 +1997,31 @@ function adaptAssessmentSummary(
     'AT_LEAST',
     'UNKNOWN',
   ] as const)
+  // Optional and additive, and accepted in either form: a single `reason` from
+  // the older shape, or a `reasons` array. Both normalise to a list, because
+  // more than one cause can hold at once and the UI must be able to show all of
+  // them rather than the first.
+  const rawReasons =
+    currentUsers.reasons !== undefined
+      ? currentUsers.reasons
+      : currentUsers.reason === undefined || currentUsers.reason === null
+        ? []
+        : [currentUsers.reason]
+  const reasons =
+    Array.isArray(rawReasons) &&
+    rawReasons.length <= assessmentCountReasons.length
+      ? rawReasons.map((item) => enumValue(item, assessmentCountReasons))
+      : null
   if (
     asOf === undefined ||
     count === undefined ||
     !accuracy ||
+    !reasons ||
+    reasons.some((item) => item === null) ||
+    new Set(reasons).size !== reasons.length ||
+    // A reason explains a withheld or bounded total. Attaching one to an exact
+    // count would be a contradiction.
+    (accuracy === 'EXACT' && reasons.length > 0) ||
     (accuracy === 'UNKNOWN' && count !== null) ||
     (accuracy !== 'UNKNOWN' && (count === null || asOf === null)) ||
     (accuracy === 'AT_LEAST' && count === 0)
@@ -1876,7 +2031,11 @@ function adaptAssessmentSummary(
   return {
     scope: 'TENANT',
     asOf,
-    currentUsers: { value: count, accuracy },
+    currentUsers: {
+      value: count,
+      accuracy,
+      reasons: reasons as RiskAssessmentCountReason[],
+    },
   }
 }
 
@@ -1891,6 +2050,10 @@ function adaptAssessmentMeta(
   const observedAt = nullableDateTime(value.observedAt, now)
   const limitation =
     value.limitation === null ? null : boundedString(value.limitation, 600)
+  const reasonCode =
+    value.reasonCode === undefined || value.reasonCode === null
+      ? null
+      : enumValue(value.reasonCode, channelReasons)
   if (
     !capability ||
     !status ||
@@ -1901,6 +2064,9 @@ function adaptAssessmentMeta(
     value.engineVersion !== hawkViewEngineVersion ||
     value.catalogVersion !== hawkViewCatalogVersion ||
     (value.limitation !== null && !limitation) ||
+    (value.reasonCode !== undefined &&
+      value.reasonCode !== null &&
+      !reasonCode) ||
     (status === 'AVAILABLE' &&
       (!evaluatedAt || capability === 'UNAVAILABLE')) ||
     (capability === 'FULL' &&
@@ -1917,6 +2083,7 @@ function adaptAssessmentMeta(
     evaluatedAt,
     observedAt,
     limitation,
+    reasonCode,
   }
 }
 

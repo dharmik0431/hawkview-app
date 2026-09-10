@@ -21,7 +21,8 @@ import EnterpriseAppsSection from './components/sections/enterprise-apps-section
 import SignInActivitySection from './components/sections/signins-section'
 import ExchangePage from './components/sections/exchange-section'
 import SharePointPage from './components/sections/sharepoint-section'
-import IdentityRiskSection from '@/components/identity-risk/identity-risk-section'
+import RiskyUsersSection from '@/components/identity-risk/risky-users-section'
+import { RiskyUsersCountCard } from '@/components/identity-risk/risky-users-count-card'
 import { TenantBlade } from './components/tenant-blade'
 import { TenantOverview } from './components/tenant-overview'
 import TenantBreadcrumb from './components/tenant-breadcrumb'
@@ -30,8 +31,10 @@ import { deriveTenantWorkspaceDisplay, formatTenantTimestamp } from '@/lib/tenan
 import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { normalizeCollectionReadiness } from '@/lib/tenants/collection-readiness'
 import {
+  legacyRiskyUsersRedirect,
   parseTenantPath,
   tenantEntraPath,
+  tenantRiskyUsersPath,
   tenantOfficePath,
   tenantOverviewPath,
   tenantSectionPath,
@@ -130,6 +133,7 @@ type TenantSection =
   | 'overview'
   | 'home'
   | 'entra'
+  | 'risky-users'
   | 'exchange'
   | 'teams'
   | 'sharepoint'
@@ -1381,11 +1385,8 @@ export default function TenantDetailsPage() {
   }
 
   const signInViewParam = searchParams ? searchParams.get('signInView') : null
-  const requestedSecurityView = routeState.securityView
-  const securityView =
-    requestedSecurityView === 'identity-risk' && !identityRiskUi
-      ? 'policies'
-      : requestedSecurityView
+  // Risky Users is no longer one of these; it has its own tenant-level section.
+  const securityView = routeState.securityView
   const securityTabs: Array<{
     id: TenantRouteSecurityView
     label: string
@@ -1394,23 +1395,26 @@ export default function TenantDetailsPage() {
     { id: 'sign-ins', label: 'Sign-in Activity' },
     { id: 'auth', label: 'Authentication' },
     { id: 'locations', label: 'Named Locations' },
-    ...(identityRiskUi
-      ? [{ id: 'identity-risk' as const, label: 'Identity Risk' }]
-      : []),
   ]
 
   useEffect(() => {
-    if (
-      requestedSecurityView === 'identity-risk' &&
-      !identityRiskUi &&
-      resolvedTenantId
-    ) {
+    if (!resolvedTenantId) return
+    // Risky Users used to live at /entra/security/identity-risk. Send anyone
+    // holding that link to its new home rather than showing them a dead tab.
+    const legacy = pathname
+      ? legacyRiskyUsersRedirect(pathname, resolvedTenantId)
+      : null
+    if (legacy) {
       router.replace(
-        tenantEntraPath(resolvedTenantId, 'security', 'policies'),
+        identityRiskUi ? legacy : tenantOverviewPath(resolvedTenantId),
         { scroll: false }
       )
+      return
     }
-  }, [identityRiskUi, requestedSecurityView, resolvedTenantId, router])
+    if (routeState.section === 'risky-users' && !identityRiskUi) {
+      router.replace(tenantOverviewPath(resolvedTenantId), { scroll: false })
+    }
+  }, [identityRiskUi, pathname, resolvedTenantId, router, routeState.section])
 
   const signInView = signInViewParam === 'map' ? 'map' : 'list'
 
@@ -3967,8 +3971,22 @@ export default function TenantDetailsPage() {
             onOpenModule={(m) => handleSectionNavigate(m as TenantSection)}
             onSync={runSync}
             isSyncing={syncState === 'syncing'}
+            riskyUsers={
+              identityRiskUi ? (
+                <RiskyUsersCountCard
+                  tenantId={resolvedTenantId}
+                  onOpen={() => handleSectionNavigate('risky-users')}
+                />
+              ) : null
+            }
           />
         )
+      }
+
+      if (section === 'risky-users') {
+        return identityRiskUi ? (
+          <RiskyUsersSection tenantId={resolvedTenantId} />
+        ) : null
       }
 
       if (section === 'settings') {
@@ -4654,16 +4672,6 @@ export default function TenantDetailsPage() {
                     </div>
                   )}
 
-                  {identityRiskUi && securityView === 'identity-risk' && (
-                    <div
-                      role="tabpanel"
-                      id="security-tabpanel-identity-risk"
-                      aria-labelledby="security-tab-identity-risk"
-                      className="mt-4"
-                    >
-                      <IdentityRiskSection tenantId={resolvedTenantId} />
-                    </div>
-                  )}
                 </div>
               )}
 
@@ -4695,6 +4703,7 @@ export default function TenantDetailsPage() {
             <TenantBlade
               tenant={tenant}
               display={workspaceDisplay}
+              hiddenSections={identityRiskUi ? undefined : ['risky-users']}
               currentSection={section}
               onSelectSection={(sec) =>
                 handleSectionNavigate(sec as TenantSection)

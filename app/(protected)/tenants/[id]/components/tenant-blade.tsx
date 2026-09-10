@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react'
 import Link from 'next/link'
 import {
   Activity,
+  ShieldAlert,
   Building2,
   ChevronDown,
   ChevronLeft,
@@ -37,6 +38,7 @@ const NAV_GROUPS: NavGroup[] = [
     title: 'Overview',
     items: [
       { key: 'overview', label: 'Tenant Overview', icon: Activity },
+      { key: 'risky-users', label: 'Risky Users', icon: ShieldAlert },
     ],
   },
   {
@@ -79,6 +81,7 @@ export function TenantBlade({
   onToggleCollapse,
   isMobileOpen,
   onMobileClose,
+  hiddenSections,
 }: {
   tenant: any
   display: TenantWorkspaceDisplay
@@ -90,7 +93,18 @@ export function TenantBlade({
   onToggleCollapse: () => void
   isMobileOpen: boolean
   onMobileClose: () => void
+  /** Sections switched off for this deployment; their entries are not shown. */
+  hiddenSections?: readonly TenantSection[]
 }) {
+  const navGroups = React.useMemo(() => {
+    if (!hiddenSections?.length) return NAV_GROUPS
+    const hidden = new Set(hiddenSections)
+    return NAV_GROUPS.map((group) => ({
+      ...group,
+      items: group.items.filter((item) => !hidden.has(item.key)),
+    })).filter((group) => group.items.length > 0)
+  }, [hiddenSections])
+
   const [pickerOpen, setPickerOpen] = useState(false)
   const [pickerSearch, setPickerSearch] = useState('')
 
@@ -195,7 +209,7 @@ export function TenantBlade({
 
       {/* Main Tenant Navigation Links */}
       <nav aria-label="Tenant Blade Navigation" className="flex-1 min-h-0 overflow-y-auto px-2 py-3 space-y-4">
-        {NAV_GROUPS.map((group) => (
+        {navGroups.map((group) => (
           <div key={group.title} className="space-y-1">
             {!isCollapsed && (
               <div className="px-2.5 pb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
