@@ -638,7 +638,8 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
     verification: {
       state: 'NO_PRODUCTION_EVIDENCE',
       why:
-        'Zero occurrences. Across all 1,479 rows of code 50053 in all history and all tenants there are ' +
+        'Zero occurrences. Across all 1,493 rows of code 50053 in all history and all tenants (as of ' +
+        '2026-09-10T16:36Z) there are ' +
         'exactly TWO distinct description values — lockout and malicious-IP — and this is neither of them. ' +
         'It is a documented Microsoft string and anticipating it is reasonable, but it is exercised only by ' +
         'a synthetic fixture, exactly like the Graph subject-binding failure path. Present in code, no data ' +
@@ -659,7 +660,8 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
     verification: {
       state: 'OBSERVED_IN_PRODUCTION',
       evidence:
-        'One of exactly two description values observed on code 50053, at 921 of 1,479 rows (62.3%) in a ' +
+        'One of exactly two description values observed on code 50053, at 932 of 1,493 rows (62.4%) as of ' +
+        '2026-09-10T16:36Z, in a ' +
         'single-instant query. Literal, measured with terminal characters checked: ' +
         '"Sign-in was blocked because it came from an IP address with malicious activity" — 78 characters, ' +
         'no trailing period, all ASCII.',
@@ -678,7 +680,8 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
     verification: {
       state: 'OBSERVED_IN_PRODUCTION',
       evidence:
-        'The other of exactly two description values observed on code 50053, at 558 of 1,479 rows (37.7%) ' +
+        'The other of exactly two description values observed on code 50053, at 561 of 1,493 rows (37.6%) ' +
+        'as of 2026-09-10T16:36Z ' +
         'in a single-instant query. Literal, measured with terminal characters checked: "The account is ' +
         'locked, you\'ve tried to sign in too many times with an incorrect user ID or password." — 100 ' +
         'characters, TRAILING PERIOD PRESENT, and the apostrophe is ASCII 0x27 rather than a Unicode right ' +
@@ -690,7 +693,7 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
         'lockout this is the ONLY signal present. A 50126-only detector eventually surfaces the affected ' +
         'users — 100% of them appear in 50126 rows at some point — but misses the lockout events, and ' +
         'misses them when they happen. CAVEAT: one tenant, at most four users, one locale, six weeks, and ' +
-        '1,479 blocks against four accounts is not obviously normal traffic, so the 94.8% informs the ' +
+        '1,493 blocks against FOUR accounts is not obviously normal traffic, so the 94.8% informs the ' +
         'mapping and does not settle the general case.',
     },
     note:
@@ -703,7 +706,15 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
   },
 ];
 
-/** Description-text branches with no production evidence behind them. */
+/**
+ * Description-text branches with no production evidence behind them.
+ *
+ * STRONGER THAN IT LOOKS, because the denominator MOVED and the claim held.
+ * The 14 rows that arrived between two measurements split into the same two
+ * literals and no third text appeared, so "exactly two values" survived a
+ * fresh sample rather than only a fixed one. A zero across a growing
+ * denominator is better evidence than the same zero across a frozen one.
+ */
 export const UNVALIDATED_FAILURE_REASON_MEANINGS: readonly FailureReasonMeaning[] = FAILURE_REASON_MEANINGS
   .filter(pattern => pattern.verification.state === 'NO_PRODUCTION_EVIDENCE')
   .map(pattern => pattern.meaning);
@@ -971,13 +982,28 @@ export const AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES: readonly { readonly name:
 //
 // (1) The GRAPH feed has NEVER OBSERVED A POST-PASSWORD INTERRUPT. 50076,
 //     50072 and 50079 are zero rows across all tenants and all history, while
-//     the audit feed carries 13 UserStrongAuthClientAuthNRequiredInterrupt, 3
-//     UserStrongAuthEnrollmentRequiredInterrupt and 4
-//     PasswordResetRegistrationRequiredInterrupt. "Password accepted, sign-in
-//     did not complete" is the basis of the highest-value detector available
-//     without Entra ID P2 — and its evidence is on the feed we treat as the
-//     fallback, not the one we treat as primary. That inverts the assumption
-//     that Graph is strictly the better source.
+//     the audit feed carries SIXTEEN, from TWO reason names:
+//     UserStrongAuthClientAuthNRequiredInterrupt (13) and
+//     UserStrongAuthEnrollmentRequiredInterrupt (3).
+//
+//     NOT the 4 PasswordResetRegistrationRequiredInterrupt rows. Those are
+//     NOT_YET_CITED — held because asserting a credential outcome from an
+//     analogy to 50072/50079 is the riskier direction — so they produce no
+//     outcome and cannot be part of a claim about what this feed supplies.
+//     CORRECTED HERE: an earlier version of this comment listed all three
+//     names together and a summary of it reached two other sessions as
+//     "13 + 3 + 4 = 16", which mis-sums AND silently re-includes rows this
+//     table deliberately declines to act on. The README addendum written
+//     when the family was first counted had it right — 16 cited, the 4
+//     excluded and why — so this was a later summary contradicting an
+//     earlier correct statement, which is the more dangerous direction: the
+//     summary travels and the original does not.
+//
+//     "Password accepted, sign-in did not complete" is the basis of the
+//     highest-value detector available without Entra ID P2 — and its
+//     evidence is on the feed we treat as the fallback, not the one we treat
+//     as primary. That inverts the assumption that Graph is strictly the
+//     better source.
 //
 // (2) The audit feed's successes DO NOT COME FROM THE REASON-NAME TABLE.
 //     They come from Operation (UserLoggedIn, 1,412 rows), where no LogonError
@@ -1001,9 +1027,9 @@ export const FEED_CAPABILITIES: readonly FeedOutcomeCapability[] = [
       PASSWORD_REJECTED: 'MAPPED_AND_OBSERVED',
       // Code 0, 1,010 rows.
       PASSWORD_ACCEPTED_COMPLETED: 'MAPPED_AND_OBSERVED',
-      // 53003 (5) and 53000 (2), plus 50053's malicious-IP text (~921).
+      // 53003 (5) and 53000 (2), plus 50053's malicious-IP text (932).
       BLOCKED_BY_CONTROL: 'MAPPED_AND_OBSERVED',
-      // 50053's smart-lockout text. The CODE is 1,479 rows; the outcome is
+      // 50053's smart-lockout text. The CODE is 1,493 rows; the outcome is
       // reached only through the text, which is why this is not derivable
       // from a code's own disposition.
       LOCKED_OUT_AFTER_REPEATED_FAILURES: 'MAPPED_AND_OBSERVED',
@@ -1078,6 +1104,14 @@ export function observedOutcomes(source: NormalizationSource): ReadonlySet<Event
 }
 
 /**
+ * ROW COUNTS IN THIS FILE CARRY AN AS-OF, AND COMPARISONS ACROSS STAMPS ARE
+ * INVALID. The table is live and grows during a working session: the 50053
+ * denominator moved 1,479 → 1,493 inside ninety minutes, and two figures
+ * taken at different moments were presented as one snapshot in a document
+ * whose purpose was to be a control — which produced a tenant count that
+ * exceeded its own all-tenant total. A bare number in a registry invites
+ * exactly that, so figures load-bearing enough to argue from are stamped.
+ *
  * Microsoft's own assessment of a sign-in, as a CLOSED SET of measured values.
  *
  * Measured across 2,648 Graph rows: exactly three values exist — `none`
@@ -1177,6 +1211,28 @@ export function riskDetailVerdict(detail: unknown, state: unknown):
   return { kind: 'VERDICT', verdict: entry.verdict };
 }
 
+/**
+ * THE THREE ROLES A FIELD PLAYS IN A PREDICATE, and why only one is `reads`.
+ *
+ * A static diff of every predicate's `reads` list against the field names in
+ * its own evidence prose found one real gap and five explainable mentions.
+ * The five are informative rather than noise: the prose cites fields in three
+ * distinct roles that this registry does not distinguish.
+ *
+ *  - SUBJECT: the paths the predicate is about. This is `reads`, and it is
+ *    what the disproved-path lists are derived from.
+ *  - CONTROL INSTRUMENT: a field used to build the cohort that must not
+ *    match. `audit.result-status` is disproved BY LogonError-bearing rows;
+ *    LogonError is the instrument, not the subject.
+ *  - CONTRAST: a different predicate mentioned to locate this one.
+ *    `graph.is-interactive-false` cites signInEventTypes as "same shape,
+ *    different cause".
+ *
+ * Only the SUBJECT belongs in `reads`. Adding fields for the other two was
+ * considered and declined: it would be a third registry to keep in step, and
+ * the test that runs this diff carries the explanations instead, so a NEW
+ * unexplained mention fails rather than every existing one.
+ */
 export type ShapePredicateVerification
   = | {
       readonly state: 'PRODUCTION_VERIFIED';
@@ -1325,7 +1381,12 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'Holding as one tenant backfills: UPN resolution 97.0% at 1,773 rows against the other tenant’s ' +
         '97.1%, essentially unmoved as volume grew from 1,385 rows. Two-tenant agreement surviving contact ' +
         'with more data is the test that matters. ' +
-        'Audit rows resolving against directory_users, deleted excluded: 96.8% / 97.1% / 77.8% by UPN ' +
+        'Audit rows resolving against directory_users, deleted excluded: 96.9% (1,730/1,786), 97.1% ' +
+        '(968/997) and 77.8% (7 of 9) by UPN. THE THIRD IS NOT A RATE and must not be read beside the ' +
+        'other two as though it were: nine rows, two of them unbound. Presenting it as a percentage ' +
+        'alongside two four-figure samples invites exactly that comparison, and a prediction built on ' +
+        'it (that the 997-row tenant would lose ~20% of its rows) would have been wrong by 190 rows. ' +
+        'The low-binding tenant is a different, nine-row tenant. ' +
         'across the three fallback-path tenants, versus 15.2% / 0.0% / 0.0% by GUID. Re-measured across ' +
         'two INDEPENDENT tenants with separate MSPs and separate directories — 97.2% vs 12.0% and 97.1% ' +
         'vs 0.0% — agreeing within 0.1 percentage points. The UPN-in-record / GUID-in-column split holds ' +
@@ -1350,7 +1411,7 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       evidence:
         'The highest-volume predicate in the layer: code 50053 is 1,479 of 2,645 Graph rows, 55.9% of ' +
         'everything collected. Both literals were measured with terminal characters checked explicitly, ' +
-        'and the closed set accounts for 100.0% of observed 50053 rows — 921 malicious-IP, 558 lockout, ' +
+        'and the closed set accounts for 100.0% of observed 50053 rows — 932 malicious-IP, 561 lockout, ' +
         'ZERO matching neither.',
       control:
         'Each literal matches exactly ONE fragment set and not the other, and neither reaches the ' +
@@ -1524,7 +1585,16 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
   {
     id: 'audit.operation-as-outcome',
     feed: 'M365_AUDIT_STS',
-    reads: ['managementActivityRecord.Operation'],
+    // LogonError ADDED by the reads-versus-evidence diff. The claim below
+    // names it, the evidence is a JOINT fact about the partition of the two
+    // fields, and the classifier reads both — so declaring only Operation
+    // understated the predicate's scope. Same species as the riskState gap,
+    // with one honest difference worth keeping straight: there the CODE read
+    // half the fact, so the conclusion rested on half; here the code already
+    // read both and only the declaration was short. Documentation, not
+    // behaviour. It still matters, because `reads` is what another reader
+    // diffs and what the disproved-path lists are derived from.
+    reads: ['managementActivityRecord.Operation', 'managementActivityRecord.LogonError'],
     claim:
       'On the audit feed, Operation carries the sign-in outcome: UserLoggedIn is a success and ' +
       'UserLoginFailed is a failure whose reason is named in LogonError.',

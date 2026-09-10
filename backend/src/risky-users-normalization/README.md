@@ -1080,13 +1080,20 @@ reading *decide what this does to feed capability*, rather than a silent change 
 ### Two findings fell out of building it
 
 **The Graph feed has never once observed a post-password interrupt.** 50076, 50072 and
-50079: zero rows, all tenants, all history. The audit feed carries 13
-`UserStrongAuthClientAuthNRequiredInterrupt`, 3 `UserStrongAuthEnrollmentRequiredInterrupt`
-and 4 `PasswordResetRegistrationRequiredInterrupt`. "Password accepted, sign-in did not
-complete" is the basis of the highest-value detector available without Entra ID P2 — and
-its only real evidence is on the feed we treat as the **fallback**. That inverts the
-assumption that Graph is strictly the better source, so it is asserted in a test rather
-than left in prose.
+50079: zero rows, all tenants, all history. The audit feed carries **sixteen, from two
+reason names** — `UserStrongAuthClientAuthNRequiredInterrupt` (13) and
+`UserStrongAuthEnrollmentRequiredInterrupt` (3).
+
+**Not** the 4 `PasswordResetRegistrationRequiredInterrupt` rows: those are `NOT_YET_CITED`,
+held because asserting a credential outcome from an analogy is the riskier direction, so
+they produce no outcome and cannot be part of a claim about what the feed supplies. See
+*the interrupt family was counted in one vocabulary and undercounted*, above, which got
+this right when the family was first counted.
+
+"Password accepted, sign-in did not complete" is the basis of the highest-value detector
+available without Entra ID P2 — and its only real evidence is on the feed we treat as the
+**fallback**. That inverts the assumption that Graph is strictly the better source, so it
+is asserted in a test rather than left in prose.
 
 **Deriving audit capability from the reason-name table alone re-creates the original bug.**
 The audit feed's successes come from `Operation` (`UserLoggedIn`, 1,412 rows), where no
@@ -1134,8 +1141,10 @@ The current measured inventory, and the module agrees with all of it:
   `SsoUserAccountNotFoundInResourceTenant` 1, `InvalidReplyTo` 1, `UserUnauthorized` 1,
   `MisconfiguredApplicationWithGraphErrorMessage` 1, plus **absent** on the 1,412
   `UserLoggedIn` successes.
-- **Graph codes**: `50053` 1,479, `0` 1,010, `50126` 107, `65001` 20, `50140` 16, `53003` 5,
-  `50074` 3, `53000` 2, and `16003`/`50011`/`50020`/`70044`/`90094`/`500121` one each.
+- **Graph codes**, as of 2026-09-10T16:36Z: `50053` 1,493, `0` 1,010, `50126` 108,
+  `65001` 20, `50140` 16, `53003` 5, `50074` 3, `53000` 2, and
+  `16003`/`50011`/`50020`/`70044`/`90094`/`500121` one each. The 50053 text split is
+  **932 malicious-IP / 561 lockout**, still exactly two values.
 
 The diff produced one gap: **`SsoUserAccountNotFoundInResourceTenant`** was landing in
 `UNRECOGNIZED_REASON_NAME`. It is now in the table as `NOT_YET_CITED` — **held, not
@@ -1149,3 +1158,120 @@ if it is wrong, mapping it asserts something false.
 That is the **third** entry this table has gained from a diff, and none of the three was
 found by a test — which is the argument for the exchange being standing rather than a
 one-off. The Graph side matched exactly: 14 codes measured, 14 declared.
+
+## Addendum: diff what a claim was validated on against what the code reads
+
+A detection technique, and it is **static** — no data, no distribution, no query. Every
+shape predicate carries an evidence line saying what the claim was validated on, and a
+`reads` list saying which paths the code consumes. When the first is wider than the second,
+**the conclusion rests on more than the code looks at.**
+
+That is how the `riskState` gap was found — after the fact, by a consumer asking a question.
+`graph.risk-detail`'s evidence named the `(riskDetail, riskState)` pair while its `reads`
+list named one field. No suite could see it, because every result was correct. Correct by
+coincidence.
+
+Running the comparison across all seventeen predicates found **one more**, and it is now a
+test rather than an exercise. `audit.operation-as-outcome` declared only
+`managementActivityRecord.Operation`, while its claim names `LogonError` and its evidence is
+a joint fact about the *partition* of the two fields. Weaker than the `riskState` instance,
+and the difference is worth keeping straight rather than blurring: there the **code** read
+half the fact, so the conclusion rested on half; here the classifier already read both and
+only the declaration was short. Documentation, not behaviour. Still worth fixing, because
+`reads` is what another reader diffs and what the disproved-path lists are derived from.
+
+### The five other mentions were informative, not noise
+
+The diff also flagged five field names that appear in prose and not in `reads`, and all five
+are correct as they stand — because the prose cites fields in **three distinct roles** that
+the registry does not distinguish:
+
+| Role | Belongs in `reads`? | Example |
+| --- | --- | --- |
+| **subject** — the paths the predicate is about | yes | `raw.riskDetail` |
+| **control instrument** — the field the cohort is built from | no | `audit.result-status` is disproved *by* `LogonError`-bearing rows |
+| **contrast** — another predicate, cited to locate this one | no | `graph.is-interactive-false` cites `signInEventTypes` as "same shape, different cause" |
+
+Adding registry fields for the other two roles was considered and declined: a third registry
+to keep in step is how two tables silently disagree, which has happened here twice. The test
+carries the explanations instead, **keyed per predicate**, so an explanation cannot cover a
+mention somewhere else and a *new* unexplained mention fails rather than every existing one
+being grandfathered. A stale explanation for a predicate that no longer exists also fails.
+
+Two mutations: understating either predicate's `reads` again fails the check.
+
+## Addendum: a later summary contradicting an earlier correct statement
+
+The worst thing in this session's output was mine, it was small, and it had already been
+written down correctly hours before.
+
+When the interrupt family was first counted, the addendum above recorded it exactly:
+**16 cited events** from two reason names, with the 4
+`PasswordResetRegistrationRequiredInterrupt` rows *explicitly excluded* because they rest
+on an analogy this table declines to act on. Correct, reasoned, and stated.
+
+Building the feed-capability table hours later, I wrote the same finding as a one-line
+summary listing all three names together, and relayed it to two other sessions as
+"13 + 3 + 4 = 16". That mis-sums, and worse, it silently re-includes the rows the table
+deliberately holds — the ones held for exactly the right reason, which my summary sentence
+then quietly counted anyway. Both sessions repeated it back, one of them on its way to
+putting the finding in front of the owner as a product fact.
+
+**The direction is what makes it dangerous.** A wrong statement followed by a correct one
+is a fix. A correct statement followed by a wrong summary is a regression that leaves the
+correct version in place, untouched and unread, while the summary travels. Nobody
+re-reads the original once the summary exists — that is what a summary is for.
+
+And it is the same mechanism as the redaction claim, one notch smaller: the effort went
+into the sentence rather than into checking it. "Zero on Graph, sixteen on audit" is a
+good line. Making the arithmetic come out at sixteen mattered more, in the moment, than
+whether the three numbers I was adding belonged in the sum.
+
+The check that would have caught it costs nothing and is now the habit: **when restating a
+finding you have already written down, re-read what you wrote rather than what you
+remember.** The earlier text disagreed with me and was right.
+
+## Addendum: row counts carry an as-of
+
+This table is live and grows during a working session. The 50053 denominator moved
+1,479 → 1,493 in ninety minutes; the 14 new rows split into the same two literals and no
+third text appeared.
+
+Two consequences.
+
+**The zero-occurrence claim got stronger, not staler.** `UNVALIDATED_FAILURE_REASON_MEANINGS`
+rests on "exactly two description values, no third ever" — and that survived a *fresh*
+sample rather than only a fixed one. A zero across a growing denominator is better evidence
+than the same zero across a frozen one.
+
+**Two figures from different moments must never be presented as one snapshot.** Doing that
+produced a per-tenant count exceeding its own all-tenant total, in a document whose whole
+purpose was to be a pre-registered control. A bare number in a registry invites exactly
+that, so figures load-bearing enough to argue from now carry a stamp, and comparisons
+across stamps are invalid.
+
+### And one figure that was never a rate
+
+Audit UPN binding was recorded as **96.8% / 97.1% / 77.8%**, three percentages in a row.
+The third is **7 of 9 rows** — two unbound rows on a nine-row tenant. Presenting it beside
+two four-figure samples invites reading them as comparable, and I did exactly that: I
+predicted a 997-row tenant would lose ~20% of its rows and look like a defect. It resolves
+at 97.1%. The prediction was wrong by about 190 rows, and it was wrong because I read a
+ratio on nine rows as a property of a tenant.
+
+Stating the prediction *in advance* is still what made the real number legible rather than
+reassuring-by-accident — a prediction that does not fire is worth as much as one that does,
+provided it was written down first. The figures now carry their fractions so the sample
+size travels with the number.
+
+### The four-account caveat stands
+
+greentech's 50053 volume is **1,493 rows across 4 distinct users** (its 108 bad-password
+rows span 8; it has 16 UPNs in total). So `provider-facts.ts` — "blocks against four
+accounts" — and the README caveat "one tenant, at most four users" are both correct, and
+only the denominator moves.
+
+Worth recording that a document had implied the volume was spread across 16 users, which
+would have turned a correct caveat into a false one — and that the 94.8%
+lockout-without-50126 finding therefore does **not** get the strengthening that would have
+implied. A caveat being narrower than you would like is not a reason to widen it.
