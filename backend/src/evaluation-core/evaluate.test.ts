@@ -11,6 +11,7 @@ const event = (id: string, extra: Partial<Event> = {}): Event => ({ id, subject:
 /** Stands in for what the classification layer reports. The core never builds
  * one of these, which is the point — it cannot classify, only consume. */
 const coverage = (parts: Partial<Coverage> = {}): Coverage => ({
+  collectionScope: { declared: true, asked: 'test fixture: all rows' },
   applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {}, ...parts,
 })
 
@@ -89,7 +90,7 @@ test('a lower bound is never zero, and zero arrives only through the exact branc
   // Exhaustive: no combination of inputs yields a zero-valued lower bound.
   for (const permitted of [true, false]) {
     for (const subjects of [0, 1, 5]) {
-      const count = countOf(subjects, permitted, { covered: [], notCovered: [] })
+      const count = countOf(subjects, permitted, { evidenceRequested: [], covered: [], notCovered: [] })
       assert.ok(!(count.accuracy === 'AT_LEAST' && count.value === 0))
       if (count.accuracy === 'EXACT') assert.equal(permitted, true, 'exact requires the claim to be permitted')
     }
@@ -163,7 +164,9 @@ test('unread evidence cannot produce a finding, because it cannot carry an event
     // No detector is credited with having considered anything, because none ran.
     // Reporting them as RAN with considered:0 would read like healthy silence.
     assert.deepEqual(result.detectors, [])
-    assert.deepEqual(result.coverage, { applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {} })
+    assert.deepEqual(result.coverage.applies, 0)
+    assert.deepEqual(result.coverage.unknown, {})
+    assert.deepEqual(result.coverage.unprocessable, {})
     assert.deepEqual(result.claim, { permitted: false, because: [availability] })
     assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
   }
@@ -282,6 +285,7 @@ test('a detector the evidence cannot support narrows the scope without blocking 
   // "everything is clean" — the 1,054-runs defect exactly: checks that never ran
   // producing the same zero as checks that ran and found nothing.
   assert.deepEqual(result.count.scope, {
+    evidenceRequested: ['test fixture: all rows'],
     covered: ['silent'],
     notCovered: [{
       detectorId: 'conditional-access',
@@ -305,13 +309,13 @@ test('a crashed detector and an inapplicable one are never the same answer', () 
   assert.deepEqual(skipped.claim, { permitted: true })
   // A crash never silently narrows scope: it is in neither list, because what it
   // would have covered is exactly what we do not know.
-  assert.deepEqual(crashed.count.scope, { covered: ['silent'], notCovered: [] })
+  assert.deepEqual(crashed.count.scope, { evidenceRequested: ['test fixture: all rows'], covered: ['silent'], notCovered: [] })
   assert.equal(skipped.count.scope.notCovered.length, 1)
 })
 
 test('a fully covered run says so, so full and partial coverage are distinguishable', () => {
   const result = run([event('1')], { detectors: [matching, silent] })
-  assert.deepEqual(result.count.scope, { covered: ['matches-flagged', 'silent'], notCovered: [] })
+  assert.deepEqual(result.count.scope, { evidenceRequested: ['test fixture: all rows'], covered: ['matches-flagged', 'silent'], notCovered: [] })
 })
 
 test('distinct subjects are counted once however many findings they carry', () => {
@@ -414,7 +418,7 @@ test('a detector opting out without saying why is treated as having failed', () 
   assert.deepEqual(result.claim.permitted === false && result.claim.because, ['DETECTOR_FAILED'])
   // And it cannot quietly shrink the scope, which is what a silent opt-out
   // would otherwise buy: absent from covered and from notCovered alike.
-  assert.deepEqual(result.count.scope, { covered: ['silent'], notCovered: [] })
+  assert.deepEqual(result.count.scope, { evidenceRequested: ['test fixture: all rows'], covered: ['silent'], notCovered: [] })
 })
 
 test('a non-monotonic detector never sees a truncated window, because it would invent a finding', () => {
@@ -484,9 +488,16 @@ test('findings say they are partial when a detector crashed, and complete when n
     id: 'unsupported', monotonic: true,
     run: () => ({ status: 'INAPPLICABLE', because: 'This source does not carry it.' }),
   }
+  // QA's correction: this previously reported complete:true beside a scope
+  // naming an unrun check — "yes" and "no" to the same question, split across
+  // two objects. The reasons still differ; the ANSWER is now given once.
   const narrowed = run([event('1')], { detectors: [silent, unsupported] })
-  assert.equal(narrowed.findings.complete, true, 'complete for the questions we asked')
-  assert.equal(narrowed.count.scope.notCovered.length, 1, 'and the unasked one is named')
+  assert.equal(narrowed.findings.complete, false)
+  assert.deepEqual(narrowed.findings.complete === false && narrowed.findings.because, ['CHECK_NOT_RUN'])
+  // And the per-detector detail, in the detector's own words, stays in the scope
+  // rather than being flattened into the findings answer.
+  assert.deepEqual(narrowed.count.scope.notCovered,
+    [{ detectorId: 'unsupported', because: 'This source does not carry it.' }])
 })
 
 test('a detector whose account of itself is impossible is not trusted to have run', () => {
@@ -556,4 +567,29 @@ test('a claim cannot be asked about unread evidence that somehow has findings', 
       withinBudget: true, allDetectorsRan: true, allSubjectsResolved: true,
     }),
     { permitted: false, because: ['UNINTERPRETED_EVENTS'] })
+})
+
+test('what was asked of the provider travels with the count, and an unrecorded ask withholds it', () => {
+  // Coverage is computed over the rows we were handed, so full coverage of a
+  // partial view reports 100% while saying nothing about traffic nobody asked
+  // for. A narrow-but-named request is a smaller question honestly asked.
+  const narrow = run([event('1')], {
+    coverage: coverage({ applies: 1, collectionScope: { declared: true, asked: 'GRAPH_INTERACTIVE_ONLY' } }),
+  })
+  assert.deepEqual(narrow.claim, { permitted: true }, 'a smaller question still has an exact answer')
+  assert.deepEqual(narrow.count.scope.evidenceRequested, ['GRAPH_INTERACTIVE_ONLY'])
+  assert.equal(narrow.findings.complete, true)
+
+  // An unrecorded request is different in kind: we cannot say what a clean
+  // result would cover, and no scope note rescues that.
+  const unknownAsk = run([event('1')], {
+    coverage: coverage({ applies: 1, collectionScope: { declared: false } }),
+  })
+  assert.deepEqual(unknownAsk.claim.permitted === false && unknownAsk.claim.because, ['COLLECTION_SCOPE_UNDECLARED'])
+  assert.deepEqual(unknownAsk.count.scope.evidenceRequested, [], 'nothing to name')
+  assert.deepEqual(unknownAsk.findings.complete === false && unknownAsk.findings.because, ['EVIDENCE_REQUEST_UNKNOWN'])
+
+  // It is its own sentence, not folded into "we could not read the evidence" —
+  // evidence we may never have requested is not evidence we failed to read.
+  assert.notEqual(withheldExplanation('COLLECTION_SCOPE_UNDECLARED'), withheldExplanation('UNINTERPRETED_EVENTS'))
 })

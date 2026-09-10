@@ -1,5 +1,5 @@
 import type {
-  Assessment, Budget, Count, CountScope, Coverage, Detector, DetectorReport, Evidence, EvidenceState, Finding,
+  Assessment, Budget, CollectionScope, Count, CountScope, Coverage, Detector, DetectorReport, Evidence, EvidenceState, Finding,
   FindingGap, FindingSet,
   WithheldReason, ZeroClaim,
 } from './contract.js'
@@ -27,6 +27,10 @@ export const declined = (coverage: Coverage): number => total(coverage.doesNotAp
 
 /** Evidence we hold nothing of: no counts, because nothing was read to count. */
 export const NO_COVERAGE: Coverage = Object.freeze({
+  // Nothing was read, so the request is beside the point — the claim is already
+  // withheld for never-collected or unreadable, and adding a second reason about
+  // an unrecorded request would be noise rather than information.
+  collectionScope: { declared: true, asked: 'none — no evidence was read' },
   applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {},
 })
 
@@ -73,6 +77,10 @@ export function zeroClaim(basis: ClaimBasis): ZeroClaim {
   if (!withinBudget) reasons.push('CAPACITY_EXCEEDED')
   if (!allDetectorsRan) reasons.push('DETECTOR_FAILED')
   if (!allSubjectsResolved) reasons.push('UNRESOLVED_SUBJECT_IDENTITY')
+  // A named request is a smaller question honestly asked, and narrows the scope.
+  // An unrecorded one means we cannot say what a clean result would cover, which
+  // is not something a scope note can rescue.
+  if (!coverage.collectionScope.declared) reasons.push('COLLECTION_SCOPE_UNDECLARED')
   // Derived here rather than passed in beside the coverage it describes: two
   // inputs saying the same thing is two inputs that can disagree.
   if (uninterpreted(coverage) > 0) reasons.push('UNINTERPRETED_EVENTS')
@@ -127,8 +135,9 @@ export function countOf(distinctSubjects: number, permitted: boolean, scope: Cou
 
 /** Derived from the reports once, so the scope and the detector list cannot
  * drift into telling different stories about the same run. */
-export function scopeOf(reports: readonly DetectorReport[]): CountScope {
+export function scopeOf(reports: readonly DetectorReport[], collectionScope: CollectionScope): CountScope {
   return {
+    evidenceRequested: collectionScope.declared ? [collectionScope.asked] : [],
     covered: reports.flatMap(report => report.status === 'RAN' ? [report.detectorId] : []),
     notCovered: reports.flatMap(report =>
       report.status === 'INAPPLICABLE' ? [{ detectorId: report.detectorId, because: report.because }] : []),
@@ -164,6 +173,7 @@ export function withheldExplanation(reason: WithheldReason): string {
     case 'CAPACITY_EXCEEDED': return 'This window held more events than can be assessed at once, so it was not assessed in full.'
     case 'DETECTOR_FAILED': return 'One of the checks could not complete, so anything it would have found is unknown. The other checks reported normally.'
     case 'UNRESOLVED_SUBJECT_IDENTITY': return 'Something was found on a mailbox we could not match to a person, so the number of people affected cannot be stated exactly. The findings themselves are listed.'
+    case 'COLLECTION_SCOPE_UNDECLARED': return 'There is no record of what was requested from Microsoft for this window, so what a clean result would cover cannot be stated.'
     default: return unreachable(reason)
   }
 }
@@ -198,7 +208,7 @@ export function evaluate<Event>(input: Readonly<{
       // Nothing ran, so nothing is covered. An empty scope beside a
       // not-available count says exactly that, without implying a check
       // was skipped for a reason of its own.
-      count: countOf(0, claim.permitted, { covered: [], notCovered: [] }),
+      count: countOf(0, claim.permitted, { evidenceRequested: [], covered: [], notCovered: [] }),
       claim,
     }
   }
@@ -290,8 +300,10 @@ export function evaluate<Event>(input: Readonly<{
     findings: findingSet(findings, {
       truncated: !withinBudget,
       detectorFailed: reports.some(report => report.status === 'FAILED'),
+      checkNotRun: reports.some(report => report.status === 'INAPPLICABLE'),
+      requestUnknown: !coverage.collectionScope.declared,
     }),
-    count: countOf(distinctUsers(findings), claim.permitted, scopeOf(reports)),
+    count: countOf(distinctUsers(findings), claim.permitted, scopeOf(reports, coverage.collectionScope)),
     claim,
   }
 }
@@ -302,11 +314,18 @@ export function evaluate<Event>(input: Readonly<{
  * the count's scope, and merging the two would lose which of "we may have missed
  * some" and "we never asked this question" applies. */
 export function findingSet(
-  items: readonly Finding[], gaps: Readonly<{ truncated: boolean; detectorFailed: boolean }>,
+  items: readonly Finding[],
+  gaps: Readonly<{ truncated: boolean; detectorFailed: boolean; checkNotRun: boolean; requestUnknown: boolean }>,
 ): FindingSet {
   const because: FindingGap[] = []
   if (gaps.truncated) because.push('WINDOW_TRUNCATED')
   if (gaps.detectorFailed) because.push('DETECTOR_FAILED')
+  // QA's catch: `complete` said nothing about WHICH questions it was complete
+  // for, so a findings table could read "that is all of it" while the count's
+  // scope said a check never ran. One question, two answers, either misleading
+  // alone. The per-detector detail stays in CountScope; this is only the answer.
+  if (gaps.checkNotRun) because.push('CHECK_NOT_RUN')
+  if (gaps.requestUnknown) because.push('EVIDENCE_REQUEST_UNKNOWN')
   const [first, ...rest] = because
   return first === undefined ? { items, complete: true } : { items, complete: false, because: [first, ...rest] }
 }

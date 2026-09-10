@@ -25,7 +25,7 @@ const rule = (parts: Partial<MailboxForwardingArtefact['rules'][number]> = {}) =
 
 const detector = externalForwardingDetector({ verifiedDomains: ['contoso.com', 'Contoso.co.uk'] })
 const coverage = (applies: number, parts: Partial<Coverage> = {}): Coverage =>
-  ({ applies, doesNotApply: {}, unknown: {}, unprocessable: {}, ...parts })
+  ({ collectionScope: { declared: true, asked: 'test fixture: all rows' }, applies, doesNotApply: {}, unknown: {}, unprocessable: {}, ...parts })
 
 const assess = (mailboxes: readonly MailboxForwardingArtefact[], detectors = [detector]) =>
   evaluate<MailboxForwardingArtefact>({

@@ -29,6 +29,14 @@
  * failed to read is the collapse this whole design exists to prevent.
  */
 export type Coverage = Readonly<{
+  /** What the collector actually asked the provider for.
+   *
+   * Coverage is computed over the rows we were handed, so a feed that was never
+   * requested is indistinguishable from one requested and empty — and full
+   * coverage of a partial view reports 100% while saying nothing about the
+   * traffic nobody asked about. That is the true-but-misleading number this
+   * design exists to remove, so the request travels with the counts. */
+  collectionScope: CollectionScope
   /** Events in scope for the rules. The denominator any claim rests on. */
   applies: number
   /** Correctly out of scope. The rules worked; these do not reduce coverage. */
@@ -60,6 +68,11 @@ export type Count =
  * that never ran once produced the same zero as three rules that ran and found
  * nothing, because nothing in the number said which questions it answered. */
 export type CountScope = Readonly<{
+  /** What was asked of the provider, in the collector's own words. Rendered
+   * beside the figure, because a count over a view nobody fully requested is
+   * true about its rows and misleading about the tenant. An unrecorded request
+   * appears nowhere here — it withholds the claim instead. */
+  evidenceRequested: readonly string[]
   /** Detectors whose verdict this count includes. */
   covered: readonly string[]
   /** Detectors this evidence could not support, each saying why in its own
@@ -90,6 +103,10 @@ export type WithheldReason =
    * UNINTERPRETED_EVENTS because that one is about evidence we could not read,
    * and this is about evidence we read perfectly well and could not attribute. */
   | 'UNRESOLVED_SUBJECT_IDENTITY'
+  /** Nobody recorded what was asked of the provider, so we cannot say what a
+   * clean result would cover. Distinct from evidence we could not read: this is
+   * evidence we may never have requested. */
+  | 'COLLECTION_SCOPE_UNDECLARED'
 
 /** Decided once. Every surface reads this rather than re-deriving it, because
  * two surfaces answering the same question against different bars is how a
@@ -170,13 +187,37 @@ export type FindingSet =
   | Readonly<{ items: readonly Finding[]; complete: true }>
   | Readonly<{ items: readonly Finding[]; complete: false; because: readonly [FindingGap, ...FindingGap[]] }>
 
-/** Why there may be findings we have not shown. */
+/** Why there may be findings we have not shown.
+ *
+ * Distinct reasons, one answer. The reasons genuinely differ — a truncated
+ * window is not a crashed check is not a question nobody could ask — but they
+ * are all answers to "is this all of it?", and that question must not be
+ * answered twice in two voices. A findings list saying `complete` beside a
+ * count whose scope names an unrun check is "yes" and "no" to the same
+ * question, split across two objects, either of which alone misleads. */
 export type FindingGap =
   /** The window held more events than could be assessed, so some were not
    * looked at. What they contained is unknown. */
   | 'WINDOW_TRUNCATED'
   /** A check crashed part-way, so anything it had left to find is unknown. */
   | 'DETECTOR_FAILED'
+  /** A check could not run on this evidence at all, so findings of that kind
+   * were never looked for. `CountScope.notCovered` holds which, and why, in the
+   * detector's own words; this is only the answer that there is more. */
+  | 'CHECK_NOT_RUN'
+  /** We do not know what was asked of the provider, so we cannot say what these
+   * findings are complete with respect to. */
+  | 'EVIDENCE_REQUEST_UNKNOWN'
+
+/** What the collector asked the provider for.
+ *
+ * The core never interprets the request — the vocabulary belongs to the layer
+ * that talks to Microsoft — it only distinguishes a request we can name from
+ * one nobody recorded. A narrow-but-named request is a smaller question
+ * honestly stated; an unrecorded one means we cannot say what any answer covers. */
+export type CollectionScope =
+  | Readonly<{ declared: true; asked: string }>
+  | Readonly<{ declared: false }>
 
 export type DetectorResult =
   | Readonly<{ status: 'RAN'; considered: number; findings: readonly Finding[] }>

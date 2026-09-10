@@ -86,6 +86,7 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
     // evidence source is not covered for that tenant, however many streams it
     // has. A tenant-level zero has to name the same gaps its parts named.
     count: countOf(distinctUsers(findings), claim.permitted, {
+      evidenceRequested: [...new Set(streams.flatMap(entry => entry.assessment.count.scope.evidenceRequested))],
       covered: streams.flatMap(entry => entry.assessment.count.scope.covered),
       notCovered: streams.flatMap(entry => entry.assessment.count.scope.notCovered),
     }),
