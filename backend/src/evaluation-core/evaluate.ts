@@ -162,6 +162,24 @@ export function countOf(distinctSubjects: number, permitted: boolean, scope: Cou
 const examinedSomething = (report: DetectorReport): boolean =>
   report.status === 'RAN' && report.considered > 0
 
+/** Whether this detector's silence is trustworthy — it either answered, or
+ * declined for a stated reason. Only a crash leaves what it would have found
+ * unknown.
+ *
+ * Written as explicit membership rather than "anything except FAILED", on
+ * Engineer 3's finding: an exclusion definition ABSORBS NEW MEMBERS. A future
+ * status would have been silently enrolled here as trustworthy and would have
+ * quietly stopped gating the claim, which is the one direction that costs us a
+ * real finding. The switch makes a new status a compile error instead. */
+const answeredOrDeclined = (report: DetectorReport): boolean => {
+  switch (report.status) {
+    case 'RAN': return true
+    case 'INAPPLICABLE': return true
+    case 'FAILED': return false
+    default: return unreachable(report)
+  }
+}
+
 export function scopeOf(reports: readonly DetectorReport[], collectionScope: CollectionScope): CountScope {
   return {
     evidenceRequested: collectionScope.declared ? [collectionScope.asked] : [],
@@ -347,7 +365,7 @@ export function evaluate<Event>(input: Readonly<{
     // would have found unknown; evidence that cannot carry a question narrows
     // the scope instead, which is why that distinction is a status and not a
     // boolean.
-    allDetectorsRan: reports.every(report => report.status !== 'FAILED'),
+    allDetectorsRan: reports.every(answeredOrDeclined),
     allSubjectsResolved: unattributedFindings(findings) === 0,
     anyCheckExaminedEvidence: reports.some(examinedSomething),
   })
@@ -386,4 +404,21 @@ export function findingSet(
   if (gaps.requestUnknown) because.push('EVIDENCE_REQUEST_UNKNOWN')
   const [first, ...rest] = because
   return first === undefined ? { items, complete: true } : { items, complete: false, because: [first, ...rest] }
+}
+
+/** Every sentence a withheld claim needs to say, in one call.
+ *
+ * `withheldExplanation` takes a single reason, so the natural way to use it is
+ * `withheldExplanation(claim.because[0])` — which silently re-creates, in the
+ * presentation layer, the one-reason collapse this module removed twice inside
+ * itself. The core cannot compel a surface to render four sentences; what it
+ * can do is make the convenient call the correct one.
+ *
+ * Returns an array, and is named plural, because a field called `reason` is an
+ * invitation and a field called `reasons` is a hint. That is a mitigation, not
+ * a guarantee: a consumer can still take the first element, which is why this
+ * is also something the acceptance gate checks rather than something the type
+ * system settles. */
+export function withheldExplanations(claim: ZeroClaim): readonly string[] {
+  return claim.permitted ? [] : claim.because.map(withheldExplanation)
 }

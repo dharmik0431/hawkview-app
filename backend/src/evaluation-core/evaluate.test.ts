@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { countOf, declined, evaluate, uninterpreted, withheldExplanation, zeroClaim } from './evaluate.js'
+import {
+  countOf, declined, evaluate, uninterpreted, withheldExplanation, withheldExplanations, zeroClaim,
+} from './evaluate.js'
 import type { Coverage, Detector, Finding, WithheldReason } from './contract.js'
 import { figure } from './test-support.js'
 
@@ -713,4 +715,36 @@ test('a detector that balanced its books without examining anything cannot suppo
   assert.deepEqual(alongside.claim, { permitted: true })
   assert.deepEqual(alongside.count.scope.covered, ['silent'])
   assert.equal(alongside.count.scope.notCovered.length, 1)
+})
+
+test('a withheld claim explains itself in as many sentences as it has reasons', () => {
+  // QA's sixth face: the core knows a claim can be withheld for four reasons at
+  // once, and a surface rendering "the reason" re-creates the collapse we
+  // removed twice inside the core, from outside it, looking entirely natural.
+  const unattributedMailbox: Detector<Event> = {
+    id: 'mailbox', monotonic: true,
+    run: applicable => ({
+      status: 'RAN', considered: applicable.length, declined: {},
+      findings: applicable.map(item => ({
+        detectorId: 'mailbox',
+        subject: { kind: 'MAILBOX', mailboxRef: item.id, binding: 'UNRESOLVED' } as const,
+        observedAt: '2026-09-10T00:00:00.000Z',
+      })),
+    }),
+  }
+  const many = run([event('1'), event('2')], {
+    coverage: coverage({ applies: 2, unknown: { X: 1 } }),
+    detectors: [unattributedMailbox, broken],
+    maxEvents: 1,
+  })
+
+  const reasons = many.claim.permitted === false ? many.claim.because : []
+  assert.ok(reasons.length >= 3, 'several reasons hold at once')
+  const sentences = withheldExplanations(many.claim)
+  assert.equal(sentences.length, reasons.length, 'one sentence per reason, none dropped')
+  assert.equal(new Set(sentences).size, sentences.length, 'and no two reasons share wording')
+
+  // A permitted claim has nothing to explain, rather than an empty-string
+  // explanation that a surface would render as a blank caption.
+  assert.deepEqual(withheldExplanations({ permitted: true }), [])
 })
