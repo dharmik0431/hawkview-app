@@ -17,7 +17,7 @@ import type { CollectorSyncStatus } from '../tenants/service-sync-freshness.js'
  * READ-ONLY. Two findMany calls, no write of any kind.
  *
  *   DATABASE_URL=... npx tsx src/risky-users-wiring/dump-tenant.ts \
- *     --org <uuid> --tenant <uuid> [--source GRAPH_SIGN_INS] [--days 30]
+ *     --org <uuid> --tenant <uuid> [--feed-if-no-rows GRAPH_SIGN_INS] [--days 30]
  */
 
 const arg = (name: string): string | undefined => {
@@ -29,12 +29,14 @@ async function main(): Promise<void> {
   const organizationId = arg('org')
   const customerTenantId = arg('tenant')
   if (!organizationId || !customerTenantId) {
-    console.error('usage: --org <uuid> --tenant <uuid> [--source GRAPH_SIGN_INS|M365_AUDIT_STS] [--days 30]')
+    console.error('usage: --org <uuid> --tenant <uuid> [--feed-if-no-rows GRAPH_SIGN_INS|M365_AUDIT_STS] [--days 30]')
     process.exitCode = 2
     return
   }
 
-  const source = (arg('source') ?? 'GRAPH_SIGN_INS') as NormalizationSource
+  // Used ONLY if the window returns no rows. `--source` used to choose the feed
+  // outright, and on three tenants it chose the wrong one and said nothing.
+  const feedIfNoRows = (arg('feed-if-no-rows') ?? 'GRAPH_SIGN_INS') as NormalizationSource
   const days = Number(arg('days') ?? '30')
   const windowEnd = new Date()
   const windowStart = new Date(windowEnd.getTime() - days * 24 * 60 * 60 * 1000)
@@ -48,12 +50,18 @@ async function main(): Promise<void> {
   const pool = new PrismaPg({ connectionString, max: 2 })
   const prisma = new PrismaClient({ adapter: pool })
   try {
-    const { assessment, rowsFetched } = await readTenantAssessment(prisma, {
+    const { assessment, rowsFetched, feed } = await readTenantAssessment(prisma, {
       organizationId,
       customerTenantId,
-      source,
+      feedIfNoRows,
       detectors: [credentialFailureDetector({ rejectionThreshold: Number(arg('threshold') ?? '5') })],
-      collectionScope: (source === 'GRAPH_SIGN_INS' ? 'GRAPH_INTERACTIVE_ONLY' : 'AUDIT_STS_LOGON_EVENTS') as CollectionScope,
+      // Stated per feed, because which one applies is not known until the rows
+      // are read. One value would have to be picked by a caller who does not yet
+      // know what it describes.
+      collectionScope: {
+        GRAPH_SIGN_INS: 'GRAPH_INTERACTIVE_ONLY' as CollectionScope,
+        M365_AUDIT_STS: 'AUDIT_STS_LOGON_EVENTS' as CollectionScope,
+      },
       // Asserted rather than read, and printed as such: the sync-state read is
       // the next piece. Passing SUCCESS here means "assume it was collected",
       // which is the assumption the four-state vocabulary exists to remove — so
@@ -96,7 +104,7 @@ async function main(): Promise<void> {
       reading,
       window: { from: windowStart.toISOString(), to: windowEnd.toISOString(), days },
       rowsFetched,
-      source,
+      feed,
       syncStatusAssumed: arg('sync') ?? 'SUCCESS',
       coverage,
       rowsClassified: classified,

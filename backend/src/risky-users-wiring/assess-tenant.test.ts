@@ -30,7 +30,7 @@ const silent: Detector<NormalizedEvent> = {
 
 test('a classified batch reaches a tenant assessment without the core learning Microsoft', async () => {
   const assessment = assessTenant({
-    streams: [{ stream: 'sign-ins', collection: 'READ', batch: await emptyGraphBatch(), scope: graphScope, detectors: [silent] }],
+    streams: [{ stream: 'sign-ins', collection: 'READ', batch: await emptyGraphBatch(), scope: graphScope, detectors: [silent], rowsFetched: 0 }],
     budget: { maxEvents: 5000 },
   })
   // An empty window: nothing applied and no check examined anything, so no
@@ -42,7 +42,7 @@ test('a classified batch reaches a tenant assessment without the core learning M
 
 test('the request that produced the evidence travels through to the tenant count', async () => {
   const assessment = assessTenant({
-    streams: [{ stream: 'sign-ins', collection: 'READ', batch: await emptyGraphBatch(), scope: graphScope, detectors: [silent] }],
+    streams: [{ stream: 'sign-ins', collection: 'READ', batch: await emptyGraphBatch(), scope: graphScope, detectors: [silent], rowsFetched: 0 }],
     budget: { maxEvents: 5000 },
   })
   // The narrow request is named beside the figure, so a zero cannot be read as
@@ -74,13 +74,13 @@ test('a coverage that has lost a bucket is refused rather than under-reporting',
   }
 
   const complete = toEvaluationCoverage(withUncited, graphScope)
-  assert.doesNotThrow(() => assertAccountsForEveryRow(withUncited, complete))
+  assert.doesNotThrow(() => assertAccountsForEveryRow(withUncited, complete, 9))
 
   // The same coverage with the fourth bucket dropped — exactly what mapping
   // without `notYetCited` would have produced before the integration branch
   // surfaced it. Nine events vanish and the coverage still looks well-formed.
   const lostBucket = { ...complete, notYetCited: {} }
-  assert.throws(() => assertAccountsForEveryRow(withUncited, lostBucket), /lost rows/)
+  assert.throws(() => assertAccountsForEveryRow(withUncited, lostBucket, 9), /lost rows/)
 })
 
 test('the gating totals must be the same events, not merely the same number', async () => {
@@ -90,13 +90,13 @@ test('the gating totals must be the same events, not merely the same number', as
     counts: { ...batch.counts, unknownByObservation: { ...batch.counts.unknownByObservation, UNRECOGNIZED_ERROR_CODE: 4 } },
   }
   const coverage = toEvaluationCoverage(withUnknown, graphScope)
-  assert.doesNotThrow(() => assertAccountsForEveryRow(withUnknown, coverage))
+  assert.doesNotThrow(() => assertAccountsForEveryRow(withUnknown, coverage, 4))
 
   // Moving events from a gating bucket to a non-gating one keeps the row total
   // identical, so the first check still passes — and the claim silently stops
   // being withheld. The second check is what catches that.
   const misfiled = { ...coverage, unknown: {}, doesNotApply: { ...coverage.doesNotApply, UNRECOGNIZED_ERROR_CODE: 4 } }
-  assert.throws(() => assertAccountsForEveryRow(withUnknown, misfiled), /Gating total disagrees/)
+  assert.throws(() => assertAccountsForEveryRow(withUnknown, misfiled, 4), /Gating total disagrees/)
 })
 
 test('a stale collection cannot be assessed as a quiet tenant', async () => {
@@ -137,6 +137,7 @@ test('a stale collection cannot be assessed as a quiet tenant', async () => {
       batch: await emptyGraphBatch(),
       scope: graphScope,
       detectors: [silent],
+      rowsFetched: 0,
     }],
     budget: { maxEvents: 5000 },
   })

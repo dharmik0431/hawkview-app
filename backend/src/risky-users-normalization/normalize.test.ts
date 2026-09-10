@@ -696,6 +696,35 @@ test('isInteractive is inert on real data and changes nothing', async () => {
   assert.equal(nonInteractive.counts.doesNotApplyByReason.NON_INTERACTIVE_SIGN_IN, 0);
 });
 
+test('a CreationTime with no UTC designator is read as UTC, because that is what Microsoft sends', async () => {
+  // EVERY audit row in production fails without this, and the suite could not
+  // see it: `auditRow` writes '2026-09-10T10:00:00.000Z', and the Management
+  // Activity API returns '2026-09-10T10:00:00'. The fixture was shaped like
+  // what the reader wanted rather than like the provider, so the audit feed
+  // passed 40-odd tests while rejecting 100% of real rows on three tenants.
+  //
+  // Microsoft documents CreationTime as UTC and sends no designator, so the
+  // provider is right and the reader was wrong. Interpreting it here rather
+  // than in the collector is deliberate: rows already stored carry no
+  // designator either, and a collector-side fix would leave every one of them
+  // unreadable while looking repaired.
+  const naive = await run([auditRow({ CreationTime: '2026-09-10T10:00:00' })], { source: 'M365_AUDIT_STS' });
+  assert.equal(naive.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 0);
+  assert.equal(only(naive).eventAt, '2026-09-10T10:00:00.000Z');
+
+  // A designator, if one ever arrives, still means what it says.
+  const stamped = await run([auditRow({ CreationTime: '2026-09-10T10:00:00.000Z' })], { source: 'M365_AUDIT_STS' });
+  assert.equal(only(stamped).eventAt, '2026-09-10T10:00:00.000Z');
+
+  // Still a timestamp reader, not a parser of anything date-shaped. An OFFSET
+  // is the dangerous case: reading '+05:00' as UTC would move the event five
+  // hours and land it in the wrong window silently, so it stays rejected.
+  for (const value of ['2026-09-10T10:00:00+05:00', '2026-09-10 10:00:00', '2026-09-10', 'yesterday', '']) {
+    const bad = await run([auditRow({ CreationTime: value })], { source: 'M365_AUDIT_STS' });
+    assert.equal(bad.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1, `accepted ${JSON.stringify(value)}`);
+  }
+});
+
 test('the audit ResultStatus is never consulted', async () => {
   // For STS logon events "Succeeded" means HTTP success, NOT logon success.
   // This one fails silently in the direction of calling failures successes.

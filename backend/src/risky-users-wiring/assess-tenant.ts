@@ -29,6 +29,13 @@ export type ClassifiedStream =
     batch: NormalizationBatch
     scope: CollectionScopeSource
     detectors: readonly Detector<NormalizedEvent>[]
+    /** How many rows the query returned, which the batch cannot tell us.
+     *
+     * Every total inside a batch is computed from the rows it SELECTED, so a
+     * run that selected none of them is internally consistent and empty. This
+     * is the one number from outside, and it is the only thing that can make
+     * `assertAccountsForEveryRow` fail on a whole-feed mismatch. */
+    rowsFetched: number
   }>
   /** Collection did not deliver evidence for this window. A union rather than a
    * flag, because the alternative is a caller passing an empty batch and the
@@ -62,7 +69,7 @@ export function assessTenant(input: AssessTenantInput): TenantAssessment {
     // complete while describing fewer events than were classified — and this is
     // the last place that can still be noticed before it becomes a number on a
     // screen.
-    assertAccountsForEveryRow(stream.batch, coverage)
+    assertAccountsForEveryRow(stream.batch, coverage, stream.rowsFetched)
     return {
       stream: stream.stream,
       assessment: evaluate<NormalizedEvent>({

@@ -56,7 +56,7 @@ export function toEvaluationCoverage(
 const total = (counts: Readonly<Record<string, number>>): number =>
   Object.values(counts).reduce((sum, count) => sum + count, 0)
 
-/** Fails loudly if the mapping loses a row.
+/** Fails loudly if a row we fetched is not accounted for anywhere.
  *
  * A bucket added on the classifier's side that this file does not map would
  * otherwise vanish silently, and the coverage would keep looking complete while
@@ -64,8 +64,25 @@ const total = (counts: Readonly<Record<string, number>>): number =>
  * detector narrowing its own input without saying so, one layer out — so it is
  * checked here rather than trusted, and the check compares two independently
  * computed totals rather than one value against itself.
+ *
+ * TAKES `rowsFetched`, and that is the whole strength of it. The first two arms
+ * below both derive their numbers from the SELECTED set, so a run where nothing
+ * was selected compares 0 to 0 and passes. That is not hypothetical: on three
+ * real tenants 1237, 1000 and 9 rows were fetched and every one was left
+ * unselected as ROW_FROM_OTHER_FEED, because the reader asked for the wrong
+ * feed. Coverage described nothing, this guard passed, and the tenant was
+ * reported NOTHING_APPLICABLE — which on a screen reads as a quiet tenant, over
+ * evidence we had already collected. Only a number from OUTSIDE the batch can
+ * make a guard like this fail.
+ *
+ * `unselectedRowsByReason` is deliberately NOT folded into coverage — those rows
+ * were never this feed's to classify, and counting them as covered would be a
+ * second lie on top of the first. But they were ours to fetch, so they are ours
+ * to account for.
  */
-export function assertAccountsForEveryRow(batch: NormalizationBatch, coverage: Coverage): void {
+export function assertAccountsForEveryRow(
+  batch: NormalizationBatch, coverage: Coverage, rowsFetched: number,
+): void {
   const reported = coverageForEvaluation(batch)
   const mapped = coverage.applies
     + total(coverage.doesNotApply) + total(coverage.notYetCited)
@@ -83,6 +100,20 @@ export function assertAccountsForEveryRow(batch: NormalizationBatch, coverage: C
     throw new Error(
       `Gating total disagrees: core would gate on ${coreGates}, classifier reports `
       + `${reported.uninterpretedEvents}. The two must be the same events.`)
+  }
+  const unselected = total(batch.counts.unselectedRowsByReason)
+  if (classified + unselected !== rowsFetched) {
+    throw new Error(
+      `Rows went missing between the query and the classifier: fetched ${rowsFetched} row(s), `
+      + `classified ${classified}, left unselected ${unselected}. `
+      + 'A row that is neither classified nor unselected is one nobody looked at, and a tenant '
+      + 'assessed on the rest would be told a smaller story than its evidence supports.')
+  }
+  if (unselected > 0 && classified === 0 && rowsFetched > 0) {
+    throw new Error(
+      `Every one of ${rowsFetched} fetched row(s) belongs to a different feed than the one being `
+      + 'assessed, so this run classified nothing. Reporting it would describe a tenant with '
+      + 'evidence as a tenant without any. The feed must be derived from the rows.')
   }
 }
 

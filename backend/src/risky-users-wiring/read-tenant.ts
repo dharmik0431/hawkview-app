@@ -2,6 +2,7 @@ import { PrismaClient } from '../generated/prisma/client.js'
 import { normalizeSignInBatch } from '../risky-users-normalization/index.js'
 import { assessTenant, type ClassifiedStream } from './assess-tenant.js'
 import { bindToFeed, capabilityOf, type FeedBoundDetector } from './feed-capability.js'
+import { decideFeed, type FeedDecision } from './decide-feed.js'
 import { watchedResolver } from './coverage-bridge.js'
 import { evidenceFromSync } from './evidence-availability.js'
 import type { NormalizationSource } from '../risky-users-normalization/contract.js'
@@ -22,9 +23,23 @@ import type { TenantAssessment } from '../evaluation-core/compose.js'
 export type ReadTenantInput = Readonly<{
   organizationId: string
   customerTenantId: string
-  source: NormalizationSource
-  /** What the collector asked Microsoft for, in the collector's own words. */
-  collectionScope: ClassifierCollectionScope
+  /** Which feed to assume when the window returned NO rows, and only then.
+   *
+   * Not "which feed this tenant uses" — that is read off the rows, because a
+   * caller asserting it is how three tenants came to be assessed against a feed
+   * none of their evidence belonged to. A tenant with no rows still needs a feed
+   * to bind detectors to, so the assumption is allowed; it is named so it cannot
+   * be mistaken for a derived answer, and `TenantRead.feed` reports which of the
+   * two happened. */
+  feedIfNoRows: NormalizationSource
+  /** What the collector asked Microsoft for, in the collector's own words, per
+   * feed.
+   *
+   * Keyed by feed rather than given as one value because the feed is no longer
+   * known before the rows are read. A single value would have to be chosen by a
+   * caller who does not yet know which feed it describes — which is the same
+   * asserted-input mistake one field along. */
+  collectionScope: Readonly<Record<NormalizationSource, ClassifierCollectionScope>>
   /** From the collector's own sync state. Deciding this from row counts would
    * be the defect the whole four-state vocabulary exists to prevent: an empty
    * window and an uncollected one look identical in the rows. */
@@ -44,7 +59,13 @@ export type ReadTenantInput = Readonly<{
  * every row it was handed — which cannot be checked without knowing how many
  * that was. Returning it here keeps the two numbers from being read out of
  * different places at different times. */
-export type TenantRead = Readonly<{ assessment: TenantAssessment; rowsFetched: number }>
+export type TenantRead = Readonly<{
+  assessment: TenantAssessment
+  rowsFetched: number
+  /** Which feed was assessed, and whether the rows said so or nobody could.
+   * Travels with the answer so no run can be quoted without its assumption. */
+  feed: FeedDecision
+}>
 
 export async function readTenantAssessment(
   prisma: PrismaClient, input: ReadTenantInput,
@@ -54,12 +75,16 @@ export async function readTenantAssessment(
     // No query at all. Asking the database for rows we have already established
     // we cannot treat as evidence would invite reading the answer off the row
     // count, which is exactly what the sync state exists to stop.
+    // Nothing was read, so nothing can be derived. The stream is named by the
+    // fallback and the decision says so rather than implying the rows agreed.
+    const feed = decideFeed([], input.feedIfNoRows)
     return {
       assessment: assessTenant({
-        streams: [{ stream: input.source, collection: availability.availability }],
+        streams: [{ stream: feed.feed, collection: availability.availability }],
         budget: { maxEvents: input.maxEvents },
       }),
       rowsFetched: 0,
+      feed,
     }
   }
 
@@ -109,9 +134,15 @@ export async function readTenantAssessment(
     }),
   ])
 
+  // Off the rows, before anything is classified. A caller asserting this is how
+  // three tenants came to be read against a feed none of their evidence
+  // belonged to, and every guard downstream passed while it happened.
+  const feed = decideFeed(rows.map(row => row.raw as Record<string, unknown>), input.feedIfNoRows)
+  const collectionScope = input.collectionScope[feed.feed]
+
   const batch = await normalizeSignInBatch({
     scope,
-    source: input.source,
+    source: feed.feed,
     rows: rows.map(row => ({
       organizationId: input.organizationId,
       customerTenantId: input.customerTenantId,
@@ -137,7 +168,7 @@ export async function readTenantAssessment(
     // was perfect, and the sum invariant held. Every guard passed because none
     // of them checks identity resolution.
     reference: resolver.resolve,
-    collectionScope: input.collectionScope,
+    collectionScope,
   })
 
   // Before anything reads the batch: if distinct people collapsed into one
@@ -145,18 +176,20 @@ export async function readTenantAssessment(
   resolver.assertNoCollapse()
 
   const stream: ClassifiedStream = {
-    stream: input.source,
+    stream: feed.feed,
     collection: 'READ',
     batch,
-    scope: { declared: true, asked: input.collectionScope },
+    scope: { declared: true, asked: collectionScope },
     // Bound to the feed rather than handed over raw: a rule whose feed cannot
     // supply its pattern reports INAPPLICABLE instead of running and finding
     // nothing, which would be indistinguishable from a clean tenant.
-    detectors: input.detectors.map(bound => bindToFeed(bound, capabilityOf(input.source))),
+    detectors: input.detectors.map(bound => bindToFeed(bound, capabilityOf(feed.feed))),
+    rowsFetched: rows.length,
   }
 
   return {
     assessment: assessTenant({ streams: [stream], budget: { maxEvents: input.maxEvents } }),
     rowsFetched: rows.length,
+    feed,
   }
 }
