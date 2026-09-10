@@ -628,10 +628,10 @@ test('a sign-in Microsoft cleared is never rendered among its detections', () =>
   const panel = microsoftPanel(document)
   const sections = [...panel.querySelectorAll('section')]
   const risk = sections.find((section: any) =>
-    /currently reports risk/.test(section.textContent ?? '')
+    /currently considers at risk/.test(section.textContent ?? '')
   )
   const cleared = sections.find((section: any) =>
-    /concluded these were safe/.test(section.textContent ?? '')
+    /currently considers safe/.test(section.textContent ?? '')
   )
   assert.ok(risk, 'active risk has its own group')
   assert.ok(cleared, 'clearances have their own group')
@@ -658,7 +658,7 @@ test('an unrecognised verdict renders as unrecognised, not as a risk', () => {
     /does not recognise/.test(section.textContent ?? '')
   )
   const risk = sections.find((section: any) =>
-    /currently reports risk/.test(section.textContent ?? '')
+    /currently considers at risk/.test(section.textContent ?? '')
   )
   assert.ok(unrecognised)
   assert.match(unrecognised!.textContent ?? '', /Unrecognised verdict user/)
@@ -1091,4 +1091,29 @@ test('a hidden label does not repeat what its visible partner already says', () 
   }
   // What it does carry is the number the glyph withholds.
   assert.ok(labels.includes('1'))
+})
+
+test('the Microsoft panel names the question it answers, not just its source', () => {
+  // Microsoft answers two different questions by two different roads: this
+  // API gives its current assessment of a person, and sign-in verdicts give
+  // its reading of one event as logged. They can disagree without either being
+  // wrong. A heading that says only "Microsoft" invites that disagreement to
+  // read as Microsoft contradicting itself, and makes it possible to drop
+  // event-level rows into a user-level group without anyone noticing.
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftMixedVerdicts(),
+  })
+  const panel = microsoftPanel(document)
+
+  // Every group names its subject as a user.
+  for (const heading of [...panel.querySelectorAll('h5')]) {
+    assert.match(
+      heading.textContent ?? '',
+      /^Users /,
+      heading.textContent ?? ''
+    )
+  }
+  // And the panel names the tense and the evidence base.
+  assert.match(panel.textContent ?? '', /considers at risk now/)
+  assert.match(panel.textContent ?? '', /telemetry HawkView cannot see/)
 })

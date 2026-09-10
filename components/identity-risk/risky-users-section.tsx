@@ -156,22 +156,22 @@ const polarityGroups: ReadonlyArray<{
 }> = [
   {
     polarity: 'ACTIVE_RISK',
-    heading: 'Microsoft currently reports risk',
-    note: 'Microsoft considers these identities at risk right now.',
+    heading: 'Users Microsoft currently considers at risk',
+    note: 'Microsoft’s present assessment of the person, drawn from all of its own telemetry.',
   },
   {
     polarity: 'CLOSED',
-    heading: 'Closed by Microsoft',
+    heading: 'Users Microsoft has closed',
     note: 'Microsoft has remediated or dismissed these. Its automatic remediation lands in the dismissed state, so a dismissal here is not necessarily someone waving it away — the detail names who or what closed it.',
   },
   {
     polarity: 'CLEARED',
-    heading: 'Microsoft concluded these were safe',
-    note: 'These are Microsoft clearing a sign-in or account, not Microsoft flagging one. They are listed for completeness and are not findings.',
+    heading: 'Users Microsoft currently considers safe',
+    note: 'These are Microsoft clearing a person or a sign-in, not Microsoft flagging one. They are listed for completeness and are not findings.',
   },
   {
     polarity: 'UNRECOGNISED',
-    heading: 'Verdicts this client does not recognise',
+    heading: 'Users whose Microsoft state this client does not recognise',
     note: 'Microsoft reported something HawkView has not learned to read. It is shown as unrecognised rather than assumed to be a risk.',
   },
 ]
@@ -267,11 +267,12 @@ function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
         </p>
       </div>
       <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-        {count.detail} These are Microsoft&rsquo;s determinations and are never
-        added to, or subtracted from, the HawkView count above.
-        Microsoft&rsquo;s level is a confidence scale rather than a severity
-        one: <em>high</em> means Microsoft is confident, not that the impact is
-        large.
+        {count.detail} These answer one question — which people Microsoft
+        considers at risk <em>now</em>, from telemetry HawkView cannot see. They
+        are Microsoft&rsquo;s determinations and are never added to, or
+        subtracted from, the HawkView count above. Microsoft&rsquo;s level is a
+        confidence scale rather than a severity one: <em>high</em> means
+        Microsoft is confident, not that the impact is large.
       </p>
       {microsoftLevelsHidden(view) && (
         <p className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2.5 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-300">
