@@ -782,9 +782,27 @@ uninterpretable.
 essentially all carrying a `LogonError` that names the reason. Present on every row in both
 collection eras. So the audit path now reads **Operation for the outcome and LogonError for
 the reason**, with any result code that does appear used only as corroboration that can
-contradict but never override. That recovers ~1,412 successes that were previously
-unclassifiable — and it is the audit feed's first source of successes at all, which matters
-for any rule needing "failures then a success".
+contradict but never override.
+
+### This is a capability, not a row count
+
+Read as "~1,412 successes recovered" it sounds like an improvement. What it actually was:
+**the audit feed had no source of successes whatsoever.** So a rule of the form *invalid
+credentials followed by a verified success* had nothing to match against there — not a low
+match rate, structurally zero.
+
+That is `HV-ID-AUTH-005`, one of the three sanctioned rules this rebuild exists to make
+work, and on the audit-fallback tenants it **could never have fired**. Those are the tenants
+without P1 — exactly the customers HawkView's own detection is for, the ones Microsoft's
+tooling does not serve. The detector was not underperforming there. It was inert, and
+nothing said so.
+
+The generalisable question, which nobody was asking: **which feed can supply a rule's whole
+pattern?** Per-detector accounting would have reported `considered: N, matched: 0` — a
+healthy-looking silent detector — because the events forming the other half of the pattern
+were not there to count. That is the 1,054-runs failure reached from a direction none of the
+accounting covers: not a rule that never ran, but a rule run against a feed that could only
+ever supply half its evidence.
 
 `ResultStatus` stays disproved, now on our own data rather than documentation: **141
 locked-out accounts carry `ResultStatus: Success`**, along with 232
@@ -903,3 +921,31 @@ Applying the ruling to them would return them to `APPLIES / BLOCKED_BY_CONTROL` 
 verdict `RISK` — roughly 921 rows for the malicious-IP text. That was previously ruled the
 other way under the older framing, so it is escalated as a consistency question rather than
 decided here.
+
+## Addendum: a negative claim must say what would overturn it
+
+`DISPROVED` and `HYPOTHESIS_SUBJECT_ABSENT` now both require a `revivedBy` field: the
+evidence that would overturn the claim. Verification material has to be able to fail, and a
+tombstone with no revival condition is a claim nothing could ever overturn.
+
+The asymmetry it corrects: a negative claim *feels* cheaper than a positive one — "do not
+read this" seems to cost nothing — so it gets made more broadly and checked less, while
+actually being among the strongest claims in the module: a permanent instruction to every
+future reader, in a registry they will trust precisely because it exists. This mechanism has
+needed two corrections already, both in the negative direction.
+
+It also makes disproof and absence **unwriteable as the same thing**. If the only condition
+you can state is "revived if the field ever appears", you do not have a disproof — you have
+a field you did not find, and it belongs in `HYPOTHESIS_SUBJECT_ABSENT`. Both earlier
+corrections would have been caught at write time by having to fill this in.
+
+Writing them out immediately surfaced a case I had classified on history rather than on
+evidence. `raw.signInEventTypes` is a tombstone because a predicate on it shipped and was
+reported as a fix — but its primary defect is **absence**, and nobody ever tested whether it
+discriminates. Its revival condition therefore needs two clauses (the field appearing, *and*
+a control cohort of human sign-ins that does not carry the marker), and the entry now says
+so rather than implying we found the field and caught it lying.
+
+Five states is the cap. Each additional one is another way to be wrong about a claim about a
+claim, and the mechanism's value comes from being small enough that someone reads all of it.
+A test asserts both the revival conditions and the cap.

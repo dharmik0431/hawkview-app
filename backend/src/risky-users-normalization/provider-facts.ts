@@ -1003,6 +1003,25 @@ export type ShapePredicateVerification
        */
       readonly state: 'DISPROVED';
       readonly evidence: string;
+      /**
+       * REQUIRED: the evidence that would overturn this.
+       *
+       * A negative claim feels cheaper than a positive one — "do not read
+       * this" seems to cost nothing — so it gets made more broadly and
+       * checked less. It is actually among the strongest claims here: a
+       * permanent instruction to every future reader, in a registry they
+       * will trust precisely because it exists. Verification material has to
+       * be able to fail, and a tombstone with no revival condition is a claim
+       * nothing could ever overturn.
+       *
+       * It also makes disproof and absence unwriteable as the same thing. If
+       * the only condition you can state is "revived if the field ever
+       * appears", you do not have a disproof — you have a field you did not
+       * find, and it belongs in HYPOTHESIS_SUBJECT_ABSENT. Both corrections
+       * this mechanism has already needed would have been caught at write
+       * time by having to fill this in.
+       */
+      readonly revivedBy: string;
     }
   | {
       /**
@@ -1019,6 +1038,8 @@ export type ShapePredicateVerification
        */
       readonly state: 'HYPOTHESIS_SUBJECT_ABSENT';
       readonly evidence: string;
+      /** REQUIRED, and for these it is a question of presence, not behaviour. */
+      readonly revivedBy: string;
     };
 
 export interface ShapePredicate {
@@ -1166,6 +1187,11 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'request in tenant-sync.service.ts filters on createdDateTime only and applies no ' +
         'signInEventTypes filter, so Graph returns its default set, which is interactive user sign-ins. ' +
         'That is a collection-scope gap, not a classification one.',
+      revivedBy:
+        'A distribution in which the field takes MORE THAN ONE value — specifically rows carrying ' +
+        'false alongside a 50126 control cohort carrying true. That would make it discriminating ' +
+        'rather than inert. Fixing the collector filter is the likely route, and until then the ' +
+        'predicate cannot be revived by argument.',
     },
   },
   {
@@ -1181,6 +1207,11 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'events ResultStatus is HTTP-level, not logon-level. It fails silently in the direction of calling ' +
         'failed sign-ins successful, which is the worst available direction. Read Operation instead, which ' +
         'passes the same control cleanly.',
+      revivedBy:
+        'A control cohort in which NO failure-bearing row carries Success — i.e. zero rows with a ' +
+        'LogonError and ResultStatus Success. Today that cohort has 141 IdsLocked rows in it. This is a ' +
+        'genuine disproof rather than an absence: the field is present on every row and says the wrong ' +
+        'thing.',
     },
   },
   {
@@ -1203,6 +1234,10 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'raw.managementActivityRecord instead — a choice made before there was a reason, which now has ' +
         'one. NOTE: on the GRAPH feed raw.status IS the provider object and is read normally; only the ' +
         'audit projection of the same name is disproved.',
+      revivedBy:
+        'The projection becoming deterministic for identical inputs AND dropping its Operation fallback. ' +
+        'Even then it would be a derived field rather than provider data, so reviving it would need a ' +
+        'reason to prefer it over reading the record directly.',
     },
   },
   {
@@ -1215,6 +1250,10 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'GUID-shaped on essentially every row, matching no directory user on any row, and MORE granular ' +
         'than the real user: one tenant carries 6 distinct column GUIDs against 2 distinct real users ' +
         'across 950 rows. It appears synthesized rather than sourced. Subjects bind from the raw payload.',
+      revivedBy:
+        'The column matching directory_users on a meaningful share of rows AND being no more granular ' +
+        'than the real user. Both clauses matter: matching alone would not rescue an identifier that ' +
+        'splits one person into six.',
     },
   },
   {
@@ -1226,7 +1265,15 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       evidence:
         'Absent from every row in the dataset, so a predicate on it matches nothing and would have shipped ' +
         'as a verified fix that changed nothing at all. Storage is not the cause: raw is persisted as the ' +
-        'whole provider row, and redaction replaces values without dropping keys.',
+        'whole provider row, and redaction replaces values without dropping keys. HONEST NOTE ON WHICH ' +
+        'DEFECT THIS IS: the primary one is ABSENCE, not a field that was found to lie — nobody ever ' +
+        'tested whether it discriminates. It is kept as a tombstone rather than an absent-subject ' +
+        'hypothesis because a predicate on it actually shipped and was reported as a fix, so the value ' +
+        'of the entry is stopping it coming back.',
+      revivedBy:
+        'BOTH clauses, and the second has never been tested: the field appearing in collected rows, AND ' +
+        'a control cohort of ordinary human sign-ins that does NOT carry servicePrincipal or ' +
+        'managedIdentity. Presence alone would revive only the question, not the predicate.',
     },
   },
   {
@@ -1241,6 +1288,9 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'present on 60/60 rows of the tenant someone wanted to exclude; the query nobody ran was whether ' +
         'it was also present on humans, and it was, on all of them. The control is not optional and it is ' +
         'not the same query.',
+      revivedBy:
+        'A control cohort of ordinary human sign-ins in which the field is EMPTY. That is the query ' +
+        'nobody ran the first time, and it is the only thing that could overturn this.',
     },
   },
   {
@@ -1314,8 +1364,12 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'exists in the data, so the 613 rows carrying it predate the current code and their provenance ' +
         'is unexplained. Nothing depends on the answer — this layer neither keys on nor corroborates ' +
         'with that value. NOTE FOR STORAGE, kept because it outlives this predicate: if two vocabularies ' +
-        'ever do share one column, the fix is to stop merging them rather than to read them more ' +
+        'merging them rather than to read them more ' +
         'cleverly.',
+      revivedBy:
+        'Either field appearing in an audit record at all — again a question of PRESENCE. If one does, ' +
+        'the two-vocabulary question becomes live again and needs the disjoint-range check that could ' +
+        'not be run against absent fields.',
     },
   },
   {
@@ -1341,6 +1395,11 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'than a licensing wall. That needs one Graph call to settle and is not asserted here. Retired ' +
         'rather than left pending: the hypothesis as stated is dead, and reviving it is a collection ' +
         'question rather than a classification one.',
+      revivedBy:
+        'The keys appearing in collected rows at all — a question of PRESENCE, which is what makes this ' +
+        'an absent subject rather than a disproof. Most likely route: an explicit $select on the sign-in ' +
+        'request. If they appear, the hypothesis returns as untested rather than as confirmed, and needs ' +
+        'its own control cohort.',
     },
   },
   {

@@ -1683,3 +1683,27 @@ test('the codes that carry a verdict still reach the risk list', async () => {
   assert.equal(lockout.counts.microsoftVerdicts.RISK, 0);
   assert.deepEqual(lockout.microsoftRiskVerdicts, []);
 });
+
+test('a negative claim must say what would overturn it', async () => {
+  // A registry of negative facts needs the same scoping discipline as the
+  // positive ones. "Do not read this" feels cheaper than a positive claim, so
+  // it gets made more broadly and checked less — while actually being a
+  // permanent instruction to every future reader, in a registry they trust
+  // because it exists. Verification material has to be able to fail.
+  const negative = SHAPE_PREDICATES.filter(
+    entry => entry.verification.state === 'DISPROVED'
+      || entry.verification.state === 'HYPOTHESIS_SUBJECT_ABSENT',
+  );
+  assert.ok(negative.length >= 8, 'expected the negative registry to be non-trivial');
+  for (const entry of negative) {
+    const { verification } = entry;
+    assert.ok(
+      'revivedBy' in verification && verification.revivedBy.length > 40,
+      `${entry.id} makes a negative claim with no revival condition`,
+    );
+  }
+  // And the mechanism stays small enough to be read whole: each extra state is
+  // another way to be wrong about a claim about a claim.
+  const states = new Set(SHAPE_PREDICATES.map(entry => entry.verification.state));
+  assert.ok(states.size <= 5, 'more than five verification states');
+});
