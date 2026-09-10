@@ -732,17 +732,23 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
         'match are not agreement when only one of them says what it measured. Reading the match as ' +
         'corroboration would be the two-moments-as-one-snapshot error wearing a better suit. The old ' +
         'basis stays lost; this one stands on its own. ' +
-        'CAVEAT: one tenant, at most four users, one locale, six weeks, and 1,493 blocks against FOUR ' +
-        'accounts is not obviously normal traffic, so this informs the mapping and does not settle the ' +
-        'general case. ' +
-        'AND ONE CONTROL IS STILL MISSING, in the direction that flatters the claim: the pairing key ' +
-        'is the sign_in_logs.user_principal_name COLUMN, which this layer never reads and holds no ' +
-        'verification for — while its sibling identity column on the same table, sign_in_logs.user_id, ' +
-        'is DISPROVED for being MORE GRANULAR than the real user (6 distinct GUIDs against 2 real users ' +
-        'across 950 rows). If the UPN column splits one person the same way, a 50126 belonging to the ' +
-        'same real person fails to pair with the lockout and INFLATES this figure. The control is the ' +
-        'query that disproved the other column: distinct user_principal_name values against distinct ' +
-        'directory users on this tenant. Until it runs, treat the 532/561 as an upper bound. ' +
+        'CAVEAT: one tenant, one locale, six weeks. The LOCKOUT-LITERAL subset is THREE users — not ' +
+        'the four cited elsewhere, which is the whole 50053 block population including the ' +
+        'malicious-IP text. Three accounts is not obviously normal traffic, so this informs the ' +
+        'mapping and does not settle the general case. ' +
+        'THE PAIRING CONTROL PASSED, so this is a measurement rather than an upper bound. The pairing ' +
+        'key is the sign_in_logs.user_principal_name column, which this layer never reads — and whose ' +
+        'sibling identity column on the same table is DISPROVED for splitting one person across six ' +
+        'GUIDs, so an inflated figure was the live worry: a 50126 that failed to pair would count as ' +
+        'an absent one. Measured 2026-09-10T17:02Z over greentech’s 1,601 rows of 50053 plus 50126: ' +
+        'the UPN matches a directory_users row on 1,601 of 1,601, and 8 distinct UPNs resolve to 8 ' +
+        'distinct directory people through 8 distinct (UPN, user_id) pairs — exact one-to-one, no ' +
+        'person split across aliases. The inflation does not occur. ' +
+        'A SECOND CONTROL, which nobody asked for and which matters more: the alternative reading is ' +
+        'that these are simply users who never fail passwords, which would make the finding an ' +
+        'artefact of the cohort rather than a fact about Microsoft’s emission. All THREE lockout users ' +
+        'DO generate 50126 rows elsewhere in the window — 3 of 3 — just never within ±15 minutes of a ' +
+        'lockout. So the pattern is about WHEN Microsoft emits the attempts, not about who fails. ' +
         'NOTE ALSO that this layer binds Graph subjects by raw.userId (DIRECTORY_OBJECT_ID), not by ' +
         'any UPN, so the measurement’s notion of "the same user" is not the same as the module’s ' +
         'notion of "the same subject". That does not make it wrong, but it is not the module ' +
@@ -1589,8 +1595,19 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'across 950 rows. It appears synthesized rather than sourced. Subjects bind from the raw payload.',
       revivedBy:
         'The column matching directory_users on a meaningful share of rows AND being no more granular ' +
-        'than the real user. Both clauses matter: matching alone would not rescue an identifier that ' +
-        'splits one person into six.',
+        'than the real user — BOTH CLAUSES, ON THE POPULATION THAT PRODUCED THE DISPROOF. Matching ' +
+        'alone would not rescue an identifier that splits one person into six. ' +
+        'THE THIRD CLAUSE WAS MISSING AND IS THE POINT: this condition, as first written, named the ' +
+        'clauses and not the POPULATION, and a control run for an unrelated purpose then satisfied it ' +
+        'by accident. On greentech’s 50053/50126 rows (1,601 rows, measured 2026-09-10T17:02Z) the ' +
+        'column is 1:1 with the real user — 8 distinct values, 8 distinct people — and matches on 100% ' +
+        'of rows. Both stated clauses pass, and THIS MUST NOT REVIVE THE PREDICATE: a column being ' +
+        'well-behaved on one slice is not evidence about the slice where it was found lying. The ' +
+        'disproof is 6 distinct GUIDs against 2 real users across 950 rows on a DIFFERENT population, ' +
+        'and that is the population a revival has to address. ' +
+        'This is the same defect as a percentage without its denominator, one level up — a claim that ' +
+        'names its test and not its subject — and it was caught by someone noticing the coincidence ' +
+        'rather than by anything here.',
     },
   },
   {

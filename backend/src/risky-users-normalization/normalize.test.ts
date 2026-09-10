@@ -2244,14 +2244,28 @@ test('the lockout figure carries a definition, and does not claim the old one co
   assert.match(prose, /REPLACES AN EARLIER .*RATHER THAN CONFIRMING IT/);
   assert.match(prose, /DENOMINATOR\b[^.]{0,40}NOT RECORDED/, 'the old figure stays disclosed as lost');
 
-  // And the control still missing, in the direction that flatters the claim:
-  // the pairing key is a sign_in_logs column this layer never reads, whose
-  // sibling identity column on the same table is DISPROVED for splitting one
-  // person into six. If the UPN column splits the same way, a 50126 belonging
-  // to the same real person fails to pair and inflates the figure — so it is
-  // an upper bound until that control runs.
+  // THE TWO CONTROLS, both now run, and both had to for different reasons.
+  //
+  // The pairing control: the key is a sign_in_logs column this layer never
+  // reads, whose sibling identity column on the same table is DISPROVED for
+  // splitting one person across six GUIDs. If the UPN column split the same
+  // way, a 50126 that failed to pair would count as an absent one and inflate
+  // the figure — the worry ran toward the answer we wanted, which is the
+  // direction that gets checked least. It passes: 1,601 of 1,601 rows match a
+  // directory user, and 8 UPNs resolve to 8 people one-to-one.
   assert.match(prose, /user_principal_name/);
-  assert.match(prose, /upper bound/);
+  assert.match(prose, /1,601 of 1,601/);
+  assert.match(prose, /rather than an upper bound/);
+  //
+  // The second control nobody asked for, and it carries more weight: the
+  // alternative reading is that these are simply users who never fail
+  // passwords, which would make the finding an artefact of the cohort rather
+  // than a fact about when Microsoft emits attempts. All three lockout users
+  // DO produce 50126 rows elsewhere in the window — just never within the
+  // window around a lockout. Asserted because a figure with its alternative
+  // explanation ruled out is a different claim from the same figure alone.
+  assert.match(prose, /3 of 3/);
+  assert.match(prose, /THREE users/, 'the lockout subset is three users, not the four of the whole 50053 population');
 
   // The mapping was never in doubt either way: it rests on the direction.
   assert.deepEqual(lockout.disposition, { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' });
@@ -2349,4 +2363,52 @@ test('a guest identity in two customer tenants never shares a subject reference'
   // mistake a consumer can make, which is why the field says so.
   assert.equal(only(first).customerTenantId, CUSTOMER_TENANT_ID);
   assert.equal(only(second).customerTenantId, OTHER_TENANT);
+});
+
+test('a revival condition names its population, not just its test', () => {
+  // A NEAR-MISS WORTH LOCKING DOWN. sign_in_logs.user_id is DISPROVED for
+  // being MORE GRANULAR than the real user: 6 distinct column GUIDs against 2
+  // distinct real users across 950 rows. Its revival condition read "matching
+  // directory_users on a meaningful share of rows AND being no more granular
+  // than the real user" — two clauses, both sensible.
+  //
+  // A control run for an entirely different purpose then SATISFIED BOTH by
+  // accident. On one tenant's 50053-plus-50126 rows the column matches on 100%
+  // of rows and is exactly 1:1 with the real user — 8 values, 8 people. Read
+  // literally, the predicate was revivable on evidence from a population where
+  // it had never been accused of anything.
+  //
+  // The condition named its TEST and not its SUBJECT, which is the same defect
+  // as a percentage without its denominator, one level up. A revival has to
+  // address the population that produced the disproof; a column behaving well
+  // on one slice says nothing about the slice where it was found lying.
+  //
+  // Caught by a person noticing the coincidence, not by anything here. So:
+  // asserted, and the general rule asserted with it for every negative claim.
+  const column = SHAPE_PREDICATES.find(entry => entry.id === 'signin.user-id-column')!;
+  assert.equal(column.verification.state, 'DISPROVED');
+  const revived = (column.verification as { revivedBy: string }).revivedBy;
+  // Asserting the CLAUSE, not the word: the word appears four times in this
+  // entry's prose, so a match on it alone survives deleting the clause that
+  // does the work. Learned two commits ago and re-learned here — the first
+  // version of this assertion passed a mutation that removed the clause.
+  assert.match(revived, /ON THE POPULATION THAT PRODUCED THE DISPROOF/,
+    'a revival condition that omits its population can be met by accident');
+  assert.match(revived, /MUST NOT REVIVE/, 'the accidental satisfaction has to be recorded, or someone will act on it');
+
+  // And the general form, across every negative claim: a revival condition has
+  // to scope itself somehow — to a population, a cohort, or a named field —
+  // rather than stating a bare test that any slice might happen to pass.
+  const negative = SHAPE_PREDICATES.filter(
+    entry => entry.verification.state === 'DISPROVED'
+      || entry.verification.state === 'HYPOTHESIS_SUBJECT_ABSENT',
+  );
+  const SCOPED = /population|cohort|control|rows|tenant|field|column|feed|record/i;
+  for (const entry of negative) {
+    const condition = (entry.verification as { revivedBy: string }).revivedBy;
+    assert.ok(
+      SCOPED.test(condition),
+      `${entry.id} states a revival test with nothing to scope it to; any slice might pass it`,
+    );
+  }
 });
