@@ -129,7 +129,12 @@ function auditRow(record: Record<string, unknown> = {}, overrides: Partial<SignI
       hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY',
       managementActivityRecord: {
         Id: 'aud-1',
-        CreationTime: '2026-09-10T10:00:00.000Z',
+        // THE SHAPE MICROSOFT ACTUALLY SENDS: UTC, no designator. This default
+        // used to carry a trailing Z, which Microsoft never sends — so ~40 audit
+        // tests passed against a fixture shaped like what the reader wanted while
+        // 100% of real audit rows were rejected. A fixture never checked against
+        // one real stored row is an assumption with a test wrapped round it.
+        CreationTime: '2026-09-10T10:00:00',
         OrganizationId: MICROSOFT_TENANT_ID,
         RecordType: 15,
         Operation: 'UserLoginFailed',
