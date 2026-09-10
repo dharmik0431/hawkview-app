@@ -32,7 +32,8 @@ const row = (n: number, zulu: boolean) => ({
   raw: {
     hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY',
     managementActivityRecord: {
-      Id: `qa-aud-${n}`, CreationTime: zulu ? at(n).toISOString() : at(n).toISOString().replace(/Z$/, ''), OrganizationId: microsoftTenantId,
+      Id: `qa-aud-${n}`, CreationTime: process.env.QA_TS === 'offset' ? at(n).toISOString().replace(/Z$/, '+05:00')
+        : zulu ? at(n).toISOString() : at(n).toISOString().replace(/Z$/, ''), OrganizationId: microsoftTenantId,
       UserId: upn, UserType: 0, RecordType: 15, Operation: 'UserLoggedIn',
       ApplicationId: randomUUID(), ActorIpAddress: '203.0.113.9',
     },
@@ -63,7 +64,7 @@ try {
   const namedInScope = inapplicable.every(id => scope.notCovered.some(n => n.detectorId === id))
   const zero = a.count.accuracy === 'EXACT' && a.count.value === 0
 
-  console.log(JSON.stringify({ QA_GATE_AUDIT: { timestampCarriesZ: process.env.QA_ZULU !== '0',
+  console.log(JSON.stringify({ QA_GATE_AUDIT: { timestampShape: process.env.QA_TS === 'offset' ? 'OFFSET +05:00' : process.env.QA_ZULU === '0' ? 'NO DESIGNATOR' : 'Z',
     rowsFetched: read.rowsFetched, applies: coverage.applies,
     unprocessable: coverage.unprocessable, unknown: coverage.unknown,
     count: { accuracy: a.count.accuracy, value: a.count.value },
