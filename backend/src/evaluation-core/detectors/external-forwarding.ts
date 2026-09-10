@@ -99,7 +99,11 @@ export function externalForwardingDetector(
             signals: [{
               signal: 'EXTERNAL_FORWARDING_CONFIGURED',
               count: external.length,
-              latest: mailbox.observedAt,
+              // A read time, not an event time: forwarding is a STATE, and
+              // Exchange reports no moment at which it was configured. Saying
+              // so is what stops a six-month-old rule rendering as today's
+              // most urgent finding.
+              latest: { at: mailbox.observedAt, kind: 'STATE_OBSERVED' },
             }],
           })
         }

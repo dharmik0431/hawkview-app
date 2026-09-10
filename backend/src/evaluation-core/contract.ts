@@ -258,7 +258,36 @@ export type DetectorSignal = Readonly<{
    * evaluated — "we looked and found none" versus "we did not look" is this
    * feature's signature defect, and it is as wrong per signal as it was per
    * tenant. */
-  latest: string | null
+  latest: SignalRecency | null
+}>
+
+/** When a signal was last true, AND WHAT KIND OF TIME THAT IS.
+ *
+ * The kind is part of the value because these two are not interchangeable and
+ * were briefly held in one `string`:
+ *
+ *   EVENT_OCCURRED   the last time the thing HAPPENED — a lockout, a rejection
+ *   STATE_OBSERVED   the last time we LOOKED and the state was still set —
+ *                    a mailbox forwarding rule, which has no event time at all
+ *
+ * A READ TIME IS ALWAYS RECENT. So a forwarding rule created six months ago
+ * carries today's timestamp, renders as the most urgent thing on the screen,
+ * and is in fact the worst case precisely because it is old. The error also
+ * grows as collection improves — a defect that degrades as the system gets
+ * healthier will never be found by making the system healthier.
+ *
+ * Found by rendering, not by reasoning: on the assembled screen one person
+ * appeared twice, four inches apart, both rows stamped 5:59 p.m. — one an event
+ * time, one a read time — narrating "the attacker got in and set up forwarding
+ * in the same minute" out of a coincidence between when something happened and
+ * when we happened to look. Neither row was false alone.
+ *
+ * A renderer keying the unit off the detector's id would be the convention this
+ * design keeps removing; the kind travels with the value instead, for the same
+ * reason the truncation flag sits on the count it qualifies. */
+export type SignalRecency = Readonly<{
+  at: string
+  kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED'
 }>
 
 /** A signal as it reaches a reader: what the detector measured, plus whether

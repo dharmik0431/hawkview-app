@@ -1,5 +1,5 @@
 import type { EventOutcome, NormalizedEvent } from '../../risky-users-normalization/contract.js'
-import type { CorrelationRef, DetectorFinding } from '../../evaluation-core/contract.js'
+import type { CorrelationRef, DetectorFinding, SignalRecency } from '../../evaluation-core/contract.js'
 import type { FeedBoundDetector } from '../feed-capability.js'
 
 /** Somebody is trying passwords against this account.
@@ -49,7 +49,7 @@ export function credentialFailureDetector(
       id: 'repeated-credential-failure',
       monotonic: true,
       run: applicable => {
-        type Tally = Readonly<Record<EventOutcome, { count: number; latest: string | null }>> & { latestEvent: NormalizedEvent }
+        type Tally = Readonly<Record<EventOutcome, { count: number; latest: SignalRecency | null }>> & { latestEvent: NormalizedEvent }
         const blank = (event: NormalizedEvent): Tally => ({
           LOCKED_OUT_AFTER_REPEATED_FAILURES: { count: 0, latest: null },
           PASSWORD_REJECTED: { count: 0, latest: null },
@@ -77,7 +77,7 @@ export function credentialFailureDetector(
             // than once for the family. One shared timestamp is what let 467
             // lockouts render beside a later rejection's date, overstating the
             // lockouts' recency by six days on a real tenant.
-            [outcome]: { count: running[outcome].count + 1, latest: event.eventAt },
+            [outcome]: { count: running[outcome].count + 1, latest: { at: event.eventAt, kind: 'EVENT_OCCURRED' } },
             latestEvent: event,
           } as Tally)
         }

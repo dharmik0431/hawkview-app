@@ -60,14 +60,36 @@ test('each signal carries its OWN recency, not the family’s', () => {
   assert.ok(finding)
   assert.equal(signalOf(finding, 'LOCKED_OUT_AFTER_REPEATED_FAILURES')?.count, 2)
   // The lockouts' own last occurrence — NOT the later rejection.
-  assert.equal(signalOf(finding, 'LOCKED_OUT_AFTER_REPEATED_FAILURES')?.latest, '2026-09-03T11:00:00.000Z')
+  assert.equal(signalOf(finding, 'LOCKED_OUT_AFTER_REPEATED_FAILURES')?.latest?.at, '2026-09-03T11:00:00.000Z')
   assert.equal(signalOf(finding, 'PASSWORD_REJECTED')?.count, 1)
-  assert.equal(signalOf(finding, 'PASSWORD_REJECTED')?.latest, '2026-09-09T04:00:00.000Z')
+  assert.equal(signalOf(finding, 'PASSWORD_REJECTED')?.latest?.at, '2026-09-09T04:00:00.000Z')
 
   // And no single field a surface could reach for and pair with the wrong
   // count. Removing `observedAt` is what makes the misrendering unwriteable
   // rather than merely discouraged.
   assert.equal((finding as Record<string, unknown>).observedAt, undefined)
+})
+
+test('a recency says what KIND of time it is, and this rule only ever reports event times', () => {
+  // The counterpart detector, `external-mailbox-forwarding`, reports
+  // STATE_OBSERVED — a read time, because Exchange gives no moment at which a
+  // forwarding rule was configured. Both were briefly a bare string, so a
+  // renderer told them apart by knowing which rule had produced them.
+  //
+  // A READ TIME IS ALWAYS RECENT. That made a six-month-old forwarding rule
+  // render as the most urgent item on the screen, and made the error grow as
+  // collection improved. Everything this rule reports is an event that actually
+  // happened, so it must never claim otherwise.
+  const result = run([
+    event('victim', 'LOCKED_OUT_AFTER_REPEATED_FAILURES', '2026-09-03T10:00:00.000Z'),
+    event('victim', 'PASSWORD_REJECTED', '2026-09-09T04:00:00.000Z'),
+  ])
+  const [finding] = result.findings.items
+  assert.ok(finding)
+  for (const signal of finding.signals) {
+    if (signal.latest === null) continue
+    assert.equal(signal.latest.kind, 'EVENT_OCCURRED', `${signal.signal} must report an event time`)
+  }
 })
 
 test('a signal evaluated and absent is present with a null recency, not omitted', () => {
