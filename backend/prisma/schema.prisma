@@ -841,6 +841,10 @@ model IdentityRiskEvaluationRun {
   sourceContentHash   String       @map("source_content_hash") @db.VarChar(128)
   capability        String         @default("UNAVAILABLE") @db.VarChar(20)
   aggregate         Json           @default("{}") @db.JsonB
+  /// NULL means no accounting was recorded — never the same as accounting that
+  /// recorded zero. Deliberately has no default: a default would convert every
+  /// pre-existing row into "assessed nothing, found nothing", permanently.
+  evaluationCoverage Json?         @map("evaluation_coverage") @db.JsonB
   alertDeliveryDisabled Boolean    @default(false) @map("alert_delivery_disabled")
   failureCode       String?        @map("failure_code") @db.VarChar(80)
   leaseToken        String?        @map("lease_token") @db.Uuid
