@@ -147,3 +147,20 @@ export type Assessment = Readonly<{
  * of its own, so nothing below a caller can quietly impose a limit the caller
  * cannot widen. */
 export type Budget = Readonly<{ maxEvents: number }>
+
+/** What the caller has of a stream — and the events, when there are any, are
+ * reachable only through the branch that says there are.
+ *
+ * This replaces a pair of booleans beside an events array, which let a caller
+ * declare evidence unreadable and hand over rows from it in the same breath.
+ * Nothing rejected that, so detectors would run over evidence we had just said
+ * we could not read, and the assessment would report UNREADABLE_NOW while
+ * carrying findings drawn from it. No caller did that, which is exactly the
+ * problem: it was true by convention, and the next caller inherits no
+ * convention. Coverage likewise belongs only to the read branch — evidence
+ * never read has no counts to report, only a reason.
+ */
+export type Evidence<Event> =
+  | Readonly<{ availability: 'NEVER_COLLECTED' }>
+  | Readonly<{ availability: 'UNREADABLE_NOW' }>
+  | Readonly<{ availability: 'READ'; applies: readonly Event[]; coverage: Coverage }>

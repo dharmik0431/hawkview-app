@@ -27,27 +27,28 @@ const userRefOf = (finding: Finding): string | null =>
 /** Built through `evaluate` rather than as literals, so these are assessments
  * the core actually produces — a hand-written one could drift from it and take
  * the composition tests with it. */
-const stream = (name: string, events: readonly Event[], options: Partial<{
-  coverage: Coverage; collected: boolean; readable: boolean
-}> = {}): StreamAssessment => ({
+const stream = (name: string, events: readonly Event[], options: Partial<{ coverage: Coverage }> = {}): StreamAssessment => ({
   stream: name,
-  assessment: evaluate({
-    applies: events,
-    coverage: options.coverage ?? coverage({ applies: events.length }),
+  assessment: evaluate<Event>({
+    evidence: {
+      availability: 'READ',
+      applies: events,
+      coverage: options.coverage ?? coverage({ applies: events.length }),
+    },
     detectors: [matching],
     budget: { maxEvents: 1000 },
-    collected: options.collected ?? true,
-    readable: options.readable ?? true,
   }),
 })
 
-/** Evidence we never collected, or could not read at all, yields no events —
- * there is nothing to have read. Separate constructors so a test cannot express
- * the contradiction of an unreadable stream that nonetheless handed us rows. */
-const uncollectedStream = (name: string): StreamAssessment =>
-  stream(name, [], { coverage: coverage({ applies: 0 }), collected: false })
-const unreadableStream = (name: string): StreamAssessment =>
-  stream(name, [], { coverage: coverage({ applies: 0 }), readable: false })
+/** Evidence never collected, or unreadable, carries no events — the contract
+ * now admits no other shape, so these cannot express the contradiction the
+ * earlier fixtures could. */
+const unreadStream = (name: string, availability: 'NEVER_COLLECTED' | 'UNREADABLE_NOW'): StreamAssessment => ({
+  stream: name,
+  assessment: evaluate<Event>({ evidence: { availability }, detectors: [matching], budget: { maxEvents: 1000 } }),
+})
+const uncollectedStream = (name: string): StreamAssessment => unreadStream(name, 'NEVER_COLLECTED')
+const unreadableStream = (name: string): StreamAssessment => unreadStream(name, 'UNREADABLE_NOW')
 
 const found = (subject: string): Event => ({ subject, match: true })
 
@@ -168,8 +169,7 @@ test('mailbox findings cross streams without ever becoming people', () => {
   const mailboxStream: StreamAssessment = {
     stream: 'mailbox-forwarding',
     assessment: evaluate<Event>({
-      applies: [{ subject: 'shared-billing' }],
-      coverage: coverage({ applies: 1 }),
+      evidence: { availability: 'READ', applies: [{ subject: 'shared-billing' }], coverage: coverage({ applies: 1 }) },
       detectors: [{
         id: 'external-mailbox-forwarding',
         run: applicable => ({
@@ -181,7 +181,7 @@ test('mailbox findings cross streams without ever becoming people', () => {
           })),
         }),
       }],
-      budget: { maxEvents: 1000 }, collected: true, readable: true,
+      budget: { maxEvents: 1000 },
     }),
   }
 

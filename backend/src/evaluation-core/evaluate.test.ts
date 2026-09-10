@@ -29,15 +29,18 @@ const silent: Detector<Event> = { id: 'silent', run: applicable => ({ considered
 const broken: Detector<Event> = { id: 'broken', run: () => { throw new Error('detector fault') } }
 
 const run = (applies: readonly Event[], options: Partial<{
-  coverage: Coverage; detectors: readonly Detector<Event>[]; maxEvents: number; collected: boolean; readable: boolean
-}> = {}) => evaluate({
-  applies,
-  coverage: options.coverage ?? coverage({ applies: applies.length }),
+  coverage: Coverage; detectors: readonly Detector<Event>[]; maxEvents: number
+}> = {}) => evaluate<Event>({
+  evidence: { availability: 'READ', applies, coverage: options.coverage ?? coverage({ applies: applies.length }) },
   detectors: options.detectors ?? [matching, silent],
   budget: { maxEvents: options.maxEvents ?? 1000 },
-  collected: options.collected ?? true,
-  readable: options.readable ?? true,
 })
+
+/** Unread evidence carries no events and no coverage — the type admits no other
+ * shape, which is the point of this branch existing. */
+const unread = (availability: 'NEVER_COLLECTED' | 'UNREADABLE_NOW',
+  detectors: readonly Detector<Event>[] = [matching, silent]) =>
+  evaluate<Event>({ evidence: { availability }, detectors, budget: { maxEvents: 1000 } })
 
 test('an event nobody could interpret never blocks a finding another event supports', () => {
   // The whole point. Under the previous design one unrecognized row took the
@@ -122,14 +125,14 @@ test('a partly declined window is judged by what applied, not by the ratio', () 
 
 test('the four states stay distinct, and each withholds as its own sentence', () => {
   const applied = coverage({ applies: 1 })
-  assert.equal(run([event('1')], { coverage: applied, collected: false }).state, 'NEVER_COLLECTED')
-  assert.equal(run([event('1')], { coverage: applied, readable: false }).state, 'UNREADABLE_NOW')
+  assert.equal(unread('NEVER_COLLECTED').state, 'NEVER_COLLECTED')
+  assert.equal(unread('UNREADABLE_NOW').state, 'UNREADABLE_NOW')
   assert.equal(run([event('1')], { coverage: applied }).state, 'FULLY_INTERPRETED')
   assert.equal(run([event('1')], { coverage: coverage({ applies: 1, unknown: { X: 1 } }) }).state, 'PARTIALLY_UNINTERPRETABLE')
 
   const reasons = [
-    run([event('1')], { coverage: applied, collected: false }).claim,
-    run([event('1')], { coverage: applied, readable: false }).claim,
+    unread('NEVER_COLLECTED').claim,
+    unread('UNREADABLE_NOW').claim,
     run([event('1')], { coverage: coverage({ applies: 1, unknown: { X: 1 } }) }).claim,
     run([], { coverage: coverage({ applies: 0 }) }).claim,
     run([event('1')], { coverage: applied, detectors: [broken] }).claim,
@@ -138,6 +141,28 @@ test('the four states stay distinct, and each withholds as its own sentence', ()
   // label meaning "we could not read it" came to mean "never collected".
   assert.equal(new Set(reasons).size, 5)
   assert.equal(new Set(reasons.map(reason => reason === 'permitted' ? reason : withheldExplanation(reason))).size, 5)
+})
+
+test('unread evidence cannot produce a finding, because it cannot carry an event', () => {
+  // The gap this shape closes. Previously `readable: false` sat beside an events
+  // array and nothing rejected the pair, so detectors ran over evidence the
+  // caller had just declared unreadable and the assessment reported
+  // UNREADABLE_NOW while carrying findings drawn from it. There is now no way to
+  // express that: events live only on the READ branch.
+  for (const availability of ['NEVER_COLLECTED', 'UNREADABLE_NOW'] as const) {
+    const result = unread(availability, [matching, silent])
+    assert.deepEqual(result.findings, [])
+    // No detector is credited with having considered anything, because none ran.
+    // Reporting them as RAN with considered:0 would read like healthy silence.
+    assert.deepEqual(result.detectors, [])
+    assert.deepEqual(result.coverage, { applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {} })
+    assert.deepEqual(result.claim, { permitted: false, because: availability })
+    assert.deepEqual(result.count, { accuracy: 'NOT_AVAILABLE', value: null })
+  }
+
+  // A detector that would throw is never reached, so unread evidence reports its
+  // own reason rather than being relabelled as a detector failure.
+  assert.deepEqual(unread('UNREADABLE_NOW', [broken]).claim, { permitted: false, because: 'UNREADABLE_NOW' })
 })
 
 test('the budget belongs to the caller and exceeding it withholds rather than truncating silently', () => {

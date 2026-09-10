@@ -1,5 +1,6 @@
 import type {
-  Assessment, Budget, Count, Coverage, Detector, DetectorReport, EvidenceState, Finding, WithheldReason, ZeroClaim,
+  Assessment, Budget, Count, Coverage, Detector, DetectorReport, Evidence, EvidenceState, Finding,
+  WithheldReason, ZeroClaim,
 } from './contract.js'
 
 /** Makes an unmapped case a compile error rather than a silent fall-through.
@@ -23,12 +24,21 @@ export const uninterpreted = (coverage: Coverage): number =>
  * them cannot look like a window that was examined. */
 export const declined = (coverage: Coverage): number => total(coverage.doesNotApply)
 
-/** Derived from the coverage it describes, so the state cannot disagree with
- * it. The caller supplies only the two conditions it alone knows. */
-export function evidenceState(coverage: Coverage, collected: boolean, readable: boolean): EvidenceState {
-  if (!collected) return 'NEVER_COLLECTED'
-  if (!readable) return 'UNREADABLE_NOW'
-  return uninterpreted(coverage) > 0 ? 'PARTIALLY_UNINTERPRETABLE' : 'FULLY_INTERPRETED'
+/** Evidence we hold nothing of: no counts, because nothing was read to count. */
+export const NO_COVERAGE: Coverage = Object.freeze({
+  applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {},
+})
+
+/** Read straight off the evidence, so the state cannot disagree with what the
+ * caller actually has. Only the read branch can be partial, because only read
+ * evidence has anything to be partial about. */
+export function evidenceState(evidence: Evidence<unknown>): EvidenceState {
+  switch (evidence.availability) {
+    case 'NEVER_COLLECTED': return 'NEVER_COLLECTED'
+    case 'UNREADABLE_NOW': return 'UNREADABLE_NOW'
+    case 'READ': return uninterpreted(evidence.coverage) > 0 ? 'PARTIALLY_UNINTERPRETABLE' : 'FULLY_INTERPRETED'
+    default: return unreachable(evidence)
+  }
 }
 
 /** The single decision. Everything user-facing consumes this answer rather than
@@ -98,17 +108,25 @@ export function withheldExplanation(reason: WithheldReason): string {
  * and no detector can veto another's.
  */
 export function evaluate<Event>(input: Readonly<{
-  /** Already classified as in scope, by the layer that knows what the fields mean. */
-  applies: readonly Event[]
-  /** Already counted by that same layer. Passed through, not recomputed. */
-  coverage: Coverage
+  /** Already classified and counted by the layer that knows what the fields
+   * mean. Events exist only on the READ branch, so there is no way to hand this
+   * function rows from evidence the caller has declared it could not read. */
+  evidence: Evidence<Event>
   detectors: readonly Detector<Event>[]
   budget: Budget
-  collected: boolean
-  readable: boolean
 }>): Assessment {
-  const withinBudget = input.applies.length <= input.budget.maxEvents
-  const applicable = withinBudget ? input.applies : input.applies.slice(0, input.budget.maxEvents)
+  const state = evidenceState(input.evidence)
+  if (input.evidence.availability !== 'READ') {
+    // Nothing was read, so nothing ran. An empty detector list is the honest
+    // report — not a list of detectors credited with having considered zero
+    // events, which reads like a healthy silent detector.
+    const claim = zeroClaim(state, NO_COVERAGE, true, true)
+    return { state, coverage: NO_COVERAGE, detectors: [], findings: [], count: countOf(0, claim), claim }
+  }
+
+  const { applies, coverage } = input.evidence
+  const withinBudget = applies.length <= input.budget.maxEvents
+  const applicable = withinBudget ? applies : applies.slice(0, input.budget.maxEvents)
 
   const findings: Finding[] = []
   const reports: DetectorReport[] = []
@@ -125,11 +143,10 @@ export function evaluate<Event>(input: Readonly<{
     }
   }
 
-  const state = evidenceState(input.coverage, input.collected, input.readable)
-  const claim = zeroClaim(state, input.coverage, withinBudget, reports.every(report => report.status === 'RAN'))
+  const claim = zeroClaim(state, coverage, withinBudget, reports.every(report => report.status === 'RAN'))
   return {
     state,
-    coverage: input.coverage,
+    coverage,
     detectors: reports,
     findings,
     count: countOf(distinctUsers(findings), claim),

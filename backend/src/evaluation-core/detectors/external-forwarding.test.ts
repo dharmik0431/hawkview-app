@@ -23,7 +23,10 @@ const coverage = (applies: number, parts: Partial<Coverage> = {}): Coverage =>
   ({ applies, doesNotApply: {}, unknown: {}, unprocessable: {}, ...parts })
 
 const assess = (mailboxes: readonly MailboxForwardingArtefact[], detectors = [detector]) =>
-  evaluate({ applies: mailboxes, coverage: coverage(mailboxes.length), detectors, budget: { maxEvents: 500 }, collected: true, readable: true })
+  evaluate<MailboxForwardingArtefact>({
+    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(mailboxes.length) },
+    detectors, budget: { maxEvents: 500 },
+  })
 
 test('forwarding outside the tenant is found wherever Exchange reports it', () => {
   const found = [
@@ -73,10 +76,9 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
     }),
   })
   const withMailboxes = (mailboxes: readonly MailboxForwardingArtefact[]) => evaluate<MailboxForwardingArtefact>({
-    applies: mailboxes,
-    coverage: coverage(Math.max(mailboxes.length, 1)),
+    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(Math.max(mailboxes.length, 1)) },
     detectors: [detector, userSide('shared-billing')],
-    budget: { maxEvents: 500 }, collected: true, readable: true,
+    budget: { maxEvents: 500 },
   })
 
   const exfiltrating = (ref: string) => mailbox(ref, { forwardingSmtpAddress: 'exfil@evil.example' })
@@ -133,10 +135,13 @@ test('the detector plugs into the core without the core knowing anything about m
 
   // And the coverage rules apply unchanged: an artefact nobody could read
   // withholds the clean claim without suppressing what was found elsewhere.
-  const partial = evaluate({
-    applies: [mailbox('a', { forwardingSmtpAddress: 'exfil@evil.example' })],
-    coverage: coverage(1, { unprocessable: { MAILBOX_UNREADABLE: 1 } }),
-    detectors: [detector], budget: { maxEvents: 500 }, collected: true, readable: true,
+  const partial = evaluate<MailboxForwardingArtefact>({
+    evidence: {
+      availability: 'READ',
+      applies: [mailbox('a', { forwardingSmtpAddress: 'exfil@evil.example' })],
+      coverage: coverage(1, { unprocessable: { MAILBOX_UNREADABLE: 1 } }),
+    },
+    detectors: [detector], budget: { maxEvents: 500 },
   })
   assert.equal(partial.findings.length, 1)
   assert.deepEqual(partial.claim, { permitted: false, because: 'UNINTERPRETED_EVENTS' })
