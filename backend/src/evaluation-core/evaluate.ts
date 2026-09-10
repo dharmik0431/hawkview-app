@@ -1,44 +1,45 @@
-import {
-  DOES_NOT_APPLY_REASONS, UNKNOWN_REASONS,
-  type Assessment, type Budget, type Classifier, type Count, type Coverage,
-  type Detector, type DetectorReport, type EvidenceState, type Finding, type WithheldReason, type ZeroClaim,
+import type {
+  Assessment, Budget, Count, Coverage, Detector, DetectorReport, EvidenceState, Finding, WithheldReason, ZeroClaim,
 } from './contract.js'
 
 /** Makes an unmapped case a compile error rather than a silent fall-through.
- * Every reason mapping in this module routes through it, because the defect it
- * replaces was a default arm that answered ten questions with one sentence. */
+ * Every reason mapping here routes through it, because the defect it replaces
+ * was a default arm that answered ten different questions with one sentence. */
 export function unreachable(value: never): never {
   throw new Error(`Unhandled evaluation case: ${JSON.stringify(value)}`)
 }
 
-const emptyCoverage = (): Coverage => ({
-  applies: 0,
-  doesNotApply: Object.fromEntries(DOES_NOT_APPLY_REASONS.map(reason => [reason, 0])) as Coverage['doesNotApply'],
-  unknown: Object.fromEntries(UNKNOWN_REASONS.map(reason => [reason, 0])) as Coverage['unknown'],
-})
+const total = (counts: Readonly<Record<string, number>>): number =>
+  Object.values(counts).reduce((sum, count) => sum + count, 0)
 
-export const uninterpretedCount = (coverage: Coverage): number =>
-  UNKNOWN_REASONS.reduce((total, reason) => total + coverage.unknown[reason], 0)
+/** Evidence we could not turn into an answer, whether we failed to read the row
+ * or read it and could not interpret it. Both reduce what may be claimed, and
+ * both stay separately reported — this sum exists only to gate, never to
+ * display. Neither is ever added to `doesNotApply`. */
+export const uninterpreted = (coverage: Coverage): number =>
+  total(coverage.unknown) + total(coverage.unprocessable)
 
-export const declinedCount = (coverage: Coverage): number =>
-  DOES_NOT_APPLY_REASONS.reduce((total, reason) => total + coverage.doesNotApply[reason], 0)
+/** Events the rules correctly declined. Reported so a window made entirely of
+ * them cannot look like a window that was examined. */
+export const declined = (coverage: Coverage): number => total(coverage.doesNotApply)
 
-/** Derives the state from what the classification actually produced, so the
- * state cannot disagree with the coverage it is meant to describe. A caller
- * supplies only the two conditions it alone knows. */
+/** Derived from the coverage it describes, so the state cannot disagree with
+ * it. The caller supplies only the two conditions it alone knows. */
 export function evidenceState(coverage: Coverage, collected: boolean, readable: boolean): EvidenceState {
   if (!collected) return 'NEVER_COLLECTED'
   if (!readable) return 'UNREADABLE_NOW'
-  return uninterpretedCount(coverage) > 0 ? 'PARTIALLY_UNINTERPRETABLE' : 'FULLY_INTERPRETED'
+  return uninterpreted(coverage) > 0 ? 'PARTIALLY_UNINTERPRETABLE' : 'FULLY_INTERPRETED'
 }
 
-/** The single decision. Everything user-facing consumes this answer instead of
- * asking the same question again with a different bar.
+/** The single decision. Everything user-facing consumes this answer rather than
+ * asking the same question again against a different bar.
  *
  * A failed detector is partial evidence about findings, so it withholds the
  * clean claim for the same reason partial evidence does: what it would have
- * found is unknown. It does not erase what its neighbours found. */
-export function zeroClaim(state: EvidenceState, coverage: Coverage, withinBudget: boolean, allDetectorsRan = true): ZeroClaim {
+ * found is unknown. It never erases what its neighbours found. */
+export function zeroClaim(
+  state: EvidenceState, coverage: Coverage, withinBudget: boolean, allDetectorsRan: boolean,
+): ZeroClaim {
   if (!withinBudget) return { permitted: false, because: 'CAPACITY_EXCEEDED' }
   if (!allDetectorsRan) return { permitted: false, because: 'DETECTOR_FAILED' }
   switch (state) {
@@ -74,38 +75,27 @@ export function withheldExplanation(reason: WithheldReason): string {
   }
 }
 
-/** Runs the classification once, then the detectors over what applied.
+/** Runs the detectors over events that were classified elsewhere.
  *
- * Detectors never see the classification and cannot alter it, so an event no
- * detector matches is not thereby a gap, and an event we could not interpret
- * cannot suppress a finding that another event supports.
+ * The core never sees an unclassified event and holds no classifier, so
+ * "classified exactly once" is structural rather than a rule someone has to
+ * follow. Detectors receive only what applied and cannot influence coverage, so
+ * an event nobody could interpret cannot suppress a finding another supports,
+ * and no detector can veto another's.
  */
 export function evaluate<Event>(input: Readonly<{
-  events: readonly Event[]
-  classify: Classifier<Event>
+  /** Already classified as in scope, by the layer that knows what the fields mean. */
+  applies: readonly Event[]
+  /** Already counted by that same layer. Passed through, not recomputed. */
+  coverage: Coverage
   detectors: readonly Detector<Event>[]
   budget: Budget
   collected: boolean
   readable: boolean
 }>): Assessment {
-  const withinBudget = input.events.length <= input.budget.maxEvents
-  const considered = withinBudget ? input.events : input.events.slice(0, input.budget.maxEvents)
-  const coverage = emptyCoverage()
-  const doesNotApply = { ...coverage.doesNotApply }
-  const unknown = { ...coverage.unknown }
-  const applicable: Event[] = []
+  const withinBudget = input.applies.length <= input.budget.maxEvents
+  const applicable = withinBudget ? input.applies : input.applies.slice(0, input.budget.maxEvents)
 
-  for (const event of considered) {
-    const disposition = input.classify(event)
-    switch (disposition.kind) {
-      case 'APPLIES': applicable.push(event); break
-      case 'DOES_NOT_APPLY': doesNotApply[disposition.reason] += 1; break
-      case 'UNKNOWN': unknown[disposition.reason] += 1; break
-      default: unreachable(disposition)
-    }
-  }
-
-  const counted: Coverage = { applies: applicable.length, doesNotApply, unknown }
   const findings: Finding[] = []
   const reports: DetectorReport[] = []
   // A detector that cannot run is that detector's failure alone. Erasing its
@@ -121,11 +111,11 @@ export function evaluate<Event>(input: Readonly<{
     }
   }
 
-  const state = evidenceState(counted, input.collected, input.readable)
-  const claim = zeroClaim(state, counted, withinBudget, reports.every(report => report.status === 'RAN'))
+  const state = evidenceState(input.coverage, input.collected, input.readable)
+  const claim = zeroClaim(state, input.coverage, withinBudget, reports.every(report => report.status === 'RAN'))
   return {
     state,
-    coverage: counted,
+    coverage: input.coverage,
     detectors: reports,
     findings,
     count: countOf(new Set(findings.map(finding => finding.subject)).size, claim),
