@@ -79,6 +79,7 @@ function finding(): RiskAssessmentFinding {
     activityWindowEndsAt: '2026-09-08T22:15:00.000Z',
     window: { start: '2026-09-08T20:45:00.000Z', end: observedAt },
     evidenceCount: 10,
+    signals: null,
     evidenceCountCapped: false,
     selectedSource: 'GRAPH_SIGN_INS',
     application: {

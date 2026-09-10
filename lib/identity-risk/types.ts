@@ -331,6 +331,42 @@ export type RiskRecommendedAction = {
   text: string
 }
 
+/**
+ * When a finding's timestamp marks something happening, and when it marks
+ * HawkView looking.
+ *
+ * The kind travels with the value rather than being looked up from the signal's
+ * name or the rule's id. A name is a proxy for the kind in the same way an id
+ * is, so keying on one would move the convention rather than remove it -- and a
+ * convention held somewhere else is what produced "3 records, last 3:04 p.m."
+ * for a mailbox that had simply been read.
+ */
+export type SignalInstant = {
+  at: string
+  kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED'
+}
+
+/**
+ * One reason inside a finding, with its own volume and its own recency.
+ *
+ * A finding is per subject per detector and can rest on several signals at
+ * once: on the fleet today one account carries 462 lockouts that stopped on 3
+ * September beside 12 password rejections from the 9th. Those are one finding
+ * and two facts, and a surface that shows one count and one date for it states
+ * the quieter signal's recency over the louder signal's volume.
+ *
+ * A null instant means the signal was evaluated and nothing occurred. A signal
+ * missing from the array was never evaluated. The two must not be collapsed,
+ * and neither may be read as a floor when the count is capped -- a capped zero
+ * is the absence of a reading, not a finding of none.
+ */
+export type FindingSignal = {
+  signal: string
+  count: number
+  latest: SignalInstant | null
+  capped: boolean
+}
+
 export type RiskAssessmentFinding = {
   id: string
   ruleId: ReportedRuleId
@@ -347,6 +383,16 @@ export type RiskAssessmentFinding = {
   window: RiskEvidenceWindow
   evidenceCount: number
   evidenceCountCapped: boolean
+  /**
+   * Present only on servers that speak it. Absent -- the key missing, never an
+   * empty array -- means this response predates the field, and the
+   * finding-level count and dates above are read instead.
+   *
+   * Non-empty when present. An empty array would say every signal was never
+   * evaluated, which is a finding resting on nothing rather than an ambiguous
+   * one, so it is rejected rather than tolerated.
+   */
+  signals: FindingSignal[] | null
   selectedSource: RiskAssessmentSource
   application: {
     id: string | null

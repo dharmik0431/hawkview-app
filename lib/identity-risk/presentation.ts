@@ -520,6 +520,66 @@ export function riskAssessmentEmptyPresentation(assessment: RiskAssessment) {
   }
 }
 
+
+/**
+ * The words for one signal: what to call it, and what its count counts.
+ *
+ * This is the division the contract was changed to make possible, and the two
+ * halves come from different places on purpose.
+ *
+ * The UNIT is human copy and belongs to the client. The core holds no Microsoft
+ * vocabulary and should not learn one, so "lockouts" and "external
+ * destinations" live here, keyed by signal name.
+ *
+ * The KIND -- whether a timestamp marks an event occurring or a state being
+ * observed -- travels on the value itself and is never looked up here. Keying
+ * the kind on the name would move the convention rather than remove it, and
+ * would look like progress because the key sits closer to the data. The unit
+ * being name-keyed and the kind being value-carried is not an inconsistency:
+ * copy is a client concern and can be wrong only cosmetically, while a kind
+ * read from the wrong place renders a read time as an event.
+ */
+const signalCopy: Record<
+  string,
+  { title: string; singular: string; plural: string }
+> = {
+  LOCKED_OUT_AFTER_REPEATED_FAILURES: {
+    title: 'Locked out after repeated failures',
+    singular: 'lockout',
+    plural: 'lockouts',
+  },
+  PASSWORD_REJECTED: {
+    title: 'Password rejected',
+    singular: 'rejected sign-in',
+    plural: 'rejected sign-ins',
+  },
+  EXTERNAL_FORWARDING_CONFIGURED: {
+    title: 'Forwarding to an external address',
+    singular: 'external destination',
+    plural: 'external destinations',
+  },
+}
+
+/**
+ * What to call a signal on screen.
+ *
+ * The closed set lives in the wiring layer and the core's type is a plain
+ * string, so a fourth signal can appear without anything failing to compile.
+ * One that does gets a sentence saying this build does not know it, never the
+ * raw identifier: an identifier is not something a technician can act on, and
+ * printing it invites the reading that it is a name.
+ */
+export function signalTitle(signal: string): string {
+  return (
+    signalCopy[signal]?.title ??
+    'A detector signal this build of HawkView does not recognise'
+  )
+}
+
+export function signalIsRecognised(signal: string): boolean {
+  return Object.hasOwn(signalCopy, signal)
+}
+
 /* -------------------------------------------------------------------------- */
 /* What a finding's count counts, and what its date marks                     */
 /* -------------------------------------------------------------------------- */
@@ -572,7 +632,7 @@ export function riskAssessmentEmptyPresentation(assessment: RiskAssessment) {
  * to the data.
  */
 export type FindingEvidenceShape =
-  | { kind: 'OCCURRENCES' }
+  | { kind: 'OCCURRENCES'; singular?: string; plural?: string }
   | { kind: 'CONFIGURED_STATE'; singular: string; plural: string }
   | { kind: 'UNRECOGNISED' }
 
@@ -607,9 +667,48 @@ export type FindingEvidenceSummary = {
  * The date formatter is supplied by the caller because the list and the drawer
  * format times differently, and neither of those choices belongs here.
  */
+
+/**
+ * The shape for one reason, preferring what the value carries.
+ *
+ * A signal this build does not recognise is unrecognised even if its kind is
+ * known: without a unit there is no honest noun for its count, and "records"
+ * is the guess the mailbox check already proved wrong.
+ */
+function evidenceShapeFor(finding: {
+  ruleId: string
+  signal?: string | null
+  kind?: 'EVENT_OCCURRED' | 'STATE_OBSERVED' | null
+}): FindingEvidenceShape {
+  if (finding.signal === undefined || finding.signal === null) {
+    return findingEvidenceShape(finding.ruleId)
+  }
+  const copy = signalCopy[finding.signal]
+  if (!copy) return { kind: 'UNRECOGNISED' }
+  if (finding.kind === 'STATE_OBSERVED') {
+    return {
+      kind: 'CONFIGURED_STATE',
+      singular: copy.singular,
+      plural: copy.plural,
+    }
+  }
+  return {
+    kind: 'OCCURRENCES',
+    singular: copy.singular,
+    plural: copy.plural,
+  }
+}
+
 export function findingEvidenceSummary(
   finding: {
     ruleId: string
+    /** Set when this reason came from a signal rather than a whole finding. */
+    signal?: string | null
+    /**
+     * The kind carried by the signal's own timestamp. Preferred over anything
+     * inferred from the rule, and null when the signal has no timestamp.
+     */
+    kind?: 'EVENT_OCCURRED' | 'STATE_OBSERVED' | null
     evidenceCount: number
     evidenceCountCapped: boolean
     /**
@@ -626,7 +725,7 @@ export function findingEvidenceSummary(
   },
   formatDate: (value: string) => string
 ): FindingEvidenceSummary {
-  const shape = findingEvidenceShape(finding.ruleId)
+  const shape = evidenceShapeFor(finding)
   const when = finding.lastSeen === null ? null : formatDate(finding.lastSeen)
   if (shape.kind === 'UNRECOGNISED') {
     return {
@@ -693,7 +792,12 @@ export function findingEvidenceSummary(
     }
   }
   return {
-    count: amount + ' ' + (finding.evidenceCount === 1 ? 'record' : 'records'),
+    count:
+      amount +
+      ' ' +
+      (finding.evidenceCount === 1
+        ? (shape.singular ?? 'record')
+        : (shape.plural ?? 'records')),
     timing: when === null ? 'no time recorded' : 'last ' + when,
     note: null,
   }

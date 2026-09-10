@@ -22,6 +22,7 @@
  *  - Nothing here concludes that a user is safe.
  */
 import {
+  signalTitle,
   currentRiskAssessmentUsers,
   hawkViewRiskyUserCountPresentation,
   riskAssessmentEmptyPresentation,
@@ -546,6 +547,16 @@ export type RiskyUserPriority = 'LOW' | 'MEDIUM' | 'HIGH'
 export type RiskyUserReason = {
   title: string
   /**
+   * The signal this reason came from, or null on a response that predates
+   * signals and where a whole finding is the reason.
+   */
+  signal: string | null
+  /**
+   * The kind of time this reason's date marks, carried by the value rather
+   * than inferred from the signal's name or the rule's id.
+   */
+  kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED' | null
+  /**
    * Carried so the surface can say what this rule's count counts and what its
    * date marks. Those differ per rule and are not derivable from the numbers.
    */
@@ -650,14 +661,49 @@ function rowFor(
   const findings = currentOnly
     ? user.findings.filter((finding) => finding.activityState === 'CURRENT')
     : user.findings
-  const reasons: RiskyUserReason[] = findings.map((finding) => ({
-    title: finding.title,
-    ruleId: finding.ruleId,
-    evidenceCount: finding.evidenceCount,
-    evidenceCountCapped: finding.evidenceCountCapped,
-    firstSeen: finding.firstSeen,
-    lastSeen: finding.lastSeen,
-  }))
+  // One reason per signal, not per finding.
+  //
+  // A finding is per subject per detector and can rest on several signals at
+  // once: on the fleet one account carries 462 lockouts that stopped on 3
+  // September beside 12 password rejections from the 9th. One finding, two
+  // facts. Mapping a finding to a reason would show one count and one date for
+  // both, which is the collapse the contract was changed to remove, re-created
+  // one level up in the layer that renders it.
+  //
+  // A response without signals still yields one reason per finding, because
+  // frontend and backend ship separately and every release has a window where
+  // one side is old. The fallback carries no signal and no kind, so the rule
+  // table supplies the unit for exactly as long as the field is absent.
+  const reasons: RiskyUserReason[] = findings.flatMap(
+    (finding): RiskyUserReason[] =>
+      finding.signals
+        ? finding.signals.map((signal) => ({
+            title: signalTitle(signal.signal),
+            signal: signal.signal,
+            kind: signal.latest?.kind ?? null,
+            ruleId: finding.ruleId,
+            evidenceCount: signal.count,
+            evidenceCountCapped: signal.capped,
+            // A signal reports one instant, not a span. Claiming the finding's
+            // first-seen for it would attach the earliest of any signal to every
+            // signal, which is the same defect as the shared last-seen it
+            // replaces, pointed backwards.
+            firstSeen: null,
+            lastSeen: signal.latest?.at ?? null,
+          }))
+        : [
+            {
+              title: finding.title,
+              signal: null,
+              kind: null,
+              ruleId: finding.ruleId,
+              evidenceCount: finding.evidenceCount,
+              evidenceCountCapped: finding.evidenceCountCapped,
+              firstSeen: finding.firstSeen,
+              lastSeen: finding.lastSeen,
+            },
+          ]
+  )
   // Only reasons that carry a time can supply the column's date. A dateless
   // reason is not sorted to the front or the back of this list; it is excluded
   // from a maximum it has no value to contribute to.

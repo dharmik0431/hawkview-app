@@ -511,7 +511,7 @@ function UserRows({
                 </p>
                 <ul className="mt-1.5 space-y-1">
                   {row.reasons.map((reason) => (
-                    <ReasonLine key={reason.title} reason={reason} />
+                    <ReasonLine key={reason.signal ?? reason.title} reason={reason} />
                   ))}
                 </ul>
               </td>

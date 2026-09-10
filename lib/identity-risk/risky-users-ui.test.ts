@@ -1572,3 +1572,221 @@ test('a count with no findings behind it is a gap, never an all-clear', () => {
     'the disclosure fired on a response that delivered its findings'
   )
 })
+
+const withSignals = (signals: unknown) => {
+  const value = assessmentFixture(true)
+  value.users[0].findings[0].title = 'Repeated invalid credentials'
+  value.users[0].findings[0].evidenceCount = 474
+  ;(value.users[0].findings[0] as any).signals = signals
+  return value
+}
+
+const rowText = (document: Document) =>
+  document.querySelector(
+    '[aria-labelledby="risky-users-list-heading"] tbody tr'
+  )?.textContent ?? ''
+
+test('one finding resting on two signals renders two reasons, not one', () => {
+  // Raymonds, as the contract now delivers it: a single credential-failure
+  // finding carrying 462 lockouts that stopped on the 3rd and 12 password
+  // rejections from the 9th. Mapping a finding to a reason would show one
+  // count and one date for both -- the collapse the contract was changed to
+  // remove, re-created one level up in the layer that renders it.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+        count: 462,
+        capped: false,
+        latest: { at: at(-14), kind: 'EVENT_OCCURRED' },
+      },
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 12,
+        capped: false,
+        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+
+  // Each signal keeps its own volume, in its own unit, with its own date.
+  assert.match(row, /Locked out after repeated failures/)
+  assert.match(row, /462 lockouts, last /)
+  assert.match(row, /Password rejected/)
+  assert.match(row, /12 rejected sign-ins, last /)
+
+  // And the two dates are different, so neither count sits beside the other's.
+  const dates = row
+    .split('last ')
+    .slice(1)
+    .map((part: string) => part.slice(0, 24))
+  assert.equal(dates.length, 2, row)
+  assert.notEqual(dates[0], dates[1], row)
+
+  // The finding's own aggregate count is never printed beside the signals it
+  // was summed from; 474 would read as a third reason.
+  assert.ok(!/474/.test(row), 'the finding total was rendered beside its parts')
+})
+
+test('a state signal is not described in the vocabulary of events', () => {
+  // The kind comes off the value. Nothing here consults the signal's name to
+  // decide it, which is the point of the contract change: a name is a proxy
+  // for the kind in exactly the way a rule id is.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'EXTERNAL_FORWARDING_CONFIGURED',
+        count: 3,
+        capped: false,
+        latest: { at: at(-1), kind: 'STATE_OBSERVED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+  assert.match(row, /3 external destinations/)
+  assert.match(row, /configuration read /)
+  assert.ok(!/, last /.test(row), 'a read time was rendered as an occurrence')
+})
+
+test('an unrecognised signal says so and never shows its identifier', () => {
+  // The closed set lives in the wiring layer and the core's type is a plain
+  // string, so a fourth signal can appear without anything failing to compile.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'SOMETHING_SHIPPED_AFTER_THIS_BUILD',
+        count: 9,
+        capped: false,
+        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+  assert.match(row, /does not recognise/)
+  assert.match(row, /does not know this check/)
+  assert.ok(!/9 records/.test(row), 'a unit was guessed for an unknown signal')
+  assert.ok(
+    !/SOMETHING_SHIPPED_AFTER_THIS_BUILD/.test(row),
+    'an identifier was rendered where a description belongs'
+  )
+})
+
+test('a response without signals still renders, and one with an empty array does not', () => {
+  // Frontend and backend ship through separate systems, so every release has a
+  // window where one side is old. Absence has to be survivable; the key simply
+  // missing is what an old server sends.
+  const older = render(withSignals(undefined))
+  assert.match(rowText(older.document), /Repeated invalid credentials/)
+  assert.match(rowText(older.document), /474 records, last /)
+
+  // An empty array is not the same thing and must not be tolerated as though
+  // it were. Under the contract a signal missing from the array was never
+  // evaluated, so an empty one says every signal was never evaluated -- a
+  // finding resting on nothing. Accepting it as an old-server sentinel would
+  // drop every finding in the tenant for the length of a deploy, which fails
+  // silently and reads exactly like a clean tenant.
+  const empty = adapter.adaptRiskAssessmentResponse(
+    withSignals([]),
+    assessmentNow
+  )
+  assert.equal(empty, null)
+
+  // Two entries for one signal make every count ambiguous.
+  const duplicated = adapter.adaptRiskAssessmentResponse(
+    withSignals([
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 1,
+        capped: false,
+        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
+      },
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 2,
+        capped: false,
+        latest: { at: at(-2), kind: 'EVENT_OCCURRED' },
+      },
+    ]),
+    assessmentNow
+  )
+  assert.equal(duplicated, null)
+})
+
+test('a signal evaluated and empty is distinguishable from one never evaluated', () => {
+  // Two of the nine findings on the fleet carry a zero lockout count beside a
+  // real rejection count. The zero is a result and reads as one; the signal
+  // that is simply absent renders nothing at all.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+        count: 0,
+        capped: false,
+        latest: null,
+      },
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 7,
+        capped: false,
+        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+  assert.match(row, /Locked out after repeated failures/)
+  assert.match(row, /none recorded/)
+  assert.match(row, /7 rejected sign-ins, last /)
+  assert.ok(
+    !/0 lockouts/.test(row),
+    'an evaluated zero was rendered as a count'
+  )
+  // Nothing invents a forwarding line for a signal that was never sent.
+  assert.ok(!/external destination/.test(row))
+})
+
+test('the kind comes off the value even when the name suggests otherwise', () => {
+  // The guard the contract change exists for, and it was not guarded until a
+  // mutation said so: replacing "read the kind" with "infer it from the signal
+  // name" broke none of the tests above, because in every fixture the name and
+  // the kind agree. A test that cannot tell the two apart is not testing the
+  // thing the field was added for.
+  //
+  // So both are inverted here. A forwarding signal whose instant marks an
+  // event is a legitimate payload -- a future detector could watch forwarding
+  // being changed rather than read its current state -- and the client must
+  // not overrule it from the name. That is the whole reason the kind travels
+  // on the value: a name is a proxy for it in exactly the way a rule id is.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'EXTERNAL_FORWARDING_CONFIGURED',
+        count: 3,
+        capped: false,
+        latest: { at: at(-14), kind: 'EVENT_OCCURRED' },
+      },
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 5,
+        capped: false,
+        latest: { at: at(-1), kind: 'STATE_OBSERVED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+
+  // The forwarding signal keeps its own unit and takes the event wording.
+  assert.match(row, /3 external destinations, last /)
+  // The rejection signal keeps its own unit and takes the observation wording.
+  assert.match(row, /5 rejected sign-ins, configuration read /)
+
+  // Neither borrowed the reading its name would have implied.
+  assert.ok(
+    !/3 external destinations, configuration read /.test(row),
+    'the kind was inferred from the signal name rather than read from the value'
+  )
+  assert.ok(
+    !/5 rejected sign-ins, last /.test(row),
+    'the kind was inferred from the signal name rather than read from the value'
+  )
+})
