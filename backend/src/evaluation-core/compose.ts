@@ -96,6 +96,14 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
         }
         return merged
       }, {}),
+      // Exclusions accumulate the same way: a stream that declined nothing does
+      // not make another stream's declined events un-declined.
+      excluded: streams.reduce<Record<string, number>>((merged, entry) => {
+        for (const [reason, count] of Object.entries(entry.assessment.count.scope.excluded)) {
+          merged[reason] = (merged[reason] ?? 0) + count
+        }
+        return merged
+      }, {}),
       covered: streams.flatMap(entry => entry.assessment.count.scope.covered),
       notCovered: streams.flatMap(entry => entry.assessment.count.scope.notCovered),
     }),

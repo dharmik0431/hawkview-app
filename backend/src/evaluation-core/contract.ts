@@ -109,6 +109,23 @@ export type CountScope = Readonly<{
    * threshold at which it flips, because a threshold hides the thing it
    * measures. Any non-zero value belongs in the sentence. */
   scopeUnsettled: Readonly<Record<string, number>>
+  /** Events the rules correctly declined, by reason — the SETTLED exclusions.
+   *
+   * Here for the reason everything else in this object is here: a qualification
+   * one object away from the number is a qualification a renderer will not
+   * reach for. These were recorded on `coverage.doesNotApply` and honestly so,
+   * but a surface built from `count` and `count.scope` — the natural thing to
+   * build, since scope is where the qualifications live — rendered a bare zero
+   * while the excluded events sat on a per-stream path it had to seek out.
+   *
+   * That is the live production defect exactly: a zero over a window whose
+   * exclusions were recorded somewhere nobody looked.
+   *
+   * The boundary here is KNOWN, unlike `scopeUnsettled` — the zero really is
+   * exact over it. That is an argument for stating the boundary, not for
+   * omitting it. I had reasoned that a settled scope needs no qualification and
+   * QA was right that this was inherited rather than decided. */
+  excluded: Readonly<Record<string, number>>
 }>
 
 /** The four states kept distinct, because collapsing any pair of them is how

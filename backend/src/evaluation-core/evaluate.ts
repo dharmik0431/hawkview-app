@@ -184,6 +184,7 @@ export function scopeOf(reports: readonly DetectorReport[], coverage: Coverage):
   return {
     evidenceRequested: coverage.collectionScope.declared ? [coverage.collectionScope.asked] : [],
     scopeUnsettled: { ...coverage.notYetCited },
+    excluded: { ...coverage.doesNotApply },
     covered: reports.flatMap(report => examinedSomething(report) ? [report.detectorId] : []),
     notCovered: reports.flatMap(report => {
       if (report.status === 'INAPPLICABLE') return [{ detectorId: report.detectorId, because: report.because }]
@@ -268,7 +269,7 @@ export function evaluate<Event>(input: Readonly<{
       // Nothing ran, so nothing is covered. An empty scope beside a
       // not-available count says exactly that, without implying a check
       // was skipped for a reason of its own.
-      count: countOf(0, claim.permitted, { evidenceRequested: [], scopeUnsettled: {}, covered: [], notCovered: [] }),
+      count: countOf(0, claim.permitted, { evidenceRequested: [], scopeUnsettled: {}, excluded: {}, covered: [], notCovered: [] }),
       claim,
     }
   }
