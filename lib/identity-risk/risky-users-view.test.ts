@@ -987,10 +987,9 @@ test('corroboration breaks ties inside a priority band', () => {
 
 test('the panel never claims unavailability while showing Microsoft records', () => {
   // Microsoft verdicts reach HawkView through sign-in evidence too, which
-  // needs no Entra ID P2 licence — around nine hundred malicious-IP verdicts
-  // arrive that way on a tenant whose risky-users channel reports itself
-  // unlicensed. "Requires Entra ID P2" printed above those records is a
-  // flat contradiction on one screen.
+  // needs no Entra ID P2 licence, so records and an unlicensed channel are
+  // independent facts and both can hold at once. "Requires Entra ID P2"
+  // printed above those records is a flat contradiction on one screen.
   const unlicensed = unavailableMicrosoftEntraRiskyUsers(
     'UNAVAILABLE',
     'Microsoft Entra risky-user evidence is not available on this tenant.',

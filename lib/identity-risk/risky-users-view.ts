@@ -127,10 +127,14 @@ export function microsoftChannel(
   const recordCount = view.users?.length ?? 0
 
   // Microsoft verdicts also reach us through sign-in evidence, which does not
-  // need an Entra ID P2 licence — roughly nine hundred malicious-IP verdicts
-  // arrive that way on a tenant whose risky-users channel reports itself
-  // unlicensed. Left alone, this panel would print "requires Entra ID P2"
-  // directly above them.
+  // need an Entra ID P2 licence. So records can be present on a tenant whose
+  // risky-users channel truthfully reports itself unlicensed, and left alone
+  // this panel would print "requires Entra ID P2" directly above them.
+  //
+  // (One such tenant held 932 of those verdicts on 2026-09-10, up from 921
+  // ninety minutes earlier. The count is an illustration with a date on it,
+  // not the reason — the reason is that the two facts are independent, which
+  // does not decay.)
   //
   // Neither half is safe to suppress: hiding the records would withhold what
   // Microsoft said, and hiding the status would imply a working channel that
