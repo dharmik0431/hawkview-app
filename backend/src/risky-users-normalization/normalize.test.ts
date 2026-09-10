@@ -23,20 +23,22 @@ import {
   dispositionForCode,
   failureReasonMeaning,
   mayExclude,
+  resultCodeEntry,
 } from './provider-facts.js';
 import { normalizeSignInBatch } from './normalize.js';
 import {
   OUT_OF_SCOPE_LABELS,
   UNKNOWN_LABELS,
+  UNCITED_LABELS,
   UNPROCESSABLE_LABELS,
-  UNCITED_POLICY_OBSERVATIONS,
-  UNINTERPRETABLE_OBSERVATIONS,
   UNSELECTED_ROW_LABELS,
   describeOutOfScope,
+  describeUncited,
   describeUnknown,
   describeUnprocessable,
   describeUnselectedRow,
   type OutOfScopeReason,
+  type UncitedReason,
   type UnknownObservation,
   type UnprocessableReason,
 } from './reasons.js';
@@ -211,6 +213,7 @@ test('a malformed row and an expected-flow interrupt land in different counters'
 test('the reason vocabularies share no key, so no counter can be double-read', () => {
   const all = [
     ...Object.keys(OUT_OF_SCOPE_LABELS),
+    ...Object.keys(UNCITED_LABELS),
     ...Object.keys(UNKNOWN_LABELS),
     ...Object.keys(UNPROCESSABLE_LABELS),
     ...Object.keys(UNSELECTED_ROW_LABELS),
@@ -227,19 +230,22 @@ test('"we never looked" is reported by reason, not as a bare number', () => {
   assert.ok(describeUnselectedRow('ROW_FROM_OTHER_FEED').length > 12);
 });
 
-test('unknown observations split into "could not read" and "no policy yet"', () => {
+test('"we lack a citation" is a sibling of unknown, not a reason inside it', () => {
   // Gating a clean claim on anything unknown would let eighteen rows of a
-  // well-understood consent prompt withhold a tenant's claim indefinitely.
-  const partition = [...UNINTERPRETABLE_OBSERVATIONS, ...UNCITED_POLICY_OBSERVATIONS];
-  assert.deepEqual([...partition].sort(), Object.keys(UNKNOWN_LABELS).sort(), 'every observation must be in exactly one half');
-  assert.equal(new Set(partition).size, partition.length, 'an observation appears in both halves');
-  assert.deepEqual([...UNCITED_POLICY_OBSERVATIONS].sort(), [
-    'AMBIGUOUS_BY_PROVIDER_STATEMENT',
-    'RECOGNIZED_BUT_EXCLUSION_UNCITED',
-  ]);
+  // well-understood consent prompt withhold a tenant's claim indefinitely. As
+  // its own classification, a switch forces a consumer to decide about it.
+  const uncited: UncitedReason[] = Object.keys(UNCITED_LABELS) as UncitedReason[];
+  assert.deepEqual(uncited, ['EXCLUSION_NOT_YET_CITED']);
+  assert.ok(describeUncited('EXCLUSION_NOT_YET_CITED').length > 12);
+  for (const key of uncited) {
+    assert.equal(Object.keys(UNKNOWN_LABELS).includes(key), false, 'must not also live inside unknown');
+  }
+  // 50158 stays in unknown: no citation can resolve it, because the ambiguity
+  // is Microsoft's own statement about the code, not our unfinished homework.
+  assert.ok(Object.keys(UNKNOWN_LABELS).includes('AMBIGUOUS_BY_PROVIDER_STATEMENT'));
 });
 
-test('the evaluation coverage view separates what we could not read from what we lack a citation for', async () => {
+test('the evaluation coverage view keeps "no citation" out of the gate', async () => {
   const batch = await run([
     graphRow({ id: 'applies', status: { errorCode: 50126 } }),
     graphRow({ id: 'consent', status: { errorCode: 65001 } }),
@@ -252,17 +258,22 @@ test('the evaluation coverage view separates what we could not read from what we
   assert.equal(coverage.applies, 1);
   assert.equal(coverage.doesNotApply.KEEP_ME_SIGNED_IN, 1);
   // 65001 is understood; only our basis for excluding it is missing. It is
-  // disclosed, but it is not a limit on what we read.
-  assert.equal(coverage.uncitedPolicyEvents, 1);
+  // disclosed, but it is not a limit on what we read, so it is NOT in the
+  // number a consumer gates on.
+  assert.equal(coverage.notYetCitedEvents, 1);
   assert.equal(coverage.uninterpretedEvents, 2, 'the unrecognized code and the malformed row');
   assert.deepEqual(Object.keys(coverage).sort(), [
-    'applies', 'doesNotApply', 'uncitedPolicyEvents', 'uninterpretedEvents', 'unknown', 'unprocessable',
+    'applies', 'doesNotApply', 'notYetCited', 'notYetCitedEvents',
+    'uninterpretedEvents', 'unknown', 'unprocessable',
   ]);
+  // Recognized includes the uncited ones: we read those events correctly.
+  assert.equal(batch.coverage.recognizedRows, 3);
 });
 
 test('every reason is reported with a zero, so a reporting layer cannot omit one', async () => {
   const batch = await run([graphRow()]);
   assert.deepEqual(Object.keys(batch.counts.doesNotApplyByReason).sort(), Object.keys(OUT_OF_SCOPE_LABELS).sort());
+  assert.deepEqual(Object.keys(batch.counts.notYetCitedByReason).sort(), Object.keys(UNCITED_LABELS).sort());
   assert.deepEqual(Object.keys(batch.counts.unknownByObservation).sort(), Object.keys(UNKNOWN_LABELS).sort());
   assert.deepEqual(Object.keys(batch.counts.unprocessableByReason).sort(), Object.keys(UNPROCESSABLE_LABELS).sort());
 });
@@ -380,12 +391,12 @@ test('the post-password interrupt family is expressible and groupable', async ()
   }
 });
 
-test('codes with no exclusion citation land in unknown rather than out of scope', async () => {
+test('codes with no exclusion citation are held, not excluded and not called unreadable', async () => {
   for (const code of [50055, 50144, 50056, 50133, 50173, 65001]) {
     const batch = await run([graphRow({ status: { errorCode: code } })]);
     assert.deepEqual(
       only(batch).classification,
-      { kind: 'UNKNOWN', observation: 'RECOGNIZED_BUT_EXCLUSION_UNCITED' },
+      { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
       `code ${code}`,
     );
   }
@@ -474,7 +485,7 @@ test('50053 text that matches nothing, or more than one meaning, stays unknown',
 test('the description-text meanings are a closed set and each records its evidence', () => {
   assert.deepEqual(
     FAILURE_REASON_MEANINGS.map(pattern => pattern.meaning).sort(),
-    ['HIGH_CONFIDENCE_RISK_BLOCK', 'MALICIOUS_IP_BLOCK', 'SMART_LOCKOUT'],
+    ['HIGH_CONFIDENCE_RISK_BLOCK', 'MALICIOUS_IP_BLOCK', 'SMART_LOCKOUT', 'SUSPICIOUS_ACTIVITY_BLOCK'],
   );
   for (const pattern of FAILURE_REASON_MEANINGS) {
     assert.ok(pattern.fragments.length > 0);
@@ -485,7 +496,7 @@ test('the description-text meanings are a closed set and each records its eviden
   // The risk-verdict branch has zero occurrences across all 1,479 rows of
   // 50053 in all history: it is present in code, exercised only synthetically,
   // and must not read as a working path.
-  assert.deepEqual(UNVALIDATED_FAILURE_REASON_MEANINGS, ['HIGH_CONFIDENCE_RISK_BLOCK']);
+  assert.deepEqual([...UNVALIDATED_FAILURE_REASON_MEANINGS].sort(), ['HIGH_CONFIDENCE_RISK_BLOCK', 'SUSPICIOUS_ACTIVITY_BLOCK']);
 });
 
 test('the one branch that removes an event from evaluation has the narrowest fragment', () => {
@@ -951,4 +962,66 @@ test('the per-run row bound costs the excess rows, never the run', async () => {
   assert.equal(batch.counts.applies, 1, 'the row inside the bound is still evaluated');
   assert.equal(batch.counts.unprocessableByReason.BATCH_LIMIT_EXCEEDED, 3);
   assert.equal(batch.counts.rows, MAX_ROWS_PER_RUN + 3);
+});
+
+test('a code’s description text can only mean what that code declares', async () => {
+  // Matching every fragment against every code would let one code's phrasing
+  // be read as another code's meaning. 50131 declares only the two risk
+  // meanings, so lockout wording cannot turn it into a lockout.
+  const lockoutWording = await run([graphRow({ status: {
+    errorCode: 50131,
+    failureReason: 'You’ve tried to sign in too many times with an incorrect user ID or password.',
+  } })]);
+  assert.deepEqual(only(lockoutWording).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
+
+  const entry = resultCodeEntry(50131)!;
+  assert.deepEqual(entry.textMeanings, ['SUSPICIOUS_ACTIVITY_BLOCK', 'HIGH_CONFIDENCE_RISK_BLOCK']);
+  assert.deepEqual(resultCodeEntry(50053)!.textMeanings, [
+    'SMART_LOCKOUT', 'MALICIOUS_IP_BLOCK', 'HIGH_CONFIDENCE_RISK_BLOCK',
+  ]);
+  // A code with no declared text meanings is never refined by text at all.
+  assert.equal(resultCodeEntry(50126)!.textMeanings, undefined);
+});
+
+test('50131’s suspicious-activity variant is Microsoft’s judgement, not our finding', async () => {
+  const suspicious = await run([graphRow({ status: {
+    errorCode: 50131,
+    failureReason: 'Request blocked due to suspicious activity.',
+  } })]);
+  assert.deepEqual(only(suspicious).classification, {
+    kind: 'DOES_NOT_APPLY',
+    reason: 'MICROSOFT_RISK_VERDICT',
+  });
+  assert.deepEqual(suspicious.microsoftRiskVerdicts.map(event => event.eventId), ['evt-1']);
+  assert.equal(suspicious.applies.length, 0);
+
+  // A plain Conditional Access failure is the tenant's own control working,
+  // which is ours to report.
+  const plain = await run([graphRow({ status: { errorCode: 50131, failureReason: 'Access denied.' } })]);
+  assert.deepEqual(only(plain).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
+});
+
+test('53004 is flagged as the next channel candidate rather than reclassified here', () => {
+  // Its "DueToRisk" naming means it is probably Microsoft's judgement too, but
+  // further variants are to be flagged rather than settled case by case.
+  const entry = resultCodeEntry(53004)!;
+  assert.deepEqual(entry.disposition, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
+  assert.match(entry.note ?? '', /FLAGGED, NOT DECIDED/);
+  assert.equal(entry.textMeanings, undefined);
+});
+
+test('the enumeration blind spot is counted, not left as a comment', async () => {
+  // 50034 and 51004 describe a subject that is by definition absent from the
+  // directory, so subject resolution discards the row before classification
+  // and the code is lost. The count is what keeps that visible.
+  const batch = await run([
+    graphRow({ id: 'probe-a', userId: OTHER_USER_ID, status: { errorCode: 50034 } }),
+    graphRow({ id: 'probe-b', userId: OTHER_USER_ID, status: { errorCode: 51004 } }),
+    graphRow({ id: 'ordinary-miss', userId: OTHER_USER_ID, status: { errorCode: 50126 } }),
+    graphRow({ id: 'resolves' }),
+  ]);
+
+  assert.equal(batch.shapeObservations.enumerationCodesOnUnresolvedSubjects, 2);
+  assert.equal(batch.counts.unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY, 3);
+  assert.equal(batch.counts.applies, 1, 'the resolvable row is unaffected');
 });

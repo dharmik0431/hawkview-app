@@ -1,9 +1,9 @@
-import {
-  UNCITED_POLICY_OBSERVATIONS,
-  type OutOfScopeReason,
-  type UnknownObservation,
-  type UnprocessableReason,
-  type UnselectedRowReason,
+import type {
+  OutOfScopeReason,
+  UncitedReason,
+  UnknownObservation,
+  UnprocessableReason,
+  UnselectedRowReason,
 } from './reasons.js';
 
 /**
@@ -102,9 +102,19 @@ export type SubjectBindingMethod = 'DIRECTORY_OBJECT_ID' | 'NORMALIZED_UPN';
  */
 export type ClientQualification = 'QUALIFIED' | 'MISSING';
 
+/**
+ * Exactly one per event.
+ *
+ * `NOT_YET_CITED` is a sibling of `UNKNOWN` rather than a reason inside it,
+ * because "our vocabulary has a hole" and "our paperwork has a hole" are
+ * different facts with different urgency — and because a `switch` over these
+ * four forces a consumer to decide about the paperwork case rather than
+ * sweeping it into a gate by default.
+ */
 export type EventClassification =
   | { readonly kind: 'APPLIES'; readonly outcome: EventOutcome }
   | { readonly kind: 'DOES_NOT_APPLY'; readonly reason: OutOfScopeReason }
+  | { readonly kind: 'NOT_YET_CITED'; readonly reason: UncitedReason }
   | { readonly kind: 'UNKNOWN'; readonly observation: UnknownObservation };
 
 export interface NormalizationScope {
@@ -198,6 +208,19 @@ export interface ShapeObservations {
   readonly graphErrorCodeShape: Readonly<Record<ErrorCodeShape, number>>;
   readonly graphIsInteractive: Readonly<Record<IsInteractiveShape, number>>;
   readonly graphIsInteractiveAmongCredentialFailures: Readonly<Record<IsInteractiveShape, number>>;
+  /**
+   * Rows that failed subject resolution while carrying a documented
+   * username-enumeration code (50034, 51004).
+   *
+   * A KNOWN BLIND SPOT made visible rather than left as a comment. Those codes
+   * describe a subject that is by definition not in the directory, so subject
+   * resolution discards the row before classification runs and the code is
+   * lost. Microsoft names clusters of them from one address as directory
+   * probing — a tenant-level finding, where this whole model is user-scoped —
+   * so detecting it is a different detector shape and not this layer's to
+   * build. This counter is what keeps its absence from being invisible.
+   */
+  readonly enumerationCodesOnUnresolvedSubjects: number;
 }
 
 export interface NormalizationCounts {
@@ -205,6 +228,8 @@ export interface NormalizationCounts {
   readonly rows: number;
   readonly applies: number;
   readonly doesNotApplyByReason: Readonly<Record<OutOfScopeReason, number>>;
+  /** Understood, exclusion not yet established. Disclosed; never a gate. */
+  readonly notYetCitedByReason: Readonly<Record<UncitedReason, number>>;
   readonly unknownByObservation: Readonly<Record<UnknownObservation, number>>;
   readonly unprocessableByReason: Readonly<Record<UnprocessableReason, number>>;
   /** How the events that did bind were bound, so weaker bindings are visible. */
@@ -236,9 +261,14 @@ export interface NormalizationCounts {
 export interface NormalizationCoverage {
   /** Rows from the selected feed. Excludes `unselectedSourceRows`. */
   readonly consideredRows: number;
-  /** Rows that produced an event, i.e. applies + does-not-apply + unknown. */
+  /** Rows that produced an event, in any classification. */
   readonly normalizedRows: number;
-  /** Rows HawkView could name the meaning of, i.e. applies + does-not-apply. */
+  /**
+   * Rows HawkView could name the meaning of: applies + does-not-apply +
+   * not-yet-cited. The last of those is included deliberately — we did read
+   * those events correctly; what is missing is our own basis for excluding
+   * them, which is not a limit on our reading of the data.
+   */
   readonly recognizedRows: number;
 }
 
@@ -273,40 +303,40 @@ export interface NormalizationBatch {
 }
 
 /**
- * The batch's tallies in the shape the evaluation core consumes, plus the
- * split it needs to gate honestly.
+ * The batch's tallies in the shape the evaluation core consumes, plus the one
+ * derived number it needs to gate honestly.
  *
  * One mapping in one place, for the same reason the sort lives here: two
- * mappings drift. `uninterpretedEvents` is the subset of unknown observations
- * that genuinely could not be read, and is the number a consumer should gate a
- * clean claim on. `uncitedPolicyEvents` is the rest — events we interpreted
- * fine, where only our own basis for excluding them is missing. Gating on the
- * latter would let a handful of well-understood consent prompts withhold a
- * tenant's claim indefinitely, which is the veto pattern in a better label.
- * Both are still disclosed; only one is a limit on what we read.
+ * mappings drift.
+ *
+ * `uninterpretedEvents` is the number to gate a clean claim on — events we
+ * could not read, plus rows we could not process. `notYetCited` is reported
+ * beside it and deliberately NOT included: those events were read correctly
+ * and only our own basis for excluding them is missing, so gating on them
+ * would let a handful of well-understood consent prompts withhold a tenant's
+ * claim indefinitely. Everything here is disclosed; only some of it is a limit
+ * on what we read.
  */
 export function coverageForEvaluation(batch: NormalizationBatch): {
   readonly applies: number;
   readonly doesNotApply: Readonly<Record<OutOfScopeReason, number>>;
+  readonly notYetCited: Readonly<Record<UncitedReason, number>>;
   readonly unknown: Readonly<Record<UnknownObservation, number>>;
   readonly unprocessable: Readonly<Record<UnprocessableReason, number>>;
   readonly uninterpretedEvents: number;
-  readonly uncitedPolicyEvents: number;
+  readonly notYetCitedEvents: number;
 } {
   const { counts } = batch;
-  const uncited = UNCITED_POLICY_OBSERVATIONS.reduce(
-    (sum, observation) => sum + counts.unknownByObservation[observation],
-    0,
-  );
-  const unknownTotal = Object.values(counts.unknownByObservation).reduce((sum, value) => sum + value, 0);
-  const unprocessableTotal = Object.values(counts.unprocessableByReason).reduce((sum, value) => sum + value, 0);
+  const sum = (values: Readonly<Record<string, number>>) =>
+    Object.values(values).reduce((total, value) => total + value, 0);
   return {
     applies: counts.applies,
     doesNotApply: counts.doesNotApplyByReason,
+    notYetCited: counts.notYetCitedByReason,
     unknown: counts.unknownByObservation,
     unprocessable: counts.unprocessableByReason,
-    uninterpretedEvents: unknownTotal - uncited + unprocessableTotal,
-    uncitedPolicyEvents: uncited,
+    uninterpretedEvents: sum(counts.unknownByObservation) + sum(counts.unprocessableByReason),
+    notYetCitedEvents: sum(counts.notYetCitedByReason),
   };
 }
 

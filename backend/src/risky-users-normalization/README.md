@@ -285,3 +285,63 @@ in one place, for the same reason the sort lives here.
 `counts.unselectedRowsByReason` replaces the earlier bare number, so "we never looked"
 can be told apart from "we looked and declined". One member, `ROW_FROM_OTHER_FEED`, and
 that is the answer: nothing is excluded from the covered feed by a predicate.
+
+## Addendum: four classifications, not three
+
+`NOT_YET_CITED` was promoted from a reason code inside UNKNOWN to a sibling of it. The
+three-bucket shape was the original contract; this is a deliberate change, made on the
+PM's proposal, for the reason the rest of the module exists: UNKNOWN was carrying two
+different facts, and "our vocabulary has a hole" and "our paperwork has a hole" warrant
+different urgency. Folding them together is the same collapse we keep removing, one layer
+down.
+
+| Classification | Meaning | Coverage | Gates a claim? |
+| --- | --- | --- | --- |
+| `APPLIES` | A credential event, with an `outcome`. | Recognized | — |
+| `DOES_NOT_APPLY` | Out of scope on a documented citation. | Recognized | No |
+| `NOT_YET_CITED` | Understood; our basis for excluding it is missing. | Recognized | **No** |
+| `UNKNOWN` | We cannot interpret it. | Reduces | Yes |
+
+`NOT_YET_CITED` counts as *recognized* on purpose — those events were read correctly, and
+what is absent is our own paperwork. `coverageForEvaluation()` reports
+`notYetCitedEvents` beside `uninterpretedEvents` and deliberately excludes it from the
+latter, so a handful of well-understood consent prompts cannot withhold a tenant's claim
+indefinitely. The fix is a citation, not a weaker gate: 50055, 50144, 50056, 50133, 50173
+and 65001 are all waiting on one, and a non-zero count here is unfinished homework rather
+than a property of the design.
+
+50158 stays in UNKNOWN, not here: no citation can resolve it, because the ambiguity is
+Microsoft's own statement about the code.
+
+## Addendum: whose control blocked it
+
+The channel-separation rule needs a line, and the line is **who made the judgement**:
+
+- A control the **tenant configured** — Conditional Access, device compliance, domain
+  join — is ours to report. `APPLIES / BLOCKED_BY_CONTROL`.
+- A judgement **Microsoft's own intelligence** made is Microsoft's channel.
+  `DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT`, surfaced as `batch.microsoftRiskVerdicts`.
+
+That is why 53003 stays in `applies` while 50053's high-confidence-risk text and 50131's
+suspicious-activity text do not. Smart lockout stays in `applies` too: it is a mechanical
+consequence of counted failures, not an assertion that something is risky.
+
+Text meanings are now declared **per code** (`ResultCodeEntry.textMeanings`) rather than
+matched globally, so one code's phrasing can never be read as another code's meaning — a
+50131 carrying lockout wording stays a control block.
+
+**Flagged, not decided:** 53004 (`ProofUpBlockedDueToRisk`) is by its own name a
+risk-driven block and probably belongs in the Microsoft channel. It is left as a control
+block pending that call, because further variants are to be flagged rather than settled
+here. So is 50053's malicious-IP variant, which is Microsoft's threat intelligence making
+the call and is currently `APPLIES / BLOCKED_BY_CONTROL` — that one is 919 of greentech's
+rows, so moving it is a large, visible change and not mine to make unilaterally.
+
+## Addendum: the enumeration blind spot is now a number
+
+`shapeObservations.enumerationCodesOnUnresolvedSubjects` counts rows that failed subject
+resolution while carrying 50034 or 51004. Those codes describe a subject that is by
+definition absent from the directory, so resolution discards the row before classification
+and the code is lost. Detecting directory probing needs a tenant-level finding where this
+whole model is user-scoped, which is a different detector shape and out of scope. The
+counter exists so the gap is visible in coverage rather than living in a comment.

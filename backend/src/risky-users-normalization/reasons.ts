@@ -1,15 +1,17 @@
 /**
  * Reason vocabularies for the Risky Users normalization layer.
  *
- * THREE SEPARATE VOCABULARIES THAT ARE NEVER SUMMED. A malformed row and an
+ * FOUR SEPARATE VOCABULARIES THAT ARE NEVER SUMMED. A malformed row and an
  * expected keep-me-signed-in interrupt are different claims about what a
  * result is worth, and one counter for both destroys the distinction:
  *
  *   OutOfScopeReason      the event was understood, and there is a documented
  *                         basis for saying it is not evidence our detectors
  *                         act on. Does NOT reduce stated coverage.
- *   UnknownObservation    we cannot interpret the event, or we can interpret
- *                         it but cannot defend excluding it. Reduces stated
+ *   UncitedReason         the event was understood, and OUR basis for
+ *                         excluding it is missing. Disclosed, never gates.
+ *                         Unfinished homework, not a limit on the data.
+ *   UnknownObservation    we cannot interpret the event. Reduces stated
  *                         coverage. Blocks nothing, ever.
  *   UnprocessableReason   we could not read the row at all. Reduces stated
  *                         coverage. Blocks nothing, ever.
@@ -20,11 +22,11 @@
  * label meaning "incomplete collection window", which told technicians to go
  * chase a collection failure that did not exist.
  *
- * THE EXCLUSION STANDARD, which is why this vocabulary is short. A result code
- * may be mapped out of scope only with a positive documented citation for why
- * it can NEVER be credential-attack evidence. Absence of a reason to include
- * is not a reason to exclude — that is precisely how the predecessor
- * classified 50076 as "not a credential event", when 50076 means a
+ * THE EXCLUSION STANDARD, which is why the out-of-scope vocabulary is short. A
+ * result code may be mapped out of scope only with a positive documented
+ * citation for why it can NEVER be credential-attack evidence. Absence of a
+ * reason to include is not a reason to exclude — that is precisely how the
+ * predecessor classified 50076 as "not a credential event", when 50076 means a
  * post-password MFA challenge was issued and sits one digit from 50074, the
  * highest-value code in the catalogue. A confident-but-wrong exclusion walks
  * straight past the unverified-predicate guard, because it is not unverified;
@@ -35,7 +37,7 @@
  * Understood, and out of scope on a documented basis.
  *
  * Each member names the citation that admits it. A member with no citation
- * does not belong here; it belongs in `RECOGNIZED_BUT_EXCLUSION_UNCITED`.
+ * does not belong here; it belongs in `UncitedReason`.
  */
 export type OutOfScopeReason =
   /** 50140. Microsoft: "This is an expected part of the sign in flow." */
@@ -43,10 +45,15 @@ export type OutOfScopeReason =
   /** 50058. Microsoft: "a common error that's expected." */
   | 'INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN'
   /**
-   * Microsoft's own high-confidence risk verdict. Excluded from HawkView's
-   * findings on the owner's product rule, not on a Microsoft citation: our
-   * findings and Microsoft's reported risk are two channels that are never
-   * merged or summed. Surfaced via `batch.microsoftRiskVerdicts`.
+   * Microsoft's own risk judgement, reached by Microsoft's intelligence rather
+   * than by a control the tenant configured.
+   *
+   * Excluded from HawkView's findings on the owner's product rule, not on a
+   * Microsoft citation: our findings and Microsoft's reported risk are two
+   * channels that are never merged or summed, and Microsoft's detections must
+   * never be presented as our own. A doc says what a code means; the brief
+   * says what we are permitted to assert, which is the stronger citation here.
+   * Surfaced via `batch.microsoftRiskVerdicts` so the signal is not lost.
    */
   | 'MICROSOFT_RISK_VERDICT'
   /**
@@ -61,18 +68,40 @@ export type OutOfScopeReason =
    */
   | 'APPLICATION_ACTOR';
 
-/** We cannot interpret it, or cannot defend excluding it. Costs coverage only. */
+/**
+ * We know exactly what the event is; what is missing is OUR documented basis
+ * for ruling it out of scope.
+ *
+ * Its own classification rather than a reason code inside UNKNOWN, because
+ * folding it there is the same collapse this module keeps removing, one layer
+ * down: "our vocabulary has a hole" and "our paperwork has a hole" warrant
+ * different urgency, and a technician reading a coverage statement deserves to
+ * know which one they are looking at.
+ *
+ * It also makes the safe reading the default one. A consumer that gates a
+ * clean claim on "anything unknown" would let a handful of well-understood
+ * consent prompts withhold a tenant's claim indefinitely — the veto pattern in
+ * a better label. As a sibling of UNKNOWN, a `switch` over the classification
+ * forces that consumer to decide about this case rather than sweeping it in.
+ *
+ * These events are DISCLOSED and never gate. The fix is a citation, not a
+ * weaker gate: once cited, each moves to its proper bucket. Treat a non-zero
+ * count as unfinished homework, not as a property of the design.
+ */
+export type UncitedReason = 'EXCLUSION_NOT_YET_CITED';
+
+/** We cannot interpret the event. Costs stated coverage only. */
 export type UnknownObservation =
   | 'ERROR_CODE_ABSENT'
   | 'ERROR_CODE_SHAPE_UNRECOGNIZED'
   | 'UNRECOGNIZED_ERROR_CODE'
   /**
-   * We know what the code means and have no documented basis for ruling it out
-   * of scope. Costs coverage, blocks nothing, and is recoverable the moment a
-   * citation exists. This is the exclusion standard's designated landing spot.
+   * 50158. Microsoft: "This code alone doesn't indicate a failure."
+   *
+   * This stays here rather than moving to `UncitedReason`: no citation will
+   * ever resolve it, because the ambiguity is Microsoft's own statement about
+   * the code. A permanent hole in the vocabulary, not unfinished homework.
    */
-  | 'RECOGNIZED_BUT_EXCLUSION_UNCITED'
-  /** 50158. Microsoft: "This code alone doesn't indicate a failure." */
   | 'AMBIGUOUS_BY_PROVIDER_STATEMENT'
   /** A code whose meaning lives in free text, where the text matched nothing known. */
   | 'AMBIGUOUS_FAILURE_REASON_TEXT'
@@ -80,40 +109,6 @@ export type UnknownObservation =
   | 'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON'
   /** Audit path: the operation and the result code describe different outcomes. */
   | 'INCONSISTENT_OPERATION_AND_CODE';
-
-/**
- * Observations meaning we genuinely could not interpret the event. These are
- * the ones that reduce what HawkView can claim about a window.
- */
-export const UNINTERPRETABLE_OBSERVATIONS: readonly UnknownObservation[] = [
-  'ERROR_CODE_ABSENT',
-  'ERROR_CODE_SHAPE_UNRECOGNIZED',
-  'UNRECOGNIZED_ERROR_CODE',
-  'AMBIGUOUS_FAILURE_REASON_TEXT',
-  'HAWKVIEW_SYNTHETIC_ERROR_CODE',
-  'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON',
-  'INCONSISTENT_OPERATION_AND_CODE',
-];
-
-/**
- * Observations where the event IS interpreted and only OUR policy is missing.
- *
- * This distinction is load-bearing, and it exists because a consumer that
- * gates a clean claim on "anything unknown" would otherwise let eighteen rows
- * of a well-understood consent prompt withhold a tenant's claim permanently —
- * not until someone researches it, but for as long as the mapping stands.
- * That is the veto pattern again, wearing a better label.
- *
- * We know exactly what these events are. What is absent is a documented basis
- * for ruling them out of scope, which is a gap in our own policy rather than a
- * limit on our reading of the data. They must still be DISCLOSED in the
- * coverage statement — out-of-scope evidence is never silently dropped — but a
- * consumer should not treat them as uninterpreted window.
- */
-export const UNCITED_POLICY_OBSERVATIONS: readonly UnknownObservation[] = [
-  'RECOGNIZED_BUT_EXCLUSION_UNCITED',
-  'AMBIGUOUS_BY_PROVIDER_STATEMENT',
-];
 
 /**
  * Why a row was not part of the assessed scope at all.
@@ -148,6 +143,16 @@ export type UnprocessableReason =
   | 'REFERENCE_BUDGET_EXCEEDED'
   | 'BATCH_LIMIT_EXCEEDED';
 
+/** Unprocessable reasons that mean the subject could not be bound to a person. */
+export const SUBJECT_RESOLUTION_FAILURES: readonly UnprocessableReason[] = [
+  'SUBJECT_ID_ABSENT_OR_MALFORMED',
+  'SUBJECT_NOT_IN_DIRECTORY',
+  'SUBJECT_AMBIGUOUS_IN_DIRECTORY',
+  'SUBJECT_UPN_ABSENT_OR_MALFORMED',
+  'SUBJECT_UPN_NOT_IN_DIRECTORY',
+  'SUBJECT_UPN_AMBIGUOUS_IN_DIRECTORY',
+];
+
 /**
  * Technician-facing labels. Exhaustive by construction.
  *
@@ -157,9 +162,18 @@ export type UnprocessableReason =
 export const OUT_OF_SCOPE_LABELS: Readonly<Record<OutOfScopeReason, string>> = {
   KEEP_ME_SIGNED_IN: 'Keep-me-signed-in prompt, which Microsoft documents as an expected part of the sign-in flow',
   INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN: 'Existing session was insufficient for silent sign-in, which Microsoft documents as expected',
-  MICROSOFT_RISK_VERDICT: 'Microsoft blocked this sign-in as high-confidence risk; shown under Microsoft-reported risk, not as a HawkView finding',
+  MICROSOFT_RISK_VERDICT: 'Microsoft judged this sign-in risky and blocked it; shown under Microsoft-reported risk, not as a HawkView finding',
   NON_INTERACTIVE_SIGN_IN: 'Background sign-in rather than a person entering a credential',
   APPLICATION_ACTOR: 'The actor was an application or service principal, not a person',
+};
+
+/**
+ * Wording rule: an uncited label makes clear the gap is ours, not the data's,
+ * and that the event is neither acted on nor dismissed.
+ */
+export const UNCITED_LABELS: Readonly<Record<UncitedReason, string>> = {
+  EXCLUSION_NOT_YET_CITED:
+    'HawkView recognises this sign-in result but has not yet established whether it can be ruled out of scope, so it is neither acted on nor dismissed',
 };
 
 /**
@@ -171,7 +185,6 @@ export const UNKNOWN_LABELS: Readonly<Record<UnknownObservation, string>> = {
   ERROR_CODE_ABSENT: 'The record carried no sign-in result code, so HawkView cannot say what the result was',
   ERROR_CODE_SHAPE_UNRECOGNIZED: 'The sign-in result code was not in a form HawkView reads',
   UNRECOGNIZED_ERROR_CODE: 'HawkView does not recognise this sign-in result code',
-  RECOGNIZED_BUT_EXCLUSION_UNCITED: 'HawkView recognises this result code but has no documented basis for ruling it out of scope, so it is neither acted on nor dismissed',
   AMBIGUOUS_BY_PROVIDER_STATEMENT: 'Microsoft states this code alone does not indicate a failure, so HawkView will not read one into it',
   AMBIGUOUS_FAILURE_REASON_TEXT: 'This code carries several meanings in its description text, and the text did not match any meaning HawkView knows',
   HAWKVIEW_SYNTHETIC_ERROR_CODE: 'Result code was generated by HawkView’s own fallback path, not by Microsoft',
@@ -229,6 +242,9 @@ export function unreachable(value: never): never {
 
 export function describeOutOfScope(reason: OutOfScopeReason): string {
   return OUT_OF_SCOPE_LABELS[reason];
+}
+export function describeUncited(reason: UncitedReason): string {
+  return UNCITED_LABELS[reason];
 }
 export function describeUnknown(observation: UnknownObservation): string {
   return UNKNOWN_LABELS[observation];

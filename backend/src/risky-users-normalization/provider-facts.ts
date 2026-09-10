@@ -1,5 +1,5 @@
 import type { EventOutcome } from './contract.js';
-import type { OutOfScopeReason, UnknownObservation } from './reasons.js';
+import type { OutOfScopeReason, UncitedReason, UnknownObservation } from './reasons.js';
 
 /**
  * What HawkView is willing to claim about Microsoft's payloads, and on what
@@ -39,6 +39,7 @@ import type { OutOfScopeReason, UnknownObservation } from './reasons.js';
 export type CodeDisposition =
   | { readonly kind: 'APPLIES'; readonly outcome: EventOutcome }
   | { readonly kind: 'DOES_NOT_APPLY'; readonly reason: OutOfScopeReason }
+  | { readonly kind: 'NOT_YET_CITED'; readonly reason: UncitedReason }
   | { readonly kind: 'UNKNOWN'; readonly observation: UnknownObservation };
 
 /** Microsoft's three claim classes. Every mapping states which it makes. */
@@ -63,6 +64,13 @@ export interface ResultCodeEntry {
    * evidence. Enforced by a test, not by convention.
    */
   readonly exclusionCitation?: string;
+  /**
+   * The text meanings this code's description may resolve to, when its meaning
+   * lives in free text. Declared PER CODE rather than matching every fragment
+   * against every code, so one code's phrasing can never be read as another
+   * code's meaning.
+   */
+  readonly textMeanings?: readonly FailureReasonMeaning[];
   readonly note?: string;
 }
 
@@ -176,17 +184,25 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     microsoftName: 'ProofUpBlockedDueToRisk',
     claimClass: 'ATTACK_AND_CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
-    note: 'Cannot configure MFA due to suspicious activity. The "DueToRisk" naming indicates risk-driven blocking.',
+    note:
+      'Cannot configure MFA due to suspicious activity. FLAGGED, NOT DECIDED: the "DueToRisk" naming means ' +
+      'this is Microsoft’s own risk judgement, which by the channel-separation rule would put it in ' +
+      'MICROSOFT_RISK_VERDICT alongside 50053’s risk text and 50131’s suspicious-activity variant. It is ' +
+      'left as a control block pending that decision, because further variants are to be flagged rather ' +
+      'than settled case by case here.',
   },
   {
     code: 50131,
     microsoftName: 'ConditionalAccessFailed',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
+    textMeanings: ['SUSPICIOUS_ACTIVITY_BLOCK', 'HIGH_CONFIDENCE_RISK_BLOCK'],
     note:
-      'Includes a "request blocked due to suspicious activity" variant in its description text. Mapped as ' +
-      'a control block regardless of the text; whether that variant belongs in the Microsoft-reported-risk ' +
-      'channel instead is an open product question, not settled here.',
+      'A Conditional Access failure is the TENANT’S OWN control working, which is ours to report. But this ' +
+      'code also carries a "request blocked due to suspicious activity" variant in its description, and ' +
+      'that is Microsoft’s judgement rather than a control the tenant configured — so the text can move it ' +
+      'to MICROSOFT_RISK_VERDICT. Unmatched text keeps the control-block default, which is the confident ' +
+      'reading of the code itself.',
   },
   {
     code: 50057,
@@ -225,39 +241,39 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     code: 50055,
     microsoftName: 'InvalidPasswordExpiredPassword',
     claimClass: 'NEITHER',
-    disposition: { kind: 'UNKNOWN', observation: 'RECOGNIZED_BUT_EXCLUSION_UNCITED' },
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
     note: 'Password hygiene. No citation establishes it can never be attack evidence, so it is not excluded.',
   },
   {
     code: 50144,
     microsoftName: 'InvalidPasswordExpiredOnPremPassword',
     claimClass: 'NEITHER',
-    disposition: { kind: 'UNKNOWN', observation: 'RECOGNIZED_BUT_EXCLUSION_UNCITED' },
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
   },
   {
     code: 50056,
     microsoftName: 'InvalidOrNullPassword',
     claimClass: 'NEITHER',
-    disposition: { kind: 'UNKNOWN', observation: 'RECOGNIZED_BUT_EXCLUSION_UNCITED' },
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
   },
   {
     code: 50133,
     microsoftName: 'SsoArtifactInvalidOrExpired (password change)',
     claimClass: 'NEITHER',
-    disposition: { kind: 'UNKNOWN', observation: 'RECOGNIZED_BUT_EXCLUSION_UNCITED' },
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
     note: 'Useful as remediation-took-effect confirmation, which is a different product surface.',
   },
   {
     code: 50173,
     microsoftName: 'FreshTokenNeeded (grant expired)',
     claimClass: 'NEITHER',
-    disposition: { kind: 'UNKNOWN', observation: 'RECOGNIZED_BUT_EXCLUSION_UNCITED' },
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
   },
   {
     code: 65001,
     microsoftName: 'ConsentRequired',
     claimClass: 'NEITHER',
-    disposition: { kind: 'UNKNOWN', observation: 'RECOGNIZED_BUT_EXCLUSION_UNCITED' },
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
     note:
       'Previously mapped out of scope here on no citation, which is the 50076 mistake in miniature. It is ' +
       'also one of only three codes observed in more than one tenant, so it is high-volume: a citation ' +
@@ -270,6 +286,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     microsoftName: 'IdsLocked / IP blocked / built-in protection block',
     claimClass: 'ATTACK_AND_CONTROL',
     disposition: { kind: 'UNKNOWN', observation: 'AMBIGUOUS_FAILURE_REASON_TEXT' },
+    textMeanings: ['SMART_LOCKOUT', 'MALICIOUS_IP_BLOCK', 'HIGH_CONFIDENCE_RISK_BLOCK'],
     note:
       'THREE documented meanings, resolved from the description text via FAILURE_REASON_MEANINGS. This ' +
       'entry is the fallback for text matching none of them, or more than one.',
@@ -346,7 +363,8 @@ export function resultCodeEntry(code: number): ResultCodeEntry | undefined {
 export type FailureReasonMeaning =
   | 'SMART_LOCKOUT'
   | 'MALICIOUS_IP_BLOCK'
-  | 'HIGH_CONFIDENCE_RISK_BLOCK';
+  | 'HIGH_CONFIDENCE_RISK_BLOCK'
+  | 'SUSPICIOUS_ACTIVITY_BLOCK';
 
 export interface FailureReasonPattern {
   readonly meaning: FailureReasonMeaning;
@@ -365,6 +383,20 @@ export interface FailureReasonPattern {
 }
 
 export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
+  {
+    meaning: 'SUSPICIOUS_ACTIVITY_BLOCK',
+    fragments: ['suspicious activity'],
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
+    verification: {
+      state: 'NO_PRODUCTION_EVIDENCE',
+      why:
+        'Code 50131 is not among the codes observed with volume, so this branch has no rows behind it. ' +
+        'Synthetic fixture only, and recorded as such.',
+    },
+    note:
+      'Microsoft’s judgement, not a control the tenant configured, so it goes to the Microsoft-reported ' +
+      'risk channel for the same reason as the high-confidence-risk text.',
+  },
   {
     meaning: 'HIGH_CONFIDENCE_RISK_BLOCK',
     // ONE fragment, and the most distinctive one available. This is the only
@@ -446,12 +478,16 @@ export function normalizeFailureReason(value: string): string {
  * deliberate: choosing between them would be the guess this closed set exists
  * to avoid.
  */
-export function failureReasonMeaning(value: unknown): FailureReasonPattern | null {
+export function failureReasonMeaning(
+  value: unknown,
+  allowed?: readonly FailureReasonMeaning[],
+): FailureReasonPattern | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > 2048) return null;
   const text = normalizeFailureReason(value);
-  const matched = FAILURE_REASON_MEANINGS.filter(pattern =>
-    pattern.fragments.some(fragment => text.includes(fragment)),
-  );
+  const candidates = allowed
+    ? FAILURE_REASON_MEANINGS.filter(pattern => allowed.includes(pattern.meaning))
+    : FAILURE_REASON_MEANINGS;
+  const matched = candidates.filter(pattern => pattern.fragments.some(fragment => text.includes(fragment)));
   return matched.length === 1 ? matched[0]! : null;
 }
 

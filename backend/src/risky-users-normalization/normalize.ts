@@ -14,15 +14,24 @@ import {
   type SignInRow,
   type SubjectBindingMethod,
 } from './contract.js';
-import { dispositionForCode, failureReasonMeaning, type CodeDisposition } from './provider-facts.js';
+import {
+  UNREACHABLE_BY_SUBJECT_RESOLUTION,
+  dispositionForCode,
+  failureReasonMeaning,
+  resultCodeEntry,
+  type CodeDisposition,
+} from './provider-facts.js';
 import {
   OUT_OF_SCOPE_LABELS,
   UNKNOWN_LABELS,
+  SUBJECT_RESOLUTION_FAILURES,
+  UNCITED_LABELS,
   UNPROCESSABLE_LABELS,
   UNSELECTED_ROW_LABELS,
   unreachable,
   zeroCounts,
   type OutOfScopeReason,
+  type UncitedReason,
   type UnknownObservation,
   type UnprocessableReason,
   type UnselectedRowReason,
@@ -129,11 +138,10 @@ export function readGraphErrorCode(record: Record<string, unknown>): number | nu
  * only to a member of the closed set. Text matching nothing, or matching more
  * than one meaning, keeps the table's UNKNOWN disposition.
  */
-function refineByDescription(disposition: CodeDisposition, description: unknown): CodeDisposition {
-  if (disposition.kind !== 'UNKNOWN' || disposition.observation !== 'AMBIGUOUS_FAILURE_REASON_TEXT') {
-    return disposition;
-  }
-  return failureReasonMeaning(description)?.disposition ?? disposition;
+function refineByDescription(code: number, disposition: CodeDisposition, description: unknown): CodeDisposition {
+  const allowed = resultCodeEntry(code)?.textMeanings;
+  if (!allowed || allowed.length === 0) return disposition;
+  return failureReasonMeaning(description, allowed)?.disposition ?? disposition;
 }
 
 export function classifyGraphRecord(record: Record<string, unknown>): {
@@ -150,7 +158,7 @@ export function classifyGraphRecord(record: Record<string, unknown>): {
 
   const status = plainObject(record.status) ? record.status : {};
   const description = status.failureReason;
-  const disposition = refineByDescription(dispositionForCode(errorCode), description);
+  const disposition = refineByDescription(errorCode, dispositionForCode(errorCode), description);
 
   if (disposition.kind === 'APPLIES' && disposition.outcome === 'PASSWORD_ACCEPTED_COMPLETED') {
     if (!descriptionPermitsSuccess(description)) {
@@ -230,7 +238,7 @@ export function classifyAuditRecord(record: Record<string, unknown>): {
   // The audit feed has no failureReason; its description text is the logon
   // error, so that is what a text-dependent code is refined from.
   const description = logonErrors.find(value => textValue(value));
-  const disposition = refineByDescription(dispositionForCode(code), description);
+  const disposition = refineByDescription(code, dispositionForCode(code), description);
 
   // Operation and code must describe the same outcome. Disagreement is not
   // resolved by preferring one of them.
@@ -480,6 +488,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
 
   const doesNotApplyByReason = zeroCounts<OutOfScopeReason>(OUT_OF_SCOPE_LABELS);
   const unknownByObservation = zeroCounts<UnknownObservation>(UNKNOWN_LABELS);
+  const notYetCitedByReason = zeroCounts<UncitedReason>(UNCITED_LABELS);
   const unprocessableByReason = zeroCounts<UnprocessableReason>(UNPROCESSABLE_LABELS);
   const unselectedRowsByReason = zeroCounts<UnselectedRowReason>(UNSELECTED_ROW_LABELS);
   const bindingMethods: Record<SubjectBindingMethod, number> = { DIRECTORY_OBJECT_ID: 0, NORMALIZED_UPN: 0 };
@@ -492,6 +501,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
   };
 
   let applies = 0;
+  let enumerationCodesOnUnresolvedSubjects = 0;
 
   let consideredRows = 0;
   const events: NormalizedEvent[] = [];
@@ -567,6 +577,16 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
     const result = await normalizeRow(row, row.raw, context);
     if (result.kind === 'UNPROCESSABLE') {
       unprocessableByReason[result.reason] += 1;
+      // A row that failed subject resolution while carrying an enumeration
+      // code is a signal this layer structurally cannot classify: those codes
+      // describe a subject that is by definition absent from the directory.
+      // Counted so the blind spot is visible rather than merely commented.
+      if (SUBJECT_RESOLUTION_FAILURES.includes(result.reason)) {
+        const code = rowFeed === 'GRAPH_SIGN_INS' ? readGraphErrorCode(row.raw) : null;
+        if (code !== null && UNREACHABLE_BY_SUBJECT_RESOLUTION.some(entry => entry.code === code)) {
+          enumerationCodesOnUnresolvedSubjects += 1;
+        }
+      }
       continue;
     }
     const { event } = result;
@@ -584,6 +604,9 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       case 'DOES_NOT_APPLY':
         doesNotApplyByReason[classification.reason] += 1;
         break;
+      case 'NOT_YET_CITED':
+        notYetCitedByReason[classification.reason] += 1;
+        break;
       case 'UNKNOWN':
         unknownByObservation[classification.observation] += 1;
         break;
@@ -598,6 +621,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       : (left.eventAt < right.eventAt ? -1 : 1),
   );
   const outOfScopeTotal = Object.values(doesNotApplyByReason).reduce((sum, value) => sum + value, 0);
+  const notYetCitedTotal = Object.values(notYetCitedByReason).reduce((sum, value) => sum + value, 0);
 
   return {
     scope,
@@ -614,6 +638,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       rows: rows.length,
       applies,
       doesNotApplyByReason,
+      notYetCitedByReason,
       unknownByObservation,
       unprocessableByReason,
       bindingMethods,
@@ -622,12 +647,13 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
     coverage: {
       consideredRows,
       normalizedRows: ordered.length,
-      recognizedRows: applies + outOfScopeTotal,
+      recognizedRows: applies + outOfScopeTotal + notYetCitedTotal,
     },
     shapeObservations: {
       graphErrorCodeShape,
       graphIsInteractive,
       graphIsInteractiveAmongCredentialFailures,
+      enumerationCodesOnUnresolvedSubjects,
     },
   };
 }
