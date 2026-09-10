@@ -49,8 +49,8 @@ try {
   await prisma.signInLog.createMany({ data: Array.from({ length: 15 }, (_, i) => row(i, zulu)) })
 
   const read = await readTenantAssessment(prisma, {
-    organizationId, customerTenantId, source: 'M365_AUDIT_STS',
-    collectionScope: 'AUDIT_STS_LOGON_EVENTS', syncStatus: 'SUCCESS',
+    organizationId, customerTenantId, feedIfNoRows: 'M365_AUDIT_STS',
+    collectionScope: { GRAPH_SIGN_INS: 'GRAPH_INTERACTIVE_ONLY', M365_AUDIT_STS: 'AUDIT_STS_LOGON_EVENTS' } as any, syncStatus: 'SUCCESS',
     detectors: [credentialFailureDetector({ rejectionThreshold: 5 })],
     windowStart, windowEnd, maxEvents: 5000,
   })

@@ -49,8 +49,8 @@ try {
     row(i, i % 2 === 0 ? userA : userB, i % 2 === 0 ? 'alice@fixture.invalid' : 'bob@fixture.invalid')) })
 
   const read = await readTenantAssessment(prisma, {
-    organizationId, customerTenantId, source: 'GRAPH_SIGN_INS',
-    collectionScope: 'GRAPH_INTERACTIVE_ONLY', syncStatus: 'SUCCESS',
+    organizationId, customerTenantId, feedIfNoRows: 'GRAPH_SIGN_INS',
+    collectionScope: { GRAPH_SIGN_INS: 'GRAPH_INTERACTIVE_ONLY', M365_AUDIT_STS: 'AUDIT_STS_LOGON_EVENTS' } as any, syncStatus: 'SUCCESS',
     detectors: [credentialFailureDetector({ rejectionThreshold: 5 })],
     windowStart, windowEnd, maxEvents: 5000,
   })

@@ -49,8 +49,8 @@ try {
     ...Array.from({ length: 8 }, (_, i) => row(100 + i, false))] })
 
   const read = await readTenantAssessment(prisma, {
-    organizationId, customerTenantId, source: 'GRAPH_SIGN_INS',
-    collectionScope: 'GRAPH_INTERACTIVE_ONLY', syncStatus: 'SUCCESS',
+    organizationId, customerTenantId, feedIfNoRows: 'GRAPH_SIGN_INS',
+    collectionScope: { GRAPH_SIGN_INS: 'GRAPH_INTERACTIVE_ONLY', M365_AUDIT_STS: 'AUDIT_STS_LOGON_EVENTS' } as any, syncStatus: 'SUCCESS',
     detectors: [credentialFailureDetector({ rejectionThreshold: 5 })], windowStart, windowEnd, maxEvents: 5000,
   })
 
