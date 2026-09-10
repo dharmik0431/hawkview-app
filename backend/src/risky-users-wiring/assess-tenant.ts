@@ -19,12 +19,29 @@ import type { Budget, Detector } from '../evaluation-core/contract.js'
  * construction. Composing both would gate a tenant's clean zero on a feed it
  * does not use. The stream is named by its source so a withheld claim can say
  * which feed withheld it. */
-export type ClassifiedStream = Readonly<{
-  stream: string
-  batch: NormalizationBatch
-  scope: CollectionScopeSource
-  detectors: readonly Detector<NormalizedEvent>[]
-}>
+export type ClassifiedStream =
+  /** Collection succeeded, so there is a batch to assess — including a batch
+   * that is legitimately empty, which is how a genuinely quiet tenant reaches a
+   * confident zero. */
+  | Readonly<{
+    stream: string
+    collection: 'READ'
+    batch: NormalizationBatch
+    scope: CollectionScopeSource
+    detectors: readonly Detector<NormalizedEvent>[]
+  }>
+  /** Collection did not deliver evidence for this window. A union rather than a
+   * flag, because the alternative is a caller passing an empty batch and the
+   * assessment reporting "collected and clean" for a window nobody collected —
+   * which is this feature's original defect, and it is what a caller does by
+   * default when nothing forces the choice.
+   *
+   * `evidenceFromSync` derives which case applies from the collector's own sync
+   * state, so this is a decision the caller records rather than makes. */
+  | Readonly<{
+    stream: string
+    collection: 'NEVER_COLLECTED' | 'UNREADABLE_NOW'
+  }>
 
 export type AssessTenantInput = Readonly<{
   streams: readonly ClassifiedStream[]
@@ -38,6 +55,7 @@ const eventTime = (event: NormalizedEvent): string => event.eventAt
 
 export function assessTenant(input: AssessTenantInput): TenantAssessment {
   const streams: StreamAssessment[] = input.streams.map(stream => {
+    if (stream.collection !== 'READ') return unreadStream(stream.stream, stream.collection)
     const coverage = toEvaluationCoverage(stream.batch, stream.scope)
     // Fails loudly rather than quietly under-reporting. A bucket the classifier
     // added and the bridge does not map would otherwise leave coverage looking
