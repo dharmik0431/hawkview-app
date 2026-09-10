@@ -47,7 +47,7 @@ async function main(): Promise<void> {
   const pool = new PrismaPg({ connectionString, max: 2 })
   const prisma = new PrismaClient({ adapter: pool })
   try {
-    const assessment = await readTenantAssessment(prisma, {
+    const { assessment, rowsFetched } = await readTenantAssessment(prisma, {
       organizationId,
       customerTenantId,
       source,
@@ -70,19 +70,30 @@ async function main(): Promise<void> {
     // classified means the payload did not look like what the classifier
     // expects — and read as a result rather than a fault, that is "no risky
     // users" for a tenant nobody assessed.
+    const sum = (counts: Readonly<Record<string, number>> | undefined): number =>
+      Object.values(counts ?? {}).reduce((running: number, count: number) => running + count, 0)
     const classified = (coverage?.applies ?? 0)
-      + Object.values(coverage?.doesNotApply ?? {}).reduce((a, b) => a + b, 0)
-      + Object.values(coverage?.notYetCited ?? {}).reduce((a, b) => a + b, 0)
-      + Object.values(coverage?.unknown ?? {}).reduce((a, b) => a + b, 0)
-    const unprocessable = Object.values(coverage?.unprocessable ?? {}).reduce((a, b) => a + b, 0)
-    if (unprocessable > 0 && classified === 0) {
-      console.error(
-        'SUSPECT INPUT SHAPE: every row was unprocessable and none was classified. '
-        + 'This is what a wrong raw-payload shape looks like — it does not error. '
-        + 'Do not read the count below as a result.')
-    }
+      + sum(coverage?.doesNotApply) + sum(coverage?.notYetCited) + sum(coverage?.unknown)
+    const unprocessable = sum(coverage?.unprocessable)
+    // PM's discriminator, computed rather than remembered. A wiring fault and a
+    // real finding both look like zeros, and whoever reads this output will not
+    // have the contract in front of them.
+    //
+    //   rows in, nothing accounted for  -> WIRING. Five-minute fix.
+    //   rows in, all accounted for      -> the classifier ran. Its answer is
+    //                                      the finding, whatever it says.
+    const accountedFor = classified + unprocessable
+    const reading = rowsFetched === 0
+      ? 'NO_ROWS: the window returned nothing. Check the window and the tenant before reading anything else.'
+      : accountedFor !== rowsFetched
+        ? `WIRING: ${rowsFetched} rows fetched, ${accountedFor} accounted for. Rows went missing between the query and the classifier; this is not a result.`
+        : classified === 0
+          ? 'WIRING: every row was unprocessable and none classified. This is what a wrong raw-payload shape looks like — it does not error. Do NOT read the count as a result.'
+          : 'CLASSIFIER RAN: every fetched row is accounted for. Whatever the count says below is a real answer about this window.'
     console.log(JSON.stringify({
+      reading,
       window: { from: windowStart.toISOString(), to: windowEnd.toISOString(), days },
+      rowsFetched,
       source,
       syncStatusAssumed: arg('sync') ?? 'SUCCESS',
       coverage,
