@@ -141,3 +141,27 @@ test('no run at all is its own answer, not an empty assessment', async () => {
   const { client } = reader(null)
   assert.deepEqual(await readLatestRun(client as never, scope, now), { present: false, because: 'NO_RUN' })
 })
+
+test('a run that has not recorded completion is unreachable, not merely unlikely', async () => {
+  // A row whose `completedAt` is null describes an evaluation that did not
+  // finish. Serving it would present a partial assessment as a finished one —
+  // and the status value that keeps these rows away from the LIVE reader does
+  // nothing to keep a half-written one away from THIS reader.
+  //
+  // Not reachable by the current writer: `persistRun` is the last operation in
+  // `evaluateAndPersistTenant` and a single insert, so a row exists only once
+  // the assessment is complete. This asserts the guard anyway, because the
+  // property depends on the write staying last and the guard was previously
+  // enforced by code that nothing tested.
+  const row = await writtenRow()
+
+  const incomplete = reader({ ...row, completedAt: null })
+  assert.deepEqual(
+    await readLatestRun(incomplete.client as never, scope, now),
+    { present: false, because: 'NO_RUN' })
+
+  // POSITIVE CONTROL: the same row with a completion stamp is served, so the
+  // refusal is about the missing stamp rather than the fixture.
+  const complete = reader(row)
+  assert.equal((await readLatestRun(complete.client as never, scope, now)).present, true)
+})
