@@ -193,12 +193,22 @@ function record(value: unknown): RecordValue | null {
     : null
 }
 
-function exactKeys(value: RecordValue, keys: readonly string[]) {
-  const actual = Object.keys(value)
-  return (
-    actual.length === keys.length &&
-    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
-  )
+/**
+ * Required-key check: every listed key must be present, and any additional key
+ * the server sends is ignored.
+ *
+ * Unknown fields are safe to ignore here because every adapter below builds its
+ * result from explicitly named fields — nothing is spread or passed through, so
+ * an unrecognised field cannot reach the view model or the screen.
+ *
+ * This replaces an exact-key check that rejected the entire response whenever a
+ * single unrecognised field appeared. That made the wire format unchangeable
+ * while both sides ship from this repository, and a rejected response reached
+ * the technician as an unevaluated tenant — the state collapse this surface
+ * exists to prevent.
+ */
+function hasKeys(value: RecordValue, keys: readonly string[]) {
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
 }
 
 function containsSecret(value: string) {
@@ -440,7 +450,7 @@ function sameMeta(
 
 function adaptPageInfo(value: unknown): IdentityRiskPageInfo | null {
   const source = record(value)
-  if (!source || !exactKeys(source, ['hasMore', 'nextCursor'])) return null
+  if (!source || !hasKeys(source, ['hasMore', 'nextCursor'])) return null
   if (typeof source.hasMore !== 'boolean') return null
   const nextCursor =
     source.nextCursor === null ? null : boundedString(source.nextCursor, 256)
@@ -457,7 +467,7 @@ function adaptPageInfo(value: unknown): IdentityRiskPageInfo | null {
 
 function adaptBoundedCount(value: unknown) {
   const source = record(value)
-  if (!source || !exactKeys(source, ['value', 'exact', 'capped'])) return null
+  if (!source || !hasKeys(source, ['value', 'exact', 'capped'])) return null
   if (
     !Number.isSafeInteger(source.value) ||
     (source.value as number) < 0 ||
@@ -488,7 +498,7 @@ function adaptCounts(value: unknown): HawkViewIdentityRiskCounts | null {
     'notMatchedResults',
     'notEvaluatedResults',
   ] as const
-  if (!source || !exactKeys(source, keys)) return null
+  if (!source || !hasKeys(source, keys)) return null
 
   const counts = Object.fromEntries(
     keys.map((key) => [key, adaptBoundedCount(source[key])])
@@ -531,7 +541,7 @@ function adaptFinding(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'id',
       'state',
       'severity',
@@ -575,7 +585,7 @@ function adaptFinding(
   const affectedIdentitySource = record(source.affectedIdentity)
   if (
     !affectedIdentitySource ||
-    !exactKeys(affectedIdentitySource, ['id', 'label', 'type'])
+    !hasKeys(affectedIdentitySource, ['id', 'label', 'type'])
   ) {
     return null
   }
@@ -679,7 +689,7 @@ function adaptMicrosoftUser(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'id',
       'identityLabel',
       'riskLevel',
@@ -781,7 +791,7 @@ export function adaptIdentityRiskResponses(input: {
   if (
     summary?.version === 1 &&
     summary.channel === 'HAWKVIEW_IDENTITY_SIGNALS' &&
-    exactKeys(summary, [
+    hasKeys(summary, [
       'version',
       'channel',
       'engineVersion',
@@ -797,7 +807,7 @@ export function adaptIdentityRiskResponses(input: {
     ]) &&
     findingEnvelope?.version === 1 &&
     findingEnvelope.channel === 'HAWKVIEW_IDENTITY_SIGNALS' &&
-    exactKeys(findingEnvelope, [
+    hasKeys(findingEnvelope, [
       'version',
       'channel',
       'engineVersion',
@@ -874,7 +884,7 @@ export function adaptIdentityRiskResponses(input: {
   if (
     microsoftEnvelope?.version === 1 &&
     microsoftEnvelope.channel === 'MICROSOFT_ENTRA_RISKY_USERS' &&
-    exactKeys(microsoftEnvelope, [
+    hasKeys(microsoftEnvelope, [
       'version',
       'channel',
       'engineVersion',
@@ -973,7 +983,7 @@ function adaptEvidenceWindow(
   trustedCurrentTimeMs: number
 ): RiskEvidenceWindow | null {
   const source = record(value)
-  if (!source || !exactKeys(source, ['start', 'end'])) return null
+  if (!source || !hasKeys(source, ['start', 'end'])) return null
   const start = nullableDateTime(source.start, trustedCurrentTimeMs)
   const end = nullableDateTime(source.end, trustedCurrentTimeMs)
   if (
@@ -1013,7 +1023,7 @@ function adaptSourceReadiness(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'source',
       'status',
       'reasonCode',
@@ -1087,7 +1097,7 @@ function adaptRuleReadiness(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'ruleId',
       'ruleVersion',
       'title',
@@ -1164,7 +1174,7 @@ function adaptConditionalAccessPolicy(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, ['id', 'name', 'state', 'outcome', 'materialConditions'])
+    !hasKeys(source, ['id', 'name', 'state', 'outcome', 'materialConditions'])
   ) {
     return null
   }
@@ -1205,7 +1215,7 @@ function adaptProtection(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'conditionalAccess',
       'securityDefaults',
       'legacyPerUserMfa',
@@ -1217,7 +1227,7 @@ function adaptProtection(
   const conditionalAccess = record(source.conditionalAccess)
   if (
     !conditionalAccess ||
-    !exactKeys(conditionalAccess, [
+    !hasKeys(conditionalAccess, [
       'contractVersion',
       'status',
       'policies',
@@ -1315,13 +1325,7 @@ function adaptProtectionEvidence<const State extends string>(
   const item = record(value)
   if (
     !item ||
-    !exactKeys(item, [
-      'state',
-      'source',
-      'observedAt',
-      'freshness',
-      'reasonCode',
-    ])
+    !hasKeys(item, ['state', 'source', 'observedAt', 'freshness', 'reasonCode'])
   )
     return null
   const state = enumValue(item.state, [...states, 'UNKNOWN'] as const)
@@ -1353,7 +1357,7 @@ function adaptProtectionEvidence<const State extends string>(
 
 function adaptRecommendedAction(value: unknown): RiskRecommendedAction | null {
   const source = record(value)
-  if (!source || !exactKeys(source, ['code', 'text'])) return null
+  if (!source || !hasKeys(source, ['code', 'text'])) return null
   const code = enumValue(source.code, recommendationCodes)
   const text = boundedString(source.text, 400)
   return code && text ? { code, text } : null
@@ -1366,7 +1370,7 @@ function adaptAssessmentFinding(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'id',
       'ruleId',
       'ruleVersion',
@@ -1445,7 +1449,7 @@ function adaptAssessmentFinding(
     Array.isArray(rawReferences) && rawReferences.length <= 50
       ? rawReferences.map((reference) => {
           const item = record(reference)
-          if (!item || !exactKeys(item, ['id', 'recordedAt', 'ingestedAt']))
+          if (!item || !hasKeys(item, ['id', 'recordedAt', 'ingestedAt']))
             return null
           const referenceId = boundedString(item.id, 160)
           const recordedAt = nullableDateTime(
@@ -1513,7 +1517,7 @@ function adaptAssessmentFinding(
       RISK_ASSESSMENT_RULE_TUPLES[ruleId].sources as readonly string[]
     ).includes(selectedSource) ||
     !application ||
-    !exactKeys(application, ['id', 'state', 'label']) ||
+    !hasKeys(application, ['id', 'state', 'label']) ||
     !applicationState ||
     (application.label !== null && !applicationLabel) ||
     (applicationState === 'RESOLVED'
@@ -1521,11 +1525,11 @@ function adaptAssessmentFinding(
         !/^hvr1_application_[a-f0-9]{64}$/.test(application.id)
       : application.id !== null || application.label !== null) ||
     !device ||
-    !exactKeys(device, ['state', 'label']) ||
+    !hasKeys(device, ['state', 'label']) ||
     !deviceState ||
     device.label !== null ||
     !client ||
-    !exactKeys(client, ['reference', 'qualification']) ||
+    !hasKeys(client, ['reference', 'qualification']) ||
     !qualification ||
     (client.reference !== null &&
       (typeof client.reference !== 'string' ||
@@ -1619,7 +1623,7 @@ function adaptAssessmentUser(
   const source = record(value)
   if (
     !source ||
-    !exactKeys(source, [
+    !hasKeys(source, [
       'id',
       'label',
       'subjectType',
@@ -1705,18 +1709,13 @@ export function adaptRiskAssessmentResponse(
   const hasSummary = Boolean(
     source && Object.prototype.hasOwnProperty.call(source, 'summary')
   )
-  if (
-    !source ||
-    (!exactKeys(source, rootKeys) &&
-      !exactKeys(source, [...rootKeys, 'summary']))
-  )
-    return null
+  if (!source || !hasKeys(source, rootKeys)) return null
   const rawMeta = record(source.meta)
   if (
     source.version !== 1 ||
     source.schemaVersion !== assessmentSchema ||
     !rawMeta ||
-    !exactKeys(rawMeta, assessmentMetaKeys) ||
+    !hasKeys(rawMeta, assessmentMetaKeys) ||
     rawMeta.version !== 1 ||
     rawMeta.channel !== 'HAWKVIEW_IDENTITY_SIGNALS'
   )
@@ -1845,14 +1844,14 @@ function adaptAssessmentSummary(
   trustedCurrentTimeMs: number
 ): RiskAssessmentSummary | null {
   const source = record(value)
-  if (!source || !exactKeys(source, ['scope', 'asOf', 'currentUsers'])) {
+  if (!source || !hasKeys(source, ['scope', 'asOf', 'currentUsers'])) {
     return null
   }
   const currentUsers = record(source.currentUsers)
   if (
     source.scope !== 'TENANT' ||
     !currentUsers ||
-    !exactKeys(currentUsers, ['value', 'accuracy'])
+    !hasKeys(currentUsers, ['value', 'accuracy'])
   ) {
     return null
   }

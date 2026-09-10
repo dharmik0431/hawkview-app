@@ -172,7 +172,7 @@ test('accepts server-resolved exact GUID mailbox rollup under a USER without wea
   assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
 })
 
-test('rejects malformed provenance, future event evidence, unknown fields and unsupported schema', () => {
+test('rejects malformed provenance, future event evidence and unsupported schema', () => {
   for (const mutate of [
     (v: any) => {
       v.users[0].protection.legacyPerUserMfa = 'ENFORCED'
@@ -184,11 +184,67 @@ test('rejects malformed provenance, future event evidence, unknown fields and un
       v.schemaVersion = 'future/v2'
     },
     (v: any) => {
-      v.rawEvent = {}
-    },
-    (v: any) => {
       v.rules.pop()
     },
+  ]) {
+    const value = assessmentFixture(true)
+    mutate(value)
+    assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
+  }
+})
+
+test('tolerates unknown fields at every level without projecting them', () => {
+  // The backend and this client ship from the same repository and there is no
+  // external consumer, so the server adding a field must never cost the
+  // technician the whole assessment. Unknown fields are ignored, and because
+  // every adapter names the fields it reads, none of them can reach the screen.
+  const root = assessmentFixture(true)
+  root.rawEvent = {}
+  root.evaluationTrace = ['ignored']
+  const adaptedRoot = adaptRiskAssessmentResponse(root, assessmentNow)
+  assert.ok(adaptedRoot)
+  assert.ok(!Object.hasOwn(adaptedRoot!, 'rawEvent'))
+  assert.ok(!Object.hasOwn(adaptedRoot!, 'evaluationTrace'))
+
+  const nested = assessmentFixture(true)
+  nested.meta.experimentArm = 'B'
+  nested.sources[0].collectorBuild = 'abc123'
+  nested.rules[0].debugCounters = { skipped: 4 }
+  nested.users[0].tenantHint = 'ignored'
+  nested.users[0].findings[0].rawScore = 0.91
+  nested.users[0].protection.experimentalSignal = 'ignored'
+  const adaptedNested = adaptRiskAssessmentResponse(nested, assessmentNow)
+  assert.ok(adaptedNested)
+  assert.ok(!Object.hasOwn(adaptedNested!.meta, 'experimentArm'))
+  assert.ok(!Object.hasOwn(adaptedNested!.sources[0], 'collectorBuild'))
+  assert.ok(!Object.hasOwn(adaptedNested!.rules[0], 'debugCounters'))
+  assert.ok(!Object.hasOwn(adaptedNested!.users[0], 'tenantHint'))
+  assert.ok(!Object.hasOwn(adaptedNested!.users[0].findings[0], 'rawScore'))
+  assert.ok(
+    !Object.hasOwn(adaptedNested!.users[0].protection, 'experimentalSignal')
+  )
+
+  const summary = assessmentFixture(true)
+  summary.summary.extra = true
+  summary.summary.currentUsers.derivation = 'ignored'
+  const adaptedSummary = adaptRiskAssessmentResponse(summary, assessmentNow)
+  assert.ok(adaptedSummary)
+  assert.ok(!Object.hasOwn(adaptedSummary!.summary!, 'extra'))
+  assert.ok(!Object.hasOwn(adaptedSummary!.summary!.currentUsers, 'derivation'))
+  // The tolerated fields changed nothing about what the count claims.
+  assert.equal(adaptedSummary!.summary!.currentUsers.accuracy, 'EXACT')
+})
+
+test('still requires every contracted field to be present', () => {
+  // Tolerating an unknown field is not the same as tolerating a missing one.
+  for (const mutate of [
+    (v: any) => delete v.meta,
+    (v: any) => delete v.rules,
+    (v: any) => delete v.page,
+    (v: any) => delete v.meta.freshness,
+    (v: any) => delete v.sources[0].window,
+    (v: any) => delete v.users[0].findings[0].explanation,
+    (v: any) => delete v.summary.currentUsers.accuracy,
   ]) {
     const value = assessmentFixture(true)
     mutate(value)
@@ -304,12 +360,6 @@ test('rejects malformed or contradictory tenant count summaries', () => {
     currentUsers = { value: 1, accuracy: 'EXACT' }
   }
   const malformed = [
-    {
-      scope: 'TENANT',
-      asOf: at(),
-      currentUsers: { value: 1, accuracy: 'EXACT' },
-      extra: true,
-    },
     new UnsafeSummary(),
     {
       scope: 'WORKSPACE',
