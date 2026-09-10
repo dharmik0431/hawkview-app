@@ -1183,10 +1183,17 @@ test('an empty screen never reads as a clean tenant, whatever emptied it', () =>
   // a blank surface reads as "nothing to worry about" unless the words say
   // otherwise. This is the bare-zero defect reached by a different route, so
   // the same rule applies: none of these may be readable as an all-clear.
+  // Every reason the endpoint can return, taken from the served union rather
+  // than from a description of it.
   const codes = [
     'ROLE_NOT_PERMITTED',
     'NOT_ENABLED_FOR_TENANT',
     'EVALUATION_DISABLED',
+    'NO_RUN',
+    'COVERAGE_NOT_RECORDED',
+    'COVERAGE_UNREADABLE',
+    'FINDINGS_NOT_RECORDED',
+    'FINDINGS_UNREADABLE',
     'A_REASON_SHIPPED_AFTER_THIS_BUILD',
   ]
   const seen = new Set<string>()
@@ -1201,7 +1208,14 @@ test('an empty screen never reads as a clean tenant, whatever emptied it', () =>
     seen.add(copy.headline)
 
     // None of them may be read as a result.
-    assert.match(rendered, /not an all-clear|says nothing about whether/i)
+    //
+    // One canonical phrase rather than an alternation over however each caption
+    // happens to be worded. A regex over prose tests the phrasing, not the
+    // property, and widening it every time a new caption says the same thing
+    // differently turns the guard into a record of what has been written rather
+    // than a requirement on what may be. It also gives a technician the same
+    // boundary sentence wherever they land.
+    assert.match(rendered, /is not an all-clear/i)
     assert.ok(
       !/no risky users|nothing to review|all clear/i.test(rendered),
       code + ' reads as a clean tenant: ' + rendered

@@ -892,7 +892,7 @@ const unavailableCopy: Record<string, AssessmentUnavailableCopy> = {
     posture: 'PERMISSION',
     headline: 'Your role cannot see this tenant&rsquo;s risky users',
     caption:
-      'Nothing is wrong and nothing needs retrying. Named users are restricted to roles with permission to see them, and yours does not have it for this tenant. An administrator can change that. This says nothing about whether the tenant has risky users.',
+      'Nothing is wrong and nothing needs retrying. Named users are restricted to roles with permission to see them, and yours does not have it for this tenant. An administrator can change that. It is not an all-clear, and says nothing about whether the tenant has risky users.',
   },
   NOT_ENABLED_FOR_TENANT: {
     posture: 'NOT_CONFIGURED',
@@ -905,6 +905,36 @@ const unavailableCopy: Record<string, AssessmentUnavailableCopy> = {
     headline: 'HawkView risk evaluation is currently switched off',
     caption:
       'Risk evaluation has been disabled for all tenants at the operator level, so no current assessment exists for this one. Nothing has failed and no retry will help. This is not an all-clear.',
+  },
+  NO_RUN: {
+    posture: 'NOT_YET_RUN',
+    headline: 'HawkView has not assessed this tenant yet',
+    caption:
+      'No evaluation has completed for this tenant, so there is nothing to report. This is a question about scheduling rather than about the tenant: the checks have not run, which is not the same as running and finding nobody. It is not a zero, and it is not an all-clear.',
+  },
+  COVERAGE_NOT_RECORDED: {
+    posture: 'NOT_YET_RUN',
+    headline: 'The last assessment did not record what it covered',
+    caption:
+      'An evaluation completed, but it did not store the scope its result rested on, so HawkView cannot say what any number from it would be a number about. Runs made before that scope was recorded are all in this position. The findings are not shown rather than absent, and this is not an all-clear.',
+  },
+  COVERAGE_UNREADABLE: {
+    posture: 'FAULT',
+    headline: 'The last assessment&rsquo;s coverage could not be read',
+    caption:
+      'A record exists and HawkView could not interpret it. That is a problem on our side and worth reporting; it is not a statement about this tenant, no result should be inferred from it, and it is not an all-clear.',
+  },
+  FINDINGS_NOT_RECORDED: {
+    posture: 'NOT_YET_RUN',
+    headline: 'The last assessment did not record its findings',
+    caption:
+      'A count exists for this run and the per-user findings behind it do not. Rather than show a number with nothing behind it, HawkView shows neither. The users this run counted have not been checked and cleared &mdash; they have not been shown. This is not an all-clear.',
+  },
+  FINDINGS_UNREADABLE: {
+    posture: 'FAULT',
+    headline: 'The last assessment&rsquo;s findings could not be read',
+    caption:
+      'A findings record exists and HawkView could not interpret it. That is a problem on our side and worth reporting. No result should be inferred from it, and this is not an all-clear.',
   },
 }
 
