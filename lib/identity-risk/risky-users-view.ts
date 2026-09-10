@@ -173,6 +173,161 @@ export function microsoftChannel(
 }
 
 /* -------------------------------------------------------------------------- */
+/* Microsoft verdict polarity                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Microsoft's channel is a list of risk-related *conclusions*, and some of those
+ * conclusions are that a sign-in was safe. A surface that iterates the list and
+ * paints every row as a detection shows a technician something Microsoft cleared
+ * as something Microsoft flagged, and the technician disables an account over
+ * it. Every part of the pipeline can be correct and the screen still lies.
+ *
+ * Polarity is therefore resolved before anything renders, and an unrecognised
+ * verdict is never allowed to fall to the risk side.
+ */
+export type MicrosoftVerdictPolarity =
+  /** Microsoft currently considers this identity at risk. */
+  | 'ACTIVE_RISK'
+  /** Microsoft concluded this was safe. Not a finding. */
+  | 'CLEARED'
+  /** Microsoft considers this closed - remediated or dismissed. */
+  | 'CLOSED'
+  /** Microsoft said something this client does not recognise. */
+  | 'UNRECOGNISED'
+
+const clearedRiskDetails = new Set([
+  'adminConfirmedSigninSafe',
+  'aiConfirmedSigninSafe',
+  'adminConfirmedAccountSafe',
+])
+
+export function microsoftVerdictPolarity(
+  user: MicrosoftEntraRiskyUser
+): MicrosoftVerdictPolarity {
+  // An explicit safe conclusion settles it, whatever the state says.
+  if (user.riskDetail && clearedRiskDetails.has(user.riskDetail))
+    return 'CLEARED'
+  switch (user.riskState) {
+    case 'atRisk':
+    case 'confirmedCompromised':
+      return 'ACTIVE_RISK'
+    case 'confirmedSafe':
+    case 'none':
+      return 'CLEARED'
+    case 'remediated':
+    case 'dismissed':
+      return 'CLOSED'
+    default:
+      // unknownFutureValue, or anything a later Microsoft adds. Deliberately
+      // not ACTIVE_RISK: guessing upward invents a detection Microsoft never
+      // made, and that is the direction that gets an account disabled.
+      return 'UNRECOGNISED'
+  }
+}
+
+export const microsoftPolarityLabel: Readonly<
+  Record<MicrosoftVerdictPolarity, string>
+> = {
+  ACTIVE_RISK: 'Microsoft reports risk',
+  CLEARED: 'Microsoft concluded safe',
+  CLOSED: 'Closed by Microsoft',
+  UNRECOGNISED: 'Verdict not recognised',
+}
+
+/**
+ * `dismissed` is where Microsoft's *automatic* remediation lands, not
+ * `remediated`. Rendering it as "someone waved this away" turns a machine
+ * assessment into apparent human negligence, so the actor is named from
+ * riskDetail rather than inferred from the state.
+ */
+export function microsoftVerdictDetail(user: MicrosoftEntraRiskyUser): string {
+  const detail = user.riskDetail
+  if (!detail || detail === 'none') return ''
+  switch (detail) {
+    case 'aiConfirmedSigninSafe':
+      return 'Microsoft\u2019s automated assessment concluded this sign-in was safe'
+    case 'adminConfirmedSigninSafe':
+      return 'An administrator confirmed this sign-in was safe'
+    case 'adminConfirmedAccountSafe':
+      return 'An administrator confirmed this account was safe'
+    case 'adminConfirmedSigninCompromised':
+      return 'An administrator confirmed this sign-in was compromised'
+    case 'adminConfirmedUserCompromised':
+      return 'An administrator confirmed this user was compromised'
+    case 'adminDismissedAllRiskForUser':
+      return 'An administrator dismissed all risk for this user'
+    case 'adminDismissedRiskForSignIn':
+      return 'An administrator dismissed the risk for this sign-in'
+    case 'm365DAdminDismissedDetection':
+      return 'An administrator dismissed this detection in Microsoft 365 Defender'
+    case 'userPassedMFADrivenByRiskBasedPolicy':
+      return 'The user satisfied MFA required by a risk-based policy'
+    // Microsoft's own documentation notes this identifier is misleading: it
+    // means a secure password change, not a self-service reset flow. The word
+    // "reset" is deliberately not rendered from it.
+    case 'userPerformedSecuredPasswordReset':
+    case 'userPerformedSecuredPasswordChange':
+      return 'The user completed a secure password change'
+    case 'userChangedPasswordOnPremises':
+      return 'The user changed their password on-premises'
+    case 'adminGeneratedTemporaryPassword':
+      return 'An administrator issued a temporary password'
+    case 'hidden':
+      return 'Microsoft is not disclosing the detail on this tenant'
+    default:
+      return 'Microsoft reported a detail this client does not recognise'
+  }
+}
+
+/**
+ * `hidden` does not mean "no risk". It means the tenant is not licensed for
+ * Identity Protection, so Microsoft withholds the level. Rendering it as "none",
+ * or as a blank cell, tells an MSP their customer is clean when we simply cannot
+ * see - and hides the one moment where the licence is worth naming.
+ *
+ * The level is also a confidence scale, not a severity scale: "high" means
+ * Microsoft is confident, not that the impact is large. It is labelled as
+ * confidence and never sorted or coloured as severity.
+ */
+export function microsoftRiskLevelLabel(
+  level: MicrosoftEntraRiskyUser['riskLevel']
+) {
+  switch (level) {
+    case 'hidden':
+      return 'Detected \u2014 level requires Entra ID P2'
+    case 'unknownFutureValue':
+      return 'Not recognised'
+    case 'none':
+      return 'None reported'
+    default:
+      return `${level[0].toUpperCase()}${level.slice(1)} confidence`
+  }
+}
+
+/** True when Microsoft is withholding levels for want of a P2 licence. */
+export function microsoftLevelsHidden(view: MicrosoftEntraRiskyUsersView) {
+  return Boolean(view.users?.some((user) => user.riskLevel === 'hidden'))
+}
+
+/**
+ * Microsoft's records split by what Microsoft actually concluded, so a caller
+ * cannot render a clearance among the detections by accident.
+ */
+export function microsoftRecordsByPolarity(view: MicrosoftEntraRiskyUsersView) {
+  const groups: Record<MicrosoftVerdictPolarity, MicrosoftEntraRiskyUser[]> = {
+    ACTIVE_RISK: [],
+    CLEARED: [],
+    CLOSED: [],
+    UNRECOGNISED: [],
+  }
+  for (const user of view.users ?? []) {
+    groups[microsoftVerdictPolarity(user)].push(user)
+  }
+  return groups
+}
+
+/* -------------------------------------------------------------------------- */
 /* Detection attribution                                                      */
 /* -------------------------------------------------------------------------- */
 
@@ -375,7 +530,12 @@ export type RiskyUserCountAccuracy =
 export type RiskyUserCount = {
   accuracy: RiskyUserCountAccuracy
   value: number | null
-  /** What the tile prints. */
+  /**
+   * What the tile prints. Never a dash and never a blank when there is no
+   * number: a dash reads as zero to anyone who has used a dashboard, which is
+   * exactly the reading these states exist to prevent. `value === null` is the
+   * signal that this is words rather than a numeral, so it can be set smaller.
+   */
   display: string
   /** What a screen reader says instead of the glyph. */
   accessibleValue: string
@@ -461,19 +621,25 @@ const unreportedWithheldReason = {
  */
 function knownDespiteNoCount(assessment: RiskAssessment | null) {
   if (!assessment) return []
-  const byReason = new Map<string, Set<string>>()
+  // Grouped on a structured key rather than a concatenated string: a finding
+  // title is server-supplied text and could contain any separator character.
+  const byTitle = new Map<
+    string,
+    Map<RiskAssessmentUser['subjectType'], Set<string>>
+  >()
   for (const user of assessment.users) {
     for (const finding of user.findings) {
       if (finding.activityState !== 'CURRENT') continue
-      const key = `${finding.title} ${user.subjectType}`
-      const subjects = byReason.get(key) ?? new Set<string>()
+      const bySubjectType = byTitle.get(finding.title) ?? new Map()
+      const subjects = bySubjectType.get(user.subjectType) ?? new Set<string>()
       subjects.add(user.id)
-      byReason.set(key, subjects)
+      bySubjectType.set(user.subjectType, subjects)
+      byTitle.set(finding.title, bySubjectType)
     }
   }
-  return Array.from(byReason.entries())
-    .map(([key, subjects]) => {
-      const [title, subjectType] = key.split(' ')
+  const lines: string[] = []
+  for (const [title, bySubjectType] of Array.from(byTitle)) {
+    for (const [subjectType, subjects] of Array.from(bySubjectType)) {
       const noun =
         subjectType === 'MAILBOX'
           ? subjects.size === 1
@@ -482,9 +648,10 @@ function knownDespiteNoCount(assessment: RiskAssessment | null) {
           : subjects.size === 1
             ? 'account'
             : 'accounts'
-      return `${title}: ${subjects.size} ${noun}`
-    })
-    .sort()
+      lines.push(`${title}: ${subjects.size} ${noun}`)
+    }
+  }
+  return lines.sort()
 }
 
 function coverageGaps(
@@ -553,7 +720,7 @@ export function riskyUserCount({
     return {
       accuracy: 'UNAVAILABLE',
       value: null,
-      display: '—',
+      display: 'Not available',
       accessibleValue: 'Not available',
       headline: contractFailed
         ? 'The latest response could not be read'
@@ -584,7 +751,7 @@ export function riskyUserCount({
     return {
       accuracy: 'WITHHELD',
       value: null,
-      display: '—',
+      display: 'Not counted',
       accessibleValue: 'Not counted',
       headline: copy.headline,
       caption: copy.caption,

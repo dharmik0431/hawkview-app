@@ -114,19 +114,19 @@ export function RiskyUsersCountCard({
 }
 
 /**
- * A withheld count is a decision, not an absence, so the slot where the number
- * belongs says "Not counted" rather than showing a glyph that reads as an empty
- * state. A failed read keeps the neutral dash, because there a value really is
- * missing and a retry may produce one.
+ * Where there is no number, the slot says so in words. A dash reads as zero to
+ * anyone who has used a dashboard, and a blank reads as nothing to see, so
+ * neither is used: a withheld count says "Not counted", a failed read says "Not
+ * available", and only an actual number is set at numeral size.
  */
 function CountValue({ count }: { count: RiskyUserCount }) {
-  if (count.accuracy === 'WITHHELD') {
+  if (count.value === null) {
     return (
       <p
         className="text-[19px] font-semibold leading-tight text-slate-600 dark:text-slate-300"
         aria-hidden="true"
       >
-        Not counted
+        {count.display}
       </p>
     )
   }

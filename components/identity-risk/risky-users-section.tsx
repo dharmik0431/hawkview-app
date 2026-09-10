@@ -16,9 +16,17 @@ import {
   riskReadinessLabel,
   riskSourceLabel,
 } from '@/lib/identity-risk/presentation'
-import { detectedByLabel } from '@/lib/identity-risk/risky-users-view'
+import {
+  detectedByLabel,
+  microsoftLevelsHidden,
+  microsoftRecordsByPolarity,
+  microsoftRiskLevelLabel,
+  microsoftVerdictDetail,
+  microsoftVerdictPolarity,
+} from '@/lib/identity-risk/risky-users-view'
 import type {
   MicrosoftChannel,
+  MicrosoftVerdictPolarity,
   RiskyUserCount,
   RiskyUserRow,
 } from '@/lib/identity-risk/risky-users-view'
@@ -140,9 +148,112 @@ const microsoftRiskStateLabel: Readonly<
  * either invent a correspondence or silently drop records. Keeping them apart
  * is what preserves which system said what.
  */
+const polarityGroups: ReadonlyArray<{
+  polarity: MicrosoftVerdictPolarity
+  heading: string
+  note: string
+}> = [
+  {
+    polarity: 'ACTIVE_RISK',
+    heading: 'Microsoft currently reports risk',
+    note: 'Microsoft considers these identities at risk right now.',
+  },
+  {
+    polarity: 'CLOSED',
+    heading: 'Closed by Microsoft',
+    note: 'Microsoft has remediated or dismissed these. Its automatic remediation lands in the dismissed state, so a dismissal here is not necessarily someone waving it away — the detail names who or what closed it.',
+  },
+  {
+    polarity: 'CLEARED',
+    heading: 'Microsoft concluded these were safe',
+    note: 'These are Microsoft clearing a sign-in or account, not Microsoft flagging one. They are listed for completeness and are not findings.',
+  },
+  {
+    polarity: 'UNRECOGNISED',
+    heading: 'Verdicts this client does not recognise',
+    note: 'Microsoft reported something HawkView has not learned to read. It is shown as unrecognised rather than assumed to be a risk.',
+  },
+]
+
+function MicrosoftRecordTable({
+  users,
+  caption,
+}: {
+  users: MicrosoftEntraRiskyUser[]
+  caption: string
+}) {
+  return (
+    <div className="mt-2 overflow-x-auto">
+      <table className="w-full min-w-[34rem] border-collapse text-left">
+        <caption className="sr-only">{caption}</caption>
+        <thead>
+          <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800 dark:text-slate-400">
+            <th scope="col" className="px-3 py-2 font-semibold">
+              Identity
+            </th>
+            <th scope="col" className="px-3 py-2 font-semibold">
+              Microsoft confidence
+            </th>
+            <th scope="col" className="px-3 py-2 font-semibold">
+              What Microsoft concluded
+            </th>
+            <th scope="col" className="px-3 py-2 font-semibold">
+              Observed
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {users.map((user) => {
+            const detail = microsoftVerdictDetail(user)
+            const polarity = microsoftVerdictPolarity(user)
+            // Microsoft can report a risk state and a superseding safe
+            // conclusion on the same record. Printing the state alone under a
+            // "concluded safe" heading would contradict the heading, so the row
+            // says which of the two governs.
+            const superseded =
+              polarity === 'CLEARED' &&
+              (user.riskState === 'atRisk' ||
+                user.riskState === 'confirmedCompromised')
+            return (
+              <tr
+                key={user.id}
+                className="border-b border-slate-100 align-top last:border-0 dark:border-slate-800/70"
+              >
+                <td className="px-3 py-2.5 text-sm font-medium text-slate-900 dark:text-slate-50">
+                  {user.identityLabel}
+                </td>
+                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
+                  {microsoftRiskLevelLabel(user.riskLevel)}
+                </td>
+                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
+                  {microsoftRiskStateLabel[user.riskState]}
+                  {superseded && (
+                    <span className="block text-xs font-medium text-slate-600 dark:text-slate-400">
+                      superseded by the conclusion below
+                    </span>
+                  )}
+                  {detail && (
+                    <span className="block text-xs text-slate-500 dark:text-slate-400">
+                      {detail}
+                    </span>
+                  )}
+                </td>
+                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
+                  {time(user.observedAt)}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
   if (!view.users || view.users.length === 0) return null
   const count = microsoftRiskyUserCountPresentation(view)
+  const groups = microsoftRecordsByPolarity(view)
   return (
     <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -157,56 +268,33 @@ function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
       <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
         {count.detail} These are Microsoft&rsquo;s determinations and are never
         added to, or subtracted from, the HawkView count above.
+        Microsoft&rsquo;s level is a confidence scale rather than a severity
+        one: <em>high</em> means Microsoft is confident, not that the impact is
+        large.
       </p>
-      <div className="mt-3 overflow-x-auto">
-        <table className="w-full min-w-[34rem] border-collapse text-left">
-          <caption className="sr-only">
-            Risky users as reported by Microsoft Entra Identity Protection
-          </caption>
-          <thead>
-            <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800 dark:text-slate-400">
-              <th scope="col" className="px-3 py-2 font-semibold">
-                Identity
-              </th>
-              <th scope="col" className="px-3 py-2 font-semibold">
-                Microsoft risk level
-              </th>
-              <th scope="col" className="px-3 py-2 font-semibold">
-                Microsoft risk state
-              </th>
-              <th scope="col" className="px-3 py-2 font-semibold">
-                Observed
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {view.users.map((user) => (
-              <tr
-                key={user.id}
-                className="border-b border-slate-100 align-top last:border-0 dark:border-slate-800/70"
-              >
-                <td className="px-3 py-2.5 text-sm font-medium text-slate-900 dark:text-slate-50">
-                  {user.identityLabel}
-                </td>
-                <td className="px-3 py-2.5 text-sm capitalize text-slate-700 dark:text-slate-300">
-                  {user.riskLevel}
-                </td>
-                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
-                  {microsoftRiskStateLabel[user.riskState]}
-                  {user.riskDetail && (
-                    <span className="block text-xs text-slate-500 dark:text-slate-400">
-                      {user.riskDetail}
-                    </span>
-                  )}
-                </td>
-                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
-                  {time(user.observedAt)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {microsoftLevelsHidden(view) && (
+        <p className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2.5 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-300">
+          Microsoft is withholding the risk level on some of these records
+          because this tenant is not licensed for Entra ID P2. That is Microsoft
+          declining to show the level of a risk it detected — not an absence of
+          risk.
+        </p>
+      )}
+      {polarityGroups.map(({ polarity, heading, note }) => {
+        const users = groups[polarity]
+        if (users.length === 0) return null
+        return (
+          <section key={polarity} className="mt-4">
+            <h5 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              {heading} ({users.length})
+            </h5>
+            <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+              {note}
+            </p>
+            <MicrosoftRecordTable users={users} caption={heading} />
+          </section>
+        )
+      })}
       {view.pageInfo?.hasMore && (
         <p className="mt-2 text-xs text-slate-600 dark:text-slate-300">
           More Microsoft records exist than were read into this page, so this is
@@ -464,12 +552,12 @@ function CountSummary({ count }: { count: RiskyUserCount }) {
         >
           {count.headline}
         </h2>
-        {count.accuracy === 'WITHHELD' ? (
+        {count.value === null ? (
           <p
             className="text-base font-semibold leading-none text-slate-600 dark:text-slate-300"
             aria-hidden="true"
           >
-            Not counted
+            {count.display}
           </p>
         ) : (
           <p

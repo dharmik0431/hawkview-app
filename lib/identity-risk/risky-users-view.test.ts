@@ -8,6 +8,11 @@ import {
 import {
   detectedByLabel,
   microsoftChannel,
+  microsoftLevelsHidden,
+  microsoftRecordsByPolarity,
+  microsoftRiskLevelLabel,
+  microsoftVerdictDetail,
+  microsoftVerdictPolarity,
   riskyUserCount,
   riskyUserList,
 } from './risky-users-view.ts'
@@ -126,7 +131,8 @@ test('a failed read is a failure and says so, unlike a withheld count', () => {
     const count = riskyUserCount({ ...input, channel: licenceBlocked })
     assert.equal(count.accuracy, 'UNAVAILABLE', label)
     assert.equal(count.value, null, label)
-    assert.equal(count.display, '—', label)
+    // Never a dash and never a blank: both read as zero on a dashboard.
+    assert.equal(count.display, 'Not available', label)
     assert.match(count.caption, /not zero|has not resolved/i, label)
   }
 })
@@ -519,4 +525,169 @@ test('the highest priority and most recent evidence sorts first', () => {
   )
   assert.equal(rows[1].lastSeen, at(-1))
   assert.equal(rows[2].lastSeen, at(-9))
+})
+
+/* -------------------------------------------------------------------------- */
+/* Microsoft verdict polarity                                                 */
+/* -------------------------------------------------------------------------- */
+
+function verdict(
+  overrides: Partial<MicrosoftEntraRiskyUser> = {}
+): MicrosoftEntraRiskyUser {
+  return {
+    id: 'microsoft-record-1',
+    identityLabel: 'Synthetic user',
+    riskLevel: 'high',
+    riskState: 'atRisk',
+    riskDetail: null,
+    observedAt: at(-5),
+    ...overrides,
+  }
+}
+
+test('a verdict that clears a sign-in is never treated as a detection', () => {
+  // Microsoft's channel carries conclusions, and some of them are "this was
+  // safe". Rendering one of those as a risk gets an account disabled over a
+  // sign-in Microsoft cleared.
+  for (const riskDetail of [
+    'aiConfirmedSigninSafe',
+    'adminConfirmedSigninSafe',
+    'adminConfirmedAccountSafe',
+  ]) {
+    // Even when the state still reads atRisk, the explicit safe conclusion wins.
+    assert.equal(
+      microsoftVerdictPolarity(verdict({ riskDetail, riskState: 'atRisk' })),
+      'CLEARED',
+      riskDetail
+    )
+  }
+  assert.equal(
+    microsoftVerdictPolarity(verdict({ riskState: 'confirmedSafe' })),
+    'CLEARED'
+  )
+})
+
+test('an unrecognised verdict never defaults to the risk side', () => {
+  assert.equal(
+    microsoftVerdictPolarity(verdict({ riskState: 'unknownFutureValue' })),
+    'UNRECOGNISED'
+  )
+  assert.equal(
+    microsoftVerdictDetail(verdict({ riskDetail: 'unknownFutureValue' })),
+    'Microsoft reported a detail this client does not recognise'
+  )
+})
+
+test('active risk, closed and cleared stay three separate groups', () => {
+  assert.equal(
+    microsoftVerdictPolarity(verdict({ riskState: 'atRisk' })),
+    'ACTIVE_RISK'
+  )
+  assert.equal(
+    microsoftVerdictPolarity(verdict({ riskState: 'confirmedCompromised' })),
+    'ACTIVE_RISK'
+  )
+  assert.equal(
+    microsoftVerdictPolarity(verdict({ riskState: 'remediated' })),
+    'CLOSED'
+  )
+  assert.equal(
+    microsoftVerdictPolarity(verdict({ riskState: 'dismissed' })),
+    'CLOSED'
+  )
+
+  const view = {
+    channel: 'MICROSOFT_ENTRA_RISKY_USERS' as const,
+    meta: unavailableMicrosoftEntraRiskyUsers('AVAILABLE', 'x').meta,
+    users: [
+      verdict({ id: 'a', riskState: 'atRisk' }),
+      verdict({ id: 'b', riskState: 'dismissed' }),
+      verdict({ id: 'c', riskDetail: 'aiConfirmedSigninSafe' }),
+      verdict({ id: 'd', riskState: 'unknownFutureValue' }),
+    ],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+  const groups = microsoftRecordsByPolarity(view)
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(groups).map(([key, users]) => [key, users.length])
+    ),
+    { ACTIVE_RISK: 1, CLOSED: 1, CLEARED: 1, UNRECOGNISED: 1 }
+  )
+})
+
+test('Microsoft automatic remediation is not rendered as human negligence', () => {
+  // Microsoft's automatic remediation lands in the dismissed state, not the remediated one.
+  const automatic = microsoftVerdictDetail(
+    verdict({ riskState: 'dismissed', riskDetail: 'aiConfirmedSigninSafe' })
+  )
+  const person = microsoftVerdictDetail(
+    verdict({
+      riskState: 'dismissed',
+      riskDetail: 'adminDismissedAllRiskForUser',
+    })
+  )
+  assert.match(automatic, /automated assessment/)
+  assert.match(person, /An administrator/)
+  assert.notEqual(automatic, person)
+})
+
+test('a hidden risk level reads as withheld, never as no risk', () => {
+  const label = microsoftRiskLevelLabel('hidden')
+  assert.match(label, /requires Entra ID P2/)
+  // The two readings that would tell an MSP their customer is clean.
+  assert.doesNotMatch(label, /^none$/i)
+  assert.notEqual(label.trim(), '')
+
+  assert.equal(
+    microsoftLevelsHidden({
+      channel: 'MICROSOFT_ENTRA_RISKY_USERS',
+      meta: unavailableMicrosoftEntraRiskyUsers('AVAILABLE', 'x').meta,
+      users: [verdict({ riskLevel: 'hidden' })],
+      pageInfo: { hasMore: false, nextCursor: null },
+    }),
+    true
+  )
+})
+
+test('the risk level is labelled as confidence, not as severity', () => {
+  assert.equal(microsoftRiskLevelLabel('high'), 'High confidence')
+  assert.equal(microsoftRiskLevelLabel('low'), 'Low confidence')
+})
+
+test('the misleading password-reset identifier is never rendered as a reset', () => {
+  // Microsoft's own documentation notes this means a secure password change,
+  // not a self-service reset flow.
+  for (const riskDetail of [
+    'userPerformedSecuredPasswordReset',
+    'userPerformedSecuredPasswordChange',
+  ]) {
+    const detail = microsoftVerdictDetail(verdict({ riskDetail }))
+    assert.match(detail, /secure password change/)
+    assert.doesNotMatch(detail, /reset/i, riskDetail)
+  }
+})
+
+test('no raw Microsoft identifier reaches the rendered detail', () => {
+  for (const riskDetail of [
+    'none',
+    'adminGeneratedTemporaryPassword',
+    'userPerformedSecuredPasswordChange',
+    'userPerformedSecuredPasswordReset',
+    'adminConfirmedSigninSafe',
+    'aiConfirmedSigninSafe',
+    'userPassedMFADrivenByRiskBasedPolicy',
+    'adminDismissedAllRiskForUser',
+    'adminConfirmedSigninCompromised',
+    'hidden',
+    'adminConfirmedUserCompromised',
+    'm365DAdminDismissedDetection',
+    'userChangedPasswordOnPremises',
+    'adminDismissedRiskForSignIn',
+    'adminConfirmedAccountSafe',
+    'unknownFutureValue',
+  ]) {
+    const detail = microsoftVerdictDetail(verdict({ riskDetail }))
+    assert.doesNotMatch(detail, /[a-z][A-Z]/, riskDetail)
+  }
 })

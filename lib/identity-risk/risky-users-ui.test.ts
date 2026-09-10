@@ -81,6 +81,54 @@ function microsoftLive(hasMore = false) {
   }
 }
 
+function microsoftMixedVerdicts() {
+  const envelope = syntheticRiskResponses().microsoftRiskyUsers
+  const base = {
+    riskLevel: 'high',
+    riskDetail: null,
+    observedAt: envelope.observedAt,
+  }
+  return {
+    ...envelope,
+    users: [
+      {
+        ...base,
+        id: 'ms-1',
+        identityLabel: 'Flagged user',
+        riskState: 'atRisk',
+      },
+      {
+        ...base,
+        id: 'ms-2',
+        identityLabel: 'Machine cleared user',
+        riskState: 'atRisk',
+        riskDetail: 'aiConfirmedSigninSafe',
+      },
+      {
+        ...base,
+        id: 'ms-3',
+        identityLabel: 'Admin dismissed user',
+        riskState: 'dismissed',
+        riskDetail: 'adminDismissedAllRiskForUser',
+      },
+      {
+        ...base,
+        id: 'ms-4',
+        identityLabel: 'Unrecognised verdict user',
+        riskState: 'unknownFutureValue',
+      },
+      {
+        ...base,
+        id: 'ms-5',
+        identityLabel: 'Level withheld user',
+        riskLevel: 'hidden',
+        riskState: 'atRisk',
+      },
+    ],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+}
+
 function render(
   assessmentValue: unknown = assessmentFixture(true),
   options: {
@@ -546,4 +594,175 @@ test('the coverage behind the number is available on the same screen', () => {
   assert.match(text, /What HawkView checked/)
   assert.match(text, /identities assessed/)
   assert.match(text, /Microsoft 365 audit sign-ins/)
+})
+
+/* -------------------------------------------------------------------------- */
+/* Microsoft verdict polarity, rendered                                        */
+/* -------------------------------------------------------------------------- */
+
+function microsoftPanel(document: any) {
+  const panel = document.querySelector(
+    '[aria-labelledby="microsoft-channel-heading"]'
+  )
+  assert.ok(panel)
+  return panel
+}
+
+test('a sign-in Microsoft cleared is never rendered among its detections', () => {
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftMixedVerdicts(),
+  })
+  const panel = microsoftPanel(document)
+  const sections = [...panel.querySelectorAll('section')]
+  const risk = sections.find((section: any) =>
+    /currently reports risk/.test(section.textContent ?? '')
+  )
+  const cleared = sections.find((section: any) =>
+    /concluded these were safe/.test(section.textContent ?? '')
+  )
+  assert.ok(risk, 'active risk has its own group')
+  assert.ok(cleared, 'clearances have their own group')
+
+  // The machine-cleared identity sits under "safe", not under "reports risk",
+  // even though its state still reads atRisk.
+  assert.match(cleared!.textContent ?? '', /Machine cleared user/)
+  assert.doesNotMatch(risk!.textContent ?? '', /Machine cleared user/)
+  assert.match(risk!.textContent ?? '', /Flagged user/)
+  assert.match(cleared!.textContent ?? '', /not Microsoft flagging one/)
+  // Microsoft can carry a risk state and a superseding safe conclusion on the
+  // same record; the row says which governs rather than printing a state that
+  // contradicts the heading above it.
+  assert.match(cleared!.textContent ?? '', /superseded by the conclusion below/)
+})
+
+test('an unrecognised verdict renders as unrecognised, not as a risk', () => {
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftMixedVerdicts(),
+  })
+  const panel = microsoftPanel(document)
+  const sections = [...panel.querySelectorAll('section')]
+  const unrecognised = sections.find((section: any) =>
+    /does not recognise/.test(section.textContent ?? '')
+  )
+  const risk = sections.find((section: any) =>
+    /currently reports risk/.test(section.textContent ?? '')
+  )
+  assert.ok(unrecognised)
+  assert.match(unrecognised!.textContent ?? '', /Unrecognised verdict user/)
+  assert.doesNotMatch(risk!.textContent ?? '', /Unrecognised verdict user/)
+})
+
+test('Microsoft automatic remediation is not shown as human negligence', () => {
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftMixedVerdicts(),
+  })
+  const panel = microsoftPanel(document)
+  assert.match(panel.textContent ?? '', /An administrator dismissed all risk/)
+  assert.match(
+    panel.textContent ?? '',
+    /automatic remediation lands in the dismissed state/
+  )
+})
+
+test('a withheld risk level says so instead of reading as no risk', () => {
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftMixedVerdicts(),
+  })
+  const panel = microsoftPanel(document)
+  assert.match(panel.textContent ?? '', /level requires Entra ID P2/)
+  assert.match(panel.textContent ?? '', /not an absence of risk/)
+  // And the level is named as confidence, not severity.
+  assert.match(panel.textContent ?? '', /Microsoft confidence/)
+  assert.match(
+    panel.textContent ?? '',
+    /confidence scale rather than a severity/
+  )
+})
+
+test('no raw Microsoft identifier is ever painted on screen', () => {
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftMixedVerdicts(),
+  })
+  const panel = microsoftPanel(document)
+  for (const identifier of [
+    'aiConfirmedSigninSafe',
+    'adminDismissedAllRiskForUser',
+    'unknownFutureValue',
+  ]) {
+    assert.doesNotMatch(panel.textContent ?? '', new RegExp(identifier))
+  }
+})
+
+test('a count with no number is words, never a dash or a blank', () => {
+  const withheld = assessmentFixture(false)
+  withheld.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reason: 'UNRESOLVED_SUBJECT_IDENTITY',
+  }
+  for (const [label, rendered] of [
+    ['withheld', render(withheld)],
+    ['failed read', render(assessmentFixture(true), { requestFailed: true })],
+  ] as const) {
+    for (const text of [rendered.text, rendered.cardText]) {
+      // A dash reads as zero to every technician who has used a dashboard.
+      assert.doesNotMatch(text, /—s*(Not|$)/, label)
+      assert.match(text, /Not counted|Not available/, label)
+    }
+  }
+})
+
+/* -------------------------------------------------------------------------- */
+/* Naming discipline in the copy this surface owns                            */
+/* -------------------------------------------------------------------------- */
+
+test('our own copy never borrows Microsoft detection names', () => {
+  // A technician who has read Microsoft's documentation reads these names as
+  // Microsoft's claim, which is far stronger than ours: Microsoft's password
+  // spray confirms credential validation from cross-tenant telemetry, its
+  // impossible travel is a behavioural model with VPN suppression, and its
+  // leaked credentials means the credential was validated against the tenant's
+  // current password hashes. We do none of those things.
+  //
+  // Finding titles arrive from the server and cannot be policed here, but every
+  // string this surface owns can be, and this is what stops them drifting.
+  const owned = [
+    '../../components/identity-risk/risky-users-section.tsx',
+    '../../components/identity-risk/risky-users-count-card.tsx',
+    './risky-users-view.ts',
+  ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
+
+  for (const source of owned) {
+    for (const borrowed of [
+      /password spray/i,
+      /impossible travel/i,
+      /leaked credential/i,
+      /anonymous IP address/i,
+      /malware linked IP/i,
+    ]) {
+      assert.doesNotMatch(source, borrowed, String(borrowed))
+    }
+  }
+})
+
+test('the surface never offers to write back to Microsoft', () => {
+  // Confirming a compromise in Entra alters Microsoft's ML training and sets
+  // that user high-risk tenant-wide. That is a technician's deliberate
+  // decision, never an automated consequence of one of our detectors firing.
+  const owned = [
+    '../../components/identity-risk/risky-users-section.tsx',
+    '../../components/identity-risk/risky-users-count-card.tsx',
+    '../api/risky-users-hooks.ts',
+  ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
+
+  for (const source of owned) {
+    for (const mutation of [
+      /apiClient.(post|put|patch|delete)/,
+      /useMutation/,
+      /confirmCompromised/i,
+      /dismissRisk/i,
+    ]) {
+      assert.doesNotMatch(source, mutation, String(mutation))
+    }
+  }
 })
