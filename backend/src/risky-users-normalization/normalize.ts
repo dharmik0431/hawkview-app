@@ -307,6 +307,13 @@ const emptyLogonError = (value: unknown): boolean =>
  * key nor as corroboration. Its provenance is an open question — see the code-1
  * entry in provider-facts — and the treatment does not depend on the answer.
  *
+ * NOTE ON THE CODE PATH BELOW: measured against real data, the audit records
+ * carry neither LoginStatus nor ErrorCode anywhere, so the code branches are
+ * effectively dead on current traffic. They are kept because they are correct
+ * and cheap, and because a projector change could start supplying a code — but
+ * the working reading is Operation for the outcome and LogonError for the
+ * reason, which is why those come first.
+ *
  * The code still CORROBORATES and never overrides. A contradiction between the
  * name, the operation and a real Microsoft code is reported as a contradiction
  * rather than resolved by preferring one field.
@@ -334,22 +341,26 @@ export function classifyAuditRecord(record: Record<string, unknown>): {
   if (reasonName !== undefined && reasonName === record.Operation) reasonName = undefined;
 
   if (reasonName === undefined) {
-    // No reason name to go on. The code is only trustworthy here for a clean
-    // success, and code "1" is not a provider code at all.
-    if (providerCode === 0) {
-      return succeeded
-        ? { classification: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' }, errorCode: code }
-        : inconsistent;
+    // No reason name, so the OUTCOME comes from Operation — the field that
+    // actually works on this feed. Measured: a clean partition present on
+    // every row in both collection eras, where UserLoggedIn rows carry no
+    // LogonError at all. The result-code fields do not exist in the audit data
+    // at all, so a classifier that waited for one would read nothing and file
+    // every genuine success as uninterpretable.
+    if (providerCode !== null && providerCode !== 0) {
+      if (succeeded) return inconsistent;
+      return { classification: dispositionForCode(providerCode), errorCode: code };
     }
-    if (providerCode === null) {
-      const observation: UnknownObservation =
-        !reported ? 'OUTCOME_NOT_REPORTED'
-          : code === 1 ? 'RESULT_CODE_NOT_AN_AZURE_CODE'
-            : 'ERROR_CODE_SHAPE_UNRECOGNIZED';
-      return { classification: { kind: 'UNKNOWN', observation }, errorCode: code };
+    if (providerCode === 0 && !succeeded) return inconsistent;
+    if (succeeded) {
+      return { classification: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' }, errorCode: code };
     }
-    if (succeeded) return inconsistent;
-    return { classification: dispositionForCode(providerCode), errorCode: code };
+    // Operation says it failed; nothing says why.
+    const observation: UnknownObservation =
+      code === 1 ? 'RESULT_CODE_NOT_AN_AZURE_CODE'
+        : reported ? 'ERROR_CODE_SHAPE_UNRECOGNIZED'
+          : 'FAILURE_REASON_NOT_REPORTED';
+    return { classification: { kind: 'UNKNOWN', observation }, errorCode: code };
   }
 
   const entry = auditReasonEntry(reasonName as string);

@@ -179,16 +179,20 @@ export type UnknownObservation =
   | 'RESULT_CODE_NOT_AN_AZURE_CODE'
   | 'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON'
   /**
-   * The provider reported NO OUTCOME for this event at all.
+   * The provider said the sign-in FAILED but did not say why.
    *
-   * A fact about the record, not about our table — which is the whole point of
-   * separating it from UNRECOGNIZED_REASON_NAME. No mapping can ever fix these,
-   * because there is nothing to map, and labelling them as an unrecognised name
-   * is a standing invitation for someone to "finish the table" by mapping an
-   * absent outcome to a definite one. That is the exact defect this vocabulary
-   * exists to prevent, and it has already happened once at collection level.
+   * Replaces an earlier `OUTCOME_NOT_REPORTED`, which was claiming something
+   * about Microsoft that was actually true about us. Those records DO report an
+   * outcome — in `Operation` — and the audit feed always carries one, so
+   * "outcome not reported" was never reachable on honest terms. The reason is
+   * what can be missing, and this says so.
+   *
+   * Still separate from UNRECOGNIZED_REASON_NAME for the original argument: no
+   * mapping can fix an absent reason, and labelling it as an unrecognised NAME
+   * invites someone to "finish the table" by mapping absence to a definite
+   * outcome.
    */
-  | 'OUTCOME_NOT_REPORTED'
+  | 'FAILURE_REASON_NOT_REPORTED'
   /** Audit path: Microsoft's own name for the result says it is unclassified. */
   | 'PROVIDER_DECLARED_UNCLASSIFIED'
   /** Audit path: the reason name is not one this layer recognises. */
@@ -319,7 +323,7 @@ export const UNKNOWN_LABELS: Readonly<Record<UnknownObservation, string>> = {
   AMBIGUOUS_FAILURE_REASON_TEXT: 'This code carries several meanings in its description text, and the text did not match any meaning HawkView knows',
   MICROSOFT_VERDICT_FIELD_UNRECOGNIZED: 'Microsoft recorded an assessment of this sign-in that HawkView does not recognise, so it is neither read as a finding of ours nor as Microsoft-reported risk',
   RESULT_CODE_NOT_AN_AZURE_CODE: 'The result code on this record is not one of Microsoft’s sign-in error codes, so HawkView will not read a sign-in outcome from it',
-  OUTCOME_NOT_REPORTED: 'Microsoft recorded this event without saying whether the sign-in succeeded or failed, so there is no outcome to read',
+  FAILURE_REASON_NOT_REPORTED: 'Microsoft recorded this sign-in as failed without saying why, so HawkView cannot say what kind of failure it was',
   SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON: 'Reported as a success but carried an unrecognised description, so HawkView will not call it a success',
   PROVIDER_DECLARED_UNCLASSIFIED: 'Microsoft recorded this sign-in result as unclassified, so there is nothing for HawkView to read from it',
   UNRECOGNIZED_REASON_NAME: 'HawkView does not recognise the name Microsoft gave this sign-in result',

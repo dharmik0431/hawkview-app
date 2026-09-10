@@ -768,3 +768,90 @@ paths dead on *every* feed; `disprovedPathsForFeed()` returns the scoped ones. F
 together would have told a future reader never to read a field this layer reads on every
 Graph row — a wrong claim inside the mechanism that exists to prevent wrong claims, and
 the same collapse-two-facts-into-one defect one level further in.
+
+## Addendum: Operation is the audit outcome, and the numbers restated
+
+**The audit records carry neither `LoginStatus` nor `ErrorCode` anywhere** — not top-level,
+not in `ExtendedProperties`, which hold only `ResultStatusDetail`, `RequestType`,
+`UserAuthenticationMethod`, `UserAgent` and `KeepMeSignedIn`. A classifier keyed on a
+result code therefore reads nothing on this feed and files every genuine success as
+uninterpretable.
+
+`Operation` is the field that works, and it passes its control cleanly: `UserLoggedIn` on
+1,412 rows, **all with no `LogonError` at all**; `UserLoginFailed` on the remainder,
+essentially all carrying a `LogonError` that names the reason. Present on every row in both
+collection eras. So the audit path now reads **Operation for the outcome and LogonError for
+the reason**, with any result code that does appear used only as corroboration that can
+contradict but never override. That recovers ~1,412 successes that were previously
+unclassifiable — and it is the audit feed's first source of successes at all, which matters
+for any rule needing "failures then a success".
+
+`ResultStatus` stays disproved, now on our own data rather than documentation: **141
+locked-out accounts carry `ResultStatus: Success`**, along with 232
+`UnclassifiedAuthenticationError` and 13 `UserStrongAuthClientAuthNRequiredInterrupt`. For
+STS logon events it is HTTP-level, not logon-level, and it fails in the worst available
+direction.
+
+**Restated with provenance, from `managementActivityRecord.LogonError` — Microsoft's own
+field:** `IdsLocked` 715, `UnclassifiedAuthenticationError` 558, `InvalidUserNameOrPassword`
+65, `UserStrongAuthClientAuthNRequiredInterrupt` 13, `DelegationDoesNotExist` 9,
+`PasswordResetRegistrationRequiredInterrupt` 4, `UserStrongAuthEnrollmentRequiredInterrupt`
+3, and five names at one row each. The withdrawn figures were the subsets that happened to
+project; the real recovery is **larger** than the contaminated numbers claimed, which is
+why leaving the entry silent would itself have misled.
+
+`OUTCOME_NOT_REPORTED` is renamed `FAILURE_REASON_NOT_REPORTED`. Those records *do* report
+an outcome — in `Operation` — so the old name claimed something about Microsoft that was
+actually true about us. What can be missing is the reason.
+
+## Addendum: the two tables had drifted, and nothing failed
+
+The audit reason-name table and the Graph result-code table encode the same provider
+semantics in two vocabularies, and were built weeks apart. They disagreed:
+
+- `InvalidReplyTo` was held here while **50011 — the same Microsoft text — was out of scope
+  with a provider citation** on the Graph side. Now aligned.
+- `SsoArtifactRevoked` was **missing entirely** while 50133 was mapped. Now added.
+
+Neither showed up as a test failure; both were found by cross-checking the tables against a
+measured list of audit reason names. `AuditReasonEntry` now carries `graphCode` and a test
+requires linked entries to agree or state a `divergenceReason` — so a future edit to one
+table cannot silently disagree with the other. `IdsLocked` is the one deliberate divergence
+and says why: Graph maps 50053 to UNKNOWN because the code carries three meanings, while on
+this feed the *name* is the lockout meaning.
+
+## Addendum: a fourth verification state, because DISPROVED was carrying two meanings
+
+Registering the vocabulary question and the `authenticationDetails` hypothesis as DISPROVED
+put `managementActivityRecord.LoginStatus`, `raw.authenticationDetails` and their siblings
+into the never-read tombstone list. That is wrong, and wrong in the same way the feed-scoping
+bug was: those fields are *absent*, so reading them is pointless rather than dangerous, while
+a real tombstone names a field that misleads when read.
+
+`HYPOTHESIS_SUBJECT_ABSENT` now covers "the fields this was about do not exist, so the
+hypothesis has no subject and nothing was built on it". It keeps `mayExclude` false — you
+cannot exclude on a field that is not there — but does not throw, and its paths stay out of
+`DISPROVED_PREDICATE_PATHS`. That is twice now that the tombstone mechanism itself has had to
+be made more precise to stop it asserting things that are not true.
+
+## Addendum: a correction I owe the record
+
+I reported that `incomingTokenType`, `tokenIssuerName` and `tokenIssuerType` were being
+stored as `[REDACTED]` on every Graph row, called it unrecoverable retroactive data loss,
+and sharpened that framing for escalation. **The keys are absent from all 2,648 rows.** They
+are not being redacted, because they never arrive.
+
+The regex reading was right and the mechanism was right; what nobody checked was whether the
+input the regex would destroy was ever present. I verified the mechanism and asserted the
+effect — the same error as keying a predicate on a field that turns out to be absent, which
+is the defect this whole module exists to prevent, committed while I was being careful about
+everything else.
+
+What survives is better than what I claimed. Those three fields and
+`authenticationDetails`/`authenticationRequirement` are absent for **one** reason — the
+sign-in request issues no `$select`, so Graph's default projection omits the family — so it
+is one collector change rather than several bugs. And the regex bug is real but **latent**:
+it destroys those fields the moment they start arriving, so **the regex fix must land before
+the `$select`, or the fix creates the bug.** The generalisation I offered needs its partner:
+when you check whether a filter affects the thing you care about, check what else it matches
+— *and then check whether the thing it matches is ever actually there.*

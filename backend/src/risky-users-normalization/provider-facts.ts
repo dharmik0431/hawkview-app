@@ -745,12 +745,28 @@ export function failureReasonMeaning(
 export interface AuditReasonEntry {
   readonly name: string;
   readonly disposition: CodeDisposition;
+  /**
+   * The Graph result code that carries the SAME Microsoft meaning, when there
+   * is one.
+   *
+   * This exists because the two tables encode the same provider semantics in
+   * two vocabularies and were built weeks apart, so they can drift without
+   * anything failing. They HAD drifted: InvalidReplyTo was held here while
+   * 50011 — the same meaning, same provider text — was out of scope with a
+   * citation on the Graph side. A test now requires the dispositions to match
+   * or the divergence to be stated, so a future edit to one table cannot
+   * silently disagree with the other.
+   */
+  readonly graphCode?: number;
+  /** Required when the linked Graph code's disposition differs, and why. */
+  readonly divergenceReason?: string;
   readonly note?: string;
 }
 
 export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
   {
     name: 'InvalidUserNameOrPassword',
+    graphCode: 50126,
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' },
     note:
       'Microsoft’s documented name for 50126. VOLUMES WITHDRAWN: the row counts previously cited here ' +
@@ -760,6 +776,11 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
   },
   {
     name: 'IdsLocked',
+    graphCode: 50053,
+    divergenceReason:
+      'Graph maps 50053 to UNKNOWN because the code carries three meanings resolved only by description ' +
+      'text. On this feed the NAME is the lockout meaning, so the ambiguity does not arise — the whole ' +
+      'reason this feed is keyed on names. 715 rows, measured from managementActivityRecord.LogonError.',
     disposition: { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' },
     note:
       'Microsoft’s documented name for the smart-lockout meaning of 50053 specifically. A useful ' +
@@ -768,11 +789,13 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
   },
   {
     name: 'UserStrongAuthClientAuthNRequiredInterrupt',
+    graphCode: 50076,
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED' },
     note: 'Microsoft’s documented name for 50076. Post-password challenge issued.',
   },
   {
     name: 'UserStrongAuthEnrollmentRequiredInterrupt',
+    graphCode: 50072,
     disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED' },
     note:
       'The audit-path name for 50072, which is mapped identically on Graph. It was MISSING from this ' +
@@ -790,9 +813,37 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
   },
   // Recognised names with no documented basis for excluding them. Each is a
   // singleton in observed data, and each is held rather than guessed at.
-  { name: 'UserUnauthorized', disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' } },
-  { name: 'DelegationDoesNotExist', disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' } },
-  { name: 'InvalidReplyTo', disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' } },
+  {
+    name: 'UserUnauthorized',
+    graphCode: 50020,
+    divergenceReason:
+      'Its Graph counterpart is not in RESULT_CODES at all — 50020 is recorded in ' +
+      'UNREACHABLE_BY_SUBJECT_RESOLUTION, because it describes an identity from another provider that by ' +
+      'definition is not in the tenant. The same is true here: the UPN of an out-of-tenant identity ' +
+      'cannot resolve, so this entry is held and is effectively unreachable on both feeds.',
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+  },
+  {
+    name: 'DelegationDoesNotExist',
+    graphCode: 65001,
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    note: 'Matches 65001 on the Graph side, including the consent-grant pointer. 9 rows.',
+  },
+  {
+    name: 'InvalidReplyTo',
+    graphCode: 50011,
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'APPLICATION_CONFIGURATION_ERROR' },
+    note:
+      'ALIGNED WITH 50011, which it had drifted from: the same Microsoft meaning was out of scope with a ' +
+      'provider citation on the Graph side while being held here. Found by cross-checking the two tables ' +
+      'against a measured list of audit reason names, not by any test failing.',
+  },
+  {
+    name: 'SsoArtifactRevoked',
+    graphCode: 50133,
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'SESSION_INVALIDATED_BY_REMEDIATION' },
+    note: 'Was MISSING from this table while 50133 was mapped on the Graph side. Same drift, same cause.',
+  },
   {
     name: 'MisconfiguredApplicationWithGraphErrorMessage',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
@@ -928,7 +979,30 @@ export type ShapePredicateVerification
       readonly cohort: string;
       readonly controlCohort: string;
     }
-  | { readonly state: 'DISPROVED'; readonly evidence: string };
+  | {
+      /**
+       * A predicate on this WAS or COULD BE built and would be wrong. Do not
+       * read these fields for classification.
+       */
+      readonly state: 'DISPROVED';
+      readonly evidence: string;
+    }
+  | {
+      /**
+       * The fields the hypothesis was about DO NOT EXIST in the data, so the
+       * hypothesis has no subject and nothing was built on it.
+       *
+       * Distinct from DISPROVED because conflating them makes the tombstone
+       * list lie. A disproved predicate names a field that must never be read,
+       * because reading it misleads; an absent-subject hypothesis names a field
+       * whose reading is merely pointless. Folding the second into the first
+       * would put "never read this" against fields that are harmless, and this
+       * module has already had to fix that exact collapse once for feed
+       * scoping.
+       */
+      readonly state: 'HYPOTHESIS_SUBJECT_ABSENT';
+      readonly evidence: string;
+    };
 
 export interface ShapePredicate {
   readonly id: string;
@@ -1084,9 +1158,12 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     verification: {
       state: 'DISPROVED',
       evidence:
-        'For STS logon events a ResultStatus of "Succeeded" means HTTP success, NOT logon success — it ' +
-        'describes audit processing. Key off ErrorCode and Operation, never ResultStatus. This one fails ' +
-        'silently in the direction of calling failed sign-ins successful.',
+        'CONFIRMED AGAINST OUR OWN DATA rather than taken from documentation: 141 rows with LogonError ' +
+        'IdsLocked — locked-out accounts — carry ResultStatus "Success", along with 232 ' +
+        'UnclassifiedAuthenticationError and 13 UserStrongAuthClientAuthNRequiredInterrupt. For STS logon ' +
+        'events ResultStatus is HTTP-level, not logon-level. It fails silently in the direction of calling ' +
+        'failed sign-ins successful, which is the worst available direction. Read Operation instead, which ' +
+        'passes the same control cleanly.',
     },
   },
   {
@@ -1171,31 +1248,57 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     },
   },
   {
+    id: 'audit.operation-as-outcome',
+    feed: 'M365_AUDIT_STS',
+    reads: ['managementActivityRecord.Operation'],
+    claim:
+      'On the audit feed, Operation carries the sign-in outcome: UserLoggedIn is a success and ' +
+      'UserLoginFailed is a failure whose reason is named in LogonError.',
+    verification: {
+      state: 'PRODUCTION_VERIFIED',
+      evidence:
+        'A clean partition present on EVERY row in both collection eras: Operation UserLoggedIn on 1,412 ' +
+        'rows, all of them with no LogonError at all; UserLoginFailed on the remainder, essentially all ' +
+        'of which carry a LogonError naming the reason. This is the field the audit path now reads for ' +
+        'the outcome, because the result code fields do not exist in the data at all.',
+      control:
+        'PASSES: no UserLoggedIn row carries a LogonError, so the two halves of the partition do not ' +
+        'overlap. Contrast ResultStatus, which fails the same control badly — 141 IdsLocked rows are ' +
+        'marked ResultStatus Success — and is recorded as disproved.',
+    },
+  },
+  {
     id: 'audit.result-code-vocabulary',
     reads: ['managementActivityRecord.LoginStatus', 'managementActivityRecord.ErrorCode'],
     claim:
       'The audit result code is a single vocabulary, so pooling LoginStatus and ErrorCode into one ' +
       'numeric space and requiring them to agree is a sound reading.',
     verification: {
-      state: 'PENDING_DISTRIBUTION_CHECK',
-      cohort:
-        'SUSPECTED FALSE, and this is the ground for reading the feed by name instead. If LoginStatus is ' +
+      state: 'HYPOTHESIS_SUBJECT_ABSENT',
+      evidence:
+        'THE QUESTION DISSOLVED RATHER THAN BEING ANSWERED: neither LoginStatus nor ErrorCode exists ' +
+        'anywhere in the audit records — not at top level, not in ExtendedProperties, which carry only ' +
+        'ResultStatusDetail, RequestType, UserAuthenticationMethod, UserAgent and KeepMeSignedIn. So ' +
+        'there is no two-vocabulary merge to check for and nothing to restructure. The provenance of ' +
+        'result code 1 remains unexplained under every account offered — it is not Microsoft LoginStatus ' +
+        'surfaced into the wrong field, because the field is not there — and RESULT_CODE_NOT_AN_AZURE_CODE ' +
+        'stays the right name precisely because it is true without knowing where the value came from. ' +
+        'Retired; this layer reads Operation for the outcome and LogonError for the reason. NOT a ' +
+        'tombstone: these two fields are absent rather than misleading, so reading them is pointless ' +
+        'rather than dangerous, and this layer still checks them cheaply in case a projector change ' +
+        'starts supplying one. The superseded hypothesis, for the record: if LoginStatus is ' +
         'a success/failure flag while ErrorCode carries AADSTS codes, then the two are different ' +
         'vocabularies sharing one field, a 1 and a 50126 are not comparable numbers, and requiring them ' +
         'to agree numerically would discard rows that agree semantically (LoginStatus 1 and ErrorCode ' +
         '50126 both mean failure). Nothing is built on the hypothesis: this layer keys on the reason name ' +
         'and uses the code only as corroboration, and disagreement routes to UNKNOWN, which is the ' +
-        'conservative direction either way.',
-      controlCohort:
-        'NARROWED BY MEASUREMENT: LoginStatus is absent at the TOP LEVEL on every audit row, so the ' +
-        'value 1 does not arrive there. It must come from an ExtendedProperties entry or from somewhere ' +
-        'not yet checked. The remaining query, stated precisely: for audit rows whose projected ' +
-        'status.errorCode is 1, list managementActivityRecord.ErrorCode and every ExtendedProperties ' +
-        'entry whose Name matches ErrorCode, ErrorNumber or LoginStatus case-insensitively, with values. ' +
-        'That pins the provenance. This layer already reads all of those places, so the answer changes ' +
-        'the note rather than the behaviour. NOTE FOR STORAGE, separate from classification: two ' +
-        'vocabularies in one column is a schema defect whose fix is to stop merging them, not to read ' +
-        'them more cleverly.',
+        'conservative direction either way. WHAT REMAINS OPEN: where result code 1 came from at all. ' +
+        'It cannot be produced by the current projector, and neither field it would have been read from ' +
+        'exists in the data, so the 613 rows carrying it predate the current code and their provenance ' +
+        'is unexplained. Nothing depends on the answer — this layer neither keys on nor corroborates ' +
+        'with that value. NOTE FOR STORAGE, kept because it outlives this predicate: if two vocabularies ' +
+        'ever do share one column, the fix is to stop merging them rather than to read them more ' +
+        'cleverly.',
     },
   },
   {
@@ -1206,10 +1309,15 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       'second-factor step did not" is readable WITHIN a single event rather than inferred from the ' +
       'presence of an interrupt error code.',
     verification: {
-      state: 'DISPROVED',
+      state: 'HYPOTHESIS_SUBJECT_ABSENT',
       evidence:
         'KILL CONDITION MET, as stated in advance. Absent from all 2,648 Graph rows — the key is not ' +
-        'present, not empty — and authenticationRequirement is absent too. Since raw is the full payload ' +
+        'present, not empty — and authenticationRequirement is absent too. SAME CAUSE AS A WHOLE FAMILY: ' +
+        'incomingTokenType, tokenIssuerName and tokenIssuerType are absent from every row as well, so ' +
+        'ONE collector change (an explicit $select) governs all five rather than there being several ' +
+        'separate bugs. SEQUENCING MATTERS: the redaction regex matches any key containing "token", so it ' +
+        'WOULD destroy three of those fields the moment they start arriving — a latent bug, not an active ' +
+        'one, and the fix has to land before the $select or the $select creates it. Since raw is the full payload ' +
         'post-redaction and redaction preserves keys, Microsoft did not send these fields. Both are ' +
         'documented on the v1.0 signIn resource, so the likely cause is omission from the default list ' +
         'projection, needing an explicit $select — which would make this a fixable COLLECTION gap rather ' +
@@ -1270,5 +1378,7 @@ export function mayExclude(id: string): boolean {
   if (verification.state === 'DISPROVED') {
     throw new Error(`RISKY_USERS_NORMALIZATION_DISPROVED_PREDICATE:${id}`);
   }
+  // An absent subject cannot exclude anything: there is no field to read.
+  // It does not throw, because reading it is harmless rather than forbidden.
   return verification.state === 'PRODUCTION_VERIFIED';
 }

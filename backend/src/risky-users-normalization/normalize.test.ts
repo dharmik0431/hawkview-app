@@ -658,8 +658,6 @@ test('disproved predicates are recorded and cannot be consulted', () => {
     [...DISPROVED_PREDICATE_PATHS].sort(),
     [
       'managementActivityRecord.ResultStatus',
-      'raw.authenticationDetails',
-      'raw.authenticationRequirement',
       'raw.isInteractive',
       'raw.servicePrincipalId',
       'raw.servicePrincipalName',
@@ -1257,7 +1255,7 @@ test('an audit reason Microsoft calls unclassified is unknown, and an unlisted o
 });
 
 test('an audit reason with no exclusion citation is held, not claimed', async () => {
-  for (const name of ['UserUnauthorized', 'DelegationDoesNotExist', 'InvalidReplyTo',
+  for (const name of ['UserUnauthorized', 'DelegationDoesNotExist',
     'MisconfiguredApplicationWithGraphErrorMessage', 'PasswordResetRegistrationRequiredInterrupt']) {
     const batch = await run([auditRow({ ErrorCode: '1', LogonError: name })], { source: 'M365_AUDIT_STS' });
     assert.deepEqual(
@@ -1460,32 +1458,63 @@ test('the audit feed names an interrupt the Graph codes never showed', async () 
 // An unreported outcome is a fact about the record, not a gap in our table.
 // ---------------------------------------------------------------------------
 
-test('an audit record that reports no outcome says so, rather than looking unrecognised', async () => {
-  // The collector's own success flag collapsed "reported nothing" into
-  // "reported a failure". This layer must not inherit that, and it must not
-  // label these as an unrecognised NAME either: no mapping can ever fix them,
-  // and calling them unrecognised invites someone to "finish the table" by
-  // mapping an absent outcome to a definite one.
+test('a failure with no stated reason says the reason is missing, not the outcome', async () => {
+  // Operation reports the outcome on every audit row, so "outcome not
+  // reported" was never honest here — what can be missing is the REASON. It
+  // must also not be labelled an unrecognised NAME: no mapping can fix an
+  // absent reason, and calling it unrecognised invites someone to finish the
+  // table by mapping absence to a definite outcome.
   const batch = await run([auditRow({ ErrorCode: undefined })], { source: 'M365_AUDIT_STS' });
   assert.deepEqual(only(batch).classification, {
     kind: 'UNKNOWN',
-    observation: 'OUTCOME_NOT_REPORTED',
+    observation: 'FAILURE_REASON_NOT_REPORTED',
   });
   assert.equal(only(batch).errorCode, null);
 });
 
-test('a reason equal to the operation name is the collector fallback, not a provider value', async () => {
-  // Defensive: this layer reads the original record, where it should not
-  // arise. If anything ever points it at the projected field, an unreported
-  // outcome must not arrive wearing an operation name and be mapped.
+test('Operation carries the audit outcome when no result code exists at all', async () => {
+  // This is the recovery that matters most on this feed: the audit records
+  // carry neither LoginStatus nor ErrorCode anywhere, so a classifier keyed on
+  // a code files every genuine success as uninterpretable. Operation is the
+  // field that works — a clean partition on every row in both eras.
+  const success = await run(
+    [auditRow({ ErrorCode: undefined, Operation: 'UserLoggedIn' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(success).classification, {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_COMPLETED',
+  });
+  assert.equal(success.counts.applies, 1);
+  assert.equal(only(success).errorCode, null, 'no code exists, and none is invented');
+
+  // A real code still corroborates and can still contradict.
+  const contradicted = await run(
+    [auditRow({ ErrorCode: '50126', Operation: 'UserLoggedIn' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(contradicted).classification, {
+    kind: 'UNKNOWN',
+    observation: 'INCONSISTENT_OPERATION_AND_CODE',
+  });
+});
+
+test('a reason equal to the operation name is never looked up as a reason', async () => {
+  // Defensive: this layer reads the original record, where the projected
+  // Operation fallback should not arise. If anything ever points it at the
+  // projected field, the operation name must not be treated as a provider
+  // reason value — the outcome then comes from Operation itself, which is the
+  // correct answer rather than a guess.
   const batch = await run(
     [auditRow({ ErrorCode: undefined, Operation: 'UserLoggedIn', LogonError: 'UserLoggedIn' })],
     { source: 'M365_AUDIT_STS' },
   );
   assert.deepEqual(only(batch).classification, {
-    kind: 'UNKNOWN',
-    observation: 'OUTCOME_NOT_REPORTED',
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_COMPLETED',
   });
+  // The point of the guard: it did NOT become an unrecognised reason name.
+  assert.equal(batch.counts.unknownByObservation.UNRECOGNIZED_REASON_NAME, 0);
 });
 
 test('a genuinely unknown reason name is still reported as one', async () => {
@@ -1558,4 +1587,58 @@ test('an expired password is a confirmed credential, not an interrupt and not hy
     'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'] as const) {
     assert.equal(isPostPasswordInterrupt(outcome), true, outcome);
   }
+});
+
+test('the two tables cannot silently disagree about the same Microsoft meaning', () => {
+  // The audit reason table and the Graph result-code table encode the same
+  // provider semantics in two vocabularies and were built weeks apart. They
+  // HAD drifted, and nothing failed: InvalidReplyTo was held here while 50011
+  // — same meaning, same provider text — was out of scope with a citation on
+  // the Graph side. Linked entries must now agree or say why not.
+  for (const entry of AUDIT_REASON_NAMES) {
+    if (entry.graphCode === undefined) continue;
+    const byCode = dispositionForCode(entry.graphCode);
+    const agrees = JSON.stringify(byCode) === JSON.stringify(entry.disposition);
+    if (!agrees) {
+      assert.ok(
+        (entry.divergenceReason ?? '').length > 40,
+        `${entry.name} disagrees with code ${entry.graphCode} and does not say why`,
+      );
+    }
+  }
+  // The two that had drifted are now aligned with their Graph counterparts.
+  assert.deepEqual(auditReasonEntry('InvalidReplyTo')!.disposition, dispositionForCode(50011));
+  assert.deepEqual(auditReasonEntry('SsoArtifactRevoked')!.disposition, dispositionForCode(50133));
+  assert.deepEqual(auditReasonEntry('InvalidUserNameOrPassword')!.disposition, dispositionForCode(50126));
+  // And the deliberate divergence states its reason.
+  const lockout = auditReasonEntry('IdsLocked')!;
+  assert.notDeepEqual(lockout.disposition, dispositionForCode(50053));
+  assert.match(lockout.divergenceReason ?? '', /three meanings/);
+});
+
+test('the audit feed reads Operation, and ResultStatus stays disproved', async () => {
+  // ResultStatus fails its control badly on our own rows: 141 locked-out
+  // accounts are marked Success. Operation passes cleanly.
+  assert.equal(mayExclude('audit.operation-as-outcome'), true);
+  assert.throws(() => mayExclude('audit.result-status'), /DISPROVED_PREDICATE/);
+  // An absent subject is NOT a tombstone: reading those fields is pointless
+  // rather than dangerous, so it returns false instead of throwing, and the
+  // paths stay out of the never-read list.
+  assert.equal(mayExclude('audit.result-code-vocabulary'), false);
+  assert.equal(mayExclude('graph.authentication-details'), false);
+  for (const path of ['raw.authenticationDetails', 'managementActivityRecord.LoginStatus']) {
+    assert.equal(DISPROVED_PREDICATE_PATHS.includes(path), false, path);
+  }
+
+  // The worst case the tombstone exists for: a lockout marked Success.
+  const lockout = await run([auditRow({
+    ErrorCode: undefined,
+    Operation: 'UserLoginFailed',
+    ResultStatus: 'Success',
+    LogonError: 'IdsLocked',
+  })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(lockout).classification, {
+    kind: 'APPLIES',
+    outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+  });
 });
