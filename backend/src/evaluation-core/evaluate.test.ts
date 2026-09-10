@@ -57,7 +57,7 @@ test('an event nobody could interpret never blocks a finding another event suppo
   assert.equal(uninterpreted(result.coverage), 1)
   // It reduces what we claim, and only that.
   assert.equal(result.state, 'PARTIALLY_UNINTERPRETABLE')
-  assert.deepEqual(result.claim, { permitted: false, because: 'UNINTERPRETED_EVENTS' })
+  assert.deepEqual(result.claim, { permitted: false, because: ['UNINTERPRETED_EVENTS'] })
   assert.deepEqual(figure(result.count), { accuracy: 'AT_LEAST', value: 1 })
 })
 
@@ -66,7 +66,7 @@ test('a row we could not read and an outcome we could not interpret both gate, a
   const unreadOutcome = run([event('1')], { coverage: coverage({ applies: 1, unknown: { UNRECOGNIZED_OUTCOME: 2 } }) })
   for (const result of [unreadRow, unreadOutcome]) {
     assert.equal(result.state, 'PARTIALLY_UNINTERPRETABLE')
-    assert.deepEqual(result.claim, { permitted: false, because: 'UNINTERPRETED_EVENTS' })
+    assert.deepEqual(result.claim, { permitted: false, because: ['UNINTERPRETED_EVENTS'] })
   }
   // Both gate, but the core never merges them — the maps travel through intact,
   // so a reader can still tell "could not read the row" from "could not tell
@@ -113,7 +113,7 @@ test('a window where nothing applied cannot report a confident zero', () => {
   // The live production defect: everything set aside, nothing assessed, and a
   // headline zero captioned as though the evidence had been examined.
   const result = run([], { coverage: coverage({ applies: 0, doesNotApply: { NOT_A_CREDENTIAL_EVENT: 12 } }) })
-  assert.deepEqual(result.claim, { permitted: false, because: 'NOTHING_APPLICABLE' })
+  assert.deepEqual(result.claim, { permitted: false, because: ['NOTHING_APPLICABLE'] })
   assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
 })
 
@@ -141,11 +141,13 @@ test('the four states stay distinct, and each withholds as its own sentence', ()
     run([event('1')], { coverage: coverage({ applies: 1, unknown: { X: 1 } }) }).claim,
     run([], { coverage: coverage({ applies: 0 }) }).claim,
     run([event('1')], { coverage: applied, detectors: [broken] }).claim,
-  ].map(claim => (claim.permitted ? 'permitted' : claim.because))
-  // Five distinct reasons, five distinct sentences. Collapsing them is how a
-  // label meaning "we could not read it" came to mean "never collected".
-  assert.equal(new Set(reasons).size, 5)
-  assert.equal(new Set(reasons.map(reason => reason === 'permitted' ? reason : withheldExplanation(reason))).size, 5)
+  ].map(claim => (claim.permitted ? [] : claim.because))
+  // Each of these withholds for exactly one reason, and the five stay distinct.
+  // Collapsing them is how a label meaning "we could not read it" came to mean
+  // "never collected".
+  assert.deepEqual(reasons.map(list => list.length), [1, 1, 1, 1, 1])
+  assert.equal(new Set(reasons.map(list => list.join('+'))).size, 5)
+  assert.equal(new Set(reasons.flat().map(withheldExplanation)).size, 5)
 })
 
 test('unread evidence cannot produce a finding, because it cannot carry an event', () => {
@@ -161,19 +163,19 @@ test('unread evidence cannot produce a finding, because it cannot carry an event
     // Reporting them as RAN with considered:0 would read like healthy silence.
     assert.deepEqual(result.detectors, [])
     assert.deepEqual(result.coverage, { applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {} })
-    assert.deepEqual(result.claim, { permitted: false, because: availability })
+    assert.deepEqual(result.claim, { permitted: false, because: [availability] })
     assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
   }
 
   // A detector that would throw is never reached, so unread evidence reports its
   // own reason rather than being relabelled as a detector failure.
-  assert.deepEqual(unread('UNREADABLE_NOW', [broken]).claim, { permitted: false, because: 'UNREADABLE_NOW' })
+  assert.deepEqual(unread('UNREADABLE_NOW', [broken]).claim, { permitted: false, because: ['UNREADABLE_NOW'] })
 })
 
 test('the budget belongs to the caller and exceeding it withholds rather than truncating silently', () => {
   const events = Array.from({ length: 5 }, (_, index) => event(`${index}`, { match: index === 0 }))
   const result = run(events, { coverage: coverage({ applies: 5 }), maxEvents: 3 })
-  assert.deepEqual(result.claim, { permitted: false, because: 'CAPACITY_EXCEEDED' })
+  assert.deepEqual(result.claim, { permitted: false, because: ['CAPACITY_EXCEEDED'] })
   assert.equal(result.detectors[0]?.status === 'RAN' && result.detectors[0].considered, 3)
 
   assert.deepEqual(run(events, { coverage: coverage({ applies: 5 }), maxEvents: 5 }).claim, { permitted: true })
@@ -204,7 +206,7 @@ test('truncation keeps the most recent events, however the input happens to be o
 
   // Choosing a subset is never permission to imply the window was complete.
   assert.deepEqual(run(ascending, { coverage: coverage({ applies: 5 }), maxEvents: 2 }).claim,
-    { permitted: false, because: 'CAPACITY_EXCEEDED' })
+    { permitted: false, because: ['CAPACITY_EXCEEDED'] })
 })
 
 test('the survivors keep the order they arrived in, not the order recency picked them', () => {
@@ -232,7 +234,7 @@ test('one failing detector costs the exact claim without erasing its neighbours'
   assert.deepEqual(result.detectors.find(report => report.detectorId === 'broken'), { detectorId: 'broken', status: 'FAILED' })
   assert.equal(result.detectors.filter(report => report.status === 'RAN').length, 2)
   // And the count does not overclaim: the broken detector might have found more.
-  assert.deepEqual(result.claim, { permitted: false, because: 'DETECTOR_FAILED' })
+  assert.deepEqual(result.claim, { permitted: false, because: ['DETECTOR_FAILED'] })
   assert.deepEqual(figure(result.count), { accuracy: 'AT_LEAST', value: 1 })
 
   // A failure with nothing else found cannot produce a lower bound of zero.
@@ -295,7 +297,7 @@ test('a crashed detector and an inapplicable one are never the same answer', () 
   const crashed = run([event('1')], { detectors: [silent, broken] })
   const skipped = run([event('1')], { detectors: [silent, unsupported] })
 
-  assert.deepEqual(crashed.claim, { permitted: false, because: 'DETECTOR_FAILED' })
+  assert.deepEqual(crashed.claim, { permitted: false, because: ['DETECTOR_FAILED'] })
   assert.deepEqual(skipped.claim, { permitted: true })
   // A crash never silently narrows scope: it is in neither list, because what it
   // would have covered is exactly what we do not know.
@@ -340,4 +342,71 @@ test('the claim is computed once and the count cannot disagree with it', () => {
       result.claim,
       'recomputing from the reported state and coverage gives the same answer')
   }
+})
+
+test('every reason that applies is reported, so there is no precedence to get wrong', () => {
+  // QA's second surviving mutant lived here. Narrowing the identity gate to
+  // fire only when FULLY_INTERPRETED left the count identical and changed only
+  // which true statement was made — so no assertion caught it, and a technician
+  // would have been sent to chase data quality when the real problem was
+  // identity binding. A list has no precedence to mutate.
+  const unattributed = (id: string) => ({
+    detectorId: 'mailbox', subject: { kind: 'MAILBOX', mailboxRef: id, binding: 'UNRESOLVED' } as const,
+    observedAt: '2026-09-10T00:00:00.000Z',
+  })
+  const mailbox: Detector<Event> = {
+    id: 'mailbox',
+    run: applicable => ({ status: 'RAN', considered: applicable.length, findings: applicable.map(item => unattributed(item.id)) }),
+  }
+
+  // Uninterpretable events AND an unattributed finding: an ordinary Tuesday.
+  const both = run([event('1')], {
+    coverage: coverage({ applies: 1, unknown: { X: 1 } }), detectors: [mailbox],
+  })
+  assert.equal(both.claim.permitted, false)
+  assert.deepEqual(both.claim.permitted === false && [...both.claim.because].sort(),
+    ['UNINTERPRETED_EVENTS', 'UNRESOLVED_SUBJECT_IDENTITY'])
+
+  // Three at once, including a crashed detector and an over-budget window.
+  const three = run([event('1'), event('2')], {
+    coverage: coverage({ applies: 2, unknown: { X: 1 } }), detectors: [mailbox, broken], maxEvents: 1,
+  })
+  assert.deepEqual(three.claim.permitted === false && [...three.claim.because].sort(),
+    ['CAPACITY_EXCEEDED', 'DETECTOR_FAILED', 'UNINTERPRETED_EVENTS', 'UNRESOLVED_SUBJECT_IDENTITY'])
+
+  // Each reason still reaches the reader as its own sentence.
+  const sentences = three.claim.permitted === false ? three.claim.because.map(withheldExplanation) : []
+  assert.equal(new Set(sentences).size, 4)
+})
+
+test('a withheld claim always names at least one reason', () => {
+  // An undifferentiated "not available" is the defect this whole vocabulary
+  // replaces, so the type makes the empty list unrepresentable and this pins
+  // that no path produces one.
+  const cases = [
+    run([event('1')], { coverage: coverage({ applies: 1, unknown: { X: 1 } }) }),
+    run([], { coverage: coverage({ applies: 0 }) }),
+    run([event('1')], { detectors: [broken] }),
+    unread('NEVER_COLLECTED'),
+    unread('UNREADABLE_NOW'),
+  ]
+  for (const result of cases) {
+    if (result.claim.permitted) continue
+    assert.ok(result.claim.because.length >= 1, 'withheld without a reason is not a statement')
+  }
+})
+
+test('a detector opting out without saying why is treated as having failed', () => {
+  // The type can require a reason but not that it says anything, and a blank
+  // one is a silent opt-out: the check removes itself from the answer and
+  // nothing tells a reader what stopped being checked. Silence is made
+  // expensive rather than free, in the gating direction.
+  const mute: Detector<Event> = { id: 'mute', run: () => ({ status: 'INAPPLICABLE', because: '   ' }) }
+  const result = run([event('1')], { detectors: [silent, mute] })
+
+  assert.deepEqual(result.detectors[1], { detectorId: 'mute', status: 'FAILED' })
+  assert.deepEqual(result.claim.permitted === false && result.claim.because, ['DETECTOR_FAILED'])
+  // And it cannot quietly shrink the scope, which is what a silent opt-out
+  // would otherwise buy: absent from covered and from notCovered alike.
+  assert.deepEqual(result.count.scope, { covered: ['silent'], notCovered: [] })
 })

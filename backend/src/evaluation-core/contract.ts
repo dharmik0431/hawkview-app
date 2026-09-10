@@ -96,7 +96,18 @@ export type WithheldReason =
  * headline came to disagree with the caption beneath it. */
 export type ZeroClaim =
   | Readonly<{ permitted: true }>
-  | Readonly<{ permitted: false; because: WithheldReason }>
+  /** Every reason that applies, not the first one a precedence order happened to
+   * reach. Several can hold at once — a window both over budget and carrying a
+   * mailbox we could not attribute — and choosing between them means telling a
+   * technician one true thing instead of two, which sends them to investigate
+   * data quality when the real problem was identity binding.
+   *
+   * There is deliberately no precedence to get right. The tenant layer already
+   * carries a list for exactly this reason; a single reason here was the same
+   * collapse one level down, and the ordering was a decision nobody had written
+   * down as a decision. Non-empty by construction: withheld with no reason is
+   * the undifferentiated "not available" this design exists to remove. */
+  | Readonly<{ permitted: false; because: readonly [WithheldReason, ...WithheldReason[]] }>
 
 /** Two namespaces, and only one of them is people.
  *

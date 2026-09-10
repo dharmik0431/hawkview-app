@@ -57,19 +57,26 @@ export function zeroClaim(input: Readonly<{
   allSubjectsResolved: boolean
 }>): ZeroClaim {
   const { state, coverage, withinBudget, allDetectorsRan, allSubjectsResolved } = input
-  if (!withinBudget) return { permitted: false, because: 'CAPACITY_EXCEEDED' }
-  if (!allDetectorsRan) return { permitted: false, because: 'DETECTOR_FAILED' }
-  if (!allSubjectsResolved) return { permitted: false, because: 'UNRESOLVED_SUBJECT_IDENTITY' }
-  switch (state) {
-    case 'NEVER_COLLECTED': return { permitted: false, because: 'NEVER_COLLECTED' }
-    case 'UNREADABLE_NOW': return { permitted: false, because: 'UNREADABLE_NOW' }
-    case 'PARTIALLY_UNINTERPRETABLE': return { permitted: false, because: 'UNINTERPRETED_EVENTS' }
-    case 'FULLY_INTERPRETED':
+  const reasons: WithheldReason[] = []
+  if (!withinBudget) reasons.push('CAPACITY_EXCEEDED')
+  if (!allDetectorsRan) reasons.push('DETECTOR_FAILED')
+  if (!allSubjectsResolved) reasons.push('UNRESOLVED_SUBJECT_IDENTITY')
+
+  const fromState = ((): WithheldReason | null => {
+    switch (state) {
+      case 'NEVER_COLLECTED': return 'NEVER_COLLECTED'
+      case 'UNREADABLE_NOW': return 'UNREADABLE_NOW'
+      case 'PARTIALLY_UNINTERPRETABLE': return 'UNINTERPRETED_EVENTS'
       // Nothing applicable means nothing was assessed. A zero drawn from an
       // empty denominator states a clean result the evidence never supported.
-      return coverage.applies > 0 ? { permitted: true } : { permitted: false, because: 'NOTHING_APPLICABLE' }
-    default: return unreachable(state)
-  }
+      case 'FULLY_INTERPRETED': return coverage.applies > 0 ? null : 'NOTHING_APPLICABLE'
+      default: return unreachable(state)
+    }
+  })()
+  if (fromState !== null) reasons.push(fromState)
+
+  const [first, ...rest] = reasons
+  return first === undefined ? { permitted: true } : { permitted: false, because: [first, ...rest] }
 }
 
 /** Distinct directory users carrying a finding.
@@ -210,6 +217,17 @@ export function evaluate<Event>(input: Readonly<{
     try {
       const result = detector.run(applicable)
       if (result.status === 'INAPPLICABLE') {
+        // A blank reason is a silent opt-out, and opting out silently is the
+        // veto pattern again: the detector removes itself from the answer and
+        // nothing tells a reader what stopped being checked. The type can
+        // require the field but not that it says anything, so an empty one is
+        // treated as the detector failing to produce a usable result — which
+        // gates, the safe direction, and makes silence expensive rather than
+        // free.
+        if (result.because.trim() === '') {
+          reports.push({ detectorId: detector.id, status: 'FAILED' })
+          continue
+        }
         // Narrows what the count answers rather than blocking it. Unlike a
         // crash, nothing was lost: this evidence was never going to carry the
         // answer, and saying so is more useful than withholding the tenant's

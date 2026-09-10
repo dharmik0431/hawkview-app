@@ -71,7 +71,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
   const unattributed = mailbox('orphan', { forwardingSmtpAddress: 'exfil@evil.example' })
   const result = assess([{ ...unattributed, subject: { kind: 'MAILBOX', mailboxRef: 'orphan', binding: 'UNRESOLVED' } }])
   assert.equal(result.findings.length, 1, 'still found, still reported')
-  assert.deepEqual(result.claim, { permitted: false, because: 'UNRESOLVED_SUBJECT_IDENTITY' })
+  assert.deepEqual(result.claim, { permitted: false, because: ['UNRESOLVED_SUBJECT_IDENTITY'] })
   assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
 
   // And it does not erase what we could attribute: a known user still yields a
@@ -203,7 +203,7 @@ test('the detector plugs into the core without the core knowing anything about m
     detectors: [detector], budget: { maxEvents: 500 },
   })
   assert.equal(partial.findings.length, 1)
-  assert.deepEqual(partial.claim, { permitted: false, because: 'UNINTERPRETED_EVENTS' })
+  assert.deepEqual(partial.claim, { permitted: false, because: ['UNINTERPRETED_EVENTS'] })
   // No user was identified, so there is no floor to state about people — and a
   // lower bound of zero is not a statement. The mailbox finding is still
   // reported; it simply is not evidence about how many humans are affected.

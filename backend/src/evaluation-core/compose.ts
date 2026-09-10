@@ -51,9 +51,12 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
     // empty denominator is the same overclaim as a rule with no applicable
     // events reporting clean, so it reuses that reason rather than a new one.
     ? [{ stream: null, because: 'NOTHING_APPLICABLE' }]
+    // A stream withheld for several reasons contributes several withholdings.
+    // Picking one to represent it would reintroduce, per stream, the collapse
+    // this list exists to prevent.
     : streams.flatMap(entry => entry.assessment.claim.permitted
       ? []
-      : [{ stream: entry.stream, because: entry.assessment.claim.because }])
+      : entry.assessment.claim.because.map(because => ({ stream: entry.stream, because })))
 
   // An exact tenant zero asserts "across everything HawkView checks, nobody has
   // a finding". One stream that could not answer means we did not check
