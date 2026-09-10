@@ -117,8 +117,12 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
   const userSide = (userRef: string) => ({
     id: `user-${userRef}`,
     monotonic: true,
-    run: () => ({
-      status: 'RAN' as const, considered: 1,
+    // Reports what it was actually handed. An earlier version claimed to have
+    // considered one event even when given none, which the core now rejects as
+    // an account it cannot trust — it caught this fixture immediately.
+    run: (applicable: readonly MailboxForwardingArtefact[]) => ({
+      status: 'RAN' as const,
+      considered: applicable.length,
       findings: [{
         detectorId: `user-${userRef}`,
         subject: { kind: 'DIRECTORY_USER', userRef } as const,
@@ -126,8 +130,16 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
       }],
     }),
   })
+  // Always at least one mailbox, so the user-side detector has something to have
+  // looked at. The variable under test is which *extra* mailbox is present.
+  const benign = mailbox('nothing-to-see', { forwardingSmtpAddress: 'colleague@contoso.com' })
   const withMailboxes = (mailboxes: readonly MailboxForwardingArtefact[]) => evaluate<MailboxForwardingArtefact>({
-    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(Math.max(mailboxes.length, 1)), timeOf: () => 0 },
+    evidence: {
+      availability: 'READ',
+      applies: [benign, ...mailboxes],
+      coverage: coverage(mailboxes.length + 1),
+      timeOf: () => 0,
+    },
     detectors: [detector, userSide('shared-billing')],
     budget: { maxEvents: 500 },
   })

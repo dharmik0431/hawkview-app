@@ -338,14 +338,14 @@ test('the claim is computed once and the count cannot disagree with it', () => {
       'an exact count is available exactly when the claim is permitted')
     assert.deepEqual(
       zeroClaim({
-        state: result.state,
+        read: true,
         coverage: result.coverage,
         withinBudget: true,
         allDetectorsRan: true,
         allSubjectsResolved: true,
       }),
       result.claim,
-      'recomputing from the reported state and coverage gives the same answer')
+      'recomputing from the reported coverage gives the same answer')
   }
 })
 
@@ -487,4 +487,73 @@ test('findings say they are partial when a detector crashed, and complete when n
   const narrowed = run([event('1')], { detectors: [silent, unsupported] })
   assert.equal(narrowed.findings.complete, true, 'complete for the questions we asked')
   assert.equal(narrowed.count.scope.notCovered.length, 1, 'and the unasked one is named')
+})
+
+test('a detector whose account of itself is impossible is not trusted to have run', () => {
+  // `considered` is what makes "ran and found nothing" believable rather than
+  // merely silent, and it is self-reported. A detector cannot have looked at
+  // more events than it was handed, so a figure outside that range means the
+  // account is untrustworthy — and an untrustworthy account of a clean result
+  // is worth less than no account at all.
+  const overclaims: Detector<Event> = {
+    id: 'overclaims', monotonic: true,
+    run: () => ({ status: 'RAN', considered: 1000, findings: [] }),
+  }
+  const negative: Detector<Event> = {
+    id: 'negative', monotonic: true,
+    run: () => ({ status: 'RAN', considered: -1, findings: [] }),
+  }
+  for (const bad of [overclaims, negative]) {
+    const result = run([event('1')], { detectors: [bad] })
+    assert.deepEqual(result.detectors, [{ detectorId: bad.id, status: 'FAILED' }])
+    assert.deepEqual(result.claim.permitted === false && result.claim.because, ['DETECTOR_FAILED'])
+  }
+
+  // But what it found is still kept. Discarding real findings over a wrong
+  // counter would be the veto pattern in its smallest costume.
+  const foundButMiscounted: Detector<Event> = {
+    id: 'miscounts', monotonic: true,
+    run: applicable => ({
+      status: 'RAN',
+      considered: applicable.length + 5,
+      findings: [{ detectorId: 'miscounts', subject: user('user-1'), observedAt: '2026-09-10T00:00:00.000Z' }],
+    }),
+  }
+  const kept = run([event('1')], { detectors: [foundButMiscounted] })
+  assert.equal(kept.findings.items.length, 1)
+  assert.deepEqual(figure(kept.count), { accuracy: 'AT_LEAST', value: 1 })
+
+  // A detector reporting more findings than events considered is NOT impossible
+  // — one event can support several findings — so that stays permitted.
+  const many: Detector<Event> = {
+    id: 'many', monotonic: true,
+    run: applicable => ({
+      status: 'RAN',
+      considered: applicable.length,
+      findings: [0, 1, 2].map(() => ({ detectorId: 'many', subject: user('user-1'), observedAt: '2026-09-10T00:00:00.000Z' })),
+    }),
+  }
+  assert.equal(run([event('1')], { detectors: [many] }).claim.permitted, true)
+})
+
+test('a claim cannot be asked about unread evidence that somehow has findings', () => {
+  // QA's observation: the previous shape accepted NEVER_COLLECTED alongside an
+  // unattributed finding. Unreachable through evaluate, reachable through this
+  // exported function — the same gap the Evidence union closed, one level along.
+  // The unread branch now carries no coverage and no flags to contradict it.
+  assert.deepEqual(zeroClaim({ read: false, because: 'NEVER_COLLECTED' }),
+    { permitted: false, because: ['NEVER_COLLECTED'] })
+  assert.deepEqual(zeroClaim({ read: false, because: 'UNREADABLE_NOW' }),
+    { permitted: false, because: ['UNREADABLE_NOW'] })
+
+  // And the read branch derives its own interpretability from the coverage it
+  // was given, rather than being told it separately by something that could
+  // disagree with it.
+  assert.deepEqual(
+    zeroClaim({
+      read: true,
+      coverage: coverage({ applies: 1, unknown: { X: 1 } }),
+      withinBudget: true, allDetectorsRan: true, allSubjectsResolved: true,
+    }),
+    { permitted: false, because: ['UNINTERPRETED_EVENTS'] })
 })

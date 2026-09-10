@@ -48,33 +48,37 @@ export function evidenceState<Event>(evidence: Evidence<Event>): EvidenceState {
  * A failed detector is partial evidence about findings, so it withholds the
  * clean claim for the same reason partial evidence does: what it would have
  * found is unknown. It never erases what its neighbours found. */
-export function zeroClaim(input: Readonly<{
-  state: EvidenceState
-  coverage: Coverage
-  withinBudget: boolean
-  allDetectorsRan: boolean
-  /** False when any finding names a subject we could not attribute. A count of
-   * people cannot be exact while we hold a finding and cannot say whose it is. */
-  allSubjectsResolved: boolean
-}>): ZeroClaim {
-  const { state, coverage, withinBudget, allDetectorsRan, allSubjectsResolved } = input
+export type ClaimBasis =
+  /** Nothing was read, so there are no events, no coverage, no detectors and no
+   * findings to attribute. QA found the previous shape would accept "never
+   * collected" alongside an unattributed finding — incoherent, unreachable
+   * through `evaluate`, and reachable through this function, which is exported.
+   * The same gap the Evidence union closed, one level along. */
+  | Readonly<{ read: false; because: 'NEVER_COLLECTED' | 'UNREADABLE_NOW' }>
+  | Readonly<{
+    read: true
+    coverage: Coverage
+    withinBudget: boolean
+    allDetectorsRan: boolean
+    /** False when any finding names a subject we could not attribute. A count of
+     * people cannot be exact while we hold a finding and cannot say whose it is. */
+    allSubjectsResolved: boolean
+  }>
+
+export function zeroClaim(basis: ClaimBasis): ZeroClaim {
+  if (!basis.read) return { permitted: false, because: [basis.because] }
+
+  const { coverage, withinBudget, allDetectorsRan, allSubjectsResolved } = basis
   const reasons: WithheldReason[] = []
   if (!withinBudget) reasons.push('CAPACITY_EXCEEDED')
   if (!allDetectorsRan) reasons.push('DETECTOR_FAILED')
   if (!allSubjectsResolved) reasons.push('UNRESOLVED_SUBJECT_IDENTITY')
-
-  const fromState = ((): WithheldReason | null => {
-    switch (state) {
-      case 'NEVER_COLLECTED': return 'NEVER_COLLECTED'
-      case 'UNREADABLE_NOW': return 'UNREADABLE_NOW'
-      case 'PARTIALLY_UNINTERPRETABLE': return 'UNINTERPRETED_EVENTS'
-      // Nothing applicable means nothing was assessed. A zero drawn from an
-      // empty denominator states a clean result the evidence never supported.
-      case 'FULLY_INTERPRETED': return coverage.applies > 0 ? null : 'NOTHING_APPLICABLE'
-      default: return unreachable(state)
-    }
-  })()
-  if (fromState !== null) reasons.push(fromState)
+  // Derived here rather than passed in beside the coverage it describes: two
+  // inputs saying the same thing is two inputs that can disagree.
+  if (uninterpreted(coverage) > 0) reasons.push('UNINTERPRETED_EVENTS')
+  // Nothing applicable means nothing was assessed. A zero drawn from an empty
+  // denominator states a clean result the evidence never supported.
+  else if (coverage.applies === 0) reasons.push('NOTHING_APPLICABLE')
 
   const [first, ...rest] = reasons
   return first === undefined ? { permitted: true } : { permitted: false, because: [first, ...rest] }
@@ -185,9 +189,7 @@ export function evaluate<Event>(input: Readonly<{
     // Nothing was read, so nothing ran. An empty detector list is the honest
     // report — not a list of detectors credited with having considered zero
     // events, which reads like a healthy silent detector.
-    const claim = zeroClaim({
-      state, coverage: NO_COVERAGE, withinBudget: true, allDetectorsRan: true, allSubjectsResolved: true,
-    })
+    const claim = zeroClaim({ read: false, because: input.evidence.availability })
     return {
       state,
       coverage: NO_COVERAGE,
@@ -249,7 +251,21 @@ export function evaluate<Event>(input: Readonly<{
         reports.push({ detectorId: detector.id, status: 'INAPPLICABLE', because: result.because })
         continue
       }
+      // What it found is kept either way. Discarding real findings because a
+      // counter was wrong would be the veto pattern in its smallest costume.
       findings.push(...result.findings)
+
+      // `considered` is self-reported, and it is the number that makes "ran and
+      // found nothing" believable rather than merely silent — the whole point
+      // of per-detector accounting. A detector cannot have looked at fewer than
+      // none, or at more events than it was handed, so a figure outside that
+      // range means its account of itself cannot be trusted. An untrustworthy
+      // account of a clean result is worth less than no account, so this gates,
+      // the same resolution as a blank inapplicability reason.
+      if (!Number.isInteger(result.considered) || result.considered < 0 || result.considered > applicable.length) {
+        reports.push({ detectorId: detector.id, status: 'FAILED' })
+        continue
+      }
       reports.push({ detectorId: detector.id, status: 'RAN', considered: result.considered, matched: result.findings.length })
     } catch {
       reports.push({ detectorId: detector.id, status: 'FAILED' })
@@ -257,7 +273,7 @@ export function evaluate<Event>(input: Readonly<{
   }
 
   const claim = zeroClaim({
-    state,
+    read: true,
     coverage,
     withinBudget,
     // An inapplicable detector is not a failed one. Only a crash leaves what it
