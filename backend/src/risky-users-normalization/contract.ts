@@ -393,10 +393,18 @@ export interface NormalizationCounts {
    *
    * DO NOT SUM THIS WITH THE FOUR, and the concrete failure is worth naming
    * because a summary card is exactly where it happens: on a tenant where
-   * ~921 rows carry a RISK verdict, a total built by adding all five reads
-   * about 35% higher than the number of rows handed in, and it would look
-   * plausible. The four vocabularies account for every row exactly once and a
-   * test asserts it; this is a second reading of some of those same rows.
+   * 932 rows carry a RISK verdict, a total built by adding all five reads
+   * about 35% higher than the number of rows handed in. THIRTY-FIVE PERCENT
+   * IS THE DANGEROUS SIZE. A 300% error is caught in review; a 35% one ships
+   * and is then defended, because it looks like the kind of number that could
+   * be right.
+   *
+   * AND THE WORSE CASE IS A RATE, NOT A TOTAL. Any percentage whose
+   * denominator is built this way is silently wrong, and a rate is far harder
+   * to sanity-check by eye than a total — nobody looks at 41% and thinks to
+   * ask what was underneath it. The four vocabularies account for every row
+   * exactly once and a test asserts it; use those for any denominator. This
+   * counter is a second reading of some of those same rows.
    */
   readonly microsoftVerdicts: Readonly<Record<MicrosoftVerdict | 'UNRECOGNIZED', number>>;
   /**
@@ -521,20 +529,36 @@ export interface NormalizationBatch {
    */
   readonly microsoftSafetyVerdicts: readonly NormalizedEvent[];
   //
-  // THE THREE LISTS ARE DISJOINT PER EVENT, NOT PER SUBJECT.
+  // THE THREE LISTS ARE DISJOINT PER EVENT, NOT PER SUBJECT — AND A PER-USER
+  // ROLLUP OF THEM IS A CATEGORY ERROR RATHER THAN A CHOICE.
   //
   // One verdict per event, and a test asserts no event reaches two lists. But
-  // a subject has many events, and nothing stops one person having a RISK
+  // a subject has many events, and nothing stops one person carrying a RISK
   // verdict on Tuesday and a SAFE verdict on Thursday — both true, about
   // different sign-ins.
   //
-  // So a surface that groups BY USER has a case this layer does not decide
-  // for it: a user who belongs in two groups at once. Picking the worst
-  // verdict, the latest, or showing the user twice are all defensible, and
-  // they are rendering decisions rather than facts about the data — which is
-  // why this says the shape rather than choosing. What is NOT defensible is
-  // reaching for one of them without noticing the case exists, because the
-  // failure is silent and lands in the direction that reads as reassurance.
+  // An earlier version of this comment offered three ways to reconcile that:
+  // take the worst verdict, take the latest, or show the user twice. All
+  // three are wrong, and for one reason rather than three: they treat an
+  // event-level judgement as a statement about a PERSON. Microsoft judged a
+  // sign-in. Grouping those by user and then reconciling them is the error,
+  // not the reconciliation strategy — so there is no correct strategy to
+  // offer, and offering three was offering three ways to do the wrong thing.
+  //
+  // THIS IS THE SAME RULE AS KEEPING THE VERDICT OFF THE EVENT, one level up.
+  // A verdict does not travel from Microsoft's channel into a HawkView
+  // finding, and it does not ascend from an event to a subject. Both are the
+  // same claim: it means what it was said about, and nothing wider.
+  //
+  // What a surface does instead is render these AS SIGN-INS, in their own
+  // section, where one person appearing twice is obviously two events rather
+  // than two opinions — and nothing needs reconciling because nothing is
+  // being compared. A user-level question ("who does Microsoft consider at
+  // risk now?") is answered by the user-level riskyUsers API, which needs P2
+  // and reads telemetry we cannot see. Different subject, different tense,
+  // different evidence base: the two can disagree with neither being wrong,
+  // and they stop looking contradictory as soon as each is labelled by the
+  // question it answers rather than both being labelled "Microsoft".
   /** Reference-to-identifier mapping for subjects that resolved, kept off the events. */
   readonly resolvedSubjects: readonly {
     readonly subjectRef: string;

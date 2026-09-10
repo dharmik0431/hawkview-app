@@ -1275,3 +1275,49 @@ Worth recording that a document had implied the volume was spread across 16 user
 would have turned a correct caveat into a false one — and that the 94.8%
 lockout-without-50126 finding therefore does **not** get the strengthening that would have
 implied. A caveat being narrower than you would like is not a reason to widen it.
+
+## Addendum: a verdict does not ascend from an event to a subject
+
+I documented the per-subject case and got the shape right and the answer wrong.
+
+The shape: the three verdict lists are disjoint **per event**, never per subject, so one
+person can carry `RISK` on Tuesday's sign-in and `SAFE` on Thursday's — both true, about
+different events. I flagged that a by-user grouping therefore has an undecided case, and
+offered three ways to resolve it: worst verdict, latest verdict, or show the user twice.
+Said they were rendering decisions rather than facts, and left it there.
+
+**All three are wrong, for one reason rather than three.** They treat an event-level
+judgement as a statement about a *person*. Microsoft judged a sign-in. Grouping those by
+user and then reconciling them is the error — not the reconciliation strategy. So there was
+no correct option to offer, and offering three was offering three ways to do the wrong
+thing while calling it a choice.
+
+The consumer got there and I did not, which is worth recording because I had the principle
+already: **it is the same rule as keeping the verdict off the event, one level up.** A
+verdict does not travel from Microsoft's channel into a HawkView finding, and it does not
+ascend from an event to a subject. Both are one claim — *it means what it was said about,
+and nothing wider*. I built the first as a structural guarantee and then, asked about the
+second, reached for a rendering preference.
+
+What a surface does instead: render these **as sign-ins**, in their own section, where one
+person appearing twice is obviously two events rather than two opinions. Nothing needs
+reconciling because nothing is being compared. The user-level question — *who does
+Microsoft consider at risk now?* — is answered by the user-level `riskyUsers` API, which
+needs P2 and reads telemetry we cannot see.
+
+That also disposes of a case I had flagged as needing its own guard: an empty API panel
+above populated sign-in verdicts reads as a bug only while both are labelled "Microsoft".
+Once each is labelled by the question it answers, "no users Microsoft currently considers
+at risk" above "four sign-ins Microsoft flagged last week" is two true statements about two
+different questions. **Labelling by question retires a guard rather than needing one** —
+and note the direction, against the standing rule that a fix usually moves a danger rather
+than removing it. Here it genuinely removed one, because the defect was a false equivalence
+in a label rather than a fact about the data.
+
+### And the not-summable warning was still too weak
+
+It now carries two things it did not. **Thirty-five percent is the dangerous size**: a 300%
+error is caught in review, a 35% one ships and is then defended, because it looks like the
+kind of number that could be right. And **the worse case is a rate, not a total** — any
+percentage whose denominator is built by summing those counters is silently wrong, and
+nobody looks at 41% and thinks to ask what was underneath it.
