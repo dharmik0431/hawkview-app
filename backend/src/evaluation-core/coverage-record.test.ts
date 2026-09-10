@@ -24,7 +24,7 @@ test('a coverage vector survives a round trip with its partition intact', () => 
   // to does-not-apply, which is the collapse this design exists to prevent.
   const stored = encodeCoverage(original) as Record<string, unknown>
   assert.deepEqual(Object.keys(stored).sort(),
-    ['applies', 'collectionScope', 'doesNotApply', 'unknown', 'unprocessable', 'version'])
+    ['applies', 'collectionScope', 'doesNotApply', 'notYetCited', 'unknown', 'unprocessable', 'version'])
 })
 
 test('no accounting recorded is never the same answer as accounting recorded as zero', () => {
