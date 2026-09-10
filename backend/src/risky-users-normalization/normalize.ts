@@ -72,32 +72,6 @@ function utcMillis(value: unknown): number | null {
   return new Date(parsed).toISOString().slice(0, 19) === value.slice(0, 19) ? parsed : null;
 }
 
-/** The Management Activity API states UTC and omits the designator. */
-const AUDIT_UTC_WITHOUT_DESIGNATOR = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?$/;
-
-/** `CreationTime`, which is UTC and does not say so.
- *
- * Microsoft documents the Management Activity API's CreationTime as UTC and
- * returns it bare — "2026-09-10T10:00:00". `utcMillis` requires the designator,
- * correctly, so every audit row in production was EVENT_TIMESTAMP_INVALID: three
- * tenants, 100% of rows, no error and no zero claimed. The suite could not see
- * it because the audit fixture wrote a Z the provider never sends.
- *
- * DELIBERATELY NOT a relaxation of `utcMillis`. Graph sends a designator on
- * every row and must keep being held to it; only the feed that is documented to
- * omit one is allowed to omit one, so the tolerance cannot spread to a feed
- * where a missing designator would mean something is wrong.
- *
- * An OFFSET is still rejected rather than assumed. "+05:00" read as UTC moves
- * the event five hours and files it in a window it does not belong to, which is
- * the silent-wrong-answer direction; a rejected row is at least counted.
- */
-function auditUtcMillis(value: unknown): number | null {
-  return typeof value === 'string' && AUDIT_UTC_WITHOUT_DESIGNATOR.test(value)
-    ? utcMillis(`${value}Z`)
-    : utcMillis(value);
-}
-
 /**
  * Qualify a client address across the places a feed may report it.
  *
@@ -580,11 +554,7 @@ async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, contex
 
   const eventId = record[feed.eventIdField];
   if (!textValue(eventId)) return unprocessable('EVENT_ID_ABSENT_OR_MALFORMED');
-  // Per feed, because the two providers make different promises about the
-  // designator and only one of them is documented to omit it.
-  const eventAt = graph
-    ? utcMillis(record[feed.eventAtField])
-    : auditUtcMillis(record[feed.eventAtField]);
+  const eventAt = utcMillis(record[feed.eventAtField]);
   if (eventAt === null) return unprocessable('EVENT_TIMESTAMP_INVALID');
   if (ingestedAt < eventAt) return unprocessable('INGESTION_PRECEDES_EVENT');
 
