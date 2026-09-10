@@ -1,0 +1,71 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { bindToFeed, unreachableRequirements, type FeedBoundDetector } from './feed-capability.js'
+import { evaluate } from '../evaluation-core/evaluate.js'
+import type { EventOutcome, NormalizedEvent } from '../risky-users-normalization/contract.js'
+import type { Coverage } from '../evaluation-core/contract.js'
+
+/** The real shape of the problem: a rule that reads "failures, then a success". */
+const failuresThenSuccess: FeedBoundDetector = {
+  detector: {
+    id: 'invalid-attempts-then-success',
+    monotonic: true,
+    run: applicable => ({ status: 'RAN', considered: applicable.length, declined: {}, findings: [] }),
+  },
+  requires: ['PASSWORD_REJECTED', 'PASSWORD_ACCEPTED_COMPLETED'],
+}
+
+const feed = (name: string, outcomes: readonly EventOutcome[]) =>
+  ({ feed: name, reachable: new Set(outcomes) })
+
+const coverage = (applies: number): Coverage => ({
+  collectionScope: { declared: true, asked: 'test fixture' },
+  applies, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {},
+})
+
+test('a feed that cannot produce half the pattern is identified before the rule runs', () => {
+  // The audit feed's real historical state: failures, and no source of
+  // successes whatsoever.
+  const failuresOnly = feed('audit', ['PASSWORD_REJECTED'])
+  assert.deepEqual(unreachableRequirements(failuresThenSuccess, failuresOnly), ['PASSWORD_ACCEPTED_COMPLETED'])
+
+  const bothReachable = feed('graph', ['PASSWORD_REJECTED', 'PASSWORD_ACCEPTED_COMPLETED'])
+  assert.deepEqual(unreachableRequirements(failuresThenSuccess, bothReachable), [])
+})
+
+test('an inert rule reports that it cannot run, rather than that it found nothing', () => {
+  // Without this the detector reports considered: N, matched: 0 — a healthy
+  // silent detector — and nothing anywhere distinguishes "no compromise
+  // happened" from "this rule could never have fired here".
+  const bound = bindToFeed(failuresThenSuccess, feed('audit', ['PASSWORD_REJECTED']))
+  const events = [{ eventAt: '2026-09-10T00:00:00.000Z' }] as unknown as NormalizedEvent[]
+  const result = evaluate<NormalizedEvent>({
+    evidence: { availability: 'READ', applies: events, coverage: coverage(1), timeOf: event => event.eventAt },
+    detectors: [bound],
+    budget: { maxEvents: 100 },
+  })
+
+  const report = result.detectors[0]
+  assert.equal(report?.status, 'INAPPLICABLE')
+  assert.match(report?.status === 'INAPPLICABLE' ? report.because : '', /PASSWORD_ACCEPTED_COMPLETED/)
+  assert.match(report?.status === 'INAPPLICABLE' ? report.because : '', /audit/)
+
+  // It narrows the count's scope rather than gating the claim — the same
+  // treatment as a check whose source lacks conditional-access data, because it
+  // is the same fact.
+  assert.deepEqual(result.count.scope.covered, [])
+  assert.equal(result.count.scope.notCovered.length, 1)
+})
+
+test('the rule is replaced, never dropped', () => {
+  // Filtering it out would leave the tenant one check short with nothing saying
+  // so — the disappearance this design exists to prevent.
+  const bound = bindToFeed(failuresThenSuccess, feed('audit', ['PASSWORD_REJECTED']))
+  assert.equal(bound.id, failuresThenSuccess.detector.id, 'same identity, so the scope can name it')
+  assert.equal(bound.monotonic, failuresThenSuccess.detector.monotonic)
+})
+
+test('a feed that supports the pattern gets the real detector, untouched', () => {
+  const bound = bindToFeed(failuresThenSuccess, feed('graph', ['PASSWORD_REJECTED', 'PASSWORD_ACCEPTED_COMPLETED']))
+  assert.equal(bound, failuresThenSuccess.detector, 'not a wrapper — the detector itself')
+})
