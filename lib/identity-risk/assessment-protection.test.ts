@@ -664,3 +664,40 @@ test('an unrecognised check declines to name a unit rather than guessing one', (
   assert.match(rendered.text, /Repeated invalid credentials/)
   rendered.dom.window.close()
 })
+
+test('a Current badge over a window that has closed says when it closed', () => {
+  // The Raymonds shape, and the one that started the per-signal work: 462
+  // lockouts that stopped on 3 September, a detector window that closed on the
+  // 4th, and a check that ran on the 8th. Every field accurate. Read together
+  // the badge says the account is under attack now, and the technician who
+  // calls out-of-hours is responding to something that stopped days ago.
+  //
+  // The classification is the server's and is not overridden here -- inferring
+  // a verdict from two dates would be the same overreach in the other
+  // direction. Only the relationship between the dates is stated.
+  const stale = user()
+  stale.findings[0].evidenceCount = 462
+  stale.findings[0].firstSeen = '2026-09-02T10:00:00.000Z'
+  stale.findings[0].lastSeen = '2026-09-03T10:40:00.000Z'
+  stale.findings[0].activityWindowEndsAt = '2026-09-04T22:40:00.000Z'
+  stale.findings[0].activityState = 'CURRENT'
+  const rendered = renderDrawer(stale)
+
+  assert.match(rendered.text, /activity window closed on/)
+  assert.match(rendered.text, /before the check ran on/)
+  assert.match(rendered.text, /rather than as something in progress/)
+  // The badge is still the server's word, not ours.
+  assert.match(rendered.text, /Current/)
+  rendered.dom.window.close()
+
+  // Control: a finding whose window is still open at evaluation time says none
+  // of this. A note on every finding is a note on none of them.
+  const live = user()
+  live.findings[0].activityWindowEndsAt = '2026-09-09T00:00:00.000Z'
+  const open = renderDrawer(live)
+  assert.ok(
+    !/activity window closed on/.test(open.text),
+    'the note fired on a finding whose window was still open'
+  )
+  open.dom.window.close()
+})

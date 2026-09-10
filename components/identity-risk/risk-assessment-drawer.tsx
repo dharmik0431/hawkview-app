@@ -284,6 +284,7 @@ function FindingDetail({ finding }: { finding: RiskAssessmentFinding }) {
         </div>
       </dl>
 
+      <ClosedActivityWindow finding={finding} />
       <EvidenceReadingCaveat finding={finding} />
 
       {finding.evidenceReferences.length > 0 && (
@@ -516,6 +517,41 @@ function EvidenceReadingCaveat({
           guess one.
         </>
       )}
+    </p>
+  )
+}
+
+/**
+ * When a finding's own activity window closed before the check that reported
+ * it ran.
+ *
+ * "Current" is the server's classification and is not overridden here — that
+ * would be inferring a verdict from two dates. What is stated is the
+ * relationship between the dates, which the payload gives directly and which a
+ * badge reading "Current" beside a window that closed last week does not.
+ *
+ * This is the Raymonds shape, the one that started the per-signal work: 462
+ * lockouts that stopped on 3 September, a window that closed on the 4th, and a
+ * check that ran on the 10th. Every field is accurate. Read together without
+ * this line they say the account is under attack right now, and the technician
+ * who calls out-of-hours is responding to something that stopped a week ago.
+ *
+ * The window end is the detector's own tolerance beyond the last evidence, so
+ * its passing means the detector would no longer treat the activity as
+ * ongoing. Nothing stronger than that is claimed.
+ */
+function ClosedActivityWindow({ finding }: { finding: RiskAssessmentFinding }) {
+  const closed = Date.parse(finding.activityWindowEndsAt)
+  const evaluated = finding.evaluatedAt ? Date.parse(finding.evaluatedAt) : NaN
+  if (!Number.isFinite(closed) || !Number.isFinite(evaluated)) return null
+  if (closed >= evaluated) return null
+  return (
+    <p className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
+      This finding&rsquo;s activity window closed on{' '}
+      {formatTimestamp(finding.activityWindowEndsAt)}, before the check ran on{' '}
+      {formatTimestamp(finding.evaluatedAt)}. Nothing here shows activity after{' '}
+      {formatTimestamp(finding.lastSeen)}, so read it as something to
+      investigate rather than as something in progress.
     </p>
   )
 }
