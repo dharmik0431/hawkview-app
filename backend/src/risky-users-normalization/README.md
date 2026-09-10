@@ -161,23 +161,22 @@ than one meaning routed to `UNKNOWN / AMBIGUOUS_FAILURE_REASON_TEXT`. A reworded
 localised string therefore costs stated coverage and cannot silently misclassify. The
 hazard was never "parse text", it was "guess from text".
 
-| Text | Disposition |
-| --- | --- |
-| smart lockout after repeated wrong passwords | `APPLIES / LOCKED_OUT_AFTER_REPEATED_FAILURES` |
-| blocked from an IP with malicious activity | `APPLIES / BLOCKED_BY_CONTROL` |
-| blocked by built-in protections, high confidence of risk | `DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT` |
+| Text | Classification | Verdict |
+| --- | --- | --- |
+| smart lockout after repeated wrong passwords | `APPLIES / LOCKED_OUT_AFTER_REPEATED_FAILURES` | — |
+| blocked from an IP with malicious activity | `APPLIES / BLOCKED_BY_CONTROL` | `RISK` |
+| blocked by built-in protections, high confidence of risk | `APPLIES / BLOCKED_BY_CONTROL` | `RISK` |
 
 Smart lockout "tracks the last three bad password hashes to avoid incrementing the
 lockout counter for the same password", so a lockout implies **varied** password
 attempts — a misconfigured client replaying one stale credential will not lock out. That
 removes the main false-positive objection to treating a lockout as attack evidence.
 
-**The third meaning does not go into `applies`, and that is deliberate.** It is
-Microsoft's own high-confidence risk verdict, and the owner's product rule is that
-HawkView's findings and Microsoft-reported risk are two channels that are never merged
-or summed. A verdict Microsoft reached is not a HawkView finding. It is also the only
-Microsoft risk signal an unlicensed tenant will ever see, so it is surfaced as
-`batch.microsoftRiskVerdicts` rather than lost to a counter.
+**All three go into `applies`, and the last two also carry a verdict.** What separates the
+verdict-bearing texts from the lockout is not the classification but the second column:
+Microsoft made a judgement in those two and did not in the lockout. See *the observation
+is ours even when the sentence contains a judgement*, below, for why the earlier design
+removed these from `applies` and why that was wrong.
 
 ## Bounds never cost the run
 
@@ -328,13 +327,17 @@ Microsoft's own statement about the code.
 The channel-separation rule needs a line, and the line is **who made the judgement**:
 
 - A control the **tenant configured** — Conditional Access, device compliance, domain
-  join — is ours to report. `APPLIES / BLOCKED_BY_CONTROL`.
-- A judgement **Microsoft's own intelligence** made is Microsoft's channel.
-  `DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT`, surfaced as `batch.microsoftRiskVerdicts`.
+  join — is ours to report, and Microsoft made no judgement about it.
+- A judgement **Microsoft's own intelligence** made belongs to Microsoft's channel, and
+  travels as a `MicrosoftVerdict` on the batch.
 
-That is why 53003 stays in `applies` while 50053's high-confidence-risk text and 50131's
-suspicious-activity text do not. Smart lockout stays in `applies` too: it is a mechanical
-consequence of counted failures, not an assertion that something is risky.
+What the line decides, since a later ruling: not whether the event is evaluated — every
+one of these classifies `APPLIES / BLOCKED_BY_CONTROL` — but whether Microsoft is credited
+with a judgement. 53003 and smart lockout carry no verdict; 50053's high-confidence-risk
+text, its malicious-IP text, 50131's suspicious-activity variant and 53004 all do. A
+lockout in particular is a mechanical consequence of counted failures, not an assertion
+that something is risky, so crediting Microsoft with it would be putting words in their
+mouth.
 
 Text meanings are now declared **per code** (`ResultCodeEntry.textMeanings`) rather than
 matched globally, so one code's phrasing can never be read as another code's meaning — a
@@ -441,10 +444,11 @@ API. 50053's high-confidence-risk text, 50053's malicious-IP block, 50131's
 suspicious-activity variant and 53004 are all Microsoft's own judgements, and all arrive
 in a feed we already collect: no risk API, no consent grant, no licence.
 
-Concretely, the ~921 malicious-IP rows now routed to `MICROSOFT_RISK_VERDICT` had been
-sitting in the sign-in log misfiled as HawkView findings, for a tenant whose
-Microsoft-risk channel was empty. Moving them fills that channel today. Worth knowing
-before anyone plans work around the risk API being the only route to Microsoft's verdicts.
+Concretely, the ~921 malicious-IP rows now carry `verdict: 'RISK'` and populate
+`microsoftRiskVerdicts` for a tenant whose Microsoft-risk channel was otherwise empty.
+They stay in `applies` as well — two channels reading one log line, not a move. Worth
+knowing before anyone plans work around the risk API being the only route to Microsoft's
+verdicts.
 
 ## Addendum: observation versus anticipation
 
@@ -496,19 +500,15 @@ misleading direction. `aiConfirmedSigninSafe` is Microsoft's AI concluding a sig
 **safe** — a dismissal, not a detection. Rendered in a "risky users" view it would say
 "this user is at risk" when Microsoft said the opposite.
 
-So there are two reasons and **two separate lists**, `batch.microsoftRiskVerdicts` and
-`batch.microsoftSafetyVerdicts`, rather than one list and a flag — a test asserts no event
-appears in both. The state is modelled, not the mere presence of a risk field.
+So there are **three separate lists** — `microsoftRiskVerdicts`,
+`microsoftRemediatedVerdicts`, `microsoftSafetyVerdicts` — rather than one list and a
+flag: a consumer can ignore a flag but cannot iterate a list it does not have. A test
+asserts no event appears in more than one.
 
-`MICROSOFT_SAFETY_VERDICT` is currently **unreachable**, and so is the risk-based-CA case
-above, because reaching either means reading `raw.riskDetail` — a payload-shape predicate
-with **no control cohort**. The gap is live rather than hypothetical: those 55 rows
-classify today as ordinary successes and sit in `applies`, which is the channel mixing the
-predicate would fix. But routing on an unconfirmed field would remove 55 real successes
-from evaluation if it means something other than we think, so it is registered as
-`graph.risk-detail` / `PENDING_DISTRIBUTION_CHECK` and has no effect until the control
-cohort lands: every Graph row bucketed by `riskDetail` value, with ordinary human
-successes as the cohort that must NOT carry a verdict-shaped value.
+Two later rulings changed how these are reached, and both are recorded in their own
+addenda below: the verdict became a dimension orthogonal to classification rather than a
+reason for exclusion, and `graph.risk-detail` is now `PRODUCTION_VERIFIED` on a control
+cohort that passes.
 
 ## Addendum: the same collapse, found in my own layer
 
@@ -688,25 +688,19 @@ does not default to a verdict on ordinary human traffic. Documentation had sugge
 would be hidden without P2; it is not, which is exactly why that expectation needed
 checking rather than assuming.
 
-| `riskDetail` | `riskState` | rows | Disposition | Frontend group |
+| `riskDetail` | `riskState` | rows | `MicrosoftVerdict` | Frontend group |
 | --- | --- | --- | --- | --- |
-| `none` | `none` | 2,593 | not a verdict — classify on the code | — |
-| `userPassedMFADrivenByRiskBasedPolicy` | `remediated` | 54 | `MICROSOFT_RISK_REMEDIATED` | CLOSED |
-| `aiConfirmedSigninSafe` | `dismissed` | 1 | `MICROSOFT_SAFETY_VERDICT` | CLEARED |
+| `none` | `none` | 2,593 | none — classify on the code | — |
+| `userPassedMFADrivenByRiskBasedPolicy` | `remediated` | 54 | `REMEDIATED` | CLOSED |
+| `aiConfirmedSigninSafe` | `dismissed` | 1 | `SAFE` | CLEARED |
 
 **The remediated kind is a third thing, not a shade of the other two.** It reads: Microsoft
 assessed risk, a risk-based Conditional Access policy challenged the user, MFA passed.
-`MICROSOFT_RISK_VERDICT` would overstate it as live risk; `MICROSOFT_SAFETY_VERDICT` would
-understate it as never-risky. So there are now three lists —
-`microsoftRiskVerdicts` (ACTIVE_RISK), `microsoftRemediatedVerdicts` (CLOSED),
-`microsoftSafetyVerdicts` (CLEARED) — for the same reason there were two: a consumer can
-ignore a flag but cannot iterate a list it does not have. A test asserts an event appears
-in at most one.
+`RISK` would overstate it as live; `SAFE` would understate it as never-risky.
 
-Unrecognised values route to `UNKNOWN / MICROSOFT_VERDICT_FIELD_UNRECOGNIZED`, never
-through. The asymmetry is the argument: falling through risks presenting Microsoft's
-detection as a HawkView finding, which is a correctness violation, while UNKNOWN only
-costs stated coverage. 100% of observed is still not 100% of possible.
+Unrecognised values are **counted and change nothing** — see the orthogonal-verdict
+addendum for why the earlier routing to `UNKNOWN` was protection against a leak that the
+structure now makes impossible.
 
 `riskDetail` is checked **before** the result code, because a risk-based CA outcome sits on
 an ordinary success code — reading the code first would file Microsoft's detection as ours.
@@ -911,16 +905,13 @@ An unrecognised `riskDetail` value now classifies **normally** and is counted. T
 routing to UNKNOWN rested on a verdict being able to reach a detector; it cannot, so
 removing the event would cost coverage for no protection.
 
-### One open inconsistency, recorded rather than resolved
+### One open inconsistency — since resolved
 
-53004 and 50053's risk-text meanings are still classified `DOES_NOT_APPLY /
-MICROSOFT_RISK_VERDICT`, while now also carrying verdict `RISK`. They differ from the
-`riskDetail` cases in one real way: `riskDetail` is a *separate field*, so the observation
-is readable without the verdict, whereas there the code **is** both statements at once.
-Applying the ruling to them would return them to `APPLIES / BLOCKED_BY_CONTROL` with
-verdict `RISK` — roughly 921 rows for the malicious-IP text. That was previously ruled the
-other way under the older framing, so it is escalated as a consistency question rather than
-decided here.
+53004 and 50053's risk-text meanings were left classified `DOES_NOT_APPLY` while carrying
+verdict `RISK`, on the argument that `riskDetail` is a separate field whereas those codes
+**are** both statements at once. That argument does not hold and they now classify
+`APPLIES / BLOCKED_BY_CONTROL` like everything else that carries a verdict — see *the
+observation is ours even when the sentence contains a judgement*, below.
 
 ## Addendum: a negative claim must say what would overturn it
 
@@ -949,3 +940,97 @@ so rather than implying we found the field and caught it lying.
 Five states is the cap. Each additional one is another way to be wrong about a claim about a
 claim, and the mechanism's value comes from being small enough that someone reads all of it.
 A test asserts both the revival conditions and the cap.
+
+## Addendum: the observation is ours even when the sentence contains a judgement
+
+The last inconsistency in the verdict model is resolved, against my own earlier ruling.
+Code `53004` and the two 50053 risk texts — roughly **921 rows** for the malicious-IP text
+alone — are back in `APPLIES / BLOCKED_BY_CONTROL`, each carrying `verdict: 'RISK'`.
+
+My objection had been that `riskDetail` is a separate field, so the observation is readable
+there without the verdict, whereas these codes ARE both statements at once and cannot be
+split. They can. "Sign-in was blocked by built-in protections due to high confidence of
+risk" is one sentence and four facts:
+
+| | |
+| --- | --- |
+| a sign-in was attempted, by this subject, at this time, from this address | **observation** |
+| it did not succeed | **observation** |
+| a control stopped it, rather than a wrong credential | **observation** |
+| the control fired because Microsoft assessed the source as risky | **judgement** |
+
+`BLOCKED_BY_CONTROL` names the first three and no judgement. The fourth leaves as a
+`MicrosoftVerdict`, which never appears on an event.
+
+**The test that settles which side a case falls on:** would a HawkView finding over these
+rows be derivable *without* Microsoft's judgement? For these, yes — repeated failed
+attempts from one source is a pattern in the attempt data itself, so Microsoft's stated
+reason corroborates a finding rather than being its source. If it were not independently
+derivable, these would belong out of scope, and that is the question to ask of the next
+case rather than re-deriving the answer.
+
+And the split was already mechanically available, which is the part I had missed: code
+50053 alone is ambiguous across three meanings, so the text is *already* a separate string
+doing separate work. The outcome is classified from it and the text itself is never handed
+on — `NormalizedEvent` carries no `failureReason`.
+
+### What the fix retired, and what it did not
+
+A structural fix should always be followed by asking which guards it retires. Two things
+came out of that pass, in opposite directions.
+
+**Retired, and deleted.** `MICROSOFT_RISK_REMEDIATED` and `MICROSOFT_SAFETY_VERDICT` were
+the last members of `OutOfScopeReason` that nothing could produce. An unproduced member of
+a closed vocabulary is not inert: a reader of the exclusion vocabulary concludes that
+Microsoft-judged sign-ins are excluded from our findings, which is now false. Their prose
+was worth keeping and moved to `MicrosoftVerdict`, where it is true. Deleting them turned
+three test assertions into **compile errors**, which is the no-default-arm rule working as
+intended.
+
+**Not retired — inverted.** One test held a single fragment to a narrow phrase *because
+that branch alone diverted an event out of our findings*. No branch does that now, so the
+stated reason is gone. But the danger did not go with it, it moved: a too-broad fragment
+now attaches a Microsoft `RISK` verdict to a row Microsoft never judged, which fabricates
+evidence in the other channel. That is the worse of the two failures — dropping an event
+costs coverage and is counted, while inventing a judgement is a false claim about what
+Microsoft said. The guard was restated on the new failure mode and made stronger: it now
+asserts structurally that *no* description text can remove an event, and holds every
+verdict-bearing branch to a single phrase. Broadening one fragment to `blocked` fails five
+tests.
+
+The generalisable form: **a fix that removes a guard's stated reason has not necessarily
+removed its subject.** Ask where the failure went, not just whether it is still possible
+in the same shape.
+
+## Addendum: a verdict read from half a fact
+
+Caught by a consumer asking a question this layer could not answer. The frontend groups
+Microsoft records by **`riskState`** — `atRisk`, `remediated` and `dismissed` are different
+headings — and asked which state the remediated records carry. This layer derived the
+verdict from **`riskDetail`** and never read `riskState` at all.
+
+Every grouping would have been correct. It would also have been correct *by coincidence*,
+with nothing anywhere to notice if the two ever disagreed — which is the thing the
+consumer said they wanted to avoid most, and they were right to: a stable-looking
+arbitrary grouping is worse than one that is wrong on purpose, because the wrong one gets
+found.
+
+`RISK_DETAIL_VALUES` is now keyed on the **pair**, and `riskDetailVerdict` takes both. The
+1:1 mapping holds across all 2,648 rows, so requiring agreement costs nothing today and
+refuses to guess if it ever changes: a known detail arriving with an unexpected state is
+`UNRECOGNIZED`, not a verdict. The classification is untouched — the observation is intact
+and the event stays in `applies`; only the claim about what Microsoft concluded is
+withheld.
+
+**One deliberate asymmetry.** The state is checked only where a verdict is at stake. A
+detail carrying no verdict (`none`) cannot be turned into one by any state, so demanding
+agreement there would inflate the unrecognised tally on ordinary traffic for no
+protection. The strict check guards the claim that costs something — and removing the
+asymmetry is also a type error, since the early return is what narrows
+`verdict` out of `undefined`.
+
+This is the same shape as the module's other findings and it is worth naming plainly: the
+predicate had been **validated against a distribution that measured the pair**, while the
+code read one half of it. The evidence was stronger than the implementation, and the
+`reads:` list did not mention `raw.riskState` — so the gap was visible in the registry all
+along, to anyone comparing the evidence line against the field list.

@@ -17,6 +17,7 @@ import {
   DISPROVED_PREDICATE_PATHS,
   FAILURE_REASON_MEANINGS,
   disprovedPathsForFeed,
+  RISK_DETAIL_VALUES,
   RESULT_CODES,
   SHAPE_PREDICATES,
   OBSERVED_BUT_UNMAPPED_GRAPH_CODES,
@@ -354,10 +355,11 @@ test('out-of-scope and unknown labels never point at collection', () => {
 
 test('every out-of-scope code carries a documented citation', () => {
   const excluded = RESULT_CODES.filter(entry => entry.disposition.kind === 'DOES_NOT_APPLY');
-  // 50058 and 50140 on Microsoft's own "expected part of the flow" statements;
-  // 53004 on the owner's channel-separation rule, since ProofUpBlockedDueToRisk
-  // is a block Microsoft's intelligence decided on.
-  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50011, 50058, 50133, 50140, 50173, 53004, 70044]);
+  // 50058 and 50140 on Microsoft's own "expected part of the flow" statements.
+  // 53004 is NO LONGER HERE: the observation is that MFA configuration was
+  // blocked, which is ours; "due to suspicious activity" is the judgement, and
+  // it now travels as a verdict instead of removing the event.
+  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50011, 50058, 50133, 50140, 50173, 70044]);
   for (const entry of excluded) {
     assert.ok(
       entry.exclusionCitation && entry.exclusionCitation.text.length > 15,
@@ -373,7 +375,16 @@ test('every out-of-scope code carries a documented citation', () => {
   }
   assert.equal(resultCodeEntry(50140)!.exclusionCitation!.kind, 'PROVIDER_STATEMENT');
   assert.equal(resultCodeEntry(50058)!.exclusionCitation!.kind, 'PROVIDER_STATEMENT');
-  assert.equal(resultCodeEntry(53004)!.exclusionCitation!.kind, 'PRODUCT_DECISION');
+  // And nothing is excluded on Microsoft's judgement any more, which was the
+  // one PRODUCT_DECISION exclusion in the table. Every remaining exclusion
+  // rests on a Microsoft statement about what the code MEANS.
+  for (const entry of excluded) {
+    assert.equal(
+      entry.exclusionCitation!.kind,
+      'PROVIDER_STATEMENT',
+      `code ${entry.code} is excluded on our own choice; the verdict dimension is where a judgement goes`,
+    );
+  }
 });
 
 test('50076 is a control signal, not "not a credential event"', () => {
@@ -476,25 +487,30 @@ test('50053 resolves its three documented meanings from the description text', a
     outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
   });
 
-  // Microsoft's own threat intelligence made this call, so it is Microsoft's
-  // channel rather than a control the tenant configured.
+  // The other two texts decompose. "A sign-in was attempted, it did not
+  // succeed, and a control stopped it rather than a wrong credential" are
+  // three observations; "because Microsoft assessed the source as risky" is a
+  // judgement. BLOCKED_BY_CONTROL names the observations and no judgement, and
+  // the judgement leaves as a verdict.
   const malicious = await run([graphRow({ status: {
     errorCode: 50053,
     failureReason: 'Sign-in was blocked because it came from an IP address with malicious activity.',
   } })]);
   assert.deepEqual(only(malicious).classification, {
-    kind: 'DOES_NOT_APPLY',
-    reason: 'MICROSOFT_RISK_VERDICT',
+    kind: 'APPLIES',
+    outcome: 'BLOCKED_BY_CONTROL',
   });
+  assert.equal(malicious.counts.microsoftVerdicts.RISK, 1, 'the judgement is not discarded either');
 
   const risk = await run([graphRow({ status: {
     errorCode: 50053,
     failureReason: 'Sign-in was blocked by built-in protections due to high confidence of risk.',
   } })]);
   assert.deepEqual(only(risk).classification, {
-    kind: 'DOES_NOT_APPLY',
-    reason: 'MICROSOFT_RISK_VERDICT',
+    kind: 'APPLIES',
+    outcome: 'BLOCKED_BY_CONTROL',
   });
+  assert.equal(risk.counts.microsoftVerdicts.RISK, 1);
 });
 
 test('50053 text that matches nothing, or more than one meaning, stays unknown', async () => {
@@ -539,27 +555,57 @@ test('the description-text meanings are a closed set and each records its eviden
   assert.deepEqual([...UNVALIDATED_FAILURE_REASON_MEANINGS].sort(), ['HIGH_CONFIDENCE_RISK_BLOCK', 'SUSPICIOUS_ACTIVITY_BLOCK']);
 });
 
-test('the one branch that removes an event from evaluation has the narrowest fragment', () => {
-  // Every other branch keeps the event in `applies`, so a too-broad fragment
-  // there costs an outcome label. The risk-verdict branch diverts the event
-  // into Microsoft's channel and out of our findings entirely, so it is held
-  // to a single distinctive phrase — and the two texts that DO occur in
-  // production must not reach it.
-  const risk = FAILURE_REASON_MEANINGS.find(pattern => pattern.meaning === 'HIGH_CONFIDENCE_RISK_BLOCK')!;
-  assert.equal(risk.disposition.kind, 'DOES_NOT_APPLY');
-  assert.deepEqual(risk.fragments, ['high confidence of risk']);
-
-  for (const text of [
-    'You’ve tried to sign in too many times with an incorrect user ID or password.',
-    'Sign-in was blocked because it came from an IP address with malicious activity.',
-    'The account is locked by built-in protections.',
-  ]) {
-    assert.notEqual(
-      failureReasonMeaning(text)?.meaning,
-      'HIGH_CONFIDENCE_RISK_BLOCK',
-      `"${text}" must not be diverted out of our findings`,
+test('no description text can remove an event from evaluation, and the verdict-bearing fragments stay narrow', () => {
+  // THE GUARD THIS REPLACES, and why it did not simply retire. It previously
+  // held one branch to a narrow fragment because that branch alone diverted an
+  // event out of our findings. No branch does that now, so the stated reason
+  // is gone — but the danger did not go with it, it MOVED. A too-broad
+  // fragment now attaches a Microsoft RISK verdict to a row Microsoft never
+  // judged, which fabricates evidence in the other channel. That is the worse
+  // of the two failures: dropping an event costs coverage and is counted,
+  // while inventing a judgement is a claim about what Microsoft said.
+  //
+  // So the first assertion is the property the fix established, structurally:
+  for (const pattern of FAILURE_REASON_MEANINGS) {
+    assert.equal(
+      pattern.disposition.kind,
+      'APPLIES',
+      `${pattern.meaning} removes an event from evaluation; the text carries a judgement, not a veto`,
     );
   }
+
+  // And the second is narrowness, now scoped to the branches that speak for
+  // Microsoft rather than to the one that used to divert.
+  const verdictBearing = FAILURE_REASON_MEANINGS.filter(pattern => pattern.verdict !== undefined);
+  assert.deepEqual(
+    verdictBearing.map(pattern => pattern.meaning).sort(),
+    ['HIGH_CONFIDENCE_RISK_BLOCK', 'MALICIOUS_IP_BLOCK', 'SUSPICIOUS_ACTIVITY_BLOCK'],
+  );
+  for (const pattern of verdictBearing) {
+    assert.equal(pattern.fragments.length, 1, `${pattern.meaning} speaks for Microsoft on more than one phrase`);
+  }
+  assert.deepEqual(
+    FAILURE_REASON_MEANINGS.find(pattern => pattern.meaning === 'HIGH_CONFIDENCE_RISK_BLOCK')!.fragments,
+    ['high confidence of risk'],
+  );
+
+  // The control cohort: a lockout is a threshold being crossed, not a
+  // judgement, so no lockout text may pick up a verdict.
+  for (const text of [
+    'You’ve tried to sign in too many times with an incorrect user ID or password.',
+    'The account is locked by built-in protections.',
+  ]) {
+    assert.equal(
+      failureReasonMeaning(text)?.verdict,
+      undefined,
+      `"${text}" must not be credited to Microsoft’s judgement`,
+    );
+  }
+  // And each verdict-bearing text still resolves to its own meaning only.
+  assert.equal(
+    failureReasonMeaning('Sign-in was blocked because it came from an IP address with malicious activity.')?.meaning,
+    'MALICIOUS_IP_BLOCK',
+  );
 });
 
 test('the lockout gets its own outcome rather than being called an invalid credential', async () => {
@@ -577,22 +623,27 @@ test('the lockout gets its own outcome rather than being called an invalid crede
   assert.equal(isPostPasswordInterrupt('LOCKED_OUT_AFTER_REPEATED_FAILURES'), false);
 });
 
-test('Microsoft’s risk verdict is surfaced separately and kept out of our findings', async () => {
+test('Microsoft’s risk verdict travels beside the observation rather than replacing it', async () => {
   // Our findings and Microsoft-reported risk are two evidence channels that
-  // are never merged or summed. A verdict Microsoft reached is not a HawkView
-  // finding — but it is the only Microsoft risk signal an unlicensed tenant
-  // gets, so it must not be lost to a counter either.
+  // are never merged or summed. Separation is enforced by the verdict being
+  // unreadable from an event, NOT by the event leaving evaluation: two
+  // analysts reading the same log line and reaching independent conclusions is
+  // the point of running two channels.
   const batch = await run([
     graphRow({ id: 'ours', status: { errorCode: 50126 } }),
-    graphRow({ id: 'microsofts', status: {
+    graphRow({ id: 'both', status: {
       errorCode: 50053,
       failureReason: 'Sign-in was blocked by built-in protections due to high confidence of risk.',
     } }),
   ]);
 
-  assert.deepEqual(batch.applies.map(event => event.eventId), ['ours']);
-  assert.deepEqual(batch.microsoftRiskVerdicts.map(event => event.eventId), ['microsofts']);
-  assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_RISK_VERDICT, 1);
+  assert.deepEqual(batch.applies.map(event => event.eventId), ['both', 'ours']);
+  assert.deepEqual(batch.microsoftRiskVerdicts.map(event => event.eventId), ['both']);
+  assert.equal(batch.counts.microsoftVerdicts.RISK, 1);
+  // The same object in both places, so nothing is duplicated or copied.
+  assert.equal(batch.microsoftRiskVerdicts[0], batch.applies.find(event => event.eventId === 'both'));
+  // And the judged event still leaks nothing a detector could read.
+  assert.equal(JSON.stringify(batch.microsoftRiskVerdicts[0]).includes('RISK'), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -1047,22 +1098,26 @@ test('a code’s description text can only mean what that code declares', async 
   assert.equal(resultCodeEntry(50126)!.textMeanings, undefined);
 });
 
-test('50131’s suspicious-activity variant is Microsoft’s judgement, not our finding', async () => {
+test('50131’s two variants classify the same and differ only in the verdict', async () => {
+  // The text refinement no longer changes the OUTCOME here at all — both
+  // variants are a control blocking a sign-in — so what the fragment buys is
+  // exactly one thing: whether Microsoft is credited with the judgement.
+  // Stating it this way makes the cost of a too-broad fragment visible.
   const suspicious = await run([graphRow({ status: {
     errorCode: 50131,
     failureReason: 'Request blocked due to suspicious activity.',
   } })]);
-  assert.deepEqual(only(suspicious).classification, {
-    kind: 'DOES_NOT_APPLY',
-    reason: 'MICROSOFT_RISK_VERDICT',
-  });
+  assert.deepEqual(only(suspicious).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
   assert.deepEqual(suspicious.microsoftRiskVerdicts.map(event => event.eventId), ['evt-1']);
-  assert.equal(suspicious.applies.length, 0);
+  assert.equal(suspicious.applies.length, 1);
 
-  // A plain Conditional Access failure is the tenant's own control working,
-  // which is ours to report.
+  // A plain Conditional Access failure is the tenant's own control working.
+  // Same classification, and NO verdict: we do not put words in Microsoft's
+  // mouth for a block the tenant configured itself.
   const plain = await run([graphRow({ status: { errorCode: 50131, failureReason: 'Access denied.' } })]);
   assert.deepEqual(only(plain).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
+  assert.deepEqual(plain.microsoftRiskVerdicts, []);
+  assert.equal(plain.counts.microsoftVerdicts.RISK, 0);
 });
 
 test('subject-not-in-tenant loss is in the coverage statement, not left internal', async () => {
@@ -1164,18 +1219,22 @@ test('the measured 50053 literals are byte-exact in this test', () => {
 test('each measured literal resolves to exactly its own meaning', async () => {
   const malicious = await run([graphRow({ status: { errorCode: 50053, failureReason: MALICIOUS_IP_LITERAL } })]);
   assert.deepEqual(only(malicious).classification, {
-    kind: 'DOES_NOT_APPLY',
-    reason: 'MICROSOFT_RISK_VERDICT',
+    kind: 'APPLIES',
+    outcome: 'BLOCKED_BY_CONTROL',
   });
+  assert.equal(malicious.counts.microsoftVerdicts.RISK, 1);
 
   const lockout = await run([graphRow({ status: { errorCode: 50053, failureReason: LOCKOUT_LITERAL } })]);
   assert.deepEqual(only(lockout).classification, {
     kind: 'APPLIES',
     outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
   });
+  // The two measured texts now share a classification KIND, so the outcome is
+  // what separates them, and the verdict is what separates their channels.
+  assert.equal(lockout.counts.microsoftVerdicts.RISK, 0);
 
   // Control: each literal matches ONE fragment set and not the other, and
-  // neither reaches the risk-verdict branch that has no production evidence.
+  // neither reaches the two branches that have no production evidence.
   assert.equal(failureReasonMeaning(MALICIOUS_IP_LITERAL)?.meaning, 'MALICIOUS_IP_BLOCK');
   assert.equal(failureReasonMeaning(LOCKOUT_LITERAL)?.meaning, 'SMART_LOCKOUT');
   for (const literal of [MALICIOUS_IP_LITERAL, LOCKOUT_LITERAL]) {
@@ -1293,12 +1352,16 @@ test('the audit code corroborates and never overrides the reason name', async ()
   assert.deepEqual(only(synthetic).classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
 });
 
-test('53004 is in Microsoft’s channel and shows up in that list', async () => {
+test('53004 is an observation of ours that also carries Microsoft’s judgement', async () => {
+  // ProofUpBlockedDueToRisk. The observation is that MFA registration was
+  // blocked for this subject at this time — a fact from our own log, and one
+  // a rule can use without Microsoft's reasoning. "Due to risk" is the
+  // judgement and leaves separately.
   const batch = await run([graphRow({ status: { errorCode: 53004 } })]);
-  assert.deepEqual(only(batch).classification, { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' });
+  assert.deepEqual(only(batch).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
   assert.deepEqual(batch.microsoftRiskVerdicts.map(event => event.eventId), ['evt-1']);
-  assert.equal(batch.applies.length, 0);
-  assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_RISK_VERDICT, 1);
+  assert.equal(batch.applies.length, 1);
+  assert.equal(batch.counts.microsoftVerdicts.RISK, 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -1340,12 +1403,18 @@ test('observed codes we do not map are recorded, and cost coverage rather than b
   }
 });
 
-test('53004 stays in Microsoft’s channel but is marked as never observed', () => {
+test('53004 classifies normally and is still marked as never observed', () => {
+  // Returning it to evaluation does not make it evidence. The observation
+  // marker is the separate claim, and it is unchanged: zero rows in all
+  // history, so this is a mapping read from documentation.
   const entry = resultCodeEntry(53004)!;
-  assert.deepEqual(entry.disposition, { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' });
+  assert.deepEqual(entry.disposition, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
+  assert.equal(entry.verdict, 'RISK');
   assert.equal(entry.graphObservation, 'NOT_OBSERVED');
   assert.match(entry.note ?? '', /NO PRODUCTION EVIDENCE/);
-  assert.ok((entry.exclusionCitation?.text ?? '').length > 15);
+  // No citation, because nothing is being excluded any more. A leftover one
+  // would be a documented reason for a decision that was reversed.
+  assert.equal(entry.exclusionCitation, undefined);
 });
 
 test('a Microsoft risk verdict and a Microsoft safety verdict can never be the same thing', async () => {
@@ -1362,8 +1431,8 @@ test('a Microsoft risk verdict and a Microsoft safety verdict can never be the s
     assert.equal(riskIds.has(event.eventId), false, 'an event must never be in both lists');
   }
   // Asserted last: node:assert narrows the type, which would make the loop above vacuous.
-  assert.equal(batch.microsoftSafetyVerdicts.length, 0, 'unreachable until riskDetail has a control cohort');
-  assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_SAFETY_VERDICT, 0);
+  assert.equal(batch.microsoftSafetyVerdicts.length, 0, 'no row here carries a safety verdict');
+  assert.equal(batch.counts.microsoftVerdicts.SAFE, 0);
 });
 
 
@@ -1583,6 +1652,7 @@ test('a judged success still feeds our rules, and the verdict travels separately
   // Microsoft independently thought worth challenging.
   const remediated = await run([graphRow({
     riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
+    riskState: 'remediated',
     conditionalAccessStatus: 'success',
     status: { errorCode: 0, failureReason: 'Other.' },
   })]);
@@ -1598,12 +1668,13 @@ test('a judged success still feeds our rules, and the verdict travels separately
   // detection. Disagreeing with Microsoft visibly is the product.
   const safe = await run([graphRow({
     riskDetail: 'aiConfirmedSigninSafe',
+    riskState: 'dismissed',
     status: { errorCode: 0, failureReason: 'Other.' },
   })]);
   assert.deepEqual(only(safe).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
   assert.deepEqual(safe.microsoftSafetyVerdicts.map(e => e.eventId), ['evt-1']);
 
-  const benign = await run([graphRow({ riskDetail: 'none', status: { errorCode: 0, failureReason: 'Other.' } })]);
+  const benign = await run([graphRow({ riskDetail: 'none', riskState: 'none', status: { errorCode: 0, failureReason: 'Other.' } })]);
   assert.deepEqual(benign.microsoftSafetyVerdicts, []);
   assert.deepEqual(benign.microsoftRemediatedVerdicts, []);
   assert.equal(benign.counts.microsoftVerdicts.SAFE, 0);
@@ -1615,6 +1686,7 @@ test('a detector cannot read Microsoft’s judgement, structurally', async () =>
   // HawkView finding cannot cite Microsoft's conclusion even by accident.
   const batch = await run([graphRow({
     riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
+    riskState: 'remediated',
     status: { errorCode: 0, failureReason: 'Other.' },
   })]);
   const event = only(batch);
@@ -1624,6 +1696,65 @@ test('a detector cannot read Microsoft’s judgement, structurally', async () =>
   }
   // The same object is in both places, and only the batch-level list knows.
   assert.equal(batch.microsoftRemediatedVerdicts[0], batch.applies[0]);
+});
+
+test('a verdict is read from the detail AND the state, not from the detail alone', async () => {
+  // The gap a consumer found by asking a question this layer could not
+  // answer: the frontend groups Microsoft records by riskState — atRisk,
+  // remediated and dismissed are different headings — while the verdict here
+  // was derived from riskDetail and the state was never read at all. Every
+  // grouping would have been correct on observed data and correct by
+  // COINCIDENCE, with nothing to notice if the two ever disagreed. A stable-
+  // looking arbitrary grouping is worse than one that is wrong on purpose.
+  const measured = await run([graphRow({
+    riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
+    riskState: 'remediated',
+    status: { errorCode: 0, failureReason: 'Other.' },
+  })]);
+  assert.equal(measured.counts.microsoftVerdicts.REMEDIATED, 1);
+
+  // Same detail, a state it has never been observed with. We do not know
+  // which half to believe, and saying so beats picking one.
+  for (const riskState of ['atRisk', 'confirmedCompromised', 'none', undefined]) {
+    const mismatched = await run([graphRow({
+      riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
+      riskState,
+      status: { errorCode: 0, failureReason: 'Other.' },
+    })]);
+    assert.equal(mismatched.counts.microsoftVerdicts.UNRECOGNIZED, 1, `riskState ${String(riskState)}`);
+    assert.equal(mismatched.counts.microsoftVerdicts.REMEDIATED, 0, `riskState ${String(riskState)}`);
+    assert.deepEqual(mismatched.microsoftRemediatedVerdicts, [], `riskState ${String(riskState)}`);
+    // UNKNOWN would have been the wrong response: the observation is intact.
+    assert.deepEqual(only(mismatched).classification, {
+      kind: 'APPLIES',
+      outcome: 'PASSWORD_ACCEPTED_COMPLETED',
+    });
+  }
+
+  // THE ASYMMETRY, and it is deliberate. A detail carrying NO verdict cannot
+  // be turned into one by any state, so demanding agreement there would
+  // inflate the unrecognised tally on ordinary traffic for no protection.
+  // The strict check guards only the claim that costs something.
+  for (const riskState of ['none', 'atRisk', undefined]) {
+    const benign = await run([graphRow({
+      riskDetail: 'none',
+      riskState,
+      status: { errorCode: 0, failureReason: 'Other.' },
+    })]);
+    assert.equal(benign.counts.microsoftVerdicts.UNRECOGNIZED, 0, `riskState ${String(riskState)}`);
+    assert.equal(benign.counts.microsoftVerdicts.RISK, 0, `riskState ${String(riskState)}`);
+  }
+
+  // And the closed set records the pair, so the agreement requirement rests
+  // on measurement rather than on a guess about Microsoft's vocabulary.
+  assert.deepEqual(
+    RISK_DETAIL_VALUES.map(entry => [entry.value, entry.riskState, entry.verdict ?? null]),
+    [
+      ['none', 'none', null],
+      ['userPassedMFADrivenByRiskBasedPolicy', 'remediated', 'REMEDIATED'],
+      ['aiConfirmedSigninSafe', 'dismissed', 'SAFE'],
+    ],
+  );
 });
 
 test('an unrecognised verdict value classifies normally and is counted', async () => {
@@ -1644,7 +1775,7 @@ test('an unrecognised verdict value classifies normally and is counted', async (
 
 test('the verdict counters are orthogonal and must not be summed with the tallies', async () => {
   const batch = await run([
-    graphRow({ id: 'judged', riskDetail: 'userPassedMFADrivenByRiskBasedPolicy', status: { errorCode: 0, failureReason: 'Other.' } }),
+    graphRow({ id: 'judged', riskDetail: 'userPassedMFADrivenByRiskBasedPolicy', riskState: 'remediated', status: { errorCode: 0, failureReason: 'Other.' } }),
     graphRow({ id: 'ours', status: { errorCode: 50126 } }),
   ]);
   // Two rows, two events, and one of them ALSO carries a verdict.
@@ -1660,12 +1791,20 @@ test('the verdict counters are orthogonal and must not be summed with the tallie
   assert.equal(accounted, batch.counts.rows, 'the four vocabularies still account for every row');
 });
 
-test('the codes that carry a verdict still reach the risk list', async () => {
-  // 53004 and 50053's risk texts remain classified DOES_NOT_APPLY pending a
-  // consistency ruling, but they now reach the list through the verdict
-  // dimension rather than through their reason, so the mechanism is uniform.
+test('every code and text that carries a RISK verdict also classifies into evaluation', async () => {
+  // The inconsistency this test used to record is resolved: there is no
+  // longer a route by which Microsoft's judgement removes an event. One
+  // mechanism, applied to riskDetail, 53004 and the description texts alike.
+  for (const entry of RESULT_CODES) {
+    if (entry.verdict === undefined) continue;
+    assert.equal(
+      entry.disposition.kind,
+      'APPLIES',
+      `code ${entry.code} carries a verdict AND removes the event; that is the collapse this layer exists to prevent`,
+    );
+  }
   const batch = await run([graphRow({ id: 'proofup', status: { errorCode: 53004 } })]);
-  assert.deepEqual(only(batch).classification, { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' });
+  assert.deepEqual(only(batch).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
   assert.deepEqual(batch.microsoftRiskVerdicts.map(e => e.eventId), ['proofup']);
   assert.equal(batch.counts.microsoftVerdicts.RISK, 1);
 

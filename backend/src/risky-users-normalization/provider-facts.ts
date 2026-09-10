@@ -228,27 +228,18 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     verdict: 'RISK',
     microsoftName: 'ProofUpBlockedDueToRisk',
     claimClass: 'ATTACK_AND_CONTROL',
-    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
-    exclusionCitation: {
-      kind: 'PRODUCT_DECISION',
-      text:
-        'The owner’s channel-separation rule: our findings and Microsoft-reported risk are two channels ' +
-        'that are never merged or summed. Microsoft’s own name for this code is ProofUpBlockedDueToRisk — ' +
-        'a block Microsoft’s intelligence decided on, not a control the tenant configured. A CHOICE we ' +
-        'made, revisitable, unlike a provider statement.',
-    },
+    disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
     note:
       'Cannot configure MFA due to suspicious activity. NO PRODUCTION EVIDENCE: zero rows, all ' +
       'tenants, all history, so it is exercised by synthetic fixture only and kept because the name ' +
       'ProofUpBlockedDueToRisk is reasonable anticipation from documentation. ' +
-      'OPEN INCONSISTENCY, recorded rather than resolved: the ruling that the observation is ours ' +
-      'while the verdict is Microsoft own returned the riskDetail cases to normal classification, ' +
-      'while this code and the 50053 risk-text meanings stay classified DOES_NOT_APPLY. The two ' +
-      'differ in one real way — riskDetail is a SEPARATE field, so the observation is readable ' +
-      'without the verdict, whereas here the code IS both statements at once. Applying the ruling ' +
-      'here would return these to APPLIES/BLOCKED_BY_CONTROL carrying verdict RISK, which for the ' +
-      '50053 malicious-IP text is roughly 921 rows. Escalated as a consistency question rather than ' +
-      'decided, because it was previously ruled the other way under the older framing.',
+      'THE INCONSISTENCY THAT WAS RECORDED HERE IS RESOLVED. The objection was that riskDetail is a ' +
+      'SEPARATE field, so an observation is readable there without the verdict, whereas this code IS ' +
+      'both statements at once and cannot be split. The answer is that it can: "MFA configuration ' +
+      'was blocked for this subject at this time" is the observation, and "due to risk" is the ' +
+      'judgement, which travels as a verdict. Nothing about the observation needs Microsoft reasoning ' +
+      'to be usable by a rule. The same reading returned the 50053 risk texts, roughly 921 rows for ' +
+      'the malicious-IP text alone.',
   },
   {
     code: 50131,
@@ -261,7 +252,8 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
       'A Conditional Access failure is the TENANT’S OWN control working, which is ours to report. But this ' +
       'code also carries a "request blocked due to suspicious activity" variant in its description, and ' +
       'that is Microsoft’s judgement rather than a control the tenant configured — so the text can move it ' +
-      'to MICROSOFT_RISK_VERDICT. Unmatched text keeps the control-block default, which is the confident ' +
+      'to a Microsoft RISK verdict, which travels beside the classification rather than replacing it. ' +
+      'Unmatched text keeps the control-block default, which is the confident ' +
       'reading of the code itself.',
   },
   {
@@ -593,11 +585,36 @@ export interface FailureReasonPattern extends CarriesVerdict {
 }
 
 export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
+  // WHY THESE CLASSIFY AS OBSERVATIONS WHILE CARRYING A VERDICT.
+  //
+  // The text is one sentence but it is not one fact. "Blocked by built-in
+  // protections due to high confidence of risk" decomposes into:
+  //   - a sign-in attempt occurred, by this subject, at this time, from this
+  //     address                                              OBSERVATION
+  //   - it did not succeed                                    OBSERVATION
+  //   - it was stopped by a control rather than by a wrong
+  //     credential                                           OBSERVATION
+  //   - the control fired because Microsoft assessed the
+  //     source as risky                                       JUDGEMENT
+  //
+  // BLOCKED_BY_CONTROL names the first three and no judgement. The fourth
+  // travels as a MicrosoftVerdict, which never appears on an event.
+  //
+  // THE TEST THAT SETTLES IT: would a HawkView finding over these rows be
+  // derivable WITHOUT Microsoft's judgement? Yes — repeated failed attempts
+  // from one source is a pattern in the attempt data itself, so Microsoft's
+  // reason corroborates a finding rather than being its source. If it were
+  // not independently derivable, these would belong out of scope.
+  //
+  // And the split is mechanically available: code 50053 alone is ambiguous
+  // across three meanings, so the text is already a separate string doing
+  // separate work. The outcome is classified from it and the text itself is
+  // never handed on — NormalizedEvent carries no failureReason.
   {
     meaning: 'SUSPICIOUS_ACTIVITY_BLOCK',
     verdict: 'RISK',
     fragments: ['suspicious activity'],
-    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
+    disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
     verification: {
       state: 'NO_PRODUCTION_EVIDENCE',
       why:
@@ -617,7 +634,7 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
     // the Microsoft channel. 'built-in protections' was dropped for that
     // reason: it is not distinctive enough to carry that consequence.
     fragments: ['high confidence of risk'],
-    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
+    disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
     verification: {
       state: 'NO_PRODUCTION_EVIDENCE',
       why:
@@ -638,7 +655,7 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
     meaning: 'MALICIOUS_IP_BLOCK',
     verdict: 'RISK',
     fragments: ['malicious activity'],
-    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
+    disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
     verification: {
       state: 'OBSERVED_IN_PRODUCTION',
       evidence:
@@ -909,27 +926,42 @@ export const AUDIT_REASON_NAMES_OBSERVED_UNMAPPED: readonly { readonly name: str
  * explicit string `none` rather than a missing or hidden value, so the field
  * does not default to a verdict on ordinary human traffic.
  *
- * Unmatched values route to UNKNOWN, never through and never to risk. The cost
- * of being wrong is asymmetric — an unrecognised verdict falling through would
- * risk presenting Microsoft's detection as our own finding, a correctness
- * violation, whereas landing in UNKNOWN only costs stated coverage. And 100%
- * of observed is not 100% of possible: `none` may not be the only benign
- * value another tenant emits.
+ * Unmatched values are COUNTED and change nothing, because the verdict cannot
+ * reach a detector: it never appears on a NormalizedEvent. 100% of observed is
+ * not 100% of possible — `none` may not be the only benign value another
+ * tenant emits — so the unrecognised tally is how coverage discloses that
+ * Microsoft said something we could not read.
  */
 export interface RiskDetailEntry extends CarriesVerdict {
   readonly value: string;
+  /**
+   * The riskState this detail is observed WITH.
+   *
+   * Recorded because a consumer groups Microsoft records by STATE — atRisk,
+   * remediated and dismissed land in different groups under different
+   * headings — while this layer derived its verdict from the DETAIL alone and
+   * never read the state at all. That is stable-looking and arbitrary: every
+   * grouping would have been correct on observed data and correct by
+   * coincidence, with nothing to notice if the two ever disagreed.
+   *
+   * Measured 1:1 across all 2,648 rows, so requiring agreement costs nothing
+   * today and refuses to guess if that changes.
+   */
+  readonly riskState: string;
   readonly note: string;
 }
 
 export const RISK_DETAIL_VALUES: readonly RiskDetailEntry[] = [
   {
     value: 'none',
+    riskState: 'none',
     note:
       'The benign value, and the control cohort: 2,593 of 2,648 rows including 958 ordinary successes. ' +
       'Explicitly the string "none" rather than absent or hidden.',
   },
   {
     value: 'userPassedMFADrivenByRiskBasedPolicy',
+    riskState: 'remediated',
     verdict: 'REMEDIATED',
     note:
       'Microsoft assessed risk, a risk-based Conditional Access policy challenged the user, and MFA ' +
@@ -939,6 +971,7 @@ export const RISK_DETAIL_VALUES: readonly RiskDetailEntry[] = [
   },
   {
     value: 'aiConfirmedSigninSafe',
+    riskState: 'dismissed',
     verdict: 'SAFE',
     note:
       'Microsoft AI concluded the sign-in was safe. A dismissal, not a detection. Microsoft own ' +
@@ -961,16 +994,26 @@ const BY_RISK_DETAIL: ReadonlyMap<string, RiskDetailEntry> = new Map(
  * and it cannot: verdicts never appear on NormalizedEvent. An unrecognised
  * value is counted instead, so coverage can disclose that Microsoft said
  * something we could not read.
+ *
+ * TAKES THE PAIR, not the detail. The state is checked only where a verdict
+ * is at stake, and the asymmetry is deliberate: a detail carrying no verdict
+ * cannot be turned into one by any state, so demanding agreement there would
+ * inflate the unrecognised tally on ordinary traffic for no protection.
+ * Where a verdict IS at stake, a disagreeing state means we do not know which
+ * half to believe, and saying so is better than picking one.
  */
-export function riskDetailVerdict(value: unknown):
+export function riskDetailVerdict(detail: unknown, state: unknown):
   | { readonly kind: 'NONE' }
   | { readonly kind: 'VERDICT'; readonly verdict: MicrosoftVerdict }
   | { readonly kind: 'UNRECOGNIZED' } {
-  if (value === undefined || value === null || value === '') return { kind: 'NONE' };
-  if (typeof value !== 'string' || value.length > 256) return { kind: 'UNRECOGNIZED' };
-  const entry = BY_RISK_DETAIL.get(value.trim().toLowerCase());
+  if (detail === undefined || detail === null || detail === '') return { kind: 'NONE' };
+  if (typeof detail !== 'string' || detail.length > 256) return { kind: 'UNRECOGNIZED' };
+  const entry = BY_RISK_DETAIL.get(detail.trim().toLowerCase());
   if (!entry) return { kind: 'UNRECOGNIZED' };
-  return entry.verdict === undefined ? { kind: 'NONE' } : { kind: 'VERDICT', verdict: entry.verdict };
+  if (entry.verdict === undefined) return { kind: 'NONE' };
+  const observedState = typeof state === 'string' ? state.trim().toLowerCase() : '';
+  if (observedState !== entry.riskState.toLowerCase()) return { kind: 'UNRECOGNIZED' };
+  return { kind: 'VERDICT', verdict: entry.verdict };
 }
 
 export type ShapePredicateVerification
@@ -1295,7 +1338,7 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
   },
   {
     id: 'graph.risk-detail',
-    reads: ['raw.riskDetail', 'raw.conditionalAccessStatus', 'raw.appliedConditionalAccessPolicies'],
+    reads: ['raw.riskDetail', 'raw.riskState', 'raw.conditionalAccessStatus', 'raw.appliedConditionalAccessPolicies'],
     claim:
       'raw.riskDetail carries Microsoft’s own verdict about a sign-in, so a row bearing one belongs in ' +
       'the Microsoft channel rather than in HawkView’s findings — and the verdict KIND (risky versus ' +
@@ -1305,7 +1348,10 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       evidence:
         'Measured across 2,648 Graph rows. Exactly three values exist: none (2,593), ' +
         'userPassedMFADrivenByRiskBasedPolicy / remediated (54), aiConfirmedSigninSafe / dismissed (1). ' +
-        'See RISK_DETAIL_VALUES for the closed set and the dispositions.',
+        'The detail and the state are 1:1 on every row, and the closed set is keyed on the PAIR rather ' +
+        'than the detail alone: a consumer groups Microsoft records by STATE, so a verdict derived from ' +
+        'the detail while never reading the state would have been right by coincidence. ' +
+        'See RISK_DETAIL_VALUES for the closed set and the verdicts.',
       control:
         'PASSES and is NOT EMPTY, which is what makes it usable: 958 ordinary successes (result code 0) ' +
         'carry the explicit string "none" with riskState "none" — not absent, not hidden — so the field ' +
