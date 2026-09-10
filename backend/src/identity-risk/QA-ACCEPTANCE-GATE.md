@@ -151,3 +151,40 @@ data — a check that matched 100% of Graph rows including humans would have
 reported every tenant clean having examined nothing. Only a distribution check
 against real data with a human-cohort control finds that. Validate any predicate
 about Microsoft payload shape that way **before** it ships.
+
+## The monotonicity harness
+
+`backend/src/evaluation-core/qa-monotonicity-harness.ts` and its proof.
+
+`Detector.monotonic` declares that adding events can never remove a finding.
+That property is what makes a detector safe to run on a **truncated** window,
+and getting it wrong on an absence-keyed rule does not lose a finding — it
+**fabricates** one, because the disconfirming event is exactly what truncation
+removes. So it is the last place a self-declaration should go unchecked.
+
+The harness runs a detector over random nested pairs `S ⊆ S'` and asserts every
+finding from `S` survives in `S'`. It is **generic over the event type**, so it
+needs no knowledge of Microsoft fields and works for every detector, present and
+future. Seeding is deterministic: a failure reproduces from its seed alone.
+
+Two properties it was built with, both learned the hard way here:
+
+- **`findingsSeen` must be non-zero.** A harness whose detector produced no
+  findings reports `held: true` while proving nothing. That is the vacuity
+  failure this workstream hit three times; insist on the count, not the verdict.
+- **A decline is not a violation.** If the larger run returns `INAPPLICABLE` the
+  finding is gone, but the detector never claimed to have looked — and some
+  declines are correct by construction, such as refusing a truncated window.
+  Reported as `LOST_TO_DECLINE`, separate from `LOST_WHILE_RAN`, and tolerable
+  via `declineIsViolation: false`. Collapsing the two would make a correct
+  decline read as a defect, which is the same collapse this project exists to
+  remove.
+
+The proof file demonstrates the harness **discriminates** rather than assuming
+it: a presence-keyed detector holds (519 findings observed surviving), an
+absence-keyed one mis-declared monotonic fails at trial 1 with a named
+counterexample, and a declining detector is reported as `LOST_TO_DECLINE`.
+
+Like the probes, these import the rebuild's `evaluation-core` contract and will
+not compile on this branch. Kept here because a QA instrument is stronger when
+it is not maintained by the author whose declarations it checks.
