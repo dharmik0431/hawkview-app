@@ -26,15 +26,36 @@ import type { CollectionScope } from '../risky-users-normalization/reasons.js'
  * the two are set together, here, from one clock. */
 const WINDOW_DAYS = 30
 
-/** Which collector feeds which classifier source.
+/** WHICH COLLECTOR WROTE THE TABLE WE READ — not which collector name matches
+ * the feed.
  *
- * Two collectors with independent health: Graph sign-ins arrive via SIGN_INS,
- * the audit fallback via M365_AUDIT. Three of five tenants are audit-fed, so
- * asking the wrong collector about a tenant's evidence is the majority case
- * rather than an edge. */
+ * Both entries are SIGN_INS, and that is the correction rather than an
+ * oversight. This reader reads `sign_in_logs`, and `syncSignInLogs` is what
+ * writes it: when Graph refuses a non-premium tenant it falls back to limited
+ * login activity INSIDE that same collector and stores the result as sign-in
+ * logs. Audit-shaped rows therefore arrive under SIGN_INS too, flagged
+ * `sign-ins-non-premium-fallback-active`.
+ *
+ * M365_AUDIT is a DIFFERENT collector writing a DIFFERENT table,
+ * `m365_audit_records`, which this reader never touches.
+ *
+ * Mapping the audit feed to M365_AUDIT asked a collector that did not supply
+ * the rows whether the rows were current. Measured:
+ *
+ *   Biolink   newest ingest 0.8h   SIGN_INS 0.1h   M365_AUDIT 389.7h
+ *   Raymonds  newest ingest 0.5h   SIGN_INS 0.2h   M365_AUDIT   8.6h
+ *
+ * Against a two-hour freshness window that made all three audit-fed tenants
+ * STALE and withheld their findings — including Raymonds' 462 lockouts — on the
+ * health of a collector whose rows were never being assessed. The evidence was
+ * never stale; the question was pointed at the wrong collector.
+ *
+ * Kept as a per-feed record rather than collapsed to one value: a future feed
+ * reading a different table would need a different resource, and the shape is
+ * where that distinction belongs. */
 const COLLECTOR_FOR: Readonly<Record<NormalizationSource, string>> = {
   GRAPH_SIGN_INS: 'SIGN_INS',
-  M365_AUDIT_STS: 'M365_AUDIT',
+  M365_AUDIT_STS: 'SIGN_INS',
 }
 
 const COLLECTION_SCOPE_FOR: Readonly<Record<NormalizationSource, CollectionScope>> = {
