@@ -543,6 +543,16 @@ export function microsoftDetectionSummary(detection: RiskyUserDetection) {
 
 export type RiskyUserPriority = 'LOW' | 'MEDIUM' | 'HIGH'
 
+export type RiskyUserReason = {
+  title: string
+  /** Distinct pieces of evidence behind this reason, as the server counted. */
+  evidenceCount: number
+  /** True when the count is a ceiling rather than a total. */
+  evidenceCountCapped: boolean
+  firstSeen: string
+  lastSeen: string
+}
+
 export type RiskyUserRow = {
   id: string
   name: string
@@ -557,7 +567,21 @@ export type RiskyUserRow = {
   priorityLabel: string
   /** Most recent observation across this user's current findings. */
   lastSeen: string | null
-  reasons: string[]
+  /**
+   * Each reason with its own count and its own recency, never a list of titles
+   * beside one shared date.
+   *
+   * A row reading "Repeated invalid credentials, External mailbox forwarding —
+   * last seen Tuesday" states two true things and implies a third that is
+   * false: the reader cannot tell which reason was Tuesday, and the natural
+   * assumption is both. On real data one account carried 467 lockouts that
+   * stopped six days before the last password rejection, so the shared date
+   * described the quieter signal and made the louder one look current.
+   *
+   * The count and the date travel in the same object because separating them
+   * is what allows a surface to put one beside the other's date.
+   */
+  reasons: RiskyUserReason[]
   detection: RiskyUserDetection
   protection: { label: string; tone: 'positive' | 'attention' | 'unknown' }
   /** Kept whole so the detail view has the full evidence without a second read. */
@@ -603,7 +627,13 @@ function rowFor(
     priority: user.priority,
     priorityLabel: riskyUserPriorityLabel(user.priority),
     lastSeen,
-    reasons: findings.map((finding) => finding.title),
+    reasons: findings.map((finding) => ({
+      title: finding.title,
+      evidenceCount: finding.evidenceCount,
+      evidenceCountCapped: finding.evidenceCountCapped,
+      firstSeen: finding.firstSeen,
+      lastSeen: finding.lastSeen,
+    })),
     detection: detectionFor(user, channel, microsoftUsers),
     protection: riskProtectionSummary(user),
     user,

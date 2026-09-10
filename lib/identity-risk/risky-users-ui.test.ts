@@ -9,6 +9,7 @@ import {
   assessmentFixture,
   assessmentNow,
   assessmentUser,
+  at,
 } from './assessment-test-fixtures.ts'
 import { syntheticRiskResponses, unavailableMeta } from './test-fixtures.ts'
 
@@ -242,7 +243,7 @@ test('the list gives a technician the four things they triage on', () => {
     'User',
     'Detected by',
     'HawkView priority',
-    'Last seen',
+    'Latest of any reason',
   ])
   assert.match(text, /Synthetic identity/)
   assert.match(text, /Repeated invalid credentials/)
@@ -1241,4 +1242,58 @@ test('an unconfirmed empty Microsoft result never becomes an authoritative zero'
   assert.doesNotMatch(panel!.textContent ?? '', /snapshot is empty/)
   assert.doesNotMatch(panel!.textContent ?? '', /At least 0/)
   assert.doesNotMatch(panel!.textContent ?? '', /≥0/)
+})
+
+test('two reasons with different dates never share one', () => {
+  // Real shape from the fleet: an account with 467 lockouts that stopped six
+  // days before its last password rejection. A row listing both titles beside
+  // a single "last seen" describes the quieter signal and makes the louder one
+  // look current — two true facts implying a false third.
+  const value = assessmentFixture(true)
+  const older = JSON.parse(JSON.stringify(value.users[0].findings[0]))
+  older.id = older.id.replace(/a{4}$/, 'bbbb')
+  older.ruleId = 'HV-ID-AUTH-005.v2'
+  older.ruleVersion = 'v2'
+  older.priority = 'MEDIUM'
+  older.title = 'Failures followed by successful sign-in'
+  older.firstSeen = at(-14)
+  older.lastSeen = at(-12)
+  older.activityWindowEndsAt = at(-11)
+  older.window = { start: at(-15), end: at() }
+  older.evidenceCount = 467
+  older.clientSource = {
+    reference: 'hvr1_context_' + 'a'.repeat(64),
+    qualification: 'QUALIFIED',
+  }
+  value.users[0].findings.push(older)
+  value.users[0].priority = 'MEDIUM'
+  value.rules[1].matchedIdentities = 1
+
+  const { document } = render(value)
+  const cell =
+    document.querySelector(
+      '[aria-labelledby="risky-users-list-heading"] tbody tr td'
+    )?.textContent ?? ''
+
+  // Each reason states its own volume and its own recency.
+  assert.match(cell, /Repeated invalid credentials/)
+  assert.match(cell, /Failures followed by successful sign-in/)
+  assert.match(cell, /467 records/)
+  assert.match(cell, /10 records/)
+  // Two different dates are present, so neither number sits beside the other's.
+  // Two different dates are present, so neither number sits beside the
+  // other's. Split on the label rather than pattern-matching a locale date.
+  const afterLast = cell
+    .split('last ')
+    .slice(1)
+    .map((part: string) => part.trim())
+  assert.equal(afterLast.length, 2, cell)
+  assert.notEqual(afterLast[0], afterLast[1], cell)
+
+  // And the column that aggregates says that is what it does.
+  const headers = [...document.querySelectorAll('th')].map((h: any) =>
+    h.textContent?.trim()
+  )
+  assert.ok(headers.includes('Latest of any reason'))
+  assert.ok(!headers.includes('Last seen'))
 })

@@ -417,7 +417,7 @@ function UserRows({
               HawkView priority
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
-              Last seen
+              Latest of any reason
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
               <span className="sr-only">Open detail</span>
@@ -443,13 +443,20 @@ function UserRows({
                 >
                   {row.email ?? shortReference(row.reference)}
                 </p>
-                <ul className="mt-1.5 space-y-0.5">
+                <ul className="mt-1.5 space-y-1">
                   {row.reasons.map((reason) => (
                     <li
-                      key={reason}
+                      key={reason.title}
                       className="text-xs text-slate-600 dark:text-slate-300"
                     >
-                      {reason}
+                      {reason.title}
+                      <span className="block text-slate-500 dark:text-slate-400">
+                        {reason.evidenceCountCapped
+                          ? `at least ${reason.evidenceCount.toLocaleString()}`
+                          : reason.evidenceCount.toLocaleString()}{' '}
+                        {reason.evidenceCount === 1 ? 'record' : 'records'},
+                        last {time(reason.lastSeen)}
+                      </span>
                     </li>
                   ))}
                 </ul>

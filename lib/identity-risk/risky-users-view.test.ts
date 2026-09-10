@@ -586,7 +586,15 @@ test('the list carries what a technician triages on', () => {
   assert.equal(row.priority, 'LOW')
   assert.equal(row.priorityLabel, 'Low')
   assert.equal(row.lastSeen, at(-1))
-  assert.deepEqual(row.reasons, ['Repeated invalid credentials'])
+  assert.deepEqual(
+    row.reasons.map((reason) => reason.title),
+    ['Repeated invalid credentials']
+  )
+  // Each reason carries its own count and its own recency, so a surface
+  // cannot pair one reason's number with another reason's date.
+  assert.equal(row.reasons[0].evidenceCount, 10)
+  assert.equal(row.reasons[0].evidenceCountCapped, false)
+  assert.equal(row.reasons[0].lastSeen, at(-1))
   assert.equal(row.protection.label, 'Protection not verified')
   // The contract carries no address, so none is invented.
   assert.equal(row.email, null)
