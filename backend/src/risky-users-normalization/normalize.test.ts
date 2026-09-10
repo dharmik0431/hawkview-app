@@ -22,6 +22,7 @@ import {
   reachableOutcomes,
   observedOutcomes,
   AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES,
+  FAILURE_REASON_MEANINGS as ALL_TEXT_MEANINGS,
   RESULT_CODES,
   SHAPE_PREDICATES,
   OBSERVED_BUT_UNMAPPED_GRAPH_CODES,
@@ -2096,4 +2097,106 @@ test('no predicate cites evidence about a field it does not declare', () => {
   for (const id of Object.keys(explained)) {
     assert.ok(SHAPE_PREDICATES.some(entry => entry.id === id), `${id} is explained but does not exist`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// A figure must carry what it rests on, or the number gets quoted without it.
+// ---------------------------------------------------------------------------
+
+test('no percentage in the registry is stated without its denominator', () => {
+  // THE INSTANCE THAT MOTIVATED THIS. Audit UPN binding was recorded as
+  // "96.8% / 97.1% / 77.8%" — three percentages in a row. The third is 7 of 9
+  // rows. Reading it beside two four-figure samples, from my own notes, I
+  // predicted a 997-row tenant would lose ~20% of its rows and look like a
+  // defect; it resolves at 97.1%, an error of about 190 rows. The notes were
+  // the problem: a percentage stripped of its sample size, stored in a place
+  // people quote from, will eventually be quoted without it.
+  //
+  // Sweeping every figure in the registry found nine more bare percentages,
+  // of which the most quotable were the '100% of rows' claims — that form
+  // sounds like a complete claim while hiding whether it is 100% of nine rows
+  // or 100% of 2,645. It is the same defect in its strongest disguise.
+  //
+  // TWO WAYS TO PASS, and the second matters as much as the first: state the
+  // denominator, OR say that it was not recorded. A figure whose basis is
+  // genuinely lost is a real state and should be sayable — what must not be
+  // possible is a bare percentage that reads as though someone checked.
+  const PERCENTAGE = /\d+(?:\.\d+)?%/g;
+  const BASIS = new RegExp([
+    '\\d[\\d,]*\\s*/\\s*\\d[\\d,]*',       // an explicit fraction
+    '\\bof\\s+[\\d,]+',                    // "of 2,645"
+    '\\b\\d{1,3},\\d{3}\\b',                 // a four-figure count nearby
+    '\\b\\d{3,}\\b',                        // a three-figure count nearby
+    '\\bof\\s+(?:nine|ten)\\b',             // spelled-out tiny samples
+    'DENOMINATOR\\b[^.]{0,40}NOT RECORDED',  // the honest escape hatch
+  ].join('|'));
+
+  // PROXIMITY IS NOT ATTRIBUTION, and the window size is where that bites.
+  // A hundred characters was chosen by MUTATION rather than by taste: at 170
+  // a figure passed by sitting near somebody ELSE'S denominator — stripping
+  // the sample sizes out of the UPN triple still passed, because a later
+  // sentence in the same string mentioned two row counts. At 60 a legitimate
+  // disclosure failed. At 100 both mutations fail and nothing legitimate
+  // does.
+  //
+  // So the honest scope: this catches a percentage standing ALONE. It cannot
+  // tell whether a nearby number is the right denominator, and a determined
+  // author can satisfy it with an irrelevant one. That is the same shape as
+  // the reads-versus-evidence check — a cheap static diff that surfaces
+  // candidates, not a proof — and saying so is what keeps it from being
+  // trusted beyond its evidence.
+  const bare: string[] = [];
+  const scan = (label: string, prose: string): void => {
+    for (const match of prose.matchAll(PERCENTAGE)) {
+      const at = match.index ?? 0;
+      if (!BASIS.test(prose.slice(Math.max(0, at - 100), at + 100))) {
+        bare.push(`${label} states ${match[0]} with no denominator and no note that it was not recorded`);
+      }
+    }
+  };
+
+  for (const predicate of SHAPE_PREDICATES) {
+    const verification = predicate.verification as Record<string, unknown>;
+    scan(`predicate ${predicate.id}`, [
+      verification.evidence, verification.control, verification.cohort,
+      verification.controlCohort, verification.revivedBy, predicate.claim,
+    ].filter((value): value is string => typeof value === 'string').join('   '));
+  }
+  for (const entry of RESULT_CODES) {
+    scan(`code ${entry.code}`, [entry.note ?? '', entry.exclusionCitation?.text ?? ''].join('   '));
+  }
+  for (const entry of AUDIT_REASON_NAMES) {
+    scan(`audit ${entry.name}`, [entry.note ?? '', entry.divergenceReason ?? ''].join('   '));
+  }
+  for (const pattern of ALL_TEXT_MEANINGS) {
+    const verification = pattern.verification as Record<string, unknown>;
+    scan(`text ${pattern.meaning}`, [verification.evidence, verification.control]
+      .filter((value): value is string => typeof value === 'string').join('   '));
+  }
+  for (const entry of RISK_DETAIL_VALUES) scan(`riskDetail ${entry.value}`, entry.note);
+
+  assert.deepEqual(bare, []);
+});
+
+test('the one figure whose basis is lost says so, and says what it still supports', () => {
+  // 94.8% of lockout rows have no 50126 for the same user within ±15 minutes.
+  // The most load-bearing bare percentage in the file, and its denominator was
+  // never recorded — so it cannot be checked or compared against a later
+  // measurement, and reconstructing it from today's lockout count would be the
+  // two-moments-as-one-snapshot error that started all of this.
+  //
+  // Kept rather than deleted, because the mapping it supports — a lockout is
+  // its own outcome rather than a rejected password — rests on the DIRECTION
+  // of the finding and not its magnitude. That distinction is the reason a lost
+  // denominator is a disclosure rather than a retraction, and the entry has to
+  // state it or a later reader cannot tell which kind it is.
+  const lockout = ALL_TEXT_MEANINGS.find(pattern => pattern.meaning === 'SMART_LOCKOUT')!;
+  const verification = lockout.verification as Record<string, unknown>;
+  const prose = [verification.evidence, verification.control]
+    .filter((value): value is string => typeof value === 'string').join('   ');
+  assert.match(prose, /94\.8%/);
+  assert.match(prose, /DENOMINATOR\b[^.]{0,40}NOT RECORDED/);
+  assert.match(prose, /DIRECTION/, 'must say what the figure still supports, not only that it is limited');
+  // And the mapping itself is unaffected either way.
+  assert.deepEqual(lockout.disposition, { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' });
 });

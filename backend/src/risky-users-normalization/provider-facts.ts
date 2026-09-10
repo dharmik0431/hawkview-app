@@ -688,13 +688,21 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
         'single quote. The two literals differ in terminal punctuation and that difference survives a paste ' +
         'and fails a comparison, which is why this matcher is substring-based on a distinctive fragment ' +
         'rather than an equality test. It carries unique detection ' +
-        'weight: for 94.8% of lockout rows there is NO 50126 for the same user within ±15 minutes, so ' +
+        'weight: for 94.8% of lockout rows there is NO 50126 for the same user within ±15 minutes ' +
+        '(DENOMINATOR NOT RECORDED — see the caveat below; it is not reconstructed from today’s 561, ' +
+        'because the figure was measured against whatever the lockout count was then), so ' +
         'Microsoft emits the lockout without the individual attempts alongside it and at the moment of ' +
         'lockout this is the ONLY signal present. A 50126-only detector eventually surfaces the affected ' +
         'users — 100% of them appear in 50126 rows at some point — but misses the lockout events, and ' +
         'misses them when they happen. CAVEAT: one tenant, at most four users, one locale, six weeks, and ' +
         '1,493 blocks against FOUR accounts is not obviously normal traffic, so the 94.8% informs the ' +
-        'mapping and does not settle the general case.',
+        'mapping and does not settle the general case. ' +
+        'AND ITS DENOMINATOR WAS NOT RECORDED, which is the sharper limit: 94.8% of an unstated ' +
+        'number of lockout rows cannot be checked, cannot be compared against a later measurement, and ' +
+        'is the most load-bearing bare percentage in this file. It is kept because the mapping it ' +
+        'supports — a lockout is its own outcome rather than a rejected password — rests on the ' +
+        'DIRECTION of the finding rather than its magnitude, and the direction is not in doubt. Restate ' +
+        'as lockouts-without-a-nearby-50126 over lockouts at the next measurement.',
     },
     note:
       'Smart lockout "tracks the last three bad password hashes to avoid incrementing the lockout counter ' +
@@ -1348,7 +1356,9 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     claim: 'On the GRAPH feed, errorCode 0 carries the literal description "Other." and that is a genuine success.',
     verification: {
       state: 'PRODUCTION_VERIFIED',
-      evidence: 'On the Graph path, errorCode 0 carries "Other." on 100% of rows: no absent, no null, no empty string.',
+      evidence:
+        'On the Graph path, errorCode 0 carries "Other." on 100% of code-0 rows — that population is ' +
+        '1,010 as of 2026-09-10T16:36Z: no absent, no null, no empty string.',
       control:
         'The empty-description successes observed earlier are all AUDIT rows, a different feed. The two ' +
         'paths are verified separately and never mixed; the predecessor’s emptiness test treated ' +
@@ -1387,9 +1397,16 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'alongside two four-figure samples invites exactly that comparison, and a prediction built on ' +
         'it (that the 997-row tenant would lose ~20% of its rows) would have been wrong by 190 rows. ' +
         'The low-binding tenant is a different, nine-row tenant. ' +
-        'across the three fallback-path tenants, versus 15.2% / 0.0% / 0.0% by GUID. Re-measured across ' +
-        'two INDEPENDENT tenants with separate MSPs and separate directories — 97.2% vs 12.0% and 97.1% ' +
-        'vs 0.0% — agreeing within 0.1 percentage points. The UPN-in-record / GUID-in-column split holds ' +
+        'across the three fallback-path tenants, versus 15.2% / 0.0% / 0.0% by GUID, over row ' +
+        'populations of 1,786 / 997 / 9. ' +
+        'THE THIRD COLUMN OF BOTH TRIPLES IS NINE ROWS, so neither the 77.8% nor the 0.0% there is a ' +
+        'rate — it is 7 of 9 and 0 of 9. Listing them beside four-figure samples invites a comparison ' +
+        'that already cost one wrong prediction: read that way, it forecast a ~20% shortfall on the ' +
+        '997-row tenant, which resolves at 97.1%, an error of about 190 rows. Re-measured across ' +
+        'two INDEPENDENT tenants with separate MSPs and separate directories — 97.2% vs 12.0% (1,786 ' +
+        'rows) and 97.1% vs 0.0% (997 rows) — agreeing within 0.1 percentage points. Those two are the ' +
+        'samples large enough for the agreement to mean anything. ' +
+        'The UPN-in-record / GUID-in-column split holds ' +
         'in all three audit tenants. Previously labelled thin evidence; it is now the best-corroborated ' +
         'finding in the workstream.',
       control:
@@ -1416,7 +1433,8 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       control:
         'Each literal matches exactly ONE fragment set and not the other, and neither reaches the ' +
         'risk-verdict fragment — asserted against the byte-exact strings in normalize.test.ts. THE LIMIT ' +
-        'OF THE CLAIM: 100% is true of OBSERVED data, one tenant, one locale, six weeks. It does NOT ' +
+        'OF THE CLAIM: 100% is true of OBSERVED data — 1,493 rows of code 50053, one tenant, four ' +
+        'accounts, one locale, six weeks. It does NOT ' +
         'establish that Microsoft emits no third string, and we know it does, because the documented ' +
         'high-confidence-risk variant appears zero times here. The honest claim is "these two literals ' +
         'account for every 50053 row we have ever collected", never "these are the only values 50053 ' +
@@ -1430,7 +1448,12 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     claim: 'On the Graph feed, raw.userId is a directory object id matching exactly one non-deleted directory user.',
     verification: {
       state: 'CONTROL_COHORT_UNAVAILABLE',
-      evidence: 'Graph rows bind 100% on both Graph tenants, with zero ambiguous matches.',
+      evidence:
+        'Graph rows bind 100% on both Graph tenants, with zero ambiguous matches. DENOMINATOR NOT ' +
+        'RECORDED AT MEASUREMENT TIME, and not reconstructed here: the Graph population is ~2,645 rows ' +
+        'but the figure was taken against whatever it was then, and quoting today’s total beside a ' +
+        'percentage measured earlier is precisely the two-moments-as-one-snapshot error. Needs a ' +
+        're-measurement stating bound/considered. The claim is strong and cheap to re-verify.',
       why:
         'The control cohort is EMPTY: zero observed rows carry a well-formed GUID absent from the ' +
         'directory. Guests, deleted users and cross-tenant sign-ins do not appear in observed data, so ' +
@@ -1548,7 +1571,8 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     verification: {
       state: 'DISPROVED',
       evidence:
-        'Non-empty on 100% of Graph rows INCLUDING ordinary human sign-ins that resolve to real directory ' +
+        'Non-empty on 100% of Graph rows — 2,645 as of the re-measurement — INCLUDING ordinary human ' +
+        'sign-ins that resolve to real directory ' +
         'users, and servicePrincipalName always empty. Neither discriminates anything. It was confirmed ' +
         'present on 60/60 rows of the tenant someone wanted to exclude; the query nobody ran was whether ' +
         'it was also present on humans, and it was, on all of them. The control is not optional and it is ' +
