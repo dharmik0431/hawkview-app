@@ -555,6 +555,21 @@ export function riskAssessmentEmptyPresentation(assessment: RiskAssessment) {
  * the mailbox rule is the proof that a new check can falsify both. So an
  * unrecognised rule reports that it is unrecognised, and its two values are
  * shown without a reading attached.
+ *
+ * THIS TABLE IS A STOPGAP, and should be read as one rather than as the design.
+ * It works by knowing which rules produce which kind of time, which is the very
+ * arrangement that caused the defect: two kinds of fact in one field, told
+ * apart by a convention held somewhere else. It is the right thing to do only
+ * while the value does not carry its own kind.
+ *
+ * The agreed replacement puts the kind on the value — a timestamp that says
+ * whether it marks an event occurring or a state being observed. When that
+ * arrives, read the kind and delete this table.
+ *
+ * Specifically, do not re-key it on the signal name. A name is a proxy for the
+ * kind in exactly the way a rule id is, so that would move the convention
+ * rather than remove it, while looking like progress because the key is closer
+ * to the data.
  */
 export type FindingEvidenceShape =
   | { kind: 'OCCURRENCES' }
