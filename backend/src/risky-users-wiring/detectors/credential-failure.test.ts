@@ -86,10 +86,17 @@ test('a recency says what KIND of time it is, and this rule only ever reports ev
   ])
   const [finding] = result.findings.items
   assert.ok(finding)
+  let checked = 0
   for (const signal of finding.signals) {
     if (signal.latest === null) continue
     assert.equal(signal.latest.kind, 'EVENT_OCCURRED', `${signal.signal} must report an event time`)
+    checked += 1
   }
+  // POSITIVE CONTROL. The loop skips null recencies, so it asserts nothing at
+  // all if every signal happens to be null — and a vacuous assertion passes
+  // exactly as loudly as a real one. This is the line that fails if the input
+  // ever stops exercising the check.
+  assert.equal(checked, 2, 'both signals must have been checked, not skipped')
 })
 
 test('a signal evaluated and absent is present with a null recency, not omitted', () => {
@@ -122,6 +129,10 @@ test('counts from a truncated window are marked as floors', () => {
   const whole = run(events)
   const truncated = run(events, 3)
 
+  // POSITIVE CONTROL, same reason: `every` is true of an empty array, so these
+  // two assertions would hold over a finding carrying no signals at all.
+  assert.equal(whole.findings.items[0]?.signals.length, 2)
+  assert.equal(truncated.findings.items[0]?.signals.length, 2)
   assert.equal(whole.findings.items[0]?.signals.every(signal => !signal.capped), true)
   assert.equal(truncated.findings.items[0]?.signals.every(signal => signal.capped), true)
   // The count really did shrink, so the flag is describing something true
