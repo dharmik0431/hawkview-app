@@ -1941,7 +1941,10 @@ test('unreachable and unobserved are different claims, and the pair is not summa
 
   // THE FINDING THIS ENCODES. The Graph feed has never once observed a
   // post-password interrupt — 50076, 50072 and 50079 are zero rows in all
-  // history — while the audit feed carries 16 of them. "Password accepted,
+  // history — while the audit feed carries 16, from TWO reason names. NOT the 4
+  // PasswordResetRegistrationRequiredInterrupt rows: those are NOT_YET_CITED,
+  // held on an analogy this table declines to act on, so they produce no
+  // outcome. "Password accepted,
   // sign-in did not complete" is the basis of the highest-value detector
   // available without Entra ID P2, and its only real evidence is on the feed
   // treated as the fallback. That inverts the assumption that Graph is
