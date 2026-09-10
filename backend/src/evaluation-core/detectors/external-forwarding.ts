@@ -67,7 +67,16 @@ export function externalForwardingDetector(
             .flatMap(rule => [...rule.redirectTo, ...rule.forwardTo, ...rule.forwardAsAttachmentTo]),
         ]
         if (destinations.some(isExternal)) {
-          findings.push({ detectorId: 'external-mailbox-forwarding', subject: mailbox.mailboxRef, observedAt: mailbox.observedAt })
+          // Mailbox-scoped, always. This detector reads Exchange artefacts and
+          // has no directory binding to offer, so it cannot assert a human. The
+          // classifier promotes a mailbox to a directory user on proven binding
+          // — exact GUID with userPurpose 'user' — and a detector that guessed
+          // here would inflate a count of people with room and shared mailboxes.
+          findings.push({
+            detectorId: 'external-mailbox-forwarding',
+            subject: { kind: 'MAILBOX', mailboxRef: mailbox.mailboxRef },
+            observedAt: mailbox.observedAt,
+          })
         }
       }
       return { considered: applicable.length, findings }

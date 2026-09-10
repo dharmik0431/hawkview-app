@@ -54,6 +54,20 @@ export function zeroClaim(
   }
 }
 
+/** Distinct directory users carrying a finding.
+ *
+ * Mailbox-scoped findings are deliberately not counted and not deduplicated
+ * against user refs: the two namespaces are unrelated, so a mailbox ref that
+ * happened to equal a user ref would merge two different subjects, and one
+ * person's mailbox and sign-in refs differing would split one. A mailbox enters
+ * this total only once the classifier has promoted it on proven binding.
+ *
+ * Used by both the per-stream and the tenant path, so the two cannot drift into
+ * counting differently — which is how a headline and its caption disagreed. */
+export const distinctUsers = (findings: readonly Finding[]): number =>
+  new Set(findings.flatMap(finding =>
+    finding.subject.kind === 'DIRECTORY_USER' ? [finding.subject.userRef] : [])).size
+
 /** Zero only ever arrives through the exact branch. A lower bound of zero is
  * unrepresentable here rather than merely discouraged. */
 export function countOf(distinctSubjects: number, claim: ZeroClaim): Count {
@@ -118,7 +132,7 @@ export function evaluate<Event>(input: Readonly<{
     coverage: input.coverage,
     detectors: reports,
     findings,
-    count: countOf(new Set(findings.map(finding => finding.subject)).size, claim),
+    count: countOf(distinctUsers(findings), claim),
     claim,
   }
 }

@@ -13,12 +13,16 @@ const coverage = (parts: Partial<Coverage> = {}): Coverage => ({
   applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {}, ...parts,
 })
 
+/** Sign-in events carry a directory user, so this detector's findings are about
+ * people and do count. Contrast the mailbox detector, whose findings are not. */
+const user = (userRef: string) => ({ kind: 'DIRECTORY_USER', userRef } as const)
+
 const matching: Detector<Event> = {
   id: 'matches-flagged',
   run: applicable => ({
     considered: applicable.length,
     findings: applicable.filter(item => item.match)
-      .map(item => ({ detectorId: 'matches-flagged', subject: item.subject, observedAt: '2026-09-10T00:00:00.000Z' })),
+      .map(item => ({ detectorId: 'matches-flagged', subject: user(item.subject), observedAt: '2026-09-10T00:00:00.000Z' })),
   }),
 }
 const silent: Detector<Event> = { id: 'silent', run: applicable => ({ considered: applicable.length, findings: [] }) }
@@ -185,7 +189,7 @@ test('distinct subjects are counted once however many findings they carry', () =
     run: applicable => ({
       considered: applicable.length,
       findings: applicable.flatMap((item): Finding[] => [0, 1].map(() =>
-        ({ detectorId: 'twice', subject: item.subject, observedAt: '2026-09-10T00:00:00.000Z' }))),
+        ({ detectorId: 'twice', subject: user(item.subject), observedAt: '2026-09-10T00:00:00.000Z' }))),
     }),
   }
   const result = run([event('1'), event('1')], { coverage: coverage({ applies: 2 }), detectors: [twice] })

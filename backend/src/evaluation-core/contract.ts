@@ -74,9 +74,26 @@ export type ZeroClaim =
   | Readonly<{ permitted: true }>
   | Readonly<{ permitted: false; because: WithheldReason }>
 
+/** Two namespaces, and only one of them is people.
+ *
+ * A mailbox is promoted into the user namespace on proven binding alone: an
+ * exact directory-GUID match whose record states `userPurpose = 'user'`. Never
+ * on UPN, email address, or display name. A shared, room, or equipment mailbox
+ * also has a directory GUID, so a GUID is not evidence of a human — and a
+ * distinct-user total is a claim about humans.
+ *
+ * An unpromoted mailbox stays a mailbox: reported, visible, and actionable, but
+ * never counted as a user and never deduplicated against a sign-in subject. The
+ * two ref spaces are unrelated, so comparing them as strings would silently
+ * either merge two different people or split one.
+ */
+export type Subject =
+  | Readonly<{ kind: 'DIRECTORY_USER'; userRef: string }>
+  | Readonly<{ kind: 'MAILBOX'; mailboxRef: string }>
+
 export type Finding = Readonly<{
   detectorId: string
-  subject: string
+  subject: Subject
   observedAt: string
 }>
 
@@ -110,7 +127,18 @@ export type Assessment = Readonly<{
   state: EvidenceState
   coverage: Coverage
   detectors: readonly DetectorReport[]
+  /** Every finding, in both namespaces. Never filtered to what `count` counts. */
   findings: readonly Finding[]
+  /** Distinct **directory users** with a finding — not findings, and not
+   * subjects. Mailbox-scoped findings are absent from this number by design, so
+   * a count of zero beside a non-empty `findings` is coherent rather than a
+   * contradiction: no human was identified, and these mailboxes were still
+   * found. A surface that renders this number as "nothing found" is wrong; it
+   * has to read the findings.
+   *
+   * A mailbox whose binding could not be resolved must not be silently absent
+   * from the user total — the classifier reports it in `coverage.unknown`, which
+   * withholds the exact claim through the machinery already here. */
   count: Count
   claim: ZeroClaim
 }>

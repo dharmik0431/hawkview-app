@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { composeTenantAssessment, type StreamAssessment } from './compose.js'
 import { evaluate } from './evaluate.js'
-import type { Coverage, Detector } from './contract.js'
+import type { Coverage, Detector, Finding } from './contract.js'
 
 type Event = Readonly<{ subject: string; match?: boolean }>
 
@@ -13,10 +13,16 @@ const matching: Detector<Event> = {
   id: 'matches-flagged',
   run: applicable => ({
     considered: applicable.length,
-    findings: applicable.filter(item => item.match)
-      .map(item => ({ detectorId: 'matches-flagged', subject: item.subject, observedAt: '2026-09-10T00:00:00.000Z' })),
+    findings: applicable.filter(item => item.match).map(item => ({
+      detectorId: 'matches-flagged',
+      subject: { kind: 'DIRECTORY_USER', userRef: item.subject } as const,
+      observedAt: '2026-09-10T00:00:00.000Z',
+    })),
   }),
 }
+
+const userRefOf = (finding: Finding): string | null =>
+  finding.subject.kind === 'DIRECTORY_USER' ? finding.subject.userRef : null
 
 /** Built through `evaluate` rather than as literals, so these are assessments
  * the core actually produces — a hand-written one could drift from it and take
@@ -53,7 +59,7 @@ test('rule 1: a stream that could not be read never hides what another stream fo
   // The finding survives. Suppressing it because some *other* evidence was
   // unreadable is the veto pattern, and it is what put a real detection behind
   // an "unavailable" banner in production.
-  assert.deepEqual(result.findings.map(finding => finding.subject), ['alice'])
+  assert.deepEqual(result.findings.map(userRefOf), ['alice'])
 })
 
 test('rule 2: an exact tenant zero requires every stream to have permitted a claim', () => {
@@ -146,15 +152,46 @@ test('a stream that ran and found nothing is not a stream that failed', () => {
   assert.equal(failed.claim.permitted, false)
 })
 
-test('a subject found in two streams is one subject', () => {
+test('a user found in two streams is one user', () => {
   const result = composeTenantAssessment([
     stream('sign-ins', [found('alice')]),
-    stream('mailbox-forwarding', [found('alice'), found('bob')]),
+    stream('audit-log', [found('alice'), found('bob')]),
   ])
   assert.equal(result.findings.length, 3)
   // Counts people, not findings — two streams noticing the same person is one
-  // person at risk, and a headline that said three would be inflating it.
+  // person at risk, and a headline that said three would be inflating it. This
+  // is the owner's explicit requirement, so getting it wrong is visible.
   assert.deepEqual(result.count, { accuracy: 'EXACT', value: 2 })
+})
+
+test('mailbox findings cross streams without ever becoming people', () => {
+  const mailboxStream: StreamAssessment = {
+    stream: 'mailbox-forwarding',
+    assessment: evaluate<Event>({
+      applies: [{ subject: 'shared-billing' }],
+      coverage: coverage({ applies: 1 }),
+      detectors: [{
+        id: 'external-mailbox-forwarding',
+        run: applicable => ({
+          considered: applicable.length,
+          findings: applicable.map(item => ({
+            detectorId: 'external-mailbox-forwarding',
+            subject: { kind: 'MAILBOX', mailboxRef: item.subject } as const,
+            observedAt: '2026-09-10T00:00:00.000Z',
+          })),
+        }),
+      }],
+      budget: { maxEvents: 1000 }, collected: true, readable: true,
+    }),
+  }
+
+  const result = composeTenantAssessment([stream('sign-ins', [found('alice')]), mailboxStream])
+  // Both findings reach the tenant view — rule 1 does not care which namespace.
+  assert.equal(result.findings.length, 2)
+  // But only alice is a person. A shared mailbox has a directory GUID too, and
+  // counting it would tell an MSP two humans are affected when one is a room.
+  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 1 })
+  assert.deepEqual(result.findings.map(userRefOf), ['alice', null])
 })
 
 test('a partly uninterpretable stream withholds the tenant claim under its own reason', () => {

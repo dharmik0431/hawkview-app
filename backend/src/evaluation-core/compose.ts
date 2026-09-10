@@ -1,4 +1,4 @@
-import { countOf } from './evaluate.js'
+import { countOf, distinctUsers } from './evaluate.js'
 import type { Assessment, Count, Finding, WithheldReason, ZeroClaim } from './contract.js'
 
 /** Composing several evidence streams into one tenant answer.
@@ -39,11 +39,10 @@ export type TenantAssessment = Readonly<{
   claim: TenantClaim
 }>
 
-/** NOTE: the tenant count treats subject refs as one tenant-wide namespace, so
- * a subject found in two streams is one subject. That holds only while every
- * detector emits the same kind of ref for the same person; a stream keying
- * findings by something else (a raw mailbox id, say) would count that person
- * twice. Raised with PM rather than assumed silently. */
+/** The tenant total counts distinct directory users across streams, so one
+ * person found in both sign-ins and mailbox artefacts is one person. Only
+ * promoted directory-user refs are compared; mailbox refs are a separate
+ * namespace and are never matched against them. */
 export function composeTenantAssessment(streams: readonly StreamAssessment[]): TenantAssessment {
   const findings = streams.flatMap(entry => entry.assessment.findings)
 
@@ -73,7 +72,7 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
   return {
     streams,
     findings,
-    count: countOf(new Set(findings.map(finding => finding.subject)).size, forCount),
+    count: countOf(distinctUsers(findings), forCount),
     claim,
   }
 }
