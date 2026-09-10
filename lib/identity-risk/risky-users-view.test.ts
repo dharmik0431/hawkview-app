@@ -984,3 +984,35 @@ test('corroboration breaks ties inside a priority band', () => {
   )
   assert.equal(rows[0].name, 'Low, corroborated')
 })
+
+test('the panel never claims unavailability while showing Microsoft records', () => {
+  // Microsoft verdicts reach HawkView through sign-in evidence too, which
+  // needs no Entra ID P2 licence — around nine hundred malicious-IP verdicts
+  // arrive that way on a tenant whose risky-users channel reports itself
+  // unlicensed. "Requires Entra ID P2" printed above those records is a
+  // flat contradiction on one screen.
+  const unlicensed = unavailableMicrosoftEntraRiskyUsers(
+    'UNAVAILABLE',
+    'Microsoft Entra risky-user evidence is not available on this tenant.',
+    'LICENSE_REQUIRED'
+  )
+  const withRecords = {
+    ...unlicensed,
+    users: [microsoftRecord(null, 'a'), microsoftRecord(null, 'b')],
+  }
+  const channel = microsoftChannel(withRecords)
+  assert.equal(channel.state, 'CONTRADICTORY')
+  assert.match(channel.headline, /2 records/)
+  assert.match(channel.headline, /reports itself unavailable/)
+  // Neither half is suppressed: the records stand, and the status is marked
+  // as not to be relied on rather than quietly dropped.
+  assert.match(channel.detail, /cannot both be right/)
+  assert.match(channel.detail, /should not be relied on/)
+  // And it does not turn an unlicensed tenant into a licensed-looking one.
+  assert.doesNotMatch(channel.headline, /requires Entra ID P2/)
+  assert.equal(channel.addressable, false)
+
+  // With no records the licence statement is still exactly right.
+  assert.equal(microsoftChannel(unlicensed).state, 'UNAVAILABLE')
+  assert.match(microsoftChannel(unlicensed).headline, /requires Entra ID P2/)
+})

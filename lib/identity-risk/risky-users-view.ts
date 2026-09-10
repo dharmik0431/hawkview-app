@@ -50,6 +50,12 @@ export type MicrosoftChannelState =
   | 'INTERRUPTED'
   /** Microsoft has not been evaluated yet on this tenant. */
   | 'NOT_EVALUATED'
+  /**
+   * Microsoft records are present while the channel reports itself unable to
+   * produce any. Both cannot be true, and the panel says so rather than
+   * printing one of them over the other.
+   */
+  | 'CONTRADICTORY'
 
 export type MicrosoftChannel = {
   state: MicrosoftChannelState
@@ -73,7 +79,7 @@ const microsoftReasonCopy: Readonly<
     headline:
       'Microsoft Entra risk detection is unavailable on this tenant — requires Entra ID P2',
     detail:
-      'Microsoft only reports risky users for tenants licensed for Entra ID P2. Nothing on this page reflects Microsoft Identity Protection, and a HawkView result of zero does not mean Microsoft would also report zero. Licensing this tenant for P2 would add Microsoft as a second, independent source alongside HawkView.',
+      'Microsoft only reports risky users for tenants licensed for Entra ID P2. Nothing on this page reflects Microsoft Identity Protection, and a HawkView result of zero does not mean Microsoft would also report zero. Licensing this tenant for P2 would add Microsoft’s own determinations alongside HawkView’s findings, including detections drawn from telemetry HawkView cannot see.',
   },
   MISSING_PERMISSION: {
     headline:
@@ -118,6 +124,33 @@ export function microsoftChannel(
   view: MicrosoftEntraRiskyUsersView
 ): MicrosoftChannel {
   const { status, reasonCode, observedAt } = view.meta
+  const recordCount = view.users?.length ?? 0
+
+  // Microsoft verdicts also reach us through sign-in evidence, which does not
+  // need an Entra ID P2 licence — roughly nine hundred malicious-IP verdicts
+  // arrive that way on a tenant whose risky-users channel reports itself
+  // unlicensed. Left alone, this panel would print "requires Entra ID P2"
+  // directly above them.
+  //
+  // Neither half is safe to suppress: hiding the records would withhold what
+  // Microsoft said, and hiding the status would imply a working channel that
+  // may not be. So the disagreement is what gets rendered.
+  if (
+    recordCount > 0 &&
+    (status === 'UNAVAILABLE' || status === 'NOT_EVALUATED')
+  ) {
+    return {
+      state: 'CONTRADICTORY',
+      headline: `Microsoft reported ${recordCount} ${
+        recordCount === 1 ? 'record' : 'records'
+      } while its channel reports itself unavailable`,
+      detail:
+        'These two cannot both be right. The records below are shown as Microsoft reported them, and the channel status above them should not be relied on until that is resolved. Microsoft verdicts can reach HawkView through sign-in evidence without an Entra ID P2 licence, so records here do not by themselves mean the tenant is licensed.',
+      addressable: false,
+      reasonCode,
+      observedAt,
+    }
+  }
   const copy = reasonCode
     ? microsoftReasonCopy[reasonCode]
     : unknownMicrosoftReason
@@ -467,7 +500,14 @@ export function detectedByLabel(detection: RiskyUserDetection) {
   switch (detection.microsoft) {
     case 'REPORTED':
       // The strongest signal this product can produce: two systems reporting
-      // the same person independently.
+      // the same person.
+      //
+      // Agreement is not always independent corroboration. Microsoft's
+      // sign-in-derived verdicts read the same log lines HawkView reads, so the
+      // two can agree because they interpreted one piece of evidence the same
+      // way; its Identity Protection detections do draw on telemetry we cannot
+      // see. The row says both reported, which is true either way, and claims
+      // nothing about independence.
       return 'HawkView and Microsoft'
     case 'NOT_REPORTED':
       // Only sayable once the join was actually possible.

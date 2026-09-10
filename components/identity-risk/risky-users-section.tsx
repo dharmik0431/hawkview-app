@@ -309,8 +309,10 @@ function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Two systems reporting the same person independently is the strongest signal
- * this product produces, so it gets both badges. Everything else says which of
+ * Two systems reporting the same person is the strongest signal this product
+ * produces, so it gets both badges. It does not assert that they reached it
+ * independently: Microsoft's sign-in-derived verdicts read the same log lines
+ * HawkView does, so agreement can be two readings of one piece of evidence. Everything else says which of
  * three different things is true — Microsoft looked and did not report them,
  * Microsoft could not be compared to them, or Microsoft cannot report on this
  * tenant at all — because they lead a technician to different places.
