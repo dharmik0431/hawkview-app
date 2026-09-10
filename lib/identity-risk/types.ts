@@ -132,7 +132,15 @@ export const RISK_ASSESSMENT_RULE_TUPLES = {
   },
 } as const
 
+/** A rule the client carries published metadata for. */
 export type RiskAssessmentRuleId = (typeof RISK_ASSESSMENT_RULE_IDS)[number]
+
+/**
+ * A rule identifier as reported by the server. Server rule catalogues change on
+ * their own schedule, so this is any well-formed identifier, not only the ones
+ * this client knows. Nothing treats an unrecognised rule as evaluated.
+ */
+export type ReportedRuleId = RiskAssessmentRuleId | (string & {})
 export type RiskAssessmentSource =
   | 'M365_AUDIT_STS'
   | 'GRAPH_SIGN_INS'
@@ -195,7 +203,7 @@ export type RiskSourceReadiness = {
 }
 
 export type RiskRuleReadiness = {
-  ruleId: RiskAssessmentRuleId
+  ruleId: ReportedRuleId
   ruleVersion: string
   title: string
   status: RiskAssessmentReadiness
@@ -266,7 +274,7 @@ export type RiskRecommendedAction = {
 
 export type RiskAssessmentFinding = {
   id: string
-  ruleId: RiskAssessmentRuleId
+  ruleId: ReportedRuleId
   ruleVersion: string
   priority: 'LOW' | 'MEDIUM' | 'HIGH'
   confidence: 'LOW' | 'MEDIUM' | 'HIGH'

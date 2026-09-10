@@ -53,6 +53,37 @@ const assessmentRuleIds = [
   'HV-ID-AUTH-005.v2',
   'HV-ID-MBX-001.v1',
 ] as const
+
+const MAX_REPORTED_RULES = 64
+/** Widest activity-window tolerance in the known catalogue. */
+const DEFAULT_ACTIVITY_WINDOW_TOLERANCE_MS = 36 * 60 * 60_000
+const RULE_ID_PATTERN = /^[A-Z0-9]+(?:-[A-Z0-9]+)*.v[0-9]{1,3}$/
+
+/**
+ * The client keeps a catalogue of the rules it knows, and holds those to their
+ * published version, priority, evidence sources and activity-window tolerance.
+ *
+ * A rule the client does not know is accepted on generic validation rather than
+ * discarding the assessment. Backend rule catalogues change on their own
+ * schedule, and a technician losing every finding in a tenant because one new
+ * check appeared is a far worse failure than showing that check without the
+ * client's own metadata for it.
+ *
+ * An unrecognised rule is still held to every evidence requirement that a known
+ * one is — see evaluatedRuleScope in presentation.ts. What it loses is only the
+ * client-side cross-check that the rule's version and evidence sources match
+ * this table, which detects a stale table rather than bad evidence.
+ */
+function knownRule(ruleId: string) {
+  return Object.hasOwn(RISK_ASSESSMENT_RULE_TUPLES, ruleId)
+    ? RISK_ASSESSMENT_RULE_TUPLES[ruleId as RiskAssessmentRuleId]
+    : null
+}
+
+function reportedRuleId(value: unknown): string | null {
+  const ruleId = boundedString(value, 64)
+  return ruleId && RULE_ID_PATTERN.test(ruleId) ? ruleId : null
+}
 const assessmentSources = [
   'M365_AUDIT_STS',
   'GRAPH_SIGN_INS',
@@ -1114,7 +1145,8 @@ function adaptRuleReadiness(
   ) {
     return null
   }
-  const ruleId = enumValue(source.ruleId, assessmentRuleIds)
+  const ruleId = reportedRuleId(source.ruleId)
+  const catalogued = ruleId ? knownRule(ruleId) : null
   const ruleVersion = boundedString(source.ruleVersion, 40)
   const title = assessmentText(source.title, 180)
   const status = enumValue(source.status, assessmentReadiness)
@@ -1131,16 +1163,15 @@ function adaptRuleReadiness(
   if (
     !ruleId ||
     !ruleVersion ||
-    ruleVersion !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].version ||
+    (catalogued && ruleVersion !== catalogued.version) ||
     !title ||
     !status ||
     !reasonCode ||
     !explanation ||
     (source.selectedSource !== null && !selectedSource) ||
-    (selectedSource !== null &&
-      !(
-        RISK_ASSESSMENT_RULE_TUPLES[ruleId].sources as readonly string[]
-      ).includes(selectedSource)) ||
+    (catalogued &&
+      selectedSource !== null &&
+      !(catalogued.sources as readonly string[]).includes(selectedSource)) ||
     !window ||
     evaluatedAt === undefined ||
     assessedIdentities === undefined ||
@@ -1398,7 +1429,8 @@ function adaptAssessmentFinding(
   )
     return null
   const id = boundedString(source.id, 200)
-  const ruleId = enumValue(source.ruleId, assessmentRuleIds)
+  const ruleId = reportedRuleId(source.ruleId)
+  const catalogued = ruleId ? knownRule(ruleId) : null
   const ruleVersion = boundedString(source.ruleVersion, 40)
   const priority = enumValue(source.priority, [
     'LOW',
@@ -1486,9 +1518,9 @@ function adaptAssessmentFinding(
     !/^hvr1_contribution_[a-f0-9]{64}$/.test(id) ||
     !ruleId ||
     !ruleVersion ||
-    ruleVersion !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].version ||
+    (catalogued && ruleVersion !== catalogued.version) ||
     !priority ||
-    priority !== RISK_ASSESSMENT_RULE_TUPLES[ruleId].priority ||
+    (catalogued && priority !== catalogued.priority) ||
     !confidence ||
     !activityState ||
     !title ||
@@ -1503,7 +1535,9 @@ function adaptAssessmentFinding(
         ? 36 * 60 * 60_000
         : ruleId === 'HV-ID-AUTH-005.v2'
           ? 10 * 60_000
-          : 15 * 60_000) ||
+          : catalogued
+            ? 15 * 60_000
+            : DEFAULT_ACTIVITY_WINDOW_TOLERANCE_MS) ||
     new Date(firstSeen).getTime() > new Date(lastSeen).getTime() ||
     new Date(lastSeen).getTime() >
       new Date(evaluatedAt).getTime() + MAX_FUTURE_SKEW_MS ||
@@ -1513,9 +1547,8 @@ function adaptAssessmentFinding(
     (source.evidenceCount as number) > MAX_ASSESSMENT_COUNT ||
     typeof source.evidenceCountCapped !== 'boolean' ||
     !selectedSource ||
-    !(
-      RISK_ASSESSMENT_RULE_TUPLES[ruleId].sources as readonly string[]
-    ).includes(selectedSource) ||
+    (catalogued &&
+      !(catalogued.sources as readonly string[]).includes(selectedSource)) ||
     !application ||
     !hasKeys(application, ['id', 'state', 'label']) ||
     !applicationState ||
@@ -1729,8 +1762,7 @@ export function adaptRiskAssessmentResponse(
         )
       : null
   const rules =
-    Array.isArray(source.rules) &&
-    source.rules.length === assessmentRuleIds.length
+    Array.isArray(source.rules) && source.rules.length <= MAX_REPORTED_RULES
       ? source.rules.map((item) =>
           adaptRuleReadiness(item, trustedCurrentTimeMs)
         )

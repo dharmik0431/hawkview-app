@@ -183,9 +183,6 @@ test('rejects malformed provenance, future event evidence and unsupported schema
     (v: any) => {
       v.schemaVersion = 'future/v2'
     },
-    (v: any) => {
-      v.rules.pop()
-    },
   ]) {
     const value = assessmentFixture(true)
     mutate(value)
@@ -249,6 +246,132 @@ test('still requires every contracted field to be present', () => {
     const value = assessmentFixture(true)
     mutate(value)
     assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
+  }
+})
+
+function unknownRule(overrides: Record<string, unknown> = {}) {
+  return {
+    ruleId: 'HV-ID-NEW-042.v1',
+    ruleVersion: 'v1',
+    title: 'A check this client has no metadata for',
+    status: 'READY',
+    reasonCode: 'READY',
+    explanation: 'This check evaluated its reported evidence window.',
+    selectedSource: 'GRAPH_SIGN_INS',
+    window: { start: at(-15), end: at() },
+    evaluatedAt: at(),
+    assessedIdentities: 2,
+    matchedIdentities: 0,
+    countsCapped: false,
+    ...overrides,
+  }
+}
+
+test('accepts a rule the client carries no metadata for', () => {
+  // The backend rule catalogue changes on its own schedule. A new check must
+  // not cost the technician the rest of the assessment.
+  const value = assessmentFixture(true)
+  value.rules.push(unknownRule())
+  const adapted = adaptRiskAssessmentResponse(value, assessmentNow)
+  assert.ok(adapted)
+  assert.equal(adapted!.rules.length, 4)
+  const added = adapted!.rules.find(
+    (rule) => rule.ruleId === 'HV-ID-NEW-042.v1'
+  )
+  assert.ok(added)
+  assert.equal(added!.title, 'A check this client has no metadata for')
+  assert.equal(added!.status, 'READY')
+
+  // A shorter reported rule set is equally acceptable.
+  const fewer = assessmentFixture(false)
+  fewer.rules.pop()
+  assert.ok(adaptRiskAssessmentResponse(fewer, assessmentNow))
+})
+
+test('never drops a finding because it cites an unrecognised rule', () => {
+  // Losing a finding is the worst outcome this surface has: it is an
+  // investigation lead disappearing with no trace that it existed.
+  const value = assessmentFixture(true)
+  value.rules.push(unknownRule({ matchedIdentities: 1 }))
+  value.users[0].findings[0].ruleId = 'HV-ID-NEW-042.v1'
+  value.users[0].findings[0].ruleVersion = 'v1'
+  value.users[0].findings[0].selectedSource = 'GRAPH_SIGN_INS'
+  const adapted = adaptRiskAssessmentResponse(value, assessmentNow)
+  assert.ok(adapted)
+  assert.equal(adapted!.users[0].findings.length, 1)
+  assert.equal(adapted!.users[0].findings[0].ruleId, 'HV-ID-NEW-042.v1')
+})
+
+test('holds a rule the client does know to its published metadata', () => {
+  for (const mutate of [
+    (v: any) => {
+      v.rules[0].ruleVersion = 'v9'
+    },
+    (v: any) => {
+      v.rules[2].selectedSource = 'GRAPH_SIGN_INS'
+    },
+    (v: any) => {
+      v.users[0].findings[0].priority = 'HIGH'
+    },
+  ]) {
+    const value = assessmentFixture(true)
+    mutate(value)
+    assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
+  }
+})
+
+test('still rejects a malformed rule identifier', () => {
+  for (const ruleId of [
+    'not a rule id',
+    'HV-ID-NEW-042',
+    'hv-id-new-042.v1',
+    '<script>.v1',
+    `${'H'.repeat(80)}.v1`,
+    '',
+    null,
+    42,
+  ]) {
+    const value = assessmentFixture(false)
+    value.rules[0].ruleId = ruleId
+    assert.equal(
+      adaptRiskAssessmentResponse(value, assessmentNow),
+      null,
+      String(ruleId)
+    )
+  }
+})
+
+test('an unrecognised rule clears the same evidence bar before it counts as clean', () => {
+  const clean = assessmentFixture(false)
+  clean.rules.push(unknownRule())
+  const adapted = adaptRiskAssessmentResponse(clean, assessmentNow)
+  assert.ok(adapted)
+  const presentation = riskAssessmentEmptyPresentation(adapted!)
+  assert.equal(presentation?.label, 'No findings in evaluated evidence')
+  // The copy states what was actually evaluated rather than a fixed number.
+  assert.match(presentation!.detail, /All 4 reported checks/)
+
+  // The same unknown rule without a complete evaluated scope withdraws the
+  // clean claim for the whole assessment, exactly as a known rule would. The
+  // optional summary is dropped here because an incomplete check also forces
+  // capability down to PARTIAL, which an EXACT tenant count would contradict.
+  for (const overrides of [
+    { status: 'PARTIAL', reasonCode: 'INCOMPLETE_WINDOW' },
+    { assessedIdentities: 0 },
+    { countsCapped: true },
+    { evaluatedAt: null },
+    { selectedSource: null },
+  ]) {
+    const degraded = assessmentFixture(false)
+    delete degraded.summary
+    degraded.rules.push(unknownRule(overrides))
+    const view = adaptRiskAssessmentResponse(degraded, assessmentNow)
+    assert.ok(view, JSON.stringify(overrides))
+    assert.notEqual(
+      riskAssessmentEmptyPresentation(view!)?.label,
+      'No findings in evaluated evidence',
+      JSON.stringify(overrides)
+    )
   }
 })
 
