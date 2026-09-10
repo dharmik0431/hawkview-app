@@ -140,8 +140,31 @@ export type ZeroClaim =
  * either merge two different people or split one.
  */
 export type Subject =
-  | Readonly<{ kind: 'DIRECTORY_USER'; userRef: string }>
+  | Readonly<{ kind: 'DIRECTORY_USER'; userRef: string; correlation: CorrelationRef }>
   | Readonly<{ kind: 'MAILBOX'; mailboxRef: string; binding: MailboxBinding }>
+
+/** What lets this user be matched against Microsoft's own risk channel.
+ *
+ * The product's strongest signal is "flagged independently by both HawkView and
+ * Microsoft", and it is unrepresentable without a shared key: our findings are
+ * keyed by a tenant-scoped handle, Microsoft's risky-users API by directory
+ * object id. Nothing joined them, so the only sentences available were "HawkView
+ * found this" and a silence that a reader would take for "Microsoft did not" —
+ * which on one tenant would have been wrong 919 times, because Microsoft did
+ * report those, through sign-in logs rather than the risk API.
+ *
+ * The core never reads `ref`. It carries the value and states its `shape` so the
+ * read path knows how to join; deciding what a directory object id or a user
+ * principal name means is not this module's business.
+ *
+ * `available: false` is deliberately a case rather than a missing field. The
+ * audit-log path has no GUID and resolves subjects by UPN, so a GUID-only design
+ * would silently take three tenants to zero. And a tenant with no correlation is
+ * a true statement about capability — Microsoft's risky-users channel requires
+ * Entra ID P2 — not a shrug, so it needs somewhere to say so. */
+export type CorrelationRef =
+  | Readonly<{ available: true; shape: 'DIRECTORY_OBJECT_ID' | 'USER_PRINCIPAL_NAME'; ref: string }>
+  | Readonly<{ available: false; because: string }>
 
 /** Why a mailbox is not a user — and these are not the same answer.
  *

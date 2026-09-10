@@ -90,7 +90,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
         status: 'RAN' as const, considered: 1, declined: {},
         findings: [{
           detectorId: 'user-side',
-          subject: { kind: 'DIRECTORY_USER', userRef: 'alice' } as const,
+          subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-alice' } } as const,
           observedAt: '2026-09-10T00:00:00.000Z',
         }],
       }),
@@ -104,9 +104,52 @@ test('a mailbox that resolved to a real person counts as that person', () => {
   // Promotion happens in the layer that can query the directory; the detector
   // passes the resolved subject through untouched.
   const bound = mailbox('alice-mailbox', { forwardingSmtpAddress: 'exfil@evil.example' })
-  const result = assess([{ ...bound, subject: { kind: 'DIRECTORY_USER', userRef: 'alice' } }])
+  const result = assess([{
+    ...bound,
+    subject: {
+      kind: 'DIRECTORY_USER',
+      userRef: 'alice',
+      // Graph evidence, so the directory object id is available and this user
+      // can be matched against Microsoft's own risk channel.
+      correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-alice' },
+    },
+  }])
   assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 1 })
   assert.equal(result.claim.permitted, true)
+})
+
+test('a subject can say it has no correlation key rather than leaving the field empty', () => {
+  // The audit-log path has no directory GUID and resolves by UPN, and a tenant
+  // without Entra ID P2 has no Microsoft risk channel to correlate against at
+  // all. Both are true statements about capability, and an absent field would
+  // have rendered as "Microsoft did not report this user" — which on one tenant
+  // would have been wrong 919 times, because Microsoft did report them, through
+  // sign-in logs rather than the risk API.
+  const upnBound = mailbox('audit-tenant', { forwardingSmtpAddress: 'exfil@evil.example' })
+  const byUpn = assess([{
+    ...upnBound,
+    subject: {
+      kind: 'DIRECTORY_USER',
+      userRef: 'alice',
+      correlation: { available: true, shape: 'USER_PRINCIPAL_NAME', ref: 'opaque-upn-handle' },
+    },
+  }])
+  assert.deepEqual(figure(byUpn.count), { accuracy: 'EXACT', value: 1 })
+
+  const noChannel = assess([{
+    ...upnBound,
+    subject: {
+      kind: 'DIRECTORY_USER',
+      userRef: 'alice',
+      correlation: { available: false, because: "Microsoft's risky-users channel requires Entra ID P2." },
+    },
+  }])
+  // It does not withhold the claim: not being able to cross-check Microsoft is
+  // a limit on what we can *say about* the finding, not on the finding itself.
+  assert.deepEqual(figure(noChannel.count), { accuracy: 'EXACT', value: 1 })
+  assert.equal(noChannel.claim.permitted, true)
+  const subject = noChannel.findings.items[0]?.subject
+  assert.equal(subject?.kind === 'DIRECTORY_USER' && subject.correlation.available, false)
 })
 
 test('adding a mailbox finding never moves the user count, colliding ref or not', () => {
@@ -126,7 +169,7 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
       declined: {},
       findings: [{
         detectorId: `user-${userRef}`,
-        subject: { kind: 'DIRECTORY_USER', userRef } as const,
+        subject: { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const,
         observedAt: '2026-09-10T00:00:00.000Z',
       }],
     }),

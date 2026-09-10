@@ -77,9 +77,18 @@ export function zeroClaim(basis: ClaimBasis): ZeroClaim {
   if (!withinBudget) reasons.push('CAPACITY_EXCEEDED')
   if (!allDetectorsRan) reasons.push('DETECTOR_FAILED')
   if (!allSubjectsResolved) reasons.push('UNRESOLVED_SUBJECT_IDENTITY')
-  // A named request is a smaller question honestly asked, and narrows the scope.
-  // An unrecorded one means we cannot say what a clean result would cover, which
-  // is not something a scope note can rescue.
+  // A narrower request is a DIFFERENT QUESTION, not an incomplete answer to the
+  // same one — which is why it narrows the scope rather than withholding. A
+  // truncated window and a crashed detector are incomplete answers to the
+  // question we did ask; 'interactive sign-ins only' is a complete answer to a
+  // smaller one. An UNSTATED scope is neither: not a narrower question but an
+  // unknown one, so it withholds.
+  //
+  // (I first defended this line by saying the alternative would leave the word
+  // "complete" unreachable. QA was right that this is an argument from
+  // consequence — what goes wrong elsewhere, not where truth puts the line —
+  // and that kind of reasoning is how "we may have missed some" and "we never
+  // asked" got conflated in the first place.)
   if (!coverage.collectionScope.declared) reasons.push('COLLECTION_SCOPE_UNDECLARED')
   // Derived here rather than passed in beside the coverage it describes: two
   // inputs saying the same thing is two inputs that can disagree.
