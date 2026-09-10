@@ -16,6 +16,7 @@ import {
 import {
   DISPROVED_PREDICATE_PATHS,
   FAILURE_REASON_MEANINGS,
+  disprovedPathsForFeed,
   RESULT_CODES,
   SHAPE_PREDICATES,
   OBSERVED_BUT_UNMAPPED_GRAPH_CODES,
@@ -186,8 +187,9 @@ test('a batch that is entirely unrecognized still returns events and no gate', a
   // Nothing in the batch is a readiness flag, a gap count, or a partial state
   // the evaluation core could branch on to skip a rule.
   assert.deepEqual(Object.keys(batch).sort(), [
-    'applies', 'counts', 'coverage', 'events', 'microsoftRiskVerdicts',
-    'microsoftSafetyVerdicts', 'resolvedSubjects', 'scope', 'shapeObservations', 'source',
+    'applies', 'counts', 'coverage', 'events', 'microsoftRemediatedVerdicts',
+    'microsoftRiskVerdicts', 'microsoftSafetyVerdicts', 'resolvedSubjects', 'scope',
+    'shapeObservations', 'source',
   ]);
   assert.deepEqual(Object.keys(batch.coverage).sort(), [
     'collectionScope', 'consideredRows', 'enumerationCodedRows', 'normalizedRows',
@@ -656,6 +658,8 @@ test('disproved predicates are recorded and cannot be consulted', () => {
     [...DISPROVED_PREDICATE_PATHS].sort(),
     [
       'managementActivityRecord.ResultStatus',
+      'raw.authenticationDetails',
+      'raw.authenticationRequirement',
       'raw.isInteractive',
       'raw.servicePrincipalId',
       'raw.servicePrincipalName',
@@ -663,6 +667,17 @@ test('disproved predicates are recorded and cannot be consulted', () => {
       'sign_in_logs.user_id',
     ],
   );
+  // A path dead on ONE feed must not be listed as dead everywhere. raw.status
+  // is the provider object on Graph and is read on every Graph row; only the
+  // audit projection of the same name is disproved.
+  assert.deepEqual(
+    [...disprovedPathsForFeed('M365_AUDIT_STS')].sort(),
+    ['raw.status.errorCode', 'raw.status.failureReason'],
+  );
+  assert.deepEqual(disprovedPathsForFeed('GRAPH_SIGN_INS'), []);
+  for (const path of ['raw.status.errorCode', 'raw.status.failureReason']) {
+    assert.equal(DISPROVED_PREDICATE_PATHS.includes(path), false, path);
+  }
   for (const id of ['graph.service-principal-id', 'graph.sign-in-event-types', 'graph.is-interactive-false',
     'audit.result-status', 'signin.user-id-column']) {
     assert.throws(() => mayExclude(id), /DISPROVED_PREDICATE/, id);
@@ -1353,32 +1368,92 @@ test('a Microsoft risk verdict and a Microsoft safety verdict can never be the s
   assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_SAFETY_VERDICT, 0);
 });
 
-test('riskDetail has no control cohort yet, so it changes nothing', async () => {
-  // 55 measured rows carry a riskDetail alongside a Conditional Access
-  // success, and they currently classify as ordinary successes. Routing them
-  // on an unconfirmed field would remove 55 real successes from evaluation if
-  // the field means something other than we think.
-  assert.equal(mayExclude('graph.risk-detail'), false);
+test('riskDetail is now verified and routes each verdict to its own channel', async () => {
+  // Control cohort passes and is non-empty: ordinary successes carry the
+  // explicit string 'none', so the field does not default to a verdict.
+  assert.equal(mayExclude('graph.risk-detail'), true);
 
-  const withRiskDetail = await run([graphRow({
+  const remediated = await run([graphRow({
     riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
     conditionalAccessStatus: 'success',
     status: { errorCode: 0, failureReason: 'Other.' },
   })]);
-  const withSafeDetail = await run([graphRow({
+  assert.deepEqual(only(remediated).classification, {
+    kind: 'DOES_NOT_APPLY',
+    reason: 'MICROSOFT_RISK_REMEDIATED',
+  });
+  assert.deepEqual(remediated.microsoftRemediatedVerdicts.map(event => event.eventId), ['evt-1']);
+  assert.equal(remediated.applies.length, 0, 'Microsoft detected it, so it is not our finding');
+
+  const safe = await run([graphRow({
     riskDetail: 'aiConfirmedSigninSafe',
-    conditionalAccessStatus: 'success',
     status: { errorCode: 0, failureReason: 'Other.' },
   })]);
-  const without = await run([graphRow({ status: { errorCode: 0, failureReason: 'Other.' } })]);
+  assert.deepEqual(only(safe).classification, {
+    kind: 'DOES_NOT_APPLY',
+    reason: 'MICROSOFT_SAFETY_VERDICT',
+  });
+  assert.deepEqual(safe.microsoftSafetyVerdicts.map(event => event.eventId), ['evt-1']);
 
-  const expected = { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' };
-  assert.deepEqual(only(withRiskDetail).classification, expected);
-  assert.deepEqual(only(withSafeDetail).classification, expected);
-  assert.deepEqual(only(without).classification, expected);
-  // And neither reaches Microsoft's channel on an unverified field.
-  assert.deepEqual(withRiskDetail.microsoftRiskVerdicts, []);
-  assert.deepEqual(withSafeDetail.microsoftSafetyVerdicts, []);
+  // The benign value is not a verdict: classification proceeds on the code.
+  const benign = await run([graphRow({ riskDetail: 'none', status: { errorCode: 0, failureReason: 'Other.' } })]);
+  assert.deepEqual(only(benign).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
+  const absent = await run([graphRow({ status: { errorCode: 0, failureReason: 'Other.' } })]);
+  assert.deepEqual(only(absent).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
+});
+
+test('the three Microsoft verdict kinds are mutually exclusive lists', async () => {
+  const batch = await run([
+    graphRow({ id: 'active', status: { errorCode: 53004 } }),
+    graphRow({ id: 'closed', riskDetail: 'userPassedMFADrivenByRiskBasedPolicy', status: { errorCode: 0, failureReason: 'Other.' } }),
+    graphRow({ id: 'cleared', riskDetail: 'aiConfirmedSigninSafe', status: { errorCode: 0, failureReason: 'Other.' } }),
+    graphRow({ id: 'ours', status: { errorCode: 50126 } }),
+  ]);
+
+  assert.deepEqual(batch.microsoftRiskVerdicts.map(event => event.eventId), ['active']);
+  assert.deepEqual(batch.microsoftRemediatedVerdicts.map(event => event.eventId), ['closed']);
+  assert.deepEqual(batch.microsoftSafetyVerdicts.map(event => event.eventId), ['cleared']);
+  assert.deepEqual(batch.applies.map(event => event.eventId), ['ours']);
+
+  // Detected-and-live, detected-and-closed, and assessed-safe are three
+  // different claims. A consumer must not be able to conflate them by
+  // iterating one list and assuming it holds everything Microsoft said.
+  const ids = [
+    ...batch.microsoftRiskVerdicts,
+    ...batch.microsoftRemediatedVerdicts,
+    ...batch.microsoftSafetyVerdicts,
+  ].map(event => event.eventId);
+  assert.equal(new Set(ids).size, ids.length, 'an event must appear in at most one verdict list');
+});
+
+test('an unrecognised Microsoft verdict value is never let through', async () => {
+  // Falling through would risk filing Microsoft's detection as our own
+  // finding. Landing in UNKNOWN only costs stated coverage.
+  const batch = await run([graphRow({
+    riskDetail: 'someValueMicrosoftAddedLastWeek',
+    status: { errorCode: 0, failureReason: 'Other.' },
+  })]);
+  assert.deepEqual(only(batch).classification, {
+    kind: 'UNKNOWN',
+    observation: 'MICROSOFT_VERDICT_FIELD_UNRECOGNIZED',
+  });
+  assert.equal(batch.applies.length, 0);
+  assert.deepEqual(batch.microsoftRiskVerdicts, []);
+});
+
+test('the audit feed names an interrupt the Graph codes never showed', async () => {
+  // The family was reported near-empty from Graph numeric codes alone. The
+  // audit feed names the same events in words, and this name was missing from
+  // the table until someone counted in both vocabularies.
+  const batch = await run(
+    [auditRow({ ErrorCode: '1', LogonError: 'UserStrongAuthEnrollmentRequiredInterrupt' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(batch).classification, {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED',
+  });
+  assert.deepEqual(dispositionForCode(50072), only(batch).classification);
 });
 
 // ---------------------------------------------------------------------------

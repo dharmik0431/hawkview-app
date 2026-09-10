@@ -1,4 +1,4 @@
-import type { EventOutcome } from './contract.js';
+import type { EventOutcome, NormalizationSource } from './contract.js';
 import type { OutOfScopeReason, UncitedReason, UnknownObservation } from './reasons.js';
 
 /**
@@ -296,10 +296,9 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
         'with the same caveat as 500121.',
     },
     note:
-      'VOLUME UNKNOWN, and it matters here more than elsewhere: if this code is high-volume then a ' +
-      'non-canonical citation is doing a lot of exclusion work. Worth a row count before anyone relies on ' +
-      'the exclusion. Whatever the volume is, it is a property of the tenant’s sign-in-frequency setting ' +
-      'rather than of any attacker.',
+      'VOLUME MEASURED AT ONE ROW, so the concern that a non-canonical citation might be doing a lot of ' +
+      'exclusion work is closed: it excludes exactly one event. Whatever the volume becomes, it is a ' +
+      'property of the tenant sign-in-frequency setting rather than of any attacker.',
   },
   // ---- The codes that clear the exclusion standard. ----
   {
@@ -773,6 +772,15 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
     note: 'Microsoft’s documented name for 50076. Post-password challenge issued.',
   },
   {
+    name: 'UserStrongAuthEnrollmentRequiredInterrupt',
+    disposition: { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED' },
+    note:
+      'The audit-path name for 50072, which is mapped identically on Graph. It was MISSING from this ' +
+      'table until the interrupt family was counted in both vocabularies, so its rows were landing in ' +
+      'UNRECOGNIZED_REASON_NAME — a gap found only because someone measured the same family twice, once ' +
+      'per feed.',
+  },
+  {
     name: 'UnclassifiedAuthenticationError',
     disposition: { kind: 'UNKNOWN', observation: 'PROVIDER_DECLARED_UNCLASSIFIED' },
     note:
@@ -825,6 +833,78 @@ export const AUDIT_REASON_NAMES_OBSERVED_UNMAPPED: readonly { readonly name: str
   },
 ];
 
+/**
+ * Microsoft's own assessment of a sign-in, as a CLOSED SET of measured values.
+ *
+ * Measured across 2,648 Graph rows: exactly three values exist — `none`
+ * (2,593), `userPassedMFADrivenByRiskBasedPolicy` (54, riskState
+ * `remediated`), and `aiConfirmedSigninSafe` (1, riskState `dismissed`).
+ * The control cohort passes and is not empty: 958 ordinary successes carry the
+ * explicit string `none` rather than a missing or hidden value, so the field
+ * does not default to a verdict on ordinary human traffic.
+ *
+ * Unmatched values route to UNKNOWN, never through and never to risk. The cost
+ * of being wrong is asymmetric — an unrecognised verdict falling through would
+ * risk presenting Microsoft's detection as our own finding, a correctness
+ * violation, whereas landing in UNKNOWN only costs stated coverage. And 100%
+ * of observed is not 100% of possible: `none` may not be the only benign
+ * value another tenant emits.
+ */
+export interface RiskDetailEntry {
+  readonly value: string;
+  /** null means "not a verdict; carry on and classify by result code". */
+  readonly disposition: CodeDisposition | null;
+  readonly note: string;
+}
+
+export const RISK_DETAIL_VALUES: readonly RiskDetailEntry[] = [
+  {
+    value: 'none',
+    disposition: null,
+    note:
+      'The benign value, and the control cohort: 2,593 of 2,648 rows including 958 ordinary successes. ' +
+      'Explicitly the string "none" rather than absent or hidden.',
+  },
+  {
+    value: 'userPassedMFADrivenByRiskBasedPolicy',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_REMEDIATED' },
+    note:
+      'Microsoft assessed risk, a risk-based Conditional Access policy challenged the user, and MFA ' +
+      'passed. Detected, handled, closed — and delivered on a tenant with no P2, which makes this the ' +
+      'THIRD route by which Microsoft risk output reaches us without the risk API, after sign-in log ' +
+      'failure reasons and 53004.',
+  },
+  {
+    value: 'aiConfirmedSigninSafe',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_SAFETY_VERDICT' },
+    note:
+      'Microsoft AI concluded the sign-in was safe. A dismissal, not a detection. Microsoft own ' +
+      'vocabulary sets a trap here: auto-remediation lands on riskState "dismissed", so this is a ' +
+      'machine assessment rather than a human waving it away.',
+  },
+];
+
+const BY_RISK_DETAIL: ReadonlyMap<string, RiskDetailEntry> = new Map(
+  RISK_DETAIL_VALUES.map(entry => [entry.value.toLowerCase(), entry]),
+);
+
+/**
+ * How to treat a `riskDetail` value: a disposition, "carry on" for the benign
+ * value, or "unrecognised" for anything outside the closed set.
+ */
+export function riskDetailDisposition(value: unknown):
+  | { readonly kind: 'NOT_A_VERDICT' }
+  | { readonly kind: 'VERDICT'; readonly disposition: CodeDisposition }
+  | { readonly kind: 'UNRECOGNIZED' } {
+  if (value === undefined || value === null || value === '') return { kind: 'NOT_A_VERDICT' };
+  if (typeof value !== 'string' || value.length > 256) return { kind: 'UNRECOGNIZED' };
+  const entry = BY_RISK_DETAIL.get(value.trim().toLowerCase());
+  if (!entry) return { kind: 'UNRECOGNIZED' };
+  return entry.disposition === null
+    ? { kind: 'NOT_A_VERDICT' }
+    : { kind: 'VERDICT', disposition: entry.disposition };
+}
+
 export type ShapePredicateVerification
   = | {
       readonly state: 'PRODUCTION_VERIFIED';
@@ -856,6 +936,18 @@ export interface ShapePredicate {
   readonly reads: readonly string[];
   readonly claim: string;
   readonly verification: ShapePredicateVerification;
+  /**
+   * The feed this predicate is about, when it is about only one.
+   *
+   * This exists because a path can be legitimate on one feed and disproved on
+   * another: `raw.status` IS the provider object on Graph and is read
+   * normally, while on the audit feed the object of the same name is
+   * HawkView-synthesized and must never be read. A tombstone list that
+   * conflated the two would tell a future reader never to read a field this
+   * layer reads on every Graph row — a wrong claim inside the very mechanism
+   * meant to prevent wrong claims.
+   */
+  readonly feed?: NormalizationSource;
 }
 
 /**
@@ -998,6 +1090,28 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     },
   },
   {
+    id: 'signin.synthesized-status-object',
+    feed: 'M365_AUDIT_STS',
+    reads: ['raw.status.errorCode', 'raw.status.failureReason'],
+    claim:
+      'DISPROVED FOR THE AUDIT FEED. raw.status on an audit row is provider data that can be read like ' +
+      'the Graph status object of the same name.',
+    verification: {
+      state: 'DISPROVED',
+      evidence:
+        'It is HawkView-synthesized rather than provider data, and it is INCONSISTENT FOR IDENTICAL ' +
+        'INPUTS: for the same LogonError and the same Operation, the projected failureReason is ' +
+        'sometimes populated and sometimes not — IdsLocked 578 populated against 137 not, ' +
+        'UserStrongAuthClientAuthNRequiredInterrupt 1 against 12. An ingest-date boundary was checked as ' +
+        'an explanation and ruled out; the ranges overlap. CAUSE UNRESOLVED and reported as unresolved. ' +
+        'Its failureReason also falls back to record.Operation, and a distribution computed from it was ' +
+        'already withdrawn for describing our own fallback rather than Microsoft. This layer reads ' +
+        'raw.managementActivityRecord instead — a choice made before there was a reason, which now has ' +
+        'one. NOTE: on the GRAPH feed raw.status IS the provider object and is read normally; only the ' +
+        'audit projection of the same name is disproved.',
+    },
+  },
+  {
     id: 'signin.user-id-column',
     reads: ['sign_in_logs.user_id'],
     claim: 'DISPROVED. The user_id COLUMN identifies the signing-in user.',
@@ -1043,21 +1157,17 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       'the Microsoft channel rather than in HawkView’s findings — and the verdict KIND (risky versus ' +
       'safe) can be read from its value.',
     verification: {
-      state: 'PENDING_DISTRIBUTION_CHECK',
-      cohort:
-        'Measured on one tenant: 55 rows carry a riskDetail alongside conditionalAccessStatus success and ' +
-        'grant controls ["Mfa"] — 54 userPassedMFADrivenByRiskBasedPolicy and 1 aiConfirmedSigninSafe. ' +
-        'Those 55 rows currently classify as ordinary successes (errorCode 0, description "Other.") and ' +
-        'therefore sit in the applies list, so the channel mixing this predicate would fix is live rather than ' +
-        'hypothetical.',
-      controlCohort:
-        'MISSING, and it is the whole question: what does riskDetail contain on rows that are NOT ' +
-        'risk-driven? Documentation says it is P2-only and otherwise hidden, so plausible values include ' +
-        '"none", "hidden", or absent — but reading a verdict out of an unconfirmed field would remove 55 ' +
-        'real successes from evaluation if the field means something else. Needed: every Graph row ' +
-        'bucketed by riskDetail value, with the ordinary-human-success rows as the cohort that must NOT ' +
-        'carry a verdict-shaped value. Until then this predicate has NO effect and ' +
-        'MICROSOFT_SAFETY_VERDICT is unreachable.',
+      state: 'PRODUCTION_VERIFIED',
+      evidence:
+        'Measured across 2,648 Graph rows. Exactly three values exist: none (2,593), ' +
+        'userPassedMFADrivenByRiskBasedPolicy / remediated (54), aiConfirmedSigninSafe / dismissed (1). ' +
+        'See RISK_DETAIL_VALUES for the closed set and the dispositions.',
+      control:
+        'PASSES and is NOT EMPTY, which is what makes it usable: 958 ordinary successes (result code 0) ' +
+        'carry the explicit string "none" with riskState "none" — not absent, not hidden — so the field ' +
+        'does not default to a verdict on ordinary human traffic. Only 52 successes carry a ' +
+        'verdict-shaped value. Documentation had suggested the field would be hidden without P2, and it ' +
+        'is not; that expectation is exactly what needed checking rather than assuming.',
     },
   },
   {
@@ -1077,11 +1187,15 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'and uses the code only as corroboration, and disagreement routes to UNKNOWN, which is the ' +
         'conservative direction either way.',
       controlCohort:
-        'Needed: LoginStatus values paired with ErrorCode values on the same records. Rows where ONLY ' +
-        'LoginStatus is present must be distinguishable from rows where only ErrorCode is. If the two ' +
-        'fields draw from disjoint value ranges, that settles it. NOTE FOR STORAGE, separate from ' +
-        'classification: two vocabularies in one column is a schema defect whose fix is to stop merging ' +
-        'them, not to read them more cleverly.',
+        'NARROWED BY MEASUREMENT: LoginStatus is absent at the TOP LEVEL on every audit row, so the ' +
+        'value 1 does not arrive there. It must come from an ExtendedProperties entry or from somewhere ' +
+        'not yet checked. The remaining query, stated precisely: for audit rows whose projected ' +
+        'status.errorCode is 1, list managementActivityRecord.ErrorCode and every ExtendedProperties ' +
+        'entry whose Name matches ErrorCode, ErrorNumber or LoginStatus case-insensitively, with values. ' +
+        'That pins the provenance. This layer already reads all of those places, so the answer changes ' +
+        'the note rather than the behaviour. NOTE FOR STORAGE, separate from classification: two ' +
+        'vocabularies in one column is a schema defect whose fix is to stop merging them, not to read ' +
+        'them more cleverly.',
     },
   },
   {
@@ -1092,22 +1206,16 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       'second-factor step did not" is readable WITHIN a single event rather than inferred from the ' +
       'presence of an interrupt error code.',
     verification: {
-      state: 'PENDING_DISTRIBUTION_CHECK',
-      cohort:
-        'HYPOTHESIS, nothing built on it. The sign-in request issues no $select, so Graph returns the ' +
-        'full default signIn payload and the collector stores it whole — which should include ' +
-        'authenticationDetails. If it is populated, the post-password interrupt detector stops depending ' +
-        'on sparse error codes and would also work on successful-looking rows where no interrupt code was ' +
-        'ever emitted. REDACTION IS NOT THE OBSTACLE: redactSensitiveValues matches KEY names against ' +
-        '/password|secret|token|authorization|credential|private.?key|client.?secret|assertion|certificate/i, ' +
-        'and none of the documented keys inside authenticationDetails matches, so the array survives ' +
-        'storage intact. (Sibling fields DO get redacted — tokenIssuerName, tokenIssuerType and ' +
-        'incomingTokenType all contain "token" — which is a separate fact about what we retain.)',
-      controlCohort:
-        'Ordinary SINGLE-FACTOR successes must look DIFFERENT from multi-factor ones. What would kill the ' +
-        'hypothesis: the array absent or empty on rows we know required MFA, which Microsoft documents as ' +
-        'possible. No row has been looked at, so this is unverified in the strongest sense and has no ' +
-        'effect on classification.',
+      state: 'DISPROVED',
+      evidence:
+        'KILL CONDITION MET, as stated in advance. Absent from all 2,648 Graph rows — the key is not ' +
+        'present, not empty — and authenticationRequirement is absent too. Since raw is the full payload ' +
+        'post-redaction and redaction preserves keys, Microsoft did not send these fields. Both are ' +
+        'documented on the v1.0 signIn resource, so the likely cause is omission from the default list ' +
+        'projection, needing an explicit $select — which would make this a fixable COLLECTION gap rather ' +
+        'than a licensing wall. That needs one Graph call to settle and is not asserted here. Retired ' +
+        'rather than left pending: the hypothesis as stated is dead, and reviving it is a collection ' +
+        'question rather than a classification one.',
     },
   },
   {
@@ -1125,10 +1233,25 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
   },
 ];
 
-/** Payload paths no classification path may read. Asserted behaviourally in tests. */
+/**
+ * Payload paths no classification path may read ON ANY FEED. Asserted
+ * behaviourally in tests.
+ *
+ * Feed-scoped disproved predicates are deliberately NOT here — see
+ * `disprovedPathsForFeed`. Folding them in would assert that a path is dead
+ * everywhere when it is dead in one place, which is the same
+ * collapse-two-facts-into-one defect this list exists to guard against.
+ */
 export const DISPROVED_PREDICATE_PATHS: readonly string[] = SHAPE_PREDICATES
-  .filter(entry => entry.verification.state === 'DISPROVED')
+  .filter(entry => entry.verification.state === 'DISPROVED' && entry.feed === undefined)
   .flatMap(entry => entry.reads);
+
+/** Paths disproved for one feed only, and legitimate on the other. */
+export function disprovedPathsForFeed(feed: NormalizationSource): readonly string[] {
+  return SHAPE_PREDICATES
+    .filter(entry => entry.verification.state === 'DISPROVED' && entry.feed === feed)
+    .flatMap(entry => entry.reads);
+}
 
 function predicate(id: string): ShapePredicate {
   const found = SHAPE_PREDICATES.find(entry => entry.id === id);

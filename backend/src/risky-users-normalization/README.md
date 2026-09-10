@@ -678,3 +678,93 @@ unselected feed still account for exactly every row.
 The detector is still not built and should not be: it needs a tenant-level finding where
 this model is user-scoped, and hanging one on a synthetic subject would be fabricating an
 identity — worse than the gap. What changed is that the gap is stated rather than silent.
+
+## Addendum: three Microsoft verdict kinds, on a passing control cohort
+
+`riskDetail` is verified. Measured across 2,648 Graph rows, exactly three values exist,
+and **the control cohort passes and is not empty** — 958 ordinary successes carry the
+explicit string `none` with `riskState: none`, not absent and not hidden, so the field
+does not default to a verdict on ordinary human traffic. Documentation had suggested it
+would be hidden without P2; it is not, which is exactly why that expectation needed
+checking rather than assuming.
+
+| `riskDetail` | `riskState` | rows | Disposition | Frontend group |
+| --- | --- | --- | --- | --- |
+| `none` | `none` | 2,593 | not a verdict — classify on the code | — |
+| `userPassedMFADrivenByRiskBasedPolicy` | `remediated` | 54 | `MICROSOFT_RISK_REMEDIATED` | CLOSED |
+| `aiConfirmedSigninSafe` | `dismissed` | 1 | `MICROSOFT_SAFETY_VERDICT` | CLEARED |
+
+**The remediated kind is a third thing, not a shade of the other two.** It reads: Microsoft
+assessed risk, a risk-based Conditional Access policy challenged the user, MFA passed.
+`MICROSOFT_RISK_VERDICT` would overstate it as live risk; `MICROSOFT_SAFETY_VERDICT` would
+understate it as never-risky. So there are now three lists —
+`microsoftRiskVerdicts` (ACTIVE_RISK), `microsoftRemediatedVerdicts` (CLOSED),
+`microsoftSafetyVerdicts` (CLEARED) — for the same reason there were two: a consumer can
+ignore a flag but cannot iterate a list it does not have. A test asserts an event appears
+in at most one.
+
+Unrecognised values route to `UNKNOWN / MICROSOFT_VERDICT_FIELD_UNRECOGNIZED`, never
+through. The asymmetry is the argument: falling through risks presenting Microsoft's
+detection as a HawkView finding, which is a correctness violation, while UNKNOWN only
+costs stated coverage. 100% of observed is still not 100% of possible.
+
+`riskDetail` is checked **before** the result code, because a risk-based CA outcome sits on
+an ordinary success code — reading the code first would file Microsoft's detection as ours.
+
+**Consequence worth stating plainly:** ~52 of ~1,010 successes now leave `applies`. Any
+rule needing "failures then a success" loses those successes for those users. That is the
+channel rule working as specified, and it is a real cost.
+
+And this is the **third** route by which Microsoft's risk output reaches us without the
+risk API — after sign-in log failure reasons and 53004. Anyone scoping work on the
+assumption that the risk API is the only route now has three counterexamples.
+
+## Addendum: `authenticationDetails` is dead, on its own kill condition
+
+Absent from all 2,648 Graph rows — the key is not present, not empty — and
+`authenticationRequirement` with it. That was the disqualifying condition stated in
+advance, so the predicate is **retired rather than left pending**.
+
+Since `raw` is the full payload post-redaction and redaction preserves keys, Microsoft did
+not send these fields. Both are documented on the v1.0 `signIn` resource, so the likely
+cause is omission from the default list projection, needing an explicit `$select` — which
+would make this a fixable **collection** gap rather than a licensing wall. One Graph call
+settles it; not asserted here.
+
+## Addendum: the interrupt family was counted in one vocabulary and undercounted
+
+I reported that family as near-empty from Graph numeric codes, and that was drawn from
+half the evidence. The audit feed *names* the same events:
+`UserStrongAuthClientAuthNRequiredInterrupt` at 13 rows across three tenants, plus
+`UserStrongAuthEnrollmentRequiredInterrupt` at 3 — so **16 cited events, not 3**.
+(A further 4 `PasswordResetRegistrationRequiredInterrupt` rows are counted by some as
+family members; they rest on an analogy this table declines to act on and remain held, so
+they are excluded from the 16.)
+
+`UserStrongAuthEnrollmentRequiredInterrupt` was **missing from `AUDIT_REASON_NAMES`
+entirely** — the audit-path name for 50072, which was mapped on Graph all along — so its
+rows were landing in `UNRECOGNIZED_REASON_NAME`. That gap was found only because the same
+family got measured twice, once per feed.
+
+**The generalisable rule, which is this module's own asymmetry thesis arriving with a bill:
+the two feeds needed opposite mechanisms, so any measurement spanning them must be taken
+in both vocabularies or it undercounts silently.** Counting numbers on one feed while the
+other names the same events in words produces a confident, wrong, small number. Ordering
+still puts lockout first — ~715 audit plus 558 Graph — but a detector sized from Graph
+codes alone would have been judged not worth building.
+
+## Addendum: a path can be dead on one feed and alive on the other
+
+`raw.status` is the provider object on the Graph feed and is read on every Graph row. On
+the audit feed the object of the same name is HawkView-synthesized, and it is **inconsistent
+for identical inputs** — same `LogonError`, same `Operation`, sometimes populated and
+sometimes not (IdsLocked 578 against 137; `UserStrongAuthClientAuthNRequiredInterrupt` 1
+against 12). An ingest-date boundary was checked and ruled out. Cause unresolved, and
+recorded as unresolved.
+
+So `signin.synthesized-status-object` is disproved **for the audit feed only**, and
+`ShapePredicate` now carries a `feed` qualifier. `DISPROVED_PREDICATE_PATHS` lists only
+paths dead on *every* feed; `disprovedPathsForFeed()` returns the scoped ones. Folding them
+together would have told a future reader never to read a field this layer reads on every
+Graph row — a wrong claim inside the mechanism that exists to prevent wrong claims, and
+the same collapse-two-facts-into-one defect one level further in.

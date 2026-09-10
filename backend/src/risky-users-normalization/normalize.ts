@@ -22,6 +22,7 @@ import {
   dispositionForCode,
   failureReasonMeaning,
   resultCodeEntry,
+  riskDetailDisposition,
   type CodeDisposition,
 } from './provider-facts.js';
 import {
@@ -175,6 +176,26 @@ export function classifyGraphRecord(record: Record<string, unknown>): {
 } {
   const shape = errorCodeShape(record);
   const errorCode = readGraphErrorCode(record);
+
+  // Microsoft's own assessment of the sign-in is checked FIRST, and outranks
+  // our reading of the result code, because of the attribution rule: whose
+  // judgement GENERATED the finding, not whose machinery responded. A
+  // risk-based Conditional Access outcome sits on an ordinary success code, so
+  // reading the code first would file Microsoft's detection as our finding.
+  //
+  // An unrecognised value routes to UNKNOWN rather than falling through. The
+  // asymmetry is the reason: falling through risks presenting Microsoft's
+  // detection as ours, which is a correctness violation, while UNKNOWN only
+  // costs stated coverage.
+  const verdict = riskDetailDisposition(record.riskDetail);
+  if (verdict.kind === 'VERDICT') return { classification: verdict.disposition, errorCode };
+  if (verdict.kind === 'UNRECOGNIZED') {
+    return {
+      classification: { kind: 'UNKNOWN', observation: 'MICROSOFT_VERDICT_FIELD_UNRECOGNIZED' },
+      errorCode,
+    };
+  }
+
   if (errorCode === null) {
     const observation: UnknownObservation =
       shape === 'ABSENT' || shape === 'NULL' ? 'ERROR_CODE_ABSENT' : 'ERROR_CODE_SHAPE_UNRECOGNIZED';
@@ -709,6 +730,11 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       event =>
         event.classification.kind === 'DOES_NOT_APPLY' &&
         event.classification.reason === 'MICROSOFT_RISK_VERDICT',
+    ),
+    microsoftRemediatedVerdicts: ordered.filter(
+      event =>
+        event.classification.kind === 'DOES_NOT_APPLY' &&
+        event.classification.reason === 'MICROSOFT_RISK_REMEDIATED',
     ),
     microsoftSafetyVerdicts: ordered.filter(
       event =>

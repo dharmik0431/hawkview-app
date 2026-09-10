@@ -380,6 +380,17 @@ export interface NormalizationBatch {
    */
   readonly microsoftRiskVerdicts: readonly NormalizedEvent[];
   /**
+   * Events where Microsoft DETECTED risk, the tenant's own policy responded,
+   * and the sign-in completed. Detected, handled, closed.
+   *
+   * A third list rather than a flag on either of the others, for the same
+   * reason there are two: a consumer can ignore a flag but cannot iterate a
+   * list it does not have. These map onto the frontend's CLOSED group, while
+   * `microsoftSafetyVerdicts` maps onto CLEARED and `microsoftRiskVerdicts`
+   * onto ACTIVE_RISK.
+   */
+  readonly microsoftRemediatedVerdicts: readonly NormalizedEvent[];
+  /**
    * Events where Microsoft judged the sign-in SAFE — a dismissal, not a
    * detection.
    *
@@ -389,8 +400,7 @@ export interface NormalizationBatch {
    * opposite. Two lists make that impossible to do by accident, and a test
    * asserts nothing appears in both.
    *
-   * Empty today: populating it means reading `riskDetail`, which has no
-   * control cohort yet.
+   * Populated from `riskDetail`, whose control cohort now passes.
    */
   readonly microsoftSafetyVerdicts: readonly NormalizedEvent[];
   /** Reference-to-identifier mapping for subjects that resolved, kept off the events. */
