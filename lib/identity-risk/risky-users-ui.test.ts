@@ -1117,3 +1117,71 @@ test('the Microsoft panel names the question it answers, not just its source', (
   assert.match(panel.textContent ?? '', /considers at risk now/)
   assert.match(panel.textContent ?? '', /telemetry HawkView cannot see/)
 })
+
+/* -------------------------------------------------------------------------- */
+/* Tenant and session scoping                                                 */
+/* -------------------------------------------------------------------------- */
+
+/** Compiles the real channel hook and captures the query keys it builds. */
+function capturedQueries(tenantId: string, cacheScope: string) {
+  const queries: Record<string, any>[] = []
+  const hooks = compile('../api/identity-risk-hooks.ts', {
+    '@tanstack/react-query': {
+      useQuery: (query: Record<string, any>) => {
+        queries.push(query)
+        return {
+          data: undefined,
+          isError: false,
+          isLoading: true,
+          refetch: async () => undefined,
+        }
+      },
+    },
+    '@/components/providers/auth-provider': { useAuth: () => ({ cacheScope }) },
+    './client': {
+      apiClient: {
+        get: () => {
+          throw new Error('No network requests in UI tests')
+        },
+      },
+    },
+    './mailbox-investigation': { parseInvestigationAccess: () => false },
+    '@/lib/identity-risk/adapter': adapter,
+    // The only real React hook this reads is useMemo, and the query keys are
+    // built before it. Evaluating it eagerly is enough to collect them without
+    // standing up a renderer for an assertion about cache keys.
+    react: { ...React, useMemo: (factory: () => unknown) => factory() },
+  })
+  hooks.useIdentityRiskChannels(tenantId, true)
+  return queries.map((query) => query.queryKey)
+}
+
+test('every read is keyed to the exact tenant and the authorised session', () => {
+  // One MSP technician holds many customers open. A cache key that omits
+  // either would serve one customer's assessment under another's heading —
+  // and this surface exists to be acted on, so that is the worst failure it
+  // has.
+  //
+  // This lived only in a test that renders the superseded section, which the
+  // app no longer routes to. Deleting that dead component — which somebody
+  // should — would have taken the guarantee's only coverage with it, silently.
+  for (const key of capturedQueries('tenant-a', 'session-1')) {
+    assert.deepEqual(key.slice(0, 3), [
+      'identity-risk',
+      'session-1',
+      'tenant-a',
+    ])
+  }
+
+  // Both halves are load-bearing: change either and the key changes.
+  const [assessmentA] = capturedQueries('tenant-a', 'session-1')
+  const [assessmentB] = capturedQueries('tenant-b', 'session-1')
+  const [otherSession] = capturedQueries('tenant-a', 'session-2')
+  assert.notDeepEqual(assessmentA, assessmentB)
+  assert.notDeepEqual(assessmentA, otherSession)
+
+  // And the two channels are not keyed alike, so one cannot serve the other.
+  const keys = capturedQueries('tenant-a', 'session-1')
+  assert.equal(keys.length, 2)
+  assert.notDeepEqual(keys[0], keys[1])
+})
