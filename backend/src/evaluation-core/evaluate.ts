@@ -1,5 +1,6 @@
 import type {
   Assessment, Budget, Count, CountScope, Coverage, Detector, DetectorReport, Evidence, EvidenceState, Finding,
+  FindingGap, FindingSet,
   WithheldReason, ZeroClaim,
 } from './contract.js'
 
@@ -191,7 +192,7 @@ export function evaluate<Event>(input: Readonly<{
       state,
       coverage: NO_COVERAGE,
       detectors: [],
-      findings: [],
+      findings: { items: [], complete: true },
       // Nothing ran, so nothing is covered. An empty scope beside a
       // not-available count says exactly that, without implying a check
       // was skipped for a reason of its own.
@@ -214,6 +215,19 @@ export function evaluate<Event>(input: Readonly<{
   // neighbours' findings would be the same veto this design exists to remove,
   // so the failure is isolated, reported, and costs only the exact claim.
   for (const detector of input.detectors) {
+    // A truncated window is a different question from the one a non-monotonic
+    // detector was written to answer. Running it anyway does not risk a missing
+    // finding, it risks a fabricated one: an absence-keyed rule fires precisely
+    // BECAUSE the disconfirming event was the one we dropped. So it does not
+    // run, and says why — the same INAPPLICABLE machinery, a different cause.
+    if (!withinBudget && !detector.monotonic) {
+      reports.push({
+        detectorId: detector.id,
+        status: 'INAPPLICABLE',
+        because: 'This check reads a whole window, and this window held more events than could be assessed at once.',
+      })
+      continue
+    }
     try {
       const result = detector.run(applicable)
       if (result.status === 'INAPPLICABLE') {
@@ -257,8 +271,26 @@ export function evaluate<Event>(input: Readonly<{
     state,
     coverage,
     detectors: reports,
-    findings,
+    findings: findingSet(findings, {
+      truncated: !withinBudget,
+      detectorFailed: reports.some(report => report.status === 'FAILED'),
+    }),
     count: countOf(distinctUsers(findings), claim.permitted, scopeOf(reports)),
     claim,
   }
+}
+
+/** Pairs the findings with whether they are all of them.
+ *
+ * A detector that could not run at all is deliberately NOT a gap here — that is
+ * the count's scope, and merging the two would lose which of "we may have missed
+ * some" and "we never asked this question" applies. */
+export function findingSet(
+  items: readonly Finding[], gaps: Readonly<{ truncated: boolean; detectorFailed: boolean }>,
+): FindingSet {
+  const because: FindingGap[] = []
+  if (gaps.truncated) because.push('WINDOW_TRUNCATED')
+  if (gaps.detectorFailed) because.push('DETECTOR_FAILED')
+  const [first, ...rest] = because
+  return first === undefined ? { items, complete: true } : { items, complete: false, because: [first, ...rest] }
 }

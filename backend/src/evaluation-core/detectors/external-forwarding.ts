@@ -61,6 +61,7 @@ export function externalForwardingDetector(
 
   return {
     id: 'external-mailbox-forwarding',
+    monotonic: true,
     run: applicable => {
       // Reported as inapplicable rather than as a run considering nothing:
       // "considered 0" is indistinguishable from a dead detector, which is the

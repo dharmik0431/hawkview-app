@@ -154,6 +154,30 @@ export type Finding = Readonly<{
  * genuinely inapplicable and one that is silently dead produce identical
  * output — which is exactly the position the previous engine left us in, with
  * three rules that have never once run against real evidence. */
+/** The findings, and whether they are all of them.
+ *
+ * The count is protected by its claim — an over-budget window cannot report an
+ * exact total. The findings list had no such protection: a technician reading
+ * three findings from a truncated window had no way to know there might be
+ * seven. So completeness travels inside the set rather than beside it, for the
+ * same reason scope travels inside the count: reaching the items means having
+ * been handed the qualification.
+ *
+ * Note this is about findings we might be MISSING. A check that could not run
+ * at all is in the count's scope instead — the two answer different questions
+ * and collapsing them would lose which one applies. */
+export type FindingSet =
+  | Readonly<{ items: readonly Finding[]; complete: true }>
+  | Readonly<{ items: readonly Finding[]; complete: false; because: readonly [FindingGap, ...FindingGap[]] }>
+
+/** Why there may be findings we have not shown. */
+export type FindingGap =
+  /** The window held more events than could be assessed, so some were not
+   * looked at. What they contained is unknown. */
+  | 'WINDOW_TRUNCATED'
+  /** A check crashed part-way, so anything it had left to find is unknown. */
+  | 'DETECTOR_FAILED'
+
 export type DetectorResult =
   | Readonly<{ status: 'RAN'; considered: number; findings: readonly Finding[] }>
   /** This evidence source cannot answer this detector's question at all — the
@@ -167,6 +191,24 @@ export type DetectorResult =
  * cannot influence coverage, and one failing cannot erase what another found. */
 export type Detector<Event> = Readonly<{
   id: string
+  /** True iff adding events can never remove a finding.
+   *
+   * This is what makes a detector safe to run on a truncated window, and it is
+   * a precise property rather than a category judgement: a presence-keyed rule
+   * ("these failures occurred") is monotonic; an absence-keyed rule ("failures
+   * with no subsequent success") is not, because the disconfirming event is
+   * exactly what truncation may remove.
+   *
+   * Get this wrong on an absence-keyed detector and truncation does not lose a
+   * finding, it FABRICATES one: drop the successful completion and "password
+   * accepted, MFA never completed" fires on a user who simply finished signing
+   * in. We would name someone compromised on evidence we deleted ourselves.
+   *
+   * Declared rather than inferred, because the core cannot inspect a detector's
+   * internals — but unlike an unverifiable assertion, this one is testable from
+   * outside: run the detector over random subsets and check that no finding
+   * disappears when events are added. */
+  monotonic: boolean
   run: (applicable: readonly Event[]) => DetectorResult
 }>
 
@@ -193,8 +235,9 @@ export type Assessment = Readonly<{
   state: EvidenceState
   coverage: Coverage
   detectors: readonly DetectorReport[]
-  /** Every finding, in both namespaces. Never filtered to what `count` counts. */
-  findings: readonly Finding[]
+  /** Every finding, in both namespaces, never filtered to what `count` counts —
+   * and inseparable from whether it is the whole list. */
+  findings: FindingSet
   /** Distinct **directory users** with a finding — not findings, and not
    * subjects. Mailbox-scoped findings are absent from this number by design, so
    * a count of zero beside a non-empty `findings` is coherent rather than a

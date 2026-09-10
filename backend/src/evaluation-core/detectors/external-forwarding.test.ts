@@ -43,14 +43,14 @@ test('forwarding outside the tenant is found wherever Exchange reports it', () =
   ]
   const result = assess(found)
   assert.deepEqual(
-    result.findings.map(finding => finding.subject.kind === 'MAILBOX' ? finding.subject.mailboxRef : null).sort(),
+    result.findings.items.map(finding => finding.subject.kind === 'MAILBOX' ? finding.subject.mailboxRef : null).sort(),
     ['a', 'b', 'c', 'd', 'e'])
   // Five mailboxes found, and zero *users* — exactly, because every mailbox was
   // read and the detector ran. None of these were bound to a directory user, so
   // none may be counted as a person. The findings are reported in full; it is
   // the user total they stay out of.
   assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
-  assert.equal(result.findings.length, 5)
+  assert.equal(result.findings.items.length, 5)
 })
 
 test('a zero user count beside real findings is coherent when the mailbox is provably not a person', () => {
@@ -59,7 +59,7 @@ test('a zero user count beside real findings is coherent when the mailbox is pro
   // people", the findings answer "what did we find" — different questions.
   const result = assess([mailbox('reception-room', { forwardingSmtpAddress: 'exfil@evil.example' })])
   assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
-  assert.equal(result.findings.length, 1)
+  assert.equal(result.findings.items.length, 1)
   assert.equal(result.claim.permitted, true)
 })
 
@@ -70,7 +70,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
   // and one — so the exact claim is refused instead of reading as "nobody".
   const unattributed = mailbox('orphan', { forwardingSmtpAddress: 'exfil@evil.example' })
   const result = assess([{ ...unattributed, subject: { kind: 'MAILBOX', mailboxRef: 'orphan', binding: 'UNRESOLVED' } }])
-  assert.equal(result.findings.length, 1, 'still found, still reported')
+  assert.equal(result.findings.items.length, 1, 'still found, still reported')
   assert.deepEqual(result.claim, { permitted: false, because: ['UNRESOLVED_SUBJECT_IDENTITY'] })
   assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
 
@@ -85,6 +85,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
     },
     detectors: [detector, {
       id: 'user-side',
+      monotonic: true,
       run: () => ({
         status: 'RAN' as const, considered: 1,
         findings: [{
@@ -115,6 +116,7 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
   // case is what actually discriminates, so both are here.
   const userSide = (userRef: string) => ({
     id: `user-${userRef}`,
+    monotonic: true,
     run: () => ({
       status: 'RAN' as const, considered: 1,
       findings: [{
@@ -138,7 +140,7 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
   // And an unrelated mailbox does not become a second person either. This is the
   // case that fails if the two namespaces are ever compared as bare strings.
   assert.deepEqual(figure(withMailboxes([exfiltrating('reception-room')]).count), { accuracy: 'EXACT', value: 1 })
-  assert.equal(withMailboxes([exfiltrating('reception-room')]).findings.length, 2, 'still reported, just not counted')
+  assert.equal(withMailboxes([exfiltrating('reception-room')]).findings.items.length, 2, 'still reported, just not counted')
 })
 
 test('the tenant\'s own domains are not exfiltration, case and subdomain handled', () => {
@@ -149,13 +151,13 @@ test('the tenant\'s own domains are not exfiltration, case and subdomain handled
     // A lookalike domain is external however much it resembles the tenant's.
     mailbox('lookalike', { forwardingSmtpAddress: 'attacker@contoso.com.evil.example' }),
   ])
-  assert.deepEqual(result.findings.map(finding =>
+  assert.deepEqual(result.findings.items.map(finding =>
     finding.subject.kind === 'MAILBOX' ? finding.subject.mailboxRef : null), ['lookalike'])
 })
 
 test('a disabled rule is configuration, not exfiltration', () => {
   const result = assess([mailbox('a', { rules: [rule({ enabled: false, forwardTo: ['exfil@evil.example'] })] })])
-  assert.deepEqual(result.findings, [])
+  assert.deepEqual(result.findings.items, [])
   // Considered and cleared, which is what lets this read as a genuine zero.
   assert.deepEqual(result.detectors, [{ detectorId: 'external-mailbox-forwarding', status: 'RAN', considered: 1, matched: 0 }])
   assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
@@ -168,7 +170,7 @@ test('without verified domains it declares itself inapplicable rather than flagg
   // indistinguishable from a dead detector.
   const blind = externalForwardingDetector({ verifiedDomains: [] })
   const result = assess([mailbox('a', { forwardingSmtpAddress: 'colleague@contoso.com' })], [blind])
-  assert.deepEqual(result.findings, [])
+  assert.deepEqual(result.findings.items, [])
   assert.deepEqual(result.detectors, [{
     detectorId: 'external-mailbox-forwarding',
     status: 'INAPPLICABLE',
@@ -189,7 +191,7 @@ test('the detector plugs into the core without the core knowing anything about m
   const clean = assess([mailbox('a', { forwardingSmtpAddress: 'colleague@contoso.com' })])
   assert.deepEqual(clean.claim, { permitted: true })
   assert.deepEqual(figure(clean.count), { accuracy: 'EXACT', value: 0 })
-  assert.deepEqual(clean.findings, [], 'nothing found, as distinct from nothing counted')
+  assert.deepEqual(clean.findings.items, [], 'nothing found, as distinct from nothing counted')
 
   // And the coverage rules apply unchanged: an artefact nobody could read
   // withholds the clean claim without suppressing what was found elsewhere.
@@ -202,7 +204,7 @@ test('the detector plugs into the core without the core knowing anything about m
     },
     detectors: [detector], budget: { maxEvents: 500 },
   })
-  assert.equal(partial.findings.length, 1)
+  assert.equal(partial.findings.items.length, 1)
   assert.deepEqual(partial.claim, { permitted: false, because: ['UNINTERPRETED_EVENTS'] })
   // No user was identified, so there is no floor to state about people — and a
   // lower bound of zero is not a statement. The mailbox finding is still

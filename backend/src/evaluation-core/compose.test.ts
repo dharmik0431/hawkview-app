@@ -12,6 +12,7 @@ const coverage = (parts: Partial<Coverage> = {}): Coverage =>
 
 const matching: Detector<Event> = {
   id: 'matches-flagged',
+  monotonic: true,
   run: applicable => ({
     status: 'RAN', considered: applicable.length,
     findings: applicable.filter(item => item.match).map(item => ({
@@ -62,7 +63,7 @@ test('rule 1: a stream that could not be read never hides what another stream fo
   // The finding survives. Suppressing it because some *other* evidence was
   // unreadable is the veto pattern, and it is what put a real detection behind
   // an "unavailable" banner in production.
-  assert.deepEqual(result.findings.map(userRefOf), ['alice'])
+  assert.deepEqual(result.findings.items.map(userRefOf), ['alice'])
 })
 
 test('rule 2: an exact tenant zero requires every stream to have permitted a claim', () => {
@@ -160,7 +161,7 @@ test('a user found in two streams is one user', () => {
     stream('sign-ins', [found('alice')]),
     stream('audit-log', [found('alice'), found('bob')]),
   ])
-  assert.equal(result.findings.length, 3)
+  assert.equal(result.findings.items.length, 3)
   // Counts people, not findings — two streams noticing the same person is one
   // person at risk, and a headline that said three would be inflating it. This
   // is the owner's explicit requirement, so getting it wrong is visible.
@@ -174,6 +175,7 @@ test('mailbox findings cross streams without ever becoming people', () => {
       evidence: { availability: 'READ', applies: [{ subject: 'shared-billing' }], coverage: coverage({ applies: 1 }), timeOf: () => 0 },
       detectors: [{
         id: 'external-mailbox-forwarding',
+        monotonic: true,
         run: applicable => ({
           status: 'RAN', considered: applicable.length,
           findings: applicable.map(item => ({
@@ -189,11 +191,11 @@ test('mailbox findings cross streams without ever becoming people', () => {
 
   const result = composeTenantAssessment([stream('sign-ins', [found('alice')]), mailboxStream])
   // Both findings reach the tenant view — rule 1 does not care which namespace.
-  assert.equal(result.findings.length, 2)
+  assert.equal(result.findings.items.length, 2)
   // But only alice is a person. A shared mailbox has a directory GUID too, and
   // counting it would tell an MSP two humans are affected when one is a room.
   assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 1 })
-  assert.deepEqual(result.findings.map(userRefOf), ['alice', null])
+  assert.deepEqual(result.findings.items.map(userRefOf), ['alice', null])
 })
 
 test('a partly uninterpretable stream withholds the tenant claim under its own reason', () => {

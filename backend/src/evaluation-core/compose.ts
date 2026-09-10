@@ -1,5 +1,5 @@
 import { countOf, distinctUsers } from './evaluate.js'
-import type { Assessment, Count, Finding, WithheldReason } from './contract.js'
+import type { Assessment, Count, FindingSet, WithheldReason } from './contract.js'
 
 /** Composing several evidence streams into one tenant answer.
  *
@@ -33,8 +33,8 @@ export type TenantAssessment = Readonly<{
   /** Every finding from every stream that produced one. A stream that could not
    * be read never suppresses what another stream found — the veto pattern at
    * tenant scale, and the same mistake as a failed detector erasing its
-   * neighbours' findings. */
-  findings: readonly Finding[]
+   * neighbours' findings. Incomplete in any stream is incomplete here. */
+  findings: FindingSet
   count: Count
   claim: TenantClaim
 }>
@@ -44,7 +44,12 @@ export type TenantAssessment = Readonly<{
  * promoted directory-user refs are compared; mailbox refs are a separate
  * namespace and are never matched against them. */
 export function composeTenantAssessment(streams: readonly StreamAssessment[]): TenantAssessment {
-  const findings = streams.flatMap(entry => entry.assessment.findings)
+  const findings = streams.flatMap(entry => entry.assessment.findings.items)
+  // Incomplete anywhere is incomplete for the tenant: a technician reading the
+  // tenant view must not be told the list is whole because one of its parts was.
+  const findingGaps = [...new Set(streams.flatMap(entry =>
+    entry.assessment.findings.complete ? [] : entry.assessment.findings.because))]
+  const [firstGap, ...restGaps] = findingGaps
 
   const withheld: readonly Withholding[] = streams.length === 0
     // No streams means nothing was assessed. A tenant-wide zero drawn from an
@@ -66,7 +71,9 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
 
   return {
     streams,
-    findings,
+    findings: firstGap === undefined
+      ? { items: findings, complete: true }
+      : { items: findings, complete: false, because: [firstGap, ...restGaps] },
     // The per-stream count rule, unchanged. Because it is unchanged, the
     // corollary holds without being coded: a lower bound is never zero, so a
     // tenant with one unreadable stream and nothing found in the others reports
