@@ -321,6 +321,30 @@ export class IdentityRiskService {
     }
   }
 
+  /** The SAME authorization as every other identity-risk read, exposed so a
+   * second reader does not grow a second copy of it.
+   *
+   * `scope` resolves the caller from their auth subject, requires an ACTIVE
+   * membership in an ACTIVE organization, and finds the tenant only within
+   * those organizations — so a caller cannot name a tenant belonging to
+   * somebody else. `pilotReadAllowed` is the separate gate on who may read
+   * identity-risk data at all.
+   *
+   * Additive: nothing existing changes. A reimplementation in the new reader
+   * would be two copies of a rule whose failure mode is cross-tenant data
+   * exposure, and a new endpoint quietly skipping the pilot gate would widen
+   * who can read this while looking like a feature.
+   *
+   * Returns null rather than throwing when the pilot gate declines, because
+   * "you may not read this yet" is a different answer from "this is not yours"
+   * and the caller renders them differently. `scope` still throws Forbidden
+   * for the second.
+   */
+  async authorizeRiskyUsersRead(identity: AuthenticatedIdentity, tenantId: string) {
+    const tenant = await this.scope(identity, tenantId)
+    return pilotReadAllowed(tenant) ? tenant : null
+  }
+
   private async scope(
     identity: AuthenticatedIdentity,
     tenantId: string,
