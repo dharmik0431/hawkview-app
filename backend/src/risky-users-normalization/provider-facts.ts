@@ -1,4 +1,4 @@
-import type { EventOutcome, NormalizationSource } from './contract.js';
+import type { EventOutcome, MicrosoftVerdict, NormalizationSource } from './contract.js';
 import type { OutOfScopeReason, UncitedReason, UnknownObservation } from './reasons.js';
 
 /**
@@ -68,7 +68,7 @@ export type ClaimClass =
   /** Neither: hygiene, expected flow, or remediation confirmation. */
   | 'NEITHER';
 
-export interface ResultCodeEntry {
+export interface ResultCodeEntry extends CarriesVerdict {
   readonly code: number;
   readonly microsoftName: string;
   /**
@@ -225,6 +225,7 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
   {
     code: 53004,
     graphObservation: 'NOT_OBSERVED',
+    verdict: 'RISK',
     microsoftName: 'ProofUpBlockedDueToRisk',
     claimClass: 'ATTACK_AND_CONTROL',
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
@@ -237,11 +238,17 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
         'made, revisitable, unlike a provider statement.',
     },
     note:
-      'Cannot configure MFA due to suspicious activity. Placed in the Microsoft channel on the standing ' +
-      'whose-judgement test, which is sound — but NO PRODUCTION EVIDENCE: zero rows, all tenants, all ' +
-      'history. Same shape as the third 50053 text variant. The branch is kept because ' +
-      'ProofUpBlockedDueToRisk naming a risk-driven block is reasonable anticipation from documentation, ' +
-      'and it is exercised by synthetic fixture only.',
+      'Cannot configure MFA due to suspicious activity. NO PRODUCTION EVIDENCE: zero rows, all ' +
+      'tenants, all history, so it is exercised by synthetic fixture only and kept because the name ' +
+      'ProofUpBlockedDueToRisk is reasonable anticipation from documentation. ' +
+      'OPEN INCONSISTENCY, recorded rather than resolved: the ruling that the observation is ours ' +
+      'while the verdict is Microsoft own returned the riskDetail cases to normal classification, ' +
+      'while this code and the 50053 risk-text meanings stay classified DOES_NOT_APPLY. The two ' +
+      'differ in one real way — riskDetail is a SEPARATE field, so the observation is readable ' +
+      'without the verdict, whereas here the code IS both statements at once. Applying the ruling ' +
+      'here would return these to APPLIES/BLOCKED_BY_CONTROL carrying verdict RISK, which for the ' +
+      '50053 malicious-IP text is roughly 921 rows. Escalated as a consistency question rather than ' +
+      'decided, because it was previously ruled the other way under the older framing.',
   },
   {
     code: 50131,
@@ -569,7 +576,7 @@ export type FailureReasonMeaning =
   | 'HIGH_CONFIDENCE_RISK_BLOCK'
   | 'SUSPICIOUS_ACTIVITY_BLOCK';
 
-export interface FailureReasonPattern {
+export interface FailureReasonPattern extends CarriesVerdict {
   readonly meaning: FailureReasonMeaning;
   /** Distinctive lowercase fragments. Deliberately punctuation-light. */
   readonly fragments: readonly string[];
@@ -588,6 +595,7 @@ export interface FailureReasonPattern {
 export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
   {
     meaning: 'SUSPICIOUS_ACTIVITY_BLOCK',
+    verdict: 'RISK',
     fragments: ['suspicious activity'],
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
     verification: {
@@ -602,6 +610,7 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
   },
   {
     meaning: 'HIGH_CONFIDENCE_RISK_BLOCK',
+    verdict: 'RISK',
     // ONE fragment, and the most distinctive one available. This is the only
     // branch here that moves an event OUT of `applies`, so a fragment broad
     // enough to catch a neighbouring meaning would divert real evidence into
@@ -627,6 +636,7 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
   },
   {
     meaning: 'MALICIOUS_IP_BLOCK',
+    verdict: 'RISK',
     fragments: ['malicious activity'],
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
     verification: {
@@ -761,6 +771,11 @@ export interface AuditReasonEntry {
   /** Required when the linked Graph code's disposition differs, and why. */
   readonly divergenceReason?: string;
   readonly note?: string;
+}
+
+/** Microsoft's judgement carried by a result code or description, if any. */
+export interface CarriesVerdict {
+  readonly verdict?: MicrosoftVerdict;
 }
 
 export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
@@ -901,24 +916,21 @@ export const AUDIT_REASON_NAMES_OBSERVED_UNMAPPED: readonly { readonly name: str
  * of observed is not 100% of possible: `none` may not be the only benign
  * value another tenant emits.
  */
-export interface RiskDetailEntry {
+export interface RiskDetailEntry extends CarriesVerdict {
   readonly value: string;
-  /** null means "not a verdict; carry on and classify by result code". */
-  readonly disposition: CodeDisposition | null;
   readonly note: string;
 }
 
 export const RISK_DETAIL_VALUES: readonly RiskDetailEntry[] = [
   {
     value: 'none',
-    disposition: null,
     note:
       'The benign value, and the control cohort: 2,593 of 2,648 rows including 958 ordinary successes. ' +
       'Explicitly the string "none" rather than absent or hidden.',
   },
   {
     value: 'userPassedMFADrivenByRiskBasedPolicy',
-    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_REMEDIATED' },
+    verdict: 'REMEDIATED',
     note:
       'Microsoft assessed risk, a risk-based Conditional Access policy challenged the user, and MFA ' +
       'passed. Detected, handled, closed — and delivered on a tenant with no P2, which makes this the ' +
@@ -927,7 +939,7 @@ export const RISK_DETAIL_VALUES: readonly RiskDetailEntry[] = [
   },
   {
     value: 'aiConfirmedSigninSafe',
-    disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_SAFETY_VERDICT' },
+    verdict: 'SAFE',
     note:
       'Microsoft AI concluded the sign-in was safe. A dismissal, not a detection. Microsoft own ' +
       'vocabulary sets a trap here: auto-remediation lands on riskState "dismissed", so this is a ' +
@@ -940,20 +952,25 @@ const BY_RISK_DETAIL: ReadonlyMap<string, RiskDetailEntry> = new Map(
 );
 
 /**
- * How to treat a `riskDetail` value: a disposition, "carry on" for the benign
- * value, or "unrecognised" for anything outside the closed set.
+ * Microsoft's verdict for a riskDetail value, if it carries one.
+ *
+ * NOTE what this no longer does: it does not return a disposition, because
+ * the verdict does not change classification at all. An unrecognised value
+ * is therefore safe to classify normally. The earlier reasoning that it had
+ * to route to UNKNOWN rested on the verdict being able to reach a detector,
+ * and it cannot: verdicts never appear on NormalizedEvent. An unrecognised
+ * value is counted instead, so coverage can disclose that Microsoft said
+ * something we could not read.
  */
-export function riskDetailDisposition(value: unknown):
-  | { readonly kind: 'NOT_A_VERDICT' }
-  | { readonly kind: 'VERDICT'; readonly disposition: CodeDisposition }
+export function riskDetailVerdict(value: unknown):
+  | { readonly kind: 'NONE' }
+  | { readonly kind: 'VERDICT'; readonly verdict: MicrosoftVerdict }
   | { readonly kind: 'UNRECOGNIZED' } {
-  if (value === undefined || value === null || value === '') return { kind: 'NOT_A_VERDICT' };
+  if (value === undefined || value === null || value === '') return { kind: 'NONE' };
   if (typeof value !== 'string' || value.length > 256) return { kind: 'UNRECOGNIZED' };
   const entry = BY_RISK_DETAIL.get(value.trim().toLowerCase());
   if (!entry) return { kind: 'UNRECOGNIZED' };
-  return entry.disposition === null
-    ? { kind: 'NOT_A_VERDICT' }
-    : { kind: 'VERDICT', disposition: entry.disposition };
+  return entry.verdict === undefined ? { kind: 'NONE' } : { kind: 'VERDICT', verdict: entry.verdict };
 }
 
 export type ShapePredicateVerification

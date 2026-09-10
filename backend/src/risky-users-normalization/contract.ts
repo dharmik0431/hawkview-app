@@ -134,6 +134,45 @@ export function isPostPasswordInterrupt(outcome: EventOutcome): boolean {
 export type SubjectBindingMethod = 'DIRECTORY_OBJECT_ID' | 'NORMALIZED_UPN';
 
 /**
+ * Microsoft's own judgement about a sign-in, as a dimension ORTHOGONAL to
+ * classification.
+ *
+ * It is not a classification, and that is the whole design. Splitting the
+ * event from the judgement is what lets both channels read the same log line
+ * independently:
+ *
+ *  - The OBSERVATION (a sign-in happened, at this time, by this subject, with
+ *    this outcome) is a fact from the same log that gives us every other
+ *    event. It classifies normally and feeds our rules.
+ *  - The VERDICT is Microsoft's conclusion. It never enters a HawkView
+ *    finding, never contributes to our count, and never appears as a reason.
+ *
+ * The channel rule is not violated by one event being evidence in both: two
+ * analysts reading the same log line and reaching independent conclusions is
+ * not merging, it is the point of running two channels, and it is what makes
+ * agreement between them mean anything.
+ *
+ * THE GUARANTEE IS STRUCTURAL, NOT A CONVENTION. This never appears on
+ * NormalizedEvent, so a detector iterating the applies list cannot read it
+ * even by accident, and a HawkView finding cannot cite Microsoft's judgement.
+ * Verdicts reach a consumer only through the batch-level lists.
+ *
+ * Treating the verdict as a classification, and so removing judged events
+ * from evaluation, was the earlier design and was wrong three ways: it went
+ * silent on the most suspicious pattern the data can hold (failures then a
+ * success Microsoft independently thought worth challenging); it made our
+ * findings anti-correlated with real risk, invisibly; and it made
+ * detected-by-both structurally rarest exactly where it is most valuable.
+ */
+export type MicrosoftVerdict =
+  /** Microsoft judged the sign-in risky. */
+  | 'RISK'
+  /** Microsoft detected risk, a control the tenant configured held, closed. */
+  | 'REMEDIATED'
+  /** Microsoft assessed the sign-in and judged it safe. A dismissal. */
+  | 'SAFE';
+
+/**
  * Client-source qualification.
  *
  * THREE values, not two. 'MISSING' previously collapsed two different facts:
@@ -288,6 +327,15 @@ export interface NormalizationCounts {
   /** How the events that did bind were bound, so weaker bindings are visible. */
   readonly bindingMethods: Readonly<Record<SubjectBindingMethod, number>>;
   /**
+   * Microsoft's verdicts seen, by kind, plus values we could not read.
+   *
+   * An ORTHOGONAL dimension rather than a fifth bucket: every event counted
+   * here is also counted in one of the four vocabularies, because the verdict
+   * does not decide whether our detectors act. Summing this with the four
+   * double-counts.
+   */
+  readonly microsoftVerdicts: Readonly<Record<MicrosoftVerdict | 'UNRECOGNIZED', number>>;
+  /**
    * Rows that were never part of the assessed scope, BY REASON.
    *
    * Independent feeds are never pooled, so these rows are not evaluated — and
@@ -368,8 +416,12 @@ export interface NormalizationBatch {
   /** The subset HawkView's own detectors act on. Same ordering. */
   readonly applies: readonly NormalizedEvent[];
   /**
-   * Events where Microsoft judged the sign-in RISKY, kept OUT of `applies` and
-   * surfaced separately.
+   * Events carrying Microsoft's RISK verdict.
+   *
+   * These events also classify normally and may appear in the applies list:
+   * the observation is ours, the verdict is Microsoft's. The events here
+   * carry no verdict field, so reading this list is the only way to learn
+   * what Microsoft concluded.
    *
    * Classified DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT, because the owner's
    * product rule is that HawkView's own findings and Microsoft's reported risk

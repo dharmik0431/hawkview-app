@@ -9,6 +9,7 @@ import {
   type NormalizationBatch,
   type NormalizationScope,
   type ClientQualification,
+  type MicrosoftVerdict,
   type NormalizationSource,
   type NormalizeBatchOptions,
   type NormalizedEvent,
@@ -22,7 +23,7 @@ import {
   dispositionForCode,
   failureReasonMeaning,
   resultCodeEntry,
-  riskDetailDisposition,
+  riskDetailVerdict,
   type CodeDisposition,
 } from './provider-facts.js';
 import {
@@ -164,57 +165,60 @@ export function readGraphErrorCode(record: Record<string, unknown>): number | nu
  * only to a member of the closed set. Text matching nothing, or matching more
  * than one meaning, keeps the table's UNKNOWN disposition.
  */
-function refineByDescription(code: number, disposition: CodeDisposition, description: unknown): CodeDisposition {
-  const allowed = resultCodeEntry(code)?.textMeanings;
-  if (!allowed || allowed.length === 0) return disposition;
-  return failureReasonMeaning(description, allowed)?.disposition ?? disposition;
+function refineByDescription(
+  code: number,
+  disposition: CodeDisposition,
+  description: unknown,
+): { disposition: CodeDisposition; verdict?: MicrosoftVerdict } {
+  const entry = resultCodeEntry(code);
+  const allowed = entry?.textMeanings;
+  if (!allowed || allowed.length === 0) return { disposition, verdict: entry?.verdict };
+  const matched = failureReasonMeaning(description, allowed);
+  if (!matched) return { disposition, verdict: entry?.verdict };
+  return { disposition: matched.disposition, verdict: matched.verdict ?? entry?.verdict };
 }
 
 export function classifyGraphRecord(record: Record<string, unknown>): {
   classification: EventClassification;
   errorCode: number | null;
+  /** Microsoft's judgement, orthogonal to the classification. */
+  verdict: MicrosoftVerdict | 'UNRECOGNIZED' | null;
 } {
   const shape = errorCodeShape(record);
   const errorCode = readGraphErrorCode(record);
 
-  // Microsoft's own assessment of the sign-in is checked FIRST, and outranks
-  // our reading of the result code, because of the attribution rule: whose
-  // judgement GENERATED the finding, not whose machinery responded. A
-  // risk-based Conditional Access outcome sits on an ordinary success code, so
-  // reading the code first would file Microsoft's detection as our finding.
-  //
-  // An unrecognised value routes to UNKNOWN rather than falling through. The
-  // asymmetry is the reason: falling through risks presenting Microsoft's
-  // detection as ours, which is a correctness violation, while UNKNOWN only
-  // costs stated coverage.
-  const verdict = riskDetailDisposition(record.riskDetail);
-  if (verdict.kind === 'VERDICT') return { classification: verdict.disposition, errorCode };
-  if (verdict.kind === 'UNRECOGNIZED') {
-    return {
-      classification: { kind: 'UNKNOWN', observation: 'MICROSOFT_VERDICT_FIELD_UNRECOGNIZED' },
-      errorCode,
-    };
-  }
+  // Microsoft's verdict is read but does NOT steer classification. The
+  // observation is ours and classifies on its own terms; the verdict travels
+  // separately and never reaches a detector. An unrecognised value is safe to
+  // classify normally for exactly that reason.
+  const fromField = riskDetailVerdict(record.riskDetail);
+  let verdict: MicrosoftVerdict | 'UNRECOGNIZED' | null =
+    fromField.kind === 'VERDICT' ? fromField.verdict
+      : fromField.kind === 'UNRECOGNIZED' ? 'UNRECOGNIZED'
+        : null;
 
   if (errorCode === null) {
     const observation: UnknownObservation =
       shape === 'ABSENT' || shape === 'NULL' ? 'ERROR_CODE_ABSENT' : 'ERROR_CODE_SHAPE_UNRECOGNIZED';
-    return { classification: { kind: 'UNKNOWN', observation }, errorCode: null };
+    return { classification: { kind: 'UNKNOWN', observation }, errorCode: null, verdict };
   }
 
   const status = plainObject(record.status) ? record.status : {};
   const description = status.failureReason;
-  const disposition = refineByDescription(errorCode, dispositionForCode(errorCode), description);
+  const refined = refineByDescription(errorCode, dispositionForCode(errorCode), description);
+  const { disposition } = refined;
+  if (verdict === null && refined.verdict !== undefined) verdict = refined.verdict;
 
   if (disposition.kind === 'APPLIES' && disposition.outcome === 'PASSWORD_ACCEPTED_COMPLETED') {
     if (!descriptionPermitsSuccess(description)) {
       return {
         classification: { kind: 'UNKNOWN', observation: 'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON' },
         errorCode,
+        verdict,
       };
     }
   }
-  return { classification: disposition, errorCode };
+  return { classification: disposition, errorCode, verdict };
 }
 
 /**
@@ -471,6 +475,11 @@ type InternalRowResult =
       readonly kind: 'NORMALIZED';
       readonly event: NormalizedEvent;
       readonly microsoftUserId: string;
+      /**
+       * Deliberately NOT on the event: this is how the structural guarantee is
+       * kept. A detector iterating the applies list has no field to read.
+       */
+      readonly verdict: MicrosoftVerdict | 'UNRECOGNIZED' | null;
     }
   | { readonly kind: 'UNPROCESSABLE'; readonly reason: UnprocessableReason };
 
@@ -568,7 +577,10 @@ async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, contex
   if (applicationRef === 'BUDGET') return unprocessable('REFERENCE_BUDGET_EXCEEDED');
   if (applicationRef === 'UNAVAILABLE') return unprocessable('REFERENCE_UNAVAILABLE');
 
-  const { classification, errorCode } = graph ? classifyGraphRecord(record) : classifyAuditRecord(record);
+  const classified = graph
+    ? classifyGraphRecord(record)
+    : { ...classifyAuditRecord(record), verdict: null as MicrosoftVerdict | 'UNRECOGNIZED' | null };
+  const { classification, errorCode, verdict } = classified;
   const clientSource = graph
     ? qualifyClient([record.ipAddress])
     : qualifyClient([record.ClientIP, record.ActorIpAddress]);
@@ -588,7 +600,7 @@ async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, contex
     clientSource,
     classification,
   };
-  return { kind: 'NORMALIZED', event, microsoftUserId: binding.user.microsoftUserId };
+  return { kind: 'NORMALIZED', event, microsoftUserId: binding.user.microsoftUserId, verdict };
 }
 
 export async function normalizeSignInBatch(options: NormalizeBatchOptions): Promise<NormalizationBatch> {
@@ -611,6 +623,10 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
 
   let applies = 0;
   let enumerationCodedRows = 0;
+  const microsoftVerdicts: Record<MicrosoftVerdict | 'UNRECOGNIZED', number> = {
+    RISK: 0, REMEDIATED: 0, SAFE: 0, UNRECOGNIZED: 0,
+  };
+  const verdictOf = new Map<NormalizedEvent, MicrosoftVerdict>();
 
   let consideredRows = 0;
   const events: NormalizedEvent[] = [];
@@ -700,6 +716,10 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
     }
     const { event } = result;
     events.push(event);
+    if (result.verdict !== null) {
+      microsoftVerdicts[result.verdict] += 1;
+      if (result.verdict !== 'UNRECOGNIZED') verdictOf.set(event, result.verdict);
+    }
     bindingMethods[event.subjectBinding] += 1;
     resolvedSubjects.set(event.subjectRef, {
       microsoftUserId: result.microsoftUserId,
@@ -737,21 +757,9 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
     source,
     events: ordered,
     applies: ordered.filter(event => event.classification.kind === 'APPLIES'),
-    microsoftRiskVerdicts: ordered.filter(
-      event =>
-        event.classification.kind === 'DOES_NOT_APPLY' &&
-        event.classification.reason === 'MICROSOFT_RISK_VERDICT',
-    ),
-    microsoftRemediatedVerdicts: ordered.filter(
-      event =>
-        event.classification.kind === 'DOES_NOT_APPLY' &&
-        event.classification.reason === 'MICROSOFT_RISK_REMEDIATED',
-    ),
-    microsoftSafetyVerdicts: ordered.filter(
-      event =>
-        event.classification.kind === 'DOES_NOT_APPLY' &&
-        event.classification.reason === 'MICROSOFT_SAFETY_VERDICT',
-    ),
+    microsoftRiskVerdicts: ordered.filter(event => verdictOf.get(event) === 'RISK'),
+    microsoftRemediatedVerdicts: ordered.filter(event => verdictOf.get(event) === 'REMEDIATED'),
+    microsoftSafetyVerdicts: ordered.filter(event => verdictOf.get(event) === 'SAFE'),
     resolvedSubjects: [...resolvedSubjects].map(([subjectRef, entry]) => ({ subjectRef, ...entry })),
     counts: {
       rows: rows.length,
@@ -761,6 +769,9 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       unknownByObservation,
       unprocessableByReason,
       bindingMethods,
+      // An ORTHOGONAL dimension, not a bucket: these events are also counted
+      // in one of the four vocabularies. Summing this with them double-counts.
+      microsoftVerdicts,
       unselectedRowsByReason,
     },
     coverage: {

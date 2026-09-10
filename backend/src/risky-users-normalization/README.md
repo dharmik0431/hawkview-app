@@ -855,3 +855,51 @@ it destroys those fields the moment they start arriving, so **the regex fix must
 the `$select`, or the fix creates the bug.** The generalisation I offered needs its partner:
 when you check whether a filter affects the thing you care about, check what else it matches
 — *and then check whether the thing it matches is ever actually there.*
+
+## Addendum: the verdict is a dimension, not a classification
+
+**Ruling: the observation is ours, the verdict is Microsoft's.** A sign-in happened, at
+this time, by this subject, with this outcome — that is a fact from the same log that gives
+us every other event, so it classifies normally and feeds our rules. Microsoft's conclusion
+(`riskDetail`, `riskState`) never enters a HawkView finding.
+
+So `MicrosoftVerdict` is **orthogonal to classification**: `RISK`, `REMEDIATED`, `SAFE`,
+carried alongside the four buckets rather than as one of them. `counts.microsoftVerdicts`
+is not a fifth bucket and must not be summed with the vocabularies — every event counted
+there is also counted in one of the four. A test asserts the four still account for exactly
+every row.
+
+**The guarantee is structural, not a convention.** `MicrosoftVerdict` never appears on
+`NormalizedEvent`, so a detector iterating `applies` has no field to read and a HawkView
+finding cannot cite Microsoft's judgement even by accident. Verdicts reach a consumer only
+through the batch-level lists. A test serializes a judged event and asserts no trace of
+`riskDetail`, `riskState`, `verdict` or the verdict values appears — and mutation-testing
+confirms that adding the field "for convenience" fails it.
+
+**Why the earlier strict reading was wrong**, in cost order: it went silent on the most
+suspicious pattern the data can hold — failures followed by a success Microsoft
+independently thought worth challenging; it made our findings **anti-correlated with real
+risk**, invisibly, since we would fire on successes Microsoft didn't flag and stay quiet on
+the ones it did; and it made "detected by HawkView *and* Microsoft" structurally rarest
+exactly where it is most valuable.
+
+The channel rule is not violated by one event being evidence in both. Two analysts reading
+the same log line and reaching independent conclusions is not merging — it is the point of
+running two channels, and it is what makes agreement between them mean anything. The same
+applies to `aiConfirmedSigninSafe`: we no more defer to Microsoft's clearance than borrow
+its detection, and showing that disagreement is the product.
+
+An unrecognised `riskDetail` value now classifies **normally** and is counted. The earlier
+routing to UNKNOWN rested on a verdict being able to reach a detector; it cannot, so
+removing the event would cost coverage for no protection.
+
+### One open inconsistency, recorded rather than resolved
+
+53004 and 50053's risk-text meanings are still classified `DOES_NOT_APPLY /
+MICROSOFT_RISK_VERDICT`, while now also carrying verdict `RISK`. They differ from the
+`riskDetail` cases in one real way: `riskDetail` is a *separate field*, so the observation
+is readable without the verdict, whereas there the code **is** both statements at once.
+Applying the ruling to them would return them to `APPLIES / BLOCKED_BY_CONTROL` with
+verdict `RISK` — roughly 921 rows for the malicious-IP text. That was previously ruled the
+other way under the older framing, so it is escalated as a consistency question rather than
+decided here.

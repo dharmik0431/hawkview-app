@@ -63,8 +63,10 @@ export type OutOfScopeReason =
    */
   | 'MICROSOFT_RISK_VERDICT'
   /**
-   * Microsoft DETECTED risk, a control the tenant configured responded, and
-   * the sign-in completed anyway. Detected, handled, closed.
+   * RETIRED as a classification. Microsoft-detected-and-closed is now carried
+   * by MicrosoftVerdict 'REMEDIATED' rather than by removing the event from
+   * evaluation, so nothing maps here. Kept only as documentation of what the
+   * verdict means.
    *
    * The third kind, and it is neither of the other two: MICROSOFT_RISK_VERDICT
    * would overstate it as live risk, MICROSOFT_SAFETY_VERDICT would understate
@@ -160,14 +162,7 @@ export type UnknownObservation =
   | 'AMBIGUOUS_BY_PROVIDER_STATEMENT'
   /** A code whose meaning lives in free text, where the text matched nothing known. */
   | 'AMBIGUOUS_FAILURE_REASON_TEXT'
-  /**
-   * Microsoft reported a verdict about this sign-in in a value we do not
-   * recognise. Routed here rather than allowed through, because the cost of
-   * being wrong is asymmetric: an unrecognised verdict falling through would
-   * risk presenting Microsoft's detection as a HawkView finding, which is a
-   * correctness violation, while landing here only costs stated coverage.
-   */
-  | 'MICROSOFT_VERDICT_FIELD_UNRECOGNIZED'
+
   /**
    * A result code that is not an Azure AD sign-in error code.
    *
@@ -321,7 +316,6 @@ export const UNKNOWN_LABELS: Readonly<Record<UnknownObservation, string>> = {
   UNRECOGNIZED_ERROR_CODE: 'HawkView does not recognise this sign-in result code',
   AMBIGUOUS_BY_PROVIDER_STATEMENT: 'Microsoft states this code alone does not indicate a failure, so HawkView will not read one into it',
   AMBIGUOUS_FAILURE_REASON_TEXT: 'This code carries several meanings in its description text, and the text did not match any meaning HawkView knows',
-  MICROSOFT_VERDICT_FIELD_UNRECOGNIZED: 'Microsoft recorded an assessment of this sign-in that HawkView does not recognise, so it is neither read as a finding of ours nor as Microsoft-reported risk',
   RESULT_CODE_NOT_AN_AZURE_CODE: 'The result code on this record is not one of Microsoft’s sign-in error codes, so HawkView will not read a sign-in outcome from it',
   FAILURE_REASON_NOT_REPORTED: 'Microsoft recorded this sign-in as failed without saying why, so HawkView cannot say what kind of failure it was',
   SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON: 'Reported as a success but carried an unrecognised description, so HawkView will not call it a success',
