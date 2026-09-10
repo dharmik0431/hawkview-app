@@ -81,11 +81,20 @@ export interface ResultCodeEntry {
   readonly claimClass: ClaimClass;
   readonly disposition: CodeDisposition;
   /**
-   * Required when `disposition.kind === 'DOES_NOT_APPLY'`: the documented
-   * statement establishing that this code can never be credential-attack
-   * evidence. Enforced by a test, not by convention.
+   * Required when `disposition.kind === 'DOES_NOT_APPLY'`: the grounds for
+   * saying this code can never be credential-attack evidence. Enforced by a
+   * test, not by convention.
+   *
+   * The KIND is carried separately because the two kinds age differently and
+   * would otherwise be read as the same strength. A provider statement is a
+   * fact about the world and stays true until Microsoft changes it; a product
+   * decision is a choice we made and can revisit. Anyone auditing an exclusion
+   * needs to know which one they are looking at.
    */
-  readonly exclusionCitation?: string;
+  readonly exclusionCitation?: {
+    readonly kind: 'PROVIDER_STATEMENT' | 'PRODUCT_DECISION';
+    readonly text: string;
+  };
   /**
    * The text meanings this code's description may resolve to, when its meaning
    * lives in free text. Declared PER CODE rather than matching every fragment
@@ -219,11 +228,14 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     microsoftName: 'ProofUpBlockedDueToRisk',
     claimClass: 'ATTACK_AND_CONTROL',
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' },
-    exclusionCitation:
-      'The owner’s product rule, which is a stronger citation here than a Microsoft doc: our findings and ' +
-      'Microsoft-reported risk are two channels that are never merged or summed. Microsoft’s own name for ' +
-      'this code is ProofUpBlockedDueToRisk — a block Microsoft’s intelligence decided on, not a control ' +
-      'the tenant configured.',
+    exclusionCitation: {
+      kind: 'PRODUCT_DECISION',
+      text:
+        'The owner’s channel-separation rule: our findings and Microsoft-reported risk are two channels ' +
+        'that are never merged or summed. Microsoft’s own name for this code is ProofUpBlockedDueToRisk — ' +
+        'a block Microsoft’s intelligence decided on, not a control the tenant configured. A CHOICE we ' +
+        'made, revisitable, unlike a provider statement.',
+    },
     note:
       'Cannot configure MFA due to suspicious activity. Placed in the Microsoft channel on the standing ' +
       'whose-judgement test, which is sound — but NO PRODUCTION EVIDENCE: zero rows, all tenants, all ' +
@@ -261,7 +273,10 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     microsoftName: 'InterruptedKMSI',
     claimClass: 'NEITHER',
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'KEEP_ME_SIGNED_IN' },
-    exclusionCitation: 'Microsoft: "This is an expected part of the sign in flow."',
+    exclusionCitation: {
+      kind: 'PROVIDER_STATEMENT',
+      text: 'Microsoft: "This is an expected part of the sign in flow."',
+    },
     note: 'Naive implementations inflate failure counts with this code.',
   },
   {
@@ -270,7 +285,10 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     microsoftName: 'UserUnauthenticated (session insufficient for SSO)',
     claimClass: 'NEITHER',
     disposition: { kind: 'DOES_NOT_APPLY', reason: 'INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN' },
-    exclusionCitation: 'Microsoft: "a common error that’s expected."',
+    exclusionCitation: {
+      kind: 'PROVIDER_STATEMENT',
+      text: 'Microsoft: "a common error that’s expected."',
+    },
   },
 
   // ---- Recognized, but no citation supports excluding them. ----
@@ -352,11 +370,17 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     graphObservation: 'NOT_OBSERVED',
     microsoftName: '(not a Microsoft code)',
     claimClass: 'NEITHER',
-    disposition: { kind: 'UNKNOWN', observation: 'HAWKVIEW_SYNTHETIC_ERROR_CODE' },
+    disposition: { kind: 'UNKNOWN', observation: 'RESULT_CODE_NOT_AN_AZURE_CODE' },
     note:
-      'Verified: "1" is a value HawkView itself invents on the audit-fallback path, with eight distinct ' +
-      'description variants. Its instability is ours. Microsoft result-code logic must never be extended ' +
-      'onto it.',
+      'PROVENANCE IS AN OPEN QUESTION and the earlier claim here was too strong. I was told "1" is a ' +
+      'value HawkView invents on the audit-fallback path. Reading the collector, ' +
+      'reportedAuthenticationErrorCode() sources it from the record’s own LoginStatus/ErrorCode fields ' +
+      'and their extended properties — so a 1 appears to be Microsoft’s LoginStatus surfaced into a field ' +
+      'that otherwise carries Azure AD error codes, which is a category confusion rather than an ' +
+      'invention. That distinction matters: an invented value is unstable and ours to fix, whereas ' +
+      'Microsoft’s LoginStatus in a mislabelled field is stable data we are reading wrongly. Flagged for ' +
+      're-verification. Either way the treatment is the same and is not affected by the answer: 1 is not ' +
+      'an Azure sign-in error code, so it is used neither as a key nor as corroboration.',
   },
 ];
 

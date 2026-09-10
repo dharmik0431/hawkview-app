@@ -96,12 +96,25 @@ export function isPostPasswordInterrupt(outcome: EventOutcome): boolean {
 export type SubjectBindingMethod = 'DIRECTORY_OBJECT_ID' | 'NORMALIZED_UPN';
 
 /**
- * Client-source qualification. Only the two values this layer can actually
- * substantiate are declared: an address that canonicalises, or one that does
- * not. 'AMBIGUOUS' and 'PROXY_ONLY' existed in the predecessor contract with
- * no grounded predicate behind them and are deliberately absent.
+ * Client-source qualification.
+ *
+ * THREE values, not two. 'MISSING' previously collapsed two different facts:
+ * the provider did not report an address, and the provider reported something
+ * this layer could not read. That is the same
+ * unknown-folded-into-a-definite-answer shape found three times elsewhere in
+ * this workstream — coverage booleans, the classification table, and the
+ * collector's own success flag — and it was in my own layer, found only by
+ * deliberately looking for it after the third instance.
+ *
+ * The distinction is not cosmetic for a consumer: 'NOT_REPORTED' is a limit on
+ * what Microsoft gave us, while 'UNREADABLE' is a data-quality signal about
+ * what it gave us. Any detector keyed on client address needs to tell those
+ * apart before treating an absent address as a coverage gap.
+ *
+ * 'AMBIGUOUS' and 'PROXY_ONLY' existed in the predecessor contract with no
+ * grounded predicate behind them and remain deliberately absent.
  */
-export type ClientQualification = 'QUALIFIED' | 'MISSING';
+export type ClientQualification = 'QUALIFIED' | 'NOT_REPORTED' | 'UNREADABLE';
 
 /**
  * Exactly one per event.

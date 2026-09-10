@@ -495,3 +495,61 @@ from evaluation if it means something other than we think, so it is registered a
 `graph.risk-detail` / `PENDING_DISTRIBUTION_CHECK` and has no effect until the control
 cohort lands: every Graph row bucketed by `riskDetail` value, with ordinary human
 successes as the cohort that must NOT carry a verdict-shaped value.
+
+## Addendum: the same collapse, found in my own layer
+
+The unknown-folded-into-a-definite-answer shape turned up three times in one day at
+different altitudes — a coverage boolean, this module's classification table, and the
+collector's own `succeeded` flag. Going looking for a fourth found one here:
+
+`clientSource.qualification` was `'QUALIFIED' | 'MISSING'`, and `MISSING` covered two
+different facts — Microsoft reported no address, and Microsoft reported something we
+could not read. It is now `'QUALIFIED' | 'NOT_REPORTED' | 'UNREADABLE'`. The distinction
+is not cosmetic for a consumer: the first is a limit on what we were given, the second a
+data-quality signal about what we were given, and a geo or velocity detector needs to tell
+them apart before treating an absent address as a coverage gap.
+
+Nothing observable changed for any current caller, which is exactly why neither the tests
+nor a review would have found it. Only looking did.
+
+## Addendum: an unreported outcome is a fact about the record
+
+`OUTCOME_NOT_REPORTED` is separate from `UNRECOGNIZED_REASON_NAME`, and the difference is
+a claim rather than a nicety. "Our table is incomplete" invites the next person to finish
+the table; "the provider never said what happened" cannot be fixed by any mapping. On the
+audit feed the second is common, and mapping it to an outcome is precisely the defect that
+already occurred one layer down.
+
+**Where this layer reads from, and why it matters.** The audit projection stores a
+Graph-shaped `status` object *alongside* the original record, and that synthesized
+`status.failureReason` carries `?? record.Operation` as its final fallback — so an
+operation name appears there whenever no logon error of any kind exists. This layer reads
+`raw.managementActivityRecord`, the original Microsoft record, and therefore does not
+inherit that fallback. A guard drops a reason equal to the `Operation` value anyway, in
+case anything ever points this at the projected field.
+
+Field reading is now aligned with `reportedAuthenticationErrorCode()` in
+`authentication-audit-projection.ts`, which is the closest thing to a spec for where these
+values live. An earlier version of this file read only `ErrorCode` and matched extended
+property names case-sensitively, so it missed `LoginStatus` entirely — two readers of the
+same record disagreeing about where the outcome is, which is its own hazard.
+
+## Addendum: two kinds of citation
+
+`exclusionCitation` now carries a `kind`: `PROVIDER_STATEMENT` or `PRODUCT_DECISION`. Both
+are legitimate grounds for putting a code out of scope, but they age differently — a
+Microsoft statement is a fact about the world, while a channel rule is a choice we can
+revisit — and sharing one field would have them read as the same strength. 50140 and 50058
+rest on provider statements; 53004 rests on a product decision.
+
+Relatedly, the note on result code `1` has been softened to match what can actually be
+substantiated. It was recorded as a value HawkView invents; reading the collector,
+`reportedAuthenticationErrorCode()` sources it from the record's own `LoginStatus` /
+`ErrorCode` fields, which would make it Microsoft's `LoginStatus` surfaced into a field
+that otherwise carries Azure AD error codes — a category confusion rather than an
+invention. That difference matters, because an invented value is unstable and ours to fix
+whereas misread provider data is stable and ours to read correctly. Flagged for
+re-verification; the treatment is unaffected either way, since `1` is not an Azure sign-in
+error code and is used neither as a key nor as corroboration. The observation was renamed
+from `HAWKVIEW_SYNTHETIC_ERROR_CODE` to `RESULT_CODE_NOT_AN_AZURE_CODE`, which is true
+under both accounts.

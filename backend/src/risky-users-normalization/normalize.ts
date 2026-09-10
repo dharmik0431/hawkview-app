@@ -8,6 +8,7 @@ import {
   type IsInteractiveShape,
   type NormalizationBatch,
   type NormalizationScope,
+  type ClientQualification,
   type NormalizationSource,
   type NormalizeBatchOptions,
   type NormalizedEvent,
@@ -67,6 +68,28 @@ function utcMillis(value: unknown): number | null {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) return null;
   return new Date(parsed).toISOString().slice(0, 19) === value.slice(0, 19) ? parsed : null;
+}
+
+/**
+ * Qualify a client address across the places a feed may report it.
+ *
+ * THREE outcomes, not two. "the provider reported no address" and "the
+ * provider reported something we cannot read" are different facts, and
+ * collapsing them is the same shape as every other defect in this workstream.
+ * The first is a limit on what Microsoft gave us; the second is a data-quality
+ * signal about what it gave us.
+ */
+function qualifyClient(values: readonly unknown[]): {
+  qualification: ClientQualification;
+  address: string | null;
+} {
+  const reported = values.filter(value => value !== undefined && value !== null && value !== '');
+  if (reported.length === 0) return { qualification: 'NOT_REPORTED', address: null };
+  for (const value of reported) {
+    const address = canonicalAddress(value);
+    if (address !== null) return { qualification: 'QUALIFIED', address };
+  }
+  return { qualification: 'UNREADABLE', address: null };
 }
 
 function canonicalAddress(value: unknown): string | null {
@@ -174,25 +197,55 @@ export function classifyGraphRecord(record: Record<string, unknown>): {
 }
 
 /**
+ * The property names the collector's own projection reads for an audit
+ * outcome, matched case-insensitively as it does.
+ *
+ * Aligned deliberately with `reportedAuthenticationErrorCode()` in
+ * `authentication-audit-projection.ts`, which is the closest thing to a spec
+ * for where these values live. An earlier version of this file read only
+ * `ErrorCode` and matched property names case-sensitively, so it missed
+ * `LoginStatus` entirely and would have missed any casing variant — a
+ * disagreement between two readers of the same record, which is its own hazard.
+ *
+ * `ErrorNumber` is included beyond the collector's set: requiring agreement
+ * across more places can only ever move a row toward "unreadable", which is
+ * the conservative direction.
+ */
+const AUDIT_CODE_PROPERTY_NAMES = new Set(['loginstatus', 'errorcode', 'errornumber']);
+const AUDIT_REASON_PROPERTY_NAMES = new Set(['loginerror', 'logonerror']);
+
+function auditExtendedValues(record: Record<string, unknown>, names: ReadonlySet<string>): unknown[] {
+  const found: unknown[] = [];
+  const properties = record.ExtendedProperties;
+  if (!Array.isArray(properties)) return found;
+  for (const property of properties.slice(0, 100)) {
+    if (!plainObject(property) || typeof property.Name !== 'string') continue;
+    if (names.has(property.Name.trim().toLowerCase())) found.push(property.Value);
+  }
+  return found;
+}
+
+/**
  * Collect the audit result code from every place it can appear, requiring all
  * of them to agree.
+ *
+ * `reported` distinguishes "the provider said nothing about the outcome" from
+ * "the provider said something we could not read". Collapsing those is how the
+ * collector's own `succeeded` flag turned an unreported outcome into a
+ * reported failure, so this function returns both facts rather than one.
  *
  * `ResultStatus` is deliberately not consulted anywhere in this file. For STS
  * logon events a ResultStatus of "Succeeded" means HTTP success, NOT logon
  * success, and reading it fails silently in the direction of calling failed
  * sign-ins successful.
  */
-function readAuditErrorCode(record: Record<string, unknown>): { code: number | null; present: boolean } {
+function readAuditErrorCode(record: Record<string, unknown>): { code: number | null; reported: boolean } {
   const codes: unknown[] = [];
-  if (record.ErrorCode !== undefined) codes.push(record.ErrorCode);
-  const properties = record.ExtendedProperties;
-  if (Array.isArray(properties)) {
-    for (const property of properties.slice(0, 100)) {
-      if (!plainObject(property) || typeof property.Name !== 'string') continue;
-      if (property.Name === 'ErrorCode' || property.Name === 'ErrorNumber') codes.push(property.Value);
-    }
+  for (const key of ['LoginStatus', 'ErrorCode']) {
+    if (record[key] !== undefined) codes.push(record[key]);
   }
-  if (codes.length === 0) return { code: null, present: false };
+  codes.push(...auditExtendedValues(record, AUDIT_CODE_PROPERTY_NAMES));
+  if (codes.length === 0) return { code: null, reported: false };
   const canonical = codes.map(value =>
     typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
       ? String(value)
@@ -201,20 +254,17 @@ function readAuditErrorCode(record: Record<string, unknown>): { code: number | n
         : null,
   );
   if (canonical.some(value => value === null) || new Set(canonical).size !== 1) {
-    return { code: null, present: true };
+    return { code: null, reported: true };
   }
-  return { code: Number(canonical[0]), present: true };
+  return { code: Number(canonical[0]), reported: true };
 }
 
 function readAuditLogonErrors(record: Record<string, unknown>): unknown[] {
-  const errors: unknown[] = [record.LogonError];
-  const properties = record.ExtendedProperties;
-  if (Array.isArray(properties)) {
-    for (const property of properties.slice(0, 100)) {
-      if (plainObject(property) && property.Name === 'LogonError') errors.push(property.Value);
-    }
-  }
-  return errors;
+  return [
+    record.LogonError,
+    record.LoginError,
+    ...auditExtendedValues(record, AUDIT_REASON_PROPERTY_NAMES),
+  ];
 }
 
 const emptyLogonError = (value: unknown): boolean =>
@@ -243,16 +293,23 @@ export function classifyAuditRecord(record: Record<string, unknown>): {
   classification: EventClassification;
   errorCode: number | null;
 } {
-  const { code, present } = readAuditErrorCode(record);
+  const { code, reported } = readAuditErrorCode(record);
   const providerCode = code === 1 ? null : code;
   const succeeded = record.Operation === 'UserLoggedIn';
   const inconsistent = {
     classification: { kind: 'UNKNOWN', observation: 'INCONSISTENT_OPERATION_AND_CODE' } as const,
     errorCode: code,
   };
-  const reasonName = readAuditLogonErrors(record).find(
+  let reasonName = readAuditLogonErrors(record).find(
     value => textValue(value) && !emptyLogonError(value),
   );
+  // The collector's projection falls back to the Operation name when no logon
+  // error of any kind exists, so a reason equal to the Operation is that
+  // fallback rather than a provider value. Defensive: this layer reads the
+  // original record, where it should not arise — but if anything ever points
+  // it at the projected field, an unreported outcome must not arrive here
+  // wearing an operation name and be mapped to an outcome.
+  if (reasonName !== undefined && reasonName === record.Operation) reasonName = undefined;
 
   if (reasonName === undefined) {
     // No reason name to go on. The code is only trustworthy here for a clean
@@ -264,9 +321,9 @@ export function classifyAuditRecord(record: Record<string, unknown>): {
     }
     if (providerCode === null) {
       const observation: UnknownObservation =
-        code === 1 ? 'HAWKVIEW_SYNTHETIC_ERROR_CODE'
-          : present ? 'ERROR_CODE_SHAPE_UNRECOGNIZED'
-            : 'ERROR_CODE_ABSENT';
+        !reported ? 'OUTCOME_NOT_REPORTED'
+          : code === 1 ? 'RESULT_CODE_NOT_AN_AZURE_CODE'
+            : 'ERROR_CODE_SHAPE_UNRECOGNIZED';
       return { classification: { kind: 'UNKNOWN', observation }, errorCode: code };
     }
     if (succeeded) return inconsistent;
@@ -479,9 +536,9 @@ async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, contex
   if (applicationRef === 'UNAVAILABLE') return unprocessable('REFERENCE_UNAVAILABLE');
 
   const { classification, errorCode } = graph ? classifyGraphRecord(record) : classifyAuditRecord(record);
-  const address = graph
-    ? canonicalAddress(record.ipAddress)
-    : canonicalAddress(record.ClientIP) ?? canonicalAddress(record.ActorIpAddress);
+  const clientSource = graph
+    ? qualifyClient([record.ipAddress])
+    : qualifyClient([record.ClientIP, record.ActorIpAddress]);
 
   const event: NormalizedEvent = {
     organizationId: context.scope.organizationId,
@@ -495,10 +552,7 @@ async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, contex
     subjectBinding: binding.method,
     applicationRef,
     errorCode,
-    clientSource: {
-      qualification: address === null ? 'MISSING' : 'QUALIFIED',
-      address,
-    },
+    clientSource,
     classification,
   };
   return { kind: 'NORMALIZED', event, microsoftUserId: binding.user.microsoftUserId };

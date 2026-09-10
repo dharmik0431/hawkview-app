@@ -357,10 +357,20 @@ test('every out-of-scope code carries a documented citation', () => {
   assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50058, 50140, 53004]);
   for (const entry of excluded) {
     assert.ok(
-      entry.exclusionCitation && entry.exclusionCitation.length > 15,
-      `${entry.code} is excluded with no citation; absence of a reason to include is not a reason to exclude`,
+      entry.exclusionCitation && entry.exclusionCitation.text.length > 15,
+      `code ${entry.code} is excluded with no citation; absence of a reason to include is not a reason to exclude`,
+    );
+    // A provider statement and a product decision are both legitimate grounds
+    // but they age differently: one is a fact about the world, the other a
+    // choice we can revisit. Sharing a field would read them as equal strength.
+    assert.ok(
+      ['PROVIDER_STATEMENT', 'PRODUCT_DECISION'].includes(entry.exclusionCitation.kind),
+      `code ${entry.code} does not say what KIND of citation it rests on`,
     );
   }
+  assert.equal(resultCodeEntry(50140)!.exclusionCitation!.kind, 'PROVIDER_STATEMENT');
+  assert.equal(resultCodeEntry(50058)!.exclusionCitation!.kind, 'PROVIDER_STATEMENT');
+  assert.equal(resultCodeEntry(53004)!.exclusionCitation!.kind, 'PRODUCT_DECISION');
 });
 
 test('50076 is a control signal, not "not a credential event"', () => {
@@ -740,7 +750,7 @@ test('error code 1 is HawkView’s own invention and gets no Microsoft code logi
   const batch = await run([graphRow({ status: { errorCode: 1, failureReason: 'Other.' } })]);
   assert.deepEqual(only(batch).classification, {
     kind: 'UNKNOWN',
-    observation: 'HAWKVIEW_SYNTHETIC_ERROR_CODE',
+    observation: 'RESULT_CODE_NOT_AN_AZURE_CODE',
   });
 });
 
@@ -960,17 +970,30 @@ test('events are ordered by event time, then by event id', async () => {
   assert.deepEqual(batch.applies.map(event => event.eventId), ['earlier', 'a', 'b']);
 });
 
-test('the client address is canonicalized and its absence is qualified, not dropped', async () => {
-  const missing = await run([graphRow({ ipAddress: undefined })]);
-  assert.deepEqual(only(missing).clientSource, { qualification: 'MISSING', address: null });
+test('an unreported client address is distinguished from an unreadable one', async () => {
+  // Previously both were 'MISSING'. They are different facts: one is a limit
+  // on what Microsoft gave us, the other a data-quality signal about what it
+  // gave us. This was the same collapse found three times elsewhere in the
+  // workstream, sitting in my own layer.
+  const notReported = await run([graphRow({ ipAddress: undefined })]);
+  assert.deepEqual(only(notReported).clientSource, { qualification: 'NOT_REPORTED', address: null });
+
+  const unreadable = await run([graphRow({ ipAddress: 'unknown' })]);
+  assert.deepEqual(only(unreadable).clientSource, { qualification: 'UNREADABLE', address: null });
+
   const ipv6 = await run([graphRow({ ipAddress: '2001:DB8::1' })]);
   assert.deepEqual(only(ipv6).clientSource, { qualification: 'QUALIFIED', address: '2001:db8::1' });
-  const garbage = await run([graphRow({ ipAddress: 'unknown' })]);
-  assert.deepEqual(only(garbage).clientSource, { qualification: 'MISSING', address: null });
+
   const auditFallback = await run([auditRow({ ClientIP: undefined, ActorIpAddress: '198.51.100.7' })], {
     source: 'M365_AUDIT_STS',
   });
   assert.deepEqual(only(auditFallback).clientSource, { qualification: 'QUALIFIED', address: '198.51.100.7' });
+
+  const auditNone = await run([auditRow({ ClientIP: undefined })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(auditNone).clientSource, { qualification: 'NOT_REPORTED', address: null });
+
+  const auditUnreadable = await run([auditRow({ ClientIP: 'not-an-address' })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(auditUnreadable).clientSource, { qualification: 'UNREADABLE', address: null });
 });
 
 test('the per-run row bound costs the excess rows, never the run', async () => {
@@ -1275,7 +1298,7 @@ test('53004 stays in Microsoft’s channel but is marked as never observed', () 
   assert.deepEqual(entry.disposition, { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' });
   assert.equal(entry.graphObservation, 'NOT_OBSERVED');
   assert.match(entry.note ?? '', /NO PRODUCTION EVIDENCE/);
-  assert.ok((entry.exclusionCitation ?? '').length > 15);
+  assert.ok((entry.exclusionCitation?.text ?? '').length > 15);
 });
 
 test('a Microsoft risk verdict and a Microsoft safety verdict can never be the same thing', async () => {
@@ -1322,4 +1345,80 @@ test('riskDetail has no control cohort yet, so it changes nothing', async () => 
   // And neither reaches Microsoft's channel on an unverified field.
   assert.deepEqual(withRiskDetail.microsoftRiskVerdicts, []);
   assert.deepEqual(withSafeDetail.microsoftSafetyVerdicts, []);
+});
+
+// ---------------------------------------------------------------------------
+// An unreported outcome is a fact about the record, not a gap in our table.
+// ---------------------------------------------------------------------------
+
+test('an audit record that reports no outcome says so, rather than looking unrecognised', async () => {
+  // The collector's own success flag collapsed "reported nothing" into
+  // "reported a failure". This layer must not inherit that, and it must not
+  // label these as an unrecognised NAME either: no mapping can ever fix them,
+  // and calling them unrecognised invites someone to "finish the table" by
+  // mapping an absent outcome to a definite one.
+  const batch = await run([auditRow({ ErrorCode: undefined })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(batch).classification, {
+    kind: 'UNKNOWN',
+    observation: 'OUTCOME_NOT_REPORTED',
+  });
+  assert.equal(only(batch).errorCode, null);
+});
+
+test('a reason equal to the operation name is the collector fallback, not a provider value', async () => {
+  // Defensive: this layer reads the original record, where it should not
+  // arise. If anything ever points it at the projected field, an unreported
+  // outcome must not arrive wearing an operation name and be mapped.
+  const batch = await run(
+    [auditRow({ ErrorCode: undefined, Operation: 'UserLoggedIn', LogonError: 'UserLoggedIn' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(batch).classification, {
+    kind: 'UNKNOWN',
+    observation: 'OUTCOME_NOT_REPORTED',
+  });
+});
+
+test('a genuinely unknown reason name is still reported as one', async () => {
+  // OUTCOME_NOT_REPORTED must not swallow the case it was split from.
+  const batch = await run(
+    [auditRow({ ErrorCode: '1', LogonError: 'SomeReasonMicrosoftAddedLastWeek' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(batch).classification, {
+    kind: 'UNKNOWN',
+    observation: 'UNRECOGNIZED_REASON_NAME',
+  });
+});
+
+test('the audit outcome is read from every field the collector reads', async () => {
+  // An earlier version read only ErrorCode, case-sensitively, so it missed
+  // LoginStatus entirely — a disagreement between two readers of the same
+  // record, which is its own hazard.
+  const viaLoginStatus = await run(
+    [auditRow({ ErrorCode: undefined, LoginStatus: '0', Operation: 'UserLoggedIn' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(viaLoginStatus).classification, {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_COMPLETED',
+  });
+
+  const viaExtendedProperty = await run([auditRow({
+    ErrorCode: undefined,
+    ExtendedProperties: [{ Name: 'loginstatus', Value: '50126' }],
+  })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(viaExtendedProperty).classification, {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_REJECTED',
+  });
+
+  const reasonViaExtendedProperty = await run([auditRow({
+    ErrorCode: undefined,
+    ExtendedProperties: [{ Name: 'LoginError', Value: 'IdsLocked' }],
+  })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(reasonViaExtendedProperty).classification, {
+    kind: 'APPLIES',
+    outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+  });
 });
