@@ -4,6 +4,7 @@ import type {
   HawkViewIdentitySignalsView,
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
+  CorrelationRef,
   IdentityRiskChannelReason,
   IdentityRiskChannelStatus,
   IdentityRiskFreshness,
@@ -237,6 +238,30 @@ const microsoftRiskDetailCatalog = new Set([
 
 type RecordValue = Record<string, unknown>
 
+/**
+ * Optional on the wire. A server that does not send one yields null, which the
+ * view treats as "cannot be compared" rather than as "Microsoft found nothing".
+ * An unavailable ref still carries its reason, so a row can state a capability
+ * rather than shrug.
+ */
+function adaptCorrelation(value: unknown): CorrelationRef | null | undefined {
+  if (value === undefined || value === null) return null
+  const source = record(value)
+  if (!source || typeof source.available !== 'boolean') return undefined
+  if (source.available === false) {
+    if (!hasKeys(source, ['available', 'because'])) return undefined
+    const because = boundedString(source.because, 300)
+    return because ? { available: false, because } : undefined
+  }
+  if (!hasKeys(source, ['available', 'shape', 'ref'])) return undefined
+  const shape = enumValue(source.shape, [
+    'DIRECTORY_OBJECT_ID',
+    'USER_PRINCIPAL_NAME',
+  ] as const)
+  const ref = boundedString(source.ref, 320)
+  return shape && ref ? { available: true, shape, ref } : undefined
+}
+
 function record(value: unknown): RecordValue | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value))
     return null
@@ -443,9 +468,7 @@ function adaptMeta(
     (value.evaluatedAt !== null && !evaluatedAt) ||
     (value.observedAt !== null && !observedAt) ||
     (value.limitation !== null && !limitation) ||
-    (value.reasonCode !== undefined &&
-      value.reasonCode !== null &&
-      !reasonCode)
+    (value.reasonCode !== undefined && value.reasonCode !== null && !reasonCode)
   ) {
     return null
   }
@@ -810,7 +833,18 @@ function adaptMicrosoftUser(
     return null
   }
 
-  return { id, identityLabel, riskLevel, riskState, riskDetail, observedAt }
+  const correlation = adaptCorrelation(source.correlation)
+  if (correlation === undefined) return null
+
+  return {
+    id,
+    identityLabel,
+    correlation,
+    riskLevel,
+    riskState,
+    riskDetail,
+    observedAt,
+  }
 }
 
 export function unavailableHawkViewIdentitySignals(
@@ -1708,6 +1742,18 @@ function adaptAssessmentUser(
   ] as const)
   const id = boundedString(source.id, 160)
   const label = authorizedLabel(source.label, 320)
+  // Resolved for authorised callers at read time; never persisted in the
+  // finding row. Absent on servers that do not resolve it, and absent is shown
+  // as the opaque reference rather than as a blank identity.
+  const displayName =
+    source.displayName === undefined || source.displayName === null
+      ? null
+      : authorizedLabel(source.displayName, 320)
+  const userPrincipalName =
+    source.userPrincipalName === undefined || source.userPrincipalName === null
+      ? null
+      : authorizedLabel(source.userPrincipalName, 320)
+  const correlation = adaptCorrelation(source.correlation)
   const priority =
     source.priority === null
       ? null
@@ -1751,9 +1797,23 @@ function adaptAssessmentUser(
         )
       : null
   if (priority !== highestCurrent) return null
+  if (
+    correlation === undefined ||
+    (source.displayName !== undefined &&
+      source.displayName !== null &&
+      !displayName) ||
+    (source.userPrincipalName !== undefined &&
+      source.userPrincipalName !== null &&
+      !userPrincipalName)
+  ) {
+    return null
+  }
   return {
     id,
     label,
+    displayName,
+    userPrincipalName,
+    correlation,
     subjectType,
     priority,
     protection,
@@ -1860,17 +1920,17 @@ export function adaptRiskAssessmentResponse(
     (rule) =>
       rule.status === 'INAPPLICABLE' ||
       (rule.status === 'READY' &&
-      !rule.countsCapped &&
-      rule.evaluatedAt !== null &&
-      rule.window.start !== null &&
-      rule.window.end !== null &&
-      (sources as RiskSourceReadiness[]).some(
-        (item) =>
-          item.source === rule.selectedSource &&
-          item.status === 'READY' &&
-          item.freshness === 'CURRENT' &&
-          item.lastSuccessfulCollectionAt !== null
-      ))
+        !rule.countsCapped &&
+        rule.evaluatedAt !== null &&
+        rule.window.start !== null &&
+        rule.window.end !== null &&
+        (sources as RiskSourceReadiness[]).some(
+          (item) =>
+            item.source === rule.selectedSource &&
+            item.status === 'READY' &&
+            item.freshness === 'CURRENT' &&
+            item.lastSuccessfulCollectionAt !== null
+        ))
   )
   if (meta.capability === 'FULL' && !complete) {
     meta.capability = 'PARTIAL'

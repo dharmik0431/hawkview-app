@@ -110,6 +110,9 @@ function user(): RiskAssessmentUser {
   return {
     id: 'opaque.subject.1',
     label: 'Authorized directory identity',
+    displayName: null,
+    userPrincipalName: null,
+    correlation: null,
     subjectType: 'USER',
     priority: 'LOW',
     protection: protection(),

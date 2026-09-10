@@ -42,13 +42,13 @@ export function useRiskyUsers(tenantId: string, enabled = true) {
     [assessmentView, channel, assessmentRequestError, assessmentContractError]
   )
 
-  // Correlating a HawkView pseudonym to a Microsoft directory object needs a key
-  // both channels agree on, which the contract does not yet carry. Passing none
-  // is what makes a row say "not comparable" rather than claiming Microsoft
-  // reported nothing about that person.
+  // Microsoft's records go in so the join can be made per user. The matching
+  // rule lives in the view model, which is where it is tested: same shape and
+  // same ref, never across shapes, and never a claim that Microsoft cleared
+  // someone it could not be asked about.
   const list = useMemo(
-    () => riskyUserList(assessmentView, channel, null),
-    [assessmentView, channel]
+    () => riskyUserList(assessmentView, channel, microsoftView.users),
+    [assessmentView, channel, microsoftView.users]
   )
 
   return {

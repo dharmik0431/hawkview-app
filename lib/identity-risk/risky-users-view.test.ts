@@ -398,61 +398,147 @@ test('a row never implies Microsoft cleared a user it could not be asked about',
   assert.equal(blocked.detection.microsoft, 'UNAVAILABLE')
   assert.equal(
     detectedByLabel(blocked.detection),
-    'HawkView — Microsoft unavailable'
+    'HawkView — Microsoft unavailable on this tenant'
   )
+  // The row carries the reason, so a technician learns what would change it.
+  assert.match(blocked.detection.because ?? '', /requires Entra ID P2/)
 
   // Microsoft is reporting, but nothing correlates its records to a HawkView
-  // pseudonym. "Not reported" would be a claim about Microsoft that no evidence
-  // supports, so the row says the two cannot be compared.
+  // identity. "Not reported" would be a claim about Microsoft that no evidence
+  // supports, so the row says the two cannot be compared. These two states are
+  // deliberately not one sentence: one is a capability, the other is a gap.
   const reporting = reportingMicrosoft()
   const uncorrelated = riskyUserList(assessment, reporting).rows[0]
   assert.equal(uncorrelated.detection.microsoft, 'NOT_COMPARABLE')
   assert.equal(
     detectedByLabel(uncorrelated.detection),
-    'HawkView — Microsoft not comparable'
+    'HawkView — Microsoft cannot be compared for this user'
   )
 })
 
-test('with a correlation, each channel keeps its own attribution', () => {
-  const assessment = adapt(assessmentFixture(true))
-  const subjectId = assessment.users[0].id
-  const record: MicrosoftEntraRiskyUser = {
-    id: 'microsoft-record-1',
+function microsoftRecord(
+  correlation: MicrosoftEntraRiskyUser['correlation'],
+  id = 'microsoft-record-1'
+): MicrosoftEntraRiskyUser {
+  return {
+    id,
     identityLabel: 'Reported by Microsoft',
+    correlation,
     riskLevel: 'high',
     riskState: 'atRisk',
     riskDetail: null,
     observedAt: at(-5),
   }
-  const reporting = reportingMicrosoft()
+}
 
-  const matched = riskyUserList(
-    assessment,
-    reporting,
-    new Map([[subjectId, record]])
-  ).rows[0]
-  assert.equal(matched.detection.microsoft, 'REPORTED')
-  assert.equal(matched.detection.microsoftRecord, record)
-  assert.equal(detectedByLabel(matched.detection), 'HawkView and Microsoft')
+function assessmentWithCorrelation(
+  correlation: unknown,
+  overrides: Record<string, unknown> = {}
+) {
+  const value = assessmentFixture(true)
+  Object.assign(value.users[0], { correlation, ...overrides })
+  return adapt(value)
+}
+
+const guid = {
+  available: true as const,
+  shape: 'DIRECTORY_OBJECT_ID' as const,
+  ref: '11111111-2222-3333-4444-555555555555',
+}
+const upn = {
+  available: true as const,
+  shape: 'USER_PRINCIPAL_NAME' as const,
+  ref: 'wrapped:alice',
+}
+
+test('a matched key is the strongest thing this product can say', () => {
+  const assessment = assessmentWithCorrelation(guid)
+  const record = microsoftRecord(guid)
+  const row = riskyUserList(assessment, reportingMicrosoft(), [record]).rows[0]
+  assert.equal(row.detection.microsoft, 'REPORTED')
+  assert.equal(row.detection.microsoftRecord, record)
+  assert.equal(detectedByLabel(row.detection), 'HawkView and Microsoft')
   // Both systems are named. Neither is folded into the other or into a score.
-  assert.equal(matched.detection.hawkView, true)
+  assert.equal(row.detection.hawkView, true)
+})
 
-  const unmatched = riskyUserList(assessment, reporting, new Map()).rows[0]
-  assert.equal(unmatched.detection.microsoft, 'NOT_REPORTED')
-  assert.equal(unmatched.detection.microsoftRecord, null)
-  assert.equal(detectedByLabel(unmatched.detection), 'HawkView only')
+test('Microsoft did not report this user is only sayable once the join worked', () => {
+  const assessment = assessmentWithCorrelation(guid)
+  const other = microsoftRecord({ ...guid, ref: 'a-different-guid' })
+  const row = riskyUserList(assessment, reportingMicrosoft(), [other]).rows[0]
+  assert.equal(row.detection.microsoft, 'NOT_REPORTED')
+  assert.equal(row.detection.microsoftRecord, null)
+  assert.match(
+    detectedByLabel(row.detection),
+    /Microsoft did not report this user/
+  )
+})
+
+test('refs are never compared across shapes', () => {
+  // A directory object GUID and a user principal name are different
+  // namespaces. Comparing them would match nothing, or match by coincidence.
+  const assessment = assessmentWithCorrelation(guid)
+  const crossShape = microsoftRecord({ ...upn, ref: guid.ref })
+  const row = riskyUserList(assessment, reportingMicrosoft(), [crossShape])
+    .rows[0]
+  assert.equal(row.detection.microsoft, 'NOT_REPORTED')
+  assert.equal(row.detection.microsoftRecord, null)
+})
+
+test('an audit-fallback tenant joins by user principal name, not by GUID', () => {
+  // Three of five tenants have no GUID at all. A GUID-only join would silently
+  // return nothing for them.
+  const assessment = assessmentWithCorrelation(upn)
+  const record = microsoftRecord(upn)
+  const row = riskyUserList(assessment, reportingMicrosoft(), [record]).rows[0]
+  assert.equal(row.detection.microsoft, 'REPORTED')
+})
+
+test('a mismatched wrapping fails closed rather than matching by accident', () => {
+  const assessment = assessmentWithCorrelation(upn)
+  const unwrapped = microsoftRecord({ ...upn, ref: 'alice' })
+  const row = riskyUserList(assessment, reportingMicrosoft(), [unwrapped])
+    .rows[0]
+  assert.equal(row.detection.microsoft, 'NOT_REPORTED')
+})
+
+test('an unavailable key states the capability instead of shrugging', () => {
+  const assessment = assessmentWithCorrelation({
+    available: false,
+    because: "Microsoft's channel requires Entra ID P2 on this tenant.",
+  })
+  const row = riskyUserList(assessment, reportingMicrosoft(), [
+    microsoftRecord(guid),
+  ]).rows[0]
+  assert.equal(row.detection.microsoft, 'NOT_COMPARABLE')
+  assert.equal(
+    row.detection.because,
+    "Microsoft's channel requires Entra ID P2 on this tenant."
+  )
+})
+
+test('an unmatchable Microsoft record makes a miss unproven, not negative', () => {
+  // If some of Microsoft's records carry no usable key, the absence of a match
+  // is not evidence that Microsoft cleared anyone.
+  const assessment = assessmentWithCorrelation(guid)
+  const row = riskyUserList(assessment, reportingMicrosoft(), [
+    microsoftRecord(null, 'unkeyed'),
+  ]).rows[0]
+  assert.equal(row.detection.microsoft, 'NOT_COMPARABLE')
+  assert.match(row.detection.because ?? '', /not evidence that Microsoft/)
+})
+
+test('a server that sends no key at all still cannot imply a clearance', () => {
+  const assessment = adapt(assessmentFixture(true))
+  assert.equal(assessment.users[0].correlation, null)
+  const row = riskyUserList(assessment, reportingMicrosoft(), [
+    microsoftRecord(guid),
+  ]).rows[0]
+  assert.equal(row.detection.microsoft, 'NOT_COMPARABLE')
 })
 
 test('a Microsoft record never changes the HawkView count', () => {
-  const assessment = adapt(assessmentFixture(true))
-  const record: MicrosoftEntraRiskyUser = {
-    id: 'microsoft-record-1',
-    identityLabel: 'Reported by Microsoft',
-    riskLevel: 'high',
-    riskState: 'atRisk',
-    riskDetail: null,
-    observedAt: at(-5),
-  }
+  const assessment = assessmentWithCorrelation(guid)
   const withMicrosoft = riskyUserCount({
     assessment,
     channel: reportingMicrosoft(),
@@ -463,13 +549,29 @@ test('a Microsoft record never changes the HawkView count', () => {
   })
   assert.equal(withMicrosoft.value, withoutMicrosoft.value)
   assert.equal(
-    riskyUserList(
-      assessment,
-      reportingMicrosoft(),
-      new Map([[assessment.users[0].id, record]])
-    ).rows.length,
+    riskyUserList(assessment, reportingMicrosoft(), [microsoftRecord(guid)])
+      .rows.length,
     1
   )
+})
+
+test('a resolved identity is shown, and an unresolved one is not invented', () => {
+  const resolved = assessmentWithCorrelation(guid, {
+    displayName: 'Alice Chen',
+    userPrincipalName: 'alice.chen@synthetic.invalid',
+  })
+  const [row] = riskyUserList(resolved, licenceBlocked).rows
+  assert.equal(row.name, 'Alice Chen')
+  assert.equal(row.email, 'alice.chen@synthetic.invalid')
+
+  // A server that does not resolve identity yields the opaque reference, not a
+  // blank and not a fabricated address.
+  const [plain] = riskyUserList(
+    adapt(assessmentFixture(true)),
+    licenceBlocked
+  ).rows
+  assert.equal(plain.email, null)
+  assert.match(plain.reference, /^hvr1_subject_/)
 })
 
 /* -------------------------------------------------------------------------- */
@@ -537,6 +639,7 @@ function verdict(
   return {
     id: 'microsoft-record-1',
     identityLabel: 'Synthetic user',
+    correlation: null,
     riskLevel: 'high',
     riskState: 'atRisk',
     riskDetail: null,
@@ -690,4 +793,41 @@ test('no raw Microsoft identifier reaches the rendered detail', () => {
     const detail = microsoftVerdictDetail(verdict({ riskDetail }))
     assert.doesNotMatch(detail, /[a-z][A-Z]/, riskDetail)
   }
+})
+
+test('a zero counts people and never speaks for the findings beneath it', () => {
+  // The count is distinct directory users. Evidence that cannot be tied to a
+  // person is deliberately excluded from it, so EXACT 0 beside a non-empty
+  // findings list is a legitimate state: zero people identified, three
+  // mailboxes still forwarding externally. Reading the zero as "nothing to
+  // show" would render an exfiltrating tenant as a clean one.
+  const value = assessmentFixture(true)
+  value.users = ['a', 'b', 'c'].map((character) =>
+    assessmentUser('HV-ID-MBX-001.v1', character)
+  )
+  value.rules[0].matchedIdentities = 0
+  value.rules[2].assessedIdentities = 3
+  value.rules[2].matchedIdentities = 3
+  value.summary.currentUsers = { value: 0, accuracy: 'EXACT' }
+  const assessment = adapt(value)
+
+  const count = riskyUserCount({ assessment, channel: licenceBlocked })
+  assert.equal(count.accuracy, 'EXACT')
+  assert.equal(count.value, 0)
+  // The headline itself refuses to read as an all-clear.
+  assert.match(count.headline, /but there are findings/)
+  assert.match(count.caption, /counts people/)
+  assert.match(count.caption, /not an all-clear/)
+  // And what was found travels with the number.
+  assert.deepEqual(count.known, ['External mailbox forwarding: 3 mailboxes'])
+
+  // A genuinely clean tenant keeps the plain wording; this is not a blanket
+  // hedge applied to every zero.
+  const clean = riskyUserCount({
+    assessment: adapt(assessmentFixture(false)),
+    channel: licenceBlocked,
+  })
+  assert.equal(clean.value, 0)
+  assert.doesNotMatch(clean.headline, /but there are findings/)
+  assert.deepEqual(clean.known, [])
 })

@@ -18,6 +18,7 @@ import {
 } from '@/lib/identity-risk/presentation'
 import {
   detectedByLabel,
+  microsoftDetectionSummary,
   microsoftLevelsHidden,
   microsoftRecordsByPolarity,
   microsoftRiskLevelLabel,
@@ -307,6 +308,13 @@ function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Two systems reporting the same person independently is the strongest signal
+ * this product produces, so it gets both badges. Everything else says which of
+ * three different things is true — Microsoft looked and did not report them,
+ * Microsoft could not be compared to them, or Microsoft cannot report on this
+ * tenant at all — because they lead a technician to different places.
+ */
 function DetectedBy({ row }: { row: RiskyUserRow }) {
   const microsoft = row.detection.microsoft
   return (
@@ -317,21 +325,16 @@ function DetectedBy({ row }: { row: RiskyUserRow }) {
       >
         HawkView
       </Badge>
-      {microsoft === 'REPORTED' && (
+      {microsoft === 'REPORTED' ? (
         <Badge
           variant="outline"
           className="border-violet-200 text-violet-700 dark:border-violet-800 dark:text-violet-300"
         >
           Microsoft
         </Badge>
-      )}
-      {microsoft !== 'REPORTED' && (
+      ) : (
         <span className="text-xs text-slate-500 dark:text-slate-400">
-          {microsoft === 'NOT_REPORTED'
-            ? 'Microsoft did not report this user'
-            : microsoft === 'NOT_COMPARABLE'
-              ? 'Microsoft not comparable'
-              : 'Microsoft unavailable'}
+          {microsoftDetectionSummary(row.detection)}
         </span>
       )}
       <span className="sr-only">{detectedByLabel(row.detection)}</span>
@@ -524,6 +527,10 @@ function Coverage({ assessment }: { assessment: RiskAssessment }) {
  * count just refused to answer.
  */
 function EmptyUserList({ count }: { count: RiskyUserCount }) {
+  // "No user needs attention" is only true when HawkView both counted and
+  // found nothing. Beside a withheld count, or beside a zero that counts people
+  // while mailbox evidence sits below, the same sentence quietly answers a
+  // question the number did not.
   const copy =
     count.accuracy === 'WITHHELD'
       ? count.known.length > 0
@@ -531,7 +538,9 @@ function EmptyUserList({ count }: { count: RiskyUserCount }) {
         : 'HawkView is not stating a number of users for this tenant, and no finding has been attributed to a specific user. Read this as an open question rather than an all-clear.'
       : count.accuracy === 'UNAVAILABLE'
         ? 'No current list can be shown. This is not an empty result, and nothing here has been checked and cleared.'
-        : 'No user is listed as needing attention right now. The summary above states what that is based on and what it does not cover.'
+        : count.known.length > 0
+          ? 'No finding was tied to a specific user, so no user is listed here. HawkView did find evidence on this tenant — it is listed above and below, and it is not an all-clear.'
+          : 'No user is listed as needing attention right now. The summary above states what that is based on and what it does not cover.'
   return (
     <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
       {copy}
@@ -573,7 +582,7 @@ function CountSummary({ count }: { count: RiskyUserCount }) {
         {count.caption}
       </p>
       {count.known.length > 0 &&
-        (count.accuracy === 'WITHHELD' || count.accuracy === 'UNAVAILABLE') && (
+        (count.value === 0 || count.value === null) && (
           <div className="mt-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
               What HawkView did find

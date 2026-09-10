@@ -293,6 +293,9 @@ test('every row still names which system reported it', () => {
     // implying Microsoft looked and found nothing.
     assert.match(cell, /Microsoft unavailable/)
     assert.doesNotMatch(cell, /Microsoft did not report/)
+    // "Cannot report on this tenant" and "looked and found nothing" are
+    // different claims and never share a sentence.
+    assert.doesNotMatch(cell, /Not comparable/)
   }
 })
 
@@ -367,7 +370,7 @@ test('rows say Microsoft is not comparable rather than that it cleared anyone', 
   )) {
     const detectedBy = row.querySelectorAll('td')[1]?.textContent ?? ''
     assert.match(detectedBy, /HawkView/)
-    assert.match(detectedBy, /Microsoft not comparable/)
+    assert.match(detectedBy, /Not comparable/)
     assert.doesNotMatch(detectedBy, /Microsoft did not report/)
   }
 })
@@ -765,4 +768,136 @@ test('the surface never offers to write back to Microsoft', () => {
       assert.doesNotMatch(source, mutation, String(mutation))
     }
   }
+})
+
+test('a zero never renders as a clean tenant while findings sit below it', () => {
+  const value = assessmentFixture(true)
+  value.users = ['a', 'b', 'c'].map((character) =>
+    assessmentUser('HV-ID-MBX-001.v1', character)
+  )
+  value.rules[0].matchedIdentities = 0
+  value.rules[2].assessedIdentities = 3
+  value.rules[2].matchedIdentities = 3
+  value.summary.currentUsers = { value: 0, accuracy: 'EXACT' }
+  const { document, text, cardText } = render(value)
+
+  for (const [label, rendered] of [
+    ['section', text],
+    ['overview card', cardText],
+  ] as const) {
+    assert.match(rendered, /but there are findings/, label)
+    // What was found is beside the number, not only further down the page.
+    assert.match(rendered, /External mailbox forwarding: 3 mailboxes/, label)
+  }
+
+  // The empty user list must not answer the question the zero did not.
+  const list = document.querySelector(
+    '[aria-labelledby="risky-users-list-heading"]'
+  )
+  assert.ok(list)
+  assert.doesNotMatch(
+    list!.textContent ?? '',
+    /No user is listed as needing attention/
+  )
+  assert.match(list!.textContent ?? '', /it is not an all-clear/)
+
+  // A genuinely clean tenant still gets the plain sentence.
+  const clean = render(assessmentFixture(false))
+  assert.match(
+    clean.document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? '',
+    /No user is listed as needing attention/
+  )
+  assert.doesNotMatch(clean.text, /but there are findings/)
+})
+
+test('a user both systems reported shows both, and neither is folded in', () => {
+  // The strongest signal this product can produce, and the reason the join was
+  // worth waiting for rather than faking.
+  const key = {
+    available: true,
+    shape: 'DIRECTORY_OBJECT_ID',
+    ref: '11111111-2222-3333-4444-555555555555',
+  }
+  const value = assessmentFixture(true)
+  value.users[0].correlation = key
+  value.users[0].displayName = 'Alice Chen'
+  value.users[0].userPrincipalName = 'alice.chen@synthetic.invalid'
+
+  const envelope = syntheticRiskResponses().microsoftRiskyUsers
+  const microsoft = {
+    ...envelope,
+    users: [
+      {
+        id: 'ms-1',
+        identityLabel: 'Alice Chen',
+        correlation: key,
+        riskLevel: 'high',
+        riskState: 'atRisk',
+        riskDetail: null,
+        observedAt: envelope.observedAt,
+      },
+    ],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+
+  const { document } = render(value, { microsoft })
+  const row = document.querySelector(
+    '[aria-labelledby="risky-users-list-heading"] tbody tr'
+  )
+  assert.ok(row)
+  const detectedBy = row!.querySelectorAll('td')[1]?.textContent ?? ''
+  assert.match(detectedBy, /HawkView/)
+  assert.match(detectedBy, /Microsoft/)
+  assert.match(detectedBy, /HawkView and Microsoft/)
+  assert.doesNotMatch(detectedBy, /Not comparable|did not report|unavailable/)
+
+  // The resolved identity is shown rather than the opaque reference.
+  const identity = row!.querySelectorAll('td')[0]?.textContent ?? ''
+  assert.match(identity, /Alice Chen/)
+  assert.match(identity, /alice.chen@synthetic.invalid/)
+  assert.doesNotMatch(identity, /hvr1_subject_/)
+
+  // Microsoft's record still lives in Microsoft's own panel, and the HawkView
+  // count is unchanged by it.
+  const summary = document.querySelector(
+    '[aria-labelledby="risky-users-total-heading"]'
+  )
+  assert.match(summary?.textContent ?? '', /Risky user/)
+})
+
+test('Microsoft looked and did not report this user is a distinct sentence', () => {
+  const value = assessmentFixture(true)
+  value.users[0].correlation = {
+    available: true,
+    shape: 'DIRECTORY_OBJECT_ID',
+    ref: 'aaaa-user',
+  }
+  const envelope = syntheticRiskResponses().microsoftRiskyUsers
+  const microsoft = {
+    ...envelope,
+    users: [
+      {
+        id: 'ms-other',
+        identityLabel: 'Someone else',
+        correlation: {
+          available: true,
+          shape: 'DIRECTORY_OBJECT_ID',
+          ref: 'bbbb-other',
+        },
+        riskLevel: 'high',
+        riskState: 'atRisk',
+        riskDetail: null,
+        observedAt: envelope.observedAt,
+      },
+    ],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+  const { document } = render(value, { microsoft })
+  const detectedBy =
+    document
+      .querySelector('[aria-labelledby="risky-users-list-heading"] tbody tr')
+      ?.querySelectorAll('td')[1]?.textContent ?? ''
+  assert.match(detectedBy, /Microsoft did not report this user/)
+  assert.doesNotMatch(detectedBy, /Not comparable/)
 })

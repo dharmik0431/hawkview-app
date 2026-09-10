@@ -62,9 +62,34 @@ export type HawkViewIdentityFinding = {
   investigationGuidance: string
 }
 
+/**
+ * The key that makes it possible to say whether HawkView and Microsoft reported
+ * the same person. Both channels supply one; a match requires the same shape on
+ * both sides and identical refs, because the ref may be wrapped and a wrapped
+ * value only matches another wrapped identically.
+ *
+ * The shape varies by tenant: Graph tenants carry a directory object GUID,
+ * audit-fallback tenants have no GUID at all and resolve by user principal
+ * name. A join that assumed GUIDs would silently return nothing on most of the
+ * estate, so nothing here compares refs across shapes.
+ *
+ * `available: false` is a statement about capability, not a failure — it
+ * carries the reason, so the row can say "Microsoft's channel requires Entra ID
+ * P2" rather than shrugging.
+ */
+export type CorrelationRef =
+  | {
+      available: true
+      shape: 'DIRECTORY_OBJECT_ID' | 'USER_PRINCIPAL_NAME'
+      ref: string
+    }
+  | { available: false; because: string }
+
 export type MicrosoftEntraRiskyUser = {
   id: string
   identityLabel: string
+  /** Optional on the wire; null from a server that does not send one. */
+  correlation: CorrelationRef | null
   riskLevel:
     | 'none'
     | 'low'
@@ -346,6 +371,14 @@ export type RiskAssessmentFinding = {
 export type RiskAssessmentUser = {
   id: string
   label: string
+  /**
+   * Resolved at read time for authorised callers and never persisted in the
+   * finding row. Null when the server does not supply it, in which case the
+   * list shows the opaque reference rather than inventing an identity.
+   */
+  displayName: string | null
+  userPrincipalName: string | null
+  correlation: CorrelationRef | null
   subjectType: 'USER' | 'MAILBOX'
   priority: 'LOW' | 'MEDIUM' | 'HIGH' | null
   protection: RiskProtection

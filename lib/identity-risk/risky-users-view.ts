@@ -28,6 +28,7 @@ import {
   riskProtectionSummary,
 } from './presentation.ts'
 import type {
+  CorrelationRef,
   IdentityRiskChannelReason,
   RiskAssessmentCountReason,
   MicrosoftEntraRiskyUser,
@@ -351,50 +352,144 @@ export type RiskyUserDetection = {
   hawkView: true
   microsoft: MicrosoftDetection
   microsoftRecord: MicrosoftEntraRiskyUser | null
+  /**
+   * Why Microsoft has nothing to say about this user, when it has nothing to
+   * say. A capability statement an MSP can act on beats a shrug, so this is
+   * carried rather than flattened into one label.
+   */
+  because: string | null
 }
 
 /**
- * Matching HawkView identities to Microsoft records requires a key both sides
- * agree on. HawkView identifies subjects by tenant-keyed pseudonym and
- * Microsoft by directory object id, so a caller can only supply the mapping
- * once the contract carries one. Until then the honest answer for a reporting
- * Microsoft channel is NOT_COMPARABLE, never NOT_REPORTED.
+ * Two refs match only when they are the same shape and the same value.
+ *
+ * Never across shapes: a directory object GUID and a user principal name are
+ * different namespaces, and a tenant supplies one or the other depending on
+ * whether its evidence comes from Graph or from the audit log. Comparing them
+ * would either match nothing or, worse, match by coincidence.
+ *
+ * The ref may also be wrapped rather than raw. Equality still works for a
+ * wrapped pair, and a wrapped ref never equals an unwrapped one, so a mismatched
+ * wrapping fails closed to "cannot compare" rather than to a false match.
  */
-export type MicrosoftCorrelation = ReadonlyMap<string, MicrosoftEntraRiskyUser>
+function refsMatch(left: CorrelationRef | null, right: CorrelationRef | null) {
+  return Boolean(
+    left?.available &&
+    right?.available &&
+    left.shape === right.shape &&
+    left.ref === right.ref
+  )
+}
 
 function detectionFor(
-  userId: string,
+  user: RiskAssessmentUser,
   channel: MicrosoftChannel,
-  correlation: MicrosoftCorrelation | null
+  microsoftUsers: MicrosoftEntraRiskyUser[] | null
 ): RiskyUserDetection {
+  // Microsoft cannot report on this tenant at all.
   if (channel.state !== 'REPORTING') {
-    return { hawkView: true, microsoft: 'UNAVAILABLE', microsoftRecord: null }
+    return {
+      hawkView: true,
+      microsoft: 'UNAVAILABLE',
+      microsoftRecord: null,
+      because: channel.headline,
+    }
   }
+
+  // Microsoft is reporting, but its records were not supplied to compare
+  // against. That is a different statement from Microsoft being unavailable,
+  // and flattening the two would misdescribe the channel.
+  if (!microsoftUsers) {
+    return {
+      hawkView: true,
+      microsoft: 'NOT_COMPARABLE',
+      microsoftRecord: null,
+      because:
+        'Microsoft is reporting on this tenant, but its records were not available to compare against this user.',
+    }
+  }
+
+  const correlation = user.correlation
+  // No key at all, from a server that does not yet send one. Saying Microsoft
+  // did not report this user would be a claim about Microsoft with nothing
+  // behind it.
   if (!correlation) {
     return {
       hawkView: true,
       microsoft: 'NOT_COMPARABLE',
       microsoftRecord: null,
+      because:
+        'HawkView and Microsoft cannot be matched for this user, so neither agreement nor disagreement can be shown.',
     }
   }
-  const record = correlation.get(userId) ?? null
+
+  // A key that is unavailable for a stated reason. This is a fact about what
+  // this tenant can support, and it is more useful to an MSP than a shrug.
+  if (!correlation.available) {
+    return {
+      hawkView: true,
+      microsoft: 'NOT_COMPARABLE',
+      microsoftRecord: null,
+      because: correlation.because,
+    }
+  }
+
+  const record =
+    microsoftUsers.find((candidate) =>
+      refsMatch(correlation, candidate.correlation)
+    ) ?? null
+
+  // Every Microsoft record would have to be comparable before an absence of a
+  // match could mean Microsoft did not report this person. If some records
+  // carry no usable key, a miss is unproven rather than negative.
+  const allComparable = microsoftUsers.every(
+    (candidate) => candidate.correlation?.available
+  )
+  if (!record && !allComparable) {
+    return {
+      hawkView: true,
+      microsoft: 'NOT_COMPARABLE',
+      microsoftRecord: null,
+      because:
+        'Some Microsoft records could not be matched to a HawkView identity, so an absence here is not evidence that Microsoft cleared this user.',
+    }
+  }
+
   return {
     hawkView: true,
     microsoft: record ? 'REPORTED' : 'NOT_REPORTED',
     microsoftRecord: record,
+    because: null,
   }
 }
 
 export function detectedByLabel(detection: RiskyUserDetection) {
   switch (detection.microsoft) {
     case 'REPORTED':
+      // The strongest signal this product can produce: two systems reporting
+      // the same person independently.
       return 'HawkView and Microsoft'
     case 'NOT_REPORTED':
-      return 'HawkView only'
+      // Only sayable once the join was actually possible.
+      return 'HawkView only — Microsoft did not report this user'
     case 'NOT_COMPARABLE':
-      return 'HawkView — Microsoft not comparable'
+      return 'HawkView — Microsoft cannot be compared for this user'
     default:
-      return 'HawkView — Microsoft unavailable'
+      return 'HawkView — Microsoft unavailable on this tenant'
+  }
+}
+
+/** The short form for the cell; the reason goes underneath it. */
+export function microsoftDetectionSummary(detection: RiskyUserDetection) {
+  switch (detection.microsoft) {
+    case 'REPORTED':
+      return 'Microsoft'
+    case 'NOT_REPORTED':
+      return 'Microsoft did not report this user'
+    case 'NOT_COMPARABLE':
+      return 'Not comparable'
+    default:
+      return 'Microsoft unavailable'
   }
 }
 
@@ -444,7 +539,7 @@ export function riskyUserPriorityLabel(priority: RiskyUserPriority | null) {
 function rowFor(
   user: RiskAssessmentUser,
   channel: MicrosoftChannel,
-  correlation: MicrosoftCorrelation | null,
+  microsoftUsers: MicrosoftEntraRiskyUser[] | null,
   currentOnly: boolean
 ): RiskyUserRow {
   const findings = currentOnly
@@ -457,15 +552,15 @@ function rowFor(
       .at(-1) ?? null
   return {
     id: user.id,
-    name: user.label,
-    email: null,
+    name: user.displayName ?? user.label,
+    email: user.userPrincipalName,
     reference: user.id,
     subjectType: user.subjectType,
     priority: user.priority,
     priorityLabel: riskyUserPriorityLabel(user.priority),
     lastSeen,
     reasons: findings.map((finding) => finding.title),
-    detection: detectionFor(user.id, channel, correlation),
+    detection: detectionFor(user, channel, microsoftUsers),
     protection: riskProtectionSummary(user),
     user,
   }
@@ -485,7 +580,7 @@ export type RiskyUserList = {
 export function riskyUserList(
   assessment: RiskAssessment | null,
   channel: MicrosoftChannel,
-  correlation: MicrosoftCorrelation | null = null
+  microsoftUsers: MicrosoftEntraRiskyUser[] | null = null
 ): RiskyUserList {
   if (!assessment) return { rows: [], context: [] }
   const current = currentRiskAssessmentUsers(assessment)
@@ -499,11 +594,11 @@ export function riskyUserList(
   }
   return {
     rows: current
-      .map((user) => rowFor(user, channel, correlation, true))
+      .map((user) => rowFor(user, channel, microsoftUsers, true))
       .sort(byPriorityThenRecency),
     context: assessment.users
       .filter((user) => !currentIds.has(user.id))
-      .map((user) => rowFor(user, channel, correlation, false))
+      .map((user) => rowFor(user, channel, microsoftUsers, false))
       .sort(byPriorityThenRecency),
   }
 }
@@ -780,16 +875,28 @@ export function riskyUserCount({
     // The one place a confident zero is printed. It carries the scope of the
     // claim and every disclosed gap, because a zero on its own is the defect
     // this rebuild was called to remove.
+    //
+    // This count is distinct people, and evidence that could not be tied to a
+    // person is deliberately excluded from it. So a zero can sit beside real
+    // findings — three mailboxes forwarding externally with no proven owner is
+    // exactly that state — and a zero presented as the whole answer would show
+    // an exfiltrating tenant as a clean one.
     const empty = riskAssessmentEmptyPresentation(assessment)
+    const baseCaption =
+      empty?.detail ??
+      'HawkView reported no users with a current finding. This covers only the checks below and their reported windows; it does not establish that any user is safe.'
+    const findingsWithoutPeople = known.length > 0
     return {
       accuracy: 'EXACT',
       value: 0,
       display: '0',
       accessibleValue: '0',
-      headline: empty?.label ?? 'No risky users reported',
-      caption:
-        empty?.detail ??
-        'HawkView reported no users with a current finding. This covers only the checks below and their reported windows; it does not establish that any user is safe.',
+      headline: findingsWithoutPeople
+        ? 'No risky users identified — but there are findings'
+        : (empty?.label ?? 'No risky users reported'),
+      caption: findingsWithoutPeople
+        ? `This counts people, and none of the evidence below could be tied to one. It is not a finding count and it is not an all-clear: HawkView did report evidence on this tenant, listed beside this number and below. ${baseCaption}`
+        : baseCaption,
       known,
       gaps,
       asOf: reported.asOf,

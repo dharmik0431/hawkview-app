@@ -92,7 +92,9 @@ export function RiskyUsersCountCard({
         {count.caption}
       </p>
 
-      <CountKnown known={count.known} accuracy={count.accuracy} />
+      {count.value !== 0 && count.value !== null ? null : (
+        <CountKnown known={count.known} />
+      )}
       <CountGaps gaps={count.gaps} />
 
       <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
@@ -141,19 +143,13 @@ function CountValue({ count }: { count: RiskyUserCount }) {
 }
 
 /**
- * What is still true when there is no number. "3 mailboxes forwarding
- * externally" is far more useful than a blank, and the findings behind it exist
- * whether or not they can be attributed to people.
+ * What is still true when the number does not speak for the evidence — a
+ * withheld count, a failed read, or a zero that counts people while findings
+ * sit underneath it. "3 mailboxes forwarding externally" is far more useful
+ * than a blank, and far safer than a lone zero.
  */
-function CountKnown({
-  known,
-  accuracy,
-}: {
-  known: RiskyUserCount['known']
-  accuracy: RiskyUserCount['accuracy']
-}) {
+function CountKnown({ known }: { known: RiskyUserCount['known'] }) {
   if (known.length === 0) return null
-  if (accuracy !== 'WITHHELD' && accuracy !== 'UNAVAILABLE') return null
   return (
     <div className="mt-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
       <p className="text-[12px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
