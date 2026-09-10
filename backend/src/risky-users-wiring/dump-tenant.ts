@@ -64,11 +64,30 @@ async function main(): Promise<void> {
     })
 
     const stream = assessment.streams[0]
+    const coverage = stream?.assessment.coverage
+    // Engineer 3's warning made explicit, because the symptom of a wrong input
+    // shape is a batch of zeros rather than a crash. Rows in and nothing
+    // classified means the payload did not look like what the classifier
+    // expects — and read as a result rather than a fault, that is "no risky
+    // users" for a tenant nobody assessed.
+    const classified = (coverage?.applies ?? 0)
+      + Object.values(coverage?.doesNotApply ?? {}).reduce((a, b) => a + b, 0)
+      + Object.values(coverage?.notYetCited ?? {}).reduce((a, b) => a + b, 0)
+      + Object.values(coverage?.unknown ?? {}).reduce((a, b) => a + b, 0)
+    const unprocessable = Object.values(coverage?.unprocessable ?? {}).reduce((a, b) => a + b, 0)
+    if (unprocessable > 0 && classified === 0) {
+      console.error(
+        'SUSPECT INPUT SHAPE: every row was unprocessable and none was classified. '
+        + 'This is what a wrong raw-payload shape looks like — it does not error. '
+        + 'Do not read the count below as a result.')
+    }
     console.log(JSON.stringify({
       window: { from: windowStart.toISOString(), to: windowEnd.toISOString(), days },
       source,
       syncStatusAssumed: arg('sync') ?? 'SUCCESS',
-      coverage: stream?.assessment.coverage,
+      coverage,
+      rowsClassified: classified,
+      rowsUnprocessable: unprocessable,
       state: stream?.assessment.state,
       detectors: stream?.assessment.detectors,
       count: assessment.count,

@@ -47,10 +47,27 @@ export async function readTenantAssessment(
     })
   }
 
+  // Microsoft's directory tenant id is a DIFFERENT id from our internal tenant
+  // uuid, and the classifier binds audit rows on it — a row whose
+  // OrganizationId does not match is rejected as TENANT_BINDING_MISMATCH.
+  // Passing our own uuid here would have rejected every audit row and produced
+  // a batch of zeros with no error, which is the symptom Engineer 3 warned
+  // about: found because they said what to look for, not because anything
+  // failed.
+  const tenant = await prisma.customerTenant.findFirst({
+    where: { id: input.customerTenantId, organizationId: input.organizationId },
+    select: { microsoftTenantId: true },
+  })
+  if (tenant === null) {
+    throw new Error(
+      'No such customer tenant in this organization. Refusing to assess rather than '
+      + 'assessing against a directory we cannot identify.')
+  }
+
   const scope = {
     organizationId: input.organizationId,
     customerTenantId: input.customerTenantId,
-    microsoftTenantId: input.customerTenantId,
+    microsoftTenantId: tenant.microsoftTenantId,
   }
 
   const [rows, directory] = await Promise.all([
