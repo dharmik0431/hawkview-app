@@ -151,6 +151,20 @@ export function microsoftRiskyUserCountPresentation(
     }
   }
   const returned = new Set(view.users.map((user) => user.id)).size
+  // A page that returned nothing while reporting more pages cannot be stated
+  // as a bound. "At least 0" is the one reading this product forbids
+  // everywhere else — the assessment adapter refuses a zero lower bound
+  // outright — and it would arrive here as a confident-looking glyph.
+  if (returned === 0 && view.pageInfo?.hasMore) {
+    return {
+      value: '—',
+      accessibleValue: 'Not available',
+      label: 'Microsoft count unavailable',
+      detail:
+        'This page of Microsoft records was empty while Microsoft reported further pages, so no count can be stated. It is not zero.',
+      exact: false,
+    }
+  }
   return {
     value: view.pageInfo?.hasMore
       ? `≥${returned.toLocaleString()}`

@@ -252,7 +252,29 @@ function MicrosoftRecordTable({
 }
 
 function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
-  if (!view.users || view.users.length === 0) return null
+  const reporting =
+    view.meta.status === 'AVAILABLE' || view.meta.status === 'STALE'
+
+  // A reporting channel with no records is a result, not an absence. Returning
+  // null here rendered "Microsoft is reporting on this tenant" followed by
+  // nothing, which reads the same as having failed to fetch its records — and
+  // hid the one statement that distinguishes them. microsoftRiskyUserCount
+  // Presentation already separates an authoritative empty snapshot from an
+  // unconfirmed one; this surface simply never reached it.
+  if (!view.users || view.users.length === 0) {
+    if (!reporting) return null
+    const empty = microsoftRiskyUserCountPresentation(view)
+    return (
+      <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
+        <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
+          {empty.label}
+        </h4>
+        <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+          {empty.detail}
+        </p>
+      </div>
+    )
+  }
   const count = microsoftRiskyUserCountPresentation(view)
   const groups = microsoftRecordsByPolarity(view)
   return (

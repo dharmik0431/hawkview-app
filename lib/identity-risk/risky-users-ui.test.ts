@@ -1185,3 +1185,60 @@ test('every read is keyed to the exact tenant and the authorised session', () =>
   assert.equal(keys.length, 2)
   assert.notDeepEqual(keys[0], keys[1])
 })
+
+test('a reporting Microsoft channel with no records says so, rather than showing nothing', () => {
+  // "Microsoft is looking and currently lists nobody at risk" is a result and
+  // is worth having. Rendering nothing made it indistinguishable from having
+  // failed to fetch Microsoft's records, and hid the one statement that
+  // separates an authoritative empty snapshot from an unconfirmed one.
+  const { document } = render(assessmentFixture(true), {
+    microsoft: syntheticRiskResponses().microsoftRiskyUsers,
+  })
+  const panel = document.querySelector(
+    '[aria-labelledby="microsoft-channel-heading"]'
+  )
+  assert.ok(panel)
+  assert.match(panel!.textContent ?? '', /reporting on this tenant/)
+  assert.match(panel!.textContent ?? '', /Microsoft records reported/)
+  assert.match(
+    panel!.textContent ?? '',
+    /latest complete, current Microsoft snapshot is empty/
+  )
+  // And it does not become a HawkView safety verdict on the way.
+  assert.match(panel!.textContent ?? '', /not a HawkView safety verdict/)
+})
+
+test('an unavailable Microsoft channel adds no empty-count line', () => {
+  // There the panel already explains itself, and a second "no records" line
+  // would be noise that competes with the licence statement.
+  const { document } = render(assessmentFixture(true))
+  const panel = document.querySelector(
+    '[aria-labelledby="microsoft-channel-heading"]'
+  )
+  assert.match(panel!.textContent ?? '', /requires Entra ID P2/)
+  assert.doesNotMatch(panel!.textContent ?? '', /Microsoft records reported/)
+})
+
+test('an unconfirmed empty Microsoft result never becomes an authoritative zero', () => {
+  // The distinction microsoftHasConfirmedEmptySnapshot exists to make. An
+  // empty page while Microsoft reports further pages is not a clean tenant,
+  // and it must not borrow the wording of one.
+  const envelope = syntheticRiskResponses().microsoftRiskyUsers
+  const { document } = render(assessmentFixture(true), {
+    microsoft: {
+      ...envelope,
+      users: [],
+      pageInfo: { hasMore: true, nextCursor: 'cursor.abc' },
+    },
+  })
+  const panel = document.querySelector(
+    '[aria-labelledby="microsoft-channel-heading"]'
+  )
+  assert.ok(panel)
+  assert.match(panel!.textContent ?? '', /Microsoft count unavailable/)
+  assert.match(panel!.textContent ?? '', /It is not zero/)
+  // Never the confirmed-empty wording, and never a zero lower bound.
+  assert.doesNotMatch(panel!.textContent ?? '', /snapshot is empty/)
+  assert.doesNotMatch(panel!.textContent ?? '', /At least 0/)
+  assert.doesNotMatch(panel!.textContent ?? '', /≥0/)
+})
