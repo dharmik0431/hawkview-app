@@ -23,7 +23,7 @@ export function RiskyUsersCountCard({
   tenantId: string
   onOpen: () => void
 }) {
-  const { count, loading, channel } = useRiskyUsers(tenantId)
+  const { count, loading } = useRiskyUsers(tenantId)
 
   if (loading) {
     return (
@@ -72,16 +72,14 @@ export function RiskyUsersCountCard({
             </h2>
             <p className="mt-0.5 text-[13px] text-slate-500 dark:text-slate-400">
               HawkView&rsquo;s own analysis of this tenant&rsquo;s identity
-              evidence
+              evidence. Investigation leads, not confirmed compromise.
             </p>
           </div>
         </div>
 
         <div className="max-w-[16rem] text-right">
           <CountValue count={count} />
-          <p className="sr-only">
-            {count.accessibleValue} {count.headline}
-          </p>
+          <p className="sr-only">{count.accessibleValue}</p>
           <p className="mt-1.5 text-[13px] font-medium text-slate-700 dark:text-slate-200">
             {count.headline}
           </p>
@@ -107,11 +105,6 @@ export function RiskyUsersCountCard({
           <ChevronRight className="ml-1 h-4 w-4" aria-hidden="true" />
         </Button>
       </div>
-
-      <p className="sr-only">
-        {channel.headline}. Findings are investigation leads and do not
-        establish that a user is compromised or safe.
-      </p>
     </section>
   )
 }

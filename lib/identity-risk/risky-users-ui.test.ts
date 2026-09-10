@@ -216,10 +216,18 @@ function render(
       })
     )
   )
+  const visibleTextOf = (document: any) => {
+    const clone = document.body.cloneNode(true)
+    for (const hidden of clone.querySelectorAll('.sr-only')) hidden.remove()
+    return (clone.textContent ?? '').replace(/\s+/g, ' ')
+  }
   return {
     document: dom.window.document,
     text: dom.window.document.body.textContent ?? '',
     cardText: cardDom.window.document.body.textContent ?? '',
+    cardDocument: cardDom.window.document,
+    visibleCardText: visibleTextOf(cardDom.window.document),
+    visibleText: visibleTextOf(dom.window.document),
   }
 }
 
@@ -1037,4 +1045,50 @@ test('several withholding reasons all reach the screen', () => {
     assert.match(rendered, /belongs to a person/, label)
     assert.match(rendered, /does not recognise/, label)
   }
+})
+
+test('the no-safe-verdict boundary is on screen, not only announced', () => {
+  // It is the product's central claim about what these numbers are. On the
+  // overview card it lived in a visually-hidden label, so a sighted technician
+  // never met it — and on a lower-bound count the visible caption says nothing
+  // about leads versus confirmed compromise either.
+  const bounded = assessmentFixture(true)
+  bounded.meta.capability = 'PARTIAL'
+  bounded.meta.freshness = 'UNKNOWN'
+  bounded.meta.limitation = 'One evidence source is incomplete.'
+  bounded.sources[1].status = 'PARTIAL'
+  bounded.sources[1].reasonCode = 'INCOMPLETE_WINDOW'
+  bounded.sources[1].freshness = 'UNKNOWN'
+  bounded.rules[1].status = 'PARTIAL'
+  bounded.rules[1].reasonCode = 'INCOMPLETE_WINDOW'
+  bounded.summary.currentUsers = { value: 1, accuracy: 'AT_LEAST' }
+
+  for (const [label, value] of [
+    ['exact count', assessmentFixture(true)],
+    ['lower bound', bounded],
+  ] as const) {
+    const { visibleCardText, visibleText } = render(value)
+    assert.match(
+      visibleCardText,
+      /Investigation leads, not confirmed compromise/,
+      label
+    )
+    assert.match(visibleText, /investigation lead/i, label)
+  }
+})
+
+test('a hidden label does not repeat what its visible partner already says', () => {
+  // The label stands in for a glyph a screen reader cannot voice. It used to
+  // carry the headline as well, which the headline's own visible element
+  // already announces — so a screen reader heard the headline twice.
+  const { cardDocument } = render(assessmentFixture(true))
+  const labels = [...cardDocument.querySelectorAll('.sr-only')].map(
+    (label: any) => label.textContent?.trim() ?? ''
+  )
+  assert.ok(labels.length > 0, 'the card has something to check')
+  for (const label of labels) {
+    assert.doesNotMatch(label, /Risky user/, label)
+  }
+  // What it does carry is the number the glyph withholds.
+  assert.ok(labels.includes('1'))
 })
