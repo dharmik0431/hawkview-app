@@ -76,6 +76,7 @@ export type WithheldReason =
   | 'UNINTERPRETED_EVENTS'
   | 'NOTHING_APPLICABLE'
   | 'CAPACITY_EXCEEDED'
+  | 'DETECTOR_FAILED'
 
 /** Decided once. Every surface reads this rather than re-deriving it, because
  * two surfaces answering the same question against different bars is how a
@@ -97,6 +98,7 @@ export type Finding = Readonly<{
 export type Assessment = Readonly<{
   state: EvidenceState
   coverage: Coverage
+  detectors: readonly DetectorReport[]
   findings: readonly Finding[]
   count: Count
   claim: ZeroClaim
@@ -112,9 +114,24 @@ export type Budget = Readonly<{ maxEvents: number }>
  * what stops "this is not an invalid-credential event" from reading as a gap. */
 export type Classifier<Event> = (event: Event) => Disposition
 
+/** A detector reports how many events it actually looked at after its own
+ * filtering, not how many it was handed. Without that, a detector that is
+ * genuinely inapplicable and one that is silently dead produce identical
+ * output — which is exactly the position the previous engine left us in, with
+ * three rules that have never once run against real evidence. */
+export type DetectorResult = Readonly<{ considered: number; findings: readonly Finding[] }>
+
 /** Detectors plug in and swap out. They see only the events that applied, and
  * they cannot influence coverage, so no detector can veto another's finding. */
 export type Detector<Event> = Readonly<{
   id: string
-  findings: (applicable: readonly Event[]) => readonly Finding[]
+  run: (applicable: readonly Event[]) => DetectorResult
 }>
+
+/** Diagnostic, deliberately separate from coverage. A detector that considered
+ * 500 events and matched none is healthy; one that considered none is either
+ * inapplicable or broken, and only this tells them apart. A failed detector
+ * reports no counts, because what it would have considered is unknown. */
+export type DetectorReport =
+  | Readonly<{ detectorId: string; status: 'RAN'; considered: number; matched: number }>
+  | Readonly<{ detectorId: string; status: 'FAILED' }>

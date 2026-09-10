@@ -12,10 +12,13 @@ const classify = (event: Event): Disposition =>
 
 const matching: Detector<Event> = {
   id: 'matches-flagged',
-  findings: applicable => applicable.filter(event => event.match)
-    .map(event => ({ detectorId: 'matches-flagged', subject: event.subject, observedAt: '2026-09-10T00:00:00.000Z' })),
+  run: applicable => ({
+    considered: applicable.length,
+    findings: applicable.filter(event => event.match)
+      .map(event => ({ detectorId: 'matches-flagged', subject: event.subject, observedAt: '2026-09-10T00:00:00.000Z' })),
+  }),
 }
-const silent: Detector<Event> = { id: 'silent', findings: () => [] }
+const silent: Detector<Event> = { id: 'silent', run: applicable => ({ considered: applicable.length, findings: [] }) }
 
 const event = (id: string, kind: Event['kind'], extra: Partial<Event> = {}): Event =>
   ({ id, subject: `user-${id}`, kind, ...extra })
@@ -131,20 +134,46 @@ test('the budget belongs to the caller and exceeding it withholds rather than tr
   assert.deepEqual(run(events, { maxEvents: 5 }).claim, { permitted: true })
 })
 
-test('one failing detector cannot erase what another already found', () => {
-  const broken: Detector<Event> = { id: 'broken', findings: () => { throw new Error('detector fault') } }
-  // Today this propagates, which is honest but total. Pinning it so the
-  // behaviour is a decision rather than an accident when detectors are added.
-  assert.throws(() => run([event('1', 'applies', { match: true })], { detectors: [matching, broken] }), /detector fault/)
-  const survived = run([event('1', 'applies', { match: true })], { detectors: [matching, silent] })
-  assert.equal(survived.findings.length, 1)
+test('one failing detector costs the exact claim without erasing its neighbours', () => {
+  const broken: Detector<Event> = { id: 'broken', run: () => { throw new Error('detector fault') } }
+  const result = run([event('1', 'applies', { match: true })], { detectors: [matching, broken, silent] })
+
+  // Erasing what the others found would be the same veto in a third costume.
+  assert.equal(result.findings.length, 1)
+  // The failure is visible and distinguishable, not swallowed.
+  assert.deepEqual(result.detectors.find(report => report.detectorId === 'broken'), { detectorId: 'broken', status: 'FAILED' })
+  assert.equal(result.detectors.filter(report => report.status === 'RAN').length, 2)
+  // And the count does not overclaim: the broken detector might have found more.
+  assert.deepEqual(result.claim, { permitted: false, because: 'DETECTOR_FAILED' })
+  assert.deepEqual(result.count, { accuracy: 'AT_LEAST', value: 1 })
+
+  // A failure with nothing else found cannot produce a lower bound of zero.
+  const nothingFound = run([event('1', 'applies')], { detectors: [broken, silent] })
+  assert.deepEqual(nothingFound.count, { accuracy: 'NOT_AVAILABLE', value: null })
+})
+
+test('per-detector accounting separates a healthy silent detector from a dead one', () => {
+  // The position the previous engine left us in: three rules, 1,054 runs, zero
+  // findings, and no way to tell "ran and matched nothing" from "never ran".
+  const dead: Detector<Event> = { id: 'dead', run: () => ({ considered: 0, findings: [] }) }
+  const result = run([event('1', 'applies'), event('2', 'applies')], { detectors: [silent, dead] })
+
+  assert.deepEqual(result.detectors, [
+    { detectorId: 'silent', status: 'RAN', considered: 2, matched: 0 },
+    { detectorId: 'dead', status: 'RAN', considered: 0, matched: 0 },
+  ])
+  // Both produced no findings; only the considered count tells them apart.
+  assert.equal(result.findings.length, 0)
+  // And it is diagnostic, not coverage: a dead detector does not make the
+  // evidence less interpretable, so the claim is unaffected.
+  assert.deepEqual(result.claim, { permitted: true })
 })
 
 test('distinct subjects are counted once however many findings they carry', () => {
   const twice: Detector<Event> = {
     id: 'twice',
-    findings: applicable => applicable.flatMap(item => [0, 1].map((): Finding =>
-      ({ detectorId: 'twice', subject: item.subject, observedAt: '2026-09-10T00:00:00.000Z' }))),
+    run: applicable => ({ considered: applicable.length, findings: applicable.flatMap(item => [0, 1].map((): Finding =>
+      ({ detectorId: 'twice', subject: item.subject, observedAt: '2026-09-10T00:00:00.000Z' }))) }),
   }
   const result = run([event('1', 'applies'), event('1', 'applies')], { detectors: [twice] })
   assert.equal(result.findings.length, 4)
