@@ -10,6 +10,23 @@ export type IdentityRiskChannelStatus =
 
 export type IdentityRiskFreshness = 'CURRENT' | 'STALE' | 'UNKNOWN'
 
+/**
+ * Why a channel is not reporting. `limitation` carries the server's prose; this
+ * is the machine-readable cause the UI needs in order to say something specific
+ * and actionable instead of "unavailable".
+ *
+ * Optional on the wire. A server that does not send it yields null, and the UI
+ * says it does not know the reason rather than guessing one.
+ */
+export type IdentityRiskChannelReason =
+  | 'LICENSE_REQUIRED'
+  | 'MISSING_PERMISSION'
+  | 'WAITING_FOR_COLLECTION'
+  | 'COLLECTION_FAILED'
+  | 'COLLECTION_STALE'
+  | 'SOURCE_UNAVAILABLE'
+  | 'EVALUATION_DISABLED'
+
 export type IdentityRiskChannelMeta = {
   capability: IdentityRiskCapability
   status: IdentityRiskChannelStatus
@@ -20,6 +37,7 @@ export type IdentityRiskChannelMeta = {
   evaluatedAt: string | null
   observedAt: string | null
   limitation: string | null
+  reasonCode: IdentityRiskChannelReason | null
 }
 
 export type HawkViewIdentityFinding = {

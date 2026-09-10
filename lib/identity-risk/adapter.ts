@@ -4,6 +4,7 @@ import type {
   HawkViewIdentitySignalsView,
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
+  IdentityRiskChannelReason,
   IdentityRiskChannelStatus,
   IdentityRiskFreshness,
   IdentityRiskPageInfo,
@@ -38,6 +39,15 @@ const statuses = [
   'ERROR',
 ] as const
 const freshnessValues = ['CURRENT', 'STALE', 'UNKNOWN'] as const
+const channelReasons = [
+  'LICENSE_REQUIRED',
+  'MISSING_PERMISSION',
+  'WAITING_FOR_COLLECTION',
+  'COLLECTION_FAILED',
+  'COLLECTION_STALE',
+  'SOURCE_UNAVAILABLE',
+  'EVALUATION_DISABLED',
+] as const
 const MAX_PAGE_SIZE = 100
 const MAX_SUMMARY_COUNT = 10_000
 const MAX_ASSESSMENT_COUNT = 1_000_000
@@ -361,7 +371,8 @@ function catalogList(
 
 function fallbackMeta(
   status: IdentityRiskChannelStatus,
-  limitation: string
+  limitation: string,
+  reasonCode: IdentityRiskChannelReason | null = null
 ): IdentityRiskChannelMeta {
   return {
     capability: 'UNAVAILABLE',
@@ -373,6 +384,7 @@ function fallbackMeta(
     evaluatedAt: null,
     observedAt: null,
     limitation,
+    reasonCode,
   }
 }
 
@@ -396,6 +408,12 @@ function adaptMeta(
       : observedDateTime(value.observedAt, evaluatedAt, trustedCurrentTimeMs)
   const limitation =
     value.limitation === null ? null : boundedString(value.limitation, 500)
+  // Optional, and additive. Absent means the cause was not reported, which the
+  // UI states plainly rather than inventing a cause for.
+  const reasonCode =
+    value.reasonCode === undefined || value.reasonCode === null
+      ? null
+      : enumValue(value.reasonCode, channelReasons)
 
   if (
     !capability ||
@@ -412,7 +430,10 @@ function adaptMeta(
         trustedCurrentTimeMs + MAX_FUTURE_SKEW_MS) ||
     (value.evaluatedAt !== null && !evaluatedAt) ||
     (value.observedAt !== null && !observedAt) ||
-    (value.limitation !== null && !limitation)
+    (value.limitation !== null && !limitation) ||
+    (value.reasonCode !== undefined &&
+      value.reasonCode !== null &&
+      !reasonCode)
   ) {
     return null
   }
@@ -459,6 +480,7 @@ function adaptMeta(
     evaluatedAt,
     observedAt,
     limitation,
+    reasonCode,
   }
 }
 
@@ -475,7 +497,8 @@ function sameMeta(
     left.catalogVersion === right.catalogVersion &&
     left.evaluatedAt === right.evaluatedAt &&
     left.observedAt === right.observedAt &&
-    left.limitation === right.limitation
+    left.limitation === right.limitation &&
+    left.reasonCode === right.reasonCode
   )
 }
 
@@ -793,11 +816,12 @@ export function unavailableHawkViewIdentitySignals(
 
 export function unavailableMicrosoftEntraRiskyUsers(
   status: IdentityRiskChannelStatus,
-  limitation: string
+  limitation: string,
+  reasonCode: IdentityRiskChannelReason | null = null
 ): MicrosoftEntraRiskyUsersView {
   return {
     channel: 'MICROSOFT_ENTRA_RISKY_USERS',
-    meta: fallbackMeta(status, limitation),
+    meta: fallbackMeta(status, limitation, reasonCode),
     users: null,
     pageInfo: null,
   }
@@ -1922,6 +1946,10 @@ function adaptAssessmentMeta(
   const observedAt = nullableDateTime(value.observedAt, now)
   const limitation =
     value.limitation === null ? null : boundedString(value.limitation, 600)
+  const reasonCode =
+    value.reasonCode === undefined || value.reasonCode === null
+      ? null
+      : enumValue(value.reasonCode, channelReasons)
   if (
     !capability ||
     !status ||
@@ -1932,6 +1960,9 @@ function adaptAssessmentMeta(
     value.engineVersion !== hawkViewEngineVersion ||
     value.catalogVersion !== hawkViewCatalogVersion ||
     (value.limitation !== null && !limitation) ||
+    (value.reasonCode !== undefined &&
+      value.reasonCode !== null &&
+      !reasonCode) ||
     (status === 'AVAILABLE' &&
       (!evaluatedAt || capability === 'UNAVAILABLE')) ||
     (capability === 'FULL' &&
@@ -1948,6 +1979,7 @@ function adaptAssessmentMeta(
     evaluatedAt,
     observedAt,
     limitation,
+    reasonCode,
   }
 }
 
