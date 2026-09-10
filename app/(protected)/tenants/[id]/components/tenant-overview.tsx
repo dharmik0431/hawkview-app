@@ -35,12 +35,19 @@ export function TenantOverview({
   onOpenModule,
   onSync,
   isSyncing = false,
+  riskyUsers = null,
 }: {
   bundle: TenantBundle
   display: TenantWorkspaceDisplay
   onOpenModule: (module: string) => void
   onSync?: () => void
   isSyncing?: boolean
+  /**
+   * The Risky Users count. Passed in rather than read here, so the overview
+   * stays free of the identity-risk data layer and so the count and the list
+   * cannot drift apart — both derive from the same hook.
+   */
+  riskyUsers?: React.ReactNode
 }) {
   const [selectedIssue, setSelectedIssue] = useState<TenantIssue | null>(null)
   const [isTechDetailsOpen, setIsTechDetailsOpen] = useState(false)
@@ -298,6 +305,8 @@ export function TenantOverview({
           View connection details
         </button>
       </div>
+
+      {riskyUsers}
 
       {/* 2. Cohesive "Tenant action center" with optional Desktop Summary Rail */}
       <div className="flex flex-col xl:flex-row gap-6 items-start">
