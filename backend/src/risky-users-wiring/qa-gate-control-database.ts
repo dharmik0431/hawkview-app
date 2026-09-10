@@ -60,16 +60,27 @@ try {
   const excluded = totalOn(coverage.doesNotApply)
   const zero = a.count.accuracy === 'EXACT' && a.count.value === 0
   const reports = a.streams[0]!.assessment.detectors
+  const scope = a.count.scope
+  // A zero must rest on checks that COVERED it. An exact zero whose covered
+  // list is empty is a confident answer asserting nothing checked it -- the
+  // bare-zero family inverted, and the count alone cannot see it.
+  const scopeSupportsZero = scope.covered.length > 0
+  // And a check that could not run must be NAMED, not silently absent: the
+  // common clean shape is audit-fallback where one check is inapplicable.
+  const inapplicable = reports.filter(r => r.status === 'INAPPLICABLE').map(r => r.detectorId)
+  const namedInScope = inapplicable.every(id => scope.notCovered.some(n => n.detectorId === id))
 
   console.log(JSON.stringify({ QA_GATE_CONTROL_DATABASE: {
     rowsFetched: read.rowsFetched, applies: coverage.applies, excluded,
     count: { accuracy: a.count.accuracy, value: a.count.value },
-    claimPermitted: a.claim.permitted,
+    claimPermitted: a.claim.permitted, covered: scope.covered, notCovered: scope.notCovered, scopeSupportsZero, inapplicable, namedInScope,
     withheldReasons: a.claim.permitted ? [] : a.claim.withheld,
     detectorReports: reports,
     findings: a.findings.items.length,
     verdict: excluded > 0 ? 'UNEXPECTED - the control window contained exclusions'
-      : zero ? 'CONTROL HOLDS - a genuinely clean tenant still reports EXACT 0'
+      : zero && !scopeSupportsZero ? 'CONTRADICTION - EXACT 0 but no check is listed as covering it'
+      : zero && !namedInScope ? 'CONTRADICTION - a check could not run and the scope does not name it'
+      : zero ? 'CONTROL HOLDS - EXACT 0, and the scope supports it'
       : 'OVERCORRECTION - a clean tenant does not get a confident zero',
   } }, null, 2))
 } finally {
