@@ -1,6 +1,6 @@
 import { RUN_ENGINE_VERSION, RUN_STATUS } from './persist-run.js'
 import { decodeRunCoverage, type StreamCoverage } from './run-coverage.js'
-import { decodeRunFindings } from './run-findings.js'
+import { decodeRunFindings, type SourceCollection } from './run-findings.js'
 import type { Count, Finding } from '../evaluation-core/contract.js'
 import type { TenantClaim } from '../evaluation-core/compose.js'
 
@@ -34,6 +34,7 @@ export type ReadRunResult =
     count: Count
     claim: TenantClaim
     complete: boolean
+    sources: readonly SourceCollection[]
     completedAt: Date
     windowStart: Date
     windowEnd: Date
@@ -118,6 +119,7 @@ export async function readLatestRun(
     count: findings.count,
     claim: findings.claim,
     complete: findings.complete,
+    sources: findings.sources,
     completedAt: row.completedAt,
     windowStart: row.windowStart,
     windowEnd: row.windowEnd,

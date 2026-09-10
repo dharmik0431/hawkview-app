@@ -26,7 +26,7 @@ const assessment = (items: readonly Finding[]): TenantAssessment => ({
 } as unknown as TenantAssessment)
 
 test('a real finding survives storage with each signal still carrying its own date', () => {
-  const decoded = decodeRunFindings(encodeRunFindings(assessment([raymonds])))
+  const decoded = decodeRunFindings(encodeRunFindings(assessment([raymonds]), [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }]))
   assert.equal(decoded.present, true)
   assert.ok(decoded.present)
 
@@ -49,13 +49,13 @@ test('a record that was never written is not a run that found nothing', () => {
   assert.deepEqual(decodeRunFindings(undefined), { present: false, because: 'NOT_RECORDED' })
 
   // And a run that genuinely produced none is PRESENT with an empty list.
-  const none = decodeRunFindings(encodeRunFindings(assessment([])))
+  const none = decodeRunFindings(encodeRunFindings(assessment([]), [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }]))
   assert.equal(none.present, true)
   assert.deepEqual(none.present && none.findings, [])
 })
 
 test('a version this build does not know is refused, not read optimistically', () => {
-  const future = { ...encodeRunFindings(assessment([raymonds])), version: 'hawkview-run-findings/v2' }
+  const future = { ...encodeRunFindings(assessment([raymonds]), [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }]), version: 'hawkview-run-findings/v2' }
   assert.deepEqual(decodeRunFindings(future), { present: false, because: 'UNRECOGNIZED_VERSION' })
 
   // POSITIVE CONTROL: the same payload at the version this build writes does
@@ -65,7 +65,7 @@ test('a version this build does not know is refused, not read optimistically', (
 })
 
 test('one unreadable signal makes the whole record unreadable', () => {
-  const good = encodeRunFindings(assessment([raymonds])) as { items: { signals: Record<string, unknown>[] }[] }
+  const good = encodeRunFindings(assessment([raymonds]), [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }]) as { items: { signals: Record<string, unknown>[] }[] }
 
   // A finding shown with part of its basis silently dropped is worse than one
   // not shown: the count stays, the evidence under it shrinks, and nothing on
@@ -95,7 +95,7 @@ test('an unknown recency kind is refused rather than guessed', () => {
   // always recent — so guessing the kind makes six-month-old evidence look
   // like it happened this morning. Refusing costs a record; guessing costs a
   // technician's judgement about whether to act tonight.
-  const good = encodeRunFindings(assessment([raymonds])) as { items: { signals: Record<string, unknown>[] }[] }
+  const good = encodeRunFindings(assessment([raymonds]), [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }]) as { items: { signals: Record<string, unknown>[] }[] }
   const broken = structuredClone(good)
   broken.items[0]!.signals[0]!.latest = { at: '2026-09-03T10:40:00.000Z', kind: 'STATE_OBSERVED' }
   // A DIFFERENT known kind is not corruption — it decodes, and means something
@@ -106,7 +106,7 @@ test('an unknown recency kind is refused rather than guessed', () => {
 })
 
 test('a finding recorded with no signals is a malformed record, not a basisless finding', () => {
-  const good = encodeRunFindings(assessment([raymonds])) as { items: { signals: unknown[] }[] }
+  const good = encodeRunFindings(assessment([raymonds]), [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }]) as { items: { signals: unknown[] }[] }
   const broken = structuredClone(good)
   broken.items[0]!.signals = []
   assert.deepEqual(decodeRunFindings(broken), { present: false, because: 'MALFORMED' })
@@ -120,7 +120,7 @@ test('a verdict with no basis, and a basis with no verdict, are both refused', (
   //
   // They are in ONE record so the refusal is possible at all — two columns
   // would be two reads and two chances to drift.
-  const whole = encodeRunFindings(assessment([raymonds])) as Record<string, unknown>
+  const whole = encodeRunFindings(assessment([raymonds]), [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }]) as Record<string, unknown>
 
   for (const missing of ['count', 'claim', 'complete']) {
     const partial = { ...whole }

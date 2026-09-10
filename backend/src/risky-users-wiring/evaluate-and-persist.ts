@@ -2,6 +2,7 @@ import { IDENTITY_RISK_RUN_RETENTION_MS } from '../identity-risk/identity-risk.c
 import { collectorStatus } from '../tenants/service-sync-freshness.js'
 import { credentialFailureDetector } from './detectors/credential-failure.js'
 import { persistRun } from './persist-run.js'
+import type { SourceCollection } from './run-findings.js'
 import { readTenantAssessment } from './read-tenant.js'
 import type { PrismaClient } from '../generated/prisma/client.js'
 import type { CollectorSyncStatus } from '../tenants/service-sync-freshness.js'
@@ -76,7 +77,7 @@ const COLLECTION_SCOPE_FOR: Readonly<Record<NormalizationSource, CollectionScope
  * from saying it was collected and was empty. */
 async function syncStatusPerFeed(
   prisma: PrismaClient, scope: Readonly<{ organizationId: string; customerTenantId: string }>, now: Date,
-): Promise<Readonly<Record<NormalizationSource, CollectorSyncStatus>>> {
+): Promise<Readonly<{ status: Readonly<Record<NormalizationSource, CollectorSyncStatus>>; sources: readonly SourceCollection[] }>> {
   const states = await prisma.syncState.findMany({
     where: {
       organizationId: scope.organizationId,
@@ -115,7 +116,21 @@ async function syncStatusPerFeed(
 
   const read = (source: NormalizationSource): CollectorSyncStatus =>
     collectorStatus(COLLECTOR_FOR[source], settled(byResource.get(COLLECTOR_FOR[source])) as never, now)
-  return { GRAPH_SIGN_INS: read('GRAPH_SIGN_INS'), M365_AUDIT_STS: read('M365_AUDIT_STS') }
+  const lastSuccess = (source: NormalizationSource): string | null => {
+    const state = byResource.get(COLLECTOR_FOR[source])
+    return state?.lastSuccessfulAt ? state.lastSuccessfulAt.toISOString() : null
+  }
+  return {
+    status: { GRAPH_SIGN_INS: read('GRAPH_SIGN_INS'), M365_AUDIT_STS: read('M365_AUDIT_STS') },
+    // The facts, not a verdict about them. Already read for the gate above and
+    // previously discarded — a consumer cannot check our freshness reasoning
+    // without the inputs we reasoned from.
+    sources: (Object.keys(COLLECTOR_FOR) as NormalizationSource[]).map(source => ({
+      source,
+      status: read(source),
+      lastSuccessfulCollectionAt: lastSuccess(source),
+    })),
+  }
 }
 
 export type EvaluateAndPersistResult = Readonly<{
@@ -136,6 +151,7 @@ export async function evaluateAndPersistTenant(
   const now = options.now ?? new Date()
   const windowEnd = now
   const windowStart = new Date(now.getTime() - WINDOW_DAYS * 24 * 60 * 60 * 1_000)
+  const collectors = await syncStatusPerFeed(prisma, scope, now)
 
   const { assessment, rowsFetched, feed } = await readTenantAssessment(prisma, {
     organizationId: scope.organizationId,
@@ -145,7 +161,7 @@ export async function evaluateAndPersistTenant(
     // read from.
     feedIfNoRows: 'GRAPH_SIGN_INS',
     collectionScope: COLLECTION_SCOPE_FOR,
-    syncStatus: await syncStatusPerFeed(prisma, scope, now),
+    syncStatus: collectors.status,
     detectors: [credentialFailureDetector({ rejectionThreshold: options.rejectionThreshold ?? 5 })],
     windowStart,
     windowEnd,
@@ -168,6 +184,7 @@ export async function evaluateAndPersistTenant(
     // so one maintenance job prunes both and neither outlives the other.
     expiresAt: new Date(now.getTime() + IDENTITY_RISK_RUN_RETENTION_MS),
     completedAt: now,
+    sources: collectors.sources,
   })
 
   return { runId: id, rowsFetched, feed: feed.feed, findings: assessment.findings.items.length }

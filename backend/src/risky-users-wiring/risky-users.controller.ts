@@ -79,6 +79,19 @@ export class RiskyUsersController {
         windowEnd: run.windowEnd.toISOString(),
         completedAt: run.completedAt.toISOString(),
       },
+      /** WHAT EACH COLLECTOR HAD ACHIEVED, not a freshness verdict about it.
+       *
+       * The consumer recomputes coverage from these and refuses an EXACT total
+       * the evidence does not support. Sending a one-word verdict would make
+       * that check trust us rather than check us — and that check existing is
+       * the reason a server cannot assert an exact total over stale evidence.
+       *
+       * NAMED `collectors`, NOT `sources`. The old envelope has a `sources[]`
+       * carrying reasonCode, explanation, freshness and a window — a different
+       * shape. Reusing the name for a different thing is the mistake that cost
+       * four wrong inferences today: a name is a claim made by whoever typed it,
+       * carrying no evidence, sitting beside fields that do. */
+      collectors: run.sources,
       count: run.count,
       claim: run.claim,
       coverage: run.streams,

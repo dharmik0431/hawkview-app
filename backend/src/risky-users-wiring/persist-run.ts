@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { encodeRunCoverage } from './run-coverage.js'
-import { encodeRunFindings } from './run-findings.js'
+import { encodeRunFindings, type SourceCollection } from './run-findings.js'
 import type { TenantAssessment } from '../evaluation-core/compose.js'
 
 /** Writing a run this engine produced, into a table the old engine owns.
@@ -54,6 +54,9 @@ export type PersistRunInput = Readonly<{
    * one silently. */
   expiresAt: Date
   completedAt: Date
+  /** What each collector had achieved when this run read it. Stored so a
+   * consumer can judge freshness from the facts rather than from our verdict. */
+  sources: readonly SourceCollection[]
 }>
 
 /** The subset of the Prisma client this needs, so the unit tests can supply a
@@ -123,7 +126,7 @@ export async function persistRun(
       // require severity, confidence and coverage as NOT NULL strings that
       // this engine does not compute. A nullable column has nothing to
       // satisfy, so there is nothing to fabricate.
-      evaluationFindings: encodeRunFindings(assessment),
+      evaluationFindings: encodeRunFindings(assessment, input.sources),
       expiresAt: input.expiresAt,
       completedAt: input.completedAt,
     },

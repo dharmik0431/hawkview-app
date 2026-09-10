@@ -37,6 +37,7 @@ const input = {
   rowsFetched: 2069,
   expiresAt: new Date('2026-12-10T00:00:00.000Z'),
   completedAt: new Date('2026-09-10T00:05:00.000Z'),
+  sources: [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }],
 }
 
 const assessment = async () => assessTenant({

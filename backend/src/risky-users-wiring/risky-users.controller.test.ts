@@ -26,6 +26,7 @@ const run = {
     count: { accuracy: 'EXACT', value: 1, scope: { evidenceRequested: ['GRAPH_INTERACTIVE_ONLY'], setAside: [], covered: ['repeated-credential-failure'], notCovered: [] } },
     claim: { permitted: true },
     complete: true,
+    sources: [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }],
     items: [{
       detectorId: 'repeated-credential-failure',
       subject: { kind: 'DIRECTORY_USER', userRef: 'subject:c54eb6ce', correlation: { available: false, because: 'pseudonymous' } },
@@ -167,4 +168,32 @@ test('no run, and an unreadable run, keep their own reasons', async () => {
   }).controller.assessment(request, 'tenant-1') as Record<string, unknown>
   assert.equal(broken.available, false)
   assert.equal(broken.because, 'FINDINGS_UNREADABLE')
+})
+
+test('the collector facts are served under their own name, and no freshness verdict is', async () => {
+  // The consumer derives coverage from these and downgrades an EXACT claim the
+  // evidence does not support. That check is only meaningful if it gets the
+  // facts rather than our conclusion about them — the same principle as not
+  // serving `capability`, one level down.
+  const { controller: subject } = controller({
+    authorize: async () => ({ id: 'tenant-1', organizationId: 'org-1' }),
+  })
+
+  const response = await subject.assessment(request, 'tenant-1') as Record<string, any>
+  assert.equal(response.available, true)
+
+  const [source] = response.collectors
+  assert.equal(source.source, 'GRAPH_SIGN_INS')
+  // Deliberately not under `sources`: that key belongs to the old envelope and
+  // carries a different shape. A colliding name is a claim nobody checked.
+  assert.equal('sources' in response, false)
+  assert.equal(source.lastSuccessfulCollectionAt, '2026-09-10T20:55:00.000Z')
+  // Null would mean never collected — a different fact from an old collection,
+  // and the one a consumer needs to tell "stale" from "never".
+  assert.notEqual(source.lastSuccessfulCollectionAt, null)
+
+  // And no verdict derived FOR them.
+  for (const verdict of ['freshness', 'capability', 'complete']) {
+    assert.equal(verdict in source, false, `${verdict} is the consumer's to derive`)
+  }
 })

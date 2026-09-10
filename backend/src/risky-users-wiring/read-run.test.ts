@@ -39,7 +39,8 @@ async function writtenRow(findings: readonly Finding[] = [raymonds]) {
     { identityRiskEvaluationRun: { create: async ({ data }) => { captured = data; return { id: 'run-1' } } } },
     withFindings as never,
     { ...scope, windowStart: new Date('2026-08-11T00:00:00.000Z'), windowEnd: new Date('2026-09-10T00:00:00.000Z'),
-      rowsFetched: 2069, expiresAt: new Date('2026-12-10T00:00:00.000Z'), completedAt: new Date('2026-09-10T20:31:00.000Z') })
+      rowsFetched: 2069, expiresAt: new Date('2026-12-10T00:00:00.000Z'), completedAt: new Date('2026-09-10T20:31:00.000Z'),
+      sources: [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-10T20:55:00.000Z' }] })
   return captured
 }
 

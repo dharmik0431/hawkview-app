@@ -36,17 +36,35 @@ export const RUN_FINDINGS_VERSION = 'hawkview-run-findings/v1'
  * a count whose findings did not decode. */
 
 export type DecodedRunFindings =
-  | Readonly<{ present: true; findings: readonly Finding[]; count: Count; claim: TenantClaim; complete: boolean }>
+  | Readonly<{ present: true; findings: readonly Finding[]; count: Count; claim: TenantClaim; complete: boolean; sources: readonly SourceCollection[] }>
   /** Distinct from `findings: []`, which means a run that genuinely produced
    * none. Absence is not zero. */
   | Readonly<{ present: false; because: 'NOT_RECORDED' | 'UNRECOGNIZED_VERSION' | 'MALFORMED' }>
 
-export function encodeRunFindings(assessment: TenantAssessment): Record<string, unknown> {
+/** What a collector had actually achieved when the run read it. */
+export type SourceCollection = Readonly<{
+  source: string
+  /** The collector state this run gated on, in the collector's own vocabulary. */
+  status: string
+  /** Null means the collector has never reported a success — distinct from an
+   * old one, and the distinction a consumer needs to tell "stale" from "never". */
+  lastSuccessfulCollectionAt: string | null
+}>
+
+export function encodeRunFindings(
+  assessment: TenantAssessment, sources: readonly SourceCollection[],
+): Record<string, unknown> {
   return {
     version: RUN_FINDINGS_VERSION,
     // `complete` travels with the list because "these are the findings" and
     // "these are the findings we could produce" are different claims, and the
     // second one is only visible from the gaps that explain it.
+    // THE INPUTS A CONSUMER DERIVES FRESHNESS FROM, not a freshness verdict.
+    // The surface recomputes coverage from these and refuses an EXACT total the
+    // evidence does not support — which is only possible if it gets the facts
+    // rather than our summary of them. Serving a one-word verdict would make
+    // that check trust us instead of checking us.
+    sources,
     count: assessment.count,
     claim: assessment.claim,
     complete: assessment.findings.complete,
@@ -136,6 +154,7 @@ export function decodeRunFindings(raw: unknown): DecodedRunFindings {
   return {
     present: true,
     findings,
+    sources: Array.isArray(raw.sources) ? raw.sources as unknown as readonly SourceCollection[] : [],
     count: raw.count as unknown as Count,
     claim: raw.claim as unknown as TenantClaim,
     complete: raw.complete,
