@@ -27,12 +27,12 @@ const at = (n: number) => new Date(windowEnd.getTime() - (n + 1) * 60_000)
 // STS-shaped: the feed is selected by hawkviewSource, the record sits inside
 // managementActivityRecord, and the subject binds on UserId (a UPN) rather than
 // an object id. Passing Graph-shaped rows here rejects every one of them.
-const row = (n: number) => ({
+const row = (n: number, zulu: boolean) => ({
   organizationId, customerTenantId, microsoftSignInId: `qa-aud-${n}`, eventDateTime: at(n),
   raw: {
     hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY',
     managementActivityRecord: {
-      Id: `qa-aud-${n}`, CreationTime: at(n).toISOString(), OrganizationId: microsoftTenantId,
+      Id: `qa-aud-${n}`, CreationTime: zulu ? at(n).toISOString() : at(n).toISOString().replace(/Z$/, ''), OrganizationId: microsoftTenantId,
       UserId: upn, UserType: 0, RecordType: 15, Operation: 'UserLoggedIn',
       ApplicationId: randomUUID(), ActorIpAddress: '203.0.113.9',
     },
@@ -45,7 +45,8 @@ try {
   await prisma.customerTenant.create({ data: { id: customerTenantId, organizationId, microsoftTenantId, displayName: 'QA audit tenant', status: 'ACTIVE' } })
   await prisma.directoryUser.create({ data: { organizationId, customerTenantId, microsoftUserId: userId,
     displayName: upn, userPrincipalName: upn, userType: 'Member', lastSeenAt: windowStart, updatedAt: windowStart } })
-  await prisma.signInLog.createMany({ data: Array.from({ length: 15 }, (_, i) => row(i)) })
+  const zulu = process.env.QA_ZULU !== '0'
+  await prisma.signInLog.createMany({ data: Array.from({ length: 15 }, (_, i) => row(i, zulu)) })
 
   const read = await readTenantAssessment(prisma, {
     organizationId, customerTenantId, source: 'M365_AUDIT_STS',
@@ -62,7 +63,7 @@ try {
   const namedInScope = inapplicable.every(id => scope.notCovered.some(n => n.detectorId === id))
   const zero = a.count.accuracy === 'EXACT' && a.count.value === 0
 
-  console.log(JSON.stringify({ QA_GATE_AUDIT_INAPPLICABLE: {
+  console.log(JSON.stringify({ QA_GATE_AUDIT: { timestampCarriesZ: process.env.QA_ZULU !== '0',
     rowsFetched: read.rowsFetched, applies: coverage.applies,
     unprocessable: coverage.unprocessable, unknown: coverage.unknown,
     count: { accuracy: a.count.accuracy, value: a.count.value },
@@ -70,7 +71,10 @@ try {
     withheld: a.claim.permitted ? [] : a.claim.withheld,
     detectorReports: reports, covered: scope.covered, notCovered: scope.notCovered,
     inapplicable, namedInScope,
-    verdict: inapplicable.length === 0
+    rowsRejectedOnTimestamp: (coverage.unprocessable as Record<string, number>).EVENT_TIMESTAMP_INVALID ?? 0,
+    verdict: ((coverage.unprocessable as Record<string, number>).EVENT_TIMESTAMP_INVALID ?? 0) > 0
+      ? 'TIMESTAMP REJECTED - every row unprocessable, tenant reads as quiet over collected rows'
+      : inapplicable.length === 0
       ? 'NO INAPPLICABLE CHECK on this feed - the shape under test did not occur'
       : !namedInScope ? 'WIDENED - a check could not run and the scope does not name it'
       : zero ? 'HOLDS - zero, and the scope names the check that could not run'
