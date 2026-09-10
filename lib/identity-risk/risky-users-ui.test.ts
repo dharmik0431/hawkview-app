@@ -138,12 +138,18 @@ function render(
     contractFailed?: boolean
     notReported?: boolean
     loading?: boolean
+    // Applied after adaptation, for states the wire contract does not yet
+    // allow but the projection is required to survive. The adapter's job is to
+    // reject malformed payloads; the view model's is to be honest about shapes
+    // the server is permitted to grow into.
+    afterAdapt?: (value: any) => void
   } = {}
 ) {
   const assessment = adapter.adaptRiskAssessmentResponse(
     assessmentValue,
     assessmentNow
   )
+  if (assessment) options.afterAdapt?.(assessment)
   const microsoftView = adapter.adaptMicrosoftRiskyUsersResponse(
     options.microsoft ?? microsoftWithoutP2()
   )
@@ -1389,4 +1395,81 @@ test('an unrecognised rule never lets its identifier become the description', ()
     !/HV-ID-NEW-777/.test(list),
     'an identifier was rendered where a description belongs'
   )
+})
+
+test('a check that ran without a time says so, and is not called unreported', () => {
+  // No detector emits a dateless finding today, and that is a fact about the
+  // two detectors that exist rather than about the contract. The alternative to
+  // handling it is a default — now, the epoch, the empty string — which would
+  // place the row somewhere specific in the one column that means recency, on
+  // the strength of a value nobody supplied.
+  //
+  // The words matter as much as the handling. "Not reported" describes a gap in
+  // collection. A check that ran and produced evidence carrying no time is a
+  // gap in the evidence, and sending a technician to look at collection for it
+  // is this surface's standing mistake in miniature.
+  const { document } = render(assessmentFixture(true), {
+    afterAdapt: (value) => {
+      for (const finding of value.users[0].findings) finding.lastSeen = null
+    },
+  })
+  const rows = Array.from(
+    document.querySelectorAll(
+      '[aria-labelledby="risky-users-list-heading"] tbody tr'
+    )
+  ) as Element[]
+  const dateless = rows.find((row) =>
+    row.textContent?.includes('No time recorded')
+  )
+  assert.ok(dateless, 'the dateless row rendered no distinct state')
+  assert.match(
+    dateless!.textContent ?? '',
+    /the checks ran; their evidence carries no time/
+  )
+  assert.ok(
+    !/Not reported/.test(dateless!.textContent ?? ''),
+    'an evidence gap was reported as a collection gap'
+  )
+  // The reason line beside it must not invent one either.
+  assert.ok(
+    !/, last /.test(dateless!.textContent ?? ''),
+    'a reason without a time was given one'
+  )
+})
+
+test('a row with no time sorts after dated rows rather than being coerced to one', () => {
+  // Scope of this guard, stated because mutation testing narrowed it: the
+  // empty-string fallback it replaced already produced this order, so reverting
+  // to that does not fail here. What fails is any filler that puts the row at a
+  // definite position — "now" or a forward date — and any change of sort
+  // direction, which the old pairing of filler and direction would have
+  // silently inverted.
+  const value = assessmentFixture(true)
+  value.users = [
+    assessmentUser('HV-ID-AUTH-010.v1', 'a'),
+    assessmentUser('HV-ID-AUTH-010.v1', 'b'),
+  ]
+  value.rules[0].assessedIdentities = 2
+  value.rules[0].matchedIdentities = 2
+  value.summary.currentUsers.value = 2
+  const { document } = render(value, {
+    afterAdapt: (adapted) => {
+      // Same priority, so the date is the only key left. The first user loses
+      // its time; a coerced empty string would sort it first, not last.
+      for (const finding of adapted.users[0].findings) finding.lastSeen = null
+    },
+  })
+  const names = (
+    Array.from(
+      document.querySelectorAll(
+        '[aria-labelledby="risky-users-list-heading"] tbody tr'
+      )
+    ) as Element[]
+  ).map((row) => row.textContent ?? '')
+  assert.equal(names.length, 2)
+  assert.ok(
+    !names[0].includes('No time recorded'),
+    'the undated row sorted ahead of a dated one'
+  )
+  assert.ok(names[1].includes('No time recorded'))
 })

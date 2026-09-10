@@ -597,12 +597,22 @@ export function findingEvidenceSummary(
     ruleId: string
     evidenceCount: number
     evidenceCountCapped: boolean
-    lastSeen: string
+    /**
+     * Null when the check ran and its evidence carries no time at all.
+     *
+     * That is a real state rather than a missing field, and it has to stay
+     * distinguishable from one. No detector produces it today, but that is a
+     * property of the two detectors that exist, not of the contract, and the
+     * alternative to handling it is a default — now, the epoch, the empty
+     * string — that would place a row somewhere specific in a column meaning
+     * recency on the strength of a value nobody supplied.
+     */
+    lastSeen: string | null
   },
   formatDate: (value: string) => string
 ): FindingEvidenceSummary {
   const shape = findingEvidenceShape(finding.ruleId)
-  const when = formatDate(finding.lastSeen)
+  const when = finding.lastSeen === null ? null : formatDate(finding.lastSeen)
   if (shape.kind === 'UNRECOGNISED') {
     return {
       count: null,
@@ -610,9 +620,8 @@ export function findingEvidenceSummary(
       note:
         'This build of HawkView does not know this check, so it cannot say what its count of ' +
         finding.evidenceCount.toLocaleString() +
-        ' counts, or what ' +
-        when +
-        ' marks.',
+        ' counts' +
+        (when === null ? '.' : ', or what ' + when + ' marks.'),
     }
   }
   // A capped count is a floor, never a total: the evidence was truncated before
@@ -628,13 +637,14 @@ export function findingEvidenceSummary(
         (finding.evidenceCount === 1 ? shape.singular : shape.plural),
       // Deliberately not "last". Nothing here happened at this time; this is
       // when HawkView read a setting that may be far older.
-      timing: 'configuration read ' + when,
+      timing:
+        when === null ? 'no read time recorded' : 'configuration read ' + when,
       note: null,
     }
   }
   return {
     count: amount + ' ' + (finding.evidenceCount === 1 ? 'record' : 'records'),
-    timing: 'last ' + when,
+    timing: when === null ? 'no time recorded' : 'last ' + when,
     note: null,
   }
 }

@@ -554,8 +554,16 @@ export type RiskyUserReason = {
   evidenceCount: number
   /** True when the count is a ceiling rather than a total. */
   evidenceCountCapped: boolean
-  firstSeen: string
-  lastSeen: string
+  firstSeen: string | null
+  /**
+   * Null when this reason was evaluated and its evidence carries no time.
+   *
+   * Distinct from a reason that was never evaluated, which does not appear at
+   * all. Nothing emits it today; that is a fact about the two detectors that
+   * exist rather than about the contract, and the cost of assuming otherwise is
+   * a fabricated date in the one column that means recency.
+   */
+  lastSeen: string | null
 }
 
 export type RiskyUserRow = {
@@ -586,6 +594,16 @@ export type RiskyUserRow = {
    * beside it — the aggregate was the half still implying "this happened".
    */
   lastSeenFrom: RiskyUserReason | null
+  /**
+   * Why the row has the date it has, or has none.
+   *
+   * Two different absences reach this column and must not print the same
+   * words. DATELESS means the checks ran and none of their evidence carries a
+   * time. NO_REASONS means there is nothing here to have a date. Collapsing
+   * them into one "Not reported" would report a gap in collection where the
+   * truth is a gap in the evidence itself.
+   */
+  lastSeenState: 'DATED' | 'DATELESS' | 'NO_REASONS'
   /**
    * Each reason with its own count and its own recency, never a list of titles
    * beside one shared date.
@@ -640,10 +658,19 @@ function rowFor(
     firstSeen: finding.firstSeen,
     lastSeen: finding.lastSeen,
   }))
+  // Only reasons that carry a time can supply the column's date. A dateless
+  // reason is not sorted to the front or the back of this list; it is excluded
+  // from a maximum it has no value to contribute to.
+  const dated = reasons.filter(
+    (reason): reason is RiskyUserReason & { lastSeen: string } =>
+      reason.lastSeen !== null
+  )
   const lastSeenFrom =
-    [...reasons].sort((a, b) => a.lastSeen.localeCompare(b.lastSeen)).at(-1) ??
+    [...dated].sort((a, b) => a.lastSeen.localeCompare(b.lastSeen)).at(-1) ??
     null
   const lastSeen = lastSeenFrom?.lastSeen ?? null
+  const lastSeenState =
+    lastSeen !== null ? 'DATED' : reasons.length > 0 ? 'DATELESS' : 'NO_REASONS'
   return {
     id: user.id,
     name: user.displayName ?? user.label,
@@ -654,6 +681,7 @@ function rowFor(
     priorityLabel: riskyUserPriorityLabel(user.priority),
     lastSeen,
     lastSeenFrom,
+    lastSeenState,
     reasons,
     detection: detectionFor(user, channel, microsoftUsers),
     protection: riskProtectionSummary(user),
@@ -705,7 +733,25 @@ export function riskyUserList(
     if (rank !== 0) return rank
     const corroboration = corroborated(b) - corroborated(a)
     if (corroboration !== 0) return corroboration
-    return (b.lastSeen ?? '').localeCompare(a.lastSeen ?? '')
+    // A row with no date has no recency to compare, so it sorts after every
+    // dated row in its band rather than being coerced to one.
+    //
+    // The empty-string default this replaces produced the same order, and it is
+    // worth being exact about why rather than claiming a bug that was not
+    // there: the empty string sorts below every timestamp, and this comparison
+    // runs descending, so undated rows already fell to the back. That is two
+    // unrelated choices — the filler value and the sort direction — agreeing by
+    // coincidence, with neither stated anywhere. Reverse the direction and
+    // every undated row leads the list, from an edit that has nothing to do
+    // with dates. Other fillers are worse and not coincidental at all: the
+    // epoch or "now" place the row at a definite end of a column that means
+    // recency, on the strength of a value nobody supplied.
+    //
+    // The branch below cannot be inverted by a change made elsewhere.
+    if (a.lastSeen === b.lastSeen) return 0
+    if (a.lastSeen === null) return 1
+    if (b.lastSeen === null) return -1
+    return b.lastSeen.localeCompare(a.lastSeen)
   }
   return {
     rows: current

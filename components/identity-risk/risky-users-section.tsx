@@ -47,6 +47,45 @@ function time(value: string | null) {
 }
 
 /**
+ * The row's one aggregate date, and what kind of date it is.
+ *
+ * Three different things can appear here and none of them may borrow another's
+ * words. A date, qualified by the kind of time it turned out to be. No date
+ * because the checks that ran carry none — an evidence gap, not a collection
+ * one. And no date because there is nothing here to have one.
+ *
+ * "Not reported" for the middle case would be the surface's standing mistake in
+ * miniature: a true-sounding phrase about collection, printed where the truth is
+ * about the evidence.
+ */
+function LatestCell({ row }: { row: RiskyUserRow }) {
+  if (row.lastSeenState === 'NO_REASONS') return <>{time(null)}</>
+  if (row.lastSeenState === 'DATELESS') {
+    return (
+      <>
+        No time recorded
+        <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
+          the checks ran; their evidence carries no time
+        </span>
+      </>
+    )
+  }
+  const settingRead =
+    row.lastSeenFrom &&
+    findingEvidenceShape(row.lastSeenFrom.ruleId).kind !== 'OCCURRENCES'
+  return (
+    <>
+      {time(row.lastSeen)}
+      {settingRead && (
+        <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
+          when HawkView read a setting, not when anything happened
+        </span>
+      )}
+    </>
+  )
+}
+
+/**
  * One reason, with its own count and its own recency, in the unit that reason
  * actually counts.
  *
@@ -491,14 +530,7 @@ function UserRows({
                 </p>
               </td>
               <td className="px-3 py-3 text-sm text-slate-700 dark:text-slate-300">
-                {time(row.lastSeen)}
-                {row.lastSeenFrom &&
-                  findingEvidenceShape(row.lastSeenFrom.ruleId).kind !==
-                    'OCCURRENCES' && (
-                    <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
-                      when HawkView read a setting, not when anything happened
-                    </span>
-                  )}
+                <LatestCell row={row} />
               </td>
               <td className="px-3 py-3 text-right">
                 <Button
