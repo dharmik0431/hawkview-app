@@ -233,7 +233,7 @@ test('the list gives a technician the four things they triage on', () => {
   assert.deepEqual(headers.slice(0, 4), [
     'User',
     'Detected by',
-    'Priority',
+    'HawkView priority',
     'Last seen',
   ])
   assert.match(text, /Synthetic identity/)
@@ -251,7 +251,9 @@ test('the opaque subject reference is shortened but stays available', () => {
   const { document } = render()
   const cell = document.querySelector('tbody tr td')
   assert.ok(cell)
-  const reference = cell!.querySelectorAll('p')[1]
+  // Selected by its title attribute rather than by position, so adding a
+  // line to the cell does not silently retarget the assertion.
+  const reference = cell!.querySelector('p[title]')
   assert.ok(reference)
   // Shown short, so it does not crowd out the name and the reasons.
   assert.match(reference!.textContent ?? '', /^hvr1_subject_[0-9a-f]{10}…$/)
@@ -910,4 +912,107 @@ test('per-check identity counts cannot be read as tenant coverage', () => {
   assert.match(text, /two checks may have evaluated different populations/)
   // And the zero carries the same admission beside the number itself.
   assert.match(text, /not a proportion of your people/)
+})
+
+test('a corroborated row never reads as a combined judgement', () => {
+  // Microsoft calls this person at risk with high confidence in its own panel.
+  // HawkView rates its own finding Low. Both are true; a row labelled
+  // "HawkView and Microsoft" carrying a bare "Low" reads as the verdict of
+  // both, and a technician triaging by that column works the one row where two
+  // systems agree last.
+  const key = {
+    available: true,
+    shape: 'DIRECTORY_OBJECT_ID',
+    ref: 'shared-guid',
+  }
+  const value = assessmentFixture(true)
+  value.users[0].correlation = key
+  value.users[0].displayName = 'Alice Chen'
+  // A second, uncorroborated user that HawkView rates higher.
+  const louder = assessmentUser('HV-ID-AUTH-005.v2', 'b')
+  louder.label = 'Higher priority, one source'
+  value.users.push(louder)
+  value.rules[1].matchedIdentities = 1
+  value.summary.currentUsers = { value: 2, accuracy: 'EXACT' }
+
+  const envelope = syntheticRiskResponses().microsoftRiskyUsers
+  const microsoft = {
+    ...envelope,
+    users: [
+      {
+        id: 'ms-1',
+        identityLabel: 'Alice Chen',
+        correlation: key,
+        riskLevel: 'high',
+        riskState: 'atRisk',
+        riskDetail: null,
+        observedAt: envelope.observedAt,
+      },
+    ],
+    pageInfo: { hasMore: false, nextCursor: null },
+  }
+
+  const { document } = render(value, { microsoft })
+  const rows = [
+    ...document.querySelectorAll(
+      '[aria-labelledby="risky-users-list-heading"] tbody tr'
+    ),
+  ]
+  assert.equal(rows.length, 2)
+
+  // The column names whose rating it is.
+  const headers = [...document.querySelectorAll('th')].map((cell: any) =>
+    cell.textContent?.trim()
+  )
+  assert.ok(headers.includes('HawkView priority'))
+
+  // Microsoft's own verdict travels with the row rather than living only in
+  // the panel above, so the two are read together.
+  const alice = rows.find((row: any) =>
+    /Alice Chen/.test(row.textContent ?? '')
+  )
+  assert.ok(alice)
+  assert.match(alice!.textContent ?? '', /Microsoft says/)
+  assert.match(alice!.textContent ?? '', /At risk/)
+  assert.match(alice!.textContent ?? '', /High confidence/)
+  // And the cell says the rating is HawkView's alone.
+  assert.match(alice!.textContent ?? '', /rating of its own finding/)
+
+  // The row two systems agree on is not buried under a louder single source.
+  assert.match(rows[0].textContent ?? '', /Alice Chen/)
+  // The ordering is stated rather than left to be inferred.
+  const list = document.querySelector(
+    '[aria-labelledby="risky-users-list-heading"]'
+  )
+  assert.match(list!.textContent ?? '', /come first/)
+  assert.match(list!.textContent ?? '', /never combined into one score/)
+})
+
+test('a person and a mailbox sharing a name are visibly different subjects', () => {
+  // A shared mailbox named after its owner is ordinary in Microsoft 365. Two
+  // rows reading "Alice Chen" with different priorities look like the page
+  // contradicting itself unless each says what it is a row about.
+  const value = assessmentFixture(true)
+  value.users[0].displayName = 'Alice Chen'
+  const mailbox = assessmentUser('HV-ID-MBX-001.v1', 'd')
+  mailbox.label = 'Alice Chen'
+  value.users.push(mailbox)
+  value.rules[2].assessedIdentities = 2
+  value.rules[2].matchedIdentities = 1
+
+  const { document } = render(value)
+  const counted = document.querySelector(
+    '[aria-labelledby="risky-users-list-heading"] tbody tr'
+  )
+  const supporting = document.querySelector(
+    '[aria-labelledby="risky-users-context-heading"] tbody tr'
+  )
+  assert.ok(counted)
+  assert.ok(supporting)
+  assert.match(counted!.textContent ?? '', /Alice Chen/)
+  assert.match(supporting!.textContent ?? '', /Alice Chen/)
+  // Each row says which kind of subject it is, so the two are not read as one
+  // person the page cannot make its mind up about.
+  assert.match(counted!.textContent ?? '', /User account/)
+  assert.match(supporting!.textContent ?? '', /Mailbox/)
 })

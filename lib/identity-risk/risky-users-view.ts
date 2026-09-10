@@ -585,7 +585,16 @@ export function riskyUserList(
   if (!assessment) return { rows: [], context: [] }
   const current = currentRiskAssessmentUsers(assessment)
   const currentIds = new Set(current.map((user) => user.id))
-  const byPriorityThenRecency = (a: RiskyUserRow, b: RiskyUserRow) => {
+  const corroborated = (row: RiskyUserRow) =>
+    row.detection.microsoft === 'REPORTED' ? 1 : 0
+  const byCorroborationThenPriority = (a: RiskyUserRow, b: RiskyUserRow) => {
+    // Two independent systems reporting the same person is the strongest lead
+    // this product produces, and HawkView's own priority cannot express it —
+    // a Low finding corroborated by Microsoft is not a Low lead. Sorting on
+    // the fact of corroboration keeps the two judgements separate while still
+    // putting the row a technician should open first at the top.
+    const corroboration = corroborated(b) - corroborated(a)
+    if (corroboration !== 0) return corroboration
     const rank =
       (b.priority ? priorityRank[b.priority] : 0) -
       (a.priority ? priorityRank[a.priority] : 0)
@@ -595,11 +604,11 @@ export function riskyUserList(
   return {
     rows: current
       .map((user) => rowFor(user, channel, microsoftUsers, true))
-      .sort(byPriorityThenRecency),
+      .sort(byCorroborationThenPriority),
     context: assessment.users
       .filter((user) => !currentIds.has(user.id))
       .map((user) => rowFor(user, channel, microsoftUsers, false))
-      .sort(byPriorityThenRecency),
+      .sort(byCorroborationThenPriority),
   }
 }
 

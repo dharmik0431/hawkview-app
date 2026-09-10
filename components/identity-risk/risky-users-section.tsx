@@ -337,6 +337,13 @@ function DetectedBy({ row }: { row: RiskyUserRow }) {
           {microsoftDetectionSummary(row.detection)}
         </span>
       )}
+      {row.detection.microsoftRecord && (
+        <span className="block w-full text-xs text-slate-600 dark:text-slate-300">
+          Microsoft says:{' '}
+          {microsoftRiskStateLabel[row.detection.microsoftRecord.riskState]} ·{' '}
+          {microsoftRiskLevelLabel(row.detection.microsoftRecord.riskLevel)}
+        </span>
+      )}
       <span className="sr-only">{detectedByLabel(row.detection)}</span>
     </div>
   )
@@ -382,7 +389,7 @@ function UserRows({
               Detected by
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
-              Priority
+              HawkView priority
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
               Last seen
@@ -401,6 +408,9 @@ function UserRows({
               <td className="px-3 py-3">
                 <p className="break-words text-sm font-semibold text-slate-900 dark:text-slate-50">
                   {row.name}
+                </p>
+                <p className="text-xs font-medium text-slate-600 dark:text-slate-400">
+                  {row.subjectType === 'MAILBOX' ? 'Mailbox' : 'User account'}
                 </p>
                 <p
                   className="mt-0.5 break-all font-mono text-xs text-slate-500 dark:text-slate-400"
@@ -424,6 +434,12 @@ function UserRows({
               </td>
               <td className="px-3 py-3">
                 <PriorityBadge row={row} />
+                {row.detection.microsoftRecord && (
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    HawkView&rsquo;s rating of its own finding. Microsoft rates
+                    this person separately, in the cell to the left.
+                  </p>
+                )}
                 <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
                   {row.protection.label}
                 </p>
@@ -724,6 +740,13 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
             >
               Users needing attention
             </h2>
+            <p className="mt-1 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
+              Users both HawkView and Microsoft reported independently come
+              first — that agreement is the strongest lead here, and neither
+              system&rsquo;s rating expresses it. After those, HawkView&rsquo;s
+              own investigation priority. The two ratings are never combined
+              into one score.
+            </p>
             {list.rows.length > 0 ? (
               <div className="mt-3">
                 <UserRows
