@@ -82,9 +82,14 @@ export function zeroClaim(basis: ClaimBasis): ZeroClaim {
   if (!withinBudget) reasons.push('CAPACITY_EXCEEDED')
   if (!allDetectorsRan) reasons.push('DETECTOR_FAILED')
   if (!allSubjectsResolved) reasons.push('UNRESOLVED_SUBJECT_IDENTITY')
-  // The sum invariant proves a detector's accounting is COMPLETE. It proves
-  // nothing was EXAMINED: assessed 0 with 1,000 declined balances perfectly.
-  // So the same guard as coverage.applies > 0, one layer further in.
+  // Gated on whether any check RAN, not on how much any check assessed.
+  // "assessed 0, declined 1,000" is a complete, honest answer from a detector
+  // whose kind of event did not occur in this window.
+  //
+  // Load-bearing, and the reason this is safe: a detector claiming assessed 0
+  // without accounting for the rest of the applicable set fails the sum
+  // invariant below and is recorded FAILED, never RAN. Weaken that check and
+  // this one stops meaning anything.
   if (!anyCheckExaminedEvidence) reasons.push('NO_CHECK_EXAMINED_EVIDENCE')
   // A narrower request is a DIFFERENT QUESTION, not an incomplete answer to the
   // same one — which is why it narrows the scope rather than withholding. A

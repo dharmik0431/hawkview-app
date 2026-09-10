@@ -142,11 +142,20 @@ export type WithheldReason =
    * clean result would cover. Distinct from evidence we could not read: this is
    * evidence we may never have requested. */
   | 'COLLECTION_SCOPE_UNDECLARED'
-  /** No check examined a single event, so there is nothing for a clean result to
-   * rest on. A detector may honestly decline everything it was handed — that is
-   * the fully-excluded case and its accounting is complete — but a check that
-   * looked at nothing cannot be one of the checks a confident zero stands on.
-   * The same guard as coverage.applies > 0, one layer further in. */
+  /** No check RAN, so there is nothing for a clean result to rest on.
+   *
+   * NOT "no check assessed a non-zero number of events". A detector handed a
+   * thousand events that honestly declines all thousand as not its kind HAS
+   * asked its question and answered it, and its zero is a real zero. Gating on
+   * how much a check assessed is what made healthy tenants unanswerable, and it
+   * gets worse as detectors are added, because each one declines the events
+   * belonging to the others.
+   *
+   * This fires only when no detector reached RAN at all: every one INAPPLICABLE,
+   * every one FAILED, or none supplied. Sound only because a detector reporting
+   * assessed 0 WITHOUT accounting for the whole applicable set fails the sum
+   * invariant in evaluate.ts and is recorded FAILED rather than RAN — so RAN
+   * already carries "this check accounted for every event it was handed". */
   | 'NO_CHECK_EXAMINED_EVIDENCE'
 
 /** Decided once. Every surface reads this rather than re-deriving it, because
