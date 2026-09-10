@@ -17,8 +17,13 @@ const raymonds: Finding = {
   ],
 }
 
-const assessment = (items: readonly Finding[]): TenantAssessment =>
-  ({ findings: { items, complete: true } } as unknown as TenantAssessment)
+/** Carries the verdict as well as the findings, because the record does: a
+ * count stored apart from its basis is the separation this design removes. */
+const assessment = (items: readonly Finding[]): TenantAssessment => ({
+  findings: { items, complete: true },
+  count: { accuracy: 'AT_LEAST', value: items.length, scope: { evidenceRequested: ['GRAPH_INTERACTIVE_ONLY'], setAside: [], covered: ['repeated-credential-failure'], notCovered: [] } },
+  claim: items.length === 0 ? { permitted: true } : { permitted: false, withheld: [{ stream: 'GRAPH_SIGN_INS', because: 'UNINTERPRETED_EVENTS' }] },
+} as unknown as TenantAssessment)
 
 test('a real finding survives storage with each signal still carrying its own date', () => {
   const decoded = decodeRunFindings(encodeRunFindings(assessment([raymonds])))
@@ -105,4 +110,31 @@ test('a finding recorded with no signals is a malformed record, not a basisless 
   const broken = structuredClone(good)
   broken.items[0]!.signals = []
   assert.deepEqual(decodeRunFindings(broken), { present: false, because: 'MALFORMED' })
+})
+
+test('a verdict with no basis, and a basis with no verdict, are both refused', () => {
+  // The two halves of the same defect. A count whose findings did not decode is
+  // a number with nothing under it; findings with no count is a basis nobody
+  // drew a conclusion from. Rendering either produces the pair Engineer 2 found:
+  // a tile saying four above a list saying none.
+  //
+  // They are in ONE record so the refusal is possible at all — two columns
+  // would be two reads and two chances to drift.
+  const whole = encodeRunFindings(assessment([raymonds])) as Record<string, unknown>
+
+  for (const missing of ['count', 'claim', 'complete']) {
+    const partial = { ...whole }
+    delete partial[missing]
+    assert.deepEqual(
+      decodeRunFindings(partial), { present: false, because: 'MALFORMED' },
+      `accepted a record with no ${missing}`)
+  }
+
+  // And the verdict really does come back when it is there, so the refusals
+  // above are about absence rather than a decoder that rejects everything.
+  const decoded = decodeRunFindings(whole)
+  assert.equal(decoded.present, true)
+  assert.equal(decoded.present && decoded.count.accuracy, 'AT_LEAST')
+  assert.equal(decoded.present && decoded.claim.permitted, false)
+  assert.equal(decoded.present && decoded.complete, true)
 })

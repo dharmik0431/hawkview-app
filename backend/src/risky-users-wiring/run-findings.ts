@@ -1,5 +1,5 @@
-import type { Finding, FindingSignal, SignalRecency } from '../evaluation-core/contract.js'
-import type { TenantAssessment } from '../evaluation-core/compose.js'
+import type { Count, Finding, FindingSignal, SignalRecency } from '../evaluation-core/contract.js'
+import type { TenantAssessment, TenantClaim } from '../evaluation-core/compose.js'
 
 /** Persisting the findings a run produced, and what they rested on.
  *
@@ -23,8 +23,20 @@ import type { TenantAssessment } from '../evaluation-core/compose.js'
 
 export const RUN_FINDINGS_VERSION = 'hawkview-run-findings/v1'
 
+/** The verdict travels WITH the findings that support it, in one record.
+ *
+ * Not a convenience. A count stored apart from its basis is the separation
+ * this whole feature exists to remove — it is how `exact: true, value: 0`
+ * came to sit beside `capability: PARTIAL` in the table this replaces, and how
+ * a tile reading "4 users" came to sit above a list reading "none". Two rows,
+ * two reads, two chances to drift.
+ *
+ * So `count`, `claim` and `items` are one JSON document. Either the whole
+ * verdict comes back or none of it does, which is what lets the reader refuse
+ * a count whose findings did not decode. */
+
 export type DecodedRunFindings =
-  | Readonly<{ present: true; findings: readonly Finding[] }>
+  | Readonly<{ present: true; findings: readonly Finding[]; count: Count; claim: TenantClaim; complete: boolean }>
   /** Distinct from `findings: []`, which means a run that genuinely produced
    * none. Absence is not zero. */
   | Readonly<{ present: false; because: 'NOT_RECORDED' | 'UNRECOGNIZED_VERSION' | 'MALFORMED' }>
@@ -35,6 +47,8 @@ export function encodeRunFindings(assessment: TenantAssessment): Record<string, 
     // `complete` travels with the list because "these are the findings" and
     // "these are the findings we could produce" are different claims, and the
     // second one is only visible from the gaps that explain it.
+    count: assessment.count,
+    claim: assessment.claim,
     complete: assessment.findings.complete,
     because: assessment.findings.complete ? [] : assessment.findings.because,
     items: assessment.findings.items.map(finding => ({
@@ -113,5 +127,17 @@ export function decodeRunFindings(raw: unknown): DecodedRunFindings {
       signals: [first, ...rest],
     })
   }
-  return { present: true, findings }
+  // The verdict is required, not optional. A record carrying findings with no
+  // count is half a verdict, and half a verdict rendered is a number with no
+  // basis or a basis with no number — both of which this reader exists to refuse.
+  if (!isObject(raw.count) || !isObject(raw.claim) || typeof raw.complete !== 'boolean') {
+    return { present: false, because: 'MALFORMED' }
+  }
+  return {
+    present: true,
+    findings,
+    count: raw.count as unknown as Count,
+    claim: raw.claim as unknown as TenantClaim,
+    complete: raw.complete,
+  }
 }
