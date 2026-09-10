@@ -1,4 +1,32 @@
 import type { EventOutcome, MicrosoftVerdict, NormalizationSource, OutcomeReachability } from './contract.js';
+
+/*
+ * WHERE EVERY NUMBER IN THIS FILE CAME FROM, stated once rather than per
+ * figure.
+ *
+ * No row count here was computed by this layer. All of them come from
+ * measurements run against production by the owner's side and relayed to this
+ * module; this session has no production access by design. That matters for
+ * two reasons a reader cannot otherwise recover:
+ *
+ *  - A BORROWED MEASUREMENT BECOMES THE BORROWING CODE'S OWN CLAIM once it
+ *    sits in a comment with no date and no source. The next reader has no way
+ *    to tell it was true on one afternoon, and no way to tell it was ever
+ *    someone else's. Both facts are load-bearing when a figure turns out to
+ *    be wrong, because they say who can re-check it.
+ *  - THIS FILE HAS ALREADY CARRIED FIGURES THAT WERE NOT WHAT THEY CLAIMED.
+ *    An earlier set of audit volumes was computed from raw.status.failureReason
+ *    — a field HawkView synthesizes, whose final arm is `?? record.Operation` —
+ *    and presented as Microsoft's data. They were withdrawn and re-derived
+ *    from managementActivityRecord.LogonError, Microsoft's own field. Entries
+ *    that survived that episode say which field they were computed from; that
+ *    is not decoration.
+ *
+ * So: a figure load-bearing enough to argue from carries its denominator, its
+ * as-of, and the field it was read from. A test enforces the denominator. The
+ * other two are conventions, deliberately not tested — see the note in
+ * normalize.test.ts on the check that was written and thrown away.
+ */
 import type { OutOfScopeReason, UncitedReason, UnknownObservation } from './reasons.js';
 
 /**
@@ -221,6 +249,54 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     microsoftName: 'DeviceAuthenticationRequired',
     claimClass: 'CONTROL',
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
+  },
+  {
+    code: 16003,
+    graphObservation: 'OBSERVED',
+    microsoftName: 'SsoUserAccountNotFoundInResourceTenant',
+    claimClass: 'NEITHER',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE' },
+    exclusionCitation: {
+      kind: 'PRODUCT_DECISION',
+      text:
+        'RESTS ON A MEASUREMENT THAT CONTRADICTS MICROSOFT’S OWN TEXT, which is why it is a product ' +
+        'decision and not a provider statement. Microsoft says the user "hasn’t been explicitly added ' +
+        'to the tenant"; measured, the single observed row resolves to a Member of the tenant, from ' +
+        'HawkView’s own tenant connector. A multi-tenant app hitting a user context not provisioned ' +
+        'for the resource it requested is a provisioning artefact — not enumeration, not a credential ' +
+        'event, and not a signal about the customer. Where the subject does NOT resolve the row never ' +
+        'reaches this mapping at all; see UNREACHABLE_BY_SUBJECT_RESOLUTION.',
+    },
+    note:
+      'PREVIOUSLY UNMAPPED ON A PREMISE THAT WAS FALSE. The code sat in ' +
+      'UNREACHABLE_BY_SUBJECT_RESOLUTION on the grounds that it describes a subject by definition ' +
+      'absent from the directory, so a single row came out UNRECOGNIZED_ERROR_CODE — a FALSE ' +
+      'STATEMENT, since the code was recognised, cited, and deliberately filed. A technician sent to ' +
+      'look for an unrecognised code would have found a documented one. That one row was also the ' +
+      'entire reason a Microsoft-verdict count was withheld rather than reported as a clean zero.',
+  },
+  {
+    code: 50020,
+    graphObservation: 'OBSERVED',
+    microsoftName: 'UserUnauthorized',
+    claimClass: 'NEITHER',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE' },
+    exclusionCitation: {
+      kind: 'PRODUCT_DECISION',
+      text:
+        'RESTS ON A MEASUREMENT THAT CONTRADICTS MICROSOFT’S OWN TEXT, identically to 16003. ' +
+        'Microsoft says the account "from identity ' +
+        'provider does not exist in tenant"; the single observed row resolves to a Member, from ' +
+        'HawkView’s own connector. I had suspected this code shared 16003’s problem and it does, in ' +
+        '100% of observed instances for both. ' +
+        'NOT GENERALISED TO APP-ACTOR TRAFFIC. Both rows come from our own connector, and the ' +
+        'tempting move — exclude traffic that looks like an application actor — is the ' +
+        'servicePrincipalId mistake: a predicate built on our own rows that also matches every human. ' +
+        'The disposition is per CODE, on a stated provider meaning, not per application.',
+    },
+    note:
+      'See 16003. Both were unmapped on the same false premise and both are now conditional on ' +
+      'subject resolution — structurally, because binding precedes classification.',
   },
   {
     code: 53004,
@@ -477,6 +553,32 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
  * with the code discarded. Detecting enumeration needs a path for unresolved
  * subjects, which is a scope decision and not this layer's to make.
  */
+/**
+ * Codes whose subject is OFTEN absent from the directory — so when it is, the
+ * row is lost before classification and the loss should be visible.
+ *
+ * THE PREMISE WAS STRONGER AND IT WAS FALSE. It read "codes whose subject is
+ * BY DEFINITION absent from the directory, so the classifier structurally
+ * cannot attribute them" — which was read straight off Microsoft's own text
+ * for these codes, and is wrong in 100% of the instances we hold. Both
+ * observed members resolve to Members of the tenant. `enumerationCodedRows`
+ * never fired for either, because it counts rows that FAILED subject
+ * resolution and these did not: the blind-spot counter was watching the
+ * wrong door.
+ *
+ * A CASE WHERE DOCUMENTATION AND DATA DISAGREE AND THE DATA WINS, which is
+ * worth naming because the discipline here usually runs the other way —
+ * refusing to map a code without a provider statement. A provider statement
+ * says what a code MEANS; it does not say what our rows contain, and this
+ * premise used the first as though it were the second.
+ *
+ * MEMBERSHIP IS UNCHANGED. The citations describe a PATTERN — clusters from
+ * one source are enumeration — and that stands for the unresolved case. What
+ * it never was is a disposition for a single attributable row. So these codes
+ * are now BOTH mapped in RESULT_CODES (for when the subject resolves) and
+ * listed here (for when it does not), and those are two different facts
+ * rather than a contradiction.
+ */
 export const UNREACHABLE_BY_SUBJECT_RESOLUTION: readonly {
   readonly code: number;
   readonly microsoftName: string;
@@ -688,13 +790,43 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
         'single quote. The two literals differ in terminal punctuation and that difference survives a paste ' +
         'and fails a comparison, which is why this matcher is substring-based on a distinctive fragment ' +
         'rather than an equality test. It carries unique detection ' +
-        'weight: for 94.8% of lockout rows there is NO 50126 for the same user within ±15 minutes, so ' +
-        'Microsoft emits the lockout without the individual attempts alongside it and at the moment of ' +
-        'lockout this is the ONLY signal present. A 50126-only detector eventually surfaces the affected ' +
-        'users — 100% of them appear in 50126 rows at some point — but misses the lockout events, and ' +
-        'misses them when they happen. CAVEAT: one tenant, at most four users, one locale, six weeks, and ' +
-        '1,493 blocks against FOUR accounts is not obviously normal traffic, so the 94.8% informs the ' +
-        'mapping and does not settle the general case.',
+        'weight: 532 of 561 lockout rows have NO 50126 for the same user within ±15 minutes — 94.8%, ' +
+        'measured 2026-09-10T16:54Z — so Microsoft emits the lockout without the individual attempts ' +
+        'alongside it and at the moment of lockout this is the ONLY signal present. A 50126-only ' +
+        'detector eventually surfaces the affected users — 100% of them appear in 50126 rows at some ' +
+        'point — but misses the lockout events, and misses them when they happen. ' +
+        'DEFINITION, which is the half that was missing before: numerator population is Graph rows ' +
+        '(no managementActivityRecord) with status_error_code 50053 and a failureReason of length 100 ' +
+        '— the lockout literal, not the 78-character malicious-IP one; the test is no 50126 row for the ' +
+        'same customer_tenant_id plus lowercased user_principal_name within ±15 minutes of ' +
+        'event_date_time; reported as lockouts-without-a-nearby-50126 OVER lockouts. ' +
+        'THIS REPLACES AN EARLIER 94.8% RATHER THAN CONFIRMING IT — a figure whose DENOMINATOR WAS ' +
+        'NOT RECORDED and whose definition was never stated either, so there is nothing to compare ' +
+        'it against. Two numbers that ' +
+        'match are not agreement when only one of them says what it measured. Reading the match as ' +
+        'corroboration would be the two-moments-as-one-snapshot error wearing a better suit. The old ' +
+        'basis stays lost; this one stands on its own. ' +
+        'CAVEAT: one tenant, one locale, six weeks. The LOCKOUT-LITERAL subset is THREE users — not ' +
+        'the four cited elsewhere, which is the whole 50053 block population including the ' +
+        'malicious-IP text. Three accounts is not obviously normal traffic, so this informs the ' +
+        'mapping and does not settle the general case. ' +
+        'THE PAIRING CONTROL PASSED, so this is a measurement rather than an upper bound. The pairing ' +
+        'key is the sign_in_logs.user_principal_name column, which this layer never reads — and whose ' +
+        'sibling identity column on the same table is DISPROVED for splitting one person across six ' +
+        'GUIDs, so an inflated figure was the live worry: a 50126 that failed to pair would count as ' +
+        'an absent one. Measured 2026-09-10T17:02Z over greentech’s 1,601 rows of 50053 plus 50126: ' +
+        'the UPN matches a directory_users row on 1,601 of 1,601, and 8 distinct UPNs resolve to 8 ' +
+        'distinct directory people through 8 distinct (UPN, user_id) pairs — exact one-to-one, no ' +
+        'person split across aliases. The inflation does not occur. ' +
+        'A SECOND CONTROL, which nobody asked for and which matters more: the alternative reading is ' +
+        'that these are simply users who never fail passwords, which would make the finding an ' +
+        'artefact of the cohort rather than a fact about Microsoft’s emission. All THREE lockout users ' +
+        'DO generate 50126 rows elsewhere in the window — 3 of 3 — just never within ±15 minutes of a ' +
+        'lockout. So the pattern is about WHEN Microsoft emits the attempts, not about who fails. ' +
+        'NOTE ALSO that this layer binds Graph subjects by raw.userId (DIRECTORY_OBJECT_ID), not by ' +
+        'any UPN, so the measurement’s notion of "the same user" is not the same as the module’s ' +
+        'notion of "the same subject". That does not make it wrong, but it is not the module ' +
+        'measuring itself.',
     },
     note:
       'Smart lockout "tracks the last three bad password hashes to avoid incrementing the lockout counter ' +
@@ -870,7 +1002,9 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
     name: 'DelegationDoesNotExist',
     graphCode: 65001,
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
-    note: 'Matches 65001 on the Graph side, including the consent-grant pointer. 9 rows.',
+    note:
+      'Matches 65001 on the Graph side, including the consent-grant pointer. 9 rows, from ' +
+      'managementActivityRecord.LogonError as of 2026-09-10T16:36Z.',
   },
   {
     name: 'InvalidReplyTo',
@@ -1151,8 +1285,11 @@ export const RISK_DETAIL_VALUES: readonly RiskDetailEntry[] = [
     value: 'none',
     riskState: 'none',
     note:
-      'The benign value, and the control cohort: 2,593 of 2,648 rows including 958 ordinary successes. ' +
-      'Explicitly the string "none" rather than absent or hidden.',
+      'The benign value, and the control cohort: 2,593 of 2,648 rows including 958 ordinary successes, ' +
+      'read from raw.riskDetail paired with raw.riskState. Explicitly the string "none" rather than ' +
+      'absent or hidden. NOTE the Graph total has since moved to ~2,645+; the pair split was not ' +
+      're-measured at 16:36Z, so these three are an earlier snapshot and must not be compared with the ' +
+      'stamped figures elsewhere in this file.',
   },
   {
     value: 'userPassedMFADrivenByRiskBasedPolicy',
@@ -1348,7 +1485,9 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     claim: 'On the GRAPH feed, errorCode 0 carries the literal description "Other." and that is a genuine success.',
     verification: {
       state: 'PRODUCTION_VERIFIED',
-      evidence: 'On the Graph path, errorCode 0 carries "Other." on 100% of rows: no absent, no null, no empty string.',
+      evidence:
+        'On the Graph path, errorCode 0 carries "Other." on 100% of code-0 rows — that population is ' +
+        '1,010 as of 2026-09-10T16:36Z: no absent, no null, no empty string.',
       control:
         'The empty-description successes observed earlier are all AUDIT rows, a different feed. The two ' +
         'paths are verified separately and never mixed; the predecessor’s emptiness test treated ' +
@@ -1387,9 +1526,16 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'alongside two four-figure samples invites exactly that comparison, and a prediction built on ' +
         'it (that the 997-row tenant would lose ~20% of its rows) would have been wrong by 190 rows. ' +
         'The low-binding tenant is a different, nine-row tenant. ' +
-        'across the three fallback-path tenants, versus 15.2% / 0.0% / 0.0% by GUID. Re-measured across ' +
-        'two INDEPENDENT tenants with separate MSPs and separate directories — 97.2% vs 12.0% and 97.1% ' +
-        'vs 0.0% — agreeing within 0.1 percentage points. The UPN-in-record / GUID-in-column split holds ' +
+        'across the three fallback-path tenants, versus 15.2% / 0.0% / 0.0% by GUID, over row ' +
+        'populations of 1,786 / 997 / 9. ' +
+        'THE THIRD COLUMN OF BOTH TRIPLES IS NINE ROWS, so neither the 77.8% nor the 0.0% there is a ' +
+        'rate — it is 7 of 9 and 0 of 9. Listing them beside four-figure samples invites a comparison ' +
+        'that already cost one wrong prediction: read that way, it forecast a ~20% shortfall on the ' +
+        '997-row tenant, which resolves at 97.1%, an error of about 190 rows. Re-measured across ' +
+        'two INDEPENDENT tenants with separate MSPs and separate directories — 97.2% vs 12.0% (1,786 ' +
+        'rows) and 97.1% vs 0.0% (997 rows) — agreeing within 0.1 percentage points. Those two are the ' +
+        'samples large enough for the agreement to mean anything. ' +
+        'The UPN-in-record / GUID-in-column split holds ' +
         'in all three audit tenants. Previously labelled thin evidence; it is now the best-corroborated ' +
         'finding in the workstream.',
       control:
@@ -1416,7 +1562,8 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
       control:
         'Each literal matches exactly ONE fragment set and not the other, and neither reaches the ' +
         'risk-verdict fragment — asserted against the byte-exact strings in normalize.test.ts. THE LIMIT ' +
-        'OF THE CLAIM: 100% is true of OBSERVED data, one tenant, one locale, six weeks. It does NOT ' +
+        'OF THE CLAIM: 100% is true of OBSERVED data — 1,493 rows of code 50053, one tenant, four ' +
+        'accounts, one locale, six weeks. It does NOT ' +
         'establish that Microsoft emits no third string, and we know it does, because the documented ' +
         'high-confidence-risk variant appears zero times here. The honest claim is "these two literals ' +
         'account for every 50053 row we have ever collected", never "these are the only values 50053 ' +
@@ -1430,7 +1577,12 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     claim: 'On the Graph feed, raw.userId is a directory object id matching exactly one non-deleted directory user.',
     verification: {
       state: 'CONTROL_COHORT_UNAVAILABLE',
-      evidence: 'Graph rows bind 100% on both Graph tenants, with zero ambiguous matches.',
+      evidence:
+        'Graph rows bind 100% on both Graph tenants, with zero ambiguous matches. DENOMINATOR NOT ' +
+        'RECORDED AT MEASUREMENT TIME, and not reconstructed here: the Graph population is ~2,645 rows ' +
+        'but the figure was taken against whatever it was then, and quoting today’s total beside a ' +
+        'percentage measured earlier is precisely the two-moments-as-one-snapshot error. Needs a ' +
+        're-measurement stating bound/considered. The claim is strong and cheap to re-verify.',
       why:
         'The control cohort is EMPTY: zero observed rows carry a well-formed GUID absent from the ' +
         'directory. Guests, deleted users and cross-tenant sign-ins do not appear in observed data, so ' +
@@ -1517,8 +1669,19 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'across 950 rows. It appears synthesized rather than sourced. Subjects bind from the raw payload.',
       revivedBy:
         'The column matching directory_users on a meaningful share of rows AND being no more granular ' +
-        'than the real user. Both clauses matter: matching alone would not rescue an identifier that ' +
-        'splits one person into six.',
+        'than the real user — BOTH CLAUSES, ON THE POPULATION THAT PRODUCED THE DISPROOF. Matching ' +
+        'alone would not rescue an identifier that splits one person into six. ' +
+        'THE THIRD CLAUSE WAS MISSING AND IS THE POINT: this condition, as first written, named the ' +
+        'clauses and not the POPULATION, and a control run for an unrelated purpose then satisfied it ' +
+        'by accident. On greentech’s 50053/50126 rows (1,601 rows, measured 2026-09-10T17:02Z) the ' +
+        'column is 1:1 with the real user — 8 distinct values, 8 distinct people — and matches on 100% ' +
+        'of rows. Both stated clauses pass, and THIS MUST NOT REVIVE THE PREDICATE: a column being ' +
+        'well-behaved on one slice is not evidence about the slice where it was found lying. The ' +
+        'disproof is 6 distinct GUIDs against 2 real users across 950 rows on a DIFFERENT population, ' +
+        'and that is the population a revival has to address. ' +
+        'This is the same defect as a percentage without its denominator, one level up — a claim that ' +
+        'names its test and not its subject — and it was caught by someone noticing the coincidence ' +
+        'rather than by anything here.',
     },
   },
   {
@@ -1548,7 +1711,8 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     verification: {
       state: 'DISPROVED',
       evidence:
-        'Non-empty on 100% of Graph rows INCLUDING ordinary human sign-ins that resolve to real directory ' +
+        'Non-empty on 100% of Graph rows — 2,645 as of the re-measurement — INCLUDING ordinary human ' +
+        'sign-ins that resolve to real directory ' +
         'users, and servicePrincipalName always empty. Neither discriminates anything. It was confirmed ' +
         'present on 60/60 rows of the tenant someone wanted to exclude; the query nobody ran was whether ' +
         'it was also present on humans, and it was, on all of them. The control is not optional and it is ' +
@@ -1580,6 +1744,30 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
         'does not default to a verdict on ordinary human traffic. Only 52 successes carry a ' +
         'verdict-shaped value. Documentation had suggested the field would be hidden without P2, and it ' +
         'is not; that expectation is exactly what needed checking rather than assuming.',
+    },
+  },
+  {
+    id: 'audit.creation-time-designator',
+    feed: 'M365_AUDIT_STS',
+    reads: ['managementActivityRecord.CreationTime'],
+    claim:
+      'On the audit feed CreationTime is UTC and arrives with NO timezone designator, so a parser ' +
+      'requiring a trailing Z rejects every row.',
+    verification: {
+      state: 'PRODUCTION_VERIFIED',
+      evidence:
+        'Reported by the evaluation core and verified in SQL: 100% of audit rows across THREE tenants ' +
+        'carry CreationTime with no designator, so all of them failed as EVENT_TIMESTAMP_INVALID. ' +
+        'Microsoft documents CreationTime as UTC for the Management Activity API and returns it without ' +
+        'a designator, so the PROVIDER is consistent and the reader was wrong. ' +
+        'THE FIX BELONGS HERE AND NOT IN COLLECTION: every stored row already lacks the designator, so ' +
+        'changing the collector would leave three tenants broken while looking fixed.',
+      control:
+        'PASSES, and it is the OTHER FEED. Graph createdDateTime carries the Z, so the leniency is ' +
+        'scoped to the audit feed and Graph keeps the strict form — a designator-less Graph timestamp ' +
+        'is still rejected, asserted by test. Widening a check that currently passes buys nothing and ' +
+        'loses a guard. An explicit non-UTC offset stays rejected on BOTH feeds: unambiguous, easy to ' +
+        'convert, and never observed, so accepting it would validate a path nothing has exercised.',
     },
   },
   {

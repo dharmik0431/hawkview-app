@@ -22,6 +22,7 @@ import {
   reachableOutcomes,
   observedOutcomes,
   AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES,
+  FAILURE_REASON_MEANINGS as ALL_TEXT_MEANINGS,
   RESULT_CODES,
   SHAPE_PREDICATES,
   OBSERVED_BUT_UNMAPPED_GRAPH_CODES,
@@ -87,6 +88,9 @@ const DIRECTORY: readonly DirectoryUserRow[] = [
  */
 function makeReference(): ReferenceResolver {
   const issued = new Map<string, string>();
+  // Deliberately keyed on (kind, identifier) with NO tenant, which is the
+  // resolver shape that looked unsafe and is not: the identifier reaching here
+  // is already a per-tenant directory object id.
   return async (kind, identifier) => {
     const key = `${kind}:${identifier.toLowerCase()}`;
     const existing = issued.get(key);
@@ -125,7 +129,12 @@ function auditRow(record: Record<string, unknown> = {}, overrides: Partial<SignI
       hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY',
       managementActivityRecord: {
         Id: 'aud-1',
-        CreationTime: '2026-09-10T10:00:00.000Z',
+        // THE SHAPE MICROSOFT ACTUALLY SENDS: UTC, no designator. This default
+        // used to carry a trailing Z, which Microsoft never sends — so ~40 audit
+        // tests passed against a fixture shaped like what the reader wanted while
+        // 100% of real audit rows were rejected. A fixture never checked against
+        // one real stored row is an assumption with a test wrapped round it.
+        CreationTime: '2026-09-10T10:00:00',
         OrganizationId: MICROSOFT_TENANT_ID,
         RecordType: 15,
         Operation: 'UserLoginFailed',
@@ -363,7 +372,9 @@ test('every out-of-scope code carries a documented citation', () => {
   // 53004 is NO LONGER HERE: the observation is that MFA configuration was
   // blocked, which is ours; "due to suspicious activity" is the judgement, and
   // it now travels as a verdict instead of removing the event.
-  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50011, 50058, 50133, 50140, 50173, 70044]);
+  // 16003 and 50020 ARE here now, and they are the only two resting on a
+  // measurement rather than on a provider statement.
+  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [16003, 50011, 50020, 50058, 50133, 50140, 50173, 70044]);
   for (const entry of excluded) {
     assert.ok(
       entry.exclusionCitation && entry.exclusionCitation.text.length > 15,
@@ -379,14 +390,38 @@ test('every out-of-scope code carries a documented citation', () => {
   }
   assert.equal(resultCodeEntry(50140)!.exclusionCitation!.kind, 'PROVIDER_STATEMENT');
   assert.equal(resultCodeEntry(50058)!.exclusionCitation!.kind, 'PROVIDER_STATEMENT');
-  // And nothing is excluded on Microsoft's judgement any more, which was the
-  // one PRODUCT_DECISION exclusion in the table. Every remaining exclusion
-  // rests on a Microsoft statement about what the code MEANS.
-  for (const entry of excluded) {
-    assert.equal(
-      entry.exclusionCitation!.kind,
-      'PROVIDER_STATEMENT',
-      `code ${entry.code} is excluded on our own choice; the verdict dimension is where a judgement goes`,
+
+  // EXACTLY TWO PRODUCT DECISIONS, and they are the two where a MEASUREMENT
+  // contradicts Microsoft's own text. Every other exclusion rests on a
+  // provider statement about what the code means. The kinds age differently —
+  // a provider statement is a fact about the world, a product decision is a
+  // choice we can revisit — so which is which has to stay legible.
+  //
+  // Asserted as a closed LIST rather than as "no product decisions allowed":
+  // the previous version of this test banned the kind outright, on the
+  // accident that the only one had just been retired. Banning a legitimate
+  // category because it happens to be empty is how a vocabulary loses a
+  // member it needs — the same mistake as keeping an unproduced member, from
+  // the other direction.
+  const productDecisions = excluded
+    .filter(entry => entry.exclusionCitation!.kind === 'PRODUCT_DECISION')
+    .map(entry => entry.code)
+    .sort((a, b) => a - b);
+  assert.deepEqual(productDecisions, [16003, 50020]);
+  //
+  // A PRODUCT DECISION LEADS WITH ITS GROUNDS. Asserted on the OPENING of the
+  // citation rather than as a keyword search, and that distinction cost a
+  // mutation: the first version matched /MEASUREMENT|measured/ anywhere in the
+  // text, and deleting the clause that states the grounds still passed —
+  // because the word "measured" appears again further down. An alternation
+  // over synonyms is a weaker assertion than it looks, since prose repeats
+  // words. Fourth instance of presence-is-not-attribution in this file, so it
+  // is now a convention with a fixed position rather than a search.
+  for (const code of productDecisions) {
+    assert.match(
+      resultCodeEntry(code)!.exclusionCitation!.text,
+      /^RESTS ON A MEASUREMENT/,
+      `code ${code} is excluded on our own choice and must OPEN with what that choice rests on`,
     );
   }
 });
@@ -463,18 +498,67 @@ test('the two expected-flow codes are out of scope', async () => {
   }
 });
 
-test('the enumeration codes are recorded as a known blind spot rather than mapped', () => {
-  // Requiring a resolved directory user means these can never be classified:
-  // by definition their subject is not in the directory.
-  assert.deepEqual(UNREACHABLE_BY_SUBJECT_RESOLUTION.map(entry => entry.code).sort((a, b) => a - b), [16003, 50020, 50034, 51004]);
-  // The blind spot is no longer theoretical: two of the fourteen OBSERVED
-  // codes fall into it, so real rows are being discarded before classification.
+test('the blind-spot list says its subject is OFTEN absent, not absent by definition', () => {
+  // THE PREMISE WAS FALSE IN 100% OF THE INSTANCES WE HOLD, and this test used
+  // to assert it: requiring a resolved directory user means these can never be
+  // classified, because by definition their subject is not in the directory.
+  //
+  // Measured: both OBSERVED members resolve to Members of the tenant, and both
+  // rows are our own tenant connector hitting a user context not provisioned
+  // for the resource it requested. enumerationCodedRows never fired for
+  // either, because it counts rows that FAILED subject resolution and these
+  // did not — the blind-spot counter was watching the wrong door.
+  //
+  // The premise was read straight off Microsoft's own text for these codes,
+  // which is the part worth keeping: a provider statement says what a code
+  // MEANS, and this used it as though it said what our rows CONTAIN.
+  assert.deepEqual(
+    UNREACHABLE_BY_SUBJECT_RESOLUTION.map(entry => entry.code).sort((a, b) => a - b),
+    [16003, 50020, 50034, 51004],
+    'membership is unchanged: the citations describe a PATTERN, which stands for the unresolved case',
+  );
   const observedBlind = UNREACHABLE_BY_SUBJECT_RESOLUTION.filter(e => e.graphObservation === 'OBSERVED');
   assert.deepEqual(observedBlind.map(e => e.code).sort((a, b) => a - b), [16003, 50020]);
   for (const entry of observedBlind) assert.ok((entry.citation ?? '').length > 40, String(entry.code));
-  for (const entry of UNREACHABLE_BY_SUBJECT_RESOLUTION) {
-    assert.equal(dispositionForCode(entry.code).kind, 'UNKNOWN', 'must not be silently mapped');
+
+  // The two OBSERVED members are now ALSO mapped, and being in both places is
+  // two facts rather than a contradiction: mapped for when the subject
+  // resolves, listed here for when it does not.
+  for (const code of [16003, 50020]) {
+    assert.deepEqual(
+      dispositionForCode(code),
+      { kind: 'DOES_NOT_APPLY', reason: 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE' },
+      `code ${code}`,
+    );
   }
+  // The two never-observed members stay unmapped: nothing has contradicted
+  // Microsoft's text for them, and a measurement on two other codes is not
+  // evidence about these.
+  for (const code of [50034, 51004]) {
+    assert.equal(dispositionForCode(code).kind, 'UNKNOWN', `code ${code} must not be mapped by analogy`);
+  }
+});
+
+test('a resolved subject is what makes the disposition reachable, structurally', async () => {
+  // The ruling asked for a disposition CONDITIONAL on subject resolution. No
+  // conditional was needed: a row whose subject fails to bind returns from
+  // normalizeRow BEFORE classification, so reaching a disposition at all
+  // proves the subject resolved. Adding an explicit check would be a second
+  // guard for something the first already covers.
+  //
+  // Both halves asserted, because the pair is the claim.
+  const resolved = await run([graphRow({ status: { errorCode: 16003 } })]);
+  assert.deepEqual(only(resolved).classification, {
+    kind: 'DOES_NOT_APPLY',
+    reason: 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE',
+  });
+  assert.equal(resolved.counts.unknownByObservation.UNRECOGNIZED_ERROR_CODE, 0,
+    'this row used to be reported as an unrecognised code, which was a false statement about it');
+
+  const unresolved = await run([graphRow({ userId: OTHER_USER_ID, status: { errorCode: 16003 } })]);
+  assert.equal(unresolved.events.length, 0, 'no event, so no disposition was reached');
+  assert.equal(unresolved.counts.unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY, 1);
+  assert.equal(unresolved.coverage.enumerationCodedRows, 1, 'and the blind spot still counts it');
 });
 
 // ---------------------------------------------------------------------------
@@ -1390,7 +1474,14 @@ test('every mapped code declares whether we have actually seen it', () => {
     );
   }
   const seen = RESULT_CODES.filter(entry => entry.graphObservation === 'OBSERVED');
-  assert.equal(seen.length, 12, 'twelve of the fourteen observed codes are mapped');
+  // ALL FOURTEEN now, since 16003 and 50020 were mapped once a measurement
+  // contradicted the premise that had kept them out. Nothing observed on this
+  // feed is unaccounted for.
+  assert.equal(seen.length, 14, 'every observed code is mapped');
+  assert.deepEqual(
+    seen.map(entry => entry.code).sort((a, b) => a - b),
+    [...OBSERVED_GRAPH_ERROR_CODES].sort((a, b) => a - b),
+  );
 });
 
 test('observed codes we do not map are recorded, and cost coverage rather than being invented', async () => {
@@ -2096,4 +2187,429 @@ test('no predicate cites evidence about a field it does not declare', () => {
   for (const id of Object.keys(explained)) {
     assert.ok(SHAPE_PREDICATES.some(entry => entry.id === id), `${id} is explained but does not exist`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// A figure must carry what it rests on, or the number gets quoted without it.
+// ---------------------------------------------------------------------------
+
+// A THIRD CHECK WAS WRITTEN AND THROWN AWAY, and the reason is worth keeping
+// next to the two that survived.
+//
+// A figure needs three things: a denominator, an as-of, and the field it was
+// read from. The denominator is enforced below. Having found that the first two
+// were missing across the registry, the obvious next move was to sweep for the
+// third — every count should name its source, because a borrowed measurement
+// becomes the borrowing code's own claim once it sits in a comment with no date
+// and no source.
+//
+// The sweep flagged nineteen entries. TWO were real. The other seventeen were
+// Microsoft ERROR CODES — 50126, 65001, 53003 — which are four- and five-digit
+// identifiers indistinguishable from row counts by any regex. Telling a count
+// from an identifier reliably would mean marking every figure in the registry,
+// which is a third registry to keep in step: the same reason the field-role
+// distinction was left in a comment rather than added as data.
+//
+// So it was not shipped, and that is a decision rather than an omission. A
+// check that flags nineteen things of which two are real teaches whoever reads
+// the next failure to skip it — and this module already holds the rule that
+// marking a healthy test as noise is worse than having no test, because it
+// decays the suite permanently and in the file.
+//
+// The two checks that DID ship earned it on the same criterion, which is worth
+// stating because it is not obvious: their false positives were INFORMATIVE.
+// The reads-versus-evidence diff's five non-findings revealed that evidence
+// prose does three different jobs under one name. The percentage check's window
+// tuning revealed that proximity is not attribution. This one's false positives
+// revealed only that error codes have four digits.
+//
+// The two real hits were fixed by hand, and provenance is now stated once at
+// the top of provider-facts.ts — every figure there came from the owner's side,
+// because this layer has no production access. One statement covering the file
+// beats an annotation per figure and a test nobody trusts.
+test('no percentage in the registry is stated without its denominator', () => {
+  // THE INSTANCE THAT MOTIVATED THIS. Audit UPN binding was recorded as
+  // "96.8% / 97.1% / 77.8%" — three percentages in a row. The third is 7 of 9
+  // rows. Reading it beside two four-figure samples, from my own notes, I
+  // predicted a 997-row tenant would lose ~20% of its rows and look like a
+  // defect; it resolves at 97.1%, an error of about 190 rows. The notes were
+  // the problem: a percentage stripped of its sample size, stored in a place
+  // people quote from, will eventually be quoted without it.
+  //
+  // Sweeping every figure in the registry found nine more bare percentages,
+  // of which the most quotable were the '100% of rows' claims — that form
+  // sounds like a complete claim while hiding whether it is 100% of nine rows
+  // or 100% of 2,645. It is the same defect in its strongest disguise.
+  //
+  // TWO WAYS TO PASS, and the second matters as much as the first: state the
+  // denominator, OR say that it was not recorded. A figure whose basis is
+  // genuinely lost is a real state and should be sayable — what must not be
+  // possible is a bare percentage that reads as though someone checked.
+  const PERCENTAGE = /\d+(?:\.\d+)?%/g;
+  const BASIS = new RegExp([
+    '\\d[\\d,]*\\s*/\\s*\\d[\\d,]*',       // an explicit fraction
+    '\\bof\\s+[\\d,]+',                    // "of 2,645"
+    '\\b\\d{1,3},\\d{3}\\b',                 // a four-figure count nearby
+    '\\b\\d{3,}\\b',                        // a three-figure count nearby
+    '\\bof\\s+(?:nine|ten)\\b',             // spelled-out tiny samples
+    'DENOMINATOR\\b[^.]{0,40}NOT RECORDED',  // the honest escape hatch
+  ].join('|'));
+
+  // PROXIMITY IS NOT ATTRIBUTION, and the window size is where that bites.
+  // A hundred characters was chosen by MUTATION rather than by taste: at 170
+  // a figure passed by sitting near somebody ELSE'S denominator — stripping
+  // the sample sizes out of the UPN triple still passed, because a later
+  // sentence in the same string mentioned two row counts. At 60 a legitimate
+  // disclosure failed. At 100 both mutations fail and nothing legitimate
+  // does.
+  //
+  // So the honest scope: this catches a percentage standing ALONE. It cannot
+  // tell whether a nearby number is the right denominator, and a determined
+  // author can satisfy it with an irrelevant one. That is the same shape as
+  // the reads-versus-evidence check — a cheap static diff that surfaces
+  // candidates, not a proof — and saying so is what keeps it from being
+  // trusted beyond its evidence.
+  const bare: string[] = [];
+  const scan = (label: string, prose: string): void => {
+    for (const match of prose.matchAll(PERCENTAGE)) {
+      const at = match.index ?? 0;
+      if (!BASIS.test(prose.slice(Math.max(0, at - 100), at + 100))) {
+        bare.push(`${label} states ${match[0]} with no denominator and no note that it was not recorded`);
+      }
+    }
+  };
+
+  for (const predicate of SHAPE_PREDICATES) {
+    const verification = predicate.verification as Record<string, unknown>;
+    scan(`predicate ${predicate.id}`, [
+      verification.evidence, verification.control, verification.cohort,
+      verification.controlCohort, verification.revivedBy, predicate.claim,
+    ].filter((value): value is string => typeof value === 'string').join('   '));
+  }
+  for (const entry of RESULT_CODES) {
+    scan(`code ${entry.code}`, [entry.note ?? '', entry.exclusionCitation?.text ?? ''].join('   '));
+  }
+  for (const entry of AUDIT_REASON_NAMES) {
+    scan(`audit ${entry.name}`, [entry.note ?? '', entry.divergenceReason ?? ''].join('   '));
+  }
+  for (const pattern of ALL_TEXT_MEANINGS) {
+    const verification = pattern.verification as Record<string, unknown>;
+    scan(`text ${pattern.meaning}`, [verification.evidence, verification.control]
+      .filter((value): value is string => typeof value === 'string').join('   '));
+  }
+  for (const entry of RISK_DETAIL_VALUES) scan(`riskDetail ${entry.value}`, entry.note);
+
+  assert.deepEqual(bare, []);
+});
+
+test('the lockout figure carries a definition, and does not claim the old one confirmed it', () => {
+  // This entry held the most load-bearing bare percentage in the file: 94.8%
+  // of lockout rows with no 50126 for the same user within ±15 minutes, over a
+  // denominator nobody recorded. It was disclosed as lost rather than
+  // reconstructed from the current lockout count — and the owner's side then
+  // ran the measurement properly, which is the only honest way to get it back:
+  // a new stamped measurement, never a backfill of the old one.
+  //
+  // 532 of 561 at 2026-09-10T16:54Z, and the DEFINITION came with it, which is
+  // the half that was missing the first time.
+  const lockout = ALL_TEXT_MEANINGS.find(pattern => pattern.meaning === 'SMART_LOCKOUT')!;
+  const verification = lockout.verification as Record<string, unknown>;
+  const prose = [verification.evidence, verification.control]
+    .filter((value): value is string => typeof value === 'string').join('   ');
+  assert.match(prose, /532 of 561/);
+  assert.match(prose, /2026-09-10T16:54Z/);
+  assert.match(prose, /DEFINITION/, 'a figure without its definition is not checkable');
+
+  // THE PART THAT MATTERS MOST, and note that it asserts the WEAKER claim: the
+  // new figure REPLACES the old one and does not corroborate it. Two numbers
+  // that match are not agreement when only one of them says what it measured —
+  // the old figure had neither denominator nor definition, so there is nothing
+  // here for it to agree with. Calling it a reproduction would be the
+  // two-moments-as-one-snapshot error in a better suit, and it is exactly the
+  // kind of upgrade a reader accepts without checking, because it arrives as
+  // good news about a number they were already worried about.
+  assert.match(prose, /REPLACES AN EARLIER .*RATHER THAN CONFIRMING IT/);
+  assert.match(prose, /DENOMINATOR\b[^.]{0,40}NOT RECORDED/, 'the old figure stays disclosed as lost');
+
+  // THE TWO CONTROLS, both now run, and both had to for different reasons.
+  //
+  // The pairing control: the key is a sign_in_logs column this layer never
+  // reads, whose sibling identity column on the same table is DISPROVED for
+  // splitting one person across six GUIDs. If the UPN column split the same
+  // way, a 50126 that failed to pair would count as an absent one and inflate
+  // the figure — the worry ran toward the answer we wanted, which is the
+  // direction that gets checked least. It passes: 1,601 of 1,601 rows match a
+  // directory user, and 8 UPNs resolve to 8 people one-to-one.
+  assert.match(prose, /user_principal_name/);
+  assert.match(prose, /1,601 of 1,601/);
+  assert.match(prose, /rather than an upper bound/);
+  //
+  // The second control nobody asked for, and it carries more weight: the
+  // alternative reading is that these are simply users who never fail
+  // passwords, which would make the finding an artefact of the cohort rather
+  // than a fact about when Microsoft emits attempts. All three lockout users
+  // DO produce 50126 rows elsewhere in the window — just never within the
+  // window around a lockout. Asserted because a figure with its alternative
+  // explanation ruled out is a different claim from the same figure alone.
+  assert.match(prose, /3 of 3/);
+  assert.match(prose, /THREE users/, 'the lockout subset is three users, not the four of the whole 50053 population');
+
+  // The mapping was never in doubt either way: it rests on the direction.
+  assert.deepEqual(lockout.disposition, { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' });
+});
+
+// ---------------------------------------------------------------------------
+// The next wider scope: a reference is unique within a tenant, not globally.
+// ---------------------------------------------------------------------------
+
+test('a guest identity in two customer tenants never shares a subject reference', async () => {
+  // WRITTEN FOR A DEFECT THAT TURNED OUT NOT TO EXIST, and kept because the
+  // property is worth locking down regardless.
+  //
+  // The question was a consumer's, asked back at this layer: after building a
+  // scope guarantee, what is the NEXT WIDER scope, and would the same claim be
+  // false there? A verdict does not reach an event (structural). A verdict does
+  // not ascend from an event to a subject (documented). The next one out is
+  // that a subject does not span tenants — and ReferenceResolver takes
+  // (kind, identifier) with no tenant, so it looked held by convention.
+  //
+  // The worry was concrete: the audit path binds subjects on a normalized UPN,
+  // and an external identity is a guest in as many customer tenants as invited
+  // it, so a resolver memoising on (kind, identifier) would hand two MSP
+  // customers the same subjectRef and merge one customer's evidence into
+  // another's. For a tool an MSP reads to decide what to investigate that is
+  // the worst failure available.
+  //
+  // IT CANNOT HAPPEN. The reference is minted from binding.user.microsoftUserId
+  // — the directory object id of the matched user in THAT tenant's directory.
+  // The UPN is only the lookup key and is never handed on as the identity. A
+  // guest in two tenants is two directory objects with two GUIDs.
+  //
+  // I added a scope parameter to the resolver, wrote the justification, and
+  // only found out by MUTATION: making the resolver ignore the scope broke
+  // nothing, which meant the scope was doing no work. Reverted — a seam a peer
+  // is calling does not get a new parameter on a false premise. The resolver
+  // below is deliberately keyed with no tenant, so this test exercises the
+  // shape that looked unsafe.
+  const OTHER_ORGANIZATION = '77777777-7777-4777-8777-777777777777';
+  const OTHER_TENANT = '88888888-8888-4888-8888-888888888888';
+  const GUEST_UPN = 'guest@partner.example';
+
+  // ONE resolver across both runs, which is exactly the caller that used to be
+  // unsafe: it keys its own store per tenant only because the scope arrives.
+  const shared = makeReference();
+
+  const first = await normalizeSignInBatch({
+    scope: SCOPE,
+    source: 'M365_AUDIT_STS',
+    rows: [auditRow({ UserId: GUEST_UPN, LogonError: 'InvalidUserNameOrPassword' })],
+    directory: [{
+      organizationId: ORGANIZATION_ID,
+      customerTenantId: CUSTOMER_TENANT_ID,
+      microsoftUserId: USER_ID,
+      userPrincipalName: GUEST_UPN,
+      userType: 'Guest',
+    }],
+    reference: shared,
+    collectionScope: 'AUDIT_STS_LOGON_EVENTS',
+  });
+
+  const second = await normalizeSignInBatch({
+    scope: {
+      organizationId: OTHER_ORGANIZATION,
+      customerTenantId: OTHER_TENANT,
+      microsoftTenantId: '99999999-9999-4999-8999-999999999999',
+    },
+    source: 'M365_AUDIT_STS',
+    rows: [auditRow({ UserId: GUEST_UPN, LogonError: 'InvalidUserNameOrPassword', OrganizationId: '99999999-9999-4999-8999-999999999999' }, {
+      organizationId: OTHER_ORGANIZATION,
+      customerTenantId: OTHER_TENANT,
+    })],
+    directory: [{
+      organizationId: OTHER_ORGANIZATION,
+      customerTenantId: OTHER_TENANT,
+      microsoftUserId: OTHER_USER_ID,
+      userPrincipalName: GUEST_UPN,
+      userType: 'Guest',
+    }],
+    reference: shared,
+    collectionScope: 'AUDIT_STS_LOGON_EVENTS',
+  });
+
+  // Same person, same UPN, two customers. Both resolve — the feature works —
+  // and the references must differ.
+  assert.equal(first.applies.length, 1);
+  assert.equal(second.applies.length, 1);
+  assert.notEqual(
+    only(first).subjectRef,
+    only(second).subjectRef,
+    'one guest identity was handed the same reference in two customer tenants; evidence would merge across MSP customers',
+  );
+  // And the events carry the scope, so a consumer CAN key on the pair. That is
+  // the half this layer can guarantee; keying on subjectRef alone is still a
+  // mistake a consumer can make, which is why the field says so.
+  assert.equal(only(first).customerTenantId, CUSTOMER_TENANT_ID);
+  assert.equal(only(second).customerTenantId, OTHER_TENANT);
+});
+
+test('a revival condition names its population, not just its test', () => {
+  // A NEAR-MISS WORTH LOCKING DOWN. sign_in_logs.user_id is DISPROVED for
+  // being MORE GRANULAR than the real user: 6 distinct column GUIDs against 2
+  // distinct real users across 950 rows. Its revival condition read "matching
+  // directory_users on a meaningful share of rows AND being no more granular
+  // than the real user" — two clauses, both sensible.
+  //
+  // A control run for an entirely different purpose then SATISFIED BOTH by
+  // accident. On one tenant's 50053-plus-50126 rows the column matches on 100%
+  // of rows and is exactly 1:1 with the real user — 8 values, 8 people. Read
+  // literally, the predicate was revivable on evidence from a population where
+  // it had never been accused of anything.
+  //
+  // The condition named its TEST and not its SUBJECT, which is the same defect
+  // as a percentage without its denominator, one level up. A revival has to
+  // address the population that produced the disproof; a column behaving well
+  // on one slice says nothing about the slice where it was found lying.
+  //
+  // Caught by a person noticing the coincidence, not by anything here. So:
+  // asserted, and the general rule asserted with it for every negative claim.
+  const column = SHAPE_PREDICATES.find(entry => entry.id === 'signin.user-id-column')!;
+  assert.equal(column.verification.state, 'DISPROVED');
+  const revived = (column.verification as { revivedBy: string }).revivedBy;
+  // Asserting the CLAUSE, not the word: the word appears four times in this
+  // entry's prose, so a match on it alone survives deleting the clause that
+  // does the work. Learned two commits ago and re-learned here — the first
+  // version of this assertion passed a mutation that removed the clause.
+  assert.match(revived, /ON THE POPULATION THAT PRODUCED THE DISPROOF/,
+    'a revival condition that omits its population can be met by accident');
+  assert.match(revived, /MUST NOT REVIVE/, 'the accidental satisfaction has to be recorded, or someone will act on it');
+
+  // And the general form, across every negative claim: a revival condition has
+  // to scope itself somehow — to a population, a cohort, or a named field —
+  // rather than stating a bare test that any slice might happen to pass.
+  const negative = SHAPE_PREDICATES.filter(
+    entry => entry.verification.state === 'DISPROVED'
+      || entry.verification.state === 'HYPOTHESIS_SUBJECT_ABSENT',
+  );
+  const SCOPED = /population|cohort|control|rows|tenant|field|column|feed|record/i;
+  for (const entry of negative) {
+    const condition = (entry.verification as { revivedBy: string }).revivedBy;
+    assert.ok(
+      SCOPED.test(condition),
+      `${entry.id} states a revival test with nothing to scope it to; any slice might pass it`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The two feeds disagree about the timezone designator, so the parser does.
+// ---------------------------------------------------------------------------
+
+test('an audit CreationTime with no designator is read as UTC', async () => {
+  // 100% of audit rows across three tenants carry CreationTime with no
+  // designator, so requiring a trailing Z rejected every one of them as
+  // EVENT_TIMESTAMP_INVALID. Microsoft documents CreationTime as UTC for the
+  // Management Activity API and returns it without a designator: the provider
+  // is consistent and the reader was wrong.
+  //
+  // The fix belongs here rather than in collection because every STORED row
+  // already lacks the designator — changing the collector would leave three
+  // tenants broken while looking fixed.
+  // THE HOST TIMEZONE IS PINNED, AND THE PRECONDITION IS ASSERTED. An earlier
+  // version of this test recorded the limitation instead of removing it: the
+  // assertion below distinguishes appending a Z from letting Date.parse read
+  // the string as LOCAL time only when the host is not on UTC. CI is
+  // ubuntu-latest with no TZ set, which is UTC — so on CI it passed while
+  // proving nothing. Inert material, in the one test whose entire subject is
+  // timezone handling.
+  //
+  // I argued against pinning on the grounds that it makes the suite depend on
+  // where it runs in a way the next reader has to discover. That was wrong in
+  // the trade: a test that silently stops discriminating is worse than a
+  // dependency stated in the open. What makes it safe is the SECOND line —
+  // asserting that the pin took effect. If the timezone cannot be set, or a
+  // future runtime stops honouring it mid-process, this FAILS rather than
+  // reverting to passing-for-no-reason.
+  const originalTz = process.env.TZ;
+  process.env.TZ = 'America/Toronto';
+  try {
+    assert.notEqual(
+      new Date('2026-09-10T10:00:00').getTime(),
+      Date.parse('2026-09-10T10:00:00Z'),
+      'the host reads a designator-less string as UTC, so nothing below can tell the two apart',
+    );
+
+    const bare = await run(
+      [auditRow({ CreationTime: '2026-09-10T10:00:00' })],
+      { source: 'M365_AUDIT_STS' },
+    );
+    assert.equal(bare.counts.applies, 1, 'a designator-less audit timestamp must not cost the row');
+    assert.equal(only(bare).eventAt, '2026-09-10T10:00:00.000Z', 'read as UTC, not as local time');
+
+    // Fractional seconds, still no designator.
+    const fractional = await run(
+      [auditRow({ CreationTime: '2026-09-10T10:00:00.123' })],
+      { source: 'M365_AUDIT_STS' },
+    );
+    assert.equal(only(fractional).eventAt, '2026-09-10T10:00:00.123Z');
+
+    // And the designator is still ACCEPTED where it appears, since the claim is
+    // that it may be absent rather than that it must be.
+    const withZ = await run(
+      [auditRow({ CreationTime: '2026-09-10T10:00:00Z' })],
+      { source: 'M365_AUDIT_STS' },
+    );
+    assert.equal(only(withZ).eventAt, '2026-09-10T10:00:00.000Z');
+  } finally {
+    if (originalTz === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTz;
+  }
+});
+
+test('the designator leniency is scoped to the feed that needs it', async () => {
+  // THE CONTROL COHORT, and it is the other feed. Graph createdDateTime
+  // carries the Z on the rows we hold, so Graph keeps the strict form. A
+  // parser fix is a widening, and widening a check that currently passes buys
+  // nothing while losing a guard — the same reason a tombstone can be dead on
+  // one feed and alive on the other.
+  const graph = await run([graphRow({}, { raw: {
+    id: 'evt-1', createdDateTime: '2026-09-10T10:00:00',
+    userId: USER_ID, appId: APP_ID, status: { errorCode: 50126 },
+  } })]);
+  assert.equal(graph.counts.applies, 0);
+  assert.equal(graph.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1);
+});
+
+test('an explicit non-UTC offset is refused on both feeds rather than converted', async () => {
+  // Unambiguous, trivial to convert, and NEVER OBSERVED. Accepting it would
+  // validate a path nothing has exercised, which is the mistake this module
+  // exists to prevent; it costs one counted row instead. The reason names the
+  // timestamp rather than the outcome, so a coverage line can say what was
+  // lost.
+  for (const source of ['GRAPH_SIGN_INS', 'M365_AUDIT_STS'] as const) {
+    const rows = source === 'GRAPH_SIGN_INS'
+      ? [graphRow({}, { raw: {
+          id: 'evt-1', createdDateTime: '2026-09-10T15:00:00+05:00',
+          userId: USER_ID, appId: APP_ID, status: { errorCode: 50126 },
+        } })]
+      : [auditRow({ CreationTime: '2026-09-10T15:00:00+05:00' })];
+    const batch = await run(rows, { source });
+    assert.equal(batch.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1, source);
+  }
+});
+
+test('an impossible date is still rejected on the lenient feed', async () => {
+  // The round-trip check is what stops Date.parse rolling 2026-02-30 forward
+  // into March. Appending a designator must not lose it — a lenient parser
+  // that also became a permissive one would trade a loud failure for a wrong
+  // answer, which is the worse of the two.
+  const rolled = await run(
+    [auditRow({ CreationTime: '2026-02-30T10:00:00' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.equal(rolled.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1);
+  const nonsense = await run(
+    [auditRow({ CreationTime: '10/09/2026 10:00' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.equal(nonsense.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1);
 });

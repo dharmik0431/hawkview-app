@@ -278,7 +278,16 @@ export interface NormalizedEvent extends NormalizationScope {
   /** ISO-8601 UTC, millisecond precision. */
   readonly eventAt: string;
   readonly ingestedAt: string;
-  /** Protected reference to the resolved directory user. Never a raw identifier. */
+  /**
+   * Protected reference to the resolved directory user. Never a raw identifier.
+   *
+   * Minted from the directory object id of the matched user in THIS tenant's
+   * directory, never from a UPN — so a guest identity present in two customer
+   * tenants gets two references, and evidence cannot merge across MSP
+   * customers. A test asserts it. The event also carries organizationId and
+   * customerTenantId, so a consumer can key on the pair; that is belt and
+   * braces rather than the guarantee.
+   */
   readonly subjectRef: string;
   readonly subjectBinding: SubjectBindingMethod;
   readonly applicationRef: string;
@@ -340,6 +349,39 @@ export type ReferenceResolver = (
   identifier: string,
 ) => Promise<string>;
 
+/*
+ * NO SCOPE PARAMETER, AND THAT WAS CHECKED RATHER THAN ASSUMED — the check
+ * found my own reasoning wrong, so the reasoning is recorded here.
+ *
+ * The worry: a pseudonymised reference is only meaningful inside a namespace,
+ * and this signature cannot express which one. The audit path binds subjects
+ * on a normalized UPN, and an external identity is a guest in as many
+ * customer tenants as invited it — so a resolver memoising on
+ * (kind, identifier) looked able to hand two MSP customers the same
+ * subjectRef, merging one customer's evidence into another's.
+ *
+ * IT CANNOT. The reference is minted from `binding.user.microsoftUserId` —
+ * the DIRECTORY OBJECT ID of the matched user in THAT tenant's directory. The
+ * UPN is only the lookup key; it is never the identity handed on. A guest in
+ * two tenants is two directory objects with two GUIDs, so the references
+ * differ with or without a scope parameter. A test asserts it.
+ *
+ * Caught by mutation: I added the parameter, wrote the justification above,
+ * and only when a mutation making the resolver IGNORE the scope failed to
+ * break anything did it become clear the scope was doing no work. A test that
+ * passes with and without a change is not testing that change.
+ *
+ * ONE RESIDUAL QUESTION, deliberately left open rather than fixed. Application
+ * references ARE minted from a globally shared value: a Microsoft first-party
+ * appId is identical in every tenant, so one resolver across tenants issues
+ * one applicationRef for it. Whether that is correct (it is the same
+ * application) or a leak (it reveals that two customers both use it) is a
+ * question about the resolver's contract, which belongs to its owner. Not
+ * changed here: a seam a peer is calling does not get a new parameter for a
+ * hypothetical, and this layer has spent the day refusing to act on
+ * unverified predicates.
+ */
+
 /** Observed JSON shape of `raw.status.errorCode` on Graph rows. */
 export type ErrorCodeShape =
   | 'NUMBER'
@@ -393,10 +435,18 @@ export interface NormalizationCounts {
    *
    * DO NOT SUM THIS WITH THE FOUR, and the concrete failure is worth naming
    * because a summary card is exactly where it happens: on a tenant where
-   * ~921 rows carry a RISK verdict, a total built by adding all five reads
-   * about 35% higher than the number of rows handed in, and it would look
-   * plausible. The four vocabularies account for every row exactly once and a
-   * test asserts it; this is a second reading of some of those same rows.
+   * 932 rows carry a RISK verdict, a total built by adding all five reads
+   * about 35% higher than the number of rows handed in. THIRTY-FIVE PERCENT
+   * IS THE DANGEROUS SIZE. A 300% error is caught in review; a 35% one ships
+   * and is then defended, because it looks like the kind of number that could
+   * be right.
+   *
+   * AND THE WORSE CASE IS A RATE, NOT A TOTAL. Any percentage whose
+   * denominator is built this way is silently wrong, and a rate is far harder
+   * to sanity-check by eye than a total — nobody looks at 41% and thinks to
+   * ask what was underneath it. The four vocabularies account for every row
+   * exactly once and a test asserts it; use those for any denominator. This
+   * counter is a second reading of some of those same rows.
    */
   readonly microsoftVerdicts: Readonly<Record<MicrosoftVerdict | 'UNRECOGNIZED', number>>;
   /**
@@ -521,20 +571,36 @@ export interface NormalizationBatch {
    */
   readonly microsoftSafetyVerdicts: readonly NormalizedEvent[];
   //
-  // THE THREE LISTS ARE DISJOINT PER EVENT, NOT PER SUBJECT.
+  // THE THREE LISTS ARE DISJOINT PER EVENT, NOT PER SUBJECT — AND A PER-USER
+  // ROLLUP OF THEM IS A CATEGORY ERROR RATHER THAN A CHOICE.
   //
   // One verdict per event, and a test asserts no event reaches two lists. But
-  // a subject has many events, and nothing stops one person having a RISK
+  // a subject has many events, and nothing stops one person carrying a RISK
   // verdict on Tuesday and a SAFE verdict on Thursday — both true, about
   // different sign-ins.
   //
-  // So a surface that groups BY USER has a case this layer does not decide
-  // for it: a user who belongs in two groups at once. Picking the worst
-  // verdict, the latest, or showing the user twice are all defensible, and
-  // they are rendering decisions rather than facts about the data — which is
-  // why this says the shape rather than choosing. What is NOT defensible is
-  // reaching for one of them without noticing the case exists, because the
-  // failure is silent and lands in the direction that reads as reassurance.
+  // An earlier version of this comment offered three ways to reconcile that:
+  // take the worst verdict, take the latest, or show the user twice. All
+  // three are wrong, and for one reason rather than three: they treat an
+  // event-level judgement as a statement about a PERSON. Microsoft judged a
+  // sign-in. Grouping those by user and then reconciling them is the error,
+  // not the reconciliation strategy — so there is no correct strategy to
+  // offer, and offering three was offering three ways to do the wrong thing.
+  //
+  // THIS IS THE SAME RULE AS KEEPING THE VERDICT OFF THE EVENT, one level up.
+  // A verdict does not travel from Microsoft's channel into a HawkView
+  // finding, and it does not ascend from an event to a subject. Both are the
+  // same claim: it means what it was said about, and nothing wider.
+  //
+  // What a surface does instead is render these AS SIGN-INS, in their own
+  // section, where one person appearing twice is obviously two events rather
+  // than two opinions — and nothing needs reconciling because nothing is
+  // being compared. A user-level question ("who does Microsoft consider at
+  // risk now?") is answered by the user-level riskyUsers API, which needs P2
+  // and reads telemetry we cannot see. Different subject, different tense,
+  // different evidence base: the two can disagree with neither being wrong,
+  // and they stop looking contradictory as soon as each is labelled by the
+  // question it answers rather than both being labelled "Microsoft".
   /** Reference-to-identifier mapping for subjects that resolved, kept off the events. */
   readonly resolvedSubjects: readonly {
     readonly subjectRef: string;
