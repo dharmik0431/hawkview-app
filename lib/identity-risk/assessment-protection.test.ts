@@ -614,3 +614,53 @@ test('a mailbox subject gets only the guidance that applies to a mailbox', () =>
   assert.doesNotMatch(text, /reset twice/)
   rendered.dom.window.close()
 })
+
+test('a check that reads a setting says so, and says what its dates are not', () => {
+  // The mailbox check's timestamps are read times. "Last evidence time" reads
+  // as when something last happened, and for this check nothing happened at
+  // that time at all — HawkView looked. Left unsaid, a forwarding rule created
+  // in March and one created this morning are indistinguishable, and both look
+  // like they are unfolding now, because the read time is always recent.
+  const value = user()
+  value.subjectType = 'MAILBOX'
+  value.findings[0].ruleId = 'HV-ID-MBX-001.v1'
+  value.findings[0].title = 'External mailbox forwarding'
+  value.findings[0].evidenceCount = 3
+  const rendered = renderDrawer(value)
+
+  assert.equal(field(rendered.document, 'Evidence'), '3 external destinations')
+  assert.match(rendered.text, /reads a setting rather than watching events/)
+  assert.match(rendered.text, /not when the forwarding was set up/)
+  rendered.dom.window.close()
+})
+
+test('an event check is not given the setting caveat', () => {
+  // The caveat must be earned by the check, not sprayed over all of them: a
+  // qualification that appears everywhere qualifies nothing.
+  const rendered = renderDrawer(user())
+  assert.equal(field(rendered.document, 'Evidence'), '10 records')
+  assert.doesNotMatch(rendered.text, /reads a setting rather than watching/)
+  assert.doesNotMatch(rendered.text, /does not know this check/)
+  rendered.dom.window.close()
+})
+
+test('an unrecognised check declines to name a unit rather than guessing one', () => {
+  // A rule this build has never seen may count events or may count things.
+  // "Records" is a guess, and the mailbox check is the standing proof that the
+  // guess can be wrong in both halves at once. So the number is shown bare and
+  // the reason it is bare is stated.
+  const value = user()
+  value.findings[0].ruleId = 'HV-ID-XYZ-999.v4'
+  const rendered = renderDrawer(value)
+
+  assert.equal(field(rendered.document, 'Evidence'), '10')
+  assert.match(rendered.text, /does not know this check/)
+  assert.doesNotMatch(rendered.text, /10 records/)
+  // The rule identifier is on screen here, and that is correct in the detail
+  // view: it is labelled as a reference beside the title, not standing in for
+  // the words a technician reads. What must never happen is the identifier
+  // becoming the description, which is asserted in the list, where an
+  // unrecognised rule has no other copy to fall back on.
+  assert.match(rendered.text, /Repeated invalid credentials/)
+  rendered.dom.window.close()
+})

@@ -4,6 +4,7 @@ import type {
   MicrosoftEntraRiskyUsersView,
   RiskAssessment,
   RiskAssessmentReadiness,
+  RiskAssessmentRuleId,
   RiskAssessmentSource,
   RiskAssessmentUser,
   RiskRecommendedAction,
@@ -516,5 +517,124 @@ export function riskAssessmentEmptyPresentation(assessment: RiskAssessment) {
     label: 'No findings can be confirmed yet',
     detail:
       'No per-user findings were returned, but one or more checks lack a complete evaluated scope. Review collection and rule readiness below.',
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* What a finding's count counts, and what its date marks                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Every rule reports its evidence in the same two fields — a number and a
+ * timestamp — and those fields do not mean the same thing in every rule. The
+ * difference is invisible in the data, so it has to be carried by the copy.
+ *
+ * A repeated-failure check counts events that happened, each at a time of its
+ * own, and its date is when the most recent one occurred. The mailbox check
+ * counts the external destinations a mailbox is currently configured to forward
+ * to. Those are a state, not a sequence, and its date is when HawkView read the
+ * configuration.
+ *
+ * One phrase for both makes the second reading false twice over. "3 records,
+ * last 3:04 p.m." says three things happened and the newest was minutes ago,
+ * where the truth is that one setting names three destinations and 3:04 p.m. is
+ * when we looked. The read time is always recent, so every forwarding finding
+ * would read as though it were unfolding right now — exactly backwards, because
+ * a forwarding rule set six months ago is the more alarming case, not the less.
+ *
+ * This is the same defect this surface keeps producing: a true sentence
+ * positioned where a reader takes it as an answer to a different question. It
+ * is worth stating why it only became load-bearing now. Until the detector was
+ * corrected, one destination and four produced the same finding, so the number
+ * was not meaningful and nobody could act on it. Making it meaningful is what
+ * made mislabelling it dangerous — a correct number under the wrong noun earns
+ * a trust the meaningless one never had.
+ *
+ * A rule this build does not know gets neither phrase. "Records" asserts that
+ * the count is of events and "last" asserts that the date is an occurrence, and
+ * the mailbox rule is the proof that a new check can falsify both. So an
+ * unrecognised rule reports that it is unrecognised, and its two values are
+ * shown without a reading attached.
+ */
+export type FindingEvidenceShape =
+  | { kind: 'OCCURRENCES' }
+  | { kind: 'CONFIGURED_STATE'; singular: string; plural: string }
+  | { kind: 'UNRECOGNISED' }
+
+const evidenceShapes: Record<RiskAssessmentRuleId, FindingEvidenceShape> = {
+  'HV-ID-AUTH-010.v1': { kind: 'OCCURRENCES' },
+  'HV-ID-AUTH-005.v2': { kind: 'OCCURRENCES' },
+  'HV-ID-MBX-001.v1': {
+    kind: 'CONFIGURED_STATE',
+    singular: 'external destination',
+    plural: 'external destinations',
+  },
+}
+
+export function findingEvidenceShape(ruleId: string): FindingEvidenceShape {
+  return Object.hasOwn(evidenceShapes, ruleId)
+    ? evidenceShapes[ruleId as RiskAssessmentRuleId]
+    : { kind: 'UNRECOGNISED' }
+}
+
+export type FindingEvidenceSummary = {
+  /** How much evidence, in the unit this rule actually counts. */
+  count: string | null
+  /** What the rule's timestamp marks, said in words rather than implied. */
+  timing: string | null
+  /** Why neither of the above could be said. Never set alongside them. */
+  note: string | null
+}
+
+/**
+ * The count and timing phrases for one finding.
+ *
+ * The date formatter is supplied by the caller because the list and the drawer
+ * format times differently, and neither of those choices belongs here.
+ */
+export function findingEvidenceSummary(
+  finding: {
+    ruleId: string
+    evidenceCount: number
+    evidenceCountCapped: boolean
+    lastSeen: string
+  },
+  formatDate: (value: string) => string
+): FindingEvidenceSummary {
+  const shape = findingEvidenceShape(finding.ruleId)
+  const when = formatDate(finding.lastSeen)
+  if (shape.kind === 'UNRECOGNISED') {
+    return {
+      count: null,
+      timing: null,
+      note:
+        'This build of HawkView does not know this check, so it cannot say what its count of ' +
+        finding.evidenceCount.toLocaleString() +
+        ' counts, or what ' +
+        when +
+        ' marks.',
+    }
+  }
+  // A capped count is a floor, never a total: the evidence was truncated before
+  // the check ran, so the check could not have known there was more.
+  const amount =
+    (finding.evidenceCountCapped ? 'at least ' : '') +
+    finding.evidenceCount.toLocaleString()
+  if (shape.kind === 'CONFIGURED_STATE') {
+    return {
+      count:
+        amount +
+        ' ' +
+        (finding.evidenceCount === 1 ? shape.singular : shape.plural),
+      // Deliberately not "last". Nothing here happened at this time; this is
+      // when HawkView read a setting that may be far older.
+      timing: 'configuration read ' + when,
+      note: null,
+    }
+  }
+  return {
+    count: amount + ' ' + (finding.evidenceCount === 1 ? 'record' : 'records'),
+    timing: 'last ' + when,
+    note: null,
   }
 }

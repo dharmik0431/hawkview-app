@@ -1297,3 +1297,96 @@ test('two reasons with different dates never share one', () => {
   assert.ok(headers.includes('Latest of any reason'))
   assert.ok(!headers.includes('Last seen'))
 })
+
+test('a setting is never counted as though it were a sequence of events', () => {
+  // The mailbox check counts the external destinations a mailbox is currently
+  // configured to forward to, and its timestamp is when HawkView read that
+  // configuration. Every other check counts events that happened, and its
+  // timestamp is when the last one happened. Both arrive in the same two
+  // fields, so one phrase for both is false for one of them.
+  //
+  // "10 records, last 4:12 p.m." says ten things happened and the newest was
+  // minutes ago. The truth is that one setting names ten destinations and
+  // 4:12 p.m. is when we looked. The read time is always recent, which makes
+  // every forwarding finding read as though it were unfolding right now --
+  // backwards, since a rule set six months ago is the worse case.
+  const value = assessmentFixture(true)
+  value.users = [assessmentUser('HV-ID-MBX-001.v1', 'a')]
+  value.rules[0].matchedIdentities = 0
+  value.rules[2].assessedIdentities = 1
+  value.rules[2].matchedIdentities = 1
+  const { document } = render(value)
+  // Mailbox evidence is never counted as a person, so the row lives in the
+  // context region rather than the user list.
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-context-heading"]')
+      ?.textContent ?? ''
+
+  assert.match(list, /10 external destinations/)
+  assert.match(list, /configuration read/)
+  // The row must not describe the setting in the vocabulary of events.
+  assert.ok(!/10 records/.test(list), 'destinations rendered as event records')
+  assert.ok(
+    !/configured to forward[^.]*, last /.test(list),
+    'a read time rendered as an occurrence time'
+  )
+
+  // The aggregate beside the reason is the half that survives a per-reason fix.
+  // "Latest of any reason" is a maximum over timestamps that do not all mean
+  // the same thing, and a read time is always the most recent thing on the
+  // page, so an unlabelled column puts every forwarding row at the top and
+  // tells the reader it just happened.
+  assert.match(list, /when HawkView read a setting, not when anything happened/)
+})
+
+test('an event check keeps the event vocabulary', () => {
+  // The guard above must not have been bought by flattening every check into
+  // the cautious wording. A check that really does count events still says so.
+  const { document } = render(assessmentFixture(true))
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? ''
+  assert.match(list, /10 records, last /)
+  assert.ok(
+    !/external destinations/.test(list),
+    'an event check borrowed the state vocabulary'
+  )
+  assert.ok(
+    !/read a setting/.test(list),
+    'an event row was told its own timestamp was a read time'
+  )
+})
+
+test('an unrecognised rule never lets its identifier become the description', () => {
+  // Backend rule catalogues move on their own schedule, so a check this build
+  // has never seen will appear in a row eventually. The row has to say
+  // something, and the two tempting options are both wrong: "10 records"
+  // guesses a unit the mailbox check has already proved can be wrong, and the
+  // identifier is not a sentence a technician can act on.
+  const value = assessmentFixture(true)
+  const subject = assessmentUser('HV-ID-AUTH-005.v2', 'a')
+  subject.findings[0].ruleId = 'HV-ID-NEW-777.v1'
+  value.users = [subject]
+  // The server publishes the new check in its readiness list; only this build's
+  // own catalogue is behind. That is the case worth covering, because it is the
+  // one that happens on every backend release.
+  value.rules.push({
+    ...value.rules[1],
+    ruleId: 'HV-ID-NEW-777.v1',
+    ruleVersion: 'v1',
+    title: 'A check released after this build',
+    matchedIdentities: 1,
+  })
+  value.rules[0].matchedIdentities = 0
+  const { document } = render(value)
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? ''
+
+  assert.match(list, /does not know this check/)
+  assert.ok(!/10 records/.test(list), 'a unit was guessed for an unknown rule')
+  assert.ok(
+    !/HV-ID-NEW-777/.test(list),
+    'an identifier was rendered where a description belongs'
+  )
+})

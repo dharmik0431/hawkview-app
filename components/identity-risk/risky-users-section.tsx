@@ -12,6 +12,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
 import {
+  findingEvidenceShape,
+  findingEvidenceSummary,
   microsoftRiskyUserCountPresentation,
   riskReadinessLabel,
   riskSourceLabel,
@@ -29,6 +31,7 @@ import type {
   MicrosoftChannel,
   MicrosoftVerdictPolarity,
   RiskyUserCount,
+  RiskyUserReason,
   RiskyUserRow,
 } from '@/lib/identity-risk/risky-users-view'
 import type {
@@ -41,6 +44,29 @@ import { RiskAssessmentDrawer } from './risk-assessment-drawer'
 
 function time(value: string | null) {
   return value ? new Date(value).toLocaleString() : 'Not reported'
+}
+
+/**
+ * One reason, with its own count and its own recency, in the unit that reason
+ * actually counts.
+ *
+ * Two reasons on one row never share a date, and neither shares a noun. A
+ * repeated-failure reason counts events and its date is when the last one
+ * happened; the mailbox reason counts destinations a mailbox is configured to
+ * forward to and its date is when the setting was read. Both readings are
+ * supplied by findingEvidenceSummary, which is also the only place that decides
+ * a rule it does not recognise gets no reading at all.
+ */
+function ReasonLine({ reason }: { reason: RiskyUserReason }) {
+  const evidence = findingEvidenceSummary(reason, time)
+  return (
+    <li className="text-xs text-slate-600 dark:text-slate-300">
+      {reason.title}
+      <span className="block text-slate-500 dark:text-slate-400">
+        {evidence.note ?? [evidence.count, evidence.timing].join(', ')}
+      </span>
+    </li>
+  )
 }
 
 /**
@@ -445,19 +471,7 @@ function UserRows({
                 </p>
                 <ul className="mt-1.5 space-y-1">
                   {row.reasons.map((reason) => (
-                    <li
-                      key={reason.title}
-                      className="text-xs text-slate-600 dark:text-slate-300"
-                    >
-                      {reason.title}
-                      <span className="block text-slate-500 dark:text-slate-400">
-                        {reason.evidenceCountCapped
-                          ? `at least ${reason.evidenceCount.toLocaleString()}`
-                          : reason.evidenceCount.toLocaleString()}{' '}
-                        {reason.evidenceCount === 1 ? 'record' : 'records'},
-                        last {time(reason.lastSeen)}
-                      </span>
-                    </li>
+                    <ReasonLine key={reason.title} reason={reason} />
                   ))}
                 </ul>
               </td>
@@ -478,6 +492,13 @@ function UserRows({
               </td>
               <td className="px-3 py-3 text-sm text-slate-700 dark:text-slate-300">
                 {time(row.lastSeen)}
+                {row.lastSeenFrom &&
+                  findingEvidenceShape(row.lastSeenFrom.ruleId).kind !==
+                    'OCCURRENCES' && (
+                    <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
+                      when HawkView read a setting, not when anything happened
+                    </span>
+                  )}
               </td>
               <td className="px-3 py-3 text-right">
                 <Button

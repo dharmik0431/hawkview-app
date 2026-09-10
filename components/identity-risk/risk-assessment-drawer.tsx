@@ -13,6 +13,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import {
+  findingEvidenceShape,
+  findingEvidenceSummary,
   riskConditionalAccessIsCurrent,
   riskProtectionEvidenceIsCurrent,
   riskProtectionSummary,
@@ -238,8 +240,8 @@ function FindingDetail({ finding }: { finding: RiskAssessmentFinding }) {
         <div>
           <dt className="text-slate-500 dark:text-slate-400">Evidence</dt>
           <dd className="mt-0.5 font-medium text-slate-900 dark:text-slate-100">
-            {finding.evidenceCountCapped ? 'At least ' : ''}
-            {finding.evidenceCount.toLocaleString()} records
+            {findingEvidenceSummary(finding, formatTimestamp).count ??
+              finding.evidenceCount.toLocaleString()}
           </dd>
         </div>
         <div>
@@ -281,6 +283,8 @@ function FindingDetail({ finding }: { finding: RiskAssessmentFinding }) {
           </dd>
         </div>
       </dl>
+
+      <EvidenceReadingCaveat finding={finding} />
 
       {finding.evidenceReferences.length > 0 && (
         <div className="mt-4">
@@ -467,6 +471,52 @@ function ContainmentGuidance({ user }: { user: RiskAssessmentUser }) {
         )}
       </ul>
     </details>
+  )
+}
+
+/**
+ * What the numbers above this line mean, for the checks where the field names
+ * are not enough on their own.
+ *
+ * "Evidence" and "evidence time" are accurate for a check that watches events
+ * and misleading for one that reads a setting: the count is of destinations
+ * rather than occurrences, and the timestamps are when HawkView looked rather
+ * than when anything happened. The dl cannot say that in a label without
+ * repeating it on every row of every finding, so it is said once, and only for
+ * the findings it applies to.
+ *
+ * An unrecognised check gets the same treatment for a different reason. This
+ * build cannot know whether its count is of events or of things, so it declines
+ * to name a unit rather than guessing "records" — the mailbox check is the
+ * standing proof that guessing gets it wrong.
+ */
+function EvidenceReadingCaveat({
+  finding,
+}: {
+  finding: RiskAssessmentFinding
+}) {
+  const shape = findingEvidenceShape(finding.ruleId)
+  if (shape.kind === 'OCCURRENCES') return null
+  return (
+    <p className="mt-3 text-xs leading-5 text-slate-500 dark:text-slate-400">
+      {shape.kind === 'CONFIGURED_STATE' ? (
+        <>
+          This check reads a setting rather than watching events. The count
+          above is how many {shape.plural} the mailbox is currently configured
+          to forward to, and the times are when HawkView read that
+          configuration. They are not when the forwarding was set up, and this
+          finding does not carry that date &mdash; a rule created months ago and
+          one created this morning look the same here.
+        </>
+      ) : (
+        <>
+          This build of HawkView does not know this check, so it cannot say what
+          the count above counts or what the times mark. Both are shown as the
+          server reported them, without a unit, because the alternative is to
+          guess one.
+        </>
+      )}
+    </p>
   )
 }
 

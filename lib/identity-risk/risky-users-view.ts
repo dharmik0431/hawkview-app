@@ -545,6 +545,11 @@ export type RiskyUserPriority = 'LOW' | 'MEDIUM' | 'HIGH'
 
 export type RiskyUserReason = {
   title: string
+  /**
+   * Carried so the surface can say what this rule's count counts and what its
+   * date marks. Those differ per rule and are not derivable from the numbers.
+   */
+  ruleId: string
   /** Distinct pieces of evidence behind this reason, as the server counted. */
   evidenceCount: number
   /** True when the count is a ceiling rather than a total. */
@@ -567,6 +572,20 @@ export type RiskyUserRow = {
   priorityLabel: string
   /** Most recent observation across this user's current findings. */
   lastSeen: string | null
+  /**
+   * The reason that produced lastSeen.
+   *
+   * The column is a maximum over reasons whose timestamps do not all mean the
+   * same thing: a repeated-failure reason contributes the time something last
+   * happened, and the mailbox reason contributes the time HawkView read a
+   * setting. A read time is always recent, so without saying which kind won,
+   * every forwarding row sorts and reads as the freshest thing on the page.
+   *
+   * Naming the source lets the cell say what kind of time it is showing. It is
+   * the same fix as the per-reason line, applied to the aggregate that sits
+   * beside it — the aggregate was the half still implying "this happened".
+   */
+  lastSeenFrom: RiskyUserReason | null
   /**
    * Each reason with its own count and its own recency, never a list of titles
    * beside one shared date.
@@ -613,11 +632,18 @@ function rowFor(
   const findings = currentOnly
     ? user.findings.filter((finding) => finding.activityState === 'CURRENT')
     : user.findings
-  const lastSeen =
-    findings
-      .map((finding) => finding.lastSeen)
-      .sort()
-      .at(-1) ?? null
+  const reasons: RiskyUserReason[] = findings.map((finding) => ({
+    title: finding.title,
+    ruleId: finding.ruleId,
+    evidenceCount: finding.evidenceCount,
+    evidenceCountCapped: finding.evidenceCountCapped,
+    firstSeen: finding.firstSeen,
+    lastSeen: finding.lastSeen,
+  }))
+  const lastSeenFrom =
+    [...reasons].sort((a, b) => a.lastSeen.localeCompare(b.lastSeen)).at(-1) ??
+    null
+  const lastSeen = lastSeenFrom?.lastSeen ?? null
   return {
     id: user.id,
     name: user.displayName ?? user.label,
@@ -627,13 +653,8 @@ function rowFor(
     priority: user.priority,
     priorityLabel: riskyUserPriorityLabel(user.priority),
     lastSeen,
-    reasons: findings.map((finding) => ({
-      title: finding.title,
-      evidenceCount: finding.evidenceCount,
-      evidenceCountCapped: finding.evidenceCountCapped,
-      firstSeen: finding.firstSeen,
-      lastSeen: finding.lastSeen,
-    })),
+    lastSeenFrom,
+    reasons,
     detection: detectionFor(user, channel, microsoftUsers),
     protection: riskProtectionSummary(user),
     user,
