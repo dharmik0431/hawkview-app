@@ -831,3 +831,32 @@ test('a zero counts people and never speaks for the findings beneath it', () => 
   assert.doesNotMatch(clean.headline, /but there are findings/)
   assert.deepEqual(clean.known, [])
 })
+
+test('a zero says what it is a proportion of, and admits it is not people', () => {
+  // A zero invites one question: out of how many? The contract carries no
+  // identity population, so the honest answer is that the number qualifies the
+  // checks that ran. Leaving it unsaid lets a technician supply "out of
+  // everyone" themselves, which is the reading that makes a zero dangerous.
+  const zero = riskyUserCount({
+    assessment: adapt(assessmentFixture(false)),
+    channel: licenceBlocked,
+  })
+  assert.equal(zero.value, 0)
+  assert.ok(
+    zero.gaps.some((gap) =>
+      /not reported how many identities in this tenant were in scope/.test(gap)
+    )
+  )
+  assert.ok(
+    zero.gaps.some((gap) => /not a proportion of your people/.test(gap))
+  )
+
+  // A positive count is a report of what was found rather than a claim about
+  // what was not, so it does not carry the same qualification.
+  const positive = riskyUserCount({
+    assessment: adapt(assessmentFixture(true)),
+    channel: licenceBlocked,
+  })
+  assert.equal(positive.value, 1)
+  assert.ok(!positive.gaps.some((gap) => /proportion of your people/.test(gap)))
+})

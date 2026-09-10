@@ -595,7 +595,7 @@ test('the surface never claims a user is safe or that HawkView acted', () => {
 test('the coverage behind the number is available on the same screen', () => {
   const { text } = render()
   assert.match(text, /What HawkView checked/)
-  assert.match(text, /identities assessed/)
+  assert.match(text, /identities evaluated by this check/)
   assert.match(text, /Microsoft 365 audit sign-ins/)
 })
 
@@ -900,4 +900,14 @@ test('Microsoft looked and did not report this user is a distinct sentence', () 
       ?.querySelectorAll('td')[1]?.textContent ?? ''
   assert.match(detectedBy, /Microsoft did not report this user/)
   assert.doesNotMatch(detectedBy, /Not comparable/)
+})
+
+test('per-check identity counts cannot be read as tenant coverage', () => {
+  const { text } = render(assessmentFixture(false))
+  // Labelled as what the check evaluated, never as a share of the tenant.
+  assert.match(text, /identities evaluated by this check/)
+  assert.match(text, /does not report how many identities exist in this tenant/)
+  assert.match(text, /two checks may have evaluated different populations/)
+  // And the zero carries the same admission beside the number itself.
+  assert.match(text, /not a proportion of your people/)
 })

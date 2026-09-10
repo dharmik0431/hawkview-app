@@ -886,6 +886,15 @@ export function riskyUserCount({
       empty?.detail ??
       'HawkView reported no users with a current finding. This covers only the checks below and their reported windows; it does not establish that any user is safe.'
     const findingsWithoutPeople = known.length > 0
+    // A zero invites exactly one question: out of how many? The contract
+    // carries no identity population, so the honest answer is that this
+    // qualifies the checks that ran rather than the people they covered.
+    // Said plainly here rather than left to be inferred from the per-check
+    // figures further down, which have no denominator either.
+    const zeroGaps = [
+      ...gaps,
+      'HawkView has not reported how many identities in this tenant were in scope, so this is a statement about the checks that ran, not a proportion of your people',
+    ]
     return {
       accuracy: 'EXACT',
       value: 0,
@@ -898,7 +907,7 @@ export function riskyUserCount({
         ? `This counts people, and none of the evidence below could be tied to one. It is not a finding count and it is not an all-clear: HawkView did report evidence on this tenant, listed beside this number and below. ${baseCaption}`
         : baseCaption,
       known,
-      gaps,
+      gaps: zeroGaps,
       asOf: reported.asOf,
     }
   }

@@ -465,6 +465,12 @@ function Coverage({ assessment }: { assessment: RiskAssessment }) {
         What HawkView checked, and how current the evidence is
       </summary>
       <div className="mt-3 space-y-4">
+        <p className="text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+          These are counts of what each check evaluated. HawkView does not
+          report how many identities exist in this tenant, so they are not a
+          proportion of your people and two checks may have evaluated different
+          populations.
+        </p>
         <div>
           <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
             Checks
@@ -479,8 +485,8 @@ function Coverage({ assessment }: { assessment: RiskAssessment }) {
                   · {riskReadinessLabel(rule.status)} ·{' '}
                   {riskSourceLabel(rule.selectedSource)} ·{' '}
                   {rule.assessedIdentities === null
-                    ? 'identities assessed not reported'
-                    : `${rule.assessedIdentities.toLocaleString()} identities assessed${
+                    ? 'identities evaluated not reported'
+                    : `${rule.assessedIdentities.toLocaleString()} identities evaluated by this check${
                         rule.countsCapped ? ' (capped)' : ''
                       }`}
                 </span>
