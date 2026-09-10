@@ -587,28 +587,39 @@ export function riskyUserList(
   const currentIds = new Set(current.map((user) => user.id))
   const corroborated = (row: RiskyUserRow) =>
     row.detection.microsoft === 'REPORTED' ? 1 : 0
-  const byCorroborationThenPriority = (a: RiskyUserRow, b: RiskyUserRow) => {
-    // Two independent systems reporting the same person is the strongest lead
-    // this product produces, and HawkView's own priority cannot express it —
-    // a Low finding corroborated by Microsoft is not a Low lead. Sorting on
-    // the fact of corroboration keeps the two judgements separate while still
-    // putting the row a technician should open first at the top.
-    const corroboration = corroborated(b) - corroborated(a)
-    if (corroboration !== 0) return corroboration
+  const byPriorityThenCorroboration = (a: RiskyUserRow, b: RiskyUserRow) => {
+    // HawkView's own priority orders HawkView's own list, and corroboration
+    // only breaks ties inside a band.
+    //
+    // Corroboration cannot be the primary key even though it is a structural
+    // fact rather than a blend of severities. Microsoft's channel is populated
+    // on Entra ID P2 tenants and empty everywhere else, so ranking on it would
+    // make the order depend on what each customer pays Microsoft: the same two
+    // HawkView findings sort one way on a P2 tenant and the other way on an
+    // identical tenant without it. An MSP working across a fleet would have no
+    // way to see that the rule had changed, because on most tenants the key is
+    // a no-op and the inconsistency is invisible from any single screen.
+    //
+    // As a tiebreaker it cannot flip a High below a Low, and it still puts a
+    // corroborated row at the top of its band. What actually resolves the case
+    // it was built for is on the row itself — the column names whose rating it
+    // is, and Microsoft's verdict travels beside it.
     const rank =
       (b.priority ? priorityRank[b.priority] : 0) -
       (a.priority ? priorityRank[a.priority] : 0)
     if (rank !== 0) return rank
+    const corroboration = corroborated(b) - corroborated(a)
+    if (corroboration !== 0) return corroboration
     return (b.lastSeen ?? '').localeCompare(a.lastSeen ?? '')
   }
   return {
     rows: current
       .map((user) => rowFor(user, channel, microsoftUsers, true))
-      .sort(byCorroborationThenPriority),
+      .sort(byPriorityThenCorroboration),
     context: assessment.users
       .filter((user) => !currentIds.has(user.id))
       .map((user) => rowFor(user, channel, microsoftUsers, false))
-      .sort(byCorroborationThenPriority),
+      .sort(byPriorityThenCorroboration),
   }
 }
 

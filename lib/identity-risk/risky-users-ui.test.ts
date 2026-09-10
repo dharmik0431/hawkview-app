@@ -978,13 +978,17 @@ test('a corroborated row never reads as a combined judgement', () => {
   // And the cell says the rating is HawkView's alone.
   assert.match(alice!.textContent ?? '', /rating of its own finding/)
 
-  // The row two systems agree on is not buried under a louder single source.
-  assert.match(rows[0].textContent ?? '', /Alice Chen/)
+  // HawkView's own priority still orders HawkView's list: the Medium leads the
+  // corroborated Low. Ordering on corroboration would have made the position
+  // of a HawkView finding depend on the customer's Microsoft licensing, which
+  // is a rule that changes per tenant without saying so.
+  assert.match(rows[0].textContent ?? '', /Higher priority, one source/)
+  assert.match(rows[1].textContent ?? '', /Alice Chen/)
   // The ordering is stated rather than left to be inferred.
   const list = document.querySelector(
     '[aria-labelledby="risky-users-list-heading"]'
   )
-  assert.match(list!.textContent ?? '', /come first/)
+  assert.match(list!.textContent ?? '', /whatever its Microsoft licensing/)
   assert.match(list!.textContent ?? '', /never combined into one score/)
 })
 

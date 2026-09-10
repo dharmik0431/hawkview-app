@@ -929,3 +929,58 @@ test('a repeated or unknown reason is refused rather than shown twice', () => {
     )
   }
 })
+
+test('ordering does not depend on what the customer pays Microsoft', () => {
+  // Microsoft's channel is populated on Entra ID P2 tenants and empty
+  // everywhere else. If corroboration ordered the list, the same two HawkView
+  // findings would sort one way on a P2 tenant and the other way on an
+  // identical tenant without it — a rule that changes per tenant without
+  // saying so, invisible from any single screen.
+  const build = () => {
+    const value = assessmentFixture(true)
+    Object.assign(value.users[0], {
+      correlation: guid,
+      displayName: 'Low, corroborated',
+    })
+    const louder = assessmentUser('HV-ID-AUTH-005.v2', 'b')
+    louder.label = 'Medium, single source'
+    value.users.push(louder)
+    value.rules[1].matchedIdentities = 1
+    value.summary.currentUsers = { value: 2, accuracy: 'EXACT' }
+    return adapt(value)
+  }
+
+  const onP2 = riskyUserList(build(), reportingMicrosoft(), [
+    microsoftRecord(guid),
+  ]).rows.map((row) => row.name)
+  const withoutP2 = riskyUserList(build(), licenceBlocked).rows.map(
+    (row) => row.name
+  )
+  assert.deepEqual(onP2, withoutP2)
+  assert.deepEqual(onP2, ['Medium, single source', 'Low, corroborated'])
+})
+
+test('corroboration breaks ties inside a priority band', () => {
+  // It cannot flip a High below a Low, but it does put the row two systems
+  // agree on at the top of its own band.
+  const value = assessmentFixture(true)
+  Object.assign(value.users[0], {
+    correlation: guid,
+    displayName: 'Low, corroborated',
+  })
+  const other = assessmentUser('HV-ID-AUTH-010.v1', 'b')
+  other.label = 'Low, single source'
+  value.users.push(other)
+  value.rules[0].assessedIdentities = 2
+  value.rules[0].matchedIdentities = 2
+  value.summary.currentUsers = { value: 2, accuracy: 'EXACT' }
+
+  const rows = riskyUserList(adapt(value), reportingMicrosoft(), [
+    microsoftRecord(guid),
+  ]).rows
+  assert.deepEqual(
+    rows.map((row) => row.priority),
+    ['LOW', 'LOW']
+  )
+  assert.equal(rows[0].name, 'Low, corroborated')
+})

@@ -763,11 +763,11 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
               Users needing attention
             </h2>
             <p className="mt-1 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-              Users both HawkView and Microsoft reported independently come
-              first — that agreement is the strongest lead here, and neither
-              system&rsquo;s rating expresses it. After those, HawkView&rsquo;s
-              own investigation priority. The two ratings are never combined
-              into one score.
+              Ordered by HawkView&rsquo;s own investigation priority, so the
+              same findings sit in the same order on every tenant whatever its
+              Microsoft licensing. Within a priority, users Microsoft also
+              reported come first. The two systems&rsquo; ratings are never
+              combined into one score.
             </p>
             {list.rows.length > 0 ? (
               <div className="mt-3">
