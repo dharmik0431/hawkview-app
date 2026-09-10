@@ -1,4 +1,4 @@
-import type { EventOutcome, MicrosoftVerdict, NormalizationSource } from './contract.js';
+import type { EventOutcome, MicrosoftVerdict, NormalizationSource, OutcomeReachability } from './contract.js';
 import type { OutOfScopeReason, UncitedReason, UnknownObservation } from './reasons.js';
 
 /**
@@ -881,6 +881,21 @@ export const AUDIT_REASON_NAMES: readonly AuditReasonEntry[] = [
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
   },
   {
+    name: 'SsoUserAccountNotFoundInResourceTenant',
+    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    note:
+      'ADDED FROM A MEASURED INVENTORY, 1 row, and it was landing in UNRECOGNIZED_REASON_NAME before ' +
+      'that. Found by diffing this table against a measured list of LogonError values rather than by ' +
+      'any test — the third entry this table has gained that way, which is why the diff is a standing ' +
+      'exchange rather than a one-off. ' +
+      'HELD RATHER THAN MAPPED, and the temptation is worth naming: the name reads like an ' +
+      'out-of-tenant identity, which would make it a sibling of UserUnauthorized and effectively ' +
+      'unreachable behind subject resolution. That is INFERENCE FROM A NAME, not a citation, and ' +
+      'reading a disposition off a plausible-sounding name is the specific mistake this table exists ' +
+      'to prevent. If the inference is right the entry is unreachable and mapping it changes nothing; ' +
+      'if it is wrong, mapping it asserts something false. Held either way.',
+  },
+  {
     name: 'PasswordResetRegistrationRequiredInterrupt',
     disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
     note:
@@ -901,20 +916,166 @@ export function auditReasonEntry(name: string): AuditReasonEntry | undefined {
 /**
  * Reason names seen in production and deliberately NOT mapped, with why.
  * Recorded so the gap is a decision on the record rather than an oversight.
+ *
+ * EMPTY, and that is a live claim rather than a placeholder: every name in the
+ * measured LogonError inventory is now in AUDIT_REASON_NAMES. It refills the
+ * moment a measurement turns up a name this table lacks.
  */
-export const AUDIT_REASON_NAMES_OBSERVED_UNMAPPED: readonly { readonly name: string; readonly why: string }[] = [
+export const AUDIT_REASON_NAMES_OBSERVED_UNMAPPED: readonly { readonly name: string; readonly why: string }[] = [];
+
+/**
+ * Names that are NOT provider reason values at all, and must never be mapped.
+ *
+ * A SEPARATE list from the one above, because that one's name asserts these
+ * were OBSERVED as reason names, and they were not. UserLoggedIn sat there
+ * with a `why` that correctly said "artefact, never map it" while its
+ * membership said "we saw this as a reason and chose not to map it" — a
+ * registry entry right about the outcome and wrong about the reason, which is
+ * a category every check here was blind to, since all of them look for wrong
+ * outcomes. Surfaced by a measurement of the real field: LogonError is
+ * ABSENT on all 1,412 UserLoggedIn rows, so the name never appears there.
+ */
+export const AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES: readonly { readonly name: string; readonly why: string }[] = [
   {
     name: 'UserLoggedIn',
     why:
-      'CONFIRMED AN ARTEFACT, not a provider value. It appears as a "reason" only in the synthesized ' +
+      'An OPERATION name, not a reason. It appears as a "reason" only in the synthesized ' +
       '`raw.status.failureReason`, whose final arm is `?? record.Operation` — so every audit record with ' +
-      'no logon error of any kind contributes its own Operation name there. It is not a Microsoft reason ' +
-      'value at all, and nothing should ever map it. This layer reads the original record, where it does ' +
-      'not appear; the guard in classifyAuditRecord exists for any reader that is pointed at the ' +
-      'projected field instead. Volumes previously cited here came from that same synthesized field and ' +
+      'no logon error of any kind contributes its own Operation name there. Measured confirmation: ' +
+      'managementActivityRecord.LogonError is ABSENT on all 1,412 UserLoggedIn rows, so it is not a ' +
+      'Microsoft reason value and nothing should ever map it. This layer reads the original record, ' +
+      'where it does not appear; the guard in classifyAuditRecord exists for any reader pointed at the ' +
+      'projected field instead. Volumes previously cited came from that same synthesized field and ' +
       'are withdrawn.',
   },
 ];
+
+// ===========================================================================
+// WHICH OUTCOMES EACH FEED CAN SUPPLY.
+//
+// Built for the evaluation core's feed-capability check, which reports a rule
+// INAPPLICABLE rather than RAN when the feed cannot supply an outcome the
+// rule's logic reads. That check needs an answer this layer is the only one
+// holding, and it is deliberately NOT derived from the tables at runtime.
+//
+// WHY EXPLICIT RATHER THAN DERIVED. A derived set absorbs new members
+// silently: add a mapping for a code and the feed quietly gains a capability,
+// which is exactly how isPostPasswordInterrupt would have enrolled
+// CREDENTIAL_CONFIRMED_VALID and lent it a claim no control had established.
+// So the table is written out, and a test cross-checks it against
+// RESULT_CODES, FAILURE_REASON_MEANINGS and AUDIT_REASON_NAMES. A new mapping
+// is then a test failure that says "decide what this does to feed capability"
+// rather than a silent change of answer.
+//
+// WHAT THE MEASUREMENTS SAY, and the two findings in them:
+//
+// (1) The GRAPH feed has NEVER OBSERVED A POST-PASSWORD INTERRUPT. 50076,
+//     50072 and 50079 are zero rows across all tenants and all history, while
+//     the audit feed carries 13 UserStrongAuthClientAuthNRequiredInterrupt, 3
+//     UserStrongAuthEnrollmentRequiredInterrupt and 4
+//     PasswordResetRegistrationRequiredInterrupt. "Password accepted, sign-in
+//     did not complete" is the basis of the highest-value detector available
+//     without Entra ID P2 — and its evidence is on the feed we treat as the
+//     fallback, not the one we treat as primary. That inverts the assumption
+//     that Graph is strictly the better source.
+//
+// (2) The audit feed's successes DO NOT COME FROM THE REASON-NAME TABLE.
+//     They come from Operation (UserLoggedIn, 1,412 rows), where no LogonError
+//     exists at all. Anything deriving audit capability from AUDIT_REASON_NAMES
+//     alone concludes the feed has no successes and declares every
+//     failures-then-success rule inapplicable there — which is the original
+//     inert-detector bug re-created by the machinery built to detect it. The
+//     Operation path is why PASSWORD_ACCEPTED_COMPLETED is present below.
+// ===========================================================================
+
+export interface FeedOutcomeCapability {
+  readonly source: NormalizationSource;
+  readonly outcomes: Readonly<Record<EventOutcome, OutcomeReachability>>;
+}
+
+export const FEED_CAPABILITIES: readonly FeedOutcomeCapability[] = [
+  {
+    source: 'GRAPH_SIGN_INS',
+    outcomes: {
+      // 50126, 107 rows.
+      PASSWORD_REJECTED: 'MAPPED_AND_OBSERVED',
+      // Code 0, 1,010 rows.
+      PASSWORD_ACCEPTED_COMPLETED: 'MAPPED_AND_OBSERVED',
+      // 53003 (5) and 53000 (2), plus 50053's malicious-IP text (~921).
+      BLOCKED_BY_CONTROL: 'MAPPED_AND_OBSERVED',
+      // 50053's smart-lockout text. The CODE is 1,479 rows; the outcome is
+      // reached only through the text, which is why this is not derivable
+      // from a code's own disposition.
+      LOCKED_OUT_AFTER_REPEATED_FAILURES: 'MAPPED_AND_OBSERVED',
+      // 50074, 3 rows. The only observed member of the interrupt family here.
+      PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED: 'MAPPED_AND_OBSERVED',
+      // FINDING (1). Mapped from documentation, zero rows ever.
+      PASSWORD_ACCEPTED_CHALLENGE_ISSUED: 'MAPPED_NOT_OBSERVED',
+      PASSWORD_ACCEPTED_REGISTRATION_REQUIRED: 'MAPPED_NOT_OBSERVED',
+      // 50057 and 50055/50144: mapped, never seen.
+      DISABLED_ACCOUNT_ATTEMPT: 'MAPPED_NOT_OBSERVED',
+      CREDENTIAL_CONFIRMED_VALID: 'MAPPED_NOT_OBSERVED',
+    },
+  },
+  {
+    source: 'M365_AUDIT_STS',
+    outcomes: {
+      // InvalidUserNameOrPassword, 65 rows.
+      PASSWORD_REJECTED: 'MAPPED_AND_OBSERVED',
+      // FINDING (2): from Operation, not from a reason name. 1,412 rows.
+      PASSWORD_ACCEPTED_COMPLETED: 'MAPPED_AND_OBSERVED',
+      // IdsLocked, 715 rows — the largest single outcome on either feed.
+      LOCKED_OUT_AFTER_REPEATED_FAILURES: 'MAPPED_AND_OBSERVED',
+      // UserStrongAuthClientAuthNRequiredInterrupt, 13 rows.
+      PASSWORD_ACCEPTED_CHALLENGE_ISSUED: 'MAPPED_AND_OBSERVED',
+      // UserStrongAuthEnrollmentRequiredInterrupt, 3 rows.
+      PASSWORD_ACCEPTED_REGISTRATION_REQUIRED: 'MAPPED_AND_OBSERVED',
+      // UNREACHABLE, not merely unseen: no entry in AUDIT_REASON_NAMES maps to
+      // any of these, so no audit row can produce one however the tenant
+      // behaves. A rule needing one cannot run on this feed, and that is the
+      // statement the INAPPLICABLE path exists to make.
+      PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED: 'UNREACHABLE',
+      BLOCKED_BY_CONTROL: 'UNREACHABLE',
+      DISABLED_ACCOUNT_ATTEMPT: 'UNREACHABLE',
+      CREDENTIAL_CONFIRMED_VALID: 'UNREACHABLE',
+    },
+  },
+];
+
+const BY_FEED: ReadonlyMap<NormalizationSource, FeedOutcomeCapability> = new Map(
+  FEED_CAPABILITIES.map(entry => [entry.source, entry]),
+);
+
+/**
+ * The outcomes a rule may assume this feed can produce.
+ *
+ * MAPPED_NOT_OBSERVED counts as reachable, deliberately: a quiet window is not
+ * an incapable feed, and treating "we have not seen one yet" as "impossible"
+ * would make a rule inapplicable on a tenant that simply had a good month.
+ * Consumers wanting the stronger claim should read FEED_CAPABILITIES and ask
+ * for MAPPED_AND_OBSERVED themselves — the distinction is in the data rather
+ * than left to whoever remembers it.
+ */
+export function reachableOutcomes(source: NormalizationSource): ReadonlySet<EventOutcome> {
+  const entry = BY_FEED.get(source);
+  if (entry === undefined) return new Set();
+  const reachable = new Set<EventOutcome>();
+  for (const [outcome, reachability] of Object.entries(entry.outcomes) as [EventOutcome, OutcomeReachability][]) {
+    if (reachability !== 'UNREACHABLE') reachable.add(outcome);
+  }
+  return reachable;
+}
+
+/** Exactly what it says, for a consumer that needs the stronger claim. */
+export function observedOutcomes(source: NormalizationSource): ReadonlySet<EventOutcome> {
+  const entry = BY_FEED.get(source);
+  if (entry === undefined) return new Set();
+  const observed = new Set<EventOutcome>();
+  for (const [outcome, reachability] of Object.entries(entry.outcomes) as [EventOutcome, OutcomeReachability][]) {
+    if (reachability === 'MAPPED_AND_OBSERVED') observed.add(outcome);
+  }
+  return observed;
+}
 
 /**
  * Microsoft's own assessment of a sign-in, as a CLOSED SET of measured values.

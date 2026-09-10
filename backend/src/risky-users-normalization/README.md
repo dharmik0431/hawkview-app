@@ -1034,3 +1034,118 @@ predicate had been **validated against a distribution that measured the pair**, 
 code read one half of it. The evidence was stronger than the implementation, and the
 `reads:` list did not mention `raw.riskState` — so the gap was visible in the registry all
 along, to anyone comparing the evidence line against the field list.
+
+## Addendum: which feed can supply a rule's whole pattern
+
+The question raised by the inert-detector finding now has machinery behind it, because a
+question alone relies on someone thinking to ask it.
+
+The evaluation core declares the outcomes a rule's logic **reads** — not what it expects to
+find — and a rule whose feed cannot supply one is *replaced with one that reports*
+`INAPPLICABLE`, naming the missing outcomes and the feed. Replaced rather than filtered:
+dropping it would leave the tenant one check short with nothing saying so, which is the
+disappearance this whole repair is about. `INAPPLICABLE` is not a new state — it is the same
+fact as a check needing data the source does not carry, so it narrows the count's scope
+rather than gating the claim.
+
+This layer supplies the other half: `FEED_CAPABILITIES`, `reachableOutcomes(source)` and
+`observedOutcomes(source)`.
+
+### Reachability has three values, not two
+
+| Value | Meaning |
+| --- | --- |
+| `MAPPED_AND_OBSERVED` | a route exists and rows have been measured producing it |
+| `MAPPED_NOT_OBSERVED` | a route exists and nothing has matched it yet |
+| `UNREACHABLE` | no route exists on this feed at all |
+
+Collapsing the middle two would be this module's recurring defect one level up. A rule
+needing a `MAPPED_NOT_OBSERVED` outcome is **applicable** — a quiet window is not an
+incapable feed, and calling it inapplicable would silence a rule on a tenant that had a
+good month. A rule needing an `UNREACHABLE` one cannot fire however the tenant behaves, and
+reporting a clean zero for it is exactly the failure being removed. `reachableOutcomes`
+therefore includes the unobserved; a consumer wanting the stronger claim asks
+`observedOutcomes` — the distinction is in the data rather than left to whoever remembers
+it.
+
+### The table is written out, not derived
+
+A derived set absorbs new members silently: add a mapping for a code and the feed quietly
+gains a capability. That is the `isPostPasswordInterrupt` mistake — an exclusion definition
+enrolling `CREDENTIAL_CONFIRMED_VALID` and lending it a claim no control had established.
+So the table is explicit and a test cross-checks it against `RESULT_CODES`,
+`FAILURE_REASON_MEANINGS` and `AUDIT_REASON_NAMES`. A new mapping is then a test failure
+reading *decide what this does to feed capability*, rather than a silent change of answer.
+
+### Two findings fell out of building it
+
+**The Graph feed has never once observed a post-password interrupt.** 50076, 50072 and
+50079: zero rows, all tenants, all history. The audit feed carries 13
+`UserStrongAuthClientAuthNRequiredInterrupt`, 3 `UserStrongAuthEnrollmentRequiredInterrupt`
+and 4 `PasswordResetRegistrationRequiredInterrupt`. "Password accepted, sign-in did not
+complete" is the basis of the highest-value detector available without Entra ID P2 — and
+its only real evidence is on the feed we treat as the **fallback**. That inverts the
+assumption that Graph is strictly the better source, so it is asserted in a test rather
+than left in prose.
+
+**Deriving audit capability from the reason-name table alone re-creates the original bug.**
+The audit feed's successes come from `Operation` (`UserLoggedIn`, 1,412 rows), where no
+`LogonError` exists at all. A capability set built from `AUDIT_REASON_NAMES` concludes the
+feed has no successes and declares every failures-then-success rule inapplicable there —
+the inert detector, re-created by the machinery built to detect it, and now reported
+confidently instead of silently. A mutation that drops the `Operation` route fails two
+tests.
+
+## Addendum: a registry entry right about the outcome and wrong about the reason
+
+A category no check here could see, because every check looks for wrong **outcomes**.
+
+`raw.signInEventTypes` was filed as a tombstone on its *history* — a predicate on it
+shipped and failed — while its actual defect is that the field is **absent** and nobody
+ever established whether it discriminates. The entry implied we caught the field lying when
+we had only caught ourselves. Requiring `revivedBy` surfaced it, because a revival
+condition is a statement about the *reason*: you cannot write one without naming what you
+actually established, and needing two clauses is the tell.
+
+The same shape then turned up again, in a place a diff found rather than a test.
+`UserLoggedIn` sat in `AUDIT_REASON_NAMES_OBSERVED_UNMAPPED` with a `why` that correctly
+said *artefact, never map it* — while its membership said *we saw this as a reason name and
+chose not to map it*. Measuring the real field settles it: `LogonError` is absent on all
+1,412 of those rows, so the name never appears there at all. It has moved to
+`AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES`, and the observed-unmapped list is now empty —
+a live claim that refills the moment a measurement turns up a name this table lacks.
+
+So the generalisable check: **for each registry entry, is the stated reason the one you
+established, or the one that happens to sit next to the right answer?** The outcome being
+correct is what makes these survive review.
+
+## Addendum: the standing inventory diff
+
+Any time either side gains an entry, diff both tables against a fresh measurement. Two
+minutes, and no test performs it.
+
+The current measured inventory, and the module agrees with all of it:
+
+- **Audit reason names** (`managementActivityRecord.LogonError`, all tenants): `IdsLocked`
+  715, `UnclassifiedAuthenticationError` 558, `InvalidUserNameOrPassword` 65,
+  `UserStrongAuthClientAuthNRequiredInterrupt` 13, `DelegationDoesNotExist` 9,
+  `PasswordResetRegistrationRequiredInterrupt` 4,
+  `UserStrongAuthEnrollmentRequiredInterrupt` 3, `SsoArtifactRevoked` 1,
+  `SsoUserAccountNotFoundInResourceTenant` 1, `InvalidReplyTo` 1, `UserUnauthorized` 1,
+  `MisconfiguredApplicationWithGraphErrorMessage` 1, plus **absent** on the 1,412
+  `UserLoggedIn` successes.
+- **Graph codes**: `50053` 1,479, `0` 1,010, `50126` 107, `65001` 20, `50140` 16, `53003` 5,
+  `50074` 3, `53000` 2, and `16003`/`50011`/`50020`/`70044`/`90094`/`500121` one each.
+
+The diff produced one gap: **`SsoUserAccountNotFoundInResourceTenant`** was landing in
+`UNRECOGNIZED_REASON_NAME`. It is now in the table as `NOT_YET_CITED` — **held, not
+mapped**, and the temptation is worth naming. The name reads like an out-of-tenant
+identity, which would make it a sibling of `UserUnauthorized` and effectively unreachable
+behind subject resolution. That is inference from a name, not a citation, and reading a
+disposition off a plausible-sounding name is the specific mistake this table exists to
+prevent. If the inference is right the entry is unreachable and mapping it changes nothing;
+if it is wrong, mapping it asserts something false.
+
+That is the **third** entry this table has gained from a diff, and none of the three was
+found by a test — which is the argument for the exchange being standing rather than a
+one-off. The Graph side matched exactly: 14 codes measured, 14 declared.

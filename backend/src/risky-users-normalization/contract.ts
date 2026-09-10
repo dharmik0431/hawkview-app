@@ -134,6 +134,35 @@ export function isPostPasswordInterrupt(outcome: EventOutcome): boolean {
 export type SubjectBindingMethod = 'DIRECTORY_OBJECT_ID' | 'NORMALIZED_UPN';
 
 /**
+ * Whether a feed can produce an outcome at all, and whether it ever has.
+ *
+ * TWO CLAIMS, kept apart, because collapsing them is this workstream's
+ * recurring defect in a new place. "No mapping exists on this feed" and
+ * "a mapping exists and no row has matched it" are different facts, and a
+ * consumer deciding whether a rule can run needs the first while a consumer
+ * asking what the data has shown needs the second.
+ */
+export type OutcomeReachability =
+  /**
+   * A mapping exists on this feed AND rows have been measured producing it.
+   */
+  | 'MAPPED_AND_OBSERVED'
+  /**
+   * A mapping exists on this feed and zero rows have been measured producing
+   * it. A rule needing this outcome is APPLICABLE — a quiet window is not an
+   * incapable feed — but a zero result over this evidence says less than the
+   * same zero over an observed outcome.
+   */
+  | 'MAPPED_NOT_OBSERVED'
+  /**
+   * NO route to this outcome exists on this feed. Not rare: impossible. A
+   * rule whose pattern needs it cannot fire here no matter what the tenant
+   * does, and reporting a clean zero for it is the failure this exists to
+   * prevent.
+   */
+  | 'UNREACHABLE';
+
+/**
  * Microsoft's own judgement about a sign-in, as a dimension ORTHOGONAL to
  * classification.
  *

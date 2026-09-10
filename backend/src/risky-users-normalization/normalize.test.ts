@@ -18,6 +18,10 @@ import {
   FAILURE_REASON_MEANINGS,
   disprovedPathsForFeed,
   RISK_DETAIL_VALUES,
+  FEED_CAPABILITIES,
+  reachableOutcomes,
+  observedOutcomes,
+  AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES,
   RESULT_CODES,
   SHAPE_PREDICATES,
   OBSERVED_BUT_UNMAPPED_GRAPH_CODES,
@@ -1309,8 +1313,11 @@ test('an audit reason Microsoft calls unclassified is unknown, and an unlisted o
     kind: 'UNKNOWN',
     observation: 'UNRECOGNIZED_REASON_NAME',
   });
-  assert.deepEqual(AUDIT_REASON_NAMES_OBSERVED_UNMAPPED.map(entry => entry.name), ['UserLoggedIn']);
-  for (const entry of AUDIT_REASON_NAMES_OBSERVED_UNMAPPED) assert.ok(entry.why.length > 40, entry.name);
+  // Filed under NEVER_PROVIDER_VALUES rather than OBSERVED_UNMAPPED: a
+  // measurement of the real LogonError field shows it absent on all 1,412 of
+  // these rows, so it was never observed AS A REASON at all.
+  assert.deepEqual(AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES.map(entry => entry.name), ['UserLoggedIn']);
+  for (const entry of AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES) assert.ok(entry.why.length > 40, entry.name);
 });
 
 test('an audit reason with no exclusion citation is held, not claimed', async () => {
@@ -1845,4 +1852,161 @@ test('a negative claim must say what would overturn it', async () => {
   // another way to be wrong about a claim about a claim.
   const states = new Set(SHAPE_PREDICATES.map(entry => entry.verification.state));
   assert.ok(states.size <= 5, 'more than five verification states');
+});
+
+// ---------------------------------------------------------------------------
+// Which outcomes each feed can supply. The table is explicit so a new mapping
+// cannot enrol a capability silently; these tests are what keeps it honest.
+// ---------------------------------------------------------------------------
+
+test('the feed capability table cannot drift from the mapping tables', () => {
+  // The whole point of writing the table out rather than deriving it is that a
+  // new mapping must be a DECISION rather than a silent gain of capability.
+  // That only holds if something notices the divergence, so: derive the same
+  // answer here and require agreement.
+  const graphMapped = new Set<EventOutcome>();
+  for (const entry of RESULT_CODES) {
+    if (entry.disposition.kind === 'APPLIES') graphMapped.add(entry.disposition.outcome);
+  }
+  // Text meanings are a second route on this feed, and the reason a code's own
+  // disposition is not enough: 50053 is UNKNOWN as a code and reaches two
+  // outcomes through its text.
+  for (const pattern of FAILURE_REASON_MEANINGS) {
+    if (pattern.disposition.kind === 'APPLIES') graphMapped.add(pattern.disposition.outcome);
+  }
+  assert.deepEqual(
+    [...reachableOutcomes('GRAPH_SIGN_INS')].sort(),
+    [...graphMapped].sort(),
+    'a Graph mapping exists that the capability table does not account for, or vice versa',
+  );
+
+  const auditMapped = new Set<EventOutcome>();
+  for (const entry of AUDIT_REASON_NAMES) {
+    if (entry.disposition.kind === 'APPLIES') auditMapped.add(entry.disposition.outcome);
+  }
+  // AND the Operation route, which is NOT in that table. Deriving audit
+  // capability from reason names alone concludes the feed has no successes and
+  // declares every failures-then-success rule inapplicable there — the
+  // original inert-detector bug, re-created by the machinery built to find it.
+  auditMapped.add('PASSWORD_ACCEPTED_COMPLETED');
+  assert.deepEqual(
+    [...reachableOutcomes('M365_AUDIT_STS')].sort(),
+    [...auditMapped].sort(),
+    'the audit capability set disagrees with the reason-name table plus the Operation route',
+  );
+});
+
+test('every outcome has a stated reachability on every feed, with no default', () => {
+  // A missing entry would read as UNREACHABLE to anything iterating, which is
+  // the wrong direction to fail in: it would silently declare a rule
+  // inapplicable rather than run it.
+  assert.equal(FEED_CAPABILITIES.length, 2);
+  const outcomes: EventOutcome[] = [
+    'PASSWORD_REJECTED',
+    'PASSWORD_ACCEPTED_COMPLETED',
+    'PASSWORD_ACCEPTED_CHALLENGE_ISSUED',
+    'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED',
+    'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED',
+    'BLOCKED_BY_CONTROL',
+    'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+    'DISABLED_ACCOUNT_ATTEMPT',
+    'CREDENTIAL_CONFIRMED_VALID',
+  ];
+  for (const entry of FEED_CAPABILITIES) {
+    for (const outcome of outcomes) {
+      assert.ok(
+        entry.outcomes[outcome] !== undefined,
+        `${entry.source} states nothing about ${outcome}`,
+      );
+    }
+    // And the record is exhaustive in the other direction too, so a new
+    // EventOutcome member is a compile error here rather than a silent gap.
+    assert.deepEqual(Object.keys(entry.outcomes).sort(), [...outcomes].sort(), entry.source);
+  }
+});
+
+test('unreachable and unobserved are different claims, and the pair is not summable', () => {
+  // "No route exists" and "a route exists and nothing has matched it" are the
+  // same collapse this module exists to prevent, one level up: a rule needing
+  // an unobserved outcome is APPLICABLE, and one needing an unreachable
+  // outcome cannot run at all.
+  const graphReachable = reachableOutcomes('GRAPH_SIGN_INS');
+  const graphObserved = observedOutcomes('GRAPH_SIGN_INS');
+  for (const outcome of graphObserved) {
+    assert.ok(graphReachable.has(outcome), `${outcome} is observed but not reachable, which is incoherent`);
+  }
+  // A quiet window is not an incapable feed, so these are reachable.
+  assert.equal(graphReachable.has('PASSWORD_ACCEPTED_CHALLENGE_ISSUED'), true);
+  assert.equal(graphObserved.has('PASSWORD_ACCEPTED_CHALLENGE_ISSUED'), false);
+
+  // THE FINDING THIS ENCODES. The Graph feed has never once observed a
+  // post-password interrupt — 50076, 50072 and 50079 are zero rows in all
+  // history — while the audit feed carries 16 of them. "Password accepted,
+  // sign-in did not complete" is the basis of the highest-value detector
+  // available without Entra ID P2, and its only real evidence is on the feed
+  // treated as the fallback. That inverts the assumption that Graph is
+  // strictly the better source, so it is asserted rather than left in prose.
+  assert.equal(observedOutcomes('M365_AUDIT_STS').has('PASSWORD_ACCEPTED_CHALLENGE_ISSUED'), true);
+  assert.equal(observedOutcomes('M365_AUDIT_STS').has('PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'), true);
+});
+
+test('a rule needing both halves of a pattern can run on either feed', async () => {
+  // HV-ID-AUTH-005 reads invalid credentials followed by a verified success.
+  // Before Operation was read for the audit outcome, that feed supplied only
+  // the first half — not a low match rate, structurally zero — so the rule was
+  // inert on exactly the tenants without P1, the customers our own detection
+  // exists for. This asserts the capability rather than the row count.
+  for (const source of ['GRAPH_SIGN_INS', 'M365_AUDIT_STS'] as const) {
+    const reachable = reachableOutcomes(source);
+    assert.equal(reachable.has('PASSWORD_REJECTED'), true, source);
+    assert.equal(reachable.has('PASSWORD_ACCEPTED_COMPLETED'), true, source);
+  }
+  // And the audit half is real rather than declared: Operation produces it.
+  const batch = await run([auditRow({ ErrorCode: undefined, Operation: 'UserLoggedIn' })], {
+    source: 'M365_AUDIT_STS',
+  });
+  assert.deepEqual(only(batch).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
+});
+
+test('the measured reason-name inventory is fully mapped, and artefacts are filed apart', async () => {
+  // Every name in the measured LogonError inventory. SsoUserAccountNotFound-
+  // InResourceTenant was landing in UNRECOGNIZED_REASON_NAME until a table
+  // diff turned it up — the third entry this table gained that way, and none
+  // of the three was found by a test.
+  for (const name of [
+    'IdsLocked',
+    'UnclassifiedAuthenticationError',
+    'InvalidUserNameOrPassword',
+    'UserStrongAuthClientAuthNRequiredInterrupt',
+    'DelegationDoesNotExist',
+    'PasswordResetRegistrationRequiredInterrupt',
+    'UserStrongAuthEnrollmentRequiredInterrupt',
+    'SsoArtifactRevoked',
+    'SsoUserAccountNotFoundInResourceTenant',
+    'InvalidReplyTo',
+    'UserUnauthorized',
+    'MisconfiguredApplicationWithGraphErrorMessage',
+  ]) {
+    assert.ok(auditReasonEntry(name) !== undefined, `${name} is measured in production and unmapped`);
+  }
+  assert.deepEqual([...AUDIT_REASON_NAMES_OBSERVED_UNMAPPED], []);
+
+  // UserLoggedIn is in a SEPARATE list, and the separation is the point. It
+  // sat among the observed-unmapped names with a `why` that correctly said
+  // "artefact, never map it" while its membership said "we saw this as a
+  // reason and chose not to map it". Right about the outcome, wrong about the
+  // reason — a category every check here was blind to, since all of them look
+  // for wrong outcomes. LogonError is absent on all 1,412 of those rows.
+  assert.deepEqual(AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES.map(entry => entry.name), ['UserLoggedIn']);
+  for (const entry of AUDIT_REASON_NAMES_NEVER_PROVIDER_VALUES) {
+    assert.equal(auditReasonEntry(entry.name), undefined, `${entry.name} must never be mapped`);
+  }
+  // And it still classifies as a reason nobody should read, not as a success.
+  const batch = await run([auditRow({ ErrorCode: undefined, LogonError: 'UserLoggedIn' })], {
+    source: 'M365_AUDIT_STS',
+  });
+  assert.deepEqual(only(batch).classification, {
+    kind: 'UNKNOWN',
+    observation: 'UNRECOGNIZED_REASON_NAME',
+  });
 });
