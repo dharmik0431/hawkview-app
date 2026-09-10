@@ -17,7 +17,7 @@ const accuse = (id: string): Finding => ({
 })
 const det = (id: string, fires: (e: readonly Ev[]) => boolean): Detector<Ev> => ({
   id, monotonic: true, // deliberately mis-declared for every shape
-  run: (applicable): DetectorResult => ({ status: 'RAN', considered: applicable.length, findings: fires(applicable) ? [accuse(id)] : [] }),
+  run: (applicable): DetectorResult => ({ status: 'RAN', assessed: applicable.length, findings: fires(applicable) ? [accuse(id)] : [] }),
 })
 
 // Oldest -> newest. Keep-newest truncation drops from the FRONT.

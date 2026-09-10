@@ -24,7 +24,7 @@ const windowDerived: Detector<Ev> = { id: 'window-derived', monotonic: true,
     const seen = new Set<string>(); const novel: string[] = []
     for (const e of applicable) { if (!seen.has(e.ip)) novel.push(e.ip); seen.add(e.ip) }
     // Fires when the FIRST event of the window introduces an IP -- i.e. no history.
-    return { status: 'RAN', considered: applicable.length,
+    return { status: 'RAN', assessed: applicable.length,
       findings: applicable.length > 0 && novel.length > 0 && applicable.length < 3 ? [accuse('window-derived')] : [] }
   } }
 
@@ -32,7 +32,7 @@ const windowDerived: Detector<Ev> = { id: 'window-derived', monotonic: true,
 // that truncation cannot reach.
 const baseline = new Set(['10.0.0.1'])
 const baselineBacked: Detector<Ev> = { id: 'baseline-backed', monotonic: true,
-  run: (applicable): DetectorResult => ({ status: 'RAN', considered: applicable.length,
+  run: (applicable): DetectorResult => ({ status: 'RAN', assessed: applicable.length,
     findings: applicable.some(e => !baseline.has(e.ip)) ? [accuse('baseline-backed')] : [] }) }
 
 const run = (d: Detector<Ev>, maxEvents: number) => evaluate({

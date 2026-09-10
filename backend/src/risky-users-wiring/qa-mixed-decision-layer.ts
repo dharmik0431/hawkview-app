@@ -25,7 +25,7 @@ const rows = [...Array.from({ length: 4 }, (_, i) => row(i, true)),
               ...Array.from({ length: 8 }, (_, i) => row(100 + i, false))]
 
 const silent: Detector<NormalizedEvent> = { id: 'silent', monotonic: true,
-  run: applicable => ({ status: 'RAN', considered: applicable.length, declined: {}, findings: [] }) }
+  run: applicable => ({ status: 'RAN', assessed: applicable.length, declined: {}, findings: [] }) }
 
 const batch = await normalizeSignInBatch({ scope, source: 'GRAPH_SIGN_INS', rows,
   directory: [{ organizationId: scope.organizationId, customerTenantId: scope.customerTenantId,
@@ -33,7 +33,11 @@ const batch = await normalizeSignInBatch({ scope, source: 'GRAPH_SIGN_INS', rows
   reference: async () => 'subject-ref', collectionScope: 'GRAPH_INTERACTIVE_ONLY' })
 
 const a = assessTenant({
-  streams: [{ stream: 'sign-ins', batch, scope: { declared: true, asked: 'GRAPH_INTERACTIVE_ONLY' }, detectors: [silent] }],
+  // rowsFetched is the count from OUTSIDE the batch. Passing rows.length rather
+  // than a batch-derived total keeps assertAccountsForEveryRow able to fail: a
+  // number the batch computed about itself can never contradict the batch.
+  streams: [{ stream: 'sign-ins', collection: 'READ', batch, rowsFetched: rows.length,
+    scope: { declared: true, asked: 'GRAPH_INTERACTIVE_ONLY' }, detectors: [silent] }],
   budget: { maxEvents: 5000 },
 })
 
