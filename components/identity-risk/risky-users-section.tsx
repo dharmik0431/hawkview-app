@@ -73,7 +73,7 @@ function MicrosoftChannelPanel({
     <section
       aria-labelledby="microsoft-channel-heading"
       className={cn(
-        'rounded-xl border p-4',
+        'rounded-xl border p-5 shadow-2xs',
         reporting
           ? 'border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900'
           : 'border-slate-300 bg-slate-50 dark:border-slate-700 dark:bg-slate-900/60'
@@ -501,7 +501,7 @@ function UserRows({
  */
 function Coverage({ assessment }: { assessment: RiskAssessment }) {
   return (
-    <details className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+    <details className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900">
       <summary className="cursor-pointer text-sm font-semibold text-slate-900 dark:text-slate-50">
         What HawkView checked, and how current the evidence is
       </summary>
@@ -620,7 +620,7 @@ function CountSummary({ count }: { count: RiskyUserCount }) {
   return (
     <section
       aria-labelledby="risky-users-total-heading"
-      className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900"
+      className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900"
     >
       <div className="flex flex-wrap items-baseline justify-between gap-3">
         <h2
@@ -745,7 +745,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
       </header>
 
       {loading ? (
-        <p className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
+        <p className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600 shadow-2xs dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
           Loading the current assessment…
         </p>
       ) : (
@@ -779,7 +779,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
 
           <section
             aria-labelledby="risky-users-list-heading"
-            className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900"
+            className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900"
           >
             <h2
               id="risky-users-list-heading"
@@ -810,7 +810,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
           {list.context.length > 0 && (
             <section
               aria-labelledby="risky-users-context-heading"
-              className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900"
+              className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900"
             >
               <h2
                 id="risky-users-context-heading"
