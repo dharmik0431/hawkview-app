@@ -1790,3 +1790,71 @@ test('the kind comes off the value even when the name suggests otherwise', () =>
     'the kind was inferred from the signal name rather than read from the value'
   )
 })
+
+test('a page of a list is never presented as the list', () => {
+  // The count counts the tenant; the rows are what this response returned.
+  // Both true, and a reader who counts the rows and compares gets a different
+  // answer with nothing on screen to reconcile them. Eight people go missing
+  // and the page reads as though they were cleared.
+  //
+  // Reachable at scale rather than in principle: a tenant with nine findings
+  // returns a first page, and the collector fix means tenants that reported
+  // none now report nine.
+  const paged = () => {
+    const value = assessmentFixture(true)
+    value.summary.currentUsers = { value: 9, accuracy: 'EXACT' }
+    value.rules[0].assessedIdentities = 12
+    value.rules[0].matchedIdentities = 9
+    value.page = { hasMore: true, nextCursor: 'abc123.def456' }
+    return value
+  }
+  const { document, cardText } = render(paged())
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? ''
+
+  assert.match(list, /part of the list, not all of it/)
+  assert.match(list, /have not been checked and cleared/)
+  // The card travels alone, so it carries the fact too.
+  assert.match(cardText, /longer than what came back with it/)
+
+  // Arithmetic alone is enough, without the server saying so. A response that
+  // sets one signal and not the other is still a list that does not account
+  // for its own number.
+  const noFlag = paged()
+  noFlag.page = { hasMore: false, nextCursor: null }
+  const arithmetic = render(noFlag)
+  assert.match(
+    arithmetic.document.querySelector(
+      '[aria-labelledby="risky-users-list-heading"]'
+    )?.textContent ?? '',
+    /part of the list, not all of it/
+  )
+
+  // Control: a complete list says none of this. Without this half the guard
+  // passes just as well if the notice is always on, which is a warning a
+  // technician learns to skim past.
+  const complete = render(assessmentFixture(true))
+  assert.ok(
+    !/part of the list, not all of it/.test(complete.text),
+    'the partial notice fired on a list that was complete'
+  )
+  assert.ok(
+    !/longer than what came back with it/.test(complete.cardText),
+    'the partial notice fired on a list that was complete'
+  )
+
+  // And the two gaps stay distinct: nothing delivered is not the same as some
+  // delivered, and each has its own sentence.
+  const none = assessmentFixture(false)
+  none.users = []
+  none.summary.currentUsers = { value: 4, accuracy: 'EXACT' }
+  none.rules[0].assessedIdentities = 12
+  none.rules[0].matchedIdentities = 4
+  const undelivered = render(none)
+  assert.match(undelivered.text, /gap in what this response delivered/)
+  assert.ok(
+    !/part of the list, not all of it/.test(undelivered.text),
+    'an empty list borrowed the partial-list wording'
+  )
+})

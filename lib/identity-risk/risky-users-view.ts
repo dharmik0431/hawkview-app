@@ -833,14 +833,22 @@ export type RiskyUserCount = {
   accuracy: RiskyUserCountAccuracy
   value: number | null
   /**
-   * The count asserts users with current findings and none arrived.
+   * Whether the list below accounts for the number above.
    *
-   * A gap in what the response delivered, never a statement about the tenant.
-   * The list must not fall through to "no user is listed as needing attention"
-   * here: that sentence points the reader up to a summary confidently stating a
-   * number, so the pointer deepens the contradiction rather than resolving it.
+   * NONE_DELIVERED -- the count asserts users and no row arrived.
+   * PARTIAL        -- rows arrived, but fewer than the count, or the server
+   *                   said there are more pages.
+   * COMPLETE       -- the rows are the whole of what the count counted.
+   *
+   * One field rather than two booleans, because these are three values of one
+   * fact and a surface that reads two flags can render a combination that
+   * cannot occur. Both gaps are gaps in what the response delivered and never
+   * statements about the tenant: the list must not fall through to "no user is
+   * listed as needing attention", which points the reader up at a summary
+   * confidently stating a number and so deepens the contradiction rather than
+   * resolving it.
    */
-  findingsUndelivered: boolean
+  listCoverage: 'COMPLETE' | 'PARTIAL' | 'NONE_DELIVERED'
   /**
    * What the tile prints. Never a dash and never a blank when there is no
    * number: a dash reads as zero to anyone who has used a dashboard, which is
@@ -1043,13 +1051,25 @@ export function riskyUserCount(input: RiskyUserCountInput): RiskyUserCount {
   const delivered = input.assessment
     ? currentRiskAssessmentUsers(input.assessment).length
     : 0
+  const counted =
+    (count.accuracy === 'EXACT' || count.accuracy === 'AT_LEAST') &&
+    count.value !== null &&
+    count.value > 0
+  // hasMore is the server saying so; a count above the rows is the arithmetic
+  // saying so. Either alone is enough, because a response that sets one and not
+  // the other is still a list that does not account for its own number.
+  const moreExist = Boolean(
+    input.assessment?.page?.hasMore ||
+    (counted && count.value !== null && count.value > delivered)
+  )
   return {
     ...count,
-    findingsUndelivered:
-      (count.accuracy === 'EXACT' || count.accuracy === 'AT_LEAST') &&
-      count.value !== null &&
-      count.value > 0 &&
-      delivered === 0,
+    listCoverage:
+      counted && delivered === 0
+        ? 'NONE_DELIVERED'
+        : moreExist && delivered > 0
+          ? 'PARTIAL'
+          : 'COMPLETE',
   }
 }
 
@@ -1058,7 +1078,7 @@ function riskyUserCountFrom({
   channel,
   requestFailed = false,
   contractFailed = false,
-}: RiskyUserCountInput): Omit<RiskyUserCount, 'findingsUndelivered'> {
+}: RiskyUserCountInput): Omit<RiskyUserCount, 'listCoverage'> {
   const gaps = coverageGaps(assessment, channel)
   const known = knownDespiteNoCount(assessment)
 

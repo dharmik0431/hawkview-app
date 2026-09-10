@@ -511,7 +511,10 @@ function UserRows({
                 </p>
                 <ul className="mt-1.5 space-y-1">
                   {row.reasons.map((reason) => (
-                    <ReasonLine key={reason.signal ?? reason.title} reason={reason} />
+                    <ReasonLine
+                      key={reason.signal ?? reason.title}
+                      reason={reason}
+                    />
                   ))}
                 </ul>
               </td>
@@ -630,6 +633,30 @@ function Coverage({ assessment }: { assessment: RiskAssessment }) {
  * attributed to people, the same sentence would quietly answer the question the
  * count just refused to answer.
  */
+/**
+ * When the rows on screen are only part of what the number counted.
+ *
+ * A page of a list is a true list and a tenant total is a true number, and a
+ * reader who counts the rows and compares gets a different answer with nothing
+ * on screen to reconcile them. The missing users have not been cleared, they
+ * have not been shown.
+ *
+ * This became reachable at scale rather than in principle once the collector
+ * fix surfaced findings on tenants that had been reporting none: a first page
+ * is what a tenant with nine findings returns.
+ */
+function PartialUserList({ count }: { count: RiskyUserCount }) {
+  if (count.listCoverage !== 'PARTIAL') return null
+  return (
+    <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm leading-relaxed text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+      These rows are part of the list, not all of it. The number above counts
+      the tenant; what is shown here is what this response returned. Users not
+      on screen have not been checked and cleared &mdash; they have not been
+      shown.
+    </p>
+  )
+}
+
 function EmptyUserList({ count }: { count: RiskyUserCount }) {
   // "No user needs attention" is only true when HawkView both counted and
   // found nothing. Beside a withheld count, or beside a zero that counts people
@@ -648,23 +675,24 @@ function EmptyUserList({ count }: { count: RiskyUserCount }) {
   // sentence it would otherwise fall through to is worse than merely wrong: it
   // points the reader up to a summary that confidently says four, so the
   // pointer deepens the contradiction instead of resolving it.
-  const copy = count.findingsUndelivered
-    ? 'The count above reports ' +
-      (count.accuracy === 'AT_LEAST' ? 'at least ' : '') +
-      count.value!.toLocaleString() +
-      (count.value === 1
-        ? ' user with a current finding, but no per-user finding came back with it.'
-        : ' users with current findings, but no per-user finding came back with it.') +
-      ' That is a gap in what this response delivered, not a finding that nobody needs attention. Do not read this as an all-clear.'
-    : count.accuracy === 'WITHHELD'
-      ? count.known.length > 0
-        ? 'No finding could be attributed to a specific user, so no user is listed here. That is not the same as no user needing attention — what HawkView did find is listed above and below.'
-        : 'HawkView is not stating a number of users for this tenant, and no finding has been attributed to a specific user. Read this as an open question rather than an all-clear.'
-      : count.accuracy === 'UNAVAILABLE'
-        ? 'No current list can be shown. This is not an empty result, and nothing here has been checked and cleared.'
-        : count.known.length > 0
-          ? 'No finding was tied to a specific user, so no user is listed here. HawkView did find evidence on this tenant — it is listed above and below, and it is not an all-clear.'
-          : 'No user is listed as needing attention right now. The summary above states what that is based on and what it does not cover.'
+  const copy =
+    count.listCoverage === 'NONE_DELIVERED'
+      ? 'The count above reports ' +
+        (count.accuracy === 'AT_LEAST' ? 'at least ' : '') +
+        count.value!.toLocaleString() +
+        (count.value === 1
+          ? ' user with a current finding, but no per-user finding came back with it.'
+          : ' users with current findings, but no per-user finding came back with it.') +
+        ' That is a gap in what this response delivered, not a finding that nobody needs attention. Do not read this as an all-clear.'
+      : count.accuracy === 'WITHHELD'
+        ? count.known.length > 0
+          ? 'No finding could be attributed to a specific user, so no user is listed here. That is not the same as no user needing attention — what HawkView did find is listed above and below.'
+          : 'HawkView is not stating a number of users for this tenant, and no finding has been attributed to a specific user. Read this as an open question rather than an all-clear.'
+        : count.accuracy === 'UNAVAILABLE'
+          ? 'No current list can be shown. This is not an empty result, and nothing here has been checked and cleared.'
+          : count.known.length > 0
+            ? 'No finding was tied to a specific user, so no user is listed here. HawkView did find evidence on this tenant — it is listed above and below, and it is not an all-clear.'
+            : 'No user is listed as needing attention right now. The summary above states what that is based on and what it does not cover.'
   return (
     <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
       {copy}
@@ -878,6 +906,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                   onOpen={(row) => setSelectedId(row.id)}
                   caption="Users with a current HawkView finding"
                 />
+                <PartialUserList count={count} />
               </div>
             ) : (
               <EmptyUserList count={count} />
