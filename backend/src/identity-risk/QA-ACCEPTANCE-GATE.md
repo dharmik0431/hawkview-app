@@ -299,3 +299,36 @@ and `qa-reader-lane-contention.database-integration.test.ts` targeted
 `qa-security-events-never-zero.database-integration.test.ts` was NOT deleted.
 It is the only thing here that tests the path a customer actually reaches, and
 it is the only thing here that still fails.
+
+### Added: `qa-probe-signal-truthfulness.ts`
+
+Two claims the per-signal contract makes that nothing else here checked.
+
+**`capped`.** Over budget, `evaluate` truncates to the most recent slice before
+any detector sees it, so every count from that window is a floor. Pool of 40,
+budget 10: every signal comes back `capped: true` and the claim is `AT_LEAST`,
+not `EXACT`. The same detector over the whole window is `capped: false` and
+`EXACT`.
+
+**Evaluated-and-none vs never-evaluated.** `latest: null` means the signal was
+evaluated and none occurred; a signal absent from the array was never
+evaluated. A core that dropped zero-count signals would collapse the two while
+every count stayed correct. It does not: the zero-count signal survives and the
+absent one stays absent.
+
+Both verified by mutating the product source and restoring it:
+
+| Mutation to `evaluate.ts` | Result |
+| --- | --- |
+| `cappedWhenTruncated(finding, false)` | capped check FAILS, other check unaffected |
+| drop signals with `count === 0` | looked-vs-didn't check FAILS, capped check unaffected |
+
+Each mutation fails the check that should catch it and no others, so neither
+PASS is a check that cannot fail.
+
+One thing checked and found sound rather than defective: `capped` is stamped
+from the `evaluate` budget alone, so a count truncated further upstream would
+carry `capped: false`. In this path it cannot happen — `read-tenant.ts` puts no
+`take` on the query, `rowsFetched` is the true fetched count, and
+`assertAccountsForEveryRow` holds it against the classifier. Worth re-checking
+if a query limit is ever added.
