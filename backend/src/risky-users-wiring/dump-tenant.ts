@@ -1,6 +1,7 @@
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 import { readTenantAssessment } from './read-tenant.js'
+import { credentialFailureDetector } from './detectors/credential-failure.js'
 import { withheldExplanations } from '../evaluation-core/evaluate.js'
 import type { CollectionScope } from '../risky-users-normalization/reasons.js'
 import type { NormalizationSource } from '../risky-users-normalization/contract.js'
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
       organizationId,
       customerTenantId,
       source,
+      detectors: [credentialFailureDetector({ rejectionThreshold: Number(arg('threshold') ?? '5') })],
       collectionScope: (source === 'GRAPH_SIGN_INS' ? 'GRAPH_INTERACTIVE_ONLY' : 'AUDIT_STS_LOGON_EVENTS') as CollectionScope,
       // Asserted rather than read, and printed as such: the sync-state read is
       // the next piece. Passing SUCCESS here means "assume it was collected",

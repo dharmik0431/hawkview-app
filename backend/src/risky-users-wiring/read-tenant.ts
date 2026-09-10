@@ -1,7 +1,7 @@
 import { PrismaClient } from '../generated/prisma/client.js'
 import { normalizeSignInBatch } from '../risky-users-normalization/index.js'
 import { assessTenant, type ClassifiedStream } from './assess-tenant.js'
-import { capabilityOf } from './feed-capability.js'
+import { bindToFeed, capabilityOf, type FeedBoundDetector } from './feed-capability.js'
 import { evidenceFromSync } from './evidence-availability.js'
 import type { NormalizationSource } from '../risky-users-normalization/contract.js'
 import type { CollectionScope as ClassifierCollectionScope } from '../risky-users-normalization/reasons.js'
@@ -28,6 +28,9 @@ export type ReadTenantInput = Readonly<{
    * be the defect the whole four-state vocabulary exists to prevent: an empty
    * window and an uncollected one look identical in the rows. */
   syncStatus: CollectorSyncStatus
+  /** Bound to the feed inside, so a caller cannot hand over a rule the feed
+   * cannot support without that being reported. */
+  detectors: readonly FeedBoundDetector[]
   windowStart: Date
   windowEnd: Date
   maxEvents: number
@@ -117,7 +120,15 @@ export async function readTenantAssessment(
     // Pseudonymous by default. The real reader resolves subject refs through the
     // pseudonym service; this keeps a raw directory id out of the assessment
     // while the shape is being proven.
-    reference: async (microsoftUserId: string) => `subject:${microsoftUserId}`,
+    //
+    // TAKES TWO ARGUMENTS. An earlier version took one and named it
+    // microsoftUserId, so it received 'subject' and returned the SAME ref for
+    // every user — 2046 events collapsing to one subject and a count of 1 for a
+    // tenant with several affected accounts. TypeScript permits a shorter
+    // function where a longer one is expected, so nothing complained, coverage
+    // was perfect, and the sum invariant held. Every guard passed because none
+    // of them checks identity resolution.
+    reference: async (kind: 'subject' | 'application', identifier: string) => kind + ':' + identifier,
     collectionScope: input.collectionScope,
   })
 
@@ -126,15 +137,11 @@ export async function readTenantAssessment(
     collection: 'READ',
     batch,
     scope: { declared: true, asked: input.collectionScope },
-    // No detectors yet. That is deliberate for this step: it proves the rows
-    // reach the engine and what the engine says about coverage, without a
-    // detector's findings standing in for whether the pipeline works.
-    detectors: [],
+    // Bound to the feed rather than handed over raw: a rule whose feed cannot
+    // supply its pattern reports INAPPLICABLE instead of running and finding
+    // nothing, which would be indistinguishable from a clean tenant.
+    detectors: input.detectors.map(bound => bindToFeed(bound, capabilityOf(input.source))),
   }
-
-  // Capability is available and unused until there are detectors to bind. Named
-  // here so the next person sees where it attaches rather than reinventing it.
-  void capabilityOf(input.source)
 
   return {
     assessment: assessTenant({ streams: [stream], budget: { maxEvents: input.maxEvents } }),

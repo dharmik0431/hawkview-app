@@ -49,3 +49,58 @@ the engine and the engine declined to guess.
 
 The next run binds a detector. That is when a zero would mean something, and
 when PM's "a zero for greentech is a failure of the rebuild" starts to apply.
+
+---
+
+# Second run — detector bound
+
+**Run 2026-09-10, same 30-day window. The table is live and grew between runs
+(2046 → 2048 in-scope), which is itself a reason every figure carries an as-of.**
+
+## Result
+
+```
+reading    CLASSIFIER RAN: every fetched row is accounted for
+applies    2048
+detector   repeated-credential-failure
+           considered 540, declined { NOT_A_CREDENTIAL_FAILURE_OUTCOME: 1508 }
+           540 + 1508 = 2048 exactly
+matched    4
+count      AT_LEAST 4
+claim      withheld: UNINTERPRETED_EVENTS
+findings   4
+```
+
+**Independently verified in SQL, not by asking the detector twice:** 3 users
+carry a lockout, 1 more has ≥5 rejections, 4 should be flagged. The detector
+found 4.
+
+`AT_LEAST` rather than `EXACT` because one event in the window carries an
+unrecognised code. Four users are certainly affected; whether a fifth is hides
+behind that one event, and the count says so instead of rounding.
+
+## THE DEFECT THIS RUN FOUND, WHICH IS THE MORE IMPORTANT RESULT
+
+The first pass with the detector reported **1 finding**. SQL said 3 users had
+lockouts. The detector was under-reporting by a factor of three.
+
+Cause: `ReferenceResolver` takes TWO arguments, `(kind, identifier)`. Mine took
+one and named it `microsoftUserId`, so it received `'subject'` and returned the
+same reference for every user. All 2046 events collapsed to ONE subject.
+
+TypeScript permits a shorter function where a longer one is expected, so
+nothing complained. And every guard built over the preceding day PASSED:
+
+- the classifier accounted for every row
+- the detector's sum invariant balanced exactly
+- coverage was complete, unprocessable was zero
+- the verdict line correctly said CLASSIFIER RAN
+
+**All of it was true. The number was still wrong.** Not one of those checks
+looks at identity resolution, so a tenant with four affected accounts would
+have been reported as one — a confident, well-qualified, wrong answer, which is
+the exact failure this rebuild exists to prevent, arriving through the wiring
+rather than the engine.
+
+It was caught only by checking the output against the database independently.
+No amount of internal consistency would have surfaced it.
