@@ -845,6 +845,12 @@ model IdentityRiskEvaluationRun {
   /// recorded zero. Deliberately has no default: a default would convert every
   /// pre-existing row into "assessed nothing, found nothing", permanently.
   evaluationCoverage Json?         @map("evaluation_coverage") @db.JsonB
+  /// The findings a run produced, with each signal's own count, recency and
+  /// ceiling. NULL means no findings record was written — never the same as a
+  /// run that recorded an empty list. Deliberately has no default, for the same
+  /// reason as evaluationCoverage: a default would convert every pre-existing
+  /// row into "this run found nothing", permanently and undetectably.
+  evaluationFindings Json?         @map("evaluation_findings") @db.JsonB
   alertDeliveryDisabled Boolean    @default(false) @map("alert_delivery_disabled")
   failureCode       String?        @map("failure_code") @db.VarChar(80)
   leaseToken        String?        @map("lease_token") @db.Uuid

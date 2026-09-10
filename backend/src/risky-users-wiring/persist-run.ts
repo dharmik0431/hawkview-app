@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { encodeRunCoverage } from './run-coverage.js'
+import { encodeRunFindings } from './run-findings.js'
 import type { TenantAssessment } from '../evaluation-core/compose.js'
 
 /** Writing a run this engine produced, into a table the old engine owns.
@@ -118,6 +119,11 @@ export async function persistRun(
       // The claim, the count and the coverage all live in `evaluationCoverage`,
       // where they carry their own qualifications.
       evaluationCoverage: encodeRunCoverage(assessment),
+      // Beside the coverage rather than in the old engine's tables: those
+      // require severity, confidence and coverage as NOT NULL strings that
+      // this engine does not compute. A nullable column has nothing to
+      // satisfy, so there is nothing to fabricate.
+      evaluationFindings: encodeRunFindings(assessment),
       expiresAt: input.expiresAt,
       completedAt: input.completedAt,
     },
