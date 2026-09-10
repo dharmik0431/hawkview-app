@@ -141,6 +141,31 @@ function auditRow(record: Record<string, unknown> = {}, overrides: Partial<SignI
         UserId: 'ann@example.com',
         ApplicationId: APP_ID,
         ClientIP: '203.0.113.10',
+        // KNOWN DEFECT, PARKED DELIBERATELY — READ THIS BEFORE ADDING AN
+        // AUDIT-PATH DETECTOR OR CHANGING AUDIT CLASSIFICATION.
+        //
+        // This field does not exist in production. `audit.result-code-vocabulary`
+        // is HYPOTHESIS_SUBJECT_ABSENT: neither LoginStatus nor ErrorCode appears
+        // anywhere in the audit records, at top level or in ExtendedProperties.
+        // So nearly every audit test below is handed corroboration Microsoft
+        // never supplies, and the reason-name-only path — which is 100% of real
+        // rows — is exercised only where a test passes `ErrorCode: undefined`.
+        //
+        // It is the same defect as the CreationTime designator above, one field
+        // over: a fixture richer than reality. It is parked rather than fixed
+        // for one reason only — unlike the timestamp, it hides no production
+        // failure, because the reason-name path is separately tested and the
+        // measured LogonError inventory confirms it classifies.
+        //
+        // MEASURED COST OF THE FIX, so the next person does not have to redo it:
+        // removing this and defaulting `LogonError: 'InvalidUserNameOrPassword'`
+        // instead breaks SIX tests — the ones that deliberately probe an absent
+        // reason name or the code-only path, which cannot probe it once the
+        // default supplies one. That is a fixture rework, not a one-line change.
+        //
+        // THE TRIGGER: the moment audit classification changes or an audit-path
+        // detector is added, a test passing on corroboration production does not
+        // send stops being harmless. Fix it then, and expect to re-key those six.
         ErrorCode: '50126',
         ...record,
       },
