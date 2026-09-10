@@ -1523,3 +1523,52 @@ test('an exact zero over a population never examined is not a clean tenant', () 
     'the unexamined-tenant gate fired on a tenant that was examined'
   )
 })
+
+test('a count with no findings behind it is a gap, never an all-clear', () => {
+  // The first shape a real assessment will take. The read path can serve
+  // coverage, count and claim while findings have nowhere to persist, so a
+  // response that states four users and carries no finding is not a defensive
+  // branch — it is the state the wire produces on its first day.
+  //
+  // Each component on its own sees something coherent: the tile a number, the
+  // list an emptiness. The contradiction lives only in the pair, and the
+  // sentence the list used to fall through to made it worse by pointing the
+  // reader up at the summary — which confidently says four.
+  const value = assessmentFixture(false)
+  value.users = []
+  value.summary.currentUsers = { value: 4, accuracy: 'EXACT' }
+  value.rules[0].assessedIdentities = 12
+  value.rules[0].matchedIdentities = 4
+  const { document, cardText } = render(value)
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? ''
+
+  assert.match(list, /reports 4 users with current findings/)
+  assert.match(list, /gap in what this response delivered/)
+  assert.ok(
+    !/No user is listed as needing attention/.test(list),
+    'a number of users was rendered beside a sentence saying none need attention'
+  )
+
+  // The card carries the whole claim on its own, because it is often the only
+  // Risky Users surface a technician sees.
+  assert.match(cardText, /did not come back with it/)
+  assert.ok(
+    !/No user is listed as needing attention/.test(cardText),
+    'the standalone card left the contradiction to the section'
+  )
+
+  // Control: a count with its findings behind it says none of this. Without
+  // this half the guard would pass just as well if the disclosure were always
+  // on, which is a warning a technician learns to skim.
+  const delivered = render(assessmentFixture(true))
+  assert.ok(
+    !/did not come back with it/.test(delivered.cardText),
+    'the disclosure fired on a response that delivered its findings'
+  )
+  assert.ok(
+    !/gap in what this response delivered/.test(delivered.text),
+    'the disclosure fired on a response that delivered its findings'
+  )
+})

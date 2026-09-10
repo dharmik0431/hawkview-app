@@ -787,6 +787,15 @@ export type RiskyUserCount = {
   accuracy: RiskyUserCountAccuracy
   value: number | null
   /**
+   * The count asserts users with current findings and none arrived.
+   *
+   * A gap in what the response delivered, never a statement about the tenant.
+   * The list must not fall through to "no user is listed as needing attention"
+   * here: that sentence points the reader up to a summary confidently stating a
+   * number, so the pointer deepens the contradiction rather than resolving it.
+   */
+  findingsUndelivered: boolean
+  /**
    * What the tile prints. Never a dash and never a blank when there is no
    * number: a dash reads as zero to anyone who has used a dashboard, which is
    * exactly the reading these states exist to prevent. `value === null` is the
@@ -967,12 +976,43 @@ function coverageGaps(
   return gaps
 }
 
-export function riskyUserCount({
+/**
+ * The count, plus one fact neither the count nor the list can establish alone.
+ *
+ * A response that states a positive number of users with current findings and
+ * carries no finding contradicts itself: those two cannot both be true, and the
+ * only thing that reconciles them is that the findings were not delivered. It
+ * has to be decided here rather than at each surface, because the count tile
+ * and the list are separate components and each one on its own sees a coherent
+ * picture — the tile a number, the list an emptiness. The contradiction exists
+ * only in the pair, which is precisely the class of defect this surface keeps
+ * producing.
+ *
+ * The read path being built can serve coverage, count and claim while findings
+ * have nowhere to persist, so this is the first shape a real assessment will
+ * take rather than a defensive branch.
+ */
+export function riskyUserCount(input: RiskyUserCountInput): RiskyUserCount {
+  const count = riskyUserCountFrom(input)
+  const delivered = input.assessment
+    ? currentRiskAssessmentUsers(input.assessment).length
+    : 0
+  return {
+    ...count,
+    findingsUndelivered:
+      (count.accuracy === 'EXACT' || count.accuracy === 'AT_LEAST') &&
+      count.value !== null &&
+      count.value > 0 &&
+      delivered === 0,
+  }
+}
+
+function riskyUserCountFrom({
   assessment,
   channel,
   requestFailed = false,
   contractFailed = false,
-}: RiskyUserCountInput): RiskyUserCount {
+}: RiskyUserCountInput): Omit<RiskyUserCount, 'findingsUndelivered'> {
   const gaps = coverageGaps(assessment, channel)
   const known = knownDespiteNoCount(assessment)
 

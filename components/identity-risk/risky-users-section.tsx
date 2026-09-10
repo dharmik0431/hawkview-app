@@ -635,8 +635,28 @@ function EmptyUserList({ count }: { count: RiskyUserCount }) {
   // found nothing. Beside a withheld count, or beside a zero that counts people
   // while mailbox evidence sits below, the same sentence quietly answers a
   // question the number did not.
-  const copy =
-    count.accuracy === 'WITHHELD'
+  //
+  // The count asserting people while no row arrives outranks every other
+  // reading, so it is tested first. A response cannot both know that four users
+  // have current findings and have no finding to show: the two statements
+  // contradict inside one payload, and the only thing that reconciles them is
+  // that the findings were not delivered.
+  //
+  // This is not hypothetical. The read path being built can serve coverage,
+  // count and claim while findings have nowhere to persist, so a real number
+  // beside an empty list is the first thing a real assessment will produce. The
+  // sentence it would otherwise fall through to is worse than merely wrong: it
+  // points the reader up to a summary that confidently says four, so the
+  // pointer deepens the contradiction instead of resolving it.
+  const copy = count.findingsUndelivered
+    ? 'The count above reports ' +
+      (count.accuracy === 'AT_LEAST' ? 'at least ' : '') +
+      count.value!.toLocaleString() +
+      (count.value === 1
+        ? ' user with a current finding, but no per-user finding came back with it.'
+        : ' users with current findings, but no per-user finding came back with it.') +
+      ' That is a gap in what this response delivered, not a finding that nobody needs attention. Do not read this as an all-clear.'
+    : count.accuracy === 'WITHHELD'
       ? count.known.length > 0
         ? 'No finding could be attributed to a specific user, so no user is listed here. That is not the same as no user needing attention — what HawkView did find is listed above and below.'
         : 'HawkView is not stating a number of users for this tenant, and no finding has been attributed to a specific user. Read this as an open question rather than an all-clear.'
