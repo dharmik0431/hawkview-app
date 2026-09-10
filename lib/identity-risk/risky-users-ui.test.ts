@@ -1472,3 +1472,54 @@ test('a row with no time sorts after dated rows rather than being coerced to one
   )
   assert.ok(names[1].includes('No time recorded'))
 })
+
+test('an exact zero over a population never examined is not a clean tenant', () => {
+  // This is the live engine's output on all five tenants right now: an exact
+  // zero, with zero eligible subjects, on three tenants that are under attack.
+  // It is the state this surface is most likely to be asked to render today,
+  // and until the wire exists it is also the state it has never met.
+  //
+  // Both cohorts are asserted together on purpose. A gate that fires on the
+  // unexamined tenant proves nothing on its own — it has to be shown not to
+  // fire on the tenant that really was checked and really was clean, or it is
+  // a warning that is always on, which a technician learns to skim past.
+  const tenant = (assessedIdentities: number) => {
+    const value = assessmentFixture(false)
+    value.users = []
+    value.summary.currentUsers = { value: 0, accuracy: 'EXACT' }
+    for (const rule of value.rules) {
+      rule.assessedIdentities = assessedIdentities
+      rule.matchedIdentities = 0
+    }
+    return render(value)
+  }
+
+  const neverExamined = tenant(0)
+  assert.match(neverExamined.cardText, /No findings can be confirmed yet/)
+  assert.match(neverExamined.cardText, /lack a complete evaluated scope/)
+  assert.ok(
+    !/reported no matches/.test(neverExamined.cardText),
+    'a tenant nothing was examined on was described as having been checked'
+  )
+
+  // The coverage panel must not describe the check as having run over a
+  // population either. "0 identities evaluated" reads as a check that examined
+  // people and found none; the truth is that it had nobody to examine, and one
+  // of those is a quiet tenant while the other is a broken pipeline.
+  assert.match(neverExamined.text, /no identities were in scope for this check/)
+  assert.ok(
+    !/0 identities evaluated/.test(neverExamined.text),
+    'an empty population was rendered as an evaluated one'
+  )
+
+  // The control: a tenant that really was checked keeps its clean-sweep
+  // sentence, so the gate above is discriminating rather than always on.
+  const clean = tenant(5)
+  assert.match(clean.cardText, /No findings in evaluated evidence/)
+  assert.match(clean.cardText, /reported no matches/)
+  assert.match(clean.text, /5 identities evaluated by this check/)
+  assert.ok(
+    !/No findings can be confirmed yet/.test(clean.cardText),
+    'the unexamined-tenant gate fired on a tenant that was examined'
+  )
+})

@@ -16,7 +16,7 @@ import {
   riskyUserCount,
   riskyUserList,
 } from './risky-users-view.ts'
-import { findingEvidenceSummary } from './presentation.ts'
+import { findingEvidenceSummary, ruleScopeSummary } from './presentation.ts'
 import type { MicrosoftEntraRiskyUser } from './types.ts'
 import {
   assessmentFixture,
@@ -1099,6 +1099,16 @@ test('no combination of inputs can assemble a zero lower bound', () => {
     for (const evidenceCount of [0, 1, 2]) {
       for (const evidenceCountCapped of [false, true]) {
         for (const lastSeen of [null, '2026-09-08T00:00:00.000Z']) {
+          // The coverage panel builds a count phrase from the same parts, in a
+          // component that never knew about this ban. That is how "at least 0"
+          // got assembled a second time, so it is swept here rather than there.
+          const scope = ruleScopeSummary({
+            assessedIdentities: evidenceCount,
+            countsCapped: evidenceCountCapped,
+          })
+          for (const pattern of banned) {
+            assert.ok(!pattern.test(scope), 'rule scope :: ' + scope)
+          }
           const summary = findingEvidenceSummary(
             { ruleId, evidenceCount, evidenceCountCapped, lastSeen },
             (value) => value
@@ -1115,4 +1125,50 @@ test('no combination of inputs can assemble a zero lower bound', () => {
       }
     }
   }
+})
+
+test('a check with nobody to examine does not read as a check that found nobody', () => {
+  // The state the live engine reports on every tenant today, three of which are
+  // under attack: zero eligible subjects. "0 identities evaluated by this
+  // check" beside a readiness of Ready describes a check that ran over a
+  // population and came back empty. The truth is that it had no population.
+  // One is a quiet tenant; the other is a broken pipeline, and they send a
+  // technician to different places.
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: 0, countsCapped: false }),
+    'no identities were in scope for this check'
+  )
+
+  // Truncated before anything was counted is a third answer again: the check
+  // cannot say nobody was in scope either.
+  assert.match(
+    ruleScopeSummary({ assessedIdentities: 0, countsCapped: true }),
+    /truncated/
+  )
+  assert.notEqual(
+    ruleScopeSummary({ assessedIdentities: 0, countsCapped: true }),
+    ruleScopeSummary({ assessedIdentities: 0, countsCapped: false })
+  )
+
+  // A real population keeps its number, and a capped one states its bound
+  // rather than trailing a parenthetical the reader may not tie to the count.
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: 2, countsCapped: false }),
+    '2 identities evaluated by this check'
+  )
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: 2, countsCapped: true }),
+    'at least 2 identities evaluated by this check'
+  )
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: 1, countsCapped: false }),
+    '1 identity evaluated by this check'
+  )
+
+  // Never reported stays distinct from zero: one is a gap in what the server
+  // said, the other is a statement the server made.
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: null, countsCapped: false }),
+    'identities evaluated not reported'
+  )
 })

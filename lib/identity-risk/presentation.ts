@@ -698,3 +698,45 @@ export function findingEvidenceSummary(
     note: null,
   }
 }
+
+/**
+ * How many identities a check actually had in front of it.
+ *
+ * The live engine reports zero eligible subjects on every tenant, including
+ * three that are under attack, so "0 identities evaluated by this check" beside
+ * a readiness of Ready is the line a technician is most likely to meet. It
+ * reads as a check that ran over a population and came back empty. The truth is
+ * that the check had nobody to examine, and those are different enough to send
+ * someone to different places: one is a quiet tenant, the other is a broken
+ * pipeline.
+ *
+ * A truncated zero is a third answer. If the scope reading was capped before
+ * anything was counted, the check cannot say nobody was in scope either — and
+ * putting it through the ordinary floor wording would produce "at least 0",
+ * which excludes nothing. That phrase has now been assembled twice on this
+ * surface from parts that had no knowledge of each other, which is the argument
+ * for every count phrase being built here rather than at the site that renders
+ * it.
+ */
+export function ruleScopeSummary(rule: {
+  assessedIdentities: number | null
+  countsCapped: boolean
+}): string {
+  if (rule.assessedIdentities === null) {
+    return 'identities evaluated not reported'
+  }
+  if (rule.assessedIdentities === 0) {
+    return rule.countsCapped
+      ? 'no identities read before the scope was truncated'
+      : 'no identities were in scope for this check'
+  }
+  const amount =
+    (rule.countsCapped ? 'at least ' : '') +
+    rule.assessedIdentities.toLocaleString()
+  return (
+    amount +
+    (rule.assessedIdentities === 1
+      ? ' identity evaluated by this check'
+      : ' identities evaluated by this check')
+  )
+}

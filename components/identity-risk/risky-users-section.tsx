@@ -14,6 +14,7 @@ import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
 import {
   findingEvidenceShape,
   findingEvidenceSummary,
+  ruleScopeSummary,
   microsoftRiskyUserCountPresentation,
   riskReadinessLabel,
   riskSourceLabel,
@@ -585,11 +586,7 @@ function Coverage({ assessment }: { assessment: RiskAssessment }) {
                 <span className="text-xs text-slate-500 dark:text-slate-400">
                   · {riskReadinessLabel(rule.status)} ·{' '}
                   {riskSourceLabel(rule.selectedSource)} ·{' '}
-                  {rule.assessedIdentities === null
-                    ? 'identities evaluated not reported'
-                    : `${rule.assessedIdentities.toLocaleString()} identities evaluated by this check${
-                        rule.countsCapped ? ' (capped)' : ''
-                      }`}
+                  {ruleScopeSummary(rule)}
                 </span>
                 <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300">
                   {rule.explanation}
