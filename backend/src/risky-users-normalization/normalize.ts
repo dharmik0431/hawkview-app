@@ -578,7 +578,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
   };
 
   let applies = 0;
-  let enumerationCodesOnUnresolvedSubjects = 0;
+  let enumerationCodedRows = 0;
 
   let consideredRows = 0;
   const events: NormalizedEvent[] = [];
@@ -661,7 +661,7 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       if (SUBJECT_RESOLUTION_FAILURES.includes(result.reason)) {
         const code = rowFeed === 'GRAPH_SIGN_INS' ? readGraphErrorCode(row.raw) : null;
         if (code !== null && UNREACHABLE_BY_SUBJECT_RESOLUTION.some(entry => entry.code === code)) {
-          enumerationCodesOnUnresolvedSubjects += 1;
+          enumerationCodedRows += 1;
         }
       }
       continue;
@@ -731,12 +731,16 @@ export async function normalizeSignInBatch(options: NormalizeBatchOptions): Prom
       consideredRows,
       normalizedRows: ordered.length,
       recognizedRows: applies + outOfScopeTotal + notYetCitedTotal,
+      // A projection of two unprocessable reasons, not a new bucket. Summing
+      // it with the tallies would double-count.
+      subjectNotInTenantRows:
+        unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY + unprocessableByReason.SUBJECT_UPN_NOT_IN_DIRECTORY,
+      enumerationCodedRows,
     },
     shapeObservations: {
       graphErrorCodeShape,
       graphIsInteractive,
       graphIsInteractiveAmongCredentialFailures,
-      enumerationCodesOnUnresolvedSubjects,
     },
   };
 }

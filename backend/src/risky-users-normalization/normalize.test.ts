@@ -190,7 +190,8 @@ test('a batch that is entirely unrecognized still returns events and no gate', a
     'microsoftSafetyVerdicts', 'resolvedSubjects', 'scope', 'shapeObservations', 'source',
   ]);
   assert.deepEqual(Object.keys(batch.coverage).sort(), [
-    'collectionScope', 'consideredRows', 'normalizedRows', 'recognizedRows',
+    'collectionScope', 'consideredRows', 'enumerationCodedRows', 'normalizedRows',
+    'recognizedRows', 'subjectNotInTenantRows',
   ]);
 });
 
@@ -419,7 +420,7 @@ test('the post-password interrupt family is expressible and groupable', async ()
 });
 
 test('codes with no exclusion citation are held, not excluded and not called unreadable', async () => {
-  for (const code of [50055, 50144, 50056, 65001, 90094]) {
+  for (const code of [50056, 65001, 90094]) {
     const batch = await run([graphRow({ status: { errorCode: code } })]);
     assert.deepEqual(
       only(batch).classification,
@@ -1051,20 +1052,40 @@ test('50131’s suspicious-activity variant is Microsoft’s judgement, not our 
   assert.deepEqual(only(plain).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
 });
 
-test('the enumeration blind spot is counted, not left as a comment', async () => {
-  // 50034 and 51004 describe a subject that is by definition absent from the
-  // directory, so subject resolution discards the row before classification
-  // and the code is lost. The count is what keeps that visible.
+test('subject-not-in-tenant loss is in the coverage statement, not left internal', async () => {
+  // These rows previously vanished with nothing recorded — evidence dropped,
+  // no trace, and a confident answer computed from what was left. Now a screen
+  // can say how many events were not evaluated and why.
   const batch = await run([
-    graphRow({ id: 'probe-a', userId: OTHER_USER_ID, status: { errorCode: 50034 } }),
-    graphRow({ id: 'probe-b', userId: OTHER_USER_ID, status: { errorCode: 51004 } }),
+    graphRow({ id: 'probe-a', userId: OTHER_USER_ID, status: { errorCode: 16003 } }),
+    graphRow({ id: 'probe-b', userId: OTHER_USER_ID, status: { errorCode: 50020 } }),
     graphRow({ id: 'ordinary-miss', userId: OTHER_USER_ID, status: { errorCode: 50126 } }),
     graphRow({ id: 'resolves' }),
   ]);
 
-  assert.equal(batch.shapeObservations.enumerationCodesOnUnresolvedSubjects, 2);
+  assert.equal(batch.coverage.subjectNotInTenantRows, 3);
+  // Two of the three carried a documented enumeration code, so real
+  // enumeration evidence is being discarded upstream of any detector.
+  assert.equal(batch.coverage.enumerationCodedRows, 2);
   assert.equal(batch.counts.unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY, 3);
   assert.equal(batch.counts.applies, 1, 'the resolvable row is unaffected');
+
+  // It is a PROJECTION of the tallies, not an extra bucket: the four vocabularies
+  // plus the unselected feed must still account for exactly every row.
+  const accounted =
+    batch.counts.applies +
+    total(batch.counts.doesNotApplyByReason) +
+    total(batch.counts.notYetCitedByReason) +
+    total(batch.counts.unknownByObservation) +
+    total(batch.counts.unprocessableByReason) +
+    total(batch.counts.unselectedRowsByReason);
+  assert.equal(accounted, batch.counts.rows);
+});
+
+test('the UPN path contributes to the not-in-tenant count too', async () => {
+  const batch = await run([auditRow({ UserId: 'nobody@example.com' })], { source: 'M365_AUDIT_STS' });
+  assert.equal(batch.coverage.subjectNotInTenantRows, 1);
+  assert.equal(batch.coverage.enumerationCodedRows, 0, 'no Graph result code on an audit row');
 });
 
 test('coverage cannot be read without knowing what was requested', async () => {
@@ -1434,4 +1455,32 @@ test('the audit outcome is read from every field the collector reads', async () 
     kind: 'APPLIES',
     outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
   });
+});
+
+test('an expired password is a confirmed credential, not an interrupt and not hygiene', async () => {
+  // Researched: the password IS validated before the expiry ends the session.
+  // But a password policy is not an attacker-resistant control — the change
+  // flow typically needs only the old password — so this records the fact
+  // without borrowing the interrupt family's claim that something held.
+  for (const code of [50055, 50144]) {
+    const batch = await run([graphRow({ status: { errorCode: code } })]);
+    assert.deepEqual(
+      only(batch).classification,
+      { kind: 'APPLIES', outcome: 'CREDENTIAL_CONFIRMED_VALID' },
+      `code ${code}`,
+    );
+  }
+
+  // The fact established is the same one the interrupt family establishes:
+  // somebody submitted a working password for this account.
+  assert.equal(passwordWasAccepted('CREDENTIAL_CONFIRMED_VALID'), true);
+  // But it is NOT in the interrupt family, and this is the assertion that
+  // matters: the family membership is explicit, so a new password-accepted
+  // outcome cannot silently inherit a claim that a control held.
+  assert.equal(isPostPasswordInterrupt('CREDENTIAL_CONFIRMED_VALID'), false);
+  assert.equal(isPostPasswordInterrupt('PASSWORD_ACCEPTED_COMPLETED'), false);
+  for (const outcome of ['PASSWORD_ACCEPTED_CHALLENGE_ISSUED', 'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED',
+    'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'] as const) {
+    assert.equal(isPostPasswordInterrupt(outcome), true, outcome);
+  }
 });

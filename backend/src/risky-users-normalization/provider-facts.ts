@@ -339,23 +339,26 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     code: 50055,
     graphObservation: 'NOT_OBSERVED',
     microsoftName: 'InvalidPasswordExpiredPassword',
-    claimClass: 'NEITHER',
-    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    claimClass: 'ATTACK_IN_AGGREGATE',
+    disposition: { kind: 'APPLIES', outcome: 'CREDENTIAL_CONFIRMED_VALID' },
     note:
-      'Microsoft: "InvalidPasswordExpiredPassword - The password is expired." Cited as hygiene, and still ' +
-      'HELD rather than excluded, because of an unresolved question that would move it a long way: to be ' +
-      'told a password is expired, was the password VERIFIED first? If so this is a post-password ' +
-      'interrupt — "the credential was correct" — which is the highest-signal family we have, and ' +
-      'excluding it would discard exactly the evidence that family exists to find. Microsoft\'s quoted ' +
-      'text does not say either way, so it is neither claimed nor excluded. This is a documentation ' +
-      'question, not a data one.',
+      'RESEARCHED: the password IS validated before the expiry ends the session. Microsoft\'s ' +
+      'troubleshooting guidance describes the credentials as "correct and validated" with the password ' +
+      'expired; the canonical text says the "login or session was ended", which presupposes a login that ' +
+      'got far enough to end; a wrong password produces 50126 instead; and the user is offered a reset, ' +
+      'which is not offered to someone who failed authentication. SOURCING CAVEAT, same class as 70044 ' +
+      'and 500121: the explicit "password step succeeds" phrasing is troubleshooting and support ' +
+      'guidance, not the canonical error reference, which supports it by implication only. NOT in the ' +
+      'interrupt family — see CREDENTIAL_CONFIRMED_VALID for why a password policy is not an ' +
+      'attacker-resistant control.',
   },
   {
     code: 50144,
     graphObservation: 'NOT_OBSERVED',
     microsoftName: 'InvalidPasswordExpiredOnPremPassword',
-    claimClass: 'NEITHER',
-    disposition: { kind: 'NOT_YET_CITED', reason: 'EXCLUSION_NOT_YET_CITED' },
+    claimClass: 'ATTACK_IN_AGGREGATE',
+    disposition: { kind: 'APPLIES', outcome: 'CREDENTIAL_CONFIRMED_VALID' },
+    note: 'The on-premises counterpart of 50055, same reasoning and same sourcing caveat.',
   },
   {
     code: 50056,

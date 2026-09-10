@@ -627,3 +627,54 @@ Three rows in 2,645 events is a **rare, high-signal** event: each one is "somebo
 password and could not pass the second factor". The mapping stays, and what changes is
 what it promises — a rare alarm, not a steady stream. Nothing user-facing should depend on
 it for volume.
+
+## Addendum: a third bucket for a confirmed credential
+
+50055 and 50144 are neither hygiene nor post-password interrupts. Research settled the
+question they were held on: **the password IS validated before the expiry ends the
+session** — Microsoft's troubleshooting guidance describes the credentials as correct and
+validated, the canonical text says the login "was ended" (presupposing one that got far
+enough to end), a wrong password produces 50126 instead, and the user is offered a reset,
+which is not offered to someone who failed authentication. *Sourcing caveat, same class as
+70044 and 500121: the explicit phrasing is troubleshooting guidance, and the canonical
+reference supports it only by implication.*
+
+They now map to `APPLIES / CREDENTIAL_CONFIRMED_VALID`, deliberately outside the interrupt
+family. The interrupt family's value is "the credential was correct **and an
+attacker-resistant control stopped them**" — the second factor does the work. A password
+policy is not attacker-resistant, because the change flow typically needs only the old
+password, which whoever submitted it already has. So this outcome is **weaker** than an
+MFA interrupt as evidence a control held (nothing held), and **stronger** than hygiene,
+because it establishes the fact the interrupt family exists to establish: somebody
+submitted a working password for this account.
+
+The discriminator is location, not the code: from a familiar location this is almost
+always the legitimate user meeting a policy, and from an unfamiliar one — or an address
+that also produced 50126 storms — it means somebody other than the user holds a working
+credential. Expired passwords are overwhelmingly ordinary users, so it must corroborate
+rather than alarm.
+
+**And it exposed a flaw in how the family was defined.** `isPostPasswordInterrupt` was
+`passwordWasAccepted(outcome) && outcome !== 'PASSWORD_ACCEPTED_COMPLETED'` — an
+**exclusion** definition, and exclusion definitions absorb new members. Adding
+`CREDENTIAL_CONFIRMED_VALID` would have silently joined the family and lent it a claim
+that a control held, when nothing held. Membership is now stated rather than inferred,
+which is the same fix as everywhere else in this module: a new case must not quietly
+inherit a definite answer. Mutation-tested by reverting to the derived form.
+
+## Addendum: the not-in-tenant loss is now in the coverage statement
+
+`coverage.subjectNotInTenantRows` and `coverage.enumerationCodedRows` were promoted out of
+`shapeObservations`. Those rows previously vanished with nothing recorded, which is this
+feature's signature defect in its purest form — evidence dropped, no trace, and a
+confident answer computed from what was left. A screen can now say *"N events were not
+evaluated because the subject is not in this tenant"*, and how many of those carried a
+documented enumeration code.
+
+Both are **projections** of `unprocessableByReason`, not additional buckets. Summing them
+with the tallies double-counts, and a test asserts the four vocabularies plus the
+unselected feed still account for exactly every row.
+
+The detector is still not built and should not be: it needs a tenant-level finding where
+this model is user-scoped, and hanging one on a synthetic subject would be fabricating an
+identity — worse than the gap. What changed is that the gap is stated rather than silent.

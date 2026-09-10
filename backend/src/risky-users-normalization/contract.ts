@@ -65,7 +65,33 @@ export type EventOutcome =
   /** 50053 smart lockout. Implies VARIED wrong passwords — see provider-facts. */
   | 'LOCKED_OUT_AFTER_REPEATED_FAILURES'
   /** 50057. An attempt against an account that is disabled. */
-  | 'DISABLED_ACCOUNT_ATTEMPT';
+  | 'DISABLED_ACCOUNT_ATTEMPT'
+  /**
+   * 50055, 50144. The password was submitted, VALIDATED, and then the session
+   * ended on the expiry policy.
+   *
+   * Deliberately NOT in the post-password interrupt family, and deliberately
+   * not named after it. The interrupt family's value is "the credential was
+   * correct AND an attacker-resistant control stopped them" — the second
+   * factor is what does the work. This is "the credential was correct AND a
+   * password policy stopped them", and a password policy is not
+   * attacker-resistant: the change flow typically needs only the old password,
+   * which whoever submitted it already has.
+   *
+   * That cuts both ways, and both halves matter. WEAKER than a genuine MFA
+   * interrupt as evidence a control held — nothing held, and the holder can
+   * likely rotate the credential themselves. STRONGER than hygiene, because it
+   * establishes the same fact the interrupt family exists to establish:
+   * somebody submitted a working password for this account.
+   *
+   * FOR WHOEVER BUILDS ON IT: the discriminator is location, not the code. From
+   * a familiar location this is almost always the legitimate user meeting a
+   * policy — high volume, no signal. From an unfamiliar location, or an address
+   * that also produced 50126 storms, it means somebody other than the user
+   * holds a working credential. Expired passwords are overwhelmingly ordinary
+   * users, so this must corroborate rather than alarm on its own.
+   */
+  | 'CREDENTIAL_CONFIRMED_VALID';
 
 /** True when Microsoft's result code establishes that the password itself was accepted. */
 export function passwordWasAccepted(outcome: EventOutcome): boolean {
@@ -73,17 +99,29 @@ export function passwordWasAccepted(outcome: EventOutcome): boolean {
     outcome === 'PASSWORD_ACCEPTED_COMPLETED' ||
     outcome === 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED' ||
     outcome === 'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED' ||
-    outcome === 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'
+    outcome === 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED' ||
+    outcome === 'CREDENTIAL_CONFIRMED_VALID'
   );
 }
 
 /**
- * The post-password interrupt family: the password was accepted and the
- * sign-in did not complete. Provided so a detector groups the family by
- * calling this rather than by listing result codes of its own.
+ * The post-password interrupt family: the password was accepted and an
+ * attacker-resistant control stopped the sign-in. Provided so a detector
+ * groups the family by calling this rather than by listing result codes.
+ *
+ * MEMBERSHIP IS EXPLICIT, not derived as "accepted and not completed". That
+ * derivation was an EXCLUSION definition, and exclusion definitions absorb new
+ * members: adding CREDENTIAL_CONFIRMED_VALID would silently have joined this
+ * family and lent it a claim about a control that held, when nothing held. The
+ * same shape as every other defect in this module — a new case quietly
+ * inheriting a definite answer — so the list is stated rather than inferred.
  */
 export function isPostPasswordInterrupt(outcome: EventOutcome): boolean {
-  return passwordWasAccepted(outcome) && outcome !== 'PASSWORD_ACCEPTED_COMPLETED';
+  return (
+    outcome === 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED' ||
+    outcome === 'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED' ||
+    outcome === 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'
+  );
 }
 
 /**
@@ -236,19 +274,6 @@ export interface ShapeObservations {
   readonly graphErrorCodeShape: Readonly<Record<ErrorCodeShape, number>>;
   readonly graphIsInteractive: Readonly<Record<IsInteractiveShape, number>>;
   readonly graphIsInteractiveAmongCredentialFailures: Readonly<Record<IsInteractiveShape, number>>;
-  /**
-   * Rows that failed subject resolution while carrying a documented
-   * username-enumeration code (50034, 51004).
-   *
-   * A KNOWN BLIND SPOT made visible rather than left as a comment. Those codes
-   * describe a subject that is by definition not in the directory, so subject
-   * resolution discards the row before classification runs and the code is
-   * lost. Microsoft names clusters of them from one address as directory
-   * probing — a tenant-level finding, where this whole model is user-scoped —
-   * so detecting it is a different detector shape and not this layer's to
-   * build. This counter is what keeps its absence from being invisible.
-   */
-  readonly enumerationCodesOnUnresolvedSubjects: number;
 }
 
 export interface NormalizationCounts {
@@ -307,6 +332,32 @@ export interface NormalizationCoverage {
    * them, which is not a limit on our reading of the data.
    */
   readonly recognizedRows: number;
+  /**
+   * Rows not evaluated because the subject is not in this tenant.
+   *
+   * A PROJECTION of two entries in `unprocessableByReason`
+   * (SUBJECT_NOT_IN_DIRECTORY and SUBJECT_UPN_NOT_IN_DIRECTORY), not an
+   * additional bucket — do not add it to the tallies or it double-counts.
+   *
+   * It is in the coverage statement rather than left internal because these
+   * rows previously vanished with nothing recorded, which is this feature's
+   * signature defect in its purest form: evidence dropped, no trace, and a
+   * confident answer computed from what is left. A screen can now say "N
+   * events were not evaluated because the subject is not in this tenant",
+   * which converts an invisible loss into a stated limit.
+   */
+  readonly subjectNotInTenantRows: number;
+  /**
+   * Of those, how many carried a documented username-enumeration code.
+   *
+   * Non-zero means real enumeration evidence is being discarded upstream of
+   * any detector — the codes describe a subject that by definition is not in
+   * the tenant, so subject resolution drops the row before classification.
+   * Detecting directory probing needs a tenant-level finding where this model
+   * is user-scoped, which is a scope decision and not this layer's to make.
+   * The number exists so the gap is visible while that is decided.
+   */
+  readonly enumerationCodedRows: number;
 }
 
 export interface NormalizationBatch {
