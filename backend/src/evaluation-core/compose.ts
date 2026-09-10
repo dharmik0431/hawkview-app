@@ -72,7 +72,13 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
     // It takes only whether a claim was permitted. Every withheld stream's
     // reason stays in `claim.withheld`, so there is no longer a place where one
     // reason has to stand in for several.
-    count: countOf(distinctUsers(findings), claim.permitted),
+    // Scope unions across streams: a check that could not run on one tenant's
+    // evidence source is not covered for that tenant, however many streams it
+    // has. A tenant-level zero has to name the same gaps its parts named.
+    count: countOf(distinctUsers(findings), claim.permitted, {
+      covered: streams.flatMap(entry => entry.assessment.count.scope.covered),
+      notCovered: streams.flatMap(entry => entry.assessment.count.scope.notCovered),
+    }),
     claim,
   }
 }

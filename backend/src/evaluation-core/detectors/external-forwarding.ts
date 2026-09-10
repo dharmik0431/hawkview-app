@@ -62,7 +62,16 @@ export function externalForwardingDetector(
   return {
     id: 'external-mailbox-forwarding',
     run: applicable => {
-      if (!usable) return { considered: 0, findings: [] }
+      // Reported as inapplicable rather than as a run considering nothing:
+      // "considered 0" is indistinguishable from a dead detector, which is the
+      // ambiguity the per-detector accounting exists to remove. Saying why also
+      // makes the count's scope name the gap.
+      if (!usable) {
+        return {
+          status: 'INAPPLICABLE',
+          because: "The tenant's verified domains are unknown, so internal and external recipients cannot be told apart.",
+        }
+      }
       const findings: Finding[] = []
       for (const mailbox of applicable) {
         const destinations = [
@@ -82,7 +91,7 @@ export function externalForwardingDetector(
           })
         }
       }
-      return { considered: applicable.length, findings }
+      return { status: 'RAN', considered: applicable.length, findings }
     },
   }
 }

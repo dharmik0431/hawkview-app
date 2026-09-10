@@ -44,9 +44,29 @@ export type Coverage = Readonly<{
 /** Zero is reachable only through EXACT. A lower bound is never zero, because
  * "at least none" states nothing while looking like a measurement. */
 export type Count =
-  | Readonly<{ accuracy: 'EXACT'; value: number }>
-  | Readonly<{ accuracy: 'AT_LEAST'; value: number }>
-  | Readonly<{ accuracy: 'NOT_AVAILABLE'; value: null }>
+  | Readonly<{ accuracy: 'EXACT'; value: number; scope: CountScope }>
+  | Readonly<{ accuracy: 'AT_LEAST'; value: number; scope: CountScope }>
+  | Readonly<{ accuracy: 'NOT_AVAILABLE'; value: null; scope: CountScope }>
+
+/** Which questions this count is the answer to.
+ *
+ * An exact zero means "none of the checks that could run found anyone" — never
+ * "everything is clean" — and the difference is invisible unless the scope
+ * arrives with the number. A scoped zero whose scope sits one component away is
+ * a bare zero in practice, so the scope is inside `Count` rather than beside it:
+ * there is no way to render the figure without having held the qualification.
+ *
+ * This is the previous engine's headline defect stated precisely. Three rules
+ * that never ran once produced the same zero as three rules that ran and found
+ * nothing, because nothing in the number said which questions it answered. */
+export type CountScope = Readonly<{
+  /** Detectors whose verdict this count includes. */
+  covered: readonly string[]
+  /** Detectors this evidence could not support, each saying why in its own
+   * words. Non-empty means the count answers a narrower question than the
+   * product claims to ask. */
+  notCovered: readonly Readonly<{ detectorId: string; because: string }>[]
+}>
 
 /** The four states kept distinct, because collapsing any pair of them is how
  * every reporting defect in the previous implementation began. */
@@ -123,7 +143,14 @@ export type Finding = Readonly<{
  * genuinely inapplicable and one that is silently dead produce identical
  * output — which is exactly the position the previous engine left us in, with
  * three rules that have never once run against real evidence. */
-export type DetectorResult = Readonly<{ considered: number; findings: readonly Finding[] }>
+export type DetectorResult =
+  | Readonly<{ status: 'RAN'; considered: number; findings: readonly Finding[] }>
+  /** This evidence source cannot answer this detector's question at all — the
+   * audit feed carries no conditional-access status, say. Requires a reason in
+   * the detector's own words, held to the same standard as an exclusion
+   * citation: a detector that could silently declare itself inapplicable would
+   * be the veto pattern in one more costume. */
+  | Readonly<{ status: 'INAPPLICABLE'; because: string }>
 
 /** Detectors plug in and swap out. They see only the events that applied, they
  * cannot influence coverage, and one failing cannot erase what another found. */
@@ -139,6 +166,13 @@ export type Detector<Event> = Readonly<{
 export type DetectorReport =
   | Readonly<{ detectorId: string; status: 'RAN'; considered: number; matched: number }>
   | Readonly<{ detectorId: string; status: 'FAILED' }>
+  /** Did not run, and should not have. Distinct from FAILED: a detector that
+   * crashed might have found something, so it withholds the clean claim; one
+   * the evidence cannot support was never going to answer, so it narrows the
+   * claim's scope instead of blocking it. Conflating them would either make
+   * three audit-only tenants permanently unable to report clean, or let a
+   * crash quietly shrink the scope. */
+  | Readonly<{ detectorId: string; status: 'INAPPLICABLE'; because: string }>
 
 /** The count and what qualifies it, in one value. There is deliberately no way
  * to obtain the number alone: three honest counts beside a confident zero is a
@@ -184,14 +218,21 @@ export type Budget = Readonly<{ maxEvents: number }>
 export type Evidence<Event> =
   | Readonly<{ availability: 'NEVER_COLLECTED' }>
   | Readonly<{ availability: 'UNREADABLE_NOW' }>
-  | Readonly<{ availability: 'READ'; applies: readonly Event[]; coverage: Coverage; order: EventOrder }>
-
-/** How `applies` is sorted in time.
- *
- * The core is generic over the event type and so cannot read a timestamp, let
- * alone verify an ordering. But truncation has to keep the most recent events,
- * which is meaningless without knowing which end that is — so the caller states
- * it rather than the core assuming it. A caller that hands newest-first events
- * to a core assuming oldest-first would silently discard exactly the events a
- * technician most needs, with nothing in the output to show it happened. */
-export type EventOrder = 'OLDEST_FIRST' | 'NEWEST_FIRST'
+  | Readonly<{
+    availability: 'READ'
+    applies: readonly Event[]
+    coverage: Coverage
+    /** When an event happened, as a sortable key.
+     *
+     * Truncation has to keep the most recent events, and the core is generic
+     * over the event type so it cannot find a timestamp on its own. The first
+     * version of this had the caller declare which end was newest — but a
+     * declaration can be wrong, and a wrong one silently discards exactly the
+     * events a technician needs. An accessor removes the declaration instead
+     * of verifying it: there is no longer an ordering claim to be mistaken,
+     * because the core reads the time itself.
+     *
+     * This is an ordering key, not a licence to interpret events. The core
+     * compares the values and never inspects them. */
+    timeOf: (event: Event) => number | string
+  }>

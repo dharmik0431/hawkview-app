@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { countOf, declined, evaluate, uninterpreted, withheldExplanation, zeroClaim } from './evaluate.js'
-import type { Coverage, Detector, EventOrder, Finding } from './contract.js'
+import type { Coverage, Detector, Finding } from './contract.js'
+import { figure } from './test-support.js'
 
-type Event = Readonly<{ id: string; subject: string; match?: boolean }>
+type Event = Readonly<{ id: string; subject: string; match?: boolean; at?: number }>
 
 const event = (id: string, extra: Partial<Event> = {}): Event => ({ id, subject: `user-${id}`, ...extra })
 
@@ -20,22 +21,22 @@ const user = (userRef: string) => ({ kind: 'DIRECTORY_USER', userRef } as const)
 const matching: Detector<Event> = {
   id: 'matches-flagged',
   run: applicable => ({
-    considered: applicable.length,
+    status: 'RAN', considered: applicable.length,
     findings: applicable.filter(item => item.match)
       .map(item => ({ detectorId: 'matches-flagged', subject: user(item.subject), observedAt: '2026-09-10T00:00:00.000Z' })),
   }),
 }
-const silent: Detector<Event> = { id: 'silent', run: applicable => ({ considered: applicable.length, findings: [] }) }
+const silent: Detector<Event> = { id: 'silent', run: applicable => ({ status: 'RAN', considered: applicable.length, findings: [] }) }
 const broken: Detector<Event> = { id: 'broken', run: () => { throw new Error('detector fault') } }
 
 const run = (applies: readonly Event[], options: Partial<{
-  coverage: Coverage; detectors: readonly Detector<Event>[]; maxEvents: number; order: EventOrder
+  coverage: Coverage; detectors: readonly Detector<Event>[]; maxEvents: number
 }> = {}) => evaluate<Event>({
   evidence: {
     availability: 'READ',
     applies,
     coverage: options.coverage ?? coverage({ applies: applies.length }),
-    order: options.order ?? 'OLDEST_FIRST',
+    timeOf: item => item.at ?? 0,
   },
   detectors: options.detectors ?? [matching, silent],
   budget: { maxEvents: options.maxEvents ?? 1000 },
@@ -57,7 +58,7 @@ test('an event nobody could interpret never blocks a finding another event suppo
   // It reduces what we claim, and only that.
   assert.equal(result.state, 'PARTIALLY_UNINTERPRETABLE')
   assert.deepEqual(result.claim, { permitted: false, because: 'UNINTERPRETED_EVENTS' })
-  assert.deepEqual(result.count, { accuracy: 'AT_LEAST', value: 1 })
+  assert.deepEqual(figure(result.count), { accuracy: 'AT_LEAST', value: 1 })
 })
 
 test('a row we could not read and an outcome we could not interpret both gate, and stay apart', () => {
@@ -78,16 +79,16 @@ test('a row we could not read and an outcome we could not interpret both gate, a
 
 test('a lower bound is never zero, and zero arrives only through the exact branch', () => {
   const nothingFound = run([event('1')], { coverage: coverage({ applies: 1, unknown: { UNRECOGNIZED_OUTCOME: 1 } }) })
-  assert.deepEqual(nothingFound.count, { accuracy: 'NOT_AVAILABLE', value: null })
+  assert.deepEqual(figure(nothingFound.count), { accuracy: 'NOT_AVAILABLE', value: null })
 
   const clean = run([event('1')])
-  assert.deepEqual(clean.count, { accuracy: 'EXACT', value: 0 })
+  assert.deepEqual(figure(clean.count), { accuracy: 'EXACT', value: 0 })
   assert.deepEqual(clean.claim, { permitted: true })
 
   // Exhaustive: no combination of inputs yields a zero-valued lower bound.
   for (const permitted of [true, false]) {
     for (const subjects of [0, 1, 5]) {
-      const count = countOf(subjects, permitted)
+      const count = countOf(subjects, permitted, { covered: [], notCovered: [] })
       assert.ok(!(count.accuracy === 'AT_LEAST' && count.value === 0))
       if (count.accuracy === 'EXACT') assert.equal(permitted, true, 'exact requires the claim to be permitted')
     }
@@ -102,7 +103,7 @@ test('declined events do not reduce coverage and are never merged with unread ev
   // Declining an event is the rules working, so a clean claim survives it.
   assert.equal(result.state, 'FULLY_INTERPRETED')
   assert.deepEqual(result.claim, { permitted: true })
-  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 1 })
+  assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 1 })
   // Broken out by reason, so background traffic cannot bury the exclusion an
   // investigator would care about beneath a large token-refresh number.
   assert.deepEqual(result.coverage.doesNotApply, { NON_INTERACTIVE: 40, APPLICATION_ACTOR: 2 })
@@ -113,7 +114,7 @@ test('a window where nothing applied cannot report a confident zero', () => {
   // headline zero captioned as though the evidence had been examined.
   const result = run([], { coverage: coverage({ applies: 0, doesNotApply: { NOT_A_CREDENTIAL_EVENT: 12 } }) })
   assert.deepEqual(result.claim, { permitted: false, because: 'NOTHING_APPLICABLE' })
-  assert.deepEqual(result.count, { accuracy: 'NOT_AVAILABLE', value: null })
+  assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
 })
 
 test('a partly declined window is judged by what applied, not by the ratio', () => {
@@ -123,7 +124,7 @@ test('a partly declined window is judged by what applied, not by the ratio', () 
   const result = run([event('1'), event('2'), event('3'), event('4')],
     { coverage: coverage({ applies: 4, doesNotApply: { NOT_A_CREDENTIAL_EVENT: 8 } }) })
   assert.deepEqual(result.claim, { permitted: true })
-  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 0 })
+  assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
   assert.ok(declined(result.coverage) > 0, 'the qualification travels beside the count')
 })
 
@@ -161,7 +162,7 @@ test('unread evidence cannot produce a finding, because it cannot carry an event
     assert.deepEqual(result.detectors, [])
     assert.deepEqual(result.coverage, { applies: 0, doesNotApply: {}, unknown: {}, unprocessable: {} })
     assert.deepEqual(result.claim, { permitted: false, because: availability })
-    assert.deepEqual(result.count, { accuracy: 'NOT_AVAILABLE', value: null })
+    assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
   }
 
   // A detector that would throw is never reached, so unread evidence reports its
@@ -178,33 +179,48 @@ test('the budget belongs to the caller and exceeding it withholds rather than tr
   assert.deepEqual(run(events, { coverage: coverage({ applies: 5 }), maxEvents: 5 }).claim, { permitted: true })
 })
 
-test('truncation keeps the most recent events, at whichever end the caller says they are', () => {
-  // A security tool that shows last month's attack while hiding today's is
-  // strictly worse than the reverse, and truncation can only ever lose a
-  // pattern, never invent one — so the surviving subset should be the recent end.
-  const oldestFirst = Array.from({ length: 5 }, (_, index) =>
-    event(`${index}`, { match: index === 4, subject: `user-${index}` }))
-  const kept = run(oldestFirst, { coverage: coverage({ applies: 5 }), maxEvents: 2, order: 'OLDEST_FIRST' })
-  assert.deepEqual(kept.findings.map(finding =>
-    finding.subject.kind === 'DIRECTORY_USER' ? finding.subject.userRef : null), ['user-4'])
+test('truncation keeps the most recent events, however the input happens to be ordered', () => {
+  const userRefs = (assessment: ReturnType<typeof run>) => assessment.findings.map(finding =>
+    finding.subject.kind === 'DIRECTORY_USER' ? finding.subject.userRef : null)
+  // `at` is the caller's own notion of when, which is the only thing the core
+  // reads. There is no ordering claim to be right or wrong about.
+  const at = (index: number) => event(`${index}`, { at: index, match: index === 4, subject: `user-${index}` })
 
-  // The oldest event is the one dropped, not the newest.
-  const staleMatch = Array.from({ length: 5 }, (_, index) =>
-    event(`${index}`, { match: index === 0, subject: `user-${index}` }))
+  const ascending = [0, 1, 2, 3, 4].map(at)
+  assert.deepEqual(userRefs(run(ascending, { coverage: coverage({ applies: 5 }), maxEvents: 2 })), ['user-4'])
+
+  // Same events, reversed. Under a declared-order design this is precisely where
+  // a wrong declaration would silently keep the stale half; here the answer
+  // cannot change, because recency is read rather than asserted.
+  assert.deepEqual(userRefs(run([...ascending].reverse(), { coverage: coverage({ applies: 5 }), maxEvents: 2 })), ['user-4'])
+
+  // And unsorted, which no order enum could even describe. This is the case
+  // that made the declaration the wrong shape rather than merely a risky one.
+  assert.deepEqual(userRefs(run([2, 0, 4, 1, 3].map(at), { coverage: coverage({ applies: 5 }), maxEvents: 2 })), ['user-4'])
+
+  // The stale end really is dropped: a match on the oldest event does not survive.
+  const staleMatch = [0, 1, 2, 3, 4].map(index => event(`${index}`, { at: index, match: index === 0 }))
   assert.deepEqual(run(staleMatch, { coverage: coverage({ applies: 5 }), maxEvents: 2 }).findings, [])
 
-  // And the caller's declared order is obeyed rather than assumed: the same
-  // events labelled newest-first keep the other end. Assuming one order would
-  // silently discard exactly the events a technician needs, invisibly.
-  const reversed = [...staleMatch]
-  assert.deepEqual(
-    run(reversed, { coverage: coverage({ applies: 5 }), maxEvents: 2, order: 'NEWEST_FIRST' })
-      .findings.map(finding => finding.subject.kind === 'DIRECTORY_USER' ? finding.subject.userRef : null),
-    ['user-0'])
+  // Choosing a subset is never permission to imply the window was complete.
+  assert.deepEqual(run(ascending, { coverage: coverage({ applies: 5 }), maxEvents: 2 }).claim,
+    { permitted: false, because: 'CAPACITY_EXCEEDED' })
+})
 
-  // Whichever end survives, the claim still says the window was not assessed in
-  // full — choosing a subset is not permission to imply completeness.
-  assert.deepEqual(kept.claim, { permitted: false, because: 'CAPACITY_EXCEEDED' })
+test('the survivors keep the order they arrived in, not the order recency picked them', () => {
+  // Detectors may depend on the sequence they are handed — Engineer 3 sorts and
+  // asks us not to re-sort — so selecting a subset must not quietly reorder it.
+  const seen: string[] = []
+  const recorder: Detector<Event> = {
+    id: 'recorder',
+    run: applicable => {
+      seen.push(...applicable.map(item => item.id))
+      return { status: 'RAN', considered: applicable.length, findings: [] }
+    },
+  }
+  run([0, 1, 2, 3].map(index => event(`${index}`, { at: index })),
+    { coverage: coverage({ applies: 4 }), maxEvents: 2, detectors: [recorder] })
+  assert.deepEqual(seen, ['2', '3'], 'newest two, still in input order')
 })
 
 test('one failing detector costs the exact claim without erasing its neighbours', () => {
@@ -217,16 +233,16 @@ test('one failing detector costs the exact claim without erasing its neighbours'
   assert.equal(result.detectors.filter(report => report.status === 'RAN').length, 2)
   // And the count does not overclaim: the broken detector might have found more.
   assert.deepEqual(result.claim, { permitted: false, because: 'DETECTOR_FAILED' })
-  assert.deepEqual(result.count, { accuracy: 'AT_LEAST', value: 1 })
+  assert.deepEqual(figure(result.count), { accuracy: 'AT_LEAST', value: 1 })
 
   // A failure with nothing else found cannot produce a lower bound of zero.
-  assert.deepEqual(run([event('1')], { detectors: [broken, silent] }).count, { accuracy: 'NOT_AVAILABLE', value: null })
+  assert.deepEqual(figure(run([event('1')], { detectors: [broken, silent] }).count), { accuracy: 'NOT_AVAILABLE', value: null })
 })
 
 test('per-detector accounting separates a healthy silent detector from a dead one', () => {
   // The position the previous engine left us in: three rules, 1,054 runs, zero
   // findings, and no way to tell "ran and matched nothing" from "never ran".
-  const dead: Detector<Event> = { id: 'dead', run: () => ({ considered: 0, findings: [] }) }
+  const dead: Detector<Event> = { id: 'dead', run: () => ({ status: 'RAN', considered: 0, findings: [] }) }
   const result = run([event('1'), event('2')], { detectors: [silent, dead] })
 
   assert.deepEqual(result.detectors, [
@@ -239,18 +255,71 @@ test('per-detector accounting separates a healthy silent detector from a dead on
   assert.deepEqual(result.claim, { permitted: true })
 })
 
+test('a detector the evidence cannot support narrows the scope without blocking the claim', () => {
+  // Three audit-only tenants must not sit permanently unable to report clean
+  // because of a licence they do not hold. So an inapplicable detector is not a
+  // failed one: nothing was lost, the question simply cannot be asked here.
+  const unsupported: Detector<Event> = {
+    id: 'conditional-access',
+    run: () => ({ status: 'INAPPLICABLE', because: 'The audit source does not carry conditional-access status.' }),
+  }
+  const result = run([event('1')], { detectors: [silent, unsupported] })
+
+  assert.deepEqual(result.claim, { permitted: true }, 'inapplicable does not gate')
+  assert.equal(result.count.accuracy, 'EXACT')
+  assert.deepEqual(result.detectors[1], {
+    detectorId: 'conditional-access',
+    status: 'INAPPLICABLE',
+    because: 'The audit source does not carry conditional-access status.',
+  })
+
+  // But the zero says which questions it answered. Without this it reads as
+  // "everything is clean" — the 1,054-runs defect exactly: checks that never ran
+  // producing the same zero as checks that ran and found nothing.
+  assert.deepEqual(result.count.scope, {
+    covered: ['silent'],
+    notCovered: [{
+      detectorId: 'conditional-access',
+      because: 'The audit source does not carry conditional-access status.',
+    }],
+  })
+})
+
+test('a crashed detector and an inapplicable one are never the same answer', () => {
+  // A crash might have found something, so it withholds. Inapplicable evidence
+  // was never going to answer, so it narrows instead. Conflating them either
+  // strands audit-only tenants or lets a crash quietly shrink the scope.
+  const unsupported: Detector<Event> = {
+    id: 'needs-risk-fields', run: () => ({ status: 'INAPPLICABLE', because: 'This source carries no risk fields.' }),
+  }
+  const crashed = run([event('1')], { detectors: [silent, broken] })
+  const skipped = run([event('1')], { detectors: [silent, unsupported] })
+
+  assert.deepEqual(crashed.claim, { permitted: false, because: 'DETECTOR_FAILED' })
+  assert.deepEqual(skipped.claim, { permitted: true })
+  // A crash never silently narrows scope: it is in neither list, because what it
+  // would have covered is exactly what we do not know.
+  assert.deepEqual(crashed.count.scope, { covered: ['silent'], notCovered: [] })
+  assert.equal(skipped.count.scope.notCovered.length, 1)
+})
+
+test('a fully covered run says so, so full and partial coverage are distinguishable', () => {
+  const result = run([event('1')], { detectors: [matching, silent] })
+  assert.deepEqual(result.count.scope, { covered: ['matches-flagged', 'silent'], notCovered: [] })
+})
+
 test('distinct subjects are counted once however many findings they carry', () => {
   const twice: Detector<Event> = {
     id: 'twice',
     run: applicable => ({
-      considered: applicable.length,
+      status: 'RAN', considered: applicable.length,
       findings: applicable.flatMap((item): Finding[] => [0, 1].map(() =>
         ({ detectorId: 'twice', subject: user(item.subject), observedAt: '2026-09-10T00:00:00.000Z' }))),
     }),
   }
   const result = run([event('1'), event('1')], { coverage: coverage({ applies: 2 }), detectors: [twice] })
   assert.equal(result.findings.length, 4)
-  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 1 })
+  assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 1 })
 })
 
 test('the claim is computed once and the count cannot disagree with it', () => {

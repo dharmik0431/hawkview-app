@@ -3,6 +3,7 @@ import test from 'node:test'
 import { evaluate } from '../evaluate.js'
 import { externalForwardingDetector, type MailboxForwardingArtefact } from './external-forwarding.js'
 import type { Coverage } from '../contract.js'
+import { figure } from '../test-support.js'
 
 /** Defaults to a mailbox whose binding RESOLVED and said "not a person" — a
  * proven shared or resource mailbox. That is the case where a user count of zero
@@ -28,7 +29,7 @@ const coverage = (applies: number, parts: Partial<Coverage> = {}): Coverage =>
 
 const assess = (mailboxes: readonly MailboxForwardingArtefact[], detectors = [detector]) =>
   evaluate<MailboxForwardingArtefact>({
-    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(mailboxes.length), order: 'OLDEST_FIRST' },
+    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(mailboxes.length), timeOf: () => 0 },
     detectors, budget: { maxEvents: 500 },
   })
 
@@ -48,7 +49,7 @@ test('forwarding outside the tenant is found wherever Exchange reports it', () =
   // read and the detector ran. None of these were bound to a directory user, so
   // none may be counted as a person. The findings are reported in full; it is
   // the user total they stay out of.
-  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 0 })
+  assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
   assert.equal(result.findings.length, 5)
 })
 
@@ -57,7 +58,7 @@ test('a zero user count beside real findings is coherent when the mailbox is pro
   // affected, and the finding is still reported. The count answers "how many
   // people", the findings answer "what did we find" — different questions.
   const result = assess([mailbox('reception-room', { forwardingSmtpAddress: 'exfil@evil.example' })])
-  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 0 })
+  assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
   assert.equal(result.findings.length, 1)
   assert.equal(result.claim.permitted, true)
 })
@@ -71,7 +72,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
   const result = assess([{ ...unattributed, subject: { kind: 'MAILBOX', mailboxRef: 'orphan', binding: 'UNRESOLVED' } }])
   assert.equal(result.findings.length, 1, 'still found, still reported')
   assert.deepEqual(result.claim, { permitted: false, because: 'UNRESOLVED_SUBJECT_IDENTITY' })
-  assert.deepEqual(result.count, { accuracy: 'NOT_AVAILABLE', value: null })
+  assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
 
   // And it does not erase what we could attribute: a known user still yields a
   // floor. One person for certain, possibly two — never "exactly one".
@@ -80,12 +81,12 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
       availability: 'READ',
       applies: [{ ...unattributed, subject: { kind: 'MAILBOX', mailboxRef: 'orphan', binding: 'UNRESOLVED' } }],
       coverage: coverage(1),
-      order: 'OLDEST_FIRST',
+      timeOf: () => 0,
     },
     detectors: [detector, {
       id: 'user-side',
       run: () => ({
-        considered: 1,
+        status: 'RAN' as const, considered: 1,
         findings: [{
           detectorId: 'user-side',
           subject: { kind: 'DIRECTORY_USER', userRef: 'alice' } as const,
@@ -95,7 +96,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
     }],
     budget: { maxEvents: 500 },
   })
-  assert.deepEqual(withKnownUser.count, { accuracy: 'AT_LEAST', value: 1 })
+  assert.deepEqual(figure(withKnownUser.count), { accuracy: 'AT_LEAST', value: 1 })
 })
 
 test('a mailbox that resolved to a real person counts as that person', () => {
@@ -103,7 +104,7 @@ test('a mailbox that resolved to a real person counts as that person', () => {
   // passes the resolved subject through untouched.
   const bound = mailbox('alice-mailbox', { forwardingSmtpAddress: 'exfil@evil.example' })
   const result = assess([{ ...bound, subject: { kind: 'DIRECTORY_USER', userRef: 'alice' } }])
-  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 1 })
+  assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 1 })
   assert.equal(result.claim.permitted, true)
 })
 
@@ -115,7 +116,7 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
   const userSide = (userRef: string) => ({
     id: `user-${userRef}`,
     run: () => ({
-      considered: 1,
+      status: 'RAN' as const, considered: 1,
       findings: [{
         detectorId: `user-${userRef}`,
         subject: { kind: 'DIRECTORY_USER', userRef } as const,
@@ -124,19 +125,19 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
     }),
   })
   const withMailboxes = (mailboxes: readonly MailboxForwardingArtefact[]) => evaluate<MailboxForwardingArtefact>({
-    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(Math.max(mailboxes.length, 1)), order: 'OLDEST_FIRST' },
+    evidence: { availability: 'READ', applies: mailboxes, coverage: coverage(Math.max(mailboxes.length, 1)), timeOf: () => 0 },
     detectors: [detector, userSide('shared-billing')],
     budget: { maxEvents: 500 },
   })
 
   const exfiltrating = (ref: string) => mailbox(ref, { forwardingSmtpAddress: 'exfil@evil.example' })
-  assert.deepEqual(withMailboxes([]).count, { accuracy: 'EXACT', value: 1 })
+  assert.deepEqual(figure(withMailboxes([]).count), { accuracy: 'EXACT', value: 1 })
   // A mailbox whose ref happens to spell the same string as a user is still a
   // mailbox — it is not evidence of a second person, nor of that person.
-  assert.deepEqual(withMailboxes([exfiltrating('shared-billing')]).count, { accuracy: 'EXACT', value: 1 })
+  assert.deepEqual(figure(withMailboxes([exfiltrating('shared-billing')]).count), { accuracy: 'EXACT', value: 1 })
   // And an unrelated mailbox does not become a second person either. This is the
   // case that fails if the two namespaces are ever compared as bare strings.
-  assert.deepEqual(withMailboxes([exfiltrating('reception-room')]).count, { accuracy: 'EXACT', value: 1 })
+  assert.deepEqual(figure(withMailboxes([exfiltrating('reception-room')]).count), { accuracy: 'EXACT', value: 1 })
   assert.equal(withMailboxes([exfiltrating('reception-room')]).findings.length, 2, 'still reported, just not counted')
 })
 
@@ -157,19 +158,28 @@ test('a disabled rule is configuration, not exfiltration', () => {
   assert.deepEqual(result.findings, [])
   // Considered and cleared, which is what lets this read as a genuine zero.
   assert.deepEqual(result.detectors, [{ detectorId: 'external-mailbox-forwarding', status: 'RAN', considered: 1, matched: 0 }])
-  assert.deepEqual(result.count, { accuracy: 'EXACT', value: 0 })
+  assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 0 })
 })
 
-test('without verified domains it considers nothing rather than flagging everyone', () => {
-  // Every address would look external, so the honest answer is that it could
-  // not run — not a page of findings asserting the whole tenant is exfiltrating.
+test('without verified domains it declares itself inapplicable rather than flagging everyone', () => {
+  // Every address would look external, so the honest answer is that this check
+  // cannot be asked here — not a page of findings asserting the whole tenant is
+  // exfiltrating, and not a run that "considered nothing", which is
+  // indistinguishable from a dead detector.
   const blind = externalForwardingDetector({ verifiedDomains: [] })
   const result = assess([mailbox('a', { forwardingSmtpAddress: 'colleague@contoso.com' })], [blind])
   assert.deepEqual(result.findings, [])
-  assert.deepEqual(result.detectors, [{ detectorId: 'external-mailbox-forwarding', status: 'RAN', considered: 0, matched: 0 }])
-  // Considered-none is exactly what the per-detector accounting exists to
-  // surface: this reads differently from a detector that examined the mailboxes.
-  assert.equal(result.detectors[0]?.status === 'RAN' && result.detectors[0].considered, 0)
+  assert.deepEqual(result.detectors, [{
+    detectorId: 'external-mailbox-forwarding',
+    status: 'INAPPLICABLE',
+    because: "The tenant's verified domains are unknown, so internal and external recipients cannot be told apart.",
+  }])
+
+  // It does not withhold the claim — nothing was lost, the question could not be
+  // asked — but the count carries the gap rather than reading as clean.
+  assert.equal(result.claim.permitted, true)
+  assert.deepEqual(result.count.scope.covered, [])
+  assert.equal(result.count.scope.notCovered.length, 1)
 })
 
 test('the detector plugs into the core without the core knowing anything about mailboxes', () => {
@@ -178,7 +188,7 @@ test('the detector plugs into the core without the core knowing anything about m
   // other evidence stream.
   const clean = assess([mailbox('a', { forwardingSmtpAddress: 'colleague@contoso.com' })])
   assert.deepEqual(clean.claim, { permitted: true })
-  assert.deepEqual(clean.count, { accuracy: 'EXACT', value: 0 })
+  assert.deepEqual(figure(clean.count), { accuracy: 'EXACT', value: 0 })
   assert.deepEqual(clean.findings, [], 'nothing found, as distinct from nothing counted')
 
   // And the coverage rules apply unchanged: an artefact nobody could read
@@ -188,7 +198,7 @@ test('the detector plugs into the core without the core knowing anything about m
       availability: 'READ',
       applies: [mailbox('a', { forwardingSmtpAddress: 'exfil@evil.example' })],
       coverage: coverage(1, { unprocessable: { MAILBOX_UNREADABLE: 1 } }),
-      order: 'OLDEST_FIRST',
+      timeOf: () => 0,
     },
     detectors: [detector], budget: { maxEvents: 500 },
   })
@@ -197,5 +207,5 @@ test('the detector plugs into the core without the core knowing anything about m
   // No user was identified, so there is no floor to state about people — and a
   // lower bound of zero is not a statement. The mailbox finding is still
   // reported; it simply is not evidence about how many humans are affected.
-  assert.deepEqual(partial.count, { accuracy: 'NOT_AVAILABLE', value: null })
+  assert.deepEqual(figure(partial.count), { accuracy: 'NOT_AVAILABLE', value: null })
 })

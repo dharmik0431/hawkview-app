@@ -1,5 +1,5 @@
 import type {
-  Assessment, Budget, Count, Coverage, Detector, DetectorReport, Evidence, EvidenceState, Finding,
+  Assessment, Budget, Count, CountScope, Coverage, Detector, DetectorReport, Evidence, EvidenceState, Finding,
   WithheldReason, ZeroClaim,
 } from './contract.js'
 
@@ -32,7 +32,7 @@ export const NO_COVERAGE: Coverage = Object.freeze({
 /** Read straight off the evidence, so the state cannot disagree with what the
  * caller actually has. Only the read branch can be partial, because only read
  * evidence has anything to be partial about. */
-export function evidenceState(evidence: Evidence<unknown>): EvidenceState {
+export function evidenceState<Event>(evidence: Evidence<Event>): EvidenceState {
   switch (evidence.availability) {
     case 'NEVER_COLLECTED': return 'NEVER_COLLECTED'
     case 'UNREADABLE_NOW': return 'UNREADABLE_NOW'
@@ -106,11 +106,41 @@ export const unattributedFindings = (findings: readonly Finding[]): number =>
  * no assertion could observe. QA found exactly that by mutation: substituting a
  * wrong reason changed nothing and every test still passed. Narrowing the
  * parameter deletes the opportunity instead of testing for it. */
-export function countOf(distinctSubjects: number, permitted: boolean): Count {
-  if (permitted) return { accuracy: 'EXACT', value: distinctSubjects }
+export function countOf(distinctSubjects: number, permitted: boolean, scope: CountScope): Count {
+  if (permitted) return { accuracy: 'EXACT', value: distinctSubjects, scope }
   return distinctSubjects > 0
-    ? { accuracy: 'AT_LEAST', value: distinctSubjects }
-    : { accuracy: 'NOT_AVAILABLE', value: null }
+    ? { accuracy: 'AT_LEAST', value: distinctSubjects, scope }
+    : { accuracy: 'NOT_AVAILABLE', value: null, scope }
+}
+
+/** Derived from the reports once, so the scope and the detector list cannot
+ * drift into telling different stories about the same run. */
+export function scopeOf(reports: readonly DetectorReport[]): CountScope {
+  return {
+    covered: reports.flatMap(report => report.status === 'RAN' ? [report.detectorId] : []),
+    notCovered: reports.flatMap(report =>
+      report.status === 'INAPPLICABLE' ? [{ detectorId: report.detectorId, because: report.because }] : []),
+  }
+}
+
+/** The most recent events, by the caller's own time accessor.
+ *
+ * Ties keep the later position, so a run over identical inputs selects
+ * identically. Input order is preserved among the survivors: detectors may
+ * depend on the sequence they were handed, and reordering here would change
+ * what they see for reasons unrelated to the budget.
+ */
+function mostRecent<Event>(
+  applies: readonly Event[], limit: number, timeOf: (event: Event) => number | string,
+): readonly Event[] {
+  if (limit <= 0) return []
+  const ranked = applies
+    .map((event, index) => ({ index, at: timeOf(event) }))
+    .sort((left, right) => left.at < right.at ? 1 : left.at > right.at ? -1 : right.index - left.index)
+    .slice(0, limit)
+    .map(entry => entry.index)
+    .sort((left, right) => left - right)
+  return ranked.map(index => applies[index]!)
 }
 
 export function withheldExplanation(reason: WithheldReason): string {
@@ -150,23 +180,26 @@ export function evaluate<Event>(input: Readonly<{
     const claim = zeroClaim({
       state, coverage: NO_COVERAGE, withinBudget: true, allDetectorsRan: true, allSubjectsResolved: true,
     })
-    return { state, coverage: NO_COVERAGE, detectors: [], findings: [], count: countOf(0, claim.permitted), claim }
+    return {
+      state,
+      coverage: NO_COVERAGE,
+      detectors: [],
+      findings: [],
+      // Nothing ran, so nothing is covered. An empty scope beside a
+      // not-available count says exactly that, without implying a check
+      // was skipped for a reason of its own.
+      count: countOf(0, claim.permitted, { covered: [], notCovered: [] }),
+      claim,
+    }
   }
 
-  const { applies, coverage, order } = input.evidence
+  const { applies, coverage, timeOf } = input.evidence
   const withinBudget = applies.length <= input.budget.maxEvents
-  // Over budget, keep the most recent. Truncation is safe in one direction —
-  // fewer events can break a window and miss a real pattern, but cannot invent
-  // one — so this only decides which subset a technician sees, and a tool that
-  // shows last month's attack while hiding today's is the worse choice. The
-  // claim is withheld as CAPACITY_EXCEEDED either way, so nobody is misled
-  // about completeness. Which end is recent comes from the caller's declared
-  // order, because the core cannot read a timestamp off a generic event.
-  const applicable = withinBudget
-    ? applies
-    : order === 'OLDEST_FIRST'
-      ? applies.slice(applies.length - input.budget.maxEvents)
-      : applies.slice(0, input.budget.maxEvents)
+  // Over budget, keep the most recent: a window that overflows is precisely one
+  // where something may be happening now, and showing last month's findings
+  // while dropping today's is the worse failure. The claim is withheld as
+  // CAPACITY_EXCEEDED either way, so nobody is told the window was complete.
+  const applicable = withinBudget ? applies : mostRecent(applies, input.budget.maxEvents, timeOf)
 
   const findings: Finding[] = []
   const reports: DetectorReport[] = []
@@ -176,6 +209,14 @@ export function evaluate<Event>(input: Readonly<{
   for (const detector of input.detectors) {
     try {
       const result = detector.run(applicable)
+      if (result.status === 'INAPPLICABLE') {
+        // Narrows what the count answers rather than blocking it. Unlike a
+        // crash, nothing was lost: this evidence was never going to carry the
+        // answer, and saying so is more useful than withholding the tenant's
+        // claim because of a licence it does not hold.
+        reports.push({ detectorId: detector.id, status: 'INAPPLICABLE', because: result.because })
+        continue
+      }
       findings.push(...result.findings)
       reports.push({ detectorId: detector.id, status: 'RAN', considered: result.considered, matched: result.findings.length })
     } catch {
@@ -187,7 +228,11 @@ export function evaluate<Event>(input: Readonly<{
     state,
     coverage,
     withinBudget,
-    allDetectorsRan: reports.every(report => report.status === 'RAN'),
+    // An inapplicable detector is not a failed one. Only a crash leaves what it
+    // would have found unknown; evidence that cannot carry a question narrows
+    // the scope instead, which is why that distinction is a status and not a
+    // boolean.
+    allDetectorsRan: reports.every(report => report.status !== 'FAILED'),
     allSubjectsResolved: unattributedFindings(findings) === 0,
   })
   return {
@@ -195,7 +240,7 @@ export function evaluate<Event>(input: Readonly<{
     coverage,
     detectors: reports,
     findings,
-    count: countOf(distinctUsers(findings), claim.permitted),
+    count: countOf(distinctUsers(findings), claim.permitted, scopeOf(reports)),
     claim,
   }
 }
