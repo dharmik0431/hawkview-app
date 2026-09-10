@@ -107,6 +107,12 @@ export type WithheldReason =
    * clean result would cover. Distinct from evidence we could not read: this is
    * evidence we may never have requested. */
   | 'COLLECTION_SCOPE_UNDECLARED'
+  /** No check examined a single event, so there is nothing for a clean result to
+   * rest on. A detector may honestly decline everything it was handed — that is
+   * the fully-excluded case and its accounting is complete — but a check that
+   * looked at nothing cannot be one of the checks a confident zero stands on.
+   * The same guard as coverage.applies > 0, one layer further in. */
+  | 'NO_CHECK_EXAMINED_EVIDENCE'
 
 /** Decided once. Every surface reads this rather than re-deriving it, because
  * two surfaces answering the same question against different bars is how a

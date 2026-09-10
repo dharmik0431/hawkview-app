@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { countOf, declined, evaluate, uninterpreted, withheldExplanation, zeroClaim } from './evaluate.js'
-import type { Coverage, Detector, Finding } from './contract.js'
+import type { Coverage, Detector, Finding, WithheldReason } from './contract.js'
 import { figure } from './test-support.js'
 
 type Event = Readonly<{ id: string; subject: string; match?: boolean; at?: number }>
@@ -18,7 +18,7 @@ const coverage = (parts: Partial<Coverage> = {}): Coverage => ({
 /** Sign-in events carry a directory user, so this detector's findings are about
  * people and do count. Contrast the mailbox detector, whose findings are not. */
 const user = (userRef: string) => (
-  { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: `guid-` } } as const)
+  { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const)
 
 const matching: Detector<Event> = {
   id: 'matches-flagged',
@@ -116,7 +116,10 @@ test('a window where nothing applied cannot report a confident zero', () => {
   // The live production defect: everything set aside, nothing assessed, and a
   // headline zero captioned as though the evidence had been examined.
   const result = run([], { coverage: coverage({ applies: 0, doesNotApply: { NOT_A_CREDENTIAL_EVENT: 12 } }) })
-  assert.deepEqual(result.claim, { permitted: false, because: ['NOTHING_APPLICABLE'] })
+  // Two reasons now, and both are true: no event applied, and no check assessed
+  // anything. Reporting only the first would answer a question nobody asked.
+  assert.deepEqual([...(result.claim.permitted === false ? result.claim.because : [])].sort(),
+    ['NOTHING_APPLICABLE', 'NO_CHECK_EXAMINED_EVIDENCE'])
   assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
 })
 
@@ -144,13 +147,19 @@ test('the four states stay distinct, and each withholds as its own sentence', ()
     run([event('1')], { coverage: coverage({ applies: 1, unknown: { X: 1 } }) }).claim,
     run([], { coverage: coverage({ applies: 0 }) }).claim,
     run([event('1')], { coverage: applied, detectors: [broken] }).claim,
-  ].map(claim => (claim.permitted ? [] : claim.because))
-  // Each of these withholds for exactly one reason, and the five stay distinct.
-  // Collapsing them is how a label meaning "we could not read it" came to mean
-  // "never collected".
-  assert.deepEqual(reasons.map(list => list.length), [1, 1, 1, 1, 1])
+  ].map(claim => (claim.permitted ? [] : [...claim.because].sort()))
+  // Five situations, five distinct answers, each carrying its own characteristic
+  // reason. Collapsing them is how a label meaning "we could not read it" came
+  // to mean "never collected".
   assert.equal(new Set(reasons.map(list => list.join('+'))).size, 5)
-  assert.equal(new Set(reasons.flat().map(withheldExplanation)).size, 5)
+  const characteristic: readonly WithheldReason[] =
+    ['NEVER_COLLECTED', 'UNREADABLE_NOW', 'UNINTERPRETED_EVENTS', 'NOTHING_APPLICABLE', 'DETECTOR_FAILED']
+  characteristic.forEach((reason, index) =>
+    assert.ok(reasons[index]?.includes(reason), `case ${index} should name ${reason}`))
+
+  // Every reason reaches a reader as its own sentence — no two share wording.
+  const everyReason: readonly WithheldReason[] = [...new Set(reasons.flat())]
+  assert.equal(new Set(everyReason.map(withheldExplanation)).size, everyReason.length)
 })
 
 test('unread evidence cannot produce a finding, because it cannot carry an event', () => {
@@ -366,6 +375,7 @@ test('the claim is computed once and the count cannot disagree with it', () => {
         withinBudget: true,
         allDetectorsRan: true,
         allSubjectsResolved: true,
+        anyCheckExaminedEvidence: true,
       }),
       result.claim,
       'recomputing from the reported coverage gives the same answer')
@@ -537,7 +547,7 @@ test('a detector whose account of itself is impossible is not trusted to have ru
   for (const bad of [overclaims, negative]) {
     const result = run([event('1')], { detectors: [bad] })
     assert.deepEqual(result.detectors, [{ detectorId: bad.id, status: 'FAILED' }])
-    assert.deepEqual(result.claim.permitted === false && result.claim.because, ['DETECTOR_FAILED'])
+    assert.ok(result.claim.permitted === false && result.claim.because.includes('DETECTOR_FAILED'))
   }
 
   // But what it found is still kept. Discarding real findings over a wrong
@@ -586,7 +596,7 @@ test('a claim cannot be asked about unread evidence that somehow has findings', 
     zeroClaim({
       read: true,
       coverage: coverage({ applies: 1, unknown: { X: 1 } }),
-      withinBudget: true, allDetectorsRan: true, allSubjectsResolved: true,
+      withinBudget: true, allDetectorsRan: true, allSubjectsResolved: true, anyCheckExaminedEvidence: true,
     }),
     { permitted: false, because: ['UNINTERPRETED_EVENTS'] })
 })
@@ -631,7 +641,8 @@ test('a detector that silently narrows its own input is rejected, which a range 
   const narrowed = run(thousand, { coverage: coverage({ applies: 1000 }), detectors: [silentlyNarrows] })
 
   assert.deepEqual(narrowed.detectors, [{ detectorId: 'narrows', status: 'FAILED' }])
-  assert.deepEqual(narrowed.claim.permitted === false && narrowed.claim.because, ['DETECTOR_FAILED'])
+  assert.deepEqual([...(narrowed.claim.permitted === false ? narrowed.claim.because : [])].sort(),
+    ['DETECTOR_FAILED', 'NO_CHECK_EXAMINED_EVIDENCE'])
   // Note this figure is inside any plausible range check: 5 of 1000 is neither
   // negative nor greater than the input. Only the sum catches it.
   assert.ok(5 < thousand.length)
@@ -660,4 +671,46 @@ test('setting events aside under a blank reason is a silent opt-out wearing a nu
   }
   const result = run([event('1'), event('2')], { detectors: [blankReason] })
   assert.deepEqual(result.detectors, [{ detectorId: 'blank', status: 'FAILED' }])
+})
+
+test('a detector that balanced its books without examining anything cannot support a zero', () => {
+  // QA's hole in the sum invariant. `considered: 0, declined: 1000` balances
+  // perfectly, accounts for every event, and looked at none of them — and a
+  // legitimate reason attached makes it more plausible rather than less. The
+  // sum proves the accounting is COMPLETE; it proves nothing was EXAMINED.
+  const declinesEverything: Detector<Event> = {
+    id: 'declines-all', monotonic: true,
+    run: applicable => ({
+      status: 'RAN',
+      considered: 0,
+      declined: { NOT_THE_FAMILY_THIS_RULE_READS: applicable.length },
+      findings: [],
+    }),
+  }
+  const thousand = Array.from({ length: 1000 }, (_, index) => event(`${index}`, { at: index }))
+  const result = run(thousand, { coverage: coverage({ applies: 1000 }), detectors: [declinesEverything] })
+
+  // The report is honest and stays RAN — this is the fully-excluded case, not a
+  // broken detector, and its accounting is complete.
+  assert.deepEqual(result.detectors, [{
+    detectorId: 'declines-all', status: 'RAN', considered: 0,
+    declined: { NOT_THE_FAMILY_THIS_RULE_READS: 1000 }, matched: 0,
+  }])
+  // But it cannot be one of the checks a confident zero rests on.
+  assert.deepEqual(result.claim.permitted === false && result.claim.because, ['NO_CHECK_EXAMINED_EVIDENCE'])
+  assert.deepEqual(figure(result.count), { accuracy: 'NOT_AVAILABLE', value: null })
+  // And it is absent from `covered`, so it is not credited with clearing
+  // anything — which is how "ran and found nothing" stayed believable over
+  // events nobody looked at.
+  assert.deepEqual(result.count.scope.covered, [])
+  assert.equal(result.count.scope.notCovered.length, 1)
+
+  // One check that did examine something is enough to carry the claim, and the
+  // abstaining one still shows as not covering anything.
+  const alongside = run(thousand, {
+    coverage: coverage({ applies: 1000 }), detectors: [declinesEverything, silent],
+  })
+  assert.deepEqual(alongside.claim, { permitted: true })
+  assert.deepEqual(alongside.count.scope.covered, ['silent'])
+  assert.equal(alongside.count.scope.notCovered.length, 1)
 })

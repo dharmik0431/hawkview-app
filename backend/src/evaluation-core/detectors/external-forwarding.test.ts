@@ -233,11 +233,27 @@ test('without verified domains it declares itself inapplicable rather than flagg
     because: "The tenant's verified domains are unknown, so internal and external recipients cannot be told apart.",
   }])
 
-  // It does not withhold the claim — nothing was lost, the question could not be
-  // asked — but the count carries the gap rather than reading as clean.
-  assert.equal(result.claim.permitted, true)
+  // An inapplicable check does not withhold on its own account — nothing was
+  // lost, the question could not be asked. But this tenant has only that one
+  // check, so nothing examined anything, and a zero resting on no examined
+  // evidence is a zero resting on nothing. Withheld, and it says which.
+  assert.deepEqual(result.claim.permitted === false && result.claim.because, ['NO_CHECK_EXAMINED_EVIDENCE'])
   assert.deepEqual(result.count.scope.covered, [])
   assert.equal(result.count.scope.notCovered.length, 1)
+
+  // Beside a second check that did examine something, the inapplicable one
+  // still does not gate — it only narrows the scope.
+  const alongside = assess([mailbox('a', { forwardingSmtpAddress: 'colleague@contoso.com' })], [
+    blind,
+    {
+      id: 'looked-at-it',
+      monotonic: true,
+      run: applicable => ({ status: 'RAN' as const, considered: applicable.length, declined: {}, findings: [] }),
+    },
+  ])
+  assert.deepEqual(alongside.claim, { permitted: true })
+  assert.deepEqual(alongside.count.scope.covered, ['looked-at-it'])
+  assert.equal(alongside.count.scope.notCovered.length, 1)
 })
 
 test('the detector plugs into the core without the core knowing anything about mailboxes', () => {

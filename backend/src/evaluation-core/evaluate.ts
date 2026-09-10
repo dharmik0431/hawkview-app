@@ -67,16 +67,24 @@ export type ClaimBasis =
     /** False when any finding names a subject we could not attribute. A count of
      * people cannot be exact while we hold a finding and cannot say whose it is. */
     allSubjectsResolved: boolean
+    /** False when no check examined a single event. Distinct from a check that
+     * could not run: these ran, accounted for everything, and assessed none of
+     * it, which is honest and still cannot support a confident zero. */
+    anyCheckExaminedEvidence: boolean
   }>
 
 export function zeroClaim(basis: ClaimBasis): ZeroClaim {
   if (!basis.read) return { permitted: false, because: [basis.because] }
 
-  const { coverage, withinBudget, allDetectorsRan, allSubjectsResolved } = basis
+  const { coverage, withinBudget, allDetectorsRan, allSubjectsResolved, anyCheckExaminedEvidence } = basis
   const reasons: WithheldReason[] = []
   if (!withinBudget) reasons.push('CAPACITY_EXCEEDED')
   if (!allDetectorsRan) reasons.push('DETECTOR_FAILED')
   if (!allSubjectsResolved) reasons.push('UNRESOLVED_SUBJECT_IDENTITY')
+  // The sum invariant proves a detector's accounting is COMPLETE. It proves
+  // nothing was EXAMINED: considered 0 with 1,000 declined balances perfectly.
+  // So the same guard as coverage.applies > 0, one layer further in.
+  if (!anyCheckExaminedEvidence) reasons.push('NO_CHECK_EXAMINED_EVIDENCE')
   // A narrower request is a DIFFERENT QUESTION, not an incomplete answer to the
   // same one — which is why it narrows the scope rather than withholding. A
   // truncated window and a crashed detector are incomplete answers to the
@@ -144,12 +152,30 @@ export function countOf(distinctSubjects: number, permitted: boolean, scope: Cou
 
 /** Derived from the reports once, so the scope and the detector list cannot
  * drift into telling different stories about the same run. */
+/** A check that examined nothing covers nothing.
+ *
+ * `considered: 0` with everything declined is an honest report — the
+ * fully-excluded case, complete accounting, nothing to look at — but it is not
+ * a question that was answered, so it belongs beside the checks that could not
+ * run rather than among the checks a zero rests on. Listing it as covered is
+ * how "ran and found nothing" stayed believable over events nobody looked at. */
+const examinedSomething = (report: DetectorReport): boolean =>
+  report.status === 'RAN' && report.considered > 0
+
 export function scopeOf(reports: readonly DetectorReport[], collectionScope: CollectionScope): CountScope {
   return {
     evidenceRequested: collectionScope.declared ? [collectionScope.asked] : [],
-    covered: reports.flatMap(report => report.status === 'RAN' ? [report.detectorId] : []),
-    notCovered: reports.flatMap(report =>
-      report.status === 'INAPPLICABLE' ? [{ detectorId: report.detectorId, because: report.because }] : []),
+    covered: reports.flatMap(report => examinedSomething(report) ? [report.detectorId] : []),
+    notCovered: reports.flatMap(report => {
+      if (report.status === 'INAPPLICABLE') return [{ detectorId: report.detectorId, because: report.because }]
+      if (report.status === 'RAN' && report.considered === 0) {
+        return [{
+          detectorId: report.detectorId,
+          because: 'This check assessed none of the events it was given, so it has not cleared any of them.',
+        }]
+      }
+      return []
+    }),
   }
 }
 
@@ -183,6 +209,7 @@ export function withheldExplanation(reason: WithheldReason): string {
     case 'DETECTOR_FAILED': return 'One of the checks could not complete, so anything it would have found is unknown. The other checks reported normally.'
     case 'UNRESOLVED_SUBJECT_IDENTITY': return 'Something was found on a mailbox we could not match to a person, so the number of people affected cannot be stated exactly. The findings themselves are listed.'
     case 'COLLECTION_SCOPE_UNDECLARED': return 'There is no record of what was requested from Microsoft for this window, so what a clean result would cover cannot be stated.'
+    case 'NO_CHECK_EXAMINED_EVIDENCE': return 'None of the checks assessed a single event in this window, so there is nothing for a clear result to rest on.'
     default: return unreachable(reason)
   }
 }
@@ -322,6 +349,7 @@ export function evaluate<Event>(input: Readonly<{
     // boolean.
     allDetectorsRan: reports.every(report => report.status !== 'FAILED'),
     allSubjectsResolved: unattributedFindings(findings) === 0,
+    anyCheckExaminedEvidence: reports.some(examinedSomething),
   })
   return {
     state,
