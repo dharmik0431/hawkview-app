@@ -49,6 +49,38 @@ function microsoftWithoutP2() {
   }
 }
 
+/**
+ * A tenant where Microsoft's channel is live — threat-intelligence verdicts
+ * already present in the sign-in evidence, no API call or purchase involved.
+ */
+function microsoftLive(hasMore = false) {
+  const envelope = syntheticRiskResponses().microsoftRiskyUsers
+  return {
+    ...envelope,
+    users: [
+      {
+        id: 'microsoft-record-1',
+        identityLabel: 'Synthetic finance user',
+        riskLevel: 'high',
+        riskState: 'atRisk',
+        riskDetail: null,
+        observedAt: envelope.observedAt,
+      },
+      {
+        id: 'microsoft-record-2',
+        identityLabel: 'Synthetic sales user',
+        riskLevel: 'medium',
+        riskState: 'dismissed',
+        riskDetail: null,
+        observedAt: envelope.observedAt,
+      },
+    ],
+    pageInfo: hasMore
+      ? { hasMore: true, nextCursor: 'cursor.abc' }
+      : { hasMore: false, nextCursor: null },
+  }
+}
+
 function render(
   assessmentValue: unknown = assessmentFixture(true),
   options: {
@@ -230,6 +262,200 @@ test('a zero is never rendered alone', () => {
   }
 })
 
+test('a live Microsoft channel shows its own records in its own vocabulary', () => {
+  const { document, text } = render(assessmentFixture(true), {
+    microsoft: microsoftLive(),
+  })
+  const panel = document.querySelector(
+    '[aria-labelledby="microsoft-channel-heading"]'
+  )
+  assert.ok(panel)
+  assert.match(panel!.textContent ?? '', /reporting on this tenant/)
+  // Microsoft's records, under Microsoft's heading, using Microsoft's terms.
+  assert.match(panel!.textContent ?? '', /Synthetic finance user/)
+  assert.match(panel!.textContent ?? '', /At risk/)
+  assert.match(panel!.textContent ?? '', /Dismissed/)
+  // Never a licence pitch on a tenant that is already reporting.
+  assert.doesNotMatch(text, /requires Entra ID P2/)
+})
+
+test('Microsoft records are never folded into the HawkView list or its count', () => {
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftLive(),
+  })
+  const hawkViewList = document.querySelector(
+    '[aria-labelledby="risky-users-list-heading"]'
+  )
+  assert.ok(hawkViewList)
+  // Microsoft's identities do not appear among HawkView's rows.
+  assert.doesNotMatch(hawkViewList!.textContent ?? '', /Synthetic finance user/)
+
+  // And the HawkView total is unchanged by Microsoft having two records.
+  const summary = document.querySelector(
+    '[aria-labelledby="risky-users-total-heading"]'
+  )
+  assert.ok(summary)
+  assert.match(summary!.textContent ?? '', /Risky user/)
+  assert.doesNotMatch(summary!.textContent ?? '', /3/)
+
+  const panel = document.querySelector(
+    '[aria-labelledby="microsoft-channel-heading"]'
+  )
+  assert.match(
+    panel!.textContent ?? '',
+    /never\s+added to, or subtracted from, the HawkView count/
+  )
+})
+
+test('rows say Microsoft is not comparable rather than that it cleared anyone', () => {
+  // Microsoft is live, but nothing correlates its directory objects to
+  // HawkView's tenant-keyed pseudonyms. "Microsoft did not report this user"
+  // would be a claim no evidence supports.
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftLive(),
+  })
+  for (const row of document.querySelectorAll(
+    '[aria-labelledby="risky-users-list-heading"] tbody tr'
+  )) {
+    const detectedBy = row.querySelectorAll('td')[1]?.textContent ?? ''
+    assert.match(detectedBy, /HawkView/)
+    assert.match(detectedBy, /Microsoft not comparable/)
+    assert.doesNotMatch(detectedBy, /Microsoft did not report/)
+  }
+})
+
+test('a bounded Microsoft page says so instead of implying a full total', () => {
+  const { document } = render(assessmentFixture(true), {
+    microsoft: microsoftLive(true),
+  })
+  const panel = document.querySelector(
+    '[aria-labelledby="microsoft-channel-heading"]'
+  )
+  assert.match(panel!.textContent ?? '', /More Microsoft records exist/)
+  assert.match(panel!.textContent ?? '', /incomplete result set/)
+})
+
+test('a withheld count reads as a decision, not as a blank or a breakage', () => {
+  const value = assessmentFixture(false)
+  value.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reason: 'UNRESOLVED_SUBJECT_IDENTITY',
+  }
+  const { text, cardText } = render(value)
+
+  for (const [label, rendered] of [
+    ['section', text],
+    ['overview card', cardText],
+  ] as const) {
+    // The slot where the number belongs says what happened, rather than
+    // showing a glyph a technician would read as an empty or broken state.
+    assert.match(rendered, /Not counted/, label)
+    assert.match(rendered, /could not be tied to people/, label)
+    assert.match(rendered, /belongs to a person/, label)
+    // Nothing invites a retry, because no retry would help.
+    assert.doesNotMatch(rendered, /Support code/, label)
+    assert.doesNotMatch(rendered, /try again/i, label)
+  }
+})
+
+test('an empty list never answers the question a withheld count refused', () => {
+  const value = assessmentFixture(true)
+  value.users = ['a', 'b', 'c'].map((character) =>
+    assessmentUser('HV-ID-MBX-001.v1', character)
+  )
+  value.rules[0].matchedIdentities = 0
+  value.rules[2].assessedIdentities = 3
+  value.rules[2].matchedIdentities = 3
+  value.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reason: 'UNRESOLVED_SUBJECT_IDENTITY',
+  }
+  const { document } = render(value)
+  const list = document.querySelector(
+    '[aria-labelledby="risky-users-list-heading"]'
+  )
+  assert.ok(list)
+  // Three mailboxes are forwarding externally and HawkView has just said it
+  // cannot tell how many belong to people. "No user needs attention" would
+  // answer that question anyway.
+  assert.doesNotMatch(
+    list!.textContent ?? '',
+    /No user is listed as needing attention/
+  )
+  assert.match(
+    list!.textContent ?? '',
+    /not the same as no user needing attention/
+  )
+
+  // Where HawkView did count, the plain sentence is still the right one.
+  const counted = render(assessmentFixture(false))
+  assert.match(
+    counted.document.querySelector(
+      '[aria-labelledby="risky-users-list-heading"]'
+    )?.textContent ?? '',
+    /No user is listed as needing attention/
+  )
+})
+
+test('what HawkView did find is rendered beside a withheld count', () => {
+  // Three mailboxes forwarding externally, none attributable to a person.
+  const value = assessmentFixture(true)
+  value.users = ['a', 'b', 'c'].map((character) =>
+    assessmentUser('HV-ID-MBX-001.v1', character)
+  )
+  value.rules[0].matchedIdentities = 0
+  value.rules[2].assessedIdentities = 3
+  value.rules[2].matchedIdentities = 3
+  value.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reason: 'UNRESOLVED_SUBJECT_IDENTITY',
+  }
+  const { text, cardText } = render(value)
+
+  for (const [label, rendered] of [
+    ['section', text],
+    ['overview card', cardText],
+  ] as const) {
+    assert.match(rendered, /What HawkView did find/, label)
+    assert.match(rendered, /External mailbox forwarding: 3 mailboxes/, label)
+  }
+})
+
+test('a check that cannot run states its scope beside the number, not elsewhere', () => {
+  const value = assessmentFixture(false)
+  value.rules[2].status = 'INAPPLICABLE'
+  value.rules[2].reasonCode = 'CHECK_NOT_APPLICABLE'
+  value.rules[2].assessedIdentities = null
+  value.rules[2].matchedIdentities = null
+  value.rules[2].evaluatedAt = null
+  value.rules[2].window = { start: null, end: null }
+  const { document, cardText } = render(value)
+
+  // The overview card carries the whole claim on its own, because that is
+  // often the only Risky Users surface a technician sees.
+  assert.match(cardText, /2 checks this tenant/)
+  assert.match(cardText, /1 further check cannot run/)
+  assert.match(cardText, /cannot run on this tenant/)
+  assert.match(cardText, /External mailbox forwarding/)
+
+  // In the section, the scope sits inside the same block as the number rather
+  // than in the coverage panel further down the page. A scoped zero whose
+  // scope lives one component away is a bare zero in practice.
+  const summary = document.querySelector(
+    '[aria-labelledby="risky-users-total-heading"]'
+  )
+  assert.ok(summary)
+  assert.match(summary!.textContent ?? '', /2 checks this tenant/)
+  assert.match(summary!.textContent ?? '', /1 further check cannot run/)
+  assert.match(summary!.textContent ?? '', /External mailbox forwarding/)
+
+  // And the check is labelled as unable to run, not as a failure.
+  assert.match(document.body.textContent ?? '', /Cannot run on this tenant/)
+})
+
 test('the four evidence states never share the same words', () => {
   const partial = assessmentFixture(false)
   delete partial.summary
@@ -245,7 +471,7 @@ test('the four evidence states never share the same words', () => {
   const states = {
     'never collected': {
       rendered: render(assessmentFixture(false), { notReported: true }).text,
-      sentence: /No assessment has been reported for this tenant yet/,
+      sentence: /HawkView has not evaluated this tenant yet/,
     },
     'genuinely clean': {
       rendered: render(assessmentFixture(false)).text,
@@ -286,7 +512,7 @@ test('a failed read keeps prior findings on screen and withdraws only the total'
   assert.match(text, /has not resolved or dismissed any of them/)
   // The user is still listed.
   assert.match(text, /Synthetic identity/)
-  assert.match(text, /Risky users could not be counted/)
+  assert.match(text, /The latest assessment could not be loaded/)
 })
 
 test('mailbox evidence is shown but visibly excluded from the count', () => {

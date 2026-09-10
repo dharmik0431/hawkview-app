@@ -85,7 +85,7 @@ test('a lower bound is marked as one and can never be zero', () => {
   assert.equal(adaptRiskAssessmentResponse(zeroBound, assessmentNow), null)
 })
 
-test('"cannot confirm a count" is an answer, and it is never zero', () => {
+test('a withheld count is a coverage statement, not an error', () => {
   const unknown = assessmentFixture(false)
   unknown.summary.currentUsers = { value: null, accuracy: 'UNKNOWN' }
   const withoutSummary = assessmentFixture(false)
@@ -94,6 +94,25 @@ test('"cannot confirm a count" is an answer, and it is never zero', () => {
   for (const [label, input] of [
     ['unknown accuracy', { assessment: adapt(unknown) }],
     ['no summary reported', { assessment: adapt(withoutSummary) }],
+  ] as const) {
+    const count = riskyUserCount({ ...input, channel: licenceBlocked })
+    assert.equal(count.accuracy, 'WITHHELD', label)
+    assert.equal(count.value, null, label)
+    assert.equal(count.accessibleValue, 'Not counted', label)
+    assert.match(count.caption, /not zero/i, label)
+    // A technician who reads this as breakage opens a support ticket, so
+    // nothing in it may sound like a fault or invite a retry.
+    assert.doesNotMatch(
+      count.headline,
+      /error|failed|could not be loaded/i,
+      label
+    )
+    assert.doesNotMatch(count.caption, /try again|retry|error/i, label)
+  }
+})
+
+test('a failed read is a failure and says so, unlike a withheld count', () => {
+  for (const [label, input] of [
     ['no assessment at all', { assessment: null }],
     [
       'request failed',
@@ -105,12 +124,91 @@ test('"cannot confirm a count" is an answer, and it is never zero', () => {
     ],
   ] as const) {
     const count = riskyUserCount({ ...input, channel: licenceBlocked })
-    assert.equal(count.accuracy, 'NOT_AVAILABLE', label)
+    assert.equal(count.accuracy, 'UNAVAILABLE', label)
     assert.equal(count.value, null, label)
     assert.equal(count.display, '—', label)
-    assert.equal(count.accessibleValue, 'Not available', label)
     assert.match(count.caption, /not zero|has not resolved/i, label)
   }
+})
+
+test('each withholding reason gets its own words', () => {
+  const reasons = [
+    'UNRESOLVED_SUBJECT_IDENTITY',
+    'UNINTERPRETABLE_EVIDENCE',
+    'CAPACITY_LIMIT',
+    'INCOMPLETE_WINDOW',
+    'COLLECTION_STALE',
+    'SOURCE_UNAVAILABLE',
+  ] as const
+  const headlines = new Set<string>()
+  const captions = new Set<string>()
+  for (const reason of reasons) {
+    const value = assessmentFixture(false)
+    value.summary.currentUsers = { value: null, accuracy: 'UNKNOWN', reason }
+    const count = riskyUserCount({
+      assessment: adapt(value),
+      channel: licenceBlocked,
+    })
+    assert.equal(count.accuracy, 'WITHHELD', reason)
+    headlines.add(count.headline)
+    captions.add(count.caption)
+  }
+  // Collapsing these into one generic "unavailable" string is the defect this
+  // rebuild exists to remove, so no two may share wording.
+  assert.equal(headlines.size, reasons.length)
+  assert.equal(captions.size, reasons.length)
+})
+
+test('the two reasons that send a technician to different places read differently', () => {
+  const forReason = (reason: string) => {
+    const value = assessmentFixture(false)
+    value.summary.currentUsers = { value: null, accuracy: 'UNKNOWN', reason }
+    return riskyUserCount({
+      assessment: adapt(value),
+      channel: licenceBlocked,
+    })
+  }
+  const identity = forReason('UNRESOLVED_SUBJECT_IDENTITY')
+  const events = forReason('UNINTERPRETABLE_EVIDENCE')
+  assert.match(identity.caption, /belongs to a person/)
+  assert.match(events.caption, /does not recognise/)
+  assert.notEqual(identity.caption, events.caption)
+  assert.notEqual(identity.headline, events.headline)
+})
+
+test('an unreported withholding reason is admitted, never guessed at', () => {
+  const value = assessmentFixture(false)
+  value.summary.currentUsers = { value: null, accuracy: 'UNKNOWN' }
+  const count = riskyUserCount({
+    assessment: adapt(value),
+    channel: licenceBlocked,
+  })
+  assert.match(count.caption, /did not report why/)
+})
+
+test('what HawkView does know is carried beside a withheld count', () => {
+  // Three mailboxes forwarding externally, none of which can be tied to a
+  // person. The count is withheld; the findings are not.
+  const value = assessmentFixture(true)
+  value.users = ['a', 'b', 'c'].map((character) =>
+    assessmentUser('HV-ID-MBX-001.v1', character)
+  )
+  value.rules[0].matchedIdentities = 0
+  value.rules[2].assessedIdentities = 3
+  value.rules[2].matchedIdentities = 3
+  value.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reason: 'UNRESOLVED_SUBJECT_IDENTITY',
+  }
+  const count = riskyUserCount({
+    assessment: adapt(value),
+    channel: licenceBlocked,
+  })
+  assert.equal(count.accuracy, 'WITHHELD')
+  // "3 mailboxes forwarding externally" is true and useful even though the
+  // number of people behind them is not knowable.
+  assert.deepEqual(count.known, ['External mailbox forwarding: 3 mailboxes'])
 })
 
 test('a failed read never resolves findings that were already reported', () => {
@@ -120,7 +218,7 @@ test('a failed read never resolves findings that were already reported', () => {
     channel: licenceBlocked,
     requestFailed: true,
   })
-  assert.equal(count.accuracy, 'NOT_AVAILABLE')
+  assert.equal(count.accuracy, 'UNAVAILABLE')
   assert.match(count.caption, /has not resolved them/)
   // The users themselves stay on screen; only the total is withdrawn.
   assert.equal(riskyUserList(assessment, licenceBlocked).rows.length, 1)
@@ -178,12 +276,45 @@ test('a partial page is disclosed rather than counted as the whole tenant', () =
     assessment: adapt(value),
     channel: licenceBlocked,
   })
-  assert.equal(count.accuracy, 'NOT_AVAILABLE')
+  assert.equal(count.accuracy, 'WITHHELD')
   assert.ok(
     count.gaps.some((gap) =>
       /More users are available than the page that was read/.test(gap)
     )
   )
+})
+
+test('a check that cannot run bounds the claim and travels with the count', () => {
+  // Three of five tenants are on the audit-log fallback, which carries no
+  // conditional-access status, device detail or risk fields, so some checks
+  // have nothing to execute against.
+  const value = assessmentFixture(false)
+  value.rules[2].status = 'INAPPLICABLE'
+  value.rules[2].reasonCode = 'CHECK_NOT_APPLICABLE'
+  value.rules[2].assessedIdentities = null
+  value.rules[2].matchedIdentities = null
+  value.rules[2].evaluatedAt = null
+  value.rules[2].window = { start: null, end: null }
+  const assessment = adapt(value)
+
+  // A check that cannot run is not incomplete collection, so an exact zero is
+  // still reachable — otherwise those three tenants could never show a number.
+  const count = riskyUserCount({ assessment, channel: licenceBlocked })
+  assert.equal(count.accuracy, 'EXACT')
+  assert.equal(count.value, 0)
+
+  // But the zero states its own scope, in the claim itself...
+  assert.match(count.caption, /2 checks this tenant/)
+  assert.match(count.caption, /1 further check cannot run/)
+  // ...and in the disclosure carried alongside the number, so the scope is
+  // never a footnote one component away.
+  assert.ok(
+    count.gaps.some((gap) =>
+      /1 of 3 HawkView checks? cannot run on this tenant/.test(gap)
+    )
+  )
+  // Naming which check it was is what makes the scope actionable.
+  assert.ok(count.gaps.some((gap) => /External mailbox forwarding/.test(gap)))
 })
 
 /* -------------------------------------------------------------------------- */

@@ -5,9 +5,14 @@
  * All three read from here so they cannot disagree with each other, and so the
  * rules that keep them honest are written once:
  *
- *  - A count is exact, a lower bound, or not available. Zero is reachable only
- *    through the exact branch, a lower bound is never zero, and "we cannot
- *    confirm a count" is an answer rather than an error.
+ *  - A count is exact, a lower bound, withheld, or unavailable. Zero is
+ *    reachable only through the exact branch, and a lower bound is never zero.
+ *  - Withheld and unavailable are not the same thing and never share wording.
+ *    Withheld means HawkView will not guess: nothing is broken, no retry helps,
+ *    and the reason is specific enough to send a technician somewhere.
+ *    Unavailable means the read failed, which is a fault and says so.
+ *  - When a count is withheld, what HawkView does know is shown beside it. The
+ *    findings exist even when the total does not.
  *  - A zero is never shown on its own. It always carries what was evaluated to
  *    produce it and what was not covered, because a bare zero beside an
  *    undisclosed gap is the defect this rebuild exists to remove.
@@ -24,6 +29,7 @@ import {
 } from './presentation.ts'
 import type {
   IdentityRiskChannelReason,
+  RiskAssessmentCountReason,
   MicrosoftEntraRiskyUser,
   MicrosoftEntraRiskyUsersView,
   RiskAssessment,
@@ -351,7 +357,20 @@ export function riskyUserList(
 /* Count                                                                      */
 /* -------------------------------------------------------------------------- */
 
-export type RiskyUserCountAccuracy = 'EXACT' | 'AT_LEAST' | 'NOT_AVAILABLE'
+export type RiskyUserCountAccuracy =
+  | 'EXACT'
+  | 'AT_LEAST'
+  /**
+   * HawkView could count but will not, because any number it produced would be
+   * a guess. This is a statement about coverage, not a failure: nothing is
+   * broken, no retry helps, and the findings behind it are still real. It must
+   * never be presented as an error or an empty state — a technician who reads a
+   * withheld count as breakage opens a support ticket, which is a worse outcome
+   * than the dishonest number would have been.
+   */
+  | 'WITHHELD'
+  /** The assessment could not be loaded or read. This one is a failure. */
+  | 'UNAVAILABLE'
 
 export type RiskyUserCount = {
   accuracy: RiskyUserCountAccuracy
@@ -363,6 +382,13 @@ export type RiskyUserCount = {
   headline: string
   /** What this number is, and what it does not cover. Never omitted. */
   caption: string
+  /**
+   * What HawkView does know, when it will not give a number. "3 mailboxes
+   * forwarding externally; cannot confirm how many belong to users" is far more
+   * useful than a blank, and it is true — the findings exist even when the
+   * count does not.
+   */
+  known: string[]
   /**
    * Everything the number does not account for. A zero is never rendered
    * without these, and a caller that drops them is dropping the disclosure that
@@ -381,6 +407,86 @@ export type RiskyUserCountInput = {
   contractFailed?: boolean
 }
 
+/**
+ * Why an exact total was withheld, in words that send a technician somewhere.
+ * These are deliberately not interchangeable: "we could not confirm whether
+ * these mailboxes belong to people" and "we could not interpret some sign-in
+ * events" are different problems with different next steps, and collapsing them
+ * into one generic "unavailable" is the defect this rebuild exists to remove.
+ */
+const withheldReasonCopy: Readonly<
+  Record<RiskAssessmentCountReason, { headline: string; caption: string }>
+> = {
+  UNRESOLVED_SUBJECT_IDENTITY: {
+    headline: 'Not counted — findings could not be tied to people',
+    caption:
+      'HawkView found activity worth reviewing but could not establish which of it belongs to a person, so it will not state a number of users. The mailbox or account binding was stale, missing, duplicated or ambiguous. The findings themselves are listed below and are unaffected.',
+  },
+  UNINTERPRETABLE_EVIDENCE: {
+    headline: 'Not counted — some evidence could not be interpreted',
+    caption:
+      'This tenant’s evidence contains sign-in codes or events that HawkView does not recognise. Rather than count around them and imply the rest is the whole picture, HawkView withholds the total. What it did interpret is listed below.',
+  },
+  CAPACITY_LIMIT: {
+    headline: 'Not counted — more evidence than a single assessment covers',
+    caption:
+      'This tenant produced more matching evidence than one assessment reads, so a tenant-wide total would understate it. What was read is listed below.',
+  },
+  INCOMPLETE_WINDOW: {
+    headline: 'Not counted — the evidence window is incomplete',
+    caption:
+      'The evidence window HawkView assessed does not cover the full period, so a tenant total would describe part of it as though it were all of it. Findings inside the window are listed below.',
+  },
+  COLLECTION_STALE: {
+    headline: 'Not counted — the evidence is out of date',
+    caption:
+      'The most recent collection for this tenant is older than its freshness expectation. Findings are shown as they were last observed rather than counted as a current position.',
+  },
+  SOURCE_UNAVAILABLE: {
+    headline: 'Not counted — an evidence source is unavailable',
+    caption:
+      'One of the sources this count depends on did not return evidence. A total drawn from the remaining sources would look like a tenant-wide answer without being one.',
+  },
+}
+
+const unreportedWithheldReason = {
+  headline: 'Not counted — HawkView could not confirm a total',
+  caption:
+    'HawkView did not report a confirmed number of users for this tenant, and did not report why. It is not zero. Any users it did report are listed below.',
+}
+
+/**
+ * What is still true when the count is not. Built from the findings that were
+ * returned, so it never claims more than the assessment did.
+ */
+function knownDespiteNoCount(assessment: RiskAssessment | null) {
+  if (!assessment) return []
+  const byReason = new Map<string, Set<string>>()
+  for (const user of assessment.users) {
+    for (const finding of user.findings) {
+      if (finding.activityState !== 'CURRENT') continue
+      const key = `${finding.title} ${user.subjectType}`
+      const subjects = byReason.get(key) ?? new Set<string>()
+      subjects.add(user.id)
+      byReason.set(key, subjects)
+    }
+  }
+  return Array.from(byReason.entries())
+    .map(([key, subjects]) => {
+      const [title, subjectType] = key.split(' ')
+      const noun =
+        subjectType === 'MAILBOX'
+          ? subjects.size === 1
+            ? 'mailbox'
+            : 'mailboxes'
+          : subjects.size === 1
+            ? 'account'
+            : 'accounts'
+      return `${title}: ${subjects.size} ${noun}`
+    })
+    .sort()
+}
+
 function coverageGaps(
   assessment: RiskAssessment | null,
   channel: MicrosoftChannel
@@ -389,8 +495,25 @@ function coverageGaps(
   if (channel.state !== 'REPORTING') gaps.push(channel.headline)
   if (!assessment) return gaps
 
+  // A check that cannot run on this tenant's evidence bounds what any number
+  // here means, so it is disclosed beside the number rather than left to the
+  // coverage panel further down the page.
+  const inapplicable = assessment.rules.filter(
+    (rule) => rule.status === 'INAPPLICABLE'
+  )
+  if (inapplicable.length > 0) {
+    gaps.push(
+      `${inapplicable.length} of ${assessment.rules.length} HawkView ${
+        assessment.rules.length === 1 ? 'check' : 'checks'
+      } cannot run on this tenant’s evidence: ${inapplicable
+        .map((rule) => rule.title)
+        .join(', ')}`
+    )
+  }
   const incomplete = assessment.rules.filter(
-    (rule) => rule.status !== 'READY' || rule.countsCapped
+    (rule) =>
+      rule.status !== 'INAPPLICABLE' &&
+      (rule.status !== 'READY' || rule.countsCapped)
   )
   if (incomplete.length > 0) {
     gaps.push(
@@ -422,19 +545,27 @@ export function riskyUserCount({
   contractFailed = false,
 }: RiskyUserCountInput): RiskyUserCount {
   const gaps = coverageGaps(assessment, channel)
+  const known = knownDespiteNoCount(assessment)
 
+  // A read that failed is a failure and says so — it is actionable, a retry
+  // may fix it, and it is a different thing from HawkView declining to guess.
   if (requestFailed || contractFailed || !assessment) {
     return {
-      accuracy: 'NOT_AVAILABLE',
+      accuracy: 'UNAVAILABLE',
       value: null,
       display: '—',
       accessibleValue: 'Not available',
-      headline: 'Risky users could not be counted',
+      headline: contractFailed
+        ? 'The latest response could not be read'
+        : requestFailed
+          ? 'The latest assessment could not be loaded'
+          : 'No assessment has been reported yet',
       caption: contractFailed
         ? 'A response arrived that HawkView could not read, so no current count can be confirmed. This is not zero.'
         : requestFailed
           ? 'The latest assessment could not be loaded, so no current count can be confirmed. Any findings shown are from an earlier read and this failure has not resolved them.'
-          : 'No assessment has been reported for this tenant yet. This is not zero.',
+          : 'HawkView has not evaluated this tenant yet. This is not zero.',
+      known,
       gaps,
       asOf: assessment?.summary?.asOf ?? null,
     }
@@ -444,14 +575,20 @@ export function riskyUserCount({
   const summary = assessment.summary?.currentUsers
 
   if (!summary || summary.accuracy === 'UNKNOWN' || summary.value === null) {
+    // Withheld on purpose. Nothing is broken and no retry helps, so this reads
+    // as a statement about what the evidence supports, with the specific reason
+    // HawkView gave and the findings that are true regardless.
+    const copy = summary?.reason
+      ? withheldReasonCopy[summary.reason]
+      : unreportedWithheldReason
     return {
-      accuracy: 'NOT_AVAILABLE',
+      accuracy: 'WITHHELD',
       value: null,
       display: '—',
-      accessibleValue: 'Not available',
-      headline: 'Risky user count not available',
-      caption:
-        'HawkView did not report a confirmed total for this tenant. This is not zero — any users it did report are listed below.',
+      accessibleValue: 'Not counted',
+      headline: copy.headline,
+      caption: copy.caption,
+      known,
       gaps,
       asOf: reported.asOf,
     }
@@ -466,6 +603,7 @@ export function riskyUserCount({
       headline: 'Risky users, at least',
       caption:
         'A lower bound on distinct users with a current HawkView finding. Partial coverage or a capacity limit prevented a complete tenant count, so the real number may be higher.',
+      known,
       gaps,
       asOf: reported.asOf,
     }
@@ -485,6 +623,7 @@ export function riskyUserCount({
       caption:
         empty?.detail ??
         'HawkView reported no users with a current finding. This covers only the checks below and their reported windows; it does not establish that any user is safe.',
+      known,
       gaps,
       asOf: reported.asOf,
     }
@@ -498,6 +637,7 @@ export function riskyUserCount({
     headline: summary.value === 1 ? 'Risky user' : 'Risky users',
     caption:
       'Distinct users with at least one current HawkView finding. A user with several findings is counted once. These are investigation leads, not confirmed compromise.',
+    known,
     gaps,
     asOf: reported.asOf,
   }

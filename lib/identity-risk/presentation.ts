@@ -196,6 +196,7 @@ export function benignAlternativeLabel(code: string) {
 const readinessLabels: Record<RiskAssessmentReadiness, string> = {
   READY: 'Ready',
   PARTIAL: 'Partial coverage',
+  INAPPLICABLE: 'Cannot run on this tenant',
   WAITING: 'Waiting for first collection',
   MISSING_PERMISSION: 'Permission required',
   LICENSE_REQUIRED: 'License required',
@@ -465,26 +466,36 @@ export function riskAssessmentEmptyPresentation(assessment: RiskAssessment) {
       (rule.status === 'READY' || rule.status === 'PARTIAL') &&
       evaluatedRuleScope(assessment, rule)
   )
-  const reported = assessment.rules.length
+  // A check that cannot run on this tenant's evidence is not a coverage
+  // failure — it is a bound on what any result here can claim. It is excluded
+  // from what has to be assessed, and named in the claim instead.
+  const applicable = assessment.rules.filter(
+    (rule) => rule.status !== 'INAPPLICABLE'
+  )
+  const inapplicable = assessment.rules.length - applicable.length
+  const scopeNote = inapplicable
+    ? ` ${inapplicable} further ${inapplicable === 1 ? 'check cannot' : 'checks cannot'} run on this tenant’s evidence, so nothing here covers ${inapplicable === 1 ? 'it' : 'them'}.`
+    : ''
   const completeEvaluation =
     assessment.meta.status === 'AVAILABLE' &&
     assessment.meta.capability === 'FULL' &&
     assessment.meta.freshness === 'CURRENT' &&
     evidenceTimestamp(assessment.meta.evaluatedAt) !== null &&
-    reported > 0 &&
-    new Set(assessment.rules.map((rule) => rule.ruleId)).size === reported &&
-    assessed.length === reported &&
+    applicable.length > 0 &&
+    new Set(assessment.rules.map((rule) => rule.ruleId)).size ===
+      assessment.rules.length &&
+    assessed.length === applicable.length &&
     assessed.every((rule) => rule.status === 'READY')
   if (completeEvaluation) {
     return {
       label: 'No findings in evaluated evidence',
-      detail: `${reported === 1 ? 'The single reported check' : `All ${reported} reported checks`} assessed identities in complete, current evidence windows and reported no matches. This applies only to those checks and their reported windows; it does not establish that an identity is safe.`,
+      detail: `${applicable.length === 1 ? 'The single check this tenant’s evidence supports' : `All ${applicable.length} checks this tenant’s evidence supports`} assessed identities in complete, current evidence windows and reported no matches.${scopeNote} This applies only to those checks and their reported windows; it does not establish that an identity is safe.`,
     }
   }
   if (assessed.length > 0) {
     return {
       label: 'No findings in partially evaluated evidence',
-      detail: `${assessed.length} of ${reported} reported checks evaluated identities without matches. The overall assessment is incomplete or not current; unavailable checks, capped counts, and uncovered windows cannot support a complete no-findings conclusion.`,
+      detail: `${assessed.length} of ${applicable.length} applicable checks evaluated identities without matches.${scopeNote} The overall assessment is incomplete or not current; unavailable checks, capped counts, and uncovered windows cannot support a complete no-findings conclusion.`,
     }
   }
   return {

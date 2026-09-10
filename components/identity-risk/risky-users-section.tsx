@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
 import {
+  microsoftRiskyUserCountPresentation,
   riskReadinessLabel,
   riskSourceLabel,
 } from '@/lib/identity-risk/presentation'
@@ -21,7 +22,11 @@ import type {
   RiskyUserCount,
   RiskyUserRow,
 } from '@/lib/identity-risk/risky-users-view'
-import type { RiskAssessment } from '@/lib/identity-risk/types'
+import type {
+  MicrosoftEntraRiskyUser,
+  MicrosoftEntraRiskyUsersView,
+  RiskAssessment,
+} from '@/lib/identity-risk/types'
 import { cn } from '@/lib/utils'
 import { RiskAssessmentDrawer } from './risk-assessment-drawer'
 
@@ -47,7 +52,13 @@ function shortReference(reference: string) {
  * without Entra ID P2 this panel is the whole answer to "why does every row
  * say HawkView?", and it tells the MSP what licensing the tenant would add.
  */
-function MicrosoftChannelPanel({ channel }: { channel: MicrosoftChannel }) {
+function MicrosoftChannelPanel({
+  channel,
+  view,
+}: {
+  channel: MicrosoftChannel
+  view: MicrosoftEntraRiskyUsersView
+}) {
   const reporting = channel.state === 'REPORTING'
   return (
     <section
@@ -104,7 +115,105 @@ function MicrosoftChannelPanel({ channel }: { channel: MicrosoftChannel }) {
           )}
         </div>
       </div>
+      <MicrosoftRecords view={view} />
     </section>
+  )
+}
+
+const microsoftRiskStateLabel: Readonly<
+  Record<MicrosoftEntraRiskyUser['riskState'], string>
+> = {
+  none: 'None',
+  atRisk: 'At risk',
+  remediated: 'Remediated',
+  dismissed: 'Dismissed',
+  confirmedSafe: 'Confirmed safe',
+  confirmedCompromised: 'Confirmed compromised',
+  unknownFutureValue: 'Reported by Microsoft, state not recognised',
+}
+
+/**
+ * Microsoft's own records, in Microsoft's own vocabulary, under Microsoft's own
+ * heading. They are deliberately not folded into the list above: HawkView
+ * identifies a subject by tenant-keyed pseudonym and Microsoft by directory
+ * object, and without a key both sides agree on, merging the two lists would
+ * either invent a correspondence or silently drop records. Keeping them apart
+ * is what preserves which system said what.
+ */
+function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
+  if (!view.users || view.users.length === 0) return null
+  const count = microsoftRiskyUserCountPresentation(view)
+  return (
+    <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
+          {count.label}
+        </h4>
+        <p className="text-sm font-semibold text-slate-900 dark:text-white">
+          <span aria-hidden="true">{count.value}</span>
+          <span className="sr-only">{count.accessibleValue}</span>
+        </p>
+      </div>
+      <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+        {count.detail} These are Microsoft&rsquo;s determinations and are never
+        added to, or subtracted from, the HawkView count above.
+      </p>
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full min-w-[34rem] border-collapse text-left">
+          <caption className="sr-only">
+            Risky users as reported by Microsoft Entra Identity Protection
+          </caption>
+          <thead>
+            <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800 dark:text-slate-400">
+              <th scope="col" className="px-3 py-2 font-semibold">
+                Identity
+              </th>
+              <th scope="col" className="px-3 py-2 font-semibold">
+                Microsoft risk level
+              </th>
+              <th scope="col" className="px-3 py-2 font-semibold">
+                Microsoft risk state
+              </th>
+              <th scope="col" className="px-3 py-2 font-semibold">
+                Observed
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {view.users.map((user) => (
+              <tr
+                key={user.id}
+                className="border-b border-slate-100 align-top last:border-0 dark:border-slate-800/70"
+              >
+                <td className="px-3 py-2.5 text-sm font-medium text-slate-900 dark:text-slate-50">
+                  {user.identityLabel}
+                </td>
+                <td className="px-3 py-2.5 text-sm capitalize text-slate-700 dark:text-slate-300">
+                  {user.riskLevel}
+                </td>
+                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
+                  {microsoftRiskStateLabel[user.riskState]}
+                  {user.riskDetail && (
+                    <span className="block text-xs text-slate-500 dark:text-slate-400">
+                      {user.riskDetail}
+                    </span>
+                  )}
+                </td>
+                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
+                  {time(user.observedAt)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {view.pageInfo?.hasMore && (
+        <p className="mt-2 text-xs text-slate-600 dark:text-slate-300">
+          More Microsoft records exist than were read into this page, so this is
+          an incomplete result set rather than Microsoft&rsquo;s full total.
+        </p>
+      )}
+    </div>
   )
 }
 
@@ -319,6 +428,29 @@ function Coverage({ assessment }: { assessment: RiskAssessment }) {
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * An empty user list means different things depending on why the count is what
+ * it is. "No user is listed as needing attention" is only true when HawkView
+ * actually counted; when the count was withheld because findings could not be
+ * attributed to people, the same sentence would quietly answer the question the
+ * count just refused to answer.
+ */
+function EmptyUserList({ count }: { count: RiskyUserCount }) {
+  const copy =
+    count.accuracy === 'WITHHELD'
+      ? count.known.length > 0
+        ? 'No finding could be attributed to a specific user, so no user is listed here. That is not the same as no user needing attention — what HawkView did find is listed above and below.'
+        : 'HawkView is not stating a number of users for this tenant, and no finding has been attributed to a specific user. Read this as an open question rather than an all-clear.'
+      : count.accuracy === 'UNAVAILABLE'
+        ? 'No current list can be shown. This is not an empty result, and nothing here has been checked and cleared.'
+        : 'No user is listed as needing attention right now. The summary above states what that is based on and what it does not cover.'
+  return (
+    <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
+      {copy}
+    </p>
+  )
+}
+
 function CountSummary({ count }: { count: RiskyUserCount }) {
   return (
     <section
@@ -332,17 +464,44 @@ function CountSummary({ count }: { count: RiskyUserCount }) {
         >
           {count.headline}
         </h2>
-        <p
-          className="text-[28px] font-semibold leading-none text-slate-900 dark:text-white"
-          aria-hidden="true"
-        >
-          {count.display}
-        </p>
+        {count.accuracy === 'WITHHELD' ? (
+          <p
+            className="text-base font-semibold leading-none text-slate-600 dark:text-slate-300"
+            aria-hidden="true"
+          >
+            Not counted
+          </p>
+        ) : (
+          <p
+            className="text-[28px] font-semibold leading-none text-slate-900 dark:text-white"
+            aria-hidden="true"
+          >
+            {count.display}
+          </p>
+        )}
         <p className="sr-only">{count.accessibleValue}</p>
       </div>
       <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
         {count.caption}
       </p>
+      {count.known.length > 0 &&
+        (count.accuracy === 'WITHHELD' || count.accuracy === 'UNAVAILABLE') && (
+          <div className="mt-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              What HawkView did find
+            </p>
+            <ul className="mt-1.5 space-y-1">
+              {count.known.map((item) => (
+                <li
+                  key={item}
+                  className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+                >
+                  {item}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       {count.gaps.length > 0 && (
         <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950/40">
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
@@ -377,6 +536,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
     channel,
     count,
     list,
+    microsoftView,
     loading,
     requestFailed,
     contractFailed,
@@ -449,7 +609,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
           )}
 
           <CountSummary count={count} />
-          <MicrosoftChannelPanel channel={channel} />
+          <MicrosoftChannelPanel channel={channel} view={microsoftView} />
 
           <section
             aria-labelledby="risky-users-list-heading"
@@ -470,10 +630,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                 />
               </div>
             ) : (
-              <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-                No user is listed as needing attention right now. The summary
-                above states what that is based on and what it does not cover.
-              </p>
+              <EmptyUserList count={count} />
             )}
           </section>
 

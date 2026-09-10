@@ -102,6 +102,7 @@ const assessmentSources = [
 const assessmentReadiness = [
   'READY',
   'PARTIAL',
+  'INAPPLICABLE',
   'WAITING',
   'MISSING_PERMISSION',
   'LICENSE_REQUIRED',
@@ -139,6 +140,17 @@ const assessmentReasons = [
   'RULE_VALIDATION_UNATTESTABLE',
   'SOURCE_NOT_ATTESTED',
   'ATTESTED_COMPLETE',
+  'CHECK_NOT_APPLICABLE',
+  'UNRESOLVED_SUBJECT_IDENTITY',
+  'UNINTERPRETABLE_EVIDENCE',
+] as const
+const assessmentCountReasons = [
+  'UNRESOLVED_SUBJECT_IDENTITY',
+  'UNINTERPRETABLE_EVIDENCE',
+  'CAPACITY_LIMIT',
+  'INCOMPLETE_WINDOW',
+  'COLLECTION_STALE',
+  'SOURCE_UNAVAILABLE',
 ] as const
 const recommendationCodes = [
   'CONFIRM_EXPECTED_ACTIVITY',
@@ -1839,9 +1851,15 @@ export function adaptRiskAssessmentResponse(
   )
     return null
   // Never let an optimistic aggregate override individual source/rule coverage.
+  // INAPPLICABLE is excluded deliberately: a check that cannot run on this
+  // tenant's evidence is not incomplete collection, and treating it as such
+  // would make an exact count unreachable on every audit-log-fallback tenant.
+  // What it does instead is bound the claim, which travels with the count as
+  // scope rather than as a coverage gap.
   const complete = (rules as RiskRuleReadiness[]).every(
     (rule) =>
-      rule.status === 'READY' &&
+      rule.status === 'INAPPLICABLE' ||
+      (rule.status === 'READY' &&
       !rule.countsCapped &&
       rule.evaluatedAt !== null &&
       rule.window.start !== null &&
@@ -1852,7 +1870,7 @@ export function adaptRiskAssessmentResponse(
           item.status === 'READY' &&
           item.freshness === 'CURRENT' &&
           item.lastSuccessfulCollectionAt !== null
-      )
+      ))
   )
   if (meta.capability === 'FULL' && !complete) {
     meta.capability = 'PARTIAL'
@@ -1918,10 +1936,23 @@ function adaptAssessmentSummary(
     'AT_LEAST',
     'UNKNOWN',
   ] as const)
+  // Optional and additive. A server that does not say why an exact total was
+  // withheld yields null, and the UI admits the cause is unreported instead of
+  // picking one.
+  const reason =
+    currentUsers.reason === undefined || currentUsers.reason === null
+      ? null
+      : enumValue(currentUsers.reason, assessmentCountReasons)
   if (
     asOf === undefined ||
     count === undefined ||
     !accuracy ||
+    (currentUsers.reason !== undefined &&
+      currentUsers.reason !== null &&
+      !reason) ||
+    // A reason explains a withheld or bounded total. Attaching one to an exact
+    // count would be a contradiction.
+    (accuracy === 'EXACT' && reason !== null) ||
     (accuracy === 'UNKNOWN' && count !== null) ||
     (accuracy !== 'UNKNOWN' && (count === null || asOf === null)) ||
     (accuracy === 'AT_LEAST' && count === 0)
@@ -1931,7 +1962,7 @@ function adaptAssessmentSummary(
   return {
     scope: 'TENANT',
     asOf,
-    currentUsers: { value: count, accuracy },
+    currentUsers: { value: count, accuracy, reason },
   }
 }
 

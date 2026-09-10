@@ -349,7 +349,7 @@ test('an unrecognised rule clears the same evidence bar before it counts as clea
   const presentation = riskAssessmentEmptyPresentation(adapted!)
   assert.equal(presentation?.label, 'No findings in evaluated evidence')
   // The copy states what was actually evaluated rather than a fixed number.
-  assert.match(presentation!.detail, /All 4 reported checks/)
+  assert.match(presentation!.detail, /All 4 checks this tenant/)
 
   // The same unknown rule without a complete evaluated scope withdraws the
   // clean claim for the whole assessment, exactly as a known rule would. The

@@ -166,6 +166,16 @@ export type RiskAssessmentSource =
 export type RiskAssessmentReadiness =
   | 'READY'
   | 'PARTIAL'
+  /**
+   * The check cannot run on this tenant's evidence at all — the audit-log
+   * fallback carries no conditional-access status, device detail or risk
+   * fields, so some checks have nothing to execute against.
+   *
+   * This is not incomplete evidence and not a failure. It bounds what any
+   * result from this tenant can claim, so it travels with the count as scope
+   * rather than being reported as a gap in collection.
+   */
+  | 'INAPPLICABLE'
   | 'WAITING'
   | 'MISSING_PERMISSION'
   | 'LICENSE_REQUIRED'
@@ -202,6 +212,12 @@ export type RiskAssessmentReason =
   | 'RULE_VALIDATION_UNATTESTABLE'
   | 'SOURCE_NOT_ATTESTED'
   | 'ATTESTED_COMPLETE'
+  /** The tenant's evidence does not carry the fields this check needs. */
+  | 'CHECK_NOT_APPLICABLE'
+  /** Findings exist but cannot be attributed to a person. */
+  | 'UNRESOLVED_SUBJECT_IDENTITY'
+  /** Evidence carries codes or events outside HawkView's vocabulary. */
+  | 'UNINTERPRETABLE_EVIDENCE'
 
 export type RiskEvidenceWindow = {
   start: string | null
@@ -338,12 +354,29 @@ export type RiskAssessmentUser = {
 
 export type RiskAssessmentCountAccuracy = 'EXACT' | 'AT_LEAST' | 'UNKNOWN'
 
+/**
+ * Why an exact tenant total was not claimed. Optional on the wire; a server
+ * that omits it yields null, and the UI says the cause was not reported rather
+ * than inventing one. These must never be collapsed into a single generic
+ * string: "we could not confirm whether these mailboxes belong to people" and
+ * "we could not interpret some sign-in events" send a technician to different
+ * places.
+ */
+export type RiskAssessmentCountReason =
+  | 'UNRESOLVED_SUBJECT_IDENTITY'
+  | 'UNINTERPRETABLE_EVIDENCE'
+  | 'CAPACITY_LIMIT'
+  | 'INCOMPLETE_WINDOW'
+  | 'COLLECTION_STALE'
+  | 'SOURCE_UNAVAILABLE'
+
 export type RiskAssessmentSummary = {
   scope: 'TENANT'
   asOf: string | null
   currentUsers: {
     value: number | null
     accuracy: RiskAssessmentCountAccuracy
+    reason: RiskAssessmentCountReason | null
   }
 }
 

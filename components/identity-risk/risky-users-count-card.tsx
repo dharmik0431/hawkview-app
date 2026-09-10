@@ -54,7 +54,7 @@ export function RiskyUsersCountCard({
           <span
             className={cn(
               'flex h-11 w-11 shrink-0 items-center justify-center rounded-lg',
-              count.accuracy === 'NOT_AVAILABLE'
+              count.accuracy === 'UNAVAILABLE' || count.accuracy === 'WITHHELD'
                 ? 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
                 : count.value === 0
                   ? 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
@@ -77,13 +77,8 @@ export function RiskyUsersCountCard({
           </div>
         </div>
 
-        <div className="text-right">
-          <p
-            className="text-[34px] font-semibold leading-none text-slate-900 dark:text-white"
-            aria-hidden="true"
-          >
-            {count.display}
-          </p>
+        <div className="max-w-[16rem] text-right">
+          <CountValue count={count} />
           <p className="sr-only">
             {count.accessibleValue} {count.headline}
           </p>
@@ -97,6 +92,7 @@ export function RiskyUsersCountCard({
         {count.caption}
       </p>
 
+      <CountKnown known={count.known} accuracy={count.accuracy} />
       <CountGaps gaps={count.gaps} />
 
       <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
@@ -104,9 +100,7 @@ export function RiskyUsersCountCard({
           {asOfLabel(count.asOf) ?? 'No assessment time reported'}
         </p>
         <Button type="button" variant="outline" size="sm" onClick={onOpen}>
-          {count.accuracy === 'NOT_AVAILABLE' || count.value !== 0
-            ? 'Review risky users'
-            : 'See what was checked'}
+          {count.value === 0 ? 'See what was checked' : 'Review risky users'}
           <ChevronRight className="ml-1 h-4 w-4" aria-hidden="true" />
         </Button>
       </div>
@@ -116,6 +110,66 @@ export function RiskyUsersCountCard({
         establish that a user is compromised or safe.
       </p>
     </section>
+  )
+}
+
+/**
+ * A withheld count is a decision, not an absence, so the slot where the number
+ * belongs says "Not counted" rather than showing a glyph that reads as an empty
+ * state. A failed read keeps the neutral dash, because there a value really is
+ * missing and a retry may produce one.
+ */
+function CountValue({ count }: { count: RiskyUserCount }) {
+  if (count.accuracy === 'WITHHELD') {
+    return (
+      <p
+        className="text-[19px] font-semibold leading-tight text-slate-600 dark:text-slate-300"
+        aria-hidden="true"
+      >
+        Not counted
+      </p>
+    )
+  }
+  return (
+    <p
+      className="text-[34px] font-semibold leading-none text-slate-900 dark:text-white"
+      aria-hidden="true"
+    >
+      {count.display}
+    </p>
+  )
+}
+
+/**
+ * What is still true when there is no number. "3 mailboxes forwarding
+ * externally" is far more useful than a blank, and the findings behind it exist
+ * whether or not they can be attributed to people.
+ */
+function CountKnown({
+  known,
+  accuracy,
+}: {
+  known: RiskyUserCount['known']
+  accuracy: RiskyUserCount['accuracy']
+}) {
+  if (known.length === 0) return null
+  if (accuracy !== 'WITHHELD' && accuracy !== 'UNAVAILABLE') return null
+  return (
+    <div className="mt-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
+      <p className="text-[12px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        What HawkView did find
+      </p>
+      <ul className="mt-1.5 space-y-1">
+        {known.map((item) => (
+          <li
+            key={item}
+            className="text-[13px] leading-relaxed text-slate-700 dark:text-slate-300"
+          >
+            {item}
+          </li>
+        ))}
+      </ul>
+    </div>
   )
 }
 
