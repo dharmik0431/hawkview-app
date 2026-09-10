@@ -570,6 +570,27 @@ function EmptyUserList({ count }: { count: RiskyUserCount }) {
   )
 }
 
+/**
+ * When more than one thing stopped HawkView counting, all of them are listed.
+ * The headline goes neutral in that case rather than picking one, because a
+ * single reason shown where several hold reads as the reason.
+ */
+function CountReasons({ reasons }: { reasons: RiskyUserCount['reasons'] }) {
+  if (reasons.length < 2) return null
+  return (
+    <ul className="mt-3 space-y-2">
+      {reasons.map((reason) => (
+        <li
+          key={reason}
+          className="rounded-lg border border-slate-200 bg-white p-3 text-sm leading-relaxed text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+        >
+          {reason}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
 function CountSummary({ count }: { count: RiskyUserCount }) {
   return (
     <section
@@ -603,6 +624,7 @@ function CountSummary({ count }: { count: RiskyUserCount }) {
       <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
         {count.caption}
       </p>
+      <CountReasons reasons={count.reasons} />
       {count.known.length > 0 &&
         (count.value === 0 || count.value === null) && (
           <div className="mt-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">

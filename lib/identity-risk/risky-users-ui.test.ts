@@ -1016,3 +1016,21 @@ test('a person and a mailbox sharing a name are visibly different subjects', () 
   assert.match(counted!.textContent ?? '', /User account/)
   assert.match(supporting!.textContent ?? '', /Mailbox/)
 })
+
+test('several withholding reasons all reach the screen', () => {
+  const value = assessmentFixture(false)
+  value.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reasons: ['UNRESOLVED_SUBJECT_IDENTITY', 'UNINTERPRETABLE_EVIDENCE'],
+  }
+  const { text, cardText } = render(value)
+  for (const [label, rendered] of [
+    ['section', text],
+    ['overview card', cardText],
+  ] as const) {
+    assert.match(rendered, /2 reasons/, label)
+    assert.match(rendered, /belongs to a person/, label)
+    assert.match(rendered, /does not recognise/, label)
+  }
+})

@@ -860,3 +860,72 @@ test('a zero says what it is a proportion of, and admits it is not people', () =
   assert.equal(positive.value, 1)
   assert.ok(!positive.gaps.some((gap) => /proportion of your people/.test(gap)))
 })
+
+test('every reason a count was withheld is carried, not the first one', () => {
+  // Unresolved mailbox bindings and uninterpretable sign-in codes are
+  // independent problems and a tenant can have both. Showing one of them reads
+  // as "this is the reason", which sends a technician to fix half of it.
+  const value = assessmentFixture(false)
+  value.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reasons: ['UNRESOLVED_SUBJECT_IDENTITY', 'UNINTERPRETABLE_EVIDENCE'],
+  }
+  const count = riskyUserCount({
+    assessment: adapt(value),
+    channel: licenceBlocked,
+  })
+  assert.equal(count.accuracy, 'WITHHELD')
+  assert.equal(count.reasons.length, 2)
+  assert.ok(count.reasons.some((reason) => /belongs to a person/.test(reason)))
+  assert.ok(count.reasons.some((reason) => /does not recognise/.test(reason)))
+  // The headline does not privilege either one.
+  assert.match(count.headline, /2 reasons/)
+  assert.doesNotMatch(count.headline, /tied to people|interpreted/)
+
+  // A single reason keeps its own specific headline, which is more useful.
+  const one = assessmentFixture(false)
+  one.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reasons: ['UNRESOLVED_SUBJECT_IDENTITY'],
+  }
+  const single = riskyUserCount({
+    assessment: adapt(one),
+    channel: licenceBlocked,
+  })
+  assert.match(single.headline, /could not be tied to people/)
+  assert.equal(single.reasons.length, 1)
+})
+
+test('the older single-reason shape is still accepted', () => {
+  // Both forms normalise to a list, so the client does not need the server to
+  // migrate first.
+  const value = assessmentFixture(false)
+  value.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reason: 'CAPACITY_LIMIT',
+  }
+  const count = riskyUserCount({
+    assessment: adapt(value),
+    channel: licenceBlocked,
+  })
+  assert.equal(count.accuracy, 'WITHHELD')
+  assert.match(count.headline, /more evidence than a single assessment covers/)
+})
+
+test('a repeated or unknown reason is refused rather than shown twice', () => {
+  for (const reasons of [
+    ['CAPACITY_LIMIT', 'CAPACITY_LIMIT'],
+    ['NOT_A_REAL_REASON'],
+  ]) {
+    const value = assessmentFixture(false)
+    value.summary.currentUsers = { value: null, accuracy: 'UNKNOWN', reasons }
+    assert.equal(
+      adaptRiskAssessmentResponse(value, assessmentNow),
+      null,
+      JSON.stringify(reasons)
+    )
+  }
+})

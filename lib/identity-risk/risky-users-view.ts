@@ -647,6 +647,12 @@ export type RiskyUserCount = {
   /** What this number is, and what it does not cover. Never omitted. */
   caption: string
   /**
+   * Every reason an exact total was withheld, in full. Empty unless the count
+   * is withheld for more than one reason, in which case the headline is
+   * deliberately neutral and these carry the detail.
+   */
+  reasons: string[]
+  /**
    * What HawkView does know, when it will not give a number. "3 mailboxes
    * forwarding externally; cannot confirm how many belong to users" is far more
    * useful than a blank, and it is true — the findings exist even when the
@@ -836,6 +842,7 @@ export function riskyUserCount({
         : requestFailed
           ? 'The latest assessment could not be loaded, so no current count can be confirmed. Any findings shown are from an earlier read and this failure has not resolved them.'
           : 'HawkView has not evaluated this tenant yet. This is not zero.',
+      reasons: [],
       known,
       gaps,
       asOf: assessment?.summary?.asOf ?? null,
@@ -847,18 +854,33 @@ export function riskyUserCount({
 
   if (!summary || summary.accuracy === 'UNKNOWN' || summary.value === null) {
     // Withheld on purpose. Nothing is broken and no retry helps, so this reads
-    // as a statement about what the evidence supports, with the specific reason
+    // as a statement about what the evidence supports, with every reason
     // HawkView gave and the findings that are true regardless.
-    const copy = summary?.reason
-      ? withheldReasonCopy[summary.reason]
-      : unreportedWithheldReason
+    //
+    // More than one reason can hold at once, and showing the first would read
+    // as "this is the reason" — the same defect as any other true sentence
+    // standing in for the ones beside it. One reason keeps its own headline,
+    // because that is more useful than a generic one; several share a neutral
+    // headline and are listed in full underneath.
+    const reasons = summary?.reasons ?? []
+    const copies = reasons.map((reason) => withheldReasonCopy[reason])
+    const single = copies.length === 1 ? copies[0] : null
     return {
       accuracy: 'WITHHELD',
       value: null,
       display: 'Not counted',
       accessibleValue: 'Not counted',
-      headline: copy.headline,
-      caption: copy.caption,
+      headline:
+        single?.headline ??
+        (copies.length > 1
+          ? `Not counted — ${copies.length} reasons`
+          : unreportedWithheldReason.headline),
+      caption:
+        single?.caption ??
+        (copies.length > 1
+          ? 'HawkView will not state a number of users for this tenant. Every reason it gave is listed below; each one on its own is enough to withhold the total.'
+          : unreportedWithheldReason.caption),
+      reasons: copies.map((copy) => copy.caption),
       known,
       gaps,
       asOf: reported.asOf,
@@ -874,6 +896,7 @@ export function riskyUserCount({
       headline: 'Risky users, at least',
       caption:
         'A lower bound on distinct users with a current HawkView finding. Partial coverage or a capacity limit prevented a complete tenant count, so the real number may be higher.',
+      reasons: [],
       known,
       gaps,
       asOf: reported.asOf,
@@ -915,6 +938,7 @@ export function riskyUserCount({
       caption: findingsWithoutPeople
         ? `This counts people, and none of the evidence below could be tied to one. It is not a finding count and it is not an all-clear: HawkView did report evidence on this tenant, listed beside this number and below. ${baseCaption}`
         : baseCaption,
+      reasons: [],
       known,
       gaps: zeroGaps,
       asOf: reported.asOf,
@@ -929,6 +953,7 @@ export function riskyUserCount({
     headline: summary.value === 1 ? 'Risky user' : 'Risky users',
     caption:
       'Distinct users with at least one current HawkView finding. A user with several findings is counted once. These are investigation leads, not confirmed compromise.',
+    reasons: [],
     known,
     gaps,
     asOf: reported.asOf,

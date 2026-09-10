@@ -409,7 +409,17 @@ export type RiskAssessmentSummary = {
   currentUsers: {
     value: number | null
     accuracy: RiskAssessmentCountAccuracy
-    reason: RiskAssessmentCountReason | null
+    /**
+     * Every reason the exact claim was withheld, not the first one. Several can
+     * hold at once — unresolved mailbox bindings and uninterpretable sign-in
+     * codes are independent problems and a tenant can have both. Rendering one
+     * of four reads as "this is the reason", which is the same defect as
+     * rendering one true sentence where another belongs.
+     *
+     * Empty means no reason was reported, which the UI admits rather than
+     * filling in.
+     */
+    reasons: RiskAssessmentCountReason[]
   }
 }
 

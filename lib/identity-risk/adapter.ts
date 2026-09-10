@@ -5,6 +5,7 @@ import type {
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
   CorrelationRef,
+  RiskAssessmentCountReason,
   IdentityRiskChannelReason,
   IdentityRiskChannelStatus,
   IdentityRiskFreshness,
@@ -1996,23 +1997,31 @@ function adaptAssessmentSummary(
     'AT_LEAST',
     'UNKNOWN',
   ] as const)
-  // Optional and additive. A server that does not say why an exact total was
-  // withheld yields null, and the UI admits the cause is unreported instead of
-  // picking one.
-  const reason =
-    currentUsers.reason === undefined || currentUsers.reason === null
-      ? null
-      : enumValue(currentUsers.reason, assessmentCountReasons)
+  // Optional and additive, and accepted in either form: a single `reason` from
+  // the older shape, or a `reasons` array. Both normalise to a list, because
+  // more than one cause can hold at once and the UI must be able to show all of
+  // them rather than the first.
+  const rawReasons =
+    currentUsers.reasons !== undefined
+      ? currentUsers.reasons
+      : currentUsers.reason === undefined || currentUsers.reason === null
+        ? []
+        : [currentUsers.reason]
+  const reasons =
+    Array.isArray(rawReasons) &&
+    rawReasons.length <= assessmentCountReasons.length
+      ? rawReasons.map((item) => enumValue(item, assessmentCountReasons))
+      : null
   if (
     asOf === undefined ||
     count === undefined ||
     !accuracy ||
-    (currentUsers.reason !== undefined &&
-      currentUsers.reason !== null &&
-      !reason) ||
+    !reasons ||
+    reasons.some((item) => item === null) ||
+    new Set(reasons).size !== reasons.length ||
     // A reason explains a withheld or bounded total. Attaching one to an exact
     // count would be a contradiction.
-    (accuracy === 'EXACT' && reason !== null) ||
+    (accuracy === 'EXACT' && reasons.length > 0) ||
     (accuracy === 'UNKNOWN' && count !== null) ||
     (accuracy !== 'UNKNOWN' && (count === null || asOf === null)) ||
     (accuracy === 'AT_LEAST' && count === 0)
@@ -2022,7 +2031,11 @@ function adaptAssessmentSummary(
   return {
     scope: 'TENANT',
     asOf,
-    currentUsers: { value: count, accuracy, reason },
+    currentUsers: {
+      value: count,
+      accuracy,
+      reasons: reasons as RiskAssessmentCountReason[],
+    },
   }
 }
 
