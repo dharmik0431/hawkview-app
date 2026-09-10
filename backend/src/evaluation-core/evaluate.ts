@@ -1,9 +1,25 @@
 import type {
-  Assessment, Budget, CollectionScope, Count, CountScope, Coverage, Detector, DetectorReport, Evidence, EvidenceState, Finding,
+  Assessment, Budget, CollectionScope, Count, CountScope, Coverage, Detector, DetectorReport, DetectorFinding,
+  DetectorSignal, Evidence, EvidenceState, Finding, FindingSignal,
   SetAsideVocabulary,
   FindingGap, FindingSet,
   WithheldReason, ZeroClaim,
 } from './contract.js'
+
+/** Marks every signal of a finding as a floor when the window was truncated.
+ *
+ * Rebuilt head-and-tail rather than mapped, because `signals` is a NON-EMPTY
+ * tuple and `Array.prototype.map` returns a plain array — losing the one
+ * guarantee that stops a finding existing with no recorded basis. */
+const cappedWhenTruncated = (finding: DetectorFinding, capped: boolean): Finding => {
+  const mark = (signal: DetectorSignal): FindingSignal => ({ ...signal, capped })
+  const [first, ...rest] = finding.signals
+  return {
+    detectorId: finding.detectorId,
+    subject: finding.subject,
+    signals: [mark(first), ...rest.map(mark)],
+  }
+}
 
 /** Makes an unmapped case a compile error rather than a silent fall-through.
  * Every reason mapping here routes through it, because the defect it replaces
@@ -347,7 +363,12 @@ export function evaluate<Event>(input: Readonly<{
       }
       // What it found is kept either way. Discarding real findings because a
       // counter was wrong would be the veto pattern in its smallest costume.
-      findings.push(...result.findings)
+      //
+      // `capped` is stamped HERE rather than by the detector, because the
+      // detector was handed an already-truncated slice and has no way to know
+      // it. A count taken from a truncated window is a floor, and a floor
+      // rendered as a total is the count-vocabulary defect one level down.
+      findings.push(...result.findings.map(finding => cappedWhenTruncated(finding, !withinBudget)))
 
       // The detector must account for every event it was handed: what it
       // assessed, plus where the rest went, in its own words.

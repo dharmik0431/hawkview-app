@@ -1,5 +1,5 @@
 import type { EventOutcome, NormalizedEvent } from '../../risky-users-normalization/contract.js'
-import type { CorrelationRef, Finding } from '../../evaluation-core/contract.js'
+import type { CorrelationRef, DetectorFinding } from '../../evaluation-core/contract.js'
 import type { FeedBoundDetector } from '../feed-capability.js'
 
 /** Somebody is trying passwords against this account.
@@ -49,7 +49,13 @@ export function credentialFailureDetector(
       id: 'repeated-credential-failure',
       monotonic: true,
       run: applicable => {
-        const bySubject = new Map<string, { lockouts: number; rejections: number; latest: NormalizedEvent }>()
+        type Tally = Readonly<Record<EventOutcome, { count: number; latest: string | null }>> & { latestEvent: NormalizedEvent }
+        const blank = (event: NormalizedEvent): Tally => ({
+          LOCKED_OUT_AFTER_REPEATED_FAILURES: { count: 0, latest: null },
+          PASSWORD_REJECTED: { count: 0, latest: null },
+          latestEvent: event,
+        } as Tally)
+        const bySubject = new Map<string, Tally>()
         let assessed = 0
         let otherOutcome = 0
 
@@ -63,28 +69,41 @@ export function credentialFailureDetector(
             continue
           }
           assessed += 1
-          const running = bySubject.get(event.subjectRef)
-            ?? { lockouts: 0, rejections: 0, latest: event }
+          const running = bySubject.get(event.subjectRef) ?? blank(event)
           bySubject.set(event.subjectRef, {
-            lockouts: running.lockouts + (outcome === 'LOCKED_OUT_AFTER_REPEATED_FAILURES' ? 1 : 0),
-            rejections: running.rejections + (outcome === 'PASSWORD_REJECTED' ? 1 : 0),
-            // Events arrive sorted ascending, so the last one seen is the most
-            // recent — what a technician wants beside the finding.
-            latest: event,
-          })
+            ...running,
+            // Events arrive sorted ascending, so the last one seen of a GIVEN
+            // outcome is that outcome's most recent — tracked per signal rather
+            // than once for the family. One shared timestamp is what let 467
+            // lockouts render beside a later rejection's date, overstating the
+            // lockouts' recency by six days on a real tenant.
+            [outcome]: { count: running[outcome].count + 1, latest: event.eventAt },
+            latestEvent: event,
+          } as Tally)
         }
 
-        const findings: Finding[] = []
+        const findings: DetectorFinding[] = []
         for (const [subjectRef, tally] of bySubject) {
-          if (tally.lockouts === 0 && tally.rejections < options.rejectionThreshold) continue
+          const lockouts = tally.LOCKED_OUT_AFTER_REPEATED_FAILURES
+          const rejections = tally.PASSWORD_REJECTED
+          if (lockouts.count === 0 && rejections.count < options.rejectionThreshold) continue
           findings.push({
             detectorId: 'repeated-credential-failure',
             subject: {
               kind: 'DIRECTORY_USER',
               userRef: subjectRef,
-              correlation: correlationFor(tally.latest),
+              correlation: correlationFor(tally.latestEvent),
             },
-            observedAt: tally.latest.eventAt,
+            // BOTH signals, always, including one this subject never produced.
+            // This rule reads both, so both were evaluated, and `count: 0` with
+            // `latest: null` says "we looked and found none". Omitting the empty
+            // one would make it indistinguishable from a signal never
+            // evaluated — the same collapse as an uncollected window reading as
+            // a quiet tenant, one level down.
+            signals: [
+              { signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES', count: lockouts.count, latest: lockouts.latest },
+              { signal: 'PASSWORD_REJECTED', count: rejections.count, latest: rejections.latest },
+            ],
           })
         }
 
