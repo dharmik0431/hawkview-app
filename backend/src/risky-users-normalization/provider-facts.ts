@@ -716,21 +716,37 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
         'single quote. The two literals differ in terminal punctuation and that difference survives a paste ' +
         'and fails a comparison, which is why this matcher is substring-based on a distinctive fragment ' +
         'rather than an equality test. It carries unique detection ' +
-        'weight: for 94.8% of lockout rows there is NO 50126 for the same user within ±15 minutes ' +
-        '(DENOMINATOR NOT RECORDED — see the caveat below; it is not reconstructed from today’s 561, ' +
-        'because the figure was measured against whatever the lockout count was then), so ' +
-        'Microsoft emits the lockout without the individual attempts alongside it and at the moment of ' +
-        'lockout this is the ONLY signal present. A 50126-only detector eventually surfaces the affected ' +
-        'users — 100% of them appear in 50126 rows at some point — but misses the lockout events, and ' +
-        'misses them when they happen. CAVEAT: one tenant, at most four users, one locale, six weeks, and ' +
-        '1,493 blocks against FOUR accounts is not obviously normal traffic, so the 94.8% informs the ' +
-        'mapping and does not settle the general case. ' +
-        'AND ITS DENOMINATOR WAS NOT RECORDED, which is the sharper limit: 94.8% of an unstated ' +
-        'number of lockout rows cannot be checked, cannot be compared against a later measurement, and ' +
-        'is the most load-bearing bare percentage in this file. It is kept because the mapping it ' +
-        'supports — a lockout is its own outcome rather than a rejected password — rests on the ' +
-        'DIRECTION of the finding rather than its magnitude, and the direction is not in doubt. Restate ' +
-        'as lockouts-without-a-nearby-50126 over lockouts at the next measurement.',
+        'weight: 532 of 561 lockout rows have NO 50126 for the same user within ±15 minutes — 94.8%, ' +
+        'measured 2026-09-10T16:54Z — so Microsoft emits the lockout without the individual attempts ' +
+        'alongside it and at the moment of lockout this is the ONLY signal present. A 50126-only ' +
+        'detector eventually surfaces the affected users — 100% of them appear in 50126 rows at some ' +
+        'point — but misses the lockout events, and misses them when they happen. ' +
+        'DEFINITION, which is the half that was missing before: numerator population is Graph rows ' +
+        '(no managementActivityRecord) with status_error_code 50053 and a failureReason of length 100 ' +
+        '— the lockout literal, not the 78-character malicious-IP one; the test is no 50126 row for the ' +
+        'same customer_tenant_id plus lowercased user_principal_name within ±15 minutes of ' +
+        'event_date_time; reported as lockouts-without-a-nearby-50126 OVER lockouts. ' +
+        'THIS REPLACES AN EARLIER 94.8% RATHER THAN CONFIRMING IT — a figure whose DENOMINATOR WAS ' +
+        'NOT RECORDED and whose definition was never stated either, so there is nothing to compare ' +
+        'it against. Two numbers that ' +
+        'match are not agreement when only one of them says what it measured. Reading the match as ' +
+        'corroboration would be the two-moments-as-one-snapshot error wearing a better suit. The old ' +
+        'basis stays lost; this one stands on its own. ' +
+        'CAVEAT: one tenant, at most four users, one locale, six weeks, and 1,493 blocks against FOUR ' +
+        'accounts is not obviously normal traffic, so this informs the mapping and does not settle the ' +
+        'general case. ' +
+        'AND ONE CONTROL IS STILL MISSING, in the direction that flatters the claim: the pairing key ' +
+        'is the sign_in_logs.user_principal_name COLUMN, which this layer never reads and holds no ' +
+        'verification for — while its sibling identity column on the same table, sign_in_logs.user_id, ' +
+        'is DISPROVED for being MORE GRANULAR than the real user (6 distinct GUIDs against 2 real users ' +
+        'across 950 rows). If the UPN column splits one person the same way, a 50126 belonging to the ' +
+        'same real person fails to pair with the lockout and INFLATES this figure. The control is the ' +
+        'query that disproved the other column: distinct user_principal_name values against distinct ' +
+        'directory users on this tenant. Until it runs, treat the 532/561 as an upper bound. ' +
+        'NOTE ALSO that this layer binds Graph subjects by raw.userId (DIRECTORY_OBJECT_ID), not by ' +
+        'any UPN, so the measurement’s notion of "the same user" is not the same as the module’s ' +
+        'notion of "the same subject". That does not make it wrong, but it is not the module ' +
+        'measuring itself.',
     },
     note:
       'Smart lockout "tracks the last three bad password hashes to avoid incrementing the lockout counter ' +

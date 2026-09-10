@@ -2212,25 +2212,44 @@ test('no percentage in the registry is stated without its denominator', () => {
   assert.deepEqual(bare, []);
 });
 
-test('the one figure whose basis is lost says so, and says what it still supports', () => {
-  // 94.8% of lockout rows have no 50126 for the same user within ±15 minutes.
-  // The most load-bearing bare percentage in the file, and its denominator was
-  // never recorded — so it cannot be checked or compared against a later
-  // measurement, and reconstructing it from today's lockout count would be the
-  // two-moments-as-one-snapshot error that started all of this.
+test('the lockout figure carries a definition, and does not claim the old one confirmed it', () => {
+  // This entry held the most load-bearing bare percentage in the file: 94.8%
+  // of lockout rows with no 50126 for the same user within ±15 minutes, over a
+  // denominator nobody recorded. It was disclosed as lost rather than
+  // reconstructed from the current lockout count — and the owner's side then
+  // ran the measurement properly, which is the only honest way to get it back:
+  // a new stamped measurement, never a backfill of the old one.
   //
-  // Kept rather than deleted, because the mapping it supports — a lockout is
-  // its own outcome rather than a rejected password — rests on the DIRECTION
-  // of the finding and not its magnitude. That distinction is the reason a lost
-  // denominator is a disclosure rather than a retraction, and the entry has to
-  // state it or a later reader cannot tell which kind it is.
+  // 532 of 561 at 2026-09-10T16:54Z, and the DEFINITION came with it, which is
+  // the half that was missing the first time.
   const lockout = ALL_TEXT_MEANINGS.find(pattern => pattern.meaning === 'SMART_LOCKOUT')!;
   const verification = lockout.verification as Record<string, unknown>;
   const prose = [verification.evidence, verification.control]
     .filter((value): value is string => typeof value === 'string').join('   ');
-  assert.match(prose, /94\.8%/);
-  assert.match(prose, /DENOMINATOR\b[^.]{0,40}NOT RECORDED/);
-  assert.match(prose, /DIRECTION/, 'must say what the figure still supports, not only that it is limited');
-  // And the mapping itself is unaffected either way.
+  assert.match(prose, /532 of 561/);
+  assert.match(prose, /2026-09-10T16:54Z/);
+  assert.match(prose, /DEFINITION/, 'a figure without its definition is not checkable');
+
+  // THE PART THAT MATTERS MOST, and note that it asserts the WEAKER claim: the
+  // new figure REPLACES the old one and does not corroborate it. Two numbers
+  // that match are not agreement when only one of them says what it measured —
+  // the old figure had neither denominator nor definition, so there is nothing
+  // here for it to agree with. Calling it a reproduction would be the
+  // two-moments-as-one-snapshot error in a better suit, and it is exactly the
+  // kind of upgrade a reader accepts without checking, because it arrives as
+  // good news about a number they were already worried about.
+  assert.match(prose, /REPLACES AN EARLIER .*RATHER THAN CONFIRMING IT/);
+  assert.match(prose, /DENOMINATOR\b[^.]{0,40}NOT RECORDED/, 'the old figure stays disclosed as lost');
+
+  // And the control still missing, in the direction that flatters the claim:
+  // the pairing key is a sign_in_logs column this layer never reads, whose
+  // sibling identity column on the same table is DISPROVED for splitting one
+  // person into six. If the UPN column splits the same way, a 50126 belonging
+  // to the same real person fails to pair and inflates the figure — so it is
+  // an upper bound until that control runs.
+  assert.match(prose, /user_principal_name/);
+  assert.match(prose, /upper bound/);
+
+  // The mapping was never in doubt either way: it rests on the direction.
   assert.deepEqual(lockout.disposition, { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' });
 });
