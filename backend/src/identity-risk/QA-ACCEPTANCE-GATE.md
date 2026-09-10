@@ -35,6 +35,28 @@ and matches nothing, so the **only** variable is how sign-in events are classifi
 | `MIXED` | 8 of 12 excluded, 4 genuinely assessed | MUST_NOT_SHOW_BARE_ZERO |
 | `CONTROL` | fully assessed, nothing excluded, no matches | MUST_REPORT_EXACT_ZERO |
 
+### Which scenarios are branch-independent — read before comparing results
+
+The scenarios seed **error codes**, and what a code *means* is decided by the
+classifier on the branch under test. So the same gate legitimately produces
+different results on different branches, and that is not drift.
+
+- `PRE_EXISTING` (only `50076`) and `MIXED` (`50076` + `0`) are
+  **branch-independent**. `50076` has been out of scope since long before this
+  work. These two are the load-bearing ones.
+- `NON_QUALIFYING` also uses `50140`, which is only out of scope on branches
+  carrying `0b3929c`. On `origin/main` it is UNKNOWN, so it caps coverage and
+  the scenario correctly reports WITHHELD — a pass, and **not** evidence the
+  defect is fixed.
+
+Observed on `origin/main` (`d3791cb`): 3 pass, 2 fail — `PRE_EXISTING` and
+`MIXED` trap. Observed on the lane-fix branch: 2 pass, 3 fail — `NON_QUALIFYING`
+additionally traps. Both are correct readings of the same gate.
+
+**If you are checking whether the defect is fixed, look at `MIXED`.** It is
+branch-independent, it fires at any exclusion rate, and it is the live
+production defect.
+
 The rule is an **implication**, not a fixed shape:
 
 > If the assessment claims an exact zero, something a user can see must disclose
