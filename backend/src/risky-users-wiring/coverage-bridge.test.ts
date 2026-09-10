@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { assertAccountsForEveryRow, collectionScopeOf, toEvaluationCoverage } from './coverage-bridge.js'
+import {
+  assertAccountsForEveryRow, collectionScopeOf, toEvaluationCoverage, watchedResolver,
+} from './coverage-bridge.js'
 import { coverageForEvaluation, normalizeSignInBatch } from '../risky-users-normalization/index.js'
 import type { NormalizedEvent } from '../risky-users-normalization/contract.js'
 import { evaluate, uninterpreted } from '../evaluation-core/evaluate.js'
@@ -65,4 +67,37 @@ test('the core consumes the bridged coverage and reaches a claim', async () => {
   // in more than one way — which is the whole point of the vocabulary.
   assert.equal(assessment.claim.permitted, false)
   assert.deepEqual(assessment.count.accuracy, 'NOT_AVAILABLE')
+})
+
+
+test('a resolver that ignores its identifier is caught; the batch alone cannot see it', async () => {
+  // The guard that works, and the reason the obvious one does not. A batch's
+  // `resolvedSubjects` is keyed BY reference, so sixteen people collapsing to
+  // one reference leaves ONE entry — the collapse erases its own evidence, and
+  // no check inside the batch can fail. My first version compared people
+  // against references within that list and stayed silent against the real bug
+  // reproduced on real data.
+  const broken = watchedResolver((async (kind: string) => 'subject:' + kind) as never)
+  await broken.resolve('subject', 'user-a')
+  await broken.resolve('subject', 'user-b')
+  await broken.resolve('subject', 'user-c')
+  assert.throws(() => broken.assertNoCollapse(), /16|3 distinct identifiers produced 1 distinct references/)
+
+  const honest = watchedResolver(async (kind, identifier) => kind + ':' + identifier)
+  await honest.resolve('subject', 'user-a')
+  await honest.resolve('subject', 'user-b')
+  assert.doesNotThrow(() => honest.assertNoCollapse())
+
+  // Kinds are counted apart: applications collapsing must not be masked by
+  // subjects resolving correctly, and vice versa.
+  const mixed = watchedResolver(async (kind, identifier) =>
+    kind === 'application' ? 'app:same' : kind + ':' + identifier)
+  await mixed.resolve('subject', 'user-a')
+  await mixed.resolve('subject', 'user-b')
+  await mixed.resolve('application', 'app-a')
+  await mixed.resolve('application', 'app-b')
+  assert.throws(() => mixed.assertNoCollapse(), /application/)
+
+  // Nothing asked, nothing to collapse — a guard that fires on emptiness is noise.
+  assert.doesNotThrow(() => watchedResolver(async (k, i) => k + ':' + i).assertNoCollapse())
 })

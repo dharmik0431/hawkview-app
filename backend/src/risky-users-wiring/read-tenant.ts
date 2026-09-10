@@ -2,6 +2,7 @@ import { PrismaClient } from '../generated/prisma/client.js'
 import { normalizeSignInBatch } from '../risky-users-normalization/index.js'
 import { assessTenant, type ClassifiedStream } from './assess-tenant.js'
 import { bindToFeed, capabilityOf, type FeedBoundDetector } from './feed-capability.js'
+import { watchedResolver } from './coverage-bridge.js'
 import { evidenceFromSync } from './evidence-availability.js'
 import type { NormalizationSource } from '../risky-users-normalization/contract.js'
 import type { CollectionScope as ClassifierCollectionScope } from '../risky-users-normalization/reasons.js'
@@ -85,6 +86,13 @@ export async function readTenantAssessment(
     microsoftTenantId: tenant.microsoftTenantId,
   }
 
+
+  // Watches the resolver rather than the batch. A collapse erases its own
+  // evidence — `resolvedSubjects` is keyed BY reference, so sixteen people
+  // becoming one reference leaves ONE entry, and no check inside the batch can
+  // see it. This counts what the resolver was asked against what it returned.
+  const resolver = watchedResolver(async (kind, identifier) => kind + ':' + identifier)
+
   const [rows, directory] = await Promise.all([
     prisma.signInLog.findMany({
       where: {
@@ -128,9 +136,13 @@ export async function readTenantAssessment(
     // function where a longer one is expected, so nothing complained, coverage
     // was perfect, and the sum invariant held. Every guard passed because none
     // of them checks identity resolution.
-    reference: async (kind: 'subject' | 'application', identifier: string) => kind + ':' + identifier,
+    reference: resolver.resolve,
     collectionScope: input.collectionScope,
   })
+
+  // Before anything reads the batch: if distinct people collapsed into one
+  // reference, every count below would be wrong while every other check passed.
+  resolver.assertNoCollapse()
 
   const stream: ClassifiedStream = {
     stream: input.source,

@@ -85,3 +85,54 @@ export function assertAccountsForEveryRow(batch: NormalizationBatch, coverage: C
       + `${reported.uninterpretedEvents}. The two must be the same events.`)
   }
 }
+
+
+/** Watches the reference resolver, because a collapse erases its own evidence.
+ *
+ * The obvious guard does not work, and finding out why is the point. A batch's
+ * `resolvedSubjects` is keyed BY reference, so when sixteen people collapse to
+ * one reference the list holds ONE entry — not sixteen entries sharing a
+ * reference. Comparing people against references inside it can never fail. My
+ * first version of this guard did exactly that, and stayed silent against the
+ * real bug reproduced on real data.
+ *
+ * So the count has to come from outside the batch: how many distinct
+ * identifiers the resolver was ASKED about, against how many distinct
+ * references it produced. A resolver that ignores its identifier argument is
+ * visible here and nowhere else.
+ *
+ * This is the axis every other check misses. When it fails, rows are all
+ * accounted for, the sum invariant balances, coverage is complete and the
+ * verdict line correctly reads that the classifier ran — every statement true,
+ * and the distinct-user count wrong.
+ */
+export function watchedResolver(
+  inner: (kind: 'subject' | 'application', identifier: string) => Promise<string>,
+): Readonly<{
+  resolve: (kind: 'subject' | 'application', identifier: string) => Promise<string>
+  assertNoCollapse: () => void
+}> {
+  const asked = new Map<string, Set<string>>()
+  const produced = new Map<string, Set<string>>()
+  return {
+    resolve: async (kind, identifier) => {
+      const reference = await inner(kind, identifier)
+      if (!asked.has(kind)) { asked.set(kind, new Set()); produced.set(kind, new Set()) }
+      asked.get(kind)!.add(identifier)
+      produced.get(kind)!.add(reference)
+      return reference
+    },
+    assertNoCollapse: () => {
+      for (const [kind, identifiers] of asked) {
+        const references = produced.get(kind)!
+        if (references.size < identifiers.size) {
+          throw new Error(
+            `Reference collapse for ${kind}: ${identifiers.size} distinct identifiers produced `
+            + `${references.size} distinct references. Every count derived from this batch would be `
+            + 'wrong while every other check passed. A resolver takes (kind, identifier) — check it '
+            + 'is not a one-argument function receiving the kind and ignoring the identifier.')
+        }
+      }
+    },
+  }
+}
