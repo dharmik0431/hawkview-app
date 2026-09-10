@@ -2,12 +2,15 @@ export * from './contract.js';
 export * from './reasons.js';
 export * from './provider-facts.js';
 export {
+  classifyAuditRecord,
   classifyGraphRecord,
   errorCodeShape,
   indexDirectory,
   isInteractiveShape,
   normalizeSignInBatch,
-  readErrorCode,
+  normalizeUpn,
+  readGraphErrorCode,
   rowSource,
+  type DirectoryIndex,
   type NormalizeBatchOptions,
 } from './normalize.js';

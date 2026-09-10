@@ -7,30 +7,90 @@ import type {
 /**
  * The seam between collection/storage and the Risky Users evaluation core.
  *
- * Input:  raw `sign_in_logs` rows plus `directory_users` rows.
- * Output: normalized events, each classified into exactly one of three
- *         buckets, plus three independent tallies.
+ * In:  raw `sign_in_logs` rows plus `directory_users` rows, and one selected feed.
+ * Out: normalized events, each classified into exactly one of three buckets,
+ *      plus independent tallies and a coverage statement.
  *
  * Two invariants are expressed in the types rather than in comments:
  *
  *  1. `outcome` is reachable only inside `APPLIES`. You cannot read a
  *     credential verdict off an event that is out of scope or unrecognized;
- *     that is a type error, not a convention. The predecessor's single
- *     `AuthOutcome` union mixed 'SUCCESS' with 'NON_QUALIFYING' and
- *     'UNKNOWN', which is how "out of scope" and "unrecognized" became
- *     indistinguishable.
+ *     that is a type error, not a convention.
  *
  *  2. There is no aggregate readiness flag and no `gapCount`. Nothing in this
  *     batch is a state the evaluation core can branch on to skip a rule.
  *     Unknown and unprocessable rows reduce stated coverage and do nothing
- *     else. That is the whole reason the feature produced 1,054 evaluation
- *     runs and zero findings: a single unrecognized event vetoed a rule.
+ *     else. That is the whole reason the predecessor produced 1,054
+ *     evaluation runs and zero findings: a single unrecognized event vetoed
+ *     a rule.
  */
 
 export type NormalizationSource = 'GRAPH_SIGN_INS' | 'M365_AUDIT_STS';
 
-/** Credential facts only. Anything that is not a credential verdict is not an outcome. */
-export type EventOutcome = 'INVALID_CREDENTIAL' | 'SUCCESS';
+/**
+ * What happened to the credential.
+ *
+ * The three-state shape the predecessor had — invalid / success /
+ * everything-else — cannot express "the password was accepted and the sign-in
+ * did not complete", which is the basis of the highest-value detector
+ * available without Entra ID P2. Microsoft states the inference itself: "the
+ * password is correct, but that strong authentication is required… could
+ * indicate the user's password is compromised and the bad actor is unable to
+ * fulfil MFA." Microsoft's own password-spray code set notably EXCLUDES 50126
+ * for this reason: the failure storm identifies the attack, the post-password
+ * interrupts identify the victims whose passwords are now known.
+ *
+ * The interrupt family is split three ways rather than collapsed, because
+ * 50076 (challenge issued) and 50074 (challenge NOT passed) are one digit
+ * apart and mean different things, and 50074 is the single highest-value code
+ * in the catalogue. Detectors that want the whole family should call
+ * `isPostPasswordInterrupt` rather than re-encode the distinction.
+ */
+export type EventOutcome =
+  /** 50126. The password was not accepted. Attack evidence in aggregate only. */
+  | 'PASSWORD_REJECTED'
+  /** 0. Accepted, and the sign-in completed. */
+  | 'PASSWORD_ACCEPTED_COMPLETED'
+  /** 50076. Accepted; a second-factor challenge was issued. */
+  | 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED'
+  /** 50074, 500121. Accepted; the second factor was NOT passed. */
+  | 'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED'
+  /** 50072, 50079. Accepted; the account has no usable second factor registered. */
+  | 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'
+  /** Conditional Access, device and policy blocks. A control stopped the sign-in. */
+  | 'BLOCKED_BY_CONTROL'
+  /** 50053 smart lockout. Implies VARIED wrong passwords — see provider-facts. */
+  | 'LOCKED_OUT_AFTER_REPEATED_FAILURES'
+  /** 50057. An attempt against an account that is disabled. */
+  | 'DISABLED_ACCOUNT_ATTEMPT';
+
+/** True when Microsoft's result code establishes that the password itself was accepted. */
+export function passwordWasAccepted(outcome: EventOutcome): boolean {
+  return (
+    outcome === 'PASSWORD_ACCEPTED_COMPLETED' ||
+    outcome === 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED' ||
+    outcome === 'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED' ||
+    outcome === 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'
+  );
+}
+
+/**
+ * The post-password interrupt family: the password was accepted and the
+ * sign-in did not complete. Provided so a detector groups the family by
+ * calling this rather than by listing result codes of its own.
+ */
+export function isPostPasswordInterrupt(outcome: EventOutcome): boolean {
+  return passwordWasAccepted(outcome) && outcome !== 'PASSWORD_ACCEPTED_COMPLETED';
+}
+
+/**
+ * How the event was bound to a directory user. Recorded explicitly so a
+ * technician can see that a UPN-bound finding rests on weaker evidence than a
+ * GUID-bound one, rather than having the two implied to be equivalent: a UPN
+ * can be reassigned after a user is deleted, so a historical event can bind to
+ * the wrong person.
+ */
+export type SubjectBindingMethod = 'DIRECTORY_OBJECT_ID' | 'NORMALIZED_UPN';
 
 /**
  * Client-source qualification. Only the two values this layer can actually
@@ -59,6 +119,7 @@ export interface NormalizedEvent extends NormalizationScope {
   readonly ingestedAt: string;
   /** Protected reference to the resolved directory user. Never a raw identifier. */
   readonly subjectRef: string;
+  readonly subjectBinding: SubjectBindingMethod;
   readonly applicationRef: string;
   readonly errorCode: number | null;
   readonly clientSource: {
@@ -76,7 +137,16 @@ export interface SignInRow {
   readonly ingestedAt: Date;
 }
 
-/** One collected `directory_users` row. Binding is by `microsoftUserId` only. */
+/**
+ * One collected `directory_users` row.
+ *
+ * NOTE the deliberate absence of the `sign_in_logs.user_id` COLUMN anywhere in
+ * this layer. Measured in production, that column is GUID-shaped on
+ * essentially every row, matches no directory user on any row, and is MORE
+ * granular than the actual user (one tenant: 6 distinct column GUIDs against 2
+ * distinct real users across 950 rows). It looks synthesized rather than
+ * sourced. Subjects bind from the raw payload only.
+ */
 export interface DirectoryUserRow {
   readonly organizationId: string;
   readonly customerTenantId: string;
@@ -113,16 +183,14 @@ export type IsInteractiveShape =
   | 'OTHER_TYPE';
 
 /**
- * Distributions for the payload-shape predicates this layer has NOT yet had
- * confirmed against real provider data, emitted as a by-product of a normal
- * run so the required distribution check is a run of this code rather than a
- * bespoke production query.
+ * Distributions for payload-shape claims, emitted as a by-product of a normal
+ * run so a distribution check is a run of this code rather than a bespoke
+ * production query, and so a shape that has been confirmed once is watched for
+ * drift rather than assumed forever.
  *
  * `graphIsInteractiveAmongCredentialFailures` is the CONTROL COHORT for the
  * `isInteractive === false` predicate: rows carrying a documented
- * invalid-credential code are unambiguously human interactive sign-ins, so if
- * they report FALSE or ABSENT then the predicate is wrong or inert and must
- * not be used to exclude anything.
+ * invalid-credential code are unambiguously human interactive sign-ins.
  */
 export interface ShapeObservations {
   readonly graphErrorCodeShape: Readonly<Record<ErrorCodeShape, number>>;
@@ -137,6 +205,8 @@ export interface NormalizationCounts {
   readonly doesNotApplyByReason: Readonly<Record<OutOfScopeReason, number>>;
   readonly unknownByObservation: Readonly<Record<UnknownObservation, number>>;
   readonly unprocessableByReason: Readonly<Record<UnprocessableReason, number>>;
+  /** How the events that did bind were bound, so weaker bindings are visible. */
+  readonly bindingMethods: Readonly<Record<SubjectBindingMethod, number>>;
   /**
    * Rows belonging to the feed that was not selected for this evaluation.
    * Independent feeds are never pooled, so these rows are not evaluated — but
@@ -148,7 +218,7 @@ export interface NormalizationCounts {
 }
 
 /**
- * Coverage is three counts, not a ratio and not a gate.
+ * Coverage is counts, not a ratio and not a gate.
  *
  * `recognizedRows / consideredRows` is the honest stated coverage: the share
  * of the selected feed HawkView could actually say something about. A zero
@@ -168,10 +238,26 @@ export interface NormalizationBatch {
   readonly source: NormalizationSource;
   /** Every normalized row, in all three classifications, sorted by `eventAt` then `eventId`. */
   readonly events: readonly NormalizedEvent[];
-  /** The subset the detectors act on. Same ordering. */
+  /** The subset HawkView's own detectors act on. Same ordering. */
   readonly applies: readonly NormalizedEvent[];
+  /**
+   * Events carrying Microsoft's own high-confidence risk verdict, kept OUT of
+   * `applies` and surfaced separately.
+   *
+   * These are classified DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT, because the
+   * owner's product rule is that HawkView's own findings and Microsoft's
+   * reported risk are two evidence channels that are never merged or summed.
+   * A verdict Microsoft reached is not a HawkView finding. It is still the
+   * only Microsoft risk signal an unlicensed tenant will ever see, so it is
+   * exposed here rather than buried in a counter.
+   */
+  readonly microsoftRiskVerdicts: readonly NormalizedEvent[];
   /** Reference-to-identifier mapping for subjects that resolved, kept off the events. */
-  readonly resolvedSubjects: readonly { readonly subjectRef: string; readonly microsoftUserId: string }[];
+  readonly resolvedSubjects: readonly {
+    readonly subjectRef: string;
+    readonly microsoftUserId: string;
+    readonly binding: SubjectBindingMethod;
+  }[];
   readonly counts: NormalizationCounts;
   readonly coverage: NormalizationCoverage;
   readonly shapeObservations: ShapeObservations;

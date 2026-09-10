@@ -5,11 +5,12 @@ The seam between collection/storage and the Risky Users evaluation core.
 **In:** raw `sign_in_logs` rows plus `directory_users` rows for one tenant, and one
 selected feed.
 **Out:** normalized events, each classified into exactly one of three buckets, plus
-three independent tallies and a coverage statement.
+independent tallies and a coverage statement.
 
 ```ts
 const batch = await normalizeSignInBatch({ scope, source, rows, directory, reference });
-for (const event of batch.applies) { /* detectors act on these */ }
+for (const event of batch.applies) { /* HawkView's own detectors act on these */ }
+for (const event of batch.microsoftRiskVerdicts) { /* Microsoft's channel, never merged */ }
 ```
 
 Collection and storage are unchanged. This module replaces the classification half of
@@ -17,34 +18,57 @@ Collection and storage are unchanged. This module replaces the classification ha
 
 ## The three buckets
 
-| Bucket | Meaning | Effect on stated coverage | Effect on evaluation |
+| Bucket | Meaning | Stated coverage | Evaluation |
 | --- | --- | --- | --- |
-| `APPLIES` | A credential success or failure the detectors act on. Carries `outcome`. | Counts as recognized | Evaluated |
-| `DOES_NOT_APPLY` | Understood, and correctly out of scope. Carries a `reason`, counted by reason. | Counts as recognized | Not evaluated |
-| `UNKNOWN` | We do not recognize it. Carries an `observation`, counted separately. | Reduces coverage | Not evaluated |
+| `APPLIES` | A credential event the detectors act on. Carries `outcome`. | Recognized | Evaluated |
+| `DOES_NOT_APPLY` | Out of scope **on a documented citation**. Carries a `reason`, counted by reason. | Recognized | Not evaluated |
+| `UNKNOWN` | We cannot interpret it, or cannot defend excluding it. Counted by observation. | Reduces coverage | Not evaluated |
 
 A fourth outcome is possible per *row* rather than per event: a row that could not be
-read at all is `unprocessableByReason`, which is **never** summed with
-`doesNotApplyByReason`. A malformed row and an MFA interrupt are different claims about
+read is `unprocessableByReason`, which is **never** summed with `doesNotApplyByReason`.
+A malformed row and an expected keep-me-signed-in interrupt are different claims about
 what the result is worth.
 
 `outcome` lives only inside `APPLIES`, so reading a credential verdict off an
-out-of-scope or unrecognized event is a type error rather than a convention. The
-predecessor's single `AuthOutcome` union mixed `'SUCCESS'` with `'NON_QUALIFYING'` and
-`'UNKNOWN'`, which is how "out of scope" and "unrecognized" became indistinguishable.
+out-of-scope or unrecognized event is a type error rather than a convention.
 
 ## What UNKNOWN does not do
 
 It does not block. There is no readiness flag, no `gapCount`, and no `PARTIAL` state in
 `NormalizationBatch` — nothing the evaluation core can branch on to skip a rule. The
-predecessor derived `partial = gaps > 0` from a single counter incremented by seven
-unrelated conditions and then reported `INCOMPLETE_WINDOW`, so one unrecognized event
-vetoed an entire rule. Ordinary traffic is full of events we do not recognize, so the
-detection never ran: 1,054 completed evaluation runs, zero findings.
+predecessor derived `partial = gaps > 0` from one counter incremented by seven unrelated
+conditions and reported `INCOMPLETE_WINDOW`, so a single unrecognized event vetoed a
+whole rule. Ordinary traffic is full of events we do not recognize, so detection never
+ran: 1,054 completed evaluation runs, zero findings.
 
-If a reporting layer needs to say "we could not see everything", it reads `coverage` and
-the reason maps. `recognizedRows / consideredRows` is the honest stated coverage, and a
-zero finding count is only honest reported against that scope.
+`recognizedRows / consideredRows` is the honest stated coverage, and a zero finding count
+is only honest reported against that scope.
+
+## Outcomes: the three-state vocabulary was not enough
+
+The predecessor could say invalid, success, or neither. It could not say **"the password
+was accepted and the sign-in did not complete"**, which is the basis of the highest-value
+detector available without Entra ID P2. Microsoft states the inference itself: the
+password is correct but strong authentication is required, which can indicate the
+password is compromised and the actor cannot fulfil MFA. Microsoft's own password-spray
+code set notably *excludes* 50126 — the failure storm identifies the attack, the
+post-password interrupts identify the victims whose passwords are now known.
+
+```
+PASSWORD_REJECTED                          50126
+PASSWORD_ACCEPTED_COMPLETED                0
+PASSWORD_ACCEPTED_CHALLENGE_ISSUED         50076
+PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED     50074, 500121
+PASSWORD_ACCEPTED_REGISTRATION_REQUIRED    50072, 50079
+BLOCKED_BY_CONTROL                         53003, 530032, 53000, 53001, 50097, 53004, 50131
+LOCKED_OUT_AFTER_REPEATED_FAILURES         50053 (smart-lockout text)
+DISABLED_ACCOUNT_ATTEMPT                   50057
+```
+
+The interrupt family is split three ways rather than collapsed, because 50076 (challenge
+issued) and 50074 (challenge **not** passed) are one digit apart and mean different
+things. Detectors wanting the whole family should call `isPostPasswordInterrupt` or
+`passwordWasAccepted` rather than re-encode result codes of their own.
 
 ## No default arm
 
@@ -52,105 +76,161 @@ Every technician-facing label comes from an exhaustive `Record<Reason, string>` 
 [`reasons.ts`](./reasons.ts). A reason without a label does not compile. The predecessor
 fell back to a label meaning "incomplete collection window", which sent technicians to
 chase a collection failure that did not exist; a test asserts that no out-of-scope or
-unknown label mentions collection, staleness, windows or permissions at all. Only the
-unprocessable vocabulary may point at data quality, because only it is about data
-quality.
+unknown label mentions collection, staleness, windows, retries or permissions at all.
+Only the unprocessable vocabulary may point at data quality, because only it is about
+data quality.
 
-`dispositionForCode` returning `UNKNOWN` for an unlisted provider code is not that
-default arm. An unrecognized provider code genuinely is one, and saying so is the whole
-purpose of the third bucket.
+`dispositionForCode` returning `UNKNOWN` for an unlisted code is not that default arm.
 
-## Predicates, evidence, and the control-cohort rule
+## Two rules, closing two different holes
 
-[`provider-facts.ts`](./provider-facts.ts) separates two kinds of claim:
+**Rule 1 — an unverified payload-shape predicate has no effect on classification.** It
+is observed and counted, never acted on. Not "routed to UNKNOWN" either: an event moved
+to UNKNOWN is just as absent from evaluation as one moved out of scope, so that is the
+same failure in a politer wrapper.
 
-- **Result-code claims** read a documented Azure AD code and state what Microsoft
-  documents it to mean. A code may be mapped `DOES_NOT_APPLY` only if its documented
-  meaning contains no verdict about whether a credential was correct.
-- **Payload-shape claims** assert that a field is present, absent, or carries a value
-  across real traffic. These are empirical and worth nothing until checked against real
-  rows **including a control cohort that must not match**.
+**Rule 2 — a result code may be mapped `DOES_NOT_APPLY` only with a positive documented
+citation for why it can never be credential-attack evidence.** Rule 1 does not reach
+this case, because a wrong exclusion is a *confident* classification and walks straight
+past a guard that checks whether a predicate was validated. The predecessor confidently
+classified 50076 as "not a credential event". **Absence of a reason to include is not a
+reason to exclude.** Exactly two codes clear the standard today — 50140 and 50058, both
+of which Microsoft explicitly calls expected parts of normal flow — and a test asserts
+that no third one appears without a citation.
 
-**An unverified payload-shape predicate has no effect on classification.** It is
-observed and counted, never acted on — and not "routed to UNKNOWN" either, because an
-event moved to UNKNOWN is just as absent from evaluation as one moved out of scope.
+Codes we recognize but cannot defend excluding land in
+`UNKNOWN / RECOGNIZED_BUT_EXCLUSION_UNCITED`: 50055, 50144, 50056, 50133, 50173, 65001.
+That costs coverage, blocks nothing, and is recoverable the moment a citation exists.
 
-Two predicates are recorded as `DISPROVED` and kept deliberately, as the record of
-claims that were plausible, reviewed, and false about what they meant:
+## Disproved predicates
 
-- `raw.signInEventTypes` is absent from every row in the dataset, so a predicate on it
-  matches nothing. It would have shipped as a verified fix that changed nothing.
-- `raw.servicePrincipalId` is non-empty on 100% of Graph rows **including ordinary human
-  sign-ins**, and `servicePrincipalName` is always empty. Neither discriminates
-  anything. That predicate passed review and synthetic tests and would have excluded
-  every human sign-in while reporting tenants clean.
+Kept deliberately in [`provider-facts.ts`](./provider-facts.ts) as the record of claims
+that were plausible, reviewed, and false. `mayExclude` throws if one is consulted, and
+tests assert *behaviourally* that classification is unchanged by the fields they read.
 
-`mayExclude` throws if a disproved predicate is ever consulted, and `normalize.test.ts`
-asserts *behaviourally* that classification is unchanged by the fields they read, with
-the human sign-in itself as the control cohort. Both tests were confirmed to fail when
-the corresponding bug is reintroduced.
+| Predicate | Why it is dead |
+| --- | --- |
+| `raw.signInEventTypes` | Absent from every row. Matches nothing; would have shipped as a verified fix that changed nothing. |
+| `raw.servicePrincipalId` | Non-empty on 100% of Graph rows **including ordinary human sign-ins**. Would have excluded all human traffic while reporting tenants clean. |
+| `raw.isInteractive` | `true` on 100% of 2,635 rows. Inert — a predicate true on every row discriminates nothing. |
+| `managementActivityRecord.ResultStatus` | On an STS logon event "Succeeded" means **HTTP** success, not logon success. Fails silently toward calling failures successes. |
+| `sign_in_logs.user_id` (column) | GUID-shaped, matches no directory user on any row, and more granular than the real user (6 column GUIDs vs 2 real users across 950 rows). Synthesized, not an identity. |
 
 ## Subject binding
 
-Exact match on `directory_users.microsoft_user_id`, case-insensitive, and nothing else.
-There is no UPN or mail index here: a UPN is renameable and reassignable, so binding a
-sign-in to a person by name can attribute one user's activity to another. `userType` is
-not filtered either — that would be an unverified exclusion predicate, and it would
+Two methods, and the one used is recorded on every event as `subjectBinding`.
+
+- **Graph** binds on `raw.userId`, an exact directory object id.
+- **Audit** binds on `managementActivityRecord.UserId`, an exact normalized UPN
+  (case-insensitive, whitespace-trimmed, never fuzzy or partial).
+
+GUID-only binding was the original design and would have been wrong: measured across the
+three fallback-path tenants, audit rows resolve **96.8% / 97.1% / 77.8% by UPN against
+15.2% / 0.0% / 0.0% by GUID**. Two of three tenants would have detected nothing, on a
+feature whose premise is working without premium licensing.
+
+The real hazard was never naming, it was **ambiguity** — two directory users normalizing
+to one UPN. Both lookups therefore require **exactly one** non-deleted match; zero and
+multiple are both unprocessable, with no "best match". A UPN can be reassigned after a
+user is deleted, so a historical event can bind to the wrong person — that residual risk
+is smaller than detecting nothing for two thirds of tenants, and `subjectBinding` makes
+it visible to a technician rather than implying the two bindings are equivalent.
+
+`userType` is not filtered: that would be an unverified exclusion predicate, and it would
 report the user as missing from the directory, which reads as a collection fault.
 
 Raw identifiers do not travel on events. Each event carries `subjectRef` and
-`applicationRef` from the injected `ReferenceResolver`; the id mapping is available
-separately as `batch.resolvedSubjects`.
+`applicationRef` from the injected `ReferenceResolver`; the mapping is separate, as
+`batch.resolvedSubjects`.
 
-**Consequence, raised with the PM:** audit-STS rows carry only a UPN in `UserId`, so
-under GUID-only binding every `M365_AUDIT_STS` row is unprocessable
-(`SUBJECT_NOT_RESOLVABLE_WITHOUT_GUID`) and that fallback feed produces zero events —
-visibly, in the coverage statement, rather than quietly matched by name.
+## 50053 and the Microsoft risk channel
+
+50053 has **three** documented meanings, distinguishable only from the description text,
+so the text is parsed — to a **closed set**, with anything unmatched *or* matching more
+than one meaning routed to `UNKNOWN / AMBIGUOUS_FAILURE_REASON_TEXT`. A reworded or
+localised string therefore costs stated coverage and cannot silently misclassify. The
+hazard was never "parse text", it was "guess from text".
+
+| Text | Disposition |
+| --- | --- |
+| smart lockout after repeated wrong passwords | `APPLIES / LOCKED_OUT_AFTER_REPEATED_FAILURES` |
+| blocked from an IP with malicious activity | `APPLIES / BLOCKED_BY_CONTROL` |
+| blocked by built-in protections, high confidence of risk | `DOES_NOT_APPLY / MICROSOFT_RISK_VERDICT` |
+
+Smart lockout "tracks the last three bad password hashes to avoid incrementing the
+lockout counter for the same password", so a lockout implies **varied** password
+attempts — a misconfigured client replaying one stale credential will not lock out. That
+removes the main false-positive objection to treating a lockout as attack evidence.
+
+**The third meaning does not go into `applies`, and that is deliberate.** It is
+Microsoft's own high-confidence risk verdict, and the owner's product rule is that
+HawkView's findings and Microsoft-reported risk are two channels that are never merged
+or summed. A verdict Microsoft reached is not a HawkView finding. It is also the only
+Microsoft risk signal an unlicensed tenant will ever see, so it is surfaced as
+`batch.microsoftRiskVerdicts` rather than lost to a counter.
 
 ## Bounds never cost the run
 
 `MAX_ROWS_PER_RUN` and `MAX_DISTINCT_REFERENCES` cost the excess rows, each counted with
-its own reason. The predecessor failed the entire evaluation with `CAPACITY_LIMIT`.
+its own reason. The predecessor failed the whole evaluation with `CAPACITY_LIMIT`.
 
-## Open decisions
+## Verification status
 
-1. **Result code 50053 is currently `UNKNOWN` / `AMBIGUOUS_DOCUMENTED_CODE`.** It
-   carries two meanings distinguished only by `failureReason` free text — smart lockout
-   after repeated failures, and blocked-from-malicious-IP — observed in one tenant, one
-   locale, six weeks. That is too thin for a durable text contract, so the code is
-   neither split on text nor guessed at. This is the highest-value mapping decision
-   still open: a lockout is downstream evidence of repeated invalid credentials, and one
-   tenant showed 553 lockouts and 919 Microsoft-blocked malicious-IP sign-ins that an
-   MSP would open the page and not see. Mitigating factor worth measuring: the failures
-   that cause a lockout normally also appear as 50126 rows in the same window, so rule 1
-   can fire without 50053 — unless the lockouts arrive with no 50126 alongside them.
-2. **`APPLICATION_ACTOR` currently reports zero.** No verified field distinguishes an
-   application actor from a user missing from the collected directory, so app-only
-   sign-ins land as unprocessable subject failures. That is counted and visible, but it
-   understates coverage. Activating the reason needs a discriminator that survives a
-   control cohort of ordinary human sign-ins.
+Confirmed against production, with the control cohort each check needed:
 
-## Distribution checks requested (run by the PM, not from here)
+- `status.errorCode` is a JSON `number` on 100% of 2,635 Graph rows — zero string, null
+  or absent, and zero rows missing `status`, so nothing can be misread as `0`. A numeric
+  string is therefore **drift**, not a supported form: counted in `shapeObservations` and
+  routed to UNKNOWN rather than coerced.
+- On the **Graph** path, `errorCode 0` carries the literal `"Other."` on 100% of rows.
+  The empty-description successes reported earlier are all **audit** rows — a different
+  feed, verified separately and never mixed.
+- Audit UPN resolution rates, above.
 
-This module never queries production. The two pending payload-shape questions are
-answered by *running this layer* against a real window and reading
-`batch.shapeObservations`:
+Not confirmed, and recorded as such:
 
-- `graphErrorCodeShape` — is `raw.status.errorCode` a number or a string in production?
-  Both are read here, because refusing a string would send every row to `UNKNOWN` if
-  that is what is stored.
-- `graphIsInteractive` and `graphIsInteractiveAmongCredentialFailures` — the latter is
-  the **control cohort** for `isInteractive === false`. Rows carrying 50126 are
-  unambiguously human interactive password failures; if they report `FALSE` or `ABSENT`,
-  the predicate is wrong or inert and must never exclude anything.
+- **`graph.subject-directory-object-id` has an empty control cohort.** Graph rows bind
+  100% positively, but zero observed rows carry a well-formed GUID absent from the
+  directory — guests, deleted users and cross-tenant sign-ins do not appear. The
+  unprocessable path is covered by synthetic fixtures only, which is weaker, and its
+  verification state is `CONTROL_COHORT_UNAVAILABLE` rather than verified.
+- Only fourteen distinct Graph error codes exist in all history and only three appear in
+  more than one tenant. The whole distribution is thin; the mapping table rests on
+  Microsoft's documentation, not on our frequencies.
 
-Also requested: the top result codes by row count across a real window (to ground the
-mapping table in what occurs rather than in what can be named), the exact-GUID match
-rate against `directory_users` with a control cohort of GUIDs absent from the directory,
-and the `failureReason` distribution for code 0.
+`shapeObservations` is emitted on every run so a shape confirmed once stays under
+observation rather than being assumed forever.
+
+## Open items
+
+1. **Username enumeration is invisible.** 50034 and 51004 are enumeration evidence, but
+   any row carrying them describes a subject that is not in the directory, so subject
+   resolution discards it before classification. Recorded in
+   `UNREACHABLE_BY_SUBJECT_RESOLUTION`. Detecting enumeration needs a path for
+   unresolved subjects, which is a scope decision.
+2. **Collection scope, not classification: we appear not to be collecting
+   non-interactive sign-ins.** The Graph request in `tenant-sync.service.ts` filters on
+   `createdDateTime` only and applies no `signInEventTypes` filter, so Graph returns its
+   default set — interactive user sign-ins. That explains `isInteractive` being true on
+   every row, and it means non-interactive traffic, which normally outnumbers
+   interactive, is absent from evaluation entirely.
+3. **`APPLICATION_ACTOR` reports zero.** No confirmed field distinguishes an application
+   actor from a user missing from the directory, so app-only sign-ins land as
+   unprocessable subject failures — visible, but understating coverage.
+4. **65001 wants a citation either way.** It is one of only three codes seen in more than
+   one tenant, so it is high-volume, and it currently sits in UNKNOWN.
+5. **50131's "suspicious activity" text variant** may belong in the Microsoft-reported
+   risk channel rather than as a control block. Not settled here.
 
 ## Tests
 
 ```bash
 npm --prefix backend run test:risky-users-normalization
 ```
+
+52 tests. Five bug classes were reintroduced as deliberate mutations and each confirmed
+to fail exactly the intended tests, with the rest of the suite still passing: a
+`servicePrincipalId` exclusion, 50076 mapped out of scope, Microsoft's risk verdict
+routed into our own findings, the audit `ResultStatus` read as logon success, and
+ambiguity resolved by best-match. A green suite that has not been mutation-checked is
+not evidence.

@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   MAX_ROWS_PER_RUN,
+  isPostPasswordInterrupt,
+  passwordWasAccepted,
   type DirectoryUserRow,
+  type EventOutcome,
   type NormalizationBatch,
   type NormalizationScope,
   type NormalizationSource,
@@ -11,9 +14,12 @@ import {
 } from './contract.js';
 import {
   DISPROVED_PREDICATE_PATHS,
+  FAILURE_REASON_MEANINGS,
   RESULT_CODES,
   SHAPE_PREDICATES,
+  UNREACHABLE_BY_SUBJECT_RESOLUTION,
   dispositionForCode,
+  failureReasonMeaning,
   mayExclude,
 } from './provider-facts.js';
 import { normalizeSignInBatch } from './normalize.js';
@@ -54,8 +60,8 @@ const DIRECTORY: readonly DirectoryUserRow[] = [
 
 /**
  * Opaque, order-stable references. Deliberately NOT derived from the
- * identifier: a reference that embeds the raw directory id would let these
- * tests pass while raw customer identifiers travelled on the events.
+ * identifier: a reference embedding the raw directory id would let these tests
+ * pass while raw customer identifiers travelled on the events.
  */
 function makeReference(): ReferenceResolver {
   const issued = new Map<string, string>();
@@ -80,8 +86,33 @@ function graphRow(raw: Record<string, unknown> = {}, overrides: Partial<SignInRo
       userId: USER_ID,
       appId: APP_ID,
       ipAddress: '203.0.113.10',
+      isInteractive: true,
       status: { errorCode: 50126, failureReason: 'Invalid username or password.' },
       ...raw,
+    },
+    ...overrides,
+  };
+}
+
+function auditRow(record: Record<string, unknown> = {}, overrides: Partial<SignInRow> = {}): SignInRow {
+  return {
+    organizationId: ORGANIZATION_ID,
+    customerTenantId: CUSTOMER_TENANT_ID,
+    ingestedAt: new Date('2026-09-10T10:05:00.000Z'),
+    raw: {
+      hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY',
+      managementActivityRecord: {
+        Id: 'aud-1',
+        CreationTime: '2026-09-10T10:00:00.000Z',
+        OrganizationId: MICROSOFT_TENANT_ID,
+        RecordType: 15,
+        Operation: 'UserLoginFailed',
+        UserId: 'ann@example.com',
+        ApplicationId: APP_ID,
+        ClientIP: '203.0.113.10',
+        ErrorCode: '50126',
+        ...record,
+      },
     },
     ...overrides,
   };
@@ -109,6 +140,8 @@ function only(batch: NormalizationBatch) {
   return batch.events[0]!;
 }
 
+const total = (counts: Readonly<Record<string, number>>) => Object.values(counts).reduce((a, b) => a + b, 0);
+
 // ---------------------------------------------------------------------------
 // Rule 1: UNKNOWN must never block anything.
 // ---------------------------------------------------------------------------
@@ -120,9 +153,8 @@ test('unrecognized events never remove a recognized credential failure from eval
   const batch = await run([...unrecognized, graphRow({ id: 'real' })]);
 
   assert.equal(batch.counts.applies, 1);
-  assert.equal(batch.applies.length, 1);
   assert.equal(batch.applies[0]!.eventId, 'real');
-  assert.deepEqual(batch.applies[0]!.classification, { kind: 'APPLIES', outcome: 'INVALID_CREDENTIAL' });
+  assert.deepEqual(batch.applies[0]!.classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
   assert.equal(batch.counts.unknownByObservation.UNRECOGNIZED_ERROR_CODE, 25);
 });
 
@@ -134,7 +166,8 @@ test('a batch that is entirely unrecognized still returns events and no gate', a
   // Nothing in the batch is a readiness flag, a gap count, or a partial state
   // the evaluation core could branch on to skip a rule.
   assert.deepEqual(Object.keys(batch).sort(), [
-    'applies', 'counts', 'coverage', 'events', 'resolvedSubjects', 'scope', 'shapeObservations', 'source',
+    'applies', 'counts', 'coverage', 'events', 'microsoftRiskVerdicts',
+    'resolvedSubjects', 'scope', 'shapeObservations', 'source',
   ]);
   assert.deepEqual(Object.keys(batch.coverage).sort(), ['consideredRows', 'normalizedRows', 'recognizedRows']);
 });
@@ -156,27 +189,25 @@ test('unprocessable rows never remove a recognized credential failure from evalu
 // Rule 2: never sum "could not process" with "does not apply".
 // ---------------------------------------------------------------------------
 
-test('a malformed row and an MFA interrupt land in different counters', async () => {
+test('a malformed row and an expected-flow interrupt land in different counters', async () => {
   const batch = await run([
     graphRow({}, { raw: null }),
-    graphRow({ id: 'mfa', status: { errorCode: 50076 } }),
+    graphRow({ id: 'kmsi', status: { errorCode: 50140 } }),
   ]);
 
   assert.equal(batch.counts.unprocessableByReason.RAW_PAYLOAD_MALFORMED, 1);
-  assert.equal(batch.counts.doesNotApplyByReason.MFA_INTERRUPT, 1);
-  // The distinction is only real if neither total can absorb the other.
-  assert.equal(batch.counts.doesNotApplyByReason.NON_INTERACTIVE_SIGN_IN, 0);
-  assert.equal(batch.counts.unknownByObservation.UNRECOGNIZED_ERROR_CODE, 0);
-  assert.equal(batch.coverage.recognizedRows, 1, 'the MFA interrupt is recognized; the malformed row is not');
+  assert.equal(batch.counts.doesNotApplyByReason.KEEP_ME_SIGNED_IN, 1);
+  assert.equal(batch.coverage.recognizedRows, 1, 'the interrupt is recognized; the malformed row is not');
   assert.equal(batch.coverage.consideredRows, 2);
   assert.equal(batch.coverage.normalizedRows, 1);
 });
 
 test('the three reason vocabularies share no key, so no counter can be double-read', () => {
-  const outOfScope = Object.keys(OUT_OF_SCOPE_LABELS);
-  const unknown = Object.keys(UNKNOWN_LABELS);
-  const unprocessable = Object.keys(UNPROCESSABLE_LABELS);
-  const all = [...outOfScope, ...unknown, ...unprocessable];
+  const all = [
+    ...Object.keys(OUT_OF_SCOPE_LABELS),
+    ...Object.keys(UNKNOWN_LABELS),
+    ...Object.keys(UNPROCESSABLE_LABELS),
+  ];
   assert.equal(new Set(all).size, all.length, 'a reason key appears in more than one vocabulary');
 });
 
@@ -193,25 +224,24 @@ test('the tallies plus the unselected feed account for every row handed in', asy
     graphRow({ id: 'scope-out', status: { errorCode: 50140 } }),
     graphRow({ id: 'unknown', status: { errorCode: 4242 } }),
     graphRow({}, { raw: 7 }),
-    graphRow({ hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY' }),
+    auditRow(),
   ]);
-  const sum = (counts: Readonly<Record<string, number>>) => Object.values(counts).reduce((a, b) => a + b, 0);
   const accounted =
     batch.counts.applies +
-    sum(batch.counts.doesNotApplyByReason) +
-    sum(batch.counts.unknownByObservation) +
-    sum(batch.counts.unprocessableByReason) +
+    total(batch.counts.doesNotApplyByReason) +
+    total(batch.counts.unknownByObservation) +
+    total(batch.counts.unprocessableByReason) +
     batch.counts.unselectedSourceRows;
   assert.equal(accounted, batch.counts.rows);
   assert.equal(batch.counts.unselectedSourceRows, 1);
 });
 
 test('rows from the feed that was not selected are counted separately, not as a defect', async () => {
-  const batch = await run([graphRow({ hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY' })]);
+  const batch = await run([auditRow()]);
   assert.equal(batch.counts.unselectedSourceRows, 1);
   assert.equal(batch.coverage.consideredRows, 0, 'the unselected feed is not part of the assessed scope');
-  assert.equal(Object.values(batch.counts.unprocessableByReason).reduce((a, b) => a + b, 0), 0);
-  assert.equal(Object.values(batch.counts.doesNotApplyByReason).reduce((a, b) => a + b, 0), 0);
+  assert.equal(total(batch.counts.unprocessableByReason), 0);
+  assert.equal(total(batch.counts.doesNotApplyByReason), 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -242,147 +272,344 @@ test('out-of-scope and unknown labels never point at collection', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Disproved predicates. These two tests are the ones that would have caught
-// the real bugs, because each supplies the control cohort that must NOT match.
+// The exclusion standard: excluding a code needs a positive citation.
+// ---------------------------------------------------------------------------
+
+test('only two codes are mapped out of scope, and both carry a documented citation', () => {
+  const excluded = RESULT_CODES.filter(entry => entry.disposition.kind === 'DOES_NOT_APPLY');
+  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50058, 50140]);
+  for (const entry of excluded) {
+    assert.ok(
+      entry.exclusionCitation && entry.exclusionCitation.length > 15,
+      `${entry.code} is excluded with no citation; absence of a reason to include is not a reason to exclude`,
+    );
+  }
+});
+
+test('50076 is a control signal, not "not a credential event"', () => {
+  // The predecessor confidently classified 50076 as NON_QUALIFYING. That is a
+  // wrong CONFIDENT classification, so the unverified-predicate guard does not
+  // reach it — it walks straight through. This test is the guard for it.
+  assert.deepEqual(dispositionForCode(50076), {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_CHALLENGE_ISSUED',
+  });
+  assert.deepEqual(dispositionForCode(50074), {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_CHALLENGE_NOT_PASSED',
+  });
+  for (const code of [50072, 50079, 500121]) {
+    const disposition = dispositionForCode(code);
+    assert.equal(disposition.kind, 'APPLIES', `code ${code} must stay in evaluation`);
+  }
+});
+
+test('the post-password interrupt family is expressible and groupable', async () => {
+  // The three-state predecessor vocabulary could not say "the password was
+  // accepted and the sign-in did not complete", which is the basis of the
+  // highest-value detector available without Entra ID P2.
+  const batch = await run([
+    graphRow({ id: 'rejected', status: { errorCode: 50126 } }),
+    graphRow({ id: 'completed', status: { errorCode: 0, failureReason: 'Other.' } }),
+    graphRow({ id: 'challenged', status: { errorCode: 50076 } }),
+    graphRow({ id: 'not-passed', status: { errorCode: 50074 } }),
+    graphRow({ id: 'unregistered', status: { errorCode: 50079 } }),
+  ]);
+  assert.equal(batch.counts.applies, 5);
+
+  const outcomeOf = (eventId: string): EventOutcome => {
+    const classification = batch.events.find(event => event.eventId === eventId)!.classification;
+    assert.equal(classification.kind, 'APPLIES');
+    return (classification as { kind: 'APPLIES'; outcome: EventOutcome }).outcome;
+  };
+  assert.equal(passwordWasAccepted(outcomeOf('rejected')), false);
+  assert.equal(passwordWasAccepted(outcomeOf('completed')), true);
+  assert.equal(isPostPasswordInterrupt(outcomeOf('completed')), false);
+  for (const id of ['challenged', 'not-passed', 'unregistered']) {
+    assert.equal(passwordWasAccepted(outcomeOf(id)), true, id);
+    assert.equal(isPostPasswordInterrupt(outcomeOf(id)), true, id);
+  }
+});
+
+test('codes with no exclusion citation land in unknown rather than out of scope', async () => {
+  for (const code of [50055, 50144, 50056, 50133, 50173, 65001]) {
+    const batch = await run([graphRow({ status: { errorCode: code } })]);
+    assert.deepEqual(
+      only(batch).classification,
+      { kind: 'UNKNOWN', observation: 'RECOGNIZED_BUT_EXCLUSION_UNCITED' },
+      `code ${code}`,
+    );
+  }
+  const ambiguous = await run([graphRow({ status: { errorCode: 50158 } })]);
+  assert.deepEqual(only(ambiguous).classification, {
+    kind: 'UNKNOWN',
+    observation: 'AMBIGUOUS_BY_PROVIDER_STATEMENT',
+  });
+});
+
+test('the two expected-flow codes are out of scope', async () => {
+  const cases: readonly [number, OutOfScopeReason][] = [
+    [50140, 'KEEP_ME_SIGNED_IN'],
+    [50058, 'INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN'],
+  ];
+  for (const [code, reason] of cases) {
+    const batch = await run([graphRow({ status: { errorCode: code } })]);
+    assert.deepEqual(only(batch).classification, { kind: 'DOES_NOT_APPLY', reason }, `code ${code}`);
+  }
+});
+
+test('the enumeration codes are recorded as a known blind spot rather than mapped', () => {
+  // Requiring a resolved directory user means these can never be classified:
+  // by definition their subject is not in the directory.
+  assert.deepEqual(UNREACHABLE_BY_SUBJECT_RESOLUTION.map(entry => entry.code).sort((a, b) => a - b), [50034, 51004]);
+  for (const entry of UNREACHABLE_BY_SUBJECT_RESOLUTION) {
+    assert.equal(dispositionForCode(entry.code).kind, 'UNKNOWN', 'must not be silently mapped');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 50053: the meaning lives in the description text, parsed as a closed set.
+// ---------------------------------------------------------------------------
+
+test('50053 resolves its three documented meanings from the description text', async () => {
+  const lockout = await run([graphRow({ status: {
+    errorCode: 50053,
+    failureReason: 'You’ve tried to sign in too many times with an incorrect user ID or password.',
+  } })]);
+  assert.deepEqual(only(lockout).classification, {
+    kind: 'APPLIES',
+    outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+  });
+
+  const malicious = await run([graphRow({ status: {
+    errorCode: 50053,
+    failureReason: 'Sign-in was blocked because it came from an IP address with malicious activity.',
+  } })]);
+  assert.deepEqual(only(malicious).classification, { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' });
+
+  const risk = await run([graphRow({ status: {
+    errorCode: 50053,
+    failureReason: 'Sign-in was blocked by built-in protections due to high confidence of risk.',
+  } })]);
+  assert.deepEqual(only(risk).classification, {
+    kind: 'DOES_NOT_APPLY',
+    reason: 'MICROSOFT_RISK_VERDICT',
+  });
+});
+
+test('50053 text that matches nothing, or more than one meaning, stays unknown', async () => {
+  const bare = await run([graphRow({ status: { errorCode: 50053 } })]);
+  assert.deepEqual(only(bare).classification, {
+    kind: 'UNKNOWN',
+    observation: 'AMBIGUOUS_FAILURE_REASON_TEXT',
+  });
+
+  const localised = await run([graphRow({ status: { errorCode: 50053, failureReason: 'Konto gesperrt.' } })]);
+  assert.deepEqual(only(localised).classification, {
+    kind: 'UNKNOWN',
+    observation: 'AMBIGUOUS_FAILURE_REASON_TEXT',
+  });
+
+  // Two meanings in one string is the case where guessing would be tempting.
+  const both = await run([graphRow({ status: {
+    errorCode: 50053,
+    failureReason: 'Blocked by built-in protections due to high confidence of risk after malicious activity.',
+  } })]);
+  assert.deepEqual(only(both).classification, {
+    kind: 'UNKNOWN',
+    observation: 'AMBIGUOUS_FAILURE_REASON_TEXT',
+  });
+  assert.equal(failureReasonMeaning('nothing familiar here'), null);
+});
+
+test('the description-text meanings are a closed set with distinct dispositions', () => {
+  assert.deepEqual(
+    FAILURE_REASON_MEANINGS.map(pattern => pattern.meaning).sort(),
+    ['HIGH_CONFIDENCE_RISK_BLOCK', 'MALICIOUS_IP_BLOCK', 'SMART_LOCKOUT'],
+  );
+  for (const pattern of FAILURE_REASON_MEANINGS) {
+    assert.ok(pattern.fragments.length > 0);
+    for (const fragment of pattern.fragments) {
+      assert.equal(fragment, fragment.toLowerCase(), 'fragments are matched against lowercased text');
+    }
+  }
+});
+
+test('Microsoft’s risk verdict is surfaced separately and kept out of our findings', async () => {
+  // Our findings and Microsoft-reported risk are two evidence channels that
+  // are never merged or summed. A verdict Microsoft reached is not a HawkView
+  // finding — but it is the only Microsoft risk signal an unlicensed tenant
+  // gets, so it must not be lost to a counter either.
+  const batch = await run([
+    graphRow({ id: 'ours', status: { errorCode: 50126 } }),
+    graphRow({ id: 'microsofts', status: {
+      errorCode: 50053,
+      failureReason: 'Sign-in was blocked by built-in protections due to high confidence of risk.',
+    } }),
+  ]);
+
+  assert.deepEqual(batch.applies.map(event => event.eventId), ['ours']);
+  assert.deepEqual(batch.microsoftRiskVerdicts.map(event => event.eventId), ['microsofts']);
+  assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_RISK_VERDICT, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Disproved predicates. Each supplies the control cohort that must NOT match.
 // ---------------------------------------------------------------------------
 
 test('a non-empty servicePrincipalId does not change how a human sign-in is classified', async () => {
   // servicePrincipalId is non-empty on 100% of Graph rows INCLUDING ordinary
-  // human sign-ins, and servicePrincipalName is always empty. The control
-  // cohort here is the human sign-in itself: it must still be evaluated.
+  // human sign-ins. The control cohort is the human sign-in itself: it must
+  // still be evaluated.
   const withServicePrincipal = await run([
     graphRow({ servicePrincipalId: '77777777-7777-4777-8777-777777777777', servicePrincipalName: '' }),
   ]);
   const withoutServicePrincipal = await run([graphRow()]);
 
-  assert.deepEqual(only(withServicePrincipal).classification, { kind: 'APPLIES', outcome: 'INVALID_CREDENTIAL' });
+  assert.deepEqual(only(withServicePrincipal).classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
   assert.deepEqual(
     only(withServicePrincipal).classification,
     only(withoutServicePrincipal).classification,
     'servicePrincipalId changed a classification; it discriminates nothing and must not be read',
   );
-  assert.equal(withServicePrincipal.counts.applies, 1);
 });
 
 test('signInEventTypes does not change how a sign-in is classified', async () => {
-  // signInEventTypes is absent from every row in the dataset, so a predicate
-  // on it matches nothing. Asserting behaviour rather than absence is what
-  // keeps it from being reintroduced as a "verified fix" that changes nothing.
   const withTypes = await run([graphRow({ signInEventTypes: ['servicePrincipal', 'managedIdentity'] })]);
   const withoutTypes = await run([graphRow()]);
-
-  assert.deepEqual(only(withTypes).classification, { kind: 'APPLIES', outcome: 'INVALID_CREDENTIAL' });
+  assert.deepEqual(only(withTypes).classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
   assert.deepEqual(only(withTypes).classification, only(withoutTypes).classification);
+});
+
+test('isInteractive is inert on real data and changes nothing', async () => {
+  // true on 100% of 2,635 rows. The 50126 control cohort passes, but a
+  // predicate true on every row discriminates nothing. Root cause is a
+  // collection-scope gap: the collector applies no signInEventTypes filter, so
+  // Graph returns its default interactive-only set.
+  const interactive = await run([graphRow({ isInteractive: true })]);
+  const nonInteractive = await run([graphRow({ isInteractive: false })]);
+  const absent = await run([graphRow({}, { raw: {
+    id: 'evt-1', createdDateTime: '2026-09-10T10:00:00.000Z',
+    userId: USER_ID, appId: APP_ID, status: { errorCode: 50126 },
+  } })]);
+
+  for (const batch of [interactive, nonInteractive, absent]) {
+    assert.deepEqual(only(batch).classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
+  }
+  assert.equal(nonInteractive.counts.doesNotApplyByReason.NON_INTERACTIVE_SIGN_IN, 0);
+});
+
+test('the audit ResultStatus is never consulted', async () => {
+  // For STS logon events "Succeeded" means HTTP success, NOT logon success.
+  // This one fails silently in the direction of calling failures successes.
+  const succeeded = await run([auditRow({ ResultStatus: 'Succeeded' })], { source: 'M365_AUDIT_STS' });
+  const failed = await run([auditRow({ ResultStatus: 'Failed' })], { source: 'M365_AUDIT_STS' });
+  const absent = await run([auditRow()], { source: 'M365_AUDIT_STS' });
+
+  for (const batch of [succeeded, failed, absent]) {
+    assert.deepEqual(only(batch).classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
+  }
 });
 
 test('disproved predicates are recorded and cannot be consulted', () => {
   assert.deepEqual(
     [...DISPROVED_PREDICATE_PATHS].sort(),
-    ['raw.servicePrincipalId', 'raw.servicePrincipalName', 'raw.signInEventTypes'],
+    [
+      'managementActivityRecord.ResultStatus',
+      'raw.isInteractive',
+      'raw.servicePrincipalId',
+      'raw.servicePrincipalName',
+      'raw.signInEventTypes',
+      'sign_in_logs.user_id',
+    ],
   );
-  assert.throws(() => mayExclude('graph.service-principal-id'), /DISPROVED_PREDICATE/);
-  assert.throws(() => mayExclude('graph.sign-in-event-types'), /DISPROVED_PREDICATE/);
+  for (const id of ['graph.service-principal-id', 'graph.sign-in-event-types', 'graph.is-interactive-false',
+    'audit.result-status', 'signin.user-id-column']) {
+    assert.throws(() => mayExclude(id), /DISPROVED_PREDICATE/, id);
+  }
   assert.throws(() => mayExclude('graph.no-such-predicate'), /UNKNOWN_PREDICATE/);
 });
 
-// ---------------------------------------------------------------------------
-// Unverified predicates are observed, never acted on.
-// ---------------------------------------------------------------------------
-
-test('isInteractive is not yet confirmed, so it changes nothing and is only counted', async () => {
-  assert.equal(mayExclude('graph.is-interactive-false'), false);
-
-  const batch = await run([
-    graphRow({ id: 'non-interactive', isInteractive: false }),
-    graphRow({ id: 'interactive', isInteractive: true }),
-    graphRow({ id: 'absent' }),
-  ]);
-
-  // All three stay in evaluation. Routing the non-interactive one to UNKNOWN
-  // would remove it just as effectively as routing it out of scope.
-  assert.equal(batch.counts.applies, 3);
-  assert.equal(batch.counts.doesNotApplyByReason.NON_INTERACTIVE_SIGN_IN, 0);
-  assert.deepEqual(batch.shapeObservations.graphIsInteractive, { TRUE: 1, FALSE: 1, NULL: 0, ABSENT: 1, OTHER_TYPE: 0 });
+test('a predicate whose control cohort does not exist is not treated as verified', () => {
+  // Graph subject binding matches 100% positively, but zero observed rows
+  // carry a well-formed GUID absent from the directory, so the unprocessable
+  // path is untested against production and must not be recorded as passing.
+  assert.equal(mayExclude('graph.subject-directory-object-id'), false);
+  const predicate = SHAPE_PREDICATES.find(entry => entry.id === 'graph.subject-directory-object-id')!;
+  assert.equal(predicate.verification.state, 'CONTROL_COHORT_UNAVAILABLE');
 });
 
-test('the control cohort for isInteractive is reported separately', async () => {
-  // Rows carrying 50126 are unambiguously human interactive password
-  // failures. If they report FALSE or ABSENT, the predicate is wrong or inert
-  // and must never exclude anything. This is the check, run by this layer.
-  const batch = await run([
-    graphRow({ id: 'failure-a', isInteractive: true, status: { errorCode: 50126 } }),
-    graphRow({ id: 'failure-b', status: { errorCode: 50126 } }),
-    graphRow({ id: 'refresh', isInteractive: false, status: { errorCode: 4242 } }),
-  ]);
-
-  assert.deepEqual(batch.shapeObservations.graphIsInteractiveAmongCredentialFailures, {
-    TRUE: 1, FALSE: 0, NULL: 0, ABSENT: 1, OTHER_TYPE: 0,
-  });
+test('every shape predicate records how it was checked', () => {
+  for (const predicate of SHAPE_PREDICATES) {
+    const { verification } = predicate;
+    if (verification.state === 'PENDING_DISTRIBUTION_CHECK') {
+      assert.ok(verification.controlCohort.length > 20, `${predicate.id} has no control cohort`);
+    } else if (verification.state === 'PRODUCTION_VERIFIED') {
+      assert.ok(verification.control.length > 20, `${predicate.id} records no control result`);
+      assert.ok(verification.evidence.length > 20, `${predicate.id} has no evidence`);
+    } else if (verification.state === 'CONTROL_COHORT_UNAVAILABLE') {
+      assert.ok(verification.why.length > 20, `${predicate.id} does not say why the control is unavailable`);
+    } else {
+      assert.ok(verification.evidence.length > 20, `${predicate.id} has no evidence`);
+    }
+  }
 });
 
-test('the result-code shape distribution is reported, including string codes', async () => {
+// ---------------------------------------------------------------------------
+// Graph result-code shape.
+// ---------------------------------------------------------------------------
+
+test('the Graph result code must be a number, and drift is reported not coerced', async () => {
   const batch = await run([
     graphRow({ id: 'number', status: { errorCode: 50126 } }),
     graphRow({ id: 'string', status: { errorCode: '50126' } }),
     graphRow({ id: 'junk', status: { errorCode: 'fifty-thousand' } }),
     graphRow({ id: 'null', status: { errorCode: null } }),
     graphRow({ id: 'absent', status: {} }),
-    graphRow({ id: 'no-status' }, { raw: {
-      id: 'no-status', createdDateTime: '2026-09-10T10:00:00.000Z',
-      organizationId: ORGANIZATION_ID, userId: USER_ID, appId: APP_ID,
-    } }),
   ]);
 
   assert.deepEqual(batch.shapeObservations.graphErrorCodeShape, {
-    NUMBER: 1, NUMERIC_STRING: 1, OTHER_STRING: 1, NULL: 1, ABSENT: 2, OTHER_TYPE: 0,
+    NUMBER: 1, NUMERIC_STRING: 1, OTHER_STRING: 1, NULL: 1, ABSENT: 1, OTHER_TYPE: 0,
   });
-  // A numeric string is read rather than discarded: if that is how production
-  // stores the code, refusing it would send every row to UNKNOWN.
-  const asString = batch.events.find(event => event.eventId === 'string')!;
-  assert.deepEqual(asString.classification, { kind: 'APPLIES', outcome: 'INVALID_CREDENTIAL' });
-  const junk = batch.events.find(event => event.eventId === 'junk')!;
-  assert.deepEqual(junk.classification, { kind: 'UNKNOWN', observation: 'ERROR_CODE_SHAPE_UNRECOGNIZED' });
-  const absent = batch.events.find(event => event.eventId === 'absent')!;
-  assert.deepEqual(absent.classification, { kind: 'UNKNOWN', observation: 'ERROR_CODE_ABSENT' });
+  const classificationOf = (eventId: string) => batch.events.find(event => event.eventId === eventId)!.classification;
+  assert.deepEqual(classificationOf('number'), { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
+  // Confirmed number on 100% of 2,635 rows, so a string is drift. Counted and
+  // routed to UNKNOWN rather than coerced into a verdict.
+  assert.deepEqual(classificationOf('string'), { kind: 'UNKNOWN', observation: 'ERROR_CODE_SHAPE_UNRECOGNIZED' });
+  assert.deepEqual(classificationOf('junk'), { kind: 'UNKNOWN', observation: 'ERROR_CODE_SHAPE_UNRECOGNIZED' });
+  assert.deepEqual(classificationOf('null'), { kind: 'UNKNOWN', observation: 'ERROR_CODE_ABSENT' });
+  assert.deepEqual(classificationOf('absent'), { kind: 'UNKNOWN', observation: 'ERROR_CODE_ABSENT' });
 });
 
-// ---------------------------------------------------------------------------
-// Result-code dispositions.
-// ---------------------------------------------------------------------------
-
-test('errorCode 0 is a success with an absent, empty, or "Other." failure reason', async () => {
-  for (const failureReason of [undefined, null, '', 'Other.']) {
-    const status: Record<string, unknown> = { errorCode: 0 };
-    if (failureReason !== undefined) status.failureReason = failureReason;
-    const batch = await run([graphRow({ status })]);
-    assert.deepEqual(
-      only(batch).classification,
-      { kind: 'APPLIES', outcome: 'SUCCESS' },
-      `failureReason ${JSON.stringify(failureReason)} should still be a success`,
-    );
-  }
+test('the isInteractive control cohort is reported separately', async () => {
+  const batch = await run([
+    graphRow({ id: 'failure-a', isInteractive: true, status: { errorCode: 50126 } }),
+    graphRow({ id: 'failure-b', isInteractive: false, status: { errorCode: 50126 } }),
+    graphRow({ id: 'other', isInteractive: true, status: { errorCode: 4242 } }),
+  ]);
+  assert.deepEqual(batch.shapeObservations.graphIsInteractiveAmongCredentialFailures, {
+    TRUE: 1, FALSE: 1, NULL: 0, ABSENT: 0, OTHER_TYPE: 0,
+  });
+  assert.deepEqual(batch.shapeObservations.graphIsInteractive, {
+    TRUE: 2, FALSE: 1, NULL: 0, ABSENT: 0, OTHER_TYPE: 0,
+  });
 });
 
-test('errorCode 0 with an unrecognized failure reason is unknown, not a success', async () => {
-  const batch = await run([graphRow({ status: { errorCode: 0, failureReason: 'Something we have never seen' } })]);
-  assert.deepEqual(only(batch).classification, {
+test('a Graph success carries "Other." and an unrecognized description is not a success', async () => {
+  // Verified: on the Graph path errorCode 0 carries "Other." on 100% of rows.
+  // The predecessor treated "Other." as a failure reason and demoted real
+  // successes to UNKNOWN.
+  const other = await run([graphRow({ status: { errorCode: 0, failureReason: 'Other.' } })]);
+  assert.deepEqual(only(other).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
+
+  const empty = await run([graphRow({ status: { errorCode: 0, failureReason: '' } })]);
+  assert.deepEqual(only(empty).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
+
+  const strange = await run([graphRow({ status: { errorCode: 0, failureReason: 'Something never seen' } })]);
+  assert.deepEqual(only(strange).classification, {
     kind: 'UNKNOWN',
     observation: 'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON',
   });
-});
-
-test('50053 is ambiguous and its failure-reason text never changes the classification', async () => {
-  // 50053 carries two different meanings distinguished only by free text:
-  // smart lockout after repeated failures, and blocked-from-malicious-IP. One
-  // tenant, one locale, six weeks is not a durable text contract.
-  const lockout = await run([graphRow({ status: { errorCode: 50053, failureReason: 'You’ve tried to sign in too many times with an incorrect user ID or password.' } })]);
-  const malicious = await run([graphRow({ status: { errorCode: 50053, failureReason: 'Sign-in was blocked because it came from an IP address with malicious activity.' } })]);
-  const bare = await run([graphRow({ status: { errorCode: 50053 } })]);
-
-  const expected = { kind: 'UNKNOWN', observation: 'AMBIGUOUS_DOCUMENTED_CODE' };
-  assert.deepEqual(only(lockout).classification, expected);
-  assert.deepEqual(only(malicious).classification, expected);
-  assert.deepEqual(only(bare).classification, expected);
 });
 
 test('error code 1 is HawkView’s own invention and gets no Microsoft code logic', async () => {
@@ -393,71 +620,94 @@ test('error code 1 is HawkView’s own invention and gets no Microsoft code logi
   });
 });
 
-test('interrupts and policy decisions are out of scope, never credential verdicts', async () => {
-  const cases: readonly [number, OutOfScopeReason][] = [
-    [50074, 'MFA_INTERRUPT'],
-    [50076, 'MFA_INTERRUPT'],
-    [50072, 'MFA_INTERRUPT'],
-    [50079, 'MFA_INTERRUPT'],
-    [50140, 'KEEP_ME_SIGNED_IN'],
-    [50058, 'INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN'],
-    [53003, 'CONDITIONAL_ACCESS_INTERRUPT'],
-    [65001, 'CONSENT_REQUIRED'],
-  ];
-  for (const [code, reason] of cases) {
-    const batch = await run([graphRow({ status: { errorCode: code } })]);
-    assert.deepEqual(only(batch).classification, { kind: 'DOES_NOT_APPLY', reason }, `code ${code}`);
-  }
-});
-
-test('an unlisted code is unknown, and no code is mapped to a credential verdict by accident', () => {
+test('no code is mapped to a credential verdict by accident, and codes are unique', () => {
   assert.deepEqual(dispositionForCode(123456), { kind: 'UNKNOWN', observation: 'UNRECOGNIZED_ERROR_CODE' });
-  const applying = RESULT_CODES.filter(entry => entry.disposition.kind === 'APPLIES').map(entry => entry.code);
-  assert.deepEqual(applying.sort((a, b) => a - b), [0, 50126]);
   assert.equal(new Set(RESULT_CODES.map(entry => entry.code)).size, RESULT_CODES.length);
-});
-
-test('every shape predicate carries a verification state and disproved ones carry evidence', () => {
-  assert.ok(SHAPE_PREDICATES.length > 0);
-  for (const predicate of SHAPE_PREDICATES) {
-    const { verification } = predicate;
-    if (verification.state === 'PENDING_DISTRIBUTION_CHECK') {
-      assert.ok(verification.controlCohort.length > 20, `${predicate.id} has no control cohort`);
-    } else {
-      assert.ok(verification.evidence.length > 20, `${predicate.id} has no evidence`);
-    }
-  }
+  const rejected = RESULT_CODES.filter(
+    entry => entry.disposition.kind === 'APPLIES' && entry.disposition.outcome === 'PASSWORD_REJECTED',
+  );
+  assert.deepEqual(rejected.map(entry => entry.code), [50126]);
 });
 
 // ---------------------------------------------------------------------------
-// Subject binding: exact directory object id, never a name.
+// Subject binding: exact object id on Graph, exact normalized UPN on audit.
 // ---------------------------------------------------------------------------
 
-test('a directory object id absent from the directory does not bind to anyone', async () => {
-  const batch = await run([graphRow({ userId: OTHER_USER_ID })]);
-  assert.equal(batch.events.length, 0);
-  assert.equal(batch.counts.unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY, 1);
+test('Graph binds on the directory object id and records the method', async () => {
+  const batch = await run([graphRow({ userId: USER_ID.toUpperCase() })]);
+  const event = only(batch);
+  assert.equal(event.subjectBinding, 'DIRECTORY_OBJECT_ID');
+  assert.equal(event.subjectRef, 'hvr1_subject_ref1');
+  assert.equal(event.applicationRef, 'hvr1_application_ref2');
+  assert.deepEqual(batch.resolvedSubjects, [
+    { subjectRef: 'hvr1_subject_ref1', microsoftUserId: USER_ID, binding: 'DIRECTORY_OBJECT_ID' },
+  ]);
+  assert.deepEqual(batch.counts.bindingMethods, { DIRECTORY_OBJECT_ID: 1, NORMALIZED_UPN: 0 });
+  // Raw identifiers never travel on the event.
+  assert.equal(JSON.stringify(event).includes(USER_ID.toLowerCase()), false);
+  assert.equal(JSON.stringify(event).includes(APP_ID.toLowerCase()), false);
 });
 
-test('a user principal name in the subject field never binds', async () => {
+test('a user principal name in the Graph subject field never binds', async () => {
   const batch = await run([graphRow({ userId: 'ann@example.com' })]);
   assert.equal(batch.counts.unprocessableByReason.SUBJECT_ID_ABSENT_OR_MALFORMED, 1);
   assert.equal(batch.counts.unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY, 0);
 });
 
-test('directory object ids match case-insensitively and carry a protected reference', async () => {
-  const batch = await run([graphRow({ userId: USER_ID.toUpperCase() })]);
-  const event = only(batch);
-  assert.equal(event.subjectRef, 'hvr1_subject_ref1');
-  assert.equal(event.applicationRef, 'hvr1_application_ref2');
-  assert.deepEqual(batch.resolvedSubjects, [{ subjectRef: 'hvr1_subject_ref1', microsoftUserId: USER_ID }]);
-  // The raw directory id never travels on the event itself; it is available
-  // only through the separate resolvedSubjects mapping.
-  assert.equal(JSON.stringify(event).includes(USER_ID.toLowerCase()), false);
-  assert.equal(JSON.stringify(event).includes(APP_ID.toLowerCase()), false);
+test('a well-formed object id absent from the directory does not bind to anyone', async () => {
+  // Synthetic, and stated as such: zero production rows carry this shape, so
+  // the control cohort for this path does not exist in observed data.
+  const batch = await run([graphRow({ userId: OTHER_USER_ID })]);
+  assert.equal(batch.events.length, 0);
+  assert.equal(batch.counts.unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY, 1);
 });
 
-test('an ambiguous directory object id does not bind', async () => {
+test('the audit feed binds on an exact normalized UPN and records the weaker method', async () => {
+  // GUID-only binding takes this feed from ~97% resolution to ~0%, which would
+  // leave two of three tenants detecting nothing.
+  const batch = await run([auditRow({ UserId: '  Ann@Example.COM ' })], { source: 'M365_AUDIT_STS' });
+  const event = only(batch);
+  assert.equal(event.subjectBinding, 'NORMALIZED_UPN');
+  assert.deepEqual(event.classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
+  assert.deepEqual(batch.counts.bindingMethods, { DIRECTORY_OBJECT_ID: 0, NORMALIZED_UPN: 1 });
+  assert.deepEqual(batch.resolvedSubjects, [
+    { subjectRef: 'hvr1_subject_ref1', microsoftUserId: USER_ID, binding: 'NORMALIZED_UPN' },
+  ]);
+});
+
+test('an ambiguous UPN goes unprocessable rather than picking a best match', async () => {
+  // The real hazard was never naming, it was ambiguity.
+  const batch = await run([auditRow()], {
+    source: 'M365_AUDIT_STS',
+    directory: [DIRECTORY[0]!, { ...DIRECTORY[0]!, microsoftUserId: OTHER_USER_ID }],
+  });
+  assert.equal(batch.events.length, 0);
+  assert.equal(batch.counts.unprocessableByReason.SUBJECT_UPN_AMBIGUOUS_IN_DIRECTORY, 1);
+});
+
+test('an unmatched or malformed audit UPN is named, not guessed at', async () => {
+  const missing = await run([auditRow({ UserId: 'nobody@example.com' })], { source: 'M365_AUDIT_STS' });
+  assert.equal(missing.counts.unprocessableByReason.SUBJECT_UPN_NOT_IN_DIRECTORY, 1);
+
+  for (const value of ['ann', '', 'ann@', '@example.com', 'ann example.com']) {
+    const batch = await run([auditRow({ UserId: value })], { source: 'M365_AUDIT_STS' });
+    assert.equal(
+      batch.counts.unprocessableByReason.SUBJECT_UPN_ABSENT_OR_MALFORMED,
+      1,
+      `expected malformed for ${JSON.stringify(value)}`,
+    );
+  }
+});
+
+test('the audit feed never binds from a GUID, including the synthesized column value', async () => {
+  // The user_id COLUMN is GUID-shaped on nearly every row, matches no
+  // directory user, and is more granular than the real user.
+  const batch = await run([auditRow({ UserId: USER_ID })], { source: 'M365_AUDIT_STS' });
+  assert.equal(batch.events.length, 0);
+  assert.equal(batch.counts.unprocessableByReason.SUBJECT_UPN_ABSENT_OR_MALFORMED, 1);
+});
+
+test('an ambiguous object id does not bind', async () => {
   const batch = await run([graphRow()], {
     directory: [DIRECTORY[0]!, { ...DIRECTORY[0]!, userPrincipalName: 'ann.other@example.com' }],
   });
@@ -465,9 +715,6 @@ test('an ambiguous directory object id does not bind', async () => {
 });
 
 test('a user with an unexpected userType is still bound', async () => {
-  // Filtering the directory index by userType would be an unverified
-  // exclusion predicate, and it would report the user as missing from the
-  // directory, which reads as a collection fault.
   const batch = await run([graphRow()], { directory: [{ ...DIRECTORY[0]!, userType: null }] });
   assert.equal(batch.counts.applies, 1);
 });
@@ -479,15 +726,67 @@ test('a directory row from another tenant aborts the run rather than being count
   );
 });
 
-test('the audit feed cannot resolve a subject and says so instead of matching by name', async () => {
+// ---------------------------------------------------------------------------
+// Audit outcome consistency.
+// ---------------------------------------------------------------------------
+
+test('the audit feed keys off operation and code together', async () => {
+  const success = await run([auditRow({ Operation: 'UserLoggedIn', ErrorCode: '0' })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(success).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
+
+  const failure = await run([auditRow({ Operation: 'UserLoginFailed', ErrorCode: '50126' })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(failure).classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
+
+  const mismatchedSuccess = await run([auditRow({ Operation: 'UserLoggedIn', ErrorCode: '50126' })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(mismatchedSuccess).classification, {
+    kind: 'UNKNOWN',
+    observation: 'INCONSISTENT_OPERATION_AND_CODE',
+  });
+
+  const mismatchedFailure = await run([auditRow({ Operation: 'UserLoginFailed', ErrorCode: '0' })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(mismatchedFailure).classification, {
+    kind: 'UNKNOWN',
+    observation: 'INCONSISTENT_OPERATION_AND_CODE',
+  });
+});
+
+test('an audit success carrying a logon error is not called a success', async () => {
   const batch = await run(
-    [graphRow({ hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY', UserId: 'ann@example.com' })],
+    [auditRow({ Operation: 'UserLoggedIn', ErrorCode: '0', LogonError: 'InvalidUserNameOrPassword' })],
     { source: 'M365_AUDIT_STS' },
   );
-  assert.equal(batch.events.length, 0);
-  assert.equal(batch.counts.unprocessableByReason.SUBJECT_NOT_RESOLVABLE_WITHOUT_GUID, 1);
-  assert.equal(batch.coverage.consideredRows, 1);
-  assert.equal(batch.coverage.recognizedRows, 0);
+  assert.deepEqual(only(batch).classification, {
+    kind: 'UNKNOWN',
+    observation: 'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON',
+  });
+});
+
+test('audit codes must agree wherever they appear', async () => {
+  const agreeing = await run([auditRow({
+    ErrorCode: '50126',
+    ExtendedProperties: [{ Name: 'ErrorNumber', Value: '50126' }],
+  })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(agreeing).classification, { kind: 'APPLIES', outcome: 'PASSWORD_REJECTED' });
+
+  const disagreeing = await run([auditRow({
+    ErrorCode: '50126',
+    ExtendedProperties: [{ Name: 'ErrorNumber', Value: '50074' }],
+  })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(disagreeing).classification, {
+    kind: 'UNKNOWN',
+    observation: 'ERROR_CODE_SHAPE_UNRECOGNIZED',
+  });
+});
+
+test('an audit record that is not a sign-in operation is named, not classified', async () => {
+  const wrongType = await run([auditRow({ RecordType: 8 })], { source: 'M365_AUDIT_STS' });
+  assert.equal(wrongType.counts.unprocessableByReason.UNSUPPORTED_AUDIT_OPERATION, 1);
+
+  const wrongOperation = await run([auditRow({ Operation: 'MailboxLogin' })], { source: 'M365_AUDIT_STS' });
+  assert.equal(wrongOperation.counts.unprocessableByReason.UNSUPPORTED_AUDIT_OPERATION, 1);
+
+  const wrongTenant = await run([auditRow({ OrganizationId: OTHER_USER_ID })], { source: 'M365_AUDIT_STS' });
+  assert.equal(wrongTenant.counts.unprocessableByReason.TENANT_BINDING_MISMATCH, 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -509,8 +808,8 @@ test('row defects are each named, and none of them is a scope decision', async (
   for (const [row, reason] of cases) {
     const batch = await run([row]);
     assert.equal(batch.counts.unprocessableByReason[reason], 1, `expected ${reason}`);
-    assert.equal(Object.values(batch.counts.doesNotApplyByReason).reduce((a, b) => a + b, 0), 0);
-    assert.equal(Object.values(batch.counts.unknownByObservation).reduce((a, b) => a + b, 0), 0);
+    assert.equal(total(batch.counts.doesNotApplyByReason), 0);
+    assert.equal(total(batch.counts.unknownByObservation), 0);
   }
 });
 
@@ -544,6 +843,10 @@ test('the client address is canonicalized and its absence is qualified, not drop
   assert.deepEqual(only(ipv6).clientSource, { qualification: 'QUALIFIED', address: '2001:db8::1' });
   const garbage = await run([graphRow({ ipAddress: 'unknown' })]);
   assert.deepEqual(only(garbage).clientSource, { qualification: 'MISSING', address: null });
+  const auditFallback = await run([auditRow({ ClientIP: undefined, ActorIpAddress: '198.51.100.7' })], {
+    source: 'M365_AUDIT_STS',
+  });
+  assert.deepEqual(only(auditFallback).clientSource, { qualification: 'QUALIFIED', address: '198.51.100.7' });
 });
 
 test('the per-run row bound costs the excess rows, never the run', async () => {
