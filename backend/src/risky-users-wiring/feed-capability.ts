@@ -1,4 +1,4 @@
-import { reachableOutcomes } from '../risky-users-normalization/index.js'
+import { FEED_CAPABILITIES, reachableOutcomes } from '../risky-users-normalization/index.js'
 import type { EventOutcome, NormalizationSource, NormalizedEvent } from '../risky-users-normalization/contract.js'
 import type { Detector } from '../evaluation-core/contract.js'
 
@@ -31,6 +31,11 @@ export type FeedBoundDetector = Readonly<{
    * success following failures requires both, and on a feed that can never
    * express one of them the rule is not quiet, it is inert. */
   requires: readonly EventOutcome[]
+  /** Outcomes the source mentions without reading — named in a comment, or in a
+   * guard that excludes them. Per detector on purpose: a shared allowlist lets
+   * one explanation cover a mention elsewhere, so a new unexplained mention
+   * stops failing. */
+  mentionsNotRead?: readonly EventOutcome[]
 }>
 
 /** Outcomes a feed's vocabulary can actually reach. Supplied by the classifier,
@@ -91,4 +96,52 @@ export function bindToFeed(
  */
 export function capabilityOf(source: NormalizationSource): FeedCapability {
   return { feed: source, reachable: reachableOutcomes(source) }
+}
+
+/** Every outcome the classifier's own capability table mentions.
+ *
+ * Derived from their table rather than re-listed here, because a second copy of
+ * a closed vocabulary is a second thing to keep in step — the objection
+ * Engineer 3 raised against my `kind` proposal, applied to my own code. */
+const ALL_OUTCOMES: readonly EventOutcome[] =
+  [...new Set(FEED_CAPABILITIES.flatMap(entry => Object.keys(entry.outcomes) as EventOutcome[]))]
+
+export type DeclarationGaps = Readonly<{
+  /** Mentioned in the rule's source and not declared. The dangerous direction:
+   * the rule reads an outcome nobody said it needed, so it never goes
+   * INAPPLICABLE and quietly runs on a feed that cannot feed it. */
+  readNotDeclared: readonly EventOutcome[]
+  /** Declared and not mentioned. The overreach direction: a rule marked
+   * inapplicable on feeds that could have run it. */
+  declaredNotRead: readonly EventOutcome[]
+}>
+
+/** Checks a `requires` declaration against the rule's own source.
+ *
+ * `requires` was an author's assertion checkable only by reading the rule —
+ * the same position `monotonic` was in before QA's harness. This is Engineer
+ * 3's trick from their shape registry, one level up: diff what was declared
+ * against the outcome literals the function actually mentions.
+ *
+ * WEAKER THAN A BEHAVIOURAL HARNESS, and worth saying so rather than letting it
+ * look like proof. It sees literals in the compiled source, so it cannot follow
+ * an outcome reached through a variable, a lookup table, or another module —
+ * those are false negatives. And a mention inside a comment or inside a guard
+ * that EXCLUDES an outcome reads as a use, which is a false positive.
+ *
+ * `mentionsNotRead` exists for that second case and is deliberately per
+ * detector rather than a shared allowlist. Engineer 3's version cost them a
+ * false pass until they keyed explanations per subject: a global list lets one
+ * explanation cover a mention somewhere else, so a NEW unexplained mention
+ * stops failing. That decays within a week.
+ */
+export function outcomeDeclarationGaps(bound: FeedBoundDetector): DeclarationGaps {
+  const source = bound.detector.run.toString()
+  const mentioned = ALL_OUTCOMES.filter(outcome => source.includes(outcome))
+  const declared = new Set(bound.requires)
+  const explained = new Set(bound.mentionsNotRead ?? [])
+  return {
+    readNotDeclared: mentioned.filter(outcome => !declared.has(outcome) && !explained.has(outcome)),
+    declaredNotRead: bound.requires.filter(outcome => !source.includes(outcome)),
+  }
 }
