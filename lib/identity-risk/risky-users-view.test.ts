@@ -16,6 +16,7 @@ import {
   riskyUserCount,
   riskyUserList,
 } from './risky-users-view.ts'
+import { findingEvidenceSummary } from './presentation.ts'
 import type { MicrosoftEntraRiskyUser } from './types.ts'
 import {
   assessmentFixture,
@@ -1022,4 +1023,96 @@ test('the panel never claims unavailability while showing Microsoft records', ()
   // With no records the licence statement is still exactly right.
   assert.equal(microsoftChannel(unlicensed).state, 'UNAVAILABLE')
   assert.match(microsoftChannel(unlicensed).headline, /requires Entra ID P2/)
+})
+
+test('a signal that found nothing reads as a result, not as untimed evidence', () => {
+  // Live shape: two of the nine findings on the fleet carry a zero lockout
+  // count beside a real rejection count. "0 records" describes evidence that
+  // exists and was not counted, and beside "no time recorded" it describes
+  // evidence that exists and was not dated. Neither is what happened.
+  const evaluated = findingEvidenceSummary(
+    {
+      ruleId: 'HV-ID-AUTH-010.v1',
+      evidenceCount: 0,
+      evidenceCountCapped: false,
+      lastSeen: null,
+    },
+    (value) => value
+  )
+  assert.equal(evaluated.count, 'none recorded')
+  assert.equal(evaluated.timing, null)
+
+  // A capped zero is a different answer, and the more dangerous one to blur:
+  // the window was truncated before the check saw anything, so this is the
+  // absence of a reading rather than a finding of none.
+  const truncated = findingEvidenceSummary(
+    {
+      ruleId: 'HV-ID-AUTH-010.v1',
+      evidenceCount: 0,
+      evidenceCountCapped: true,
+      lastSeen: null,
+    },
+    (value) => value
+  )
+  assert.match(truncated.count ?? '', /truncated/)
+  assert.notEqual(truncated.count, evaluated.count)
+
+  // A state read that found nothing still happened, and when it happened is
+  // worth knowing; nothing occurred for an event check to have timed.
+  const nothingConfigured = findingEvidenceSummary(
+    {
+      ruleId: 'HV-ID-MBX-001.v1',
+      evidenceCount: 0,
+      evidenceCountCapped: false,
+      lastSeen: '2026-09-08T00:00:00.000Z',
+    },
+    () => 'THE-READ-TIME'
+  )
+  assert.equal(nothingConfigured.count, 'none configured')
+  assert.match(
+    nothingConfigured.timing ?? '',
+    /configuration read THE-READ-TIME/
+  )
+})
+
+test('no combination of inputs can assemble a zero lower bound', () => {
+  // "At least 0" excludes nothing, so it is a bound that claims to inform and
+  // does not. This surface removed it once already, from the tenant count card,
+  // and it reappeared here by a different path — a capped zero going through
+  // the ordinary floor wording. A sweep rather than a case, because the defect
+  // is the phrase being assembled from parts, and parts recombine.
+  // Positive control, because this sweep has already failed silently once: the
+  // patterns were written with a mangled escape and matched nothing, so every
+  // case passed and the run looked green. A sweep that cannot fail is worse
+  // than no sweep, since its silence is read as a result. These two lines prove
+  // the patterns are live before the loop trusts them.
+  const banned = [/at least 0\b/, /\b0 record/]
+  assert.ok(banned[0].test('at least 0 records'), 'bound pattern is inert')
+  assert.ok(banned[1].test('0 records, last Tuesday'), 'count pattern is inert')
+
+  for (const ruleId of [
+    'HV-ID-AUTH-010.v1',
+    'HV-ID-AUTH-005.v2',
+    'HV-ID-MBX-001.v1',
+    'HV-ID-UNKNOWN-000.v9',
+  ]) {
+    for (const evidenceCount of [0, 1, 2]) {
+      for (const evidenceCountCapped of [false, true]) {
+        for (const lastSeen of [null, '2026-09-08T00:00:00.000Z']) {
+          const summary = findingEvidenceSummary(
+            { ruleId, evidenceCount, evidenceCountCapped, lastSeen },
+            (value) => value
+          )
+          const rendered = [summary.count, summary.timing, summary.note]
+            .filter(Boolean)
+            .join(' | ')
+          const label =
+            ruleId + ' n=' + evidenceCount + ' capped=' + evidenceCountCapped
+          for (const pattern of banned) {
+            assert.ok(!pattern.test(rendered), label + ' :: ' + rendered)
+          }
+        }
+      }
+    }
+  }
 })

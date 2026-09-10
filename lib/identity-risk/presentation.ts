@@ -639,6 +639,41 @@ export function findingEvidenceSummary(
         (when === null ? '.' : ', or what ' + when + ' marks.'),
     }
   }
+  // A signal can be evaluated and find nothing. That is a result, and it has to
+  // read as one: "0 records" describes evidence that exists and was not
+  // counted, and beside "no time recorded" it reads as evidence that exists and
+  // was not dated. Neither is what happened. Two of the nine findings on the
+  // fleet today carry a zero lockout count beside a real rejection count, so
+  // this is a live shape and not a hypothetical one.
+  //
+  // A capped zero is a different answer again, and the difference matters more
+  // than the wording. Capped means the window was truncated before the check
+  // saw anything, so a zero from a capped window is not a finding of none — it
+  // is the absence of a reading. Rendering it as a floor would also produce
+  // "at least 0", a lower bound that excludes nothing and that this surface has
+  // already removed once, from the tenant count card. It came back here by a
+  // different path, which is the argument for the phrase never being assembled
+  // from parts in more than one place.
+  if (finding.evidenceCount === 0) {
+    if (finding.evidenceCountCapped) {
+      return {
+        count: 'none read before the evidence window was truncated',
+        timing: null,
+        note: null,
+      }
+    }
+    return {
+      count:
+        shape.kind === 'CONFIGURED_STATE' ? 'none configured' : 'none recorded',
+      // A state read that found nothing still happened, and when it happened is
+      // worth knowing. Nothing occurred for an event check to have timed.
+      timing:
+        shape.kind === 'CONFIGURED_STATE' && when !== null
+          ? 'configuration read ' + when
+          : null,
+      note: null,
+    }
+  }
   // A capped count is a floor, never a total: the evidence was truncated before
   // the check ran, so the check could not have known there was more.
   const amount =

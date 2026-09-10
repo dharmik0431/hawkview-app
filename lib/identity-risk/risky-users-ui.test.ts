@@ -1286,7 +1286,6 @@ test('two reasons with different dates never share one', () => {
   assert.match(cell, /Failures followed by successful sign-in/)
   assert.match(cell, /467 records/)
   assert.match(cell, /10 records/)
-  // Two different dates are present, so neither number sits beside the other's.
   // Two different dates are present, so neither number sits beside the
   // other's. Split on the label rather than pattern-matching a locale date.
   const afterLast = cell
