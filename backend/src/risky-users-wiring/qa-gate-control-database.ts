@@ -64,7 +64,11 @@ try {
   // A zero must rest on checks that COVERED it. An exact zero whose covered
   // list is empty is a confident answer asserting nothing checked it -- the
   // bare-zero family inverted, and the count alone cannot see it.
-  const scopeSupportsZero = scope.covered.length > 0
+  // covered alone is NOT enough: it names a detector even when applies === 0.
+  // Verified at 81e70f3 -- a fully-excluded window has covered non-empty and is
+  // held safe only by a SEPARATE gate. An assertion that reads covered on its
+  // own is leaning on a guarantee it does not check.
+  const scopeSupportsZero = scope.covered.length > 0 && coverage.applies > 0
   // And a check that could not run must be NAMED, not silently absent: the
   // common clean shape is audit-fallback where one check is inapplicable.
   const inapplicable = reports.filter(r => r.status === 'INAPPLICABLE').map(r => r.detectorId)
