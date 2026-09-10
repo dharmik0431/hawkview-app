@@ -12,14 +12,22 @@ const USER = '11111111-1111-4111-8111-111111111111'
 const APP = '22222222-2222-4222-8222-222222222222'
 const at = (n: number) => new Date(Date.UTC(2026, 8, 10, 0, 0, n)).toISOString()
 
-// 4 ordinary interactive successes -> assessed. 8 carrying 53004 -> excluded as
-// MICROSOFT_RISK_VERDICT. NOTE: non-interactive rows do NOT work here -- that
-// reason exists in the vocabulary but nothing assigns it yet, so a window built
-// from them contains no exclusions at all and cannot answer this question.
+// 4 ordinary interactive successes -> assessed. 8 carrying 50140 (InterruptedKMSI)
+// -> excluded as KEEP_ME_SIGNED_IN, on a cited provider statement.
+//
+// This fixture used to carry 53004. That code is NOT_OBSERVED and now classifies
+// as RISK, so every row applied, nothing was excluded, and the probe went inert --
+// caught by the inputCanFail guard rather than by me. provider-facts.ts names
+// 53004 as one of two past mistakes in this workstream: a sound reading of
+// Microsoft's documentation for an event nobody has ever seen. A probe built on
+// a code the provider does not emit tests the documentation, not the product.
+//
+// Non-interactive rows do NOT work here either -- that reason exists in the
+// vocabulary but nothing assigns it, so such a window contains no exclusions.
 const row = (n: number, assessed: boolean) => ({
   organizationId: scope.organizationId, customerTenantId: scope.customerTenantId, ingestedAt: new Date(),
   raw: { id: `evt-${n}`, createdDateTime: at(n), userId: USER, userPrincipalName: 'alice@contoso.com',
-    appId: APP, ipAddress: '203.0.113.9', isInteractive: true, status: { errorCode: assessed ? 0 : 53004 } },
+    appId: APP, ipAddress: '203.0.113.9', isInteractive: true, status: { errorCode: assessed ? 0 : 50140 } },
 })
 const rows = [...Array.from({ length: 4 }, (_, i) => row(i, true)),
               ...Array.from({ length: 8 }, (_, i) => row(100 + i, false))]
@@ -42,9 +50,17 @@ const a = assessTenant({
 })
 
 const coverage = a.streams[0]!.assessment.coverage
-const totalOn = (r: unknown): number => r !== null && typeof r === 'object'
-  ? Object.values(r as Record<string, unknown>).filter((v): v is number => typeof v === 'number').reduce((x, y) => x + y, 0)
-  : 0
+// DEEP sum. The shallow version this replaces summed only top-level numbers, so
+// it read 0 from `setAside` -- which is an ARRAY of {vocabulary, reason, count}
+// records -- and reported BARE ZERO against a layer that was in fact disclosing
+// all eight exclusions. A probe that cannot see the disclosure reports its own
+// blindness as a product defect, which is the worst thing a probe can do.
+const totalOn = (r: unknown): number =>
+  typeof r === 'number' ? r
+  : Array.isArray(r) ? r.reduce<number>((x, y) => x + totalOn(y), 0)
+  : r !== null && typeof r === 'object'
+    ? Object.values(r as Record<string, unknown>).reduce<number>((x, y) => x + totalOn(y), 0)
+    : 0
 const excludedInWindow = totalOn(coverage.doesNotApply)
 
 // GUARD, added after this probe reported a confident verdict from a window that

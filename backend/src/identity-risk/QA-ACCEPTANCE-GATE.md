@@ -188,3 +188,83 @@ counterexample, and a declining detector is reported as `LOST_TO_DECLINE`.
 Like the probes, these import the rebuild's `evaluation-core` contract and will
 not compile on this branch. Kept here because a QA instrument is stronger when
 it is not maintained by the author whose declarations it checks.
+
+---
+
+## Re-verified against the merged contract (`4250a27`)
+
+The gate was written against the lineage the rewrite replaced. It was
+retargeted, not weakened. `tsc --noEmit` is clean, all 14 QA files are in the
+compiler's program (`--listFiles`), and an injected type error is caught and
+disappears again when removed — so the clean typecheck is a result rather than
+a file the compiler never opened.
+
+### What the rewrite repairs
+
+Run at the wiring layer, against the disposable cluster:
+
+| Scenario | Result |
+| --- | --- |
+| CONTROL — 20 successes, nothing excluded | EXACT 0, scope supports it |
+| MIXED — 4 assessed / 8 `KEEP_ME_SIGNED_IN` | EXACT 0, exclusions travel with the count |
+| FULLY EXCLUDED — 0 applied / 12 excluded | NOT_AVAILABLE / `NOTHING_APPLICABLE` |
+| AUDIT, `Z` and bare timestamps | accepted, EXACT 0 |
+| AUDIT, `+05:00` offset | rejected, count NOT_AVAILABLE — not a zero |
+
+Two contract changes close defects this gate raised earlier:
+
+- `assessed + declined === handed` is now enforced (`evaluate.ts:373`). The
+  under-reporting probe — a detector claiming it assessed 5 of 1000 — now
+  reports `CLOSED` where it previously reported `GAP`.
+- A detector may report `assessed: 0` with everything declined and still
+  support a claim. CONTROL shows `assessed: 0, declined:
+  {NOT_A_CREDENTIAL_FAILURE_OUTCOME: 20}` and reaches EXACT 0. The earlier
+  version of this guard told every clean tenant "we cannot tell you."
+
+### What it does NOT repair — read this before reading the table above as a pass
+
+**Nothing outside `risky-users-wiring/`, `risky-users-normalization/` and
+`evaluation-core/` imports any of them.** Repo-wide, the only reference is a
+test script in `backend/package.json`. `app.module.ts` still registers
+`IdentityRiskModule`, and `identity-risk.controller.ts` still serves
+`identity-signals/assessment` and `identity-signals/summary` from the old
+engine.
+
+So the five-scenario gate, which drives the old engine through its own reader,
+still fails PRE_EXISTING and MIXED at this commit — a confident exact zero over
+12 security-relevant events with nothing disclosing they fell outside the
+assessed scope. Reproduced twice, same two scenarios. CONTROL passes in the
+same run, so this is not a blanket assertion firing on everything.
+
+The repair is real and it is unreachable. A customer loading Risky Users at
+`4250a27` sees exactly what they saw before.
+
+### A probe of mine was wrong, and the guard caught it before I reported it
+
+`qa-mixed-decision-layer.ts` originally excluded rows using code `53004`. In
+the merged provider facts that code is `NOT_OBSERVED` and classifies as RISK,
+so every row applied, nothing was excluded, and the probe went inert. The
+`inputCanFail` guard reported INCONCLUSIVE rather than a pass.
+
+Then the retargeted fixture reported `BARE ZERO` — which was also wrong. The
+probe's `totalOn` summed only top-level numbers, and `setAside` is an array of
+`{vocabulary, reason, count}` records, so the probe read 0 from a layer that
+was in fact disclosing all eight exclusions. Fixed with a deep sum, and
+confirmed to still discriminate: deleting `setAside` from the scope the probe
+inspects flips it back to `BARE ZERO`.
+
+Both mistakes have the same root. `provider-facts.ts:74` names `53004` as one
+of two past errors in this workstream — "sound readings of Microsoft's
+documentation for events we have never once seen." A fixture built on a code
+the provider does not emit tests the documentation, not the product.
+
+### Deleted
+
+`qa-probe-{read-lane-race,early-reject,lane-boundary,lane-test-specificity}.ts`
+and `qa-reader-lane-contention.database-integration.test.ts` targeted
+`runInReadMemoryLane`, which does not exist in this lineage.
+`qa-zero-truthfulness.database-integration.test.ts` targeted the v1 assessment
+`summary`. They could not be ported, only rewritten against a different design.
+
+`qa-security-events-never-zero.database-integration.test.ts` was NOT deleted.
+It is the only thing here that tests the path a customer actually reaches.

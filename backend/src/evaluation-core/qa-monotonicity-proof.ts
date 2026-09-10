@@ -12,14 +12,14 @@ const pool: readonly Ev[] = [
   { id: 'f5', kind: 'FAILURE', user: 'carol' }, { id: 's3', kind: 'SUCCESS', user: 'carol' },
 ]
 const finding = (id: string, user: string) => ({
-  detectorId: id, subject: { kind: 'DIRECTORY_USER' as const, userRef: user, correlation: { available: false, because: 'qa probe' } }, observedAt: '2026-09-10T00:00:00.000Z',
+  detectorId: id, subject: { kind: 'DIRECTORY_USER' as const, userRef: user, correlation: { available: false as const, because: 'qa probe' } }, observedAt: '2026-09-10T00:00:00.000Z',
 })
 
 // PRESENCE-keyed: "this user had a failure". Adding events can only add findings.
 const monotonic: Detector<Ev> = {
   id: 'presence', monotonic: true,
   run: (events): DetectorResult => ({
-    status: 'RAN', assessed: events.length,
+    status: 'RAN', assessed: events.length, declined: {},
     findings: [...new Set(events.filter(e => e.kind === 'FAILURE').map(e => e.user))].map(u => finding('presence', u)),
   }),
 }
@@ -31,7 +31,7 @@ const notMonotonic: Detector<Ev> = {
   run: (events): DetectorResult => {
     const succeeded = new Set(events.filter(e => e.kind === 'SUCCESS').map(e => e.user))
     return {
-      status: 'RAN', assessed: events.length,
+      status: 'RAN', assessed: events.length, declined: {},
       findings: [...new Set(events.filter(e => e.kind === 'FAILURE' && !succeeded.has(e.user)).map(e => e.user))]
         .map(u => finding('absence', u)),
     }
@@ -62,7 +62,7 @@ const declines: Detector<Ev> = {
   id: 'declines', monotonic: true,
   run: (events): DetectorResult => events.length > 4
     ? { status: 'INAPPLICABLE', because: 'this evidence cannot answer at this size' }
-    : { status: 'RAN', assessed: events.length,
+    : { status: 'RAN', assessed: events.length, declined: {},
         findings: [...new Set(events.filter(e => e.kind === 'FAILURE').map(e => e.user))].map(u => finding('declines', u)) },
 }
 const strict = checkMonotonic(declines, pool, { trials: 300 })

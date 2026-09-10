@@ -23,14 +23,14 @@ const absenceKeyed = (declaredMonotonic: boolean): Detector<Ev> => ({
   run: (applicable): DetectorResult => {
     const succeeded = new Set(applicable.filter(e => e.kind === 'SUCCESS').map(e => e.user))
     const accused = [...new Set(applicable.filter(e => e.kind === 'FAILURE' && !succeeded.has(e.user)).map(e => e.user))]
-    return { status: 'RAN', assessed: applicable.length,
+    return { status: 'RAN', assessed: applicable.length, declined: {},
       findings: accused.map(u => ({ detectorId: declaredMonotonic ? 'absence-MISdeclared' : 'absence-honest',
-        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false, because: 'qa probe' } }, observedAt: '2026-09-10T00:00:00.000Z' })) }
+        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false as const, because: 'qa probe' } }, observedAt: '2026-09-10T00:00:00.000Z' })) }
   },
 })
 const run = (detector: Detector<Ev>, maxEvents: number) => evaluate({
   evidence: { availability: 'READ', applies: events,
-    coverage: { applies: events.length, doesNotApply: {}, unknown: {}, unprocessable: {} },
+    coverage: { collectionScope: { declared: true, asked: 'qa fixture: the whole synthetic pool' }, applies: events.length, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {} },
     timeOf: (e: Ev) => e.at },
   detectors: [detector], budget: { maxEvents },
 })
@@ -69,9 +69,9 @@ const priorKeyed = (declaredMonotonic: boolean): Detector<Ev> => ({
   run: (applicable): DetectorResult => {
     const failedBefore = new Set(applicable.filter(e => e.kind === 'FAILURE').map(e => e.user))
     const accused = [...new Set(applicable.filter(e => e.kind === 'SUCCESS' && !failedBefore.has(e.user)).map(e => e.user))]
-    return { status: 'RAN', assessed: applicable.length,
+    return { status: 'RAN', assessed: applicable.length, declined: {},
       findings: accused.map(u => ({ detectorId: 'prior-absence',
-        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false, because: 'qa probe' } }, observedAt: '2026-09-10T00:00:00.000Z' })) }
+        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false as const, because: 'qa probe' } }, observedAt: '2026-09-10T00:00:00.000Z' })) }
   },
 })
 const priorFull = run(priorKeyed(false), 100)

@@ -12,18 +12,18 @@ const events: readonly Ev[] = Array.from({ length: 1000 }, (_, i) =>
 // Reports considering 5 of the 1000 it was handed, and finds nothing.
 const underReporting: Detector<Ev> = {
   id: 'under-reporting', monotonic: true,
-  run: (): DetectorResult => ({ status: 'RAN', assessed: 5, findings: [] }),
+  run: (): DetectorResult => ({ status: 'RAN', assessed: 5, declined: {}, findings: [] }),
 }
 // The over-claiming direction the range check DOES catch, for contrast.
 const overClaiming: Detector<Ev> = {
   id: 'over-claiming', monotonic: true,
-  run: (): DetectorResult => ({ status: 'RAN', assessed: 5000, findings: [] }),
+  run: (): DetectorResult => ({ status: 'RAN', assessed: 5000, declined: {}, findings: [] }),
 }
 
 const run = (detector: Detector<Ev>) => evaluate({
   evidence: {
     availability: 'READ', applies: events,
-    coverage: { applies: events.length, doesNotApply: {}, unknown: {}, unprocessable: {} },
+    coverage: { collectionScope: { declared: true, asked: 'qa fixture: the whole synthetic pool' }, applies: events.length, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {} },
     timeOf: (event: Ev) => event.at,
   },
   detectors: [detector], budget: { maxEvents: 10_000 },
