@@ -1673,6 +1673,30 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
     },
   },
   {
+    id: 'audit.creation-time-designator',
+    feed: 'M365_AUDIT_STS',
+    reads: ['managementActivityRecord.CreationTime'],
+    claim:
+      'On the audit feed CreationTime is UTC and arrives with NO timezone designator, so a parser ' +
+      'requiring a trailing Z rejects every row.',
+    verification: {
+      state: 'PRODUCTION_VERIFIED',
+      evidence:
+        'Reported by the evaluation core and verified in SQL: 100% of audit rows across THREE tenants ' +
+        'carry CreationTime with no designator, so all of them failed as EVENT_TIMESTAMP_INVALID. ' +
+        'Microsoft documents CreationTime as UTC for the Management Activity API and returns it without ' +
+        'a designator, so the PROVIDER is consistent and the reader was wrong. ' +
+        'THE FIX BELONGS HERE AND NOT IN COLLECTION: every stored row already lacks the designator, so ' +
+        'changing the collector would leave three tenants broken while looking fixed.',
+      control:
+        'PASSES, and it is the OTHER FEED. Graph createdDateTime carries the Z, so the leniency is ' +
+        'scoped to the audit feed and Graph keeps the strict form — a designator-less Graph timestamp ' +
+        'is still rejected, asserted by test. Widening a check that currently passes buys nothing and ' +
+        'loses a guard. An explicit non-UTC offset stays rejected on BOTH feeds: unambiguous, easy to ' +
+        'convert, and never observed, so accepting it would validate a path nothing has exercised.',
+    },
+  },
+  {
     id: 'audit.operation-as-outcome',
     feed: 'M365_AUDIT_STS',
     // LogonError ADDED by the reads-versus-evidence diff. The claim below

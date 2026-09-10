@@ -2412,3 +2412,102 @@ test('a revival condition names its population, not just its test', () => {
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// The two feeds disagree about the timezone designator, so the parser does.
+// ---------------------------------------------------------------------------
+
+test('an audit CreationTime with no designator is read as UTC', async () => {
+  // 100% of audit rows across three tenants carry CreationTime with no
+  // designator, so requiring a trailing Z rejected every one of them as
+  // EVENT_TIMESTAMP_INVALID. Microsoft documents CreationTime as UTC for the
+  // Management Activity API and returns it without a designator: the provider
+  // is consistent and the reader was wrong.
+  //
+  // The fix belongs here rather than in collection because every STORED row
+  // already lacks the designator — changing the collector would leave three
+  // tenants broken while looking fixed.
+  const bare = await run(
+    [auditRow({ CreationTime: '2026-09-10T10:00:00' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.equal(bare.counts.applies, 1, 'a designator-less audit timestamp must not cost the row');
+  assert.equal(only(bare).eventAt, '2026-09-10T10:00:00.000Z', 'read as UTC, not as local time');
+  // THE LIMIT OF THAT SECOND ASSERTION, stated because it is a real one. It
+  // distinguishes appending a Z from letting Date.parse treat the string as
+  // LOCAL time only when the host is not on UTC — this one is America/Toronto,
+  // so the mutation that removes the append fails here by four hours. On a
+  // UTC-configured runner the two are indistinguishable and the assertion
+  // would pass either way.
+  //
+  // Not worked around, because the alternatives are worse than the gap: pinning
+  // process.env.TZ inside a test makes the suite depend on where it is run in a
+  // way the next reader has to discover, and asserting on an internal is not
+  // asserting on behaviour. Recorded instead — if this ever runs on a UTC box,
+  // this test's coverage of the local-time trap silently drops to nothing, and
+  // the comment is what tells whoever notices.
+
+  // Fractional seconds, still no designator.
+  const fractional = await run(
+    [auditRow({ CreationTime: '2026-09-10T10:00:00.123' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.equal(only(fractional).eventAt, '2026-09-10T10:00:00.123Z');
+
+  // And the designator is still ACCEPTED where it appears, since the claim is
+  // that it may be absent rather than that it must be.
+  const withZ = await run(
+    [auditRow({ CreationTime: '2026-09-10T10:00:00Z' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.equal(only(withZ).eventAt, '2026-09-10T10:00:00.000Z');
+});
+
+test('the designator leniency is scoped to the feed that needs it', async () => {
+  // THE CONTROL COHORT, and it is the other feed. Graph createdDateTime
+  // carries the Z on the rows we hold, so Graph keeps the strict form. A
+  // parser fix is a widening, and widening a check that currently passes buys
+  // nothing while losing a guard — the same reason a tombstone can be dead on
+  // one feed and alive on the other.
+  const graph = await run([graphRow({}, { raw: {
+    id: 'evt-1', createdDateTime: '2026-09-10T10:00:00',
+    userId: USER_ID, appId: APP_ID, status: { errorCode: 50126 },
+  } })]);
+  assert.equal(graph.counts.applies, 0);
+  assert.equal(graph.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1);
+});
+
+test('an explicit non-UTC offset is refused on both feeds rather than converted', async () => {
+  // Unambiguous, trivial to convert, and NEVER OBSERVED. Accepting it would
+  // validate a path nothing has exercised, which is the mistake this module
+  // exists to prevent; it costs one counted row instead. The reason names the
+  // timestamp rather than the outcome, so a coverage line can say what was
+  // lost.
+  for (const source of ['GRAPH_SIGN_INS', 'M365_AUDIT_STS'] as const) {
+    const rows = source === 'GRAPH_SIGN_INS'
+      ? [graphRow({}, { raw: {
+          id: 'evt-1', createdDateTime: '2026-09-10T15:00:00+05:00',
+          userId: USER_ID, appId: APP_ID, status: { errorCode: 50126 },
+        } })]
+      : [auditRow({ CreationTime: '2026-09-10T15:00:00+05:00' })];
+    const batch = await run(rows, { source });
+    assert.equal(batch.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1, source);
+  }
+});
+
+test('an impossible date is still rejected on the lenient feed', async () => {
+  // The round-trip check is what stops Date.parse rolling 2026-02-30 forward
+  // into March. Appending a designator must not lose it — a lenient parser
+  // that also became a permissive one would trade a loud failure for a wrong
+  // answer, which is the worse of the two.
+  const rolled = await run(
+    [auditRow({ CreationTime: '2026-02-30T10:00:00' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.equal(rolled.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1);
+  const nonsense = await run(
+    [auditRow({ CreationTime: '10/09/2026 10:00' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.equal(nonsense.counts.unprocessableByReason.EVENT_TIMESTAMP_INVALID, 1);
+});

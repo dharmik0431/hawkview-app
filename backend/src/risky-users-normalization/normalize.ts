@@ -64,12 +64,47 @@ function textValue(value: unknown): value is string {
 }
 
 /** UTC source timestamps only. Sub-millisecond precision is rejected, never rounded. */
-function utcMillis(value: unknown): number | null {
+/**
+ * Parse a provider timestamp to epoch millis, or null.
+ *
+ * `designator` says whether a trailing `Z` is REQUIRED or may be ABSENT, and
+ * it is per-feed rather than global. See the `audit.creation-time-designator`
+ * shape predicate: Microsoft's Management Activity API documents CreationTime
+ * as UTC and returns it with no designator, so requiring one there rejected
+ * 100% of three tenants' audit rows. Graph's createdDateTime does carry the
+ * `Z` and keeps the strict form — the leniency is not extended to a feed that
+ * does not need it, because widening a check that currently passes buys
+ * nothing and loses a guard.
+ *
+ * NOTE WHAT THIS DELIBERATELY DOES NOT DO. It never hands a
+ * designator-less string to Date.parse, because ECMAScript parses a
+ * date-TIME form without an offset as LOCAL time — which would have made the
+ * value silently wrong by the host's offset instead of rejected. The `Z` is
+ * appended explicitly so the UTC interpretation is ours, stated, and
+ * attributable to the provider's documentation rather than to the machine the
+ * code happens to run on.
+ *
+ * An EXPLICIT non-UTC offset is still rejected on both feeds. It is
+ * unambiguous and would be easy to convert, and it has never been observed —
+ * accepting an unobserved shape is how a reader starts trusting a path
+ * nothing has validated. It costs a counted row instead.
+ */
+function utcMillis(value: unknown, designator: 'REQUIRED' | 'MAY_BE_ABSENT'): number | null {
   if (typeof value !== 'string') return null;
-  if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3}|\.\d{3}0{1,4})?Z$/.test(value)) return null;
-  const parsed = Date.parse(value);
+  const body = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3}|\.\d{3}0{1,4})?$/;
+  let normalized: string;
+  if (value.endsWith('Z') && body.test(value.slice(0, -1))) {
+    normalized = value;
+  } else if (designator === 'MAY_BE_ABSENT' && body.test(value)) {
+    normalized = `${value}Z`;
+  } else {
+    return null;
+  }
+  const parsed = Date.parse(normalized);
   if (!Number.isFinite(parsed)) return null;
-  return new Date(parsed).toISOString().slice(0, 19) === value.slice(0, 19) ? parsed : null;
+  // Round-trip on the seconds prefix, which is what rejects an impossible
+  // date such as 2026-02-30 that Date.parse would roll forward.
+  return new Date(parsed).toISOString().slice(0, 19) === normalized.slice(0, 19) ? parsed : null;
 }
 
 /**
@@ -522,6 +557,8 @@ interface FeedRecord {
   readonly record: Record<string, unknown>;
   readonly eventIdField: 'id' | 'Id';
   readonly eventAtField: 'createdDateTime' | 'CreationTime';
+  /** Per-feed, because the two providers disagree about the designator. */
+  readonly designator: 'REQUIRED' | 'MAY_BE_ABSENT';
 }
 
 async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, context: RowContext): Promise<InternalRowResult> {
@@ -537,7 +574,7 @@ async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, contex
   const graph = context.source === 'GRAPH_SIGN_INS';
   let feed: FeedRecord;
   if (graph) {
-    feed = { record: raw, eventIdField: 'id', eventAtField: 'createdDateTime' };
+    feed = { record: raw, eventIdField: 'id', eventAtField: 'createdDateTime', designator: 'REQUIRED' };
   } else {
     const inner = raw.managementActivityRecord;
     if (!plainObject(inner)) return unprocessable('RAW_PAYLOAD_MALFORMED');
@@ -548,13 +585,13 @@ async function normalizeRow(row: SignInRow, raw: Record<string, unknown>, contex
       !AUDIT_SIGN_IN_OPERATIONS.has(inner.Operation)) {
       return unprocessable('UNSUPPORTED_AUDIT_OPERATION');
     }
-    feed = { record: inner, eventIdField: 'Id', eventAtField: 'CreationTime' };
+    feed = { record: inner, eventIdField: 'Id', eventAtField: 'CreationTime', designator: 'MAY_BE_ABSENT' };
   }
   const { record } = feed;
 
   const eventId = record[feed.eventIdField];
   if (!textValue(eventId)) return unprocessable('EVENT_ID_ABSENT_OR_MALFORMED');
-  const eventAt = utcMillis(record[feed.eventAtField]);
+  const eventAt = utcMillis(record[feed.eventAtField], feed.designator);
   if (eventAt === null) return unprocessable('EVENT_TIMESTAMP_INVALID');
   if (ingestedAt < eventAt) return unprocessable('INGESTION_PRECEDES_EVENT');
 
