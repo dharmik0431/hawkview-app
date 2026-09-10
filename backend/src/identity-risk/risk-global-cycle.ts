@@ -44,7 +44,15 @@ type Dependencies = {
  *
  * Measured rather than chosen: a real assessment runs 7,983 ms on the largest of
  * the five tenants and 4,808 ms on the next. Starting one with less than this
- * left buys a partial answer at the cost of the cycle's own release time. */
+ * left buys a partial answer at the cost of the cycle's own release time.
+ *
+ * WHEN THIS ACTUALLY BITES, because the arithmetic is not obvious: admission
+ * requires RISK_GLOBAL_ADMISSION_MS (25s) remaining, and this floor is 9s, so
+ * anything admitted clears the floor by construction. The skip is reachable
+ * ONLY once the old engine has consumed the window — which is the case it
+ * exists for, and the reason a test of it needs an advancing clock rather than
+ * a frozen one. Raise this above 20s and it starts firing on healthy cycles;
+ * lower the admission constant and it stops firing at all. */
 const ALSO_EVALUATE_MIN_MS = 9_000
 
 /** Called within the existing memory lane, never queues or starts parallel work.

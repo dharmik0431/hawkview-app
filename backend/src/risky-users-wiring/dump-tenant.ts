@@ -67,7 +67,13 @@ async function main(): Promise<void> {
       // which is the assumption the four-state vocabulary exists to remove — so
       // a run of this script cannot be quoted as proving anything about a
       // tenant whose collection may have stopped.
-      syncStatus: (arg('sync') ?? 'SUCCESS') as CollectorSyncStatus,
+      // Per feed, and still ASSERTED rather than read — printed below as such.
+      // Which of the two applies is decided by the rows, so a single value
+      // would have to be chosen before the feed is known.
+      syncStatus: {
+        GRAPH_SIGN_INS: (arg('sync') ?? 'SUCCESS') as CollectorSyncStatus,
+        M365_AUDIT_STS: (arg('sync') ?? 'SUCCESS') as CollectorSyncStatus,
+      },
       windowStart,
       windowEnd,
       maxEvents: Number(arg('max') ?? '20000'),
