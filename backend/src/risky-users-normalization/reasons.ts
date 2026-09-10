@@ -63,6 +63,23 @@ export type OutOfScopeReason =
    */
   | 'MICROSOFT_RISK_VERDICT'
   /**
+   * RETIRED as a classification. Microsoft-detected-and-closed is now carried
+   * by MicrosoftVerdict 'REMEDIATED' rather than by removing the event from
+   * evaluation, so nothing maps here. Kept only as documentation of what the
+   * verdict means.
+   *
+   * The third kind, and it is neither of the other two: MICROSOFT_RISK_VERDICT
+   * would overstate it as live risk, MICROSOFT_SAFETY_VERDICT would understate
+   * it as never-risky. Measured shape: riskDetail
+   * `userPassedMFADrivenByRiskBasedPolicy` with riskState `remediated` — risk
+   * assessed, a risk-based Conditional Access policy challenged the user, MFA
+   * passed. Microsoft detecting and a control working, on a tenant with no P2.
+   *
+   * Still Microsoft's channel under the attribution rule: whose judgement
+   * GENERATED the finding, not whose machinery responded.
+   */
+  | 'MICROSOFT_RISK_REMEDIATED'
+  /**
    * Microsoft judged the sign-in SAFE. A dismissal, not a detection.
    *
    * Separate from MICROSOFT_RISK_VERDICT because conflating them is actively
@@ -71,9 +88,10 @@ export type OutOfScopeReason =
    * Microsoft's channel carries both verdict kinds, so the state is modelled
    * rather than the mere presence of a risk field.
    *
-   * RESERVED and currently unreachable: reaching it means reading `riskDetail`,
-   * which is a payload-shape predicate with no control cohort yet. See
-   * provider-facts.
+   * Measured shape: riskDetail `aiConfirmedSigninSafe` with riskState
+   * `dismissed`. Note the trap Microsoft's own vocabulary sets — system
+   * auto-remediation lands on `dismissed`, so this is a machine assessment
+   * rather than a human waving something away.
    */
   | 'MICROSOFT_SAFETY_VERDICT'
   /**
@@ -144,6 +162,7 @@ export type UnknownObservation =
   | 'AMBIGUOUS_BY_PROVIDER_STATEMENT'
   /** A code whose meaning lives in free text, where the text matched nothing known. */
   | 'AMBIGUOUS_FAILURE_REASON_TEXT'
+
   /**
    * A result code that is not an Azure AD sign-in error code.
    *
@@ -155,16 +174,20 @@ export type UnknownObservation =
   | 'RESULT_CODE_NOT_AN_AZURE_CODE'
   | 'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON'
   /**
-   * The provider reported NO OUTCOME for this event at all.
+   * The provider said the sign-in FAILED but did not say why.
    *
-   * A fact about the record, not about our table — which is the whole point of
-   * separating it from UNRECOGNIZED_REASON_NAME. No mapping can ever fix these,
-   * because there is nothing to map, and labelling them as an unrecognised name
-   * is a standing invitation for someone to "finish the table" by mapping an
-   * absent outcome to a definite one. That is the exact defect this vocabulary
-   * exists to prevent, and it has already happened once at collection level.
+   * Replaces an earlier `OUTCOME_NOT_REPORTED`, which was claiming something
+   * about Microsoft that was actually true about us. Those records DO report an
+   * outcome — in `Operation` — and the audit feed always carries one, so
+   * "outcome not reported" was never reachable on honest terms. The reason is
+   * what can be missing, and this says so.
+   *
+   * Still separate from UNRECOGNIZED_REASON_NAME for the original argument: no
+   * mapping can fix an absent reason, and labelling it as an unrecognised NAME
+   * invites someone to "finish the table" by mapping absence to a definite
+   * outcome.
    */
-  | 'OUTCOME_NOT_REPORTED'
+  | 'FAILURE_REASON_NOT_REPORTED'
   /** Audit path: Microsoft's own name for the result says it is unclassified. */
   | 'PROVIDER_DECLARED_UNCLASSIFIED'
   /** Audit path: the reason name is not one this layer recognises. */
@@ -265,6 +288,7 @@ export const OUT_OF_SCOPE_LABELS: Readonly<Record<OutOfScopeReason, string>> = {
   INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN: 'Existing session was insufficient for silent sign-in, which Microsoft documents as expected',
   MICROSOFT_RISK_VERDICT: 'Microsoft judged this sign-in risky; shown under Microsoft-reported risk, not as a HawkView finding',
   MICROSOFT_SAFETY_VERDICT: 'Microsoft assessed this sign-in and judged it safe; shown under Microsoft-reported risk as a dismissal, never as a HawkView finding',
+  MICROSOFT_RISK_REMEDIATED: 'Microsoft judged this sign-in risky and the tenant’s own policy required multi-factor authentication, which the user passed; shown under Microsoft-reported risk as closed',
   SIGN_IN_FREQUENCY_POLICY_EXPIRY: 'A session lapsed under the tenant’s own sign-in-frequency policy, which Microsoft documents as the expected result of configuring one',
   APPLICATION_CONFIGURATION_ERROR: 'The application’s reply address is misconfigured, which Microsoft documents as a fault in the application rather than anything about the user',
   SESSION_INVALIDATED_BY_REMEDIATION: 'A session stopped working because a password was changed or a grant was revoked, which is remediation taking effect rather than a sign-in attempt',
@@ -293,7 +317,7 @@ export const UNKNOWN_LABELS: Readonly<Record<UnknownObservation, string>> = {
   AMBIGUOUS_BY_PROVIDER_STATEMENT: 'Microsoft states this code alone does not indicate a failure, so HawkView will not read one into it',
   AMBIGUOUS_FAILURE_REASON_TEXT: 'This code carries several meanings in its description text, and the text did not match any meaning HawkView knows',
   RESULT_CODE_NOT_AN_AZURE_CODE: 'The result code on this record is not one of Microsoft’s sign-in error codes, so HawkView will not read a sign-in outcome from it',
-  OUTCOME_NOT_REPORTED: 'Microsoft recorded this event without saying whether the sign-in succeeded or failed, so there is no outcome to read',
+  FAILURE_REASON_NOT_REPORTED: 'Microsoft recorded this sign-in as failed without saying why, so HawkView cannot say what kind of failure it was',
   SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON: 'Reported as a success but carried an unrecognised description, so HawkView will not call it a success',
   PROVIDER_DECLARED_UNCLASSIFIED: 'Microsoft recorded this sign-in result as unclassified, so there is nothing for HawkView to read from it',
   UNRECOGNIZED_REASON_NAME: 'HawkView does not recognise the name Microsoft gave this sign-in result',

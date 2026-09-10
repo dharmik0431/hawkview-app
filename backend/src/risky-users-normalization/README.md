@@ -678,3 +678,274 @@ unselected feed still account for exactly every row.
 The detector is still not built and should not be: it needs a tenant-level finding where
 this model is user-scoped, and hanging one on a synthetic subject would be fabricating an
 identity — worse than the gap. What changed is that the gap is stated rather than silent.
+
+## Addendum: three Microsoft verdict kinds, on a passing control cohort
+
+`riskDetail` is verified. Measured across 2,648 Graph rows, exactly three values exist,
+and **the control cohort passes and is not empty** — 958 ordinary successes carry the
+explicit string `none` with `riskState: none`, not absent and not hidden, so the field
+does not default to a verdict on ordinary human traffic. Documentation had suggested it
+would be hidden without P2; it is not, which is exactly why that expectation needed
+checking rather than assuming.
+
+| `riskDetail` | `riskState` | rows | Disposition | Frontend group |
+| --- | --- | --- | --- | --- |
+| `none` | `none` | 2,593 | not a verdict — classify on the code | — |
+| `userPassedMFADrivenByRiskBasedPolicy` | `remediated` | 54 | `MICROSOFT_RISK_REMEDIATED` | CLOSED |
+| `aiConfirmedSigninSafe` | `dismissed` | 1 | `MICROSOFT_SAFETY_VERDICT` | CLEARED |
+
+**The remediated kind is a third thing, not a shade of the other two.** It reads: Microsoft
+assessed risk, a risk-based Conditional Access policy challenged the user, MFA passed.
+`MICROSOFT_RISK_VERDICT` would overstate it as live risk; `MICROSOFT_SAFETY_VERDICT` would
+understate it as never-risky. So there are now three lists —
+`microsoftRiskVerdicts` (ACTIVE_RISK), `microsoftRemediatedVerdicts` (CLOSED),
+`microsoftSafetyVerdicts` (CLEARED) — for the same reason there were two: a consumer can
+ignore a flag but cannot iterate a list it does not have. A test asserts an event appears
+in at most one.
+
+Unrecognised values route to `UNKNOWN / MICROSOFT_VERDICT_FIELD_UNRECOGNIZED`, never
+through. The asymmetry is the argument: falling through risks presenting Microsoft's
+detection as a HawkView finding, which is a correctness violation, while UNKNOWN only
+costs stated coverage. 100% of observed is still not 100% of possible.
+
+`riskDetail` is checked **before** the result code, because a risk-based CA outcome sits on
+an ordinary success code — reading the code first would file Microsoft's detection as ours.
+
+**Consequence worth stating plainly:** ~52 of ~1,010 successes now leave `applies`. Any
+rule needing "failures then a success" loses those successes for those users. That is the
+channel rule working as specified, and it is a real cost.
+
+And this is the **third** route by which Microsoft's risk output reaches us without the
+risk API — after sign-in log failure reasons and 53004. Anyone scoping work on the
+assumption that the risk API is the only route now has three counterexamples.
+
+## Addendum: `authenticationDetails` is dead, on its own kill condition
+
+Absent from all 2,648 Graph rows — the key is not present, not empty — and
+`authenticationRequirement` with it. That was the disqualifying condition stated in
+advance, so the predicate is **retired rather than left pending**.
+
+Since `raw` is the full payload post-redaction and redaction preserves keys, Microsoft did
+not send these fields. Both are documented on the v1.0 `signIn` resource, so the likely
+cause is omission from the default list projection, needing an explicit `$select` — which
+would make this a fixable **collection** gap rather than a licensing wall. One Graph call
+settles it; not asserted here.
+
+## Addendum: the interrupt family was counted in one vocabulary and undercounted
+
+I reported that family as near-empty from Graph numeric codes, and that was drawn from
+half the evidence. The audit feed *names* the same events:
+`UserStrongAuthClientAuthNRequiredInterrupt` at 13 rows across three tenants, plus
+`UserStrongAuthEnrollmentRequiredInterrupt` at 3 — so **16 cited events, not 3**.
+(A further 4 `PasswordResetRegistrationRequiredInterrupt` rows are counted by some as
+family members; they rest on an analogy this table declines to act on and remain held, so
+they are excluded from the 16.)
+
+`UserStrongAuthEnrollmentRequiredInterrupt` was **missing from `AUDIT_REASON_NAMES`
+entirely** — the audit-path name for 50072, which was mapped on Graph all along — so its
+rows were landing in `UNRECOGNIZED_REASON_NAME`. That gap was found only because the same
+family got measured twice, once per feed.
+
+**The generalisable rule, which is this module's own asymmetry thesis arriving with a bill:
+the two feeds needed opposite mechanisms, so any measurement spanning them must be taken
+in both vocabularies or it undercounts silently.** Counting numbers on one feed while the
+other names the same events in words produces a confident, wrong, small number. Ordering
+still puts lockout first — ~715 audit plus 558 Graph — but a detector sized from Graph
+codes alone would have been judged not worth building.
+
+## Addendum: a path can be dead on one feed and alive on the other
+
+`raw.status` is the provider object on the Graph feed and is read on every Graph row. On
+the audit feed the object of the same name is HawkView-synthesized, and it is **inconsistent
+for identical inputs** — same `LogonError`, same `Operation`, sometimes populated and
+sometimes not (IdsLocked 578 against 137; `UserStrongAuthClientAuthNRequiredInterrupt` 1
+against 12). An ingest-date boundary was checked and ruled out. Cause unresolved, and
+recorded as unresolved.
+
+So `signin.synthesized-status-object` is disproved **for the audit feed only**, and
+`ShapePredicate` now carries a `feed` qualifier. `DISPROVED_PREDICATE_PATHS` lists only
+paths dead on *every* feed; `disprovedPathsForFeed()` returns the scoped ones. Folding them
+together would have told a future reader never to read a field this layer reads on every
+Graph row — a wrong claim inside the mechanism that exists to prevent wrong claims, and
+the same collapse-two-facts-into-one defect one level further in.
+
+## Addendum: Operation is the audit outcome, and the numbers restated
+
+**The audit records carry neither `LoginStatus` nor `ErrorCode` anywhere** — not top-level,
+not in `ExtendedProperties`, which hold only `ResultStatusDetail`, `RequestType`,
+`UserAuthenticationMethod`, `UserAgent` and `KeepMeSignedIn`. A classifier keyed on a
+result code therefore reads nothing on this feed and files every genuine success as
+uninterpretable.
+
+`Operation` is the field that works, and it passes its control cleanly: `UserLoggedIn` on
+1,412 rows, **all with no `LogonError` at all**; `UserLoginFailed` on the remainder,
+essentially all carrying a `LogonError` that names the reason. Present on every row in both
+collection eras. So the audit path now reads **Operation for the outcome and LogonError for
+the reason**, with any result code that does appear used only as corroboration that can
+contradict but never override.
+
+### This is a capability, not a row count
+
+Read as "~1,412 successes recovered" it sounds like an improvement. What it actually was:
+**the audit feed had no source of successes whatsoever.** So a rule of the form *invalid
+credentials followed by a verified success* had nothing to match against there — not a low
+match rate, structurally zero.
+
+That is `HV-ID-AUTH-005`, one of the three sanctioned rules this rebuild exists to make
+work, and on the audit-fallback tenants it **could never have fired**. Those are the tenants
+without P1 — exactly the customers HawkView's own detection is for, the ones Microsoft's
+tooling does not serve. The detector was not underperforming there. It was inert, and
+nothing said so.
+
+The generalisable question, which nobody was asking: **which feed can supply a rule's whole
+pattern?** Per-detector accounting would have reported `considered: N, matched: 0` — a
+healthy-looking silent detector — because the events forming the other half of the pattern
+were not there to count. That is the 1,054-runs failure reached from a direction none of the
+accounting covers: not a rule that never ran, but a rule run against a feed that could only
+ever supply half its evidence.
+
+`ResultStatus` stays disproved, now on our own data rather than documentation: **141
+locked-out accounts carry `ResultStatus: Success`**, along with 232
+`UnclassifiedAuthenticationError` and 13 `UserStrongAuthClientAuthNRequiredInterrupt`. For
+STS logon events it is HTTP-level, not logon-level, and it fails in the worst available
+direction.
+
+**Restated with provenance, from `managementActivityRecord.LogonError` — Microsoft's own
+field:** `IdsLocked` 715, `UnclassifiedAuthenticationError` 558, `InvalidUserNameOrPassword`
+65, `UserStrongAuthClientAuthNRequiredInterrupt` 13, `DelegationDoesNotExist` 9,
+`PasswordResetRegistrationRequiredInterrupt` 4, `UserStrongAuthEnrollmentRequiredInterrupt`
+3, and five names at one row each. The withdrawn figures were the subsets that happened to
+project; the real recovery is **larger** than the contaminated numbers claimed, which is
+why leaving the entry silent would itself have misled.
+
+`OUTCOME_NOT_REPORTED` is renamed `FAILURE_REASON_NOT_REPORTED`. Those records *do* report
+an outcome — in `Operation` — so the old name claimed something about Microsoft that was
+actually true about us. What can be missing is the reason.
+
+## Addendum: the two tables had drifted, and nothing failed
+
+The audit reason-name table and the Graph result-code table encode the same provider
+semantics in two vocabularies, and were built weeks apart. They disagreed:
+
+- `InvalidReplyTo` was held here while **50011 — the same Microsoft text — was out of scope
+  with a provider citation** on the Graph side. Now aligned.
+- `SsoArtifactRevoked` was **missing entirely** while 50133 was mapped. Now added.
+
+Neither showed up as a test failure; both were found by cross-checking the tables against a
+measured list of audit reason names. `AuditReasonEntry` now carries `graphCode` and a test
+requires linked entries to agree or state a `divergenceReason` — so a future edit to one
+table cannot silently disagree with the other. `IdsLocked` is the one deliberate divergence
+and says why: Graph maps 50053 to UNKNOWN because the code carries three meanings, while on
+this feed the *name* is the lockout meaning.
+
+## Addendum: a fourth verification state, because DISPROVED was carrying two meanings
+
+Registering the vocabulary question and the `authenticationDetails` hypothesis as DISPROVED
+put `managementActivityRecord.LoginStatus`, `raw.authenticationDetails` and their siblings
+into the never-read tombstone list. That is wrong, and wrong in the same way the feed-scoping
+bug was: those fields are *absent*, so reading them is pointless rather than dangerous, while
+a real tombstone names a field that misleads when read.
+
+`HYPOTHESIS_SUBJECT_ABSENT` now covers "the fields this was about do not exist, so the
+hypothesis has no subject and nothing was built on it". It keeps `mayExclude` false — you
+cannot exclude on a field that is not there — but does not throw, and its paths stay out of
+`DISPROVED_PREDICATE_PATHS`. That is twice now that the tombstone mechanism itself has had to
+be made more precise to stop it asserting things that are not true.
+
+## Addendum: a correction I owe the record
+
+I reported that `incomingTokenType`, `tokenIssuerName` and `tokenIssuerType` were being
+stored as `[REDACTED]` on every Graph row, called it unrecoverable retroactive data loss,
+and sharpened that framing for escalation. **The keys are absent from all 2,648 rows.** They
+are not being redacted, because they never arrive.
+
+The regex reading was right and the mechanism was right; what nobody checked was whether the
+input the regex would destroy was ever present. I verified the mechanism and asserted the
+effect — the same error as keying a predicate on a field that turns out to be absent, which
+is the defect this whole module exists to prevent, committed while I was being careful about
+everything else.
+
+What survives is better than what I claimed. Those three fields and
+`authenticationDetails`/`authenticationRequirement` are absent for **one** reason — the
+sign-in request issues no `$select`, so Graph's default projection omits the family — so it
+is one collector change rather than several bugs. And the regex bug is real but **latent**:
+it destroys those fields the moment they start arriving, so **the regex fix must land before
+the `$select`, or the fix creates the bug.** The generalisation I offered needs its partner:
+when you check whether a filter affects the thing you care about, check what else it matches
+— *and then check whether the thing it matches is ever actually there.*
+
+## Addendum: the verdict is a dimension, not a classification
+
+**Ruling: the observation is ours, the verdict is Microsoft's.** A sign-in happened, at
+this time, by this subject, with this outcome — that is a fact from the same log that gives
+us every other event, so it classifies normally and feeds our rules. Microsoft's conclusion
+(`riskDetail`, `riskState`) never enters a HawkView finding.
+
+So `MicrosoftVerdict` is **orthogonal to classification**: `RISK`, `REMEDIATED`, `SAFE`,
+carried alongside the four buckets rather than as one of them. `counts.microsoftVerdicts`
+is not a fifth bucket and must not be summed with the vocabularies — every event counted
+there is also counted in one of the four. A test asserts the four still account for exactly
+every row.
+
+**The guarantee is structural, not a convention.** `MicrosoftVerdict` never appears on
+`NormalizedEvent`, so a detector iterating `applies` has no field to read and a HawkView
+finding cannot cite Microsoft's judgement even by accident. Verdicts reach a consumer only
+through the batch-level lists. A test serializes a judged event and asserts no trace of
+`riskDetail`, `riskState`, `verdict` or the verdict values appears — and mutation-testing
+confirms that adding the field "for convenience" fails it.
+
+**Why the earlier strict reading was wrong**, in cost order: it went silent on the most
+suspicious pattern the data can hold — failures followed by a success Microsoft
+independently thought worth challenging; it made our findings **anti-correlated with real
+risk**, invisibly, since we would fire on successes Microsoft didn't flag and stay quiet on
+the ones it did; and it made "detected by HawkView *and* Microsoft" structurally rarest
+exactly where it is most valuable.
+
+The channel rule is not violated by one event being evidence in both. Two analysts reading
+the same log line and reaching independent conclusions is not merging — it is the point of
+running two channels, and it is what makes agreement between them mean anything. The same
+applies to `aiConfirmedSigninSafe`: we no more defer to Microsoft's clearance than borrow
+its detection, and showing that disagreement is the product.
+
+An unrecognised `riskDetail` value now classifies **normally** and is counted. The earlier
+routing to UNKNOWN rested on a verdict being able to reach a detector; it cannot, so
+removing the event would cost coverage for no protection.
+
+### One open inconsistency, recorded rather than resolved
+
+53004 and 50053's risk-text meanings are still classified `DOES_NOT_APPLY /
+MICROSOFT_RISK_VERDICT`, while now also carrying verdict `RISK`. They differ from the
+`riskDetail` cases in one real way: `riskDetail` is a *separate field*, so the observation
+is readable without the verdict, whereas there the code **is** both statements at once.
+Applying the ruling to them would return them to `APPLIES / BLOCKED_BY_CONTROL` with
+verdict `RISK` — roughly 921 rows for the malicious-IP text. That was previously ruled the
+other way under the older framing, so it is escalated as a consistency question rather than
+decided here.
+
+## Addendum: a negative claim must say what would overturn it
+
+`DISPROVED` and `HYPOTHESIS_SUBJECT_ABSENT` now both require a `revivedBy` field: the
+evidence that would overturn the claim. Verification material has to be able to fail, and a
+tombstone with no revival condition is a claim nothing could ever overturn.
+
+The asymmetry it corrects: a negative claim *feels* cheaper than a positive one — "do not
+read this" seems to cost nothing — so it gets made more broadly and checked less, while
+actually being among the strongest claims in the module: a permanent instruction to every
+future reader, in a registry they will trust precisely because it exists. This mechanism has
+needed two corrections already, both in the negative direction.
+
+It also makes disproof and absence **unwriteable as the same thing**. If the only condition
+you can state is "revived if the field ever appears", you do not have a disproof — you have
+a field you did not find, and it belongs in `HYPOTHESIS_SUBJECT_ABSENT`. Both earlier
+corrections would have been caught at write time by having to fill this in.
+
+Writing them out immediately surfaced a case I had classified on history rather than on
+evidence. `raw.signInEventTypes` is a tombstone because a predicate on it shipped and was
+reported as a fix — but its primary defect is **absence**, and nobody ever tested whether it
+discriminates. Its revival condition therefore needs two clauses (the field appearing, *and*
+a control cohort of human sign-ins that does not carry the marker), and the entry now says
+so rather than implying we found the field and caught it lying.
+
+Five states is the cap. Each additional one is another way to be wrong about a claim about a
+claim, and the mechanism's value comes from being small enough that someone reads all of it.
+A test asserts both the revival conditions and the cap.

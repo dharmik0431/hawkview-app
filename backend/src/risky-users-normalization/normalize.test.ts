@@ -16,6 +16,7 @@ import {
 import {
   DISPROVED_PREDICATE_PATHS,
   FAILURE_REASON_MEANINGS,
+  disprovedPathsForFeed,
   RESULT_CODES,
   SHAPE_PREDICATES,
   OBSERVED_BUT_UNMAPPED_GRAPH_CODES,
@@ -186,8 +187,9 @@ test('a batch that is entirely unrecognized still returns events and no gate', a
   // Nothing in the batch is a readiness flag, a gap count, or a partial state
   // the evaluation core could branch on to skip a rule.
   assert.deepEqual(Object.keys(batch).sort(), [
-    'applies', 'counts', 'coverage', 'events', 'microsoftRiskVerdicts',
-    'microsoftSafetyVerdicts', 'resolvedSubjects', 'scope', 'shapeObservations', 'source',
+    'applies', 'counts', 'coverage', 'events', 'microsoftRemediatedVerdicts',
+    'microsoftRiskVerdicts', 'microsoftSafetyVerdicts', 'resolvedSubjects', 'scope',
+    'shapeObservations', 'source',
   ]);
   assert.deepEqual(Object.keys(batch.coverage).sort(), [
     'collectionScope', 'consideredRows', 'enumerationCodedRows', 'normalizedRows',
@@ -663,6 +665,17 @@ test('disproved predicates are recorded and cannot be consulted', () => {
       'sign_in_logs.user_id',
     ],
   );
+  // A path dead on ONE feed must not be listed as dead everywhere. raw.status
+  // is the provider object on Graph and is read on every Graph row; only the
+  // audit projection of the same name is disproved.
+  assert.deepEqual(
+    [...disprovedPathsForFeed('M365_AUDIT_STS')].sort(),
+    ['raw.status.errorCode', 'raw.status.failureReason'],
+  );
+  assert.deepEqual(disprovedPathsForFeed('GRAPH_SIGN_INS'), []);
+  for (const path of ['raw.status.errorCode', 'raw.status.failureReason']) {
+    assert.equal(DISPROVED_PREDICATE_PATHS.includes(path), false, path);
+  }
   for (const id of ['graph.service-principal-id', 'graph.sign-in-event-types', 'graph.is-interactive-false',
     'audit.result-status', 'signin.user-id-column']) {
     assert.throws(() => mayExclude(id), /DISPROVED_PREDICATE/, id);
@@ -1242,7 +1255,7 @@ test('an audit reason Microsoft calls unclassified is unknown, and an unlisted o
 });
 
 test('an audit reason with no exclusion citation is held, not claimed', async () => {
-  for (const name of ['UserUnauthorized', 'DelegationDoesNotExist', 'InvalidReplyTo',
+  for (const name of ['UserUnauthorized', 'DelegationDoesNotExist',
     'MisconfiguredApplicationWithGraphErrorMessage', 'PasswordResetRegistrationRequiredInterrupt']) {
     const batch = await run([auditRow({ ErrorCode: '1', LogonError: name })], { source: 'M365_AUDIT_STS' });
     assert.deepEqual(
@@ -1353,64 +1366,85 @@ test('a Microsoft risk verdict and a Microsoft safety verdict can never be the s
   assert.equal(batch.counts.doesNotApplyByReason.MICROSOFT_SAFETY_VERDICT, 0);
 });
 
-test('riskDetail has no control cohort yet, so it changes nothing', async () => {
-  // 55 measured rows carry a riskDetail alongside a Conditional Access
-  // success, and they currently classify as ordinary successes. Routing them
-  // on an unconfirmed field would remove 55 real successes from evaluation if
-  // the field means something other than we think.
-  assert.equal(mayExclude('graph.risk-detail'), false);
 
-  const withRiskDetail = await run([graphRow({
-    riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
-    conditionalAccessStatus: 'success',
-    status: { errorCode: 0, failureReason: 'Other.' },
-  })]);
-  const withSafeDetail = await run([graphRow({
-    riskDetail: 'aiConfirmedSigninSafe',
-    conditionalAccessStatus: 'success',
-    status: { errorCode: 0, failureReason: 'Other.' },
-  })]);
-  const without = await run([graphRow({ status: { errorCode: 0, failureReason: 'Other.' } })]);
 
-  const expected = { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' };
-  assert.deepEqual(only(withRiskDetail).classification, expected);
-  assert.deepEqual(only(withSafeDetail).classification, expected);
-  assert.deepEqual(only(without).classification, expected);
-  // And neither reaches Microsoft's channel on an unverified field.
-  assert.deepEqual(withRiskDetail.microsoftRiskVerdicts, []);
-  assert.deepEqual(withSafeDetail.microsoftSafetyVerdicts, []);
+
+test('the audit feed names an interrupt the Graph codes never showed', async () => {
+  // The family was reported near-empty from Graph numeric codes alone. The
+  // audit feed names the same events in words, and this name was missing from
+  // the table until someone counted in both vocabularies.
+  const batch = await run(
+    [auditRow({ ErrorCode: '1', LogonError: 'UserStrongAuthEnrollmentRequiredInterrupt' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(batch).classification, {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED',
+  });
+  assert.deepEqual(dispositionForCode(50072), only(batch).classification);
 });
 
 // ---------------------------------------------------------------------------
 // An unreported outcome is a fact about the record, not a gap in our table.
 // ---------------------------------------------------------------------------
 
-test('an audit record that reports no outcome says so, rather than looking unrecognised', async () => {
-  // The collector's own success flag collapsed "reported nothing" into
-  // "reported a failure". This layer must not inherit that, and it must not
-  // label these as an unrecognised NAME either: no mapping can ever fix them,
-  // and calling them unrecognised invites someone to "finish the table" by
-  // mapping an absent outcome to a definite one.
+test('a failure with no stated reason says the reason is missing, not the outcome', async () => {
+  // Operation reports the outcome on every audit row, so "outcome not
+  // reported" was never honest here — what can be missing is the REASON. It
+  // must also not be labelled an unrecognised NAME: no mapping can fix an
+  // absent reason, and calling it unrecognised invites someone to finish the
+  // table by mapping absence to a definite outcome.
   const batch = await run([auditRow({ ErrorCode: undefined })], { source: 'M365_AUDIT_STS' });
   assert.deepEqual(only(batch).classification, {
     kind: 'UNKNOWN',
-    observation: 'OUTCOME_NOT_REPORTED',
+    observation: 'FAILURE_REASON_NOT_REPORTED',
   });
   assert.equal(only(batch).errorCode, null);
 });
 
-test('a reason equal to the operation name is the collector fallback, not a provider value', async () => {
-  // Defensive: this layer reads the original record, where it should not
-  // arise. If anything ever points it at the projected field, an unreported
-  // outcome must not arrive wearing an operation name and be mapped.
+test('Operation carries the audit outcome when no result code exists at all', async () => {
+  // This is the recovery that matters most on this feed: the audit records
+  // carry neither LoginStatus nor ErrorCode anywhere, so a classifier keyed on
+  // a code files every genuine success as uninterpretable. Operation is the
+  // field that works — a clean partition on every row in both eras.
+  const success = await run(
+    [auditRow({ ErrorCode: undefined, Operation: 'UserLoggedIn' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(success).classification, {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_COMPLETED',
+  });
+  assert.equal(success.counts.applies, 1);
+  assert.equal(only(success).errorCode, null, 'no code exists, and none is invented');
+
+  // A real code still corroborates and can still contradict.
+  const contradicted = await run(
+    [auditRow({ ErrorCode: '50126', Operation: 'UserLoggedIn' })],
+    { source: 'M365_AUDIT_STS' },
+  );
+  assert.deepEqual(only(contradicted).classification, {
+    kind: 'UNKNOWN',
+    observation: 'INCONSISTENT_OPERATION_AND_CODE',
+  });
+});
+
+test('a reason equal to the operation name is never looked up as a reason', async () => {
+  // Defensive: this layer reads the original record, where the projected
+  // Operation fallback should not arise. If anything ever points it at the
+  // projected field, the operation name must not be treated as a provider
+  // reason value — the outcome then comes from Operation itself, which is the
+  // correct answer rather than a guess.
   const batch = await run(
     [auditRow({ ErrorCode: undefined, Operation: 'UserLoggedIn', LogonError: 'UserLoggedIn' })],
     { source: 'M365_AUDIT_STS' },
   );
   assert.deepEqual(only(batch).classification, {
-    kind: 'UNKNOWN',
-    observation: 'OUTCOME_NOT_REPORTED',
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_COMPLETED',
   });
+  // The point of the guard: it did NOT become an unrecognised reason name.
+  assert.equal(batch.counts.unknownByObservation.UNRECOGNIZED_REASON_NAME, 0);
 });
 
 test('a genuinely unknown reason name is still reported as one', async () => {
@@ -1483,4 +1517,193 @@ test('an expired password is a confirmed credential, not an interrupt and not hy
     'PASSWORD_ACCEPTED_REGISTRATION_REQUIRED'] as const) {
     assert.equal(isPostPasswordInterrupt(outcome), true, outcome);
   }
+});
+
+test('the two tables cannot silently disagree about the same Microsoft meaning', () => {
+  // The audit reason table and the Graph result-code table encode the same
+  // provider semantics in two vocabularies and were built weeks apart. They
+  // HAD drifted, and nothing failed: InvalidReplyTo was held here while 50011
+  // — same meaning, same provider text — was out of scope with a citation on
+  // the Graph side. Linked entries must now agree or say why not.
+  for (const entry of AUDIT_REASON_NAMES) {
+    if (entry.graphCode === undefined) continue;
+    const byCode = dispositionForCode(entry.graphCode);
+    const agrees = JSON.stringify(byCode) === JSON.stringify(entry.disposition);
+    if (!agrees) {
+      assert.ok(
+        (entry.divergenceReason ?? '').length > 40,
+        `${entry.name} disagrees with code ${entry.graphCode} and does not say why`,
+      );
+    }
+  }
+  // The two that had drifted are now aligned with their Graph counterparts.
+  assert.deepEqual(auditReasonEntry('InvalidReplyTo')!.disposition, dispositionForCode(50011));
+  assert.deepEqual(auditReasonEntry('SsoArtifactRevoked')!.disposition, dispositionForCode(50133));
+  assert.deepEqual(auditReasonEntry('InvalidUserNameOrPassword')!.disposition, dispositionForCode(50126));
+  // And the deliberate divergence states its reason.
+  const lockout = auditReasonEntry('IdsLocked')!;
+  assert.notDeepEqual(lockout.disposition, dispositionForCode(50053));
+  assert.match(lockout.divergenceReason ?? '', /three meanings/);
+});
+
+test('the audit feed reads Operation, and ResultStatus stays disproved', async () => {
+  // ResultStatus fails its control badly on our own rows: 141 locked-out
+  // accounts are marked Success. Operation passes cleanly.
+  assert.equal(mayExclude('audit.operation-as-outcome'), true);
+  assert.throws(() => mayExclude('audit.result-status'), /DISPROVED_PREDICATE/);
+  // An absent subject is NOT a tombstone: reading those fields is pointless
+  // rather than dangerous, so it returns false instead of throwing, and the
+  // paths stay out of the never-read list.
+  assert.equal(mayExclude('audit.result-code-vocabulary'), false);
+  assert.equal(mayExclude('graph.authentication-details'), false);
+  for (const path of ['raw.authenticationDetails', 'managementActivityRecord.LoginStatus']) {
+    assert.equal(DISPROVED_PREDICATE_PATHS.includes(path), false, path);
+  }
+
+  // The worst case the tombstone exists for: a lockout marked Success.
+  const lockout = await run([auditRow({
+    ErrorCode: undefined,
+    Operation: 'UserLoginFailed',
+    ResultStatus: 'Success',
+    LogonError: 'IdsLocked',
+  })], { source: 'M365_AUDIT_STS' });
+  assert.deepEqual(only(lockout).classification, {
+    kind: 'APPLIES',
+    outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The verdict is orthogonal: the observation is ours, the judgement is theirs.
+// ---------------------------------------------------------------------------
+
+test('a judged success still feeds our rules, and the verdict travels separately', async () => {
+  // The strict reading removed these from evaluation, which went silent on the
+  // most suspicious pattern the data can hold: failures then a success that
+  // Microsoft independently thought worth challenging.
+  const remediated = await run([graphRow({
+    riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
+    conditionalAccessStatus: 'success',
+    status: { errorCode: 0, failureReason: 'Other.' },
+  })]);
+  assert.deepEqual(only(remediated).classification, {
+    kind: 'APPLIES',
+    outcome: 'PASSWORD_ACCEPTED_COMPLETED',
+  });
+  assert.equal(remediated.applies.length, 1, 'the observation is ours');
+  assert.deepEqual(remediated.microsoftRemediatedVerdicts.map(e => e.eventId), ['evt-1']);
+  assert.equal(remediated.counts.microsoftVerdicts.REMEDIATED, 1);
+
+  // Same for a clearance: we do not defer to it any more than we borrow a
+  // detection. Disagreeing with Microsoft visibly is the product.
+  const safe = await run([graphRow({
+    riskDetail: 'aiConfirmedSigninSafe',
+    status: { errorCode: 0, failureReason: 'Other.' },
+  })]);
+  assert.deepEqual(only(safe).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
+  assert.deepEqual(safe.microsoftSafetyVerdicts.map(e => e.eventId), ['evt-1']);
+
+  const benign = await run([graphRow({ riskDetail: 'none', status: { errorCode: 0, failureReason: 'Other.' } })]);
+  assert.deepEqual(benign.microsoftSafetyVerdicts, []);
+  assert.deepEqual(benign.microsoftRemediatedVerdicts, []);
+  assert.equal(benign.counts.microsoftVerdicts.SAFE, 0);
+});
+
+test('a detector cannot read Microsoft’s judgement, structurally', async () => {
+  // This is the guarantee the channel rule actually needs. It is not a
+  // convention a future author has to respect: there is no field to read, so a
+  // HawkView finding cannot cite Microsoft's conclusion even by accident.
+  const batch = await run([graphRow({
+    riskDetail: 'userPassedMFADrivenByRiskBasedPolicy',
+    status: { errorCode: 0, failureReason: 'Other.' },
+  })]);
+  const event = only(batch);
+  const serialized = JSON.stringify(event);
+  for (const trace of ['riskDetail', 'riskState', 'verdict', 'REMEDIATED', 'userPassedMFA']) {
+    assert.equal(serialized.includes(trace), false, 'event leaks ' + trace);
+  }
+  // The same object is in both places, and only the batch-level list knows.
+  assert.equal(batch.microsoftRemediatedVerdicts[0], batch.applies[0]);
+});
+
+test('an unrecognised verdict value classifies normally and is counted', async () => {
+  // The earlier design routed this to UNKNOWN because a verdict could reach a
+  // detector. It cannot any more, so removing the event from evaluation would
+  // cost coverage for no protection.
+  const batch = await run([graphRow({
+    riskDetail: 'someValueMicrosoftAddedLastWeek',
+    status: { errorCode: 0, failureReason: 'Other.' },
+  })]);
+  assert.deepEqual(only(batch).classification, { kind: 'APPLIES', outcome: 'PASSWORD_ACCEPTED_COMPLETED' });
+  assert.equal(batch.counts.microsoftVerdicts.UNRECOGNIZED, 1);
+  // We do not claim to know what Microsoft concluded, so it reaches no list.
+  assert.deepEqual(batch.microsoftRiskVerdicts, []);
+  assert.deepEqual(batch.microsoftRemediatedVerdicts, []);
+  assert.deepEqual(batch.microsoftSafetyVerdicts, []);
+});
+
+test('the verdict counters are orthogonal and must not be summed with the tallies', async () => {
+  const batch = await run([
+    graphRow({ id: 'judged', riskDetail: 'userPassedMFADrivenByRiskBasedPolicy', status: { errorCode: 0, failureReason: 'Other.' } }),
+    graphRow({ id: 'ours', status: { errorCode: 50126 } }),
+  ]);
+  // Two rows, two events, and one of them ALSO carries a verdict.
+  assert.equal(batch.counts.applies, 2);
+  assert.equal(batch.counts.microsoftVerdicts.REMEDIATED, 1);
+  const accounted =
+    batch.counts.applies +
+    total(batch.counts.doesNotApplyByReason) +
+    total(batch.counts.notYetCitedByReason) +
+    total(batch.counts.unknownByObservation) +
+    total(batch.counts.unprocessableByReason) +
+    total(batch.counts.unselectedRowsByReason);
+  assert.equal(accounted, batch.counts.rows, 'the four vocabularies still account for every row');
+});
+
+test('the codes that carry a verdict still reach the risk list', async () => {
+  // 53004 and 50053's risk texts remain classified DOES_NOT_APPLY pending a
+  // consistency ruling, but they now reach the list through the verdict
+  // dimension rather than through their reason, so the mechanism is uniform.
+  const batch = await run([graphRow({ id: 'proofup', status: { errorCode: 53004 } })]);
+  assert.deepEqual(only(batch).classification, { kind: 'DOES_NOT_APPLY', reason: 'MICROSOFT_RISK_VERDICT' });
+  assert.deepEqual(batch.microsoftRiskVerdicts.map(e => e.eventId), ['proofup']);
+  assert.equal(batch.counts.microsoftVerdicts.RISK, 1);
+
+  const malicious = await run([graphRow({ id: 'ip', status: {
+    errorCode: 50053,
+    failureReason: 'Sign-in was blocked because it came from an IP address with malicious activity',
+  } })]);
+  assert.deepEqual(malicious.microsoftRiskVerdicts.map(e => e.eventId), ['ip']);
+
+  // And a lockout carries no verdict: it is a threshold, not a judgement.
+  const lockout = await run([graphRow({ status: {
+    errorCode: 50053,
+    failureReason: LOCKOUT_LITERAL,
+  } })]);
+  assert.equal(lockout.counts.microsoftVerdicts.RISK, 0);
+  assert.deepEqual(lockout.microsoftRiskVerdicts, []);
+});
+
+test('a negative claim must say what would overturn it', async () => {
+  // A registry of negative facts needs the same scoping discipline as the
+  // positive ones. "Do not read this" feels cheaper than a positive claim, so
+  // it gets made more broadly and checked less — while actually being a
+  // permanent instruction to every future reader, in a registry they trust
+  // because it exists. Verification material has to be able to fail.
+  const negative = SHAPE_PREDICATES.filter(
+    entry => entry.verification.state === 'DISPROVED'
+      || entry.verification.state === 'HYPOTHESIS_SUBJECT_ABSENT',
+  );
+  assert.ok(negative.length >= 8, 'expected the negative registry to be non-trivial');
+  for (const entry of negative) {
+    const { verification } = entry;
+    assert.ok(
+      'revivedBy' in verification && verification.revivedBy.length > 40,
+      `${entry.id} makes a negative claim with no revival condition`,
+    );
+  }
+  // And the mechanism stays small enough to be read whole: each extra state is
+  // another way to be wrong about a claim about a claim.
+  const states = new Set(SHAPE_PREDICATES.map(entry => entry.verification.state));
+  assert.ok(states.size <= 5, 'more than five verification states');
 });
