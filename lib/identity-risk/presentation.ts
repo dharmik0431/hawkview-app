@@ -520,7 +520,6 @@ export function riskAssessmentEmptyPresentation(assessment: RiskAssessment) {
   }
 }
 
-
 /**
  * The words for one signal: what to call it, and what its count counts.
  *
@@ -843,4 +842,155 @@ export function ruleScopeSummary(rule: {
       ? ' identity evaluated by this check'
       : ' identities evaluated by this check')
   )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Why the assessment is not available                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Whether an unavailable assessment is something wrong or a boundary working
+ * as designed.
+ *
+ * This distinction is the whole reason these reasons are not collapsed. The
+ * existing unavailable copy has three variants and every one of them reads as
+ * breakage -- "could not be read", "could not be loaded", "not been reported
+ * yet". Rendering a role boundary that way sends a technician to raise a
+ * support ticket about a system behaving exactly as intended, which is the same
+ * cost already identified for a withheld count read as an error.
+ *
+ * PERMISSION and NOT_CONFIGURED are not faults and must never be styled or
+ * worded as though they were. NOT_YET_RUN is a scheduling question. FAULT is
+ * the only one where something is actually wrong, and even there it is wrong on
+ * the server rather than in the request.
+ */
+export type AssessmentUnavailablePosture =
+  | 'PERMISSION'
+  | 'NOT_CONFIGURED'
+  | 'NOT_YET_RUN'
+  | 'FAULT'
+  | 'UNRECOGNISED'
+
+export type AssessmentUnavailableCopy = {
+  posture: AssessmentUnavailablePosture
+  headline: string
+  caption: string
+}
+
+/**
+ * One entry per reason, and each says the same thing in a different way at the
+ * end: this is not an all-clear.
+ *
+ * That repetition is deliberate. Every one of these states puts an empty screen
+ * in front of a technician, and an empty screen is read as "nothing to worry
+ * about" unless the words on it say otherwise. The count tile already refuses
+ * to print a bare zero for the same reason; these are the same defect reached
+ * by a different route.
+ */
+const unavailableCopy: Record<string, AssessmentUnavailableCopy> = {
+  ROLE_NOT_PERMITTED: {
+    posture: 'PERMISSION',
+    headline: 'Your role cannot see this tenant&rsquo;s risky users',
+    caption:
+      'Nothing is wrong and nothing needs retrying. Named users are restricted to roles with permission to see them, and yours does not have it for this tenant. An administrator can change that. This says nothing about whether the tenant has risky users.',
+  },
+  NOT_ENABLED_FOR_TENANT: {
+    posture: 'NOT_CONFIGURED',
+    headline: 'HawkView risk evaluation is not switched on for this tenant',
+    caption:
+      'This tenant is not in the group HawkView evaluates, so no assessment has been made. Nothing has failed. This is not a result of zero, and it is not an all-clear: the checks have not run rather than run and found nothing.',
+  },
+  EVALUATION_DISABLED: {
+    posture: 'NOT_CONFIGURED',
+    headline: 'HawkView risk evaluation is currently switched off',
+    caption:
+      'Risk evaluation has been disabled for all tenants at the operator level, so no current assessment exists for this one. Nothing has failed and no retry will help. This is not an all-clear.',
+  },
+}
+
+/**
+ * The copy for one reason, or an honest admission that this build does not know
+ * it.
+ *
+ * A reason this build has never seen will happen: the backend ships on its own
+ * schedule and auto-deploys, so it is routinely newer than the frontend in
+ * front of it. The fallback must not guess a posture -- treating an unknown
+ * reason as a fault invents an incident, and treating it as a boundary invents
+ * a reassurance. It says it does not know, and never prints the raw code, which
+ * is an identifier rather than something a technician can act on.
+ */
+export function assessmentUnavailableCopyFor(
+  because: string
+): AssessmentUnavailableCopy {
+  return (
+    unavailableCopy[because] ?? {
+      posture: 'UNRECOGNISED',
+      headline: 'HawkView cannot show risky users for this tenant',
+      caption:
+        'The server gave a reason this build of HawkView does not recognise, so it cannot say whether this is a permission boundary, a setting, or a fault. It is not an all-clear, and the tenant has not been checked and cleared.',
+    }
+  )
+}
+
+/** Whether this reason describes something broken. */
+export function assessmentUnavailableIsFault(because: string): boolean {
+  return assessmentUnavailableCopyFor(because).posture === 'FAULT'
+}
+
+/* -------------------------------------------------------------------------- */
+/* Whether the run itself is current                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How far a run's evidence window may close before its completion time without
+ * being worth mentioning.
+ *
+ * The engine builds the window as [now - 30d, now] at the moment of the read,
+ * so windowEnd and completedAt are the same instant give or take the seconds
+ * the assessment takes. Anything materially past that is a run that was stored
+ * and served later, or replayed.
+ *
+ * Fifteen minutes is a floor for not bothering the reader, not a judgement
+ * about what counts as stale. The distinction matters: a threshold tuned to
+ * whichever tenant happened to be measured is calibrated by that sample, so
+ * this one is set far above the seconds a healthy run takes and far below the
+ * days a replayed one shows, and the copy states the measured gap rather than
+ * this constant's verdict. The number a reader acts on is the real one.
+ */
+const RUN_RECENCY_FLOOR_MS = 15 * 60_000
+
+export type RunRecency =
+  | { state: 'CURRENT' }
+  | { state: 'UNDATED' }
+  | { state: 'STALE_RUN'; windowClosedAt: string; completedAt: string }
+
+/**
+ * Whether this assessment describes a window that had already closed when the
+ * run finished.
+ *
+ * A third kind of staleness, and it must not be confused with either of the
+ * others on this surface. The evidence being old is COLLECTION_STALE and is
+ * about the collector. A finding's own tolerance horizon passing is about one
+ * detector's judgement. This is about the run: the numbers may be perfectly
+ * consistent and simply describe a moment that has gone.
+ *
+ * Undated is its own answer rather than a pass. A run that does not say when it
+ * finished cannot be shown to be current, and treating a missing timestamp as
+ * proof of freshness is the reassuring direction of the same error.
+ */
+export function runRecency(run: {
+  windowEnd: string | null
+  completedAt: string | null
+}): RunRecency {
+  const closed = run.windowEnd === null ? NaN : Date.parse(run.windowEnd)
+  const done = run.completedAt === null ? NaN : Date.parse(run.completedAt)
+  if (!Number.isFinite(closed) || !Number.isFinite(done)) {
+    return { state: 'UNDATED' }
+  }
+  if (done - closed <= RUN_RECENCY_FLOOR_MS) return { state: 'CURRENT' }
+  return {
+    state: 'STALE_RUN',
+    windowClosedAt: run.windowEnd as string,
+    completedAt: run.completedAt as string,
+  }
 }

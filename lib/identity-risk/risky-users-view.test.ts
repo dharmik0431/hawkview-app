@@ -16,7 +16,12 @@ import {
   riskyUserCount,
   riskyUserList,
 } from './risky-users-view.ts'
-import { findingEvidenceSummary, ruleScopeSummary } from './presentation.ts'
+import {
+  assessmentUnavailableCopyFor,
+  findingEvidenceSummary,
+  ruleScopeSummary,
+  runRecency,
+} from './presentation.ts'
 import type { MicrosoftEntraRiskyUser } from './types.ts'
 import {
   assessmentFixture,
@@ -1170,5 +1175,92 @@ test('a check with nobody to examine does not read as a check that found nobody'
   assert.equal(
     ruleScopeSummary({ assessedIdentities: null, countsCapped: false }),
     'identities evaluated not reported'
+  )
+})
+
+test('an empty screen never reads as a clean tenant, whatever emptied it', () => {
+  // Every unavailable reason puts a blank surface in front of a technician, and
+  // a blank surface reads as "nothing to worry about" unless the words say
+  // otherwise. This is the bare-zero defect reached by a different route, so
+  // the same rule applies: none of these may be readable as an all-clear.
+  const codes = [
+    'ROLE_NOT_PERMITTED',
+    'NOT_ENABLED_FOR_TENANT',
+    'EVALUATION_DISABLED',
+    'A_REASON_SHIPPED_AFTER_THIS_BUILD',
+  ]
+  const seen = new Set<string>()
+  for (const code of codes) {
+    const copy = assessmentUnavailableCopyFor(code)
+    const rendered = copy.headline + ' ' + copy.caption
+
+    // Each reason says something different. Collapsing them would send a
+    // technician to the wrong place: an administrator, a pilot list and an
+    // operator switch are three different next actions.
+    assert.ok(!seen.has(copy.headline), 'two reasons share a headline: ' + code)
+    seen.add(copy.headline)
+
+    // None of them may be read as a result.
+    assert.match(rendered, /not an all-clear|says nothing about whether/i)
+    assert.ok(
+      !/no risky users|nothing to review|all clear/i.test(rendered),
+      code + ' reads as a clean tenant: ' + rendered
+    )
+    // And none may print the identifier at a technician.
+    assert.ok(!rendered.includes(code), code + ' printed its own code')
+  }
+
+  // A permission boundary and a pilot gate are not faults, and must not be
+  // worded or styled as though something broke. A technician who reads a
+  // working boundary as breakage opens a support ticket about a healthy system.
+  assert.equal(
+    assessmentUnavailableCopyFor('ROLE_NOT_PERMITTED').posture,
+    'PERMISSION'
+  )
+  assert.equal(
+    assessmentUnavailableCopyFor('NOT_ENABLED_FOR_TENANT').posture,
+    'NOT_CONFIGURED'
+  )
+  // An unknown reason guesses neither direction: a fault invents an incident,
+  // a boundary invents a reassurance.
+  assert.equal(
+    assessmentUnavailableCopyFor('A_REASON_SHIPPED_AFTER_THIS_BUILD').posture,
+    'UNRECOGNISED'
+  )
+})
+
+test('a run that describes a window already closed is distinguishable from a current one', () => {
+  // The third kind of staleness on this surface, and the one about the run
+  // rather than the evidence or a detector's horizon.
+  const current = runRecency({
+    windowEnd: '2026-09-10T12:00:00.000Z',
+    completedAt: '2026-09-10T12:00:07.000Z',
+  })
+  assert.equal(current.state, 'CURRENT')
+
+  const replayed = runRecency({
+    windowEnd: '2026-09-06T12:00:00.000Z',
+    completedAt: '2026-09-10T12:00:00.000Z',
+  })
+  assert.equal(replayed.state, 'STALE_RUN')
+
+  // Undated is its own answer, not a pass. A run that cannot say when it
+  // finished cannot be shown to be current, and reading a missing timestamp as
+  // freshness is the reassuring direction of the same mistake.
+  assert.equal(
+    runRecency({ windowEnd: null, completedAt: null }).state,
+    'UNDATED'
+  )
+  assert.equal(
+    runRecency({ windowEnd: '2026-09-10T12:00:00.000Z', completedAt: null })
+      .state,
+    'UNDATED'
+  )
+  assert.equal(
+    runRecency({
+      windowEnd: 'not a date',
+      completedAt: '2026-09-10T12:00:00.000Z',
+    }).state,
+    'UNDATED'
   )
 })
