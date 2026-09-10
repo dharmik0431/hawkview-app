@@ -99,7 +99,7 @@ test('a lower bound is never zero, and zero arrives only through the exact branc
   // Exhaustive: no combination of inputs yields a zero-valued lower bound.
   for (const permitted of [true, false]) {
     for (const subjects of [0, 1, 5]) {
-      const count = countOf(subjects, permitted, { evidenceRequested: [], covered: [], notCovered: [] })
+      const count = countOf(subjects, permitted, { evidenceRequested: [], scopeUnsettled: {}, covered: [], notCovered: [] })
       assert.ok(!(count.accuracy === 'AT_LEAST' && count.value === 0))
       if (count.accuracy === 'EXACT') assert.equal(permitted, true, 'exact requires the claim to be permitted')
     }
@@ -322,6 +322,7 @@ test('a detector the evidence cannot support narrows the scope without blocking 
   // producing the same zero as checks that ran and found nothing.
   assert.deepEqual(result.count.scope, {
     evidenceRequested: ['test fixture: all rows'],
+    scopeUnsettled: {},
     covered: ['silent'],
     notCovered: [{
       detectorId: 'conditional-access',
@@ -345,13 +346,13 @@ test('a crashed detector and an inapplicable one are never the same answer', () 
   assert.deepEqual(skipped.claim, { permitted: true })
   // A crash never silently narrows scope: it is in neither list, because what it
   // would have covered is exactly what we do not know.
-  assert.deepEqual(crashed.count.scope, { evidenceRequested: ['test fixture: all rows'], covered: ['silent'], notCovered: [] })
+  assert.deepEqual(crashed.count.scope, { evidenceRequested: ['test fixture: all rows'], scopeUnsettled: {}, covered: ['silent'], notCovered: [] })
   assert.equal(skipped.count.scope.notCovered.length, 1)
 })
 
 test('a fully covered run says so, so full and partial coverage are distinguishable', () => {
   const result = run([event('1')], { detectors: [matching, silent] })
-  assert.deepEqual(result.count.scope, { evidenceRequested: ['test fixture: all rows'], covered: ['matches-flagged', 'silent'], notCovered: [] })
+  assert.deepEqual(result.count.scope, { evidenceRequested: ['test fixture: all rows'], scopeUnsettled: {}, covered: ['matches-flagged', 'silent'], notCovered: [] })
 })
 
 test('distinct subjects are counted once however many findings they carry', () => {
@@ -455,7 +456,7 @@ test('a detector opting out without saying why is treated as having failed', () 
   assert.deepEqual(result.claim.permitted === false && result.claim.because, ['DETECTOR_FAILED'])
   // And it cannot quietly shrink the scope, which is what a silent opt-out
   // would otherwise buy: absent from covered and from notCovered alike.
-  assert.deepEqual(result.count.scope, { evidenceRequested: ['test fixture: all rows'], covered: ['silent'], notCovered: [] })
+  assert.deepEqual(result.count.scope, { evidenceRequested: ['test fixture: all rows'], scopeUnsettled: {}, covered: ['silent'], notCovered: [] })
 })
 
 test('a non-monotonic detector never sees a truncated window, because it would invent a finding', () => {
@@ -753,4 +754,30 @@ test('a withheld claim explains itself in as many sentences as it has reasons', 
   // A permitted claim has nothing to explain, rather than an empty-string
   // explanation that a surface would render as a blank caption.
   assert.deepEqual(withheldExplanations({ permitted: true }), [])
+})
+
+test('an undecided boundary is reported apart from a known limitation', () => {
+  // PM's ruling. `notCovered` says "one further check cannot run on this
+  // evidence" — the boundary is known. `scopeUnsettled` says "N events are not
+  // yet classified as in or out of scope" — the boundary is provisional. Merged
+  // into one sentence, a provisional zero reads as a settled one.
+  const provisional = run([event('1')], {
+    coverage: coverage({ applies: 1, notYetCited: { RECOGNIZED_BUT_EXCLUSION_UNCITED: 20 } }),
+  })
+
+  // It does not gate: an uncited exclusion must never veto a finding, and the
+  // count stays exact — over the evidence we have decided how to treat.
+  assert.deepEqual(provisional.claim, { permitted: true })
+  assert.deepEqual(figure(provisional.count), { accuracy: 'EXACT', value: 0 })
+
+  // But the scope carries it, at any non-zero value. There is deliberately no
+  // threshold: a threshold would hide the thing it measures.
+  assert.deepEqual(provisional.count.scope.scopeUnsettled, { RECOGNIZED_BUT_EXCLUSION_UNCITED: 20 })
+  assert.deepEqual(provisional.count.scope.notCovered, [], 'not a known limitation')
+
+  // And a settled window says so, so the two are distinguishable rather than
+  // both rendering as an unqualified exact zero.
+  const settled = run([event('1')], { coverage: coverage({ applies: 1 }) })
+  assert.deepEqual(settled.count.scope.scopeUnsettled, {})
+  assert.deepEqual(figure(settled.count), { accuracy: 'EXACT', value: 0 })
 })

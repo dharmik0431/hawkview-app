@@ -1,20 +1,23 @@
-import { coverageForEvaluation, type NormalizationBatch } from '../risky-users-normalization/index.js'
-import type { CollectionScope, Coverage } from '../evaluation-core/contract.js'
-
 /** The seam between the classifier and the evaluation core.
  *
- * Deliberately NOT inside `evaluation-core`. The core is generic over the event
- * type and knows nothing about Microsoft; importing the classifier there would
- * end that in one line. It is equally not inside the classifier, which should
- * not have to know what an evaluation is. It lives between them, and it is the
- * only file that has to change when either side moves.
+ * WHY THIS DIRECTORY EXISTS, because the indirection will look gratuitous to
+ * whoever reads it next:
  *
- * This mapping is the thing an integration branch exists to produce. Both
- * modules compiled together cleanly before this file existed — their files are
- * disjoint, so nothing forced them to agree. What forced it was writing down
- * the conversion, at which point the classifier's fourth bucket had nowhere to
- * land and the gap became a type error rather than a silent omission.
+ * `evaluation-core` is generic over the event type and knows nothing about
+ * Microsoft — that is what lets detection strategy change without touching it,
+ * and one import of the classifier would end it permanently. The classifier
+ * equally should not have to know what an evaluation is. So the conversion
+ * belongs to neither, and lives here, as the only file that changes when either
+ * side moves.
+ *
+ * It is also where an interface mismatch becomes visible. The two modules
+ * compiled together cleanly before this file existed, with two green suites,
+ * because their files are disjoint and nothing forced them to agree. Writing
+ * the conversion down is what made the classifier's fourth coverage bucket a
+ * type error rather than a silently dropped one.
  */
+import { coverageForEvaluation, type NormalizationBatch } from '../risky-users-normalization/index.js'
+import type { CollectionScope, Coverage } from '../evaluation-core/contract.js'
 
 export type CollectionScopeSource = Readonly<{ declared: boolean; asked: string }>
 

@@ -87,6 +87,15 @@ export function composeTenantAssessment(streams: readonly StreamAssessment[]): T
     // has. A tenant-level zero has to name the same gaps its parts named.
     count: countOf(distinctUsers(findings), claim.permitted, {
       evidenceRequested: [...new Set(streams.flatMap(entry => entry.assessment.count.scope.evidenceRequested))],
+      // Unsettled anywhere leaves the tenant boundary provisional: a stream that
+      // settled its own scope cannot make another stream's undecided events
+      // decided, so these accumulate rather than being cancelled by agreement.
+      scopeUnsettled: streams.reduce<Record<string, number>>((merged, entry) => {
+        for (const [reason, count] of Object.entries(entry.assessment.count.scope.scopeUnsettled)) {
+          merged[reason] = (merged[reason] ?? 0) + count
+        }
+        return merged
+      }, {}),
       covered: streams.flatMap(entry => entry.assessment.count.scope.covered),
       notCovered: streams.flatMap(entry => entry.assessment.count.scope.notCovered),
     }),

@@ -94,6 +94,21 @@ export type CountScope = Readonly<{
    * words. Non-empty means the count answers a narrower question than the
    * product claims to ask. */
   notCovered: readonly Readonly<{ detectorId: string; because: string }>[]
+  /** Events we understand and have NOT yet decided are in or out of scope.
+   *
+   * Non-empty means the boundary this count is exact over is PROVISIONAL. That
+   * is a different statement from `notCovered`, which names a known limitation:
+   * "one further check cannot run on this evidence" tells a technician where the
+   * boundary is, and "N events are not yet classified as in or out of scope"
+   * tells them the boundary is not settled. Rendered as one thing, a provisional
+   * zero reads as a settled one.
+   *
+   * So an exact count here is exact over "the evidence we have decided how to
+   * treat", not over "this tenant's evidence". It does not gate — an uncited
+   * exclusion must never veto a finding — and there is deliberately no
+   * threshold at which it flips, because a threshold hides the thing it
+   * measures. Any non-zero value belongs in the sentence. */
+  scopeUnsettled: Readonly<Record<string, number>>
 }>
 
 /** The four states kept distinct, because collapsing any pair of them is how
