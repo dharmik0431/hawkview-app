@@ -117,6 +117,37 @@ test('a signal evaluated and absent is present with a null recency, not omitted'
   assert.equal(signalOf(finding, 'PASSWORD_REJECTED')?.count, 5)
 })
 
+test('a zero in a truncated window is not a finding of none', () => {
+  // THE THIRD CASE, and it is reachable rather than theoretical. This subject
+  // had three password rejections; the window truncates to the most recent
+  // three events, which are all lockouts. The rejections are gone.
+  //
+  // So PASSWORD_REJECTED reports count 0 and latest null — and reading that as
+  // "we looked and found none" states something false about a subject who had
+  // three. `capped` is the only thing distinguishing it from a real zero, which
+  // is why it travels on the signal rather than on the finding.
+  const result = run([
+    ...[1, 2, 3].map(index => event('victim', 'PASSWORD_REJECTED', `2026-09-0${index}T10:00:00.000Z`)),
+    ...[4, 5, 6].map(index => event('victim', 'LOCKED_OUT_AFTER_REPEATED_FAILURES', `2026-09-0${index}T10:00:00.000Z`)),
+  ], 3)
+
+  const rejections = signalOf(result.findings.items[0]!, 'PASSWORD_REJECTED')
+  assert.equal(rejections?.count, 0)
+  assert.equal(rejections?.latest, null)
+  // The bit that stops it being read as a clean signal.
+  assert.equal(rejections?.capped, true)
+
+  // POSITIVE CONTROL: the same subject and the same events, whole window. Now
+  // the zero would be a real zero — and it isn't zero at all, which is the
+  // point: the truncated run reported none where three existed.
+  const whole = signalOf(run([
+    ...[1, 2, 3].map(index => event('victim', 'PASSWORD_REJECTED', `2026-09-0${index}T10:00:00.000Z`)),
+    ...[4, 5, 6].map(index => event('victim', 'LOCKED_OUT_AFTER_REPEATED_FAILURES', `2026-09-0${index}T10:00:00.000Z`)),
+  ]).findings.items[0]!, 'PASSWORD_REJECTED')
+  assert.equal(whole?.count, 3)
+  assert.equal(whole?.capped, false)
+})
+
 test('counts from a truncated window are marked as floors', () => {
   // The window overflows, so `evaluate` keeps only the most recent events and
   // every count the detector produces is a floor. The detector is handed an

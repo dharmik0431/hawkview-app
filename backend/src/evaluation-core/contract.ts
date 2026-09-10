@@ -253,11 +253,23 @@ export type DetectorSignal = Readonly<{
    * generic core can carry a Microsoft-shaped fact without learning it. */
   signal: string
   count: number
-  /** `null` means EVALUATED AND NONE OCCURRED. That is a different fact from
-   * the signal being absent from `signals` entirely, which means it was never
-   * evaluated — "we looked and found none" versus "we did not look" is this
-   * feature's signature defect, and it is as wrong per signal as it was per
-   * tenant. */
+  /** `null` means none occurred IN WHAT WAS READ. Three cases, not two, and the
+   * third is only visible by reading `capped` alongside:
+   *
+   *   latest null, capped false   evaluated in full, and none occurred
+   *   latest null, capped true    none in the part of the window we could read.
+   *                               NOT "none occurred" — a subject with three
+   *                               rejections truncated away reports exactly
+   *                               this, and it is reachable: verified against
+   *                               a window of six events under a budget of
+   *                               three.
+   *   signal absent from `signals`   never evaluated at all
+   *
+   * "We looked and found none" versus "we did not look" is this feature's
+   * signature defect, and it is as wrong per signal as it was per tenant. The
+   * capped case is the same defect a third time: a floor of zero is not a
+   * finding of none, it is the absence of a complete reading, and rendering it
+   * as "none" states something false about a subject who may have had many. */
   latest: SignalRecency | null
 }>
 
