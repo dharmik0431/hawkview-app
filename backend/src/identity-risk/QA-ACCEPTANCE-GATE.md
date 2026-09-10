@@ -191,72 +191,102 @@ it is not maintained by the author whose declarations it checks.
 
 ---
 
-## Re-verified against the merged contract (`4250a27`)
+## Re-verified against `main` (`1142232`)
 
-The gate was written against the lineage the rewrite replaced. It was
-retargeted, not weakened. `tsc --noEmit` is clean, all 14 QA files are in the
-compiler's program (`--listFiles`), and an injected type error is caught and
-disappears again when removed — so the clean typecheck is a result rather than
-a file the compiler never opened.
+An earlier pass of this section was written against `4250a27`, the integration
+tip PM named. `main` is 47 commits beyond it and carries both PM's revert of
+this gate and a further contract change, so that pass was measuring a commit
+nobody is shipping. Everything below is `main`.
 
-### What the rewrite repairs
+`tsc --noEmit` is clean. The cleanliness is accounted for: all 14 QA files are
+in the compiler's program (`--listFiles`), an injected type error is caught,
+and it disappears again when removed.
 
-Run at the wiring layer, against the disposable cluster:
+### Repaired, and this gate can show it
 
-| Scenario | Result |
+| Scenario | Result on `main` |
 | --- | --- |
 | CONTROL — 20 successes, nothing excluded | EXACT 0, scope supports it |
 | MIXED — 4 assessed / 8 `KEEP_ME_SIGNED_IN` | EXACT 0, exclusions travel with the count |
 | FULLY EXCLUDED — 0 applied / 12 excluded | NOT_AVAILABLE / `NOTHING_APPLICABLE` |
 | AUDIT, `Z` and bare timestamps | accepted, EXACT 0 |
 | AUDIT, `+05:00` offset | rejected, count NOT_AVAILABLE — not a zero |
+| TIMESTAMP COHERENCE | **COHERENT** |
 
-Two contract changes close defects this gate raised earlier:
+Three findings this gate raised are closed:
 
-- `assessed + declined === handed` is now enforced (`evaluate.ts:373`). The
-  under-reporting probe — a detector claiming it assessed 5 of 1000 — now
-  reports `CLOSED` where it previously reported `GAP`.
-- A detector may report `assessed: 0` with everything declined and still
-  support a claim. CONTROL shows `assessed: 0, declined:
-  {NOT_A_CREDENTIAL_FAILURE_OUTCOME: 20}` and reaches EXACT 0. The earlier
-  version of this guard told every clean tenant "we cannot tell you."
+- **Timestamp incoherence.** A finding no longer carries one `observedAt`.
+  Each signal carries its own count and `latest`, and the gate now reads
+  `LOCKED_OUT_AFTER_REPEATED_FAILURES` count 6 latest 10:05 alongside
+  `PASSWORD_REJECTED` count 1 latest 20:00 — ten hours apart, each stamped
+  from its own evidence. The gate identifies which signal is which **by count**
+  (six lockouts, one rejection) rather than by name, so it does not pass
+  silently the day the vocabulary changes.
+- **Under-reporting.** `assessed + declined === handed` is now enforced
+  (`evaluate.ts:373`). A detector claiming it assessed 5 of 1000 is rejected;
+  the probe moved from `GAP` to `CLOSED`.
+- **The zero-assessed veto.** A detector may report `assessed: 0` with
+  everything declined and still support a claim. CONTROL shows `assessed: 0,
+  declined: {NOT_A_CREDENTIAL_FAILURE_OUTCOME: 20}` reaching EXACT 0. The
+  earlier version of this guard told every clean tenant "we cannot tell you."
 
-### What it does NOT repair — read this before reading the table above as a pass
+### Not repaired: none of it is reachable
 
 **Nothing outside `risky-users-wiring/`, `risky-users-normalization/` and
-`evaluation-core/` imports any of them.** Repo-wide, the only reference is a
+`evaluation-core/` imports any of them.** Checked repo-wide across
+`backend/src`, `app`, `lib` and `components`; the only reference anywhere is a
 test script in `backend/package.json`. `app.module.ts` still registers
 `IdentityRiskModule`, and `identity-risk.controller.ts` still serves
 `identity-signals/assessment` and `identity-signals/summary` from the old
 engine.
 
-So the five-scenario gate, which drives the old engine through its own reader,
-still fails PRE_EXISTING and MIXED at this commit — a confident exact zero over
-12 security-relevant events with nothing disclosing they fell outside the
-assessed scope. Reproduced twice, same two scenarios. CONTROL passes in the
-same run, so this is not a blanket assertion firing on everything.
+Driven through that old engine — the path a customer actually reaches — this
+gate still fails PRE_EXISTING and MIXED: a confident exact zero over 12
+security-relevant events, with nothing disclosing they fell outside the
+assessed scope. Reproduced on `4250a27` and again on `main`, same two scenarios
+both times, with CONTROL passing in the same run.
 
-The repair is real and it is unreachable. A customer loading Risky Users at
-`4250a27` sees exactly what they saw before.
+The repair is real, it is well built, and at `1142232` it is dead code. A
+customer loading Risky Users today sees exactly what they saw before.
 
-### A probe of mine was wrong, and the guard caught it before I reported it
+### The harness was retargeted without being weakened
 
-`qa-mixed-decision-layer.ts` originally excluded rows using code `53004`. In
-the merged provider facts that code is `NOT_OBSERVED` and classifies as RISK,
-so every row applied, nothing was excluded, and the probe went inert. The
-`inputCanFail` guard reported INCONCLUSIVE rather than a pass.
+Removing `observedAt` removed part of the finding identity `checkMonotonic` was
+keying on. The replacement is NOT `max(signals.latest)` — that value moves as
+events are added, so keying on it would make every monotonic detector look
+broken the moment a newer event arrived. Identity narrowed to the subject.
 
-Then the retargeted fixture reported `BARE ZERO` — which was also wrong. The
-probe's `totalOn` summed only top-level numbers, and `setAside` is an array of
-`{vocabulary, reason, count}` records, so the probe read 0 from a layer that
-was in fact disclosing all eight exclusions. Fixed with a deep sum, and
-confirmed to still discriminate: deleting `setAside` from the scope the probe
-inspects flips it back to `BARE ZERO`.
+Narrowing an identity key means drawing fewer distinctions, and a quieter
+harness reads as a greener product. So signal survival became its own check
+(`SIGNAL_LOST_WHILE_RAN`): a finding may gain signals, but losing one is a
+basis vanishing under a claim that survived, which the identity check cannot
+see because the finding is still there.
 
-Both mistakes have the same root. `provider-facts.ts:74` names `53004` as one
-of two past errors in this workstream — "sound readings of Microsoft's
-documentation for events we have never once seen." A fixture built on a code
-the provider does not emit tests the documentation, not the product.
+That check is proved able to fail. A detector that keeps the same finding and
+drops a signal as the window grows is caught; the same detector with its
+signals held constant is not. The original discrimination still holds too —
+519 findings survive for the presence-keyed detector, the mis-declared
+absence-keyed one fails at trial 1, and a decline is still reported as
+`LOST_TO_DECLINE` rather than as a violation.
+
+### Two probes of mine were wrong, and the guards caught both
+
+`qa-mixed-decision-layer.ts` excluded rows using code `53004`. In the merged
+provider facts that code is `NOT_OBSERVED` and classifies as RISK, so every row
+applied, nothing was excluded, and the probe went inert. The `inputCanFail`
+guard reported INCONCLUSIVE rather than a pass.
+
+Retargeted at `50140`, it then reported `BARE ZERO` — also wrong. Its `totalOn`
+summed only top-level numbers, and `setAside` is an array of
+`{vocabulary, reason, count}` records, so the probe read 0 from a layer that was
+disclosing all eight exclusions. Fixed with a deep sum, and confirmed to still
+discriminate: deleting `setAside` from the inspected scope flips it back to
+`BARE ZERO`.
+
+Both have one root. `provider-facts.ts:74` names `53004` as one of two past
+errors in this workstream — sound readings of Microsoft's documentation for
+events nobody has ever seen. A fixture built on a code the provider does not
+emit tests the documentation, not the product.
 
 ### Deleted
 
@@ -267,4 +297,5 @@ and `qa-reader-lane-contention.database-integration.test.ts` targeted
 `summary`. They could not be ported, only rewritten against a different design.
 
 `qa-security-events-never-zero.database-integration.test.ts` was NOT deleted.
-It is the only thing here that tests the path a customer actually reaches.
+It is the only thing here that tests the path a customer actually reaches, and
+it is the only thing here that still fails.

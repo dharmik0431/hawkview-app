@@ -16,7 +16,8 @@ const pool: readonly Ev[] = [
   { id: 'e', ip: '10.0.0.1', at: t(5) },
 ]
 const accuse = (id: string): Finding => ({ detectorId: id,
-  subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: false as const, because: 'probe' } }, observedAt: t(0) })
+  subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: false as const, because: 'probe' } },
+  signals: [{ signal: 'NEW_IP', count: 1, latest: t(0), capped: false }] })
 
 // WINDOW-DERIVED history: "an IP with no earlier event in this window".
 const windowDerived: Detector<Ev> = { id: 'window-derived', monotonic: true,

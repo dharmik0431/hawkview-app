@@ -25,7 +25,8 @@ const absenceKeyed = (declaredMonotonic: boolean): Detector<Ev> => ({
     const accused = [...new Set(applicable.filter(e => e.kind === 'FAILURE' && !succeeded.has(e.user)).map(e => e.user))]
     return { status: 'RAN', assessed: applicable.length, declined: {},
       findings: accused.map(u => ({ detectorId: declaredMonotonic ? 'absence-MISdeclared' : 'absence-honest',
-        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false as const, because: 'qa probe' } }, observedAt: '2026-09-10T00:00:00.000Z' })) }
+        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false as const, because: 'qa probe' } },
+        signals: [{ signal: 'FAILURE_WITHOUT_SUCCESS', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const })) }
   },
 })
 const run = (detector: Detector<Ev>, maxEvents: number) => evaluate({
@@ -71,7 +72,8 @@ const priorKeyed = (declaredMonotonic: boolean): Detector<Ev> => ({
     const accused = [...new Set(applicable.filter(e => e.kind === 'SUCCESS' && !failedBefore.has(e.user)).map(e => e.user))]
     return { status: 'RAN', assessed: applicable.length, declined: {},
       findings: accused.map(u => ({ detectorId: 'prior-absence',
-        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false as const, because: 'qa probe' } }, observedAt: '2026-09-10T00:00:00.000Z' })) }
+        subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false as const, because: 'qa probe' } },
+        signals: [{ signal: 'FAILURE_WITHOUT_SUCCESS', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const })) }
   },
 })
 const priorFull = run(priorKeyed(false), 100)

@@ -57,27 +57,54 @@ try {
 
   const a = read.assessment
   const finding = a.findings.items[0]
-  const stamped = finding?.observedAt ?? null
   const latestLockout = ago(LOCKOUT_MINUTES).toISOString()
   const loneRejection = ago(REJECTION_MINUTES).toISOString()
-  const fromRejection = stamped !== null && Math.abs(Date.parse(stamped) - Date.parse(loneRejection)) < 60_000
+
+  // The finding no longer carries one `observedAt`. Each signal carries its own
+  // count and its own `latest`, which is exactly the repair this probe asked
+  // for -- so the question changes shape rather than going away. It is no longer
+  // "is the single stamp the wrong one" but "is any signal stamped from evidence
+  // that is not its own".
+  //
+  // Asked by COUNT, not by signal name. The lockout evidence is six events and
+  // the rejection is one, so the arithmetic identifies which signal is which
+  // without this probe having to know the detector's vocabulary. Keying on a
+  // name would assert the mechanism, and would pass silently the day the name
+  // changed.
+  const signals = finding?.signals ?? []
+  const near = (value: string | null, target: string) =>
+    value !== null && Math.abs(Date.parse(value) - Date.parse(target)) < 60_000
+  const misattributed = signals.filter(signal =>
+    (signal.count === 6 && near(signal.latest, loneRejection)) ||
+    (signal.count === 1 && near(signal.latest, latestLockout)))
+  const lockoutSignal = signals.find(signal => signal.count === 6) ?? null
+  const lockoutStampedRight = lockoutSignal !== null && near(lockoutSignal.latest, latestLockout)
+
+  // GUARD. If the six lockouts never became a signal of their own, there is
+  // nothing here that could be misattributed and a clean reading means only
+  // that the scenario did not run.
+  const inputCanFail = lockoutSignal !== null
 
   console.log(JSON.stringify({ QA_TIMESTAMP_COHERENCE: {
     lockouts: 6, rejectionsBelowThreshold: 1,
     latestLockoutAt: latestLockout, theLoneRejectionAt: loneRejection,
-    findings: a.findings.items.length, findingObservedAt: stamped,
+    findings: a.findings.items.length,
+    signals: signals.map(signal => ({ signal: signal.signal, count: signal.count, latest: signal.latest })),
     applies: a.streams[0]!.assessment.coverage.applies,
-    detectorReport: a.streams[0]!.assessment.detectors[0],
-    unknown: a.streams[0]!.assessment.coverage.unknown,
-    doesNotApply: a.streams[0]!.assessment.coverage.doesNotApply,
     count: { accuracy: a.count.accuracy, value: a.count.value },
-    stampedFromTheRejection: fromRejection,
-    hoursApart: stamped === null ? null : Math.round(Math.abs(Date.parse(loneRejection) - Date.parse(latestLockout)) / 3600_000),
+    inputCanFail,
+    lockoutStampedFromItsOwnEvidence: lockoutStampedRight,
+    misattributedSignals: misattributed.map(signal => signal.signal),
+    hoursApart: Math.round(Math.abs(Date.parse(loneRejection) - Date.parse(latestLockout)) / 3600_000),
     verdict: a.findings.items.length === 0 ? 'no finding - the scenario did not fire'
-      : fromRejection
-        ? 'INCOHERENT - the finding rests on lockouts and is stamped with a later rejection that did not contribute to it'
-        : 'COHERENT - the timestamp describes an event that drove the finding',
+      : !inputCanFail ? 'INCONCLUSIVE - the lockouts did not become a signal, so nothing here could be misattributed'
+      : misattributed.length > 0
+        ? 'INCOHERENT - a signal is stamped with the latest of evidence that did not contribute to it'
+        : lockoutStampedRight
+          ? 'COHERENT - each signal is stamped from its own evidence'
+          : 'INCOHERENT - the lockout signal is not stamped from the lockouts',
   } }, null, 2))
+
 } finally {
   await prisma.signInLog.deleteMany({ where: { organizationId } })
   await prisma.directoryUser.deleteMany({ where: { organizationId } })
