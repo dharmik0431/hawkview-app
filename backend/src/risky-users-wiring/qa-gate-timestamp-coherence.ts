@@ -75,10 +75,10 @@ try {
   const near = (value: string | null, target: string) =>
     value !== null && Math.abs(Date.parse(value) - Date.parse(target)) < 60_000
   const misattributed = signals.filter(signal =>
-    (signal.count === 6 && near(signal.latest, loneRejection)) ||
-    (signal.count === 1 && near(signal.latest, latestLockout)))
+    (signal.count === 6 && near(signal.latest?.at ?? null, loneRejection)) ||
+    (signal.count === 1 && near(signal.latest?.at ?? null, latestLockout)))
   const lockoutSignal = signals.find(signal => signal.count === 6) ?? null
-  const lockoutStampedRight = lockoutSignal !== null && near(lockoutSignal.latest, latestLockout)
+  const lockoutStampedRight = lockoutSignal !== null && near(lockoutSignal.latest?.at ?? null, latestLockout)
 
   // GUARD. If the six lockouts never became a signal of their own, there is
   // nothing here that could be misattributed and a clean reading means only
