@@ -88,6 +88,9 @@ const DIRECTORY: readonly DirectoryUserRow[] = [
  */
 function makeReference(): ReferenceResolver {
   const issued = new Map<string, string>();
+  // Deliberately keyed on (kind, identifier) with NO tenant, which is the
+  // resolver shape that looked unsafe and is not: the identifier reaching here
+  // is already a per-tenant directory object id.
   return async (kind, identifier) => {
     const key = `${kind}:${identifier.toLowerCase()}`;
     const existing = issued.get(key);
@@ -2252,4 +2255,98 @@ test('the lockout figure carries a definition, and does not claim the old one co
 
   // The mapping was never in doubt either way: it rests on the direction.
   assert.deepEqual(lockout.disposition, { kind: 'APPLIES', outcome: 'LOCKED_OUT_AFTER_REPEATED_FAILURES' });
+});
+
+// ---------------------------------------------------------------------------
+// The next wider scope: a reference is unique within a tenant, not globally.
+// ---------------------------------------------------------------------------
+
+test('a guest identity in two customer tenants never shares a subject reference', async () => {
+  // WRITTEN FOR A DEFECT THAT TURNED OUT NOT TO EXIST, and kept because the
+  // property is worth locking down regardless.
+  //
+  // The question was a consumer's, asked back at this layer: after building a
+  // scope guarantee, what is the NEXT WIDER scope, and would the same claim be
+  // false there? A verdict does not reach an event (structural). A verdict does
+  // not ascend from an event to a subject (documented). The next one out is
+  // that a subject does not span tenants — and ReferenceResolver takes
+  // (kind, identifier) with no tenant, so it looked held by convention.
+  //
+  // The worry was concrete: the audit path binds subjects on a normalized UPN,
+  // and an external identity is a guest in as many customer tenants as invited
+  // it, so a resolver memoising on (kind, identifier) would hand two MSP
+  // customers the same subjectRef and merge one customer's evidence into
+  // another's. For a tool an MSP reads to decide what to investigate that is
+  // the worst failure available.
+  //
+  // IT CANNOT HAPPEN. The reference is minted from binding.user.microsoftUserId
+  // — the directory object id of the matched user in THAT tenant's directory.
+  // The UPN is only the lookup key and is never handed on as the identity. A
+  // guest in two tenants is two directory objects with two GUIDs.
+  //
+  // I added a scope parameter to the resolver, wrote the justification, and
+  // only found out by MUTATION: making the resolver ignore the scope broke
+  // nothing, which meant the scope was doing no work. Reverted — a seam a peer
+  // is calling does not get a new parameter on a false premise. The resolver
+  // below is deliberately keyed with no tenant, so this test exercises the
+  // shape that looked unsafe.
+  const OTHER_ORGANIZATION = '77777777-7777-4777-8777-777777777777';
+  const OTHER_TENANT = '88888888-8888-4888-8888-888888888888';
+  const GUEST_UPN = 'guest@partner.example';
+
+  // ONE resolver across both runs, which is exactly the caller that used to be
+  // unsafe: it keys its own store per tenant only because the scope arrives.
+  const shared = makeReference();
+
+  const first = await normalizeSignInBatch({
+    scope: SCOPE,
+    source: 'M365_AUDIT_STS',
+    rows: [auditRow({ UserId: GUEST_UPN, LogonError: 'InvalidUserNameOrPassword' })],
+    directory: [{
+      organizationId: ORGANIZATION_ID,
+      customerTenantId: CUSTOMER_TENANT_ID,
+      microsoftUserId: USER_ID,
+      userPrincipalName: GUEST_UPN,
+      userType: 'Guest',
+    }],
+    reference: shared,
+    collectionScope: 'AUDIT_STS_LOGON_EVENTS',
+  });
+
+  const second = await normalizeSignInBatch({
+    scope: {
+      organizationId: OTHER_ORGANIZATION,
+      customerTenantId: OTHER_TENANT,
+      microsoftTenantId: '99999999-9999-4999-8999-999999999999',
+    },
+    source: 'M365_AUDIT_STS',
+    rows: [auditRow({ UserId: GUEST_UPN, LogonError: 'InvalidUserNameOrPassword', OrganizationId: '99999999-9999-4999-8999-999999999999' }, {
+      organizationId: OTHER_ORGANIZATION,
+      customerTenantId: OTHER_TENANT,
+    })],
+    directory: [{
+      organizationId: OTHER_ORGANIZATION,
+      customerTenantId: OTHER_TENANT,
+      microsoftUserId: OTHER_USER_ID,
+      userPrincipalName: GUEST_UPN,
+      userType: 'Guest',
+    }],
+    reference: shared,
+    collectionScope: 'AUDIT_STS_LOGON_EVENTS',
+  });
+
+  // Same person, same UPN, two customers. Both resolve — the feature works —
+  // and the references must differ.
+  assert.equal(first.applies.length, 1);
+  assert.equal(second.applies.length, 1);
+  assert.notEqual(
+    only(first).subjectRef,
+    only(second).subjectRef,
+    'one guest identity was handed the same reference in two customer tenants; evidence would merge across MSP customers',
+  );
+  // And the events carry the scope, so a consumer CAN key on the pair. That is
+  // the half this layer can guarantee; keying on subjectRef alone is still a
+  // mistake a consumer can make, which is why the field says so.
+  assert.equal(only(first).customerTenantId, CUSTOMER_TENANT_ID);
+  assert.equal(only(second).customerTenantId, OTHER_TENANT);
 });

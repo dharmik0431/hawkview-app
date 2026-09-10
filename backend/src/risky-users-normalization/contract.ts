@@ -278,7 +278,16 @@ export interface NormalizedEvent extends NormalizationScope {
   /** ISO-8601 UTC, millisecond precision. */
   readonly eventAt: string;
   readonly ingestedAt: string;
-  /** Protected reference to the resolved directory user. Never a raw identifier. */
+  /**
+   * Protected reference to the resolved directory user. Never a raw identifier.
+   *
+   * Minted from the directory object id of the matched user in THIS tenant's
+   * directory, never from a UPN — so a guest identity present in two customer
+   * tenants gets two references, and evidence cannot merge across MSP
+   * customers. A test asserts it. The event also carries organizationId and
+   * customerTenantId, so a consumer can key on the pair; that is belt and
+   * braces rather than the guarantee.
+   */
   readonly subjectRef: string;
   readonly subjectBinding: SubjectBindingMethod;
   readonly applicationRef: string;
@@ -339,6 +348,39 @@ export type ReferenceResolver = (
   kind: 'subject' | 'application',
   identifier: string,
 ) => Promise<string>;
+
+/*
+ * NO SCOPE PARAMETER, AND THAT WAS CHECKED RATHER THAN ASSUMED — the check
+ * found my own reasoning wrong, so the reasoning is recorded here.
+ *
+ * The worry: a pseudonymised reference is only meaningful inside a namespace,
+ * and this signature cannot express which one. The audit path binds subjects
+ * on a normalized UPN, and an external identity is a guest in as many
+ * customer tenants as invited it — so a resolver memoising on
+ * (kind, identifier) looked able to hand two MSP customers the same
+ * subjectRef, merging one customer's evidence into another's.
+ *
+ * IT CANNOT. The reference is minted from `binding.user.microsoftUserId` —
+ * the DIRECTORY OBJECT ID of the matched user in THAT tenant's directory. The
+ * UPN is only the lookup key; it is never the identity handed on. A guest in
+ * two tenants is two directory objects with two GUIDs, so the references
+ * differ with or without a scope parameter. A test asserts it.
+ *
+ * Caught by mutation: I added the parameter, wrote the justification above,
+ * and only when a mutation making the resolver IGNORE the scope failed to
+ * break anything did it become clear the scope was doing no work. A test that
+ * passes with and without a change is not testing that change.
+ *
+ * ONE RESIDUAL QUESTION, deliberately left open rather than fixed. Application
+ * references ARE minted from a globally shared value: a Microsoft first-party
+ * appId is identical in every tenant, so one resolver across tenants issues
+ * one applicationRef for it. Whether that is correct (it is the same
+ * application) or a leak (it reveals that two customers both use it) is a
+ * question about the resolver's contract, which belongs to its owner. Not
+ * changed here: a seam a peer is calling does not get a new parameter for a
+ * hypothetical, and this layer has spent the day refusing to act on
+ * unverified predicates.
+ */
 
 /** Observed JSON shape of `raw.status.errorCode` on Graph rows. */
 export type ErrorCodeShape =
