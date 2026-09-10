@@ -2010,3 +2010,87 @@ test('the measured reason-name inventory is fully mapped, and artefacts are file
     observation: 'UNRECOGNIZED_REASON_NAME',
   });
 });
+
+// ---------------------------------------------------------------------------
+// The reads-versus-evidence diff, as a standing check rather than a one-off.
+// ---------------------------------------------------------------------------
+
+test('no predicate cites evidence about a field it does not declare', () => {
+  // THE TECHNIQUE, and it is static — no data, no distribution, no query. A
+  // predicate's evidence line says what the claim was VALIDATED on; its
+  // `reads` list says what the code consumes. When the first is wider than the
+  // second, the conclusion rests on more than the code looks at.
+  //
+  // That is how the riskState gap was found, after the fact and by a consumer
+  // asking a question: graph.risk-detail's evidence named the (riskDetail,
+  // riskState) PAIR while its reads list named one field, and the verdict was
+  // derived from half a measured fact. Nothing in any suite could see it,
+  // because every result was correct — correct by coincidence. This test is
+  // the same comparison, run over every predicate, before anyone asks.
+  //
+  // Running it found one more: audit.operation-as-outcome, whose claim names
+  // LogonError and whose evidence is a joint fact about the Operation/LogonError
+  // partition, declared only Operation. Weaker than the riskState instance —
+  // the classifier already read both, so it was the declaration that was short
+  // rather than the logic — and worth fixing anyway, since `reads` is what
+  // another reader diffs and what the disproved-path lists derive from.
+  const TOKEN = /\b(?:raw|managementActivityRecord|sign_in_logs)\.[A-Za-z_][A-Za-z0-9_.]*|\b(?:riskState|riskDetail|LogonError|LoginStatus|ErrorCode|ResultStatus|Operation|failureReason|errorCode|isInteractive|signInEventTypes|servicePrincipalId|servicePrincipalName|conditionalAccessStatus|authenticationDetails|user_id)\b/g;
+  const leaf = (path: string): string => path.split('.').at(-1) ?? path;
+
+  // EXPLAINED MENTIONS, each one a field in a role that is NOT the predicate's
+  // subject — see the three-roles comment in provider-facts.ts. Listed per
+  // predicate rather than globally, so an explanation cannot cover a mention
+  // somewhere else, and a NEW unexplained mention fails instead of every
+  // existing one being grandfathered.
+  const explained: Record<string, readonly string[]> = {
+    // CONTRAST: same shape, different cause. Not read here.
+    'graph.is-interactive-false': ['signInEventTypes'],
+    // CONTROL INSTRUMENT: the disproof is built FROM LogonError-bearing rows.
+    // CONTRAST: Operation is the field to read instead.
+    'audit.result-status': ['LogonError', 'Operation'],
+    // CONTRAST throughout: this entry exists to point at the real record.
+    'signin.synthesized-status-object': ['LogonError', 'Operation', 'managementActivityRecord', 'status'],
+    // CONTRAST: ResultStatus is the field that fails the same control.
+    'audit.operation-as-outcome': ['ResultStatus'],
+    // CONTRAST: names what this layer reads instead, now the question dissolved.
+    'audit.result-code-vocabulary': ['LogonError', 'Operation'],
+    // CONTROL COHORT: names the candidate that did NOT survive its control.
+    'graph.application-actor': ['servicePrincipalId'],
+  };
+
+  const unexplained: string[] = [];
+  for (const predicate of SHAPE_PREDICATES) {
+    const verification = predicate.verification as Record<string, unknown>;
+    const prose = [
+      verification.evidence, verification.control, verification.cohort,
+      verification.controlCohort, verification.revivedBy, predicate.claim,
+    ].filter((value): value is string => typeof value === 'string').join('   ');
+
+    const declared = new Set(predicate.reads.map(leaf));
+    const allowed = new Set(explained[predicate.id] ?? []);
+    for (const match of prose.matchAll(TOKEN)) {
+      const name = leaf(match[0]);
+      if (!declared.has(name) && !allowed.has(name)) {
+        unexplained.push(`${predicate.id} cites ${name} but does not declare it`);
+      }
+    }
+  }
+  assert.deepEqual(
+    [...new Set(unexplained)],
+    [],
+    'a predicate was validated against a field its reads list does not name; widen reads, or record the role',
+  );
+
+  // And the fix that motivated all of this is asserted directly, so the
+  // allowlist above cannot be used to wave it away later.
+  const riskDetail = SHAPE_PREDICATES.find(entry => entry.id === 'graph.risk-detail')!;
+  assert.ok(riskDetail.reads.includes('raw.riskState'), 'the pair is what was measured');
+  const operation = SHAPE_PREDICATES.find(entry => entry.id === 'audit.operation-as-outcome')!;
+  assert.ok(operation.reads.includes('managementActivityRecord.LogonError'));
+
+  // An explanation for a predicate that no longer exists is stale paperwork,
+  // and stale paperwork in a registry is what this module keeps finding.
+  for (const id of Object.keys(explained)) {
+    assert.ok(SHAPE_PREDICATES.some(entry => entry.id === id), `${id} is explained but does not exist`);
+  }
+});

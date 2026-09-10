@@ -1177,6 +1177,28 @@ export function riskDetailVerdict(detail: unknown, state: unknown):
   return { kind: 'VERDICT', verdict: entry.verdict };
 }
 
+/**
+ * THE THREE ROLES A FIELD PLAYS IN A PREDICATE, and why only one is `reads`.
+ *
+ * A static diff of every predicate's `reads` list against the field names in
+ * its own evidence prose found one real gap and five explainable mentions.
+ * The five are informative rather than noise: the prose cites fields in three
+ * distinct roles that this registry does not distinguish.
+ *
+ *  - SUBJECT: the paths the predicate is about. This is `reads`, and it is
+ *    what the disproved-path lists are derived from.
+ *  - CONTROL INSTRUMENT: a field used to build the cohort that must not
+ *    match. `audit.result-status` is disproved BY LogonError-bearing rows;
+ *    LogonError is the instrument, not the subject.
+ *  - CONTRAST: a different predicate mentioned to locate this one.
+ *    `graph.is-interactive-false` cites signInEventTypes as "same shape,
+ *    different cause".
+ *
+ * Only the SUBJECT belongs in `reads`. Adding fields for the other two was
+ * considered and declined: it would be a third registry to keep in step, and
+ * the test that runs this diff carries the explanations instead, so a NEW
+ * unexplained mention fails rather than every existing one.
+ */
 export type ShapePredicateVerification
   = | {
       readonly state: 'PRODUCTION_VERIFIED';
@@ -1524,7 +1546,16 @@ export const SHAPE_PREDICATES: readonly ShapePredicate[] = [
   {
     id: 'audit.operation-as-outcome',
     feed: 'M365_AUDIT_STS',
-    reads: ['managementActivityRecord.Operation'],
+    // LogonError ADDED by the reads-versus-evidence diff. The claim below
+    // names it, the evidence is a JOINT fact about the partition of the two
+    // fields, and the classifier reads both — so declaring only Operation
+    // understated the predicate's scope. Same species as the riskState gap,
+    // with one honest difference worth keeping straight: there the CODE read
+    // half the fact, so the conclusion rested on half; here the code already
+    // read both and only the declaration was short. Documentation, not
+    // behaviour. It still matters, because `reads` is what another reader
+    // diffs and what the disproved-path lists are derived from.
+    reads: ['managementActivityRecord.Operation', 'managementActivityRecord.LogonError'],
     claim:
       'On the audit feed, Operation carries the sign-in outcome: UserLoggedIn is a success and ' +
       'UserLoginFailed is a failure whose reason is named in LogonError.',

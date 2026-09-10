@@ -1149,3 +1149,44 @@ if it is wrong, mapping it asserts something false.
 That is the **third** entry this table has gained from a diff, and none of the three was
 found by a test — which is the argument for the exchange being standing rather than a
 one-off. The Graph side matched exactly: 14 codes measured, 14 declared.
+
+## Addendum: diff what a claim was validated on against what the code reads
+
+A detection technique, and it is **static** — no data, no distribution, no query. Every
+shape predicate carries an evidence line saying what the claim was validated on, and a
+`reads` list saying which paths the code consumes. When the first is wider than the second,
+**the conclusion rests on more than the code looks at.**
+
+That is how the `riskState` gap was found — after the fact, by a consumer asking a question.
+`graph.risk-detail`'s evidence named the `(riskDetail, riskState)` pair while its `reads`
+list named one field. No suite could see it, because every result was correct. Correct by
+coincidence.
+
+Running the comparison across all seventeen predicates found **one more**, and it is now a
+test rather than an exercise. `audit.operation-as-outcome` declared only
+`managementActivityRecord.Operation`, while its claim names `LogonError` and its evidence is
+a joint fact about the *partition* of the two fields. Weaker than the `riskState` instance,
+and the difference is worth keeping straight rather than blurring: there the **code** read
+half the fact, so the conclusion rested on half; here the classifier already read both and
+only the declaration was short. Documentation, not behaviour. Still worth fixing, because
+`reads` is what another reader diffs and what the disproved-path lists are derived from.
+
+### The five other mentions were informative, not noise
+
+The diff also flagged five field names that appear in prose and not in `reads`, and all five
+are correct as they stand — because the prose cites fields in **three distinct roles** that
+the registry does not distinguish:
+
+| Role | Belongs in `reads`? | Example |
+| --- | --- | --- |
+| **subject** — the paths the predicate is about | yes | `raw.riskDetail` |
+| **control instrument** — the field the cohort is built from | no | `audit.result-status` is disproved *by* `LogonError`-bearing rows |
+| **contrast** — another predicate, cited to locate this one | no | `graph.is-interactive-false` cites `signInEventTypes` as "same shape, different cause" |
+
+Adding registry fields for the other two roles was considered and declined: a third registry
+to keep in step is how two tables silently disagree, which has happened here twice. The test
+carries the explanations instead, **keyed per predicate**, so an explanation cannot cover a
+mention somewhere else and a *new* unexplained mention fails rather than every existing one
+being grandfathered. A stale explanation for a predicate that no longer exists also fails.
+
+Two mutations: understating either predicate's `reads` again fails the check.
