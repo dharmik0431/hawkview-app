@@ -57,6 +57,28 @@ export type OutOfScopeReason =
    */
   | 'APPLICATION_CONFIGURATION_ERROR'
   /**
+   * 16003 and 50020, WHEN THE SUBJECT RESOLVES. The subject exists in the
+   * tenant and is not provisioned for the resource the application asked
+   * for. A provisioning artefact, and no statement about the user's
+   * credentials at all.
+   *
+   * A SIBLING OF APPLICATION_CONFIGURATION_ERROR RATHER THAN THE SAME
+   * REASON, and the difference is not cosmetic. That one rests on a
+   * Microsoft statement about a misconfigured reply address — a fault in how
+   * the app is set up. This one rests on a MEASUREMENT that contradicts
+   * Microsoft's own text, which is a different kind of ground and ages
+   * differently. Sharing a name would collapse them and lose which is
+   * which.
+   *
+   * WHY IT CANNOT FIRE ON AN ABSENT SUBJECT, structurally rather than by
+   * convention: a row whose subject fails to bind returns from normalizeRow
+   * BEFORE classification, so reaching a disposition at all proves the
+   * subject resolved. The conditional the ruling asked for is the pipeline's
+   * existing order, not a new mechanism — adding an explicit check would be
+   * a second guard for something the first already covers.
+   */
+  | 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE'
+  /**
    * 50133, 50173. Microsoft attributes both to a password change or a revoked
    * grant. This is remediation taking effect rather than a sign-in attempt —
    * and 50173 carries the remediation timestamp, which makes it useful
@@ -237,6 +259,7 @@ export const OUT_OF_SCOPE_LABELS: Readonly<Record<OutOfScopeReason, string>> = {
   KEEP_ME_SIGNED_IN: 'Keep-me-signed-in prompt, which Microsoft documents as an expected part of the sign-in flow',
   INSUFFICIENT_SESSION_FOR_SILENT_SIGN_IN: 'Existing session was insufficient for silent sign-in, which Microsoft documents as expected',
   SIGN_IN_FREQUENCY_POLICY_EXPIRY: 'A session lapsed under the tenant’s own sign-in-frequency policy, which Microsoft documents as the expected result of configuring one',
+  SUBJECT_NOT_PROVISIONED_FOR_RESOURCE: 'The user exists in the tenant but is not provisioned for the resource the application requested; a provisioning artefact, not a statement about credentials',
   APPLICATION_CONFIGURATION_ERROR: 'The application’s reply address is misconfigured, which Microsoft documents as a fault in the application rather than anything about the user',
   SESSION_INVALIDATED_BY_REMEDIATION: 'A session stopped working because a password was changed or a grant was revoked, which is remediation taking effect rather than a sign-in attempt',
   NON_INTERACTIVE_SIGN_IN: 'Background sign-in rather than a person entering a credential',

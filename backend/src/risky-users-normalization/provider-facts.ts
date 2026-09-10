@@ -251,6 +251,54 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     disposition: { kind: 'APPLIES', outcome: 'BLOCKED_BY_CONTROL' },
   },
   {
+    code: 16003,
+    graphObservation: 'OBSERVED',
+    microsoftName: 'SsoUserAccountNotFoundInResourceTenant',
+    claimClass: 'NEITHER',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE' },
+    exclusionCitation: {
+      kind: 'PRODUCT_DECISION',
+      text:
+        'RESTS ON A MEASUREMENT THAT CONTRADICTS MICROSOFT’S OWN TEXT, which is why it is a product ' +
+        'decision and not a provider statement. Microsoft says the user "hasn’t been explicitly added ' +
+        'to the tenant"; measured, the single observed row resolves to a Member of the tenant, from ' +
+        'HawkView’s own tenant connector. A multi-tenant app hitting a user context not provisioned ' +
+        'for the resource it requested is a provisioning artefact — not enumeration, not a credential ' +
+        'event, and not a signal about the customer. Where the subject does NOT resolve the row never ' +
+        'reaches this mapping at all; see UNREACHABLE_BY_SUBJECT_RESOLUTION.',
+    },
+    note:
+      'PREVIOUSLY UNMAPPED ON A PREMISE THAT WAS FALSE. The code sat in ' +
+      'UNREACHABLE_BY_SUBJECT_RESOLUTION on the grounds that it describes a subject by definition ' +
+      'absent from the directory, so a single row came out UNRECOGNIZED_ERROR_CODE — a FALSE ' +
+      'STATEMENT, since the code was recognised, cited, and deliberately filed. A technician sent to ' +
+      'look for an unrecognised code would have found a documented one. That one row was also the ' +
+      'entire reason a Microsoft-verdict count was withheld rather than reported as a clean zero.',
+  },
+  {
+    code: 50020,
+    graphObservation: 'OBSERVED',
+    microsoftName: 'UserUnauthorized',
+    claimClass: 'NEITHER',
+    disposition: { kind: 'DOES_NOT_APPLY', reason: 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE' },
+    exclusionCitation: {
+      kind: 'PRODUCT_DECISION',
+      text:
+        'RESTS ON A MEASUREMENT THAT CONTRADICTS MICROSOFT’S OWN TEXT, identically to 16003. ' +
+        'Microsoft says the account "from identity ' +
+        'provider does not exist in tenant"; the single observed row resolves to a Member, from ' +
+        'HawkView’s own connector. I had suspected this code shared 16003’s problem and it does, in ' +
+        '100% of observed instances for both. ' +
+        'NOT GENERALISED TO APP-ACTOR TRAFFIC. Both rows come from our own connector, and the ' +
+        'tempting move — exclude traffic that looks like an application actor — is the ' +
+        'servicePrincipalId mistake: a predicate built on our own rows that also matches every human. ' +
+        'The disposition is per CODE, on a stated provider meaning, not per application.',
+    },
+    note:
+      'See 16003. Both were unmapped on the same false premise and both are now conditional on ' +
+      'subject resolution — structurally, because binding precedes classification.',
+  },
+  {
     code: 53004,
     graphObservation: 'NOT_OBSERVED',
     verdict: 'RISK',
@@ -504,6 +552,32 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
  * directory user means the enumeration signal lands in SUBJECT_NOT_IN_DIRECTORY
  * with the code discarded. Detecting enumeration needs a path for unresolved
  * subjects, which is a scope decision and not this layer's to make.
+ */
+/**
+ * Codes whose subject is OFTEN absent from the directory — so when it is, the
+ * row is lost before classification and the loss should be visible.
+ *
+ * THE PREMISE WAS STRONGER AND IT WAS FALSE. It read "codes whose subject is
+ * BY DEFINITION absent from the directory, so the classifier structurally
+ * cannot attribute them" — which was read straight off Microsoft's own text
+ * for these codes, and is wrong in 100% of the instances we hold. Both
+ * observed members resolve to Members of the tenant. `enumerationCodedRows`
+ * never fired for either, because it counts rows that FAILED subject
+ * resolution and these did not: the blind-spot counter was watching the
+ * wrong door.
+ *
+ * A CASE WHERE DOCUMENTATION AND DATA DISAGREE AND THE DATA WINS, which is
+ * worth naming because the discipline here usually runs the other way —
+ * refusing to map a code without a provider statement. A provider statement
+ * says what a code MEANS; it does not say what our rows contain, and this
+ * premise used the first as though it were the second.
+ *
+ * MEMBERSHIP IS UNCHANGED. The citations describe a PATTERN — clusters from
+ * one source are enumeration — and that stands for the unresolved case. What
+ * it never was is a disposition for a single attributable row. So these codes
+ * are now BOTH mapped in RESULT_CODES (for when the subject resolves) and
+ * listed here (for when it does not), and those are two different facts
+ * rather than a contradiction.
  */
 export const UNREACHABLE_BY_SUBJECT_RESOLUTION: readonly {
   readonly code: number;

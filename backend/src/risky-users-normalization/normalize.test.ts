@@ -367,7 +367,9 @@ test('every out-of-scope code carries a documented citation', () => {
   // 53004 is NO LONGER HERE: the observation is that MFA configuration was
   // blocked, which is ours; "due to suspicious activity" is the judgement, and
   // it now travels as a verdict instead of removing the event.
-  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [50011, 50058, 50133, 50140, 50173, 70044]);
+  // 16003 and 50020 ARE here now, and they are the only two resting on a
+  // measurement rather than on a provider statement.
+  assert.deepEqual(excluded.map(entry => entry.code).sort((a, b) => a - b), [16003, 50011, 50020, 50058, 50133, 50140, 50173, 70044]);
   for (const entry of excluded) {
     assert.ok(
       entry.exclusionCitation && entry.exclusionCitation.text.length > 15,
@@ -383,14 +385,38 @@ test('every out-of-scope code carries a documented citation', () => {
   }
   assert.equal(resultCodeEntry(50140)!.exclusionCitation!.kind, 'PROVIDER_STATEMENT');
   assert.equal(resultCodeEntry(50058)!.exclusionCitation!.kind, 'PROVIDER_STATEMENT');
-  // And nothing is excluded on Microsoft's judgement any more, which was the
-  // one PRODUCT_DECISION exclusion in the table. Every remaining exclusion
-  // rests on a Microsoft statement about what the code MEANS.
-  for (const entry of excluded) {
-    assert.equal(
-      entry.exclusionCitation!.kind,
-      'PROVIDER_STATEMENT',
-      `code ${entry.code} is excluded on our own choice; the verdict dimension is where a judgement goes`,
+
+  // EXACTLY TWO PRODUCT DECISIONS, and they are the two where a MEASUREMENT
+  // contradicts Microsoft's own text. Every other exclusion rests on a
+  // provider statement about what the code means. The kinds age differently —
+  // a provider statement is a fact about the world, a product decision is a
+  // choice we can revisit — so which is which has to stay legible.
+  //
+  // Asserted as a closed LIST rather than as "no product decisions allowed":
+  // the previous version of this test banned the kind outright, on the
+  // accident that the only one had just been retired. Banning a legitimate
+  // category because it happens to be empty is how a vocabulary loses a
+  // member it needs — the same mistake as keeping an unproduced member, from
+  // the other direction.
+  const productDecisions = excluded
+    .filter(entry => entry.exclusionCitation!.kind === 'PRODUCT_DECISION')
+    .map(entry => entry.code)
+    .sort((a, b) => a - b);
+  assert.deepEqual(productDecisions, [16003, 50020]);
+  //
+  // A PRODUCT DECISION LEADS WITH ITS GROUNDS. Asserted on the OPENING of the
+  // citation rather than as a keyword search, and that distinction cost a
+  // mutation: the first version matched /MEASUREMENT|measured/ anywhere in the
+  // text, and deleting the clause that states the grounds still passed —
+  // because the word "measured" appears again further down. An alternation
+  // over synonyms is a weaker assertion than it looks, since prose repeats
+  // words. Fourth instance of presence-is-not-attribution in this file, so it
+  // is now a convention with a fixed position rather than a search.
+  for (const code of productDecisions) {
+    assert.match(
+      resultCodeEntry(code)!.exclusionCitation!.text,
+      /^RESTS ON A MEASUREMENT/,
+      `code ${code} is excluded on our own choice and must OPEN with what that choice rests on`,
     );
   }
 });
@@ -467,18 +493,67 @@ test('the two expected-flow codes are out of scope', async () => {
   }
 });
 
-test('the enumeration codes are recorded as a known blind spot rather than mapped', () => {
-  // Requiring a resolved directory user means these can never be classified:
-  // by definition their subject is not in the directory.
-  assert.deepEqual(UNREACHABLE_BY_SUBJECT_RESOLUTION.map(entry => entry.code).sort((a, b) => a - b), [16003, 50020, 50034, 51004]);
-  // The blind spot is no longer theoretical: two of the fourteen OBSERVED
-  // codes fall into it, so real rows are being discarded before classification.
+test('the blind-spot list says its subject is OFTEN absent, not absent by definition', () => {
+  // THE PREMISE WAS FALSE IN 100% OF THE INSTANCES WE HOLD, and this test used
+  // to assert it: requiring a resolved directory user means these can never be
+  // classified, because by definition their subject is not in the directory.
+  //
+  // Measured: both OBSERVED members resolve to Members of the tenant, and both
+  // rows are our own tenant connector hitting a user context not provisioned
+  // for the resource it requested. enumerationCodedRows never fired for
+  // either, because it counts rows that FAILED subject resolution and these
+  // did not — the blind-spot counter was watching the wrong door.
+  //
+  // The premise was read straight off Microsoft's own text for these codes,
+  // which is the part worth keeping: a provider statement says what a code
+  // MEANS, and this used it as though it said what our rows CONTAIN.
+  assert.deepEqual(
+    UNREACHABLE_BY_SUBJECT_RESOLUTION.map(entry => entry.code).sort((a, b) => a - b),
+    [16003, 50020, 50034, 51004],
+    'membership is unchanged: the citations describe a PATTERN, which stands for the unresolved case',
+  );
   const observedBlind = UNREACHABLE_BY_SUBJECT_RESOLUTION.filter(e => e.graphObservation === 'OBSERVED');
   assert.deepEqual(observedBlind.map(e => e.code).sort((a, b) => a - b), [16003, 50020]);
   for (const entry of observedBlind) assert.ok((entry.citation ?? '').length > 40, String(entry.code));
-  for (const entry of UNREACHABLE_BY_SUBJECT_RESOLUTION) {
-    assert.equal(dispositionForCode(entry.code).kind, 'UNKNOWN', 'must not be silently mapped');
+
+  // The two OBSERVED members are now ALSO mapped, and being in both places is
+  // two facts rather than a contradiction: mapped for when the subject
+  // resolves, listed here for when it does not.
+  for (const code of [16003, 50020]) {
+    assert.deepEqual(
+      dispositionForCode(code),
+      { kind: 'DOES_NOT_APPLY', reason: 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE' },
+      `code ${code}`,
+    );
   }
+  // The two never-observed members stay unmapped: nothing has contradicted
+  // Microsoft's text for them, and a measurement on two other codes is not
+  // evidence about these.
+  for (const code of [50034, 51004]) {
+    assert.equal(dispositionForCode(code).kind, 'UNKNOWN', `code ${code} must not be mapped by analogy`);
+  }
+});
+
+test('a resolved subject is what makes the disposition reachable, structurally', async () => {
+  // The ruling asked for a disposition CONDITIONAL on subject resolution. No
+  // conditional was needed: a row whose subject fails to bind returns from
+  // normalizeRow BEFORE classification, so reaching a disposition at all
+  // proves the subject resolved. Adding an explicit check would be a second
+  // guard for something the first already covers.
+  //
+  // Both halves asserted, because the pair is the claim.
+  const resolved = await run([graphRow({ status: { errorCode: 16003 } })]);
+  assert.deepEqual(only(resolved).classification, {
+    kind: 'DOES_NOT_APPLY',
+    reason: 'SUBJECT_NOT_PROVISIONED_FOR_RESOURCE',
+  });
+  assert.equal(resolved.counts.unknownByObservation.UNRECOGNIZED_ERROR_CODE, 0,
+    'this row used to be reported as an unrecognised code, which was a false statement about it');
+
+  const unresolved = await run([graphRow({ userId: OTHER_USER_ID, status: { errorCode: 16003 } })]);
+  assert.equal(unresolved.events.length, 0, 'no event, so no disposition was reached');
+  assert.equal(unresolved.counts.unprocessableByReason.SUBJECT_NOT_IN_DIRECTORY, 1);
+  assert.equal(unresolved.coverage.enumerationCodedRows, 1, 'and the blind spot still counts it');
 });
 
 // ---------------------------------------------------------------------------
@@ -1394,7 +1469,14 @@ test('every mapped code declares whether we have actually seen it', () => {
     );
   }
   const seen = RESULT_CODES.filter(entry => entry.graphObservation === 'OBSERVED');
-  assert.equal(seen.length, 12, 'twelve of the fourteen observed codes are mapped');
+  // ALL FOURTEEN now, since 16003 and 50020 were mapped once a measurement
+  // contradicted the premise that had kept them out. Nothing observed on this
+  // feed is unaccounted for.
+  assert.equal(seen.length, 14, 'every observed code is mapped');
+  assert.deepEqual(
+    seen.map(entry => entry.code).sort((a, b) => a - b),
+    [...OBSERVED_GRAPH_ERROR_CODES].sort((a, b) => a - b),
+  );
 });
 
 test('observed codes we do not map are recorded, and cost coverage rather than being invented', async () => {
