@@ -374,6 +374,102 @@ function FindingDetail({ finding }: { finding: RiskAssessmentFinding }) {
   )
 }
 
+/**
+ * What a technician does next, if they conclude the account is compromised.
+ *
+ * Three things this is deliberately not.
+ *
+ * It is not per-rule. HawkView's detectors know that something looks worth
+ * reviewing; they do not know the remedy, and attaching containment steps to a
+ * specific rule would imply the rule had determined them. This is the response
+ * procedure for a compromised account, which is the same whichever finding
+ * raised the question.
+ *
+ * It is not an instruction. Every other sentence on this surface says these are
+ * investigation leads and not confirmed compromise. "Disable the account" would
+ * undo that in one line, so the guidance is conditional throughout and
+ * attributed to Microsoft rather than issued by HawkView.
+ *
+ * It is not actionable from here. No buttons, no links that do anything.
+ * HawkView reads; the technician acts in Microsoft's own tools.
+ */
+function ContainmentGuidance({ user }: { user: RiskAssessmentUser }) {
+  const mailbox = user.subjectType === 'MAILBOX'
+  return (
+    <details className="mt-4 rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+      <summary className="cursor-pointer text-sm font-semibold text-slate-900 dark:text-slate-50">
+        {mailbox
+          ? 'If you confirm this mailbox has been tampered with'
+          : 'If you confirm this account is compromised'}
+      </summary>
+      <p className="mt-2 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+        Nothing above establishes compromise, and this is not HawkView
+        recommending that you act. It is Microsoft&rsquo;s documented response
+        procedure, summarised so it is to hand if your own investigation
+        concludes the {mailbox ? 'mailbox' : 'account'} was misused. HawkView
+        makes no changes to Microsoft; every step below is carried out in
+        Microsoft&rsquo;s own tools.
+      </p>
+
+      {!mailbox && (
+        <>
+          <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            Microsoft&rsquo;s order
+          </p>
+          <ol className="mt-1.5 list-decimal space-y-1.5 pl-5 text-xs leading-relaxed text-slate-700 dark:text-slate-300">
+            <li>
+              Disable the account. Microsoft prefers this to a password reset,
+              because it stops sessions and new sign-ins at once.
+            </li>
+            <li>Revoke the account&rsquo;s sessions and refresh tokens.</li>
+            <li>
+              Review the registered MFA methods and remove any the owner does
+              not recognise.
+            </li>
+            <li>
+              Review applications the account has consented to, and the
+              permissions each was granted.
+            </li>
+            <li>Review any administrative roles the account holds.</li>
+            <li>Review mail forwarding and inbox rules on the mailbox.</li>
+          </ol>
+        </>
+      )}
+
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        Easily missed
+      </p>
+      <ul className="mt-1.5 list-disc space-y-1.5 pl-5 text-xs leading-relaxed text-slate-700 dark:text-slate-300">
+        <li>
+          Inbox rules can be hidden from the usual view.{' '}
+          <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-800">
+            Get-InboxRule -IncludeHidden
+          </code>{' '}
+          lists them; a forwarding rule an attacker created is a common thing to
+          miss.
+        </li>
+        {!mailbox && (
+          <>
+            <li>
+              Do not send a new password to the user by email. If the mailbox is
+              compromised, the attacker receives it too — use a channel you have
+              separately confirmed.
+            </li>
+            <li>
+              For a directory-synchronised account, the password must be reset
+              twice, so that the previous hash cannot be replayed.
+            </li>
+            <li>
+              App passwords are not revoked by a password reset and have to be
+              removed separately.
+            </li>
+          </>
+        )}
+      </ul>
+    </details>
+  )
+}
+
 export function RiskAssessmentDrawer({
   user,
   onClose,
@@ -622,6 +718,7 @@ export function RiskAssessmentDrawer({
             {user.findings.map((finding) => (
               <FindingDetail key={finding.id} finding={finding} />
             ))}
+            <ContainmentGuidance user={user} />
           </section>
         </div>
       </div>
