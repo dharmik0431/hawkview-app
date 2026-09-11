@@ -239,12 +239,20 @@ function adaptSubject(item: Record<string, unknown>): NativeSubject | null {
   return {
     kind,
     ref,
-    // Inside the subject, which is where this type says identity belongs and
-    // where the server is moving to put it. Identity resolution is gated on
-    // the caller's role, so a missing name is expected for some readers and
-    // must not look like a failure of ours.
-    displayName: optionalText(source.displayName, 200),
-    userPrincipalName: optionalText(source.userPrincipalName, 320),
+    // BESIDE the subject, on the item, and read from there rather than from
+    // inside it. `finding.subject` is what the detector produced; the name is
+    // a read-time join against the directory that the controller adds when the
+    // role permits. Folding it in would present a directory lookup as
+    // something the detector found.
+    //
+    // This field moved four times in an hour across two branches, and every
+    // collision looked identical from one side: a null where a name should be.
+    // What settled it was not an argument about which shape was nicer -- it
+    // was a test asserting POSITION. Both suites had asserted presence, which
+    // either side can satisfy alone, and presence is exactly what cannot fail
+    // when the two disagree.
+    displayName: optionalText(item.displayName, 200),
+    userPrincipalName: optionalText(item.userPrincipalName, 320),
   }
 }
 

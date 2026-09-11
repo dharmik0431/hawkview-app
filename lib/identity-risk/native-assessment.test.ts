@@ -257,16 +257,15 @@ test('an identity the caller may not see is a narrower view, not a failure', () 
         items: [
           {
             ...items[0],
-            // Inside subject, which is the shape this contract settled on and
-            // the one the server is moving to. Written deliberately rather
-            // than to match whatever the code happened to do, because the
-            // rewritten UI fixtures will encode whatever this says.
             subject: {
               kind: 'DIRECTORY_USER',
               userRef: 'c54eb6ce-0000-0000-0000-000000000001',
-              displayName: 'Alice Chen',
-              userPrincipalName: 'alice.chen@synthetic.invalid',
             },
+            // Beside the subject, which is where the shipped controller puts
+            // it: the detector produced the subject, the controller joined the
+            // name at read time when the role permitted.
+            displayName: 'Alice Chen',
+            userPrincipalName: 'alice.chen@synthetic.invalid',
           },
         ],
       },
@@ -449,17 +448,25 @@ test('a figure never reaches a surface without the scope it is exact over', () =
   assert.match(unscoped.caption, /did not report what it examined/)
 })
 
-test('a resolved name reaches the row from inside the subject', () => {
+test('a resolved name reaches the row from beside the subject, and only from there', () => {
   // The shipped screen said "Identity not resolved" on every row while the
   // payload carried the names, because the two sides put identity one level
   // apart: beside subject on the wire, inside it here. Both placements are
   // defensible, both were commented, and nothing compared them, which is why
   // 469 tests here and 1,273 there all passed.
   //
-  // Settled as inside-subject, and the server moves to match -- chosen because
-  // it is what the rewritten UI fixtures will encode permanently, not because
-  // one redeploy was cheaper. This asserts the settled shape end to end, from
-  // payload through to the rendered row.
+  // This asserts POSITION, not presence, and that distinction is the whole
+  // lesson. Both suites asserted the name was there, which either side can
+  // satisfy alone -- and presence is exactly what cannot fail when the two
+  // sides disagree about where "there" is. The field moved four times tonight
+  // and every collision looked the same from one side: a null where a name
+  // should be.
+  //
+  // So the negative half below matters more than the positive one: a name
+  // placed only inside the subject must NOT reach the row. Without it this
+  // test would pass against an adapter reading either level, which is the
+  // fixture-that-cannot-discriminate failure that let the original defect
+  // through in the first place.
   const wire = {
     version: NATIVE_RISKY_USERS_VERSION,
     available: true,
@@ -490,9 +497,9 @@ test('a resolved name reaches the row from inside the subject', () => {
           subject: {
             kind: 'DIRECTORY_USER',
             userRef: 'c54eb6ce-0000-0000-0000-000000000001',
-            displayName: 'Dara Fixture',
-            userPrincipalName: 'dara@fixture.invalid',
           },
+          displayName: 'Dara Fixture',
+          userPrincipalName: 'dara@fixture.invalid',
           signals: [
             {
               signal: 'PASSWORD_REJECTED',
@@ -749,4 +756,67 @@ test('every shipped detector is both named and actionable', () => {
     detectorGuidanceFor('something-shipped-after-this-build').length,
     0
   )
+})
+
+test('a name in the wrong place does not reach the row', () => {
+  // The discriminating half. An adapter reading either level would satisfy the
+  // positive assertions; only this one fails when the position is wrong.
+  const subjectLevel = adaptNativeAssessment({
+    version: NATIVE_RISKY_USERS_VERSION,
+    available: true,
+    subjectsNamed: true,
+    run: { windowStart: null, windowEnd: null, completedAt: null },
+    collectors: [],
+    coverage: [],
+    count: {
+      accuracy: 'EXACT',
+      value: 1,
+      scope: {
+        evidenceRequested: [],
+        setAside: [],
+        covered: [],
+        notCovered: [],
+      },
+    },
+    claim: { permitted: true },
+    findings: {
+      complete: true,
+      items: [
+        {
+          detectorId: 'repeated-credential-failure',
+          subject: {
+            kind: 'DIRECTORY_USER',
+            userRef: 'c54eb6ce-0000-0000-0000-000000000003',
+            // Deliberately misplaced: this is the shape the backend briefly
+            // shipped and reverted. It must not be silently accepted, or the
+            // two sides can disagree again without anything failing.
+            displayName: 'Should Not Appear',
+            userPrincipalName: 'should-not-appear@fixture.invalid',
+          },
+          signals: [
+            {
+              signal: 'PASSWORD_REJECTED',
+              count: 2,
+              capped: false,
+              latest: null,
+            },
+          ],
+        },
+      ],
+    },
+  })
+  assert.ok(subjectLevel)
+  assert.equal(
+    subjectLevel!.available && subjectLevel!.findings[0].subject.displayName,
+    null
+  )
+
+  const rows = nativeRiskyUserList(subjectLevel).rows
+  assert.ok(
+    !/Should Not Appear/.test(rows[0].name),
+    'a name in the wrong position reached the row, so position is not asserted'
+  )
+  // And the row still says which of the two causes applies rather than
+  // inventing a failure of ours.
+  assert.equal(rows[0].name, 'Identity not resolved')
 })
