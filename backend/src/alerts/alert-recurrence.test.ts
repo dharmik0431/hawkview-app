@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { decideRecurrence } from './alert-recurrence.js'
-import { OPENED, RECORDED, acknowledge, applyObservation, type AlertLifecycle } from './alert-lifecycle.js'
+import { OPENED, RECORDED, acknowledge, applyObservation, resolveInvestigation, type AlertLifecycle } from './alert-lifecycle.js'
 import { evidenceFromSync } from '../risky-users-wiring/evidence-availability.js'
 
 /** The five recurrence cases, which must not collapse into each other.
@@ -19,7 +19,7 @@ const visibilityLost: AlertLifecycle = { ownership: 'ACKNOWLEDGED', condition: '
 
 test('more of the same on an open incident updates quietly', () => {
   for (const lifecycle of [open, ownedAndLive]) {
-    const outcome = decideRecurrence({ lifecycle, crosses: null, alreadyEscalated: [] })
+    const outcome = decideRecurrence({ lifecycle, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true })
     assert.equal(outcome.action, 'UPDATE_QUIETLY')
     assert.equal(outcome.notify, false)
   }
@@ -30,7 +30,7 @@ test('evidence that CHANGES WHAT THIS IS sends exactly one notification', () => 
   // same source is materially different from more failures, and a flat quiet rule
   // would swallow it.
   const first = decideRecurrence({
-    lifecycle: ownedAndLive, crosses: 'SUCCESS_FOLLOWED_FAILURES', alreadyEscalated: [],
+    lifecycle: ownedAndLive, crosses: 'SUCCESS_FOLLOWED_FAILURES', alreadyEscalated: [], opensInvestigationByDefault: true,
   })
   assert.equal(first.action, 'ESCALATE')
   assert.equal(first.notify, true)
@@ -39,7 +39,7 @@ test('evidence that CHANGES WHAT THIS IS sends exactly one notification', () => 
   // ONE notification however many events cross the line. A second crossing of
   // the SAME signal escalates the incident again but tells nobody twice.
   const second = decideRecurrence({
-    lifecycle: ownedAndLive, crosses: 'SUCCESS_FOLLOWED_FAILURES', alreadyEscalated: ['SUCCESS_FOLLOWED_FAILURES'],
+    lifecycle: ownedAndLive, crosses: 'SUCCESS_FOLLOWED_FAILURES', alreadyEscalated: ['SUCCESS_FOLLOWED_FAILURES'], opensInvestigationByDefault: true,
   })
   assert.equal(second.action, 'ESCALATE')
   assert.equal(second.notify, false, 'one escalation notification, not one per event')
@@ -47,20 +47,20 @@ test('evidence that CHANGES WHAT THIS IS sends exactly one notification', () => 
   // POSITIVE CONTROL: a DIFFERENT signal is a different thing to say, so it does
   // notify even though one escalation has already been sent.
   const other = decideRecurrence({
-    lifecycle: ownedAndLive, crosses: 'SUBJECT_HOLDS_PRIVILEGED_ROLE', alreadyEscalated: ['SUCCESS_FOLLOWED_FAILURES'],
+    lifecycle: ownedAndLive, crosses: 'SUBJECT_HOLDS_PRIVILEGED_ROLE', alreadyEscalated: ['SUCCESS_FOLLOWED_FAILURES'], opensInvestigationByDefault: true,
   })
   assert.equal(other.notify, true)
 })
 
 test('activity after the condition cleared reactivates it and notifies', () => {
-  const outcome = decideRecurrence({ lifecycle: clearedButOpen, crosses: null, alreadyEscalated: [] })
+  const outcome = decideRecurrence({ lifecycle: clearedButOpen, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true })
   assert.equal(outcome.action, 'REACTIVATE_CONDITION')
   assert.equal(outcome.notify, true, 'the person who owns it needs to know it came back')
 
   // An escalation signal rides along, so the message can say what changed rather
   // than only that something recurred.
   const escalating = decideRecurrence({
-    lifecycle: clearedButOpen, crosses: 'SUCCESS_FOLLOWED_FAILURES', alreadyEscalated: [],
+    lifecycle: clearedButOpen, crosses: 'SUCCESS_FOLLOWED_FAILURES', alreadyEscalated: [], opensInvestigationByDefault: true,
   })
   assert.equal(escalating.action, 'REACTIVATE_CONDITION')
   assert.equal(escalating.action === 'REACTIVATE_CONDITION' && escalating.signal, 'SUCCESS_FOLLOWED_FAILURES')
@@ -69,7 +69,7 @@ test('activity after the condition cleared reactivates it and notifies', () => {
 test('activity after a RESOLVED investigation opens a new linked episode, never a silent reopen', () => {
   // Without the episode boundary, an attack next month silently joins last
   // month's closed incident and nobody is told — grouping becoming its own bug.
-  const outcome = decideRecurrence({ lifecycle: resolved, crosses: null, alreadyEscalated: [] })
+  const outcome = decideRecurrence({ lifecycle: resolved, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true })
   assert.equal(outcome.action, 'OPEN_LINKED_EPISODE')
   assert.equal(outcome.notify, true)
 
@@ -78,7 +78,7 @@ test('activity after a RESOLVED investigation opens a new linked episode, never 
   const withEverything = decideRecurrence({
     lifecycle: resolved,
     crosses: 'SUCCESS_FOLLOWED_FAILURES',
-    alreadyEscalated: ['SUCCESS_FOLLOWED_FAILURES'],
+    alreadyEscalated: ['SUCCESS_FOLLOWED_FAILURES'], opensInvestigationByDefault: true,
   })
   assert.equal(withEverything.action, 'OPEN_LINKED_EPISODE')
   assert.equal(withEverything.notify, true, 'a resolved investigation is never silently reopened')
@@ -93,7 +93,7 @@ test('ACTIVITY AFTER A COLLECTION GAP MUST NOTIFY', () => {
   // ARRIVES, so it never fires on a quiet recovery — it fires exactly when
   // activity reappears after a blind spot. Under the old rule, breaking
   // collection was enough to make an incident go silent when it came back.
-  const outcome = decideRecurrence({ lifecycle: visibilityLost, crosses: null, alreadyEscalated: [] })
+  const outcome = decideRecurrence({ lifecycle: visibilityLost, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true })
   assert.equal(outcome.action, 'RESUMED_AFTER_GAP')
   assert.equal(outcome.notify, true)
 
@@ -104,7 +104,7 @@ test('ACTIVITY AFTER A COLLECTION GAP MUST NOTIFY', () => {
   // POSITIVE CONTROL: an incident that never lost visibility still updates
   // quietly, so this is about the gap rather than a function that now notifies
   // for everything — which would be the 301 defect restored.
-  const live = decideRecurrence({ lifecycle: ownedAndLive, crosses: null, alreadyEscalated: [] })
+  const live = decideRecurrence({ lifecycle: ownedAndLive, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true })
   assert.equal(live.notify, false)
 })
 
@@ -116,7 +116,7 @@ test('a gap reports even when the escalation was already sent', () => {
   const outcome = decideRecurrence({
     lifecycle: visibilityLost,
     crosses: 'SUCCESS_FOLLOWED_FAILURES',
-    alreadyEscalated: ['SUCCESS_FOLLOWED_FAILURES'],
+    alreadyEscalated: ['SUCCESS_FOLLOWED_FAILURES'], opensInvestigationByDefault: true,
   })
   assert.equal(outcome.action, 'RESUMED_AFTER_GAP')
   assert.equal(outcome.notify, true)
@@ -130,7 +130,7 @@ test('a new episode after a resolved investigation starts UNOWNED', () => {
   // acknowledgement forward is the system deciding somebody owns a thing they
   // have never seen, and it hides the episode from the one queue built to catch
   // it.
-  const outcome = decideRecurrence({ lifecycle: resolved, crosses: null, alreadyEscalated: [] })
+  const outcome = decideRecurrence({ lifecycle: resolved, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true })
   assert.equal(outcome.action, 'OPEN_LINKED_EPISODE')
   assert.equal(outcome.action === 'OPEN_LINKED_EPISODE' && outcome.startsAs.ownership, 'UNACKNOWLEDGED')
   assert.equal(outcome.action === 'OPEN_LINKED_EPISODE' && outcome.startsAs.investigation, 'OPEN')
@@ -171,7 +171,7 @@ test('THE WHOLE GAP SCENARIO, end to end', () => {
 
   // Activity arrives again. THIS notifies — otherwise looking away is enough to
   // silence the incident.
-  const resumed = decideRecurrence({ lifecycle: duringGap, crosses: null, alreadyEscalated: [] })
+  const resumed = decideRecurrence({ lifecycle: duringGap, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true })
   assert.equal(resumed.action, 'RESUMED_AFTER_GAP')
   assert.equal(resumed.notify, true)
 
@@ -188,12 +188,12 @@ test('A RECORD CAN BECOME AN INVESTIGATION, but only on escalating evidence', ()
   // "Records do not open investigations" is a default, not a prohibition. Without
   // this a routine change that turns out to be the first step of something would
   // be structurally un-investigable — one dead end traded for another.
-  const quiet = decideRecurrence({ lifecycle: RECORDED, crosses: null, alreadyEscalated: [] })
+  const quiet = decideRecurrence({ lifecycle: RECORDED, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: false })
   assert.equal(quiet.action, 'UPDATE_QUIETLY')
   assert.equal(quiet.notify, false, 'more routine activity is still routine')
 
   const promoted = decideRecurrence({
-    lifecycle: RECORDED, crosses: 'CORROBORATED_BY_SECOND_SOURCE', alreadyEscalated: [],
+    lifecycle: RECORDED, crosses: 'CORROBORATED_BY_SECOND_SOURCE', alreadyEscalated: [], opensInvestigationByDefault: false,
   })
   assert.equal(promoted.action, 'ESCALATE_INTO_INVESTIGATION')
   assert.equal(promoted.notify, true)
@@ -209,19 +209,19 @@ test('a record that cleared and returned is not reported as a reactivation', () 
   // it would claim a person's investigation came back to life, when there was
   // never an investigation — the wrong sentence, and one a reader acts on.
   const clearedRecord = { ...RECORDED, condition: 'CLEARED' as const }
-  const outcome = decideRecurrence({ lifecycle: clearedRecord, crosses: null, alreadyEscalated: [] })
+  const outcome = decideRecurrence({ lifecycle: clearedRecord, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true })
   assert.equal(outcome.action, 'UPDATE_QUIETLY')
   assert.notEqual(outcome.action, 'REACTIVATE_CONDITION')
 
   // And a gap on a record does not borrow the gap notification either, unless it
   // brings escalating evidence with it.
   const afterGap = { ...RECORDED, condition: 'UNKNOWN' as const }
-  assert.equal(decideRecurrence({ lifecycle: afterGap, crosses: null, alreadyEscalated: [] }).action, 'UPDATE_QUIETLY')
+  assert.equal(decideRecurrence({ lifecycle: afterGap, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true }).action, 'UPDATE_QUIETLY')
 
   // POSITIVE CONTROL: the same cleared-and-returned shape WITH an investigation
   // does reactivate, so the above is about the record.
   const realCleared: AlertLifecycle = { ownership: 'ACKNOWLEDGED', condition: 'CLEARED', investigation: 'OPEN' }
-  assert.equal(decideRecurrence({ lifecycle: realCleared, crosses: null, alreadyEscalated: [] }).action, 'REACTIVATE_CONDITION')
+  assert.equal(decideRecurrence({ lifecycle: realCleared, crosses: null, alreadyEscalated: [], opensInvestigationByDefault: true }).action, 'REACTIVATE_CONDITION')
 })
 
 test('promotion is not suppressed by the escalation dedup list', () => {
@@ -232,8 +232,90 @@ test('promotion is not suppressed by the escalation dedup list', () => {
   const outcome = decideRecurrence({
     lifecycle: RECORDED,
     crosses: 'CORROBORATED_BY_SECOND_SOURCE',
-    alreadyEscalated: ['CORROBORATED_BY_SECOND_SOURCE'],
+    alreadyEscalated: ['CORROBORATED_BY_SECOND_SOURCE'], opensInvestigationByDefault: false,
   })
   assert.equal(outcome.action, 'ESCALATE_INTO_INVESTIGATION')
   assert.equal(outcome.notify, true)
+})
+
+test('A RECORD THAT PROMOTED ONCE DOES NOT STAY PROMOTED FOREVER', () => {
+  // THE DEFECT THIS TEST WAS WRITTEN FOR, found by being asked whether "once" was
+  // enforced or merely true. It was merely true.
+  //
+  // A record promotes, a person resolves it, and new routine activity arrives.
+  // The lifecycle now reads RESOLVED — indistinguishable from an ordinary resolved
+  // incident, because it no longer remembers having been a record. The new episode
+  // therefore opened as an investigation, so ONE escalation promoted every future
+  // routine change on that incident key with no escalating evidence of its own.
+  // Escalate once, escalate forever: routine activity permanently back in the
+  // queue, which is the 301 problem re-entering through the fix for it.
+  const promoted = decideRecurrence({
+    lifecycle: RECORDED,
+    crosses: 'CORROBORATED_BY_SECOND_SOURCE',
+    alreadyEscalated: [],
+    opensInvestigationByDefault: false,
+  })
+  assert.equal(promoted.action, 'ESCALATE_INTO_INVESTIGATION')
+  const live = promoted.action === 'ESCALATE_INTO_INVESTIGATION' ? promoted.startsAs : OPENED
+  assert.equal(live.investigation, 'OPEN')
+
+  // A person resolves it, then routine activity arrives again.
+  const closed = resolveInvestigation(live)
+  const next = decideRecurrence({
+    lifecycle: closed,
+    crosses: null,
+    alreadyEscalated: [],
+    opensInvestigationByDefault: false,
+  })
+  assert.equal(next.action, 'OPEN_LINKED_EPISODE')
+  // BACK TO BEING A RECORD. The promotion was a property of that episode's
+  // evidence, never of the type.
+  assert.equal(
+    next.action === 'OPEN_LINKED_EPISODE' && next.startsAs.investigation,
+    'NONE',
+    'a promoted-then-resolved record must not have its next episode born as an investigation')
+
+  // POSITIVE CONTROL: a type that DOES open investigations still gets an
+  // investigation episode from the identical call, so the line above is about the
+  // type rather than a function that always returns a record.
+  const realType = decideRecurrence({
+    lifecycle: closed,
+    crosses: null,
+    alreadyEscalated: [],
+    opensInvestigationByDefault: true,
+  })
+  assert.equal(realType.action === 'OPEN_LINKED_EPISODE' && realType.startsAs.investigation, 'OPEN')
+})
+
+test('promotion happens at most ONCE PER EPISODE, and that is what makes skipping dedup safe', () => {
+  // The reason for not consulting the dedup list has to survive a second
+  // promotion. It does, because within one episode a second promotion is
+  // unreachable: after promoting, the investigation is OPEN, so the record branch
+  // cannot fire again.
+  const first = decideRecurrence({
+    lifecycle: RECORDED,
+    crosses: 'CORROBORATED_BY_SECOND_SOURCE',
+    alreadyEscalated: [],
+    opensInvestigationByDefault: false,
+  })
+  const afterPromotion = first.action === 'ESCALATE_INTO_INVESTIGATION' ? first.startsAs : OPENED
+
+  const again = decideRecurrence({
+    lifecycle: afterPromotion,
+    crosses: 'CORROBORATED_BY_SECOND_SOURCE',
+    alreadyEscalated: [],
+    opensInvestigationByDefault: false,
+  })
+  assert.notEqual(again.action, 'ESCALATE_INTO_INVESTIGATION', 'the same episode cannot promote twice')
+  // It is an ordinary escalation now, which IS dedup-governed — the two questions
+  // separating cleanly rather than one borrowing the other's answer.
+  assert.equal(again.action, 'ESCALATE')
+
+  const deduped = decideRecurrence({
+    lifecycle: afterPromotion,
+    crosses: 'CORROBORATED_BY_SECOND_SOURCE',
+    alreadyEscalated: ['CORROBORATED_BY_SECOND_SOURCE'],
+    opensInvestigationByDefault: false,
+  })
+  assert.equal(deduped.notify, false, 'and once promoted, the usual one-notification rule applies')
 })

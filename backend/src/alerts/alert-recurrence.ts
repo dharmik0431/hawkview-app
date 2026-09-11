@@ -1,4 +1,4 @@
-import { OPENED, openInvestigation, type AlertLifecycle } from './alert-lifecycle.js'
+import { OPENED, RECORDED, openInvestigation, type AlertLifecycle } from './alert-lifecycle.js'
 import type { EscalationSignal } from './alert-type.js'
 
 /** What happens when matching evidence arrives for something already open.
@@ -52,10 +52,24 @@ export interface RecurrenceInput {
    * notification however many events crossed the line, so a signal that has
    * already been reported updates quietly. */
   readonly alreadyEscalated: readonly EscalationSignal[]
+  /** `opensInvestigation` from the alert type's declaration — whether THIS TYPE
+   * opens an investigation by default, which is not the same as whether this
+   * incident currently has one.
+   *
+   * REQUIRED BECAUSE THE LIFECYCLE CANNOT ANSWER IT, and a defect lived in the
+   * gap. A record that promoted into an investigation and was then resolved has
+   * `investigation: 'RESOLVED'` — indistinguishable from an ordinary resolved
+   * incident, because the lifecycle no longer remembers it began as a record. The
+   * new episode therefore opened as an investigation, which means one escalation
+   * promoted every FUTURE routine change on that incident key, with no escalating
+   * evidence of its own. Escalate once, escalate forever: routine activity back in
+   * the queue permanently, which is the 301 problem re-entering through the fix
+   * meant to prevent it. */
+  readonly opensInvestigationByDefault: boolean
 }
 
 export function decideRecurrence(input: RecurrenceInput): RecurrenceOutcome {
-  const { lifecycle, crosses, alreadyEscalated } = input
+  const { lifecycle, crosses, alreadyEscalated, opensInvestigationByDefault } = input
 
   // 1. The investigation was closed by a person. Activity after that is a NEW
   //    EPISODE linked to the prior one — never a silent reopen, because an
@@ -67,7 +81,16 @@ export function decideRecurrence(input: RecurrenceInput): RecurrenceOutcome {
     // Ownership means a person said they own THIS; carrying it forward is the
     // system deciding somebody owns a thing they have never seen, and it hides
     // the new episode from the one queue built to catch it.
-    return { action: 'OPEN_LINKED_EPISODE', notify: true, startsAs: OPENED }
+    //
+    // And it starts as whatever THE TYPE is, not as whatever the last episode
+    // became. A record that was promoted once must not have every later episode
+    // born as an investigation — the promotion was a property of that episode's
+    // evidence, never of the type.
+    return {
+      action: 'OPEN_LINKED_EPISODE',
+      notify: true,
+      startsAs: opensInvestigationByDefault ? OPENED : RECORDED,
+    }
   }
 
   // 2. A RECORD that has gained evidence of a different character. It becomes an
@@ -76,9 +99,19 @@ export function decideRecurrence(input: RecurrenceInput): RecurrenceOutcome {
   //    Checked here, before the condition branches, because a record's condition
   //    moves like any other and a cleared-then-returned record would otherwise be
   //    reported as a reactivation of something that was never being investigated.
-  //    Note the escalation-deduplication list is deliberately NOT consulted:
-  //    crossing a threshold for the first time on a record is the moment it stops
-  //    being a record, which happens once and cannot be "already reported".
+  //    THE DEDUPLICATION LIST IS DELIBERATELY NOT CONSULTED, and the reason has to
+  //    survive a second promotion — because a second promotion is possible.
+  //
+  //    The two answer different questions. Deduplication answers "have we already
+  //    told somebody about this signal"; promotion answers "has this stopped being
+  //    a record". The second is not the first's to decide.
+  //
+  //    What makes that safe rather than merely tidy: promotion happens at most
+  //    ONCE PER EPISODE, because after it the investigation is OPEN and this
+  //    branch is unreachable. `alreadyEscalated` is scoped per episode as well, so
+  //    it can never legitimately hold a promotion belonging to the episode being
+  //    decided. A LATER episode may promote again on its own evidence, which is
+  //    correct — and is why the reason is stated per episode rather than "once".
   if (lifecycle.investigation === 'NONE') {
     if (crosses === null) return { action: 'UPDATE_QUIETLY', notify: false }
     return {

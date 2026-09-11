@@ -33,6 +33,12 @@ empty, which is the 301 defect rebuilt. `resolved` is worse and quieter: it read
 as "a person closed this", and the recurrence rules would then open a new linked
 episode on *every* recurrence — an episode manufactured per event.
 
+**A three-valued state read by two-valued code fails in one direction.** Anything
+that asks "is this resolved?" and treats *not OPEN* as yes will read a record as
+resolved. There is no second reader today, so this is not a defect — it is a note
+for whoever writes 02 through 04, because that reader is coming. Ask
+`investigation === 'RESOLVED'`, never `!== 'OPEN'`.
+
 They are orthogonal. An acknowledged investigation can have an active condition. A
 cleared condition does not close an investigation.
 
@@ -172,6 +178,44 @@ collector is still live — lateness is a property of the feed, not of the event
 Arrival time is still recorded, because it is genuinely useful; the constraint is
 on the **decision path**, not on the system.
 
+
+### What counts as cleared must not be weaker than what was claimed
+
+`monitoring.tenant_disconnected` says *"HawkView cannot see this tenant"*. It
+clears on `EVERY_COVERED_SOURCE_READABLE`, and it previously cleared on
+`CONNECTION_VERIFIED`, which was wrong in a way worth recording.
+
+A verified connection is positive evidence rather than an absence of complaints —
+that part was right. But *collection can resume* is a weaker claim than the one the
+alert opened on. The inverse of cannot-see is **evidence arrived**, not the
+handshake works. The failure is concrete: a tenant reconnects with narrower
+consent, or reconnects cleanly while one collector still returns
+`PERMISSION_REQUIRED`. The connection verifies, the alert closes, and an MSP has
+been told their visibility came back when part of it did not.
+
+`COLLECTOR_REPORTS_SUCCESS` would not have fixed it either: it is satisfied by
+**any one** collector succeeding, which is the same partial visibility in different
+words. The plural in `EVERY_COVERED_SOURCE_READABLE` is the whole content of it.
+
+**How long that leaves an ACT_NOW open**, measured from the scheduler rather than
+estimated:
+
+| Path | Latency after reconnect |
+|---|---|
+| Incremental (`USERS`, sign-ins) | ~5 min — `USER_INCREMENTAL_REFRESH_MS` is 5 min and the heartbeat is 5 min |
+| Daily anchors (`LICENSES`, `DOMAINS`) | due immediately if >24h stale, but attempts are spaced by `DAILY_INVENTORY_FAILURE_RETRY_MS` — so up to ~1h |
+| Bounded transient-retry resources | 30 min base, doubling to a 6h cap, after repeated transient failures |
+
+A tenant disconnected long enough to raise an `ACT_NOW` is already past the 24h
+daily window, so its anchors are due at the next heartbeat. There is no five-hour
+schedule anywhere; the only route to hours is the transient-retry backoff, and
+permission-shaped failures are explicitly excluded from that set.
+
+**The two-stage version needs no new machinery, because the axes already separate
+it.** "Stop paging" is a notification decision and belongs to routing in step 05;
+"resolve" is the condition and investigation axes. A connection verifying can stop
+the paging without clearing the condition, and nothing here has to change for that
+to become possible later.
 ### Arrival *order* is a second, subtler mistake
 
 Using arrival **time** is caught by the brand. Using arrival **order** is not: an
@@ -212,7 +256,25 @@ reason a new episode does: nobody has yet looked at this *as* an investigation,
 and pre-filling an owner hides it from the queue it just joined. And the
 escalation-deduplication list is deliberately **not** consulted for a promotion —
 crossing a threshold for the first time on a record is the moment it stops being a
-record, which happens once and cannot be "already reported".
+record, and deduplication has no business answering that question.
+
+**A promotion belongs to an episode, not to the type.** A record that promoted
+once must not have every later episode born as an investigation. That defect was
+real and is now tested: after promotion the lifecycle reads `RESOLVED` once a
+person closes it, which is indistinguishable from an ordinary resolved incident —
+the lifecycle no longer remembers having been a record. The new episode therefore
+opened as an investigation, so **one escalation promoted every future routine
+change on that incident key with no escalating evidence of its own.** Escalate
+once, escalate forever, which is the 301 problem re-entering through the fix for
+it. `decideRecurrence` now takes `opensInvestigationByDefault` from the
+declaration, because the lifecycle genuinely cannot answer it.
+
+That also settles why skipping the deduplication list for a promotion is safe
+rather than merely tidy. Promotion happens at most **once per episode** — after it
+the investigation is `OPEN` and the record branch is unreachable — and
+`alreadyEscalated` is scoped per episode too, so it can never legitimately hold a
+promotion belonging to the episode being decided. A later episode may promote
+again on its own evidence, which is correct.
 
 **2. I got the collection-gap rule backwards, and QA caught it.** I had activity
 arriving after a gap update *quietly*, reasoning that otherwise every collector

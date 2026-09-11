@@ -37,6 +37,19 @@ export type Severity =
  */
 export type ConditionClearedWhen =
   | Readonly<{ kind: 'COLLECTOR_REPORTS_SUCCESS'; because: string }>
+  /** EVERY source this alert covers is readable again — not one of them.
+   *
+   * Added because the existing members were all too weak for an alert whose
+   * claim is "HawkView cannot see this tenant". `CONNECTION_VERIFIED` says the
+   * handshake works, which is a weaker claim than the one the alert opened on: a
+   * tenant can reconnect with narrower consent, or reconnect cleanly while one
+   * collector still returns PERMISSION_REQUIRED. And `COLLECTOR_REPORTS_SUCCESS`
+   * is satisfied by ANY one collector succeeding, which is the same partial
+   * visibility wearing a different word.
+   *
+   * The inverse of "cannot see" is "can see all of it". The plural is the whole
+   * content of this member, which is why it is in the name. */
+  | Readonly<{ kind: 'EVERY_COVERED_SOURCE_READABLE'; because: string }>
   | Readonly<{ kind: 'CONNECTION_VERIFIED'; because: string }>
   | Readonly<{ kind: 'CONFIGURATION_RESTORED'; because: string }>
   | Readonly<{

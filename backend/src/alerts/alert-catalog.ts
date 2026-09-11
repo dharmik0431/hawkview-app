@@ -120,9 +120,29 @@ export const ALERT_CATALOG = [
     // Demonstrably recovered: the connection verifies or it does not.
     investigationCloses: 'AUTOMATICALLY_WHEN_CONDITION_CLEARS',
     summary: 'HawkView cannot see this tenant',
+    // CLEARS ON EVIDENCE, NOT ON THE HANDSHAKE.
+    //
+    // This was CONNECTION_VERIFIED, and the reasoning for it was half right: a
+    // verified connection IS positive evidence rather than an absence of
+    // complaints. But "collection can resume" is a weaker claim than the one this
+    // alert opened on. The summary says HawkView cannot SEE this tenant, and the
+    // inverse of cannot-see is evidence arrived — not the handshake works.
+    //
+    // The failure that makes it matter: a tenant reconnects with narrower consent,
+    // or reconnects cleanly while one collector still returns PERMISSION_REQUIRED.
+    // The connection verifies, the alert closes, and an MSP has been told their
+    // visibility came back when part of it did not. On a phone-tier page, which is
+    // how people learn to stop trusting pages.
+    //
+    // COLLECTOR_REPORTS_SUCCESS would not have fixed it either — it is satisfied
+    // by ANY one collector succeeding, which is the same partial visibility in
+    // different words. Hence the plural in EVERY_COVERED_SOURCE_READABLE.
     conditionClears: {
-      kind: 'CONNECTION_VERIFIED',
-      because: 'A verified connection is positive evidence that collection can resume, not an absence of complaints.',
+      kind: 'EVERY_COVERED_SOURCE_READABLE',
+      because:
+        'The claim this alert makes is that HawkView cannot see the tenant, so only every covered source ' +
+        'being readable again retracts it. A verified connection proves collection CAN resume; it does not ' +
+        'prove anything arrived, and one collector answering does not prove the rest did.',
     },
     escalations: [
       {

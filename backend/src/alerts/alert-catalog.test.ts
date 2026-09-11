@@ -213,3 +213,25 @@ test('a record declares escalations, so it can become an investigation', () => {
   assert.equal(routine.opensInvestigation, false)
   assert.ok(routine.escalations.length > 0, 'a routine change must be able to turn out to matter')
 })
+
+test('an alert must not clear on a weaker claim than it opened on', () => {
+  // tenant_disconnected specifically, because it is a phone-tier page and a page
+  // that clears on a weaker signal than it fired on is how people learn to stop
+  // trusting pages.
+  const blind = alertType('monitoring.tenant_disconnected')
+  assert.equal(blind.summary, 'HawkView cannot see this tenant')
+
+  // The inverse of "cannot see" is "can see all of it".
+  assert.equal(blind.conditionClears.kind, 'EVERY_COVERED_SOURCE_READABLE')
+
+  // NOT the handshake: a tenant can reconnect with narrower consent, or reconnect
+  // cleanly while one collector still returns PERMISSION_REQUIRED.
+  assert.notEqual(blind.conditionClears.kind, 'CONNECTION_VERIFIED')
+  // And NOT any-one-collector, which is the same partial visibility reworded.
+  assert.notEqual(blind.conditionClears.kind, 'COLLECTOR_REPORTS_SUCCESS')
+
+  // POSITIVE CONTROL: CONNECTION_VERIFIED is still right where the claim really is
+  // about the connection rather than about seeing. Consent expiring is retracted by
+  // re-consent, which a verification does observe.
+  assert.equal(alertType('monitoring.consent_expiring').conditionClears.kind, 'CONNECTION_VERIFIED')
+})
