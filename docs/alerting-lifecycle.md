@@ -737,3 +737,64 @@ routine-wording test, not by the tests written for casing.
 - **A verdict that is right with the wrong reason.** Every weakening lists each rule
   that fired. If a record shows one reason where two apply, the collection step was
   short-circuited.
+
+### Nothing calls this classifier yet
+
+`ConditionalAccessState` and `classifyConditionalAccessChange` are referenced only
+from their own tests and from QA's probes — nowhere in `backend/src` outside
+`src/alerts/`. The operator defect above was real and fixing it before wiring is
+cheaper than after, but **no MSP has seen a relaxed policy filed as a record,
+because nothing is classifying anything yet.**
+
+Recorded because this section is where someone goes to judge how urgent the gap
+was, and because overstating exposure spends attention a real gap elsewhere needed.
+The honest claim is: the defect existed in code that is not yet reachable.
+
+### The `unmodelledFingerprint` producer: still a decision, not a gap to fill
+
+`unmodelledFingerprint` is declared, read by the classifier, and **produced by
+nothing**. Every reference outside `privileged-change.ts` is a fixture supplying
+`'same'`, `'before'` or `'after'`. So the coupling the field's doc comment describes
+— digest the unmodelled part, never the whole policy — is currently unverifiable and
+rests on that comment.
+
+QA delivered `auditProducer()` as the contract, proven against a whole-policy digest
+and a constant one. Both are real failure directions and the audit catches both.
+**But its signature cannot describe the producer we need.**
+
+`FingerprintProducer` is `(policy: ConditionalAccessState) => string`, and
+`ConditionalAccessState` is a closed interface of six fields — it cannot carry an
+unmodelled dimension. So the audit's silent-direction case is constructed as:
+
+```ts
+{ ...base, someDimensionMicrosoftAddedLater: 'changed' } as ConditionalAccessState
+```
+
+The cast adds a field the type forbids, which makes the audit prove a property about
+a shape that cannot exist. It is the *test cannot check what it injects* form with
+the type system as the thing bypassed: a producer taking the **mapped state** has
+nothing to miss, because the unmodelled dimensions were dropped before it was
+called. A real producer must digest **the collected Graph policy.**
+
+That is what makes this a decision rather than a task. The producer needs the
+correspondence between each modelled field and its Graph path — `grantOperator` ←
+`grantControls.operator`, `excludedPrincipals` ← `conditions.users.excludeUsers` and
+its siblings — and that is a second list which must agree with the first, with
+nothing forcing it to. Exactly the coupling class that produced three defects in a
+week.
+
+**It may not need to be a new list.** `change-evidence.service.ts` already
+canonicalises `CONDITIONAL_ACCESS` policies, with unordered-array handling for
+`builtInControls`, `termsOfUse`, `authenticationStrength` and the exclude-lists.
+That is an existing production notion of "the collected policy, canonicalised", and
+deriving the digest from it would make the fingerprint evidence-based rather than a
+parallel declaration.
+
+Two reasons it is not done here: it reaches into `backend/src/changes/`, outside the
+alerts-and-docs scope this work was given; and that directory has pre-existing
+uncommitted changes in another worktree that are not ours to touch. Both need a
+ruling before the producer is written.
+
+Until it exists, `unmodelledFingerprint` is a contract the classifier honours and
+nothing supplies — which is safe in the sense that no change can slip past a guard
+that no data reaches, and unsafe the moment the first producer is written carelessly.
