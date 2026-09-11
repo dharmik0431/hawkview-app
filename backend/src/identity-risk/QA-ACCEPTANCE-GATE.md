@@ -476,3 +476,73 @@ thing that removed it is the leak.** Leak is now checked first.
 One incidental confirmation: names are role-gated on `evidenceDetailAllowed`, and
 the response carries `subjectsNamed` so a surface can say "your role does not show
 names" rather than rendering blanks.
+
+### Reading the shipped screen without the preview harness
+
+The preview harness (`preview-risky-users.mjs`) does not run against `d3932fa`:
+it has no module-map entry for `@/lib/identity-risk/native-view`, and beneath
+that it mocks `./identity-risk-hooks` while the component now imports
+`useNativeRiskyUsersRead` from `./risky-users-assessment-hooks`. It was green for
+weeks while the screen rendered the old engine and broke when the wire moved —
+**stale at exactly the seam the 52 UI tests are stale at.**
+
+So these two tools read the screen a different way, and found two customer-facing
+defects in fifteen minutes on a path where every suite is green:
+
+- `qa-dump-native-response.ts` captures a **real** native response from the
+  shipped backend path (`evaluateAndPersistTenant` → `RiskyUsersController`) on a
+  disposable database. `QA_MODE` selects `positive` / `zero` / `unavailable` /
+  `atleast` / `unnamed`.
+- `qa-render-native.mjs` runs that response through the frontend's own
+  `adaptNativeAssessment` and `nativeRiskyUserList` and prints what the screen
+  says.
+
+Using a real response rather than an authored fixture matters twice over: no
+native fixture exists anywhere in the repo, and a fixture written from reading
+the type would have encoded the same misunderstanding as the code.
+
+**What they cannot show:** visual grouping, what is above the fold, what sits
+beside what. Two of the five known instances of this feature's defect were
+exactly that, so a clean result here does not clear the screen.
+
+#### What the count vocabulary says — all correct
+
+| state | headline | reads as |
+| --- | --- | --- |
+| EXACT 0 | "Risky users 0" | scoped zero; caption says every event was assessed or accounted for |
+| WITHHELD | "Not counted — no evidence was in scope for any check" | explicitly "not a zero and not an all-clear" |
+| AT_LEAST | "Risky users, at least" · `≥1` · `listCoverage: PARTIAL` | a floor, with truncation explained |
+
+`evidenceCountCapped: true` propagates to each signal. `priority: null` is
+deliberate and documented — the engine rates nothing and inventing a sort key is
+refused. None of these read as failures.
+
+#### The two defects, both one root cause
+
+**The frontend still speaks the old engine's vocabulary while the backend ships
+the new one.** Every individual field is correct on both sides.
+
+1. **Every row renders "Identity not resolved" while the name is in the payload.**
+   The controller spreads `displayName` / `userPrincipalName` at the finding-item
+   level; `native-assessment.ts:229` reads them from inside `subject`. So
+   `native-view.ts:91` returns its fallback. `subjectsNamed: true` sits in the
+   same response. **This is the defect the subject-name resolution was built to
+   remove**, arriving one layer up.
+2. **"Risky users 4" beside "A check this build of HawkView does not recognise."**
+   `presentation.ts:639` keys its evidence-shape table on the old engine's rule
+   ids; the shipped detector id is `repeated-credential-failure`, so
+   `findingEvidenceShape()` returns `UNRECOGNISED`. **It appears on every state
+   including the clean zero and the withheld** — so a legitimate EXACT 0 is
+   undercut by a sentence saying a check was not recognised.
+
+**Consequence of (1) worth stating separately:** the named and unnamed roles
+render *identically*. A technician whose role may see names and one whose role may
+not see the same screen, and both read as "HawkView could not identify these
+people" rather than "your role does not show names."
+
+**Latent, same file, same edit:** `native-view.ts:106` hardcodes `kind: null`,
+discarding the `latest.kind` the backend now sends, and the section re-derives
+occurrence-versus-observation from `findingEvidenceShape(ruleId)` — a client-side
+table. That is the convention `2c23a97` removed ("the kind travels with the value
+instead"). Invisible with one detector; it becomes the read-time-as-event-time
+defect again the moment `external-mailbox-forwarding` ships.
