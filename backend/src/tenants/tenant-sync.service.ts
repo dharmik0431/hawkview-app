@@ -35,6 +35,7 @@ import {
 import { getMicrosoftSkuName } from '../microsoft/microsoft-sku-names.js'
 import { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { evaluateAndPersistTenant } from '../risky-users-wiring/evaluate-and-persist.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { resolveDomainDnsHealth } from './domain-dns-health.js'
 import {
@@ -1667,6 +1668,22 @@ export class TenantSyncService {
       recordAttempt: (scope, lease, deadline) => store.recordAttempt(scope, lease, deadline),
       ensure: (scope, deadline, ineligible) => keys.ensureVersion(scope, deadline, ineligible),
       evaluate: (scope, deadline, attemptId) => this.runPostSyncIdentityRiskEvaluation({ id: scope.customerTenantId, organizationId: scope.organizationId }, deadline, attemptId, diagnostic),
+      // THE REBUILT ENGINE, beside the old one and unable to harm it. The cycle
+      // treats this as optional and calls it only after the line above has
+      // already succeeded and been counted; a throw here is caught by the step
+      // itself and cannot reach the old engine's completed/failed tallies.
+      //
+      // The deadline is NOT enforced inside. What bounds this is the step's own
+      // floor — it will not start with less than 9s remaining — against a
+      // measured 7,983 ms on the largest of the five tenants. If an assessment
+      // ever runs longer than the window it was admitted into, it eats the
+      // cycle's release time rather than another tenant's turn, and the release
+      // has its own guard. Stated because an ignored parameter should be an
+      // explained decision, not an oversight.
+      alsoEvaluate: scope => evaluateAndPersistTenant(
+        this.prisma as never,
+        { organizationId: scope.organizationId, customerTenantId: scope.customerTenantId },
+      ),
     }, requestDeadlineAt))
     if (result === undefined) observeCycle(diagnostic, 'MEMORY_LANE_BUSY')
     return result

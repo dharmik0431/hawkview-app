@@ -212,8 +212,22 @@ export type Subject =
  * would silently take three tenants to zero. And a tenant with no correlation is
  * a true statement about capability — Microsoft's risky-users channel requires
  * Entra ID P2 — not a shrug, so it needs somewhere to say so. */
+/** How to join this subject back to the provider's own channels.
+ *
+ * `matchedBy` SAYS HOW THE SUBJECT WAS IDENTIFIED. It does NOT say what `ref`
+ * contains, and the distinction cost a real misreading: the field was called
+ * `shape` with values DIRECTORY_OBJECT_ID and USER_PRINCIPAL_NAME, so a reader
+ * took USER_PRINCIPAL_NAME to mean the ref held an email address. It never
+ * does — `ref` is minted from the directory object id on EVERY path, including
+ * the audit one, where the subject is matched BY upn and then referenced by
+ * its object id.
+ *
+ * Renamed because a label describing one thing while sitting beside a value
+ * that is another is the failure this team has now hit five times in a day: a
+ * name is a claim made by whoever typed it and carries no evidence. Check the
+ * value, never the label. */
 export type CorrelationRef =
-  | Readonly<{ available: true; shape: 'DIRECTORY_OBJECT_ID' | 'USER_PRINCIPAL_NAME'; ref: string }>
+  | Readonly<{ available: true; matchedBy: 'DIRECTORY_OBJECT_ID' | 'USER_PRINCIPAL_NAME'; ref: string }>
   | Readonly<{ available: false; because: string }>
 
 /** Why a mailbox is not a user — and these are not the same answer.
@@ -253,12 +267,53 @@ export type DetectorSignal = Readonly<{
    * generic core can carry a Microsoft-shaped fact without learning it. */
   signal: string
   count: number
-  /** `null` means EVALUATED AND NONE OCCURRED. That is a different fact from
-   * the signal being absent from `signals` entirely, which means it was never
-   * evaluated — "we looked and found none" versus "we did not look" is this
-   * feature's signature defect, and it is as wrong per signal as it was per
-   * tenant. */
-  latest: string | null
+  /** `null` means none occurred IN WHAT WAS READ. Three cases, not two, and the
+   * third is only visible by reading `capped` alongside:
+   *
+   *   latest null, capped false   evaluated in full, and none occurred
+   *   latest null, capped true    none in the part of the window we could read.
+   *                               NOT "none occurred" — a subject with three
+   *                               rejections truncated away reports exactly
+   *                               this, and it is reachable: verified against
+   *                               a window of six events under a budget of
+   *                               three.
+   *   signal absent from `signals`   never evaluated at all
+   *
+   * "We looked and found none" versus "we did not look" is this feature's
+   * signature defect, and it is as wrong per signal as it was per tenant. The
+   * capped case is the same defect a third time: a floor of zero is not a
+   * finding of none, it is the absence of a complete reading, and rendering it
+   * as "none" states something false about a subject who may have had many. */
+  latest: SignalRecency | null
+}>
+
+/** When a signal was last true, AND WHAT KIND OF TIME THAT IS.
+ *
+ * The kind is part of the value because these two are not interchangeable and
+ * were briefly held in one `string`:
+ *
+ *   EVENT_OCCURRED   the last time the thing HAPPENED — a lockout, a rejection
+ *   STATE_OBSERVED   the last time we LOOKED and the state was still set —
+ *                    a mailbox forwarding rule, which has no event time at all
+ *
+ * A READ TIME IS ALWAYS RECENT. So a forwarding rule created six months ago
+ * carries today's timestamp, renders as the most urgent thing on the screen,
+ * and is in fact the worst case precisely because it is old. The error also
+ * grows as collection improves — a defect that degrades as the system gets
+ * healthier will never be found by making the system healthier.
+ *
+ * Found by rendering, not by reasoning: on the assembled screen one person
+ * appeared twice, four inches apart, both rows stamped 5:59 p.m. — one an event
+ * time, one a read time — narrating "the attacker got in and set up forwarding
+ * in the same minute" out of a coincidence between when something happened and
+ * when we happened to look. Neither row was false alone.
+ *
+ * A renderer keying the unit off the detector's id would be the convention this
+ * design keeps removing; the kind travels with the value instead, for the same
+ * reason the truncation flag sits on the count it qualifies. */
+export type SignalRecency = Readonly<{
+  at: string
+  kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED'
 }>
 
 /** A signal as it reaches a reader: what the detector measured, plus whether

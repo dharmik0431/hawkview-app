@@ -60,14 +60,43 @@ test('each signal carries its OWN recency, not the family’s', () => {
   assert.ok(finding)
   assert.equal(signalOf(finding, 'LOCKED_OUT_AFTER_REPEATED_FAILURES')?.count, 2)
   // The lockouts' own last occurrence — NOT the later rejection.
-  assert.equal(signalOf(finding, 'LOCKED_OUT_AFTER_REPEATED_FAILURES')?.latest, '2026-09-03T11:00:00.000Z')
+  assert.equal(signalOf(finding, 'LOCKED_OUT_AFTER_REPEATED_FAILURES')?.latest?.at, '2026-09-03T11:00:00.000Z')
   assert.equal(signalOf(finding, 'PASSWORD_REJECTED')?.count, 1)
-  assert.equal(signalOf(finding, 'PASSWORD_REJECTED')?.latest, '2026-09-09T04:00:00.000Z')
+  assert.equal(signalOf(finding, 'PASSWORD_REJECTED')?.latest?.at, '2026-09-09T04:00:00.000Z')
 
   // And no single field a surface could reach for and pair with the wrong
   // count. Removing `observedAt` is what makes the misrendering unwriteable
   // rather than merely discouraged.
   assert.equal((finding as Record<string, unknown>).observedAt, undefined)
+})
+
+test('a recency says what KIND of time it is, and this rule only ever reports event times', () => {
+  // The counterpart detector, `external-mailbox-forwarding`, reports
+  // STATE_OBSERVED — a read time, because Exchange gives no moment at which a
+  // forwarding rule was configured. Both were briefly a bare string, so a
+  // renderer told them apart by knowing which rule had produced them.
+  //
+  // A READ TIME IS ALWAYS RECENT. That made a six-month-old forwarding rule
+  // render as the most urgent item on the screen, and made the error grow as
+  // collection improved. Everything this rule reports is an event that actually
+  // happened, so it must never claim otherwise.
+  const result = run([
+    event('victim', 'LOCKED_OUT_AFTER_REPEATED_FAILURES', '2026-09-03T10:00:00.000Z'),
+    event('victim', 'PASSWORD_REJECTED', '2026-09-09T04:00:00.000Z'),
+  ])
+  const [finding] = result.findings.items
+  assert.ok(finding)
+  let checked = 0
+  for (const signal of finding.signals) {
+    if (signal.latest === null) continue
+    assert.equal(signal.latest.kind, 'EVENT_OCCURRED', `${signal.signal} must report an event time`)
+    checked += 1
+  }
+  // POSITIVE CONTROL. The loop skips null recencies, so it asserts nothing at
+  // all if every signal happens to be null — and a vacuous assertion passes
+  // exactly as loudly as a real one. This is the line that fails if the input
+  // ever stops exercising the check.
+  assert.equal(checked, 2, 'both signals must have been checked, not skipped')
 })
 
 test('a signal evaluated and absent is present with a null recency, not omitted', () => {
@@ -88,6 +117,37 @@ test('a signal evaluated and absent is present with a null recency, not omitted'
   assert.equal(signalOf(finding, 'PASSWORD_REJECTED')?.count, 5)
 })
 
+test('a zero in a truncated window is not a finding of none', () => {
+  // THE THIRD CASE, and it is reachable rather than theoretical. This subject
+  // had three password rejections; the window truncates to the most recent
+  // three events, which are all lockouts. The rejections are gone.
+  //
+  // So PASSWORD_REJECTED reports count 0 and latest null — and reading that as
+  // "we looked and found none" states something false about a subject who had
+  // three. `capped` is the only thing distinguishing it from a real zero, which
+  // is why it travels on the signal rather than on the finding.
+  const result = run([
+    ...[1, 2, 3].map(index => event('victim', 'PASSWORD_REJECTED', `2026-09-0${index}T10:00:00.000Z`)),
+    ...[4, 5, 6].map(index => event('victim', 'LOCKED_OUT_AFTER_REPEATED_FAILURES', `2026-09-0${index}T10:00:00.000Z`)),
+  ], 3)
+
+  const rejections = signalOf(result.findings.items[0]!, 'PASSWORD_REJECTED')
+  assert.equal(rejections?.count, 0)
+  assert.equal(rejections?.latest, null)
+  // The bit that stops it being read as a clean signal.
+  assert.equal(rejections?.capped, true)
+
+  // POSITIVE CONTROL: the same subject and the same events, whole window. Now
+  // the zero would be a real zero — and it isn't zero at all, which is the
+  // point: the truncated run reported none where three existed.
+  const whole = signalOf(run([
+    ...[1, 2, 3].map(index => event('victim', 'PASSWORD_REJECTED', `2026-09-0${index}T10:00:00.000Z`)),
+    ...[4, 5, 6].map(index => event('victim', 'LOCKED_OUT_AFTER_REPEATED_FAILURES', `2026-09-0${index}T10:00:00.000Z`)),
+  ]).findings.items[0]!, 'PASSWORD_REJECTED')
+  assert.equal(whole?.count, 3)
+  assert.equal(whole?.capped, false)
+})
+
 test('counts from a truncated window are marked as floors', () => {
   // The window overflows, so `evaluate` keeps only the most recent events and
   // every count the detector produces is a floor. The detector is handed an
@@ -100,6 +160,10 @@ test('counts from a truncated window are marked as floors', () => {
   const whole = run(events)
   const truncated = run(events, 3)
 
+  // POSITIVE CONTROL, same reason: `every` is true of an empty array, so these
+  // two assertions would hold over a finding carrying no signals at all.
+  assert.equal(whole.findings.items[0]?.signals.length, 2)
+  assert.equal(truncated.findings.items[0]?.signals.length, 2)
   assert.equal(whole.findings.items[0]?.signals.every(signal => !signal.capped), true)
   assert.equal(truncated.findings.items[0]?.signals.every(signal => signal.capped), true)
   // The count really did shrink, so the flag is describing something true

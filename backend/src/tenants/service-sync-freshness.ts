@@ -138,7 +138,7 @@ function authFailure(state: PersistedSyncState) {
   return state.lastErrorCode === '401' || state.lastErrorCode === '403' || /unauthorized|forbidden|permission|consent/i.test(state.lastErrorMessage ?? '')
 }
 
-function collectorStatus(resourceType: string, state: PersistedSyncState | undefined, now: Date): CollectorSyncStatus {
+export function collectorStatus(resourceType: string, state: PersistedSyncState | undefined, now: Date): CollectorSyncStatus {
   if (!state) return 'NOT_CONFIGURED'
   if (state.status === 'RUNNING') return 'RUNNING'
   if (state.status === 'FAILED') return authFailure(state) ? 'PERMISSION_REQUIRED' : 'FAILED'

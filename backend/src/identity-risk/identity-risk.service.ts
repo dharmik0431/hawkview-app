@@ -321,6 +321,49 @@ export class IdentityRiskService {
     }
   }
 
+  /** The SAME authorization as every other identity-risk read, exposed so a
+   * second reader does not grow a second copy of it.
+   *
+   * `scope` resolves the caller from their auth subject, requires an ACTIVE
+   * membership in an ACTIVE organization, and finds the tenant only within
+   * those organizations — so a caller cannot name a tenant belonging to
+   * somebody else. `pilotReadAllowed` is the separate gate on who may read
+   * identity-risk data at all.
+   *
+   * Additive: nothing existing changes. A reimplementation in the new reader
+   * would be two copies of a rule whose failure mode is cross-tenant data
+   * exposure, and a new endpoint quietly skipping the pilot gate would widen
+   * who can read this while looking like a feature.
+   *
+   * Returns null rather than throwing when the pilot gate declines, because
+   * "you may not read this yet" is a different answer from "this is not yours"
+   * and the caller renders them differently. `scope` still throws Forbidden
+   * for the second.
+   */
+  async authorizeRiskyUsersRead(identity: AuthenticatedIdentity, tenantId: string) {
+    const tenant = await this.scope(identity, tenantId)
+    // THREE gates, not two. I originally named the pilot gate and the tenant
+    // scope and missed this one — the operator kill switch, which every other
+    // identity-risk read checks (assessment, findings, findingDetail,
+    // mailboxInvestigation). Missing it means pulling the emergency stop no
+    // longer stops the display, on the code path most likely to need stopping
+    // because it is the rebuilt engine's first exposure to customers.
+    //
+    // Each gate keeps its own answer. "Not enabled for this tenant" and
+    // "an operator has halted evaluation" send a reader to different places,
+    // and collapsing them into one unavailable is the undifferentiated answer
+    // this whole vocabulary exists to remove.
+    if (!pilotReadAllowed(tenant)) return { gate: 'NOT_ENABLED_FOR_TENANT' as const }
+    if ((await this.currentControls(tenant)).evaluationHardDisabled) {
+      return { gate: 'EVALUATION_DISABLED' as const }
+    }
+    // The role tier decides whether the SUBJECT CAN BE NAMED, not whether the
+    // page can be seen. Counts and coverage travel to every role; the display
+    // name and UPN travel only to MSP_OWNER and MSP_ADMIN, which is what
+    // evidenceDetailAllowed already means on the existing detail endpoints.
+    return { gate: null, tenant } as const
+  }
+
   private async scope(
     identity: AuthenticatedIdentity,
     tenantId: string,

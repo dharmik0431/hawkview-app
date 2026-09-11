@@ -26,7 +26,7 @@ const coverage = (parts: Partial<Coverage> = {}): Coverage => ({
 /** Sign-in events carry a directory user, so this detector's findings are about
  * people and do count. Contrast the mailbox detector, whose findings are not. */
 const user = (userRef: string) => (
-  { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const)
+  { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const)
 
 const matching: Detector<Event> = {
   id: 'matches-flagged',
@@ -34,7 +34,7 @@ const matching: Detector<Event> = {
   run: applicable => ({
     status: 'RAN', assessed: applicable.length, declined: {},
     findings: applicable.filter(item => item.match)
-      .map(item => ({ detectorId: 'matches-flagged', subject: user(item.subject), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const })),
+      .map(item => ({ detectorId: 'matches-flagged', subject: user(item.subject), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const })),
   }),
 }
 const silent: Detector<Event> = { id: 'silent', monotonic: true, run: applicable => ({ status: 'RAN', assessed: applicable.length, declined: {}, findings: [] }) }
@@ -361,7 +361,7 @@ test('distinct subjects are counted once however many findings they carry', () =
     run: applicable => ({
       status: 'RAN', assessed: applicable.length, declined: {},
       findings: applicable.flatMap((item): DetectorFinding[] => [0, 1].map(() =>
-        ({ detectorId: 'twice', subject: user(item.subject), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const }))),
+        ({ detectorId: 'twice', subject: user(item.subject), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const }))),
     }),
   }
   const result = run([event('1'), event('1')], { coverage: coverage({ applies: 2 }), detectors: [twice] })
@@ -398,7 +398,7 @@ test('every reason that applies is reported, so there is no precedence to get wr
   // identity binding. A list has no precedence to mutate.
   const unattributed = (id: string) => ({
     detectorId: 'mailbox', subject: { kind: 'MAILBOX', mailboxRef: id, binding: 'UNRESOLVED' } as const,
-    signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const,
+    signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const,
   })
   const mailbox: Detector<Event> = {
     id: 'mailbox',
@@ -473,7 +473,7 @@ test('a non-monotonic detector never sees a truncated window, because it would i
       declined: {},
       findings: applicable.some(item => item.match)
         ? []
-        : [{ detectorId: 'password-accepted-not-completed', subject: user('user-1'), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const }],
+        : [{ detectorId: 'password-accepted-not-completed', subject: user('user-1'), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const }],
     }),
   }
   // The completion is the newest event, so recency-based truncation keeps it —
@@ -566,7 +566,7 @@ test('a detector whose account of itself is impossible is not trusted to have ru
       status: 'RAN',
       assessed: applicable.length + 5,
       declined: {},
-      findings: [{ detectorId: 'miscounts', subject: user('user-1'), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const }],
+      findings: [{ detectorId: 'miscounts', subject: user('user-1'), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const }],
     }),
   }
   const kept = run([event('1')], { detectors: [foundButMiscounted] })
@@ -581,7 +581,7 @@ test('a detector whose account of itself is impossible is not trusted to have ru
       status: 'RAN',
       assessed: applicable.length,
       declined: {},
-      findings: [0, 1, 2].map(() => ({ detectorId: 'many', subject: user('user-1'), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const })),
+      findings: [0, 1, 2].map(() => ({ detectorId: 'many', subject: user('user-1'), signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const })),
     }),
   }
   assert.equal(run([event('1')], { detectors: [many] }).claim.permitted, true)
@@ -730,7 +730,7 @@ test('a withheld claim explains itself in as many sentences as it has reasons', 
       findings: applicable.map(item => ({
         detectorId: 'mailbox',
         subject: { kind: 'MAILBOX', mailboxRef: item.id, binding: 'UNRESOLVED' } as const,
-        signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const,
+        signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const,
       })),
     }),
   }

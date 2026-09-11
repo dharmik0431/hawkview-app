@@ -40,10 +40,19 @@ export type ReadTenantInput = Readonly<{
    * caller who does not yet know which feed it describes — which is the same
    * asserted-input mistake one field along. */
   collectionScope: Readonly<Record<NormalizationSource, ClassifierCollectionScope>>
-  /** From the collector's own sync state. Deciding this from row counts would
-   * be the defect the whole four-state vocabulary exists to prevent: an empty
-   * window and an uncollected one look identical in the rows. */
-  syncStatus: CollectorSyncStatus
+  /** From the collector's own sync state, PER FEED. Deciding this from row
+   * counts would be the defect the whole four-state vocabulary exists to
+   * prevent: an empty window and an uncollected one look identical in the rows.
+   *
+   * Keyed by feed for a reason that only appeared once the feed stopped being
+   * asserted. Graph sign-ins come from the SIGN_INS collector and the audit
+   * fallback from M365_AUDIT — two collectors with independent health. A single
+   * status would mean gating an audit-fed tenant on the Graph collector's
+   * state: a tenant whose own evidence collected perfectly reported as
+   * uncollectable because a feed it does not use is failing, or worse, the
+   * reverse. Three of five tenants are audit-fed, so that is the majority case,
+   * not an edge. */
+  syncStatus: Readonly<Record<NormalizationSource, CollectorSyncStatus>>
   /** Bound to the feed inside, so a caller cannot hand over a rule the feed
    * cannot support without that being reported. */
   detectors: readonly FeedBoundDetector[]
@@ -70,24 +79,19 @@ export type TenantRead = Readonly<{
 export async function readTenantAssessment(
   prisma: PrismaClient, input: ReadTenantInput,
 ): Promise<TenantRead> {
-  const availability = evidenceFromSync(input.syncStatus)
-  if (!availability.read) {
-    // No query at all. Asking the database for rows we have already established
-    // we cannot treat as evidence would invite reading the answer off the row
-    // count, which is exactly what the sync state exists to stop.
-    // Nothing was read, so nothing can be derived. The stream is named by the
-    // fallback and the decision says so rather than implying the rows agreed.
-    const feed = decideFeed([], input.feedIfNoRows)
-    return {
-      assessment: assessTenant({
-        streams: [{ stream: feed.feed, collection: availability.availability }],
-        budget: { maxEvents: input.maxEvents },
-      }),
-      rowsFetched: 0,
-      feed,
-    }
-  }
-
+  // WHICH FEED'S SYNC STATE APPLIES CANNOT BE KNOWN UNTIL THE ROWS ARE READ,
+  // and that ordering is the whole reason this looks inside-out.
+  //
+  // The gate exists so a row COUNT never decides whether evidence was
+  // collected — an empty window and an uncollected one are identical in the
+  // rows. It does not require us to stay ignorant of which COLLECTOR to ask
+  // about. Reading rows to learn the feed is not reading the answer off them;
+  // the answer is still gated, one step later, on that feed's own state.
+  //
+  // Doing it the other way meant picking a collector before knowing which one
+  // produced the evidence — gating three audit-fed tenants on the health of a
+  // Graph collector they do not use.
+  //
   // Microsoft's directory tenant id is a DIFFERENT id from our internal tenant
   // uuid, and the classifier binds audit rows on it — a row whose
   // OrganizationId does not match is rejected as TENANT_BINDING_MISMATCH.
@@ -139,6 +143,24 @@ export async function readTenantAssessment(
   // belonged to, and every guard downstream passed while it happened.
   const feed = decideFeed(rows.map(row => row.raw as Record<string, unknown>), input.feedIfNoRows)
   const collectionScope = input.collectionScope[feed.feed]
+
+  // THE GATE, now that the feed is known. Rows already fetched are discarded
+  // rather than assessed: they were read to identify the collector, not to
+  // stand as evidence, and a collector whose state says its evidence cannot be
+  // treated as current does not become trustworthy because rows happen to
+  // exist. `rowsFetched` still reports what the query returned, because
+  // claiming zero here would be the count-shaped lie one layer out.
+  const availability = evidenceFromSync(input.syncStatus[feed.feed])
+  if (!availability.read) {
+    return {
+      assessment: assessTenant({
+        streams: [{ stream: feed.feed, collection: availability.availability }],
+        budget: { maxEvents: input.maxEvents },
+      }),
+      rowsFetched: rows.length,
+      feed,
+    }
+  }
 
   const batch = await normalizeSignInBatch({
     scope,
