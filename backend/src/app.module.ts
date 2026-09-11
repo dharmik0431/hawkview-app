@@ -10,6 +10,8 @@ import { WorkspaceModule } from './workspace/workspace.module.js'
 import { AuthenticatedCanaryModule } from './canary/authenticated-canary.module.js'
 import { RequestCorrelationMiddleware } from './request-correlation.middleware.js'
 import { IdentityRiskModule } from './identity-risk/identity-risk.module.js'
+import { RateLimitingModule } from './rate-limiting/rate-limiting.module.js'
+import { UnauthenticatedRateLimitMiddleware } from './rate-limiting/unauthenticated-rate-limit.middleware.js'
 
 @Module({
   imports: [
@@ -23,9 +25,15 @@ import { IdentityRiskModule } from './identity-risk/identity-risk.module.js'
     WorkspaceModule,
     AuthenticatedCanaryModule,
     IdentityRiskModule,
+    RateLimitingModule,
   ],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(RequestCorrelationMiddleware).forRoutes('*')}
+    // Correlation FIRST: a refused request must still carry the X-Request-ID
+    // that an operator will quote when asking why it was refused.
+    consumer
+      .apply(RequestCorrelationMiddleware, UnauthenticatedRateLimitMiddleware)
+      .forRoutes('*')
+  }
 }
