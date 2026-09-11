@@ -114,6 +114,17 @@ an absence says `NO_FURTHER_EVENTS_IN_READABLE_WINDOW` in its own name, and
 `applyObservation` will not act on it without readable evidence — so a type cannot
 opt out of the silence rule by wording its resolving condition carefully.
 
+**`conditionClears` IS NOT YET CONSULTED BY ANYTHING.** Nothing reads it outside
+this catalogue and its type. `applyObservation` takes the evidence and a
+`conditionCleared` boolean the caller computed, and never looks at the
+declaration. So at step 01 the field gates construction and states intent — an
+alert type that cannot say what makes it stop still cannot be added — but it does
+not enforce that a caller's `conditionCleared` was computed the declared way.
+
+Said plainly because the alternative is that 02's author reads a declaration and
+assumes a mechanism. Connecting the two is their work, and a declaration that
+looks load-bearing and is not is exactly the shape this plan keeps finding.
+
 ## Recurrence: six cases
 
 | Situation | Behaviour | Notifies |
@@ -293,10 +304,39 @@ authentication policy and application permission grants. That list is now in
 nobody can diff.
 
 **It needs sign-off before step 05 routes anything on it**, because it decides
-what rings a phone. Each entry carries the three tests revision 3 requires of a
-phone-tier candidate: **context** (was this expected?), **persistence** (has it
-lasted?) and **urgency** (does delay make it worse?). Without the context test, a
-privileged role assigned during a scheduled onboarding would ring a phone.
+what rings a phone. A measured seven-entry replacement is with the product owner
+now; this block is **superseded pending approval** and stays until that is signed
+off, because deleting it would leave the phone tier with no written policy at all.
+Nothing routes on either version meanwhile.
+
+### Expectedness is not applied anywhere in this policy
+
+Each entry originally carried a **context** test — suppress when the change matches
+a recorded onboarding or change window. Both are gone, and the second reason is the
+one that decides it.
+
+**The failure direction.** HawkView does not know what an MSP planned, so any
+expectedness test is a guess, and a guess here fails as *silence during a real
+compromise* — the failure this whole plan exists to remove. A privileged role
+granted during genuine onboarding costs an MSP one dismissed notification; the
+reverse mistake costs them a tenant. There is no volume argument to justify the
+trade either: the urgent tier measures **25 events across 68 days and 5 tenants**.
+There is no burst to suppress.
+
+**And there are no recorded change windows.** The feature does not exist. So the
+clause suppressed nothing at all while reading exactly like a safeguard — a guard
+that cannot fire, sitting in the document steps 02 through 05 will be built from.
+That is worse than a wrong rule, because it looks handled.
+
+Each entry now carries only what can be decided from evidence HawkView holds:
+**persistence** and **urgency**. `alert-catalog.test.ts` asserts the absence of a
+`context` field, because an absence only stays absent if something checks.
+
+One finding from the measured replacement worth carrying: tenant-wide admin consent
+was going to be urgent on its own evidence, and it **fires 47 times** in production
+— consent on behalf of all users is simply how an administrator approves an
+application. It is now a multiplier on a sensitive permission rather than a
+trigger. Reasoned as exceptional, measured as the ordinary path.
 
 ## What to check first when it breaks
 
@@ -338,3 +378,31 @@ The existing `notifications` table is untouched. Mapping these three axes onto
 storage is part of 02, and it will need a migration: `resolvedAt` alone cannot
 express them, and `notification_user_states` carries `readAt`/`dismissedAt` rather
 than an acknowledgement.
+
+### Rules that must govern step 02, recorded here because this is where its author will be standing
+
+None of this is built. All three came from QA breaking their own reference against
+the plan, which is the evidence that the plan's sentences are not sufficient on
+their own.
+
+- **The episode span is a watermark that advances with EVERY event in the episode**,
+  never a value stamped when the episode opens. QA set it only at open and the
+  second event of an episode then fell outside its own episode's span, so a
+  backfill landing between the first and second read as new — a live attack
+  manufactured from a late delivery.
+- **Episode boundaries are decided by the event's own time, not by arrival order.**
+  An event delivered *after* a backfill whose own time is later still opens an
+  episode. **`EventInstant` does not cover this**: it stops an implementation
+  reading the wrong *timestamp* and does nothing about one treating
+  most-recently-delivered as newest. `compareByEventTime` and `newestByEventTime`
+  are the primitives for it, and they are the only part of the episode work that
+  exists today.
+- **Event-level idempotency stays a separate layer from incident grouping.** A
+  replayed event id must add neither a notification nor an occurrence. The event
+  id in the dedupe key is doing a necessary job; grouping is a second layer on top
+  of it, not a replacement for it.
+
+And the reader note from above, repeated here because it will bite in this code
+rather than in the lifecycle: a three-valued investigation state read by
+two-valued code fails in one direction. Ask `investigation === 'RESOLVED'`, never
+`!== 'OPEN'`, or a record reads as resolved.

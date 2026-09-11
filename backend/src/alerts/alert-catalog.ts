@@ -117,7 +117,9 @@ export const ALERT_CATALOG = [
     category: 'OPERATIONAL',
     severity: 'ACT_NOW',
     opensInvestigation: true,
-    // Demonstrably recovered: the connection verifies or it does not.
+    // Auto-close is right here — a human click between a tenant reconnecting and
+    // the alert closing is friction that buys no information. What counts as
+    // reconnected is the part that needed fixing; see conditionClears below.
     investigationCloses: 'AUTOMATICALLY_WHEN_CONDITION_CLEARS',
     summary: 'HawkView cannot see this tenant',
     // CLEARS ON EVIDENCE, NOT ON THE HANDSHAKE.
@@ -233,24 +235,34 @@ export function alertType(id: AlertTypeId): AlertTypeDeclaration {
 /** WHICH DIRECTORY CHANGES ARE PRIVILEGED — a policy, written down and
  * reviewable rather than inferred per event.
  *
- * The plan lists this as an open question that must be answered before step 01
- * can finish, and names role assignment, authentication policy and application
- * permission grants as the obvious candidates. This is that list.
+ * SUPERSEDED PENDING APPROVAL. A measured seven-entry replacement, decided on
+ * fields already collected, is with the product owner now. This block stays until
+ * that is signed off, because deleting it would leave the phone tier with no
+ * written policy at all, and nothing routes on either version meanwhile.
  *
- * IT IS PROPOSED, NOT SETTLED. Which changes are privileged is a product and
- * security decision rather than an engineering one, and it decides what rings a
- * phone — so it needs sign-off before step 05 routes anything on it. It is here,
- * in code, because a policy that lives in a document is one nobody can diff.
+ * EXPECTEDNESS IS NOT APPLIED ANYWHERE IN THIS POLICY. Each entry used to carry a
+ * `context` clause suppressing the alert when the change matched a recorded
+ * onboarding or change window. Both are gone, for two reasons:
  *
- * Each entry carries the three things revision 3 requires of a phone-tier
- * candidate: CONTEXT (was this expected?), PERSISTENCE (has it lasted?) and
- * URGENCY (does delay make it worse?). A privileged role assigned during a
- * scheduled onboarding should not ring a phone, and without the context test it
- * would. */
+ *   1. The failure direction. HawkView does not know what an MSP planned, so any
+ *      expectedness test is a guess, and the way a guess fails here is silence
+ *      during a real compromise — the failure this whole plan exists to remove. A
+ *      privileged role granted during genuine onboarding costs an MSP one
+ *      dismissed notification; the reverse mistake costs them a tenant. There is
+ *      no volume argument to justify the risk either: the urgent tier measures 25
+ *      events across 68 days and 5 tenants, so there is no burst to suppress.
+ *
+ *   2. THERE ARE NO RECORDED CHANGE WINDOWS. The feature does not exist. So the
+ *      clause suppressed nothing at all while reading exactly like a safeguard —
+ *      a guard that cannot fire, sitting in the document steps 02 through 05 will
+ *      be built from. That is the shape this codebase has been bitten by
+ *      repeatedly, and it is worse than the wrong rule because it looks handled.
+ *
+ * Each entry therefore carries only what can be decided from evidence HawkView
+ * actually holds: PERSISTENCE (has it lasted?) and URGENCY (does delay make it
+ * worse?). */
 export interface PrivilegedChangeRule {
   readonly change: string
-  /** What would make this expected rather than alarming. */
-  readonly context: string
   /** How long it must hold before it is worth waking somebody. */
   readonly persistence: string
   /** Why waiting makes it worse. */
@@ -260,25 +272,21 @@ export interface PrivilegedChangeRule {
 export const PRIVILEGED_DIRECTORY_CHANGES: readonly PrivilegedChangeRule[] = [
   {
     change: 'A directory role granting administrative access is assigned to an account.',
-    context: 'Not raised when the assignment falls inside a recorded onboarding or change window for that tenant.',
     persistence: 'Raised immediately; an administrative role is effective the moment it is granted.',
     urgency: 'An unexpected administrator can grant itself more, and can remove the evidence that it did.',
   },
   {
     change: 'An authentication policy is weakened — multi-factor requirements removed or relaxed, or a legacy authentication path re-enabled.',
-    context: 'Not raised when it matches a change the MSP has recorded for that tenant.',
     persistence: 'Raised immediately; the weakening applies to the next sign-in.',
     urgency: 'It removes the control that would have stopped the next credential attack, so delay compounds every other finding.',
   },
   {
     change: 'An application is granted a permission that can read mail, files, or directory data across the tenant.',
-    context: 'Not raised for applications on the tenant’s recorded allow-list.',
     persistence: 'Raised immediately; consent is effective at once and survives password changes.',
     urgency: 'Application access is not revoked by resetting a user, and it is the quietest way to keep access.',
   },
   {
     change: 'A conditional access policy protecting privileged accounts is disabled or deleted.',
-    context: 'Not raised when it matches a recorded change window.',
     persistence: 'Raised immediately; the policy stops applying the moment it is disabled, and nothing re-applies it.',
     urgency: 'The protection is gone from that moment, and its absence is invisible on every screen that shows only what exists.',
   },

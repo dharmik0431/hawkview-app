@@ -121,17 +121,26 @@ test('the credential-attack type cannot be resolved by a quiet collector', () =>
   assert.equal(seen.investigation, 'OPEN')
 })
 
-test('the privileged-change policy is written down, with all three tests per entry', () => {
-  // The plan lists this as an open question that must be answered before step 01
-  // can finish. Revision 3 requires each phone-tier candidate to carry context,
-  // persistence and urgency — a privileged role assigned during a scheduled
-  // onboarding must not ring a phone, and without the context test it would.
+test('the privileged-change policy decides only on evidence HawkView holds', () => {
   assert.ok(PRIVILEGED_DIRECTORY_CHANGES.length >= 3, 'the policy is empty')
   for (const rule of PRIVILEGED_DIRECTORY_CHANGES) {
     assert.ok(rule.change.length > 20, 'a rule must say what the change is')
-    assert.ok(rule.context.length > 20, `${rule.change} has no context test`)
     assert.ok(rule.persistence.length > 20, `${rule.change} has no persistence test`)
     assert.ok(rule.urgency.length > 20, `${rule.change} does not say why delay makes it worse`)
+
+    // NO EXPECTEDNESS TEST, by ruling, and asserted as an absence because that is
+    // the only way an absence stays absent.
+    //
+    // Each entry used to carry a `context` clause suppressing the alert when the
+    // change matched a recorded onboarding window. Two reasons it is gone. HawkView
+    // does not know what an MSP planned, so the test is a guess whose failure mode
+    // is silence during a real compromise — one dismissed notification against the
+    // cost of a tenant, with no volume argument to justify it at 25 urgent events
+    // across 68 days and 5 tenants. And the recorded-change-window feature does not
+    // exist, so the clause suppressed nothing at all while reading exactly like a
+    // safeguard: a guard that cannot fire, sitting in the document steps 02 to 05
+    // will be built from.
+    assert.equal('context' in rule, false, `${rule.change} carries an expectedness clause`)
   }
   // The three the plan names explicitly are all present.
   const text = PRIVILEGED_DIRECTORY_CHANGES.map((rule) => rule.change.toLowerCase()).join(' | ')
