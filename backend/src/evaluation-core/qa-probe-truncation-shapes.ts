@@ -13,7 +13,7 @@ const ev = (id: string, kind: string, ip: string, n: number): Ev => ({ id, kind,
 
 const accuse = (id: string): Finding => ({
   detectorId: id, subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: false as const, because: 'probe' } },
-  signals: [{ signal: 'ACCUSATION', count: 1, latest: t(0), capped: false }],
+  signals: [{ signal: 'ACCUSATION', count: 1, latest: { at: t(0), kind: 'EVENT_OCCURRED' }, capped: false }],
 })
 const det = (id: string, fires: (e: readonly Ev[]) => boolean): Detector<Ev> => ({
   id, monotonic: true, // deliberately mis-declared for every shape

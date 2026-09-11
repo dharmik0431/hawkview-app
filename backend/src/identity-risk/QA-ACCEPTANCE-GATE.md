@@ -332,3 +332,107 @@ carry `capped: false`. In this path it cannot happen — `read-tenant.ts` puts n
 `take` on the query, `rowsFetched` is the true fetched count, and
 `assertAccountsForEveryRow` holds it against the classifier. Worth re-checking
 if a query limit is ever added.
+
+### Retargeted again for `SignalRecency` (`2c23a97`) — and this commit is contract-coupled
+
+`DetectorSignal.latest` became `null | { at, kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED' }`.
+The fixtures take `{ at, kind }`; the coherence gate reads `latest.at`.
+
+**These files will not compile on a tree without `2c23a97`.** They must land
+with it, not before it. Verified by typechecking them against `main` without
+that commit rather than assumed.
+
+### Added: `qa-probe-recency-kind.ts`
+
+The invariant that spans two detectors, which neither detector's own unit test
+is positioned to see:
+
+```
+repeated-credential-failure   must only ever say EVENT_OCCURRED
+external-mailbox-forwarding   must only ever say STATE_OBSERVED
+```
+
+It does not stop at the label. A label is a claim, and the defect being guarded
+against was a read time wearing an event time's clothes — so it also asks
+whether `latest.at` came from where the kind says it came from: an
+`EVENT_OCCURRED` value must equal the time of an event in the input, a
+`STATE_OBSERVED` value must equal the artefact's own `observedAt`. The
+forwarding artefact is stamped six months old on purpose, because a read time
+is always recent and an input where both are recent cannot tell them apart.
+
+Mutation-verified against the product source, then restored (diff-clean):
+
+| Mutation | Result |
+| --- | --- |
+| credential rule claims `STATE_OBSERVED` | kind check FAILS, value check unaffected |
+| forwarding stamps `new Date()` instead of `observedAt` | **kind check PASSES**, value check FAILS |
+
+The second row is why the probe goes past the label. That mutation is the
+original defect exactly — the label stays honest and only the value is wrong —
+and a check that read `kind` alone would have passed it.
+
+### Added: `qa-run-harness-credential-failure.ts` — the blocking precondition
+
+The stale-evidence ruling gates on `monotonic`, and that flag had never been
+checked for `repeated-credential-failure`, the detector that carries it. This is
+that run. `held: true` is not the result; three things hold together:
+
+| | |
+| --- | --- |
+| lockout branch (`lockouts > 0`) | held, **1448** findings surviving |
+| threshold branch (`rejections >= 5`) | held, **1450** findings surviving |
+| mixed, with successes and an excluded code | held, **1362** findings surviving |
+| absence-keyed counterexample, same pool | **caught at trial 2**, `LOST_WHILE_RAN` |
+
+Both firing branches get their own pool. A pool that only ever trips the lockout
+branch leaves the threshold branch unverified while the summary line still says
+the detector holds — findings seen, but all from one arm.
+
+The counterexample is the part that makes `held: true` mean anything. A quiet
+instrument and a correct detector produce identical output, so the run includes
+a deliberately absence-keyed rule over the same events with the same
+declaration. The harness catches it at trial 2, which is what licenses reading
+the three green rows as a result rather than as silence.
+
+Reading the detector first: it fires on `lockouts > 0 || rejections >= threshold`
+and always emits both signals, including one the subject never produced. Nothing
+in it is keyed on an absence. The declaration is earned.
+
+### Fourth reconciliation (`265e61f`): `syncStatus` is now per feed
+
+`Readonly<Record<NormalizationSource, CollectorSyncStatus>>` rather than one
+status. The five database gates pass both feeds explicitly.
+
+### `qa-gate-collector-mapping.ts` — acceptance test for the `COLLECTOR_FOR` fix
+
+| commit | `COLLECTOR_FOR.M365_AUDIT_STS` | applies | verdict |
+| --- | --- | --- | --- |
+| `265e61f` | `M365_AUDIT` | 0 of 15 | **VETO** |
+| `10d1116` | `SIGN_INS` | 15 of 15 | **PASS** |
+| `1bf4a1f` | `SIGN_INS` | 15 of 15 | **PASS** |
+
+The fix is verified independently. The PASS is accounted for: the same gate
+reports VETO one commit earlier, with integrity clean and the guard satisfied
+in both runs, so the difference is the mapping and nothing else.
+
+**The first attempt at this gate was testing the wrong level.**
+`qa-gate-freshness-asks-the-right-collector.ts` calls `readTenantAssessment` and
+*injects* `syncStatus` itself. The mapping lives one level above it, in
+`syncStatusPerFeed`. So that gate reproduces the consequence of a wrong status
+and is blind to which collector was asked — it would have reported the veto
+unchanged after a correct fix and blocked it. **A test that injects the value
+under test cannot check how that value is chosen.** Both are kept: one shows
+the harm, one tests the fix.
+
+**And the first run of the corrected gate was also wrong.** It reported VETO
+because the fixture stamped `ingestedAt` before the events, so all fifteen rows
+came back `UNPROCESSABLE / INGESTION_PRECEDES_EVENT` — `applies: 0` with the
+evidence read perfectly well, which looks exactly like the veto. Caught by
+dumping the raw persisted coverage instead of trusting the verdict line. The
+gate now guards on it: rows fetched is not enough when every row can fail
+integrity.
+
+One honest limitation: the `UNREADABLE_NOW` / `NEVER_COLLECTED` marker check
+never fires in either run, so the discrimination rests entirely on `applies`.
+That is demonstrated rather than assumed, but the marker check is currently
+inert and should not be read as contributing.

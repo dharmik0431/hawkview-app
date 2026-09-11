@@ -2,7 +2,7 @@
 // so run it against a detector known monotonic and one known NOT, and require
 // it to separate them.
 import { checkMonotonic } from './qa-monotonicity-harness.js'
-import type { Detector, DetectorResult } from './contract.js'
+import type { Detector, DetectorResult, DetectorSignal } from './contract.js'
 
 type Ev = Readonly<{ id: string; kind: 'FAILURE' | 'SUCCESS'; user: string }>
 const pool: readonly Ev[] = [
@@ -12,7 +12,7 @@ const pool: readonly Ev[] = [
   { id: 'f5', kind: 'FAILURE', user: 'carol' }, { id: 's3', kind: 'SUCCESS', user: 'carol' },
 ]
 const finding = (id: string, user: string) => ({
-  detectorId: id, subject: { kind: 'DIRECTORY_USER' as const, userRef: user, correlation: { available: false as const, because: 'qa probe' } }, signals: [{ signal: 'FAILURE', count: 1, latest: '2026-09-10T00:00:00.000Z' }] as const,
+  detectorId: id, subject: { kind: 'DIRECTORY_USER' as const, userRef: user, correlation: { available: false as const, because: 'qa probe' } }, signals: [{ signal: 'FAILURE', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const,
 })
 
 // PRESENCE-keyed: "this user had a failure". Adding events can only add findings.
@@ -100,10 +100,10 @@ const dropsASignal: Detector<Ev> = {
         detectorId: 'drops-a-signal',
         subject: { kind: 'DIRECTORY_USER' as const, userRef: u, correlation: { available: false as const, because: 'qa probe' } },
         signals: (events.length > 4
-          ? [{ signal: 'FAILURE', count: 1, latest: '2026-09-10T00:00:00.000Z' }]
-          : [{ signal: 'FAILURE', count: 1, latest: '2026-09-10T00:00:00.000Z' },
-             { signal: 'CORROBORATING_DETAIL', count: 1, latest: '2026-09-10T00:00:00.000Z' }]
-        ) as unknown as readonly [{ signal: string; count: number; latest: string | null }],
+          ? [{ signal: 'FAILURE', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }]
+          : [{ signal: 'FAILURE', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } },
+             { signal: 'CORROBORATING_DETAIL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }]
+        ) as unknown as readonly [DetectorSignal],
       })),
     }
   },

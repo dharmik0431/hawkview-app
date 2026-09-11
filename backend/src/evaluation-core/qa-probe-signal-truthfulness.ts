@@ -14,14 +14,14 @@
 //    core that drops zero-count signals would erase the distinction silently
 //    while every count stayed correct.
 import { evaluate } from './evaluate.js'
-import type { Detector, DetectorResult, Subject } from './contract.js'
+import type { Detector, DetectorResult, DetectorSignal, Subject } from './contract.js'
 
 type Ev = Readonly<{ id: number; at: string }>
 const t = (n: number) => new Date(Date.UTC(2026, 8, 10, 0, 0, n)).toISOString()
 const pool: readonly Ev[] = Array.from({ length: 40 }, (_, i) => ({ id: i, at: t(i) }))
 const subject: Subject = { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: false, because: 'qa probe' } }
 
-const detector = (signals: () => readonly [{ signal: string; count: number; latest: string | null }, ...{ signal: string; count: number; latest: string | null }[]]): Detector<Ev> => ({
+const detector = (signals: () => readonly [DetectorSignal, ...DetectorSignal[]]): Detector<Ev> => ({
   id: 'probe', monotonic: true,
   run: (applicable): DetectorResult => ({
     status: 'RAN', assessed: applicable.length, declined: {},
@@ -40,7 +40,7 @@ const run = (d: Detector<Ev>, maxEvents: number) => evaluate({
 })
 
 // ---- 1. CAPPED ----
-const plain = detector(() => [{ signal: 'FAILURE', count: 40, latest: t(39) }])
+const plain = detector(() => [{ signal: 'FAILURE', count: 40, latest: { at: t(39), kind: 'EVENT_OCCURRED' } }])
 const truncated = run(plain, 10)   // 40 events, budget 10 -> a floor
 const whole = run(plain, 1000)     // whole window -> a total
 
@@ -60,10 +60,10 @@ const truncatedClaimIsNotExact = truncated.count.accuracy !== 'EXACT'
 // ---- 2. EVALUATED-AND-NONE vs NEVER-EVALUATED ----
 const looked = detector(() => [
   { signal: 'LOCKED_OUT', count: 0, latest: null },      // evaluated, none occurred
-  { signal: 'REJECTED', count: 3, latest: t(9) },
+  { signal: 'REJECTED', count: 3, latest: { at: t(9), kind: 'EVENT_OCCURRED' } },
 ])
 const didNotLook = detector(() => [
-  { signal: 'REJECTED', count: 3, latest: t(9) },        // LOCKED_OUT never evaluated
+  { signal: 'REJECTED', count: 3, latest: { at: t(9), kind: 'EVENT_OCCURRED' } },        // LOCKED_OUT never evaluated
 ])
 const lookedSignals = signalsOf(run(looked, 1000))
 const didNotLookSignals = signalsOf(run(didNotLook, 1000))
@@ -91,8 +91,8 @@ console.log(JSON.stringify({
           : `FAIL - truncatedAllCapped=${everyTruncatedSignalCapped} wholeNoneCapped=${noWholeSignalCapped} claimNotExact=${truncatedClaimIsNotExact}`,
     },
     lookedVsDidNotLook: {
-      lookedAndFoundNone: lookedSignals.map(s => ({ signal: s.signal, count: s.count, latest: s.latest })),
-      neverLooked: didNotLookSignals.map(s => ({ signal: s.signal, count: s.count, latest: s.latest })),
+      lookedAndFoundNone: lookedSignals.map(s => ({ signal: s.signal, count: s.count, latest: s.latest === null ? null : `${s.latest.at} (${s.latest.kind})` })),
+      neverLooked: didNotLookSignals.map(s => ({ signal: s.signal, count: s.count, latest: s.latest === null ? null : `${s.latest.at} (${s.latest.kind})` })),
       zeroSignalSurvives, absenceStaysAbsent,
       verdict: distinguishable
         ? 'PASS - "we looked and found none" and "we did not look" reach a reader as different facts'

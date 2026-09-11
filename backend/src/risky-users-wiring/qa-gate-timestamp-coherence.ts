@@ -51,7 +51,7 @@ try {
   const read = await readTenantAssessment(prisma, {
     organizationId, customerTenantId, feedIfNoRows: 'GRAPH_SIGN_INS',
     collectionScope: { GRAPH_SIGN_INS: 'GRAPH_INTERACTIVE_ONLY', M365_AUDIT_STS: 'AUDIT_STS_LOGON_EVENTS' } as any,
-    syncStatus: 'SUCCESS', detectors: [credentialFailureDetector({ rejectionThreshold: 5 })],
+    syncStatus: { GRAPH_SIGN_INS: 'SUCCESS', M365_AUDIT_STS: 'SUCCESS' }, detectors: [credentialFailureDetector({ rejectionThreshold: 5 })],
     windowStart, windowEnd, maxEvents: 5000,
   })
 
@@ -75,10 +75,10 @@ try {
   const near = (value: string | null, target: string) =>
     value !== null && Math.abs(Date.parse(value) - Date.parse(target)) < 60_000
   const misattributed = signals.filter(signal =>
-    (signal.count === 6 && near(signal.latest, loneRejection)) ||
-    (signal.count === 1 && near(signal.latest, latestLockout)))
+    (signal.count === 6 && near(signal.latest?.at ?? null, loneRejection)) ||
+    (signal.count === 1 && near(signal.latest?.at ?? null, latestLockout)))
   const lockoutSignal = signals.find(signal => signal.count === 6) ?? null
-  const lockoutStampedRight = lockoutSignal !== null && near(lockoutSignal.latest, latestLockout)
+  const lockoutStampedRight = lockoutSignal !== null && near(lockoutSignal.latest?.at ?? null, latestLockout)
 
   // GUARD. If the six lockouts never became a signal of their own, there is
   // nothing here that could be misattributed and a clean reading means only
