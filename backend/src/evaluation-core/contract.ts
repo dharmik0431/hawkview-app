@@ -212,8 +212,22 @@ export type Subject =
  * would silently take three tenants to zero. And a tenant with no correlation is
  * a true statement about capability — Microsoft's risky-users channel requires
  * Entra ID P2 — not a shrug, so it needs somewhere to say so. */
+/** How to join this subject back to the provider's own channels.
+ *
+ * `matchedBy` SAYS HOW THE SUBJECT WAS IDENTIFIED. It does NOT say what `ref`
+ * contains, and the distinction cost a real misreading: the field was called
+ * `shape` with values DIRECTORY_OBJECT_ID and USER_PRINCIPAL_NAME, so a reader
+ * took USER_PRINCIPAL_NAME to mean the ref held an email address. It never
+ * does — `ref` is minted from the directory object id on EVERY path, including
+ * the audit one, where the subject is matched BY upn and then referenced by
+ * its object id.
+ *
+ * Renamed because a label describing one thing while sitting beside a value
+ * that is another is the failure this team has now hit five times in a day: a
+ * name is a claim made by whoever typed it and carries no evidence. Check the
+ * value, never the label. */
 export type CorrelationRef =
-  | Readonly<{ available: true; shape: 'DIRECTORY_OBJECT_ID' | 'USER_PRINCIPAL_NAME'; ref: string }>
+  | Readonly<{ available: true; matchedBy: 'DIRECTORY_OBJECT_ID' | 'USER_PRINCIPAL_NAME'; ref: string }>
   | Readonly<{ available: false; because: string }>
 
 /** Why a mailbox is not a user — and these are not the same answer.

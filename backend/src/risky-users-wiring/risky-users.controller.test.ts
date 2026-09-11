@@ -42,12 +42,15 @@ const run = {
 }
 
 function controller(options: Readonly<{
-  authorize: () => Promise<{ id: string; organizationId: string } | null>
+  authorize: () => Promise<unknown>
   row?: typeof run | null
 }>) {
   const queried: Record<string, unknown>[] = []
   const identityRisk = { authorizeRiskyUsersRead: options.authorize } as never
   const prisma = {
+    directoryUser: {
+      findMany: async (args: Record<string, unknown>) => { queried.push({ directoryUser: args }); return [] },
+    },
     identityRiskEvaluationRun: {
       findFirst: async (args: Record<string, unknown>) => {
         queried.push(args)
@@ -79,7 +82,7 @@ test('the pilot gate declining is its own answer, not a missing assessment', asy
   // "You may not read this yet" and "there is nothing to read" are different
   // facts and a technician acts on them differently. Collapsing them into one
   // "unavailable" is the undifferentiated answer this whole vocabulary removes.
-  const { controller: subject, queried } = controller({ authorize: async () => null })
+  const { controller: subject, queried } = controller({ authorize: async () => ({ gate: 'NOT_ENABLED_FOR_TENANT' }) })
 
   const response = await subject.assessment(request, 'tenant-1') as Record<string, unknown>
   assert.equal(response.available, false)
@@ -92,12 +95,12 @@ test('an authorized read is scoped to the organization the check returned', asyn
   // parameter. If it used the parameter, a caller who passed authorization for
   // one tenant could name another in the URL.
   const { controller: subject, queried } = controller({
-    authorize: async () => ({ id: 'authorized-tenant', organizationId: 'authorized-org' }),
+    authorize: async () => ({ gate: null, tenant: { id: 'authorized-tenant', organizationId: 'authorized-org', evidenceDetailAllowed: true } }),
   })
 
   await subject.assessment(request, 'a-different-id-in-the-url')
 
-  const where = queried[0]?.where as Record<string, unknown>
+  const where = queried.find(q => q.where !== undefined)?.where as Record<string, unknown>
   assert.equal(where.customerTenantId, 'authorized-tenant')
   assert.equal(where.organizationId, 'authorized-org')
   assert.notEqual(where.customerTenantId, 'a-different-id-in-the-url')
@@ -105,7 +108,7 @@ test('an authorized read is scoped to the organization the check returned', asyn
 
 test('a complete run is served natively, with each signal keeping its own date', async () => {
   const { controller: subject } = controller({
-    authorize: async () => ({ id: 'tenant-1', organizationId: 'org-1' }),
+    authorize: async () => ({ gate: null, tenant: { id: 'tenant-1', organizationId: 'org-1', evidenceDetailAllowed: true } }),
   })
 
   const response = await subject.assessment(request, 'tenant-1') as Record<string, any>
@@ -136,7 +139,7 @@ test('the old engine\'s vocabulary is absent — nothing here invents a capabili
   // invent. Serving `capability` would mean deciding which withheld reasons are
   // PARTIAL and which are UNAVAILABLE, for a word read before the reasons are.
   const { controller: subject } = controller({
-    authorize: async () => ({ id: 'tenant-1', organizationId: 'org-1' }),
+    authorize: async () => ({ gate: null, tenant: { id: 'tenant-1', organizationId: 'org-1', evidenceDetailAllowed: true } }),
   })
 
   const response = await subject.assessment(request, 'tenant-1') as Record<string, unknown>
@@ -153,7 +156,7 @@ test('the old engine\'s vocabulary is absent — nothing here invents a capabili
 })
 
 test('no run, and an unreadable run, keep their own reasons', async () => {
-  const authorize = async () => ({ id: 'tenant-1', organizationId: 'org-1' })
+  const authorize = async () => ({ gate: null, tenant: { id: 'tenant-1', organizationId: 'org-1', evidenceDetailAllowed: true } })
 
   const none = await controller({ authorize, row: null }).controller
     .assessment(request, 'tenant-1') as Record<string, unknown>
@@ -167,7 +170,9 @@ test('no run, and an unreadable run, keep their own reasons', async () => {
     row: { ...run, evaluationFindings: { version: 'hawkview-run-findings/v9' } } as never,
   }).controller.assessment(request, 'tenant-1') as Record<string, unknown>
   assert.equal(broken.available, false)
-  assert.equal(broken.because, 'FINDINGS_UNREADABLE')
+  // Its own code: a newer backend wrote this, which is a deploy-ordering fact
+  // rather than corruption.
+  assert.equal(broken.because, 'FINDINGS_VERSION_AHEAD')
 })
 
 test('the collector facts are served under their own name, and no freshness verdict is', async () => {
@@ -176,7 +181,7 @@ test('the collector facts are served under their own name, and no freshness verd
   // facts rather than our conclusion about them — the same principle as not
   // serving `capability`, one level down.
   const { controller: subject } = controller({
-    authorize: async () => ({ id: 'tenant-1', organizationId: 'org-1' }),
+    authorize: async () => ({ gate: null, tenant: { id: 'tenant-1', organizationId: 'org-1', evidenceDetailAllowed: true } }),
   })
 
   const response = await subject.assessment(request, 'tenant-1') as Record<string, any>

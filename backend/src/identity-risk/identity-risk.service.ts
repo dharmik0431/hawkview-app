@@ -342,7 +342,26 @@ export class IdentityRiskService {
    */
   async authorizeRiskyUsersRead(identity: AuthenticatedIdentity, tenantId: string) {
     const tenant = await this.scope(identity, tenantId)
-    return pilotReadAllowed(tenant) ? tenant : null
+    // THREE gates, not two. I originally named the pilot gate and the tenant
+    // scope and missed this one — the operator kill switch, which every other
+    // identity-risk read checks (assessment, findings, findingDetail,
+    // mailboxInvestigation). Missing it means pulling the emergency stop no
+    // longer stops the display, on the code path most likely to need stopping
+    // because it is the rebuilt engine's first exposure to customers.
+    //
+    // Each gate keeps its own answer. "Not enabled for this tenant" and
+    // "an operator has halted evaluation" send a reader to different places,
+    // and collapsing them into one unavailable is the undifferentiated answer
+    // this whole vocabulary exists to remove.
+    if (!pilotReadAllowed(tenant)) return { gate: 'NOT_ENABLED_FOR_TENANT' as const }
+    if ((await this.currentControls(tenant)).evaluationHardDisabled) {
+      return { gate: 'EVALUATION_DISABLED' as const }
+    }
+    // The role tier decides whether the SUBJECT CAN BE NAMED, not whether the
+    // page can be seen. Counts and coverage travel to every role; the display
+    // name and UPN travel only to MSP_OWNER and MSP_ADMIN, which is what
+    // evidenceDetailAllowed already means on the existing detail endpoints.
+    return { gate: null, tenant } as const
   }
 
   private async scope(

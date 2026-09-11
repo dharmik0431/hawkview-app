@@ -46,13 +46,15 @@ export class RiskyUsersController {
   @Get('risky-users/assessment')
   @Header('Cache-Control', 'no-store')
   async assessment(@Req() request: AuthenticatedRequest, @Param('tenantId') tenantId: string) {
-    const tenant = await this.identityRisk.authorizeRiskyUsersRead(request.auth, tenantId)
-    if (tenant === null) {
-      // Distinct from "not yours", which `scope` has already thrown for, and
-      // distinct from "no run yet". Three different answers; an undifferentiated
-      // "unavailable" is the defect this vocabulary exists to remove.
-      return { version: RISKY_USERS_RESPONSE_VERSION, available: false, because: 'NOT_ENABLED_FOR_TENANT' }
+    const decision = await this.identityRisk.authorizeRiskyUsersRead(request.auth, tenantId)
+    if (decision.gate !== null) {
+      // Returned rather than thrown. A 403 on a list-level page someone reaches
+      // by navigating to Risky Users is indistinguishable from "this tenant is
+      // not yours" and renders as a broken page instead of an answer. Only the
+      // cross-tenant case throws, and `scope` does that before we get here.
+      return { version: RISKY_USERS_RESPONSE_VERSION, available: false, because: decision.gate }
     }
+    const tenant = decision.tenant
 
     const run = await readLatestRun(
       this.prisma as never,
@@ -60,37 +62,35 @@ export class RiskyUsersController {
       new Date(),
     )
     if (!run.present) {
-      // The reader's own reason travels rather than flattening. NO_RUN is a
-      // scheduling question, an unreadable record is a data question, and a
-      // record from a future version is a deploy-ordering question — they send
-      // an investigator to different places.
       return { version: RISKY_USERS_RESPONSE_VERSION, available: false, because: run.because }
     }
+
+    // WHO THE SUBJECT IS, and only for a role permitted to know.
+    //
+    // Without this the screen reads `subject:c54eb6ce-…` beside 339 lockouts,
+    // which is not actionable — the same dead end as the old engine's literal
+    // "Tenant identity" placeholder, reached by a different route. A rebuild
+    // more honest than its predecessor and equally unusable is not a rebuild.
+    //
+    // The named identity is what `evidenceDetailAllowed` gates, rather than a
+    // second unrelated rule beside it: every role sees the counts, the coverage
+    // and the opaque ref; MSP_OWNER and MSP_ADMIN additionally see who. That is
+    // a product statement rather than an arbitrary role check.
+    const identities = tenant.evidenceDetailAllowed
+      ? await this.resolveSubjects(tenant, run.findings)
+      : new Map<string, { displayName: string | null; userPrincipalName: string }>()
 
     return {
       version: RISKY_USERS_RESPONSE_VERSION,
       available: true,
-      /** The run's own timing. `windowEnd` is set at the read moment by the
-       * evaluator, so a gap between it and `completedAt` means a stale or
-       * replayed run — a fact about the RUN, not about the tenant, and distinct
-       * from both the evidence being old and a finding's own horizon. */
+      /** Whether this response names people. False is not an error — it is the
+       * role's answer, and a surface should say so rather than showing blanks. */
+      subjectsNamed: tenant.evidenceDetailAllowed,
       run: {
         windowStart: run.windowStart.toISOString(),
         windowEnd: run.windowEnd.toISOString(),
         completedAt: run.completedAt.toISOString(),
       },
-      /** WHAT EACH COLLECTOR HAD ACHIEVED, not a freshness verdict about it.
-       *
-       * The consumer recomputes coverage from these and refuses an EXACT total
-       * the evidence does not support. Sending a one-word verdict would make
-       * that check trust us rather than check us — and that check existing is
-       * the reason a server cannot assert an exact total over stale evidence.
-       *
-       * NAMED `collectors`, NOT `sources`. The old envelope has a `sources[]`
-       * carrying reasonCode, explanation, freshness and a window — a different
-       * shape. Reusing the name for a different thing is the mistake that cost
-       * four wrong inferences today: a name is a claim made by whoever typed it,
-       * carrying no evidence, sitting beside fields that do. */
       collectors: run.sources,
       count: run.count,
       claim: run.claim,
@@ -100,9 +100,58 @@ export class RiskyUsersController {
         items: run.findings.map(finding => ({
           detectorId: finding.detectorId,
           subject: finding.subject,
+          // Present only when the role permits AND the directory row exists.
+          // A subject with no match renders as the opaque ref rather than an
+          // empty string or an invented placeholder — absent, not blank.
+          ...(identities.get(subjectRefOf(finding)) ?? {}),
           signals: signalsOf(finding),
         })),
       },
     }
   }
+
+  /** Names the subjects, WITHIN THIS TENANT ONLY.
+   *
+   * The scope is the whole safety of it. A lookup that could reach another
+   * tenant's `directory_users` would be the cross-tenant exposure avoided
+   * everywhere else tonight, arriving through a display-name join — so both
+   * scope columns are in the where clause and a test asserts they are.
+   *
+   * The ref is minted as `subject:<microsoftUserId>`, so the directory id is
+   * recovered by stripping that prefix rather than by a second lookup table. */
+  private async resolveSubjects(
+    tenant: Readonly<{ id: string; organizationId: string }>,
+    findings: readonly Readonly<{ subject: unknown }>[],
+  ) {
+    const wanted = new Map<string, string>()
+    for (const finding of findings) {
+      const ref = subjectRefOf(finding)
+      const directoryId = ref.startsWith(SUBJECT_PREFIX) ? ref.slice(SUBJECT_PREFIX.length) : null
+      if (directoryId !== null && directoryId !== '') wanted.set(directoryId, ref)
+    }
+    if (wanted.size === 0) return new Map<string, { displayName: string | null; userPrincipalName: string }>()
+
+    const rows = await this.prisma.directoryUser.findMany({
+      where: {
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        microsoftUserId: { in: [...wanted.keys()] },
+      },
+      select: { microsoftUserId: true, displayName: true, userPrincipalName: true },
+    })
+    const named = new Map<string, { displayName: string | null; userPrincipalName: string }>()
+    for (const row of rows) {
+      const ref = wanted.get(row.microsoftUserId)
+      if (ref === undefined) continue
+      named.set(ref, { displayName: row.displayName ?? null, userPrincipalName: row.userPrincipalName })
+    }
+    return named
+  }
+}
+
+const SUBJECT_PREFIX = 'subject:'
+
+const subjectRefOf = (finding: Readonly<{ subject: unknown }>): string => {
+  const subject = finding.subject as Record<string, unknown>
+  return typeof subject?.userRef === 'string' ? subject.userRef : ''
 }

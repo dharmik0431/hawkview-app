@@ -8,7 +8,7 @@ const finding = (signals: Finding['signals']): Finding => ({
   subject: {
     kind: 'DIRECTORY_USER',
     userRef: 'subject-1',
-    correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-1' },
+    correlation: { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: 'guid-1' },
   },
   signals,
 })

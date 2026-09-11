@@ -101,7 +101,10 @@ test('a count whose findings did not come back is REFUSED, not served as an empt
   const unreadable = reader({ ...row, evaluationFindings: { version: 'hawkview-run-findings/v9', items: [] } })
   assert.deepEqual(
     await readLatestRun(unreadable.client as never, scope, now),
-    { present: false, because: 'FINDINGS_UNREADABLE' })
+    // Its OWN code now. A record from a newer backend is a deploy-ordering fact
+    // — wait for the other service — not corruption, and the decoder already knew
+    // the difference before the reader started throwing it away.
+    { present: false, because: 'FINDINGS_VERSION_AHEAD' })
 
   // POSITIVE CONTROL: the same row with its findings intact does come back, so
   // the refusals above are about the missing findings rather than a reader that

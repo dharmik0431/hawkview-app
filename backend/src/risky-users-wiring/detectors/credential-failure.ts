@@ -32,13 +32,13 @@ const FAMILY: readonly EventOutcome[] = ['LOCKED_OUT_AFTER_REPEATED_FAILURES', '
 const outcomeOf = (event: NormalizedEvent): EventOutcome | null =>
   event.classification.kind === 'APPLIES' ? event.classification.outcome : null
 
-/** The classifier says how it bound the subject; the finding carries that
+/** The classifier says how it MATCHED the subject; the finding carries that
  * through so the read path can join Microsoft's channel on the right key.
  * Inventing a shape here would produce a join that silently matches nothing. */
 const correlationFor = (event: NormalizedEvent): CorrelationRef =>
   event.subjectBinding === 'DIRECTORY_OBJECT_ID'
-    ? { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: event.subjectRef }
-    : { available: true, shape: 'USER_PRINCIPAL_NAME', ref: event.subjectRef }
+    ? { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: event.subjectRef }
+    : { available: true, matchedBy: 'USER_PRINCIPAL_NAME', ref: event.subjectRef }
 
 export function credentialFailureDetector(
   options: Readonly<{ rejectionThreshold: number }> = { rejectionThreshold: 5 },

@@ -26,7 +26,7 @@ const coverage = (parts: Partial<Coverage> = {}): Coverage => ({
 /** Sign-in events carry a directory user, so this detector's findings are about
  * people and do count. Contrast the mailbox detector, whose findings are not. */
 const user = (userRef: string) => (
-  { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const)
+  { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const)
 
 const matching: Detector<Event> = {
   id: 'matches-flagged',

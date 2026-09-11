@@ -9,7 +9,7 @@ const raymonds: Finding = {
   subject: {
     kind: 'DIRECTORY_USER',
     userRef: 'subject:c54eb6ce',
-    correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-c54eb6ce' },
+    correlation: { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: 'guid-c54eb6ce' },
   },
   signals: [
     { signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES', count: 462, latest: { at: '2026-09-03T10:40:00.000Z', kind: 'EVENT_OCCURRED' }, capped: false },

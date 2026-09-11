@@ -90,7 +90,7 @@ test('a mailbox we could not attribute refuses the exact zero rather than implyi
         status: 'RAN' as const, assessed: 1, declined: {},
         findings: [{
           detectorId: 'user-side',
-          subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-alice' } } as const,
+          subject: { kind: 'DIRECTORY_USER', userRef: 'alice', correlation: { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: 'guid-alice' } } as const,
           signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const,
         }],
       }),
@@ -111,7 +111,7 @@ test('a mailbox that resolved to a real person counts as that person', () => {
       userRef: 'alice',
       // Graph evidence, so the directory object id is available and this user
       // can be matched against Microsoft's own risk channel.
-      correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-alice' },
+      correlation: { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: 'guid-alice' },
     },
   }])
   assert.deepEqual(figure(result.count), { accuracy: 'EXACT', value: 1 })
@@ -131,7 +131,7 @@ test('a subject can say it has no correlation key rather than leaving the field 
     subject: {
       kind: 'DIRECTORY_USER',
       userRef: 'alice',
-      correlation: { available: true, shape: 'USER_PRINCIPAL_NAME', ref: 'opaque-upn-handle' },
+      correlation: { available: true, matchedBy: 'USER_PRINCIPAL_NAME', ref: 'opaque-upn-handle' },
     },
   }])
   assert.deepEqual(figure(byUpn.count), { accuracy: 'EXACT', value: 1 })
@@ -169,7 +169,7 @@ test('adding a mailbox finding never moves the user count, colliding ref or not'
       declined: {},
       findings: [{
         detectorId: `user-${userRef}`,
-        subject: { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const,
+        subject: { kind: 'DIRECTORY_USER', userRef, correlation: { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + userRef } } as const,
         signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const,
       }],
     }),

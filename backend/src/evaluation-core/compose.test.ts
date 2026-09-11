@@ -17,7 +17,7 @@ const matching: Detector<Event> = {
     status: 'RAN', assessed: applicable.length, declined: {},
     findings: applicable.filter(item => item.match).map(item => ({
       detectorId: 'matches-flagged',
-      subject: { kind: 'DIRECTORY_USER', userRef: item.subject, correlation: { available: true, shape: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + item.subject } } as const,
+      subject: { kind: 'DIRECTORY_USER', userRef: item.subject, correlation: { available: true, matchedBy: 'DIRECTORY_OBJECT_ID', ref: 'guid-' + item.subject } } as const,
       signals: [{ signal: 'TEST_SIGNAL', count: 1, latest: { at: '2026-09-10T00:00:00.000Z', kind: 'EVENT_OCCURRED' } }] as const,
     })),
   }),

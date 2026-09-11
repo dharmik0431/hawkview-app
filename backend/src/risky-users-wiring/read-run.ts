@@ -47,8 +47,8 @@ export type ReadRunResult =
   | Readonly<{
     present: false
     because: 'NO_RUN'
-      | 'COVERAGE_NOT_RECORDED' | 'COVERAGE_UNREADABLE'
-      | 'FINDINGS_NOT_RECORDED' | 'FINDINGS_UNREADABLE'
+      | 'COVERAGE_NOT_RECORDED' | 'COVERAGE_VERSION_AHEAD' | 'COVERAGE_UNREADABLE'
+      | 'FINDINGS_NOT_RECORDED' | 'FINDINGS_VERSION_AHEAD' | 'FINDINGS_UNREADABLE'
   }>
 
 type RunRow = Readonly<{
@@ -96,7 +96,15 @@ export async function readLatestRun(
   if (!coverage.present) {
     return {
       present: false,
-      because: coverage.because === 'NOT_RECORDED' ? 'COVERAGE_NOT_RECORDED' : 'COVERAGE_UNREADABLE',
+      because: coverage.because === 'NOT_RECORDED'
+        ? 'COVERAGE_NOT_RECORDED'
+        // A record written by a version this build does not know is a
+        // DEPLOY-ORDERING fact, not corruption. The decoder already drew that
+        // distinction; collapsing it here would destroy it one layer above where
+        // it was computed, which is the defect class this rebuild exists to remove.
+        : coverage.because === 'UNRECOGNIZED_VERSION'
+          ? 'COVERAGE_VERSION_AHEAD'
+          : 'COVERAGE_UNREADABLE',
     }
   }
 
@@ -108,7 +116,15 @@ export async function readLatestRun(
     // did not come back is to decline to serve the number.
     return {
       present: false,
-      because: findings.because === 'NOT_RECORDED' ? 'FINDINGS_NOT_RECORDED' : 'FINDINGS_UNREADABLE',
+      because: findings.because === 'NOT_RECORDED'
+        ? 'FINDINGS_NOT_RECORDED'
+        // A record written by a version this build does not know is a
+        // DEPLOY-ORDERING fact, not corruption. The decoder already drew that
+        // distinction; collapsing it here would destroy it one layer above where
+        // it was computed, which is the defect class this rebuild exists to remove.
+        : findings.because === 'UNRECOGNIZED_VERSION'
+          ? 'FINDINGS_VERSION_AHEAD'
+          : 'FINDINGS_UNREADABLE',
     }
   }
 
