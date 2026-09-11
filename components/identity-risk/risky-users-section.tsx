@@ -665,21 +665,59 @@ function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
           risk.
         </p>
       )}
-      {polarityGroups.map(({ polarity, heading, note }) => {
-        const users = groups[polarity]
-        if (users.length === 0) return null
+      {/* Only what Microsoft currently considers at risk is listed.
+       *
+       * The closed, cleared and unrecognised groups were rendering as three
+       * more tables of every record Microsoft has ever returned — remediations
+       * from 2024, dismissals, one confirmed-safe account — on a screen whose
+       * subject is who is at risk NOW. True records, and none of them a
+       * finding; the page's own note already says the cleared ones "are not
+       * findings". Printing them at equal weight beside current risk is the
+       * same fault this surface keeps making, in layout rather than in wording.
+       *
+       * They are summarised rather than dropped. A count that says the records
+       * exist and are not shown is honest; removing them silently would let
+       * "HawkView did not show it" read as "Microsoft never said it". */}
+      {polarityGroups
+        .filter(({ polarity }) => polarity === 'ACTIVE_RISK')
+        .map(({ polarity, heading, note }) => {
+          const users = groups[polarity]
+          if (users.length === 0) return null
+          return (
+            <section key={polarity} className="mt-4">
+              <h5 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                {heading} ({users.length})
+              </h5>
+              <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                {note}
+              </p>
+              <MicrosoftRecordTable users={users} caption={heading} />
+            </section>
+          )
+        })}
+      {(() => {
+        const notShown =
+          groups.CLOSED.length +
+          groups.CLEARED.length +
+          groups.UNRECOGNISED.length
+        if (notShown === 0) return null
+        const parts = [
+          groups.CLOSED.length > 0 &&
+            `${groups.CLOSED.length} Microsoft has remediated or dismissed`,
+          groups.CLEARED.length > 0 &&
+            `${groups.CLEARED.length} Microsoft considers safe`,
+          groups.UNRECOGNISED.length > 0 &&
+            `${groups.UNRECOGNISED.length} in a state this build does not recognise`,
+        ].filter(Boolean) as string[]
         return (
-          <section key={polarity} className="mt-4">
-            <h5 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-              {heading} ({users.length})
-            </h5>
-            <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-              {note}
-            </p>
-            <MicrosoftRecordTable users={users} caption={heading} />
-          </section>
+          <p className="mt-4 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+            Microsoft also returned {notShown} record
+            {notShown === 1 ? '' : 's'} that are not current risk and are not
+            listed here: {parts.join(', ')}. They are Microsoft&rsquo;s own
+            closed history, not people awaiting attention.
+          </p>
         )
-      })}
+      })()}
       {view.pageInfo?.hasMore && (
         <p className="mt-2 text-xs text-slate-600 dark:text-slate-300">
           More Microsoft records exist than were read into this page, so this is
