@@ -55,6 +55,21 @@ export const ALERT_CATALOG = [
   // ── Privileged directory change ────────────────────────────────────────────
   {
     id: 'security.privileged_directory_change',
+    episodeInterval: {
+      hours: 24,
+      because:
+        'MEASURED rather than chosen. Gaps between consecutive directory changes by the same actor, 761 ' +
+        'gaps across the fleet: 595 (78%) within an hour, 40 (5%) between one and twenty-four hours, 126 ' +
+        '(17%) beyond twenty-four. p50 0.0h, p90 76h, p95 166h. The distribution is BIMODAL WITH A VALLEY ' +
+        '— bursts inside an hour, then days of nothing — so only 5% of gaps fall anywhere in the 1-to-24h ' +
+        'range and any interval in it produces nearly the same grouping. The choice is robust rather than ' +
+        'tuned, which matters more than the number. 24h sits at the far end of the valley: it errs toward ' +
+        'grouping rather than splitting, and over-splitting is the 301-alert problem this work exists to ' +
+        'fix. It also matches the credential-attack window, so the product has one notion of quiet rather ' +
+        'than two. The risk over-grouping would normally carry — a new attack silently joining a closed ' +
+        'incident — is closed independently by the resolved-investigation rule, which opens a new linked ' +
+        'episode regardless of timing.',
+    },
     // Who made the change. One compromised administrator touching twelve accounts is ONE incident, not twelve pages.
     subject: 'ACTOR',
     category: 'SECURITY',
@@ -83,6 +98,15 @@ export const ALERT_CATALOG = [
   // ── Routine directory change ───────────────────────────────────────────────
   {
     id: 'security.routine_directory_change',
+    episodeInterval: {
+      hours: 24,
+      because:
+        'MEASURED, by the same distribution as the privileged case: the gaps were measured over directory ' +
+        'changes by the same actor without splitting by privilege, so the measurement covers both types. ' +
+        '595 of 761 gaps (78%) fall within an hour and only 5% land anywhere in the 1-to-24h valley. Kept ' +
+        'equal to the privileged type deliberately — a routine change and a privileged change by one ' +
+        'actor in one burst must not be split apart by a difference in the grouping rule.',
+    },
     // Who made the change, for the same reason as the privileged case — a bulk operation by one person is one record.
     subject: 'ACTOR',
     category: 'SECURITY',
@@ -120,6 +144,17 @@ export const ALERT_CATALOG = [
   // ── Tenant disconnected ────────────────────────────────────────────────────
   {
     id: 'monitoring.tenant_disconnected',
+    episodeInterval: {
+      hours: 24,
+      because:
+        'A disconnection is a condition rather than a stream of events, so its episode ends when every ' +
+        'covered source is readable again rather than when activity goes quiet. The interval only governs ' +
+        'a tenant disconnecting, being restored, and disconnecting again — one ongoing problem inside a ' +
+        'day, a new one after that. NOT measured: no gap distribution was collected for this type, and ' +
+        'this session does not query production. 24h is taken to keep ONE notion of quiet across the ' +
+        'product rather than to fit this type\'s data. Revisit with a measurement before treating the ' +
+        'number as load-bearing.',
+    },
     // Nobody performed this and nothing was targeted. The tenant is the subject.
     subject: 'TENANT',
     category: 'OPERATIONAL',
@@ -167,6 +202,15 @@ export const ALERT_CATALOG = [
   // ── Collector failing ──────────────────────────────────────────────────────
   {
     id: 'monitoring.collector_failing',
+    episodeInterval: {
+      hours: 24,
+      because:
+        'A collector failing and recovering repeatedly inside a day is one flapping collector rather than ' +
+        'several incidents, so an MSP gets one thing to look at. NOT measured: no gap distribution was ' +
+        'collected for this type, and this session does not query production. 24h is taken to keep ONE ' +
+        'notion of quiet across the product rather than to fit this type\'s data. Revisit with a ' +
+        'measurement before treating the number as load-bearing.',
+    },
     // The specific feed. TENANT here would merge two collectors failing for two different reasons into one incident, and they are two different fixes.
     subject: 'COLLECTOR',
     category: 'OPERATIONAL',
@@ -197,6 +241,15 @@ export const ALERT_CATALOG = [
   // ── Consent expiring ───────────────────────────────────────────────────────
   {
     id: 'monitoring.consent_expiring',
+    episodeInterval: {
+      hours: 24,
+      because:
+        'Consent expiry is a deadline rather than activity, so it produces one episode per expiry in ' +
+        'practice and this interval rarely decides anything. NOT measured: no gap distribution was ' +
+        'collected for this type, and this session does not query production. 24h is taken to keep ONE ' +
+        'notion of quiet across the product rather than to fit this type\'s data. Revisit with a ' +
+        'measurement before treating the number as load-bearing.',
+    },
     // Consent is granted per tenant, so the tenant is what expires.
     subject: 'TENANT',
     category: 'OPERATIONAL',
@@ -219,6 +272,15 @@ export const ALERT_CATALOG = [
   // ── Monitoring recovered ───────────────────────────────────────────────────
   {
     id: 'monitoring.recovered',
+    episodeInterval: {
+      hours: 24,
+      because:
+        'Matches the failure it resolves, so a flapping collector and its recoveries group into one span ' +
+        'instead of interleaving two differently-bounded episodes. NOT measured: no gap distribution was ' +
+        'collected for this type, and this session does not query production. 24h is taken to keep ONE ' +
+        'notion of quiet across the product rather than to fit this type\'s data. Revisit with a ' +
+        'measurement before treating the number as load-bearing.',
+    },
     // Recovery is observed per feed, matching the failure it resolves.
     subject: 'COLLECTOR',
     category: 'OPERATIONAL',

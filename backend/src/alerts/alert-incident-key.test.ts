@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ALERT_CATALOG } from './alert-catalog.js'
 import { incidentGrouping, wouldGroupTogether, type ResolvedSubject } from './alert-incident-key.js'
-import { hasQuietInterval, quietIntervalMsOf, NoQuietIntervalDeclared } from './alert-episode-interval.js'
+import { quietIntervalIsDerived, quietIntervalMsOf } from './alert-episode-interval.js'
 import type { AlertTypeDeclaration } from './alert-type.js'
 
 /** The incident key: grouping, and unable to deduplicate. */
@@ -197,6 +197,10 @@ test('THE QUIET INTERVAL IS DERIVED, and a type without one fails loudly', () =>
   // differs is what settles it.
   const withWindow = (windowHours: number): AlertTypeDeclaration => ({
     ...CREDENTIAL_ATTACK,
+    // Explicit, because spreading a declaration of union type could otherwise carry
+    // an `episodeInterval` into a quiet-timeout variant — the exact combination
+    // `EpisodeGrouping` forbids. The compiler caught this when the union landed.
+    episodeInterval: undefined,
     conditionClears: {
       kind: 'NO_FURTHER_EVENTS_IN_READABLE_WINDOW',
       windowHours,
@@ -207,32 +211,143 @@ test('THE QUIET INTERVAL IS DERIVED, and a type without one fails loudly', () =>
   assert.equal(quietIntervalMsOf(withWindow(1)), 60 * 60 * 1000)
   assert.notEqual(quietIntervalMsOf(withWindow(48)), quietIntervalMsOf(withWindow(24)))
 
-  // A type declaring no window throws rather than substituting a plausible number.
-  assert.throws(() => quietIntervalMsOf(PRIVILEGED_CHANGE), NoQuietIntervalDeclared)
-  assert.equal(hasQuietInterval(PRIVILEGED_CHANGE), false)
-  assert.equal(hasQuietInterval(CREDENTIAL_ATTACK), true)
+  // The OTHER path: a type resolving on an observation declares its interval, and
+  // that number is read too. It is not a fallback — there is no timeout to derive
+  // from, and a default would be a second constant no reviewer ever sees.
+  assert.equal(quietIntervalMsOf(PRIVILEGED_CHANGE), 24 * 60 * 60 * 1000)
+  assert.equal(quietIntervalIsDerived(PRIVILEGED_CHANGE), false)
+  assert.equal(quietIntervalIsDerived(CREDENTIAL_ATTACK), true)
+
+  // And the declared number is READ rather than matched by a constant. Same trap as
+  // the derived path: every declared interval in the catalogue is 24h today, so
+  // asserting 24h cannot tell "reads the declaration" from "returns 24".
+  const withDeclared = (hours: number): AlertTypeDeclaration => ({
+    ...PRIVILEGED_CHANGE,
+    // The condition is pinned alongside the interval. Spreading a declaration of
+    // union type and setting only the interval could produce a quiet-timeout variant
+    // carrying one, which the union forbids — the compiler caught that too.
+    conditionClears: { kind: 'CONFIGURATION_RESTORED', because: 'Synthetic, for this test.' },
+    episodeInterval: { hours, because: 'A second interval, to prove the declared value is used.' },
+  })
+  assert.equal(quietIntervalMsOf(withDeclared(72)), 72 * 60 * 60 * 1000)
+  assert.notEqual(quietIntervalMsOf(withDeclared(72)), quietIntervalMsOf(withDeclared(24)))
 })
 
-test('THE CENSUS: how many declared types can derive an episode interval', () => {
-  // NOT a coverage assertion — a MEASUREMENT, recorded because the answer decides
-  // whether step 02 can group the types it was built for.
+test('THE CENSUS: every declared type can produce an episode interval', () => {
+  // This asserted ONE of seven when the interval could only be derived. Six types
+  // resolve on an observation and had no window, including both directory-change
+  // types — the 301-alert and 334-occurrence cases this step exists to fix. So
+  // episodes were underivable for exactly the types that needed them.
   //
-  // Deriving the interval from the declared resolving condition is right, and only
-  // ONE of the seven declared types states a window. The two that cannot are
-  // security.privileged_directory_change and security.routine_directory_change —
-  // which are precisely the 301-alerts and 334-occurrences cases that motivated
-  // this step. Episodes are therefore underivable for the types that need them
-  // most, and that is a declaration gap rather than a flaw in the derivation: the
-  // repair is to declare windows on those types, not to default one here.
-  const withInterval = ALERT_CATALOG.filter(hasQuietInterval).map((d) => d.id)
-  const without = ALERT_CATALOG.filter((d) => !hasQuietInterval(d)).map((d) => d.id)
+  // The ruling that followed split the rule: derive where the concept is the same,
+  // declare where it is a different fact. The number moving from 1 to 7 IS that
+  // decision, which is why the test was written to fail when it changed.
+  const derived = ALERT_CATALOG.filter(quietIntervalIsDerived).map((d) => d.id)
+  const declared = ALERT_CATALOG.filter((d) => !quietIntervalIsDerived(d)).map((d) => d.id)
 
-  assert.deepEqual(withInterval, ['security.suspected_credential_attack'])
-  assert.equal(without.length, 6)
-  assert.ok(without.includes('security.privileged_directory_change'))
-  assert.ok(without.includes('security.routine_directory_change'))
+  assert.equal(derived.length + declared.length, 7)
+  assert.deepEqual(derived, ['security.suspected_credential_attack'])
+  assert.equal(declared.length, 6)
 
-  // This test is expected to CHANGE when windows are declared. It fails loudly at
-  // that moment, which is the point: the number moving is the decision being taken,
-  // and nobody should be able to take it without noticing.
+  // Every type, both paths, a usable interval. No type falls through.
+  for (const declaration of ALERT_CATALOG) {
+    const interval = quietIntervalMsOf(declaration)
+    assert.ok(interval > 0, `${declaration.id} has no usable interval`)
+    assert.ok(Number.isFinite(interval), declaration.id)
+  }
+
+  // BOTH PATHS ARE LIVE. If every type took one path the other would be dead code
+  // and the union protecting it would be untested — the same reason a per-type
+  // subject where every type agrees is a global answer in disguise.
+  assert.ok(derived.length > 0 && declared.length > 0)
+
+  // Collected once, with `in` rather than the boolean helper, because a boolean does
+  // not narrow a union whose other member has no such property at all.
+  const declaredIntervals = ALERT_CATALOG.flatMap((entry) =>
+    'episodeInterval' in entry ? [{ id: entry.id, interval: entry.episodeInterval }] : [])
+  assert.equal(declaredIntervals.length, 6)
+
+  // Every DECLARED interval states its reasoning, and says whether the number was
+  // measured. "24 hours" with no evidence is an assertion, and whoever revisits it
+  // needs to know which of these rests on a measurement and which does not — those
+  // are different claims and they should not look alike.
+  for (const { id, interval } of declaredIntervals) {
+    assert.ok(interval.because.length > 80, `${id}: reasoning too thin to be reasoning`)
+    assert.match(interval.because, /MEASURED|NOT measured/, `${id} does not say whether it was measured`)
+  }
+
+  // The measured ones carry the DISTRIBUTION rather than the conclusion, so the valley
+  // is visible to the next reader instead of being taken on trust.
+  const measured = declaredIntervals.filter(({ interval }) => interval.because.startsWith('MEASURED'))
+  assert.equal(measured.length, 2, 'both directory-change types rest on the gap measurement')
+  for (const { id, interval } of measured) {
+    assert.match(interval.because, /761 gaps/, id)
+    assert.match(interval.because, /78%/, id)
+    // The SHAPE, however it is worded — 'bimodal' or 'valley' both say it, and
+    // requiring one of them would assert the prose rather than the content.
+    assert.match(interval.because, /bimodal|valley/i, id)
+  }
+
+  // And the four that were NOT measured say so plainly rather than borrowing the
+  // credibility of the two that were. Taking 24h for one notion of quiet across the
+  // product is a reason; it is not evidence about those types.
+  assert.equal(declaredIntervals.length - measured.length, 4)
+  for (const { id, interval } of declaredIntervals) {
+    if (interval.because.startsWith('MEASURED')) continue
+    assert.match(interval.because, /NOT measured/, id)
+    assert.doesNotMatch(interval.because, /761 gaps/, `${id} must not cite a measurement it does not have`)
+  }
+})
+
+test('THE COMPILER DECIDES WHICH PATH A TYPE TAKES, not a reviewer', () => {
+  // Built from an explicit literal rather than by spreading a catalogue entry. A
+  // spread of `AlertTypeDeclaration` is a union, so the result could match either
+  // variant and the directives below would be testing something vaguer than the rule.
+  const OBSERVATION = {
+    id: 'synthetic.observation_type',
+    severity: 'RECORD_ONLY',
+    subject: 'TENANT',
+    summary: 'A synthetic type, used only to check what the compiler permits.',
+    escalations: [],
+    opensInvestigation: false,
+    category: 'OPERATIONAL',
+    conditionClears: { kind: 'CONFIGURATION_RESTORED', because: 'Synthetic.' },
+  } as const
+
+  const TIMEOUT = {
+    ...OBSERVATION,
+    conditionClears: {
+      kind: 'NO_FURTHER_EVENTS_IN_READABLE_WINDOW',
+      windowHours: 24,
+      because: 'Synthetic.',
+    },
+  } as const
+
+  // POSITIVE CONTROLS FIRST. Both correct forms must compile, or the two directives
+  // below could be firing for a missing field I forgot rather than for the rule —
+  // which is the failure mode of every @ts-expect-error written in isolation.
+  const observationWithInterval: AlertTypeDeclaration = {
+    ...OBSERVATION,
+    episodeInterval: { hours: 24, because: 'Synthetic, and long enough to read as reasoning.' },
+  }
+  const timeoutWithoutInterval: AlertTypeDeclaration = TIMEOUT
+  assert.ok(observationWithInterval.episodeInterval)
+  assert.ok(timeoutWithoutInterval)
+
+  // An observation type may not OMIT the interval: no type inherits one silently.
+  // @ts-expect-error an observation type must declare its episode interval
+  const missing: AlertTypeDeclaration = OBSERVATION
+  assert.ok(missing)
+
+  // A quiet-timeout type may not ALSO declare one: two numbers meaning the same
+  // thing is the case the derivation exists to prevent.
+  // @ts-expect-error a quiet-timeout type derives its interval and may not declare one
+  const twoNumbers: AlertTypeDeclaration = {
+    ...TIMEOUT,
+    episodeInterval: { hours: 1, because: 'A second number meaning the same thing.' },
+  }
+  assert.ok(twoNumbers)
+
+  // Both directives are guarantees rather than comments: if either combination stops
+  // being an error, the directive goes unused and the build fails saying so.
 })

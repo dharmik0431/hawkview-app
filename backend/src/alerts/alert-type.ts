@@ -125,6 +125,50 @@ export interface EscalationThreshold {
   readonly because: string
 }
 
+/** How long a quiet gap must be before the next activity is a NEW episode.
+ *
+ * A DIFFERENT FACT FROM THE RESOLVING CONDITION, and that distinction is the whole
+ * reason this field exists. "How long until I believe it is over" and "how long a gap
+ * means the next activity is a new burst" are genuinely different questions about a
+ * type. Stating both is not duplication.
+ *
+ * The rule against second constants still holds, and the test is whether two numbers
+ * mean the SAME thing. For a type resolving on a quiet timeout they do — so that type
+ * DERIVES its interval and may not declare one, because two numbers meaning one thing
+ * is exactly what drifts. For a type resolving on an OBSERVATION
+ * (`CONFIGURATION_RESTORED`, `COLLECTOR_REPORTS_SUCCESS`) there is no timeout to
+ * derive from, and a default would be a second constant wearing a disguise:
+ * invisible, unreviewed, and no reviewer would ever see it.
+ *
+ * Both paths are required, neither defaults, and which path a type takes is a COMPILE
+ * ERROR to get wrong rather than a convention — see `EpisodeGrouping`. */
+export interface EpisodeInterval {
+  readonly hours: number
+  /** Why this number, including the evidence behind it. A reader revisiting it should
+   * see the measurement rather than an assertion — and should be able to tell a
+   * MEASURED value from a REASONED one, because those are not the same claim. */
+  readonly because: string
+}
+
+/** The resolving condition and the episode interval as ONE choice, not two fields.
+ *
+ * `episodeInterval?: never` on the first variant is the load-bearing part: it makes
+ * declaring an interval on a quiet-timeout type a compile error, so "two numbers
+ * meaning the same thing" cannot be written at all. The second variant makes omitting
+ * one on an observation type a compile error, so no type inherits an interval
+ * silently. */
+export type EpisodeGrouping =
+  | Readonly<{
+      conditionClears: Extract<ConditionClearedWhen, { kind: 'NO_FURTHER_EVENTS_IN_READABLE_WINDOW' }>
+      /** DERIVED from `windowHours` above. Declaring one here does not compile. */
+      episodeInterval?: never
+    }>
+  | Readonly<{
+      conditionClears: Exclude<ConditionClearedWhen, { kind: 'NO_FURTHER_EVENTS_IN_READABLE_WINDOW' }>
+      /** Required: there is no timeout to derive from. */
+      episodeInterval: EpisodeInterval
+    }>
+
 interface AlertTypeBase {
   readonly id: string
   readonly severity: Severity
@@ -135,7 +179,6 @@ interface AlertTypeBase {
    * lockouts are an investigation signal, and they also come from stale
    * credentials on a phone or a misconfigured service account. */
   readonly summary: string
-  readonly conditionClears: ConditionClearedWhen
   readonly escalations: readonly EscalationThreshold[]
   /** Whether this type opens an investigation at all.
    *
@@ -164,16 +207,16 @@ interface AlertTypeBase {
 export type AlertTypeDeclaration =
   /** A record. No investigation is opened, so there is no `investigationCloses`
    * to state — the field is absent rather than set to something meaningless. */
-  | (AlertTypeBase & Readonly<{
+  | (AlertTypeBase & EpisodeGrouping & Readonly<{
       opensInvestigation: false
       category: AlertCategory
     }>)
-  | (AlertTypeBase & Readonly<{
+  | (AlertTypeBase & EpisodeGrouping & Readonly<{
       opensInvestigation: true
       category: Extract<AlertCategory, 'OPERATIONAL'>
       investigationCloses: 'AUTOMATICALLY_WHEN_CONDITION_CLEARS' | 'ONLY_BY_A_PERSON'
     }>)
-  | (AlertTypeBase & Readonly<{
+  | (AlertTypeBase & EpisodeGrouping & Readonly<{
       opensInvestigation: true
       category: Extract<AlertCategory, 'SECURITY'>
       investigationCloses: 'ONLY_BY_A_PERSON'

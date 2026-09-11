@@ -112,11 +112,18 @@ visible rather than tidying into the answer that won.
   Worth noting as method: the recommendation offered was "target, loosely", and it
   was wrong in a way that only showed up when the two failures were put side by
   side. Asking rather than filling it in is what produced the better answer.
-- **D2 — quiet interval. RULED: derived from the declared window, never a second
-  constant.** A type declaring no window has no interval and must fail loudly
-  rather than default. Implemented — and the consequence turned out to be larger
-  than the ruling anticipated: six of the seven declared types state no window,
-  including both directory-change types. See *The quiet interval is derived*.
+- **D2 — quiet interval. RULED TWICE**, and the second ruling is the one that
+  stands. The first said "derive from the declared window, never a second constant,
+  fail loudly when there is none". Implementing it exposed that six of the seven
+  types state no window, including both directory-change types — so episodes were
+  underivable for exactly the types the step exists for.
+
+  The revised rule: **derive where the two numbers mean the same thing, declare
+  where they do not.** A type resolving on a quiet timeout derives and may not also
+  declare; a type resolving on an observation declares explicitly, with reasoning.
+  The rule against second constants is about two numbers meaning ONE thing — and
+  "how long until I believe it is over" is not "how long a gap means the next
+  activity is a new burst". See *Both paths, and the compiler decides which*.
 - **D3 — backwards growth. RULED: keep symmetric**, with a presentational
   obligation attached — an episode span may never be shown as a single date.
 - **D4 — a resolved investigation opens a new episode regardless of timing.
@@ -254,35 +261,84 @@ A declaration can change. Events keyed under an old role must not join episodes
 keyed under the new one — that would merge "who did this" with "who it was done to"
 inside one incident, at the moment of a one-word edit.
 
-### The quiet interval is derived, and six of seven types cannot derive one
+### Both paths, and the compiler decides which
 
-`alert-episode-interval.ts`. `quietIntervalMsOf` reads the window off the type's
-declared `NO_FURTHER_EVENTS_IN_READABLE_WINDOW`, so there is nothing to drift
-against. A type declaring no window **throws** rather than substituting a plausible
-number: a default is a second constant wearing a disguise — invisible, unreviewed,
-and identical in effect to the coupling the derivation exists to avoid.
+`alert-episode-interval.ts`. Two ways a type gets an episode interval, and which one
+it takes follows from its resolving condition:
 
-**The consequence is larger than it looks, and it is a declaration gap rather than a
-flaw in the derivation.** Only one of the seven declared types states a window:
-
-| can derive an interval | cannot |
+| resolving condition | interval |
 |---|---|
-| `security.suspected_credential_attack` (24h) | the other six |
+| `NO_FURTHER_EVENTS_IN_READABLE_WINDOW` | **derived** from `windowHours` |
+| any observation (`CONFIGURATION_RESTORED`, `COLLECTOR_REPORTS_SUCCESS`, …) | **declared**, with reasoning |
 
-The six include **`security.privileged_directory_change` and
-`security.routine_directory_change`** — precisely the 301-alerts and
-334-occurrences cases that motivated this step. Episodes are therefore underivable
-for the types that need them most.
+The first ruling was derive-only, and implementing it surfaced the problem: **six of
+the seven types resolve on an observation**, including
+`security.privileged_directory_change` and `security.routine_directory_change` —
+precisely the 301-alert and 334-occurrence cases this step exists to fix. A
+derive-only rule left episodes underivable for the types that needed them most.
 
-The repair is to declare windows on those types, not to default one here. It is a
-product question what "quiet" means for a configuration change, whose resolving
-condition is `CONFIGURATION_RESTORED` — an observation, not a timeout — so the
-window would be a second, independent statement about the same type rather than one
-derived from the first. **That is a decision, and it is where step 02 stops.**
+What the revision turns on: the rule against second constants is about two numbers
+meaning **the same thing**. "How long until I believe it is over" and "how long a gap
+means the next activity is a new burst" are different facts about a type, and stating
+both is not duplication. For a quiet-timeout type they *are* the same number, so that
+type derives and **may not also declare one** — two numbers meaning one thing is
+exactly what drifts.
 
-A census test records the one-of-seven measurement. It is written to fail when a
-window is declared, because the number moving *is* the decision being taken and
-nobody should take it without noticing.
+**Both constraints are compile errors, not conventions.** `EpisodeGrouping` pairs the
+resolving condition with the interval in one union: `episodeInterval?: never` on the
+timeout variant makes declaring a second number unwriteable, and a required
+`episodeInterval` on the observation variant makes omitting one unwriteable. Two
+`@ts-expect-error` directives hold those, and both are load-bearing — weakening
+either variant makes its directive unused and **fails the build**, which is how that
+was verified rather than asserted.
+
+`quietIntervalMsOf` is consequently **total**. It used to throw; the guarantee moved
+from a runtime check to the type, and a guard reachable only by a deliberate cast is
+a guard whose test must fabricate a shape the type forbids.
+
+One implementation note worth keeping, because the compiler taught it: the function
+narrows on **the interval's presence**, not on the condition's kind. `conditionClears`
+cannot discriminate this union — the observation variant's condition is itself a union
+of four kinds, so there is no single literal at that path — and a check on it leaves
+`episodeInterval` possibly undefined. The compiler refusing the first version was
+right: it could not see that a non-timeout condition guarantees an interval, and nor
+could a reader.
+
+### The value is 24 hours, and the measurement is why
+
+Gaps between consecutive directory changes by the same actor, **761 gaps** across the
+fleet:
+
+| gap | count | share |
+|---|---|---|
+| within 1 hour | 595 | 78% |
+| 1 to 24 hours | 40 | **5%** |
+| beyond 24 hours | 126 | 17% |
+
+p50 0.0h, p90 76h, p95 166h.
+
+**The distribution is bimodal with a valley.** Changes arrive in bursts inside an
+hour, then nothing for days. Only 5% of gaps fall anywhere in the entire 1-to-24-hour
+range, so **any interval in that range produces nearly the same grouping** — the
+choice is robust rather than tuned, which matters more than the number itself.
+
+24h sits at the far end of that valley, for three reasons:
+
+- it errs toward **grouping rather than splitting**, and over-splitting is the
+  301-alert problem this work exists to fix;
+- it **matches the credential-attack window**, so the product has one notion of quiet
+  rather than two;
+- the risk over-grouping would normally carry — a new attack silently joining a closed
+  incident — is **already closed independently** by D4: activity after a resolved
+  investigation opens a new linked episode regardless of timing.
+
+**Four of the six declared intervals are not measured, and they say so.** No gap
+distribution was collected for the monitoring types, and this work does not query
+production. They take 24h to keep one notion of quiet across the product, which is a
+reason rather than evidence. A test asserts every declared interval states which it
+is, that the measured ones carry the distribution rather than the conclusion, and that
+**an unmeasured one may not cite the measurement** — because a borrowed number and a
+measured number should not read alike.
 
 ### Presentational obligation, carried here so it is not lost between layers
 

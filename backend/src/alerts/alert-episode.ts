@@ -53,8 +53,12 @@ export interface Placement {
  * interval is DERIVED from the alert type’s declared resolving condition by
  * `quietIntervalMsOf` in `alert-episode-interval.ts`, so there is no second notion
  * of quiet beside the one each type already declares. This function is handed the
- * number and does not choose it. A type declaring no window has no interval to
- * derive and that call throws rather than defaulting. */
+ * number and does not choose it.
+ *
+ * `quietIntervalMsOf` is TOTAL: a type resolving on a quiet timeout derives its
+ * interval from the window, and one resolving on an observation declares it. Which
+ * path a type takes is a compile error to get wrong, so there is no "no interval"
+ * case left for this function to be handed. */
 export function placeEvent(
   span: EpisodeSpan | null,
   occurredAt: EventInstant,
