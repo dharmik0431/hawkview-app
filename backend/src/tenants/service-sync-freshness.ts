@@ -1,3 +1,5 @@
+import type { SyncResourceType } from '../generated/prisma/enums.js'
+
 /**
  * Per-service synchronization freshness, derived from the persisted collector
  * SyncState rows. SyncState is deliberately the source of truth: it keeps a
@@ -103,18 +105,70 @@ export type TenantSyncFreshness = {
 type ServiceDefinition = {
   service: HawkViewSyncService
   key: keyof TenantSyncFreshness['services']
-  collectors: readonly string[]
+  // SyncResourceType, NOT string. As `string[]` a typo compiled, a collector
+  // that no longer exists compiled, and — the defect that actually shipped — a
+  // collector missing from every service compiled. The registry iterates
+  // ITSELF, so what it omits contributes to nothing and is invisible rather
+  // than mislabelled: it cannot even be reported as unknown.
+  collectors: readonly SyncResourceType[]
 }
 
-/** A collector has one owning service so service counts cannot double-count. */
-export const SERVICE_COLLECTOR_REGISTRY: readonly ServiceDefinition[] = [
-  { service: 'OFFICE_365', key: 'office365', collectors: ['LICENSES', 'DOMAINS', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'] },
-  { service: 'ENTRA_ID', key: 'entraId', collectors: ['USERS', 'GROUPS', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS', 'DEVICES', 'DIRECTORY_ROLES', 'RISKY_USERS', 'APPLICATIONS', 'SERVICE_PRINCIPALS'] },
-  { service: 'EXCHANGE', key: 'exchange', collectors: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'] },
+/** Every collector has EXACTLY ONE owning service.
+ *
+ * Both halves of that matter and neither used to be enforced. "At most one"
+ * keeps service counts from double-counting, which the original comment said.
+ * "At least one" is what was missing: SECURE_SCORES, ORGANIZATION_CONFIGURATION
+ * and EXCHANGE_MAILBOX_CONFIGURATION belonged to no service, so their state
+ * reached no screen at all. Secure Scores failing on every tenant for seventeen
+ * days could not surface, no matter what was built on the frontend.
+ *
+ * `as const satisfies` rather than a `: readonly ServiceDefinition[]`
+ * annotation, and that is load-bearing rather than style. The annotation widens
+ * each `collectors` array to the full `SyncResourceType` union, which would make
+ * `UnownedCollector` below resolve to `never` no matter what is listed here —
+ * a compile-time check that always passes. `satisfies` checks the shape without
+ * discarding the literals the check reads.
+ */
+export const SERVICE_COLLECTOR_REGISTRY = [
+  // ORGANIZATION_CONFIGURATION sits here because it shares an access-contract
+  // entry (`m365_organization_configuration`) with DOMAINS and LICENSES, both
+  // already owned by this service.
+  { service: 'OFFICE_365', key: 'office365', collectors: ['LICENSES', 'DOMAINS', 'ORGANIZATION_CONFIGURATION', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'] },
+  // SECURE_SCORES is Entra rather than Office 365, on the evidence rather than
+  // the name: its access-contract key is `entra_secure_scores`, and of the eight
+  // other resource types in its readiness workload `entra_security_configuration`,
+  // seven are already owned here.
+  { service: 'ENTRA_ID', key: 'entraId', collectors: ['USERS', 'GROUPS', 'AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES', 'CONDITIONAL_ACCESS', 'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS', 'DEVICES', 'DIRECTORY_ROLES', 'RISKY_USERS', 'SECURE_SCORES', 'APPLICATIONS', 'SERVICE_PRINCIPALS'] },
+  // EXCHANGE_MAILBOX_CONFIGURATION is a MISSING entry, not a stale rename of
+  // EXCHANGE_MAILBOX_SETTINGS. They are separate live collectors: SETTINGS reads
+  // Graph `/users/{id}/mailboxSettings` with MailboxSettings.Read, CONFIGURATION
+  // reads Exchange Online `/adminapi/v2.0/{tenantId}/Mailbox` with
+  // Exchange.ManageAsAppV2, and tenant-sync.service.ts collects both.
+  { service: 'EXCHANGE', key: 'exchange', collectors: ['EXCHANGE_MAILBOXES', 'EXCHANGE_MAILBOX_SETTINGS', 'EXCHANGE_MAILBOX_CONFIGURATION', 'EXCHANGE_MAILBOX_USAGE', 'EXCHANGE_ACCEPTED_DOMAINS', 'EXCHANGE_MAILBOX_RULES'] },
   { service: 'SHAREPOINT_ONEDRIVE', key: 'sharePointOneDrive', collectors: ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE'] },
   { service: 'SIGN_IN_LOGS', key: 'signInLogs', collectors: ['SIGN_INS'] },
   { service: 'AUDIT_LOGS', key: 'auditLogs', collectors: ['AUDIT_LOGS', 'M365_AUDIT'] },
-] as const
+] as const satisfies readonly ServiceDefinition[]
+
+/** Collectors the registry claims. */
+type OwnedCollector = (typeof SERVICE_COLLECTOR_REGISTRY)[number]['collectors'][number]
+
+/** Collectors that exist but belong to no service. Must be `never`. */
+type UnownedCollector = Exclude<SyncResourceType, OwnedCollector>
+
+type MustBeNever<T extends never> = T
+
+/** COMPILE-TIME PROOF that no collector is invisible.
+ *
+ * Add a member to `SyncResourceType` without giving it an owning service and
+ * this stops compiling, naming the member in the error. That is the point: the
+ * registry is the piece of this subsystem that decays fastest, because every new
+ * collector is another chance to forget — and forgetting was silent.
+ *
+ * It cannot catch a collector owned TWICE; that needs a set, which types cannot
+ * count. `service-sync-freshness.test.ts` covers that half against the enum
+ * Prisma generates from the schema. */
+export type EveryCollectorHasAnOwningService = MustBeNever<UnownedCollector>
 
 export const SERVICE_FRESHNESS_WINDOWS = {
   incremental: { currentMs: 15 * 60 * 1000, agingMs: 2 * 60 * 60 * 1000 },

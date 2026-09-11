@@ -7,29 +7,30 @@ const success = (resourceType: string, at = '2026-08-13T14:00:00.000Z') => ({ re
 const failed = (resourceType: string, lastSuccessfulAt: string | null = null, code = '500') => ({ resourceType, status: 'FAILED', lastAttemptAt: now, lastSuccessfulAt: lastSuccessfulAt ? new Date(lastSuccessfulAt) : null, lastErrorCode: code, lastErrorMessage: code === '403' ? 'Forbidden: consent required' : 'Microsoft API error', consecutiveFailures: 1 })
 
 test('reports a fully successful service only when every expected collector succeeded', () => {
-  const data = deriveTenantSyncFreshness(['LICENSES', 'DOMAINS', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'].map((resourceType) => success(resourceType)), now)
+  const data = deriveTenantSyncFreshness(['LICENSES', 'DOMAINS', 'ORGANIZATION_CONFIGURATION', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'].map((resourceType) => success(resourceType)), now)
   assert.equal(data.services.office365.status, 'SUCCESS')
   assert.equal(data.services.office365.freshnessStatus, 'CURRENT')
-  assert.equal(data.services.office365.successfulCollectors, 4)
+  assert.equal(data.services.office365.successfulCollectors, 5)
 })
 
 test('keeps a service partial when one Graph collector fails after other usable data succeeded', () => {
-  const data = deriveTenantSyncFreshness([success('EXCHANGE_MAILBOXES'), success('EXCHANGE_MAILBOX_SETTINGS'), success('EXCHANGE_MAILBOX_USAGE'), success('EXCHANGE_ACCEPTED_DOMAINS'), failed('EXCHANGE_MAILBOX_RULES', '2026-08-13T13:45:00.000Z')], now)
+  const data = deriveTenantSyncFreshness([success('EXCHANGE_MAILBOXES'), success('EXCHANGE_MAILBOX_SETTINGS'), success('EXCHANGE_MAILBOX_CONFIGURATION'), success('EXCHANGE_MAILBOX_USAGE'), success('EXCHANGE_ACCEPTED_DOMAINS'), failed('EXCHANGE_MAILBOX_RULES', '2026-08-13T13:45:00.000Z')], now)
   assert.equal(data.services.exchange.status, 'PARTIAL')
   assert.equal(data.services.exchange.partialFailures[0]?.collector, 'EXCHANGE_MAILBOX_RULES')
   assert.equal(data.services.exchange.partialFailures[0]?.lastSuccessfulAt, '2026-08-13T13:45:00.000Z')
 })
 
-test('treats the five Graph Exchange collectors as the complete standard service', () => {
+test('treats the six Exchange collectors as the complete standard service', () => {
   const data = deriveTenantSyncFreshness([
     success('EXCHANGE_MAILBOXES'),
     success('EXCHANGE_MAILBOX_SETTINGS'),
+    success('EXCHANGE_MAILBOX_CONFIGURATION'),
     success('EXCHANGE_MAILBOX_USAGE'),
     success('EXCHANGE_ACCEPTED_DOMAINS'),
     success('EXCHANGE_MAILBOX_RULES'),
   ], now)
   assert.equal(data.services.exchange.status, 'SUCCESS')
-  assert.equal(data.services.exchange.expectedCollectors, 5)
+  assert.equal(data.services.exchange.expectedCollectors, 6)
 })
 
 test('reports a complete service failure when no collector has usable data', () => {
@@ -62,7 +63,7 @@ test('marks previous data stale without losing its last successful timestamp', (
 
 test('keeps daily inventory current until its daily grace window expires', () => {
   const data = deriveTenantSyncFreshness(
-    ['LICENSES', 'DOMAINS', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'].map((resourceType) =>
+    ['LICENSES', 'DOMAINS', 'ORGANIZATION_CONFIGURATION', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'].map((resourceType) =>
       success(resourceType, '2026-08-12T15:00:00.000Z'),
     ),
     now,
