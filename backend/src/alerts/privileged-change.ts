@@ -112,6 +112,31 @@ export interface ConditionalAccessState {
   readonly grantOperator: 'OR' | 'AND' | null
   readonly grantControls: readonly string[]
   readonly excludedPrincipals: readonly string[]
+  /** Session controls PRESENT, by name. Modelled far enough to notice they moved
+   * and deliberately no further: their direction depends on values this does not
+   * capture — `persistentBrowser: always` weakens a policy and `never` strengthens
+   * it, and `signInFrequency` depends entirely on the interval. Guessing a
+   * direction from presence alone would be the same error as "removing a grant
+   * control weakens the policy", one dimension across. So a session-control change
+   * is reported as a change whose impact is unknown, which is what we can honestly
+   * say. */
+  readonly sessionControls: readonly string[]
+  /** A digest of everything this comparison does NOT model — the policy as
+   * collected, minus the fields above.
+   *
+   * Of everything unmodelled, deliberately, and not of the whole policy. A digest
+   * covering the modelled fields too would differ whenever anything changed at
+   * all, so it could not distinguish "a dimension we understand moved" from "a
+   * dimension we do not". It would have made the OR-removal case unreachable,
+   * which is how I first wrote it.
+   *
+   * It exists so "we did not look at that" can never resolve to "it was fine".
+   * Without it the only safe comparison would enumerate every field Microsoft has
+   * or later adds, and would silently widen its claim each time one appeared.
+   *
+   * The coupling is real and worth stating: whoever computes this must exclude
+   * exactly the fields above, and must change it when that set changes. */
+  readonly unmodelledFingerprint: string
 }
 
 export interface ClassificationContext {
@@ -280,23 +305,52 @@ export function classifyConditionalAccessChange(
   }
 
   const removed = before.grantControls.filter((control) => !after.grantControls.includes(control))
-  if (removed.length > 0) {
-    if (before.grantOperator === 'AND') {
-      return urgent(
-        `A required grant control was removed (${removed.join(', ')}) from a policy whose controls are ` +
-        'combined with AND, so a requirement is gone.')
-    }
-    if (before.grantOperator === 'OR') {
-      return routine(
-        `A grant control was removed (${removed.join(', ')}) from a policy whose controls are combined ` +
-        'with OR. That removes an ALTERNATIVE way to satisfy the policy rather than a requirement, so ' +
-        'it does not weaken it.')
-    }
+  if (removed.length > 0 && before.grantOperator === 'AND') {
+    return urgent(
+      `A required grant control was removed (${removed.join(', ')}) from a policy whose controls are ` +
+      'combined with AND, so a requirement is gone.')
+  }
+  if (removed.length > 0 && before.grantOperator === null) {
     return unclassified(
       'A grant control was removed from a policy whose combination operator is unknown, so whether a ' +
       'requirement or an alternative was removed cannot be determined. Change detected; impact unknown.',
       'grant-operator-unknown')
   }
 
-  return routine('A conditional access policy changed without removing a control, adding an exclusion, or being disabled.')
+  // NOTHING MODELLED WEAKENED. That is not the same as nothing weakened, and this
+  // is where the previous version got it wrong: it returned routine here, which
+  // caught every change to a dimension the comparison does not model and called
+  // them all fine. Unlisted is not harmless and unmodelled is not harmless either —
+  // correction 3 surviving one function deeper, written by the same hand that
+  // implemented correction 3.
+  //
+  // Routine now REQUIRES positive evidence that the dimensions which moved are ones
+  // this comparison understands. Absence of a modelled change is not that.
+  const sessionControlsChanged =
+    before.sessionControls.length !== after.sessionControls.length ||
+    before.sessionControls.some((control) => !after.sessionControls.includes(control)) ||
+    after.sessionControls.some((control) => !before.sessionControls.includes(control))
+
+  if (sessionControlsChanged) {
+    return unclassified(
+      'A session control changed. Sign-in frequency and persistent browser sessions are where a session ' +
+      'is extended from an hour to weeks, and their direction depends on values this comparison does not ' +
+      'capture. Change detected; impact unknown.',
+      'session-controls')
+  }
+
+  if (before.unmodelledFingerprint !== after.unmodelledFingerprint) {
+    return unclassified(
+      'The policy changed in a dimension this comparison does not model. Change detected; impact unknown.',
+      'unmodelled-dimension')
+  }
+
+  // Everything modelled is accounted for and the unmodelled digest is identical,
+  // so the only changes were ones understood and shown not to weaken it.
+  return removed.length > 0
+    ? routine(
+      `A grant control was removed (${removed.join(', ')}) from a policy whose controls are combined ` +
+      'with OR. That removes an ALTERNATIVE way to satisfy the policy rather than a requirement, so it ' +
+      'does not weaken it.')
+    : routine('The policy changed only in dimensions this comparison models, and none of them weakened it.')
 }

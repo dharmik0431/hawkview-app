@@ -453,6 +453,34 @@ Microsoft's grant controls combine with `OR` or `AND`:
 Where before/after values are missing, or the combination operator is unknown, the
 outcome is **"change detected; impact unknown"** rather than a silent pass — the
 same rule as an unrecognised permission, for the same reason.
+
+**Routine requires positive evidence, not the absence of a modelled change.** The
+first version ended with a fallback saying the policy changed *without* removing a
+control, adding an exclusion, or being disabled — true, and the conclusion does not
+follow. It caught every change to a dimension the comparison does not model and
+called them all routine, which is **the unlisted-is-not-harmless rule surviving one
+function deeper**, written while implementing that very rule.
+
+It was not hypothetical: one of the seven production conditional-access changes has
+`sessionControls` and no `grantControls` at all, and landed on routine by falling
+off the end. Session controls are where a sign-in session is extended from an hour
+to weeks.
+
+Two things now stand between a change and `ROUTINE`:
+
+- **Session controls are modelled far enough to notice they moved, and no
+  further.** Their direction depends on values not captured — `persistentBrowser:
+  always` weakens a policy and `never` strengthens it — so inferring a direction
+  from presence would repeat the grant-control error one dimension across. A
+  session-control change is `UNCLASSIFIED`.
+- **`unmodelledFingerprint` is a digest of everything the comparison does not
+  model.** Of the *unmodelled* part specifically, not the whole policy: a whole-policy
+  digest differs whenever anything changes, so it cannot tell a dimension we
+  understand from one we do not, and it would make the OR-removal case unreachable.
+  That was my first attempt, and a test now fails if it comes back.
+
+A weakening still outranks an unknown, and a modelled change that does not weaken
+does not vouch for an unmodelled one that happened alongside it.
 ## What to check first when it breaks
 
 **Symptom: an alert resolved itself and nobody believes it should have.** Check

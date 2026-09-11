@@ -218,6 +218,8 @@ const policy = (over: Partial<ConditionalAccessState> = {}): ConditionalAccessSt
   grantOperator: 'AND',
   grantControls: ['mfa', 'compliantDevice'],
   excludedPrincipals: [],
+  sessionControls: [],
+  unmodelledFingerprint: 'same',
   ...over,
 })
 
@@ -270,4 +272,66 @@ test('disabling a policy and excluding a principal are both weakening', () => {
   assert.equal(
     classifyConditionalAccessChange(policy({ excludedPrincipals: ['user-1'] }), policy()).classification,
     'ROUTINE')
+})
+
+test('A SESSION-CONTROL-ONLY CHANGE MUST NOT COME BACK ROUTINE', () => {
+  // The production event that proved the old fallback wrong: a policy with session
+  // controls and NO grant controls at all. It moved nothing the comparison models,
+  // fell off the end, and was called routine. Sign-in frequency and persistent
+  // browser are where a session is extended from an hour to weeks.
+  const changed = classifyConditionalAccessChange(
+    policy({ grantControls: [], grantOperator: null, sessionControls: ['signInFrequency'] }),
+    policy({ grantControls: [], grantOperator: null, sessionControls: [] }))
+  assert.equal(changed.classification, 'UNCLASSIFIED')
+  assert.equal(changed.unknown, 'session-controls')
+  assert.match(changed.because, /impact unknown/i)
+
+  // Adding one is equally unknown: the direction depends on values this does not
+  // capture, so presence alone cannot be read either way.
+  assert.equal(
+    classifyConditionalAccessChange(
+      policy({ sessionControls: [] }),
+      policy({ sessionControls: ['persistentBrowser'] })).classification,
+    'UNCLASSIFIED')
+})
+
+test('a change in a dimension nothing models is unclassified, not routine', () => {
+  // Correction 3, one function deeper. Unlisted is not harmless and unmodelled is
+  // not harmless either — "we did not look at that" must never resolve to "it was
+  // fine".
+  const unmodelled = classifyConditionalAccessChange(
+    policy({ unmodelledFingerprint: 'before' }),
+    policy({ unmodelledFingerprint: 'after' }))
+  assert.equal(unmodelled.classification, 'UNCLASSIFIED')
+  assert.equal(unmodelled.unknown, 'unmodelled-dimension')
+
+  // POSITIVE CONTROL: with everything identical there is nothing unaccounted for,
+  // so routine is reachable and this is not a function that never says yes.
+  assert.equal(classifyConditionalAccessChange(policy(), policy()).classification, 'ROUTINE')
+})
+
+test('routine requires the modelled dimensions to be the ones that moved', () => {
+  // The OR-removal case must still reach routine — it is the correction that made
+  // the whole function necessary, and my first attempt at the unmodelled check made
+  // it unreachable by digesting the whole policy instead of only the unmodelled part.
+  const orRemoval = classifyConditionalAccessChange(
+    policy({ grantOperator: 'OR' }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa'] }))
+  assert.equal(orRemoval.classification, 'ROUTINE')
+  assert.match(orRemoval.because, /alternative/i)
+
+  // But the same OR removal WITH something unmodelled also moving is unclassified:
+  // a modelled change that does not weaken must not vouch for an unmodelled one.
+  const both = classifyConditionalAccessChange(
+    policy({ grantOperator: 'OR', unmodelledFingerprint: 'before' }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa'], unmodelledFingerprint: 'after' }))
+  assert.equal(both.classification, 'UNCLASSIFIED')
+
+  // And a weakening still outranks an unknown — the urgent answer is the one that
+  // matters when both are true.
+  assert.equal(
+    classifyConditionalAccessChange(
+      policy({ unmodelledFingerprint: 'before' }),
+      policy({ enabled: false, unmodelledFingerprint: 'after' })).classification,
+    'URGENT')
 })
