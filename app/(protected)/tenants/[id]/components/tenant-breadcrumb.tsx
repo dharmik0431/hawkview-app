@@ -23,6 +23,7 @@ export function TenantBreadcrumb({
 
   // Map module key to human readable display label
   const moduleLabel = (() => {
+    if (section === 'risky-users') return 'Risky Users'
     if (section === 'sharepoint') return 'SharePoint & OneDrive'
     if (section === 'home') return 'Office 365'
     if (section === 'entra') return 'Entra ID'

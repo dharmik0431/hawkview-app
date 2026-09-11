@@ -169,9 +169,34 @@ function render(
     }),
   }
 
+  const nativeViewModule = require('./native-view.ts')
+  const riskPresentationMapper = require('./risk-presentation-mapper.ts')
+
   const uiMocks = {
     '@/lib/identity-risk/presentation': presentation,
     '@/lib/identity-risk/risky-users-view': riskyUsersView,
+    '@/lib/identity-risk/native-view': nativeViewModule,
+    '@/lib/identity-risk/risk-presentation-mapper': riskPresentationMapper,
+    '@/lib/api/hooks': {
+      useTenantOperationalProjection: () => ({ tenant: { name: 'Synthetic Tenant', defaultDomainName: 'synthetic.com' } }),
+    },
+    '@/components/ui/input': {
+      Input: (props: any) => React.createElement('input', props),
+    },
+    '@/components/ui/tooltip': {
+      TooltipProvider: ({ children }: any) => React.createElement('div', null, children),
+      Tooltip: ({ children }: any) => React.createElement('div', null, children),
+      TooltipTrigger: ({ children }: any) => React.createElement('div', null, children),
+      TooltipContent: ({ children }: any) => React.createElement('div', null, children),
+    },
+    '@/components/ui/table': {
+      Table: ({ children, ...props }: any) => React.createElement('table', props, children),
+      TableHeader: ({ children, ...props }: any) => React.createElement('thead', props, children),
+      TableBody: ({ children, ...props }: any) => React.createElement('tbody', props, children),
+      TableRow: ({ children, ...props }: any) => React.createElement('tr', props, children),
+      TableHead: ({ children, ...props }: any) => React.createElement('th', props, children),
+      TableCell: ({ children, ...props }: any) => React.createElement('td', props, children),
+    },
     '@/lib/utils': {
       cn: (...values: any[]) => values.filter(Boolean).join(' '),
     },
@@ -192,6 +217,9 @@ function render(
   const hooks = compile('../api/risky-users-hooks.ts', {
     ...uiMocks,
     './identity-risk-hooks': identityRiskHooks,
+    './risky-users-assessment-hooks': {
+      useNativeRiskyUsersRead: () => identityRiskHooks.useIdentityRiskChannels(),
+    },
   })
   const drawer = compile(
     '../../components/identity-risk/risk-assessment-drawer.tsx',
@@ -203,6 +231,9 @@ function render(
       ...uiMocks,
       '@/lib/api/risky-users-hooks': hooks,
       './risk-assessment-drawer': drawer,
+      '@/components/identity-risk/fleet-risk-assessment-drawer': {
+        FleetRiskAssessmentDrawer: () => null,
+      },
     }
   )
   const card = compile(
@@ -382,9 +413,24 @@ test('rows say Microsoft is not comparable rather than that it cleared anyone', 
   const { document } = render(assessmentFixture(true), {
     microsoft: microsoftLive(),
   })
-  for (const row of document.querySelectorAll(
+  // Non-vacuity guard. This assertion is a loop over rows, so zero rows makes
+  // it pass while testing nothing -- and that is exactly what happened when the
+  // harness began mocking useNativeRiskyUsersRead with the OLD hook's return
+  // shape: the component receives no nativeView, renders no rows, and a test
+  // named for the safety property most worth keeping goes green by asserting
+  // nothing at all.
+  //
+  // It stays red until the fixtures are rewritten against the native shape,
+  // which is owed work. Red for a known reason is worth more than green for an
+  // unknown one.
+  const rows = document.querySelectorAll(
     '[aria-labelledby="risky-users-list-heading"] tbody tr'
-  )) {
+  )
+  assert.ok(
+    rows.length > 0,
+    'no rows rendered, so the per-row assertions below check nothing'
+  )
+  for (const row of rows) {
     const detectedBy = row.querySelectorAll('td')[1]?.textContent ?? ''
     assert.match(detectedBy, /HawkView/)
     assert.match(detectedBy, /Not comparable/)

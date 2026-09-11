@@ -19,6 +19,7 @@ import {
   Building2,
   Activity,
   ShieldCheck,
+  ShieldAlert,
   Mail,
 } from 'lucide-react'
 
@@ -30,6 +31,7 @@ export const coreNavigation = [
       { name: 'Tenants', href: '/tenants', icon: Building2 },
       { name: 'Activity Logs', href: '/activity', icon: Activity },
       { name: 'What Changed?', href: '/what-changed', icon: HistoryIcon },
+      { name: 'Risky Users', href: '/risky-users', icon: ShieldAlert },
     ],
   },
 ]

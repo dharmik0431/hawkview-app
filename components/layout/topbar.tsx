@@ -17,6 +17,7 @@ const pageTitles: Record<string, string> = {
   '/alerts': 'Alerts & Notifications',
   '/activity': 'Activity Logs',
   '/what-changed': 'What Changed?',
+  '/risky-users': 'Risky Users',
   '/users': 'User Directory',
   '/licensing': 'Licensing Overview',
   '/security': 'Security Insights',
