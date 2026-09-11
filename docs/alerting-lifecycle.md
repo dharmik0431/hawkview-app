@@ -432,14 +432,29 @@ their own.
   has 147 collectors with 10 failed and 7 stale beyond a week, so the tenant it
   would break exists today. Not covered: `NOT_LICENSED` (no product — nothing to
   see and nothing to fix), `PERMISSION_REQUIRED` (a consent gap, its own alert with
-  its own action, fixable in minutes), and `UNSUPPORTED` (Microsoft does not expose
-  it — the same class as unlicensed). Everything else is covered, including
-  `NOT_CONFIGURED`, because never having collected something is a visibility gap
-  rather than a capability statement. The distinction the rule rests on: **"HawkView
+  its own action, fixable in minutes), `UNSUPPORTED` (Microsoft does not expose it —
+  a capability statement about Microsoft, and global rather than per-tenant, so
+  counting it would make the condition unsatisfiable for *every* tenant), and
+  `NOT_CONFIGURED` (never set up, and covered means what HawkView **expects** to be
+  readable — confirmed from the code: `collectorStatus` returns it only when no sync
+  row exists, so a collector that was working and stops becomes `FAILED` or `STALE`
+  instead, never this). Everything else is covered.
+  The distinction the rule rests on: **"HawkView
   cannot see this tenant" is a different fact from "HawkView was never allowed to
   see this part of it."** The first is an emergency; the second is a task. One alert
   for both makes the emergency unclearable and buries the task. `coveredSources` in
   `alert-clearing.ts` is the implementation — use it rather than re-deciding.
+- **The `NOT_CONFIGURED` exclusion is conditional, and the condition is step 05's.**
+  Excluding it means this alert can report visibility restored while HawkView
+  collects a fraction of what is available. That is a real overstatement, and a
+  different claim needing a different alert — *"collecting three of ten available
+  sources for this tenant"* is worth telling an MSP and has its own action. The
+  exclusion is conditional on that coverage gap being **visible somewhere rather
+  than silently dropped**, which is the plan's own requirement that coverage gaps
+  are shown rather than silent. If 05 ships routing without it, this exclusion has
+  traded a page that could never close for a gap nobody can see.
+  **Three siblings, and only the first is a page:** cannot see is an emergency, was
+  never allowed to see is a task, was never set up to see is a task.
 - **Event-level idempotency stays a separate layer from incident grouping.** A
   replayed event id must add neither a notification nor an occurrence. The event
   id in the dedupe key is doing a necessary job; grouping is a second layer on top

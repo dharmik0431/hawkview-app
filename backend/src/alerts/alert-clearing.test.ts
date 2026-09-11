@@ -173,7 +173,43 @@ test('readable means what the evidence engine means by it', () => {
   for (const status of ['SUCCESS', 'EMPTY'] as const) {
     assert.equal(everyCoveredSourceReadable([{ source: 'S', status }]), true, status)
   }
-  for (const status of ['FAILED', 'STALE', 'PENDING', 'RUNNING', 'NOT_CONFIGURED', 'UNKNOWN'] as const) {
+  // COVERED statuses only. NOT_CONFIGURED is deliberately absent from this list —
+  // it returns false too, but through the empty-covered guard rather than through
+  // unreadability, and a test that cannot tell those apart would keep passing
+  // while meaning something else.
+  for (const status of ['FAILED', 'STALE', 'PENDING', 'RUNNING', 'UNKNOWN'] as const) {
     assert.equal(everyCoveredSourceReadable([{ source: 'S', status }]), false, status)
+    assert.deepEqual(
+      coveredSources([{ source: 'S', status }]).map((source) => source.status), [status],
+      `${status} must be covered, or the assertion above passes for the wrong reason`)
   }
+})
+
+test('a source HawkView was never set up to collect does not hold the page open', () => {
+  // THE FAILURE THIS EXCLUSION PREVENTS, and the one I argued the wrong way on.
+  // A never-configured source does not become readable without somebody
+  // configuring it, so counting it as covered gives a phone-tier page with no path
+  // to closure — the 353 problem reached through the fix for it.
+  const nineAndOne: readonly SourceState[] = [
+    ...Array.from({ length: 9 }, (_, index) => ({ source: `S${index}`, status: 'SUCCESS' as const })),
+    { source: 'NEVER_SET_UP', status: 'NOT_CONFIGURED' as const },
+  ]
+  assert.equal(everyCoveredSourceReadable(nineAndOne), true, 'the page must be able to close')
+  assert.equal(coveredSources(nineAndOne).length, 9)
+
+  // POSITIVE CONTROL: the same nine with a FAILED tenth may NOT close, because
+  // that one is the emergency rather than a setup task.
+  assert.equal(
+    everyCoveredSourceReadable([
+      ...Array.from({ length: 9 }, (_, index) => ({ source: `S${index}`, status: 'SUCCESS' as const })),
+      { source: 'BROKEN', status: 'FAILED' as const },
+    ]),
+    false)
+
+  // And the case I was protecting against is still protected — by the
+  // empty-covered guard, not by counting NOT_CONFIGURED as covered.
+  assert.equal(
+    everyCoveredSourceReadable([{ source: 'NEVER_SET_UP', status: 'NOT_CONFIGURED' }]),
+    false,
+    'a tenant with nothing configured must not report restored visibility')
 })

@@ -44,26 +44,50 @@ export interface SourceState {
  *                       is fixable in minutes by someone who knows. Folding it in
  *                       here converts a fixable permission problem into a
  *                       permanently-open blindness page.
- *   UNSUPPORTED         Microsoft does not expose it for this tenant. Same class as
- *                       NOT_LICENSED — a capability statement rather than a
- *                       failure. THIS ONE IS MY EXTENSION of the ruling rather
- *                       than the ruling itself; flagged, because leaving it
- *                       covered would make the condition unsatisfiable for any
- *                       tenant with an unsupported source.
+ *   UNSUPPORTED         Microsoft does not expose it. A capability statement about
+ *                       Microsoft rather than about this tenant, so it is the same
+ *                       class as NOT_LICENSED — and being global rather than
+ *                       per-tenant, leaving it covered would have made the
+ *                       condition unsatisfiable for EVERY tenant, not merely some.
+ *   NOT_CONFIGURED      HawkView has never been set up to collect it, and covered
+ *                       means the sources HawkView EXPECTS to be readable. It does
+ *                       not expect one it was never configured for.
  *
- * Everything else is covered, including NOT_CONFIGURED. That is deliberate and is
- * the conservative direction: "we have never collected this" is a visibility gap
- * rather than a capability statement, and excluding it would let a tenant with
- * nothing configured report full visibility.
+ * I argued for keeping NOT_CONFIGURED covered, on the grounds that excluding it
+ * would let a tenant with nothing configured report full visibility. That reason
+ * was answered by the empty-covered guard below: if nothing is configured, covered
+ * is empty and the condition is false already. So the case was protected twice,
+ * and the second guard cost what the first does not — a tenant with nine sources
+ * working and one never configured would have had a phone-tier page that could
+ * never close, because a never-configured source does not become readable without
+ * somebody configuring it. That is the 353 problem reached through the fix for it.
  *
- * The distinction the whole ruling rests on: **"HawkView cannot see this tenant"
- * is a different fact from "HawkView was never allowed to see this part of it."**
- * The first is an emergency, the second is a task. One alert for both makes the
- * emergency unclearable and buries the task. */
+ * Confirmed from the code rather than assumed: `collectorStatus` returns
+ * NOT_CONFIGURED only when no sync-state row exists at all. A collector that was
+ * working and stops has a row, so it becomes FAILED, PERMISSION_REQUIRED or STALE.
+ * NOT_CONFIGURED is therefore a steady-state fact about setup and never a symptom
+ * of a disconnection, so it has no business gating a disconnection alert's closure.
+ *
+ * THREE SIBLINGS, AND ONLY THE FIRST IS A PAGE:
+ *   cannot see                  an emergency
+ *   was never allowed to see    a task  (consent)
+ *   was never set up to see     a task  (configuration)
+ *
+ * Everything else is covered.
+ *
+ * THE CONDITION ON THE NOT_CONFIGURED EXCLUSION. It does mean this alert can report
+ * visibility restored while HawkView collects a fraction of what is available. That
+ * is a real overstatement and a different claim needing a different alert —
+ * "collecting three of ten available sources for this tenant" is worth telling an
+ * MSP and has its own action. The exclusion is conditional on that coverage gap
+ * being visible somewhere rather than silently dropped, which is step 05's work and
+ * the plan's own requirement that coverage gaps are shown rather than silent. Noted
+ * in the handoff section; not built here. */
 const NOT_COVERED: ReadonlySet<CollectorSyncStatus> = new Set([
   'NOT_LICENSED',
   'PERMISSION_REQUIRED',
   'UNSUPPORTED',
+  'NOT_CONFIGURED',
 ])
 
 export function coveredSources(sources: readonly SourceState[]): readonly SourceState[] {
