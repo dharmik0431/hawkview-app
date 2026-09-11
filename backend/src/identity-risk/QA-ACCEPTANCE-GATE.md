@@ -436,3 +436,43 @@ One honest limitation: the `UNREADABLE_NOW` / `NEVER_COLLECTED` marker check
 never fires in either run, so the discrimination rests entirely on `applies`.
 That is demonstrated rather than assumed, but the marker check is currently
 inert and should not be read as contributing.
+
+### `qa-gate-name-resolution-isolation.ts` — gates Engineer 2's merge, not the backend push
+
+Asks whether subject-name resolution can pull a sibling tenant's person into an
+authorized tenant's answer. Verified in both directions against `f107802`:
+
+| | |
+| --- | --- |
+| unmutated | **PASS**, 2 of 2 |
+| `customerTenantId` dropped from the resolver's `where` | **CROSS-TENANT LEAK**, 3 of 3 |
+
+Scope is stated in the file: authorization is stubbed to an already-authorized
+tenant, because the controller delegates that to `authorizeRiskyUsersRead`. A
+PASS here does not mean cross-tenant *access* is safe.
+
+**The fixture took three attempts, and the two failures are the useful part.**
+
+1. **Both tenants hold a row for the same id.** Non-deterministic — the widened
+   query returns two rows, `named.set` keeps whichever Postgres returned last,
+   and there is no `ORDER BY`. Against broken code it reported PASS once and
+   CROSS-TENANT LEAK the next run. A gate that catches a real leak half the time
+   is worse than none, because the half that passes is the half that gets quoted.
+2. **Only tenant B holds a row.** Deterministic and completely inert — with no
+   directory row of its own, tenant A's subject binds by UPN, carries no
+   directory id, and never enters the resolver's lookup set. PASS three times
+   against broken code. *The absence being relied on also removed the lookup key.*
+3. **What shipped.** Tenant A holds the row during evaluation so the subject
+   binds, then it is deleted before the read — leaving tenant B's as the only
+   candidate. Also a real state: a person removed from a directory after a run.
+
+**A separate bug in the probe, caught by the same mutation.** The verdict
+originally checked the `inputCanFail` guard *before* the leak. Under the mutation
+the leaking row overwrote tenant A's name, which removed the guard's own input —
+so the verdict line read INCONCLUSIVE while `responseLeaksTenantBName: true` sat
+directly above it. **An absent guard input is not evidence of safety when the
+thing that removed it is the leak.** Leak is now checked first.
+
+One incidental confirmation: names are role-gated on `evidenceDetailAllowed`, and
+the response carries `subjectsNamed` so a surface can say "your role does not show
+names" rather than rendering blanks.
