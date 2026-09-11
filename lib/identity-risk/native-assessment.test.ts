@@ -10,6 +10,41 @@ import {
   nativeRiskyUserCount,
   nativeRiskyUserList,
 } from './native-view.ts'
+import { microsoftChannel } from './risky-users-view.ts'
+import {
+  adaptMicrosoftRiskyUsersResponse,
+  unavailableMicrosoftEntraRiskyUsers,
+} from './adapter.ts'
+import { syntheticRiskResponses } from './test-fixtures.ts'
+
+/**
+ * A tenant Microsoft IS reporting on, built from the shared fixture rather
+ * than hand-rolled, so the adapter's own acceptance rules decide whether the
+ * channel is reporting. A payload I wrote to satisfy my own expectation would
+ * prove only that I can satisfy it.
+ */
+function reportingMicrosoft() {
+  const responses = syntheticRiskResponses()
+  return microsoftChannel(
+    adaptMicrosoftRiskyUsersResponse(responses.microsoftRiskyUsers)
+  )
+}
+
+/**
+ * A tenant Microsoft cannot be asked about, which is every customer tenant
+ * today: the risky-users channel needs Entra ID P2 and none of them have it.
+ *
+ * Used where a test is about the LIST rather than about the join, so the
+ * Microsoft column states a capability rather than a verdict. The join itself
+ * is exercised separately, against a reporting channel.
+ */
+const NO_PREMIUM_LICENSING = microsoftChannel(
+  unavailableMicrosoftEntraRiskyUsers(
+    'UNAVAILABLE',
+    'Microsoft Entra risky-user evidence is not available on this tenant.',
+    'LICENSE_REQUIRED'
+  )
+)
 
 /** A payload the endpoint could actually return, with the fleet's real shape. */
 function available(overrides: Record<string, unknown> = {}) {
@@ -532,7 +567,7 @@ test('a resolved name reaches the row from beside the subject, and only from the
     /^c54eb6ce/
   )
 
-  const rows = nativeRiskyUserList(named).rows
+  const rows = nativeRiskyUserList(named, NO_PREMIUM_LICENSING).rows
   assert.equal(rows.length, 1)
   assert.equal(rows[0].name, 'Dara Fixture')
   assert.equal(rows[0].email, 'dara@fixture.invalid')
@@ -585,7 +620,10 @@ test('a missing name says which of its two causes applies', () => {
     },
   })
 
-  const gated = nativeRiskyUserList(adaptNativeAssessment(build(false))).rows
+  const gated = nativeRiskyUserList(
+    adaptNativeAssessment(build(false)),
+    NO_PREMIUM_LICENSING
+  ).rows
   assert.equal(gated[0].name, 'Name not shown for your role')
   assert.ok(
     !/not resolved/i.test(gated[0].name),
@@ -593,7 +631,8 @@ test('a missing name says which of its two causes applies', () => {
   )
 
   const unresolved = nativeRiskyUserList(
-    adaptNativeAssessment(build(true))
+    adaptNativeAssessment(build(true)),
+    NO_PREMIUM_LICENSING
   ).rows
   assert.equal(unresolved[0].name, 'Identity not resolved')
   assert.notEqual(gated[0].name, unresolved[0].name)
@@ -701,7 +740,7 @@ test('a signal says what kind of time it carries, from the value', () => {
       ],
     },
   })
-  const context = nativeRiskyUserList(forwarding).context
+  const context = nativeRiskyUserList(forwarding, NO_PREMIUM_LICENSING).context
   assert.equal(context.length, 1)
   assert.equal(context[0].reasons[0].kind, 'STATE_OBSERVED')
 
@@ -811,7 +850,7 @@ test('a name in the wrong place does not reach the row', () => {
     null
   )
 
-  const rows = nativeRiskyUserList(subjectLevel).rows
+  const rows = nativeRiskyUserList(subjectLevel, NO_PREMIUM_LICENSING).rows
   assert.ok(
     !/Should Not Appear/.test(rows[0].name),
     'a name in the wrong position reached the row, so position is not asserted'
@@ -819,4 +858,131 @@ test('a name in the wrong place does not reach the row', () => {
   // And the row still says which of the two causes applies rather than
   // inventing a failure of ours.
   assert.equal(rows[0].name, 'Identity not resolved')
+})
+
+/** A subject whose join key is present and usable. */
+function subjectWith(correlation: unknown, ref = 'obj-1') {
+  return {
+    version: NATIVE_RISKY_USERS_VERSION,
+    available: true,
+    subjectsNamed: true,
+    run: { windowStart: null, windowEnd: null, completedAt: null },
+    collectors: [],
+    coverage: [],
+    count: {
+      accuracy: 'EXACT',
+      value: 1,
+      scope: {
+        evidenceRequested: [],
+        setAside: [],
+        covered: [],
+        notCovered: [],
+      },
+    },
+    claim: { permitted: true },
+    findings: {
+      complete: true,
+      items: [
+        {
+          detectorId: 'repeated-credential-failure',
+          subject: { kind: 'DIRECTORY_USER', userRef: ref, correlation },
+          displayName: 'Gary Green',
+          userPrincipalName: 'gary@greentech-services.net',
+          signals: [
+            {
+              signal: 'PASSWORD_REJECTED',
+              count: 33,
+              capped: false,
+              latest: null,
+            },
+          ],
+        },
+      ],
+    },
+  }
+}
+
+test('"Microsoft did not flag this person" and "we cannot ask" never merge', () => {
+  // The product's thesis: HawkView exists so MSPs who cannot afford Entra ID P2
+  // still learn what is happening. Microsoft's risky-users channel requires
+  // that licensing, so on most customer tenants the honest cell is a statement
+  // about capability. Rendering "no" there would be the most expensive sentence
+  // on the screen -- it would tell an MSP that Microsoft looked and cleared
+  // someone Microsoft was never asked about.
+  const joinable = {
+    available: true,
+    matchedBy: 'DIRECTORY_OBJECT_ID',
+    ref: 'obj-1',
+  }
+
+  // 1. Microsoft cannot be asked about this tenant at all.
+  const cannotAsk = nativeRiskyUserList(
+    adaptNativeAssessment(subjectWith(joinable)),
+    NO_PREMIUM_LICENSING
+  ).rows
+  assert.equal(cannotAsk[0].detection.microsoft, 'UNAVAILABLE')
+  assert.ok(
+    cannotAsk[0].detection.because,
+    'a capability statement was flattened into a shrug'
+  )
+
+  // 2. Microsoft is reporting and did not flag this person. Only reachable
+  //    when every record it returned carries a usable key -- otherwise a miss
+  //    is unproven rather than negative.
+  const reporting = reportingMicrosoft()
+  assert.equal(
+    reporting.state,
+    'REPORTING',
+    'the fixture channel is not reporting, so the assertions below would pass for the wrong reason'
+  )
+  const notFlagged = nativeRiskyUserList(
+    adaptNativeAssessment(subjectWith(joinable)),
+    reporting,
+    []
+  ).rows
+  assert.equal(notFlagged[0].detection.microsoft, 'NOT_REPORTED')
+
+  // 3. We hold Microsoft's channel but cannot tie THIS subject to it.
+  const unjoinable = nativeRiskyUserList(
+    adaptNativeAssessment(
+      subjectWith({ available: false, because: 'No directory object id.' })
+    ),
+    reporting,
+    []
+  ).rows
+  assert.equal(unjoinable[0].detection.microsoft, 'NOT_COMPARABLE')
+  assert.match(unjoinable[0].detection.because ?? '', /directory object id/)
+
+  // The three must not share a label. A column that renders the same cell for
+  // "no" and "could not ask" is the merge this whole screen exists to prevent.
+  const labels = [cannotAsk, notFlagged, unjoinable].map(
+    (rows) => rows[0].detection.microsoft
+  )
+  assert.equal(new Set(labels).size, 3, 'two Microsoft states rendered alike')
+})
+
+test('the join compares what the ref contains, not how the subject was matched', () => {
+  // matchedBy says how the subject was IDENTIFIED; ref is always a directory
+  // object id, including on the audit path where the subject is matched by UPN
+  // and then referenced by its object id. Microsoft's records describe their
+  // ref's CONTENTS. Comparing one against the other would fail to join two
+  // records holding the same object id, and the row would then say Microsoft
+  // did not flag someone Microsoft did flag.
+  const auditPath = adaptNativeAssessment(
+    subjectWith({
+      available: true,
+      matchedBy: 'USER_PRINCIPAL_NAME',
+      ref: 'obj-1',
+    })
+  )
+  assert.ok(auditPath)
+  const correlation =
+    auditPath!.available && auditPath!.findings[0].subject.correlation
+  assert.ok(correlation && correlation.available)
+  assert.equal(
+    correlation && correlation.available && correlation.shape,
+    'DIRECTORY_OBJECT_ID',
+    'the matching method was copied into a field describing contents'
+  )
+  assert.equal(correlation && correlation.available && correlation.ref, 'obj-1')
 })

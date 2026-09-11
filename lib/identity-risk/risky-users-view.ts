@@ -420,8 +420,27 @@ function refsMatch(left: CorrelationRef | null, right: CorrelationRef | null) {
   )
 }
 
+/**
+ * What the two channels say about one subject, from its join key alone.
+ *
+ * Taking the key rather than the user so both read paths share one state
+ * machine. A second copy would be two places for "Microsoft did not flag this
+ * person" to be produced by a failure of ours, and the distinction between
+ * that and "we were never allowed to ask" is the product's whole thesis:
+ * HawkView exists so MSPs who cannot afford Entra ID P2 still learn what is
+ * happening, and a column rendering "no" where the truth is "we could not ask"
+ * would be the most expensive sentence on the screen.
+ */
 function detectionFor(
   user: RiskAssessmentUser,
+  channel: MicrosoftChannel,
+  microsoftUsers: MicrosoftEntraRiskyUser[] | null
+): RiskyUserDetection {
+  return detectionFromCorrelation(user.correlation, channel, microsoftUsers)
+}
+
+export function detectionFromCorrelation(
+  correlation: CorrelationRef | null,
   channel: MicrosoftChannel,
   microsoftUsers: MicrosoftEntraRiskyUser[] | null
 ): RiskyUserDetection {
@@ -448,7 +467,6 @@ function detectionFor(
     }
   }
 
-  const correlation = user.correlation
   // No key at all, from a server that does not yet send one. Saying Microsoft
   // did not report this user would be a claim about Microsoft with nothing
   // behind it.
