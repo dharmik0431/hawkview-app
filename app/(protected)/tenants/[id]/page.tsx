@@ -1478,6 +1478,15 @@ export default function TenantDetailsPage() {
         })
         return
       case 'overview':
+      // Risky Users routes like any other section. Omitting it here sent every
+      // click to `default`, which pushes the tenant overview — the page the
+      // user is already on — so the click did nothing at all. Both entry
+      // points go through here: the blade nav item and the count card's
+      // "Review risky users". `tenantSectionPath` has handled 'risky-users'
+      // since the section was relocated out of Entra; only this switch never
+      // learned it, and a switch whose default is a real destination cannot
+      // tell an unhandled case from a deliberate one.
+      case 'risky-users':
       case 'exchange':
       case 'sharepoint':
       case 'teams':
