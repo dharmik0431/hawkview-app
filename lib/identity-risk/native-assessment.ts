@@ -208,8 +208,23 @@ function adaptSignals(value: unknown): FindingSignal[] | null {
   return signals
 }
 
-function adaptSubject(value: unknown): NativeSubject | null {
-  const source = record(value)
+/**
+ * The subject, assembled from two levels of the item.
+ *
+ * The kind and the opaque ref live inside `subject`; the resolved name lives
+ * beside it, spread onto the ITEM, because resolution happens at read time
+ * against the directory and is not part of the finding the detector produced.
+ * Both placements are defensible and neither side is wrong on its own, which
+ * is exactly why reading the name from the wrong level produced no error --
+ * just a null, and a row claiming HawkView could not identify anybody while
+ * the payload carried their name.
+ *
+ * Taking the whole item rather than `item.subject` puts both levels in one
+ * function, so the seam is visible in the place that spans it instead of being
+ * a fact two files apart.
+ */
+function adaptSubject(item: Record<string, unknown>): NativeSubject | null {
+  const source = record(item.subject)
   if (!source) return null
   const kind =
     source.kind === 'DIRECTORY_USER' || source.kind === 'MAILBOX'
@@ -224,10 +239,20 @@ function adaptSubject(value: unknown): NativeSubject | null {
   return {
     kind,
     ref,
-    // Identity resolution is gated on the caller's role. A missing name is
-    // expected for some readers and must not look like a failure.
-    displayName: optionalText(source.displayName, 200),
-    userPrincipalName: optionalText(source.userPrincipalName, 320),
+    // BESIDE the subject, on the item, and read from there rather than from
+    // inside it. `finding.subject` is what the detector produced; the name is
+    // a read-time join against the directory that the controller adds when the
+    // role permits. Folding it in would present a directory lookup as
+    // something the detector found.
+    //
+    // This field moved four times in an hour across two branches, and every
+    // collision looked identical from one side: a null where a name should be.
+    // What settled it was not an argument about which shape was nicer -- it
+    // was a test asserting POSITION. Both suites had asserted presence, which
+    // either side can satisfy alone, and presence is exactly what cannot fail
+    // when the two disagree.
+    displayName: optionalText(item.displayName, 200),
+    userPrincipalName: optionalText(item.userPrincipalName, 320),
   }
 }
 
@@ -367,7 +392,7 @@ export function adaptNativeAssessment(value: unknown): NativeAssessment | null {
     const item = record(entry)
     if (!item || !has(item, ['detectorId', 'subject', 'signals'])) return null
     const detectorId = text(item.detectorId, 120)
-    const subject = adaptSubject(item.subject)
+    const subject = adaptSubject(item)
     const signals = adaptSignals(item.signals)
     // A finding without a subject or without signals rests on nothing. That is
     // self-contradicting rather than incomplete.

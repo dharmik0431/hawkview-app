@@ -33,7 +33,7 @@ import type { NativeAssessment } from './native-assessment'
  * act on, and printing it invites the reading that it is a name.
  */
 const detectorTitles: Record<string, string> = {
-  'credential-failure': 'Repeated credential failures',
+  'repeated-credential-failure': 'Repeated credential failures',
   'external-mailbox-forwarding': 'External mailbox forwarding',
 }
 
@@ -56,7 +56,7 @@ const detectorTitles: Record<string, string> = {
  * none.
  */
 const detectorGuidance: Record<string, readonly string[]> = {
-  'credential-failure': [
+  'repeated-credential-failure': [
     'Confirm with the account owner whether the sign-in attempts were theirs.',
     'Check for an application or device holding an outdated password, which produces repeated failures without anyone attacking anything.',
     'If the failures were followed by a success, review that sign-in specifically rather than the failures.',
@@ -79,16 +79,33 @@ export function detectorTitle(detectorId: string): string {
   )
 }
 
-function subjectLabel(subject: {
-  kind: string
-  ref: string
-  displayName: string | null
-}): string {
-  // A row showing a priority, a count and a date against an unresolvable
-  // reference is worse than an empty row, because it looks complete: a
-  // technician scans it, assumes the name is truncated or off-screen, and
-  // moves on. The absence is stated in the row, in words.
-  return subject.displayName ?? 'Identity not resolved'
+/**
+ * What to call the subject of a row, given that a missing name has two causes
+ * and they are not interchangeable.
+ *
+ * "Identity not resolved" is a statement about HawkView's own capability -- we
+ * looked and could not tell who this is. It is true only when this response
+ * names people and this particular subject had no directory row. When the
+ * response names nobody, it is a permission boundary, and printing our own
+ * failure there is a false claim about ourselves on every row at once.
+ *
+ * The two were merged until a payload arrived carrying names and every row
+ * said the identity could not be resolved. That is a worse outcome than the
+ * opaque handle it replaced, because the handle at least invited the question
+ * rather than answering it wrongly.
+ *
+ * A row is still never left as a bare reference a reader takes for a truncated
+ * name: the absence is stated in words either way, and which words is the
+ * whole point.
+ */
+function subjectLabel(
+  subject: { kind: string; ref: string; displayName: string | null },
+  subjectsNamed: boolean
+): string {
+  if (subject.displayName) return subject.displayName
+  return subjectsNamed
+    ? 'Identity not resolved'
+    : 'Name not shown for your role'
 }
 
 function reasonsOf(finding: {
@@ -96,14 +113,18 @@ function reasonsOf(finding: {
   signals: {
     signal: string
     count: number
-    latest: { at: string } | null
+    latest: { at: string; kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED' } | null
     capped: boolean
   }[]
 }): RiskyUserReason[] {
   return finding.signals.map((signal) => ({
     title: signalTitle(signal.signal),
     signal: signal.signal,
-    kind: null,
+    // The kind travels on the value. Re-deriving it from a table keyed on the
+    // detector's id is the convention this contract change removed, and a
+    // table keyed on the WRONG id -- the previous engine's -- is how it broke:
+    // silently, into "unrecognised", on every state including the clean zero.
+    kind: signal.latest?.kind ?? null,
     ruleId: finding.detectorId,
     evidenceCount: signal.count,
     evidenceCountCapped: signal.capped,
@@ -290,7 +311,7 @@ export function nativeRiskyUserList(
     }
     bySubject.set(key, {
       id: key,
-      name: subjectLabel(finding.subject),
+      name: subjectLabel(finding.subject, native.subjectsNamed),
       email: finding.subject.userPrincipalName,
       reference: key,
       subjectType: finding.subject.kind === 'MAILBOX' ? 'MAILBOX' : 'USER',
