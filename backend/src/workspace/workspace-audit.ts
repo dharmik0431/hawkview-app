@@ -14,10 +14,15 @@ const SAFE_METADATA_KEYS = new Set([
   'delivery',
   'factorsRemoved',
   'idempotent',
+  // Identity-disclosure evidence. A bounded integer and a closed enum — chosen
+  // so that the allowlist cannot become a channel for a name. See
+  // identity-disclosure-audit.ts.
+  'namedSubjectCount',
   'priorRole',
   'priorStatus',
   'role',
   'status',
+  'surface',
 ])
 const SAFE_ERROR_CODES = new Set([
   'AUTH_EMAIL_RATE_LIMITED',

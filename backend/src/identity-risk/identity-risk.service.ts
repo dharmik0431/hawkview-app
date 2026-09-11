@@ -87,6 +87,10 @@ const microsoftRiskDetails = new Set([
 ])
 
 type ScopedTenant = Readonly<{
+  /** The database id of the operator this tenant was scoped FOR. Carried here
+   * rather than looked up again because scope() already reads the user row, and
+   * because an audit row that cannot name the operator answers nothing. */
+  actorUserId: string
   id: string
   organizationId: string
   evidenceDetailAllowed: boolean
@@ -371,6 +375,7 @@ export class IdentityRiskService {
     const user = await this.prisma.user.findUnique({
       where: { authProviderUserId: identity.subject },
       select: {
+        id: true,
         disabledAt: true,
         memberships: {
           where: {
@@ -398,6 +403,7 @@ export class IdentityRiskService {
     )
     return {
       ...tenant,
+      actorUserId: user.id,
       evidenceDetailAllowed:
         membership?.role === 'MSP_OWNER' || membership?.role === 'MSP_ADMIN',
     }
