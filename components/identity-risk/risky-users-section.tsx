@@ -1,1245 +1,355 @@
 'use client'
 
-import { useCallback, useState } from 'react'
+import React, { useCallback, useMemo, useState } from 'react'
 import {
+  AlertCircle,
+  CheckCircle2,
   ChevronRight,
-  Info,
+  Clock3,
   RefreshCw,
+  Search,
   ShieldAlert,
+  ShieldCheck,
   ShieldOff,
+  Users,
+  X,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
+import { useTenantOperationalProjection } from '@/lib/api/hooks'
+import { FleetRiskAssessmentDrawer } from '@/components/identity-risk/fleet-risk-assessment-drawer'
+import type { FleetRiskyUserRow } from '@/lib/api/fleet-risky-users-hooks'
 import {
-  findingEvidenceSummary,
-  resolvedEvidenceShape,
-  runRecency,
-  ruleScopeSummary,
-  microsoftRiskyUserCountPresentation,
-  riskReadinessLabel,
-  riskSourceLabel,
-} from '@/lib/identity-risk/presentation'
-import {
-  detectedByLabel,
-  microsoftDetectionSummary,
-  microsoftLevelsHidden,
-  microsoftRecordsByPolarity,
-  microsoftRiskLevelLabel,
-  microsoftVerdictDetail,
-  microsoftVerdictPolarity,
-  nativeWithheldReasonCopy,
-} from '@/lib/identity-risk/risky-users-view'
-import {
-  detectorGuidanceFor,
-  detectorTitle,
-} from '@/lib/identity-risk/native-view'
-import type { NativeAssessment } from '@/lib/identity-risk/native-assessment'
-import type {
-  MicrosoftChannel,
-  MicrosoftVerdictPolarity,
-  RiskyUserCount,
-  RiskyUserReason,
-  RiskyUserRow,
-} from '@/lib/identity-risk/risky-users-view'
-import type {
-  MicrosoftEntraRiskyUser,
-  MicrosoftEntraRiskyUsersView,
-  RiskAssessment,
-} from '@/lib/identity-risk/types'
-import { cn } from '@/lib/utils'
+  getUserDisplayName,
+  getUserEmailOrUpn,
+  mapRuleToPresentation,
+} from '@/lib/identity-risk/risk-presentation-mapper'
+import { microsoftRecordsByPolarity } from '@/lib/identity-risk/risky-users-view'
+import type { RiskyUserRow } from '@/lib/identity-risk/risky-users-view'
 
-function time(value: string | null) {
-  return value ? new Date(value).toLocaleString() : 'Not reported'
+function formatTimestamp(value: string | null | undefined): string {
+  if (!value || !Number.isFinite(Date.parse(value))) return 'Not reported'
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value))
 }
 
-/**
- * The row's one aggregate date, and what kind of date it is.
- *
- * Three different things can appear here and none of them may borrow another's
- * words. A date, qualified by the kind of time it turned out to be. No date
- * because the checks that ran carry none — an evidence gap, not a collection
- * one. And no date because there is nothing here to have one.
- *
- * "Not reported" for the middle case would be the surface's standing mistake in
- * miniature: a true-sounding phrase about collection, printed where the truth is
- * about the evidence.
- */
-function LatestCell({ row }: { row: RiskyUserRow }) {
-  if (row.lastSeenState === 'NO_REASONS') return <>{time(null)}</>
-  if (row.lastSeenState === 'DATELESS') {
-    return (
-      <>
-        No time recorded
-        <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
-          the checks ran; their evidence carries no time
-        </span>
-      </>
-    )
+function getInitials(name: string, email: string): string {
+  if (name && name !== 'Identity not resolved') {
+    const parts = name.trim().split(/\s+/)
+    if (parts.length >= 2 && parts[0][0] && parts[parts.length - 1][0]) {
+      return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
+    }
+    if (parts[0].length >= 2) {
+      return parts[0].substring(0, 2).toUpperCase()
+    }
   }
-  // Resolved from the reason itself, which carries the kind the server sent.
-  // Asking a table keyed on the detector's id was the same fault as the other
-  // two in this pass, in the one place that decides whether a date reads as
-  // something happening or as HawkView looking.
-  const settingRead =
+  if (email && email.includes('@')) {
+    const cleanRef = email.split('@')[0]
+    if (cleanRef.length >= 2) return cleanRef.substring(0, 2).toUpperCase()
+  }
+  return 'RU'
+}
+
+function LatestEvidenceCell({ row }: { row: RiskyUserRow }) {
+  if (!row.lastSeen) {
+    return <span className="text-xs text-slate-400 dark:text-slate-500 italic">No time recorded</span>
+  }
+
+  const formattedDate = formatTimestamp(row.lastSeen)
+
+  let qualifier = 'Last observed'
+  if (
     row.lastSeenFrom &&
-    resolvedEvidenceShape(row.lastSeenFrom).kind === 'CONFIGURED_STATE'
+    typeof row.lastSeenFrom === 'object' &&
+    row.lastSeenFrom.kind === 'STATE_OBSERVED'
+  ) {
+    qualifier = 'Last evaluated'
+  } else if (row.detection.microsoft === 'REPORTED' && row.reasons.length === 0) {
+    qualifier = 'Last reported by Entra'
+  }
+
   return (
-    <>
-      {time(row.lastSeen)}
-      {settingRead && (
-        <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
-          when HawkView read a setting, not when anything happened
-        </span>
-      )}
-    </>
-  )
-}
-
-/**
- * Everything this response holds about one subject, and what to do about it.
- *
- * Built on the row rather than on the old envelope's twenty-two fields, so it
- * shows what actually arrived: every signal with its own count and its own
- * date, what Microsoft says or why it cannot be asked, and the investigation
- * steps for each detector involved.
- *
- * A signal evaluated with nothing found is a RESULT and reads as one. Rendering
- * it blank would let a reader take it for a signal that never ran, which is the
- * distinction the whole contract was reshaped to keep.
- */
-function RowDetail({
-  row,
-  onClose,
-}: {
-  row: RiskyUserRow | null
-  onClose: () => void
-}) {
-  if (!row) return null
-  const detectorIds = Array.from(
-    new Set(row.reasons.map((reason) => reason.ruleId))
-  )
-  return (
-    <div
-      className="fixed inset-0 z-50 flex justify-end bg-slate-900/40"
-      role="dialog"
-      aria-modal="true"
-      aria-label={'Findings for ' + row.name}
-    >
-      <div className="h-full w-full max-w-xl overflow-y-auto bg-white p-6 shadow-xl dark:bg-slate-950">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-50">
-              {row.name}
-            </h3>
-            <p className="text-xs text-slate-600 dark:text-slate-400">
-              {row.subjectType === 'MAILBOX' ? 'Mailbox' : 'User account'}
-              {row.email ? ' · ' + row.email : ''}
-            </p>
-            <p className="mt-0.5 break-all font-mono text-xs text-slate-500 dark:text-slate-400">
-              {row.reference}
-            </p>
-          </div>
-          <Button type="button" variant="outline" size="sm" onClick={onClose}>
-            Close
-          </Button>
-        </div>
-
-        <p className="mt-4 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-          These are investigation leads. Nothing here establishes that this
-          account is compromised, and nothing here establishes that it is safe.
-          HawkView reads Microsoft and changes nothing.
-        </p>
-
-        <section className="mt-5">
-          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
-            What HawkView found
-          </h4>
-          <ul className="mt-2 space-y-3">
-            {row.reasons.map((reason) => {
-              const evidence = findingEvidenceSummary(reason, time)
-              return (
-                <li
-                  key={(reason.signal ?? reason.title) + reason.ruleId}
-                  className="rounded-lg border border-slate-200 p-3 dark:border-slate-800"
-                >
-                  <p className="text-sm font-medium text-slate-900 dark:text-slate-100">
-                    {reason.title}
-                  </p>
-                  <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300">
-                    {evidence.note ??
-                      [evidence.count, evidence.timing]
-                        .filter(Boolean)
-                        .join(', ')}
-                  </p>
-                  <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                    Reported by {detectorTitle(reason.ruleId)}
-                  </p>
-                </li>
-              )
-            })}
-          </ul>
-        </section>
-
-        <section className="mt-5">
-          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
-            What Microsoft says
-          </h4>
-          <div className="mt-2 rounded-lg border border-slate-200 p-3 dark:border-slate-800">
-            <MicrosoftCell row={row} />
-          </div>
-        </section>
-
-        <section className="mt-5">
-          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
-            What to check next
-          </h4>
-          {detectorIds.every(
-            (detectorId) => detectorGuidanceFor(detectorId).length === 0
-          ) ? (
-            <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
-              This build has no investigation steps for these checks. That is a
-              gap in HawkView rather than a sign there is nothing to do.
-            </p>
-          ) : (
-            detectorIds.map((detectorId) => (
-              <div key={detectorId} className="mt-2">
-                <p className="text-xs font-medium text-slate-700 dark:text-slate-200">
-                  {detectorTitle(detectorId)}
-                </p>
-                <ul className="mt-1 list-disc space-y-1 pl-5 text-xs leading-5 text-slate-600 dark:text-slate-300">
-                  {detectorGuidanceFor(detectorId).map((step) => (
-                    <li key={step}>{step}</li>
-                  ))}
-                </ul>
-              </div>
-            ))
-          )}
-          <p className="mt-3 text-xs leading-5 text-slate-500 dark:text-slate-400">
-            Every step is carried out in Microsoft&rsquo;s own tools.
-          </p>
-        </section>
+    <div className="space-y-0.5">
+      <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+        {formattedDate}
+      </div>
+      <div className="text-2xs text-slate-500 dark:text-slate-400 font-medium">
+        {qualifier}
       </div>
     </div>
   )
 }
 
-/**
- * HawkView's own column. Every row is here because HawkView found something,
- * so the cell states what, not whether.
- *
- * No severity and no priority. The engine rates nothing, and a column that
- * looked like a rating would be re-inventing the vocabulary this rebuild
- * removed -- in a different font, which is the only part that would change.
- */
-function HawkViewCell({ row }: { row: RiskyUserRow }) {
-  const checks = new Set(row.reasons.map((reason) => reason.ruleId)).size
-  return (
-    <>
-      <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-900 dark:text-slate-50">
-        <ShieldAlert
-          className="h-4 w-4 text-amber-600 dark:text-amber-400"
-          aria-hidden="true"
-        />
-        Found
-      </span>
-      <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-        {row.reasons.length} {row.reasons.length === 1 ? 'signal' : 'signals'}
-        {checks > 1 ? ` across ${checks} checks` : ''}
-      </p>
-    </>
-  )
-}
-
-/**
- * Microsoft's column, and the one sentence on this screen that must never be
- * wrong in the reassuring direction.
- *
- * Microsoft's risky-users channel needs Entra ID P2. Most customer tenants do
- * not have it, so the honest cell there is a statement about capability -- we
- * were never allowed to ask. Rendering "no" for that would tell an MSP that
- * Microsoft looked at this person and cleared them, which is the most
- * expensive sentence this product could print: HawkView exists precisely so
- * the MSPs who cannot afford those licences still learn what is happening.
- *
- * Four outcomes, four different cells, none of them a dash or a blank:
- *   flagged · not flagged · cannot be asked · cannot be joined to this subject
- *
- * The last two are both "we do not know" and are still not the same thing --
- * one is about the tenant's licensing, the other about this subject's key --
- * so each carries the reason rather than a shrug.
- */
-function MicrosoftCell({ row }: { row: RiskyUserRow }) {
-  const { microsoft, microsoftRecord, because } = row.detection
-
-  if (microsoft === 'REPORTED') {
+function DataStateBadge({ row }: { row: RiskyUserRow }) {
+  if (row.detection.microsoft === 'UNAVAILABLE') {
     return (
-      <>
-        <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-900 dark:text-slate-50">
-          <ShieldAlert
-            className="h-4 w-4 text-rose-600 dark:text-rose-400"
-            aria-hidden="true"
-          />
-          Flagged
-        </span>
-        {microsoftRecord && (
-          <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300">
-            {microsoftVerdictDetail(microsoftRecord)}
-          </p>
-        )}
-      </>
-    )
-  }
-
-  if (microsoft === 'NOT_REPORTED') {
-    return (
-      <>
-        <span className="text-sm font-medium text-slate-700 dark:text-slate-200">
-          Not flagged
-        </span>
-        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-          Microsoft was asked and did not report this person. That is
-          Microsoft&rsquo;s view of its own telemetry, not agreement that
-          HawkView is wrong.
-        </p>
-      </>
-    )
-  }
-
-  // UNAVAILABLE and NOT_COMPARABLE. Both mean we cannot say, and they are not
-  // the same reason, so the cell says which.
-  return (
-    <>
-      <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-300">
-        <ShieldOff className="h-4 w-4" aria-hidden="true" />
-        {microsoft === 'UNAVAILABLE' ? 'Cannot be asked' : 'Cannot be compared'}
-      </span>
-      <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-        {because ??
-          'HawkView cannot establish what Microsoft says about this person.'}{' '}
-        This is not Microsoft clearing them.
-      </p>
-    </>
-  )
-}
-
-/**
- * What to do about this row's findings.
- *
- * Half the product is naming what we found; the other half is what an MSP can
- * do about it, and a row of counts and dates delivers only the first. The
- * guidance is static per detector rather than per finding, because the steps
- * for repeated credential failures are the same every time they occur, so it
- * is copy rather than data and needs nothing from the endpoint.
- *
- * Collapsed, phrased as investigation steps rather than instructions, and
- * carried out in Microsoft's own tools -- HawkView reads and changes nothing.
- * A detector this build does not recognise says the guidance is missing rather
- * than offering a neighbour's steps: guidance for the wrong finding is worse
- * than none, because it gets followed.
- */
-function NextSteps({ row }: { row: RiskyUserRow }) {
-  const detectorIds = Array.from(
-    new Set(row.reasons.map((reason) => reason.ruleId))
-  )
-  const known = detectorIds.filter(
-    (detectorId) => detectorGuidanceFor(detectorId).length > 0
-  )
-  if (known.length === 0) {
-    return (
-      <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
-        This build has no investigation steps for{' '}
-        {detectorIds.length === 1 ? 'this check' : 'these checks'}. That is a
-        gap in HawkView rather than a sign there is nothing to do.
-      </p>
-    )
-  }
-  return (
-    <details className="mt-2">
-      <summary className="cursor-pointer text-xs font-semibold text-slate-700 dark:text-slate-200">
-        What to check next
-      </summary>
-      {known.map((detectorId) => (
-        <div key={detectorId} className="mt-1.5">
-          {known.length > 1 && (
-            <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
-              {detectorTitle(detectorId)}
-            </p>
-          )}
-          <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-5 text-slate-600 dark:text-slate-300">
-            {detectorGuidanceFor(detectorId).map((step) => (
-              <li key={step}>{step}</li>
-            ))}
-          </ul>
-        </div>
-      ))}
-      <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
-        Nothing above establishes compromise. HawkView makes no changes to
-        Microsoft; every step is carried out in Microsoft&rsquo;s own tools.
-      </p>
-    </details>
-  )
-}
-
-/**
- * One reason, with its own count and its own recency, in the unit that reason
- * actually counts.
- *
- * Two reasons on one row never share a date, and neither shares a noun. A
- * repeated-failure reason counts events and its date is when the last one
- * happened; the mailbox reason counts destinations a mailbox is configured to
- * forward to and its date is when the setting was read. Both readings are
- * supplied by findingEvidenceSummary, which is also the only place that decides
- * a rule it does not recognise gets no reading at all.
- */
-function ReasonLine({ reason }: { reason: RiskyUserReason }) {
-  const evidence = findingEvidenceSummary(reason, time)
-  return (
-    <li className="text-xs text-slate-600 dark:text-slate-300">
-      {reason.title}
-      <span className="block text-slate-500 dark:text-slate-400">
-        {evidence.note ?? [evidence.count, evidence.timing].join(', ')}
-      </span>
-    </li>
-  )
-}
-
-/**
- * HawkView identifies a subject by a 64-character tenant-keyed pseudonym. Shown
- * in full it takes three lines and crowds out the name and the reasons, which
- * are what a technician actually reads. Shown short it still distinguishes two
- * users with the same display name, and the full value stays available to copy.
- */
-function shortReference(reference: string) {
-  const match = reference.match(/^(hvr1_[a-z]+_)([0-9a-f]{64})$/)
-  return match ? `${match[1]}${match[2].slice(0, 10)}…` : reference
-}
-
-/* -------------------------------------------------------------------------- */
-
-/**
- * The Microsoft channel is shown whether or not it is reporting. On a tenant
- * without Entra ID P2 this panel is the whole answer to "why does every row
- * say HawkView?", and it tells the MSP what licensing the tenant would add.
- */
-function MicrosoftChannelPanel({
-  channel,
-  view,
-}: {
-  channel: MicrosoftChannel
-  view: MicrosoftEntraRiskyUsersView
-}) {
-  const reporting = channel.state === 'REPORTING'
-  return (
-    <section
-      aria-labelledby="microsoft-channel-heading"
-      className={cn(
-        'rounded-xl border p-5 shadow-2xs',
-        reporting
-          ? 'border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900'
-          : 'border-slate-300 bg-slate-50 dark:border-slate-700 dark:bg-slate-900/60'
-      )}
-    >
-      <div className="flex gap-3">
-        <span
-          className={cn(
-            'flex h-9 w-9 shrink-0 items-center justify-center rounded-lg',
-            reporting
-              ? 'bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300'
-              : 'bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
-          )}
-        >
-          {reporting ? (
-            <ShieldAlert className="h-5 w-5" aria-hidden="true" />
-          ) : (
-            <ShieldOff className="h-5 w-5" aria-hidden="true" />
-          )}
-        </span>
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h3
-              id="microsoft-channel-heading"
-              className="text-sm font-semibold text-slate-900 dark:text-slate-50"
-            >
-              Microsoft Entra Identity Protection
-            </h3>
-            {channel.addressable && (
-              <Badge
-                variant="outline"
-                className="border-blue-200 text-blue-700 dark:border-blue-800 dark:text-blue-300"
-              >
-                Available with a change you control
-              </Badge>
-            )}
-          </div>
-          <p className="mt-1 text-sm font-medium text-slate-800 dark:text-slate-200">
-            {channel.headline}
-          </p>
-          <p className="mt-1.5 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-            {channel.detail}
-          </p>
-          {channel.observedAt && (
-            <p className="mt-2 text-xs text-slate-500">
-              Microsoft last observed {time(channel.observedAt)}
-            </p>
-          )}
-        </div>
-      </div>
-      <MicrosoftRecords view={view} />
-    </section>
-  )
-}
-
-const microsoftRiskStateLabel: Readonly<
-  Record<MicrosoftEntraRiskyUser['riskState'], string>
-> = {
-  none: 'None',
-  atRisk: 'At risk',
-  remediated: 'Remediated',
-  dismissed: 'Dismissed',
-  confirmedSafe: 'Confirmed safe',
-  confirmedCompromised: 'Confirmed compromised',
-  unknownFutureValue: 'Reported by Microsoft, state not recognised',
-}
-
-/**
- * Microsoft's own records, in Microsoft's own vocabulary, under Microsoft's own
- * heading. They are deliberately not folded into the list above: HawkView
- * identifies a subject by tenant-keyed pseudonym and Microsoft by directory
- * object, and without a key both sides agree on, merging the two lists would
- * either invent a correspondence or silently drop records. Keeping them apart
- * is what preserves which system said what.
- */
-const polarityGroups: ReadonlyArray<{
-  polarity: MicrosoftVerdictPolarity
-  heading: string
-  note: string
-}> = [
-  {
-    polarity: 'ACTIVE_RISK',
-    heading: 'Users Microsoft currently considers at risk',
-    note: 'Microsoft’s present assessment of the person, drawn from all of its own telemetry.',
-  },
-  {
-    polarity: 'CLOSED',
-    heading: 'Users Microsoft has closed',
-    note: 'Microsoft has remediated or dismissed these. Its automatic remediation lands in the dismissed state, so a dismissal here is not necessarily someone waving it away — the detail names who or what closed it.',
-  },
-  {
-    polarity: 'CLEARED',
-    heading: 'Users Microsoft currently considers safe',
-    note: 'These are Microsoft clearing a person or a sign-in, not Microsoft flagging one. They are listed for completeness and are not findings.',
-  },
-  {
-    polarity: 'UNRECOGNISED',
-    heading: 'Users whose Microsoft state this client does not recognise',
-    note: 'Microsoft reported something HawkView has not learned to read. It is shown as unrecognised rather than assumed to be a risk.',
-  },
-]
-
-function MicrosoftRecordTable({
-  users,
-  caption,
-}: {
-  users: MicrosoftEntraRiskyUser[]
-  caption: string
-}) {
-  return (
-    <div className="mt-2 overflow-x-auto">
-      <table className="w-full min-w-[34rem] border-collapse text-left">
-        <caption className="sr-only">{caption}</caption>
-        <thead>
-          <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800 dark:text-slate-400">
-            <th scope="col" className="px-3 py-2 font-semibold">
-              Identity
-            </th>
-            <th scope="col" className="px-3 py-2 font-semibold">
-              Microsoft confidence
-            </th>
-            <th scope="col" className="px-3 py-2 font-semibold">
-              What Microsoft concluded
-            </th>
-            <th scope="col" className="px-3 py-2 font-semibold">
-              Observed
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {users.map((user) => {
-            const detail = microsoftVerdictDetail(user)
-            const polarity = microsoftVerdictPolarity(user)
-            // Microsoft can report a risk state and a superseding safe
-            // conclusion on the same record. Printing the state alone under a
-            // "concluded safe" heading would contradict the heading, so the row
-            // says which of the two governs.
-            const superseded =
-              polarity === 'CLEARED' &&
-              (user.riskState === 'atRisk' ||
-                user.riskState === 'confirmedCompromised')
-            return (
-              <tr
-                key={user.id}
-                className="border-b border-slate-100 align-top last:border-0 dark:border-slate-800/70"
-              >
-                <td className="px-3 py-2.5 text-sm font-medium text-slate-900 dark:text-slate-50">
-                  {user.identityLabel}
-                </td>
-                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
-                  {microsoftRiskLevelLabel(user.riskLevel)}
-                </td>
-                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
-                  {microsoftRiskStateLabel[user.riskState]}
-                  {superseded && (
-                    <span className="block text-xs font-medium text-slate-600 dark:text-slate-400">
-                      superseded by the conclusion below
-                    </span>
-                  )}
-                  {detail && (
-                    <span className="block text-xs text-slate-500 dark:text-slate-400">
-                      {detail}
-                    </span>
-                  )}
-                </td>
-                <td className="px-3 py-2.5 text-sm text-slate-700 dark:text-slate-300">
-                  {time(user.observedAt)}
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
-function MicrosoftRecords({ view }: { view: MicrosoftEntraRiskyUsersView }) {
-  const reporting =
-    view.meta.status === 'AVAILABLE' || view.meta.status === 'STALE'
-
-  // A reporting channel with no records is a result, not an absence. Returning
-  // null here rendered "Microsoft is reporting on this tenant" followed by
-  // nothing, which reads the same as having failed to fetch its records — and
-  // hid the one statement that distinguishes them. microsoftRiskyUserCount
-  // Presentation already separates an authoritative empty snapshot from an
-  // unconfirmed one; this surface simply never reached it.
-  if (!view.users || view.users.length === 0) {
-    if (!reporting) return null
-    const empty = microsoftRiskyUserCountPresentation(view)
-    return (
-      <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
-        <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
-          {empty.label}
-        </h4>
-        <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-          {empty.detail}
-        </p>
-      </div>
-    )
-  }
-  const count = microsoftRiskyUserCountPresentation(view)
-  const groups = microsoftRecordsByPolarity(view)
-  return (
-    <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
-          {count.label}
-        </h4>
-        <p className="text-sm font-semibold text-slate-900 dark:text-white">
-          <span aria-hidden="true">{count.value}</span>
-          <span className="sr-only">{count.accessibleValue}</span>
-        </p>
-      </div>
-      <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-        {count.detail} These answer one question — which people Microsoft
-        considers at risk <em>now</em>, from telemetry HawkView cannot see. They
-        are Microsoft&rsquo;s determinations and are never added to, or
-        subtracted from, the HawkView count above. Microsoft&rsquo;s level is a
-        confidence scale rather than a severity one: <em>high</em> means
-        Microsoft is confident, not that the impact is large.
-      </p>
-      {microsoftLevelsHidden(view) && (
-        <p className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2.5 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-300">
-          Microsoft is withholding the risk level on some of these records
-          because this tenant is not licensed for Entra ID P2. That is Microsoft
-          declining to show the level of a risk it detected — not an absence of
-          risk.
-        </p>
-      )}
-      {/* Only what Microsoft currently considers at risk is listed.
-       *
-       * The closed, cleared and unrecognised groups were rendering as three
-       * more tables of every record Microsoft has ever returned — remediations
-       * from 2024, dismissals, one confirmed-safe account — on a screen whose
-       * subject is who is at risk NOW. True records, and none of them a
-       * finding; the page's own note already says the cleared ones "are not
-       * findings". Printing them at equal weight beside current risk is the
-       * same fault this surface keeps making, in layout rather than in wording.
-       *
-       * They are summarised rather than dropped. A count that says the records
-       * exist and are not shown is honest; removing them silently would let
-       * "HawkView did not show it" read as "Microsoft never said it". */}
-      {polarityGroups
-        .filter(({ polarity }) => polarity === 'ACTIVE_RISK')
-        .map(({ polarity, heading, note }) => {
-          const users = groups[polarity]
-          if (users.length === 0) return null
-          return (
-            <section key={polarity} className="mt-4">
-              <h5 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                {heading} ({users.length})
-              </h5>
-              <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-                {note}
-              </p>
-              <MicrosoftRecordTable users={users} caption={heading} />
-            </section>
-          )
-        })}
-      {(() => {
-        const notShown =
-          groups.CLOSED.length +
-          groups.CLEARED.length +
-          groups.UNRECOGNISED.length
-        if (notShown === 0) return null
-        const parts = [
-          groups.CLOSED.length > 0 &&
-            `${groups.CLOSED.length} Microsoft has remediated or dismissed`,
-          groups.CLEARED.length > 0 &&
-            `${groups.CLEARED.length} Microsoft considers safe`,
-          groups.UNRECOGNISED.length > 0 &&
-            `${groups.UNRECOGNISED.length} in a state this build does not recognise`,
-        ].filter(Boolean) as string[]
-        return (
-          <p className="mt-4 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
-            Microsoft also returned {notShown} record
-            {notShown === 1 ? '' : 's'} that are not current risk and are not
-            listed here: {parts.join(', ')}. They are Microsoft&rsquo;s own
-            closed history, not people awaiting attention.
-          </p>
-        )
-      })()}
-      {view.pageInfo?.hasMore && (
-        <p className="mt-2 text-xs text-slate-600 dark:text-slate-300">
-          More Microsoft records exist than were read into this page, so this is
-          an incomplete result set rather than Microsoft&rsquo;s full total.
-        </p>
-      )}
-    </div>
-  )
-}
-
-/* -------------------------------------------------------------------------- */
-
-/**
- * Two systems reporting the same person is the strongest signal this product
- * produces, so it gets both badges. It does not assert that they reached it
- * independently: Microsoft's sign-in-derived verdicts read the same log lines
- * HawkView does, so agreement can be two readings of one piece of evidence. Everything else says which of
- * three different things is true — Microsoft looked and did not report them,
- * Microsoft could not be compared to them, or Microsoft cannot report on this
- * tenant at all — because they lead a technician to different places.
- */
-function DetectedBy({ row }: { row: RiskyUserRow }) {
-  const microsoft = row.detection.microsoft
-  return (
-    <div className="flex flex-wrap items-center gap-1.5">
       <Badge
         variant="outline"
-        className="border-blue-200 text-blue-700 dark:border-blue-800 dark:text-blue-300"
+        className="bg-slate-100 text-slate-700 border-slate-300 dark:bg-slate-800/80 dark:text-slate-300 dark:border-slate-700 text-2xs gap-1 font-medium shrink-0"
       >
-        HawkView
+        <ShieldOff className="h-3 w-3 text-slate-400 shrink-0" />
+        Partial Source
       </Badge>
-      {microsoft === 'REPORTED' ? (
-        <Badge
-          variant="outline"
-          className="border-violet-200 text-violet-700 dark:border-violet-800 dark:text-violet-300"
-        >
-          Microsoft
-        </Badge>
-      ) : (
-        <span className="text-xs text-slate-500 dark:text-slate-400">
-          {microsoftDetectionSummary(row.detection)}
-        </span>
-      )}
-      {row.detection.microsoftRecord && (
-        <span className="block w-full text-xs text-slate-600 dark:text-slate-300">
-          Microsoft says:{' '}
-          {microsoftRiskStateLabel[row.detection.microsoftRecord.riskState]} ·{' '}
-          {microsoftRiskLevelLabel(row.detection.microsoftRecord.riskLevel)}
-        </span>
-      )}
-      <span className="sr-only">{detectedByLabel(row.detection)}</span>
-    </div>
-  )
-}
-
-function PriorityBadge({ row }: { row: RiskyUserRow }) {
+    )
+  }
+  if (row.lastSeenState === 'DATELESS') {
+    return (
+      <Badge
+        variant="outline"
+        className="bg-amber-50 text-amber-900 border-amber-200 dark:bg-amber-950/50 dark:text-amber-200 dark:border-amber-800 text-2xs gap-1 font-medium shrink-0"
+      >
+        <Clock3 className="h-3 w-3 text-amber-500 shrink-0" />
+        Dateless
+      </Badge>
+    )
+  }
+  if (row.lastSeenState === 'NO_REASONS') {
+    return (
+      <Badge
+        variant="outline"
+        className="bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 text-2xs gap-1 font-medium shrink-0"
+      >
+        <AlertCircle className="h-3 w-3 text-slate-400 shrink-0" />
+        Not Available
+      </Badge>
+    )
+  }
   return (
     <Badge
       variant="outline"
-      className={cn(
-        row.priority === 'HIGH' &&
-          'border-red-200 text-red-700 dark:border-red-900 dark:text-red-300',
-        row.priority === 'MEDIUM' &&
-          'border-amber-200 text-amber-800 dark:border-amber-900 dark:text-amber-300',
-        row.priority === 'LOW' &&
-          'border-slate-200 text-slate-700 dark:border-slate-700 dark:text-slate-300'
-      )}
+      className="bg-emerald-50 text-emerald-800 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800 text-2xs gap-1 font-medium shrink-0"
     >
-      {row.priorityLabel}
+      <CheckCircle2 className="h-3 w-3 text-emerald-600 dark:text-emerald-400 shrink-0" />
+      Current
     </Badge>
   )
 }
 
-function UserRows({
-  rows,
-  onOpen,
-  caption,
-}: {
-  rows: RiskyUserRow[]
-  onOpen: (row: RiskyUserRow) => void
-  caption: string
-}) {
+function FoundByBadges({ row }: { row: RiskyUserRow }) {
+  const isHawkView = row.reasons.length > 0
+  const isMicrosoft = row.detection.microsoft === 'REPORTED'
+
+  if (isHawkView && isMicrosoft) {
+    return (
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <Badge variant="secondary" className="bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/60 dark:text-blue-300 dark:border-blue-800 text-2xs font-semibold">
+          HawkView
+        </Badge>
+        <Badge variant="secondary" className="bg-purple-50 text-purple-700 border-purple-200 dark:bg-purple-950/60 dark:text-purple-300 dark:border-purple-800 text-2xs font-semibold">
+          Microsoft
+        </Badge>
+      </div>
+    )
+  }
+
+  if (isHawkView && !isMicrosoft) {
+    const isPartial =
+      row.detection.microsoft === 'UNAVAILABLE' ||
+      row.detection.microsoft === 'NOT_COMPARABLE' ||
+      Boolean(row.detection.because)
+
+    if (isPartial) {
+      return (
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <Badge variant="secondary" className="bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/60 dark:text-blue-300 dark:border-blue-800 text-2xs font-semibold">
+            HawkView
+          </Badge>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Badge variant="outline" className="bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-800 text-2xs font-medium cursor-help">
+                  Microsoft coverage partial
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent className="max-w-xs text-xs">
+                {row.detection.because || 'Microsoft Entra ID Protection risk data could not be compared or matched for this tenant identity.'}
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        </div>
+      )
+    }
+
+    return (
+      <Badge variant="secondary" className="bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/60 dark:text-blue-300 dark:border-blue-800 text-2xs font-semibold">
+        HawkView
+      </Badge>
+    )
+  }
+
+  if (isMicrosoft) {
+    return (
+      <Badge variant="secondary" className="bg-purple-50 text-purple-700 border-purple-200 dark:bg-purple-950/60 dark:text-purple-300 dark:border-purple-800 text-2xs font-semibold">
+        Microsoft
+      </Badge>
+    )
+  }
+
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full min-w-[46rem] border-collapse text-left">
-        <caption className="sr-only">{caption}</caption>
-        <thead>
-          <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800 dark:text-slate-400">
-            <th scope="col" className="px-3 py-2 font-semibold">
-              User
-            </th>
-            <th scope="col" className="px-3 py-2 font-semibold">
-              HawkView
-            </th>
-            <th scope="col" className="px-3 py-2 font-semibold">
-              Microsoft
-            </th>
-            <th scope="col" className="px-3 py-2 font-semibold">
-              Latest activity
-            </th>
-            <th scope="col" className="px-3 py-2 font-semibold">
-              <span className="sr-only">Open detail</span>
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr
-              key={row.id}
-              className="border-b border-slate-100 align-top last:border-0 dark:border-slate-800/70"
-            >
-              <td className="px-3 py-3">
-                <p className="break-words text-sm font-semibold text-slate-900 dark:text-slate-50">
-                  {row.name}
-                </p>
-                <p className="text-xs font-medium text-slate-600 dark:text-slate-400">
-                  {row.subjectType === 'MAILBOX' ? 'Mailbox' : 'User account'}
-                </p>
-                <p
-                  className="mt-0.5 break-all font-mono text-xs text-slate-500 dark:text-slate-400"
-                  title={row.email ?? row.reference}
-                >
-                  {row.email ?? shortReference(row.reference)}
-                </p>
-                <ul className="mt-1.5 space-y-1">
-                  {row.reasons.map((reason) => (
-                    <ReasonLine
-                      key={reason.signal ?? reason.title}
-                      reason={reason}
-                    />
-                  ))}
-                </ul>
-                <NextSteps row={row} />
-              </td>
-              <td className="px-3 py-3">
-                <HawkViewCell row={row} />
-              </td>
-              <td className="px-3 py-3">
-                <MicrosoftCell row={row} />
-              </td>
-              <td className="px-3 py-3 text-sm text-slate-700 dark:text-slate-300">
-                <LatestCell row={row} />
-              </td>
-              <td className="px-3 py-3 text-right">
-                {/* The detail view is built on fields the native response does
-                    not carry, so `user` is null on those rows and the drawer
-                    has nothing to open. native-view.ts sets that deliberately,
-                    reasoning that an empty drawer is worse than no drawer —
-                    and then the button was rendered anyway, so the click did
-                    nothing. A control that does nothing reads as broken; the
-                    absence it was hiding reads as a fact. Say the fact. */}
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => onOpen(row)}
-                  aria-haspopup="dialog"
-                >
-                  Investigate
-                  <span className="sr-only"> {row.name}</span>
-                  <ChevronRight className="ml-1 h-4 w-4" aria-hidden="true" />
-                </Button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <Badge variant="outline" className="text-2xs font-medium text-slate-500">
+      Not reported
+    </Badge>
+  )
+}
+
+function WhyNeedsReviewCell({ row }: { row: RiskyUserRow }) {
+  const primaryReason = row.reasons[0]
+  const isMicrosoft = row.detection.microsoft === 'REPORTED'
+
+  const mapped = primaryReason
+    ? mapRuleToPresentation(primaryReason.ruleId, primaryReason.signal)
+    : isMicrosoft
+    ? {
+        plainTitle: 'Microsoft detected elevated identity risk',
+        plainExplanation: 'Microsoft Entra ID Protection reported active risk for this identity based on security telemetry.',
+      }
+    : {
+        plainTitle: 'Security activity needs review',
+        plainExplanation: 'Observed security indicators require manual verification in tenant logs.',
+      }
+
+  const additionalCount = row.reasons.length > 1 ? row.reasons.length - 1 : 0
+
+  return (
+    <div className="space-y-0.5 max-w-md">
+      <div className="text-xs sm:text-sm font-semibold text-slate-900 dark:text-slate-100">
+        {mapped.plainTitle}
+      </div>
+      <div className="text-2xs sm:text-xs text-slate-500 dark:text-slate-400 line-clamp-2 leading-relaxed">
+        {mapped.plainExplanation}
+      </div>
+      {additionalCount > 0 && (
+        <Badge
+          variant="secondary"
+          className="mt-1 text-2xs bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300 font-normal px-1.5 py-0"
+        >
+          +{additionalCount} additional finding{additionalCount > 1 ? 's' : ''}
+        </Badge>
+      )}
     </div>
   )
 }
 
-/* -------------------------------------------------------------------------- */
-
-/**
- * What the count is standing on. Kept beside the list rather than hidden, so a
- * zero and a full list are read against the same disclosed coverage.
- */
-function Coverage({ assessment }: { assessment: RiskAssessment }) {
-  return (
-    <details className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900">
-      <summary className="cursor-pointer text-sm font-semibold text-slate-900 dark:text-slate-50">
-        What HawkView checked, and how current the evidence is
-      </summary>
-      <div className="mt-3 space-y-4">
-        <p className="text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-          These are counts of what each check evaluated. HawkView does not
-          report how many identities exist in this tenant, so they are not a
-          proportion of your people and two checks may have evaluated different
-          populations.
-        </p>
-        <div>
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Checks
-          </h4>
-          <ul className="mt-1.5 space-y-1.5">
-            {assessment.rules.map((rule) => (
-              <li key={rule.ruleId} className="text-sm">
-                <span className="font-medium text-slate-800 dark:text-slate-100">
-                  {rule.title}
-                </span>{' '}
-                <span className="text-xs text-slate-500 dark:text-slate-400">
-                  · {riskReadinessLabel(rule.status)} ·{' '}
-                  {riskSourceLabel(rule.selectedSource)} ·{' '}
-                  {ruleScopeSummary(rule)}
-                </span>
-                <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300">
-                  {rule.explanation}
-                </p>
-              </li>
-            ))}
-          </ul>
-        </div>
-        <div>
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Evidence sources
-          </h4>
-          <ul className="mt-1.5 space-y-1.5">
-            {assessment.sources.map((source) => (
-              <li key={source.source} className="text-sm">
-                <span className="font-medium text-slate-800 dark:text-slate-100">
-                  {riskSourceLabel(source.source)}
-                </span>{' '}
-                <span className="text-xs text-slate-500 dark:text-slate-400">
-                  · {riskReadinessLabel(source.status)} · window{' '}
-                  {time(source.window.start)} – {time(source.window.end)}
-                </span>
-                <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300">
-                  {source.explanation}
-                </p>
-              </li>
-            ))}
-          </ul>
-        </div>
-      </div>
-    </details>
-  )
-}
-
-/* -------------------------------------------------------------------------- */
-
-/**
- * An empty user list means different things depending on why the count is what
- * it is. "No user is listed as needing attention" is only true when HawkView
- * actually counted; when the count was withheld because findings could not be
- * attributed to people, the same sentence would quietly answer the question the
- * count just refused to answer.
- */
-/**
- * When the rows on screen are only part of what the number counted.
- *
- * A page of a list is a true list and a tenant total is a true number, and a
- * reader who counts the rows and compares gets a different answer with nothing
- * on screen to reconcile them. The missing users have not been cleared, they
- * have not been shown.
- *
- * This became reachable at scale rather than in principle once the collector
- * fix surfaced findings on tenants that had been reporting none: a first page
- * is what a tenant with nine findings returns.
- */
-function PartialUserList({ count }: { count: RiskyUserCount }) {
-  if (count.listCoverage !== 'PARTIAL') return null
-  return (
-    <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm leading-relaxed text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
-      These rows are part of the list, not all of it. The number above counts
-      the tenant; what is shown here is what this response returned. Users not
-      on screen have not been checked and cleared &mdash; they have not been
-      shown.
-    </p>
-  )
-}
-
-function EmptyUserList({ count }: { count: RiskyUserCount }) {
-  // "No user needs attention" is only true when HawkView both counted and
-  // found nothing. Beside a withheld count, or beside a zero that counts people
-  // while mailbox evidence sits below, the same sentence quietly answers a
-  // question the number did not.
-  //
-  // The count asserting people while no row arrives outranks every other
-  // reading, so it is tested first. A response cannot both know that four users
-  // have current findings and have no finding to show: the two statements
-  // contradict inside one payload, and the only thing that reconciles them is
-  // that the findings were not delivered.
-  //
-  // This is not hypothetical. The read path being built can serve coverage,
-  // count and claim while findings have nowhere to persist, so a real number
-  // beside an empty list is the first thing a real assessment will produce. The
-  // sentence it would otherwise fall through to is worse than merely wrong: it
-  // points the reader up to a summary that confidently says four, so the
-  // pointer deepens the contradiction instead of resolving it.
-  const copy =
-    count.listCoverage === 'NONE_DELIVERED'
-      ? 'The count above reports ' +
-        (count.accuracy === 'AT_LEAST' ? 'at least ' : '') +
-        count.value!.toLocaleString() +
-        (count.value === 1
-          ? ' user with a current finding, but no per-user finding came back with it.'
-          : ' users with current findings, but no per-user finding came back with it.') +
-        ' That is a gap in what this response delivered, not a finding that nobody needs attention. Do not read this as an all-clear.'
-      : count.accuracy === 'WITHHELD'
-        ? count.known.length > 0
-          ? 'No finding could be attributed to a specific user, so no user is listed here. That is not the same as no user needing attention — what HawkView did find is listed above and below.'
-          : 'HawkView is not stating a number of users for this tenant, and no finding has been attributed to a specific user. Read this as an open question rather than an all-clear.'
-        : count.accuracy === 'UNAVAILABLE'
-          ? 'No current list can be shown. This is not an empty result, and nothing here has been checked and cleared.'
-          : count.known.length > 0
-            ? 'No finding was tied to a specific user, so no user is listed here. HawkView did find evidence on this tenant — it is listed above and below, and it is not an all-clear.'
-            : 'No user is listed as needing attention right now. The summary above states what that is based on and what it does not cover.'
-  return (
-    <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-      {copy}
-    </p>
-  )
-}
-
-/**
- * When more than one thing stopped HawkView counting, all of them are listed.
- * The headline goes neutral in that case rather than picking one, because a
- * single reason shown where several hold reads as the reason.
- */
-function CountReasons({ reasons }: { reasons: RiskyUserCount['reasons'] }) {
-  if (reasons.length < 2) return null
-  return (
-    <ul className="mt-3 space-y-2">
-      {reasons.map((reason) => (
-        <li
-          key={reason}
-          className="rounded-lg border border-slate-200 bg-white p-3 text-sm leading-relaxed text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
-        >
-          {reason}
-        </li>
-      ))}
-    </ul>
-  )
-}
-
-function CountSummary({ count }: { count: RiskyUserCount }) {
-  return (
-    <section
-      aria-labelledby="risky-users-total-heading"
-      className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900"
-    >
-      <div className="flex flex-wrap items-baseline justify-between gap-3">
-        <h2
-          id="risky-users-total-heading"
-          className="text-sm font-semibold text-slate-900 dark:text-slate-50"
-        >
-          {count.headline}
-        </h2>
-        {count.value === null ? (
-          <p
-            className="text-base font-semibold leading-none text-slate-600 dark:text-slate-300"
-            aria-hidden="true"
-          >
-            {count.display}
-          </p>
-        ) : (
-          <p
-            className="text-[28px] font-semibold leading-none text-slate-900 dark:text-white"
-            aria-hidden="true"
-          >
-            {count.display}
-          </p>
-        )}
-        <p className="sr-only">{count.accessibleValue}</p>
-      </div>
-      <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-        {count.caption}
-      </p>
-      <CountReasons reasons={count.reasons} />
-      {count.known.length > 0 &&
-        (count.value === 0 || count.value === null) && (
-          <div className="mt-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-              What HawkView did find
-            </p>
-            <ul className="mt-1.5 space-y-1">
-              {count.known.map((item) => (
-                <li
-                  key={item}
-                  className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
-                >
-                  {item}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-      {count.gaps.length > 0 && (
-        <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950/40">
-          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Not covered by this number
-          </p>
-          <ul className="mt-1.5 space-y-1">
-            {count.gaps.map((gap) => (
-              <li
-                key={gap}
-                className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
-              >
-                {gap}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      {count.asOf && (
-        <p className="mt-3 text-xs text-slate-500">
-          Assessed {time(count.asOf)}
-        </p>
-      )}
-    </section>
-  )
-}
-
-/* -------------------------------------------------------------------------- */
-
-/**
- * What each check had to work with, in the engine's own terms.
- *
- * The old coverage panel read rules[] and sources[], which carried a readiness
- * verdict per rule and a freshness verdict per source. This engine serves the
- * facts instead -- which detectors ran, which did not and why, and what each
- * collector had actually achieved -- so the verdict is derived here where the
- * facts are on screen beside it.
- *
- * The collector line is the one to be careful with. A null last-success means
- * NEVER, not "a long time ago", and the two send a technician to different
- * places: one is a gap in a working feed, the other is a tenant that was never
- * wired up, and only one of them is fixed by waiting.
- */
-function NativeCoverage({
-  native,
+function CompactSummaryStrip({
+  count,
+  rows,
+  microsoftView,
+  channel,
+  asOf,
 }: {
-  native: Extract<NativeAssessment, { available: true }>
+  count: any
+  rows: RiskyUserRow[]
+  microsoftView: any
+  channel: any
+  asOf: string | null
 }) {
-  const recency = runRecency(native.run)
+  // 1. Users requiring review
+  const usersRequiringReviewText =
+    count?.value !== null && count?.value !== undefined
+      ? `${count.display} users requiring review`
+      : `Users requiring review: ${count?.display || 'Not available'}`
+
+  // 2. HawkView detections
+  const hawkViewUsers = rows.filter((r) => r.reasons.length > 0).length
+  const hawkViewText = `${hawkViewUsers} detected by HawkView`
+
+  // 3. Active Microsoft risk detections
+  const activeMsCount =
+    microsoftView?.users !== null && microsoftView?.users !== undefined
+      ? microsoftRecordsByPolarity(microsoftView).ACTIVE_RISK.length
+      : null
+  const microsoftText =
+    activeMsCount !== null
+      ? `${activeMsCount} active Microsoft risk`
+      : 'Microsoft risk: Not available'
+
+  // 4. Assessment date
+  const assessedText = asOf ? `Assessed ${formatTimestamp(asOf)}` : 'Assessment time: Not reported'
+
+  const isUnmatchedOrPartial =
+    rows.some(
+      (r) =>
+        Boolean(r.detection.because) ||
+        r.detection.microsoft === 'UNAVAILABLE' ||
+        r.detection.microsoft === 'NOT_COMPARABLE'
+    ) ||
+    microsoftView?.meta?.status === 'UNAVAILABLE' ||
+    channel?.state === 'CONTRADICTORY'
+
   return (
-    <details className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900">
-      <summary className="cursor-pointer text-sm font-semibold text-slate-900 dark:text-slate-50">
-        What HawkView checked, and what each collector had
-      </summary>
+    <div className="space-y-2">
+      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-2xs dark:border-slate-800 dark:bg-slate-900">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs sm:text-sm">
+          {/* Fact 1 */}
+          <div className="flex items-center gap-2">
+            <Users className="h-4 w-4 text-slate-500 shrink-0" />
+            <span className="font-semibold text-slate-900 dark:text-slate-100">
+              {usersRequiringReviewText}
+            </span>
+          </div>
 
-      {recency.state === 'STALE_RUN' && (
-        <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
-          This assessment describes a window that closed on{' '}
-          {time(recency.windowClosedAt)}, before the run finished on{' '}
-          {time(recency.completedAt)}. It is a stored result being shown later
-          rather than a current reading of the tenant.
-        </p>
-      )}
+          <div className="hidden sm:block h-4 w-px bg-slate-200 dark:bg-slate-800" />
 
-      <div className="mt-3 grid gap-4 sm:grid-cols-2">
-        <div>
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Checks
-          </h4>
-          <ul className="mt-1.5 space-y-1.5">
-            {native.count.covered.map((detectorId) => (
-              <li
-                key={detectorId}
-                className="text-sm text-slate-800 dark:text-slate-100"
-              >
-                {detectorTitle(detectorId)}{' '}
-                <span className="text-xs text-slate-500 dark:text-slate-400">
-                  · ran on this tenant
-                </span>
-              </li>
-            ))}
-            {native.count.notCovered.map((entry) => (
-              <li key={entry.detectorId} className="text-sm">
-                <span className="text-slate-800 dark:text-slate-100">
-                  {detectorTitle(entry.detectorId)}
-                </span>
-                <p className="mt-0.5 text-xs leading-5 text-slate-600 dark:text-slate-300">
-                  {nativeWithheldReasonCopy(entry.because).headline}
-                </p>
-              </li>
-            ))}
-            {native.count.covered.length === 0 &&
-              native.count.notCovered.length === 0 && (
-                <li className="text-xs text-slate-500 dark:text-slate-400">
-                  This response did not say which checks ran, so the number
-                  above cannot be read as covering any particular one.
-                </li>
-              )}
-          </ul>
-        </div>
+          {/* Fact 2 */}
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" />
+            <span className="font-medium text-slate-800 dark:text-slate-200">
+              {hawkViewText}
+            </span>
+          </div>
 
-        <div>
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Collectors
-          </h4>
-          <ul className="mt-1.5 space-y-1.5">
-            {native.collectors.map((collector) => (
-              <li key={collector.source} className="text-sm">
-                <span className="text-slate-800 dark:text-slate-100">
-                  {collector.source}
-                </span>{' '}
-                <span className="text-xs text-slate-500 dark:text-slate-400">
-                  · {collector.status}
-                </span>
-                <p className="mt-0.5 text-xs leading-5 text-slate-600 dark:text-slate-300">
-                  {collector.lastSuccessfulCollectionAt === null
-                    ? 'Never collected successfully. This is not an old collection — nothing has ever arrived from this source for this tenant.'
-                    : 'Last successful collection ' +
-                      time(collector.lastSuccessfulCollectionAt)}
-                </p>
-              </li>
-            ))}
-            {native.collectors.length === 0 && (
-              <li className="text-xs text-slate-500 dark:text-slate-400">
-                This response reported no collectors, so how current the
-                evidence is cannot be established from it.
-              </li>
-            )}
-          </ul>
+          <div className="hidden sm:block h-4 w-px bg-slate-200 dark:bg-slate-800" />
+
+          {/* Fact 3 */}
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="h-4 w-4 text-purple-600 dark:text-purple-400 shrink-0" />
+            <span className="font-medium text-slate-800 dark:text-slate-200">
+              {microsoftText}
+            </span>
+          </div>
+
+          <div className="hidden sm:block h-4 w-px bg-slate-200 dark:bg-slate-800" />
+
+          {/* Fact 4 */}
+          <div className="flex items-center gap-2 text-slate-500 dark:text-slate-400 text-xs">
+            <Clock3 className="h-4 w-4 shrink-0 text-slate-400" />
+            <span>{assessedText}</span>
+          </div>
         </div>
       </div>
-    </details>
+
+      {isUnmatchedOrPartial && (
+        <div className="rounded-lg border border-amber-200/80 bg-amber-50/80 p-3 dark:border-amber-900/60 dark:bg-amber-950/40 text-xs text-amber-900 dark:text-amber-200 flex items-center gap-2">
+          <ShieldOff className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
+          <span>
+            Some Microsoft risk records could not be matched to HawkView identities. Microsoft coverage may be incomplete.
+          </span>
+        </div>
+      )}
+    </div>
   )
 }
 
 export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
+  const { tenant } = useTenantOperationalProjection(tenantId)
   const {
     native,
     channel,
@@ -1253,46 +363,92 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
     retry,
   } = useRiskyUsers(tenantId)
 
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const closeDrawer = useCallback(() => setSelectedId(null), [])
-  // The selected ROW, not its old-envelope user. The detail is built from what
-  // this response actually carries, so every row can open one -- which is why
-  // the button is no longer conditional on a field the native path never sets.
-  const selectedRow =
-    [...list.rows, ...list.context].find((row) => row.id === selectedId) ?? null
+  const [searchQuery, setSearchQuery] = useState('')
+  const [sourceFilter, setSourceFilter] = useState<'ALL' | 'HAWKVIEW' | 'MICROSOFT' | 'BOTH'>('ALL')
+  const [priorityFilter, setPriorityFilter] = useState<'ALL' | 'HIGH' | 'MEDIUM' | 'LOW'>('ALL')
+  const [dataStateFilter, setDataStateFilter] = useState<'ALL' | 'CURRENT' | 'STALE' | 'PARTIAL' | 'NOT_AVAILABLE'>('ALL')
+
+  const [drawerRow, setDrawerRow] = useState<RiskyUserRow | null>(null)
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false)
+
+  const isFiltersActive =
+    Boolean(searchQuery.trim()) ||
+    sourceFilter !== 'ALL' ||
+    priorityFilter !== 'ALL' ||
+    dataStateFilter !== 'ALL'
+
+  const resetFilters = useCallback(() => {
+    setSearchQuery('')
+    setSourceFilter('ALL')
+    setPriorityFilter('ALL')
+    setDataStateFilter('ALL')
+  }, [])
+
+  const filteredRows = useMemo(() => {
+    return (list?.rows ?? []).filter((row) => {
+      const displayName = getUserDisplayName(row).toLowerCase()
+      const userEmail = getUserEmailOrUpn(row).toLowerCase()
+      const ref = (row.reference || '').toLowerCase()
+
+      const q = searchQuery.trim().toLowerCase()
+      if (q) {
+        if (!displayName.includes(q) && !userEmail.includes(q) && !ref.includes(q)) {
+          return false
+        }
+      }
+
+      const isHawkView = row.reasons.length > 0
+      const isMicrosoft = row.detection.microsoft === 'REPORTED'
+      if (sourceFilter === 'HAWKVIEW' && !isHawkView) return false
+      if (sourceFilter === 'MICROSOFT' && !isMicrosoft) return false
+      if (sourceFilter === 'BOTH' && (!isHawkView || !isMicrosoft)) return false
+
+      if (priorityFilter !== 'ALL' && row.priority !== priorityFilter) {
+        return false
+      }
+
+      if (dataStateFilter === 'CURRENT' && (row.lastSeenState === 'DATELESS' || row.detection.microsoft === 'UNAVAILABLE')) {
+        return false
+      }
+      if (dataStateFilter === 'STALE' && row.lastSeenState !== 'DATELESS') {
+        return false
+      }
+      if (dataStateFilter === 'PARTIAL' && row.detection.microsoft !== 'UNAVAILABLE' && !row.detection.because) {
+        return false
+      }
+      if (dataStateFilter === 'NOT_AVAILABLE' && row.lastSeenState !== 'NO_REASONS') {
+        return false
+      }
+
+      return true
+    })
+  }, [list?.rows, searchQuery, sourceFilter, priorityFilter, dataStateFilter])
+
+  const openDrawer = (row: RiskyUserRow) => {
+    setDrawerRow(row)
+    setIsDrawerOpen(true)
+  }
+
+  const drawerFleetRow: FleetRiskyUserRow | null = useMemo(() => {
+    if (!drawerRow) return null
+    return {
+      ...drawerRow,
+      tenantId,
+      tenantName: tenant?.name ?? 'Tenant',
+      tenantDomain: tenant?.domain ?? null,
+    }
+  }, [drawerRow, tenantId, tenant])
+
+  const nativeCompletedAt = native && 'run' in native && native.run ? native.run.completedAt : null
+  const asOf = count?.asOf || nativeCompletedAt || microsoftView?.meta?.observedAt
 
   return (
     <div className="space-y-4" key={`${cacheScope}:${tenantId}`}>
-      <header className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/60">
-        <div className="flex min-w-0 gap-3">
-          <Info
-            className="mt-0.5 h-5 w-5 shrink-0 text-slate-500 dark:text-slate-400"
-            aria-hidden="true"
-          />
-          <div>
-            <h1 className="text-base font-semibold text-slate-950 dark:text-slate-50">
-              Risky users
-            </h1>
-            <p className="mt-1 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-              HawkView&rsquo;s own analysis of this tenant&rsquo;s identity
-              evidence, kept separate from Microsoft Entra Identity Protection
-              and never combined with it into a single score. Everything here is
-              an investigation lead: it does not establish that a user is
-              compromised, and it does not establish that a user is safe.
-              HawkView makes no changes to Microsoft.
-            </p>
-          </div>
-        </div>
-        <Button type="button" variant="outline" size="sm" onClick={retry}>
-          <RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-          Refresh
-        </Button>
-      </header>
-
       {loading ? (
-        <p className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600 shadow-2xs dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
-          Loading the current assessment…
-        </p>
+        <div className="rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-600 shadow-2xs dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 flex items-center gap-2">
+          <RefreshCw className="h-4 w-4 animate-spin text-blue-600" />
+          <span>Loading identity security assessment…</span>
+        </div>
       ) : (
         <>
           {(requestFailed || contractFailed) && (
@@ -1307,84 +463,376 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
               </p>
               <p className="mt-1 text-xs leading-relaxed">
                 {native
-                  ? 'Users below are from an earlier read and remain open. This failure has not resolved or dismissed any of them, and current coverage cannot be confirmed.'
-                  : 'No current result can be confirmed. Missing evidence is not a no-findings result.'}
-              </p>
-              <p className="mt-2 font-mono text-xs">
-                Support code:{' '}
-                {requestFailed
-                  ? 'RISK_ASSESSMENT_REQUEST_FAILED'
-                  : 'RISK_ASSESSMENT_CONTRACT_INVALID'}
+                  ? 'Users below are from an earlier read and remain open. Missing evidence is not a no-findings result.'
+                  : 'No current result can be confirmed.'}
               </p>
             </div>
           )}
 
-          <CountSummary count={count} />
-          <MicrosoftChannelPanel channel={channel} view={microsoftView} />
+          <CompactSummaryStrip
+            count={count}
+            rows={list?.rows ?? []}
+            microsoftView={microsoftView}
+            channel={channel}
+            asOf={asOf}
+          />
 
           <section
-            aria-labelledby="risky-users-list-heading"
-            className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900"
+            aria-labelledby="risky-users-table-heading"
+            className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900 space-y-4"
           >
-            <h2
-              id="risky-users-list-heading"
-              className="text-sm font-semibold text-slate-900 dark:text-slate-50"
-            >
-              Users needing attention
-            </h2>
-            <p className="mt-1 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-              Ordered by HawkView&rsquo;s own investigation priority, so the
-              same findings sit in the same order on every tenant whatever its
-              Microsoft licensing. Within a priority, users Microsoft also
-              reported come first. The two systems&rsquo; ratings are never
-              combined into one score.
-            </p>
-            {list.rows.length > 0 ? (
-              <div className="mt-3">
-                <UserRows
-                  rows={list.rows}
-                  onOpen={(row) => setSelectedId(row.id)}
-                  caption="Users with a current HawkView finding"
-                />
-                <PartialUserList count={count} />
+            {/* Header & How it works */}
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2 border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div>
+                <h2
+                  id="risky-users-table-heading"
+                  className="text-base sm:text-lg font-semibold text-slate-900 dark:text-white"
+                >
+                  Users requiring review
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Ordered by the most important current finding.
+                </p>
+                <details className="group mt-1">
+                  <summary className="text-2xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer select-none inline-flex items-center gap-1">
+                    How this works
+                  </summary>
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 leading-relaxed max-w-2xl">
+                    HawkView orders findings by investigation priority. HawkView rules and Microsoft Entra ID Protection operate independently and their results are never combined into a single score.
+                  </p>
+                </details>
               </div>
-            ) : (
-              <EmptyUserList count={count} />
-            )}
+
+              <div className="text-xs font-medium text-slate-500 dark:text-slate-400 shrink-0 self-start sm:self-auto">
+                Showing {filteredRows.length} of {(list?.rows ?? []).length} users
+              </div>
+            </div>
+
+            {/* Toolbar */}
+            <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 flex-1">
+                {/* Search */}
+                <div className="relative flex-1 min-w-[200px] max-w-md">
+                  <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+                  <Input
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search by name or email..."
+                    className="pl-9 h-9 text-xs"
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setSearchQuery('')}
+                      className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Filters */}
+                <div className="flex items-center gap-2 flex-wrap">
+                  {/* Source filter */}
+                  <select
+                    value={sourceFilter}
+                    onChange={(e) => setSourceFilter(e.target.value as any)}
+                    className="h-9 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="ALL">All sources</option>
+                    <option value="HAWKVIEW">HawkView</option>
+                    <option value="MICROSOFT">Microsoft</option>
+                    <option value="BOTH">Both sources</option>
+                  </select>
+
+                  {/* Priority filter */}
+                  <select
+                    value={priorityFilter}
+                    onChange={(e) => setPriorityFilter(e.target.value as any)}
+                    className="h-9 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="ALL">All priorities</option>
+                    <option value="HIGH">High priority</option>
+                    <option value="MEDIUM">Medium priority</option>
+                    <option value="LOW">Low priority</option>
+                  </select>
+
+                  {/* Data state filter */}
+                  <select
+                    value={dataStateFilter}
+                    onChange={(e) => setDataStateFilter(e.target.value as any)}
+                    className="h-9 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="ALL">All data states</option>
+                    <option value="CURRENT">Current</option>
+                    <option value="STALE">Stale</option>
+                    <option value="PARTIAL">Partial</option>
+                    <option value="NOT_AVAILABLE">Not available</option>
+                  </select>
+
+                  {isFiltersActive && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={resetFilters}
+                      className="h-9 px-2.5 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-white"
+                    >
+                      Reset filters
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {/* Secondary Refresh Assessment Button */}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={retry}
+                className="h-9 text-xs font-medium shrink-0 self-start md:self-auto"
+                title="Refresh risk assessment"
+              >
+                <RefreshCw className="mr-1.5 h-3.5 w-3.5 text-slate-500" />
+                Refresh assessment
+              </Button>
+            </div>
+
+            {/* Desktop Table View */}
+            <div className="hidden md:block overflow-x-auto rounded-lg border border-slate-200/80 dark:border-slate-800">
+              <Table>
+                <TableHeader>
+                  <TableRow className="bg-slate-50/70 hover:bg-slate-50/70 dark:bg-slate-900/50">
+                    <TableHead className="w-[220px] text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      User
+                    </TableHead>
+                    <TableHead className="min-w-[240px] text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Why this user needs review
+                    </TableHead>
+                    <TableHead className="w-[160px] text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Found by
+                    </TableHead>
+                    <TableHead className="w-[160px] text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Latest evidence
+                    </TableHead>
+                    <TableHead className="w-[120px] text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Data state
+                    </TableHead>
+                    <TableHead className="w-[100px] text-right text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Action
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredRows.length === 0 ? (
+                    <TableRow>
+                      <TableCell
+                        colSpan={6}
+                        className="text-center py-8 text-xs text-slate-500 dark:text-slate-400"
+                      >
+                        {isFiltersActive
+                          ? 'No users match the active search or filters.'
+                          : 'No users requiring review found.'}
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    filteredRows.map((row) => {
+                      const displayName = getUserDisplayName(row)
+                      const userEmail = getUserEmailOrUpn(row)
+
+                      return (
+                        <TableRow
+                          key={row.id}
+                          className="hover:bg-slate-50/60 dark:hover:bg-slate-900/40 cursor-pointer transition-colors"
+                          onClick={() => openDrawer(row)}
+                        >
+                          {/* User */}
+                          <TableCell className="align-top py-3.5">
+                            <div className="flex items-start gap-3 min-w-0">
+                              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 font-bold text-xs border border-slate-200 dark:border-slate-700">
+                                {getInitials(displayName, userEmail)}
+                              </div>
+                              <div className="min-w-0 space-y-0.5">
+                                <div className="text-xs sm:text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                  {displayName}
+                                </div>
+                                <div className="text-2xs sm:text-xs text-slate-500 dark:text-slate-400 truncate">
+                                  {userEmail}
+                                </div>
+                              </div>
+                            </div>
+                          </TableCell>
+
+                          {/* Why needs review */}
+                          <TableCell className="align-top py-3.5">
+                            <WhyNeedsReviewCell row={row} />
+                          </TableCell>
+
+                          {/* Found by */}
+                          <TableCell className="align-top py-3.5">
+                            <FoundByBadges row={row} />
+                          </TableCell>
+
+                          {/* Latest evidence */}
+                          <TableCell className="align-top py-3.5">
+                            <LatestEvidenceCell row={row} />
+                          </TableCell>
+
+                          {/* Data state */}
+                          <TableCell className="align-top py-3.5">
+                            <DataStateBadge row={row} />
+                          </TableCell>
+
+                          {/* Action */}
+                          <TableCell className="align-top py-3.5 text-right">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                openDrawer(row)
+                              }}
+                              className="h-8 text-xs font-semibold hover:bg-slate-100 dark:hover:bg-slate-800"
+                            >
+                              Investigate
+                              <ChevronRight className="ml-1 h-3.5 w-3.5" />
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+
+            {/* Mobile / Tablet Cards View */}
+            <div className="md:hidden space-y-3">
+              {filteredRows.length === 0 ? (
+                <div className="p-6 text-center text-xs text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-800 rounded-xl">
+                  {isFiltersActive
+                    ? 'No users match the active search or filters.'
+                    : 'No users requiring review found.'}
+                </div>
+              ) : (
+                filteredRows.map((row) => {
+                  const displayName = getUserDisplayName(row)
+                  const userEmail = getUserEmailOrUpn(row)
+
+                  return (
+                    <div
+                      key={row.id}
+                      onClick={() => openDrawer(row)}
+                      className="p-4 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950 space-y-3 cursor-pointer hover:border-slate-300 dark:hover:border-slate-700 transition"
+                    >
+                      {/* Identity Header */}
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 font-bold text-xs border border-slate-200 dark:border-slate-700">
+                            {getInitials(displayName, userEmail)}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                              {displayName}
+                            </div>
+                            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                              {userEmail}
+                            </div>
+                          </div>
+                        </div>
+
+                        <DataStateBadge row={row} />
+                      </div>
+
+                      {/* Reason */}
+                      <WhyNeedsReviewCell row={row} />
+
+                      {/* Source & Evidence Footer */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800 text-xs">
+                        <FoundByBadges row={row} />
+                        <LatestEvidenceCell row={row} />
+                      </div>
+
+                      {/* Action */}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          openDrawer(row)
+                        }}
+                        className="w-full justify-between h-9 text-xs font-semibold mt-1"
+                      >
+                        <span>Investigate findings</span>
+                        <ChevronRight className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  )
+                })
+              )}
+            </div>
           </section>
 
-          {list.context.length > 0 && (
+          {/* Context / Supporting Evidence Section if present */}
+          {Boolean(list?.context?.length) && (
             <section
               aria-labelledby="risky-users-context-heading"
-              className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900"
+              className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900 space-y-3"
             >
-              <h2
+              <h3
                 id="risky-users-context-heading"
                 className="text-sm font-semibold text-slate-900 dark:text-slate-50"
               >
                 Supporting evidence
-              </h2>
-              <p className="mt-1 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
-                Mailbox-scoped and historical evidence. It is deliberately not
-                counted above, because counting it would overstate how many
-                people need attention today. It is still worth reading when
-                investigating.
+              </h3>
+              <p className="text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+                Mailbox-scoped and historical evidence. It is deliberately not counted above to avoid overstating today&rsquo;s actionable user count.
               </p>
-              <div className="mt-3">
-                <UserRows
-                  rows={list.context}
-                  onOpen={(row) => setSelectedId(row.id)}
-                  caption="Mailbox-scoped and historical evidence"
-                />
+              <div className="space-y-2">
+                {list.context.map((row) => {
+                  const displayName = getUserDisplayName(row)
+                  const userEmail = getUserEmailOrUpn(row)
+                  return (
+                    <div
+                      key={row.id}
+                      onClick={() => openDrawer(row)}
+                      className="p-3 rounded-lg border border-slate-200/80 bg-slate-50/50 dark:border-slate-800 dark:bg-slate-900/40 flex items-center justify-between gap-3 cursor-pointer hover:bg-slate-100/60 dark:hover:bg-slate-800/50"
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate">
+                          {displayName}
+                        </div>
+                        <div className="text-2xs text-slate-500 dark:text-slate-400 truncate">
+                          {userEmail}
+                        </div>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          openDrawer(row)
+                        }}
+                        className="h-7 text-2xs px-2"
+                      >
+                        Investigate
+                      </Button>
+                    </div>
+                  )
+                })}
               </div>
             </section>
           )}
-
-          {native?.available && <NativeCoverage native={native} />}
         </>
       )}
 
-      <RowDetail row={selectedRow} onClose={closeDrawer} />
+      {/* Shared Investigation Drawer */}
+      <FleetRiskAssessmentDrawer
+        row={drawerFleetRow}
+        isOpen={isDrawerOpen && Boolean(drawerFleetRow)}
+        onClose={() => {
+          setIsDrawerOpen(false)
+          setDrawerRow(null)
+        }}
+      />
     </div>
   )
 }
