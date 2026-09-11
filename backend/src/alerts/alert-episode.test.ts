@@ -129,3 +129,35 @@ test('a span is not aliased to a caller-held object', () => {
   assert.notEqual(placement.span.firstEventAt, occurredAt)
   assert.equal(placement.span.firstEventAt.getTime(), occurredAt.getTime())
 })
+
+test('EPISODE DURATION IS UNBOUNDED, which is a property and not a bug', () => {
+  // Raised by QA and confirmed here. A dense enough trickle merges arbitrarily
+  // distant activity into one episode: each step is within the quiet interval of
+  // the last, so the watermark never stops advancing.
+  //
+  // This is inherent to any quiet-interval rule and is not an argument against
+  // symmetric growth — a forward-only span does the same thing. It is recorded as
+  // a test so that capping episode duration, if anyone ever decides to, is a
+  // deliberate change that breaks this and not a silent one. What "one incident"
+  // means to an MSP when it spans a month is a product question, open with PM.
+  const start = Date.parse('2026-09-01T00:00:00.000Z')
+  const end = Date.parse('2026-10-01T00:00:00.000Z')
+  const ms = (t: number) => new Date(t).toISOString()
+
+  // Two events a month apart are two episodes.
+  assert.equal(episodesOf([at(ms(start)), at(ms(end))], QUIET).length, 2)
+
+  // Fill the month with a 23h trickle and they become one.
+  const trickle = [at(ms(start)), at(ms(end))]
+  for (let t = start; t < end; t += 23 * HOUR) trickle.push(at(ms(t)))
+  const merged = episodesOf(trickle, QUIET)
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0]?.firstEventAt.toISOString(), '2026-09-01T00:00:00.000Z')
+  assert.equal(merged[0]?.lastEventAt.toISOString(), '2026-10-01T00:00:00.000Z')
+
+  // CONTROL: it is the interval doing this, not the merging being unconditional.
+  // Widen the steps past the interval and the same month splits apart again.
+  const sparse = [at(ms(start)), at(ms(end))]
+  for (let t = start; t < end; t += 25 * HOUR) sparse.push(at(ms(t)))
+  assert.equal(episodesOf(sparse, QUIET).length, 29)
+})

@@ -19,6 +19,11 @@
  * an alert was already raised from it, which is the question here.
  */
 
+import { joinUnambiguously } from './alert-key-encoding.js'
+
+/** Components are length-prefixed rather than separator-joined; the reason, and
+ * the cross-tenant collision it prevents, are in `alert-key-encoding.ts`. */
+
 export interface AlertEventIdentity {
   /** Which collector or feed produced it. Two sources may legitimately use the
    * same identifier space, so it is part of the key. */
@@ -28,19 +33,6 @@ export interface AlertEventIdentity {
   /** The identifier the SOURCE assigned — Microsoft's audit id, for example.
    * Never one HawkView minted, or a replay would look new. */
   readonly eventId: string
-}
-
-/** Components are length-prefixed rather than joined by a separator.
- *
- * A plain `a:b:c:d` join is ambiguous the moment any component can contain the
- * separator: organization `x:y` with tenant `z` produces the same string as
- * organization `x` with tenant `y:z`. That is a cross-tenant collision in an
- * idempotency key, which would silently suppress a real alert in one tenant
- * because an unrelated one had been seen in another. Microsoft identifiers are
- * not obviously colon-free, and the cost of assuming is a suppressed alert rather
- * than a visible error. */
-function joinUnambiguously(parts: readonly string[]): string {
-  return parts.map((part) => `${part.length}:${part}`).join('')
 }
 
 export function eventKey(event: AlertEventIdentity): string {

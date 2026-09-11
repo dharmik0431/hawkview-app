@@ -132,3 +132,57 @@ depend on them, so neither is written.
   assuming an attack. `arrivedLate` exists to tell a reader "these arrived
   together because a collector caught up" — the episodes themselves are already
   placed by event time and will be spread across the real dates.
+
+## Two things found after the boundary was built
+
+### The separator earns its place, and a shape test would not have shown it
+
+`joinUnambiguously` now lives in `backend/src/alerts/alert-key-encoding.ts`
+rather than inside the event key, because the incident key needs the same
+guarantee and a copied security primitive is the arrangement where one copy gets
+fixed.
+
+Mutating it four ways exposed a weakness in the tests rather than in the code.
+Three mutations — plain colon join, no delimiter, length in characters — died to
+collision assertions. The fourth, *keeping* the length prefix but dropping the
+`:` between prefix and content, died only to a test asserting an exact output
+string. That is a shape assertion, not a behaviour one, and it would have gone
+green the moment anyone reformatted the encoding.
+
+So the question was whether `${len}${part}` is actually unsafe. An exhaustive
+search over short components said it was injective, which was the uncomfortable
+answer — the separator might have been decoration. Extending the search to
+strings with multi-digit lengths produced the pair:
+
+```
+['1','1','1','1','1','11']  and  ['11111111211']
+both encode as "1111111111211"
+```
+
+Two distinct tuples, one key. The separator is load-bearing, and there is now a
+test that says so by exhibiting the collision rather than by pinning a string.
+It is not a pair anybody would have thought of; it came out of a search.
+
+### Episode duration is unbounded
+
+Raised by QA, confirmed here against the built code:
+
+| events | episodes |
+|---|---|
+| two, 30 days apart | 2 |
+| the same two, with a 23h trickle between them | **1, spanning 30 days** |
+| the same two, with a 25h trickle between them | 29 |
+
+A dense enough trickle keeps the watermark advancing and merges arbitrarily
+distant activity into one incident. This is inherent to any quiet-interval rule
+and is **not** an argument against symmetric growth — a forward-only span does
+exactly the same thing. The third row is the control: it is the interval doing
+this, not merging being unconditional.
+
+The code does what it says. The open question is a product one — whether a
+single incident spanning a month is a useful thing to hand an MSP, or whether
+episode duration needs a cap. **D6**, and the answer is not the engineer's.
+
+A characterisation test records the current behaviour, so that adding a cap is a
+change that visibly breaks a test rather than a silent redefinition of what one
+incident means.
