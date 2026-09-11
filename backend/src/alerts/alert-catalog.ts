@@ -235,10 +235,16 @@ export function alertType(id: AlertTypeId): AlertTypeDeclaration {
 /** WHICH DIRECTORY CHANGES ARE PRIVILEGED — a policy, written down and
  * reviewable rather than inferred per event.
  *
- * SUPERSEDED PENDING APPROVAL. A measured seven-entry replacement, decided on
- * fields already collected, is with the product owner now. This block stays until
- * that is signed off, because deleting it would leave the phone tier with no
- * written policy at all, and nothing routes on either version meanwhile.
+ * APPROVED WITH CORRECTIONS, AND NOW IMPLEMENTED. The decisions live in
+ * `privileged-change.ts`, which classifies a change as URGENT, ROUTINE or
+ * UNCLASSIFIED from fields already collected. This block stays as the
+ * human-readable statement of why each kind of change is on the list at all: the
+ * classifier says what happens, this says what it is for, and they are meant to be
+ * read together.
+ *
+ * Two of the six corrections were defects rather than refinements — HawkView must
+ * not be exempt by application id alone, and the consent rule contradicted itself.
+ * Both are described where they are implemented.
  *
  * EXPECTEDNESS IS NOT APPLIED ANYWHERE IN THIS POLICY. Each entry used to carry a
  * `context` clause suppressing the alert when the change matched a recorded

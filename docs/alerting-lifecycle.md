@@ -295,7 +295,7 @@ an incident. It now notifies, with its own action. The corrected rule and the
 reason are above; it is recorded here because the mistake is more instructive than
 the fix: the argument sounded like noise-reduction and was actually a hole.
 
-## The privileged-change policy is PROPOSED, not settled
+## The privileged-change policy, approved with corrections
 
 The plan lists "which directory changes are privileged?" as an open question that
 must be answered before step 01 can finish, and names role assignment,
@@ -303,11 +303,11 @@ authentication policy and application permission grants. That list is now in
 `PRIVILEGED_DIRECTORY_CHANGES` — in code, because a policy in a document is one
 nobody can diff.
 
-**It needs sign-off before step 05 routes anything on it**, because it decides
-what rings a phone. A measured seven-entry replacement is with the product owner
-now; this block is **superseded pending approval** and stays until that is signed
-off, because deleting it would leave the phone tier with no written policy at all.
-Nothing routes on either version meanwhile.
+**Approved, with six corrections** — two of which were defects rather than
+refinements. The decisions are implemented in `privileged-change.ts` and described
+under *Classifying a privileged directory change* below; this block remains the
+statement of why each kind of change is on the list at all. The classifier says
+what happens; this says what it is for.
 
 ### Expectedness is not applied anywhere in this policy
 
@@ -367,6 +367,92 @@ a tenant whose every source is unlicensed or permission-blocked would have
 satisfied "every covered source is readable" while HawkView could see nothing at
 all — a page claiming visibility came back, closing on a tenant it cannot see.
 `everyCoveredSourceReadable` requires at least one covered source.
+
+## Classifying a privileged directory change
+
+Approved with corrections and implemented in `privileged-change.ts`. Three
+outcomes, not two.
+
+| Outcome | Means | Routes |
+|---|---|---|
+| `URGENT` | a privilege path, on evidence | `ACT_NOW` |
+| `ROUTINE` | recognised and ordinarily unremarkable | `RECORD_ONLY` |
+| `UNCLASSIFIED` | **we do not know** | `ACT_TODAY` — with one exception |
+
+**`UNCLASSIFIED` exists because unlisted is not the same as harmless.** A
+permission missing from the sensitive list is not thereby read-only; an
+unresolvable role id, a custom role, an unfamiliar permission string and an
+unparseable policy change are all *unknown*, and falling through to routine would
+be absence of evidence read as evidence of absence. The product already refuses
+that everywhere else — a count that cannot be determined is `NOT_AVAILABLE`, never
+zero. Each unclassified outcome carries the token nobody could classify, so the
+set can be surfaced and **shrunk** rather than accumulating.
+
+It routes at email tier because otherwise every permission string Microsoft invents
+rings somebody at 2am, and the tier decays in exactly the way this plan exists to
+prevent. **The exception: an unresolvable role on a role-assignment activity is
+urgent.** The activity has already told us it is a privilege grant; only the
+magnitude is unknown, which is not a reason to wait.
+
+### HawkView is not exempt by application id
+
+Suppressing every grant to our own registration would make HawkView the single
+blind spot in the tenant — an unexpected permission increase to our own AppId, or a
+credential added to it, is the most alarming event there is, and we would have said
+nothing. The exemption is our AppId **crossed with the permissions we actually
+request**, which is a precise allow-list rather than a heuristic and is strictly
+narrower.
+
+That set is **derived from `MICROSOFT_APPLICATION_PERMISSIONS`**, not copied, so it
+cannot drift from what HawkView requests. A credential added to our own
+registration is evaluated like anyone else's, because the exemption covers
+permissions and a credential is not one.
+
+### Sensitivity and scope are evaluated together
+
+Tenant-wide scope **multiplies a sensitive permission and never promotes a routine
+one.** The policy previously said both — one row raised any permission to urgent on
+a tenant-wide consent type, and a correction two rows below said tenant-wide
+consent is not urgent by itself. There is now one rule, and a test asserts the two
+cannot disagree again.
+
+Measured: tenant-wide admin consent fires **47 times** in production, because
+consenting on behalf of all users is simply how an administrator approves an
+application. Reasoned as exceptional, measured as the ordinary path.
+
+### Two escalation paths, described correctly
+
+`Application.ReadWrite.All` confers **credential management** — the holder can add
+a credential to another registration and then authenticate as that application,
+assuming whatever privileges it already holds. It does *not* let an application
+grant itself every other permission; that was the example the original argument
+rested on and it was wrong. The permission that manages permission grants is
+`AppRoleAssignment.ReadWrite.All`. Both are sensitive, by different mechanisms.
+
+### Nothing is asserted benign
+
+Registering an authentication method and an administrator resetting a password are
+**routine by default with contextual escalation** — not guaranteed benign. MFA
+registration is also how somebody holding stolen credentials registers their own
+authenticator, which is a standard persistence move.
+
+And no claim is made anywhere about what the credential-attack detector covers. An
+earlier version said one of these cases was "caught by the credential-attack
+detector, not here" — an unverified claim about another component, which is the
+mechanism-instead-of-effect failure. A test asserts no such claim reappears.
+
+### Removing a grant control does not always weaken a policy
+
+Microsoft's grant controls combine with `OR` or `AND`:
+
+- **`OR`** — any one control satisfies the policy, so removing one removes an
+  *alternative* and makes the policy **harder** to satisfy.
+- **`AND`** — every control must be satisfied, so removing one removes a
+  *requirement* and weakens it.
+
+Where before/after values are missing, or the combination operator is unknown, the
+outcome is **"change detected; impact unknown"** rather than a silent pass — the
+same rule as an unrecognised permission, for the same reason.
 ## What to check first when it breaks
 
 **Symptom: an alert resolved itself and nobody believes it should have.** Check
