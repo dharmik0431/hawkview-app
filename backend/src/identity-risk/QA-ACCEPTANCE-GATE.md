@@ -436,3 +436,162 @@ One honest limitation: the `UNREADABLE_NOW` / `NEVER_COLLECTED` marker check
 never fires in either run, so the discrimination rests entirely on `applies`.
 That is demonstrated rather than assumed, but the marker check is currently
 inert and should not be read as contributing.
+
+### `qa-gate-name-resolution-isolation.ts` — gates Engineer 2's merge, not the backend push
+
+Asks whether subject-name resolution can pull a sibling tenant's person into an
+authorized tenant's answer. Verified in both directions against `f107802`:
+
+| | |
+| --- | --- |
+| unmutated | **PASS**, 2 of 2 |
+| `customerTenantId` dropped from the resolver's `where` | **CROSS-TENANT LEAK**, 3 of 3 |
+
+Scope is stated in the file: authorization is stubbed to an already-authorized
+tenant, because the controller delegates that to `authorizeRiskyUsersRead`. A
+PASS here does not mean cross-tenant *access* is safe.
+
+**The fixture took three attempts, and the two failures are the useful part.**
+
+1. **Both tenants hold a row for the same id.** Non-deterministic — the widened
+   query returns two rows, `named.set` keeps whichever Postgres returned last,
+   and there is no `ORDER BY`. Against broken code it reported PASS once and
+   CROSS-TENANT LEAK the next run. A gate that catches a real leak half the time
+   is worse than none, because the half that passes is the half that gets quoted.
+2. **Only tenant B holds a row.** Deterministic and completely inert — with no
+   directory row of its own, tenant A's subject binds by UPN, carries no
+   directory id, and never enters the resolver's lookup set. PASS three times
+   against broken code. *The absence being relied on also removed the lookup key.*
+3. **What shipped.** Tenant A holds the row during evaluation so the subject
+   binds, then it is deleted before the read — leaving tenant B's as the only
+   candidate. Also a real state: a person removed from a directory after a run.
+
+**A separate bug in the probe, caught by the same mutation.** The verdict
+originally checked the `inputCanFail` guard *before* the leak. Under the mutation
+the leaking row overwrote tenant A's name, which removed the guard's own input —
+so the verdict line read INCONCLUSIVE while `responseLeaksTenantBName: true` sat
+directly above it. **An absent guard input is not evidence of safety when the
+thing that removed it is the leak.** Leak is now checked first.
+
+One incidental confirmation: names are role-gated on `evidenceDetailAllowed`, and
+the response carries `subjectsNamed` so a surface can say "your role does not show
+names" rather than rendering blanks.
+
+### Reading the shipped screen without the preview harness
+
+The preview harness (`preview-risky-users.mjs`) does not run against `d3932fa`:
+it has no module-map entry for `@/lib/identity-risk/native-view`, and beneath
+that it mocks `./identity-risk-hooks` while the component now imports
+`useNativeRiskyUsersRead` from `./risky-users-assessment-hooks`. It was green for
+weeks while the screen rendered the old engine and broke when the wire moved —
+**stale at exactly the seam the 52 UI tests are stale at.**
+
+So these two tools read the screen a different way, and found two customer-facing
+defects in fifteen minutes on a path where every suite is green:
+
+- `qa-dump-native-response.ts` captures a **real** native response from the
+  shipped backend path (`evaluateAndPersistTenant` → `RiskyUsersController`) on a
+  disposable database. `QA_MODE` selects `positive` / `zero` / `unavailable` /
+  `atleast` / `unnamed`.
+- `qa-render-native.mjs` runs that response through the frontend's own
+  `adaptNativeAssessment` and `nativeRiskyUserList` and prints what the screen
+  says.
+
+Using a real response rather than an authored fixture matters twice over: no
+native fixture exists anywhere in the repo, and a fixture written from reading
+the type would have encoded the same misunderstanding as the code.
+
+**What they cannot show:** visual grouping, what is above the fold, what sits
+beside what. Two of the five known instances of this feature's defect were
+exactly that, so a clean result here does not clear the screen.
+
+#### What the count vocabulary says — all correct
+
+| state | headline | reads as |
+| --- | --- | --- |
+| EXACT 0 | "Risky users 0" | scoped zero; caption says every event was assessed or accounted for |
+| WITHHELD | "Not counted — no evidence was in scope for any check" | explicitly "not a zero and not an all-clear" |
+| AT_LEAST | "Risky users, at least" · `≥1` · `listCoverage: PARTIAL` | a floor, with truncation explained |
+
+`evidenceCountCapped: true` propagates to each signal. `priority: null` is
+deliberate and documented — the engine rates nothing and inventing a sort key is
+refused. None of these read as failures.
+
+#### The two defects, both one root cause
+
+**The frontend still speaks the old engine's vocabulary while the backend ships
+the new one.** Every individual field is correct on both sides.
+
+1. **Every row renders "Identity not resolved" while the name is in the payload.**
+   The controller spreads `displayName` / `userPrincipalName` at the finding-item
+   level; `native-assessment.ts:229` reads them from inside `subject`. So
+   `native-view.ts:91` returns its fallback. `subjectsNamed: true` sits in the
+   same response. **This is the defect the subject-name resolution was built to
+   remove**, arriving one layer up.
+2. **"Risky users 4" beside "A check this build of HawkView does not recognise."**
+   `presentation.ts:639` keys its evidence-shape table on the old engine's rule
+   ids; the shipped detector id is `repeated-credential-failure`, so
+   `findingEvidenceShape()` returns `UNRECOGNISED`. **It appears on every state
+   including the clean zero and the withheld** — so a legitimate EXACT 0 is
+   undercut by a sentence saying a check was not recognised.
+
+**Consequence of (1) worth stating separately:** the named and unnamed roles
+render *identically*. A technician whose role may see names and one whose role may
+not see the same screen, and both read as "HawkView could not identify these
+people" rather than "your role does not show names."
+
+**Latent, same file, same edit:** `native-view.ts:106` hardcodes `kind: null`,
+discarding the `latest.kind` the backend now sends, and the section re-derives
+occurrence-versus-observation from `findingEvidenceShape(ruleId)` — a client-side
+table. That is the convention `2c23a97` removed ("the kind travels with the value
+instead"). Invisible with one detector; it becomes the read-time-as-event-time
+defect again the moment `external-mailbox-forwarding` ships.
+
+### Secret-store rotation, verified against a real cluster (`604dbef`)
+
+Engineer 1 wrote `secret-store.database-integration.test.ts` and could not run it
+— no Postgres in that environment. Run here against a disposable cluster built
+from the shipped migrations: **2 pass, 0 fail.** Synthetic keys throughout; no
+production secret was touched.
+
+The shipped column is `NOT NULL`, no default, `CHECK (key_version >= 1)` —
+confirmed by querying `information_schema`, not by reading the migration.
+
+**Three mutations, each caught by the assertion that should catch it:**
+
+| mutation | caught by |
+| --- | --- |
+| `rotationStatus` believes the version column instead of opening the row | "both must still open" |
+| `openAndReseal` returns before re-sealing — a rotation that never rotates | "reading should have re-sealed both" |
+| `key_version` default restored on the table | "Missing expected rejection" (23502) |
+
+So it is not a rotation test that passes without rotating, and the migration's
+safety property is real rather than asserted.
+
+### Added: `qa-probe-rotation-status.ts` — the dangerous direction
+
+The shipped test catches a column-believing `rotationStatus` by the **safe**
+symptom: during the rotation window rows sit at version 1 while current is 2, so
+believing the label reports them *unreadable* and the assertion fires. It says
+nothing about the opposite and far worse case — **a row labelled current that
+cannot be opened.** Every row in that test is genuinely readable, so
+`readable: true` from the column alone is compatible with every assertion in it.
+
+That case is the one `rotationStatus` exists for: an operator reads
+`complete: true` and deletes `SECRET_ENCRYPTION_KEY_PREVIOUS`, and a value that
+only exists sealed is gone.
+
+The probe stores two secrets, corrupts one row's **ciphertext only** — leaving
+`key_version` untouched and verified unchanged — and asks:
+
+| | opens the rows | believes the label |
+| --- | --- | --- |
+| corrupted row | `readable: false` | `readable: true` |
+| `complete` | **false** | **true** — authorises deleting the previous key |
+
+Shipped code: **PASS**. Mutated to read the column: **BELIEVES THE LABEL**. So the
+claim in that function's comment — that it opens each row because a version is a
+claim and the claim is what you are verifying — is now observed rather than read.
+
+One difference from the shipped test worth keeping: its `disposable()` guard
+checks the **host** but not the database name. This probe checks both.
