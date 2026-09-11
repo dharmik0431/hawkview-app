@@ -487,7 +487,15 @@ export const RESULT_CODES: readonly ResultCodeEntry[] = [
     note:
       'Previously mapped out of scope here on no citation, which is the 50076 mistake in miniature. It is ' +
       'also one of only three codes observed in more than one tenant, so it is high-volume: a citation ' +
-      'either way is worth having.',
+      'either way is worth having. ' +
+      'BACKLOG ITEM, NAMED SO SOMEONE FINISHES IT: this code and 90094 are the only two that reach ' +
+      'NOT_YET_CITED in volume — 14 events on one real tenant. They do NOT weaken that tenant’s ' +
+      'claim: the count is exact OVER THE SCOPE IT STATES, and scope travels inside Count so the ' +
+      'narrowing cannot be rendered away. But the narrowing persists for as long as the citation is ' +
+      'missing, and a citation EITHER WAY retires it permanently. ' +
+      'TRIGGER THAT CHANGES THIS: if a detector is ever added that keys on consent outcomes, these ' +
+      'two stop being held and become live evidence, and an exact claim over a scope excluding them ' +
+      'becomes materially wrong rather than merely narrow.',
   },
 
   {
