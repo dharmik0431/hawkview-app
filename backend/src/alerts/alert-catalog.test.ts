@@ -10,9 +10,17 @@ import { urgencyOf, collectorLagMs, arrivedLate, eventInstant, compareByEventTim
 
 test('EVERY alert type says what makes it stop', () => {
   // "An alert type with no stated resolving condition is not ready to be built."
-  // The field is required, so this cannot fail as written — which is the point.
-  // It is asserted anyway because the sweep also checks the sentences are real
-  // rather than placeholders, which the type cannot do.
+  //
+  // THIS IS A SPELLING TEST AND NOTHING MORE, which is worth saying out loud
+  // because I previously defended it as if it were a check. The field is required
+  // so the `kind` assertion cannot fail as written, and `assert.ok` on a string is
+  // satisfied by any non-empty one — including a kind naming a state the system can
+  // never be in. The sentence-length sweep checks the prose is real; it cannot
+  // check that what the prose names is reachable.
+  //
+  // Whether each condition can actually be SATISFIED is `alert-clearing.test.ts`,
+  // which exhibits one satisfying and one falsifying state per declared kind. That
+  // is the check; this is the label on the tin.
   assert.ok(ALERT_CATALOG.length >= 7, 'the catalogue was not read')
   for (const declaration of ALERT_CATALOG) {
     assert.ok(declaration.conditionClears.kind, `${declaration.id} has no resolving condition`)

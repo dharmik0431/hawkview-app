@@ -338,6 +338,35 @@ was going to be urgent on its own evidence, and it **fires 47 times** in product
 application. It is now a multiplier on a sensitive permission rather than a
 trigger. Reasoned as exceptional, measured as the ordinary path.
 
+
+## Every declared condition is satisfiable, and that is checked
+
+The stated-condition sweep in `alert-catalog.test.ts` is **a spelling test**, and
+it is labelled as one. `assert.ok(condition.kind)` passes on any non-empty string,
+including a kind naming a state the system can never be in; the sentence-length
+checks prove the prose is real and cannot prove that what it names is reachable.
+
+`alert-clearing.test.ts` is the check. For every declared kind it exhibits **one
+state that satisfies it and one that does not** — both, because a witness that
+always returned true would report every condition satisfiable, which is the same
+vacuity one level up.
+
+This matters in one direction especially. A condition too strong to satisfy
+produces an alert that never auto-clears, and **this feature exists because 353
+alerts never cleared.** Strictness was the right call on `tenant_disconnected`; the
+unchecked half of it was a phone-tier page that could never close.
+
+**Nothing is allowed to weaken a condition to pass this control.** Weakening
+`EVERY_COVERED_SOURCE_READABLE` back toward `COLLECTOR_REPORTS_SUCCESS` would make
+the control green by restoring the defect it was ruled out to fix — so that path is
+itself asserted against: the mutation fails a test in `alert-catalog.test.ts`. If a
+condition ever cannot be satisfied, the finding is a defect in the declaration.
+
+**A vacuous truth found while writing it.** `every` over an empty list is true, so
+a tenant whose every source is unlicensed or permission-blocked would have
+satisfied "every covered source is readable" while HawkView could see nothing at
+all — a page claiming visibility came back, closing on a tenant it cannot see.
+`everyCoveredSourceReadable` requires at least one covered source.
 ## What to check first when it breaks
 
 **Symptom: an alert resolved itself and nobody believes it should have.** Check
@@ -397,6 +426,20 @@ their own.
   most-recently-delivered as newest. `compareByEventTime` and `newestByEventTime`
   are the primitives for it, and they are the only part of the episode work that
   exists today.
+- **"Covered" means the sources HawkView expects to be readable for THIS tenant,
+  given its licensing and its consent** — not every collector configured for it.
+  That invention is the one that produces a page nobody can close, and production
+  has 147 collectors with 10 failed and 7 stale beyond a week, so the tenant it
+  would break exists today. Not covered: `NOT_LICENSED` (no product — nothing to
+  see and nothing to fix), `PERMISSION_REQUIRED` (a consent gap, its own alert with
+  its own action, fixable in minutes), and `UNSUPPORTED` (Microsoft does not expose
+  it — the same class as unlicensed). Everything else is covered, including
+  `NOT_CONFIGURED`, because never having collected something is a visibility gap
+  rather than a capability statement. The distinction the rule rests on: **"HawkView
+  cannot see this tenant" is a different fact from "HawkView was never allowed to
+  see this part of it."** The first is an emergency; the second is a task. One alert
+  for both makes the emergency unclearable and buries the task. `coveredSources` in
+  `alert-clearing.ts` is the implementation — use it rather than re-deciding.
 - **Event-level idempotency stays a separate layer from incident grouping.** A
   replayed event id must add neither a notification nor an occurrence. The event
   id in the dedupe key is doing a necessary job; grouping is a second layer on top
