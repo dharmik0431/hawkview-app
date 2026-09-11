@@ -79,6 +79,45 @@ export type EscalationSignal =
   | 'SPREAD_TO_ADDITIONAL_SUBJECTS'
   | 'PERSISTED_BEYOND_EXPECTED_WINDOW'
 
+/** WHOSE incident this is — declared per type, never chosen globally.
+ *
+ * Both global answers fail, in opposite directions, and the asymmetry is why this
+ * is a declaration rather than a constant:
+ *
+ *   TARGET everywhere  a compromised admin granting roles to twelve accounts
+ *                      becomes twelve incidents — the 301 problem rebuilt, at the
+ *                      tier that pages, by the step built to prevent it.
+ *   ACTOR everywhere   a credential attack has no meaningful actor: the failures
+ *                      come from many addresses and often resolve to nothing, so
+ *                      every attacked account in a tenant collapses into one
+ *                      unknown-actor incident. That HIDES an attack rather than
+ *                      duplicating it, which is worse.
+ *
+ * So the role is part of the type declaration, REQUIRED rather than optional, so
+ * the compiler enumerates every type and nothing inherits a default. Same shape as
+ * `conditionClears`: a new alert type cannot be added without answering it.
+ *
+ * THE LOSS, STATED RATHER THAN DISCOVERED: cross-class correlation is unavailable.
+ * "Y attacked X on Monday and granted themselves a role on Tuesday" is not
+ * expressible by any per-class key. That is real and deferred, not overlooked. */
+export type SubjectRole =
+  /** The account or resource acted upon. */
+  | 'TARGET'
+  /** Who performed the change. */
+  | 'ACTOR'
+  /** No person is involved and the tenant itself is the subject. */
+  | 'TENANT'
+  /** One specific feed.
+   *
+   * NOT IN THE ORIGINAL RULING, and the one place this extends it — flagged rather
+   * than folded in. The ruling paired "tenant & collector health" under TENANT, but
+   * the catalogue splits that across two types: `monitoring.tenant_disconnected`
+   * is genuinely tenant-level, and `monitoring.collector_failing` is not. Giving
+   * the second one TENANT merges two unrelated collectors failing for two
+   * different reasons into one incident, which is the 334-into-15 collapse rebuilt
+   * one category over. Two failing collectors are two fixes. */
+  | 'COLLECTOR'
+
 export interface EscalationThreshold {
   readonly signal: EscalationSignal
   /** Why this changes what the alert is. Read by a person deciding whether the
@@ -89,6 +128,9 @@ export interface EscalationThreshold {
 interface AlertTypeBase {
   readonly id: string
   readonly severity: Severity
+  /** Whose incident this is. See `SubjectRole` — required so that adding a type
+   * forces the question rather than inheriting a default. */
+  readonly subject: SubjectRole
   /** The wording a recipient sees. "Suspected", not "confirmed": repeated
    * lockouts are an investigation signal, and they also come from stale
    * credentials on a phone or a misconfigured service account. */

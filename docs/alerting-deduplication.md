@@ -94,31 +94,42 @@ enough backfill still opens a separate one. Otherwise "advances" would be
 indistinguishable from "never closes", and "grows backwards" from "swallows
 history".
 
-## Five decisions that are not mine to make
+## Six decisions, all ruled
 
-These are outstanding with PM. The incident key and the quiet interval both
-depend on them, so neither is written.
+Recorded with the reasoning because the reasoning is what a later reader needs, and
+because one answer was neither of the options put forward — which is worth keeping
+visible rather than tidying into the answer that won.
 
-- **D1 — subject of the incident key: target or actor?** `DirectoryAuditLog`
-  carries both `initiatedBy` and `targetResources`. Keying on the target groups
-  "this account was attacked"; keying on the actor groups "this account is
-  attacking". They produce different incidents from the same events and there is
-  no key that does both. *Leaning target, loosely.*
-- **D2 — what quiet interval closes an episode?** Recommend deriving it from the
-  type's declared `NO_FURTHER_EVENTS_IN_READABLE_WINDOW.windowHours` (24h for
-  the credential attack type) rather than introducing a second notion of quiet
-  beside the one each type already declares. A second constant would be free to
-  drift from the first, and the drift would show up as incidents that resolve
-  and regroup.
-- **D3 — does an episode span grow backwards?** Implemented symmetric, reasoning
-  above. Recorded as a decision rather than buried, because it is reversible and
-  someone should disagree with it now rather than after data exists.
-- **D4 — does a resolved investigation open a new episode regardless of timing?**
-  Step 01's `decideRecurrence` already says yes (case 1, `OPEN_LINKED_EPISODE`)
-  and PM approved it. Treating it as settled unless told otherwise.
-- **D5 — scope.** Staying with pure functions as step 01 did; the `notifications`
-  table has no episode column and a migration is step 03's. Taken as settled by
-  "scope to the alerts folder and docs".
+- **D1 — subject of the incident key. RULED: declared per type, not chosen
+  globally.** The question was asked as "target or actor", and both global answers
+  fail in opposite directions: target everywhere turns one compromised admin into
+  twelve pages, actor everywhere collapses every attacked account in a tenant into
+  one unknown-actor incident and *hides* an attack rather than duplicating it. So
+  the role is part of the type declaration, required so the compiler enumerates.
+  An unresolvable subject does not group at all. Implemented above; the table of
+  roles is in *Layer two, part two*.
+
+  Worth noting as method: the recommendation offered was "target, loosely", and it
+  was wrong in a way that only showed up when the two failures were put side by
+  side. Asking rather than filling it in is what produced the better answer.
+- **D2 — quiet interval. RULED: derived from the declared window, never a second
+  constant.** A type declaring no window has no interval and must fail loudly
+  rather than default. Implemented — and the consequence turned out to be larger
+  than the ruling anticipated: six of the seven declared types state no window,
+  including both directory-change types. See *The quiet interval is derived*.
+- **D3 — backwards growth. RULED: keep symmetric**, with a presentational
+  obligation attached — an episode span may never be shown as a single date.
+- **D4 — a resolved investigation opens a new episode regardless of timing.
+  RULED: yes**, and confirmed factually rather than assumed: `decideRecurrence`
+  case 1 returns `OPEN_LINKED_EPISODE`, and removing that branch fails three
+  independent checks.
+- **D5 — scope. RULED: pure functions, no migration.** The `notifications` table
+  is step 03's.
+- **D6 — episode duration. RULED: no cap.** A cap invents a boundary the evidence
+  does not contain, which is a manufactured episode reached from the opposite
+  direction. Duration is not the signal; recency is — hence D3's presentational
+  obligation. The characterisation test stays, so adding a cap must break a test
+  rather than quietly redefine what one incident means.
 
 ## What to check first when this breaks
 
@@ -186,3 +197,111 @@ episode duration needs a cap. **D6**, and the answer is not the engineer's.
 A characterisation test records the current behaviour, so that adding a cap is a
 change that visibly breaks a test rather than a silent redefinition of what one
 incident means.
+
+## Layer two, part two: the incident key
+
+`backend/src/alerts/alert-incident-key.ts`. The other half of the pair — it answers
+"which incident is this" and contains no event identifier, so it is structurally
+unable to deduplicate. The event key cannot group; this cannot deduplicate. Both
+inabilities are asserted.
+
+### The subject is declared per type, and both global answers fail
+
+| alert type | subject | why |
+|---|---|---|
+| `security.suspected_credential_attack` | **TARGET** | the account attacked; failures come from many addresses and often resolve to nothing, so the attacker is not a subject that groups |
+| `security.privileged_directory_change` | **ACTOR** | one compromised admin touching twelve accounts is ONE incident |
+| `security.routine_directory_change` | **ACTOR** | a bulk operation by one person is one record |
+| `monitoring.tenant_disconnected` | **TENANT** | nobody performed it and nothing was targeted |
+| `monitoring.consent_expiring` | **TENANT** | consent is granted per tenant |
+| `monitoring.collector_failing` | **COLLECTOR** | two collectors failing for two reasons are two fixes |
+| `monitoring.recovered` | **COLLECTOR** | recovery is observed per feed |
+
+Neither global answer survives contact with the catalogue, and they fail in opposite
+directions. **Target everywhere** turns one compromised administrator into twelve
+pages — the 301 problem rebuilt, at the tier that pages, by the step built to
+prevent it. **Actor everywhere** collapses every attacked account in a tenant into
+one unknown-actor incident, which *hides* an attack rather than duplicating it.
+
+`subject` is a **required** field on `AlertTypeDeclaration`, so the compiler
+enumerates every type and nothing inherits a default. Removing one produces
+*"Property 'subject' is missing … but required in type 'AlertTypeBase'"*, naming the
+type that failed to answer. Same shape as `conditionClears`.
+
+`COLLECTOR` is the one place this extends the ruling, flagged rather than folded in.
+The ruling paired "tenant & collector health" under TENANT; the catalogue splits that
+across two types, and giving `monitoring.collector_failing` a TENANT subject merges
+unrelated collectors into one incident — the 334-into-15 collapse one category over.
+
+**The loss, stated rather than discovered:** cross-class correlation is unavailable.
+"Y attacked X on Monday and granted themselves a role on Tuesday" is not expressible
+by any per-class key. Deferred, not overlooked.
+
+### An unresolvable subject does not group
+
+It stands alone, labelled unattributed, carrying *why* it could not be resolved.
+Merging on "unknown" would say "these are the same incident" on the strength of not
+knowing who was involved in either one. Standing alone asserts nothing. Rising
+unattributed volume is then a visible signal to fix attribution rather than a silent
+merge to find later.
+
+`wouldGroupTogether` returns **false** for two non-grouping events, because the
+alternative reintroduces the unknown-subject merge through the back door.
+
+### Why the role is in the key when it is derivable from the type id
+
+A declaration can change. Events keyed under an old role must not join episodes
+keyed under the new one — that would merge "who did this" with "who it was done to"
+inside one incident, at the moment of a one-word edit.
+
+### The quiet interval is derived, and six of seven types cannot derive one
+
+`alert-episode-interval.ts`. `quietIntervalMsOf` reads the window off the type's
+declared `NO_FURTHER_EVENTS_IN_READABLE_WINDOW`, so there is nothing to drift
+against. A type declaring no window **throws** rather than substituting a plausible
+number: a default is a second constant wearing a disguise — invisible, unreviewed,
+and identical in effect to the coupling the derivation exists to avoid.
+
+**The consequence is larger than it looks, and it is a declaration gap rather than a
+flaw in the derivation.** Only one of the seven declared types states a window:
+
+| can derive an interval | cannot |
+|---|---|
+| `security.suspected_credential_attack` (24h) | the other six |
+
+The six include **`security.privileged_directory_change` and
+`security.routine_directory_change`** — precisely the 301-alerts and
+334-occurrences cases that motivated this step. Episodes are therefore underivable
+for the types that need them most.
+
+The repair is to declare windows on those types, not to default one here. It is a
+product question what "quiet" means for a configuration change, whose resolving
+condition is `CONFIGURATION_RESTORED` — an observation, not a timeout — so the
+window would be a second, independent statement about the same type rather than one
+derived from the first. **That is a decision, and it is where step 02 stops.**
+
+A census test records the one-of-seven measurement. It is written to fail when a
+window is declared, because the number moving *is* the decision being taken and
+nobody should take it without noticing.
+
+### Presentational obligation, carried here so it is not lost between layers
+
+Episode duration is unbounded by ruling — no cap — because a cap invents a boundary
+the evidence does not contain. What makes a long episode safe is recency, not
+duration, so: **an episode span may never be rendered as its open date alone.**
+"Ongoing since 1 September, last activity two minutes ago" is actionable. "Since 1
+September" reads as stale and gets ignored, which is the failure this feature exists
+to prevent. This is a requirement on whoever renders an episode.
+
+### What to check first when this breaks
+
+- **Two things that should be one incident are two.** Compare the groupings, not the
+  keys — `wouldGroupTogether` exists because the interesting property is a relation
+  between two events, and asserting on the opaque string is a shape assertion that
+  goes green on any encoding change while saying nothing about whether they group.
+- **A flood of single-event incidents.** Check the unattributed rate before the
+  boundary logic. An unresolvable subject does not group by design, so a drop in
+  subject resolution looks exactly like a loss of grouping.
+- **Grouping that vanished after a catalogue edit.** The declared role is part of the
+  key. Changing a type's subject re-keys every future episode for that type, which is
+  intended and total.

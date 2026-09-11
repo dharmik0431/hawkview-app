@@ -17,6 +17,8 @@ export const ALERT_CATALOG = [
   // ── Suspected credential attack ────────────────────────────────────────────
   {
     id: 'security.suspected_credential_attack',
+    // The account being attacked. The failures come from many addresses and often resolve to nothing, so the attacker is not a subject that groups.
+    subject: 'TARGET',
     category: 'SECURITY',
     severity: 'ACT_NOW',
     opensInvestigation: true,
@@ -53,6 +55,8 @@ export const ALERT_CATALOG = [
   // ── Privileged directory change ────────────────────────────────────────────
   {
     id: 'security.privileged_directory_change',
+    // Who made the change. One compromised administrator touching twelve accounts is ONE incident, not twelve pages.
+    subject: 'ACTOR',
     category: 'SECURITY',
     severity: 'ACT_NOW',
     opensInvestigation: true,
@@ -79,6 +83,8 @@ export const ALERT_CATALOG = [
   // ── Routine directory change ───────────────────────────────────────────────
   {
     id: 'security.routine_directory_change',
+    // Who made the change, for the same reason as the privileged case — a bulk operation by one person is one record.
+    subject: 'ACTOR',
     category: 'SECURITY',
     severity: 'RECORD_ONLY',
     // No investigation. See the note on `opensInvestigation`: a record with
@@ -114,6 +120,8 @@ export const ALERT_CATALOG = [
   // ── Tenant disconnected ────────────────────────────────────────────────────
   {
     id: 'monitoring.tenant_disconnected',
+    // Nobody performed this and nothing was targeted. The tenant is the subject.
+    subject: 'TENANT',
     category: 'OPERATIONAL',
     severity: 'ACT_NOW',
     opensInvestigation: true,
@@ -159,6 +167,8 @@ export const ALERT_CATALOG = [
   // ── Collector failing ──────────────────────────────────────────────────────
   {
     id: 'monitoring.collector_failing',
+    // The specific feed. TENANT here would merge two collectors failing for two different reasons into one incident, and they are two different fixes.
+    subject: 'COLLECTOR',
     category: 'OPERATIONAL',
     severity: 'ACT_TODAY',
     opensInvestigation: true,
@@ -187,6 +197,8 @@ export const ALERT_CATALOG = [
   // ── Consent expiring ───────────────────────────────────────────────────────
   {
     id: 'monitoring.consent_expiring',
+    // Consent is granted per tenant, so the tenant is what expires.
+    subject: 'TENANT',
     category: 'OPERATIONAL',
     severity: 'ACT_TODAY',
     opensInvestigation: true,
@@ -207,6 +219,8 @@ export const ALERT_CATALOG = [
   // ── Monitoring recovered ───────────────────────────────────────────────────
   {
     id: 'monitoring.recovered',
+    // Recovery is observed per feed, matching the failure it resolves.
+    subject: 'COLLECTOR',
     category: 'OPERATIONAL',
     severity: 'RECORD_ONLY',
     opensInvestigation: false,

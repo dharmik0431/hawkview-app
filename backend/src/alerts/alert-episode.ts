@@ -49,10 +49,12 @@ export interface Placement {
  * arriving from the other side. So an event joins when its own time is within
  * `quietMs` of the span on EITHER side, and the span stretches to contain it.
  *
- * `quietMs` is a parameter rather than a constant here. What the interval should be
- * is a product decision — and deriving it from the alert type's declared resolving
- * condition, rather than inventing a second notion of quiet beside it, is the
- * proposal outstanding with PM. This function does not choose. */
+ * `quietMs` is a parameter rather than a constant here, and it stays one: the
+ * interval is DERIVED from the alert type’s declared resolving condition by
+ * `quietIntervalMsOf` in `alert-episode-interval.ts`, so there is no second notion
+ * of quiet beside the one each type already declares. This function is handed the
+ * number and does not choose it. A type declaring no window has no interval to
+ * derive and that call throws rather than defaulting. */
 export function placeEvent(
   span: EpisodeSpan | null,
   occurredAt: EventInstant,
