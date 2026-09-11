@@ -359,9 +359,18 @@ test('URGENT AND UNCLASSIFIED SAY HOW SOON TO LOOK, NOT THAT SOMETHING IS WRONG'
     classifyConditionalAccessChange(policy({ grantOperator: null }), policy({ grantOperator: null, grantControls: ['mfa'] })),
     classifyConditionalAccessChange(policy({ sessionControls: ['signInFrequency'] }), policy({ sessionControls: [] })),
     classifyConditionalAccessChange(policy({ unmodelledFingerprint: 'a' }), policy({ unmodelledFingerprint: 'b' })),
+    // The two paths the operator fix added. A sweep that says "every unclassified
+    // path" and enumerates stops being true the moment one is added, which is the
+    // same rot as a comment that counts.
+    classifyConditionalAccessChange(
+      policy({ grantOperator: 'OR', grantControls: [] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa'] })),
+    classifyConditionalAccessChange(
+      policy({ grantOperator: 'OR', grantControls: ['mfa', 'block'] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa'] })),
   ]
 
-  assert.equal(unclassifiedOutcomes.length, 7, 'the sweep must cover every unclassified path')
+  assert.equal(unclassifiedOutcomes.length, 9, 'the sweep must cover every unclassified path')
   for (const outcome of unclassifiedOutcomes) {
     assert.equal(outcome.classification, 'UNCLASSIFIED', outcome.because)
     assert.doesNotMatch(outcome.because, accusations, outcome.because)
@@ -390,4 +399,238 @@ test('no outcome claims an act occurred rather than describing a capability', ()
   assert.doesNotMatch(sensitive.because, /\bis exfiltration\b/i)
   // Capability language instead: what the holder CAN do.
   assert.match(sensitive.because, /can /i)
+})
+
+
+/** THE GRANT-CONTROL TRANSITION MATRIX.
+ *
+ * Derived from Microsoft's semantics rather than from what the code returns:
+ * AND(S) needs every control in S, OR(S) needs at least one, and a policy is WEAKER
+ * when more sessions pass it. QA pre-registered the same eleven transitions at
+ * c30f648 before this fix existed; these were written from the semantics and then
+ * checked against theirs, which is why the two agree without either being shaped by
+ * the other.
+ *
+ * A weakening is URGENT here. UNCLASSIFIED means "changed, impact undetermined", and
+ * for these transitions the impact is determined exactly — understating what we know
+ * would be its own inaccuracy.
+ */
+type Transition = readonly [
+  name: string,
+  before: Partial<ConditionalAccessState>,
+  after: Partial<ConditionalAccessState>,
+  weakens: boolean,
+]
+
+const TRANSITIONS: readonly Transition[] = [
+  ['AND -> OR, two controls',
+    { grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] },
+    { grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }, true],
+  ['OR -> AND, two controls',
+    { grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] },
+    { grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }, false],
+  ['control added to an OR policy',
+    { grantOperator: 'OR', grantControls: ['mfa'] },
+    { grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }, true],
+  ['control removed from an OR policy',
+    { grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] },
+    { grantOperator: 'OR', grantControls: ['mfa'] }, false],
+  ['control added to an AND policy',
+    { grantOperator: 'AND', grantControls: ['mfa'] },
+    { grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }, false],
+  ['control removed from an AND policy',
+    { grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] },
+    { grantOperator: 'AND', grantControls: ['mfa'] }, true],
+  ['DEGENERATE: AND -> OR, single control',
+    { grantOperator: 'AND', grantControls: ['mfa'] },
+    { grantOperator: 'OR', grantControls: ['mfa'] }, false],
+  ['DEGENERATE: OR -> AND, single control',
+    { grantOperator: 'OR', grantControls: ['mfa'] },
+    { grantOperator: 'AND', grantControls: ['mfa'] }, false],
+  ['COMPOUND: AND -> OR and a control added',
+    { grantOperator: 'AND', grantControls: ['mfa'] },
+    { grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }, true],
+  ['COMPOUND: AND -> OR and a control removed',
+    { grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] },
+    { grantOperator: 'OR', grantControls: ['mfa'] }, true],
+  ['no grant change at all', {}, {}, false],
+]
+
+test('EVERY WEAKENING OF THE GRANT CONTROLS IS URGENT, AND NO TIGHTENING IS', () => {
+  for (const [name, before, after, weakens] of TRANSITIONS) {
+    const verdict = classifyConditionalAccessChange(policy(before), policy(after))
+    assert.equal(verdict.classification, weakens ? 'URGENT' : 'ROUTINE',
+      `${name}: got ${verdict.classification} — ${verdict.because}`)
+  }
+
+  // MIRROR. Without it "no weakening is routine" is satisfied by a classifier that
+  // never says routine at all, which would bury the queue and pass every row above.
+  assert.ok(
+    TRANSITIONS.some(([, before, after, weakens]) =>
+      !weakens && classifyConditionalAccessChange(policy(before), policy(after)).classification === 'ROUTINE'),
+    'routine must stay reachable or the matrix proves nothing')
+})
+
+test('THE OPERATORS ARE EQUIVALENT ON A SINGLE CONTROL, and the record says why', () => {
+  // "All of [mfa]" and "any of [mfa]" are the same requirement. A fix reading
+  // "AND to OR is urgent" breaks exactly here, and this cell passed BEFORE the fix
+  // only because no operator comparison happened at all — so it is the one place a
+  // correct-looking fix regresses something that already worked.
+  const flip = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: ['mfa'] }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa'] }))
+  assert.equal(flip.classification, 'ROUTINE')
+  assert.match(flip.because, /same requirement/i)
+
+  // And it is not routine because the comparison gave up: two controls, same flip,
+  // is urgent. That is what makes the single-control answer a judgement rather than
+  // a blind spot.
+  assert.equal(
+    classifyConditionalAccessChange(
+      policy({ grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] })).classification,
+    'URGENT')
+})
+
+test('A COMPOUND WEAKENING NAMES EVERY RULE THAT FIRED, not the first', () => {
+  // AND [mfa, cd] -> OR [mfa] is urgent under TWO rules: the operator relaxed, and a
+  // requirement was removed. It was already urgent before this fix, but only because
+  // the removal rule tripped first — the operator was never examined. An
+  // implementation returning whichever reason it reached first would keep the
+  // verdict green while the reason underneath it moved, which is the changed-subject
+  // failure we have hit twice. Asserting both reasons is what makes that impossible.
+  const both = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa'] }))
+  assert.equal(both.classification, 'URGENT')
+  assert.match(both.because, /now alternatives/i, 'the operator relaxation must be named')
+  assert.match(both.because, /requirement is gone/i, 'the removed requirement must be named')
+
+  // The other compound: operator relaxed AND an alternative added.
+  const added = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: ['mfa'] }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }))
+  assert.equal(added.classification, 'URGENT')
+  assert.match(added.because, /now alternatives/i)
+  assert.match(added.because, /one more way to satisfy/i)
+})
+
+test('ROUTINE SAYS WHAT WAS COMPARED, never that nothing weakened it', () => {
+  // The sentence that stood over three weakenings was "none of them weakened it" —
+  // a positive safety claim across every dimension at once, including the operator
+  // the function never compared. A reader cannot audit a claim that does not say
+  // what it rests on.
+  const unchanged = classifyConditionalAccessChange(policy(), policy())
+  assert.equal(unchanged.classification, 'ROUTINE')
+  assert.doesNotMatch(unchanged.because, /none of them weakened/i)
+
+  for (const [name, before, after, weakens] of TRANSITIONS) {
+    if (weakens) continue
+    const verdict = classifyConditionalAccessChange(policy(before), policy(after))
+    assert.doesNotMatch(verdict.because, /none of them weakened/i, name)
+    // Every routine record names the dimensions it checked, so the claim is
+    // auditable rather than a blanket reassurance.
+    assert.match(verdict.because, /grant (control|operator)/i, name)
+    assert.match(verdict.because, /session controls are unchanged/i, name)
+    assert.match(verdict.because, /does not model is identical/i, name)
+  }
+})
+
+test('A DENIAL CONTROL HAS NO DIRECTION UNDER THE OPERATOR SEMANTICS', () => {
+  // `block` is a grant control in Microsoft's model and HawkView renders it as
+  // "Block access", so it can share the array with `mfa`. It is not an alternative
+  // way to SATISFY the policy, so removing it from an OR set would be a weakening
+  // where removing anything else is a tightening — every rule reads backwards.
+  //
+  // Not in QA's matrix and not in the report. Found by sweeping for the shape of the
+  // operator defect rather than fixing the instance: a modelled field whose
+  // direction is never computed.
+  const removedBlock = classifyConditionalAccessChange(
+    policy({ grantOperator: 'OR', grantControls: ['mfa', 'block'] }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa'] }))
+  assert.equal(removedBlock.classification, 'UNCLASSIFIED',
+    'removing a denial from an OR set must not be filed as removing an alternative')
+  assert.equal(removedBlock.unknown, 'grant-denial-control')
+
+  const addedBlock = classifyConditionalAccessChange(
+    policy({ grantOperator: 'OR', grantControls: ['mfa'] }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa', 'block'] }))
+  assert.equal(addedBlock.classification, 'UNCLASSIFIED')
+
+  // POSITIVE CONTROL: the same shape with an ordinary control is NOT undetermined,
+  // so this is about denial semantics and not a gate that gave up on any change.
+  assert.equal(
+    classifyConditionalAccessChange(
+      policy({ grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa'] })).classification,
+    'ROUTINE')
+})
+
+test('AND AND OR INVERT AT THE EMPTY SET, so an empty side is undetermined', () => {
+  // AND over no controls requires nothing and admits everything; OR over no controls
+  // admits nothing. The two operators mean opposite things there, so every rule
+  // would read the wrong way round. Microsoft does not permit a policy with neither
+  // grant nor session controls, which makes this a state to report rather than
+  // interpret.
+  const fromEmpty = classifyConditionalAccessChange(
+    policy({ grantOperator: 'OR', grantControls: [] }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa'] }))
+  assert.equal(fromEmpty.classification, 'UNCLASSIFIED')
+  assert.equal(fromEmpty.unknown, 'grant-controls-absent')
+
+  // But an unchanged empty grant set is not a grant change at all, and must still
+  // fall through to the session-control comparison — the production event that made
+  // the old fallback wrong had exactly this shape.
+  const sessionOnly = classifyConditionalAccessChange(
+    policy({ grantControls: [], grantOperator: null, sessionControls: ['signInFrequency'] }),
+    policy({ grantControls: [], grantOperator: null, sessionControls: [] }))
+  assert.equal(sessionOnly.unknown, 'session-controls')
+})
+
+test('a control that only changed case did not change', () => {
+  // `effective-mfa-enforcement.ts` lowercases builtInControls before comparing and
+  // this comparison now does the same, so the two halves of the product agree about
+  // what counts as the same control. Without it, Microsoft altering the casing of a
+  // value would read as one control removed and another added — on an AND policy,
+  // an urgent page for a change that altered nothing.
+  const recased = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }),
+    policy({ grantOperator: 'AND', grantControls: ['MFA', 'CompliantDevice'] }))
+  assert.equal(recased.classification, 'ROUTINE', recased.because)
+
+  // POSITIVE CONTROL: a genuinely different control is still seen.
+  assert.equal(
+    classifyConditionalAccessChange(
+      policy({ grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }),
+      policy({ grantOperator: 'AND', grantControls: ['MFA'] })).classification,
+    'URGENT')
+})
+
+test('THE RECORD KEEPS MICROSOFT\'S CASING for the control it names', () => {
+  // Caught by the routine-wording test above, which failed with "compliantdevice".
+  // Comparing case-insensitively is right; carrying the lowercased form into the
+  // sentence is not. An MSP reading the record goes looking for that control in the
+  // portal, and the portal calls it compliantDevice.
+  const removal = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }),
+    policy({ grantOperator: 'AND', grantControls: ['mfa'] }))
+  assert.equal(removal.classification, 'URGENT')
+  assert.match(removal.because, /compliantDevice/, 'the name must survive the comparison unchanged')
+
+  // Both directions: an added control too, and the operator-relaxation wording that
+  // lists the whole resulting set.
+  const relaxed = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }))
+  assert.match(relaxed.because, /compliantDevice/)
+
+  const added = classifyConditionalAccessChange(
+    policy({ grantOperator: 'OR', grantControls: ['mfa'] }),
+    policy({ grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }))
+  assert.match(added.because, /compliantDevice/)
+
+  // And the degenerate no-op still reports nothing at all, so this is not satisfied
+  // by a string that always contains every control name.
+  assert.doesNotMatch(
+    classifyConditionalAccessChange(policy(), policy()).because, /compliantDevice/)
 })

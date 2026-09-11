@@ -469,9 +469,11 @@ Microsoft's grant controls combine with `OR` or `AND`:
 - **`AND`** — every control must be satisfied, so removing one removes a
   *requirement* and weakens it.
 
-Where before/after values are missing, or the combination operator is unknown, the
-outcome is **"change detected; impact unknown"** rather than a silent pass — the
-same rule as an unrecognised permission, for the same reason.
+Where the direction cannot be determined, the outcome is **"change detected; impact
+unknown"** rather than a silent pass — the same rule as an unrecognised permission,
+for the same reason. That covers missing before/after values, an unknown combination
+operator, a grant set empty on one side (where `AND` and `OR` invert), and a
+denial control moving (where every rule above reads backwards).
 
 **Routine requires positive evidence, not the absence of a modelled change.** The
 first version ended with a fallback saying the policy changed *without* removing a
@@ -485,8 +487,13 @@ It was not hypothetical: one of the seven production conditional-access changes 
 off the end. Session controls are where a sign-in session is extended from an hour
 to weeks.
 
-Two things now stand between a change and `ROUTINE`:
+Three things now stand between a change and `ROUTINE`:
 
+- **Every modelled dimension of the grant controls is actually compared** — the
+  operator in both directions, controls added as well as removed. This was the third
+  thing only after QA found that it was not: the operator was modelled and never
+  compared, and three weakenings were filed as records underneath the two bullets
+  below. See *The grant operator was modelled and never compared*.
 - **Session controls are modelled far enough to notice they moved, and no
   further.** Their direction depends on values not captured — `persistentBrowser:
   always` weakens a policy and `never` strengthens it — so inferring a direction
@@ -597,3 +604,136 @@ And the reader note from above, repeated here because it will bite in this code
 rather than in the lifecycle: a three-valued investigation state read by
 two-valued code fails in one direction. Ask `investigation === 'RESOLVED'`, never
 `!== 'OPEN'`, or a record reads as resolved.
+
+## The grant operator was modelled and never compared
+
+Found by QA on the conditional-access path, confirmed from the code, and the sweep
+for siblings found two more. Three weakenings were classified `ROUTINE`:
+
+```
+AND [mfa, compliantDevice]  ->  OR  [mfa, compliantDevice]    operator relaxed
+OR  [mfa]                   ->  OR  [mfa, compliantDevice]    alternative added
+AND [mfa]                   ->  OR  [mfa, compliantDevice]    both at once
+```
+
+The first is close to the clearest relaxation available short of disabling the
+policy: a user who needed MFA **and** a compliant device now needs either. It was
+filed as a record.
+
+The mechanism is small and visible. `grantOperator` appeared three times in the
+file — the declaration and two reads, both of `before.`, both gated on
+`removed.length > 0`. `after.grantOperator` was never read, and `removed` was the
+only thing computed from the control sets. So the only transition the function
+could see was *a control disappearing from an AND policy*. The operator itself, and
+every control **added**, were invisible.
+
+### Why nothing caught it, which is the part that generalises
+
+`grantOperator` is a **modelled** field, so a correct producer excludes it from
+`unmodelledFingerprint` by construction. The unmodelled guard — the thing built
+specifically so "we did not look at that" can never resolve to "it was fine" — is
+*designed* not to fire here.
+
+**The better the producer, the more certainly this slips through.** A safety net
+covering everything except what you decided to handle yourself leaves the handled
+part uniquely undefended, and it cannot be widened to cover that part without
+destroying what makes it useful: a digest including the modelled fields would
+differ whenever anything changed at all, which is the mistake that made the
+OR-removal branch unreachable the first time. So the only defence inside the
+modelled set is that every modelled dimension is actually compared. That is now one
+function, `grantChangeVerdict`, rather than a condition per case.
+
+The irony is instructive rather than embarrassing: this function exists because of
+the correction that *removing a grant control does not always weaken a policy* — a
+statement **about the operator**. The operator was modelled precisely to get that
+case right, and a change *to* it was never classified.
+
+### The full transition matrix
+
+`AND(S)` needs every control in `S`; `OR(S)` needs at least one. A policy is weaker
+when more sessions pass it.
+
+| transition | direction | before | after |
+|---|---|---|---|
+| AND → OR (≥2 controls) | **weakens** | routine | urgent |
+| control added to OR | **weakens** | routine | urgent |
+| AND → OR *and* a control added | **weakens** | routine | urgent |
+| control removed from AND | weakens | urgent | urgent |
+| AND → OR *and* a control removed | weakens | urgent | urgent, both reasons named |
+| control removed from OR | tightens | routine | routine |
+| control added to AND | tightens | routine | routine |
+| OR → AND | tightens | routine | routine |
+
+A weakening is `URGENT`, not `UNCLASSIFIED`. `UNCLASSIFIED` means *changed, impact
+undetermined*; for these transitions the impact is determined exactly, and
+understating what we know would be its own inaccuracy.
+
+### The degenerate cells, where a correct-looking fix breaks something that worked
+
+On a **single** control the operators are equivalent — "all of [mfa]" *is* "any of
+[mfa]" — so neither `AND [mfa] → OR [mfa]` nor its reverse weakens anything. Both
+were correct before this fix **by accident**, because no operator comparison
+happened at all. The natural fix, "AND to OR is urgent", says exactly the wrong
+thing here. This feature has now produced a defect at each edge.
+
+The record says why, rather than just returning routine: *"the two are the same
+requirement: all of one control is any of one control."* A reader who sees an
+operator change filed as a record needs that sentence to trust it.
+
+### Two things the matrix does not cover
+
+**`AND [mfa, cd] → OR [mfa]` was already urgent — for a reason unrelated to the
+operator.** The removal rule tripped before the operator was ever considered. A fix
+that changed which rule fires would keep the verdict green while the reason moved
+underneath it, which is the changed-subject failure we have hit twice. So a
+weakening now reports **every** rule that fired rather than the first, and a test
+asserts both sentences are present. A list cannot have that failure.
+
+**A denial control has no direction under these semantics.** `block` is a grant
+control in Microsoft's model and HawkView already renders it as "Block access", so
+it can arrive in the same array as `mfa`. It is not an alternative way to *satisfy*
+a policy, so every rule above reads backwards for it: removing it from an OR set
+weakens the policy where removing anything else strengthens it. That is the silent
+direction — a record, not a page.
+
+How Microsoft combines a denial with a grant is not something this comparison has
+evidence for, so it does not guess: a change involving one is `UNCLASSIFIED`. Same
+discipline as session controls, and the same reason. **This is not in QA's matrix or
+in the report** — it came from sweeping for the shape rather than fixing the
+instance, and it is the only finding here that was not handed to me.
+
+### Empty grant sets, and casing
+
+`AND` over no controls requires nothing and admits everything; `OR` over no
+controls admits nothing. **The operators invert at the empty set**, so every rule
+would read the wrong way round. Microsoft does not permit a policy with neither
+grant nor session controls, so a grant change with an empty side is reported rather
+than interpreted. An *unchanged* empty set is not a grant change at all and still
+falls through to the session-control comparison — the production event that made
+the old fallback wrong had exactly that shape.
+
+Controls are compared case-insensitively, matching `effective-mfa-enforcement.ts`,
+which lowercases `builtInControls` before comparing. Without it a casing change from
+Microsoft reads as one control removed and another added — on an AND policy, an
+urgent page for a change that altered nothing.
+
+**But the comparison normalises and the record does not.** The first version
+lowercased both, and an MSP would have read "compliantdevice" in a sentence written
+for them to act on — a name that does not appear in their portal. Caught by the
+routine-wording test, not by the tests written for casing.
+
+### What to check first when this breaks
+
+- **A policy change filed as a record that should have paged.** Read the `because`
+  string first. It now names which dimensions were compared, so the absent dimension
+  is visible in the record itself. That is the whole reason the old sentence — "none
+  of them weakened it", a positive safety claim over a dimension never compared — was
+  replaced rather than reworded.
+- **An urgent page for a change that altered nothing.** Check the casing of the
+  control names on both sides, then check that the normalisation is applied to both
+  the set and the probe. Normalising one side makes every camelCase control read as
+  removed; a mutation of that line turned six unrelated tests red for a reason none
+  of them named.
+- **A verdict that is right with the wrong reason.** Every weakening lists each rule
+  that fired. If a record shows one reason where two apply, the collection step was
+  short-circuited.

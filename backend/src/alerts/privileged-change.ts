@@ -282,6 +282,177 @@ export function classifyDirectoryChange(
  * Where the evidence is missing or unparseable this reports "change detected;
  * impact unknown" rather than passing silently — the same rule as an unrecognised
  * permission, and for the same reason. */
+/** Which way a grant-control change moved the policy.
+ *
+ * THE SEMANTICS, and every rule below follows from them:
+ *
+ *   AND(S)  a session must satisfy EVERY control in S
+ *   OR(S)   a session must satisfy AT LEAST ONE control in S
+ *
+ * A policy is WEAKER when more sessions pass it. So relaxing AND to OR weakens it,
+ * adding an alternative to an OR set weakens it, and removing a requirement from an
+ * AND set weakens it. The other three transitions tighten it.
+ *
+ * THE DEFECT THIS REPLACES READ ONLY ONE OF THOSE. `before.grantOperator` was read
+ * twice, `after.grantOperator` never, and `removed` was the only thing computed
+ * from the control sets — so a policy going from "MFA AND a compliant device" to
+ * "MFA OR a compliant device" was filed as a record. That is close to the clearest
+ * relaxation available short of disabling the policy.
+ *
+ * WHY NOTHING CAUGHT IT, which is the part that generalises. `grantOperator` is a
+ * MODELLED field, so a correct producer excludes it from `unmodelledFingerprint` by
+ * construction — the unmodelled guard is designed not to fire here, and the better
+ * the producer, the more certainly a gap inside the modelled set slips through. A
+ * safety net covering everything except what you decided to handle yourself leaves
+ * the handled part uniquely undefended. The net cannot be widened to cover it
+ * without destroying what makes it useful, so the only defence is that every
+ * modelled dimension is actually compared — which is what this function is for.
+ */
+type GrantVerdict =
+  | Readonly<{ kind: 'WEAKER'; reasons: readonly string[] }>
+  | Readonly<{ kind: 'UNDETERMINED'; because: string; unknown: string }>
+  | Readonly<{ kind: 'NOT_WEAKER'; compared: string }>
+
+/** Controls that DENY access rather than offering a way to satisfy the policy.
+ *
+ * `block` is a grant control in Microsoft's model and HawkView already renders it
+ * as "Block access" (`tenant-sync.service.ts`), so it can arrive in the same array
+ * as `mfa`. Every rule above reads BACKWARDS for it: a denial is not an
+ * alternative way to pass, so removing it from an OR set weakens the policy where
+ * removing any other control strengthens it.
+ *
+ * How Microsoft combines a denial with a grant is not something this comparison has
+ * evidence for, so it does not guess a direction — a change involving one is
+ * reported as undetermined. Same discipline as session controls, and the same
+ * reason: the honest answer is that we did not look, not a direction inferred from
+ * presence. This is not in the report or in QA's matrix; it is the silent direction
+ * of the same gap, found by sweeping for the shape rather than fixing the instance. */
+const DENIAL_CONTROLS: ReadonlySet<string> = new Set(['block'])
+
+/** The controls on one side, for case-insensitive membership tests.
+ *
+ * Matching `effective-mfa-enforcement`, which lowercases `builtInControls` before
+ * comparing, so both halves of the product agree about what counts as the same
+ * control. No producer for `ConditionalAccessState` exists yet; without this, a
+ * casing change from Microsoft would read as one control removed and another added
+ * — on an AND policy, an urgent page for a change that altered nothing.
+ *
+ * A SET RATHER THAN AN ARRAY, and lowercasing happens here and at the probe below,
+ * because the failure mode is normalising ONE SIDE. Lowercase only the haystack and
+ * every camelCase control reads as removed from a policy that did not change; that
+ * is not a hypothetical — it is what a mutation of this line produced, and it turned
+ * six unrelated tests red for a reason none of them named. */
+const lowercased = (controls: readonly string[]): ReadonlySet<string> =>
+  new Set(controls.map((control) => control.toLowerCase()))
+
+/** Null when the grant dimension did not move, so the caller can say that rather
+ * than describe a comparison it never needed to make. */
+function grantChangeVerdict(
+  before: ConditionalAccessState,
+  after: ConditionalAccessState,
+): GrantVerdict | null {
+  // Compared case-insensitively, REPORTED as Microsoft sent them. Lowercasing the
+  // comparison stops a recased value reading as a change; lowercasing the report
+  // would hand an MSP a control name that does not appear in their own portal.
+  const beforeSet = lowercased(before.grantControls)
+  const afterSet = lowercased(after.grantControls)
+  const removed = before.grantControls.filter((control) => !afterSet.has(control.toLowerCase()))
+  const added = after.grantControls.filter((control) => !beforeSet.has(control.toLowerCase()))
+  const operatorChanged = before.grantOperator !== after.grantOperator
+
+  if (!operatorChanged && removed.length === 0 && added.length === 0) return null
+
+  if (before.grantOperator === null || after.grantOperator === null) {
+    return {
+      kind: 'UNDETERMINED',
+      because:
+        'Grant controls changed and the operator combining them is unknown on one side, so whether a ' +
+        'requirement or an alternative moved cannot be determined. Change detected; impact unknown.',
+      unknown: 'grant-operator-unknown',
+    }
+  }
+
+  if (before.grantControls.length === 0 || after.grantControls.length === 0) {
+    // AND over no controls requires nothing; OR over no controls admits nothing. The
+    // operators invert at the empty set, so every rule below would read the wrong
+    // way. Microsoft does not permit a policy with neither grant nor session
+    // controls, which makes this a state to report rather than interpret.
+    return {
+      kind: 'UNDETERMINED',
+      because:
+        'Grant controls changed and one side has none at all, where the AND and OR operators mean ' +
+        'opposite things. Change detected; impact unknown.',
+      unknown: 'grant-controls-absent',
+    }
+  }
+
+  const denials = [...removed, ...added].filter((control) => DENIAL_CONTROLS.has(control.toLowerCase()))
+  if (denials.length > 0) {
+    return {
+      kind: 'UNDETERMINED',
+      because:
+        `A control that denies access rather than granting it moved (${denials.join(', ')}). It is not an ` +
+        'alternative way to satisfy the policy, so the operator semantics do not describe its direction. ' +
+        'Change detected; impact unknown.',
+      unknown: 'grant-denial-control',
+    }
+  }
+
+  const controlsUnchanged = removed.length === 0 && added.length === 0
+  // ON A SINGLE CONTROL THE OPERATORS ARE EQUIVALENT. "All of [mfa]" and "any of
+  // [mfa]" are the same requirement, so the flip changes nothing and must not be
+  // reported as a weakening. This is the cell a fix reading "AND to OR is urgent"
+  // gets wrong, and it passed before only because no operator comparison happened.
+  const operatorFlipIsVacuous = controlsUnchanged && after.grantControls.length === 1
+
+  const reasons: string[] = []
+  if (before.grantOperator === 'AND' && after.grantOperator === 'OR' && !operatorFlipIsVacuous) {
+    reasons.push(
+      `Grant controls that were all required are now alternatives (${after.grantControls.join(', ')}), so any ` +
+      'one of them alone satisfies the policy where previously every one was needed.')
+  }
+  if (removed.length > 0 && before.grantOperator === 'AND') {
+    reasons.push(
+      `A required grant control was removed (${removed.join(', ')}) from a policy whose controls are ` +
+      'combined with AND, so a requirement is gone.')
+  }
+  if (added.length > 0 && after.grantOperator === 'OR') {
+    reasons.push(
+      `A grant control was added (${added.join(', ')}) to a policy whose controls are combined with OR, ` +
+      'so it is one more way to satisfy the policy without the others.')
+  }
+  if (reasons.length > 0) return { kind: 'WEAKER', reasons }
+
+  if (operatorFlipIsVacuous) {
+    return {
+      kind: 'NOT_WEAKER',
+      compared:
+        `The grant operator changed from AND to OR over a single control (${after.grantControls.join(', ')}), ` +
+        'where the two are the same requirement: all of one control is any of one control.',
+    }
+  }
+  if (removed.length > 0 && before.grantOperator === 'OR') {
+    return {
+      kind: 'NOT_WEAKER',
+      compared:
+        `A grant control was removed (${removed.join(', ')}) from a policy whose controls are combined ` +
+        'with OR. That removes an ALTERNATIVE way to satisfy the policy rather than a requirement, so it ' +
+        'does not weaken it.',
+    }
+  }
+  const moved = [
+    ...(removed.length > 0 ? [`removed ${removed.join(', ')}`] : []),
+    ...(added.length > 0 ? [`added ${added.join(', ')}`] : []),
+    ...(operatorChanged ? [`operator ${before.grantOperator} to ${after.grantOperator}`] : []),
+  ]
+  return {
+    kind: 'NOT_WEAKER',
+    compared:
+      'The grant controls and the operator combining them were compared in both directions ' +
+      `(${moved.join('; ')}) and no change makes the policy easier to satisfy.`,
+  }
+}
+
 export function classifyConditionalAccessChange(
   before: ConditionalAccessState | null,
   after: ConditionalAccessState | null,
@@ -305,17 +476,18 @@ export function classifyConditionalAccessChange(
       'so the policy no longer applies to them.')
   }
 
-  const removed = before.grantControls.filter((control) => !after.grantControls.includes(control))
-  if (removed.length > 0 && before.grantOperator === 'AND') {
-    return urgent(
-      `A required grant control was removed (${removed.join(', ')}) from a policy whose controls are ` +
-      'combined with AND, so a requirement is gone.')
+  const grant = grantChangeVerdict(before, after)
+  if (grant !== null && grant.kind === 'WEAKER') {
+    // EVERY reason that fired, not the first. A compound change weakened the policy
+    // more than once and saying so is the accurate report -- but the reason this is
+    // a list rather than an early return is narrower: AND [mfa, cd] -> OR [mfa] is
+    // urgent under TWO rules, and an implementation returning whichever it reached
+    // first would keep the verdict green while the reason underneath it moved. That
+    // is the changed-subject shape, and a list cannot have it.
+    return urgent(grant.reasons.join(' '))
   }
-  if (removed.length > 0 && before.grantOperator === null) {
-    return unclassified(
-      'A grant control was removed from a policy whose combination operator is unknown, so whether a ' +
-      'requirement or an alternative was removed cannot be determined. Change detected; impact unknown.',
-      'grant-operator-unknown')
+  if (grant !== null && grant.kind === 'UNDETERMINED') {
+    return unclassified(grant.because, grant.unknown)
   }
 
   // NOTHING MODELLED WEAKENED. That is not the same as nothing weakened, and this
@@ -346,12 +518,16 @@ export function classifyConditionalAccessChange(
       'unmodelled-dimension')
   }
 
-  // Everything modelled is accounted for and the unmodelled digest is identical,
-  // so the only changes were ones understood and shown not to weaken it.
-  return removed.length > 0
-    ? routine(
-      `A grant control was removed (${removed.join(', ')}) from a policy whose controls are combined ` +
-      'with OR. That removes an ALTERNATIVE way to satisfy the policy rather than a requirement, so it ' +
-      'does not weaken it.')
-    : routine('The policy changed only in dimensions this comparison models, and none of them weakened it.')
+  // SAY WHAT WAS COMPARED, not that nothing weakened it.
+  //
+  // The previous sentence here was "none of them weakened it", which is a positive
+  // safety claim over every dimension at once — including the grant operator, which
+  // the function did not compare at all. Three weakenings were filed as records
+  // underneath that sentence. A reader cannot audit a claim that does not say what
+  // it rests on, so this one names the comparison and stops there.
+  return routine(
+    `${grant === null
+      ? 'The grant controls and their combination operator are unchanged.'
+      : grant.compared} Session controls are unchanged, and the digest of every dimension this ` +
+    'comparison does not model is identical.')
 }
