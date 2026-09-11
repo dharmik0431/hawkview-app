@@ -441,6 +441,30 @@ export type RiskAssessmentCountAccuracy = 'EXACT' | 'AT_LEAST' | 'UNKNOWN'
  * "we could not interpret some sign-in events" send a technician to different
  * places.
  */
+/**
+ * The rebuilt engine's own withholding vocabulary, carried rather than mapped.
+ *
+ * These are not translated into the older reasons above. Several are close
+ * enough that a mapping would look reasonable and lose the distinction that
+ * makes them worth having: NEVER_COLLECTED and a stale collection both leave a
+ * tenant without current evidence, and "we have not collected since August" and
+ * "we have never successfully collected" are different sentences to put in
+ * front of an MSP. One is a gap; the other is a tenant that was never wired up.
+ *
+ * NOTHING_APPLICABLE is the one most easily misread as a result. It means no
+ * evidence was in scope for any detector, which is a statement about scope and
+ * not about the tenant -- the checks had nothing to examine rather than
+ * examining and finding nobody.
+ */
+export type NativeWithheldReason =
+  | 'NEVER_COLLECTED'
+  | 'UNREADABLE_NOW'
+  | 'UNINTERPRETED_EVENTS'
+  | 'NOTHING_APPLICABLE'
+  | 'CAPACITY_EXCEEDED'
+  | 'DETECTOR_FAILED'
+  | 'UNRESOLVED_SUBJECT_IDENTITY'
+
 export type RiskAssessmentCountReason =
   | 'UNRESOLVED_SUBJECT_IDENTITY'
   | 'UNINTERPRETABLE_EVIDENCE'

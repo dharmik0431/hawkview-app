@@ -31,6 +31,7 @@ import {
 import type {
   CorrelationRef,
   IdentityRiskChannelReason,
+  NativeWithheldReason,
   RiskAssessmentCountReason,
   MicrosoftEntraRiskyUser,
   MicrosoftEntraRiskyUsersView,
@@ -899,6 +900,87 @@ export type RiskyUserCountInput = {
  * events" are different problems with different next steps, and collapsing them
  * into one generic "unavailable" is the defect this rebuild exists to remove.
  */
+/**
+ * The rebuilt engine's withholding reasons, in the client's words.
+ *
+ * Deliberately a second table rather than a mapping onto the older reasons.
+ * Three pairs are close enough that a mapping would have looked reasonable:
+ * NEVER_COLLECTED beside COLLECTION_STALE, UNINTERPRETED_EVENTS beside
+ * UNINTERPRETABLE_EVIDENCE, CAPACITY_EXCEEDED beside CAPACITY_LIMIT. Each pair
+ * differs in the sentence a technician acts on, and the mapping is where that
+ * difference would go quietly.
+ *
+ * The one that matters most on the fleet is the first. A tenant with nine rows
+ * whose last event was in August has a collection gap. A tenant that has never
+ * successfully collected was never wired up. Both leave the surface without
+ * current evidence and they are not the same problem, and only one of them is
+ * fixed by waiting.
+ */
+const nativeWithheldCopy: Readonly<
+  Record<NativeWithheldReason, { headline: string; caption: string }>
+> = {
+  NEVER_COLLECTED: {
+    headline: 'Not counted — nothing has ever been collected',
+    caption:
+      'HawkView has never successfully collected this evidence for this tenant, so there is no basis for any number. This is not a gap in an otherwise working feed and waiting will not resolve it — it points at collection never having been established for this tenant. It is not an all-clear.',
+  },
+  UNREADABLE_NOW: {
+    headline: 'Not counted — the evidence could not be read on this run',
+    caption:
+      'Evidence exists and this run could not read it. That is a fault on HawkView’s side rather than a statement about the tenant, and a later run may succeed. Nothing here has been checked and cleared.',
+  },
+  UNINTERPRETED_EVENTS: {
+    headline: 'Not counted — some events were not interpreted',
+    caption:
+      'This tenant’s evidence contains events HawkView did not interpret on this run. Rather than count around them and imply the remainder is the whole picture, the total is withheld. What was interpreted is listed below and is unaffected.',
+  },
+  NOTHING_APPLICABLE: {
+    headline: 'Not counted — no evidence was in scope for any check',
+    caption:
+      'Every event this run examined was outside the scope of every check, so no check had anything to assess. This is a statement about scope and not about the tenant: the checks had nothing to examine rather than examining and finding nobody. It is not a zero and it is not an all-clear.',
+  },
+  CAPACITY_EXCEEDED: {
+    headline: 'Not counted — more evidence than this run could read',
+    caption:
+      'The evidence for this tenant exceeded what one run reads, so the part examined is not the whole. A number over part of the evidence would read as a number over all of it, so it is withheld. Findings from the part that was read are real and are listed below.',
+  },
+  DETECTOR_FAILED: {
+    headline: 'Not counted — a check did not complete',
+    caption:
+      'One of HawkView’s checks failed during this run, so the tenant was not fully assessed. The checks that did complete are listed below with their own scope. A total across all of them would claim coverage this run did not have.',
+  },
+  UNRESOLVED_SUBJECT_IDENTITY: {
+    headline: 'Not counted — findings could not be tied to people',
+    caption:
+      'HawkView found activity worth reviewing but could not establish which of it belongs to a person, so it will not state a number of users. The findings themselves are listed below and are unaffected.',
+  },
+}
+
+/** Every headline this build can print for a withheld count, both vocabularies.
+ *
+ * Exported for the guard that keeps the two tables from converging. The tables
+ * exist to say different things; a headline appearing in both means one of them
+ * has quietly adopted the other reason's sentence, and no per-table uniqueness
+ * check can see that.
+ */
+export function allWithheldHeadlines(): { reason: string; headline: string }[] {
+  return [
+    ...Object.entries(nativeWithheldCopy),
+    ...Object.entries(withheldReasonCopy),
+  ].map(([reason, copy]) => ({ reason, headline: copy.headline }))
+}
+
+/** The client's words for one of the rebuilt engine's withholding reasons. */
+export function nativeWithheldReasonCopy(reason: string) {
+  return (
+    nativeWithheldCopy[reason as NativeWithheldReason] ?? {
+      headline: 'Not counted — for a reason this build does not recognise',
+      caption:
+        'The server withheld the total and gave a reason this build of HawkView does not know, so it cannot say what would resolve it. It is not a zero and it is not an all-clear.',
+    }
+  )
+}
+
 const withheldReasonCopy: Readonly<
   Record<RiskAssessmentCountReason, { headline: string; caption: string }>
 > = {

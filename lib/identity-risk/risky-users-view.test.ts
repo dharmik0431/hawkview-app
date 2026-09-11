@@ -13,6 +13,8 @@ import {
   microsoftRiskLevelLabel,
   microsoftVerdictDetail,
   microsoftVerdictPolarity,
+  allWithheldHeadlines,
+  nativeWithheldReasonCopy,
   riskyUserCount,
   riskyUserList,
 } from './risky-users-view.ts'
@@ -1276,5 +1278,92 @@ test('a run that describes a window already closed is distinguishable from a cur
       completedAt: '2026-09-10T12:00:00.000Z',
     }).state,
     'UNDATED'
+  )
+})
+
+test(`the rebuilt engine withholding reasons are carried, not mapped onto the old ones`, () => {
+  // Three pairs are close enough that a mapping would have looked reasonable
+  // and lost the sentence a technician acts on. The one that matters most on
+  // the fleet is the first: a tenant whose last event was in August has a
+  // collection gap; a tenant that has never successfully collected was never
+  // wired up. Both leave the surface without current evidence, they are not the
+  // same problem, and only one of them is fixed by waiting.
+  const reasons = [
+    'NEVER_COLLECTED',
+    'UNREADABLE_NOW',
+    'UNINTERPRETED_EVENTS',
+    'NOTHING_APPLICABLE',
+    'CAPACITY_EXCEEDED',
+    'DETECTOR_FAILED',
+    'UNRESOLVED_SUBJECT_IDENTITY',
+    'A_REASON_SHIPPED_AFTER_THIS_BUILD',
+  ]
+  const headlines = new Set<string>()
+  for (const reason of reasons) {
+    const copy = nativeWithheldReasonCopy(reason)
+    assert.ok(
+      !headlines.has(copy.headline),
+      'two reasons share a headline: ' + reason
+    )
+    headlines.add(copy.headline)
+    assert.ok(
+      !(copy.headline + ' ' + copy.caption).includes(reason),
+      reason + ' printed its own identifier'
+    )
+  }
+
+  // NEVER_COLLECTED must not read as staleness. Waiting fixes one and not the
+  // other, so the words have to send a technician to different places.
+  const never = nativeWithheldReasonCopy('NEVER_COLLECTED')
+  assert.match(never.caption, /never successfully collected/)
+  assert.match(never.caption, /waiting will not resolve it/)
+
+  // NOTHING_APPLICABLE is the one most easily read as a result rather than as
+  // a statement about scope.
+  const nothing = nativeWithheldReasonCopy('NOTHING_APPLICABLE')
+  assert.match(nothing.caption, /not a zero and it is not an all-clear/)
+  assert.match(nothing.caption, /nothing to examine rather than examining/)
+
+  // An unknown reason says it is unknown rather than borrowing a neighbour's
+  // sentence, because the neighbour's sentence names a cause.
+  const unknown = nativeWithheldReasonCopy('A_REASON_SHIPPED_AFTER_THIS_BUILD')
+  assert.match(unknown.headline, /does not recognise/)
+  assert.match(unknown.caption, /not a zero and it is not an all-clear/)
+})
+
+test('the two withholding vocabularies never converge on one sentence', () => {
+  // Found by mutation: rewriting NEVER_COLLECTED's headline to the stale one
+  // passed every check above, because each table only asserted uniqueness
+  // within itself. The tables exist to say different things, so the collision
+  // that matters is between them and no per-table check can see it.
+  //
+  // This is the pair the fleet turns on. A tenant whose last event was in
+  // August has a collection gap; a tenant that has never successfully
+  // collected was never wired up. Waiting fixes one of them.
+  // Keyed on the reason's name, not on the raw list. One reason genuinely
+  // exists in both vocabularies -- UNRESOLVED_SUBJECT_IDENTITY -- and sharing a
+  // sentence there is correct rather than a collision. The first version of
+  // this check forbade every duplicate and failed on that, which would have
+  // pushed me to reword one of them for the test's benefit and make the surface
+  // say two things about one cause.
+  const seen = new Map<string, string>()
+  for (const { reason, headline } of allWithheldHeadlines()) {
+    const owner = seen.get(headline)
+    assert.ok(
+      owner === undefined || owner === reason,
+      'two different reasons print the same headline: ' +
+        owner +
+        ' and ' +
+        reason +
+        ' both say "' +
+        headline +
+        '"'
+    )
+    seen.set(headline, reason)
+  }
+  // And the specific collision, named, so the guard says what it protects.
+  assert.notEqual(
+    nativeWithheldReasonCopy('NEVER_COLLECTED').headline,
+    'Not counted — the evidence is out of date'
   )
 })
