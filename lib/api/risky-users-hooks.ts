@@ -1,21 +1,32 @@
 'use client'
 
 import { useMemo } from 'react'
+import { microsoftChannel } from '@/lib/identity-risk/risky-users-view'
 import {
-  microsoftChannel,
-  riskyUserCount,
-  riskyUserList,
-} from '@/lib/identity-risk/risky-users-view'
-import { useIdentityRiskChannels } from './identity-risk-hooks'
+  nativeRiskyUserCount,
+  nativeRiskyUserList,
+} from '@/lib/identity-risk/native-view'
+import { useNativeRiskyUsersRead } from './risky-users-assessment-hooks'
 
 /**
  * The single read behind all three Risky Users views. The count on the tenant
  * overview, the list and the detail all derive from one assessment, so they
  * cannot show a technician three different answers about the same tenant.
+ *
+ * Pointed at the rebuilt engine's own endpoint. This previously reached the old
+ * engine through useIdentityRiskChannels, which meant every view here rendered
+ * the previous engine's output regardless of what was built on top of it --
+ * a state that builds green, passes both suites and changes nothing a
+ * technician sees, because nothing in either suite asserts which URL is
+ * fetched.
+ *
+ * The old hook is deliberately untouched rather than repointed. The frontend
+ * already in front of customers keeps its route, and the two vocabularies stay
+ * in separate modules so neither can be handed the other's payload.
  */
 export function useRiskyUsers(tenantId: string, enabled = true) {
   const {
-    assessmentView,
+    nativeView,
     assessmentLoading,
     assessmentRequestError,
     assessmentContractError,
@@ -24,35 +35,28 @@ export function useRiskyUsers(tenantId: string, enabled = true) {
     cacheScope,
     retryAssessment,
     retryMicrosoft,
-  } = useIdentityRiskChannels(tenantId, enabled)
+  } = useNativeRiskyUsersRead(tenantId, enabled)
 
   const channel = useMemo(
     () => microsoftChannel(microsoftView),
     [microsoftView]
   )
 
-  const count = useMemo(
-    () =>
-      riskyUserCount({
-        assessment: assessmentView,
-        channel,
-        requestFailed: assessmentRequestError,
-        contractFailed: assessmentContractError,
-      }),
-    [assessmentView, channel, assessmentRequestError, assessmentContractError]
-  )
+  // A failed read and an unreadable response both yield null here rather than
+  // an empty assessment, so the surface reports an absence instead of a result.
+  const readable =
+    assessmentRequestError || assessmentContractError ? null : nativeView
 
-  // Microsoft's records go in so the join can be made per user. The matching
-  // rule lives in the view model, which is where it is tested: same shape and
-  // same ref, never across shapes, and never a claim that Microsoft cleared
-  // someone it could not be asked about.
-  const list = useMemo(
-    () => riskyUserList(assessmentView, channel, microsoftView.users),
-    [assessmentView, channel, microsoftView.users]
-  )
+  const count = useMemo(() => nativeRiskyUserCount(readable), [readable])
+  const list = useMemo(() => nativeRiskyUserList(readable), [readable])
 
   return {
-    assessment: assessmentView,
+    /**
+     * The native response, or null. Kept so a surface can say WHY there is
+     * nothing rather than rendering an empty screen, which is the one reading
+     * that must never be available by accident.
+     */
+    native: nativeView,
     channel,
     count,
     list,

@@ -14,6 +14,7 @@ import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
 import {
   findingEvidenceShape,
   findingEvidenceSummary,
+  runRecency,
   ruleScopeSummary,
   microsoftRiskyUserCountPresentation,
   riskReadinessLabel,
@@ -27,7 +28,10 @@ import {
   microsoftRiskLevelLabel,
   microsoftVerdictDetail,
   microsoftVerdictPolarity,
+  nativeWithheldReasonCopy,
 } from '@/lib/identity-risk/risky-users-view'
+import { detectorTitle } from '@/lib/identity-risk/native-view'
+import type { NativeAssessment } from '@/lib/identity-risk/native-assessment'
 import type {
   MicrosoftChannel,
   MicrosoftVerdictPolarity,
@@ -801,9 +805,115 @@ function CountSummary({ count }: { count: RiskyUserCount }) {
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * What each check had to work with, in the engine's own terms.
+ *
+ * The old coverage panel read rules[] and sources[], which carried a readiness
+ * verdict per rule and a freshness verdict per source. This engine serves the
+ * facts instead -- which detectors ran, which did not and why, and what each
+ * collector had actually achieved -- so the verdict is derived here where the
+ * facts are on screen beside it.
+ *
+ * The collector line is the one to be careful with. A null last-success means
+ * NEVER, not "a long time ago", and the two send a technician to different
+ * places: one is a gap in a working feed, the other is a tenant that was never
+ * wired up, and only one of them is fixed by waiting.
+ */
+function NativeCoverage({
+  native,
+}: {
+  native: Extract<NativeAssessment, { available: true }>
+}) {
+  const recency = runRecency(native.run)
+  return (
+    <details className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900">
+      <summary className="cursor-pointer text-sm font-semibold text-slate-900 dark:text-slate-50">
+        What HawkView checked, and what each collector had
+      </summary>
+
+      {recency.state === 'STALE_RUN' && (
+        <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+          This assessment describes a window that closed on{' '}
+          {time(recency.windowClosedAt)}, before the run finished on{' '}
+          {time(recency.completedAt)}. It is a stored result being shown later
+          rather than a current reading of the tenant.
+        </p>
+      )}
+
+      <div className="mt-3 grid gap-4 sm:grid-cols-2">
+        <div>
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            Checks
+          </h4>
+          <ul className="mt-1.5 space-y-1.5">
+            {native.count.covered.map((detectorId) => (
+              <li
+                key={detectorId}
+                className="text-sm text-slate-800 dark:text-slate-100"
+              >
+                {detectorTitle(detectorId)}{' '}
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  · ran on this tenant
+                </span>
+              </li>
+            ))}
+            {native.count.notCovered.map((entry) => (
+              <li key={entry.detectorId} className="text-sm">
+                <span className="text-slate-800 dark:text-slate-100">
+                  {detectorTitle(entry.detectorId)}
+                </span>
+                <p className="mt-0.5 text-xs leading-5 text-slate-600 dark:text-slate-300">
+                  {nativeWithheldReasonCopy(entry.because).headline}
+                </p>
+              </li>
+            ))}
+            {native.count.covered.length === 0 &&
+              native.count.notCovered.length === 0 && (
+                <li className="text-xs text-slate-500 dark:text-slate-400">
+                  This response did not say which checks ran, so the number
+                  above cannot be read as covering any particular one.
+                </li>
+              )}
+          </ul>
+        </div>
+
+        <div>
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            Collectors
+          </h4>
+          <ul className="mt-1.5 space-y-1.5">
+            {native.collectors.map((collector) => (
+              <li key={collector.source} className="text-sm">
+                <span className="text-slate-800 dark:text-slate-100">
+                  {collector.source}
+                </span>{' '}
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  · {collector.status}
+                </span>
+                <p className="mt-0.5 text-xs leading-5 text-slate-600 dark:text-slate-300">
+                  {collector.lastSuccessfulCollectionAt === null
+                    ? 'Never collected successfully. This is not an old collection — nothing has ever arrived from this source for this tenant.'
+                    : 'Last successful collection ' +
+                      time(collector.lastSuccessfulCollectionAt)}
+                </p>
+              </li>
+            ))}
+            {native.collectors.length === 0 && (
+              <li className="text-xs text-slate-500 dark:text-slate-400">
+                This response reported no collectors, so how current the
+                evidence is cannot be established from it.
+              </li>
+            )}
+          </ul>
+        </div>
+      </div>
+    </details>
+  )
+}
+
 export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
   const {
-    assessment,
+    native,
     channel,
     count,
     list,
@@ -866,7 +976,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                   : 'The latest response could not be read'}
               </p>
               <p className="mt-1 text-xs leading-relaxed">
-                {assessment
+                {native
                   ? 'Users below are from an earlier read and remain open. This failure has not resolved or dismissed any of them, and current coverage cannot be confirmed.'
                   : 'No current result can be confirmed. Missing evidence is not a no-findings result.'}
               </p>
@@ -940,7 +1050,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
             </section>
           )}
 
-          {assessment && <Coverage assessment={assessment} />}
+          {native?.available && <NativeCoverage native={native} />}
         </>
       )}
 
