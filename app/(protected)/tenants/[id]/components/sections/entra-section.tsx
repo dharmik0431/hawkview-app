@@ -1,6 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import { SectionFreshness } from '@/components/tenant/section-freshness'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -56,10 +57,13 @@ function accentBar(p: CaPolicy) {
 }
 
 export default function EntraSection({
+  bundle,
   policies,
   evidence,
   onPolicyClick,
 }: {
+  /** Carried so the section can state how old its own data is. */
+  bundle?: any
   policies: CaPolicy[]
   evidence: PilotEvidenceView | null
   onPolicyClick: (p: CaPolicy) => void
@@ -115,6 +119,7 @@ export default function EntraSection({
 
   return (
     <Card className="rounded-2xl mt-5 shadow-sm bg-white dark:bg-slate-900">
+      <SectionFreshness source={bundle} service="entraId" className="mx-6 mt-6" />
       <CardContent className="p-0">
         <div className="px-6 pt-6">
           {evidence?.securityDefaults.enabled === true && (

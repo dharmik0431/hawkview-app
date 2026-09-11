@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useMemo } from 'react'
+import { SectionFreshness } from '@/components/tenant/section-freshness'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -276,6 +277,11 @@ export default function DnsSection({
 
   return (
     <>
+      <SectionFreshness
+        source={{ tenant }}
+        service="office365"
+        isEmpty={domains.length === 0}
+      />
       <Card className="rounded-2xl shadow-xs border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 w-full">
         <CardContent className="p-6">
           {/* Card Header */}

@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useState, useMemo } from 'react'
+import { SectionFreshness } from '@/components/tenant/section-freshness'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -512,6 +513,7 @@ export default function LicensesSection({
 
   return (
     <div className="space-y-6 mt-4">
+      <SectionFreshness source={bundle} service="office365" />
       {/* 1. Page Summary Strip: 3 Operational Values */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {/* Card 1: Subscribed Products */}

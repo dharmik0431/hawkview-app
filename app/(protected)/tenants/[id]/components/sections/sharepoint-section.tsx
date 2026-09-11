@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useMemo, useState, useEffect, useRef } from 'react'
+import { SectionFreshness } from '@/components/tenant/section-freshness'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -586,6 +587,7 @@ export default function SharePointPage({
 
   return (
     <div className="mt-1 space-y-4 text-slate-900 dark:text-slate-100">
+      <SectionFreshness source={bundle} service="sharePointOneDrive" />
       {/* ================= SINGLE MERGED PAGE HEADER ================= */}
       <div className="flex flex-col gap-2.5 pb-3 border-b border-slate-200 dark:border-slate-800">
         {/* Top Row: Title, Mobile Trigger, Tenant Context, Sync Now Button */}
@@ -659,7 +661,7 @@ export default function SharePointPage({
           <div className="shrink-0">
             <span className="text-slate-500 dark:text-slate-400">Coverage: </span>
             <span className="font-medium text-slate-800 dark:text-slate-200">
-              {serviceFreshnessText || 'D180 usage report active'}
+              {serviceFreshnessText ?? 'Freshness unknown'}
             </span>
           </div>
 
