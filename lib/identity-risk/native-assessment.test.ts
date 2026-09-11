@@ -4,7 +4,7 @@ import {
   adaptNativeAssessment,
   NATIVE_RISKY_USERS_VERSION,
 } from './native-assessment.ts'
-import { nativeRiskyUserCount } from './native-view.ts'
+import { nativeRiskyUserCount, nativeRiskyUserList } from './native-view.ts'
 
 /** A payload the endpoint could actually return, with the fleet's real shape. */
 function available(overrides: Record<string, unknown> = {}) {
@@ -255,9 +255,14 @@ test('an identity the caller may not see is a narrower view, not a failure', () 
             subject: {
               kind: 'DIRECTORY_USER',
               userRef: 'c54eb6ce-0000-0000-0000-000000000001',
-              displayName: 'Alice Chen',
-              userPrincipalName: 'alice.chen@synthetic.invalid',
             },
+            // Beside subject, not inside it. This fixture asserted the name in
+            // the wrong place and so asserted the defect: it passed while the
+            // screen said every identity was unresolved. A fixture written to
+            // match the adapter rather than the wire cannot fail when the
+            // adapter is the thing that is wrong.
+            displayName: 'Alice Chen',
+            userPrincipalName: 'alice.chen@synthetic.invalid',
           },
         ],
       },
@@ -438,4 +443,147 @@ test('a figure never reaches a surface without the scope it is exact over', () =
     })
   )
   assert.match(unscoped.caption, /did not report what it examined/)
+})
+
+test('a resolved name is read from where the server puts it, not where we expected', () => {
+  // The shipped defect. displayName and userPrincipalName are spread onto the
+  // ITEM, beside subject, because resolution happens at read time against the
+  // directory and is not part of what the detector produced. Reading them from
+  // inside subject yields null with no error, and every row then claimed
+  // HawkView could not identify anybody while the payload carried their names.
+  //
+  // Both placements are defensible and neither side was wrong alone -- which
+  // is why nothing failed. This fixture is shaped like the wire rather than
+  // like the adapter, which is the only version of this test that could have
+  // caught it.
+  const wire = {
+    version: NATIVE_RISKY_USERS_VERSION,
+    available: true,
+    subjectsNamed: true,
+    run: {
+      windowStart: '2026-08-11T12:00:00.000Z',
+      windowEnd: '2026-09-10T12:00:00.000Z',
+      completedAt: '2026-09-10T12:00:07.000Z',
+    },
+    collectors: [],
+    coverage: [],
+    count: {
+      accuracy: 'EXACT',
+      value: 1,
+      scope: {
+        evidenceRequested: [],
+        setAside: [],
+        covered: [],
+        notCovered: [],
+      },
+    },
+    claim: { permitted: true },
+    findings: {
+      complete: true,
+      items: [
+        {
+          detectorId: 'credential-failure',
+          subject: {
+            kind: 'DIRECTORY_USER',
+            userRef: 'c54eb6ce-0000-0000-0000-000000000001',
+          },
+          displayName: 'Dara Fixture',
+          userPrincipalName: 'dara@fixture.invalid',
+          signals: [
+            {
+              signal: 'PASSWORD_REJECTED',
+              count: 12,
+              capped: false,
+              latest: {
+                at: '2026-09-09T03:58:00.000Z',
+                kind: 'EVENT_OCCURRED',
+              },
+            },
+          ],
+        },
+      ],
+    },
+  }
+
+  const named = adaptNativeAssessment(wire)
+  assert.ok(named)
+  assert.equal(
+    named!.available && named!.findings[0].subject.displayName,
+    'Dara Fixture'
+  )
+  assert.equal(
+    named!.available && named!.findings[0].subject.userPrincipalName,
+    'dara@fixture.invalid'
+  )
+  // The opaque handle still comes from inside subject and still travels.
+  assert.match(
+    named!.available ? named!.findings[0].subject.ref : '',
+    /^c54eb6ce/
+  )
+
+  const rows = nativeRiskyUserList(named).rows
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].name, 'Dara Fixture')
+  assert.equal(rows[0].email, 'dara@fixture.invalid')
+})
+
+test('a missing name says which of its two causes applies', () => {
+  // "Identity not resolved" is a claim about HawkView's own capability and is
+  // true only when this response names people and this subject had no
+  // directory row. When the response names nobody it is a permission boundary,
+  // and printing our own failure there is a false statement about ourselves on
+  // every row at once -- worse than the opaque handle it replaced, because the
+  // handle invited the question rather than answering it wrongly.
+  const build = (subjectsNamed: boolean) => ({
+    version: NATIVE_RISKY_USERS_VERSION,
+    available: true,
+    subjectsNamed,
+    run: { windowStart: null, windowEnd: null, completedAt: null },
+    collectors: [],
+    coverage: [],
+    count: {
+      accuracy: 'EXACT',
+      value: 1,
+      scope: {
+        evidenceRequested: [],
+        setAside: [],
+        covered: [],
+        notCovered: [],
+      },
+    },
+    claim: { permitted: true },
+    findings: {
+      complete: true,
+      items: [
+        {
+          detectorId: 'credential-failure',
+          subject: {
+            kind: 'DIRECTORY_USER',
+            userRef: 'c54eb6ce-0000-0000-0000-000000000002',
+          },
+          signals: [
+            {
+              signal: 'PASSWORD_REJECTED',
+              count: 3,
+              capped: false,
+              latest: null,
+            },
+          ],
+        },
+      ],
+    },
+  })
+
+  const gated = nativeRiskyUserList(adaptNativeAssessment(build(false))).rows
+  assert.equal(gated[0].name, 'Name not shown for your role')
+  assert.ok(
+    !/not resolved/i.test(gated[0].name),
+    'a permission boundary was rendered as a failure of ours'
+  )
+
+  const unresolved = nativeRiskyUserList(
+    adaptNativeAssessment(build(true))
+  ).rows
+  assert.equal(unresolved[0].name, 'Identity not resolved')
+  assert.notEqual(gated[0].name, unresolved[0].name)
 })
