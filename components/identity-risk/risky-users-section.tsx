@@ -48,7 +48,6 @@ import type {
   RiskAssessment,
 } from '@/lib/identity-risk/types'
 import { cn } from '@/lib/utils'
-import { RiskAssessmentDrawer } from './risk-assessment-drawer'
 
 function time(value: string | null) {
   return value ? new Date(value).toLocaleString() : 'Not reported'
@@ -93,6 +92,233 @@ function LatestCell({ row }: { row: RiskyUserRow }) {
           when HawkView read a setting, not when anything happened
         </span>
       )}
+    </>
+  )
+}
+
+/**
+ * Everything this response holds about one subject, and what to do about it.
+ *
+ * Built on the row rather than on the old envelope's twenty-two fields, so it
+ * shows what actually arrived: every signal with its own count and its own
+ * date, what Microsoft says or why it cannot be asked, and the investigation
+ * steps for each detector involved.
+ *
+ * A signal evaluated with nothing found is a RESULT and reads as one. Rendering
+ * it blank would let a reader take it for a signal that never ran, which is the
+ * distinction the whole contract was reshaped to keep.
+ */
+function RowDetail({
+  row,
+  onClose,
+}: {
+  row: RiskyUserRow | null
+  onClose: () => void
+}) {
+  if (!row) return null
+  const detectorIds = Array.from(
+    new Set(row.reasons.map((reason) => reason.ruleId))
+  )
+  return (
+    <div
+      className="fixed inset-0 z-50 flex justify-end bg-slate-900/40"
+      role="dialog"
+      aria-modal="true"
+      aria-label={'Findings for ' + row.name}
+    >
+      <div className="h-full w-full max-w-xl overflow-y-auto bg-white p-6 shadow-xl dark:bg-slate-950">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-50">
+              {row.name}
+            </h3>
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              {row.subjectType === 'MAILBOX' ? 'Mailbox' : 'User account'}
+              {row.email ? ' · ' + row.email : ''}
+            </p>
+            <p className="mt-0.5 break-all font-mono text-xs text-slate-500 dark:text-slate-400">
+              {row.reference}
+            </p>
+          </div>
+          <Button type="button" variant="outline" size="sm" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+
+        <p className="mt-4 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+          These are investigation leads. Nothing here establishes that this
+          account is compromised, and nothing here establishes that it is safe.
+          HawkView reads Microsoft and changes nothing.
+        </p>
+
+        <section className="mt-5">
+          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
+            What HawkView found
+          </h4>
+          <ul className="mt-2 space-y-3">
+            {row.reasons.map((reason) => {
+              const evidence = findingEvidenceSummary(reason, time)
+              return (
+                <li
+                  key={(reason.signal ?? reason.title) + reason.ruleId}
+                  className="rounded-lg border border-slate-200 p-3 dark:border-slate-800"
+                >
+                  <p className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                    {reason.title}
+                  </p>
+                  <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300">
+                    {evidence.note ??
+                      [evidence.count, evidence.timing]
+                        .filter(Boolean)
+                        .join(', ')}
+                  </p>
+                  <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                    Reported by {detectorTitle(reason.ruleId)}
+                  </p>
+                </li>
+              )
+            })}
+          </ul>
+        </section>
+
+        <section className="mt-5">
+          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
+            What Microsoft says
+          </h4>
+          <div className="mt-2 rounded-lg border border-slate-200 p-3 dark:border-slate-800">
+            <MicrosoftCell row={row} />
+          </div>
+        </section>
+
+        <section className="mt-5">
+          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-50">
+            What to check next
+          </h4>
+          {detectorIds.every(
+            (detectorId) => detectorGuidanceFor(detectorId).length === 0
+          ) ? (
+            <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
+              This build has no investigation steps for these checks. That is a
+              gap in HawkView rather than a sign there is nothing to do.
+            </p>
+          ) : (
+            detectorIds.map((detectorId) => (
+              <div key={detectorId} className="mt-2">
+                <p className="text-xs font-medium text-slate-700 dark:text-slate-200">
+                  {detectorTitle(detectorId)}
+                </p>
+                <ul className="mt-1 list-disc space-y-1 pl-5 text-xs leading-5 text-slate-600 dark:text-slate-300">
+                  {detectorGuidanceFor(detectorId).map((step) => (
+                    <li key={step}>{step}</li>
+                  ))}
+                </ul>
+              </div>
+            ))
+          )}
+          <p className="mt-3 text-xs leading-5 text-slate-500 dark:text-slate-400">
+            Every step is carried out in Microsoft&rsquo;s own tools.
+          </p>
+        </section>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * HawkView's own column. Every row is here because HawkView found something,
+ * so the cell states what, not whether.
+ *
+ * No severity and no priority. The engine rates nothing, and a column that
+ * looked like a rating would be re-inventing the vocabulary this rebuild
+ * removed -- in a different font, which is the only part that would change.
+ */
+function HawkViewCell({ row }: { row: RiskyUserRow }) {
+  const checks = new Set(row.reasons.map((reason) => reason.ruleId)).size
+  return (
+    <>
+      <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-900 dark:text-slate-50">
+        <ShieldAlert
+          className="h-4 w-4 text-amber-600 dark:text-amber-400"
+          aria-hidden="true"
+        />
+        Found
+      </span>
+      <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+        {row.reasons.length} {row.reasons.length === 1 ? 'signal' : 'signals'}
+        {checks > 1 ? ` across ${checks} checks` : ''}
+      </p>
+    </>
+  )
+}
+
+/**
+ * Microsoft's column, and the one sentence on this screen that must never be
+ * wrong in the reassuring direction.
+ *
+ * Microsoft's risky-users channel needs Entra ID P2. Most customer tenants do
+ * not have it, so the honest cell there is a statement about capability -- we
+ * were never allowed to ask. Rendering "no" for that would tell an MSP that
+ * Microsoft looked at this person and cleared them, which is the most
+ * expensive sentence this product could print: HawkView exists precisely so
+ * the MSPs who cannot afford those licences still learn what is happening.
+ *
+ * Four outcomes, four different cells, none of them a dash or a blank:
+ *   flagged · not flagged · cannot be asked · cannot be joined to this subject
+ *
+ * The last two are both "we do not know" and are still not the same thing --
+ * one is about the tenant's licensing, the other about this subject's key --
+ * so each carries the reason rather than a shrug.
+ */
+function MicrosoftCell({ row }: { row: RiskyUserRow }) {
+  const { microsoft, microsoftRecord, because } = row.detection
+
+  if (microsoft === 'REPORTED') {
+    return (
+      <>
+        <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-900 dark:text-slate-50">
+          <ShieldAlert
+            className="h-4 w-4 text-rose-600 dark:text-rose-400"
+            aria-hidden="true"
+          />
+          Flagged
+        </span>
+        {microsoftRecord && (
+          <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300">
+            {microsoftVerdictDetail(microsoftRecord)}
+          </p>
+        )}
+      </>
+    )
+  }
+
+  if (microsoft === 'NOT_REPORTED') {
+    return (
+      <>
+        <span className="text-sm font-medium text-slate-700 dark:text-slate-200">
+          Not flagged
+        </span>
+        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+          Microsoft was asked and did not report this person. That is
+          Microsoft&rsquo;s view of its own telemetry, not agreement that
+          HawkView is wrong.
+        </p>
+      </>
+    )
+  }
+
+  // UNAVAILABLE and NOT_COMPARABLE. Both mean we cannot say, and they are not
+  // the same reason, so the cell says which.
+  return (
+    <>
+      <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-300">
+        <ShieldOff className="h-4 w-4" aria-hidden="true" />
+        {microsoft === 'UNAVAILABLE' ? 'Cannot be asked' : 'Cannot be compared'}
+      </span>
+      <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+        {because ??
+          'HawkView cannot establish what Microsoft says about this person.'}{' '}
+        This is not Microsoft clearing them.
+      </p>
     </>
   )
 }
@@ -546,13 +772,13 @@ function UserRows({
               User
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
-              Detected by
+              HawkView
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
-              HawkView priority
+              Microsoft
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
-              Latest of any reason
+              Latest activity
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
               <span className="sr-only">Open detail</span>
@@ -589,19 +815,10 @@ function UserRows({
                 <NextSteps row={row} />
               </td>
               <td className="px-3 py-3">
-                <DetectedBy row={row} />
+                <HawkViewCell row={row} />
               </td>
               <td className="px-3 py-3">
-                <PriorityBadge row={row} />
-                {row.detection.microsoftRecord && (
-                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                    HawkView&rsquo;s rating of its own finding. Microsoft rates
-                    this person separately, in the cell to the left.
-                  </p>
-                )}
-                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  {row.protection.label}
-                </p>
+                <MicrosoftCell row={row} />
               </td>
               <td className="px-3 py-3 text-sm text-slate-700 dark:text-slate-300">
                 <LatestCell row={row} />
@@ -614,23 +831,17 @@ function UserRows({
                     and then the button was rendered anyway, so the click did
                     nothing. A control that does nothing reads as broken; the
                     absence it was hiding reads as a fact. Say the fact. */}
-                {row.user === null ? (
-                  <span className="text-xs text-slate-500 dark:text-slate-400">
-                    No detail on this response
-                  </span>
-                ) : (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => onOpen(row)}
-                    aria-haspopup="dialog"
-                  >
-                    Investigate
-                    <span className="sr-only"> {row.name}</span>
-                    <ChevronRight className="ml-1 h-4 w-4" aria-hidden="true" />
-                  </Button>
-                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onOpen(row)}
+                  aria-haspopup="dialog"
+                >
+                  Investigate
+                  <span className="sr-only"> {row.name}</span>
+                  <ChevronRight className="ml-1 h-4 w-4" aria-hidden="true" />
+                </Button>
               </td>
             </tr>
           ))}
@@ -1006,9 +1217,11 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const closeDrawer = useCallback(() => setSelectedId(null), [])
-  const selectedUser =
-    [...list.rows, ...list.context].find((row) => row.id === selectedId)
-      ?.user ?? null
+  // The selected ROW, not its old-envelope user. The detail is built from what
+  // this response actually carries, so every row can open one -- which is why
+  // the button is no longer conditional on a field the native path never sets.
+  const selectedRow =
+    [...list.rows, ...list.context].find((row) => row.id === selectedId) ?? null
 
   return (
     <div className="space-y-4" key={`${cacheScope}:${tenantId}`}>
@@ -1133,7 +1346,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
         </>
       )}
 
-      <RiskAssessmentDrawer user={selectedUser} onClose={closeDrawer} />
+      <RowDetail row={selectedRow} onClose={closeDrawer} />
     </div>
   )
 }

@@ -20,7 +20,7 @@
  * these do not degrade gracefully, they render something false. Missing is a
  * state; contradictory is a defect.
  */
-import type { FindingSignal, SignalInstant } from './types'
+import type { CorrelationRef, FindingSignal, SignalInstant } from './types'
 
 export const NATIVE_RISKY_USERS_VERSION = 'hawkview-risky-users/v1'
 
@@ -51,6 +51,14 @@ export type NativeSubject = {
    */
   displayName: string | null
   userPrincipalName: string | null
+  /**
+   * The key that lets this subject be matched against Microsoft's own channel.
+   *
+   * The product's strongest sentence is "flagged independently by both", and it
+   * is unrepresentable without a shared key. Discarding this was why every row
+   * said Microsoft could not be compared.
+   */
+  correlation: CorrelationRef | null
 }
 
 export type NativeFinding = {
@@ -223,6 +231,40 @@ function adaptSignals(value: unknown): FindingSignal[] | null {
  * function, so the seam is visible in the place that spans it instead of being
  * a fact two files apart.
  */
+/**
+ * The join key, with its label deliberately NOT carried across.
+ *
+ * The wire calls this field `matchedBy`, and it says how the subject was
+ * IDENTIFIED -- by object id, or by user principal name on the audit path. It
+ * does not say what `ref` contains: `ref` is minted from the directory object
+ * id on every path, including the audit one, where the subject is matched by
+ * UPN and then referenced by its object id.
+ *
+ * Microsoft's records come through the other adapter, whose `shape` describes
+ * the ref's CONTENTS. The join compares the two for equality, so copying
+ * `matchedBy` into `shape` would compare a statement about method against a
+ * statement about contents. An audit-path subject and a Microsoft record
+ * holding the SAME object id would fail to match, and the row would say
+ * "Microsoft did not flag this person" -- the one sentence on this screen that
+ * must never be produced by a failure of ours.
+ *
+ * So the contents are asserted, because the contract guarantees them, and the
+ * method is not carried into a field that means something else. Latent today
+ * only because the audit-path tenants have no premium licensing and Microsoft's
+ * channel never reports for them; it bites the first audit-fed tenant with P2.
+ */
+function adaptNativeCorrelation(value: unknown): CorrelationRef | null {
+  const source = record(value)
+  if (!source) return null
+  if (source.available === false) {
+    const because = text(source.because, 300)
+    return because ? { available: false, because } : null
+  }
+  if (source.available !== true) return null
+  const ref = text(source.ref, 320)
+  return ref ? { available: true, shape: 'DIRECTORY_OBJECT_ID', ref } : null
+}
+
 function adaptSubject(item: Record<string, unknown>): NativeSubject | null {
   const source = record(item.subject)
   if (!source) return null
@@ -253,6 +295,7 @@ function adaptSubject(item: Record<string, unknown>): NativeSubject | null {
     // when the two disagree.
     displayName: optionalText(item.displayName, 200),
     userPrincipalName: optionalText(item.userPrincipalName, 320),
+    correlation: adaptNativeCorrelation(source.correlation),
   }
 }
 

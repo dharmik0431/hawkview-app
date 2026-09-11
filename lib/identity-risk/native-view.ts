@@ -13,8 +13,10 @@
  * the one reading that must never be available by accident.
  */
 import {
+  detectionFromCorrelation,
   nativeWithheldReasonCopy,
   riskyUserPriorityLabel,
+  type MicrosoftChannel,
   type RiskyUserCount,
   type RiskyUserList,
   type RiskyUserReason,
@@ -22,6 +24,7 @@ import {
 } from './risky-users-view.ts'
 import { signalTitle } from './presentation.ts'
 import type { NativeAssessment } from './native-assessment'
+import type { MicrosoftEntraRiskyUser } from './types.ts'
 
 /**
  * What this build calls each detector on screen.
@@ -296,7 +299,9 @@ export function nativeRiskyUserCount(
  * a technician read position as severity.
  */
 export function nativeRiskyUserList(
-  native: NativeAssessment | null
+  native: NativeAssessment | null,
+  channel: MicrosoftChannel,
+  microsoftUsers: MicrosoftEntraRiskyUser[] | null = null
 ): RiskyUserList {
   if (!native || !native.available) return { rows: [], context: [] }
 
@@ -323,12 +328,15 @@ export function nativeRiskyUserList(
       lastSeenFrom: null,
       lastSeenState: 'NO_REASONS',
       reasons,
-      detection: {
-        microsoft: 'NOT_COMPARABLE',
-        label: 'HawkView',
-        detail: 'HawkView — Microsoft is not compared on this response',
-        microsoftRecord: null,
-      },
+      // The real join, not a placeholder. Four outcomes, none of which may
+      // borrow another's words: Microsoft flagged them, Microsoft did not flag
+      // them, Microsoft cannot be asked about this tenant at all, and we hold
+      // Microsoft's channel but cannot tie this subject to it.
+      detection: detectionFromCorrelation(
+        finding.subject.correlation,
+        channel,
+        microsoftUsers
+      ),
       protection: {
         label: 'Protection not reported on this response',
         tone: 'unknown',

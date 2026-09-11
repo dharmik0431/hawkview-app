@@ -48,7 +48,14 @@ export function useRiskyUsers(tenantId: string, enabled = true) {
     assessmentRequestError || assessmentContractError ? null : nativeView
 
   const count = useMemo(() => nativeRiskyUserCount(readable), [readable])
-  const list = useMemo(() => nativeRiskyUserList(readable), [readable])
+  // Microsoft's records go in so the join can be made per user. The matching
+  // rule lives in the view model, which is where it is tested: same contents
+  // and same ref, and never a claim that Microsoft cleared someone it could
+  // not be asked about.
+  const list = useMemo(
+    () => nativeRiskyUserList(readable, channel, microsoftView.users),
+    [readable, channel, microsoftView.users]
+  )
 
   return {
     /**
