@@ -1080,6 +1080,10 @@ model EncryptedSecret {
   ciphertext           Bytes
   initializationVector Bytes    @map("initialization_vector")
   authenticationTag    Bytes    @map("authentication_tag")
+  /// Which SECRET_ENCRYPTION_KEY version sealed this row. No default on purpose:
+  /// a writer that omits it must fail loudly rather than be guessed for, because a
+  /// mislabelled row is exactly as unreadable as an unlabelled one.
+  keyVersion           Int      @map("key_version")
   legacyReference      String?  @unique @map("legacy_reference") @db.VarChar(500)
   createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)

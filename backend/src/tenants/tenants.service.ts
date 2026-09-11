@@ -813,6 +813,8 @@ export class TenantsService {
             clientId: input.clientId,
             clientSecret: input.clientSecret,
             secretId: `tenant-${microsoftTenantId}-microsoft-client-secret`,
+            organizationId: organizationIds[0],
+            customerTenantId: existing.id,
           })
         const now = new Date()
         const tenant = await this.prisma.customerTenant.update({
@@ -857,6 +859,10 @@ export class TenantsService {
           clientId: input.clientId,
           clientSecret: input.clientSecret,
           secretId: `tenant-${microsoftTenantId}-microsoft-client-secret`,
+          organizationId: organizationIds[0],
+          // No tenant row exists yet on this path: the credential is stored before
+          // the tenant is created. See secret-owner.ts.
+          customerTenantId: null,
         })
       const now = new Date()
       const tenant = await this.prisma.customerTenant.create({
