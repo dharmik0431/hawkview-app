@@ -180,3 +180,44 @@ test('a subject with no directory row stays opaque, not blank and not invented',
   const withName = await matched.subject.assessment(request, 'tenant-1') as Record<string, any>
   assert.equal(withName.findings.items[0].displayName, 'Eric Raymond')
 })
+
+test("the name sits BESIDE the subject, where the consumer reads it", async () => {
+  // THE DEFECT NO TEST ON EITHER SIDE COULD SEE. The name was spread at the ITEM
+  // level and the consumer reads it from within `subject`. Both sides were
+  // internally consistent — 1,273 tests here, 469 there, all green — and nothing
+  // compared the two positions. So every row rendered "identity not resolved"
+  // while resolution worked perfectly.
+  //
+  // Asserting PRESENCE is what both suites already did. This asserts POSITION,
+  // which is the only thing that fails when two sides disagree about where a
+  // field lives.
+  const permitted = controller({ evidenceDetailAllowed: true, directory: [eric] })
+  const response = await permitted.subject.assessment(request, "tenant-1") as Record<string, any>
+
+  const [item] = response.findings.items
+  assert.equal(item.displayName, "Eric Raymond")
+  assert.equal(item.userPrincipalName, "eric@theraymonds.com")
+  // And NOT beside it. A reader looking inside `subject` finds nothing when the
+  // name is spread one level out, which is exactly what happened.
+  assert.equal("displayName" in item.subject, false)
+  assert.equal("userPrincipalName" in item.subject, false)
+  // The opaque ref survives alongside the name rather than being replaced by it,
+  // so a row stays joinable once it is also readable.
+  assert.equal(item.subject.userRef, "subject:c54eb6ce")
+})
+
+test("the two roles do not render the same payload", async () => {
+  // What made a field position urgent rather than cosmetic: subjectsNamed true and
+  // false produced IDENTICAL screens, so a technician who may see names and one
+  // who may not both read it as HawkView failing to identify anyone. The role gate
+  // was invisible.
+  const named = controller({ evidenceDetailAllowed: true, directory: [eric] })
+  const hidden = controller({ evidenceDetailAllowed: false, directory: [eric] })
+
+  const a = await named.subject.assessment(request, "tenant-1")
+  const b = await hidden.subject.assessment(request, "tenant-1")
+
+  assert.notDeepEqual(a, b, "the permitted and restricted payloads must differ")
+  assert.equal(serialised(a).includes("Eric Raymond"), true)
+  assert.equal(serialised(b).includes("Eric Raymond"), false)
+})

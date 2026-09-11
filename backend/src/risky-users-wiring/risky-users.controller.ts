@@ -100,9 +100,25 @@ export class RiskyUsersController {
         items: run.findings.map(finding => ({
           detectorId: finding.detectorId,
           subject: finding.subject,
+          // THE NAME SITS BESIDE THE SUBJECT, NOT INSIDE IT, and the reason is
+          // about provenance rather than convenience.
+          //
+          // `finding.subject` is what the DETECTOR produced. The name is an
+          // enrichment this controller adds at read time by querying the
+          // directory, when the role permits — it is not part of the detection.
+          // Folding it into `subject` would present a read-time lookup as
+          // something the detector found, and the consumer reads it from the
+          // item for exactly that reason.
+          //
+          // I briefly moved it inside, on the argument that the frontend type
+          // modelled it there. That type was evidence about one author's
+          // assumption, not about the contract — and the move would have
+          // re-broken the screen after the consumer had already fixed its own
+          // side. Verified against the consumer directly rather than a
+          // description of it: `adaptSubject(item)` reads `item.displayName`.
+          //
           // Present only when the role permits AND the directory row exists.
-          // A subject with no match renders as the opaque ref rather than an
-          // empty string or an invented placeholder — absent, not blank.
+          // Absent, not blank, never an invented placeholder.
           ...(identities.get(subjectRefOf(finding)) ?? {}),
           signals: signalsOf(finding),
         })),
