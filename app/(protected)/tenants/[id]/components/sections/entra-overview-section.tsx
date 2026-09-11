@@ -1,6 +1,7 @@
 'use client'
 
 import { useMemo } from 'react'
+import { SectionFreshness } from '@/components/tenant/section-freshness'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { tenantUserMfaRegistration } from '@/lib/tenants/mfa-status'
@@ -354,6 +355,7 @@ export default function EntraOverviewSection({
 
   return (
     <div className="mt-4 space-y-6">
+      <SectionFreshness source={bundle} service="entraId" />
       {/* UNIFIED SURFACE: ENTRA AT A GLANCE */}
       <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-2xs">
         {/* Header with subtle blue accent top gradient */}

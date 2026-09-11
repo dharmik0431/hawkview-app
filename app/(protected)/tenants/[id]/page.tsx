@@ -4635,6 +4635,7 @@ export default function TenantDetailsPage() {
                       aria-labelledby="security-tab-policies"
                     >
                       <EntraSection
+                        bundle={bundle}
                         policies={displayedCaPolicies as any}
                         evidence={collectionReadiness?.evidence ?? null}
                         onPolicyClick={(p) => setSelectedPolicy(p as any)}
