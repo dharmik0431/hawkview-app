@@ -133,10 +133,23 @@ endpoints also disclose customer identities and are **not** audited:
   both gated on `evidenceDetailAllowed` — the same role tier, the same kind of
   data.
 
-Both are live: the frontend calls `identity-signals/assessment` from
-`lib/api/identity-risk-hooks.ts` alongside the newer risky-users route. So an
-operator can be shown a customer's people today through a path that records
-nothing.
+These are registered, live endpoints, but they are **not reached from the UI**:
+the component that calls them, `identity-risk-section.tsx`, is mounted by nothing
+under `app/` since Risky Users was relocated out of Entra. So the gap is that any
+authenticated operator with the role can call them **directly** and be shown a
+customer's people with nothing recorded — not that operators are being shown
+names in normal use. That changes its urgency, not its existence.
+
+An earlier revision of this section said both paths were live and being served to
+customers. That was wrong, and the mechanism is worth keeping: a `grep -l` for
+`identity-risk-hooks` matched `risky-users-assessment-hooks.ts`, and the match
+was a sentence in a **comment** — the one explaining why that module is separate
+and deliberately does not use the old hooks. **A file mentioning a thing is not a
+file importing it, and a file importing a thing is not a route reaching it.**
+
+Overstating exposure is the safer direction to be wrong in and still wrong: it
+spends attention a real gap elsewhere needs, and this is the sentence in this
+document a reader would act on.
 
 `recordIdentityDisclosure` is written to be surface-agnostic for exactly this
 reason — covering those paths means adding a `DisclosureSurface` value and one
