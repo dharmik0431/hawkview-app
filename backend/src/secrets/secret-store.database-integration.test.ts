@@ -48,6 +48,20 @@ function disposable() {
   assert.ok(
     ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname),
     'Disposable local/CI PostgreSQL only')
+  // The host check alone is not enough: this suite's `finally` blocks DELETE,
+  // so a developer whose local database is named `hawkview` rather than
+  // `hawkview_test` would have it emptied by running the tests. Loopback-only
+  // is strong right up until someone's laptop is the exception.
+  //
+  // Both assertions must refuse BEFORE any connection is opened — a guard that
+  // rejected after connecting would already have run the DELETE.
+  //
+  // Same pattern as risk-assessment-connected.database-integration.test.ts:31;
+  // an existing convention in this repo rather than a new one.
+  assert.match(
+    url.pathname,
+    /test|qa|^\/hawkview_ci$/i,
+    'Explicit test/QA or repository CI database only')
   return url
 }
 
