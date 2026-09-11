@@ -99,11 +99,28 @@ export class RiskyUsersController {
         complete: run.complete,
         items: run.findings.map(finding => ({
           detectorId: finding.detectorId,
-          subject: finding.subject,
-          // Present only when the role permits AND the directory row exists.
-          // A subject with no match renders as the opaque ref rather than an
-          // empty string or an invented placeholder — absent, not blank.
-          ...(identities.get(subjectRefOf(finding)) ?? {}),
+          // THE NAME BELONGS INSIDE THE SUBJECT, not beside it.
+          //
+          // Spread at the item level it was invisible: the consumer reads
+          // `displayName` from within `subject`, which its own `NativeSubject`
+          // type already models — so nesting makes both sides agree with the
+          // model that exists rather than bending the reader to the writer.
+          //
+          // Neither side was wrong and nothing compared them. 1,273 tests here
+          // and 469 there, all green, disjoint files, joint breakage.
+          //
+          // The consequence is what made it urgent rather than cosmetic:
+          // `subjectsNamed: true` and `false` rendered IDENTICALLY, both as
+          // "identity not resolved". A technician permitted to see names and one
+          // who is not saw the same screen, and both read it as HawkView failing
+          // to identify anyone rather than as their role withholding names. The
+          // role gate was invisible and the absent-not-blank design was defeated
+          // one layer above itself.
+          //
+          // Semantics unchanged: present only when the role permits AND the
+          // directory row exists. Absent, not blank, never an invented
+          // placeholder.
+          subject: { ...finding.subject, ...(identities.get(subjectRefOf(finding)) ?? {}) },
           signals: signalsOf(finding),
         })),
       },
