@@ -607,17 +607,30 @@ function UserRows({
                 <LatestCell row={row} />
               </td>
               <td className="px-3 py-3 text-right">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => onOpen(row)}
-                  aria-haspopup="dialog"
-                >
-                  Investigate
-                  <span className="sr-only"> {row.name}</span>
-                  <ChevronRight className="ml-1 h-4 w-4" aria-hidden="true" />
-                </Button>
+                {/* The detail view is built on fields the native response does
+                    not carry, so `user` is null on those rows and the drawer
+                    has nothing to open. native-view.ts sets that deliberately,
+                    reasoning that an empty drawer is worse than no drawer —
+                    and then the button was rendered anyway, so the click did
+                    nothing. A control that does nothing reads as broken; the
+                    absence it was hiding reads as a fact. Say the fact. */}
+                {row.user === null ? (
+                  <span className="text-xs text-slate-500 dark:text-slate-400">
+                    No detail on this response
+                  </span>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => onOpen(row)}
+                    aria-haspopup="dialog"
+                  >
+                    Investigate
+                    <span className="sr-only"> {row.name}</span>
+                    <ChevronRight className="ml-1 h-4 w-4" aria-hidden="true" />
+                  </Button>
+                )}
               </td>
             </tr>
           ))}
