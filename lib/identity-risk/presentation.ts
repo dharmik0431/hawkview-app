@@ -674,7 +674,7 @@ export type FindingEvidenceSummary = {
  * known: without a unit there is no honest noun for its count, and "records"
  * is the guess the mailbox check already proved wrong.
  */
-function evidenceShapeFor(finding: {
+export function resolvedEvidenceShape(finding: {
   ruleId: string
   signal?: string | null
   kind?: 'EVENT_OCCURRED' | 'STATE_OBSERVED' | null
@@ -724,7 +724,7 @@ export function findingEvidenceSummary(
   },
   formatDate: (value: string) => string
 ): FindingEvidenceSummary {
-  const shape = evidenceShapeFor(finding)
+  const shape = resolvedEvidenceShape(finding)
   const when = finding.lastSeen === null ? null : formatDate(finding.lastSeen)
   if (shape.kind === 'UNRECOGNISED') {
     return {

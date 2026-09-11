@@ -12,8 +12,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
 import {
-  findingEvidenceShape,
   findingEvidenceSummary,
+  resolvedEvidenceShape,
   runRecency,
   ruleScopeSummary,
   microsoftRiskyUserCountPresentation,
@@ -78,9 +78,13 @@ function LatestCell({ row }: { row: RiskyUserRow }) {
       </>
     )
   }
+  // Resolved from the reason itself, which carries the kind the server sent.
+  // Asking a table keyed on the detector's id was the same fault as the other
+  // two in this pass, in the one place that decides whether a date reads as
+  // something happening or as HawkView looking.
   const settingRead =
     row.lastSeenFrom &&
-    findingEvidenceShape(row.lastSeenFrom.ruleId).kind !== 'OCCURRENCES'
+    resolvedEvidenceShape(row.lastSeenFrom).kind === 'CONFIGURED_STATE'
   return (
     <>
       {time(row.lastSeen)}

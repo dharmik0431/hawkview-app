@@ -239,11 +239,12 @@ function adaptSubject(item: Record<string, unknown>): NativeSubject | null {
   return {
     kind,
     ref,
-    // Read from the item, not from the subject. Identity resolution is gated
-    // on the caller's role, so a missing name is expected for some readers and
+    // Inside the subject, which is where this type says identity belongs and
+    // where the server is moving to put it. Identity resolution is gated on
+    // the caller's role, so a missing name is expected for some readers and
     // must not look like a failure of ours.
-    displayName: optionalText(item.displayName, 200),
-    userPrincipalName: optionalText(item.userPrincipalName, 320),
+    displayName: optionalText(source.displayName, 200),
+    userPrincipalName: optionalText(source.userPrincipalName, 320),
   }
 }
 

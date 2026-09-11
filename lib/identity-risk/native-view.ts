@@ -33,7 +33,7 @@ import type { NativeAssessment } from './native-assessment'
  * act on, and printing it invites the reading that it is a name.
  */
 const detectorTitles: Record<string, string> = {
-  'credential-failure': 'Repeated credential failures',
+  'repeated-credential-failure': 'Repeated credential failures',
   'external-mailbox-forwarding': 'External mailbox forwarding',
 }
 
@@ -56,7 +56,7 @@ const detectorTitles: Record<string, string> = {
  * none.
  */
 const detectorGuidance: Record<string, readonly string[]> = {
-  'credential-failure': [
+  'repeated-credential-failure': [
     'Confirm with the account owner whether the sign-in attempts were theirs.',
     'Check for an application or device holding an outdated password, which produces repeated failures without anyone attacking anything.',
     'If the failures were followed by a success, review that sign-in specifically rather than the failures.',
@@ -113,14 +113,18 @@ function reasonsOf(finding: {
   signals: {
     signal: string
     count: number
-    latest: { at: string } | null
+    latest: { at: string; kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED' } | null
     capped: boolean
   }[]
 }): RiskyUserReason[] {
   return finding.signals.map((signal) => ({
     title: signalTitle(signal.signal),
     signal: signal.signal,
-    kind: null,
+    // The kind travels on the value. Re-deriving it from a table keyed on the
+    // detector's id is the convention this contract change removed, and a
+    // table keyed on the WRONG id -- the previous engine's -- is how it broke:
+    // silently, into "unrecognised", on every state including the clean zero.
+    kind: signal.latest?.kind ?? null,
     ruleId: finding.detectorId,
     evidenceCount: signal.count,
     evidenceCountCapped: signal.capped,

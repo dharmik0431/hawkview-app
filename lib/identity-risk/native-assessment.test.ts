@@ -4,7 +4,12 @@ import {
   adaptNativeAssessment,
   NATIVE_RISKY_USERS_VERSION,
 } from './native-assessment.ts'
-import { nativeRiskyUserCount, nativeRiskyUserList } from './native-view.ts'
+import {
+  detectorGuidanceFor,
+  detectorTitle,
+  nativeRiskyUserCount,
+  nativeRiskyUserList,
+} from './native-view.ts'
 
 /** A payload the endpoint could actually return, with the fleet's real shape. */
 function available(overrides: Record<string, unknown> = {}) {
@@ -252,17 +257,16 @@ test('an identity the caller may not see is a narrower view, not a failure', () 
         items: [
           {
             ...items[0],
+            // Inside subject, which is the shape this contract settled on and
+            // the one the server is moving to. Written deliberately rather
+            // than to match whatever the code happened to do, because the
+            // rewritten UI fixtures will encode whatever this says.
             subject: {
               kind: 'DIRECTORY_USER',
               userRef: 'c54eb6ce-0000-0000-0000-000000000001',
+              displayName: 'Alice Chen',
+              userPrincipalName: 'alice.chen@synthetic.invalid',
             },
-            // Beside subject, not inside it. This fixture asserted the name in
-            // the wrong place and so asserted the defect: it passed while the
-            // screen said every identity was unresolved. A fixture written to
-            // match the adapter rather than the wire cannot fail when the
-            // adapter is the thing that is wrong.
-            displayName: 'Alice Chen',
-            userPrincipalName: 'alice.chen@synthetic.invalid',
           },
         ],
       },
@@ -445,17 +449,17 @@ test('a figure never reaches a surface without the scope it is exact over', () =
   assert.match(unscoped.caption, /did not report what it examined/)
 })
 
-test('a resolved name is read from where the server puts it, not where we expected', () => {
-  // The shipped defect. displayName and userPrincipalName are spread onto the
-  // ITEM, beside subject, because resolution happens at read time against the
-  // directory and is not part of what the detector produced. Reading them from
-  // inside subject yields null with no error, and every row then claimed
-  // HawkView could not identify anybody while the payload carried their names.
+test('a resolved name reaches the row from inside the subject', () => {
+  // The shipped screen said "Identity not resolved" on every row while the
+  // payload carried the names, because the two sides put identity one level
+  // apart: beside subject on the wire, inside it here. Both placements are
+  // defensible, both were commented, and nothing compared them, which is why
+  // 469 tests here and 1,273 there all passed.
   //
-  // Both placements are defensible and neither side was wrong alone -- which
-  // is why nothing failed. This fixture is shaped like the wire rather than
-  // like the adapter, which is the only version of this test that could have
-  // caught it.
+  // Settled as inside-subject, and the server moves to match -- chosen because
+  // it is what the rewritten UI fixtures will encode permanently, not because
+  // one redeploy was cheaper. This asserts the settled shape end to end, from
+  // payload through to the rendered row.
   const wire = {
     version: NATIVE_RISKY_USERS_VERSION,
     available: true,
@@ -486,9 +490,9 @@ test('a resolved name is read from where the server puts it, not where we expect
           subject: {
             kind: 'DIRECTORY_USER',
             userRef: 'c54eb6ce-0000-0000-0000-000000000001',
+            displayName: 'Dara Fixture',
+            userPrincipalName: 'dara@fixture.invalid',
           },
-          displayName: 'Dara Fixture',
-          userPrincipalName: 'dara@fixture.invalid',
           signals: [
             {
               signal: 'PASSWORD_REJECTED',
@@ -586,4 +590,163 @@ test('a missing name says which of its two causes applies', () => {
   ).rows
   assert.equal(unresolved[0].name, 'Identity not resolved')
   assert.notEqual(gated[0].name, unresolved[0].name)
+})
+
+test('the clean zero does not arrive discrediting itself', () => {
+  // MSFT's legitimate EXACT 0 is the case this rebuild exists to make sayable,
+  // and it rendered beside "a check this build of HawkView does not recognise"
+  // -- about the only detector running. Not a zero that overclaims: a zero
+  // nobody can trust, which is the same worry inverted and worse.
+  //
+  // The cause was a client table keyed on the PREVIOUS engine's rule ids while
+  // the server ships 'repeated-credential-failure'. Keyed on what the server
+  // actually sends, checked against it rather than against what I assumed.
+  const msft = adaptNativeAssessment({
+    version: NATIVE_RISKY_USERS_VERSION,
+    available: true,
+    subjectsNamed: true,
+    run: {
+      windowStart: '2026-08-11T12:00:00.000Z',
+      windowEnd: '2026-09-10T12:00:00.000Z',
+      completedAt: '2026-09-10T12:00:07.000Z',
+    },
+    collectors: [],
+    coverage: [
+      {
+        stream: 'SIGN_INS',
+        coverage: { applies: 40, notYetCitedEvents: 0, uninterpretedEvents: 0 },
+      },
+    ],
+    count: {
+      accuracy: 'EXACT',
+      value: 0,
+      scope: {
+        evidenceRequested: ['SIGN_INS'],
+        setAside: [],
+        covered: ['repeated-credential-failure'],
+        notCovered: [],
+      },
+    },
+    claim: { permitted: true },
+    findings: { complete: true, items: [] },
+  })
+  const count = nativeRiskyUserCount(msft)
+
+  assert.equal(count.value, 0)
+  assert.deepEqual(count.known, ['Repeated credential failures'])
+  const everything = [
+    count.headline,
+    count.caption,
+    ...count.known,
+    ...count.gaps,
+  ].join(' ')
+  assert.ok(
+    !/does not recognise/.test(everything),
+    'the surface called its own running detector unrecognised: ' + everything
+  )
+  // The zero still carries its scope, which is the other half of it being
+  // trustworthy rather than bare.
+  assert.match(count.caption, /assessed or accounted for|cited a basis for/)
+})
+
+test('a signal says what kind of time it carries, from the value', () => {
+  // Hardcoding kind to null discarded what the server sends and left the
+  // surface re-deriving occurrence-versus-observation from a table keyed on a
+  // detector id -- the convention the contract change removed. Latent with one
+  // detector, all EVENT_OCCURRED; it becomes the stale-forwarding-rule defect
+  // the moment the mailbox detector ships, so it is fixed before it can.
+  const forwarding = adaptNativeAssessment({
+    version: NATIVE_RISKY_USERS_VERSION,
+    available: true,
+    subjectsNamed: true,
+    run: { windowStart: null, windowEnd: null, completedAt: null },
+    collectors: [],
+    coverage: [],
+    count: {
+      accuracy: 'EXACT',
+      value: 1,
+      scope: {
+        evidenceRequested: [],
+        setAside: [],
+        covered: ['external-mailbox-forwarding'],
+        notCovered: [],
+      },
+    },
+    claim: { permitted: true },
+    findings: {
+      complete: true,
+      items: [
+        {
+          detectorId: 'external-mailbox-forwarding',
+          subject: { kind: 'MAILBOX', mailboxRef: 'mbx-1' },
+          signals: [
+            {
+              signal: 'EXTERNAL_FORWARDING_CONFIGURED',
+              count: 3,
+              capped: false,
+              latest: {
+                at: '2026-09-10T11:00:00.000Z',
+                kind: 'STATE_OBSERVED',
+              },
+            },
+          ],
+        },
+      ],
+    },
+  })
+  const context = nativeRiskyUserList(forwarding).context
+  assert.equal(context.length, 1)
+  assert.equal(context[0].reasons[0].kind, 'STATE_OBSERVED')
+
+  // And the detector is named rather than declared unrecognised.
+  const count = nativeRiskyUserCount(forwarding)
+  assert.deepEqual(count.known, ['External mailbox forwarding'])
+})
+
+/**
+ * Every detector the server ships, named once so both client tables are
+ * checked against the same list.
+ *
+ * Taken from the backend's own detector ids rather than from what either table
+ * happens to contain -- a list derived from the tables would agree with them
+ * by construction and could never catch the fault it exists to catch.
+ */
+const SHIPPED_DETECTOR_IDS = [
+  'repeated-credential-failure',
+  'external-mailbox-forwarding',
+] as const
+
+test('every shipped detector is both named and actionable', () => {
+  // Two client tables are keyed on detector ids, and both were keyed on the
+  // PREVIOUS engine's rule ids. One of them rendered "a check this build does
+  // not recognise" beside the count on every state including the clean zero.
+  // The other silently dropped the investigation steps, and a mutation showed
+  // nothing was asserting it -- the same fault, one table over, unguarded.
+  //
+  // Swept together because they fail the same way and for the same reason, and
+  // because a third table keyed the same way would be caught here too.
+  for (const detectorId of SHIPPED_DETECTOR_IDS) {
+    const title = detectorTitle(detectorId)
+    assert.ok(
+      !/does not recognise/.test(title),
+      detectorId + ' is shipped and this build calls it unrecognised'
+    )
+    assert.ok(!title.includes(detectorId), detectorId + ' printed its own id')
+    assert.ok(
+      detectorGuidanceFor(detectorId).length > 0,
+      detectorId +
+        ' has no investigation steps, so its row says what we found and not what to do'
+    )
+  }
+
+  // And the unrecognised path still works, so the sweep above is not passing
+  // because the fallback was removed.
+  assert.match(
+    detectorTitle('something-shipped-after-this-build'),
+    /does not recognise/
+  )
+  assert.equal(
+    detectorGuidanceFor('something-shipped-after-this-build').length,
+    0
+  )
 })
