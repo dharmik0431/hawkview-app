@@ -4,7 +4,7 @@ import { ALERT_CATALOG, PRIVILEGED_DIRECTORY_CHANGES, alertType } from './alert-
 import { mayAutoClose, routingTier } from './alert-type.js'
 import { applyObservation, OPENED } from './alert-lifecycle.js'
 import { evidenceFromSync } from '../risky-users-wiring/evidence-availability.js'
-import { urgencyOf, collectorLagMs, arrivedLate, eventInstant } from './alert-event-time.js'
+import { urgencyOf, collectorLagMs, arrivedLate, eventInstant, compareByEventTime, newestByEventTime } from './alert-event-time.js'
 
 /** What every alert type must have declared before it may exist. */
 
@@ -166,4 +166,50 @@ test('URGENCY COMES FROM THE EVENT, NOT FROM WHEN IT ARRIVED', () => {
 
   const recent = { occurredAt: new Date(now.getTime() - 2 * 60 * 60 * 1000), receivedAt: now }
   assert.equal(urgencyOf(eventInstant(recent), now), 'RECENT')
+})
+
+test('ORDER COMES FROM THE EVENT, NOT FROM ARRIVAL ORDER', () => {
+  // A different mistake from using arrival TIME, and subtler. Using arrival time
+  // is caught by the brand. Using arrival ORDER is not: an event delivered after a
+  // backfill, whose own time is later, is the newer event — the arrival order of
+  // the two is identical and only the event times differ. Code that takes "most
+  // recently delivered" as "newest" is correct on every in-order feed and wrong on
+  // exactly the feed we have.
+  const now = new Date('2026-09-11T12:00:00.000Z')
+
+  // Both arrive at the same instant. The backfill HAPPENED sixteen days ago; the
+  // live one happened five minutes ago.
+  const backfill = { occurredAt: new Date(now.getTime() - 400 * 60 * 60 * 1000), receivedAt: now }
+  const live = { occurredAt: new Date(now.getTime() - 5 * 60 * 1000), receivedAt: now }
+
+  // Delivered backfill-then-live and live-then-backfill: same answer both ways,
+  // because arrival order carries no information here.
+  assert.equal(newestByEventTime([backfill, live]), live)
+  assert.equal(newestByEventTime([live, backfill]), live)
+
+  assert.ok(compareByEventTime(live, backfill) > 0)
+  assert.ok(compareByEventTime(backfill, live) < 0)
+
+  // POSITIVE CONTROL: the comparator does order things, so the agreement above is
+  // not a function that returns its first argument.
+  const older = { occurredAt: new Date(now.getTime() - 10 * 60 * 1000), receivedAt: now }
+  assert.equal(newestByEventTime([older, live]), live)
+  assert.equal(newestByEventTime([]), null, 'no events is null, never a fabricated instant')
+})
+
+test('a record declares escalations, so it can become an investigation', () => {
+  // "Records do not open investigations" is a default. A RECORD_ONLY type with no
+  // escalation thresholds at all would be permanently un-investigable, which is
+  // the dead end we were trying not to trade for.
+  const records = ALERT_CATALOG.filter((declaration) => declaration.severity === 'RECORD_ONLY')
+  assert.ok(records.length > 0, 'no records were read')
+  assert.ok(
+    records.some((declaration) => declaration.escalations.length > 0),
+    'at least one record must be promotable, or records are structurally un-investigable')
+
+  // The routine directory change specifically, since it is the one the plan's two
+  // rules collided over.
+  const routine = alertType('security.routine_directory_change')
+  assert.equal(routine.opensInvestigation, false)
+  assert.ok(routine.escalations.length > 0, 'a routine change must be able to turn out to matter')
 })

@@ -1,9 +1,9 @@
-import { OPENED, type AlertLifecycle } from './alert-lifecycle.js'
+import { OPENED, openInvestigation, type AlertLifecycle } from './alert-lifecycle.js'
 import type { EscalationSignal } from './alert-type.js'
 
 /** What happens when matching evidence arrives for something already open.
  *
- * FIVE CASES THAT MUST NOT BE COLLAPSED. The current system collapses them into
+ * SIX CASES THAT MUST NOT BE COLLAPSED. The current system collapses them into
  * one — every event becomes an alert — which is how 301 events became 301
  * notifications. A flat "one incident, stay quiet" rule is the opposite mistake
  * and swallows the thing the recipient most needs to hear.
@@ -13,6 +13,7 @@ import type { EscalationSignal } from './alert-type.js'
  *   activity after the condition cleared      reactivate the condition, notify
  *   activity after a RESOLVED investigation   new linked episode, notify
  *   activity after a COLLECTION GAP           resumed after gap, notify
+ *   a RECORD gains escalating evidence        becomes an investigation, notify
  */
 
 export type RecurrenceOutcome =
@@ -23,6 +24,16 @@ export type RecurrenceOutcome =
    * action rather than a reactivation, because the message differs: nothing
    * cleared, we simply stopped being able to look. */
   | Readonly<{ action: 'RESUMED_AFTER_GAP'; notify: true; signal: EscalationSignal | null }>
+  /** A record has gained evidence that makes it worth investigating. Records do
+   * not open investigations BY DEFAULT; without this they could never open one at
+   * all, and a routine change that turns out to be the first step of something
+   * would be structurally un-investigable — one dead end traded for another. */
+  | Readonly<{
+      action: 'ESCALATE_INTO_INVESTIGATION'
+      notify: true
+      signal: EscalationSignal
+      startsAs: AlertLifecycle
+    }>
   | Readonly<{
       action: 'OPEN_LINKED_EPISODE'
       notify: true
@@ -59,7 +70,26 @@ export function decideRecurrence(input: RecurrenceInput): RecurrenceOutcome {
     return { action: 'OPEN_LINKED_EPISODE', notify: true, startsAs: OPENED }
   }
 
-  // 2. The condition had cleared and the activity is back, on an investigation
+  // 2. A RECORD that has gained evidence of a different character. It becomes an
+  //    investigation, and somebody is told.
+  //
+  //    Checked here, before the condition branches, because a record's condition
+  //    moves like any other and a cleared-then-returned record would otherwise be
+  //    reported as a reactivation of something that was never being investigated.
+  //    Note the escalation-deduplication list is deliberately NOT consulted:
+  //    crossing a threshold for the first time on a record is the moment it stops
+  //    being a record, which happens once and cannot be "already reported".
+  if (lifecycle.investigation === 'NONE') {
+    if (crosses === null) return { action: 'UPDATE_QUIETLY', notify: false }
+    return {
+      action: 'ESCALATE_INTO_INVESTIGATION',
+      notify: true,
+      signal: crosses,
+      startsAs: openInvestigation(lifecycle),
+    }
+  }
+
+  // 3. The condition had cleared and the activity is back, on an investigation
   //    still open. The person who owns it needs to know it returned. Any
   //    escalation signal rides along so the message can say what changed rather
   //    than only that it recurred.
@@ -67,7 +97,7 @@ export function decideRecurrence(input: RecurrenceInput): RecurrenceOutcome {
     return { action: 'REACTIVATE_CONDITION', notify: true, signal: crosses }
   }
 
-  // 3. Activity present again after a period HawkView could not see.
+  // 4. Activity present again after a period HawkView could not see.
   //
   //    A GAP MUST NOT BECOME A WAY TO SILENCE AN INCIDENT BY LOOKING AWAY.
   //
@@ -86,14 +116,14 @@ export function decideRecurrence(input: RecurrenceInput): RecurrenceOutcome {
     return { action: 'RESUMED_AFTER_GAP', notify: true, signal: crosses }
   }
 
-  // 4. Evidence of a different character on a live incident. One notification,
+  // 5. Evidence of a different character on a live incident. One notification,
   //    however many events crossed the line — and none at all if this signal has
   //    already been reported for this episode.
   if (crosses !== null) {
     return { action: 'ESCALATE', notify: !alreadyEscalated.includes(crosses), signal: crosses }
   }
 
-  // 5. More of the same on a live incident. The common case, and the one that
+  // 6. More of the same on a live incident. The common case, and the one that
   //    must stay quiet: treating it as news is what turned 301 events into 301
   //    notifications.
   return { action: 'UPDATE_QUIETLY', notify: false }

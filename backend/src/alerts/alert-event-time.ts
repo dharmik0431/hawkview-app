@@ -69,6 +69,35 @@ export function collectorLagMs(time: AlertEventTime): number {
   return time.receivedAt.getTime() - time.occurredAt.getTime()
 }
 
+/** Orders events by their OWN time. Never by arrival, and never by arrival order.
+ *
+ * THESE ARE DIFFERENT MISTAKES and the second is subtler. Using arrival *time* is
+ * caught by `urgencyOf`'s type. Using arrival *order* is not: an event delivered
+ * after a backfill, whose own time is later, is the newer event — the arrival
+ * order of the two is identical, and only the event times differ. Code that takes
+ * "most recently delivered" as "newest" behaves correctly on every in-order feed
+ * and wrongly on exactly the feed we have, where one collector is four hundred
+ * hours behind.
+ *
+ * Reads `occurredAt` only, so a caller that sorts with this cannot accidentally
+ * sort by delivery.
+ *
+ * Episode boundaries are step 02's to compute. This is the primitive they must
+ * compute them with, placed here because it is the same rule as the urgency one
+ * and belongs beside it rather than being reinvented there. */
+export function compareByEventTime(left: AlertEventTime, right: AlertEventTime): number {
+  return left.occurredAt.getTime() - right.occurredAt.getTime()
+}
+
+/** The event that happened last, which is not necessarily the one that arrived
+ * last. Null for an empty set rather than a fabricated instant. */
+export function newestByEventTime<T extends AlertEventTime>(events: readonly T[]): T | null {
+  return events.reduce<T | null>(
+    (newest, event) => (newest === null || compareByEventTime(event, newest) > 0 ? event : newest),
+    null,
+  )
+}
+
 /** Whether this arrived as part of a backfill rather than as live traffic.
  *
  * Useful for explaining a burst of incidents to a reader — "these arrived at

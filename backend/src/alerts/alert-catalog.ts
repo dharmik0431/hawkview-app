@@ -90,7 +90,25 @@ export const ALERT_CATALOG = [
       kind: 'CONFIGURATION_RESTORED',
       because: 'A record of something that happened. It has no ongoing condition to clear beyond the change itself.',
     },
-    escalations: [],
+    // A RECORD THAT CAN STILL BECOME AN INVESTIGATION. "Records do not open
+    // investigations" is a default, not a prohibition — a routine change that
+    // turns out to be the first step of something must be promotable, or keeping
+    // records out of the queue would make them un-investigable and we would have
+    // traded one dead end for another.
+    escalations: [
+      {
+        signal: 'CORROBORATED_BY_SECOND_SOURCE',
+        because:
+          'An ordinary-looking change during a suspected credential attack on the same tenant is not ordinary. ' +
+          'Nothing about the change itself moved; what changed is the company it is in.',
+      },
+      {
+        signal: 'SPREAD_TO_ADDITIONAL_SUBJECTS',
+        because:
+          'One routine change is administration. Many across subjects in one window is a pattern, ' +
+          'and the pattern is the finding rather than any single change in it.',
+      },
+    ],
   },
 
   // ── Tenant disconnected ────────────────────────────────────────────────────

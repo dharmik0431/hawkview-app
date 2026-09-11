@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   OPENED,
+  RECORDED,
+  openInvestigation,
   acknowledge,
   applyObservation,
   needsAttention,
@@ -23,10 +25,12 @@ import { evidenceFromSync } from '../risky-users-wiring/evidence-availability.js
 
 const OWNERSHIPS: readonly Ownership[] = ['UNACKNOWLEDGED', 'ACKNOWLEDGED']
 const CONDITIONS: readonly ObservedCondition[] = ['ACTIVE', 'CLEARED', 'UNKNOWN']
-const INVESTIGATIONS: readonly Investigation[] = ['OPEN', 'RESOLVED']
+const INVESTIGATIONS: readonly Investigation[] = ['OPEN', 'RESOLVED', 'NONE']
 
-/** All twelve states. If any were unrepresentable the axes would not be
- * independent. */
+/** All eighteen states. If any were unrepresentable the axes would not be
+ * independent. NONE joined the investigation axis once records were allowed to
+ * escalate: a record is neither open nor resolved, and calling it either was
+ * wrong in a different way. */
 function everyLifecycle(): AlertLifecycle[] {
   return OWNERSHIPS.flatMap((ownership) =>
     CONDITIONS.flatMap((condition) =>
@@ -40,9 +44,9 @@ const readable = evidenceFromSync('SUCCESS')
 const collectionBroken = evidenceFromSync('FAILED')
 const neverCollected = evidenceFromSync('PENDING')
 
-test('all twelve combinations exist, because the axes are independent', () => {
+test('all eighteen combinations exist, because the axes are independent', () => {
   const all = everyLifecycle()
-  assert.equal(all.length, 12)
+  assert.equal(all.length, 18)
   // An acknowledged investigation with an active condition is the combination
   // the review specifically called out, and a sequential model cannot hold it.
   assert.ok(all.some((l) => l.ownership === 'ACKNOWLEDGED' && l.condition === 'ACTIVE' && l.investigation === 'OPEN'))
@@ -68,7 +72,7 @@ test('MISSING COLLECTION MOVES THE CONDITION TO UNKNOWN AND TOUCHES NOTHING ELSE
       }
     }
   }
-  assert.equal(checked, 12 * 2 * 2, 'the sweep must actually have run')
+  assert.equal(checked, 18 * 2 * 2, 'the sweep must actually have run')
 
   // POSITIVE CONTROL: with READABLE evidence the same call does clear, so the
   // above is about the missing evidence and not a function that never acts.
@@ -159,4 +163,58 @@ test('an unknown condition still wants attention', () => {
   // not, because nobody has looked at it.
   assert.equal(needsAttention({ ownership: 'ACKNOWLEDGED', condition: 'CLEARED', investigation: 'OPEN' }), false)
   assert.equal(needsAttention({ ownership: 'UNACKNOWLEDGED', condition: 'CLEARED', investigation: 'OPEN' }), true)
+})
+
+test('A RECORD IS NEITHER OPEN NOR RESOLVED, and is not in the queue', () => {
+  // NONE exists because neither other value is correct, which only became visible
+  // once records were allowed to escalate. OPEN would put every routine directory
+  // change into the queue nobody can empty — the 301 defect rebuilt. RESOLVED
+  // reads as "a person closed this", and would make every recurrence open a new
+  // linked episode, manufacturing an episode per event.
+  assert.equal(RECORDED.investigation, 'NONE')
+  assert.equal(RECORDED.condition, 'ACTIVE')
+  assert.equal(needsAttention(RECORDED), false, 'a record belongs in a list, not a queue')
+
+  // POSITIVE CONTROL: the same shape with an investigation DOES want attention,
+  // so the line above is about being a record rather than about the condition.
+  assert.equal(needsAttention({ ...RECORDED, investigation: 'OPEN' }), true)
+})
+
+test('a record never acquires an investigation by going quiet', () => {
+  // Becoming an investigation is a deliberate act on new evidence, never a side
+  // effect of the condition clearing — otherwise a quiet record would silently
+  // join the queue it was designed to stay out of.
+  for (const mayAutoCloseInvestigation of [true, false]) {
+    const after = applyObservation(RECORDED, {
+      evidence: readable, conditionCleared: true, mayAutoCloseInvestigation,
+    })
+    assert.equal(after.condition, 'CLEARED')
+    assert.equal(after.investigation, 'NONE', 'a record must not be resolved, because it was never open')
+  }
+
+  // POSITIVE CONTROL: the same call on a real investigation does resolve it when
+  // permitted, so the above is about the record and not an inert function.
+  const real = applyObservation(OPENED, {
+    evidence: readable, conditionCleared: true, mayAutoCloseInvestigation: true,
+  })
+  assert.equal(real.investigation, 'RESOLVED')
+})
+
+test('promotion opens an investigation UNOWNED, and leaves everything else alone', () => {
+  const owned = acknowledge(RECORDED)
+  assert.equal(owned.ownership, 'ACKNOWLEDGED')
+
+  const promoted = openInvestigation(owned)
+  assert.equal(promoted.investigation, 'OPEN')
+  // Unowned for the same reason a new episode is: nobody has yet looked at this
+  // AS an investigation, and pre-filling an owner hides it from the queue it was
+  // just promoted into.
+  assert.equal(promoted.ownership, 'UNACKNOWLEDGED')
+  assert.equal(promoted.condition, owned.condition, 'promotion says nothing about the condition')
+
+  // A no-op on anything that already has an investigation, so it cannot reopen a
+  // resolved one by a side door.
+  const resolved: AlertLifecycle = { ownership: 'ACKNOWLEDGED', condition: 'CLEARED', investigation: 'RESOLVED' }
+  assert.deepEqual(openInvestigation(resolved), resolved)
+  assert.deepEqual(openInvestigation(OPENED), OPENED)
 })

@@ -36,8 +36,20 @@ export type Ownership = 'UNACKNOWLEDGED' | 'ACKNOWLEDGED'
  * cases there are none. */
 export type ObservedCondition = 'ACTIVE' | 'CLEARED' | 'UNKNOWN'
 
-/** Set by a person, for security findings. Whether the question is closed. */
-export type Investigation = 'OPEN' | 'RESOLVED'
+/** Set by a person, for security findings. Whether the question is closed.
+ *
+ * NONE is not a third way of being closed. It means this alert never opened an
+ * investigation — a record, with nothing to do about it, living in a searchable
+ * list rather than a queue.
+ *
+ * IT EXISTS BECAUSE NEITHER OTHER VALUE IS CORRECT FOR A RECORD, which only
+ * became visible once records were allowed to escalate. `OPEN` would put every
+ * routine directory change into the queue nobody can empty — the 301 defect,
+ * rebuilt. `RESOLVED` would be worse and quieter: it reads as "a person closed
+ * this", and `decideRecurrence` would open a new linked episode on every single
+ * recurrence, because that is what activity after a resolved investigation
+ * means. A record would have manufactured an episode per event. */
+export type Investigation = 'OPEN' | 'RESOLVED' | 'NONE'
 
 export type AlertLifecycle = Readonly<{
   ownership: Ownership
@@ -51,6 +63,20 @@ export const OPENED: AlertLifecycle = Object.freeze({
   ownership: 'UNACKNOWLEDGED',
   condition: 'ACTIVE',
   investigation: 'OPEN',
+})
+
+/** What a new RECORD looks like: an owner and a condition, and no investigation.
+ *
+ * Records do not open investigations BY DEFAULT — which is not the same as never
+ * being investigable. A routine directory change that turns out to be the first
+ * step of something must be able to become an investigation, or the rule that
+ * keeps records out of the queue would make them structurally un-investigable,
+ * trading one dead end for another. That transition is an escalation, and it is
+ * `decideRecurrence`'s to make. */
+export const RECORDED: AlertLifecycle = Object.freeze({
+  ownership: 'UNACKNOWLEDGED',
+  condition: 'ACTIVE',
+  investigation: 'NONE',
 })
 
 /** Whether this alert type's investigation may be closed by the system.
@@ -105,6 +131,11 @@ export function applyObservation(
   // for both categories — that is an observation, and it is true.
   const cleared: AlertLifecycle = { ...current, condition: 'CLEARED' }
 
+  // A record has no investigation to close, and must not acquire one by having
+  // its condition clear. Becoming an investigation is an escalation — a
+  // deliberate act on new evidence — never a side effect of going quiet.
+  if (cleared.investigation === 'NONE') return cleared
+
   // Whether the QUESTION closes is a different decision, and the declaration
   // decides it. Note this never reopens: an incident whose investigation a person
   // already resolved stays resolved.
@@ -135,6 +166,22 @@ export function resolveInvestigation(current: AlertLifecycle): AlertLifecycle {
  * UNKNOWN condition on an open investigation still wants attention, because not
  * being able to see is itself something to act on. */
 export function needsAttention(lifecycle: AlertLifecycle): boolean {
+  // A record is not in the queue. That is the whole point of it being a record,
+  // and it is why NONE had to be distinguishable from OPEN.
+  if (lifecycle.investigation === 'NONE') return false
   if (lifecycle.investigation === 'RESOLVED') return false
   return lifecycle.condition !== 'CLEARED' || lifecycle.ownership === 'UNACKNOWLEDGED'
+}
+
+/** Promotes a record into an investigation. The only way NONE is left.
+ *
+ * Called when new evidence crosses an escalation threshold, so a routine change
+ * that turns out to be part of something can be investigated. It opens
+ * UNACKNOWLEDGED for the same reason a new episode does: nobody has yet looked at
+ * this as an investigation, and pre-filling an owner hides it from the queue it
+ * has just been promoted into. */
+export function openInvestigation(current: AlertLifecycle): AlertLifecycle {
+  return current.investigation === 'NONE'
+    ? { ...current, investigation: 'OPEN', ownership: 'UNACKNOWLEDGED' }
+    : current
 }

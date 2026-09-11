@@ -20,10 +20,18 @@ writes it as code the later steps cannot ignore.
 ## Three independent axes, not three states
 
 ```
-Ownership           unacknowledged · acknowledged     set by a person
-Observed condition  active · cleared · unknown        set by the system, from evidence
-Investigation       open · resolved                   set by a person, for security findings
+Ownership           unacknowledged · acknowledged        set by a person
+Observed condition  active · cleared · unknown           set by the system, from evidence
+Investigation       open · resolved · none               set by a person, for security findings
 ```
+
+`none` on the investigation axis means this alert never opened one — a record. It
+is not a third way of being closed, and it exists because **neither other value is
+correct for a record**, which only became visible once records were allowed to
+escalate. `open` would put every routine directory change in the queue nobody can
+empty, which is the 301 defect rebuilt. `resolved` is worse and quieter: it reads
+as "a person closed this", and the recurrence rules would then open a new linked
+episode on *every* recurrence — an episode manufactured per event.
 
 They are orthogonal. An acknowledged investigation can have an active condition. A
 cleared condition does not close an investigation.
@@ -31,9 +39,9 @@ cleared condition does not close an investigation.
 **Written as a product type, not a union.** As `type AlertState = 'ACKNOWLEDGED' |
 'CLEARED' | 'RESOLVED'` the axes become mutually exclusive by construction, and
 every later reader has to guess which combinations are legal. As three fields all
-twelve combinations are representable, and each transition function names the
+eighteen combinations are representable, and each transition function names the
 single axis it touches — so independence is a property of the type rather than a
-rule in a comment. `alert-lifecycle.test.ts` sweeps all twelve.
+rule in a comment. `alert-lifecycle.test.ts` sweeps all eighteen.
 
 Today's `notifications.resolvedAt` is one nullable timestamp doing all three jobs,
 which is why "went quiet" and "was dealt with" are currently the same value.
@@ -100,7 +108,7 @@ an absence says `NO_FURTHER_EVENTS_IN_READABLE_WINDOW` in its own name, and
 `applyObservation` will not act on it without readable evidence — so a type cannot
 opt out of the silence rule by wording its resolving condition carefully.
 
-## Recurrence: four cases
+## Recurrence: six cases
 
 | Situation | Behaviour | Notifies |
 |---|---|---|
@@ -108,6 +116,7 @@ opt out of the silence rule by wording its resolving condition carefully.
 | Evidence that **changes what this is** | Same incident, escalated | Yes — **one** per signal, however many events crossed it |
 | Activity after the condition cleared | Reactivate the condition | Yes |
 | **Activity after a collection gap** | Resumed after gap | **Yes** — see below |
+| A **record** gains escalating evidence | Becomes an investigation | Yes |
 | Activity after a **resolved** investigation | New linked **episode** | Yes, never a silent reopen |
 
 The resolved case is checked first and outranks everything, including an
@@ -163,6 +172,20 @@ collector is still live — lateness is a property of the feed, not of the event
 Arrival time is still recorded, because it is genuinely useful; the constraint is
 on the **decision path**, not on the system.
 
+### Arrival *order* is a second, subtler mistake
+
+Using arrival **time** is caught by the brand. Using arrival **order** is not: an
+event delivered *after* a backfill, whose own time is later, is the newer event —
+the arrival order of the two is identical, and only the event times differ. Code
+that treats "most recently delivered" as "newest" is correct on every in-order
+feed and wrong on exactly the feed we have.
+
+`compareByEventTime` and `newestByEventTime` read `occurredAt` only, so a caller
+that sorts with them cannot accidentally sort by delivery. **Episode boundaries
+are step 02's to compute; these are the primitives to compute them with**, placed
+here because it is the same rule as the urgency one and belongs beside it rather
+than being reinvented there.
+
 ## Two things found by building it
 
 **1. A `RECORD_ONLY` security event would have been unclosable.** The plan puts
@@ -172,6 +195,24 @@ a queue only a person can empty — which is precisely what 301 of the current
 alerts are. So `RECORD_ONLY` types open no investigation at all: they have an
 owner and an observed condition, and belong in a searchable list exactly as the
 plan says a record should. The pairing is asserted in `alert-catalog.test.ts`.
+
+This is the degenerate-input check applied to a plan rather than to a rule. Both
+rules are individually correct and were reviewed; **combining them produced a
+broken one**, and reviewing them one at a time could not have found it.
+
+**"Records do not open investigations" is a DEFAULT, not a prohibition.** When a
+record gains evidence that crosses an escalation threshold — corroboration from a
+second source, spread across subjects — it becomes an investigation and somebody
+is told. Without that, a routine change that turns out to be the first step of
+something would be structurally un-investigable, and we would have traded one dead
+end for another.
+
+Two details follow, both tested. The promotion opens **unowned**, for the same
+reason a new episode does: nobody has yet looked at this *as* an investigation,
+and pre-filling an owner hides it from the queue it just joined. And the
+escalation-deduplication list is deliberately **not** consulted for a promotion —
+crossing a threshold for the first time on a record is the moment it stops being a
+record, which happens once and cannot be "already reported".
 
 **2. I got the collection-gap rule backwards, and QA caught it.** I had activity
 arriving after a gap update *quietly*, reasoning that otherwise every collector
