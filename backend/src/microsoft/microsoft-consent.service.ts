@@ -10,6 +10,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { decodeJwt, jwtVerify, SignJWT } from 'jose'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { SecretStoreService } from '../secrets/secret-store.service.js'
+import { PLATFORM_OWNED } from '../secrets/secret-owner.js'
 import {
   fetchMicrosoftWithRetry,
   microsoftErrorMetadata,
@@ -821,7 +822,8 @@ export class MicrosoftConsentService {
 
     const credentialReference = await this.secretStore.store(
       'hawkview-microsoft-connector-client-secret',
-      input.clientSecret
+      input.clientSecret,
+      PLATFORM_OWNED
     )
     const connector = await this.prisma.platformMicrosoftConnector.upsert({
       where: { id: 'default' },
@@ -855,6 +857,8 @@ export class MicrosoftConsentService {
     clientId: string
     clientSecret: string
     secretId: string
+    organizationId: string
+    customerTenantId: string | null
   }) {
     const verification = await this.verifyTenantWithCredentials(
       input.microsoftTenantId,
@@ -870,7 +874,16 @@ export class MicrosoftConsentService {
     }
     const credentialReference = await this.secretStore.store(
       input.secretId,
-      input.clientSecret
+      input.clientSecret,
+      {
+        // TENANT ownership, declared rather than implied. This refuses today —
+        // see secret-owner.ts. The tenant id is null on the path that creates
+        // the tenant, because the credential is stored before the tenant row
+        // exists; that ordering is part of what implementing the scope must fix.
+        kind: "TENANT" as const,
+        organizationId: input.organizationId,
+        customerTenantId: input.customerTenantId,
+      }
     )
     return { ...verification, credentialReference }
   }

@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import 'reflect-metadata'
 import { NestFactory } from '@nestjs/core'
+import helmet from 'helmet'
 import { AppModule } from './app.module.js'
 
 async function bootstrap() {
@@ -37,6 +38,23 @@ async function bootstrap() {
   }
 
   app.enableShutdownHooks()
+  app.use(
+    helmet({
+      // NO CONTENT-SECURITY-POLICY, deliberately. This service returns JSON and
+      // exactly one 303 redirect; it renders no markup at all, so CSP directives
+      // here would constrain nothing that exists. Shipping a policy that
+      // describes no resources is a security claim nobody can check, and it is
+      // the kind of thing a later reader trusts.
+      contentSecurityPolicy: false,
+      // THE ONE THAT MATTERS ON A CUSTOM DOMAIN. Two years, and applied to
+      // subdomains because the API is itself a subdomain — this instructs
+      // browsers never to attempt api.hawkviewapp.com over plaintext, which is
+      // what stops a downgrade before the request carries a bearer token.
+      // Not preloaded: submitting to the preload list is effectively permanent
+      // and is an owner's decision, not a deploy's.
+      hsts: { maxAge: 63_072_000, includeSubDomains: true, preload: false },
+    })
+  )
   app.enableCors({
     origin: (
       origin: string | undefined,
