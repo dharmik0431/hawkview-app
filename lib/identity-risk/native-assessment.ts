@@ -68,6 +68,25 @@ export type NativeCount = {
   evidenceRequested: string[]
 }
 
+/**
+ * One stream's classifier split, with the two kinds of set-aside event kept
+ * apart.
+ *
+ * They must never be summed. Uninterpreted events are ones we could not read
+ * at all: wrong by an unbounded amount in an uncharacterised direction.
+ * Not-yet-cited events are ones we read and identified and are holding because
+ * our own basis for excluding them is not written down: bounded, named and
+ * enumerable. A tenant with an interpretation failure and a tenant with a
+ * paperwork gap would become indistinguishable, which is the collapse this
+ * module exists to prevent.
+ */
+export type NativeStreamCoverage = {
+  stream: string
+  applies: number
+  uninterpretedEvents: number
+  notYetCitedEvents: number
+}
+
 export type NativeAssessment =
   | { available: false; because: string }
   | {
@@ -78,6 +97,16 @@ export type NativeAssessment =
         completedAt: string | null
       }
       collectors: NativeCollector[]
+      coverage: NativeStreamCoverage[]
+      /**
+       * Whether this response names anyone.
+       *
+       * False is an answer rather than a failure: identity resolution is gated
+       * on the caller's role. Said once, at the top, rather than as a gap on
+       * every row -- a gap per row invites the reading that the person is
+       * missing rather than the name.
+       */
+      subjectsNamed: boolean
       count: NativeCount
       /** Empty when the claim was permitted. */
       withheld: { stream: string | null; because: string }[]
@@ -295,6 +324,25 @@ export function adaptNativeAssessment(value: unknown): NativeAssessment | null {
     })
   }
 
+  const coverage: NativeStreamCoverage[] = []
+  for (const entry of list(source.coverage) ?? []) {
+    const item = record(entry)
+    if (!item) continue
+    const stream = text(item.stream, 120)
+    if (!stream) continue
+    const split = record(item.coverage) ?? {}
+    const whole = (value: unknown) =>
+      Number.isSafeInteger(value) && (value as number) >= 0
+        ? (value as number)
+        : 0
+    coverage.push({
+      stream,
+      applies: whole(split.applies),
+      uninterpretedEvents: whole(split.uninterpretedEvents),
+      notYetCitedEvents: whole(split.notYetCitedEvents),
+    })
+  }
+
   const claim = record(source.claim) ?? {}
   const withheld: { stream: string | null; because: string }[] = []
   if (claim.permitted === false) {
@@ -335,6 +383,11 @@ export function adaptNativeAssessment(value: unknown): NativeAssessment | null {
       completedAt: isoOrNull(run.completedAt),
     },
     collectors,
+    coverage,
+    // Absent means this server does not speak the field, which during a
+    // rollout is ordinary. Treated as "not named", because claiming a response
+    // names people when it may not is the direction that misleads.
+    subjectsNamed: source.subjectsNamed === true,
     count,
     withheld,
     findings,

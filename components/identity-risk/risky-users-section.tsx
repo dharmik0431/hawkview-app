@@ -30,7 +30,10 @@ import {
   microsoftVerdictPolarity,
   nativeWithheldReasonCopy,
 } from '@/lib/identity-risk/risky-users-view'
-import { detectorTitle } from '@/lib/identity-risk/native-view'
+import {
+  detectorGuidanceFor,
+  detectorTitle,
+} from '@/lib/identity-risk/native-view'
 import type { NativeAssessment } from '@/lib/identity-risk/native-assessment'
 import type {
   MicrosoftChannel,
@@ -87,6 +90,64 @@ function LatestCell({ row }: { row: RiskyUserRow }) {
         </span>
       )}
     </>
+  )
+}
+
+/**
+ * What to do about this row's findings.
+ *
+ * Half the product is naming what we found; the other half is what an MSP can
+ * do about it, and a row of counts and dates delivers only the first. The
+ * guidance is static per detector rather than per finding, because the steps
+ * for repeated credential failures are the same every time they occur, so it
+ * is copy rather than data and needs nothing from the endpoint.
+ *
+ * Collapsed, phrased as investigation steps rather than instructions, and
+ * carried out in Microsoft's own tools -- HawkView reads and changes nothing.
+ * A detector this build does not recognise says the guidance is missing rather
+ * than offering a neighbour's steps: guidance for the wrong finding is worse
+ * than none, because it gets followed.
+ */
+function NextSteps({ row }: { row: RiskyUserRow }) {
+  const detectorIds = Array.from(
+    new Set(row.reasons.map((reason) => reason.ruleId))
+  )
+  const known = detectorIds.filter(
+    (detectorId) => detectorGuidanceFor(detectorId).length > 0
+  )
+  if (known.length === 0) {
+    return (
+      <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
+        This build has no investigation steps for{' '}
+        {detectorIds.length === 1 ? 'this check' : 'these checks'}. That is a
+        gap in HawkView rather than a sign there is nothing to do.
+      </p>
+    )
+  }
+  return (
+    <details className="mt-2">
+      <summary className="cursor-pointer text-xs font-semibold text-slate-700 dark:text-slate-200">
+        What to check next
+      </summary>
+      {known.map((detectorId) => (
+        <div key={detectorId} className="mt-1.5">
+          {known.length > 1 && (
+            <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
+              {detectorTitle(detectorId)}
+            </p>
+          )}
+          <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-5 text-slate-600 dark:text-slate-300">
+            {detectorGuidanceFor(detectorId).map((step) => (
+              <li key={step}>{step}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+      <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
+        Nothing above establishes compromise. HawkView makes no changes to
+        Microsoft; every step is carried out in Microsoft&rsquo;s own tools.
+      </p>
+    </details>
   )
 }
 
@@ -521,6 +582,7 @@ function UserRows({
                     />
                   ))}
                 </ul>
+                <NextSteps row={row} />
               </td>
               <td className="px-3 py-3">
                 <DetectedBy row={row} />

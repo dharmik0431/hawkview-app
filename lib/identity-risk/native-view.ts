@@ -19,8 +19,8 @@ import {
   type RiskyUserList,
   type RiskyUserReason,
   type RiskyUserRow,
-} from './risky-users-view'
-import { signalTitle } from './presentation'
+} from './risky-users-view.ts'
+import { signalTitle } from './presentation.ts'
 import type { NativeAssessment } from './native-assessment'
 
 /**
@@ -35,6 +35,41 @@ import type { NativeAssessment } from './native-assessment'
 const detectorTitles: Record<string, string> = {
   'credential-failure': 'Repeated credential failures',
   'external-mailbox-forwarding': 'External mailbox forwarding',
+}
+
+/**
+ * What a technician does about each detector's findings.
+ *
+ * Static, keyed on the detector, and written here rather than served. The
+ * guidance for "repeated credential failures" is the same for every instance
+ * of it, so it is copy rather than per-finding data and needs no endpoint
+ * change.
+ *
+ * A screen reading "gary@ -- 366 lockouts -- 10 Sept" delivers the half of the
+ * product that says what we found and drops the half that says what to do
+ * about it. Both halves are the product.
+ *
+ * Phrased as investigation steps rather than instructions, and attributed to
+ * nobody: HawkView reads, and every one of these is carried out in Microsoft's
+ * own tools. A detector this build does not know says so rather than offering
+ * a neighbour's steps, because guidance for the wrong finding is worse than
+ * none.
+ */
+const detectorGuidance: Record<string, readonly string[]> = {
+  'credential-failure': [
+    'Confirm with the account owner whether the sign-in attempts were theirs.',
+    'Check for an application or device holding an outdated password, which produces repeated failures without anyone attacking anything.',
+    'If the failures were followed by a success, review that sign-in specifically rather than the failures.',
+  ],
+  'external-mailbox-forwarding': [
+    'Confirm with the mailbox owner whether the forwarding was set up deliberately.',
+    'List hidden inbox rules as well as visible ones; a forwarding rule created by an attacker is a common thing to miss.',
+    'Check when the rule was created against when the account last changed its password.',
+  ],
+}
+
+export function detectorGuidanceFor(detectorId: string): readonly string[] {
+  return detectorGuidance[detectorId] ?? []
 }
 
 export function detectorTitle(detectorId: string): string {
@@ -75,6 +110,63 @@ function reasonsOf(finding: {
     firstSeen: null,
     lastSeen: signal.latest?.at ?? null,
   }))
+}
+
+/**
+ * The sentence a count may never appear without.
+ *
+ * EXACT here means exact over the events we cited a basis for -- the scope
+ * travels inside Count and there is no code path producing the figure without
+ * it. That is a structural guarantee about the data, and it says nothing about
+ * a card that prints "4". The guarantee is spent at the last inch, and this is
+ * the last inch.
+ *
+ * The two set-aside kinds are never summed into one number. Fourteen consent
+ * prompts we read, identified and are holding for want of our own written
+ * basis is a paperwork gap: bounded, named, enumerable. A hundred and twelve
+ * events we could not interpret at all is wrong by an unbounded amount in an
+ * uncharacterised direction. One word for both would make a tenant with an
+ * interpretation failure indistinguishable from one with a filing problem.
+ */
+function scopeSentence(native: Extract<NativeAssessment, { available: true }>) {
+  const notYetCited = native.coverage.reduce(
+    (total, entry) => total + entry.notYetCitedEvents,
+    0
+  )
+  const uninterpreted = native.coverage.reduce(
+    (total, entry) => total + entry.uninterpretedEvents,
+    0
+  )
+  const parts: string[] = []
+  if (notYetCited > 0) {
+    parts.push(
+      notYetCited.toLocaleString() +
+        (notYetCited === 1
+          ? ' event held pending a citation'
+          : ' events held pending a citation')
+    )
+  }
+  if (uninterpreted > 0) {
+    parts.push(
+      uninterpreted.toLocaleString() +
+        (uninterpreted === 1
+          ? ' event could not be interpreted'
+          : ' events could not be interpreted')
+    )
+  }
+  if (native.coverage.length === 0) {
+    // Not a pass. A response that does not say what it examined cannot support
+    // a reading of the figure as covering anything in particular.
+    return 'This response did not report what it examined, so the figure above cannot be read as covering any particular scope.'
+  }
+  if (parts.length === 0) {
+    return 'Every event this run examined was either assessed or accounted for.'
+  }
+  return (
+    'Exact over the events HawkView cited a basis for. Also on this tenant: ' +
+    parts.join(', ') +
+    '.'
+  )
 }
 
 /** The count tile, from the native count and the reasons behind it. */
@@ -154,7 +246,8 @@ export function nativeRiskyUserCount(
         ? captions.length === 1
           ? reasons[0].caption
           : 'HawkView will not state a number of users for this tenant. Every reason it gave is listed below; each one on its own is enough to withhold the total.'
-        : 'Distinct users with at least one current HawkView finding. A user with several findings is counted once. These are investigation leads, not confirmed compromise.',
+        : 'Distinct users with at least one current HawkView finding. A user with several findings is counted once. These are investigation leads, not confirmed compromise. ' +
+          scopeSentence(native),
     reasons: captions,
     // The detectors that did run, so a number is never read as covering checks
     // that never executed.
@@ -248,7 +341,34 @@ export function nativeRiskyUserList(
           : 'NO_REASONS'
   }
 
+  // Ordered by volume, not by a judgement.
+  //
+  // The engine rates nothing, and inventing a priority to sort on would be
+  // re-creating the vocabulary this rebuild removed, in a different font. A
+  // lockout count is a fact: it puts 366 above 27 without anyone claiming to
+  // have ranked risk, and a reader who checks the order against the numbers
+  // can see exactly what it is.
+  //
+  // Lockouts lead because an account being locked out repeatedly is a stronger
+  // reason to look than a password being rejected, and rejections break the
+  // tie. Recency breaks the remaining tie rather than leading, because a read
+  // time is always recent and would float state-derived rows to the top.
+  const volume = (row: RiskyUserRow, signal: string) =>
+    row.reasons
+      .filter((reason: RiskyUserReason) => reason.signal === signal)
+      .reduce(
+        (total: number, reason: RiskyUserReason) =>
+          total + reason.evidenceCount,
+        0
+      )
   rows.sort((a, b) => {
+    const lockouts =
+      volume(b, 'LOCKED_OUT_AFTER_REPEATED_FAILURES') -
+      volume(a, 'LOCKED_OUT_AFTER_REPEATED_FAILURES')
+    if (lockouts !== 0) return lockouts
+    const rejections =
+      volume(b, 'PASSWORD_REJECTED') - volume(a, 'PASSWORD_REJECTED')
+    if (rejections !== 0) return rejections
     if (a.lastSeen === b.lastSeen) return 0
     if (a.lastSeen === null) return 1
     if (b.lastSeen === null) return -1

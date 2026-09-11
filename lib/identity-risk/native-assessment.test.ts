@@ -4,6 +4,7 @@ import {
   adaptNativeAssessment,
   NATIVE_RISKY_USERS_VERSION,
 } from './native-assessment.ts'
+import { nativeRiskyUserCount } from './native-view.ts'
 
 /** A payload the endpoint could actually return, with the fleet's real shape. */
 function available(overrides: Record<string, unknown> = {}) {
@@ -319,4 +320,122 @@ test('an unavailable response carries its reason, including one this build does 
     adaptNativeAssessment({ version: NATIVE_RISKY_USERS_VERSION }),
     null
   )
+})
+
+test('a figure never reaches a surface without the scope it is exact over', () => {
+  // The engine guarantees this structurally: scope sits inside Count and there
+  // is no path producing the number without it. That guarantee is about the
+  // data and says nothing about a card printing "4". It is spent at the last
+  // inch, and this is the last inch.
+  //
+  // greentech: 4 confirmed, 14 consent events read and identified and held for
+  // want of our own written basis for excluding them.
+  const greentech = adaptNativeAssessment({
+    version: NATIVE_RISKY_USERS_VERSION,
+    available: true,
+    subjectsNamed: true,
+    run: {
+      windowStart: '2026-08-11T12:00:00.000Z',
+      windowEnd: '2026-09-10T12:00:00.000Z',
+      completedAt: '2026-09-10T12:00:07.000Z',
+    },
+    collectors: [],
+    coverage: [
+      {
+        stream: 'SIGN_INS',
+        coverage: {
+          applies: 1586,
+          notYetCitedEvents: 14,
+          uninterpretedEvents: 0,
+        },
+      },
+    ],
+    count: {
+      accuracy: 'EXACT',
+      value: 4,
+      scope: {
+        evidenceRequested: ['SIGN_INS'],
+        setAside: [],
+        covered: [],
+        notCovered: [],
+      },
+    },
+    claim: { permitted: true },
+    findings: { complete: true, items: [] },
+  })
+  const count = nativeRiskyUserCount(greentech)
+
+  assert.equal(count.accuracy, 'EXACT')
+  assert.equal(count.value, 4)
+  // The qualification travels with the words that accompany the figure, so a
+  // surface cannot render one without having been handed the other.
+  assert.match(count.caption, /cited a basis for/)
+  assert.match(count.caption, /14 events held pending a citation/)
+
+  // The two set-aside kinds are never summed. Fourteen consent prompts we read
+  // and identified is a paperwork gap, bounded and enumerable. Events we could
+  // not interpret at all are wrong by an unbounded amount. One number for both
+  // would make a tenant with an interpretation failure indistinguishable from
+  // one with a filing problem.
+  const biolink = adaptNativeAssessment({
+    version: NATIVE_RISKY_USERS_VERSION,
+    available: true,
+    subjectsNamed: true,
+    run: {
+      windowStart: '2026-08-11T12:00:00.000Z',
+      windowEnd: '2026-09-10T12:00:00.000Z',
+      completedAt: '2026-09-10T12:00:07.000Z',
+    },
+    collectors: [],
+    coverage: [
+      {
+        stream: 'SIGN_INS',
+        coverage: {
+          applies: 900,
+          notYetCitedEvents: 0,
+          uninterpretedEvents: 112,
+        },
+      },
+    ],
+    count: {
+      accuracy: 'AT_LEAST',
+      value: 4,
+      scope: {
+        evidenceRequested: ['SIGN_INS'],
+        setAside: [],
+        covered: [],
+        notCovered: [],
+      },
+    },
+    claim: { permitted: true },
+    findings: { complete: true, items: [] },
+  })
+  const bounded = nativeRiskyUserCount(biolink)
+  assert.match(bounded.caption, /112 events could not be interpreted/)
+  assert.ok(
+    !/held pending a citation/.test(bounded.caption),
+    'an interpretation failure was described as a paperwork gap'
+  )
+  assert.ok(
+    !/could not be interpreted/.test(count.caption),
+    'a paperwork gap was described as an interpretation failure'
+  )
+
+  // A response that did not say what it examined cannot support the figure
+  // being read as covering anything, and says so rather than staying silent.
+  const unscoped = nativeRiskyUserCount(
+    adaptNativeAssessment({
+      version: NATIVE_RISKY_USERS_VERSION,
+      available: true,
+      run: {
+        windowStart: null,
+        windowEnd: null,
+        completedAt: null,
+      },
+      count: { accuracy: 'EXACT', value: 4, scope: {} },
+      claim: { permitted: true },
+      findings: { complete: true, items: [] },
+    })
+  )
+  assert.match(unscoped.caption, /did not report what it examined/)
 })
