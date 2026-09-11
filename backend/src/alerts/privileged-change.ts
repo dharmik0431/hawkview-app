@@ -61,7 +61,7 @@ const SENSITIVE_PERMISSIONS: ReadonlyMap<string, string> = new Map([
   ],
   [
     'Mail.ReadWrite',
-    'Reads and writes mailbox contents tenant-wide, which is exfiltration and forgery in one permission.',
+    'Reads and writes mailbox contents tenant-wide, so the holder can both take mail out and put mail in.',
   ],
   [
     'Mail.Read',
@@ -205,7 +205,8 @@ export function classifyDirectoryChange(
       if (unrecognised.length > 0) {
         return unclassified(
           'A permission was granted that is on neither the sensitive nor the known-routine list. ' +
-          'Unrecognised is not harmless, and this is recorded as unclassified rather than downgraded.',
+          'Unrecognised is not the same as established-harmless, so it is recorded as unclassified rather ' +
+          'than downgraded. Nobody has decided what this permission is; that is the finding.',
           unrecognised.join(', '))
       }
 

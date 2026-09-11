@@ -429,6 +429,25 @@ grant itself every other permission; that was the example the original argument
 rested on and it was wrong. The permission that manages permission grants is
 `AppRoleAssignment.ReadWrite.All`. Both are sensitive, by different mechanisms.
 
+
+### Urgency says how soon to look, not that something is wrong
+
+Neither `UNCLASSIFIED` nor the unresolvable-role case may be worded as though it
+asserted wrongdoing. Unclassified means **nobody has decided what this permission
+is**; an unresolved role means **an identifier did not resolve**. Neither is a
+finding about a person.
+
+This is the discipline the plan already holds for lockouts — *suspected*, never
+confirmed — applied one layer down, and the drift is easy: two of the strings
+failed it when the whole set was read against it. *"Unrecognised is not harmless"*
+asserts that it **is** harmful, in four words. And describing a permission as
+*"exfiltration and forgery in one permission"* claims an act rather than a
+capability; what the permission confers is that the holder **can** read and write
+mail, which is the honest sentence and the more useful one.
+
+`privileged-change.test.ts` sweeps every unclassified path against
+accusation-shaped language, with a positive control proving the pattern matches
+such language when it is present.
 ### Nothing is asserted benign
 
 Registering an authentication method and an administrator resetting a password are

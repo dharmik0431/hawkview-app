@@ -335,3 +335,59 @@ test('routine requires the modelled dimensions to be the ones that moved', () =>
       policy({ enabled: false, unmodelledFingerprint: 'after' })).classification,
     'URGENT')
 })
+
+test('URGENT AND UNCLASSIFIED SAY HOW SOON TO LOOK, NOT THAT SOMETHING IS WRONG', () => {
+  // The same discipline the plan already holds for lockouts: suspected, never
+  // confirmed. Unclassified means nobody has decided what a permission is; an
+  // unresolved role means an identifier did not resolve. Urgency is about how soon
+  // somebody should look, not about how likely it is that something is wrong.
+  //
+  // Scoped to the outcomes where an accusation would be unfounded — UNCLASSIFIED,
+  // and the unresolvable-role case that is urgent despite being unclassified.
+  const accusations = /\b(malicious|compromis|breach|unauthoris|unauthoriz|intrusion|wrongdoing|suspicious|rogue)/i
+
+  const unclassifiedOutcomes = [
+    classifyDirectoryChange({
+      kind: 'APPLICATION_PERMISSION_GRANT',
+      applicationId: THEIRS,
+      permissions: ['SomeNewThing.Invented.ByMicrosoft'],
+      scope: 'TENANT_WIDE',
+    }, context),
+    classifyDirectoryChange({ kind: 'ROLE_ASSIGNMENT', roleTemplateId: null, roleIsPrivileged: null }, context),
+    classifyDirectoryChange({ kind: 'ROLE_ASSIGNMENT', roleTemplateId: 'custom', roleIsPrivileged: null }, context),
+    classifyConditionalAccessChange(null, policy()),
+    classifyConditionalAccessChange(policy({ grantOperator: null }), policy({ grantOperator: null, grantControls: ['mfa'] })),
+    classifyConditionalAccessChange(policy({ sessionControls: ['signInFrequency'] }), policy({ sessionControls: [] })),
+    classifyConditionalAccessChange(policy({ unmodelledFingerprint: 'a' }), policy({ unmodelledFingerprint: 'b' })),
+  ]
+
+  assert.equal(unclassifiedOutcomes.length, 7, 'the sweep must cover every unclassified path')
+  for (const outcome of unclassifiedOutcomes) {
+    assert.equal(outcome.classification, 'UNCLASSIFIED', outcome.because)
+    assert.doesNotMatch(outcome.because, accusations, outcome.because)
+    // And it must not claim harm the way an earlier draft did: "unrecognised is
+    // not harmless" asserts that it IS harmful, which is the same overreach in
+    // four words.
+    assert.doesNotMatch(outcome.because, /\bis not harmless\b/i, outcome.because)
+  }
+
+  // POSITIVE CONTROL: the pattern does match accusation-shaped text, so the sweep
+  // above is not passing against a regex that matches nothing.
+  assert.match('a malicious actor compromised the tenant', accusations)
+})
+
+test('no outcome claims an act occurred rather than describing a capability', () => {
+  // The sensitive-permission reasons describe what a permission ENABLES. Saying a
+  // permission "is exfiltration" reads as an assertion about what happened, and an
+  // earlier draft said exactly that.
+  const sensitive = classifyDirectoryChange({
+    kind: 'APPLICATION_PERMISSION_GRANT',
+    applicationId: THEIRS,
+    permissions: ['Mail.ReadWrite', 'Application.ReadWrite.All'],
+    scope: 'TENANT_WIDE',
+  }, context)
+  assert.equal(sensitive.classification, 'URGENT')
+  assert.doesNotMatch(sensitive.because, /\bis exfiltration\b/i)
+  // Capability language instead: what the holder CAN do.
+  assert.match(sensitive.because, /can /i)
+})
