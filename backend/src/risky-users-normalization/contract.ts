@@ -621,11 +621,50 @@ export interface NormalizationBatch {
  *
  * `uninterpretedEvents` is the number to gate a clean claim on — events we
  * could not read, plus rows we could not process. `notYetCited` is reported
- * beside it and deliberately NOT included: those events were read correctly
- * and only our own basis for excluding them is missing, so gating on them
- * would let a handful of well-understood consent prompts withhold a tenant's
- * claim indefinitely. Everything here is disclosed; only some of it is a limit
- * on what we read.
+ * beside it and deliberately NOT included.
+ *
+ * THIS WAS CHANGED AND REVERTED IN ONE EVENING, ACROSS THREE POSITIONS. The
+ * argument that settles it is recorded here so nobody re-derives the debate,
+ * and it is not the argument this comment used to give.
+ *
+ * The original reasoning — those events were read correctly, only our own
+ * basis for excluding them is missing, and gating would let a handful of
+ * consent prompts withhold a tenant's claim indefinitely — is true, and is the
+ * WEAKEST of the three. The two that matter:
+ *
+ * 1. THE CLAIM WAS NEVER A COMPLETENESS CLAIM. `scope` sits inside `Count` and
+ *    every vocabulary is taken unconditionally, so the number cannot be
+ *    obtained without its narrowing. "Exact over the events we cited a basis
+ *    for" is well-formed and true, and the held events are named and
+ *    enumerable within it.
+ *
+ * 2. THE REDUCTIO, AND IT IS DECISIVE. Adding `notYetCited` to this sum makes
+ *    a tenant with no findings and two held events report AT_LEAST 0. Every
+ *    possible count satisfies "at least zero": that is not a weaker claim than
+ *    EXACT 0, it is NO CLAIM AT ALL wearing the costume of a number. And it
+ *    lands on exactly the tenant whose job in the acceptance set is to prove
+ *    we can still say something confident about a clean one.
+ *
+ *    Note the shape, because it generalises: the gate reads well on tenants
+ *    WITH findings — AT_LEAST 4 over 14 held is meaningful — and degrades to
+ *    vacuity at zero. A rule that collapses at the boundary is not a rule
+ *    about completeness; it is a rule that happens to look right on the cases
+ *    that have something to report. Zero is the case this product exists to
+ *    get right, because a wrong zero is the defect the rebuild was for.
+ *
+ * THE OBJECTION THIS HAS TO ANSWER, AND ITS LIMIT. Gating would not merge the
+ * two states in the DATA — the counters, `notYetCitedEvents` and `setAside`
+ * all stay separate, so a consumer could always tell them apart. But the claim
+ * WORD is what a technician reads, and at zero a clean tenant and an
+ * uninterpretable one would both say AT_LEAST 0. The vocabulary survives; the
+ * sentence does not. That distinction is why "the counters stay separate" is
+ * not a defence of gating.
+ *
+ * WHAT WOULD MAKE GATING RIGHT: `scope` becoming separable from `Count`, or a
+ * detector that keys on consent outcomes — at which point the held codes stop
+ * being held and become live evidence. Both recorded beside 65001/90094.
+ *
+ * Everything here is disclosed; only some of it is a limit on what we read.
  */
 export function coverageForEvaluation(batch: NormalizationBatch): {
   readonly applies: number;
