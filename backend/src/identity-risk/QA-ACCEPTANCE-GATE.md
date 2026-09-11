@@ -546,3 +546,52 @@ occurrence-versus-observation from `findingEvidenceShape(ruleId)` — a client-s
 table. That is the convention `2c23a97` removed ("the kind travels with the value
 instead"). Invisible with one detector; it becomes the read-time-as-event-time
 defect again the moment `external-mailbox-forwarding` ships.
+
+### Secret-store rotation, verified against a real cluster (`604dbef`)
+
+Engineer 1 wrote `secret-store.database-integration.test.ts` and could not run it
+— no Postgres in that environment. Run here against a disposable cluster built
+from the shipped migrations: **2 pass, 0 fail.** Synthetic keys throughout; no
+production secret was touched.
+
+The shipped column is `NOT NULL`, no default, `CHECK (key_version >= 1)` —
+confirmed by querying `information_schema`, not by reading the migration.
+
+**Three mutations, each caught by the assertion that should catch it:**
+
+| mutation | caught by |
+| --- | --- |
+| `rotationStatus` believes the version column instead of opening the row | "both must still open" |
+| `openAndReseal` returns before re-sealing — a rotation that never rotates | "reading should have re-sealed both" |
+| `key_version` default restored on the table | "Missing expected rejection" (23502) |
+
+So it is not a rotation test that passes without rotating, and the migration's
+safety property is real rather than asserted.
+
+### Added: `qa-probe-rotation-status.ts` — the dangerous direction
+
+The shipped test catches a column-believing `rotationStatus` by the **safe**
+symptom: during the rotation window rows sit at version 1 while current is 2, so
+believing the label reports them *unreadable* and the assertion fires. It says
+nothing about the opposite and far worse case — **a row labelled current that
+cannot be opened.** Every row in that test is genuinely readable, so
+`readable: true` from the column alone is compatible with every assertion in it.
+
+That case is the one `rotationStatus` exists for: an operator reads
+`complete: true` and deletes `SECRET_ENCRYPTION_KEY_PREVIOUS`, and a value that
+only exists sealed is gone.
+
+The probe stores two secrets, corrupts one row's **ciphertext only** — leaving
+`key_version` untouched and verified unchanged — and asks:
+
+| | opens the rows | believes the label |
+| --- | --- | --- |
+| corrupted row | `readable: false` | `readable: true` |
+| `complete` | **false** | **true** — authorises deleting the previous key |
+
+Shipped code: **PASS**. Mutated to read the column: **BELIEVES THE LABEL**. So the
+claim in that function's comment — that it opens each row because a version is a
+claim and the claim is what you are verifying — is now observed rather than read.
+
+One difference from the shipped test worth keeping: its `disposable()` guard
+checks the **host** but not the database name. This probe checks both.
