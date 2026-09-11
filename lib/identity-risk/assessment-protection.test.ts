@@ -79,6 +79,7 @@ function finding(): RiskAssessmentFinding {
     activityWindowEndsAt: '2026-09-08T22:15:00.000Z',
     window: { start: '2026-09-08T20:45:00.000Z', end: observedAt },
     evidenceCount: 10,
+    signals: null,
     evidenceCountCapped: false,
     selectedSource: 'GRAPH_SIGN_INS',
     application: {
@@ -613,4 +614,91 @@ test('a mailbox subject gets only the guidance that applies to a mailbox', () =>
   assert.doesNotMatch(text, /Disable the account/)
   assert.doesNotMatch(text, /reset twice/)
   rendered.dom.window.close()
+})
+
+test('a check that reads a setting says so, and says what its dates are not', () => {
+  // The mailbox check's timestamps are read times. "Last evidence time" reads
+  // as when something last happened, and for this check nothing happened at
+  // that time at all — HawkView looked. Left unsaid, a forwarding rule created
+  // in March and one created this morning are indistinguishable, and both look
+  // like they are unfolding now, because the read time is always recent.
+  const value = user()
+  value.subjectType = 'MAILBOX'
+  value.findings[0].ruleId = 'HV-ID-MBX-001.v1'
+  value.findings[0].title = 'External mailbox forwarding'
+  value.findings[0].evidenceCount = 3
+  const rendered = renderDrawer(value)
+
+  assert.equal(field(rendered.document, 'Evidence'), '3 external destinations')
+  assert.match(rendered.text, /reads a setting rather than watching events/)
+  assert.match(rendered.text, /not when the forwarding was set up/)
+  rendered.dom.window.close()
+})
+
+test('an event check is not given the setting caveat', () => {
+  // The caveat must be earned by the check, not sprayed over all of them: a
+  // qualification that appears everywhere qualifies nothing.
+  const rendered = renderDrawer(user())
+  assert.equal(field(rendered.document, 'Evidence'), '10 records')
+  assert.doesNotMatch(rendered.text, /reads a setting rather than watching/)
+  assert.doesNotMatch(rendered.text, /does not know this check/)
+  rendered.dom.window.close()
+})
+
+test('an unrecognised check declines to name a unit rather than guessing one', () => {
+  // A rule this build has never seen may count events or may count things.
+  // "Records" is a guess, and the mailbox check is the standing proof that the
+  // guess can be wrong in both halves at once. So the number is shown bare and
+  // the reason it is bare is stated.
+  const value = user()
+  value.findings[0].ruleId = 'HV-ID-XYZ-999.v4'
+  const rendered = renderDrawer(value)
+
+  assert.equal(field(rendered.document, 'Evidence'), '10')
+  assert.match(rendered.text, /does not know this check/)
+  assert.doesNotMatch(rendered.text, /10 records/)
+  // The rule identifier is on screen here, and that is correct in the detail
+  // view: it is labelled as a reference beside the title, not standing in for
+  // the words a technician reads. What must never happen is the identifier
+  // becoming the description, which is asserted in the list, where an
+  // unrecognised rule has no other copy to fall back on.
+  assert.match(rendered.text, /Repeated invalid credentials/)
+  rendered.dom.window.close()
+})
+
+test('a Current badge over a window that has closed says when it closed', () => {
+  // The Raymonds shape, and the one that started the per-signal work: 462
+  // lockouts that stopped on 3 September, a detector window that closed on the
+  // 4th, and a check that ran on the 8th. Every field accurate. Read together
+  // the badge says the account is under attack now, and the technician who
+  // calls out-of-hours is responding to something that stopped days ago.
+  //
+  // The classification is the server's and is not overridden here -- inferring
+  // a verdict from two dates would be the same overreach in the other
+  // direction. Only the relationship between the dates is stated.
+  const stale = user()
+  stale.findings[0].evidenceCount = 462
+  stale.findings[0].firstSeen = '2026-09-02T10:00:00.000Z'
+  stale.findings[0].lastSeen = '2026-09-03T10:40:00.000Z'
+  stale.findings[0].activityWindowEndsAt = '2026-09-04T22:40:00.000Z'
+  stale.findings[0].activityState = 'CURRENT'
+  const rendered = renderDrawer(stale)
+
+  assert.match(rendered.text, /activity window closed on/)
+  assert.match(rendered.text, /before the check ran on/)
+  assert.match(rendered.text, /rather than as something in progress/)
+  // The badge is still the server's word, not ours.
+  assert.match(rendered.text, /Current/)
+  rendered.dom.window.close()
+
+  // Control: a finding whose window is still open at evaluation time says none
+  // of this. A note on every finding is a note on none of them.
+  const live = user()
+  live.findings[0].activityWindowEndsAt = '2026-09-09T00:00:00.000Z'
+  const open = renderDrawer(live)
+  assert.ok(
+    !/activity window closed on/.test(open.text),
+    'the note fired on a finding whose window was still open'
+  )
+  open.dom.window.close()
 })

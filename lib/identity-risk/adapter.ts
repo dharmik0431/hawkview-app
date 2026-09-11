@@ -5,6 +5,8 @@ import type {
   IdentityRiskCapability,
   IdentityRiskChannelMeta,
   CorrelationRef,
+  FindingSignal,
+  SignalInstant,
   RiskAssessmentCountReason,
   IdentityRiskChannelReason,
   IdentityRiskChannelStatus,
@@ -90,6 +92,83 @@ function knownRule(ruleId: string) {
   return Object.hasOwn(RISK_ASSESSMENT_RULE_TUPLES, ruleId)
     ? RISK_ASSESSMENT_RULE_TUPLES[ruleId as RiskAssessmentRuleId]
     : null
+}
+
+
+/**
+ * A finding rests on a handful of signals, not an unbounded stream. The cap is
+ * a sanity bound on a hostile or broken payload rather than a product limit.
+ */
+const MAX_FINDING_SIGNALS = 32
+
+const signalInstantKinds = ['EVENT_OCCURRED', 'STATE_OBSERVED'] as const
+
+/**
+ * Optional and additive, and absent means absent: the key missing says this
+ * server does not speak the field, and the finding-level count and dates are
+ * read instead. That matters in production rather than in principle, because
+ * frontend and backend ship through separate systems and every release has a
+ * window where one side is old.
+ *
+ * An empty array is rejected rather than tolerated. Under the published
+ * contract a signal missing from the array was never evaluated, so an empty one
+ * says every signal was never evaluated -- a finding resting on nothing, which
+ * is self-contradicting rather than ambiguous. Accepting it as a sentinel for
+ * "old server" would reject every finding in the tenant for the length of a
+ * deploy, which fails silently and reads exactly like a clean tenant.
+ */
+function adaptFindingSignals(
+  value: unknown,
+  trustedCurrentTimeMs: number
+): FindingSignal[] | null | false {
+  if (value === undefined) return null
+  if (!Array.isArray(value)) return false
+  if (value.length === 0 || value.length > MAX_FINDING_SIGNALS) return false
+
+  const signals: FindingSignal[] = []
+  for (const entry of value) {
+    const source = record(entry)
+    if (!source || !hasKeys(source, ['signal', 'count', 'latest', 'capped'])) {
+      return false
+    }
+    const signal = boundedString(source.signal, 120)
+    const count = source.count
+    const capped = source.capped
+    if (
+      !signal ||
+      !Number.isSafeInteger(count) ||
+      (count as number) < 0 ||
+      (count as number) > MAX_ASSESSMENT_COUNT ||
+      typeof capped !== 'boolean'
+    ) {
+      return false
+    }
+
+    let latest: SignalInstant | null = null
+    if (source.latest !== null && source.latest !== undefined) {
+      const instant = record(source.latest)
+      if (!instant || !hasKeys(instant, ['at', 'kind'])) return false
+      const at = nullableDateTime(instant.at, trustedCurrentTimeMs)
+      const kind = enumValue(instant.kind, signalInstantKinds)
+      if (!at || !kind) return false
+      latest = { at, kind }
+    }
+
+    // A count above zero with no instant is evidence that exists and carries no
+    // time, which the contract permits. A zero with an instant is not: nothing
+    // occurred for that timestamp to mark.
+    if (count === 0 && latest !== null) return false
+
+    signals.push({ signal, count: count as number, latest, capped })
+  }
+
+  // Two entries for the same signal would make every per-signal count
+  // ambiguous, and the surface would render one of them as though it were the
+  // whole.
+  if (new Set(signals.map((item) => item.signal)).size !== signals.length) {
+    return false
+  }
+  return signals
 }
 
 function reportedRuleId(value: unknown): string | null {
@@ -1526,6 +1605,7 @@ function adaptAssessmentFinding(
   // This is a detector window end, allowed to be after receipt time.
   const activityWindowEndsAt = dateTime(source.activityWindowEndsAt)
   const window = adaptEvidenceWindow(source.window, trustedCurrentTimeMs)
+  const signals = adaptFindingSignals(source.signals, trustedCurrentTimeMs)
   const selectedSource = enumValue(source.selectedSource, assessmentSources)
   const application = record(source.application)
   const applicationState = enumValue(application?.state, [
@@ -1599,6 +1679,7 @@ function adaptAssessmentFinding(
     !firstSeen ||
     !lastSeen ||
     !evaluatedAt ||
+    signals === false ||
     !activityWindowEndsAt ||
     Date.parse(activityWindowEndsAt) < Date.parse(lastSeen) ||
     Date.parse(activityWindowEndsAt) - Date.parse(lastSeen) >
@@ -1668,6 +1749,7 @@ function adaptAssessmentFinding(
     window,
     evidenceCount: source.evidenceCount as number,
     evidenceCountCapped: source.evidenceCountCapped,
+    signals: signals as FindingSignal[] | null,
     selectedSource,
     application: {
       id: application.id as string | null,

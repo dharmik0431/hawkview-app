@@ -4,6 +4,7 @@ import type {
   MicrosoftEntraRiskyUsersView,
   RiskAssessment,
   RiskAssessmentReadiness,
+  RiskAssessmentRuleId,
   RiskAssessmentSource,
   RiskAssessmentUser,
   RiskRecommendedAction,
@@ -516,5 +517,510 @@ export function riskAssessmentEmptyPresentation(assessment: RiskAssessment) {
     label: 'No findings can be confirmed yet',
     detail:
       'No per-user findings were returned, but one or more checks lack a complete evaluated scope. Review collection and rule readiness below.',
+  }
+}
+
+/**
+ * The words for one signal: what to call it, and what its count counts.
+ *
+ * This is the division the contract was changed to make possible, and the two
+ * halves come from different places on purpose.
+ *
+ * The UNIT is human copy and belongs to the client. The core holds no Microsoft
+ * vocabulary and should not learn one, so "lockouts" and "external
+ * destinations" live here, keyed by signal name.
+ *
+ * The KIND -- whether a timestamp marks an event occurring or a state being
+ * observed -- travels on the value itself and is never looked up here. Keying
+ * the kind on the name would move the convention rather than remove it, and
+ * would look like progress because the key sits closer to the data. The unit
+ * being name-keyed and the kind being value-carried is not an inconsistency:
+ * copy is a client concern and can be wrong only cosmetically, while a kind
+ * read from the wrong place renders a read time as an event.
+ */
+const signalCopy: Record<
+  string,
+  { title: string; singular: string; plural: string }
+> = {
+  LOCKED_OUT_AFTER_REPEATED_FAILURES: {
+    title: 'Locked out after repeated failures',
+    singular: 'lockout',
+    plural: 'lockouts',
+  },
+  PASSWORD_REJECTED: {
+    title: 'Password rejected',
+    singular: 'rejected sign-in',
+    plural: 'rejected sign-ins',
+  },
+  EXTERNAL_FORWARDING_CONFIGURED: {
+    title: 'Forwarding to an external address',
+    singular: 'external destination',
+    plural: 'external destinations',
+  },
+}
+
+/**
+ * What to call a signal on screen.
+ *
+ * The closed set lives in the wiring layer and the core's type is a plain
+ * string, so a fourth signal can appear without anything failing to compile.
+ * One that does gets a sentence saying this build does not know it, never the
+ * raw identifier: an identifier is not something a technician can act on, and
+ * printing it invites the reading that it is a name.
+ */
+export function signalTitle(signal: string): string {
+  return (
+    signalCopy[signal]?.title ??
+    'A detector signal this build of HawkView does not recognise'
+  )
+}
+
+export function signalIsRecognised(signal: string): boolean {
+  return Object.hasOwn(signalCopy, signal)
+}
+
+/* -------------------------------------------------------------------------- */
+/* What a finding's count counts, and what its date marks                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Every rule reports its evidence in the same two fields — a number and a
+ * timestamp — and those fields do not mean the same thing in every rule. The
+ * difference is invisible in the data, so it has to be carried by the copy.
+ *
+ * A repeated-failure check counts events that happened, each at a time of its
+ * own, and its date is when the most recent one occurred. The mailbox check
+ * counts the external destinations a mailbox is currently configured to forward
+ * to. Those are a state, not a sequence, and its date is when HawkView read the
+ * configuration.
+ *
+ * One phrase for both makes the second reading false twice over. "3 records,
+ * last 3:04 p.m." says three things happened and the newest was minutes ago,
+ * where the truth is that one setting names three destinations and 3:04 p.m. is
+ * when we looked. The read time is always recent, so every forwarding finding
+ * would read as though it were unfolding right now — exactly backwards, because
+ * a forwarding rule set six months ago is the more alarming case, not the less.
+ *
+ * This is the same defect this surface keeps producing: a true sentence
+ * positioned where a reader takes it as an answer to a different question. It
+ * is worth stating why it only became load-bearing now. Until the detector was
+ * corrected, one destination and four produced the same finding, so the number
+ * was not meaningful and nobody could act on it. Making it meaningful is what
+ * made mislabelling it dangerous — a correct number under the wrong noun earns
+ * a trust the meaningless one never had.
+ *
+ * A rule this build does not know gets neither phrase. "Records" asserts that
+ * the count is of events and "last" asserts that the date is an occurrence, and
+ * the mailbox rule is the proof that a new check can falsify both. So an
+ * unrecognised rule reports that it is unrecognised, and its two values are
+ * shown without a reading attached.
+ *
+ * THIS TABLE IS A STOPGAP, and should be read as one rather than as the design.
+ * It works by knowing which rules produce which kind of time, which is the very
+ * arrangement that caused the defect: two kinds of fact in one field, told
+ * apart by a convention held somewhere else. It is the right thing to do only
+ * while the value does not carry its own kind.
+ *
+ * The agreed replacement puts the kind on the value — a timestamp that says
+ * whether it marks an event occurring or a state being observed. When that
+ * arrives, read the kind and delete this table.
+ *
+ * Specifically, do not re-key it on the signal name. A name is a proxy for the
+ * kind in exactly the way a rule id is, so that would move the convention
+ * rather than remove it, while looking like progress because the key is closer
+ * to the data.
+ */
+export type FindingEvidenceShape =
+  | { kind: 'OCCURRENCES'; singular?: string; plural?: string }
+  | { kind: 'CONFIGURED_STATE'; singular: string; plural: string }
+  | { kind: 'UNRECOGNISED' }
+
+const evidenceShapes: Record<RiskAssessmentRuleId, FindingEvidenceShape> = {
+  'HV-ID-AUTH-010.v1': { kind: 'OCCURRENCES' },
+  'HV-ID-AUTH-005.v2': { kind: 'OCCURRENCES' },
+  'HV-ID-MBX-001.v1': {
+    kind: 'CONFIGURED_STATE',
+    singular: 'external destination',
+    plural: 'external destinations',
+  },
+}
+
+export function findingEvidenceShape(ruleId: string): FindingEvidenceShape {
+  return Object.hasOwn(evidenceShapes, ruleId)
+    ? evidenceShapes[ruleId as RiskAssessmentRuleId]
+    : { kind: 'UNRECOGNISED' }
+}
+
+export type FindingEvidenceSummary = {
+  /** How much evidence, in the unit this rule actually counts. */
+  count: string | null
+  /** What the rule's timestamp marks, said in words rather than implied. */
+  timing: string | null
+  /** Why neither of the above could be said. Never set alongside them. */
+  note: string | null
+}
+
+/**
+ * The count and timing phrases for one finding.
+ *
+ * The date formatter is supplied by the caller because the list and the drawer
+ * format times differently, and neither of those choices belongs here.
+ */
+
+/**
+ * The shape for one reason, preferring what the value carries.
+ *
+ * A signal this build does not recognise is unrecognised even if its kind is
+ * known: without a unit there is no honest noun for its count, and "records"
+ * is the guess the mailbox check already proved wrong.
+ */
+function evidenceShapeFor(finding: {
+  ruleId: string
+  signal?: string | null
+  kind?: 'EVENT_OCCURRED' | 'STATE_OBSERVED' | null
+}): FindingEvidenceShape {
+  if (finding.signal === undefined || finding.signal === null) {
+    return findingEvidenceShape(finding.ruleId)
+  }
+  const copy = signalCopy[finding.signal]
+  if (!copy) return { kind: 'UNRECOGNISED' }
+  if (finding.kind === 'STATE_OBSERVED') {
+    return {
+      kind: 'CONFIGURED_STATE',
+      singular: copy.singular,
+      plural: copy.plural,
+    }
+  }
+  return {
+    kind: 'OCCURRENCES',
+    singular: copy.singular,
+    plural: copy.plural,
+  }
+}
+
+export function findingEvidenceSummary(
+  finding: {
+    ruleId: string
+    /** Set when this reason came from a signal rather than a whole finding. */
+    signal?: string | null
+    /**
+     * The kind carried by the signal's own timestamp. Preferred over anything
+     * inferred from the rule, and null when the signal has no timestamp.
+     */
+    kind?: 'EVENT_OCCURRED' | 'STATE_OBSERVED' | null
+    evidenceCount: number
+    evidenceCountCapped: boolean
+    /**
+     * Null when the check ran and its evidence carries no time at all.
+     *
+     * That is a real state rather than a missing field, and it has to stay
+     * distinguishable from one. No detector produces it today, but that is a
+     * property of the two detectors that exist, not of the contract, and the
+     * alternative to handling it is a default — now, the epoch, the empty
+     * string — that would place a row somewhere specific in a column meaning
+     * recency on the strength of a value nobody supplied.
+     */
+    lastSeen: string | null
+  },
+  formatDate: (value: string) => string
+): FindingEvidenceSummary {
+  const shape = evidenceShapeFor(finding)
+  const when = finding.lastSeen === null ? null : formatDate(finding.lastSeen)
+  if (shape.kind === 'UNRECOGNISED') {
+    return {
+      count: null,
+      timing: null,
+      note:
+        'This build of HawkView does not know this check, so it cannot say what its count of ' +
+        finding.evidenceCount.toLocaleString() +
+        ' counts' +
+        (when === null ? '.' : ', or what ' + when + ' marks.'),
+    }
+  }
+  // A signal can be evaluated and find nothing. That is a result, and it has to
+  // read as one: "0 records" describes evidence that exists and was not
+  // counted, and beside "no time recorded" it reads as evidence that exists and
+  // was not dated. Neither is what happened. Two of the nine findings on the
+  // fleet today carry a zero lockout count beside a real rejection count, so
+  // this is a live shape and not a hypothetical one.
+  //
+  // A capped zero is a different answer again, and the difference matters more
+  // than the wording. Capped means the window was truncated before the check
+  // saw anything, so a zero from a capped window is not a finding of none — it
+  // is the absence of a reading. Rendering it as a floor would also produce
+  // "at least 0", a lower bound that excludes nothing and that this surface has
+  // already removed once, from the tenant count card. It came back here by a
+  // different path, which is the argument for the phrase never being assembled
+  // from parts in more than one place.
+  if (finding.evidenceCount === 0) {
+    if (finding.evidenceCountCapped) {
+      return {
+        count: 'none read before the evidence window was truncated',
+        timing: null,
+        note: null,
+      }
+    }
+    return {
+      count:
+        shape.kind === 'CONFIGURED_STATE' ? 'none configured' : 'none recorded',
+      // A state read that found nothing still happened, and when it happened is
+      // worth knowing. Nothing occurred for an event check to have timed.
+      timing:
+        shape.kind === 'CONFIGURED_STATE' && when !== null
+          ? 'configuration read ' + when
+          : null,
+      note: null,
+    }
+  }
+  // A capped count is a floor, never a total: the evidence was truncated before
+  // the check ran, so the check could not have known there was more.
+  const amount =
+    (finding.evidenceCountCapped ? 'at least ' : '') +
+    finding.evidenceCount.toLocaleString()
+  if (shape.kind === 'CONFIGURED_STATE') {
+    return {
+      count:
+        amount +
+        ' ' +
+        (finding.evidenceCount === 1 ? shape.singular : shape.plural),
+      // Deliberately not "last". Nothing here happened at this time; this is
+      // when HawkView read a setting that may be far older.
+      timing:
+        when === null ? 'no read time recorded' : 'configuration read ' + when,
+      note: null,
+    }
+  }
+  return {
+    count:
+      amount +
+      ' ' +
+      (finding.evidenceCount === 1
+        ? (shape.singular ?? 'record')
+        : (shape.plural ?? 'records')),
+    timing: when === null ? 'no time recorded' : 'last ' + when,
+    note: null,
+  }
+}
+
+/**
+ * How many identities a check actually had in front of it.
+ *
+ * The live engine reports zero eligible subjects on every tenant, including
+ * three that are under attack, so "0 identities evaluated by this check" beside
+ * a readiness of Ready is the line a technician is most likely to meet. It
+ * reads as a check that ran over a population and came back empty. The truth is
+ * that the check had nobody to examine, and those are different enough to send
+ * someone to different places: one is a quiet tenant, the other is a broken
+ * pipeline.
+ *
+ * A truncated zero is a third answer. If the scope reading was capped before
+ * anything was counted, the check cannot say nobody was in scope either — and
+ * putting it through the ordinary floor wording would produce "at least 0",
+ * which excludes nothing. That phrase has now been assembled twice on this
+ * surface from parts that had no knowledge of each other, which is the argument
+ * for every count phrase being built here rather than at the site that renders
+ * it.
+ */
+export function ruleScopeSummary(rule: {
+  assessedIdentities: number | null
+  countsCapped: boolean
+}): string {
+  if (rule.assessedIdentities === null) {
+    return 'identities evaluated not reported'
+  }
+  if (rule.assessedIdentities === 0) {
+    return rule.countsCapped
+      ? 'no identities read before the scope was truncated'
+      : 'no identities were in scope for this check'
+  }
+  const amount =
+    (rule.countsCapped ? 'at least ' : '') +
+    rule.assessedIdentities.toLocaleString()
+  return (
+    amount +
+    (rule.assessedIdentities === 1
+      ? ' identity evaluated by this check'
+      : ' identities evaluated by this check')
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Why the assessment is not available                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Whether an unavailable assessment is something wrong or a boundary working
+ * as designed.
+ *
+ * This distinction is the whole reason these reasons are not collapsed. The
+ * existing unavailable copy has three variants and every one of them reads as
+ * breakage -- "could not be read", "could not be loaded", "not been reported
+ * yet". Rendering a role boundary that way sends a technician to raise a
+ * support ticket about a system behaving exactly as intended, which is the same
+ * cost already identified for a withheld count read as an error.
+ *
+ * PERMISSION and NOT_CONFIGURED are not faults and must never be styled or
+ * worded as though they were. NOT_YET_RUN is a scheduling question. FAULT is
+ * the only one where something is actually wrong, and even there it is wrong on
+ * the server rather than in the request.
+ */
+export type AssessmentUnavailablePosture =
+  | 'PERMISSION'
+  | 'NOT_CONFIGURED'
+  | 'NOT_YET_RUN'
+  | 'FAULT'
+  | 'UNRECOGNISED'
+
+export type AssessmentUnavailableCopy = {
+  posture: AssessmentUnavailablePosture
+  headline: string
+  caption: string
+}
+
+/**
+ * One entry per reason, and each says the same thing in a different way at the
+ * end: this is not an all-clear.
+ *
+ * That repetition is deliberate. Every one of these states puts an empty screen
+ * in front of a technician, and an empty screen is read as "nothing to worry
+ * about" unless the words on it say otherwise. The count tile already refuses
+ * to print a bare zero for the same reason; these are the same defect reached
+ * by a different route.
+ */
+const unavailableCopy: Record<string, AssessmentUnavailableCopy> = {
+  ROLE_NOT_PERMITTED: {
+    posture: 'PERMISSION',
+    headline: 'Your role cannot see this tenant&rsquo;s risky users',
+    caption:
+      'Nothing is wrong and nothing needs retrying. Named users are restricted to roles with permission to see them, and yours does not have it for this tenant. An administrator can change that. It is not an all-clear, and says nothing about whether the tenant has risky users.',
+  },
+  NOT_ENABLED_FOR_TENANT: {
+    posture: 'NOT_CONFIGURED',
+    headline: 'HawkView risk evaluation is not switched on for this tenant',
+    caption:
+      'This tenant is not in the group HawkView evaluates, so no assessment has been made. Nothing has failed. This is not a result of zero, and it is not an all-clear: the checks have not run rather than run and found nothing.',
+  },
+  EVALUATION_DISABLED: {
+    posture: 'NOT_CONFIGURED',
+    headline: 'HawkView risk evaluation is currently switched off',
+    caption:
+      'Risk evaluation has been disabled for all tenants at the operator level, so no current assessment exists for this one. Nothing has failed and no retry will help. This is not an all-clear.',
+  },
+  NO_RUN: {
+    posture: 'NOT_YET_RUN',
+    headline: 'HawkView has not assessed this tenant yet',
+    caption:
+      'No evaluation has completed for this tenant, so there is nothing to report. This is a question about scheduling rather than about the tenant: the checks have not run, which is not the same as running and finding nobody. It is not a zero, and it is not an all-clear.',
+  },
+  COVERAGE_NOT_RECORDED: {
+    posture: 'NOT_YET_RUN',
+    headline: 'The last assessment did not record what it covered',
+    caption:
+      'An evaluation completed, but it did not store the scope its result rested on, so HawkView cannot say what any number from it would be a number about. Runs made before that scope was recorded are all in this position. The findings are not shown rather than absent, and this is not an all-clear.',
+  },
+  COVERAGE_UNREADABLE: {
+    posture: 'FAULT',
+    headline: 'The last assessment&rsquo;s coverage could not be read',
+    caption:
+      'A record exists and HawkView could not interpret it. That is a problem on our side and worth reporting; it is not a statement about this tenant, no result should be inferred from it, and it is not an all-clear.',
+  },
+  FINDINGS_NOT_RECORDED: {
+    posture: 'NOT_YET_RUN',
+    headline: 'The last assessment did not record its findings',
+    caption:
+      'A count exists for this run and the per-user findings behind it do not. Rather than show a number with nothing behind it, HawkView shows neither. The users this run counted have not been checked and cleared &mdash; they have not been shown. This is not an all-clear.',
+  },
+  FINDINGS_UNREADABLE: {
+    posture: 'FAULT',
+    headline: 'The last assessment&rsquo;s findings could not be read',
+    caption:
+      'A findings record exists and HawkView could not interpret it. That is a problem on our side and worth reporting. No result should be inferred from it, and this is not an all-clear.',
+  },
+}
+
+/**
+ * The copy for one reason, or an honest admission that this build does not know
+ * it.
+ *
+ * A reason this build has never seen will happen: the backend ships on its own
+ * schedule and auto-deploys, so it is routinely newer than the frontend in
+ * front of it. The fallback must not guess a posture -- treating an unknown
+ * reason as a fault invents an incident, and treating it as a boundary invents
+ * a reassurance. It says it does not know, and never prints the raw code, which
+ * is an identifier rather than something a technician can act on.
+ */
+export function assessmentUnavailableCopyFor(
+  because: string
+): AssessmentUnavailableCopy {
+  return (
+    unavailableCopy[because] ?? {
+      posture: 'UNRECOGNISED',
+      headline: 'HawkView cannot show risky users for this tenant',
+      caption:
+        'The server gave a reason this build of HawkView does not recognise, so it cannot say whether this is a permission boundary, a setting, or a fault. It is not an all-clear, and the tenant has not been checked and cleared.',
+    }
+  )
+}
+
+/** Whether this reason describes something broken. */
+export function assessmentUnavailableIsFault(because: string): boolean {
+  return assessmentUnavailableCopyFor(because).posture === 'FAULT'
+}
+
+/* -------------------------------------------------------------------------- */
+/* Whether the run itself is current                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How far a run's evidence window may close before its completion time without
+ * being worth mentioning.
+ *
+ * The engine builds the window as [now - 30d, now] at the moment of the read,
+ * so windowEnd and completedAt are the same instant give or take the seconds
+ * the assessment takes. Anything materially past that is a run that was stored
+ * and served later, or replayed.
+ *
+ * Fifteen minutes is a floor for not bothering the reader, not a judgement
+ * about what counts as stale. The distinction matters: a threshold tuned to
+ * whichever tenant happened to be measured is calibrated by that sample, so
+ * this one is set far above the seconds a healthy run takes and far below the
+ * days a replayed one shows, and the copy states the measured gap rather than
+ * this constant's verdict. The number a reader acts on is the real one.
+ */
+const RUN_RECENCY_FLOOR_MS = 15 * 60_000
+
+export type RunRecency =
+  | { state: 'CURRENT' }
+  | { state: 'UNDATED' }
+  | { state: 'STALE_RUN'; windowClosedAt: string; completedAt: string }
+
+/**
+ * Whether this assessment describes a window that had already closed when the
+ * run finished.
+ *
+ * A third kind of staleness, and it must not be confused with either of the
+ * others on this surface. The evidence being old is COLLECTION_STALE and is
+ * about the collector. A finding's own tolerance horizon passing is about one
+ * detector's judgement. This is about the run: the numbers may be perfectly
+ * consistent and simply describe a moment that has gone.
+ *
+ * Undated is its own answer rather than a pass. A run that does not say when it
+ * finished cannot be shown to be current, and treating a missing timestamp as
+ * proof of freshness is the reassuring direction of the same error.
+ */
+export function runRecency(run: {
+  windowEnd: string | null
+  completedAt: string | null
+}): RunRecency {
+  const closed = run.windowEnd === null ? NaN : Date.parse(run.windowEnd)
+  const done = run.completedAt === null ? NaN : Date.parse(run.completedAt)
+  if (!Number.isFinite(closed) || !Number.isFinite(done)) {
+    return { state: 'UNDATED' }
+  }
+  if (done - closed <= RUN_RECENCY_FLOOR_MS) return { state: 'CURRENT' }
+  return {
+    state: 'STALE_RUN',
+    windowClosedAt: run.windowEnd as string,
+    completedAt: run.completedAt as string,
   }
 }

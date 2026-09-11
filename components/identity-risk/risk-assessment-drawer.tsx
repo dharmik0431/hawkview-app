@@ -13,6 +13,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import {
+  findingEvidenceShape,
+  findingEvidenceSummary,
   riskConditionalAccessIsCurrent,
   riskProtectionEvidenceIsCurrent,
   riskProtectionSummary,
@@ -238,8 +240,8 @@ function FindingDetail({ finding }: { finding: RiskAssessmentFinding }) {
         <div>
           <dt className="text-slate-500 dark:text-slate-400">Evidence</dt>
           <dd className="mt-0.5 font-medium text-slate-900 dark:text-slate-100">
-            {finding.evidenceCountCapped ? 'At least ' : ''}
-            {finding.evidenceCount.toLocaleString()} records
+            {findingEvidenceSummary(finding, formatTimestamp).count ??
+              finding.evidenceCount.toLocaleString()}
           </dd>
         </div>
         <div>
@@ -281,6 +283,9 @@ function FindingDetail({ finding }: { finding: RiskAssessmentFinding }) {
           </dd>
         </div>
       </dl>
+
+      <ClosedActivityWindow finding={finding} />
+      <EvidenceReadingCaveat finding={finding} />
 
       {finding.evidenceReferences.length > 0 && (
         <div className="mt-4">
@@ -467,6 +472,87 @@ function ContainmentGuidance({ user }: { user: RiskAssessmentUser }) {
         )}
       </ul>
     </details>
+  )
+}
+
+/**
+ * What the numbers above this line mean, for the checks where the field names
+ * are not enough on their own.
+ *
+ * "Evidence" and "evidence time" are accurate for a check that watches events
+ * and misleading for one that reads a setting: the count is of destinations
+ * rather than occurrences, and the timestamps are when HawkView looked rather
+ * than when anything happened. The dl cannot say that in a label without
+ * repeating it on every row of every finding, so it is said once, and only for
+ * the findings it applies to.
+ *
+ * An unrecognised check gets the same treatment for a different reason. This
+ * build cannot know whether its count is of events or of things, so it declines
+ * to name a unit rather than guessing "records" — the mailbox check is the
+ * standing proof that guessing gets it wrong.
+ */
+function EvidenceReadingCaveat({
+  finding,
+}: {
+  finding: RiskAssessmentFinding
+}) {
+  const shape = findingEvidenceShape(finding.ruleId)
+  if (shape.kind === 'OCCURRENCES') return null
+  return (
+    <p className="mt-3 text-xs leading-5 text-slate-500 dark:text-slate-400">
+      {shape.kind === 'CONFIGURED_STATE' ? (
+        <>
+          This check reads a setting rather than watching events. The count
+          above is how many {shape.plural} the mailbox is currently configured
+          to forward to, and the times are when HawkView read that
+          configuration. They are not when the forwarding was set up, and this
+          finding does not carry that date &mdash; a rule created months ago and
+          one created this morning look the same here.
+        </>
+      ) : (
+        <>
+          This build of HawkView does not know this check, so it cannot say what
+          the count above counts or what the times mark. Both are shown as the
+          server reported them, without a unit, because the alternative is to
+          guess one.
+        </>
+      )}
+    </p>
+  )
+}
+
+/**
+ * When a finding's own activity window closed before the check that reported
+ * it ran.
+ *
+ * "Current" is the server's classification and is not overridden here — that
+ * would be inferring a verdict from two dates. What is stated is the
+ * relationship between the dates, which the payload gives directly and which a
+ * badge reading "Current" beside a window that closed last week does not.
+ *
+ * This is the Raymonds shape, the one that started the per-signal work: 462
+ * lockouts that stopped on 3 September, a window that closed on the 4th, and a
+ * check that ran on the 10th. Every field is accurate. Read together without
+ * this line they say the account is under attack right now, and the technician
+ * who calls out-of-hours is responding to something that stopped a week ago.
+ *
+ * The window end is the detector's own tolerance beyond the last evidence, so
+ * its passing means the detector would no longer treat the activity as
+ * ongoing. Nothing stronger than that is claimed.
+ */
+function ClosedActivityWindow({ finding }: { finding: RiskAssessmentFinding }) {
+  const closed = Date.parse(finding.activityWindowEndsAt)
+  const evaluated = finding.evaluatedAt ? Date.parse(finding.evaluatedAt) : NaN
+  if (!Number.isFinite(closed) || !Number.isFinite(evaluated)) return null
+  if (closed >= evaluated) return null
+  return (
+    <p className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
+      This finding&rsquo;s activity window closed on{' '}
+      {formatTimestamp(finding.activityWindowEndsAt)}, before the check ran on{' '}
+      {formatTimestamp(finding.evaluatedAt)}. Nothing here shows activity after{' '}
+      {formatTimestamp(finding.lastSeen)}, so read it as something to
+      investigate rather than as something in progress.
+    </p>
   )
 }
 

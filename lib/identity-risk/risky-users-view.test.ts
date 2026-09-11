@@ -13,9 +13,17 @@ import {
   microsoftRiskLevelLabel,
   microsoftVerdictDetail,
   microsoftVerdictPolarity,
+  allWithheldHeadlines,
+  nativeWithheldReasonCopy,
   riskyUserCount,
   riskyUserList,
 } from './risky-users-view.ts'
+import {
+  assessmentUnavailableCopyFor,
+  findingEvidenceSummary,
+  ruleScopeSummary,
+  runRecency,
+} from './presentation.ts'
 import type { MicrosoftEntraRiskyUser } from './types.ts'
 import {
   assessmentFixture,
@@ -586,7 +594,15 @@ test('the list carries what a technician triages on', () => {
   assert.equal(row.priority, 'LOW')
   assert.equal(row.priorityLabel, 'Low')
   assert.equal(row.lastSeen, at(-1))
-  assert.deepEqual(row.reasons, ['Repeated invalid credentials'])
+  assert.deepEqual(
+    row.reasons.map((reason) => reason.title),
+    ['Repeated invalid credentials']
+  )
+  // Each reason carries its own count and its own recency, so a surface
+  // cannot pair one reason's number with another reason's date.
+  assert.equal(row.reasons[0].evidenceCount, 10)
+  assert.equal(row.reasons[0].evidenceCountCapped, false)
+  assert.equal(row.reasons[0].lastSeen, at(-1))
   assert.equal(row.protection.label, 'Protection not verified')
   // The contract carries no address, so none is invented.
   assert.equal(row.email, null)
@@ -1014,4 +1030,340 @@ test('the panel never claims unavailability while showing Microsoft records', ()
   // With no records the licence statement is still exactly right.
   assert.equal(microsoftChannel(unlicensed).state, 'UNAVAILABLE')
   assert.match(microsoftChannel(unlicensed).headline, /requires Entra ID P2/)
+})
+
+test('a signal that found nothing reads as a result, not as untimed evidence', () => {
+  // Live shape: two of the nine findings on the fleet carry a zero lockout
+  // count beside a real rejection count. "0 records" describes evidence that
+  // exists and was not counted, and beside "no time recorded" it describes
+  // evidence that exists and was not dated. Neither is what happened.
+  const evaluated = findingEvidenceSummary(
+    {
+      ruleId: 'HV-ID-AUTH-010.v1',
+      evidenceCount: 0,
+      evidenceCountCapped: false,
+      lastSeen: null,
+    },
+    (value) => value
+  )
+  assert.equal(evaluated.count, 'none recorded')
+  assert.equal(evaluated.timing, null)
+
+  // A capped zero is a different answer, and the more dangerous one to blur:
+  // the window was truncated before the check saw anything, so this is the
+  // absence of a reading rather than a finding of none.
+  const truncated = findingEvidenceSummary(
+    {
+      ruleId: 'HV-ID-AUTH-010.v1',
+      evidenceCount: 0,
+      evidenceCountCapped: true,
+      lastSeen: null,
+    },
+    (value) => value
+  )
+  assert.match(truncated.count ?? '', /truncated/)
+  assert.notEqual(truncated.count, evaluated.count)
+
+  // A state read that found nothing still happened, and when it happened is
+  // worth knowing; nothing occurred for an event check to have timed.
+  const nothingConfigured = findingEvidenceSummary(
+    {
+      ruleId: 'HV-ID-MBX-001.v1',
+      evidenceCount: 0,
+      evidenceCountCapped: false,
+      lastSeen: '2026-09-08T00:00:00.000Z',
+    },
+    () => 'THE-READ-TIME'
+  )
+  assert.equal(nothingConfigured.count, 'none configured')
+  assert.match(
+    nothingConfigured.timing ?? '',
+    /configuration read THE-READ-TIME/
+  )
+})
+
+test('no combination of inputs can assemble a zero lower bound', () => {
+  // "At least 0" excludes nothing, so it is a bound that claims to inform and
+  // does not. This surface removed it once already, from the tenant count card,
+  // and it reappeared here by a different path — a capped zero going through
+  // the ordinary floor wording. A sweep rather than a case, because the defect
+  // is the phrase being assembled from parts, and parts recombine.
+  // Positive control, because this sweep has already failed silently once: the
+  // patterns were written with a mangled escape and matched nothing, so every
+  // case passed and the run looked green. A sweep that cannot fail is worse
+  // than no sweep, since its silence is read as a result. These two lines prove
+  // the patterns are live before the loop trusts them.
+  const banned = [/at least 0\b/, /\b0 record/]
+  assert.ok(banned[0].test('at least 0 records'), 'bound pattern is inert')
+  assert.ok(banned[1].test('0 records, last Tuesday'), 'count pattern is inert')
+
+  for (const ruleId of [
+    'HV-ID-AUTH-010.v1',
+    'HV-ID-AUTH-005.v2',
+    'HV-ID-MBX-001.v1',
+    'HV-ID-UNKNOWN-000.v9',
+  ]) {
+    for (const evidenceCount of [0, 1, 2]) {
+      for (const evidenceCountCapped of [false, true]) {
+        for (const lastSeen of [null, '2026-09-08T00:00:00.000Z']) {
+          // The coverage panel builds a count phrase from the same parts, in a
+          // component that never knew about this ban. That is how "at least 0"
+          // got assembled a second time, so it is swept here rather than there.
+          const scope = ruleScopeSummary({
+            assessedIdentities: evidenceCount,
+            countsCapped: evidenceCountCapped,
+          })
+          for (const pattern of banned) {
+            assert.ok(!pattern.test(scope), 'rule scope :: ' + scope)
+          }
+          const summary = findingEvidenceSummary(
+            { ruleId, evidenceCount, evidenceCountCapped, lastSeen },
+            (value) => value
+          )
+          const rendered = [summary.count, summary.timing, summary.note]
+            .filter(Boolean)
+            .join(' | ')
+          const label =
+            ruleId + ' n=' + evidenceCount + ' capped=' + evidenceCountCapped
+          for (const pattern of banned) {
+            assert.ok(!pattern.test(rendered), label + ' :: ' + rendered)
+          }
+        }
+      }
+    }
+  }
+})
+
+test('a check with nobody to examine does not read as a check that found nobody', () => {
+  // The state the live engine reports on every tenant today, three of which are
+  // under attack: zero eligible subjects. "0 identities evaluated by this
+  // check" beside a readiness of Ready describes a check that ran over a
+  // population and came back empty. The truth is that it had no population.
+  // One is a quiet tenant; the other is a broken pipeline, and they send a
+  // technician to different places.
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: 0, countsCapped: false }),
+    'no identities were in scope for this check'
+  )
+
+  // Truncated before anything was counted is a third answer again: the check
+  // cannot say nobody was in scope either.
+  assert.match(
+    ruleScopeSummary({ assessedIdentities: 0, countsCapped: true }),
+    /truncated/
+  )
+  assert.notEqual(
+    ruleScopeSummary({ assessedIdentities: 0, countsCapped: true }),
+    ruleScopeSummary({ assessedIdentities: 0, countsCapped: false })
+  )
+
+  // A real population keeps its number, and a capped one states its bound
+  // rather than trailing a parenthetical the reader may not tie to the count.
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: 2, countsCapped: false }),
+    '2 identities evaluated by this check'
+  )
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: 2, countsCapped: true }),
+    'at least 2 identities evaluated by this check'
+  )
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: 1, countsCapped: false }),
+    '1 identity evaluated by this check'
+  )
+
+  // Never reported stays distinct from zero: one is a gap in what the server
+  // said, the other is a statement the server made.
+  assert.equal(
+    ruleScopeSummary({ assessedIdentities: null, countsCapped: false }),
+    'identities evaluated not reported'
+  )
+})
+
+test('an empty screen never reads as a clean tenant, whatever emptied it', () => {
+  // Every unavailable reason puts a blank surface in front of a technician, and
+  // a blank surface reads as "nothing to worry about" unless the words say
+  // otherwise. This is the bare-zero defect reached by a different route, so
+  // the same rule applies: none of these may be readable as an all-clear.
+  // Every reason the endpoint can return, taken from the served union rather
+  // than from a description of it.
+  const codes = [
+    'ROLE_NOT_PERMITTED',
+    'NOT_ENABLED_FOR_TENANT',
+    'EVALUATION_DISABLED',
+    'NO_RUN',
+    'COVERAGE_NOT_RECORDED',
+    'COVERAGE_UNREADABLE',
+    'FINDINGS_NOT_RECORDED',
+    'FINDINGS_UNREADABLE',
+    'A_REASON_SHIPPED_AFTER_THIS_BUILD',
+  ]
+  const seen = new Set<string>()
+  for (const code of codes) {
+    const copy = assessmentUnavailableCopyFor(code)
+    const rendered = copy.headline + ' ' + copy.caption
+
+    // Each reason says something different. Collapsing them would send a
+    // technician to the wrong place: an administrator, a pilot list and an
+    // operator switch are three different next actions.
+    assert.ok(!seen.has(copy.headline), 'two reasons share a headline: ' + code)
+    seen.add(copy.headline)
+
+    // None of them may be read as a result.
+    //
+    // One canonical phrase rather than an alternation over however each caption
+    // happens to be worded. A regex over prose tests the phrasing, not the
+    // property, and widening it every time a new caption says the same thing
+    // differently turns the guard into a record of what has been written rather
+    // than a requirement on what may be. It also gives a technician the same
+    // boundary sentence wherever they land.
+    assert.match(rendered, /is not an all-clear/i)
+    assert.ok(
+      !/no risky users|nothing to review|all clear/i.test(rendered),
+      code + ' reads as a clean tenant: ' + rendered
+    )
+    // And none may print the identifier at a technician.
+    assert.ok(!rendered.includes(code), code + ' printed its own code')
+  }
+
+  // A permission boundary and a pilot gate are not faults, and must not be
+  // worded or styled as though something broke. A technician who reads a
+  // working boundary as breakage opens a support ticket about a healthy system.
+  assert.equal(
+    assessmentUnavailableCopyFor('ROLE_NOT_PERMITTED').posture,
+    'PERMISSION'
+  )
+  assert.equal(
+    assessmentUnavailableCopyFor('NOT_ENABLED_FOR_TENANT').posture,
+    'NOT_CONFIGURED'
+  )
+  // An unknown reason guesses neither direction: a fault invents an incident,
+  // a boundary invents a reassurance.
+  assert.equal(
+    assessmentUnavailableCopyFor('A_REASON_SHIPPED_AFTER_THIS_BUILD').posture,
+    'UNRECOGNISED'
+  )
+})
+
+test('a run that describes a window already closed is distinguishable from a current one', () => {
+  // The third kind of staleness on this surface, and the one about the run
+  // rather than the evidence or a detector's horizon.
+  const current = runRecency({
+    windowEnd: '2026-09-10T12:00:00.000Z',
+    completedAt: '2026-09-10T12:00:07.000Z',
+  })
+  assert.equal(current.state, 'CURRENT')
+
+  const replayed = runRecency({
+    windowEnd: '2026-09-06T12:00:00.000Z',
+    completedAt: '2026-09-10T12:00:00.000Z',
+  })
+  assert.equal(replayed.state, 'STALE_RUN')
+
+  // Undated is its own answer, not a pass. A run that cannot say when it
+  // finished cannot be shown to be current, and reading a missing timestamp as
+  // freshness is the reassuring direction of the same mistake.
+  assert.equal(
+    runRecency({ windowEnd: null, completedAt: null }).state,
+    'UNDATED'
+  )
+  assert.equal(
+    runRecency({ windowEnd: '2026-09-10T12:00:00.000Z', completedAt: null })
+      .state,
+    'UNDATED'
+  )
+  assert.equal(
+    runRecency({
+      windowEnd: 'not a date',
+      completedAt: '2026-09-10T12:00:00.000Z',
+    }).state,
+    'UNDATED'
+  )
+})
+
+test(`the rebuilt engine withholding reasons are carried, not mapped onto the old ones`, () => {
+  // Three pairs are close enough that a mapping would have looked reasonable
+  // and lost the sentence a technician acts on. The one that matters most on
+  // the fleet is the first: a tenant whose last event was in August has a
+  // collection gap; a tenant that has never successfully collected was never
+  // wired up. Both leave the surface without current evidence, they are not the
+  // same problem, and only one of them is fixed by waiting.
+  const reasons = [
+    'NEVER_COLLECTED',
+    'UNREADABLE_NOW',
+    'UNINTERPRETED_EVENTS',
+    'NOTHING_APPLICABLE',
+    'CAPACITY_EXCEEDED',
+    'DETECTOR_FAILED',
+    'UNRESOLVED_SUBJECT_IDENTITY',
+    'A_REASON_SHIPPED_AFTER_THIS_BUILD',
+  ]
+  const headlines = new Set<string>()
+  for (const reason of reasons) {
+    const copy = nativeWithheldReasonCopy(reason)
+    assert.ok(
+      !headlines.has(copy.headline),
+      'two reasons share a headline: ' + reason
+    )
+    headlines.add(copy.headline)
+    assert.ok(
+      !(copy.headline + ' ' + copy.caption).includes(reason),
+      reason + ' printed its own identifier'
+    )
+  }
+
+  // NEVER_COLLECTED must not read as staleness. Waiting fixes one and not the
+  // other, so the words have to send a technician to different places.
+  const never = nativeWithheldReasonCopy('NEVER_COLLECTED')
+  assert.match(never.caption, /never successfully collected/)
+  assert.match(never.caption, /waiting will not resolve it/)
+
+  // NOTHING_APPLICABLE is the one most easily read as a result rather than as
+  // a statement about scope.
+  const nothing = nativeWithheldReasonCopy('NOTHING_APPLICABLE')
+  assert.match(nothing.caption, /not a zero and it is not an all-clear/)
+  assert.match(nothing.caption, /nothing to examine rather than examining/)
+
+  // An unknown reason says it is unknown rather than borrowing a neighbour's
+  // sentence, because the neighbour's sentence names a cause.
+  const unknown = nativeWithheldReasonCopy('A_REASON_SHIPPED_AFTER_THIS_BUILD')
+  assert.match(unknown.headline, /does not recognise/)
+  assert.match(unknown.caption, /not a zero and it is not an all-clear/)
+})
+
+test('the two withholding vocabularies never converge on one sentence', () => {
+  // Found by mutation: rewriting NEVER_COLLECTED's headline to the stale one
+  // passed every check above, because each table only asserted uniqueness
+  // within itself. The tables exist to say different things, so the collision
+  // that matters is between them and no per-table check can see it.
+  //
+  // This is the pair the fleet turns on. A tenant whose last event was in
+  // August has a collection gap; a tenant that has never successfully
+  // collected was never wired up. Waiting fixes one of them.
+  // Keyed on the reason's name, not on the raw list. One reason genuinely
+  // exists in both vocabularies -- UNRESOLVED_SUBJECT_IDENTITY -- and sharing a
+  // sentence there is correct rather than a collision. The first version of
+  // this check forbade every duplicate and failed on that, which would have
+  // pushed me to reword one of them for the test's benefit and make the surface
+  // say two things about one cause.
+  const seen = new Map<string, string>()
+  for (const { reason, headline } of allWithheldHeadlines()) {
+    const owner = seen.get(headline)
+    assert.ok(
+      owner === undefined || owner === reason,
+      'two different reasons print the same headline: ' +
+        owner +
+        ' and ' +
+        reason +
+        ' both say "' +
+        headline +
+        '"'
+    )
+    seen.set(headline, reason)
+  }
+  // And the specific collision, named, so the guard says what it protects.
+  assert.notEqual(
+    nativeWithheldReasonCopy('NEVER_COLLECTED').headline,
+    'Not counted — the evidence is out of date'
+  )
 })

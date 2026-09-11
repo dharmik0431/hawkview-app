@@ -90,6 +90,21 @@ export function RiskyUsersCountCard({
         {count.caption}
       </p>
 
+      {count.listCoverage === 'PARTIAL' && (
+        <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-[13px] leading-relaxed text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+          The list behind this number is longer than what came back with it.
+          Opening it shows part of the tenant, not all of it.
+        </p>
+      )}
+
+      {count.listCoverage === 'NONE_DELIVERED' && (
+        <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-[13px] leading-relaxed text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+          The findings behind this number did not come back with it, so there is
+          nothing to open. The number is what HawkView counted; the absence of a
+          list is a gap in this response and not a shorter list.
+        </p>
+      )}
+
       <CountReasons reasons={count.reasons} />
       {count.value !== 0 && count.value !== null ? null : (
         <CountKnown known={count.known} />

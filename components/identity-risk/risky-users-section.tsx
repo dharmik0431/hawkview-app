@@ -12,6 +12,10 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
 import {
+  findingEvidenceShape,
+  findingEvidenceSummary,
+  runRecency,
+  ruleScopeSummary,
   microsoftRiskyUserCountPresentation,
   riskReadinessLabel,
   riskSourceLabel,
@@ -24,11 +28,18 @@ import {
   microsoftRiskLevelLabel,
   microsoftVerdictDetail,
   microsoftVerdictPolarity,
+  nativeWithheldReasonCopy,
 } from '@/lib/identity-risk/risky-users-view'
+import {
+  detectorGuidanceFor,
+  detectorTitle,
+} from '@/lib/identity-risk/native-view'
+import type { NativeAssessment } from '@/lib/identity-risk/native-assessment'
 import type {
   MicrosoftChannel,
   MicrosoftVerdictPolarity,
   RiskyUserCount,
+  RiskyUserReason,
   RiskyUserRow,
 } from '@/lib/identity-risk/risky-users-view'
 import type {
@@ -41,6 +52,126 @@ import { RiskAssessmentDrawer } from './risk-assessment-drawer'
 
 function time(value: string | null) {
   return value ? new Date(value).toLocaleString() : 'Not reported'
+}
+
+/**
+ * The row's one aggregate date, and what kind of date it is.
+ *
+ * Three different things can appear here and none of them may borrow another's
+ * words. A date, qualified by the kind of time it turned out to be. No date
+ * because the checks that ran carry none — an evidence gap, not a collection
+ * one. And no date because there is nothing here to have one.
+ *
+ * "Not reported" for the middle case would be the surface's standing mistake in
+ * miniature: a true-sounding phrase about collection, printed where the truth is
+ * about the evidence.
+ */
+function LatestCell({ row }: { row: RiskyUserRow }) {
+  if (row.lastSeenState === 'NO_REASONS') return <>{time(null)}</>
+  if (row.lastSeenState === 'DATELESS') {
+    return (
+      <>
+        No time recorded
+        <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
+          the checks ran; their evidence carries no time
+        </span>
+      </>
+    )
+  }
+  const settingRead =
+    row.lastSeenFrom &&
+    findingEvidenceShape(row.lastSeenFrom.ruleId).kind !== 'OCCURRENCES'
+  return (
+    <>
+      {time(row.lastSeen)}
+      {settingRead && (
+        <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
+          when HawkView read a setting, not when anything happened
+        </span>
+      )}
+    </>
+  )
+}
+
+/**
+ * What to do about this row's findings.
+ *
+ * Half the product is naming what we found; the other half is what an MSP can
+ * do about it, and a row of counts and dates delivers only the first. The
+ * guidance is static per detector rather than per finding, because the steps
+ * for repeated credential failures are the same every time they occur, so it
+ * is copy rather than data and needs nothing from the endpoint.
+ *
+ * Collapsed, phrased as investigation steps rather than instructions, and
+ * carried out in Microsoft's own tools -- HawkView reads and changes nothing.
+ * A detector this build does not recognise says the guidance is missing rather
+ * than offering a neighbour's steps: guidance for the wrong finding is worse
+ * than none, because it gets followed.
+ */
+function NextSteps({ row }: { row: RiskyUserRow }) {
+  const detectorIds = Array.from(
+    new Set(row.reasons.map((reason) => reason.ruleId))
+  )
+  const known = detectorIds.filter(
+    (detectorId) => detectorGuidanceFor(detectorId).length > 0
+  )
+  if (known.length === 0) {
+    return (
+      <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
+        This build has no investigation steps for{' '}
+        {detectorIds.length === 1 ? 'this check' : 'these checks'}. That is a
+        gap in HawkView rather than a sign there is nothing to do.
+      </p>
+    )
+  }
+  return (
+    <details className="mt-2">
+      <summary className="cursor-pointer text-xs font-semibold text-slate-700 dark:text-slate-200">
+        What to check next
+      </summary>
+      {known.map((detectorId) => (
+        <div key={detectorId} className="mt-1.5">
+          {known.length > 1 && (
+            <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
+              {detectorTitle(detectorId)}
+            </p>
+          )}
+          <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-5 text-slate-600 dark:text-slate-300">
+            {detectorGuidanceFor(detectorId).map((step) => (
+              <li key={step}>{step}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+      <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
+        Nothing above establishes compromise. HawkView makes no changes to
+        Microsoft; every step is carried out in Microsoft&rsquo;s own tools.
+      </p>
+    </details>
+  )
+}
+
+/**
+ * One reason, with its own count and its own recency, in the unit that reason
+ * actually counts.
+ *
+ * Two reasons on one row never share a date, and neither shares a noun. A
+ * repeated-failure reason counts events and its date is when the last one
+ * happened; the mailbox reason counts destinations a mailbox is configured to
+ * forward to and its date is when the setting was read. Both readings are
+ * supplied by findingEvidenceSummary, which is also the only place that decides
+ * a rule it does not recognise gets no reading at all.
+ */
+function ReasonLine({ reason }: { reason: RiskyUserReason }) {
+  const evidence = findingEvidenceSummary(reason, time)
+  return (
+    <li className="text-xs text-slate-600 dark:text-slate-300">
+      {reason.title}
+      <span className="block text-slate-500 dark:text-slate-400">
+        {evidence.note ?? [evidence.count, evidence.timing].join(', ')}
+      </span>
+    </li>
+  )
 }
 
 /**
@@ -417,7 +548,7 @@ function UserRows({
               HawkView priority
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
-              Last seen
+              Latest of any reason
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
               <span className="sr-only">Open detail</span>
@@ -443,16 +574,15 @@ function UserRows({
                 >
                   {row.email ?? shortReference(row.reference)}
                 </p>
-                <ul className="mt-1.5 space-y-0.5">
+                <ul className="mt-1.5 space-y-1">
                   {row.reasons.map((reason) => (
-                    <li
-                      key={reason}
-                      className="text-xs text-slate-600 dark:text-slate-300"
-                    >
-                      {reason}
-                    </li>
+                    <ReasonLine
+                      key={reason.signal ?? reason.title}
+                      reason={reason}
+                    />
                   ))}
                 </ul>
+                <NextSteps row={row} />
               </td>
               <td className="px-3 py-3">
                 <DetectedBy row={row} />
@@ -470,7 +600,7 @@ function UserRows({
                 </p>
               </td>
               <td className="px-3 py-3 text-sm text-slate-700 dark:text-slate-300">
-                {time(row.lastSeen)}
+                <LatestCell row={row} />
               </td>
               <td className="px-3 py-3 text-right">
                 <Button
@@ -525,11 +655,7 @@ function Coverage({ assessment }: { assessment: RiskAssessment }) {
                 <span className="text-xs text-slate-500 dark:text-slate-400">
                   · {riskReadinessLabel(rule.status)} ·{' '}
                   {riskSourceLabel(rule.selectedSource)} ·{' '}
-                  {rule.assessedIdentities === null
-                    ? 'identities evaluated not reported'
-                    : `${rule.assessedIdentities.toLocaleString()} identities evaluated by this check${
-                        rule.countsCapped ? ' (capped)' : ''
-                      }`}
+                  {ruleScopeSummary(rule)}
                 </span>
                 <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300">
                   {rule.explanation}
@@ -573,21 +699,66 @@ function Coverage({ assessment }: { assessment: RiskAssessment }) {
  * attributed to people, the same sentence would quietly answer the question the
  * count just refused to answer.
  */
+/**
+ * When the rows on screen are only part of what the number counted.
+ *
+ * A page of a list is a true list and a tenant total is a true number, and a
+ * reader who counts the rows and compares gets a different answer with nothing
+ * on screen to reconcile them. The missing users have not been cleared, they
+ * have not been shown.
+ *
+ * This became reachable at scale rather than in principle once the collector
+ * fix surfaced findings on tenants that had been reporting none: a first page
+ * is what a tenant with nine findings returns.
+ */
+function PartialUserList({ count }: { count: RiskyUserCount }) {
+  if (count.listCoverage !== 'PARTIAL') return null
+  return (
+    <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm leading-relaxed text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+      These rows are part of the list, not all of it. The number above counts
+      the tenant; what is shown here is what this response returned. Users not
+      on screen have not been checked and cleared &mdash; they have not been
+      shown.
+    </p>
+  )
+}
+
 function EmptyUserList({ count }: { count: RiskyUserCount }) {
   // "No user needs attention" is only true when HawkView both counted and
   // found nothing. Beside a withheld count, or beside a zero that counts people
   // while mailbox evidence sits below, the same sentence quietly answers a
   // question the number did not.
+  //
+  // The count asserting people while no row arrives outranks every other
+  // reading, so it is tested first. A response cannot both know that four users
+  // have current findings and have no finding to show: the two statements
+  // contradict inside one payload, and the only thing that reconciles them is
+  // that the findings were not delivered.
+  //
+  // This is not hypothetical. The read path being built can serve coverage,
+  // count and claim while findings have nowhere to persist, so a real number
+  // beside an empty list is the first thing a real assessment will produce. The
+  // sentence it would otherwise fall through to is worse than merely wrong: it
+  // points the reader up to a summary that confidently says four, so the
+  // pointer deepens the contradiction instead of resolving it.
   const copy =
-    count.accuracy === 'WITHHELD'
-      ? count.known.length > 0
-        ? 'No finding could be attributed to a specific user, so no user is listed here. That is not the same as no user needing attention — what HawkView did find is listed above and below.'
-        : 'HawkView is not stating a number of users for this tenant, and no finding has been attributed to a specific user. Read this as an open question rather than an all-clear.'
-      : count.accuracy === 'UNAVAILABLE'
-        ? 'No current list can be shown. This is not an empty result, and nothing here has been checked and cleared.'
-        : count.known.length > 0
-          ? 'No finding was tied to a specific user, so no user is listed here. HawkView did find evidence on this tenant — it is listed above and below, and it is not an all-clear.'
-          : 'No user is listed as needing attention right now. The summary above states what that is based on and what it does not cover.'
+    count.listCoverage === 'NONE_DELIVERED'
+      ? 'The count above reports ' +
+        (count.accuracy === 'AT_LEAST' ? 'at least ' : '') +
+        count.value!.toLocaleString() +
+        (count.value === 1
+          ? ' user with a current finding, but no per-user finding came back with it.'
+          : ' users with current findings, but no per-user finding came back with it.') +
+        ' That is a gap in what this response delivered, not a finding that nobody needs attention. Do not read this as an all-clear.'
+      : count.accuracy === 'WITHHELD'
+        ? count.known.length > 0
+          ? 'No finding could be attributed to a specific user, so no user is listed here. That is not the same as no user needing attention — what HawkView did find is listed above and below.'
+          : 'HawkView is not stating a number of users for this tenant, and no finding has been attributed to a specific user. Read this as an open question rather than an all-clear.'
+        : count.accuracy === 'UNAVAILABLE'
+          ? 'No current list can be shown. This is not an empty result, and nothing here has been checked and cleared.'
+          : count.known.length > 0
+            ? 'No finding was tied to a specific user, so no user is listed here. HawkView did find evidence on this tenant — it is listed above and below, and it is not an all-clear.'
+            : 'No user is listed as needing attention right now. The summary above states what that is based on and what it does not cover.'
   return (
     <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
       {copy}
@@ -696,9 +867,115 @@ function CountSummary({ count }: { count: RiskyUserCount }) {
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * What each check had to work with, in the engine's own terms.
+ *
+ * The old coverage panel read rules[] and sources[], which carried a readiness
+ * verdict per rule and a freshness verdict per source. This engine serves the
+ * facts instead -- which detectors ran, which did not and why, and what each
+ * collector had actually achieved -- so the verdict is derived here where the
+ * facts are on screen beside it.
+ *
+ * The collector line is the one to be careful with. A null last-success means
+ * NEVER, not "a long time ago", and the two send a technician to different
+ * places: one is a gap in a working feed, the other is a tenant that was never
+ * wired up, and only one of them is fixed by waiting.
+ */
+function NativeCoverage({
+  native,
+}: {
+  native: Extract<NativeAssessment, { available: true }>
+}) {
+  const recency = runRecency(native.run)
+  return (
+    <details className="rounded-xl border border-slate-200 bg-white p-5 shadow-2xs dark:border-slate-800 dark:bg-slate-900">
+      <summary className="cursor-pointer text-sm font-semibold text-slate-900 dark:text-slate-50">
+        What HawkView checked, and what each collector had
+      </summary>
+
+      {recency.state === 'STALE_RUN' && (
+        <p className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+          This assessment describes a window that closed on{' '}
+          {time(recency.windowClosedAt)}, before the run finished on{' '}
+          {time(recency.completedAt)}. It is a stored result being shown later
+          rather than a current reading of the tenant.
+        </p>
+      )}
+
+      <div className="mt-3 grid gap-4 sm:grid-cols-2">
+        <div>
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            Checks
+          </h4>
+          <ul className="mt-1.5 space-y-1.5">
+            {native.count.covered.map((detectorId) => (
+              <li
+                key={detectorId}
+                className="text-sm text-slate-800 dark:text-slate-100"
+              >
+                {detectorTitle(detectorId)}{' '}
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  · ran on this tenant
+                </span>
+              </li>
+            ))}
+            {native.count.notCovered.map((entry) => (
+              <li key={entry.detectorId} className="text-sm">
+                <span className="text-slate-800 dark:text-slate-100">
+                  {detectorTitle(entry.detectorId)}
+                </span>
+                <p className="mt-0.5 text-xs leading-5 text-slate-600 dark:text-slate-300">
+                  {nativeWithheldReasonCopy(entry.because).headline}
+                </p>
+              </li>
+            ))}
+            {native.count.covered.length === 0 &&
+              native.count.notCovered.length === 0 && (
+                <li className="text-xs text-slate-500 dark:text-slate-400">
+                  This response did not say which checks ran, so the number
+                  above cannot be read as covering any particular one.
+                </li>
+              )}
+          </ul>
+        </div>
+
+        <div>
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            Collectors
+          </h4>
+          <ul className="mt-1.5 space-y-1.5">
+            {native.collectors.map((collector) => (
+              <li key={collector.source} className="text-sm">
+                <span className="text-slate-800 dark:text-slate-100">
+                  {collector.source}
+                </span>{' '}
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  · {collector.status}
+                </span>
+                <p className="mt-0.5 text-xs leading-5 text-slate-600 dark:text-slate-300">
+                  {collector.lastSuccessfulCollectionAt === null
+                    ? 'Never collected successfully. This is not an old collection — nothing has ever arrived from this source for this tenant.'
+                    : 'Last successful collection ' +
+                      time(collector.lastSuccessfulCollectionAt)}
+                </p>
+              </li>
+            ))}
+            {native.collectors.length === 0 && (
+              <li className="text-xs text-slate-500 dark:text-slate-400">
+                This response reported no collectors, so how current the
+                evidence is cannot be established from it.
+              </li>
+            )}
+          </ul>
+        </div>
+      </div>
+    </details>
+  )
+}
+
 export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
   const {
-    assessment,
+    native,
     channel,
     count,
     list,
@@ -761,7 +1038,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                   : 'The latest response could not be read'}
               </p>
               <p className="mt-1 text-xs leading-relaxed">
-                {assessment
+                {native
                   ? 'Users below are from an earlier read and remain open. This failure has not resolved or dismissed any of them, and current coverage cannot be confirmed.'
                   : 'No current result can be confirmed. Missing evidence is not a no-findings result.'}
               </p>
@@ -801,6 +1078,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                   onOpen={(row) => setSelectedId(row.id)}
                   caption="Users with a current HawkView finding"
                 />
+                <PartialUserList count={count} />
               </div>
             ) : (
               <EmptyUserList count={count} />
@@ -834,7 +1112,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
             </section>
           )}
 
-          {assessment && <Coverage assessment={assessment} />}
+          {native?.available && <NativeCoverage native={native} />}
         </>
       )}
 

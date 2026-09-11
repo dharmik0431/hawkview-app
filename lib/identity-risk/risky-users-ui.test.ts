@@ -9,6 +9,7 @@ import {
   assessmentFixture,
   assessmentNow,
   assessmentUser,
+  at,
 } from './assessment-test-fixtures.ts'
 import { syntheticRiskResponses, unavailableMeta } from './test-fixtures.ts'
 
@@ -137,12 +138,18 @@ function render(
     contractFailed?: boolean
     notReported?: boolean
     loading?: boolean
+    // Applied after adaptation, for states the wire contract does not yet
+    // allow but the projection is required to survive. The adapter's job is to
+    // reject malformed payloads; the view model's is to be honest about shapes
+    // the server is permitted to grow into.
+    afterAdapt?: (value: any) => void
   } = {}
 ) {
   const assessment = adapter.adaptRiskAssessmentResponse(
     assessmentValue,
     assessmentNow
   )
+  if (assessment) options.afterAdapt?.(assessment)
   const microsoftView = adapter.adaptMicrosoftRiskyUsersResponse(
     options.microsoft ?? microsoftWithoutP2()
   )
@@ -242,7 +249,7 @@ test('the list gives a technician the four things they triage on', () => {
     'User',
     'Detected by',
     'HawkView priority',
-    'Last seen',
+    'Latest of any reason',
   ])
   assert.match(text, /Synthetic identity/)
   assert.match(text, /Repeated invalid credentials/)
@@ -1241,4 +1248,613 @@ test('an unconfirmed empty Microsoft result never becomes an authoritative zero'
   assert.doesNotMatch(panel!.textContent ?? '', /snapshot is empty/)
   assert.doesNotMatch(panel!.textContent ?? '', /At least 0/)
   assert.doesNotMatch(panel!.textContent ?? '', /≥0/)
+})
+
+test('two reasons with different dates never share one', () => {
+  // Real shape from the fleet: an account with 467 lockouts that stopped six
+  // days before its last password rejection. A row listing both titles beside
+  // a single "last seen" describes the quieter signal and makes the louder one
+  // look current — two true facts implying a false third.
+  const value = assessmentFixture(true)
+  const older = JSON.parse(JSON.stringify(value.users[0].findings[0]))
+  older.id = older.id.replace(/a{4}$/, 'bbbb')
+  older.ruleId = 'HV-ID-AUTH-005.v2'
+  older.ruleVersion = 'v2'
+  older.priority = 'MEDIUM'
+  older.title = 'Failures followed by successful sign-in'
+  older.firstSeen = at(-14)
+  older.lastSeen = at(-12)
+  older.activityWindowEndsAt = at(-11)
+  older.window = { start: at(-15), end: at() }
+  older.evidenceCount = 467
+  older.clientSource = {
+    reference: 'hvr1_context_' + 'a'.repeat(64),
+    qualification: 'QUALIFIED',
+  }
+  value.users[0].findings.push(older)
+  value.users[0].priority = 'MEDIUM'
+  value.rules[1].matchedIdentities = 1
+
+  const { document } = render(value)
+  const cell =
+    document.querySelector(
+      '[aria-labelledby="risky-users-list-heading"] tbody tr td'
+    )?.textContent ?? ''
+
+  // Each reason states its own volume and its own recency.
+  assert.match(cell, /Repeated invalid credentials/)
+  assert.match(cell, /Failures followed by successful sign-in/)
+  assert.match(cell, /467 records/)
+  assert.match(cell, /10 records/)
+  // Two different dates are present, so neither number sits beside the
+  // other's. Split on the label rather than pattern-matching a locale date.
+  const afterLast = cell
+    .split('last ')
+    .slice(1)
+    .map((part: string) => part.trim())
+  assert.equal(afterLast.length, 2, cell)
+  assert.notEqual(afterLast[0], afterLast[1], cell)
+
+  // And the column that aggregates says that is what it does.
+  const headers = [...document.querySelectorAll('th')].map((h: any) =>
+    h.textContent?.trim()
+  )
+  assert.ok(headers.includes('Latest of any reason'))
+  assert.ok(!headers.includes('Last seen'))
+})
+
+test('a setting is never counted as though it were a sequence of events', () => {
+  // The mailbox check counts the external destinations a mailbox is currently
+  // configured to forward to, and its timestamp is when HawkView read that
+  // configuration. Every other check counts events that happened, and its
+  // timestamp is when the last one happened. Both arrive in the same two
+  // fields, so one phrase for both is false for one of them.
+  //
+  // "10 records, last 4:12 p.m." says ten things happened and the newest was
+  // minutes ago. The truth is that one setting names ten destinations and
+  // 4:12 p.m. is when we looked. The read time is always recent, which makes
+  // every forwarding finding read as though it were unfolding right now --
+  // backwards, since a rule set six months ago is the worse case.
+  const value = assessmentFixture(true)
+  value.users = [assessmentUser('HV-ID-MBX-001.v1', 'a')]
+  value.rules[0].matchedIdentities = 0
+  value.rules[2].assessedIdentities = 1
+  value.rules[2].matchedIdentities = 1
+  const { document } = render(value)
+  // Mailbox evidence is never counted as a person, so the row lives in the
+  // context region rather than the user list.
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-context-heading"]')
+      ?.textContent ?? ''
+
+  assert.match(list, /10 external destinations/)
+  assert.match(list, /configuration read/)
+  // The row must not describe the setting in the vocabulary of events.
+  assert.ok(!/10 records/.test(list), 'destinations rendered as event records')
+  assert.ok(
+    !/configured to forward[^.]*, last /.test(list),
+    'a read time rendered as an occurrence time'
+  )
+
+  // The aggregate beside the reason is the half that survives a per-reason fix.
+  // "Latest of any reason" is a maximum over timestamps that do not all mean
+  // the same thing, and a read time is always the most recent thing on the
+  // page, so an unlabelled column puts every forwarding row at the top and
+  // tells the reader it just happened.
+  assert.match(list, /when HawkView read a setting, not when anything happened/)
+})
+
+test('an event check keeps the event vocabulary', () => {
+  // The guard above must not have been bought by flattening every check into
+  // the cautious wording. A check that really does count events still says so.
+  const { document } = render(assessmentFixture(true))
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? ''
+  assert.match(list, /10 records, last /)
+  assert.ok(
+    !/external destinations/.test(list),
+    'an event check borrowed the state vocabulary'
+  )
+  assert.ok(
+    !/read a setting/.test(list),
+    'an event row was told its own timestamp was a read time'
+  )
+})
+
+test('an unrecognised rule never lets its identifier become the description', () => {
+  // Backend rule catalogues move on their own schedule, so a check this build
+  // has never seen will appear in a row eventually. The row has to say
+  // something, and the two tempting options are both wrong: "10 records"
+  // guesses a unit the mailbox check has already proved can be wrong, and the
+  // identifier is not a sentence a technician can act on.
+  const value = assessmentFixture(true)
+  const subject = assessmentUser('HV-ID-AUTH-005.v2', 'a')
+  subject.findings[0].ruleId = 'HV-ID-NEW-777.v1'
+  value.users = [subject]
+  // The server publishes the new check in its readiness list; only this build's
+  // own catalogue is behind. That is the case worth covering, because it is the
+  // one that happens on every backend release.
+  value.rules.push({
+    ...value.rules[1],
+    ruleId: 'HV-ID-NEW-777.v1',
+    ruleVersion: 'v1',
+    title: 'A check released after this build',
+    matchedIdentities: 1,
+  })
+  value.rules[0].matchedIdentities = 0
+  const { document } = render(value)
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? ''
+
+  assert.match(list, /does not know this check/)
+  assert.ok(!/10 records/.test(list), 'a unit was guessed for an unknown rule')
+  assert.ok(
+    !/HV-ID-NEW-777/.test(list),
+    'an identifier was rendered where a description belongs'
+  )
+})
+
+test('a check that ran without a time says so, and is not called unreported', () => {
+  // No detector emits a dateless finding today, and that is a fact about the
+  // two detectors that exist rather than about the contract. The alternative to
+  // handling it is a default — now, the epoch, the empty string — which would
+  // place the row somewhere specific in the one column that means recency, on
+  // the strength of a value nobody supplied.
+  //
+  // The words matter as much as the handling. "Not reported" describes a gap in
+  // collection. A check that ran and produced evidence carrying no time is a
+  // gap in the evidence, and sending a technician to look at collection for it
+  // is this surface's standing mistake in miniature.
+  const { document } = render(assessmentFixture(true), {
+    afterAdapt: (value) => {
+      for (const finding of value.users[0].findings) finding.lastSeen = null
+    },
+  })
+  const rows = Array.from(
+    document.querySelectorAll(
+      '[aria-labelledby="risky-users-list-heading"] tbody tr'
+    )
+  ) as Element[]
+  const dateless = rows.find((row) =>
+    row.textContent?.includes('No time recorded')
+  )
+  assert.ok(dateless, 'the dateless row rendered no distinct state')
+  assert.match(
+    dateless!.textContent ?? '',
+    /the checks ran; their evidence carries no time/
+  )
+  assert.ok(
+    !/Not reported/.test(dateless!.textContent ?? ''),
+    'an evidence gap was reported as a collection gap'
+  )
+  // The reason line beside it must not invent one either.
+  assert.ok(
+    !/, last /.test(dateless!.textContent ?? ''),
+    'a reason without a time was given one'
+  )
+})
+
+test('a row with no time sorts after dated rows rather than being coerced to one', () => {
+  // Scope of this guard, stated because mutation testing narrowed it: the
+  // empty-string fallback it replaced already produced this order, so reverting
+  // to that does not fail here. What fails is any filler that puts the row at a
+  // definite position — "now" or a forward date — and any change of sort
+  // direction, which the old pairing of filler and direction would have
+  // silently inverted.
+  const value = assessmentFixture(true)
+  value.users = [
+    assessmentUser('HV-ID-AUTH-010.v1', 'a'),
+    assessmentUser('HV-ID-AUTH-010.v1', 'b'),
+  ]
+  value.rules[0].assessedIdentities = 2
+  value.rules[0].matchedIdentities = 2
+  value.summary.currentUsers.value = 2
+  const { document } = render(value, {
+    afterAdapt: (adapted) => {
+      // Same priority, so the date is the only key left. The first user loses
+      // its time; a coerced empty string would sort it first, not last.
+      for (const finding of adapted.users[0].findings) finding.lastSeen = null
+    },
+  })
+  const names = (
+    Array.from(
+      document.querySelectorAll(
+        '[aria-labelledby="risky-users-list-heading"] tbody tr'
+      )
+    ) as Element[]
+  ).map((row) => row.textContent ?? '')
+  assert.equal(names.length, 2)
+  assert.ok(
+    !names[0].includes('No time recorded'),
+    'the undated row sorted ahead of a dated one'
+  )
+  assert.ok(names[1].includes('No time recorded'))
+})
+
+test('an exact zero over a population never examined is not a clean tenant', () => {
+  // This is the live engine's output on all five tenants right now: an exact
+  // zero, with zero eligible subjects, on three tenants that are under attack.
+  // It is the state this surface is most likely to be asked to render today,
+  // and until the wire exists it is also the state it has never met.
+  //
+  // Both cohorts are asserted together on purpose. A gate that fires on the
+  // unexamined tenant proves nothing on its own — it has to be shown not to
+  // fire on the tenant that really was checked and really was clean, or it is
+  // a warning that is always on, which a technician learns to skim past.
+  const tenant = (assessedIdentities: number) => {
+    const value = assessmentFixture(false)
+    value.users = []
+    value.summary.currentUsers = { value: 0, accuracy: 'EXACT' }
+    for (const rule of value.rules) {
+      rule.assessedIdentities = assessedIdentities
+      rule.matchedIdentities = 0
+    }
+    return render(value)
+  }
+
+  const neverExamined = tenant(0)
+  assert.match(neverExamined.cardText, /No findings can be confirmed yet/)
+  assert.match(neverExamined.cardText, /lack a complete evaluated scope/)
+  assert.ok(
+    !/reported no matches/.test(neverExamined.cardText),
+    'a tenant nothing was examined on was described as having been checked'
+  )
+
+  // The coverage panel must not describe the check as having run over a
+  // population either. "0 identities evaluated" reads as a check that examined
+  // people and found none; the truth is that it had nobody to examine, and one
+  // of those is a quiet tenant while the other is a broken pipeline.
+  assert.match(neverExamined.text, /no identities were in scope for this check/)
+  assert.ok(
+    !/0 identities evaluated/.test(neverExamined.text),
+    'an empty population was rendered as an evaluated one'
+  )
+
+  // The control: a tenant that really was checked keeps its clean-sweep
+  // sentence, so the gate above is discriminating rather than always on.
+  const clean = tenant(5)
+  assert.match(clean.cardText, /No findings in evaluated evidence/)
+  assert.match(clean.cardText, /reported no matches/)
+  assert.match(clean.text, /5 identities evaluated by this check/)
+  assert.ok(
+    !/No findings can be confirmed yet/.test(clean.cardText),
+    'the unexamined-tenant gate fired on a tenant that was examined'
+  )
+})
+
+test('a count with no findings behind it is a gap, never an all-clear', () => {
+  // The first shape a real assessment will take. The read path can serve
+  // coverage, count and claim while findings have nowhere to persist, so a
+  // response that states four users and carries no finding is not a defensive
+  // branch — it is the state the wire produces on its first day.
+  //
+  // Each component on its own sees something coherent: the tile a number, the
+  // list an emptiness. The contradiction lives only in the pair, and the
+  // sentence the list used to fall through to made it worse by pointing the
+  // reader up at the summary — which confidently says four.
+  const value = assessmentFixture(false)
+  value.users = []
+  value.summary.currentUsers = { value: 4, accuracy: 'EXACT' }
+  value.rules[0].assessedIdentities = 12
+  value.rules[0].matchedIdentities = 4
+  const { document, cardText } = render(value)
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? ''
+
+  assert.match(list, /reports 4 users with current findings/)
+  assert.match(list, /gap in what this response delivered/)
+  assert.ok(
+    !/No user is listed as needing attention/.test(list),
+    'a number of users was rendered beside a sentence saying none need attention'
+  )
+
+  // The card carries the whole claim on its own, because it is often the only
+  // Risky Users surface a technician sees.
+  assert.match(cardText, /did not come back with it/)
+  assert.ok(
+    !/No user is listed as needing attention/.test(cardText),
+    'the standalone card left the contradiction to the section'
+  )
+
+  // Control: a count with its findings behind it says none of this. Without
+  // this half the guard would pass just as well if the disclosure were always
+  // on, which is a warning a technician learns to skim.
+  const delivered = render(assessmentFixture(true))
+  assert.ok(
+    !/did not come back with it/.test(delivered.cardText),
+    'the disclosure fired on a response that delivered its findings'
+  )
+  assert.ok(
+    !/gap in what this response delivered/.test(delivered.text),
+    'the disclosure fired on a response that delivered its findings'
+  )
+})
+
+const withSignals = (signals: unknown) => {
+  const value = assessmentFixture(true)
+  value.users[0].findings[0].title = 'Repeated invalid credentials'
+  value.users[0].findings[0].evidenceCount = 474
+  ;(value.users[0].findings[0] as any).signals = signals
+  return value
+}
+
+const rowText = (document: Document) =>
+  document.querySelector(
+    '[aria-labelledby="risky-users-list-heading"] tbody tr'
+  )?.textContent ?? ''
+
+test('one finding resting on two signals renders two reasons, not one', () => {
+  // Raymonds, as the contract now delivers it: a single credential-failure
+  // finding carrying 462 lockouts that stopped on the 3rd and 12 password
+  // rejections from the 9th. Mapping a finding to a reason would show one
+  // count and one date for both -- the collapse the contract was changed to
+  // remove, re-created one level up in the layer that renders it.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+        count: 462,
+        capped: false,
+        latest: { at: at(-14), kind: 'EVENT_OCCURRED' },
+      },
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 12,
+        capped: false,
+        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+
+  // Each signal keeps its own volume, in its own unit, with its own date.
+  assert.match(row, /Locked out after repeated failures/)
+  assert.match(row, /462 lockouts, last /)
+  assert.match(row, /Password rejected/)
+  assert.match(row, /12 rejected sign-ins, last /)
+
+  // And the two dates are different, so neither count sits beside the other's.
+  const dates = row
+    .split('last ')
+    .slice(1)
+    .map((part: string) => part.slice(0, 24))
+  assert.equal(dates.length, 2, row)
+  assert.notEqual(dates[0], dates[1], row)
+
+  // The finding's own aggregate count is never printed beside the signals it
+  // was summed from; 474 would read as a third reason.
+  assert.ok(!/474/.test(row), 'the finding total was rendered beside its parts')
+})
+
+test('a state signal is not described in the vocabulary of events', () => {
+  // The kind comes off the value. Nothing here consults the signal's name to
+  // decide it, which is the point of the contract change: a name is a proxy
+  // for the kind in exactly the way a rule id is.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'EXTERNAL_FORWARDING_CONFIGURED',
+        count: 3,
+        capped: false,
+        latest: { at: at(-1), kind: 'STATE_OBSERVED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+  assert.match(row, /3 external destinations/)
+  assert.match(row, /configuration read /)
+  assert.ok(!/, last /.test(row), 'a read time was rendered as an occurrence')
+})
+
+test('an unrecognised signal says so and never shows its identifier', () => {
+  // The closed set lives in the wiring layer and the core's type is a plain
+  // string, so a fourth signal can appear without anything failing to compile.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'SOMETHING_SHIPPED_AFTER_THIS_BUILD',
+        count: 9,
+        capped: false,
+        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+  assert.match(row, /does not recognise/)
+  assert.match(row, /does not know this check/)
+  assert.ok(!/9 records/.test(row), 'a unit was guessed for an unknown signal')
+  assert.ok(
+    !/SOMETHING_SHIPPED_AFTER_THIS_BUILD/.test(row),
+    'an identifier was rendered where a description belongs'
+  )
+})
+
+test('a response without signals still renders, and one with an empty array does not', () => {
+  // Frontend and backend ship through separate systems, so every release has a
+  // window where one side is old. Absence has to be survivable; the key simply
+  // missing is what an old server sends.
+  const older = render(withSignals(undefined))
+  assert.match(rowText(older.document), /Repeated invalid credentials/)
+  assert.match(rowText(older.document), /474 records, last /)
+
+  // An empty array is not the same thing and must not be tolerated as though
+  // it were. Under the contract a signal missing from the array was never
+  // evaluated, so an empty one says every signal was never evaluated -- a
+  // finding resting on nothing. Accepting it as an old-server sentinel would
+  // drop every finding in the tenant for the length of a deploy, which fails
+  // silently and reads exactly like a clean tenant.
+  const empty = adapter.adaptRiskAssessmentResponse(
+    withSignals([]),
+    assessmentNow
+  )
+  assert.equal(empty, null)
+
+  // Two entries for one signal make every count ambiguous.
+  const duplicated = adapter.adaptRiskAssessmentResponse(
+    withSignals([
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 1,
+        capped: false,
+        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
+      },
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 2,
+        capped: false,
+        latest: { at: at(-2), kind: 'EVENT_OCCURRED' },
+      },
+    ]),
+    assessmentNow
+  )
+  assert.equal(duplicated, null)
+})
+
+test('a signal evaluated and empty is distinguishable from one never evaluated', () => {
+  // Two of the nine findings on the fleet carry a zero lockout count beside a
+  // real rejection count. The zero is a result and reads as one; the signal
+  // that is simply absent renders nothing at all.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
+        count: 0,
+        capped: false,
+        latest: null,
+      },
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 7,
+        capped: false,
+        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+  assert.match(row, /Locked out after repeated failures/)
+  assert.match(row, /none recorded/)
+  assert.match(row, /7 rejected sign-ins, last /)
+  assert.ok(
+    !/0 lockouts/.test(row),
+    'an evaluated zero was rendered as a count'
+  )
+  // Nothing invents a forwarding line for a signal that was never sent.
+  assert.ok(!/external destination/.test(row))
+})
+
+test('the kind comes off the value even when the name suggests otherwise', () => {
+  // The guard the contract change exists for, and it was not guarded until a
+  // mutation said so: replacing "read the kind" with "infer it from the signal
+  // name" broke none of the tests above, because in every fixture the name and
+  // the kind agree. A test that cannot tell the two apart is not testing the
+  // thing the field was added for.
+  //
+  // So both are inverted here. A forwarding signal whose instant marks an
+  // event is a legitimate payload -- a future detector could watch forwarding
+  // being changed rather than read its current state -- and the client must
+  // not overrule it from the name. That is the whole reason the kind travels
+  // on the value: a name is a proxy for it in exactly the way a rule id is.
+  const { document } = render(
+    withSignals([
+      {
+        signal: 'EXTERNAL_FORWARDING_CONFIGURED',
+        count: 3,
+        capped: false,
+        latest: { at: at(-14), kind: 'EVENT_OCCURRED' },
+      },
+      {
+        signal: 'PASSWORD_REJECTED',
+        count: 5,
+        capped: false,
+        latest: { at: at(-1), kind: 'STATE_OBSERVED' },
+      },
+    ])
+  )
+  const row = rowText(document)
+
+  // The forwarding signal keeps its own unit and takes the event wording.
+  assert.match(row, /3 external destinations, last /)
+  // The rejection signal keeps its own unit and takes the observation wording.
+  assert.match(row, /5 rejected sign-ins, configuration read /)
+
+  // Neither borrowed the reading its name would have implied.
+  assert.ok(
+    !/3 external destinations, configuration read /.test(row),
+    'the kind was inferred from the signal name rather than read from the value'
+  )
+  assert.ok(
+    !/5 rejected sign-ins, last /.test(row),
+    'the kind was inferred from the signal name rather than read from the value'
+  )
+})
+
+test('a page of a list is never presented as the list', () => {
+  // The count counts the tenant; the rows are what this response returned.
+  // Both true, and a reader who counts the rows and compares gets a different
+  // answer with nothing on screen to reconcile them. Eight people go missing
+  // and the page reads as though they were cleared.
+  //
+  // Reachable at scale rather than in principle: a tenant with nine findings
+  // returns a first page, and the collector fix means tenants that reported
+  // none now report nine.
+  const paged = () => {
+    const value = assessmentFixture(true)
+    value.summary.currentUsers = { value: 9, accuracy: 'EXACT' }
+    value.rules[0].assessedIdentities = 12
+    value.rules[0].matchedIdentities = 9
+    value.page = { hasMore: true, nextCursor: 'abc123.def456' }
+    return value
+  }
+  const { document, cardText } = render(paged())
+  const list =
+    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
+      ?.textContent ?? ''
+
+  assert.match(list, /part of the list, not all of it/)
+  assert.match(list, /have not been checked and cleared/)
+  // The card travels alone, so it carries the fact too.
+  assert.match(cardText, /longer than what came back with it/)
+
+  // Arithmetic alone is enough, without the server saying so. A response that
+  // sets one signal and not the other is still a list that does not account
+  // for its own number.
+  const noFlag = paged()
+  noFlag.page = { hasMore: false, nextCursor: null }
+  const arithmetic = render(noFlag)
+  assert.match(
+    arithmetic.document.querySelector(
+      '[aria-labelledby="risky-users-list-heading"]'
+    )?.textContent ?? '',
+    /part of the list, not all of it/
+  )
+
+  // Control: a complete list says none of this. Without this half the guard
+  // passes just as well if the notice is always on, which is a warning a
+  // technician learns to skim past.
+  const complete = render(assessmentFixture(true))
+  assert.ok(
+    !/part of the list, not all of it/.test(complete.text),
+    'the partial notice fired on a list that was complete'
+  )
+  assert.ok(
+    !/longer than what came back with it/.test(complete.cardText),
+    'the partial notice fired on a list that was complete'
+  )
+
+  // And the two gaps stay distinct: nothing delivered is not the same as some
+  // delivered, and each has its own sentence.
+  const none = assessmentFixture(false)
+  none.users = []
+  none.summary.currentUsers = { value: 4, accuracy: 'EXACT' }
+  none.rules[0].assessedIdentities = 12
+  none.rules[0].matchedIdentities = 4
+  const undelivered = render(none)
+  assert.match(undelivered.text, /gap in what this response delivered/)
+  assert.ok(
+    !/part of the list, not all of it/.test(undelivered.text),
+    'an empty list borrowed the partial-list wording'
+  )
 })

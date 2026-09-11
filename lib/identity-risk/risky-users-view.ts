@@ -22,6 +22,7 @@
  *  - Nothing here concludes that a user is safe.
  */
 import {
+  signalTitle,
   currentRiskAssessmentUsers,
   hawkViewRiskyUserCountPresentation,
   riskAssessmentEmptyPresentation,
@@ -30,6 +31,7 @@ import {
 import type {
   CorrelationRef,
   IdentityRiskChannelReason,
+  NativeWithheldReason,
   RiskAssessmentCountReason,
   MicrosoftEntraRiskyUser,
   MicrosoftEntraRiskyUsersView,
@@ -543,6 +545,39 @@ export function microsoftDetectionSummary(detection: RiskyUserDetection) {
 
 export type RiskyUserPriority = 'LOW' | 'MEDIUM' | 'HIGH'
 
+export type RiskyUserReason = {
+  title: string
+  /**
+   * The signal this reason came from, or null on a response that predates
+   * signals and where a whole finding is the reason.
+   */
+  signal: string | null
+  /**
+   * The kind of time this reason's date marks, carried by the value rather
+   * than inferred from the signal's name or the rule's id.
+   */
+  kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED' | null
+  /**
+   * Carried so the surface can say what this rule's count counts and what its
+   * date marks. Those differ per rule and are not derivable from the numbers.
+   */
+  ruleId: string
+  /** Distinct pieces of evidence behind this reason, as the server counted. */
+  evidenceCount: number
+  /** True when the count is a ceiling rather than a total. */
+  evidenceCountCapped: boolean
+  firstSeen: string | null
+  /**
+   * Null when this reason was evaluated and its evidence carries no time.
+   *
+   * Distinct from a reason that was never evaluated, which does not appear at
+   * all. Nothing emits it today; that is a fact about the two detectors that
+   * exist rather than about the contract, and the cost of assuming otherwise is
+   * a fabricated date in the one column that means recency.
+   */
+  lastSeen: string | null
+}
+
 export type RiskyUserRow = {
   id: string
   name: string
@@ -557,7 +592,45 @@ export type RiskyUserRow = {
   priorityLabel: string
   /** Most recent observation across this user's current findings. */
   lastSeen: string | null
-  reasons: string[]
+  /**
+   * The reason that produced lastSeen.
+   *
+   * The column is a maximum over reasons whose timestamps do not all mean the
+   * same thing: a repeated-failure reason contributes the time something last
+   * happened, and the mailbox reason contributes the time HawkView read a
+   * setting. A read time is always recent, so without saying which kind won,
+   * every forwarding row sorts and reads as the freshest thing on the page.
+   *
+   * Naming the source lets the cell say what kind of time it is showing. It is
+   * the same fix as the per-reason line, applied to the aggregate that sits
+   * beside it — the aggregate was the half still implying "this happened".
+   */
+  lastSeenFrom: RiskyUserReason | null
+  /**
+   * Why the row has the date it has, or has none.
+   *
+   * Two different absences reach this column and must not print the same
+   * words. DATELESS means the checks ran and none of their evidence carries a
+   * time. NO_REASONS means there is nothing here to have a date. Collapsing
+   * them into one "Not reported" would report a gap in collection where the
+   * truth is a gap in the evidence itself.
+   */
+  lastSeenState: 'DATED' | 'DATELESS' | 'NO_REASONS'
+  /**
+   * Each reason with its own count and its own recency, never a list of titles
+   * beside one shared date.
+   *
+   * A row reading "Repeated invalid credentials, External mailbox forwarding —
+   * last seen Tuesday" states two true things and implies a third that is
+   * false: the reader cannot tell which reason was Tuesday, and the natural
+   * assumption is both. On real data one account carried 467 lockouts that
+   * stopped six days before the last password rejection, so the shared date
+   * described the quieter signal and made the louder one look current.
+   *
+   * The count and the date travel in the same object because separating them
+   * is what allows a surface to put one beside the other's date.
+   */
+  reasons: RiskyUserReason[]
   detection: RiskyUserDetection
   protection: { label: string; tone: 'positive' | 'attention' | 'unknown' }
   /** Kept whole so the detail view has the full evidence without a second read. */
@@ -589,11 +662,62 @@ function rowFor(
   const findings = currentOnly
     ? user.findings.filter((finding) => finding.activityState === 'CURRENT')
     : user.findings
-  const lastSeen =
-    findings
-      .map((finding) => finding.lastSeen)
-      .sort()
-      .at(-1) ?? null
+  // One reason per signal, not per finding.
+  //
+  // A finding is per subject per detector and can rest on several signals at
+  // once: on the fleet one account carries 462 lockouts that stopped on 3
+  // September beside 12 password rejections from the 9th. One finding, two
+  // facts. Mapping a finding to a reason would show one count and one date for
+  // both, which is the collapse the contract was changed to remove, re-created
+  // one level up in the layer that renders it.
+  //
+  // A response without signals still yields one reason per finding, because
+  // frontend and backend ship separately and every release has a window where
+  // one side is old. The fallback carries no signal and no kind, so the rule
+  // table supplies the unit for exactly as long as the field is absent.
+  const reasons: RiskyUserReason[] = findings.flatMap(
+    (finding): RiskyUserReason[] =>
+      finding.signals
+        ? finding.signals.map((signal) => ({
+            title: signalTitle(signal.signal),
+            signal: signal.signal,
+            kind: signal.latest?.kind ?? null,
+            ruleId: finding.ruleId,
+            evidenceCount: signal.count,
+            evidenceCountCapped: signal.capped,
+            // A signal reports one instant, not a span. Claiming the finding's
+            // first-seen for it would attach the earliest of any signal to every
+            // signal, which is the same defect as the shared last-seen it
+            // replaces, pointed backwards.
+            firstSeen: null,
+            lastSeen: signal.latest?.at ?? null,
+          }))
+        : [
+            {
+              title: finding.title,
+              signal: null,
+              kind: null,
+              ruleId: finding.ruleId,
+              evidenceCount: finding.evidenceCount,
+              evidenceCountCapped: finding.evidenceCountCapped,
+              firstSeen: finding.firstSeen,
+              lastSeen: finding.lastSeen,
+            },
+          ]
+  )
+  // Only reasons that carry a time can supply the column's date. A dateless
+  // reason is not sorted to the front or the back of this list; it is excluded
+  // from a maximum it has no value to contribute to.
+  const dated = reasons.filter(
+    (reason): reason is RiskyUserReason & { lastSeen: string } =>
+      reason.lastSeen !== null
+  )
+  const lastSeenFrom =
+    [...dated].sort((a, b) => a.lastSeen.localeCompare(b.lastSeen)).at(-1) ??
+    null
+  const lastSeen = lastSeenFrom?.lastSeen ?? null
+  const lastSeenState =
+    lastSeen !== null ? 'DATED' : reasons.length > 0 ? 'DATELESS' : 'NO_REASONS'
   return {
     id: user.id,
     name: user.displayName ?? user.label,
@@ -603,7 +727,9 @@ function rowFor(
     priority: user.priority,
     priorityLabel: riskyUserPriorityLabel(user.priority),
     lastSeen,
-    reasons: findings.map((finding) => finding.title),
+    lastSeenFrom,
+    lastSeenState,
+    reasons,
     detection: detectionFor(user, channel, microsoftUsers),
     protection: riskProtectionSummary(user),
     user,
@@ -654,7 +780,25 @@ export function riskyUserList(
     if (rank !== 0) return rank
     const corroboration = corroborated(b) - corroborated(a)
     if (corroboration !== 0) return corroboration
-    return (b.lastSeen ?? '').localeCompare(a.lastSeen ?? '')
+    // A row with no date has no recency to compare, so it sorts after every
+    // dated row in its band rather than being coerced to one.
+    //
+    // The empty-string default this replaces produced the same order, and it is
+    // worth being exact about why rather than claiming a bug that was not
+    // there: the empty string sorts below every timestamp, and this comparison
+    // runs descending, so undated rows already fell to the back. That is two
+    // unrelated choices — the filler value and the sort direction — agreeing by
+    // coincidence, with neither stated anywhere. Reverse the direction and
+    // every undated row leads the list, from an edit that has nothing to do
+    // with dates. Other fillers are worse and not coincidental at all: the
+    // epoch or "now" place the row at a definite end of a column that means
+    // recency, on the strength of a value nobody supplied.
+    //
+    // The branch below cannot be inverted by a change made elsewhere.
+    if (a.lastSeen === b.lastSeen) return 0
+    if (a.lastSeen === null) return 1
+    if (b.lastSeen === null) return -1
+    return b.lastSeen.localeCompare(a.lastSeen)
   }
   return {
     rows: current
@@ -689,6 +833,23 @@ export type RiskyUserCountAccuracy =
 export type RiskyUserCount = {
   accuracy: RiskyUserCountAccuracy
   value: number | null
+  /**
+   * Whether the list below accounts for the number above.
+   *
+   * NONE_DELIVERED -- the count asserts users and no row arrived.
+   * PARTIAL        -- rows arrived, but fewer than the count, or the server
+   *                   said there are more pages.
+   * COMPLETE       -- the rows are the whole of what the count counted.
+   *
+   * One field rather than two booleans, because these are three values of one
+   * fact and a surface that reads two flags can render a combination that
+   * cannot occur. Both gaps are gaps in what the response delivered and never
+   * statements about the tenant: the list must not fall through to "no user is
+   * listed as needing attention", which points the reader up at a summary
+   * confidently stating a number and so deepens the contradiction rather than
+   * resolving it.
+   */
+  listCoverage: 'COMPLETE' | 'PARTIAL' | 'NONE_DELIVERED'
   /**
    * What the tile prints. Never a dash and never a blank when there is no
    * number: a dash reads as zero to anyone who has used a dashboard, which is
@@ -739,6 +900,87 @@ export type RiskyUserCountInput = {
  * events" are different problems with different next steps, and collapsing them
  * into one generic "unavailable" is the defect this rebuild exists to remove.
  */
+/**
+ * The rebuilt engine's withholding reasons, in the client's words.
+ *
+ * Deliberately a second table rather than a mapping onto the older reasons.
+ * Three pairs are close enough that a mapping would have looked reasonable:
+ * NEVER_COLLECTED beside COLLECTION_STALE, UNINTERPRETED_EVENTS beside
+ * UNINTERPRETABLE_EVIDENCE, CAPACITY_EXCEEDED beside CAPACITY_LIMIT. Each pair
+ * differs in the sentence a technician acts on, and the mapping is where that
+ * difference would go quietly.
+ *
+ * The one that matters most on the fleet is the first. A tenant with nine rows
+ * whose last event was in August has a collection gap. A tenant that has never
+ * successfully collected was never wired up. Both leave the surface without
+ * current evidence and they are not the same problem, and only one of them is
+ * fixed by waiting.
+ */
+const nativeWithheldCopy: Readonly<
+  Record<NativeWithheldReason, { headline: string; caption: string }>
+> = {
+  NEVER_COLLECTED: {
+    headline: 'Not counted — nothing has ever been collected',
+    caption:
+      'HawkView has never successfully collected this evidence for this tenant, so there is no basis for any number. This is not a gap in an otherwise working feed and waiting will not resolve it — it points at collection never having been established for this tenant. It is not an all-clear.',
+  },
+  UNREADABLE_NOW: {
+    headline: 'Not counted — the evidence could not be read on this run',
+    caption:
+      'Evidence exists and this run could not read it. That is a fault on HawkView’s side rather than a statement about the tenant, and a later run may succeed. Nothing here has been checked and cleared.',
+  },
+  UNINTERPRETED_EVENTS: {
+    headline: 'Not counted — some events were not interpreted',
+    caption:
+      'This tenant’s evidence contains events HawkView did not interpret on this run. Rather than count around them and imply the remainder is the whole picture, the total is withheld. What was interpreted is listed below and is unaffected.',
+  },
+  NOTHING_APPLICABLE: {
+    headline: 'Not counted — no evidence was in scope for any check',
+    caption:
+      'Every event this run examined was outside the scope of every check, so no check had anything to assess. This is a statement about scope and not about the tenant: the checks had nothing to examine rather than examining and finding nobody. It is not a zero and it is not an all-clear.',
+  },
+  CAPACITY_EXCEEDED: {
+    headline: 'Not counted — more evidence than this run could read',
+    caption:
+      'The evidence for this tenant exceeded what one run reads, so the part examined is not the whole. A number over part of the evidence would read as a number over all of it, so it is withheld. Findings from the part that was read are real and are listed below.',
+  },
+  DETECTOR_FAILED: {
+    headline: 'Not counted — a check did not complete',
+    caption:
+      'One of HawkView’s checks failed during this run, so the tenant was not fully assessed. The checks that did complete are listed below with their own scope. A total across all of them would claim coverage this run did not have.',
+  },
+  UNRESOLVED_SUBJECT_IDENTITY: {
+    headline: 'Not counted — findings could not be tied to people',
+    caption:
+      'HawkView found activity worth reviewing but could not establish which of it belongs to a person, so it will not state a number of users. The findings themselves are listed below and are unaffected.',
+  },
+}
+
+/** Every headline this build can print for a withheld count, both vocabularies.
+ *
+ * Exported for the guard that keeps the two tables from converging. The tables
+ * exist to say different things; a headline appearing in both means one of them
+ * has quietly adopted the other reason's sentence, and no per-table uniqueness
+ * check can see that.
+ */
+export function allWithheldHeadlines(): { reason: string; headline: string }[] {
+  return [
+    ...Object.entries(nativeWithheldCopy),
+    ...Object.entries(withheldReasonCopy),
+  ].map(([reason, copy]) => ({ reason, headline: copy.headline }))
+}
+
+/** The client's words for one of the rebuilt engine's withholding reasons. */
+export function nativeWithheldReasonCopy(reason: string) {
+  return (
+    nativeWithheldCopy[reason as NativeWithheldReason] ?? {
+      headline: 'Not counted — for a reason this build does not recognise',
+      caption:
+        'The server withheld the total and gave a reason this build of HawkView does not know, so it cannot say what would resolve it. It is not a zero and it is not an all-clear.',
+    }
+  )
+}
+
 const withheldReasonCopy: Readonly<
   Record<RiskAssessmentCountReason, { headline: string; caption: string }>
 > = {
@@ -870,12 +1112,55 @@ function coverageGaps(
   return gaps
 }
 
-export function riskyUserCount({
+/**
+ * The count, plus one fact neither the count nor the list can establish alone.
+ *
+ * A response that states a positive number of users with current findings and
+ * carries no finding contradicts itself: those two cannot both be true, and the
+ * only thing that reconciles them is that the findings were not delivered. It
+ * has to be decided here rather than at each surface, because the count tile
+ * and the list are separate components and each one on its own sees a coherent
+ * picture — the tile a number, the list an emptiness. The contradiction exists
+ * only in the pair, which is precisely the class of defect this surface keeps
+ * producing.
+ *
+ * The read path being built can serve coverage, count and claim while findings
+ * have nowhere to persist, so this is the first shape a real assessment will
+ * take rather than a defensive branch.
+ */
+export function riskyUserCount(input: RiskyUserCountInput): RiskyUserCount {
+  const count = riskyUserCountFrom(input)
+  const delivered = input.assessment
+    ? currentRiskAssessmentUsers(input.assessment).length
+    : 0
+  const counted =
+    (count.accuracy === 'EXACT' || count.accuracy === 'AT_LEAST') &&
+    count.value !== null &&
+    count.value > 0
+  // hasMore is the server saying so; a count above the rows is the arithmetic
+  // saying so. Either alone is enough, because a response that sets one and not
+  // the other is still a list that does not account for its own number.
+  const moreExist = Boolean(
+    input.assessment?.page?.hasMore ||
+    (counted && count.value !== null && count.value > delivered)
+  )
+  return {
+    ...count,
+    listCoverage:
+      counted && delivered === 0
+        ? 'NONE_DELIVERED'
+        : moreExist && delivered > 0
+          ? 'PARTIAL'
+          : 'COMPLETE',
+  }
+}
+
+function riskyUserCountFrom({
   assessment,
   channel,
   requestFailed = false,
   contractFailed = false,
-}: RiskyUserCountInput): RiskyUserCount {
+}: RiskyUserCountInput): Omit<RiskyUserCount, 'listCoverage'> {
   const gaps = coverageGaps(assessment, channel)
   const known = knownDespiteNoCount(assessment)
 
