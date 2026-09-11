@@ -3,6 +3,7 @@ import { IdentityRiskService } from '../identity-risk/identity-risk.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { readLatestRun } from './read-run.js'
 import { signalsOf } from './finding-signals-dto.js'
+import { recordIdentityDisclosure } from '../workspace/identity-disclosure-audit.js'
 import type { AuthenticatedRequest } from '../auth/auth.types.js'
 
 /** The rebuilt engine's own endpoint.
@@ -77,7 +78,7 @@ export class RiskyUsersController {
     // and the opaque ref; MSP_OWNER and MSP_ADMIN additionally see who. That is
     // a product statement rather than an arbitrary role check.
     const identities = tenant.evidenceDetailAllowed
-      ? await this.resolveSubjects(tenant, run.findings)
+      ? await this.discloseSubjects(tenant, run.findings, requestIdOf(request))
       : new Map<string, { displayName: string | null; userPrincipalName: string }>()
 
     return {
@@ -126,7 +127,7 @@ export class RiskyUsersController {
     }
   }
 
-  /** Names the subjects, WITHIN THIS TENANT ONLY.
+  /** Names the subjects, WITHIN THIS TENANT ONLY, and records that it happened.
    *
    * The scope is the whole safety of it. A lookup that could reach another
    * tenant's `directory_users` would be the cross-tenant exposure avoided
@@ -134,10 +135,23 @@ export class RiskyUsersController {
    * scope columns are in the where clause and a test asserts they are.
    *
    * The ref is minted as `subject:<microsoftUserId>`, so the directory id is
-   * recovered by stripping that prefix rather than by a second lookup table. */
-  private async resolveSubjects(
-    tenant: Readonly<{ id: string; organizationId: string }>,
+   * recovered by stripping that prefix rather than by a second lookup table.
+   *
+   * THE AUDIT WRITE LIVES HERE, INSIDE THE FUNCTION THAT PRODUCES THE NAMES, and
+   * not beside the call to it. If recording the disclosure were a separate step
+   * in `assessment()`, a future edit would eventually drop one of the two — and
+   * a silently-missing audit trail is worse than no audit trail, because it gets
+   * trusted. This is the only place in this controller that turns an opaque ref
+   * into a person, so there is no way to obtain a name here without passing
+   * through the line that records it.
+   *
+   * It is renamed from `resolveSubjects` deliberately: the function no longer
+   * only resolves, and a name that still said so would invite someone to add a
+   * second resolver beside it. */
+  private async discloseSubjects(
+    tenant: Readonly<{ id: string; organizationId: string; actorUserId: string }>,
     findings: readonly Readonly<{ subject: unknown }>[],
+    requestId: string | undefined,
   ) {
     const wanted = new Map<string, string>()
     for (const finding of findings) {
@@ -161,8 +175,37 @@ export class RiskyUsersController {
       if (ref === undefined) continue
       named.set(ref, { displayName: row.displayName ?? null, userPrincipalName: row.userPrincipalName })
     }
+
+    // A DISCLOSURE OF NOBODY IS NOT A DISCLOSURE. The role permits naming, but if
+    // no directory row matched then nothing identifying reached the operator, and
+    // recording it would fill the log with rows in which nothing was shown. The
+    // count is what makes each remaining row mean something.
+    if (named.size > 0) {
+      // Awaited, so the attempt is part of producing the names rather than a
+      // detached promise that may never run. It cannot throw — see
+      // recordIdentityDisclosure — so it cannot refuse a technician mid-attack.
+      await recordIdentityDisclosure(
+        this.prisma,
+        { organizationId: tenant.organizationId, userId: tenant.actorUserId },
+        {
+          customerTenantId: tenant.id,
+          namedSubjectCount: named.size,
+          surface: 'RISKY_USERS_ASSESSMENT',
+          requestId,
+        },
+      )
+    }
     return named
   }
+}
+
+/** The correlation id this request already carries, so an audit row can be tied
+ * to the response an operator actually received. Read defensively: the audit is
+ * not worth failing a read over, and `createWorkspaceAuditOperation` mints a
+ * fresh id when this is absent or malformed. */
+const requestIdOf = (request: unknown): string | undefined => {
+  const candidate = (request as { requestId?: unknown } | null)?.requestId
+  return typeof candidate === 'string' ? candidate : undefined
 }
 
 const SUBJECT_PREFIX = 'subject:'

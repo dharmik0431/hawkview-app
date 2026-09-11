@@ -253,6 +253,20 @@ model Membership {
   @@map("memberships")
 }
 
+/// THE NAME IS NARROWER THAN THE CONTENTS, AND THAT IS A KNOWN, ACCEPTED WART.
+///
+/// This table no longer holds only workspace-admin actions. It also records
+/// CUSTOMER_IDENTITY_DISCLOSED — that an operator was shown identifying
+/// information about a customer's users — because a second audit table would
+/// mean a second retention implementation, and two retention implementations is
+/// a worse failure than one misnamed table: the second one stops silently and
+/// nobody notices for a year. Retention, pruning and the isolation tests behind
+/// this table are already proven, so reads live here.
+///
+/// A name that makes a claim about its contents is the fault this codebase has
+/// hit repeatedly, so it is written down rather than left to mislead. Renaming a
+/// live table other code queries is the larger risk; a rename is a separate,
+/// optional cleanup. See docs/identity-disclosure-audit.md.
 model WorkspaceAdminAuditLog {
   id            String   @id @default(uuid()) @db.Uuid
   organizationId String  @map("organization_id") @db.Uuid
