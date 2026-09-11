@@ -798,3 +798,92 @@ ruling before the producer is written.
 Until it exists, `unmodelledFingerprint` is a contract the classifier honours and
 nothing supplies — which is safe in the sense that no change can slip past a guard
 that no data reaches, and unsafe the moment the first producer is written carelessly.
+
+## Rule identifiers: MSPs choose what they are alerted on
+
+A product decision: **HawkView's tiering is the default, not the law.** If an MSP
+wants a privileged role grant to ring a phone at 2am, that is their call; if they
+want it in the digest, also their call.
+
+This invalidates nothing in the catalogue, and the reason is the seam that already
+exists: **the classifier states HawkView's opinion, routing maps that opinion onto a
+channel.** An MSP disagreeing with the routing does not change the opinion. So the
+routing work is step 05 and the declarations stand.
+
+One piece is not step 05, because doing it later costs a migration.
+
+### The configurable grain is the rule, not the alert type
+
+`ClassifiedChange` carried `classification`, `because`, `severity` and `unknown` —
+and no stable identifier for *which rule fired*. The finest grain available to a
+settings screen would have been the seven catalogue ids, and every privileged
+directory change collapses into `security.privileged_directory_change`. That is "all
+of it or none of it": *page me for a role grant but not for an authentication
+method* would have been unexpressible, and nobody would have found that out until
+the first person tried to configure it.
+
+So `rule` is now a **required** field on `ClassifiedChange`, one per branch, with the
+identifier as the first argument of each constructor so a branch cannot be written
+without naming itself. Twenty rules across two functions.
+
+**Why now rather than in 05:** these become the keys MSP preferences are stored
+against. Once a preference row points at an identifier, changing it is a schema
+migration and a conversation about somebody's saved settings. Naming them while the
+branches are fresh costs nothing.
+
+### Treated as a wire contract
+
+- **Stable, never renamed to read better.** A test pins the exact list. Adding a rule
+  needs one line there; renaming one fails loudly and tells the next reader why.
+- **The type is derived from the array** (`typeof CHANGE_RULES[number]`) rather than
+  declared beside it. Two lists that must agree is the coupling shape that produced
+  three defects in a week; one list cannot drift from itself. A consequence worth
+  knowing: renaming a rule in the array while a branch still uses the old string is a
+  **compile** error, not a test failure.
+- **Every declared rule is reachable**, proved by a table of one input per rule, which
+  is also the reachability proof. A rule nobody can trigger is a switch in a settings
+  screen that does nothing — worse than a missing switch, because it reads as
+  coverage.
+- **A new branch cannot ship unnamed.** Verified rather than asserted: adding a branch
+  that calls `routine()` without a rule is rejected by the compiler.
+
+### The rule is finer than the classification, deliberately
+
+The three undetermined grant reasons — unknown operator, empty control set, denial
+control — are all `UNCLASSIFIED`. A classification-level identifier would collapse
+them into one switch, and an MSP who wants to hear about a denial control moving but
+not about an unknown operator needs them apart. The distinction already existed in
+the `unknown` token; the rule must not be coarser than what the function already
+knows. A test asserts all three stay distinct, and another asserts no classification
+maps to a single rule — if one did, there would be nothing to configure below the
+tier, which is the coarseness this identifier exists to remove.
+
+### Three routing constraints, recorded for step 05
+
+Not built here. Recorded because a deferral that drops its constraints rebuilds the
+bug.
+
+- **Silencing a notification must never silence the record.** An MSP may turn any rule
+  down to record-only; they may never make an event not be recorded. The evidence
+  stays searchable whatever they choose. This should be enforced by the type rather
+  than by the settings UI — if silencing *can* reach the record, someone eventually
+  wires it there.
+- **The settings screen states plainly what they will NOT hear about.** The plan's own
+  "coverage gaps shown rather than silent", and the reason "make it configurable" does
+  not become "everybody turns it off and blames HawkView". If tenant-disconnected has
+  been silenced, the product says so where they will see it.
+- **Preference changes are recorded with who and when.** An MSP who silenced something
+  and later asks why they were not told gets an answer with a date on it. One audit
+  row, and it turns a liability argument into a support conversation.
+
+### What to check first when this breaks
+
+- **A preference that appears to do nothing.** Check the rule is reachable before
+  checking the routing: the reachability table is the list of inputs that trigger each
+  one, so if a rule has no entry there it was never firing.
+- **An MSP configured one thing and a different thing went quiet.** Two branches
+  sharing a rule id. The reachability test catches it, because the duplicate steals
+  the other's expected rule.
+- **A rule id in the database that no longer exists in the code.** That is the
+  migration this section exists to prevent. The pinned-list test is the thing that
+  should have failed first.

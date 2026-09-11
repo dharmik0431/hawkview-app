@@ -6,6 +6,8 @@ import {
   classifyDirectoryChange,
   type ClassificationContext,
   type ConditionalAccessState,
+  CHANGE_RULES,
+  type ChangeRule,
 } from './privileged-change.js'
 import { MICROSOFT_APPLICATION_PERMISSIONS } from '../microsoft/microsoft-access-contract.js'
 
@@ -633,4 +635,161 @@ test('THE RECORD KEEPS MICROSOFT\'S CASING for the control it names', () => {
   // by a string that always contains every control name.
   assert.doesNotMatch(
     classifyConditionalAccessChange(policy(), policy()).because, /compliantDevice/)
+})
+
+
+/** THE RULE IDENTIFIERS — a wire contract, tested as one.
+ *
+ * These become the keys MSP preferences are stored against, so two properties
+ * matter and neither is about classification: the strings are STABLE, and every one
+ * of them is REACHABLE. A rule nobody can trigger is a switch in a settings screen
+ * that does nothing, which is worse than a missing switch because it reads as
+ * covered.
+ */
+
+const PERMISSION_GRANT = (applicationId: string, permissions: readonly string[], scope: 'TENANT_WIDE' | 'SINGLE_PRINCIPAL' = 'SINGLE_PRINCIPAL') =>
+  ({ kind: 'APPLICATION_PERMISSION_GRANT', applicationId, permissions, scope }) as const
+
+/** One input per declared rule. The table IS the reachability proof. */
+const REACHES: ReadonlyArray<readonly [ChangeRule, () => { rule: ChangeRule }]> = [
+  ['directory.hawkview_onboarding_grant',
+    () => classifyDirectoryChange(PERMISSION_GRANT(OURS, ['User.Read.All'], 'TENANT_WIDE'), context)],
+  ['directory.sensitive_permission_granted',
+    () => classifyDirectoryChange(PERMISSION_GRANT(THEIRS, ['Application.ReadWrite.All']), context)],
+  ['directory.permission_unrecognised',
+    () => classifyDirectoryChange(PERMISSION_GRANT(THEIRS, ['Some.Permission.Invented.Yesterday']), context)],
+  ['directory.read_scope_granted',
+    () => classifyDirectoryChange(PERMISSION_GRANT(THEIRS, ['User.Read.All']), context)],
+  ['directory.application_credential_added',
+    () => classifyDirectoryChange({ kind: 'APPLICATION_CREDENTIAL_ADDED', applicationId: THEIRS }, context)],
+  ['directory.privileged_role_assigned',
+    () => classifyDirectoryChange({ kind: 'ROLE_ASSIGNMENT', roleTemplateId: 'role-1', roleIsPrivileged: true }, context)],
+  ['directory.role_unidentified',
+    () => classifyDirectoryChange({ kind: 'ROLE_ASSIGNMENT', roleTemplateId: null, roleIsPrivileged: null }, context)],
+  ['directory.role_not_privileged',
+    () => classifyDirectoryChange({ kind: 'ROLE_ASSIGNMENT', roleTemplateId: 'role-2', roleIsPrivileged: false }, context)],
+  ['directory.auth_method_registered',
+    () => classifyDirectoryChange({ kind: 'AUTH_METHOD_REGISTERED' }, context)],
+  ['directory.admin_password_reset',
+    () => classifyDirectoryChange({ kind: 'ADMIN_PASSWORD_RESET' }, context)],
+  ['conditional_access.state_unavailable',
+    () => classifyConditionalAccessChange(null, policy())],
+  ['conditional_access.policy_disabled',
+    () => classifyConditionalAccessChange(policy(), policy({ enabled: false }))],
+  ['conditional_access.principal_excluded',
+    () => classifyConditionalAccessChange(policy(), policy({ excludedPrincipals: ['someone'] }))],
+  ['conditional_access.grant_weakened',
+    () => classifyConditionalAccessChange(
+      policy({ grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }))],
+  ['conditional_access.grant_operator_unknown',
+    () => classifyConditionalAccessChange(
+      policy({ grantOperator: null }), policy({ grantOperator: null, grantControls: ['mfa'] }))],
+  ['conditional_access.grant_controls_absent',
+    () => classifyConditionalAccessChange(
+      policy({ grantOperator: 'OR', grantControls: [] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa'] }))],
+  ['conditional_access.grant_denial_control',
+    () => classifyConditionalAccessChange(
+      policy({ grantOperator: 'OR', grantControls: ['mfa', 'block'] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa'] }))],
+  ['conditional_access.session_control_changed',
+    () => classifyConditionalAccessChange(
+      policy({ sessionControls: ['signInFrequency'] }), policy({ sessionControls: [] }))],
+  ['conditional_access.unmodelled_dimension',
+    () => classifyConditionalAccessChange(
+      policy({ unmodelledFingerprint: 'a' }), policy({ unmodelledFingerprint: 'b' }))],
+  ['conditional_access.no_modelled_weakening',
+    () => classifyConditionalAccessChange(policy(), policy())],
+]
+
+test('EVERY DECLARED RULE IS REACHABLE, and nothing reaches a rule twice', () => {
+  // A rule nobody can trigger is a settings switch that does nothing — and it reads
+  // as coverage, which is the part that misleads.
+  for (const [expected, produce] of REACHES) {
+    assert.equal(produce().rule, expected, expected)
+  }
+
+  // The table covers the declared list exactly. A new branch with a new rule fails
+  // here until it has an input that reaches it; a rule deleted from the list fails
+  // here too. Both directions, because either gap is silent.
+  assert.deepEqual([...REACHES.map(([rule]) => rule)].sort(), [...CHANGE_RULES].sort())
+
+  // And no two entries claim the same rule, which would hide an unreachable one
+  // behind a duplicate.
+  assert.equal(new Set(REACHES.map(([rule]) => rule)).size, REACHES.length)
+})
+
+test('THE RULE IDENTIFIERS ARE A WIRE CONTRACT, pinned so a rename cannot be casual', () => {
+  // Once an MSP preference row points at one of these, renaming it is a schema
+  // migration and a conversation about somebody's saved settings. This test exists
+  // so that "it would read better as X" fails loudly and the next reader is told
+  // why, rather than being a one-line diff nobody questions.
+  //
+  // ADDING a rule is fine and only needs a line here. RENAMING one is not.
+  assert.deepEqual([...CHANGE_RULES], [
+    'directory.hawkview_onboarding_grant',
+    'directory.sensitive_permission_granted',
+    'directory.permission_unrecognised',
+    'directory.read_scope_granted',
+    'directory.application_credential_added',
+    'directory.privileged_role_assigned',
+    'directory.role_unidentified',
+    'directory.role_not_privileged',
+    'directory.auth_method_registered',
+    'directory.admin_password_reset',
+    'conditional_access.state_unavailable',
+    'conditional_access.policy_disabled',
+    'conditional_access.principal_excluded',
+    'conditional_access.grant_weakened',
+    'conditional_access.grant_operator_unknown',
+    'conditional_access.grant_controls_absent',
+    'conditional_access.grant_denial_control',
+    'conditional_access.session_control_changed',
+    'conditional_access.unmodelled_dimension',
+    'conditional_access.no_modelled_weakening',
+  ])
+
+  // No duplicates in the contract itself, and every id is namespaced — the prefix is
+  // what lets a settings screen group them without parsing prose.
+  assert.equal(new Set(CHANGE_RULES).size, CHANGE_RULES.length)
+  for (const rule of CHANGE_RULES) {
+    assert.match(rule, /^(directory|conditional_access)\.[a-z0-9_]+$/, rule)
+  }
+})
+
+test('THE THREE UNDETERMINED GRANT REASONS STAY SEPARATE RULES', () => {
+  // They all produce UNCLASSIFIED, so a classification-level identifier would
+  // collapse them into one switch. An MSP who wants to hear about a denial control
+  // moving but not about an unknown operator needs them distinguishable, and the
+  // distinction already exists in the `unknown` token — the rule must not be
+  // coarser than what the function already knows.
+  const rules = [
+    classifyConditionalAccessChange(
+      policy({ grantOperator: null }), policy({ grantOperator: null, grantControls: ['mfa'] })).rule,
+    classifyConditionalAccessChange(
+      policy({ grantOperator: 'OR', grantControls: [] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa'] })).rule,
+    classifyConditionalAccessChange(
+      policy({ grantOperator: 'OR', grantControls: ['mfa', 'block'] }),
+      policy({ grantOperator: 'OR', grantControls: ['mfa'] })).rule,
+  ]
+  assert.equal(new Set(rules).size, 3, 'three distinct causes must be three distinct rules')
+})
+
+test('the rule is independent of the classification, which is the point of having both', () => {
+  // Routing maps an opinion onto a channel. If the rule could be derived from the
+  // classification there would be nothing to configure at a finer grain than the
+  // tier, which is the coarseness this identifier exists to remove.
+  const byClassification = new Map<string, Set<ChangeRule>>()
+  for (const [, produce] of REACHES) {
+    const verdict = produce() as { rule: ChangeRule; classification: string }
+    const existing = byClassification.get(verdict.classification) ?? new Set<ChangeRule>()
+    existing.add(verdict.rule)
+    byClassification.set(verdict.classification, existing)
+  }
+  for (const [classification, rules] of byClassification) {
+    assert.ok(rules.size > 1,
+      `${classification} maps to only ${rules.size} rule — an MSP could not configure below the tier`)
+  }
 })

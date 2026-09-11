@@ -10,10 +10,62 @@ import type { Severity } from './alert-type.js'
  * count that cannot be determined is NOT_AVAILABLE rather than zero.
  */
 
+/** WHICH RULE FIRED — a stable identifier, and a wire contract from now on.
+ *
+ * MSPs choose what they are alerted on; HawkView's tiering is the default rather
+ * than the law. The classifier states an opinion and routing maps that opinion onto
+ * a channel, so an MSP disagreeing with the routing does not change the opinion.
+ *
+ * THE CONFIGURABLE GRAIN IS THIS LIST, NOT THE SEVEN CATALOGUE IDS. Without it the
+ * finest choice available would be `security.privileged_directory_change` entire —
+ * every privileged change collapsed into one switch, so "page me for a role grant
+ * but not for an authentication method" is unexpressible. That coarseness would have
+ * been discovered by the first person who tried to configure it.
+ *
+ * THESE ARE STABLE STRINGS AND THEY ARE NEVER RENAMED TO READ BETTER. Once a
+ * preference row points at one, changing it is a schema migration and a conversation
+ * about somebody's saved settings. A test pins the exact list for that reason.
+ *
+ * The type is DERIVED from the array rather than declared beside it. Two lists that
+ * must agree is the coupling shape that produced three defects here in a week; one
+ * list cannot drift from itself. */
+export const CHANGE_RULES = [
+  // Application permission grants
+  'directory.hawkview_onboarding_grant',
+  'directory.sensitive_permission_granted',
+  'directory.permission_unrecognised',
+  'directory.read_scope_granted',
+  // Credentials
+  'directory.application_credential_added',
+  // Role assignment
+  'directory.privileged_role_assigned',
+  'directory.role_unidentified',
+  'directory.role_not_privileged',
+  // Other directory activity
+  'directory.auth_method_registered',
+  'directory.admin_password_reset',
+  // Conditional access
+  'conditional_access.state_unavailable',
+  'conditional_access.policy_disabled',
+  'conditional_access.principal_excluded',
+  'conditional_access.grant_weakened',
+  'conditional_access.grant_operator_unknown',
+  'conditional_access.grant_controls_absent',
+  'conditional_access.grant_denial_control',
+  'conditional_access.session_control_changed',
+  'conditional_access.unmodelled_dimension',
+  'conditional_access.no_modelled_weakening',
+] as const
+
+export type ChangeRule = typeof CHANGE_RULES[number]
+
 export type ChangeClassification = 'URGENT' | 'ROUTINE' | 'UNCLASSIFIED'
 
 export interface ClassifiedChange {
   readonly classification: ChangeClassification
+  /** Which rule produced this verdict. Required, so every branch names itself and
+   * the compiler enumerates them — see `CHANGE_RULES`. */
+  readonly rule: ChangeRule
   /** Why, in a sentence a person reads before acting. */
   readonly because: string
   /** Derived from the classification rather than chosen beside it. */
@@ -149,12 +201,15 @@ const URGENT_SEVERITY: Severity = 'ACT_NOW'
 const REVIEW_SEVERITY: Severity = 'ACT_TODAY'
 const ROUTINE_SEVERITY: Severity = 'RECORD_ONLY'
 
-const urgent = (because: string): ClassifiedChange =>
-  ({ classification: 'URGENT', because, severity: URGENT_SEVERITY })
-const routine = (because: string): ClassifiedChange =>
-  ({ classification: 'ROUTINE', because, severity: ROUTINE_SEVERITY })
-const unclassified = (because: string, unknown: string, severity: Severity = REVIEW_SEVERITY): ClassifiedChange =>
-  ({ classification: 'UNCLASSIFIED', because, severity, unknown })
+// The rule comes FIRST in each signature, so a branch cannot be written without
+// naming itself and a reader sees which rule a verdict belongs to before the prose.
+const urgent = (rule: ChangeRule, because: string): ClassifiedChange =>
+  ({ classification: 'URGENT', rule, because, severity: URGENT_SEVERITY })
+const routine = (rule: ChangeRule, because: string): ClassifiedChange =>
+  ({ classification: 'ROUTINE', rule, because, severity: ROUTINE_SEVERITY })
+const unclassified = (
+  rule: ChangeRule, because: string, unknown: string, severity: Severity = REVIEW_SEVERITY,
+): ClassifiedChange => ({ classification: 'UNCLASSIFIED', rule, because, severity, unknown })
 
 /** HawkView's own grants are exempt ONLY within the set we actually request.
  *
@@ -179,7 +234,8 @@ export function classifyDirectoryChange(
   switch (change.kind) {
     case 'APPLICATION_PERMISSION_GRANT': {
       if (isExpectedOnboardingGrant(change, context)) {
-        return routine('HawkView onboarding: every permission in this grant is one HawkView requests.')
+        return routine('directory.hawkview_onboarding_grant',
+          'HawkView onboarding: every permission in this grant is one HawkView requests.')
       }
 
       // SENSITIVITY AND SCOPE TOGETHER, never scope alone.
@@ -197,20 +253,22 @@ export function classifyDirectoryChange(
         const amplifier = change.scope === 'TENANT_WIDE'
           ? ' Granted tenant-wide, so it applies to every user at once.'
           : ''
-        return urgent(`A sensitive permission was granted. ${reasons.join(' ')}${amplifier}`)
+        return urgent('directory.sensitive_permission_granted',
+          `A sensitive permission was granted. ${reasons.join(' ')}${amplifier}`)
       }
 
       // Not sensitive — but "not on the list" is not "read-only".
       const unrecognised = change.permissions.filter((permission) => !KNOWN_ROUTINE_PERMISSIONS.has(permission))
       if (unrecognised.length > 0) {
         return unclassified(
+          'directory.permission_unrecognised',
           'A permission was granted that is on neither the sensitive nor the known-routine list. ' +
           'Unrecognised is not the same as established-harmless, so it is recorded as unclassified rather ' +
           'than downgraded. Nobody has decided what this permission is; that is the finding.',
           unrecognised.join(', '))
       }
 
-      return routine('Every permission in this grant is a known read scope.')
+      return routine('directory.read_scope_granted', 'Every permission in this grant is a known read scope.')
     }
 
     case 'APPLICATION_CREDENTIAL_ADDED':
@@ -218,6 +276,7 @@ export function classifyDirectoryChange(
       // permissions we request; a credential is not a permission, so it is never in
       // that set and is evaluated like anyone else's.
       return urgent(
+        'directory.application_credential_added',
         'A credential was added to an application registration. Whoever holds it can authenticate as ' +
         'that application and assume the privileges it already has, and the credential survives any ' +
         'user password reset.')
@@ -229,14 +288,15 @@ export function classifyDirectoryChange(
         // granted a role we cannot identify" is materially different from "an
         // application got a permission we do not recognise".
         return unclassified(
+          'directory.role_unidentified',
           'A directory role was assigned and the role could not be identified. The activity is a privilege ' +
           'grant regardless — only its magnitude is unknown, which is not a reason to wait.',
           change.roleTemplateId ?? 'unresolved-role',
           URGENT_SEVERITY)
       }
       return change.roleIsPrivileged
-        ? urgent('A role granting administrative access was assigned.')
-        : routine('A directory role with no administrative privilege was assigned.')
+        ? urgent('directory.privileged_role_assigned', 'A role granting administrative access was assigned.')
+        : routine('directory.role_not_privileged', 'A directory role with no administrative privilege was assigned.')
     }
 
     case 'CONDITIONAL_ACCESS_CHANGE':
@@ -252,6 +312,7 @@ export function classifyDirectoryChange(
       //
       // Deliberately says nothing about what any other detector covers.
       return routine(
+        'directory.auth_method_registered',
         'An authentication method was registered. Ordinarily unremarkable; it is also how an attacker ' +
         'holding stolen credentials establishes persistence, so it is recorded rather than dismissed.')
 
@@ -261,6 +322,7 @@ export function classifyDirectoryChange(
       // another component's coverage that was never checked. No such claim is made
       // anywhere in this file.
       return routine(
+        'directory.admin_password_reset',
         'An administrator reset a password. Ordinarily an administrator doing their job, and also the ' +
         'step that follows a successful account takeover, so it is recorded rather than dismissed.')
   }
@@ -310,7 +372,7 @@ export function classifyDirectoryChange(
  */
 type GrantVerdict =
   | Readonly<{ kind: 'WEAKER'; reasons: readonly string[] }>
-  | Readonly<{ kind: 'UNDETERMINED'; because: string; unknown: string }>
+  | Readonly<{ kind: 'UNDETERMINED'; rule: ChangeRule; because: string; unknown: string }>
   | Readonly<{ kind: 'NOT_WEAKER'; compared: string }>
 
 /** Controls that DENY access rather than offering a way to satisfy the policy.
@@ -365,6 +427,7 @@ function grantChangeVerdict(
   if (before.grantOperator === null || after.grantOperator === null) {
     return {
       kind: 'UNDETERMINED',
+      rule: 'conditional_access.grant_operator_unknown',
       because:
         'Grant controls changed and the operator combining them is unknown on one side, so whether a ' +
         'requirement or an alternative moved cannot be determined. Change detected; impact unknown.',
@@ -379,6 +442,7 @@ function grantChangeVerdict(
     // controls, which makes this a state to report rather than interpret.
     return {
       kind: 'UNDETERMINED',
+      rule: 'conditional_access.grant_controls_absent',
       because:
         'Grant controls changed and one side has none at all, where the AND and OR operators mean ' +
         'opposite things. Change detected; impact unknown.',
@@ -390,6 +454,7 @@ function grantChangeVerdict(
   if (denials.length > 0) {
     return {
       kind: 'UNDETERMINED',
+      rule: 'conditional_access.grant_denial_control',
       because:
         `A control that denies access rather than granting it moved (${denials.join(', ')}). It is not an ` +
         'alternative way to satisfy the policy, so the operator semantics do not describe its direction. ' +
@@ -459,19 +524,22 @@ export function classifyConditionalAccessChange(
 ): ClassifiedChange {
   if (before === null || after === null) {
     return unclassified(
+      'conditional_access.state_unavailable',
       'A conditional access policy changed and usable before/after values were not available. ' +
       'Change detected; impact unknown.',
       'conditional-access-state-missing')
   }
 
   if (before.enabled && !after.enabled) {
-    return urgent('A conditional access policy was disabled. Its protection stops applying immediately.')
+    return urgent('conditional_access.policy_disabled',
+      'A conditional access policy was disabled. Its protection stops applying immediately.')
   }
 
   const addedExclusions = after.excludedPrincipals.filter(
     (principal) => !before.excludedPrincipals.includes(principal))
   if (addedExclusions.length > 0) {
     return urgent(
+      'conditional_access.principal_excluded',
       `A principal was excluded from a conditional access policy (${addedExclusions.length}), ` +
       'so the policy no longer applies to them.')
   }
@@ -484,10 +552,10 @@ export function classifyConditionalAccessChange(
     // urgent under TWO rules, and an implementation returning whichever it reached
     // first would keep the verdict green while the reason underneath it moved. That
     // is the changed-subject shape, and a list cannot have it.
-    return urgent(grant.reasons.join(' '))
+    return urgent('conditional_access.grant_weakened', grant.reasons.join(' '))
   }
   if (grant !== null && grant.kind === 'UNDETERMINED') {
-    return unclassified(grant.because, grant.unknown)
+    return unclassified(grant.rule, grant.because, grant.unknown)
   }
 
   // NOTHING MODELLED WEAKENED. That is not the same as nothing weakened, and this
@@ -506,6 +574,7 @@ export function classifyConditionalAccessChange(
 
   if (sessionControlsChanged) {
     return unclassified(
+      'conditional_access.session_control_changed',
       'A session control changed. Sign-in frequency and persistent browser sessions are where a session ' +
       'is extended from an hour to weeks, and their direction depends on values this comparison does not ' +
       'capture. Change detected; impact unknown.',
@@ -514,6 +583,7 @@ export function classifyConditionalAccessChange(
 
   if (before.unmodelledFingerprint !== after.unmodelledFingerprint) {
     return unclassified(
+      'conditional_access.unmodelled_dimension',
       'The policy changed in a dimension this comparison does not model. Change detected; impact unknown.',
       'unmodelled-dimension')
   }
@@ -526,6 +596,7 @@ export function classifyConditionalAccessChange(
   // underneath that sentence. A reader cannot audit a claim that does not say what
   // it rests on, so this one names the comparison and stops there.
   return routine(
+    'conditional_access.no_modelled_weakening',
     `${grant === null
       ? 'The grant controls and their combination operator are unchanged.'
       : grant.compared} Session controls are unchanged, and the digest of every dimension this ` +
