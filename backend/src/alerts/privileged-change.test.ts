@@ -1205,3 +1205,56 @@ test('AN ABSENT OPERATOR IS KNOWABLY UNCHANGED, which is why it is not treated a
   assert.notEqual(unchanged.classification, unreadable.classification,
     'identical inputs bar the distinguished value, and they must not agree')
 })
+
+test('THE LIST CHECK OWNS THE BOTH-UNREADABLE CASE, and this pins WHICH guard owns it', () => {
+  // A different assertion from "the case is covered". QA established ownership by disabling
+  // the list check and watching the case fall to ROUTINE — so coverage sits solely here, and
+  // a later narrowing of this check would lose it silently. Asserting the RULE ID is what
+  // makes that regress loudly.
+  //
+  // Why the operator branch cannot own it: a ReadList has values.length === 0 whether the
+  // list is empty or unread, so the operator narrowing — which asks whether controls are
+  // present — cannot tell those apart and never sees this input. That is the collapse
+  // ReadList exists to prevent, recurring inside the guard of the fix for the previous
+  // instance of it.
+  //
+  // THE SIBLING RULE: a distinguished-value check must not sit behind a LENGTH predicate over
+  // a type that distinguishes empty from unread. Same family as the change-predicate rule,
+  // and both are asking a question in projection space about a value whose projection
+  // collapses the thing you care about.
+  const unreadableList = { values: [], unreadable: 1 }
+  const verdict = classifyConditionalAccessChange(
+    policy({ grantOperator: 'UNRECOGNISED', grantControls: unreadableList }),
+    policy({ grantOperator: 'UNRECOGNISED', grantControls: unreadableList }))
+
+  assert.equal(verdict.classification, 'UNCLASSIFIED')
+  assert.equal(verdict.rule, 'conditional_access.list_partially_unreadable',
+    'the LIST check owns this, not the operator branch — narrowing the list check loses the case entirely')
+  assert.notEqual(verdict.rule, 'conditional_access.grant_operator_unknown')
+  // And never the false sentence that the rejected widening produced: unreadable is not absent.
+  assert.notEqual(verdict.rule, 'conditional_access.grant_controls_absent')
+  assert.doesNotMatch(verdict.because, /\bnone at all\b/i)
+
+  // THE SENTENCE IS COMPLETE RATHER THAN MERELY CORRECT. The verdict was always right; the
+  // wording named only the lists. Widening the sentence costs nothing and was the only thing
+  // wrong with the arrangement.
+  assert.match(verdict.because, /grant controls/i)
+  assert.match(verdict.because, /operator/i, 'the operator is unreadable too and the record must say so')
+  assert.match(verdict.because, /impact unknown/i)
+
+  // POSITIVE CONTROL: with a READABLE operator, the same unreadable list reports without
+  // mentioning the operator — so the widened clause is conditional rather than always on.
+  const listOnly = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: unreadableList }),
+    policy({ grantOperator: 'AND', grantControls: unreadableList }))
+  assert.equal(listOnly.rule, 'conditional_access.list_partially_unreadable')
+  assert.doesNotMatch(listOnly.because, /operator/i,
+    'a readable operator must not be reported as unreadable')
+
+  // And the operator branch still owns its own case, where the lists ARE readable.
+  assert.equal(
+    classifyConditionalAccessChange(
+      policy({ grantOperator: 'UNRECOGNISED', grantControls: ['mfa', 'compliantDevice'] }),
+      policy({ grantOperator: 'UNRECOGNISED', grantControls: ['mfa', 'compliantDevice'] })).rule,
+    'conditional_access.grant_operator_unknown')
+})

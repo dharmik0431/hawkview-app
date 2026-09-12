@@ -720,11 +720,30 @@ export function classifyConditionalAccessChange(
   ] as const
   const incomplete = unreadable.filter(([, left, right]) => left.unreadable > 0 || right.unreadable > 0)
   if (incomplete.length > 0) {
+    // THE SENTENCE IS WIDENED HERE, NOT THE BRANCH ABOVE, and that is a ruling rather than a
+    // convenience. This check owns the case where BOTH the grant lists and the operator are
+    // unreadable — because a `ReadList` has `values.length === 0` whether it is empty or
+    // unread, so the operator branch's narrowing cannot distinguish the two and never sees
+    // it. That is the very collapse `ReadList` exists to prevent, recurring inside the guard
+    // of the fix for the previous instance of it.
+    //
+    // Widening the operator branch instead was tried and rejected twice, both times for the
+    // same reason: it reports `grant_controls_absent`, which describes UNREADABLE controls as
+    // ABSENT. That is a false sentence, and this check's verdict was already correct — only
+    // its wording was incomplete. INCOMPLETE IS RECOVERABLE; FALSE IS NOT.
+    //
+    // So when the operator is unreadable too, say it: one fact, stated completely.
+    const operatorAlsoUnreadable =
+      before.grantOperator === 'UNRECOGNISED' || after.grantOperator === 'UNRECOGNISED'
     return unclassified(
       'conditional_access.list_partially_unreadable',
-      `A policy list contained entries this comparison could not read (${incomplete.map(([name]) => name).join(', ')}), ` +
-      'so it is not a complete account of what the policy contains and no comparison over it can be ' +
-      'trusted. Change detected; impact unknown.',
+      `A policy list contained entries this comparison could not read (${incomplete.map(([name]) => name).join(', ')})` +
+      (operatorAlsoUnreadable
+        ? ', and the operator combining the grant controls could not be read either — so neither what '
+          + 'the policy requires nor how those requirements combine is a complete account. '
+        : ', so it is not a complete account of what the policy contains and no comparison over it can '
+          + 'be trusted. ') +
+      'Change detected; impact unknown.',
       'policy-list')
   }
 

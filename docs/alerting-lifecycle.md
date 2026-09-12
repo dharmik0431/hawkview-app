@@ -1414,3 +1414,35 @@ Written test-first, as required: it failed against the code as it stood, because
 tests over a behaviour nothing covered was the absence of a test rather than evidence. Three
 mutations, and the one that survived — including `ABSENT` in the unreadable set — exposed
 that nothing pinned the knowably-unchanged case either.
+
+### The recursion: a length predicate over a type that distinguishes empty from unread
+
+The sharpest instance of the root so far, because it appeared **inside the guard of the fix
+for the previous instance**.
+
+The operator narrowing asks whether controls are present — `values.length > 0`. A `ReadList`
+has `values.length === 0` **both when the list is empty and when it is unread**. So a policy
+whose operator *and* control list are both unreadable never reaches the operator branch: the
+narrowing reads it as "no controls", which is exactly the collapse `ReadList` was introduced
+to prevent.
+
+> **A distinguished-value check must not sit behind a LENGTH predicate over a type that
+> distinguishes empty from unread.**
+
+Sibling of the change-predicate rule, and the same shape: *asking a question in projection
+space about a value whose projection collapses the thing you care about.*
+
+**The case is covered — by the list check, not the operator branch.** Verified by disabling
+the list check and watching it fall to `ROUTINE`, which establishes **sole** ownership. That
+is a different assertion from "the case is covered", and a test now pins the rule id so a
+later narrowing of the list check regresses loudly instead of silently.
+
+**The widening was rejected twice, for the same reason both times.** Making the operator
+branch cover it reports `grant_controls_absent` — **describing unreadable controls as
+absent**. A false sentence, and the list check's verdict was already correct. Only its
+wording was incomplete, and **incomplete is recoverable where false is not.**
+
+So the sentence widened, not the branch: when the operator is unreadable too, the record says
+that neither what the policy requires nor how those requirements combine could be read. One
+fact, stated completely, and a test asserts the clause is conditional — a readable operator
+must not be described as unreadable.
