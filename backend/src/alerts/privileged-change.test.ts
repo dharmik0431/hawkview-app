@@ -6,6 +6,7 @@ import {
   classifyDirectoryChange,
   type ClassificationContext,
   type ConditionalAccessState,
+  type ReadList,
   CHANGE_RULES,
   type ChangeRule,
 } from './privileged-change.js'
@@ -215,16 +216,36 @@ test('nothing is asserted benign, and no coverage is claimed for another compone
   }
 })
 
-const policy = (over: Partial<ConditionalAccessState> = {}): ConditionalAccessState => ({
+/** The four list fields accept a bare array for readability, and a ReadList when a test
+ * needs to say something was unread. Lifting here rather than at eighty-seven call sites
+ * keeps the fixtures about the case under test — but a bare array lifts to
+ * `unreadable: 0`, so a test that cares about an unread entry has to say so explicitly
+ * and cannot get there by accident. */
+type ListField = readonly string[] | ReadList
+type PolicyOverrides =
+  Partial<Omit<ConditionalAccessState, 'grantControls' | 'excludedUsers' | 'excludedGroups' | 'excludedRoles'>>
+  & Readonly<{
+    grantControls?: ListField
+    excludedUsers?: ListField
+    excludedGroups?: ListField
+    excludedRoles?: ListField
+  }>
+
+const asList = (given: ListField | undefined, fallback: readonly string[]): ReadList =>
+  given === undefined
+    ? { values: fallback, unreadable: 0 }
+    : Array.isArray(given) ? { values: given, unreadable: 0 } : given as ReadList
+
+const policy = (over: PolicyOverrides = {}): ConditionalAccessState => ({
   state: 'ON',
   grantOperator: 'AND',
-  grantControls: ['mfa', 'compliantDevice'],
-  excludedUsers: [],
-  excludedGroups: [],
-  excludedRoles: [],
   sessionControls: [],
   unmodelledFingerprint: 'same',
   ...over,
+  grantControls: asList(over.grantControls, ['mfa', 'compliantDevice']),
+  excludedUsers: asList(over.excludedUsers, []),
+  excludedGroups: asList(over.excludedGroups, []),
+  excludedRoles: asList(over.excludedRoles, []),
 })
 
 test('REMOVING A GRANT CONTROL DOES NOT ALWAYS WEAKEN THE POLICY', () => {
@@ -421,8 +442,8 @@ test('no outcome claims an act occurred rather than describing a capability', ()
  */
 type Transition = readonly [
   name: string,
-  before: Partial<ConditionalAccessState>,
-  after: Partial<ConditionalAccessState>,
+  before: PolicyOverrides,
+  after: PolicyOverrides,
   weakens: boolean,
 ]
 
@@ -684,6 +705,9 @@ const REACHES: ReadonlyArray<readonly [ChangeRule, () => { rule: ChangeRule }]> 
     () => classifyConditionalAccessChange(policy({ state: 'REPORT_ONLY' }), policy({ state: 'OFF' }))],
   ['conditional_access.policy_state_unrecognised',
     () => classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'UNRECOGNISED' }))],
+  ['conditional_access.list_partially_unreadable',
+    () => classifyConditionalAccessChange(
+      policy(), policy({ grantControls: { values: ['mfa'], unreadable: 1 } }))],
   // Ordered role, group, user in the classifier, so each of these adds only its own
   // kind — otherwise the earlier rule fires and the later entry is untested.
   ['conditional_access.role_excluded',
@@ -757,6 +781,7 @@ test('THE RULE IDENTIFIERS ARE A WIRE CONTRACT, pinned so a rename cannot be cas
     'conditional_access.policy_stopped_enforcing',
     'conditional_access.policy_stopped_reporting',
     'conditional_access.policy_state_unrecognised',
+    'conditional_access.list_partially_unreadable',
     'conditional_access.user_excluded',
     'conditional_access.group_excluded',
     'conditional_access.role_excluded',
@@ -952,4 +977,44 @@ test('A WEAKENING OUTRANKS EVERY UNKNOWN FIRING ALONGSIDE IT', () => {
     policy({ unmodelledFingerprint: 'before' }), policy({ ...noisy }))
   assert.equal(unknownsOnly.classification, 'UNCLASSIFIED')
   assert.equal(unknownsOnly.rule, 'conditional_access.session_control_changed')
+})
+
+
+test('AN UNREADABLE LIST ENTRY STOPS A VERDICT, on every one of the four lists', () => {
+  // The silent drop this replaces: a helper filtered out every entry that was not a
+  // string, in four places, all of them excluded from the fingerprint. A structured
+  // entry arriving where a string used to be was unreadable by the comparison and
+  // invisible to the digest at the same time — no backstop on either side.
+  //
+  // An unread entry is a distinguished value exactly as UNRECOGNISED is, so it gets the
+  // same treatment: impact unknown, never a record.
+  const lists = ['grantControls', 'excludedUsers', 'excludedGroups', 'excludedRoles'] as const
+  for (const field of lists) {
+    const partial: ReadList = { values: ['mfa'], unreadable: 1 }
+    const onAfter = classifyConditionalAccessChange(policy(), policy({ [field]: partial }))
+    assert.equal(onAfter.classification, 'UNCLASSIFIED', `${field} on the after side`)
+    assert.equal(onAfter.rule, 'conditional_access.list_partially_unreadable', field)
+    assert.match(onAfter.because, /impact unknown/i)
+
+    // EITHER SIDE, not just the new one. A list that used to be incomplete means the
+    // comparison never had a trustworthy baseline to compare against.
+    const onBefore = classifyConditionalAccessChange(policy({ [field]: partial }), policy())
+    assert.equal(onBefore.classification, 'UNCLASSIFIED', `${field} on the before side`)
+  }
+
+  // POSITIVE CONTROL: the same lists with nothing unread reach a verdict, so this is
+  // about the count rather than a gate that fires whenever a list is present.
+  assert.equal(classifyConditionalAccessChange(policy(), policy()).classification, 'ROUTINE')
+  assert.equal(
+    classifyConditionalAccessChange(policy(), policy({ excludedUsers: ['user-1'] })).classification,
+    'URGENT')
+
+  // AND IT OUTRANKS THE WEAKENING RULES, which is the opposite of the precedence a
+  // weakening gets — deliberately. A weakening is something we determined; an unread
+  // list means we cannot trust the determination, including the one that says weakened.
+  const bothWrong = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: { values: ['mfa', 'compliantDevice'], unreadable: 2 } }),
+    policy({ grantOperator: 'OR', grantControls: { values: ['mfa', 'compliantDevice'], unreadable: 2 } }))
+  assert.equal(bothWrong.rule, 'conditional_access.list_partially_unreadable',
+    'a verdict computed over an incomplete list must not be reported as a finding')
 })

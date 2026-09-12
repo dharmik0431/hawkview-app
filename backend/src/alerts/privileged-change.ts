@@ -54,6 +54,7 @@ export const CHANGE_RULES = [
   'conditional_access.policy_stopped_enforcing',
   'conditional_access.policy_stopped_reporting',
   'conditional_access.policy_state_unrecognised',
+  'conditional_access.list_partially_unreadable',
   // REPLACES 'conditional_access.principal_excluded', which became unreachable when
   // the exclude lists stopped being merged. A deletion rather than a rename, and
   // permitted only because nothing is wired and no preference row exists yet — after
@@ -169,6 +170,27 @@ export type DirectoryChange =
   | Readonly<{ kind: 'AUTH_METHOD_REGISTERED' }>
   | Readonly<{ kind: 'ADMIN_PASSWORD_RESET' }>
 
+/** A list of identifiers read from a collected policy, WITH A COUNT OF WHAT IT COULD
+ * NOT READ.
+ *
+ * A plain `readonly string[]` cannot say "there was more here than I captured", and the
+ * helper that built one silently dropped any entry that was not a string — in four
+ * places, all of them excluded from `unmodelledFingerprint`. So if Microsoft ever sent
+ * a structured entry where a string used to be, it vanished: unreadable by the
+ * comparison and excluded from the digest as "modelled". Four copies of a silent drop
+ * is a shape rather than an instance.
+ *
+ * `unreadable` is what makes those four paths eligible to leave the digest at all —
+ * see `CanSayUnread` in `conditional-access-model.ts`. A non-zero count means this list
+ * is not a complete account of what was collected, and the classifier treats that the
+ * same way it treats an unrecognised policy state: impact unknown, never a record. */
+export interface ReadList {
+  readonly values: readonly string[]
+  /** Entries present in the collected policy that were not strings and so were not
+   * read. Zero is the normal case and the only one that permits a verdict. */
+  readonly unreadable: number
+}
+
 /** Enough of a conditional access policy to compare two of them. */
 export interface ConditionalAccessState {
   /** Enforcing, evaluating-but-not-enforcing, or off.
@@ -198,7 +220,7 @@ export interface ConditionalAccessState {
   /** How the grant controls combine. Microsoft's model: OR means any one control
    * satisfies the policy, AND means all of them must. */
   readonly grantOperator: 'OR' | 'AND' | null
-  readonly grantControls: readonly string[]
+  readonly grantControls: ReadList
   /** Excluded principals, kept apart BY KIND rather than merged.
    *
    * Merging them lost the blast radius, not a label. Excluding one named account
@@ -210,9 +232,9 @@ export interface ConditionalAccessState {
    * blind spot recorded in `docs/alerting-lifecycle.md`: role membership changes
    * alter who the exclusion covers with no policy edit at all, so there is no
    * change for us to collect. */
-  readonly excludedUsers: readonly string[]
-  readonly excludedGroups: readonly string[]
-  readonly excludedRoles: readonly string[]
+  readonly excludedUsers: ReadList
+  readonly excludedGroups: ReadList
+  readonly excludedRoles: ReadList
   /** Session controls PRESENT, by name. Modelled far enough to notice they moved
    * and deliberately no further: their direction depends on values this does not
    * capture — `persistentBrowser: always` weakens a policy and `never` strengthens
@@ -465,10 +487,12 @@ function grantChangeVerdict(
   // Compared case-insensitively, REPORTED as Microsoft sent them. Lowercasing the
   // comparison stops a recased value reading as a change; lowercasing the report
   // would hand an MSP a control name that does not appear in their own portal.
-  const beforeSet = lowercased(before.grantControls)
-  const afterSet = lowercased(after.grantControls)
-  const removed = before.grantControls.filter((control) => !afterSet.has(control.toLowerCase()))
-  const added = after.grantControls.filter((control) => !beforeSet.has(control.toLowerCase()))
+  const beforeControls = before.grantControls.values
+  const afterControls = after.grantControls.values
+  const beforeSet = lowercased(beforeControls)
+  const afterSet = lowercased(afterControls)
+  const removed = beforeControls.filter((control) => !afterSet.has(control.toLowerCase()))
+  const added = afterControls.filter((control) => !beforeSet.has(control.toLowerCase()))
   const operatorChanged = before.grantOperator !== after.grantOperator
 
   if (!operatorChanged && removed.length === 0 && added.length === 0) return null
@@ -484,7 +508,7 @@ function grantChangeVerdict(
     }
   }
 
-  if (before.grantControls.length === 0 || after.grantControls.length === 0) {
+  if (beforeControls.length === 0 || afterControls.length === 0) {
     // AND over no controls requires nothing; OR over no controls admits nothing. The
     // operators invert at the empty set, so every rule below would read the wrong
     // way. Microsoft does not permit a policy with neither grant nor session
@@ -517,12 +541,12 @@ function grantChangeVerdict(
   // [mfa]" are the same requirement, so the flip changes nothing and must not be
   // reported as a weakening. This is the cell a fix reading "AND to OR is urgent"
   // gets wrong, and it passed before only because no operator comparison happened.
-  const operatorFlipIsVacuous = controlsUnchanged && after.grantControls.length === 1
+  const operatorFlipIsVacuous = controlsUnchanged && afterControls.length === 1
 
   const reasons: string[] = []
   if (before.grantOperator === 'AND' && after.grantOperator === 'OR' && !operatorFlipIsVacuous) {
     reasons.push(
-      `Grant controls that were all required are now alternatives (${after.grantControls.join(', ')}), so any ` +
+      `Grant controls that were all required are now alternatives (${afterControls.join(', ')}), so any ` +
       'one of them alone satisfies the policy where previously every one was needed.')
   }
   if (removed.length > 0 && before.grantOperator === 'AND') {
@@ -541,7 +565,7 @@ function grantChangeVerdict(
     return {
       kind: 'NOT_WEAKER',
       compared:
-        `The grant operator changed from AND to OR over a single control (${after.grantControls.join(', ')}), ` +
+        `The grant operator changed from AND to OR over a single control (${afterControls.join(', ')}), ` +
         'where the two are the same requirement: all of one control is any of one control.',
     }
   }
@@ -608,6 +632,30 @@ export function classifyConditionalAccessChange(
       'policy-state')
   }
 
+  // THE SAME RULE, APPLIED TO THE LISTS. An entry the mapper could not read is a
+  // distinguished value exactly as UNRECOGNISED is, and these four paths are excluded
+  // from the fingerprint — so if an unread entry did not stop a verdict here, nothing
+  // would report it. That was the silent drop: four copies of a filter that discarded
+  // whatever was not a string, on four paths with no backstop.
+  //
+  // Counting rather than naming, because what was dropped is by definition something
+  // this comparison could not interpret, and printing it would be guessing at a shape.
+  const unreadable = [
+    ['grant controls', before.grantControls, after.grantControls],
+    ['excluded users', before.excludedUsers, after.excludedUsers],
+    ['excluded groups', before.excludedGroups, after.excludedGroups],
+    ['excluded roles', before.excludedRoles, after.excludedRoles],
+  ] as const
+  const incomplete = unreadable.filter(([, left, right]) => left.unreadable > 0 || right.unreadable > 0)
+  if (incomplete.length > 0) {
+    return unclassified(
+      'conditional_access.list_partially_unreadable',
+      `A policy list contained entries this comparison could not read (${incomplete.map(([name]) => name).join(', ')}), ` +
+      'so it is not a complete account of what the policy contains and no comparison over it can be ' +
+      'trusted. Change detected; impact unknown.',
+      'policy-list')
+  }
+
   // ENFORCING TO ANYTHING ELSE is the weakening, and the two destinations are not
   // the same event. Reported separately so the record says what actually happened.
   if (before.state === 'ON' && after.state === 'OFF') {
@@ -635,21 +683,21 @@ export function classifyConditionalAccessChange(
 
   // BY KIND, because the kinds are different sizes of event on the tier that pages.
   // A role exclusion first: its reach is the largest and the least knowable.
-  const addedRoles = after.excludedRoles.filter((role) => !before.excludedRoles.includes(role))
+  const addedRoles = after.excludedRoles.values.filter((role) => !before.excludedRoles.values.includes(role))
   if (addedRoles.length > 0) {
     return urgent('conditional_access.role_excluded',
       `A directory role was excluded from a conditional access policy (${addedRoles.length}), so the ` +
       'policy no longer applies to anybody holding that role. Who that covers changes as role ' +
       'assignments change, with no further edit to the policy.')
   }
-  const addedGroups = after.excludedGroups.filter((group) => !before.excludedGroups.includes(group))
+  const addedGroups = after.excludedGroups.values.filter((group) => !before.excludedGroups.values.includes(group))
   if (addedGroups.length > 0) {
     return urgent('conditional_access.group_excluded',
       `A group was excluded from a conditional access policy (${addedGroups.length}), so the policy no ` +
       'longer applies to its members. The number of accounts that covers is not visible from the policy ' +
       'itself.')
   }
-  const addedUsers = after.excludedUsers.filter((user) => !before.excludedUsers.includes(user))
+  const addedUsers = after.excludedUsers.values.filter((user) => !before.excludedUsers.values.includes(user))
   if (addedUsers.length > 0) {
     return urgent('conditional_access.user_excluded',
       `An account was excluded from a conditional access policy (${addedUsers.length}), so the policy no ` +

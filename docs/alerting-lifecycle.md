@@ -1061,6 +1061,69 @@ boolean over a structured subtree has no such member, so QA's path could not hav
 labelled LOSSLESS at all. That is checkable at authoring time and an author cannot
 satisfy it by choosing a convenient example.
 
+### The constraint that closes the witness gap
+
+The witness cannot establish LOSSLESS, for the reason above. What can is a property of
+the **target type**, checked when the path is written rather than when a pair is chosen:
+
+> **A projection may be LOSSLESS only if the state field it feeds can represent "there
+> was more here than I captured."**
+
+Three shapes qualify, and `CanSayUnread` in `conditional-access-model.ts` is the
+predicate: a `null` member, an `UNRECOGNISED` member, or an `unreadable` count.
+`LosslessCapableField` maps that over `ConditionalAccessState`, and `ModelledPath`
+becomes a union where the LOSSLESS variant accepts only those fields.
+
+**QA's defeat was replayed against it and is rejected at authoring time.** Adding their
+path — a structured subtree projected onto a boolean, witnessed absent-versus-present —
+now fails to compile with *"Type `"hasGuestRestrictions"` is not assignable to type
+`LosslessCapableField`"*. There is no witness to choose, because the label is unavailable.
+Such a path would stay in the digest, and the widening that previously read routine
+surfaces as unmodelled.
+
+An author cannot satisfy this by picking a convenient example, which is the whole
+difference between it and the witness. The witnesses are kept — they force a concrete
+pair instead of an assertion, and they kill a careless relabel — they just no longer
+carry a claim they cannot support.
+
+### Lists say what they could not read
+
+`strings()` filtered out every entry that was not a string and said nothing, in four
+places, **all of them excluded from the digest**. So a structured entry arriving where a
+string used to be was unreadable by the comparison and invisible to the fingerprint at
+the same time. Four copies of a silent drop is a shape rather than an instance, and the
+likelihood being low does not change the shape.
+
+Those four fields are now `ReadList` — `{ values, unreadable }` — which is also what
+makes them eligible to leave the digest under the constraint above. Three cases, and the
+middle one is what a bare filter gets wrong:
+
+| collected | read |
+|---|---|
+| absent | no values, nothing unread |
+| `['mfa', {authenticationStrength: …}]` | `['mfa']`, **1 unread** |
+| not a list at all | no values, **1 unread** — never "nothing was there" |
+
+**An unread entry is a distinguished value exactly as `UNRECOGNISED` is**, so it gets the
+same treatment: the verdict is impact-unknown, on either side, for any of the four lists.
+It outranks the weakening rules, which is the opposite of the precedence a weakening
+normally gets and is deliberate — a weakening is something we determined, and an unread
+list means the determination itself cannot be trusted, *including* the one that says
+weakened.
+
+The count is reported rather than the content, because what was dropped is by definition
+something this comparison could not interpret; printing it would be guessing at a shape.
+
+### What the distinguished-value rule does not yet cover
+
+`grantOperator`'s `null` conflates **absent** (no grant controls configured — normal for
+a session-controls-only policy) with **unrecognised** (Microsoft sent an operator we do
+not understand). The rule is not applied to it, because today that would report
+impact-unknown for every policy with no grant controls. Splitting those two is the
+remaining piece of this repair, and it is the same shape as everything above: a
+distinguished value that means two different things cannot carry the rule.
+
+
 ### What HawkView cannot see: role-based exclusions
 
 Recorded because it is larger than the decision that surfaced it, and because nothing in

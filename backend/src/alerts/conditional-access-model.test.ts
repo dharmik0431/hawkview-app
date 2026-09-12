@@ -6,6 +6,7 @@ import {
   mapCollectedPolicy,
   unmodelledFingerprintOf,
   type Canonicaliser,
+  type ModelledPath,
 } from './conditional-access-model.js'
 import { classifyConditionalAccessChange } from './privileged-change.js'
 
@@ -44,10 +45,10 @@ test('the mapper reads every modelled field from the collected policy', () => {
   const state = mapCollectedPolicy(policy(), canonicalise)
   assert.equal(state.state, 'ON')
   assert.equal(state.grantOperator, 'AND')
-  assert.deepEqual(state.grantControls, ['mfa', 'compliantDevice'])
-  assert.deepEqual(state.excludedUsers, [])
-  assert.deepEqual(state.excludedGroups, [])
-  assert.deepEqual(state.excludedRoles, [])
+  assert.deepEqual(state.grantControls, { values: ['mfa', 'compliantDevice'], unreadable: 0 })
+  for (const list of [state.excludedUsers, state.excludedGroups, state.excludedRoles]) {
+    assert.deepEqual(list, { values: [], unreadable: 0 })
+  }
   assert.deepEqual(state.sessionControls, [])
   assert.equal(typeof state.unmodelledFingerprint, 'string')
 
@@ -56,9 +57,9 @@ test('the mapper reads every modelled field from the collected policy', () => {
     conditions: { users: { excludeUsers: ['u1'], excludeGroups: ['g1'], excludeRoles: ['r1'] } },
   }), canonicalise)
   // KEPT APART, which is the point: merging them lost which kind was excluded.
-  assert.deepEqual(excluded.excludedUsers, ['u1'])
-  assert.deepEqual(excluded.excludedGroups, ['g1'])
-  assert.deepEqual(excluded.excludedRoles, ['r1'])
+  assert.deepEqual(excluded.excludedUsers.values, ['u1'])
+  assert.deepEqual(excluded.excludedGroups.values, ['g1'])
+  assert.deepEqual(excluded.excludedRoles.values, ['r1'])
 
   // An absent or unrecognised operator is null rather than guessed.
   assert.equal(mapCollectedPolicy(policy({ grantControls: {} }), canonicalise).grantOperator, null)
@@ -221,7 +222,7 @@ test('the fingerprint is stable and does not depend on the input being mutated',
   assert.deepEqual((collected.grantControls as Record<string, unknown>).builtInControls,
     ['mfa', 'compliantDevice'])
   const state = mapCollectedPolicy(collected, canonicalise)
-  assert.deepEqual(state.grantControls, ['mfa', 'compliantDevice'])
+  assert.deepEqual(state.grantControls.values, ['mfa', 'compliantDevice'])
 })
 
 test('A SESSION CONTROL PRESENT BUT NULL IS NOT CONFIGURED', () => {
@@ -305,5 +306,78 @@ test('EVERY FIDELITY CLAIM IS WITNESSED, so a lossy path cannot be excluded by a
     const { before, after } = modelled.witness(base)
     assert.notEqual(JSON.stringify(before), JSON.stringify(after),
       `${modelled.path.join('.')}: the witness changes nothing`)
+  }
+})
+
+
+test('A LIST REPORTS WHAT IT COULD NOT READ, in all three cases', () => {
+  // The silent drop this replaces: a filter that discarded every non-string entry,
+  // in four places, all excluded from the digest. The three cases matter separately
+  // and the middle one is what a bare filter gets wrong.
+  const read = (value: unknown) =>
+    mapCollectedPolicy(policy({ grantControls: { operator: 'AND', builtInControls: value } }), canonicalise)
+      .grantControls
+
+  // Absent: nothing there and nothing unread.
+  assert.deepEqual(read(undefined), { values: [], unreadable: 0 })
+
+  // A list: its strings, plus a count of everything else. Microsoft sending a
+  // structured control where a string used to be is the case with no backstop.
+  assert.deepEqual(read(['mfa', { authenticationStrength: 'phishingResistant' }, 'compliantDevice']),
+    { values: ['mfa', 'compliantDevice'], unreadable: 1 })
+
+  // NOT A LIST AT ALL: zero read and ONE unread — never "nothing was there", which is
+  // what a bare Array.isArray guard returns and is a silent drop of the whole field.
+  assert.deepEqual(read({ builtInControls: 'mfa' }), { values: [], unreadable: 1 })
+  assert.deepEqual(read('mfa'), { values: [], unreadable: 1 })
+})
+
+test('THE LOSSLESS LABEL IS CONSTRAINED BY THE TARGET TYPE, not by the witness', () => {
+  // ITEM 2, and the reason it exists: a witness is one pair chosen by the author, so an
+  // author can always find a pair that passes. This constraint is a property of the
+  // field the path feeds, which no choice of example can satisfy.
+  //
+  // A LOSSLESS path may only feed a field that can represent "there was more here than
+  // I captured" — a null member, an UNRECOGNISED member, or an unreadable count.
+
+  // POSITIVE CONTROLS FIRST, or the directive below could be firing for an unrelated
+  // reason. All three capable shapes are accepted.
+  const capable: readonly ModelledPath[] = [
+    { path: ['state'], fidelity: 'LOSSLESS', reads: 'state', because: 'x'.repeat(70), witness: base => ({ before: base, after: base }) },
+    { path: ['x'], fidelity: 'LOSSLESS', reads: 'grantOperator', because: 'x'.repeat(70), witness: base => ({ before: base, after: base }) },
+    { path: ['y'], fidelity: 'LOSSLESS', reads: 'grantControls', because: 'x'.repeat(70), witness: base => ({ before: base, after: base }) },
+  ]
+  assert.equal(capable.length, 3)
+
+  // sessionControls is a bare string[] — it cannot say "there was more here", which is
+  // exactly QA's boolean-over-a-subtree in a different costume. LOSSLESS is unavailable.
+  // The directive sits on the DECLARATION because that is where TypeScript reports the
+  // union mismatch — it names `reads` as incompatible with LosslessCapableField rather
+  // than blaming the fidelity line. Worth knowing: a directive on the field I expected
+  // to be at fault went unused, and an unused directive fails the build, which is how I
+  // found out rather than guessing.
+  // @ts-expect-error a LOSSLESS path may not feed a field that cannot report an unread remainder
+  const refused: ModelledPath = {
+    path: ['sessionControls'],
+    fidelity: 'LOSSLESS',
+    reads: 'sessionControls',
+    because: 'x'.repeat(70),
+    witness: base => ({ before: base, after: base }),
+  }
+  assert.ok(refused)
+
+  // And the same field IS available as LOSSY, so the constraint is about the
+  // combination rather than about the field being unusable.
+  const allowed: ModelledPath = {
+    path: ['sessionControls'], fidelity: 'LOSSY', reads: 'sessionControls',
+    because: 'x'.repeat(70), witness: base => ({ before: base, after: base }),
+  }
+  assert.ok(allowed)
+
+  // The shipped table still satisfies it, and every lossless path feeds a capable field.
+  for (const modelled of MODELLED_PATHS) {
+    if (modelled.fidelity !== 'LOSSLESS') continue
+    assert.ok(['state', 'grantOperator', 'grantControls', 'excludedUsers', 'excludedGroups', 'excludedRoles']
+      .includes(modelled.reads), modelled.reads)
   }
 })

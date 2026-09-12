@@ -1,4 +1,4 @@
-import type { ConditionalAccessState } from './privileged-change.js'
+import type { ConditionalAccessState, ReadList } from './privileged-change.js'
 
 /** Mapping a COLLECTED conditional access policy into the state the classifier
  * compares, and digesting everything the mapping did not look at.
@@ -52,11 +52,31 @@ export type Fidelity =
   /** The state captures only part of it. MUST stay in the digest. */
   | 'LOSSY'
 
-export interface ModelledPath {
+/** Whether a state field can represent "there was more here than I captured".
+ *
+ * THE CONSTRAINT THAT CLOSES THE WITNESS GAP, and it closes it at authoring time rather
+ * than at witness time. A witness is one pair chosen by the author, so an author can
+ * always find a pair that passes; this is a property of the TARGET TYPE, which no choice
+ * of example can satisfy.
+ *
+ * Three ways a field can say it: a `null` member, an `UNRECOGNISED` member, or an
+ * `unreadable` count. A boolean over a structured subtree has none of them — which is
+ * exactly the path QA used to defeat the witness, and it now cannot be labelled
+ * LOSSLESS at all. It would stay in the digest, and the widening that read as routine
+ * would surface as unmodelled. */
+export type CanSayUnread<T> =
+  [null] extends [T] ? true
+    : 'UNRECOGNISED' extends T ? true
+      : T extends { readonly unreadable: number } ? true
+        : false
+
+/** The state fields a LOSSLESS path is permitted to feed. */
+export type LosslessCapableField = {
+  [K in keyof ConditionalAccessState]-?: CanSayUnread<ConditionalAccessState[K]> extends true ? K : never
+}[keyof ConditionalAccessState]
+
+interface ModelledPathBase {
   readonly path: readonly string[]
-  readonly fidelity: Fidelity
-  /** Which field of `ConditionalAccessState` reads it. */
-  readonly reads: keyof ConditionalAccessState
   /** Why this fidelity — and for a LOSSY path, what the projection discards.
    * Required reading for anyone deciding whether to make it lossless. */
   readonly because: string
@@ -98,6 +118,13 @@ export interface ModelledPath {
    * loss and accidentally demonstrating a change. */
   readonly witness: (base: Collected) => Readonly<{ before: Collected; after: Collected }>
 }
+
+/** A path, with LOSSLESS available only where the target type can report an unread
+ * remainder. Declaring a lossless path onto a field that cannot say "there was more
+ * here" does not compile, which is the part an author cannot talk their way around. */
+export type ModelledPath =
+  | (ModelledPathBase & Readonly<{ fidelity: 'LOSSLESS'; reads: LosslessCapableField }>)
+  | (ModelledPathBase & Readonly<{ fidelity: 'LOSSY'; reads: keyof ConditionalAccessState }>)
 
 type Collected = Readonly<Record<string, unknown>>
 
@@ -230,8 +257,23 @@ const policyState = (raw: unknown): ConditionalAccessState['state'] =>
       : raw === 'disabled' ? 'OFF'
         : 'UNRECOGNISED'
 
-const strings = (value: unknown): readonly string[] =>
-  Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
+/** Reads a list of identifiers and SAYS WHAT IT COULD NOT READ.
+ *
+ * The helper this replaces returned a bare array and dropped every non-string entry
+ * without a trace, in four places, all of them excluded from the digest. So a
+ * structured entry arriving where a string used to be was unreadable by the comparison
+ * and invisible to the fingerprint at the same time.
+ *
+ * Three cases, and the middle one is the one a bare filter gets wrong: absent is an
+ * empty list with nothing unread; a value that is not a list at all is zero entries
+ * read and ONE unread, never "nothing was there"; and a list is its strings plus a
+ * count of everything else. */
+const readList = (value: unknown): ReadList => {
+  if (value === undefined || value === null) return { values: [], unreadable: 0 }
+  if (!Array.isArray(value)) return { values: [], unreadable: 1 }
+  const values = value.filter((entry): entry is string => typeof entry === 'string')
+  return { values, unreadable: value.length - values.length }
+}
 
 /** The state the classifier compares, read only from the declared paths.
  *
@@ -250,10 +292,10 @@ export function mapCollectedPolicy(
   return {
     state: policyState(at(collected, ['state'])),
     grantOperator: normalisedOperator === 'OR' || normalisedOperator === 'AND' ? normalisedOperator : null,
-    grantControls: strings(at(collected, ['grantControls', 'builtInControls'])),
-    excludedUsers: strings(at(collected, ['conditions', 'users', 'excludeUsers'])),
-    excludedGroups: strings(at(collected, ['conditions', 'users', 'excludeGroups'])),
-    excludedRoles: strings(at(collected, ['conditions', 'users', 'excludeRoles'])),
+    grantControls: readList(at(collected, ['grantControls', 'builtInControls'])),
+    excludedUsers: readList(at(collected, ['conditions', 'users', 'excludeUsers'])),
+    excludedGroups: readList(at(collected, ['conditions', 'users', 'excludeGroups'])),
+    excludedRoles: readList(at(collected, ['conditions', 'users', 'excludeRoles'])),
     // NAMES ONLY, which is why this path is LOSSY and stays in the digest. A control
     // present with a different value is a change the state cannot express.
     sessionControls: isRecord(sessionControls)
