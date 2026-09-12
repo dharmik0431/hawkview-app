@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { createPilotPseudonymProvider, WrappedRiskPseudonymProvider } from './pilot-pseudonym-provider.js'
 import { pilotRiskConfig } from './pilot-risk-config.js'
@@ -115,6 +115,48 @@ test('a session replays a reference for the same input and separates purposes', 
   })
 })
 
+/** Every rendering of a secret this codebase could plausibly produce, DERIVED FROM THE
+ * SECRET rather than searched for as a spelling somebody guessed.
+ *
+ * THE DEFECT THIS REPLACES: the old assertions searched a serialised session for
+ * `material.toString('hex')` and for the literal input. Both are spellings the leak has no
+ * reason to use. Measured by putting a real leak on the session object and running the
+ * shipped file: hex and plaintext were caught; base64, a byte array, the input as base64,
+ * and THE BUFFER ITSELF were not. The Buffer case is the one that matters, because
+ * `JSON.stringify` renders a Buffer as `{"type":"Buffer","data":[222,173,...]}` — so the
+ * single most likely way this leak ever actually happens, somebody putting `material` on the
+ * session object, produced a serialisation containing every byte of the key and passed.
+ *
+ * AN ASSERTION OVER A RENDERED STRING TESTS THE RENDERING. The search term has to come from
+ * the secret, not from the author.
+ *
+ * THE LIMIT, STATED RATHER THAN IMPLIED: this catches the renderings enumerated here. It is
+ * NOT a proof that no encoding leaks. Which encodings are worth enumerating is a judgement
+ * about what a reader could invert, so the honest claim is narrow — no run of the key's
+ * bytes in any encoding we render elsewhere. A new encoding in the codebase belongs here. */
+function renderingsOf(secret: Buffer): readonly { how: string; text: string }[] {
+  const candidates = [
+    { how: 'hex', text: secret.toString('hex') },
+    { how: 'base64', text: secret.toString('base64') },
+    { how: 'base64url', text: secret.toString('base64url') },
+    { how: 'utf8', text: secret.toString('utf8') },
+    { how: 'latin1', text: secret.toString('latin1') },
+    { how: 'ascii', text: secret.toString('ascii') },
+    // The one that would actually have happened. A Buffer reaching JSON.stringify becomes a
+    // decimal byte array, which contains no hex and no base64 and every byte of the key.
+    { how: 'JSON Buffer form', text: [...secret].join(',') },
+  ]
+  // A degenerate rendering would match everything and turn this into a test that always
+  // fails. Lossy encodings of random bytes can collapse; anything too short to be evidence
+  // is dropped rather than searched, and the drop is visible in the returned list.
+  return candidates.filter((candidate) => candidate.text.length >= 16)
+}
+
+/** Which renderings of `secret` appear in `text`. Empty is the healthy answer. */
+function leakedRenderings(text: string, secret: Buffer): readonly string[] {
+  return renderingsOf(secret).filter((r) => text.includes(r.text)).map((r) => r.how)
+}
+
 test('a session serialises without leaking its input or its key material', async () => {
   await withPilotEnv(async () => {
     const { provider } = freshProvider()
@@ -122,11 +164,53 @@ test('a session serialises without leaking its input or its key material', async
     await session.reference('mailbox', ['SYNTHETIC_MAILBOX'])
 
     const serialised = JSON.stringify(session)
-    assert.equal(serialised.includes('SYNTHETIC_MAILBOX'), false,
-      'the plaintext input must not survive serialisation — a logged session would leak it')
-    assert.equal(serialised.includes(material.toString('hex')), false,
-      'the unwrapped key material must not survive serialisation')
+    assert.deepEqual(leakedRenderings(serialised, material), [],
+      'no rendering of the unwrapped key material may survive serialisation')
+    assert.deepEqual(leakedRenderings(serialised, Buffer.from('SYNTHETIC_MAILBOX')), [],
+      'nor any rendering of the plaintext input — a logged session would carry it')
   })
+})
+
+test('THE LEAK DETECTOR FIRES, including on the case that would actually happen', () => {
+  // A leak test that has never been shown to catch a leak is a test that passes. Each of
+  // these is a real way the material reaches a serialisation, and the Buffer one is the way
+  // it would happen: nobody writes `material.toString("hex")` onto a session by accident,
+  // and plenty of people write `material`.
+  // ASSERTED BY PRESENCE, NOT BY EXACT LIST, and the reason is a flake I nearly shipped INTO
+  // the file we are fixing for flakiness. `base64url` is a prefix of `base64` whenever the
+  // payload happens to contain no `+` or `/` — so an exact-list expectation passes or fails
+  // depending on `randomBytes(32)`. It held for the 32-byte key and failed for the ASCII
+  // input on the first run. What each case must show is that the RIGHT rendering fires;
+  // whether a second, overlapping encoding also fires is an accident of the bytes.
+  const firesOn = (leaked: string, secret: Buffer) =>
+    leakedRenderings(JSON.stringify({ leaked }), secret)
+
+  assert.ok(leakedRenderings(JSON.stringify({ leaked: material }), material).includes('JSON Buffer form'),
+    'a Buffer on the object leaks every byte and must be caught')
+  assert.ok(firesOn(material.toString('base64'), material).includes('base64'),
+    'base64 was not caught before this change')
+  assert.ok(leakedRenderings(JSON.stringify({ leaked: [...material] }), material).includes('JSON Buffer form'),
+    'a plain byte array is the same leak without the Buffer wrapper')
+  assert.ok(firesOn(material.toString('hex'), material).includes('hex'),
+    'the one the old assertion caught still gets caught')
+
+  // The input, by the route the old assertion missed.
+  const input = Buffer.from('SYNTHETIC_MAILBOX')
+  assert.ok(firesOn(input.toString('base64'), input).includes('base64'),
+    'the input base64-encoded is still the input')
+  assert.ok(firesOn(input.toString('utf8'), input).includes('utf8'),
+    'and the plaintext input itself, which is what the old assertion did catch')
+})
+
+test('THE LEAK DETECTOR DOES NOT FIRE ON THE FEATURE\'S OWN CORRECT OUTPUT', () => {
+  // The control in the other direction, and it is the one that keeps this test alive. A leak
+  // detector that flags a reference DERIVED from the material would be weakened by the next
+  // person to hit it, and then it catches nothing. An HMAC is a function of the key; it is
+  // not the key, and the whole product depends on that distinction holding.
+  const derived = createHmac('sha256', material).update('SYNTHETIC_MAILBOX').digest('hex')
+  assert.deepEqual(leakedRenderings(JSON.stringify({ reference: derived }), material), [],
+    'an HMAC derived from the material is not a leak of it')
+  assert.equal(derived.length, 64, 'and the control must be a real digest, not an empty string')
 })
 
 test('a closed or expired session is unusable, and says so as KEY_UNAVAILABLE', async () => {
