@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 import {
   applyStatement,
   applyValidated,
@@ -382,4 +383,42 @@ test('THE REVERT STATEMENT CARRIES ONLY THE APPROVED ROWS', () => {
   assert.equal(statement.expectedRowCount, 1, 'only the row still ours to undo')
   assert.ok(statement.params.includes('n-1'))
   assert.ok(!statement.params.includes('n-2'), 'the refused row is not in the statement at all')
+})
+
+test('THE RUNNER CARRIES NO PRODUCTION FIGURE, and this is why that is checked here', () => {
+  // PM's criterion, made checkable rather than advisory: "a runner that prints plausible
+  // numbers is the failure this document exists to prevent, so the script should READ the
+  // figures rather than carry them — if any of those five is a constant anywhere in it, that
+  // is the defect."
+  //
+  // A grep run once is not a property. This is the same move as the one-statement assertion
+  // above: the constraint is on a file nobody can execute here, so the only way to hold it is
+  // to read the file.
+  const source = readFileSync(new URL('../../scripts/alerting-apply.mts', import.meta.url), 'utf8')
+
+  // COMMENTS ARE STRIPPED, DELIBERATELY. The figures belong in prose explaining what a number
+  // means — "47 rows are entitled to null and 317 are not" is exactly the sentence a reader
+  // needs. What must not exist is one in a position that can reach a comparison or an output.
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('//'))
+    .join('\n')
+
+  for (const figure of ['364', '317', '71', '62', '47']) {
+    assert.doesNotMatch(code, new RegExp(`\\b${figure}\\b`),
+      `${figure} is a production figure and appears in executable position. The runner must `
+      + 'read every number it prints.')
+  }
+
+  // AND THE POSITIVE CONTROL, or the test above is satisfied by an empty file. The figures
+  // ARE present in the comments, so the stripping is doing something rather than the source
+  // happening to contain no digits.
+  assert.match(source, /\b364\b/)
+  assert.match(source, /\b317\b/)
+
+  // THE SHAPE THAT WOULD REINTRODUCE IT is a comparison against an expected count, so the
+  // words are pinned too. `save-mapping` prints what it read and tells the operator to compare;
+  // it must not do the comparing, because a runner that knows the answer can agree with itself.
+  assert.doesNotMatch(code, /expected(Rows|Total|Mapping|Figures)/i)
 })
