@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ALERT_CATALOG } from './alert-catalog.js'
-import { parseDedupeKey, reconcile, TYPE_FOR_SHAPE, type ExistingAlertRow } from './reconciliation.js'
+import { adds, parseDedupeKey, reconcile, TYPE_FOR_SHAPE, type ExistingAlertRow } from './reconciliation.js'
 import { incidentGrouping, wouldGroupTogether } from './alert-incident-key.js'
 
 /** The dry run, against fixtures. It writes nothing and it checks its own output. */
@@ -155,7 +155,7 @@ test('THE OCCURRENCES BEHIND THE ROWS ARE STATED, because consolidating must pre
   ]
   const report = reconcile(rows)
   assert.equal(report.occurrencesRepresented, 335)
-  assert.equal(report.invariants.occurrencesPreserved, true)
+  assert.deepEqual(report.invariants.occurrenceCountsAddUp, [])
   assert.notEqual(report.occurrencesRepresented, report.total,
     'the point of stating it is that it differs from the row count')
 })
@@ -167,14 +167,14 @@ test('AN UNRESOLVED SUBJECT IS COUNTED, not quietly grouped', () => {
     row({ dedupeKey: 'tenant:t1:connection', customerTenantId: null }),
   ]
   const report = reconcile(rows)
-  assert.equal(report.incidents.unattributed, 1)
+  assert.equal(report.incidents.declaredSubjectUnresolvedAmongTypedRows, 1)
   assert.equal(report.mapping[0]?.incidentKey, null)
   assert.match(report.mapping[0]?.because ?? '', /no resolvable tenant|recorded on its own/i)
 
   // POSITIVE CONTROL: with the tenant present it does group, so the refusal is about the
   // missing subject rather than the shape being ungroupable.
   const withTenant = reconcile([row({ dedupeKey: 'tenant:t1:connection', customerTenantId: 't1' })])
-  assert.equal(withTenant.incidents.unattributed, 0)
+  assert.equal(withTenant.incidents.declaredSubjectUnresolvedAmongTypedRows, 0)
   assert.notEqual(withTenant.mapping[0]?.incidentKey, null)
 })
 
@@ -310,7 +310,7 @@ test('THE OCCURRENCE CHECK COMPARES TWO INDEPENDENT SIDES', () => {
   ]
   const report = reconcile(rows)
 
-  assert.equal(report.invariants.occurrencesPreserved, true)
+  assert.deepEqual(report.invariants.occurrenceCountsAddUp, [])
   assert.equal(report.occurrencesRepresented, 342)
   // The counts reached the mapping, which is what makes the check non-tautological — and
   // the apply phase needs them anyway, since consolidating must preserve the events.
@@ -465,7 +465,7 @@ test('AN UNGROUPED ROW IS STILL AN INCIDENT AND STILL AN EPISODE', () => {
   // missing: every counter that could have noticed them sits downstream of a verdict they
   // never get.
   assert.equal(report.incidents.needingClassification, 3, 'the shape determines no type')
-  assert.equal(report.incidents.unattributed, 0, 'so none of them reaches that counter')
+  assert.equal(report.incidents.declaredSubjectUnresolvedAmongTypedRows, 0, 'so none of them reaches that counter')
   assert.equal(report.episodes.counted, 3,
     'three incidents of one event each — three episodes, not zero and not one merged')
   assert.equal(report.episodes.countedDirectoryAuditOnly, 3)
@@ -594,7 +594,7 @@ test('THE STANDING-ALONE COUNT IS NAMED, not left to subtraction', () => {
   const report = reconcile(rows)
 
   assert.equal(report.episodes.rowsStandingAloneBecauseSubjectUnresolved, 1)
-  assert.equal(report.incidents.unattributed, 0,
+  assert.equal(report.incidents.declaredSubjectUnresolvedAmongTypedRows, 0,
     'and the counter that looks like it should say this cannot')
   assert.equal(report.incidents.needingClassification, 3, 'though all three rows are counted here')
 
@@ -681,4 +681,124 @@ test('THE STANDING-ALONE TOTAL IS DERIVABLE FROM THE OTHER SIDE, by shape', () =
     UNRECOGNISED: 1,
   })
 
+})
+
+test('THE IDENTITY THAT VALIDATES THE HEADLINE IS PRINTED, not performed in a message', () => {
+  // 71 = 62 + 9 was reconciled by hand, using an attributed-episode count the report did not
+  // expose — so the arithmetic that made the headline credible could not be reproduced by
+  // anyone reading the output. A number verified once in a message is not a verified number.
+  const DAY = 24 * 60 * 60 * 1000
+  const rows = [
+    // One actor, two bursts more than the quiet interval apart: TWO episodes, one incident.
+    auditAt('a1', 'admin-1', T0),
+    auditAt('a2', 'admin-1', T0 + 3 * DAY),
+    // A second actor: one more.
+    auditAt('b1', 'admin-2', T0),
+    // Two rows that stand alone.
+    ...[1, 2].map((index) =>
+      row({
+        dedupeKey: `security:directory-audit:Directory_u${index}`,
+        occurredAt: new Date(T0 + index * 1000),
+        audit: { initiatedBy: null, targetResources: [], privileged: null },
+      })),
+  ]
+  const report = reconcile(rows)
+
+  assert.equal(report.episodes.counted, 5)
+  assert.equal(report.episodes.fromAttributedRows, 3, 'two bursts from one actor, one from another')
+  assert.equal(report.episodes.fromStandingAloneRows, 2)
+  assert.deepEqual(report.invariants.episodeCountsAddUp, [])
+
+  // AND THE SPLIT MUST BE ASYMMETRIC, or a mutation swapping the two halves reads identical.
+  assert.notEqual(report.episodes.fromAttributedRows, report.episodes.fromStandingAloneRows)
+
+  // The identity is checkable from the printed output alone, which is the whole point: a
+  // reader adds the two halves and gets the headline, without having to be told the sum.
+  assert.equal(
+    report.episodes.fromAttributedRows + report.episodes.fromStandingAloneRows,
+    report.episodes.counted)
+})
+
+test('EVERY FIGURE RECONCILES AGAINST ANOTHER FIGURE, including the always-zero one', () => {
+  // `unattributed` was unconstrained AND structurally zero for directory rows, which is the
+  // quietest possible place for a wrong number: nothing contradicts it, and its correct value
+  // is indistinguishable from a broken one. It now carries its restriction in its name and
+  // has a complement and a total that must agree with it.
+  const rows = [
+    auditAt('a', 'admin-1', T0),                                           // no determined type
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1' }),  // typed, resolves
+    row({ dedupeKey: 'tenant:t1:connection', customerTenantId: null }),     // typed, does not
+    row({ dedupeKey: 'nobody:wrote:this' }),                                // no determined type
+  ]
+  const report = reconcile(rows)
+
+  assert.equal(report.incidents.withDeterminedType, 2)
+  assert.equal(report.incidents.declaredSubjectResolvedAmongTypedRows, 1)
+  assert.equal(report.incidents.declaredSubjectUnresolvedAmongTypedRows, 1)
+  assert.equal(report.incidents.needingClassification, 2)
+
+  // Both identities, and they are what makes the four figures above mutually constraining
+  // rather than four independent claims.
+  assert.deepEqual(report.invariants.rowCountsAddUp, [])
+  assert.equal(report.incidents.withDeterminedType + report.incidents.needingClassification,
+    report.total)
+  assert.equal(
+    report.incidents.declaredSubjectResolvedAmongTypedRows
+    + report.incidents.declaredSubjectUnresolvedAmongTypedRows,
+    report.incidents.withDeterminedType)
+})
+
+test('THE OCCURRENCE CHECK READS THE FIGURE IT VOUCHES FOR', () => {
+  // The boolean it replaces compared two internal sums and touched NEITHER reported field, so
+  // perturbing `occurrencesRepresented` left it reading "preserved". A misleading neighbour is
+  // worse than no neighbour: an unchecked figure standing alone is merely unverified, while one
+  // beside a boolean that looks like a guarantee is actively miscredited.
+  const rows = [
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1', occurrenceCount: 42 }),
+    row({ dedupeKey: 'tenant:t1:connection', customerTenantId: 't1', occurrenceCount: 7 }),
+  ]
+  const report = reconcile(rows)
+
+  assert.equal(report.occurrencesRepresented, 49)
+  assert.deepEqual(report.invariants.occurrenceCountsAddUp, [])
+  assert.notEqual(report.occurrencesRepresented, report.total,
+    'the figure must differ from the row count, or the check cannot tell them apart')
+})
+
+test('A DISCREPANCY IS NAMED WITH ITS SIZE, so a reader knows where to look', () => {
+  // Every one of these identities is a LIST rather than a boolean. `false` tells a reader to
+  // distrust the whole report; "3 with a time + 1 without = 4, but rows read is 5" tells them
+  // which figure to go and look at. Exercised through a duplicate id, which is the one
+  // discrepancy reachable from input alone.
+  const duplicate = row({ dedupeKey: 'tenant:t1:connection', customerTenantId: 't1' })
+  const report = reconcile([duplicate, duplicate])
+
+  assert.deepEqual(report.invariants.duplicatedNotificationIds, [duplicate.id])
+  // The arithmetic identities still hold — a duplicated row is counted twice everywhere, so
+  // the sums stay consistent. That is worth asserting: it shows the lists are reporting on
+  // the arithmetic rather than on general unhappiness.
+  assert.deepEqual(report.invariants.rowCountsAddUp, [])
+  assert.deepEqual(report.invariants.eventTimeCountsAddUp, [])
+})
+
+test('THE IDENTITY HELPER IS TESTED DIRECTLY, because no input can exercise it in place', () => {
+  // Every identity in this report has both sides computed in one pass over the same rows, so
+  // no input can make one disagree — mutations making `adds` always report agreement, and
+  // making it drop the size of the gap, both survived the whole suite. The identities are
+  // TRIPWIRES against future drift, not checks on the present computation, and the only way
+  // to cover the helper's own behaviour is to call it directly.
+  assert.deepEqual(adds([['a', 2], ['b', 3]], 5, 'the whole'), [])
+  assert.deepEqual(adds([], 0, 'the whole'), [], 'nothing adds to nothing')
+
+  // THE MESSAGE CARRIES THE SIZE OF THE GAP, which is the difference between a reader
+  // distrusting one figure and distrusting the report. Asserted on content, not on shape.
+  const gap = adds([['with a time', 317], ['without', 22]], 364, 'rows read')
+  assert.equal(gap.length, 1)
+  assert.match(gap[0] ?? '', /317 with a time/)
+  assert.match(gap[0] ?? '', /22 without/)
+  assert.match(gap[0] ?? '', /= 339/, 'the sum it actually got')
+  assert.match(gap[0] ?? '', /rows read is 364/, 'and what it should have been')
+
+  // Over-count as well as under-count: a report can inflate as easily as it can drop.
+  assert.match(adds([['counted', 9]], 5, 'the total')[0] ?? '', /= 9, but the total is 5/)
 })

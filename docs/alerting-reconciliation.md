@@ -768,3 +768,70 @@ a property of the **key** rather than of the data, so it can be counted independ
 
 Shapes that do resolve a subject are **absent** from the breakdown rather than present as
 zero, so it cannot be misread as a list of shapes that all failed.
+
+## The hardening was reactive, and that is the finding
+
+QA perturbed the report object: **13 of 32 figures move without anything contradicting them,
+and they are exactly the numbers a person would quote.** The 19 that *are* constrained —
+`byShape`, the `rowsWithEventTime`/`rowsWithoutEventTime` pair, `standingAloneByShape`,
+`auditCategories` — are **precisely the ones already caught lying once.**
+
+So the pattern is: **a figure gets a sibling only after it has embarrassed us.** Every number
+that has not yet moved is still standing alone, and we now know from `rowsWithoutEventTime`
+that it will not be found until it does. That is the argument for doing the rest now rather
+than after the next one moves — the alternative is not "no bug", it is "the bug is still
+ahead of us".
+
+**The principle, stated so it can be applied without waiting for an incident: every reported
+figure should reconcile against another reported figure.** `317 + 47 = 364`, `62 + 9 = 71`,
+`9 + 17 + 3 + 5 = 34`. Anything standing alone is where the next silent correction will live.
+
+Three figures fixed under it:
+
+**`occurrencesPreserved` was worse than nothing.** The boolean compared two internal sums and
+touched **neither reported field**, so perturbing `occurrencesRepresented` left it reading
+true — a reader saw 699 with the word "preserved" beside it and concluded the number was
+checked. **A misleading neighbour is worse than no neighbour:** a figure standing alone is
+merely unverified, while one standing beside a boolean that looks like a guarantee is actively
+miscredited. Replaced with `occurrenceCountsAddUp`, which reads the reported figure.
+
+**`countedDirectoryAuditOnly` was the headline with nothing constraining it.** 71 = 62 + 9 was
+reconciled by hand, in a message, using an attributed-episode count the report did not expose
+— so the arithmetic that made the headline credible could not be reproduced from the output.
+`episodes.fromAttributedRows` and `fromStandingAloneRows` are now printed, and
+`invariants.episodeCountsAddUp` states the identity. **A number verified once in a message is
+not a verified number.**
+
+**`incidents.unattributed` was unconstrained AND structurally zero for directory rows.** The
+increment sits after the `declaration === null` branch returns, and every directory-audit row
+takes that branch — so the figure most likely to be read as *"how many could we not attribute"*
+was the one figure guaranteed not to answer it. **An unconstrained figure that is also always
+zero is the quietest possible place for a wrong number: nothing contradicts it, and its
+correct value is indistinguishable from a broken one.** Renamed
+`declaredSubjectUnresolvedAmongTypedRows` so the restriction travels with it, and given a
+complement and a total that must agree with it.
+
+### What these identities cannot do, which matters more than what they can
+
+**All four are tripwires, not input-falsifiable checks.** Each has both sides computed in one
+pass over the same rows, so no input can separate them — a mutation making `adds` always
+report agreement survived the entire suite until the helper was unit-tested directly. They
+catch a **future derivation drifting off the rows**, which is exactly what happened to
+`rowsWithoutEventTime`, and that is worth having. It is not the same thing as verifying the
+computation.
+
+This is the same bound QA put on their own method, and it should travel with the result: their
+perturbation is applied to the report **object**, so it measures whether the output is
+self-checking, not whether the computation is right — and "constrained" means constrained
+relative to the eleven identities they wrote, no more.
+
+**Self-reconciliation catches drift. Only an independently derived reference catches error.**
+For this report that reference is the SQL count, which is what the 62-vs-68 exercise was — and
+it is why the disagreement was worth more than the agreement.
+
+Ten mutations, one survivor, and the survivor is equivalent code: pointing the occurrence check
+at `inputOccurrences` instead of `occurrences` is the same check, because both are the same
+quantity accumulated twice in one pass. Killed: the reported figure perturbed (the exact case
+the old boolean missed), the episode split collapsed into one half, the two halves swapped,
+`standingAlone` tagged from the wrong side, `withDeterminedType` counting every row, the
+complement never incrementing, and three on the helper itself.

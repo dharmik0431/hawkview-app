@@ -229,8 +229,25 @@ export interface ReconciliationReport {
      * wrong and that is worth finding before either number reaches a decision. */
     assumingSingleTypeDirectoryAuditOnly: number
     assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget: number
-    /** Rows that cannot be grouped because the declared subject did not resolve. */
-    unattributed: number
+    /** Rows whose declared subject did not resolve, AMONG ROWS WHOSE TYPE IS DETERMINED.
+     *
+     * THE RESTRICTION IS IN THE NAME BECAUSE IT WAS INVISIBLE AND LOAD-BEARING. This was
+     * `unattributed`, which reads as "rows we could not attribute" — and it is
+     * STRUCTURALLY ZERO for every directory-audit row, because the increment sits after
+     * the `declaration === null` branch returns and every such row takes that branch. So
+     * the figure most likely to be quoted as "how many could we not attribute" was the
+     * one figure guaranteed not to answer it, and its correct value (0) is
+     * indistinguishable from a broken one.
+     *
+     * AN UNCONSTRAINED FIGURE THAT IS ALSO ALWAYS ZERO IS THE QUIETEST PLACE A WRONG
+     * NUMBER CAN SIT. For the question this name used to imply, read
+     * `episodes.rowsStandingAloneBecauseSubjectUnresolved`, which covers every row. */
+    declaredSubjectUnresolvedAmongTypedRows: number
+    /** Its complement, and `withDeterminedType` above them both, so the three reconcile
+     * rather than standing alone — see `invariants.rowCountsAddUp`. */
+    declaredSubjectResolvedAmongTypedRows: number
+    /** Rows whose alert type the key shape determines. */
+    withDeterminedType: number
     /** Rows whose alert type the shape alone does not determine. */
     needingClassification: number
   }>
@@ -250,6 +267,16 @@ export interface ReconciliationReport {
   readonly episodes: Readonly<{
     /** Episodes across incidents where EVERY row carries its own event time. */
     counted: number
+    /** The two halves of `counted`, so the identity that validates it is PRINTED.
+     *
+     * 71 = 62 + 9 was reconciled by hand, in a message, using an attributed-episode count
+     * the report did not expose — so the identity that made the headline figure credible
+     * could not be reproduced by anyone reading the output. That is the difference between
+     * a number having been verified once and a number staying verified.
+     *
+     * See `invariants.episodeCountsAddUp`. */
+    fromAttributedRows: number
+    fromStandingAloneRows: number
     /** Same, restricted to directory-audit rows — the like-for-like comparison. */
     countedDirectoryAuditOnly: number
     /** Incidents whose episode count cannot be recovered because at least one row carries
@@ -360,7 +387,16 @@ export interface ReconciliationReport {
      * tautological as a COMPUTATION and would have reported true over a broken generator;
      * this one catches exactly that. A real check whose reported value is a tripwire,
      * rather than a tripwire wearing the words of a real check. */
-    occurrencesPreserved: boolean
+    /** The REPORTED occurrence figure against both sums it should equal. Empty means they
+     * agree; otherwise it names the discrepancy.
+     *
+     * THE BOOLEAN IT REPLACES COMPARED TWO INTERNAL SUMS AND TOUCHED NEITHER REPORTED
+     * FIGURE. Perturbing `occurrencesRepresented` left it reading true, so a reader saw
+     * 699 with the word "preserved" beside it and concluded the number was checked. A
+     * misleading neighbour is worse than no neighbour: an unchecked figure standing alone
+     * is merely unverified, while one standing beside a boolean that looks like a
+     * guarantee is actively miscredited. It now reads the field it vouches for. */
+    occurrenceCountsAddUp: readonly string[]
     /** Whether the event-time counts add up: withTime + withoutTime === total.
      *
      * ADDED BECAUSE A METRIC CORRECTED ITSELF IN SILENCE. `rowsWithoutEventTime` was
@@ -381,7 +417,30 @@ export interface ReconciliationReport {
      * the incident buckets and inherited their exclusions. That is worth having, and it is
      * not the same thing as a check, so it does not get to be described as one. */
     eventTimeCountsAddUp: readonly string[]
+    /** `episodes.counted` against its two halves, so the identity that validated the
+     * headline figure is printed rather than performed once in a message. */
+    episodeCountsAddUp: readonly string[]
+    /** `total` against typed + needing-classification, and typed against its own two
+     * halves. Three figures that used to stand alone now have to agree with each other. */
+    rowCountsAddUp: readonly string[]
   }>
+}
+
+/** Whether some parts add to a whole, naming the discrepancy when they do not.
+ *
+ * A LIST RATHER THAN A BOOLEAN, and it names the SIZE of the gap, because a person reads
+ * this report to decide whether to trust a number. "false" tells them to distrust
+ * everything; "317 with a time + 22 without = 339, but rows read is 364" tells them which
+ * figure to go and look at. Empty means it adds up. */
+export const adds = (
+  parts: readonly (readonly [string, number])[],
+  whole: number,
+  wholeLabel: string,
+): readonly string[] => {
+  const sum = parts.reduce((total, [, value]) => total + value, 0)
+  if (sum === whole) return []
+  const shown = parts.map(([label, value]) => value + ' ' + label).join(' + ')
+  return [shown + ' = ' + sum + ', but ' + wholeLabel + ' is ' + whole]
 }
 
 const declarationFor = (id: string): AlertTypeDeclaration | null =>
@@ -454,11 +513,20 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   // INHERITS THAT STRUCTURE’S OMISSIONS. This one is taken where the fact is known.
   let rowsWithTime = 0
   let rowsWithoutTimeByRow = 0
-  const rowsByIncident =
-    new Map<string, { times: Date[]; missing: number; events: number; auditOnly: boolean }>()
+  const rowsByIncident = new Map<string, {
+    times: Date[]; missing: number; events: number; auditOnly: boolean
+    /** Whether this bucket is a single standing-alone row rather than a resolved stream.
+     * Carried so the episode total can be SPLIT and the split printed: the identity
+     * `counted = attributed + standingAlone` was reconciled by hand once, in a message,
+     * using a figure the report did not expose. A hand-check that cannot be reproduced
+     * from the output is a claim about the past, not a property of the report. */
+    standingAlone: boolean
+  }>()
   const nominated = declarationFor('security.routine_directory_change')
   const mapping: MappingEntry[] = []
   let unattributed = 0
+  let declaredResolved = 0
+  let withDeterminedType = 0
   let needingClassification = 0
   let occurrences = 0
 
@@ -508,7 +576,7 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       }
       {
         const bucket = rowsByIncident.get(episodeKey)
-          ?? { times: [], missing: 0, events: 0, auditOnly: true }
+          ?? { times: [], missing: 0, events: 0, auditOnly: true, standingAlone: !boundGrouping.groups }
         bucket.events += row.occurrenceCount
         if (row.occurredAt instanceof Date) bucket.times.push(row.occurredAt)
         else bucket.missing += 1
@@ -535,9 +603,11 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       continue
     }
 
+    withDeterminedType += 1
     const declaredGrouping = groupingFor(row, declaration, declaration.subject)
     if (declaredGrouping.groups) declaredKeys.add(declaredGrouping.key)
     else unattributed += 1
+    if (declaredGrouping.groups) declaredResolved += 1
 
     // The comparison count only. Keyed on the target regardless of what the type declares,
     // so the two numbers come from the same rows and differ only in the subject.
@@ -561,6 +631,8 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   const quietMs = nominated === null ? 24 * 60 * 60 * 1000 : quietIntervalMsOf(nominated)
   let episodesCounted = 0
   let episodesCountedAudit = 0
+  let episodesAttributed = 0
+  let episodesStandingAlone = 0
   let unrecoverable = 0
   for (const bucket of rowsByIncident.values()) {
 
@@ -572,6 +644,8 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     if (bucket.events === 1) {
       episodesCounted += 1
       if (bucket.auditOnly) episodesCountedAudit += 1
+      if (bucket.standingAlone) episodesStandingAlone += 1
+      else episodesAttributed += 1
       continue
     }
 
@@ -586,8 +660,12 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       bucket.times.map((at) => eventInstant({ occurredAt: at, receivedAt: at })), quietMs)
     episodesCounted += spans.length
     if (bucket.auditOnly) episodesCountedAudit += spans.length
+    if (bucket.standingAlone) episodesStandingAlone += spans.length
+    else episodesAttributed += spans.length
   }
 
+  const mappingOccurrences = mapping.reduce((sum, entry) => sum + entry.occurrenceCount, 0)
+  const inputOccurrences = rows.reduce((sum, row) => sum + row.occurrenceCount, 0)
   const mapped = new Set(mapping.map((entry) => entry.notificationId))
   const seen = new Set<string>()
   const duplicated = new Set<string>()
@@ -608,11 +686,15 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       assumingSingleTypeKeyedOnTarget: boundTargetKeys.size,
       assumingSingleTypeDirectoryAuditOnly: auditBoundKeys.size,
       assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget: auditBoundTargetKeys.size,
-      unattributed,
+      declaredSubjectUnresolvedAmongTypedRows: unattributed,
+      declaredSubjectResolvedAmongTypedRows: declaredResolved,
+      withDeterminedType,
       needingClassification,
     },
     episodes: {
       counted: episodesCounted,
+      fromAttributedRows: episodesAttributed,
+      fromStandingAloneRows: episodesStandingAlone,
       countedDirectoryAuditOnly: episodesCountedAudit,
       incidentsWithUnrecoverableEpisodes: unrecoverable,
       rowsWithoutEventTime: rowsWithoutTimeByRow,
@@ -625,13 +707,41 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     invariants: {
       rowsMissingFromMapping: rows.map((row) => row.id).filter((id) => !mapped.has(id)).sort(),
       duplicatedNotificationIds: [...duplicated].sort(),
-      occurrencesPreserved:
-        mapping.reduce((sum, entry) => sum + entry.occurrenceCount, 0)
-        === rows.reduce((sum, row) => sum + row.occurrenceCount, 0),
-      eventTimeCountsAddUp: rowsWithTime + rowsWithoutTimeByRow === rows.length
-        ? []
-        : [`${rowsWithTime} with a time + ${rowsWithoutTimeByRow} without = ${
-            rowsWithTime + rowsWithoutTimeByRow}, but ${rows.length} rows were read`],
+      // ALL FOUR OF THESE ARE TRIPWIRES, NOT INPUT-FALSIFIABLE CHECKS, and that is worth
+      // saying once here rather than discovering per field. Each identity has both sides
+      // computed in ONE pass over the same rows, so no input can separate them: a mutation
+      // making `adds` always report agreement survived every test. What they catch is a
+      // FUTURE derivation drifting off the rows — which is exactly what happened to
+      // rowsWithoutEventTime — and that is genuinely worth having. It is not the same thing
+      // as verifying the computation, and only an INDEPENDENTLY DERIVED reference can do
+      // that: for this report, the SQL count. Self-reconciliation catches drift; a second
+      // instrument catches error.
+      //
+      // READS THE REPORTED FIGURE, which the boolean it replaces never did: that compared
+      // two internal sums, so perturbing `occurrencesRepresented` left it saying "preserved".
+      occurrenceCountsAddUp: [
+        ...adds([['in the mapping', mappingOccurrences]], occurrences,
+          'the reported occurrencesRepresented'),
+        ...adds([['in the input', inputOccurrences]], occurrences,
+          'the reported occurrencesRepresented'),
+      ],
+      eventTimeCountsAddUp: adds([
+        ['with a time', rowsWithTime], ['without', rowsWithoutTimeByRow],
+      ], rows.length, 'rows read'),
+      episodeCountsAddUp: adds([
+        ['from attributed rows', episodesAttributed],
+        ['from standing-alone rows', episodesStandingAlone],
+      ], episodesCounted, 'episodes.counted'),
+      rowCountsAddUp: [
+        ...adds([
+          ['with a determined type', withDeterminedType],
+          ['needing classification', needingClassification],
+        ], rows.length, 'rows read'),
+        ...adds([
+          ['declared subject resolved', declaredResolved],
+          ['unresolved', unattributed],
+        ], withDeterminedType, 'rows with a determined type'),
+      ],
     },
   }
 }
