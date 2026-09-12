@@ -528,6 +528,12 @@ function subjectFor(row: ExistingAlertRow, role: SubjectRole): ResolvedSubject {
         ? { resolved: true, id: first }
         : { resolved: false, why: row.audit === null ? 'no audit record joined' : 'no target resources' }
     }
+    case 'ACCOUNT':
+      // A migration row is a notification the OLD system produced, and the old system had
+      // no concept of an assessed account — the role arrived with step 04. Returning
+      // unresolved is the honest answer rather than reaching for the audit target, which
+      // would silently key historical rows under a subject nobody assessed.
+      return { resolved: false, why: 'this row predates account-subject findings' }
     case 'TENANT':
       return row.customerTenantId !== null
         ? { resolved: true, id: row.customerTenantId }

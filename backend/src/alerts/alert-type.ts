@@ -105,6 +105,20 @@ export type SubjectRole =
   | 'TARGET'
   /** Who performed the change. */
   | 'ACTOR'
+  /** An account a finding is ABOUT, rather than one that did something or had
+   * something done to it.
+   *
+   * ADDED FOR STEP 04 AND FLAGGED, not folded in. A Risky Users finding concerns an
+   * account nobody has necessarily touched — it is an assessment, not a change. The
+   * nearest existing role, TARGET, reads as "the account or resource acted upon", and
+   * keying a risk assessment that way would put a true-sounding sentence in the wrong
+   * company: a reader seeing TARGET concludes somebody did something to this account,
+   * which is precisely what the finding does not claim.
+   *
+   * MERGING WAS NEVER THE RISK. The role sits in the key beside the type id, and a
+   * risky-user rule has its own id, so no choice of role here could have joined these
+   * to an audit incident. The risk was the LABEL, which is the half a person reads. */
+  | 'ACCOUNT'
   /** No person is involved and the tenant itself is the subject. */
   | 'TENANT'
   /** One specific feed.

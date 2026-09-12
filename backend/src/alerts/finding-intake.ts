@@ -12,8 +12,9 @@
  * steps 01-03 and from the `IdentityRiskFinding` model.
  */
 
-import type { ResolvedSubject } from './alert-incident-key.js'
-import type { EventInstant } from './alert-event-time.js'
+import { incidentGrouping, type ResolvedSubject } from './alert-incident-key.js'
+import { eventInstant, type EventInstant } from './alert-event-time.js'
+import type { SubjectRole } from './alert-type.js'
 
 /** How complete the evidence was when the engine reached its verdict.
  *
@@ -242,3 +243,166 @@ export const OBSERVED_RUN_GAPS = {
   p95Ms: 546_000,
   worstMs: 894_000,
 } as const
+
+// ---------------------------------------------------------------------------------------
+// THE WIRING. Pure, and it decides nothing it lacks evidence for.
+// ---------------------------------------------------------------------------------------
+
+/** What `incidentGrouping` actually reads.
+ *
+ * Narrowed here rather than fabricating an `AlertTypeDeclaration` for a Risky Users rule. A
+ * rule is not an alert type declaration, and a fake one would be a wrong state made
+ * expressible: every other field would have to be invented, and each invented field is
+ * something a later reader may believe. */
+type IncidentIdentity = Readonly<{ id: string; subject: SubjectRole }>
+
+/** The account a finding is about, or why it cannot be named.
+ *
+ * A blank subject does not group — step 02's ruling applied rather than re-decided. Merging
+ * on "unknown" would assert that two findings concern the same account on the strength of
+ * not knowing which account either concerns. */
+function accountOf(finding: EmittedFinding): ResolvedSubject {
+  return finding.subjectId.trim().length > 0
+    ? { resolved: true, id: finding.subjectId }
+    : { resolved: false, why: `the finding carries no subjectId (subjectType ${finding.subjectType})` }
+}
+
+/** FULL beats PARTIAL beats UNAVAILABLE; an incident reports the weakest it was built on. */
+const COVERAGE_ORDER: readonly FindingCoverage[] = ['UNAVAILABLE', 'PARTIAL', 'FULL']
+function leastComplete(left: FindingCoverage, right: FindingCoverage): FindingCoverage {
+  return COVERAGE_ORDER.indexOf(left) <= COVERAGE_ORDER.indexOf(right) ? left : right
+}
+
+/** Build the queue from a sequence of runs.
+ *
+ * PURE, AND IT NEVER CLEARS ANYTHING. A finding's disappearance from a later completed run is
+ * not evidence the risk ended — clearing requires the resolving condition in
+ * `alert-clearing.ts` and the evidence that rule asks for, none of which is in a finding
+ * stream. So this produces OPEN incidents and nothing else, and CLEARED is unreachable from
+ * here by construction rather than by a rule somebody has to remember.
+ *
+ * A FAILED RUN CONTRIBUTES NOTHING BUT ITS RECORD. It cannot be read as absence, because it
+ * is not evidence that anything stopped — it is evidence that we stopped looking. */
+export function intake(runs: readonly IntakeRun[]): QueueState {
+  const byKey = new Map<string, {
+    incident: Omit<QueuedIncident, 'notifications'>
+    notifications: QueuedNotification[]
+  }>()
+  const failedRuns: { failedAt: Date; because: string }[] = []
+  let completedRuns = 0
+  let lastCompletedRun: QueueState['lastCompletedRun'] = null
+  let lastRunAttemptedAt: Date | null = null
+
+  for (const run of runs) {
+    const attemptedAt = run.kind === 'COMPLETED' ? run.completedAt : run.failedAt
+    // Liveness advances for BOTH arms — the one thing that legitimately reads across them,
+    // and the reason it has a name of its own rather than a shared field on the union.
+    if (lastRunAttemptedAt === null || attemptedAt > lastRunAttemptedAt) lastRunAttemptedAt = attemptedAt
+
+    if (run.kind === 'FAILED') {
+      failedRuns.push({ failedAt: run.failedAt, because: run.because })
+      continue
+    }
+
+    completedRuns += 1
+    lastCompletedRun = { completedAt: run.completedAt, emitted: run.emitted.length }
+
+    for (const finding of run.emitted) {
+      const account = accountOf(finding)
+      const identity: IncidentIdentity = { id: finding.ruleId, subject: 'ACCOUNT' }
+      const grouping = incidentGrouping(
+        identity,
+        { organizationId: finding.organizationId, customerTenantId: finding.customerTenantId },
+        account)
+
+      // An ungrouped finding stands alone on its own id — step 03's ruling, honoured here so
+      // these two steps cannot drift the way the reconciliation drifted from step 02.
+      const key = grouping.groups ? grouping.key : `ungrouped:${finding.id}`
+      // THE EVENT'S OWN TIME. The run's completion is the arrival half and reaches no
+      // decision: `eventInstant` reads `occurredAt` and nothing else.
+      const at = eventInstant({ occurredAt: finding.observedAt, receivedAt: run.completedAt })
+      const existing = byKey.get(key)
+
+      if (existing === undefined) {
+        byKey.set(key, {
+          incident: {
+            key,
+            organizationId: finding.organizationId,
+            customerTenantId: finding.customerTenantId,
+            subject: account,
+            ruleId: finding.ruleId,
+            state: 'OPEN',
+            coverage: finding.coverage,
+            firstEventAt: at,
+            latestEventAt: at,
+          },
+          // THE ONLY PLACE A NOTIFICATION IS CREATED. The re-emission path below cannot reach
+          // it, which makes "notifies once" a property of the shape rather than of a
+          // condition someone could weaken later.
+          notifications: [{
+            incidentKey: key,
+            fromFindingId: finding.id,
+            organizationId: finding.organizationId,
+            at,
+          }],
+        })
+        continue
+      }
+
+      // Re-emission: the incident learns from it, and nobody is told again.
+      existing.incident = {
+        ...existing.incident,
+        coverage: leastComplete(existing.incident.coverage, finding.coverage),
+        // BY EVENT TIME, NOT ARRIVAL ORDER — different mistakes, and the second is subtler. A
+        // backfilled finding delivered last may have happened first, so taking the most
+        // recently delivered would report it as the newest.
+        firstEventAt: at < existing.incident.firstEventAt ? at : existing.incident.firstEventAt,
+        latestEventAt: at > existing.incident.latestEventAt ? at : existing.incident.latestEventAt,
+      }
+    }
+  }
+
+  return {
+    incidents: [...byKey.values()].map(({ incident, notifications }) => ({ ...incident, notifications })),
+    runsSeen: runs.length,
+    completedRuns,
+    lastCompletedRun,
+    lastRunAttemptedAt,
+    failedRuns,
+  }
+}
+
+/** Whether the queue is current, COMPUTED FROM THE RUNS rather than from the state.
+ *
+ * Deliberately not a field, and deliberately not a function of `QueueState`. A state
+ * reporting a dead engine as current is internally consistent — nothing else in it disagrees
+ * — so a freshness check reading only the state is testing self-consistency and calling it
+ * freshness. This reads the run sequence, which is the only thing that knows. */
+export type Freshness =
+  | Readonly<{ kind: 'CURRENT'; lastCompletedAt: Date; sinceMs: number }>
+  | Readonly<{ kind: 'STALE'; lastCompletedAt: Date; sinceMs: number }>
+  /** No completed run at all. NOT stale: nothing has gone quiet, because nothing has
+   * started. Reporting a never-started engine as stale would send somebody to restart a
+   * schedule that was never configured, and the two need different people. */
+  | Readonly<{ kind: 'NEVER_COMPLETED'; because: string }>
+
+export function freshnessOf(runs: readonly IntakeRun[], now: Date): Freshness {
+  let latest: Date | null = null
+  for (const run of runs) {
+    if (run.kind !== 'COMPLETED') continue
+    if (latest === null || run.completedAt > latest) latest = run.completedAt
+  }
+  if (latest === null) {
+    const failures = runs.filter((run) => run.kind === 'FAILED').length
+    return {
+      kind: 'NEVER_COMPLETED',
+      because: failures > 0
+        ? `${failures} run(s) attempted, none completed`
+        : 'no run has been attempted',
+    }
+  }
+  const sinceMs = now.getTime() - latest.getTime()
+  return sinceMs > STALE_AFTER_MS
+    ? { kind: 'STALE', lastCompletedAt: latest, sinceMs }
+    : { kind: 'CURRENT', lastCompletedAt: latest, sinceMs }
+}

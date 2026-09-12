@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { eventInstant } from './alert-event-time.js'
-import { OBSERVED_RUN_GAPS, STALE_AFTER_MS } from './finding-intake.js'
+import { freshnessOf, intake, OBSERVED_RUN_GAPS, STALE_AFTER_MS } from './finding-intake.js'
 import type {
   EmittedFinding,
   IntakeRun,
@@ -351,4 +351,201 @@ test('the staleness threshold carries its distribution, not only its conclusion'
   // failures exist. That is the argument FOR enforcing it in the type, not against it: the
   // defect was invisible to experience rather than merely unnoticed.
   assert.equal(OBSERVED_RUN_GAPS.failed, 0)
+})
+
+/** THE NINE PROPERTIES, AGAINST THE WIRING.
+ *
+ * Everything above tests that the seam CAN express a property. These test that the
+ * implementation HAS it. Both are needed and they fail for different reasons: the gate fails
+ * when a shape collapses, these fail when the code is wrong. */
+
+const run = (completedAt: Date, ...emitted: EmittedFinding[]): IntakeRun =>
+  ({ kind: 'COMPLETED', completedAt, emitted })
+const failed = (failedAt: Date, because = 'Graph returned 503.'): IntakeRun =>
+  ({ kind: 'FAILED', failedAt, because })
+
+const MINUTE = 60 * 1000
+
+test('P1 one incident per account-rule, however many times it is emitted', () => {
+  const three = [0, 1, 2].map((n) =>
+    finding({ id: `f-${n}`, observedAt: new Date(T0 + n * MINUTE) }))
+  const state = intake([run(ARRIVED, ...three)])
+
+  assert.equal(state.incidents.length, 1, 'three emissions of one account-rule pair are one incident')
+  assert.equal(state.incidents[0]?.ruleId, 'rule-a')
+  assert.deepEqual(state.incidents[0]?.subject, { resolved: true, id: 'account-1' })
+
+  // A different rule for the same account, and a different account for the same rule, are
+  // each their own incident. Without both, "per account-rule" is satisfied by keying on
+  // either half alone.
+  const split = intake([run(ARRIVED,
+    finding({ id: 'f-a' }),
+    finding({ id: 'f-b', ruleId: 'rule-b' }),
+    finding({ id: 'f-c', subjectId: 'account-2' }))])
+  assert.equal(split.incidents.length, 3, 'rule and account are both part of the identity')
+})
+
+test('P2 re-emission adds no second incident AND no second notification', () => {
+  const once = intake([run(ARRIVED, finding({ id: 'f-1' }))])
+  const twice = intake([
+    run(ARRIVED, finding({ id: 'f-1' })),
+    run(new Date(ARRIVED.getTime() + 5 * MINUTE), finding({ id: 'f-2' })),
+  ])
+
+  assert.equal(twice.incidents.length, 1, 'still one incident')
+  assert.equal(twice.incidents[0]?.notifications.length, 1, 'and still one notification')
+  assert.equal(once.incidents[0]?.notifications.length, 1)
+  // The notification is the FIRST emission's, not the latest — a re-emission must not
+  // silently replace the record of when somebody was actually told.
+  assert.equal(twice.incidents[0]?.notifications[0]?.fromFindingId, 'f-1')
+})
+
+test('P3 absence does not clear, and a failed run is not absence', () => {
+  const stopped = intake([
+    run(ARRIVED, finding({ id: 'f-1' })),
+    run(new Date(ARRIVED.getTime() + 5 * MINUTE)),
+  ])
+  assert.equal(stopped.incidents.length, 1, 'the incident survives a run that did not emit it')
+  assert.equal(stopped.incidents[0]?.state, 'OPEN', 'and is NOT cleared by the silence')
+
+  // CLEARED IS UNREACHABLE FROM HERE AT ALL, which is stronger than "absence does not clear
+  // it". Clearing needs the resolving condition and the evidence that rule asks for, and a
+  // finding stream contains none of it — so no sequence of runs can produce a cleared
+  // incident, rather than there being a rule against it that somebody could weaken.
+  const many = intake([
+    run(ARRIVED, finding({ id: 'f-1' })),
+    ...[1, 2, 3, 4, 5].map((n) => run(new Date(ARRIVED.getTime() + n * MINUTE))),
+  ])
+  assert.deepEqual([...new Set(many.incidents.map((i) => i.state))], ['OPEN'])
+
+  // A failed run touches nothing but its own record.
+  const crashed = intake([run(ARRIVED, finding({ id: 'f-1' })), failed(new Date(ARRIVED.getTime() + MINUTE))])
+  assert.equal(crashed.incidents.length, 1)
+  assert.equal(crashed.incidents[0]?.state, 'OPEN')
+  // P8, AND IT IS THE POINT OF THE ARM: recorded, not merely not-misread. The first failure
+  // in production arrives on a path 5,166 runs have never traversed, so the one time it
+  // matters nobody will have seen it work — which is why it has to leave a trace.
+  assert.equal(crashed.failedRuns.length, 1, 'the failure is RECORDED, not merely not-misread')
+  assert.equal(crashed.failedRuns[0]?.because, 'Graph returned 503.', 'with its reason intact')
+  assert.equal(crashed.failedRuns[0]?.failedAt.getTime(), ARRIVED.getTime() + MINUTE)
+  assert.equal(crashed.completedRuns, 1, 'a failed run is not a completed one')
+  assert.equal(crashed.runsSeen, 2)
+})
+
+test('P4 the subject is the account, and an unnameable one stands alone', () => {
+  const two = intake([run(ARRIVED,
+    finding({ id: 'f-1', subjectId: 'account-1' }),
+    finding({ id: 'f-2', subjectId: 'account-2' }))])
+  assert.equal(two.incidents.length, 2, 'two accounts under one rule are two incidents')
+
+  // Two findings with NO account do not merge onto each other — step 02's refusal, honoured
+  // here rather than reintroduced a layer down, which is exactly what step 03 did wrong.
+  const nameless = intake([run(ARRIVED,
+    finding({ id: 'f-1', subjectId: '' }),
+    finding({ id: 'f-2', subjectId: '   ' }))])
+  assert.equal(nameless.incidents.length, 2, 'unknown is not a subject two findings can share')
+  for (const incident of nameless.incidents) {
+    assert.equal(incident.subject.resolved, false)
+    assert.match(incident.subject.resolved ? '' : incident.subject.why, /no subjectId/)
+  }
+})
+
+test('P5 no finding reaches another organisation', () => {
+  const both = intake([run(ARRIVED,
+    finding({ id: 'f-1', organizationId: 'org-1' }),
+    finding({ id: 'f-2', organizationId: 'org-2' }))])
+
+  assert.equal(both.incidents.length, 2, 'the same account and rule in two orgs are two incidents')
+  for (const incident of both.incidents) {
+    for (const note of incident.notifications) {
+      assert.equal(note.organizationId, incident.organizationId,
+        'a notification must never carry an organisation its incident does not')
+    }
+  }
+  assert.equal(new Set(both.incidents.map((i) => i.key)).size, 2,
+    'the organisation is part of the key, so no amount of matching elsewhere can join them')
+})
+
+test('P6 coverage survives, and an incident reports the weakest it was built on', () => {
+  const state = intake([
+    run(ARRIVED, finding({ id: 'f-1', coverage: 'FULL' })),
+    run(new Date(ARRIVED.getTime() + MINUTE), finding({ id: 'f-2', coverage: 'PARTIAL' })),
+    run(new Date(ARRIVED.getTime() + 2 * MINUTE), finding({ id: 'f-3', coverage: 'FULL' })),
+  ])
+  assert.equal(state.incidents[0]?.coverage, 'PARTIAL',
+    'one good run must not launder an earlier gap')
+
+  assert.equal(intake([run(ARRIVED, finding({ coverage: 'UNAVAILABLE' }))]).incidents[0]?.coverage,
+    'UNAVAILABLE', 'all three of the engine\'s values reach the queue')
+  assert.equal(intake([run(ARRIVED, finding({ coverage: 'FULL' }))]).incidents[0]?.coverage, 'FULL',
+    'and FULL is still reachable, or the rule is just "always report the worst value"')
+})
+
+test('P7 the time is observedAt, and ordering is by event time not arrival', () => {
+  const eventTime = new Date(T0)
+  const state = intake([run(ARRIVED, finding({ observedAt: eventTime }))])
+  assert.equal(state.incidents[0]?.latestEventAt.getTime(), eventTime.getTime())
+  assert.notEqual(state.incidents[0]?.latestEventAt.getTime(), ARRIVED.getTime(),
+    'the run completion must not become the incident time')
+  assert.equal(state.incidents[0]?.notifications[0]?.at.getTime(), eventTime.getTime())
+
+  // ARRIVAL ORDER IS THE SUBTLER MISTAKE. A backfilled finding delivered LAST may have
+  // happened FIRST; taking the most recently delivered would report it as the newest.
+  const backfilled = intake([
+    run(ARRIVED, finding({ id: 'f-1', observedAt: new Date(T0) })),
+    run(new Date(ARRIVED.getTime() + MINUTE), finding({ id: 'f-2', observedAt: new Date(T0 - 10 * 60 * MINUTE) })),
+  ])
+  assert.equal(backfilled.incidents[0]?.latestEventAt.getTime(), T0,
+    'the late-arriving OLD event must not become the latest')
+  assert.equal(backfilled.incidents[0]?.firstEventAt.getTime(), T0 - 10 * 60 * MINUTE,
+    'but it must move the earliest')
+})
+
+test('P9 freshness is computed from the RUNS, never from the state', () => {
+  // NAMED FOR WHAT IT ACTUALLY COVERS. It was called 'P8 and P9', and the mutation run
+  // showed the P8 variant — a failure handled but not recorded — being caught by the P3
+  // test and the identities test, never by this one. A check whose name claims a property
+  // it does not exercise is the same defect as a check that passes for a moved reason: it
+  // makes the property look covered. P8 is asserted in the absence test, where the failure
+  // record is actually read.
+  const now = new Date(ARRIVED.getTime() + 10 * MINUTE)
+
+  const current = freshnessOf([run(ARRIVED, finding())], now)
+  assert.equal(current.kind, 'CURRENT')
+
+  const stale = freshnessOf([run(new Date(now.getTime() - 31 * MINUTE), finding())], now)
+  assert.equal(stale.kind, 'STALE', 'past the measured threshold')
+
+  // A RUN THAT ONLY FAILED IS NOT A COMPLETED RUN, so the queue has never been current —
+  // reported as never-completed rather than as stale, because nothing has gone quiet.
+  const onlyFailures = freshnessOf([failed(ARRIVED), failed(new Date(ARRIVED.getTime() + MINUTE))], now)
+  assert.equal(onlyFailures.kind, 'NEVER_COMPLETED')
+  assert.match(onlyFailures.kind === 'NEVER_COMPLETED' ? onlyFailures.because : '', /2 run\(s\) attempted/)
+  assert.notEqual(onlyFailures.kind, 'CURRENT',
+    'a failing engine must never read as current — the whole point of the per-arm names')
+
+  // Nothing at all is also not stale: a schedule that was never configured needs a different
+  // person from one that stopped.
+  assert.equal(freshnessOf([], now).kind, 'NEVER_COMPLETED')
+
+  // AND FRESHNESS IGNORES THE STATE ENTIRELY. A fabricated marker cannot make a dead engine
+  // read as current, because this never looks at one.
+  const deadRuns = [run(new Date(now.getTime() - 90 * MINUTE), finding())]
+  assert.equal(freshnessOf(deadRuns, now).kind, 'STALE')
+  assert.equal(intake(deadRuns).lastCompletedRun?.completedAt.getTime(),
+    deadRuns[0]?.kind === 'COMPLETED' ? deadRuns[0].completedAt.getTime() : 0,
+    'and the state agrees with the runs, so the relational check has something to compare')
+})
+
+test('the identities the state reports about itself hold on real output', () => {
+  const state = intake([
+    run(ARRIVED, finding({ id: 'f-1' }), finding({ id: 'f-2', subjectId: 'account-2' })),
+    failed(new Date(ARRIVED.getTime() + MINUTE)),
+    run(new Date(ARRIVED.getTime() + 2 * MINUTE), finding({ id: 'f-3' })),
+  ])
+  assert.equal(state.runsSeen, state.completedRuns + state.failedRuns.length)
+  assert.equal(state.runsSeen, 3)
+  assert.equal(state.completedRuns, 2)
+  assert.equal(state.lastRunAttemptedAt?.getTime(), ARRIVED.getTime() + 2 * MINUTE)
+  assert.equal(state.incidents.length, 2, 'f-3 re-emits f-1, so two accounts means two incidents')
 })

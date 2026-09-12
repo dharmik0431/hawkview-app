@@ -3,7 +3,7 @@
 The Risky Users engine produces findings every five minutes and tells nobody. Steps 02 and 03
 built the queue. This step wires them together.
 
-**Nothing is implemented yet, deliberately.** What exists is the seam — the shape of the
+**The wiring now exists — see *The wiring* below.** What came first was the seam — the shape of the
 wiring's input and output — plus a gate proving each of the seven pre-registered properties is
 **expressible** through it. That check is free now and expensive later, and it has already
 found one thing.
@@ -187,3 +187,63 @@ has never contained an instance.
 It also means the first failure arrives on a path no production data has ever traversed. That
 is the case for requiring the failure to be **recorded** rather than merely not-misread: the
 one time it matters, nobody will have seen it work.
+
+## The wiring
+
+`intake(runs)` builds the queue; `freshnessOf(runs, now)` answers whether it is current. Both
+pure, no clock inside `intake`, no Prisma, no environment — the same shape as steps 02 and 03.
+
+**It never clears anything, and that is structural rather than a rule.** A finding's
+disappearance from a later completed run is not evidence the risk ended. Clearing requires the
+resolving condition in `alert-clearing.ts` and the evidence that rule asks for, none of which
+is in a finding stream — so `intake` produces `OPEN` incidents and **no sequence of runs can
+produce a cleared one.** P3 is satisfied by there being no path, not by a check somebody could
+weaken.
+
+**A notification is created in exactly one place**, the branch that creates the incident. The
+re-emission path cannot reach it, so "notifies once" is a property of the shape.
+
+**Freshness is not a field and not a function of `QueueState`.** A state reporting a dead
+engine as current is internally consistent, so a check reading only the state is testing
+self-consistency and calling it freshness. `freshnessOf` reads the run sequence, which is the
+only thing that knows. `NEVER_COMPLETED` is distinct from `STALE`: a schedule that was never
+configured and one that stopped need different people.
+
+### Two decisions made rather than assumed
+
+**`SubjectRole` gained `ACCOUNT`.** The nearest existing role, `TARGET`, reads as "the account
+or resource acted upon" — and a Risky Users finding concerns an account nobody has necessarily
+touched. Keying an assessment as a TARGET would put a true-sounding sentence in the wrong
+company: a reader seeing TARGET concludes somebody did something to this account, which is
+exactly what the finding does not claim. **Merging was never the risk** — the role sits in the
+key beside the type id, and a risky-user rule has its own id, so no choice here could have
+joined these to an audit incident. The risk was the label, which is the half a person reads.
+
+The addition produced one compile error, in step 03's `subjectFor`, which is the list of places
+that had to decide. A migration row predates account-subject findings, so it resolves to
+nothing rather than reaching for the audit target.
+
+**`incidentGrouping` was narrowed to what it reads** — `{ id, subject }` — rather than
+fabricating an `AlertTypeDeclaration` for a rule. A rule is not an alert type declaration, and
+a fake one means inventing a severity, a summary, escalations and a clearing condition to
+satisfy a parameter that reads none of them. **Every invented field is something a later reader
+may believe.** `AlertTypeDeclaration` satisfies the narrower type structurally, so no existing
+caller changed and none can now pass less.
+
+### Twelve variants injected, twelve caught — and one finding about the checks
+
+Every named defect variant was injected into the wiring and caught: incident-per-emission,
+reemission-notifies, absence-clears, a failed run read as absence, subject-rederived,
+key-omits-organisation, coverage-dropped, coverage-takes-latest, uses-arrival-time,
+ordering-by-arrival, failure-not-recorded, and staleness measured from the last attempt.
+
+**The attribution is the useful output, not the count.** It showed the P8 variant — a failure
+handled but not recorded — being caught by the P3 test and the identities test, and **never by
+the test named for P8.** That test was called "P8 a failure is recorded, and P9 freshness…" and
+only ever exercised P9. A check whose name claims a property it does not test is the same
+defect as a check that passes for a moved reason: **it makes the property look covered.**
+Renamed to P9, with P8 asserted where the failure record is actually read.
+
+It also shows the checks are not one-to-one — the P1 variant trips five tests, because a defect
+in incident identity moves everything downstream. That is expected and is why each check
+declares which variants it expects rather than being forced to fire alone.

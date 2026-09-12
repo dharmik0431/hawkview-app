@@ -1,5 +1,5 @@
 import { joinUnambiguously } from './alert-key-encoding.js'
-import type { AlertTypeDeclaration } from './alert-type.js'
+import type { SubjectRole } from './alert-type.js'
 
 /** The INCIDENT key — grouping, and nothing else.
  *
@@ -59,8 +59,19 @@ export type Grouping =
  * not join episodes keyed under the new one: that would merge "who did this" with
  * "who it was done to" under one incident.
  */
+/** WHAT THE KEY ACTUALLY NEEDS FROM A TYPE: its id and the role its subject plays.
+ *
+ * Narrowed from `AlertTypeDeclaration` when step 04 arrived. A Risky Users rule is not an
+ * alert type declaration, and the alternative was fabricating one — inventing a severity, a
+ * summary, escalations and a clearing condition purely to satisfy a parameter that reads
+ * none of them. Every invented field is something a later reader may believe.
+ *
+ * `AlertTypeDeclaration` satisfies this structurally, so every existing caller is unchanged
+ * and none of them can now pass less than they did. */
+export type IncidentIdentity = Readonly<{ id: string; subject: SubjectRole }>
+
 export function incidentGrouping(
-  declaration: AlertTypeDeclaration,
+  declaration: IncidentIdentity,
   scope: IncidentScope,
   subject: ResolvedSubject,
 ): Grouping {
