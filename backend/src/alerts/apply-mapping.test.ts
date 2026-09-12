@@ -12,6 +12,8 @@ import {
   validateRevert,
   watchedFieldsDisturbedBetween,
   type ApplyReceipt,
+  type Excluded,
+  type ExclusionReason,
   type MappingEntry,
   type StoredRow,
   type StoredSnapshot,
@@ -32,6 +34,7 @@ const row = (over: Partial<StoredRow> = {}): StoredRow => ({
 })
 
 const entryFor = (r: StoredRow, over: Partial<MappingEntry> = {}): MappingEntry => ({
+  decision: 'WRITE',
   notificationId: r.id,
   incidentKey: 'hawkview-alert-incident/v1|admin-1',
   episode: 1,
@@ -421,4 +424,121 @@ test('THE RUNNER CARRIES NO PRODUCTION FIGURE, and this is why that is checked h
   // words are pinned too. `save-mapping` prints what it read and tells the operator to compare;
   // it must not do the comparing, because a runner that knows the answer can agree with itself.
   assert.doesNotMatch(code, /expected(Rows|Total|Mapping|Figures)/i)
+})
+
+/** RULING (b): key only the rows whose shape determines a type — 47 of 364 today, 317 when the
+ * classifier reaches historical audit rows. These tests are about the consequence nobody had
+ * looked at, which is that most rows in the table are now UNWRITABLE ON PURPOSE. */
+
+const excludeFor = (r: StoredRow, because: ExclusionReason = 'TYPE_UNDETERMINED'): Excluded =>
+  ({ decision: 'EXCLUDE', notificationId: r.id, because })
+
+/** The production shape in miniature: one writable row among many that are not. */
+const manyRows = (n: number): StoredRow[] =>
+  Array.from({ length: n }, (_, i) => row({ id: `n-${i}`, dedupeKey: `security:directory-audit:Directory_${i}` }))
+
+test('AN UNWRITABLE ROW IS A DECISION, NOT A REFUSAL - and without saying so the run is impossible', () => {
+  // THE FAILURE THIS EXISTS FOR, exhibited first. With the mapping being only a list of writes,
+  // the scope of the run was INFERRED as "everything in the table" — so every row left out on
+  // purpose arrived at the final loop as ROW_UNEXPECTED.
+  const store = manyRows(20)
+  const onlyTheWrites = [entryFor(store[0]!)]
+
+  const inferred = validateApply(store, onlyTheWrites)
+  assert.equal(inferred.proceed, false)
+  assert.equal(inferred.proceed === false ? inferred.differences.length : 0, 19,
+    'nineteen deliberate exclusions read as nineteen surprises')
+  assert.ok(inferred.proceed === false
+    && inferred.differences.every((difference) => difference.kind === 'ROW_UNEXPECTED'))
+  // AT PRODUCTION SCALE THAT IS 317 DIFFERENCES ON A CLEAN TABLE. The preflight would abort
+  // every time, by construction, and the apply could never run. Not a reporting nicety.
+
+  // WITH THE SCOPE STATED, the same data proceeds and the split is carried on the run.
+  const stated = validateApply(store, [entryFor(store[0]!), ...store.slice(1).map((r) => excludeFor(r))])
+  assert.ok(stated.proceed)
+  assert.equal(stated.run.writes.length, 1)
+  assert.equal(stated.run.excluded.length, 19)
+  assert.deepEqual([...new Set(stated.run.excluded.map((entry) => entry.because))], ['TYPE_UNDETERMINED'])
+})
+
+test('A ROW THE MAPPING NEVER SAW STILL ABORTS - the original property, unchanged', () => {
+  // The point of the change was to distinguish a decision from a surprise, NOT to stop caring
+  // about surprises. An alert that arrived after the mapping was saved was never measured, so
+  // no digest speaks for it, and applying around it leaves two keying schemes with nothing
+  // saying so.
+  const store = manyRows(3)
+  const late = row({ id: 'n-late' })
+  const mapping = [entryFor(store[0]!), excludeFor(store[1]!), excludeFor(store[2]!)]
+
+  const clean = validateApply(store, mapping)
+  assert.ok(clean.proceed, 'the control: this mapping is complete over this store')
+
+  const withLate = validateApply([...store, late], mapping)
+  assert.equal(withLate.proceed, false)
+  assert.deepEqual(withLate.proceed === false ? withLate.differences : [],
+    [{ kind: 'ROW_UNEXPECTED', notificationId: 'n-late' }])
+})
+
+test('A ROW WE SAID NOT TO TOUCH THAT IS KEYED ANYWAY IS AN ABORT', () => {
+  // An exclusion is a decision about what WE write. It is never a promise about what the row
+  // holds — and a row carrying somebody else's incident key is the two-keying-schemes state the
+  // all-or-nothing rule exists to make unreachable, arriving through the rows we left alone.
+  const mine = row({ id: 'n-1' })
+  const theirs = row({ id: 'n-2', incidentKey: 'somebody-elses-key', episode: 3 })
+  const decision = validateApply([mine, theirs], [entryFor(mine), excludeFor(theirs)])
+
+  assert.equal(decision.proceed, false)
+  const differences = decision.proceed === false ? decision.differences : []
+  assert.equal(differences[0]?.kind, 'EXCLUDED_BUT_KEYED')
+  assert.match(explain(differences), /n-2 {2}holds somebody-elses-key\/3 {2}mapping says leave it alone/)
+
+  // AND IT IS NOT SATISFIED BY FLAGGING EVERY EXCLUSION: an excluded row with a null key is fine.
+  assert.equal(validateApply([mine, row({ id: 'n-2' })], [entryFor(mine), excludeFor(row({ id: 'n-2' }))]).proceed, true)
+})
+
+test('A ROW DECIDED ABOUT TWICE IS AN ABORT, whichever two decisions they are', () => {
+  // The one way left to get a mapping wrong now that a row has exactly one decision or none.
+  const only = row({ id: 'n-1' })
+
+  const twiceWritten = validateApply([only], [entryFor(only), entryFor(only)])
+  assert.equal(twiceWritten.proceed, false)
+  assert.deepEqual(twiceWritten.proceed === false ? twiceWritten.differences : [],
+    [{ kind: 'MAPPED_TWICE', notificationId: 'n-1' }])
+
+  // BOTH WAYS, because "write then exclude" is the contradiction that reads as harmless.
+  const contradicted = validateApply([only], [entryFor(only), excludeFor(only)])
+  assert.equal(contradicted.proceed, false)
+  assert.deepEqual(contradicted.proceed === false ? contradicted.differences : [],
+    [{ kind: 'MAPPED_TWICE', notificationId: 'n-1' }])
+})
+
+test('AN EXCLUDED ROW IS NEVER IN THE STATEMENT - not as a parameter, not as a row', () => {
+  // The whole point, checked at the SQL rather than at the decision: the migration must not
+  // touch a row it said it would leave alone, and the statement is where that becomes true.
+  const store = manyRows(5)
+  const decision = validateApply(store,
+    [entryFor(store[0]!), ...store.slice(1).map((r) => excludeFor(r))])
+  assert.ok(decision.proceed)
+  const statement = applyStatement(decision.run)
+
+  assert.equal(statement.expectedRowCount, 1)
+  assert.ok(statement.params.includes('n-0'))
+  for (const excludedRow of store.slice(1)) {
+    assert.ok(!statement.params.includes(excludedRow.id), `${excludedRow.id} must not be a parameter`)
+  }
+})
+
+test('THE TWO EXCLUSION REASONS ARE CARRIED SEPARATELY, because they clear at different times', () => {
+  // TYPE_UNDETERMINED waits on the classifier reaching historical audit rows — a scoped piece of
+  // work. SUBJECT_UNRESOLVED waits on the row's own subject becoming resolvable, which may never
+  // happen. Collapsing them into one count would make the second look like it is coming soon.
+  const store = manyRows(3)
+  const decision = validateApply(store, [
+    entryFor(store[0]!),
+    excludeFor(store[1]!, 'TYPE_UNDETERMINED'),
+    excludeFor(store[2]!, 'SUBJECT_UNRESOLVED'),
+  ])
+  assert.ok(decision.proceed)
+  assert.deepEqual(decision.run.excluded.map((entry) => entry.because).sort(),
+    ['SUBJECT_UNRESOLVED', 'TYPE_UNDETERMINED'])
 })

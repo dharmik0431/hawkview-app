@@ -32,7 +32,8 @@ import { parseDedupeKey, reconcile, type ExistingAlertRow } from '../src/alerts/
 import {
   applyStatement, applyValidated, digestOf, explain, revertStatement, validateApply,
   validateRevert, watchedFieldsDisturbedBetween,
-  type ApplyReceipt, type MappingEntry, type StoredRow, type StoredSnapshot,
+  type ApplyReceipt, type Excluded, type Mapping, type MappingDecision, type MappingEntry,
+  type StoredRow, type StoredSnapshot,
 } from '../src/alerts/apply-mapping.js'
 
 /** Constructed LAZILY, and with an adapter.
@@ -98,7 +99,7 @@ type Reader = Readonly<{ $queryRawUnsafe: <T>(sql: string) => Promise<T> }>
 const readStore = (on: Reader): Promise<StoredSnapshot> => on.$queryRawUnsafe<StoredRow[]>(STORE_QUERY)
 
 /** The mapping, computed the way the dry run computes it - same `reconcile`, same inputs. */
-async function computeMapping(): Promise<{ entries: MappingEntry[]; figures: Record<string, number> }> {
+async function computeMapping(): Promise<{ decisions: MappingDecision[]; figures: Record<string, number> }> {
   const notifications = await prisma().notification.findMany({
     select: {
       id: true, organizationId: true, customerTenantId: true,
@@ -139,9 +140,22 @@ async function computeMapping(): Promise<{ entries: MappingEntry[]; figures: Rec
       + report.invariants.episodeOrdinalsAgreeWithCounts.join('\n  '))
   }
 
-  const entries: MappingEntry[] = []
+  const decisions: MappingDecision[] = []
   for (const entry of report.mapping) {
-    if (entry.incidentKey === null) continue
+    if (entry.incidentKey === null) {
+      // EXCLUDED, AND SAID SO RATHER THAN LEFT OUT. Under ruling (b) this is the larger
+      // share — and a row left out of the mapping entirely is indistinguishable from an
+      // alert that arrived after the mapping was saved, which aborts the run. Stating the
+      // exclusion is what lets the preflight tell a decision from a surprise.
+      decisions.push({
+        decision: 'EXCLUDE',
+        notificationId: entry.notificationId,
+        // The two clear at different times: one waits on the classifier reaching historical
+        // audit rows, the other on the row’s own subject becoming resolvable.
+        because: entry.alertTypeId === null ? 'TYPE_UNDETERMINED' : 'SUBJECT_UNRESOLVED',
+      })
+      continue
+    }
     // AN UNDECIDED EPISODE IS AN ERROR, NOT A NULL. Null is a VALUE here - it means the count
     // could not be recovered, which 47 rows are entitled to and 317 are not. A row the episode
     // pass never reached would otherwise be written as unrecoverable and read as if that had
@@ -150,7 +164,8 @@ async function computeMapping(): Promise<{ entries: MappingEntry[]; figures: Rec
     if (!report.episodeByRow.has(entry.notificationId)) {
       throw new Error(`No episode decision for ${entry.notificationId}. Refusing to guess.`)
     }
-    entries.push({
+    decisions.push({
+      decision: 'WRITE',
       notificationId: entry.notificationId,
       incidentKey: entry.incidentKey,
       episode: report.episodeByRow.get(entry.notificationId) ?? null,
@@ -158,13 +173,23 @@ async function computeMapping(): Promise<{ entries: MappingEntry[]; figures: Rec
     })
   }
 
+  const writes = decisions.filter((entry): entry is MappingEntry => entry.decision === 'WRITE')
+  const excluded = decisions.filter((entry): entry is Excluded => entry.decision === 'EXCLUDE')
+
   return {
-    entries,
+    decisions,
     figures: {
       rows: notifications.length,
-      entries: entries.length,
-      unnumbered: entries.filter((entry) => entry.episode === null).length,
-      incidents: new Set(entries.map((entry) => entry.incidentKey)).size,
+      writable: writes.length,
+      typeUndetermined: excluded.filter((entry) => entry.because === 'TYPE_UNDETERMINED').length,
+      subjectUnresolved: excluded.filter((entry) => entry.because === 'SUBJECT_UNRESOLVED').length,
+      unnumbered: writes.filter((entry) => entry.episode === null).length,
+      incidentsAmongWritable: new Set(writes.map((entry) => entry.incidentKey)).size,
+      // THE FIGURES THAT ANSWER A DIFFERENT QUESTION, and they are grouped apart for that
+      // reason. These count incidents and episodes across ALL the data under the nominated
+      // type — the right answer to "how many incidents are in here", and not the answer to
+      // "how many rows may be keyed today". The two were read as one number for a while.
+      incidentsInAllData: report.incidents.assumingSingleType,
       episodes: report.episodes.counted,
       attributed: report.episodes.fromAttributedRows,
       standingAlone: report.episodes.fromStandingAloneRows,
@@ -177,27 +202,48 @@ async function main(): Promise<void> {
   const command = process.argv[2]
 
   if (command === 'save-mapping') {
-    const { entries, figures } = await computeMapping()
+    const { decisions, figures } = await computeMapping()
+
+    // THE SPLIT IS THE HEADLINE, and each number is labelled by the question it answers.
+    // Two questions were read as one for long enough to reach a status report: "how many
+    // incidents are in this data" and "how many rows may be keyed today" are different, and
+    // the first is much the larger. The operator sees both before anything is written.
+    console.log('')
     console.log(`Read ${figures.rows} notification rows.`)
-    console.log(`Mapping: ${figures.entries} entries across ${figures.incidents} incidents; `
-      + `${figures.unnumbered} carry no episode number.`)
-    console.log(`Episodes: ${figures.episodes} counted (${figures.attributed} attributed, `
-      + `${figures.standingAlone} standing alone), ${figures.unrecoverable} incidents unrecoverable.`)
+    console.log('')
+    console.log('  HOW MANY ROWS THIS RUN WOULD KEY')
+    console.log(`    ${figures.writable} writable, across ${figures.incidentsAmongWritable} incidents`)
+    console.log(`    ${figures.unnumbered} of those carry no episode number (unrecoverable)`)
+    console.log('')
+    console.log('  HOW MANY IT WOULD LEAVE ALONE, AND WHY - decisions, not refusals')
+    console.log(`    ${figures.typeUndetermined} the key shape does not type (waiting on the classifier)`)
+    console.log(`    ${figures.subjectUnresolved} typed, but the declared subject does not resolve`)
+    console.log('')
+    console.log('  HOW MANY INCIDENTS ARE IN THE DATA - a different question, under the nominated type')
+    console.log(`    ${figures.incidentsInAllData} incidents, ${figures.episodes} episodes `
+      + `(${figures.attributed} attributed, ${figures.standingAlone} standing alone)`)
+    console.log(`    ${figures.unrecoverable} incidents whose episode count cannot be recovered`)
+    console.log('')
     const out = required('out')
-    writeFile(out, JSON.stringify({ savedAt: new Date().toISOString(), figures, entries }, null, 2))
+    writeFile(out, JSON.stringify({ savedAt: new Date().toISOString(), figures, decisions }, null, 2))
     console.log(`Wrote ${out}`)
-    console.log('CHECK THESE FIGURES AGAINST WHAT WAS APPROVED before going further. They are '
-      + 'printed to be compared against the dry run, not to be read as confirmation.')
+    console.log('CHECK THESE AGAINST WHAT WAS APPROVED before going further, and check each '
+      + 'against the question it answers. They are printed to be compared, not to confirm.')
     return
   }
 
   if (command === 'preflight') {
-    const mapping: MappingEntry[] = JSON.parse(readFileSync(resolve(required('mapping')), 'utf8')).entries
+    const mapping: Mapping = JSON.parse(readFileSync(resolve(required('mapping')), 'utf8')).decisions
     const decision = validateApply(await readStore(prisma()), mapping)
     const report = decision.proceed
       ? ['No differences. The mapping still describes the data.',
          `${decision.run.writes.length} rows would be written. `
            + `${decision.run.alreadyApplied.length} already carry it and would not be written again.`,
+         // UNAUTHORISED-BY-MAPPING IS NOT REFUSED-BECAUSE-MOVED, and the report keeps them
+         // apart. Under ruling (b) most rows are left alone on purpose; if that read as a
+         // refusal the preflight would abort every time by design and the apply could never
+         // run. This line is why a large number here is not alarming.
+         `${decision.run.excluded.length} left alone by decision, not by refusal.`,
          'PREFLIGHT PASSED - safe to apply.'].join('\n')
       : `${explain(decision.differences)}\n`
         + 'PREFLIGHT FAILED - do not apply. Re-run save-mapping and have the new figures approved.'
@@ -209,7 +255,7 @@ async function main(): Promise<void> {
   }
 
   if (command === 'apply') {
-    const mapping: MappingEntry[] = JSON.parse(readFileSync(resolve(required('mapping')), 'utf8')).entries
+    const mapping: Mapping = JSON.parse(readFileSync(resolve(required('mapping')), 'utf8')).decisions
     const receiptPath = required('receipt')
 
     // ONE TRANSACTION, AND THE PREFLIGHT RUNS AGAIN INSIDE IT - so a change between the
@@ -218,11 +264,13 @@ async function main(): Promise<void> {
       const before = await readStore(tx as unknown as Reader)
       const decision = validateApply(before, mapping)
       if (!decision.proceed) {
-        return { aborted: explain(decision.differences), written: 0, receipt: null, before }
+        return { aborted: explain(decision.differences), written: 0, receipt: null, before, excluded: 0 }
       }
 
       const statement = applyStatement(decision.run)
-      if (statement.expectedRowCount === 0) return { aborted: null, written: 0, receipt: null, before }
+      if (statement.expectedRowCount === 0) {
+        return { aborted: null, written: 0, receipt: null, before, excluded: decision.run.excluded.length }
+      }
 
       const written = await tx.$executeRawUnsafe(statement.sql, ...statement.params)
       // ALL-OR-NOTHING. The statement declines the rows whose version moved; this turns "some
@@ -233,7 +281,7 @@ async function main(): Promise<void> {
           + 'A row changed between the check and the write. Rolled back; nothing was written.')
       }
       const { receipt } = applyValidated(before, decision.run, randomUUID(), new Date().toISOString())
-      return { aborted: null, written, receipt, before }
+      return { aborted: null, written, receipt, before, excluded: decision.run.excluded.length }
     })
 
     if (result.aborted !== null) {
@@ -245,6 +293,7 @@ async function main(): Promise<void> {
     const disturbed = watchedFieldsDisturbedBetween(result.before, await readStore(prisma()))
     console.log('Preflight re-run inside the transaction: no differences.')
     console.log(`Applied ${result.written} rows in one statement, in one transaction.`)
+    console.log(`Left alone by decision: ${result.excluded}. These were never candidates.`)
     console.log(`Watched fields disturbed: ${disturbed.length === 0 ? 'none' : disturbed.join('; ')}`)
     if (result.receipt !== null) {
       writeFile(receiptPath, JSON.stringify(result.receipt, null, 2))

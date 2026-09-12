@@ -63,6 +63,23 @@ export function digestOf(row: Pick<StoredRow, 'dedupeKey' | 'occurrenceCount'>):
 /** One row's share of the approved mapping. Saved to disk before the apply and read back by
  * it, so what runs is the artefact that was approved rather than something recomputed. */
 export interface MappingEntry {
+  /** WRITE OR EXCLUDE, ON EVERY ROW THE MAPPING SAW.
+   *
+   * ADDED WHEN THE RULING CAME BACK AS (b) — key only the rows whose shape determines a
+   * type. That makes 317 of 364 rows DELIBERATELY unwritable, and with the mapping being
+   * only a list of writes, every one of them landed in the final loop below as
+   * `ROW_UNEXPECTED`. **The preflight aborted with 317 differences, every time, by
+   * construction.** Not a reporting nicety: the apply could never have run.
+   *
+   * The cause is that the scope of the run was INFERRED — "everything in the table" — so a
+   * row left out on purpose and a row nobody had ever seen were the same input. They are
+   * different facts and the report must not collapse them: one is a decision, the other is
+   * an alert that arrived after the mapping was saved.
+   *
+   * So the mapping states its scope instead. A row it decided about is decided about,
+   * whichever way; a row it never saw is still an abort, which is the original property
+   * unchanged. */
+  readonly decision: 'WRITE'
   readonly notificationId: string
   readonly incidentKey: string
   /** Null where the episode count could not be recovered — the 47 aggregate rows. Null is the
@@ -72,6 +89,35 @@ export interface MappingEntry {
   readonly observed: string
 }
 
+/** Why the mapping is not writing a row it saw. NOT A FAILURE, and not a `Difference`.
+ *
+ * `TYPE_UNDETERMINED` is the 317: `TYPE_FOR_SHAPE` maps `DIRECTORY_AUDIT` to null on purpose,
+ * because the key shape does not determine the alert type and defaulting it would file real
+ * privileged changes as routine. Migrating them as routine would be the defect this migration
+ * exists to clear, re-entering through the migration.
+ *
+ * `SUBJECT_UNRESOLVED` is a row whose type IS determined but whose declared subject could not
+ * be resolved, so it groups with nothing. Separate from the above because they clear at
+ * different times: one waits on the classifier, the other on the row itself. */
+export type ExclusionReason = 'TYPE_UNDETERMINED' | 'SUBJECT_UNRESOLVED'
+
+export interface Excluded {
+  readonly decision: 'EXCLUDE'
+  readonly notificationId: string
+  readonly because: ExclusionReason
+}
+
+/** One decision per row the mapping saw. */
+export type MappingDecision = MappingEntry | Excluded
+
+/** THE MAPPING, WHICH IS A DECISION ABOUT A SET OF ROWS RATHER THAN A LIST OF WRITES.
+ *
+ * ONE LIST, NOT TWO. Writes and exclusions in separate fields would be two collections that
+ * can disagree — a row in both, a row in neither, and nothing owning the answer. Here a row
+ * has exactly one decision or it is not in the mapping at all, and `MAPPED_TWICE` names the
+ * remaining way to get it wrong. */
+export type Mapping = readonly MappingDecision[]
+
 /** Why a run cannot proceed. Every variant names the row, because "4 problems" is not
  * something an operator can act on. */
 export type Difference =
@@ -79,6 +125,11 @@ export type Difference =
   | Readonly<{ kind: 'ROW_MISSING'; notificationId: string }>
   | Readonly<{ kind: 'ROW_UNEXPECTED'; notificationId: string }>
   | Readonly<{ kind: 'ALREADY_KEYED_DIFFERENTLY'; notificationId: string; held: string; wanted: string }>
+  /** A row the mapping deliberately excluded is carrying an incident key anyway. Somebody
+   * else keyed it, which is the two-keying-schemes state the abort exists to prevent —
+   * arriving through the rows we said not to touch. */
+  | Readonly<{ kind: 'EXCLUDED_BUT_KEYED'; notificationId: string; held: string }>
+  | Readonly<{ kind: 'MAPPED_TWICE'; notificationId: string }>
 
 declare const VALIDATED: unique symbol
 
@@ -102,6 +153,13 @@ export interface ValidatedRun {
   /** Rows already carrying exactly this mapping. Not written again; counted so the operator
    * can tell a re-run from a first run. */
   readonly alreadyApplied: readonly string[]
+  /** Rows the mapping saw and decided not to write, with why.
+   *
+   * CARRIED ON THE RUN so the operator sees the split BEFORE anything is written rather than
+   * inferring it from a row count afterwards. Under ruling (b) this is the larger number, and
+   * a preflight reporting "47 rows would be written" without saying what happened to the
+   * other 317 is the same sentence whether the exclusion was deliberate or a bug. */
+  readonly excluded: readonly Excluded[]
   readonly [VALIDATED]: true
 }
 
@@ -113,14 +171,39 @@ export type ApplyDecision =
  *
  * Aborts on any of: a mapping input changed, a row is missing, an unexpected row is present, or
  * a row is already keyed to something else. One is enough. */
-export function validateApply(store: StoredSnapshot, mapping: readonly MappingEntry[]): ApplyDecision {
+export function validateApply(store: StoredSnapshot, mapping: Mapping): ApplyDecision {
   const byId = new Map(store.map((row) => [row.id, row]))
-  const mapped = new Set(mapping.map((entry) => entry.notificationId))
+  const decided = new Set(mapping.map((entry) => entry.notificationId))
   const differences: Difference[] = []
   const writes: ValidatedRun['writes'][number][] = []
   const alreadyApplied: string[] = []
+  const excluded: Excluded[] = []
 
+  const seen = new Set<string>()
   for (const entry of mapping) {
+    if (seen.has(entry.notificationId)) {
+      differences.push({ kind: 'MAPPED_TWICE', notificationId: entry.notificationId })
+      continue
+    }
+    seen.add(entry.notificationId)
+
+    if (entry.decision === 'EXCLUDE') {
+      const held = byId.get(entry.notificationId)
+      // A ROW WE SAID NOT TO TOUCH THAT IS KEYED ANYWAY IS STILL AN ABORT. The exclusion is a
+      // decision about what WE write, never a promise about what the row holds.
+      if (held !== undefined && held.incidentKey !== null) {
+        differences.push({
+          kind: 'EXCLUDED_BUT_KEYED', notificationId: entry.notificationId,
+          held: `${held.incidentKey}/${held.episode ?? 'null'}`,
+        })
+        continue
+      }
+      // A row the mapping excluded that is no longer in the table is not a problem: nothing
+      // was going to be written to it. Recorded so the count still reconciles.
+      excluded.push(entry)
+      continue
+    }
+
     const row = byId.get(entry.notificationId)
     if (row === undefined) {
       differences.push({ kind: 'ROW_MISSING', notificationId: entry.notificationId })
@@ -153,16 +236,21 @@ export function validateApply(store: StoredSnapshot, mapping: readonly MappingEn
     })
   }
 
-  // A ROW PRESENT AND UNMAPPED IS A DIFFERENCE, NOT A NOTE. It was never measured, so no digest
-  // can speak for it: apply 364 entries while three alerts arrive and the table holds two
-  // keying schemes with nothing saying so. Under all-or-nothing that state is unreachable.
+  // A ROW THE MAPPING NEVER SAW IS A DIFFERENCE, NOT A NOTE. It was never measured, so no
+  // digest can speak for it: apply while three alerts arrive and the table holds two keying
+  // schemes with nothing saying so. Under all-or-nothing that state is unreachable.
+  //
+  // NOTE WHAT CHANGED AND WHAT DID NOT. This reads `decided`, not the write list — so a row
+  // excluded on purpose is not a surprise, and a row that arrived after the mapping was saved
+  // still is. The original property is intact; what it is measured against is now stated by
+  // the mapping instead of inferred from the table.
   for (const row of store) {
-    if (!mapped.has(row.id)) differences.push({ kind: 'ROW_UNEXPECTED', notificationId: row.id })
+    if (!decided.has(row.id)) differences.push({ kind: 'ROW_UNEXPECTED', notificationId: row.id })
   }
 
   return differences.length > 0
     ? { proceed: false, differences: sorted(differences) }
-    : { proceed: true, run: { writes, alreadyApplied } as unknown as ValidatedRun }
+    : { proceed: true, run: { writes, alreadyApplied, excluded } as unknown as ValidatedRun }
 }
 
 /** What a run did, in enough detail to undo it WITHOUT CONSULTING THE DATABASE.
@@ -378,6 +466,8 @@ export function explain(differences: readonly Difference[]): string {
     ROW_MISSING: 'in the mapping but not in the table',
     ROW_UNEXPECTED: 'in the table but not in the mapping (arrived after the mapping was saved)',
     ALREADY_KEYED_DIFFERENTLY: 'already carries a different incident key',
+    EXCLUDED_BUT_KEYED: 'excluded by the mapping, but carries an incident key already',
+    MAPPED_TWICE: 'decided about more than once by the mapping',
   }
   for (const kind of Object.keys(say) as Difference['kind'][]) {
     const of = differences.filter((difference) => difference.kind === kind)
@@ -388,7 +478,9 @@ export function explain(differences: readonly Difference[]): string {
         ? `  ${difference.notificationId}  saw ${difference.observed}  now ${difference.now}`
         : difference.kind === 'ALREADY_KEYED_DIFFERENTLY'
           ? `  ${difference.notificationId}  holds ${difference.held}  mapping says ${difference.wanted}`
-          : `  ${difference.notificationId}`)
+          : difference.kind === 'EXCLUDED_BUT_KEYED'
+            ? `  ${difference.notificationId}  holds ${difference.held}  mapping says leave it alone`
+            : `  ${difference.notificationId}`)
     }
     lines.push('')
   }

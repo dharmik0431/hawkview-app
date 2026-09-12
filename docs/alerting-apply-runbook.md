@@ -2,41 +2,82 @@
 
 **Operator: Dharmik. Nothing here runs automatically and nothing runs from an agent session.**
 
-> **THE EXPECTED FIGURES BELOW ARE WRONG, AND THAT IS THE FIRST THING TO READ.**
+> **THIS MIGRATION KEYS ABOUT 47 ROWS, NOT 364. If you were told 364, that was us.**
 >
-> The runner now exists and typechecks. Writing it surfaced something the design did not
-> account for: **the mapping authorises an incident key for almost none of the 364 rows.**
-> `TYPE_FOR_SHAPE` maps `DIRECTORY_AUDIT` to `null` on purpose — the key shape does not
-> determine the alert type, and defaulting it would file real privileged changes as routine —
-> so those rows reach the mapping with `incidentKey: null`, and the apply writes only non-null
-> keys. **On production that is 317 of the 364 rows skipped.**
+> **What changed:** the previously stated figures — 364 / 71 / 62 / 9 / 47 — answer *how many
+> incidents are in this data*, computed under the nominated type. They are correct for that
+> question. **They are not the answer to the question an operator is asking, which is how many
+> rows this run is authorised to key today.** Two questions that were never the same number,
+> read as one, in every status report given on this migration.
 >
-> The 364 / 71 / 62 / 9 / 47 below come from `incidents.assumingSingleType` and the episode
-> counts, which are computed **under the nominated type** — a different question from what the
-> mapping authorises. Two figures that were never the same number have been read as one.
-> See *The open decision* immediately below. **Do not run step 3 until it is resolved.**
+> **Why 47.** `TYPE_FOR_SHAPE` maps `DIRECTORY_AUDIT` to `null` on purpose: the key shape does
+> not determine the alert type, and defaulting it would file real privileged changes as
+> routine. Those rows reach the mapping as EXCLUDED, and the apply writes only what the
+> mapping authorises. **That is the ruling, not a limitation** — see the section below.
 >
-> **And the commands have still never been run.** The script exists; no `psql`, no Docker and
-> no `DATABASE_URL` exist in the worktree it was written in. What is tested is the pure logic
-> it calls and the SQL it emits, which QA executed against a disposable Postgres at 364 rows.
-> Details under *Before you trust this*.
+> **Read the split, not the total.** `save-mapping` now prints three groups under three
+> headings, each labelled by the question it answers. If any one of them is read as the
+> answer to another, that is this same mistake happening again.
+>
+> **And the commands have still never been run.** The script exists and typechecks; no `psql`,
+> no Docker and no `DATABASE_URL` exist in the worktree it was written in. What is tested is
+> the pure logic it calls and the SQL it emits, which QA executed against a disposable
+> Postgres at 364 rows. Details under *Before you trust this*.
 
-## The open decision — what the apply is allowed to key
+## What the apply is allowed to key — ruled: (b), the typed rows only
 
-Two readings, and this is not a decision the code can make:
+**47 rows now, 317 when the classifier reaches historical audit rows.** The migration lands in
+two parts and the second is not blocked forever: the classifier exists, it is simply not wired
+to those rows yet, which is scoped work rather than an open question.
 
-**(a) Key everything under the nominated type.** 364 rows, 71 incidents — the figures already
-approved. It assumes a single type for rows whose type is undetermined, which is exactly what
-`reconcile` refuses to do in the mapping, in a comment that says defaulting would file real
-privileged changes as routine.
+**(a) — keying everything under the nominated type — is off the table, and not because it is
+riskier.** It contradicts a decision already made. It assumes a single type for rows whose type
+is undetermined, which is exactly what `reconcile` refuses to do, in a comment saying that
+defaulting would file real privileged changes as routine. A classifier was built precisely so
+those rows are not routine by default. **Migrating them as routine would be the original defect
+re-entering through the migration built to clear it.**
 
-**(b) Key only the rows whose shape determines a type, and let step 05 classify the rest.**
-Roughly 47 rows now, 317 later. Nothing is mis-typed, the migration lands in two parts, and
-the second part cannot be scheduled until classification exists.
+**The smaller first part is an advantage rather than a consolation.** It proves the apply, the
+receipt and the revert against 47 real rows before 317 depend on them.
 
-The runner implements neither preference: it writes what the mapping says, which today is (b).
-`save-mapping` prints the writable count and the incident count separately so the split is
-visible before anything is written rather than inferred from a row count afterwards.
+## Unwritable is not refused, and the run depends on the difference
+
+With 47 writable rows among 364 present, **317 rows are expected to be unwritable.** If those
+read as refusals the preflight aborts every time by design and the apply can never run.
+
+**That is not hypothetical — it was the state of the code when the ruling arrived.** The
+mapping was a list of writes, so the scope of the run was *inferred* as "everything in the
+table", and every row deliberately left out arrived at the final check as `ROW_UNEXPECTED`. On
+production: 317 differences, on a clean table, every time.
+
+**The fix is that the mapping states its scope instead of the table implying it.** A mapping is
+now a decision about every row it saw — `WRITE` or `EXCLUDE`, one per row, in one list so there
+is no pair of fields that can disagree. Then:
+
+| what | how it reads |
+|---|---|
+| a row the mapping excluded | **a decision.** Counted, reasoned, never a difference |
+| a row that moved since the mapping | `ROW_CHANGED` — aborts |
+| a row the mapping never saw | `ROW_UNEXPECTED` — aborts, unchanged |
+| a row we excluded that is keyed anyway | `EXCLUDED_BUT_KEYED` — aborts |
+| a row decided about twice | `MAPPED_TWICE` — aborts |
+
+**The original property is intact.** An alert that arrived after the mapping was saved was
+never measured, no digest speaks for it, and it still stops the run. What changed is that the
+thing it is measured against is now stated rather than inferred.
+
+The last two are new. An exclusion is a decision about what **we** write and never a promise
+about what the row holds, so a row we said to leave alone that is carrying an incident key is
+the two-keying-schemes state arriving through the rows nobody was watching.
+
+**The two exclusion reasons are carried separately** because they clear at different times:
+`TYPE_UNDETERMINED` waits on the classifier, which is scoped work; `SUBJECT_UNRESOLVED` waits
+on the row’s own subject becoming resolvable, which may never happen. One count would make the
+second look like it is coming soon.
+
+> **A NOTE ON EVERY 364 BELOW THIS LINE.** They are ROW counts — rows in the table, rows QA
+> ran the emitted SQL against, rows the timing was measured at. **None of them is a write
+> count.** The write count is about 47 and appears only where it is labelled as one.
 
 ## The two schema findings that determine the shape
 
@@ -102,19 +143,40 @@ its database path had never executed, and any figure attributed to it came from 
 
 ```
 Read 364 notification rows.
-Mapping: N entries across M incidents; U carry no episode number.
-Episodes: 71 counted (62 attributed, 9 standing alone), 47 incidents unrecoverable.
+
+  HOW MANY ROWS THIS RUN WOULD KEY
+    47 writable, across M incidents
+    U of those carry no episode number (unrecoverable)
+
+  HOW MANY IT WOULD LEAVE ALONE, AND WHY - decisions, not refusals
+    317 the key shape does not type (waiting on the classifier)
+    0 typed, but the declared subject does not resolve
+
+  HOW MANY INCIDENTS ARE IN THE DATA - a different question, under the nominated type
+    71 incidents, 71 episodes (62 attributed, 9 standing alone)
+    47 incidents whose episode count cannot be recovered
+
 Wrote ..\artefacts\mapping.json
 ```
 
-**`N` is the number that matters and nobody has measured it.** It is the count of rows the
-mapping authorises, not the count of rows read, and the two were conflated — see the open
-decision above. Expect it to be far below 364; if it comes back AT 364, something has changed
-in `TYPE_FOR_SHAPE` and that is a bigger conversation than this runbook.
+**Three groups, three questions, and they are not interchangeable.** The grouping is the
+headline rather than a detail because reading one group as the answer to another is the
+mistake that put 71 into every status report as though it were a write count.
 
-**`Read 364 notification rows` is the one figure to check against the approval here.** If the
-row count, the 71, the 62 / 9 split or the 47 differ, stop: the approval was for a mapping, not
-a procedure. Send the new figures to be re-approved before going further.
+**What to check, per group.**
+
+1. **Rows this run would key.** Nobody has measured this. Expect it far below 364; **if it
+   comes back AT 364 something changed in `TYPE_FOR_SHAPE`**, and that is a bigger
+   conversation than this runbook.
+2. **Rows left alone.** Should be roughly 317, and the first line should hold nearly all of
+   them. A large `subject does not resolve` count is a finding — those do not clear on the
+   classifier and may never clear.
+3. **Incidents in the data.** This is where 364 / 71 / 62 / 9 / 47 belong. **If any of those
+   five differ, stop** — the approval was for a mapping, not a procedure, and the new figures
+   need re-approving before anything is written.
+
+Groups 1 and 2 must sum to the rows read. Group 3 does not participate in that sum and is not
+supposed to.
 
 ## Step 2 — preflight (writes nothing, ever)
 
@@ -126,12 +188,17 @@ node --import tsx scripts/alerting-apply.mts preflight --mapping ..\artefacts\ma
 
 ```
 No differences. The mapping still describes the data.
-N rows would be written. 0 already carry it and would not be written again.
+47 rows would be written. 0 already carry it and would not be written again.
+317 left alone by decision, not by refusal.
 PREFLIGHT PASSED - safe to apply.
 ```
 
-`N` must equal the `N` from step 1. A second number appearing here means the mapping file and
-the database have diverged, which is what the preflight exists to catch.
+**The third line is the one to read twice.** A large number there is the design working; the
+same number appearing as differences above it would be the run aborting. See *Unwritable is
+not refused*.
+
+The write count must equal the writable count from step 1. A second number here means the
+mapping file and the database have diverged, which is what the preflight exists to catch.
 
 **Expected output — aborting:**
 
@@ -163,9 +230,10 @@ node --import tsx scripts/alerting-apply.mts apply --mapping ..\artefacts\mappin
 
 ```
 Preflight re-run inside the transaction: no differences.
-Applied N rows in one statement, in one transaction.
+Applied 47 rows in one statement, in one transaction.
+Left alone by decision: 317. These were never candidates.
 Watched fields disturbed: none
-Wrote ..\artefacts\receipt.json - N changes, 0 untouched. THE REVERT NEEDS THIS FILE.
+Wrote ..\artefacts\receipt.json - 47 changes, 0 untouched. THE REVERT NEEDS THIS FILE.
 APPLY COMPLETE.
 ```
 
@@ -186,8 +254,8 @@ node --import tsx scripts/alerting-apply.mts verify --receipt ..\artefacts\recei
 **The checklist, and what each line means:**
 
 ```
-[ok] N of N receipt rows carry the key the receipt records
-[ok] M distinct incident keys across N keyed rows
+[ok] 47 of 47 receipt rows carry the key the receipt records
+[ok] M distinct incident keys across 47 keyed rows
 [  ] X keyed rows carry an episode number, Y carry null - compare both against the
      save-mapping figures rather than reading either as a pass
 [ok] no incident key is shared across two organisations (0 are)
@@ -225,18 +293,18 @@ exactly what it wrote.** Never a blanket update, and it writes its own receipt.
 **Expected output — complete revert:**
 
 ```
-Checked N rows from receipt 4f1c8e2a-....
-Reverted N. Refused 0.
+Checked 47 rows from receipt 4f1c8e2a-....
+Reverted 47. Refused 0.
 Watched fields disturbed: none
 Wrote ..\artefacts\revert-receipt.json
-REVERT COMPLETE - N put back, 0 left alone, N of N accounted for.
+REVERT COMPLETE - 47 put back, 0 left alone, 47 of 47 accounted for.
 ```
 
 **Expected output — partial revert. THIS IS A SUCCESS, NOT A FAILURE:**
 
 ```
-Checked N rows from receipt 4f1c8e2a-....
-Reverted N-1. Refused 1.
+Checked 47 rows from receipt 4f1c8e2a-....
+Reverted 46. Refused 1.
 
 ABORTED - 1 difference(s). Nothing was written.
 
@@ -247,7 +315,7 @@ A refused row is not half-done work: somebody changed it after the apply, so it 
 longer this run's to undo. Leaving it alone is the answer, not a partial one.
 Watched fields disturbed: none
 Wrote ..\artefacts\revert-receipt.json
-REVERT COMPLETE - N-1 put back, 1 left alone, N of N accounted for.
+REVERT COMPLETE - 46 put back, 1 left alone, 47 of 47 accounted for.
 ```
 
 **The `ABORTED - ... Nothing was written` line inside a successful revert is a wart.** The

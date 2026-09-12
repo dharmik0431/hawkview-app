@@ -255,7 +255,7 @@ on production data, which no worktree here has. Contrast `STALE_AFTER_MS`, which
 runs behind it. **A placeholder that reads as authoritative is worse than one that reads as a
 guess,** because nobody goes back for the second kind.
 
-### What the apply is allowed to key — and it is not 364 rows
+### What the apply is allowed to key — ruled: about 47 rows, not 364
 
 **Found while writing the runner, and it changes the expected output of step 03.**
 
@@ -269,10 +269,26 @@ episode counts, which are computed under the NOMINATED type. That is a different
 what the mapping authorises, and the two were read as one number. Pinned by a test
 (`THE APPLY WOULD NOT KEY A SINGLE DIRECTORY-AUDIT ROW`) so it cannot be lost in a diff.
 
-Two readings, and neither is the code's to choose: key everything under the nominated type
-(364 rows, and an assumption the mapping refuses to make), or key only determined-type rows now
-and let step 05 classify the other 317. **The runner implements neither preference** — it writes
-what the mapping says, which today is the second.
+**Ruled: key only the rows whose shape determines a type.** 47 now, 317 when the classifier
+reaches historical audit rows — scoped work, not an open question. Keying everything under the
+nominated type was rejected not for being riskier but for contradicting a decision already made:
+it assumes a single type for rows whose type is undetermined, which is what the classifier exists
+to prevent. **Migrating them as routine would be the original defect re-entering through the
+migration built to clear it.** The smaller first part also proves the apply, the receipt and the
+revert against 47 real rows before 317 depend on them.
+
+**And the ruling broke the preflight, which nobody had looked at.** With the mapping being a list
+of writes, the scope of the run was INFERRED as "everything in the table" — so all 317 deliberate
+exclusions arrived at the final check as `ROW_UNEXPECTED`. **317 differences on a clean table,
+every time; the apply could never have run.** Unauthorised-by-mapping and refused-because-moved
+were the same input.
+
+A mapping is now a decision about **every row it saw** — `WRITE` or `EXCLUDE`, one per row, in one
+list rather than two fields that can disagree. An excluded row is counted and reasoned; a row the
+mapping never saw still aborts, unchanged. Two new abort kinds fall out: `EXCLUDED_BUT_KEYED` (an
+exclusion is a decision about what WE write, never a promise about what the row holds) and
+`MAPPED_TWICE`. The two exclusion reasons are carried separately because they clear at different
+times — one on the classifier, one on the row's own subject, which may never resolve.
 
 ### The per-row episode had no owner until now
 
