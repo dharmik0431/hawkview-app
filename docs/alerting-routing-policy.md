@@ -436,3 +436,82 @@ is the observed distribution of causes per MSP per tick on production data, and 
 production access. Until then the limit is a constant with its provenance recorded as *not yet
 measured*, which is the same discipline the staleness threshold got — and unlike that one, it
 does not yet have its 5,166 runs behind it.
+
+## Correction: the previous commit claimed a closure that was open
+
+`8ef3e1a` said *"the residual, closed by derivation"*. It was not closed. `RoutableIncident`
+still accepted `alertTypeId` and `ruleId` independently, and `alertTypeForChange` was **a
+function a caller may use, not a constraint on the pair.** Two incidents with a security rule
+id and an operational type still produced one cause where correct pairing gives two.
+
+**A field a caller can still set is not derived. It is derivable — a different property, and
+not the one the standing rule asks for.** I wrote that rule into the doc in the same commit
+where the object it was written for still supplied both fields, which is the difference
+between a rule being written down and being applied.
+
+### Closed properly: the pair cannot come into existence
+
+`RoutableIncident` is branded with a phantom field, so an object literal is not assignable and
+`routableIncident` is the only way one exists. It takes an **origin**, not a pair:
+
+| origin | where the type comes from |
+|---|---|
+| `CLASSIFIED_CHANGE` | `alertTypeForChange(classification)` — the verdict the classifier already reached |
+| `DECLARED_TYPE` | the type **is** the grain (`monitoring.collector_failing` is both type and rule), so this supplies one fact, not two |
+
+An `UNCLASSIFIED` change produces **no incident at all**, so there is nothing to route under
+either directory type.
+
+Every fixture in the test file had to change, and that is the evidence the old shape was
+reachable everywhere rather than only in theory.
+
+### And the limit of the brand, measured rather than assumed
+
+A spread **copies** the brand, so patching a derived incident compiles. I wrote a
+`@ts-expect-error` claiming otherwise and the compiler reported it **unused** — the compiler
+catching the same overclaim twice in a row, in the commit fixing the first one.
+
+- **What the brand gives:** an incident cannot be *fabricated*. No code path invents an
+  inconsistent pair from nothing.
+- **What it does not give:** immunity from someone holding a real incident and overriding a
+  field.
+
+That surface is smaller — it needs a valid incident in hand — and it is not zero, so it is
+written down and demonstrated by a test rather than implied away.
+
+### One more self-inflicted: the phantom was not phantom
+
+`declare const` gives a compile-time symbol with no runtime value, and I used it as a computed
+key. Every construction threw `ROUTABLE_INCIDENT is not defined` on the first call. Caught by
+the tests, not by review — a brand must be declared in the type and never emitted, with the
+constructor casting, so the one unchecked step lives in the one place allowed to make these.
+
+## Design constraints for 05b, recorded before the code
+
+**A limit-induced hold has no `until`, and that changes the shape.** A quiet-hours hold has a
+natural release: the hour they end, a `Date`, checkable. **A limit releases when volume falls,
+which is not a time.** Invent an `until` and the hold sits forever while every accounting
+identity still passes — silence that satisfies the books. So a limited delivery carries a
+release **condition**, not a timestamp, and `DeliveryTiming` needs a third variant rather than
+reusing `HELD`.
+
+**Folding must flatten, not nest.** `Delivery.incidentKeys` resists nesting only one level
+deep, so an aggregate of aggregates loses what is inside it — silence produced by a feature
+whose purpose is clarity.
+
+**`rungFor(incident, now)` measures the wrong interval.** Time since the *incident* is not time
+since the *notification*, and the natural-looking shape cannot express the difference. The
+ladder input is the notification, not the incident.
+
+**An acknowledgement carries who and when, and an assumed one has no constructor.** Same shape
+as the recipient union: the honest refusal is a variant, and the thing that must not exist is
+given no way to be written.
+
+**A ladder advances over time, so one `now` cannot express two advances** — the same
+sequence-not-snapshot repair as quiet hours, arriving a third time.
+
+**And the escalation input cannot be derived from what was sent.** QA's own seam derived the
+incident set from the deliveries, so an incident nobody had been told about did not exist to
+have a ladder — and the property passed vacuously against both the reference and the defect.
+Incidents are an input of their own. **Fourth instance of the same rule: a property about
+something that did not happen cannot be carried by a list of things that did.**

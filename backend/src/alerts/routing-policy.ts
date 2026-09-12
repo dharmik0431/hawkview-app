@@ -21,7 +21,7 @@
 
 import { joinUnambiguously } from './alert-key-encoding.js'
 import { alertType, type AlertTypeId } from './alert-catalog.js'
-import type { ChangeClassification } from './privileged-change.js'
+import type { ChangeClassification, ChangeRule } from './privileged-change.js'
 import type { AlertCategory } from './alert-lifecycle.js'
 import type { RoutingTier, Severity } from './alert-type.js'
 
@@ -224,8 +224,18 @@ export type RoutingTick = Readonly<{
   incidents: readonly RoutableIncident[]
 }>
 
-/** What routing needs to know about an incident. Taken from step 04's queue rather than
- * re-derived, so the two cannot disagree about which incident this is. */
+declare const ROUTABLE_INCIDENT: unique symbol
+
+/** What routing needs to know about an incident.
+ *
+ * NOT CONSTRUCTIBLE AS AN OBJECT LITERAL, and that is the whole point of the brand.
+ * `alertTypeId` and `ruleId` were independent fields with nothing tying them, so a
+ * security-natured rule paired with an operational type merged two tenants — and offering
+ * `alertTypeForChange` beside the fields did not fix it. A FIELD A CALLER CAN STILL SET IS
+ * NOT DERIVED, IT IS DERIVABLE, and only one of those is what the standing rule asks for.
+ *
+ * The pair now cannot come into existence inconsistently, because it cannot come into
+ * existence at all except through `routableIncident`, which computes both from one origin. */
 export interface RoutableIncident {
   readonly incidentKey: string
   readonly organizationId: string
@@ -253,6 +263,85 @@ export interface RoutableIncident {
    * one cause was not in the seam at all, so any grouping was somebody's guess rather than
    * the product's rule. */
   readonly subjectId: string
+  /** A PHANTOM FIELD: declared in the type, never emitted at runtime.
+   *
+   * `declare const` gives a compile-time symbol with no runtime value, so writing it as a
+   * computed key threw `ROUTABLE_INCIDENT is not defined` on the first call — caught by the
+   * tests rather than by review. The constructor casts instead, which confines the one
+   * unchecked step to the one place that is allowed to make these.
+   *
+   * Nothing reads it. Its job is to stop an object literal being assignable, which is what
+   * makes the derivation the only path to an incident. */
+  readonly [ROUTABLE_INCIDENT]: true
+}
+
+/** WHERE AN INCIDENT CAME FROM, and therefore what its declared type is.
+ *
+ * Two origins because there are two shapes of answer, not because there are two producers:
+ * a directory change is classified and its type follows the verdict, while every other
+ * declared type IS the grain — `monitoring.collector_failing` is both the type and the rule,
+ * so there is no pair to disagree. */
+export type IncidentOrigin =
+  | Readonly<{
+      kind: 'CLASSIFIED_CHANGE'
+      classification: ChangeClassification
+      /** The fine rule, for preferences. Never the source of the type. */
+      rule: ChangeRule
+      severity: Severity
+    }>
+  | Readonly<{
+      kind: 'DECLARED_TYPE'
+      /** The type IS the grain here, so this supplies one fact rather than two. */
+      alertTypeId: AlertTypeId
+    }>
+
+export type RoutableResult =
+  | Readonly<{ routable: true; incident: RoutableIncident }>
+  | Readonly<{ routable: false; because: string }>
+
+/** THE ONLY WAY A `RoutableIncident` EXISTS.
+ *
+ * Derives `alertTypeId` from the origin rather than accepting it beside a rule id. An
+ * UNCLASSIFIED change produces no incident at all — routing it under either directory type
+ * would file a real privileged change as a record or page somebody about a read scope, and
+ * refusing is the same answer step 03 gave a migration row it could not type.
+ *
+ * Severity comes from the origin too: the classifier already derives it from the
+ * classification, and the catalogue already declares it per type. Neither is re-decided. */
+export function routableIncident(
+  scope: Readonly<{
+    incidentKey: string
+    organizationId: string
+    customerTenantId: string
+    subjectId: string
+  }>,
+  origin: IncidentOrigin,
+): RoutableResult {
+  if (origin.kind === 'DECLARED_TYPE') {
+    const declaration = alertType(origin.alertTypeId)
+    return {
+      routable: true,
+      incident: {
+        ...scope,
+        alertTypeId: origin.alertTypeId,
+        // The type is the grain, so the rule is the same string. One fact, written once.
+        ruleId: origin.alertTypeId,
+        severity: declaration.severity,
+      } as RoutableIncident,
+    }
+  }
+
+  const derived = alertTypeForChange(origin.classification)
+  if (!derived.resolved) return { routable: false, because: derived.because }
+  return {
+    routable: true,
+    incident: {
+      ...scope,
+      alertTypeId: derived.alertTypeId,
+      ruleId: origin.rule,
+      severity: origin.severity,
+    } as RoutableIncident,
+  }
 }
 
 /** An incident that produced no delivery BECAUSE THE MSP CHOSE THAT.

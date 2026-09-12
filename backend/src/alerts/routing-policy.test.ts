@@ -4,6 +4,8 @@ import { alertType, ALERT_CATALOG } from './alert-catalog.js'
 import {
   alertTypeForChange,
   causeKeyOf,
+  routableIncident,
+  type IncidentOrigin,
   contradictions,
   defaultPreference,
   fanOutProblems,
@@ -219,16 +221,36 @@ test('A PREFERENCE CHANGE CARRIES WHO, WHEN, AND WHAT IT WAS BEFORE', () => {
 
 /** The two properties QA's seam attack showed the first shape could not express. */
 
-const incident = (over: Partial<RoutableIncident> = {}): RoutableIncident => ({
+/** A fixture built the only way an incident can be: through the constructor.
+ *
+ * The old helper was an object literal setting `alertTypeId` and `ruleId` side by side —
+ * which is exactly the pair the brand now forbids, and the fact that every fixture had to
+ * change is the evidence that it was reachable everywhere. */
+const mustRoute = (
+  scope: Parameters<typeof routableIncident>[0],
+  origin: IncidentOrigin,
+): RoutableIncident => {
+  const built = routableIncident(scope, origin)
+  assert.ok(built.routable, 'fixture must be routable')
+  return built.incident
+}
+
+const SCOPE = {
   incidentKey: 'k-1',
   organizationId: 'org-1',
   customerTenantId: 'tenant-1',
-  alertTypeId: 'security.privileged_directory_change',
-  ruleId: 'directory.privileged_role_assigned',
-  severity: 'ACT_NOW',
   subjectId: 'admin-1',
-  ...over,
-})
+}
+
+const PRIVILEGED: IncidentOrigin = {
+  kind: 'CLASSIFIED_CHANGE',
+  classification: 'URGENT',
+  rule: 'directory.privileged_role_assigned',
+  severity: 'ACT_NOW',
+}
+
+const incident = (over: Partial<typeof SCOPE> = {}): RoutableIncident =>
+  mustRoute({ ...SCOPE, ...over }, PRIVILEGED)
 
 const delivery = (over: Partial<Delivery> = {}): Delivery => ({
   organizationId: 'org-1',
@@ -346,20 +368,17 @@ test('ONLY MONITORING COALESCES — a security finding never merges across tenan
   // Microsoft's API did. Two privileged role grants in two tenants are TWO REASONS that happen
   // to share a rule, and coalescing them HIDES ONE BEHIND THE OTHER — the 301 defect wearing a
   // rate-limit costume.
-  const collectorIn = (tenant: string) => incident({
-    incidentKey: `k-${tenant}`, customerTenantId: tenant,
-    alertTypeId: 'monitoring.collector_failing', ruleId: 'monitoring.collector_failing',
-    subjectId: 'SIGN_INS', severity: 'ACT_TODAY',
-  })
+  const collectorIn = (tenant: string) =>
+    mustRoute({
+      incidentKey: `k-${tenant}`, organizationId: SCOPE.organizationId,
+      customerTenantId: tenant, subjectId: 'SIGN_INS',
+    }, { kind: 'DECLARED_TYPE', alertTypeId: 'monitoring.collector_failing' })
   const fleet = ['tenant-1', 'tenant-2', 'tenant-3'].map(collectorIn)
   assert.equal(new Set(fleet.map(causeKeyOf)).size, 1,
     'three tenants, one broken collector, one cause')
 
-  const grantIn = (tenant: string) => incident({
-    incidentKey: `g-${tenant}`, customerTenantId: tenant,
-    alertTypeId: 'security.privileged_directory_change',
-    ruleId: 'directory.privileged_role_assigned', subjectId: 'admin-1',
-  })
+  const grantIn = (tenant: string) =>
+    incident({ incidentKey: `g-${tenant}`, customerTenantId: tenant })
   const grants = ['tenant-1', 'tenant-2', 'tenant-3'].map(grantIn)
   assert.equal(new Set(grants.map(causeKeyOf)).size, 3,
     'three tenants, three grants, three causes — even with the same actor and rule')
@@ -486,17 +505,15 @@ test('THE SWEEP — every declared rule, not the two somebody thought to check',
 
   for (const declaration of ALERT_CATALOG) {
     pairs.add(`${declaration.category}/${declaration.subject}`)
-    const inTenant = (tenant: string): RoutableIncident => ({
-      incidentKey: `k-${declaration.id}-${tenant}`,
-      organizationId: 'org-1',
-      customerTenantId: tenant,
-      alertTypeId: declaration.id,
-      ruleId: declaration.id,
-      severity: declaration.severity,
-      // When the declared subject IS the tenant, the subject id is the tenant id. That is the
-      // whole defect, so the fixture has to reproduce it rather than passing a constant.
-      subjectId: declaration.subject === 'TENANT' ? tenant : 'shared-subject',
-    })
+    const inTenant = (tenant: string): RoutableIncident =>
+      mustRoute({
+        incidentKey: `k-${declaration.id}-${tenant}`,
+        organizationId: 'org-1',
+        customerTenantId: tenant,
+        // When the declared subject IS the tenant, the subject id is the tenant id. That is
+        // the whole defect, so the fixture reproduces it rather than passing a constant.
+        subjectId: declaration.subject === 'TENANT' ? tenant : 'shared-subject',
+      }, { kind: 'DECLARED_TYPE', alertTypeId: declaration.id })
     const one = causeKeyOf(inTenant('tenant-1'))
     const two = causeKeyOf(inTenant('tenant-2'))
 
@@ -535,25 +552,46 @@ test('THE CATEGORY COMES FROM THE DECLARATION, so a caller cannot put a tenant i
   // or a vendor service principal, which is precisely the identity a fleet-wide privileged
   // change involves. Same subject, two tenants, mislabelled OPERATIONAL: one message covering a
   // privileged change in two customers, naming one of them.
-  const sharedAdmin = (tenant: string): RoutableIncident => ({
-    incidentKey: `k-${tenant}`,
-    organizationId: 'org-1',
-    customerTenantId: tenant,
-    alertTypeId: 'security.privileged_directory_change',
-    ruleId: 'directory.privileged_role_assigned',
-    severity: 'ACT_NOW',
-    subjectId: 'msp-admin@example-msp.test',
-  })
+  const sharedAdmin = (tenant: string): RoutableIncident =>
+    mustRoute({
+      incidentKey: `k-${tenant}`,
+      organizationId: 'org-1',
+      customerTenantId: tenant,
+      subjectId: 'msp-admin@example-msp.test',
+    }, PRIVILEGED)
   assert.notEqual(causeKeyOf(sharedAdmin('tenant-1')), causeKeyOf(sharedAdmin('tenant-2')),
     'the same admin in two tenants is two privileged changes, not one')
 
-  // @ts-expect-error there is no `category` on an incident for a caller to assert
-  const asserted: RoutableIncident = { ...sharedAdmin('tenant-1'), category: 'OPERATIONAL' }
-  assert.ok(asserted)
+  // AND THE PAIR CANNOT BE SUPPLIED AT ALL. An object literal is not a RoutableIncident,
+  // however plausible its fields, so there is no place to set a category or to pair a
+  // security rule with an operational type. A field a caller can still set is DERIVABLE,
+  // not derived, and only the second is what the standing rule asks for.
+  // @ts-expect-error an incident cannot be written down, only derived
+  const literal: RoutableIncident = {
+    incidentKey: 'k-1', organizationId: 'org-1', customerTenantId: 'tenant-1',
+    alertTypeId: 'monitoring.collector_failing', ruleId: 'directory.privileged_role_assigned',
+    severity: 'ACT_NOW', subjectId: 'admin-1',
+  }
+  assert.ok(literal)
 
-  // @ts-expect-error nor an alert type the catalogue does not declare
-  const undeclared: RoutableIncident = { ...sharedAdmin('tenant-1'), alertTypeId: 'security.invented' }
-  assert.ok(undeclared)
+  // AND THE LIMIT OF THE BRAND, MEASURED RATHER THAN ASSUMED. A spread COPIES the brand, so
+  // patching a derived incident does compile — I wrote a `@ts-expect-error` here claiming
+  // otherwise and the compiler reported it unused, which is the compiler catching me making
+  // the same overclaim twice in a row.
+  //
+  // What the brand actually gives: an incident cannot be FABRICATED, so no code path can
+  // invent an inconsistent pair from nothing. What it does not give: immunity from someone
+  // holding a real one and overriding a field. That is a smaller surface — it needs a valid
+  // incident in hand — and it is not zero, so it is written down rather than implied.
+  const patched = { ...sharedAdmin('tenant-1'), alertTypeId: 'monitoring.collector_failing' as const }
+  assert.equal(causeKeyOf(patched).includes('tenant-1'), false,
+    'a patched incident routes as its OVERRIDDEN type — the residual, demonstrated not hidden')
+
+  // AND AN UNCLASSIFIED CHANGE PRODUCES NO INCIDENT, so it cannot be routed under either
+  // directory type by a caller who has one to hand.
+  const refused = routableIncident(SCOPE, { kind: 'CLASSIFIED_CHANGE', classification: 'UNCLASSIFIED',
+    rule: 'directory.permission_unrecognised', severity: 'ACT_TODAY' })
+  assert.equal(refused.routable, false)
 })
 
 test('THE TYPE IS DERIVED FROM THE CLASSIFICATION, not declared beside the rule', () => {
@@ -604,15 +642,14 @@ test('EVERY DERIVED TYPE IS ONE THE CATALOGUE DECLARES, and carries the category
   for (const classification of ['URGENT', 'ROUTINE'] as const) {
     const derived = alertTypeForChange(classification)
     assert.ok(derived.resolved)
-    const inTenant = (tenant: string): RoutableIncident => ({
-      incidentKey: `k-${tenant}`,
-      organizationId: 'org-1',
-      customerTenantId: tenant,
-      alertTypeId: derived.resolved ? derived.alertTypeId : 'monitoring.recovered',
-      ruleId: 'directory.privileged_role_assigned',
-      severity: 'ACT_NOW',
-      subjectId: 'msp-admin@example-msp.test',
-    })
+    const inTenant = (tenant: string): RoutableIncident =>
+      mustRoute({
+        incidentKey: `k-${tenant}`,
+        organizationId: 'org-1',
+        customerTenantId: tenant,
+        subjectId: 'msp-admin@example-msp.test',
+      }, { kind: 'CLASSIFIED_CHANGE', classification, rule: 'directory.privileged_role_assigned',
+          severity: 'ACT_NOW' })
     assert.notEqual(causeKeyOf(inTenant('tenant-1')), causeKeyOf(inTenant('tenant-2')),
       `${classification} must not coalesce the same admin across two tenants`)
   }
