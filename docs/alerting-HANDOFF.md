@@ -45,7 +45,7 @@ four questions in order) before trusting a green suite.
 | step | state |
 |---|---|
 | 01 declarations, 02 keys and episodes | closed |
-| 03 dry run | closed. **Approved by Dharmik at the corrected scope: 47 rows now, 319 for the classifier — a rehearsal, not the fix.** Apply, revert and the runner are written and typecheck; **nothing has been run against a database by anyone**, and **nobody has yet connected to production from an engineering machine.** Note: it is an ANNOTATION, not a re-keying -- the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
+| 03 dry run | closed. **Approved by Dharmik as a rehearsal: 44 rows now, 319 for the classifier, 3 never writable.** The migration adding the two columns now exists (it did not, and step 2 was the step that found out). Apply, revert and the runner are written and typecheck; **nothing has been run against a database by anyone**, and **nobody has yet connected to production from an engineering machine.** Note: it is an ANNOTATION, not a re-keying -- the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
 | 04 finding intake | closed |
 | 05 routing and policy | closed |
 | 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function landed in `42622d1`** — L1, L2 and L4 now bound. The NUMBER is still a labelled guess. See below |
@@ -276,7 +276,7 @@ the apply, the receipt, the revert and the verification exercised against real d
 stakes before the same machinery touches rows that include real privileged changes. **If
 somebody later reports this migration as having fixed the alerting problem, it did not.**
 
-**Live figures, 2026-09-12: 366 rows, 47 writable, 319 left, 5 tenants touched.** 366 rather
+**Live figures, 2026-09-12: 366 rows, 44 writable, 319 waiting on the classifier, 3 never writable, 5 tenants touched.** 366 rather
 than 364 because two rows arrived during the conversation in which the figure was being
 discussed — the photograph problem as an observation rather than a hypothetical, and the best
 argument there is for validating the mapping against current data immediately before a write.
@@ -301,6 +301,51 @@ mapping never saw still aborts, unchanged. Two new abort kinds fall out: `EXCLUD
 exclusion is a decision about what WE write, never a promise about what the row holds) and
 `MAPPED_TWICE`. The two exclusion reasons are carried separately because they clear at different
 times — one on the classifier, one on the row's own subject, which may never resolve.
+
+### The columns the migration writes did not exist
+
+**`incident_key` and `episode` were in the code and in the docs, in no migration and not in
+`schema.prisma`.** Found by QA running the five commands end to end. The failure was delayed
+and pointed at the wrong thing: `save-mapping` reads through Prisma and never selects either
+column, so **step 1 succeeds and writes a mapping file**, and step 2 dies with `column
+"incident_key" does not exist`.
+
+`20260912120000_notification_incident_key` adds both as nullable with no default, plus
+`(organization_id, incident_key)` — organisation first, because the column exists to be grouped
+by and every read here is org-scoped. **Both are in `schema.prisma` too**, which was a ruling: a
+column absent from the schema is invisible to every consumer except a raw query, so routing
+could not see the key at all.
+
+The runbook has a **step 0** that applies it and a query to confirm it landed. **The migration
+has never been run anywhere.**
+
+A partial index `WHERE incident_key IS NOT NULL` would be much smaller — 44 of 366 rows are
+keyed — and was rejected because Prisma cannot express one, so it would exist only in the SQL
+and read as drift on the next `migrate dev`. Noted in the migration for whoever revisits it.
+
+### Three rows are permanently unwritable, and a fourth shape may be
+
+**44, not 47.** Every `TENANT_INITIAL_SYNC` row is unkeyable by construction: the shape types to
+`monitoring.collector_failing`, whose subject is `COLLECTOR`, which reads a resource type out of
+the key — and `tenant:<id>:initial-sync` is anchored with no segment that could hold one. **No
+classifier and no future data changes it.** Production holds three.
+
+There are now **three** exclusion reasons rather than two, because "left alone" was collapsing a
+row that clears when the classifier lands with one that never clears — the same collapse this
+feature has refused five times elsewhere. The vocabulary is owned by `reconciliation.ts`, which
+has both the catalogue and the key grammar; `apply-mapping.ts` aliases it rather than restating
+the literals.
+
+**AND A SECOND SHAPE IS IN THE SAME POSITION, UNCOUNTED.** `RECOVERY` types to
+`monitoring.recovered`, whose subject is **also** `COLLECTOR`, and a recovery key yields no
+resource type either. How many recovery rows production holds is not known here; if any, the 44
+and the 3 are both wrong.
+
+**It is also the one case that is a decision rather than an impossibility.** A recovery key is a
+suffix on the key it recovers, so the resource type is present one field away in `recoveryOf`.
+`parseDedupeKey` deliberately does not reach into it — checking recovery first is what stops
+every recovery being classified as whatever it recovered. **Whether a recovery belongs to the
+incident it recovers is a product question**, left open rather than answered here.
 
 ### Nobody can connect to production from an engineering machine
 

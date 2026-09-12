@@ -12,6 +12,7 @@
  */
 
 import { joinUnambiguously } from './alert-key-encoding.js'
+import { type ExclusionKind } from './reconciliation.js'
 
 /** THE FIELDS A NOTIFIER WATCHES. Named as a set because the property is about all of them.
  *
@@ -96,10 +97,24 @@ export interface MappingEntry {
  * privileged changes as routine. Migrating them as routine would be the defect this migration
  * exists to clear, re-entering through the migration.
  *
- * `SUBJECT_UNRESOLVED` is a row whose type IS determined but whose declared subject could not
- * be resolved, so it groups with nothing. Separate from the above because they clear at
- * different times: one waits on the classifier, the other on the row itself. */
-export type ExclusionReason = 'TYPE_UNDETERMINED' | 'SUBJECT_UNRESOLVED'
+ * `SUBJECT_UNRESOLVED` is a row whose type IS determined but whose declared subject did not
+ * resolve for THIS row — a missing audit join, an absent actor. Another row of the same shape
+ * might resolve; this one did not.
+ *
+ * `SHAPE_CANNOT_NAME_SUBJECT` IS THE ONE THAT IS NOT WAITING FOR ANYTHING. The key shape has
+ * no segment that could ever carry what its declared subject reads, so no classifier and no
+ * future data changes it. `tenant:<id>:initial-sync` types to `monitoring.collector_failing`,
+ * whose subject is COLLECTOR, which reads a resource type the shape cannot express.
+ *
+ * THREE REASONS RATHER THAN TWO because "left alone" was collapsing a row that clears when
+ * the classifier lands with one that never clears. An operator reading one number waits for
+ * something that is not coming, which is the same collapse this feature has refused five
+ * times elsewhere.
+ *
+ * RE-EXPORTED, NOT REDECLARED. Deciding which of the three applies needs the catalogue and
+ * the key grammar, so the vocabulary is owned by `reconciliation.ts` and this is an alias.
+ * Two identical literal unions in two files are two things that can disagree. */
+export type ExclusionReason = ExclusionKind
 
 export interface Excluded {
   readonly decision: 'EXCLUDE'

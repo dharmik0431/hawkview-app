@@ -117,6 +117,75 @@ export function parseDedupeKey(dedupeKey: string): ParsedKey {
   return unparsed('UNRECOGNISED')
 }
 
+/** Whether a key of this shape can EVER name a resource type.
+ *
+ * A PROPERTY OF THE GRAMMAR, NOT OF A ROW. `tenant:<id>:sync:<resource>` has a segment for
+ * one; `tenant:<id>:initial-sync` is anchored with nothing after it, so no data in any row of
+ * that shape can supply one. That difference decides whether a row is waiting for something
+ * or is permanently unable, and those are not the same fact.
+ *
+ * RECOVERY IS THE INTERESTING ENTRY. A recovery key is a suffix on another key, so the
+ * resource type is physically present inside `recoveryOf` — and `parseDedupeKey` deliberately
+ * does not reach into it, because checking recovery first is what stops every recovery being
+ * classified as whatever it recovered. So `false` here is accurate about the parse as it
+ * stands, and it is the one entry that a DECISION could change rather than only new data.
+ * Flagged rather than quietly fixed: whether a recovery belongs to the incident it recovers
+ * is a product question.
+ *
+ * Coupled to `parseDedupeKey` by a test rather than trusted — a table restating what another
+ * function does is a second implementation until something checks the two agree. */
+export const SHAPE_CAN_NAME_A_RESOURCE_TYPE: Readonly<Record<KeyShape, boolean>> = {
+  DIRECTORY_AUDIT: false,
+  TENANT_SYNC: true,
+  TENANT_CONNECTION: false,
+  TENANT_INITIAL_SYNC: false,
+  TENANT_ONBOARDING: false,
+  RECOVERY: false,
+  UNRECOGNISED: false,
+}
+
+/** Whether NO row of this shape could ever resolve this subject role.
+ *
+ * THE DIFFERENCE THIS EXISTS TO KEEP. A row excluded from the migration is either waiting on
+ * something — the classifier, an audit join, a subject that has not appeared yet — or it is
+ * excluded by construction and no future data will change it. Reporting both as "the subject
+ * does not resolve" tells an operator to wait for something that is not coming.
+ *
+ * Only two roles can be decided here, and both are decided by reading `subjectFor`:
+ *
+ * - `COLLECTOR` reads the resource type out of the key, so it turns on the grammar above.
+ * - `ACCOUNT` returns unresolved unconditionally for a migration row, because the old system
+ *   had no concept of an assessed account. No shape can satisfy it.
+ *
+ * `ACTOR` and `TARGET` read the joined audit record and `TENANT` reads a column, so for those
+ * a row is genuinely waiting on data and this returns false. */
+export function permanentlyUnresolvable(shape: KeyShape, role: SubjectRole): boolean {
+  if (role === 'ACCOUNT') return true
+  if (role === 'COLLECTOR') return !SHAPE_CAN_NAME_A_RESOURCE_TYPE[shape]
+  return false
+}
+
+/** Why a row is not being keyed by the migration. ONE OWNER FOR THE VOCABULARY, here rather
+ * than in `apply-mapping.ts`, because deciding it needs the catalogue and the key grammar and
+ * this module has both. The apply imports the type; nothing restates the literals. */
+export type ExclusionKind = 'TYPE_UNDETERMINED' | 'SUBJECT_UNRESOLVED' | 'SHAPE_CANNOT_NAME_SUBJECT'
+
+/** Classify an unkeyable row.
+ *
+ * THE THIRD ANSWER IS THE POINT. `TYPE_UNDETERMINED` clears when the classifier reaches
+ * historical audit rows. `SUBJECT_UNRESOLVED` may clear for this row when its audit record
+ * joins. `SHAPE_CANNOT_NAME_SUBJECT` never clears — the key has no segment for what its
+ * declared subject reads — and reporting it beside the first two tells an operator to wait
+ * for something that is not coming. */
+export function exclusionKindFor(alertTypeId: string | null, shape: KeyShape): ExclusionKind {
+  if (alertTypeId === null) return 'TYPE_UNDETERMINED'
+  const declaration = declarationFor(alertTypeId)
+  if (declaration !== null && permanentlyUnresolvable(shape, declaration.subject)) {
+    return 'SHAPE_CANNOT_NAME_SUBJECT'
+  }
+  return 'SUBJECT_UNRESOLVED'
+}
+
 /** Which declared alert type a shape becomes.
  *
  * `null` where the shape alone does not determine it. A directory-audit row becomes the

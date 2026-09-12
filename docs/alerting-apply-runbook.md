@@ -2,7 +2,7 @@
 
 **Operator: Dharmik. Nothing here runs automatically and nothing runs from an agent session.**
 
-> **THIS MIGRATION KEYS ABOUT 47 ROWS, NOT 364. If you were told 364, that was us.**
+> **THIS MIGRATION KEYS ABOUT 44 ROWS, NOT 364. If you were told 364, that was us.**
 >
 > **What changed:** the previously stated figures — 364 / 71 / 62 / 9 / 47 — answer *how many
 > incidents are in this data*, computed under the nominated type. They are correct for that
@@ -10,10 +10,15 @@
 > rows this run is authorised to key today.** Two questions that were never the same number,
 > read as one, in every status report given on this migration.
 >
-> **Why 47.** `TYPE_FOR_SHAPE` maps `DIRECTORY_AUDIT` to `null` on purpose: the key shape does
+> **Why 44.** `TYPE_FOR_SHAPE` maps `DIRECTORY_AUDIT` to `null` on purpose: the key shape does
 > not determine the alert type, and defaulting it would file real privileged changes as
-> routine. Those rows reach the mapping as EXCLUDED, and the apply writes only what the
-> mapping authorises. **That is the ruling, not a limitation** — see the section below.
+> routine. Those 319 rows reach the mapping as EXCLUDED, and the apply writes only what the
+> mapping authorises. **That is the ruling, not a limitation** — see the section below. Three
+> more are unkeyable by construction and will never be writable.
+>
+> **Beware two different 47s.** Until this correction the writable count and the count of
+> incidents with unrecoverable episodes were both 47, by coincidence, and appeared in adjacent
+> sentences. The writable count is now 44; the episode figure is still 47 and is unrelated.
 >
 > **Read the split, not the total.** `save-mapping` now prints three groups under three
 > headings, each labelled by the question it answers. If any one of them is read as the
@@ -28,15 +33,15 @@
 
 **Approved by Dharmik at this scope, on this basis, and the basis is the part to keep.**
 
-**The 47 rows are monitoring rows. The 301 unclosable alerts — the thing that prompted all of
-this — are all in the other 319.** Keying 47 rows changes almost nothing an MSP would notice.
+**The 44 rows are monitoring rows. The 301 unclosable alerts — the thing that prompted all of
+this — are all in the other 319.** Keying 44 rows changes almost nothing an MSP would notice.
 
 So this is a **proving run**: the apply, the receipt, the revert and the verification exercised
 against real production data at low stakes, before the same machinery touches rows that include
 real privileged changes. He asked *what is this number for* before approving it, and chose it
 as a rehearsal rather than as a result.
 
-**Do not let 47 be read as the benefit.** If somebody later reports this migration as having
+**Do not let 44 be read as the benefit.** If somebody later reports this migration as having
 fixed the alerting problem, it did not: it proved the mechanism that will. The fix is the 319,
 and it needs the classifier pointed at historical audit rows first.
 
@@ -46,10 +51,34 @@ Measured against production on **2026-09-12**:
 
 ```
 366 rows total
- 47 writable now
-319 left for the classifier
+ 44 writable now
+319 waiting on the classifier
+  3 NEVER writable - see below
   5 tenants touched
 ```
+
+**44, not 47.** Three `TENANT_INITIAL_SYNC` rows are unkeyable by construction and are not
+waiting for anything. The chain is entirely in the code: the shape types to
+`monitoring.collector_failing`, whose subject is `COLLECTOR`, which reads a resource type out
+of the key — and `tenant:<id>:initial-sync` is anchored with no segment that could hold one.
+**No classifier and no future data changes it.**
+
+They are listed apart from the 319 because **those are different facts**. One clears when the
+classifier reaches historical audit rows; the other never clears. A single "left alone" number
+tells an operator to wait for something that is not coming.
+
+> **A second shape is in the same position and has not been counted.** `RECOVERY` types to
+> `monitoring.recovered`, whose subject is **also** `COLLECTOR`, and a recovery key yields no
+> resource type either — so recovery rows are unkeyable today for exactly the same reason.
+> **How many are in production is not known here.** If there are any, they are currently inside
+> the 44 or the 3 and neither figure is right.
+>
+> **It is also the one case that is a decision rather than an impossibility.** A recovery key is
+> a suffix on the key it recovers, so the resource type is physically present one field away, in
+> `recoveryOf`. `parseDedupeKey` deliberately does not reach into it — checking recovery first
+> is what stops every recovery being classified as whatever it recovered. **Whether a recovery
+> belongs to the incident it recovers is a product question**, and until it is answered these
+> rows report as permanently unwritable, which is accurate about today.
 
 **366, not the 364 quoted everywhere else in this document — two rows arrived during the
 conversation in which the figure was being discussed.** That is the photograph problem, not as
@@ -63,9 +92,10 @@ reason to compare against the figures above is to notice a change big enough to 
 
 ## What the apply is allowed to key — ruled: (b), the typed rows only
 
-**47 rows now, 317 when the classifier reaches historical audit rows.** The migration lands in
-two parts and the second is not blocked forever: the classifier exists, it is simply not wired
-to those rows yet, which is scoped work rather than an open question.
+**44 rows now, 319 when the classifier reaches historical audit rows, and 3 never.** The
+migration lands in two parts and the second is not blocked forever: the classifier exists, it
+is simply not wired to those rows yet, which is scoped work rather than an open question. The
+three are not part of either wave.
 
 **(a) — keying everything under the nominated type — is off the table, and not because it is
 riskier.** It contradicts a decision already made. It assumes a single type for rows whose type
@@ -75,17 +105,17 @@ those rows are not routine by default. **Migrating them as routine would be the 
 re-entering through the migration built to clear it.**
 
 **The smaller first part is an advantage rather than a consolation.** It proves the apply, the
-receipt and the revert against 47 real rows before 317 depend on them.
+receipt and the revert against 44 real rows before 319 depend on them.
 
 ## Unwritable is not refused, and the run depends on the difference
 
-With 47 writable rows among 364 present, **317 rows are expected to be unwritable.** If those
+With 44 writable rows among 366 present, **322 rows are expected to be unwritable.** If those
 read as refusals the preflight aborts every time by design and the apply can never run.
 
 **That is not hypothetical — it was the state of the code when the ruling arrived.** The
 mapping was a list of writes, so the scope of the run was *inferred* as "everything in the
 table", and every row deliberately left out arrived at the final check as `ROW_UNEXPECTED`. On
-production: 317 differences, on a clean table, every time.
+production: 322 differences, on a clean table, every time.
 
 **The fix is that the mapping states its scope instead of the table implying it.** A mapping is
 now a decision about every row it saw — `WRITE` or `EXCLUDE`, one per row, in one list so there
@@ -115,7 +145,7 @@ second look like it is coming soon.
 > **A NOTE ON EVERY 364 BELOW THIS LINE.** They are ROW counts — rows in the table when the
 > figure was taken, rows QA ran the emitted SQL against, rows the timing was measured at.
 > **None of them is a write count**, and the live row count is now 366. The write count is
-> about 47 and appears only where it is labelled as one.
+> about 44 and appears only where it is labelled as one.
 
 ## The two schema findings that determine the shape
 
@@ -201,6 +231,41 @@ if it fails, that is a finding for this section rather than a mystery.
 **The first real test of the connection is step 1, and step 1 is read-only.** There is no need
 to prove the connection some other way first.
 
+## Step 0 — apply the migration that creates the columns
+
+**This step did not exist, and without it the runbook cannot be followed to the end.**
+`incident_key` and `episode` were referred to by the runner, by `apply-mapping.ts` and
+throughout this document, and were **in no migration and not in `schema.prisma`**.
+
+**The failure was delayed and pointed at the wrong thing.** `save-mapping` reads through Prisma
+and never selects either column, so step 1 **succeeds** and writes a mapping file, and step 2
+dies with `column "incident_key" does not exist`. An operator would get a clean-looking artefact
+and then a schema error, in that order, and would reasonably suspect the runner.
+
+```powershell
+npx prisma migrate deploy
+```
+
+`20260912120000_notification_incident_key` adds two nullable columns and one index. **It reads
+no row, writes no row and deletes nothing** — every existing row gets NULL in both, which is
+exactly the state the apply expects to find and exactly the state a revert returns them to.
+
+**Confirm it landed before going on:**
+
+```sql
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_name = 'notifications' AND column_name IN ('incident_key', 'episode');
+```
+
+Two rows, both `YES` for nullable. If you get none, step 2 is the one that will tell you, and
+it will look like a runner problem.
+
+**Both columns are in `schema.prisma` as well as in the migration, and that was a ruling.** A
+column absent from the schema is invisible to every consumer except a raw query — so routing,
+and anything that reads incidents, could not see the key at all, which defeats the purpose of
+many rows sharing one.
+
 ## Step 1 — save the approved mapping
 
 **Start by confirming where you are.** This step used to open with an absolute path into one
@@ -233,12 +298,13 @@ They will have drifted — see* The figures, and when they were true.
 Read 366 notification rows.
 
   HOW MANY ROWS THIS RUN WOULD KEY
-    47 writable, across M incidents
+    44 writable, across M incidents
     U of those carry no episode number (unrecoverable)
 
   HOW MANY IT WOULD LEAVE ALONE, AND WHY - decisions, not refusals
-    319 the key shape does not type (waiting on the classifier)
-    0 typed, but the declared subject does not resolve
+    319 waiting on the classifier (the key shape does not type)
+    3 NEVER writable - the key shape cannot name what its subject reads
+    0 typed, but this row’s subject did not resolve
 
   HOW MANY INCIDENTS ARE IN THE DATA - a different question, under the nominated type
     71 incidents, 71 episodes (62 attributed, 9 standing alone)
@@ -253,11 +319,12 @@ mistake that put 71 into every status report as though it were a write count.
 
 **What to check, per group.**
 
-1. **Rows this run would key.** About 47 on 2026-09-12. **If it comes back near the total,
+1. **Rows this run would key.** About 44 on 2026-09-12. **If it comes back near the total,
    something changed in `TYPE_FOR_SHAPE`** and that is a bigger conversation than this runbook.
-2. **Rows left alone.** About 319, and the first line should hold nearly all of them. **A large
-   `subject does not resolve` count is a finding** — those do not clear when the classifier
-   lands, and may never clear.
+2. **Rows left alone.** About 319 waiting, 3 never. **The middle line is the one to read** — it
+   counts rows no classifier will ever reach, and if it is larger than 3 a shape has moved into
+   that category, which is a finding. A non-zero third line is also a finding: those are rows
+   whose subject is resolvable in principle and absent in fact.
 3. **Incidents in the data.** This is where 71 / 62 / 9 / 47 belong. A change here is not a
    reason to stop by itself — rows keep arriving — but a change **larger than the row count
    moved** is, because then something other than new data has changed.
@@ -275,8 +342,8 @@ node --import tsx scripts/alerting-apply.mts preflight --mapping ..\artefacts\ma
 
 ```
 No differences. The mapping still describes the data.
-47 rows would be written. 0 already carry it and would not be written again.
-319 left alone by decision, not by refusal.
+44 rows would be written. 0 already carry it and would not be written again.
+322 left alone by decision, not by refusal.
 PREFLIGHT PASSED - safe to apply.
 ```
 
@@ -317,10 +384,10 @@ node --import tsx scripts/alerting-apply.mts apply --mapping ..\artefacts\mappin
 
 ```
 Preflight re-run inside the transaction: no differences.
-Applied 47 rows in one statement, in one transaction.
-Left alone by decision: 319. These were never candidates.
+Applied 44 rows in one statement, in one transaction.
+Left alone by decision: 322. These were never candidates.
 Watched fields disturbed: none
-Wrote ..\artefacts\receipt.json - 47 changes, 0 untouched. THE REVERT NEEDS THIS FILE.
+Wrote ..\artefacts\receipt.json - 44 changes, 0 untouched. THE REVERT NEEDS THIS FILE.
 APPLY COMPLETE.
 ```
 
@@ -341,8 +408,8 @@ node --import tsx scripts/alerting-apply.mts verify --receipt ..\artefacts\recei
 **The checklist, and what each line means:**
 
 ```
-[ok] 47 of 47 receipt rows carry the key the receipt records
-[ok] M distinct incident keys across 47 keyed rows
+[ok] 44 of 44 receipt rows carry the key the receipt records
+[ok] M distinct incident keys across 44 keyed rows
 [  ] X keyed rows carry an episode number, Y carry null - compare both against the
      save-mapping figures rather than reading either as a pass
 [ok] no incident key is shared across two organisations (0 are)
@@ -380,18 +447,18 @@ exactly what it wrote.** Never a blanket update, and it writes its own receipt.
 **Expected output — complete revert:**
 
 ```
-Checked 47 rows from receipt 4f1c8e2a-....
-Reverted 47. Refused 0.
+Checked 44 rows from receipt 4f1c8e2a-....
+Reverted 44. Refused 0.
 Watched fields disturbed: none
 Wrote ..\artefacts\revert-receipt.json
-REVERT COMPLETE - 47 put back, 0 left alone, 47 of 47 accounted for.
+REVERT COMPLETE - 44 put back, 0 left alone, 44 of 44 accounted for.
 ```
 
 **Expected output — partial revert. THIS IS A SUCCESS, NOT A FAILURE:**
 
 ```
-Checked 47 rows from receipt 4f1c8e2a-....
-Reverted 46. Refused 1.
+Checked 44 rows from receipt 4f1c8e2a-....
+Reverted 43. Refused 1.
 
 ABORTED - 1 difference(s). Nothing was written.
 
@@ -402,7 +469,7 @@ A refused row is not half-done work: somebody changed it after the apply, so it 
 longer this run's to undo. Leaving it alone is the answer, not a partial one.
 Watched fields disturbed: none
 Wrote ..\artefacts\revert-receipt.json
-REVERT COMPLETE - 46 put back, 1 left alone, 47 of 47 accounted for.
+REVERT COMPLETE - 43 put back, 1 left alone, 44 of 44 accounted for.
 ```
 
 **The `ABORTED - ... Nothing was written` line inside a successful revert is a wart.** The
@@ -613,6 +680,9 @@ QA identified in A2, demonstrated rather than asserted.
   `DATABASE_URL` in the engineering worktree.
 - **The runner exists and typechecks; that is all.** Typechecking is not execution, and the
   two are easy to conflate at the moment a file stops being missing.
+- **The migration has never been applied anywhere.** It is written and the schema validates;
+  no database has run it. QA reproduced the missing-columns failure by dropping the columns,
+  which means they had columns to drop — that was their fixture, not this migration.
 - **The number of rows the apply would write is unmeasured.** See the open decision at the top.
   Every "364" in this document below that point is a row count, not a write count.
 - **Neither script had ever been typechecked** until `tsconfig.scripts.json` existed, and the

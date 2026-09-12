@@ -28,7 +28,9 @@ import { dirname, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../src/generated/prisma/client.js'
-import { parseDedupeKey, reconcile, type ExistingAlertRow } from '../src/alerts/reconciliation.js'
+import {
+  exclusionKindFor, parseDedupeKey, reconcile, type ExistingAlertRow,
+} from '../src/alerts/reconciliation.js'
 import {
   applyStatement, applyValidated, digestOf, explain, revertStatement, validateApply,
   validateRevert, watchedFieldsDisturbedBetween,
@@ -179,9 +181,10 @@ async function computeMapping(): Promise<{ decisions: MappingDecision[]; figures
       decisions.push({
         decision: 'EXCLUDE',
         notificationId: entry.notificationId,
-        // The two clear at different times: one waits on the classifier reaching historical
-        // audit rows, the other on the row’s own subject becoming resolvable.
-        because: entry.alertTypeId === null ? 'TYPE_UNDETERMINED' : 'SUBJECT_UNRESOLVED',
+        // THREE OUTCOMES, AND ONLY ONE OF THEM IS WAITING FOR THE CLASSIFIER. The third is
+        // decided by the key GRAMMAR rather than by this row: a shape with no segment for
+        // what its subject reads can never group, whatever arrives later.
+        because: exclusionKindFor(entry.alertTypeId, entry.shape),
       })
       continue
     }
@@ -212,6 +215,7 @@ async function computeMapping(): Promise<{ decisions: MappingDecision[]; figures
       writable: writes.length,
       typeUndetermined: excluded.filter((entry) => entry.because === 'TYPE_UNDETERMINED').length,
       subjectUnresolved: excluded.filter((entry) => entry.because === 'SUBJECT_UNRESOLVED').length,
+      shapeCannotName: excluded.filter((entry) => entry.because === 'SHAPE_CANNOT_NAME_SUBJECT').length,
       unnumbered: writes.filter((entry) => entry.episode === null).length,
       incidentsAmongWritable: new Set(writes.map((entry) => entry.incidentKey)).size,
       // THE FIGURES THAT ANSWER A DIFFERENT QUESTION, and they are grouped apart for that
@@ -245,8 +249,9 @@ async function main(): Promise<void> {
     console.log(`    ${figures.unnumbered} of those carry no episode number (unrecoverable)`)
     console.log('')
     console.log('  HOW MANY IT WOULD LEAVE ALONE, AND WHY - decisions, not refusals')
-    console.log(`    ${figures.typeUndetermined} the key shape does not type (waiting on the classifier)`)
-    console.log(`    ${figures.subjectUnresolved} typed, but the declared subject does not resolve`)
+    console.log(`    ${figures.typeUndetermined} waiting on the classifier (the key shape does not type)`)
+    console.log(`    ${figures.shapeCannotName} NEVER writable - the key shape cannot name what its subject reads`)
+    console.log(`    ${figures.subjectUnresolved} typed, but this row\u2019s subject did not resolve`)
     console.log('')
     console.log('  HOW MANY INCIDENTS ARE IN THE DATA - a different question, under the nominated type')
     console.log(`    ${figures.incidentsInAllData} incidents, ${figures.episodes} episodes `

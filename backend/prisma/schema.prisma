@@ -143,6 +143,19 @@ model Notification {
   expiresAt         DateTime?               @map("expires_at") @db.Timestamptz(6)
   createdAt         DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt         DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// The incident this row belongs to. NULL until step 03 keys it, and NULL again after a
+  /// revert. Many rows share one key: the unique constraint below forbids them sharing a
+  /// dedupe key, so consolidation is a column rather than fewer rows.
+  ///
+  /// IN THE SCHEMA RATHER THAN ONLY IN THE MIGRATION, which was a ruling. A column absent
+  /// from the schema is invisible to every consumer except a raw query — so routing, and
+  /// anything that reads incidents, could not see the key at all, and the point of the
+  /// migration is that many rows share one.
+  incidentKey       String?                 @map("incident_key") @db.VarChar(300)
+  /// Which burst within the incident. NULL where the count could not be recovered, which is
+  /// a VALUE and not an absence: it means the incident holds a row whose event time is gone.
+  /// Distinguishable from episode 1, deliberately.
+  episode           Int?
   organization      Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   customerTenant    CustomerTenant?         @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
   states            NotificationUserState[]
@@ -150,6 +163,10 @@ model Notification {
   @@unique([organizationId, dedupeKey])
   @@index([organizationId, lastOccurredAt(sort: Desc)])
   @@index([customerTenantId, resolvedAt])
+  /// Organisation first: the column exists to be grouped by, every read here is org-scoped,
+  /// and an incident key never spans two organisations. See the migration for why this is
+  /// not a partial index.
+  @@index([organizationId, incidentKey])
   @@map("notifications")
 }
 
