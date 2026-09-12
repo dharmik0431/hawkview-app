@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ALERT_CATALOG } from './alert-catalog.js'
+import { alertType, ALERT_CATALOG } from './alert-catalog.js'
 import {
+  alertTypeForChange,
   causeKeyOf,
   contradictions,
   defaultPreference,
@@ -553,4 +554,66 @@ test('THE CATEGORY COMES FROM THE DECLARATION, so a caller cannot put a tenant i
   // @ts-expect-error nor an alert type the catalogue does not declare
   const undeclared: RoutableIncident = { ...sharedAdmin('tenant-1'), alertTypeId: 'security.invented' }
   assert.ok(undeclared)
+})
+
+test('THE TYPE IS DERIVED FROM THE CLASSIFICATION, not declared beside the rule', () => {
+  // The residual: alertTypeId and ruleId were independent fields with nothing tying them, so a
+  // security-natured rule paired with an operational type merged two tenants again. The
+  // mapping has an owner already — the classifier's verdict is exactly the distinction the
+  // catalogue's two directory types draw — so this creates no second place for the fact.
+  assert.deepEqual(alertTypeForChange('URGENT'),
+    { resolved: true, alertTypeId: 'security.privileged_directory_change' })
+  assert.deepEqual(alertTypeForChange('ROUTINE'),
+    { resolved: true, alertTypeId: 'security.routine_directory_change' })
+
+  // AND IT DISCRIMINATES: two classifications, two types. A derivation returning one answer
+  // everywhere satisfies "there is a mapping" and means nothing.
+  assert.notEqual(
+    alertTypeForChange('URGENT'), alertTypeForChange('ROUTINE'))
+
+  // UNCLASSIFIED REFUSES RATHER THAN DEFAULTING. Neither privileged nor routine; picking
+  // either files a real privileged change as a record or pages somebody about a read scope.
+  const refused = alertTypeForChange('UNCLASSIFIED')
+  assert.equal(refused.resolved, false)
+  assert.match(refused.resolved ? '' : refused.because, /could not be classified/)
+
+  // The refusal must not name a type anywhere in its sentence, or a caller reading the message
+  // gets the default the type refused to give.
+  for (const declared of ALERT_CATALOG) {
+    assert.doesNotMatch(refused.resolved ? '' : refused.because,
+      new RegExp(declared.id.replace(/\./g, '\\.')),
+      `the refusal must not name ${declared.id}`)
+  }
+})
+
+test('EVERY DERIVED TYPE IS ONE THE CATALOGUE DECLARES, and carries the category it needs', () => {
+  // A derivation that produced an id the catalogue does not declare would fail at the first
+  // causeKeyOf call rather than here, which is later and further from the cause.
+  for (const classification of ['URGENT', 'ROUTINE'] as const) {
+    const derived = alertTypeForChange(classification)
+    assert.ok(derived.resolved)
+    const declaration = alertType(derived.resolved ? derived.alertTypeId : 'monitoring.recovered')
+    assert.equal(declaration.category, 'SECURITY',
+      'a directory change is a security finding, so it must never coalesce across tenants')
+    assert.equal(declaration.subject, 'ACTOR',
+      'and its subject is who made the change')
+  }
+
+  // THE CONSEQUENCE THAT MATTERS, checked through the key rather than asserted about it: two
+  // tenants stay two causes for both derived types.
+  for (const classification of ['URGENT', 'ROUTINE'] as const) {
+    const derived = alertTypeForChange(classification)
+    assert.ok(derived.resolved)
+    const inTenant = (tenant: string): RoutableIncident => ({
+      incidentKey: `k-${tenant}`,
+      organizationId: 'org-1',
+      customerTenantId: tenant,
+      alertTypeId: derived.resolved ? derived.alertTypeId : 'monitoring.recovered',
+      ruleId: 'directory.privileged_role_assigned',
+      severity: 'ACT_NOW',
+      subjectId: 'msp-admin@example-msp.test',
+    })
+    assert.notEqual(causeKeyOf(inTenant('tenant-1')), causeKeyOf(inTenant('tenant-2')),
+      `${classification} must not coalesce the same admin across two tenants`)
+  }
 })

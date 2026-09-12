@@ -339,3 +339,100 @@ rule. If two fine rules under one type carry different preferences — one silen
 coalescing them into a single cause makes one message span both, and `contradictions` would be
 right to complain. Whether the cause key should therefore use the fine rule, or whether
 preferences should be constrained not to differ within a type, is a product decision.
+
+## The standing rule, because it is the third time
+
+> **When two fields on one object can disagree about the same fact, one is derived from the
+> other or both from a shared owner — never both supplied.**
+
+| step | the fact | who was supplying it wrongly |
+|---|---|---|
+| 02 | the incident subject | the caller, instead of the declaration |
+| 05 | the alert category | the caller, instead of the catalogue |
+| 05 | the alert type | the caller, alongside an unrelated rule id |
+
+Same sentence three times. **Anything a caller can get wrong in two places will eventually be
+wrong in one of them, and the failure is always silent, because each field is individually
+plausible.** Nothing about `category: 'OPERATIONAL'` looks wrong next to a security rule id —
+it is a valid value of a real type, and only the pair is nonsense.
+
+This applies to the remaining steps as a design rule, not as a thing to check afterwards. A
+review can catch a wrong value; only the shape can stop the pair existing.
+
+### The residual, closed by derivation
+
+`alertTypeId` and `ruleId` were independent fields with nothing tying them, so a
+security-natured rule paired with an operational type merged two tenants again. Not live —
+no mapping existed — but the shape was there waiting for one.
+
+**The mapping had an owner already**, which is why this creates no second place for the fact.
+`ChangeClassification` (`URGENT | ROUTINE | UNCLASSIFIED`) is exactly the distinction the
+catalogue's two directory types draw, and `ClassifiedChange.severity` is *already* derived from
+it rather than chosen beside it. `alertTypeForChange` is the same derivation, one field over.
+
+A table from twenty-eight rule ids to seven type ids would have **been** that second place:
+twenty-eight rows somebody maintains, each able to disagree with the verdict the classifier
+already reached.
+
+**`UNCLASSIFIED` refuses rather than defaulting**, and the refusal names no type — checked
+against every catalogue id, so a caller reading the sentence cannot extract the default the
+function declined to give.
+
+### And the qualification on the sweep, which is the load-bearing part
+
+The sweep holds because **no operational rule has an ACCOUNT-shaped subject** — a fact about
+today's catalogue, not about the key. An `OPERATIONAL` rule with an `ACTOR`, `TARGET` or
+`ACCOUNT` subject would drop the tenant and put it straight back through the subject id. The
+pairs assertion is what stands between us and that, and it discriminates: mutating
+`collector_failing` to `ACTOR` fails three tests by name.
+
+## Two shapes, for approval before any code
+
+### Escalation
+
+No new axis. The ladder is a function of **time since notified** and the **ownership state**
+that already exists — step 01's `acknowledge` — so "somebody has this" is asked in exactly one
+place.
+
+```
+EscalationState =
+  | { kind: 'WAITING'; notifiedAt; nextRungAt }     // nobody has acknowledged yet
+  | { kind: 'ACKNOWLEDGED'; by; at }                // the ladder stops, permanently
+  | { kind: 'EXHAUSTED'; lastRungAt; because }      // every rung climbed, still nobody
+```
+
+Three things I would want ruled on:
+
+**A rung is a delivery, so it obeys everything above it.** Quiet hours hold it, the cause key
+coalesces it, `RECORD_ONLY` means no rung ever fires. That last one is the interesting case: an
+MSP who silenced a rule has, by the same act, silenced its escalation — which I think is right
+and is worth being deliberate about rather than discovering.
+
+**`EXHAUSTED` is not a failure state and must not read as one.** It means we told everybody we
+were told to tell. Whether it also raises something to HawkView's own operators is a product
+question I have not answered.
+
+**Acknowledgement is per incident, not per delivery.** Acknowledging a coalesced message about
+fifteen tenants acknowledges the cause. If that is wrong — if an MSP must acknowledge each
+tenant — then coalescing and escalation are in tension and I would rather know now.
+
+### Delivery limits
+
+Two mechanisms, because a fleet-wide cause and a per-tenant burst want different answers, and
+one mechanism doing both would do one of them badly.
+
+| when | mechanism | why |
+|---|---|---|
+| many tenants, one cause | **aggregate** | already how the cause key works; the limit is the same idea counted rather than keyed |
+| many causes, one MSP, short window | **defer** | each cause is a real separate thing; folding them loses the distinction, so they queue |
+
+**Counted over the MSP and the tick**, matching `fanOutProblems`, so the limit and the
+invariant measure the same window rather than two windows that nearly agree.
+
+**Never drop** — there is no bucket for it, so the shape cannot express the outcome.
+
+The open question is the number, and I would rather measure it than pick it: the honest input
+is the observed distribution of causes per MSP per tick on production data, and I do not have
+production access. Until then the limit is a constant with its provenance recorded as *not yet
+measured*, which is the same discipline the staleness threshold got — and unlike that one, it
+does not yet have its 5,166 runs behind it.

@@ -21,6 +21,7 @@
 
 import { joinUnambiguously } from './alert-key-encoding.js'
 import { alertType, type AlertTypeId } from './alert-catalog.js'
+import type { ChangeClassification } from './privileged-change.js'
 import type { AlertCategory } from './alert-lifecycle.js'
 import type { RoutingTier, Severity } from './alert-type.js'
 
@@ -446,4 +447,44 @@ export function contradictions(outcome: RoutingOutcome): readonly string[] {
       `${ruleId} was delivered while the standing statement says it is silenced. `
       + 'The preference at delivery time wins: this should be suppressed.')
     .sort()
+}
+
+/** WHICH DECLARED TYPE A CLASSIFIED CHANGE BECOMES. Derived, never declared beside the rule.
+ *
+ * THE RESIDUAL THIS CLOSES: `alertTypeId` and `ruleId` were independent fields on
+ * `RoutableIncident` with nothing tying them, so a security-natured rule paired with an
+ * operational type merged two tenants again. Not live — no mapping existed — but the shape was
+ * there waiting for one.
+ *
+ * AND THE MAPPING HAS AN OWNER ALREADY, so this creates no second place for the fact. The
+ * classifier's `ChangeClassification` is exactly the distinction the catalogue's two directory
+ * types draw, and `ClassifiedChange.severity` is already derived from it rather than chosen
+ * beside it. This is the same derivation, one field over. A table from the twenty-eight rule
+ * ids to the seven type ids would have been that second place — twenty-eight rows somebody
+ * maintains, each able to disagree with the verdict the classifier already reached.
+ *
+ * UNCLASSIFIED REFUSES RATHER THAN DEFAULTING. A change nobody could classify is neither
+ * privileged nor routine, and picking either files a real privileged change as a record or
+ * pages somebody about a read scope. Step 03 settled this for the migration — "an audit row is
+ * not given a default type" — and the reason is the same here: the shortcut is invisible
+ * afterwards, because both answers look like answers. */
+export type TypeForChange =
+  | Readonly<{ resolved: true; alertTypeId: AlertTypeId }>
+  | Readonly<{ resolved: false; because: string }>
+
+export function alertTypeForChange(classification: ChangeClassification): TypeForChange {
+  switch (classification) {
+    case 'URGENT':
+      return { resolved: true, alertTypeId: 'security.privileged_directory_change' }
+    case 'ROUTINE':
+      return { resolved: true, alertTypeId: 'security.routine_directory_change' }
+    case 'UNCLASSIFIED':
+      return {
+        resolved: false,
+        because:
+          'The change could not be classified, so it is neither the privileged type nor the '
+          + 'routine one. Routing it under either would file a real privileged change as a '
+          + 'record or page somebody about a read scope.',
+      }
+  }
 }
