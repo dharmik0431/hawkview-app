@@ -276,7 +276,7 @@ the apply, the receipt, the revert and the verification exercised against real d
 stakes before the same machinery touches rows that include real privileged changes. **If
 somebody later reports this migration as having fixed the alerting problem, it did not.**
 
-**Live figures, 2026-09-12: 366 rows, 44 writable, 319 waiting on the classifier, 3 never writable, 5 tenants touched.** 366 rather
+**Live figures, 2026-09-12: 366 rows, 319 awaiting the classifier, 3 never writable, 17 recoveries ruled writable, 44 writable today (an upper bound - see below), 5 tenants touched.** 366 rather
 than 364 because two rows arrived during the conversation in which the figure was being
 discussed — the photograph problem as an observation rather than a hypothetical, and the best
 argument there is for validating the mapping against current data immediately before a write.
@@ -323,7 +323,7 @@ A partial index `WHERE incident_key IS NOT NULL` would be much smaller — 44 of
 keyed — and was rejected because Prisma cannot express one, so it would exist only in the SQL
 and read as drift on the next `migrate dev`. Noted in the migration for whoever revisits it.
 
-### Three rows are permanently unwritable, and a fourth shape may be
+### Three rows are permanently unwritable; recoveries were ruled writable
 
 **44, not 47.** Every `TENANT_INITIAL_SYNC` row is unkeyable by construction: the shape types to
 `monitoring.collector_failing`, whose subject is `COLLECTOR`, which reads a resource type out of
@@ -336,16 +336,23 @@ feature has refused five times elsewhere. The vocabulary is owned by `reconcilia
 has both the catalogue and the key grammar; `apply-mapping.ts` aliases it rather than restating
 the literals.
 
-**AND A SECOND SHAPE IS IN THE SAME POSITION, UNCOUNTED.** `RECOVERY` types to
-`monitoring.recovered`, whose subject is **also** `COLLECTOR`, and a recovery key yields no
-resource type either. How many recovery rows production holds is not known here; if any, the 44
-and the 3 are both wrong.
+**A SECOND SHAPE WAS IN THE SAME POSITION AND HAS BEEN RULED ON.** Production holds 17
+RECOVERY rows. The ruling: **a recovery takes its subject from the key it recovers and keeps its
+own type.** The recovery-first rule is about the TYPE; this is about the SUBJECT, so
+`parseDedupeKey` still classifies a recovery as a recovery and nothing is reclassified. It does
+not merge into what it recovered, because the incident key carries the type id and the two types
+differ — a recovery becomes its own record-tier incident, which is what the tiering already says
+it is.
 
-**It is also the one case that is a decision rather than an impossibility.** A recovery key is a
-suffix on the key it recovers, so the resource type is present one field away in `recoveryOf`.
-`parseDedupeKey` deliberately does not reach into it — checking recovery first is what stops
-every recovery being classified as whatever it recovered. **Whether a recovery belongs to the
-incident it recovers is a product question**, left open rather than answered here.
+**But the ruling does not reach every recovery, and nobody has counted which.** A recovery of a
+connection or an audit alert still names no resource type, because what it recovers has none
+either. Only recoveries of sync alerts resolve. **So 44 is an upper bound until step 1 measures
+it** — the runner reports the shortfall under NEVER writable, and if that line reads above 3,
+recoveries have landed in it.
+
+**`permanentlyUnresolvable` is keyed on the dedupe key rather than the shape** because of this:
+a RECOVERY key answers differently depending on what it recovers, and a shape-level table would
+have to say sometimes, which reads as waiting.
 
 ### Nobody can connect to production from an engineering machine
 

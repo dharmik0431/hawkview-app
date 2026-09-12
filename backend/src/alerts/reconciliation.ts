@@ -117,54 +117,66 @@ export function parseDedupeKey(dedupeKey: string): ParsedKey {
   return unparsed('UNRECOGNISED')
 }
 
-/** Whether a key of this shape can EVER name a resource type.
+/** The resource type a key names — FOLLOWING A RECOVERY TO WHAT IT RECOVERS.
  *
- * A PROPERTY OF THE GRAMMAR, NOT OF A ROW. `tenant:<id>:sync:<resource>` has a segment for
- * one; `tenant:<id>:initial-sync` is anchored with nothing after it, so no data in any row of
- * that shape can supply one. That difference decides whether a row is waiting for something
- * or is permanently unable, and those are not the same fact.
+ * A RULING, and the distinction it turns on is worth keeping: **the recovery-first rule is about
+ * the TYPE, and this is about the SUBJECT.** `parseDedupeKey` still classifies
+ * `tenant:t1:sync:SIGN_INS:recovered:8` as RECOVERY, and must — checking recovery first is what
+ * stops every recovery being classified as whatever it recovered, and the count of recoveries is
+ * exactly what step 03 needs to see. Reading `SIGN_INS` out of the recovered key for the
+ * SUBJECT reclassifies nothing.
  *
- * RECOVERY IS THE INTERESTING ENTRY. A recovery key is a suffix on another key, so the
- * resource type is physically present inside `recoveryOf` — and `parseDedupeKey` deliberately
- * does not reach into it, because checking recovery first is what stops every recovery being
- * classified as whatever it recovered. So `false` here is accurate about the parse as it
- * stands, and it is the one entry that a DECISION could change rather than only new data.
- * Flagged rather than quietly fixed: whether a recovery belongs to the incident it recovers
- * is a product question.
+ * IT DOES NOT MERGE A RECOVERY INTO WHAT IT RECOVERED, because an incident key carries the type
+ * id and the two types differ: `monitoring.recovered` against `monitoring.collector_failing`. A
+ * recovery becomes its own record-tier incident, which is what the tiering already says it is —
+ * a searchable record rather than a second alert. The alternative was 17 untyped rows sitting
+ * outside the scheme permanently.
  *
- * Coupled to `parseDedupeKey` by a test rather than trusted — a table restating what another
- * function does is a second implementation until something checks the two agree. */
-export const SHAPE_CAN_NAME_A_RESOURCE_TYPE: Readonly<Record<KeyShape, boolean>> = {
-  DIRECTORY_AUDIT: false,
-  TENANT_SYNC: true,
-  TENANT_CONNECTION: false,
-  TENANT_INITIAL_SYNC: false,
-  TENANT_ONBOARDING: false,
-  RECOVERY: false,
-  UNRECOGNISED: false,
+ * BOUNDED, though it cannot loop. Each hop strips a `:recovered:<n>` suffix, so the key strictly
+ * shortens and the walk terminates on any input. The bound is there so that a future change to
+ * the recovery pattern cannot turn this into a hang, which is the failure nobody would attribute
+ * to a key parser.
+ *
+ * WHAT IT RETURNS NULL FOR IS THE POINT: a recovery of a CONNECTION or a DIRECTORY_AUDIT alert
+ * still names no resource type, because what it recovers does not have one either. So the
+ * ruling does not make every recovery writable, and how many of the 17 it reaches is a
+ * measurement rather than a claim. */
+export function resourceTypeFor(dedupeKey: string): string | null {
+  let key = dedupeKey
+  for (let hop = 0; hop < 8; hop += 1) {
+    const parsed = parseDedupeKey(key)
+    if (parsed.shape !== 'RECOVERY') return parsed.resourceType
+    if (parsed.recoveryOf === null) return null
+    key = parsed.recoveryOf
+  }
+  return null
 }
 
-/** Whether NO row of this shape could ever resolve this subject role.
+/** Whether NO row carrying this key could ever resolve this subject role.
+ *
+ * KEYED ON THE KEY RATHER THAN THE SHAPE, which changed with the recovery ruling. Before it, the
+ * answer was a property of the shape alone; now a RECOVERY key answers differently depending on
+ * what it recovers, and a shape-level table would have to say "sometimes" — which, read as
+ * "waiting", tells an operator to expect something that is not coming. A dedupe key is immutable
+ * for the life of a row, so this is still a permanent fact about the row and not a snapshot.
  *
  * THE DIFFERENCE THIS EXISTS TO KEEP. A row excluded from the migration is either waiting on
  * something — the classifier, an audit join, a subject that has not appeared yet — or it is
- * excluded by construction and no future data will change it. Reporting both as "the subject
- * does not resolve" tells an operator to wait for something that is not coming.
+ * excluded by construction and no future data will change it.
  *
  * Only two roles can be decided here, and both are decided by reading `subjectFor`:
  *
- * - `COLLECTOR` reads the resource type out of the key, so it turns on the grammar above.
- * - `ACCOUNT` returns unresolved unconditionally for a migration row, because the old system
- *   had no concept of an assessed account. No shape can satisfy it.
+ * - `COLLECTOR` reads the resource type out of the key, so it turns on the grammar.
+ * - `ACCOUNT` returns unresolved unconditionally for a migration row, because the old system had
+ *   no concept of an assessed account. No key can satisfy it.
  *
- * `ACTOR` and `TARGET` read the joined audit record and `TENANT` reads a column, so for those
- * a row is genuinely waiting on data and this returns false. */
-export function permanentlyUnresolvable(shape: KeyShape, role: SubjectRole): boolean {
+ * `ACTOR` and `TARGET` read the joined audit record and `TENANT` reads a column, so for those a
+ * row is genuinely waiting on data and this returns false. */
+export function permanentlyUnresolvable(dedupeKey: string, role: SubjectRole): boolean {
   if (role === 'ACCOUNT') return true
-  if (role === 'COLLECTOR') return !SHAPE_CAN_NAME_A_RESOURCE_TYPE[shape]
+  if (role === 'COLLECTOR') return resourceTypeFor(dedupeKey) === null
   return false
 }
-
 /** Why a row is not being keyed by the migration. ONE OWNER FOR THE VOCABULARY, here rather
  * than in `apply-mapping.ts`, because deciding it needs the catalogue and the key grammar and
  * this module has both. The apply imports the type; nothing restates the literals. */
@@ -177,10 +189,10 @@ export type ExclusionKind = 'TYPE_UNDETERMINED' | 'SUBJECT_UNRESOLVED' | 'SHAPE_
  * joins. `SHAPE_CANNOT_NAME_SUBJECT` never clears — the key has no segment for what its
  * declared subject reads — and reporting it beside the first two tells an operator to wait
  * for something that is not coming. */
-export function exclusionKindFor(alertTypeId: string | null, shape: KeyShape): ExclusionKind {
+export function exclusionKindFor(alertTypeId: string | null, dedupeKey: string): ExclusionKind {
   if (alertTypeId === null) return 'TYPE_UNDETERMINED'
   const declaration = declarationFor(alertTypeId)
-  if (declaration !== null && permanentlyUnresolvable(shape, declaration.subject)) {
+  if (declaration !== null && permanentlyUnresolvable(dedupeKey, declaration.subject)) {
     return 'SHAPE_CANNOT_NAME_SUBJECT'
   }
   return 'SUBJECT_UNRESOLVED'
@@ -636,10 +648,14 @@ function subjectFor(row: ExistingAlertRow, role: SubjectRole): ResolvedSubject {
         ? { resolved: true, id: row.customerTenantId }
         : { resolved: false, why: 'notification has no customer tenant' }
     case 'COLLECTOR': {
-      const resource = parseDedupeKey(row.dedupeKey).resourceType
+      // THROUGH `resourceTypeFor`, WHICH FOLLOWS A RECOVERY TO WHAT IT RECOVERS. A recovery
+      // notice is about the same collector as the alert it closes, and the resource type is
+      // sitting in the key one suffix away. It keeps its own type, so it groups as its own
+      // record-tier incident rather than merging into the thing it recovered.
+      const resource = resourceTypeFor(row.dedupeKey)
       return resource !== null
         ? { resolved: true, id: resource }
-        : { resolved: false, why: 'the key names no resource type' }
+        : { resolved: false, why: 'the key names no resource type, and nor does anything it recovers' }
     }
   }
 }

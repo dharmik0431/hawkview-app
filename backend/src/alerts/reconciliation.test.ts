@@ -2,9 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ALERT_CATALOG } from './alert-catalog.js'
 import {
-  adds, exclusionKindFor, parseDedupeKey, permanentlyUnresolvable, reconcile,
-  SHAPE_CAN_NAME_A_RESOURCE_TYPE, TYPE_FOR_SHAPE,
-  type ExistingAlertRow, type KeyShape,
+  adds, exclusionKindFor, parseDedupeKey, permanentlyUnresolvable, reconcile, resourceTypeFor,
+  TYPE_FOR_SHAPE, type ExistingAlertRow, type KeyShape,
 } from './reconciliation.js'
 import { incidentGrouping, wouldGroupTogether } from './alert-incident-key.js'
 
@@ -1060,53 +1059,78 @@ test('THE APPLY WOULD NOT KEY A SINGLE DIRECTORY-AUDIT ROW, and that is the open
 /** PERMANENTLY UNWRITABLE ROWS, which are not the same thing as rows waiting for the
  * classifier. Found by QA at three rows of production data; the shape of it is here. */
 
-test('THE GRAMMAR TABLE AGREES WITH THE PARSER, or it is a second implementation', () => {
-  // A table restating what another function does is a claim until something checks the two.
-  // Each key below is what that shape looks like; the assertion is that the table's verdict
-  // matches what `parseDedupeKey` actually yields.
-  const keys: Readonly<Record<KeyShape, string>> = {
-    DIRECTORY_AUDIT: 'security:directory-audit:Directory_abc',
-    TENANT_SYNC: 'tenant:t1:sync:SIGN_INS',
-    TENANT_CONNECTION: 'tenant:t1:connection',
-    TENANT_INITIAL_SYNC: 'tenant:t1:initial-sync',
-    TENANT_ONBOARDING: 'tenant:t1:onboarding-authorized',
-    RECOVERY: 'tenant:t1:sync:SIGN_INS:recovered:1',
-    UNRECOGNISED: 'nothing:like:a:known:key',
-  }
+test('A KEY NAMES A RESOURCE TYPE, OR NOTHING IT RECOVERS DOES EITHER', () => {
+  // The grammar, per shape. A witness each, and the assertion is against `resourceTypeFor`
+  // rather than a table restating it — the table this replaces was a second implementation of
+  // the parser, and it stopped being expressible the moment a RECOVERY key could answer
+  // differently depending on what it recovered.
+  assert.equal(resourceTypeFor('tenant:t1:sync:SIGN_INS'), 'SIGN_INS')
+  assert.equal(resourceTypeFor('tenant:t1:initial-sync'), null)
+  assert.equal(resourceTypeFor('tenant:t1:connection'), null)
+  assert.equal(resourceTypeFor('tenant:t1:onboarding-authorized'), null)
+  assert.equal(resourceTypeFor('security:directory-audit:Directory_abc'), null)
+  assert.equal(resourceTypeFor('nothing:like:a:known:key'), null)
 
-  for (const [shape, key] of Object.entries(keys) as [KeyShape, string][]) {
-    const parsed = parseDedupeKey(key)
-    assert.equal(parsed.shape, shape, `${key} must be the ${shape} witness`)
-    assert.equal(SHAPE_CAN_NAME_A_RESOURCE_TYPE[shape], parsed.resourceType !== null,
-      `the table and the parser disagree about ${shape}`)
-  }
+  // ADVERSARIAL, because a witness chosen by the author proves the witness. Keys that LOOK
+  // like they carry a resource type on a shape whose grammar has no segment for one.
+  assert.equal(resourceTypeFor('tenant:t1:initial-sync:SIGN_INS'), null)
+  assert.equal(resourceTypeFor('tenant:t1:connection:SIGN_INS'), null)
 
-  // ADVERSARIAL, because a witness chosen by the author proves the witness. For the shapes
-  // the table calls unable, try keys that LOOK like they carry a resource type: either they
-  // parse as a different shape, or they still yield null. Neither outcome makes the table
-  // wrong, and a third outcome would.
-  for (const key of ['tenant:t1:initial-sync:SIGN_INS', 'tenant:t1:connection:SIGN_INS',
-    'tenant:t1:onboarding-authorized:SIGN_INS']) {
-    const parsed = parseDedupeKey(key)
-    if (!SHAPE_CAN_NAME_A_RESOURCE_TYPE[parsed.shape]) {
-      assert.equal(parsed.resourceType, null, `${key} parsed as ${parsed.shape} with a resource type`)
-    }
-  }
-
-  // WHAT THIS DOES NOT ESTABLISH: that no key anywhere of an "unable" shape yields one. It is
-  // a witness set, not a proof over the grammar. The anchored regexes are the actual argument
+  // WHAT THIS DOES NOT ESTABLISH: that no key of those shapes anywhere yields one. It is a
+  // witness set, not a proof over the grammar; the anchored regexes are the actual argument
   // and this is what keeps them honest if somebody edits one.
+})
+
+test('A RECOVERY TAKES ITS SUBJECT FROM WHAT IT RECOVERS, and keeps its own type', () => {
+  // THE RULING, and the distinction it turns on: the recovery-first rule is about the TYPE and
+  // this is about the SUBJECT. Reading SIGN_INS out of the recovered key reclassifies nothing.
+  const key = 'tenant:t1:sync:SIGN_INS:recovered:8'
+  assert.equal(parseDedupeKey(key).shape, 'RECOVERY', 'still classified as a recovery')
+  assert.equal(parseDedupeKey(key).resourceType, null, 'the parse itself still does not reach in')
+  assert.equal(resourceTypeFor(key), 'SIGN_INS', 'but the subject resolves through it')
+  assert.equal(exclusionKindFor('monitoring.recovered', key), 'SUBJECT_UNRESOLVED',
+    'so it is no longer permanently unwritable')
+
+  // IT DOES NOT MERGE INTO WHAT IT RECOVERED. The incident key carries the type id, and the two
+  // types differ — so the recovery is its own record-tier incident rather than a second alert
+  // on the incident it closes.
+  const report = reconcile([
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1' }),
+    row({ dedupeKey: key, customerTenantId: 't1' }),
+  ])
+  const keys = report.mapping.map((entry) => entry.incidentKey)
+  assert.equal(keys.filter((each) => each !== null).length, 2, 'both key')
+  assert.notEqual(keys[0], keys[1], 'and they are different incidents')
+  assert.match(keys[1] ?? '', /monitoring\.recovered/)
+
+  // A NESTED RECOVERY STILL RESOLVES, because the walk follows every hop.
+  assert.equal(resourceTypeFor('tenant:t1:sync:SIGN_INS:recovered:8:recovered:2'), 'SIGN_INS')
+})
+
+test('BUT THE RULING DOES NOT REACH EVERY RECOVERY, and that is measurable rather than assumed', () => {
+  // A recovery of a CONNECTION alert names no resource type, because what it recovers does not
+  // have one either. So "17 recovery rows become writable" is a claim about which alerts those
+  // 17 recover, not about the ruling — and if any of them recover a connection or an audit row,
+  // they stay unwritable and any total quoted before counting them is wrong.
+  assert.equal(resourceTypeFor('tenant:t1:connection:recovered:1'), null)
+  assert.equal(exclusionKindFor('monitoring.recovered', 'tenant:t1:connection:recovered:1'),
+    'SHAPE_CANNOT_NAME_SUBJECT', 'still never writable')
+  assert.equal(resourceTypeFor('security:directory-audit:Directory_x:recovered:1'), null)
+
+  // The contrast, so this is about what is recovered rather than about recoveries.
+  assert.equal(exclusionKindFor('monitoring.recovered', 'tenant:t1:sync:SIGN_INS:recovered:1'),
+    'SUBJECT_UNRESOLVED')
 })
 
 test('AN INITIAL-SYNC ROW CAN NEVER BE KEYED - no classifier and no future data changes it', () => {
   // THE CHAIN, and every link is in the code rather than in a claim about production:
   // TENANT_INITIAL_SYNC types to monitoring.collector_failing, whose subject is COLLECTOR,
   // which reads a resource type out of the key — and `tenant:<id>:initial-sync` is anchored
-  // with no segment that could hold one.
+  // with no segment that could hold one, and it recovers nothing.
   assert.equal(TYPE_FOR_SHAPE.TENANT_INITIAL_SYNC, 'monitoring.collector_failing')
   assert.equal(ALERT_CATALOG.find((type) => type.id === 'monitoring.collector_failing')?.subject, 'COLLECTOR')
-  assert.equal(SHAPE_CAN_NAME_A_RESOURCE_TYPE.TENANT_INITIAL_SYNC, false)
-  assert.equal(exclusionKindFor('monitoring.collector_failing', 'TENANT_INITIAL_SYNC'),
+  assert.equal(resourceTypeFor('tenant:t1:initial-sync'), null)
+  assert.equal(exclusionKindFor('monitoring.collector_failing', 'tenant:t1:initial-sync'),
     'SHAPE_CANNOT_NAME_SUBJECT')
 
   // AND IT SHOWS UP AS UNKEYABLE END TO END, not only in the classification.
@@ -1114,51 +1138,24 @@ test('AN INITIAL-SYNC ROW CAN NEVER BE KEYED - no classifier and no future data 
   assert.equal(report.mapping[0]?.incidentKey, null)
 
   // THE CONTRAST THAT MAKES IT A FINDING RATHER THAN A COINCIDENCE: the same type, the same
-  // subject, a shape that CAN name a resource type — and that one keys.
+  // subject, a key that CAN name a resource type — and that one keys.
   const sync = reconcile([row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1' })])
   assert.notEqual(sync.mapping[0]?.incidentKey, null)
-  assert.equal(exclusionKindFor('monitoring.collector_failing', 'TENANT_SYNC'), 'SUBJECT_UNRESOLVED')
 })
-
-test('SO IS A RECOVERY ROW - and that one is a decision rather than an impossibility', () => {
-  // NOT IN THE REPORTED FINDING, and it is the same argument. RECOVERY types to
-  // monitoring.recovered, whose subject is also COLLECTOR, and a recovery key yields no
-  // resource type — so recovery rows are unkeyable today for exactly the reason initial-sync
-  // rows are.
-  assert.equal(TYPE_FOR_SHAPE.RECOVERY, 'monitoring.recovered')
-  assert.equal(ALERT_CATALOG.find((type) => type.id === 'monitoring.recovered')?.subject, 'COLLECTOR')
-  assert.equal(exclusionKindFor('monitoring.recovered', 'RECOVERY'), 'SHAPE_CANNOT_NAME_SUBJECT')
-
-  // BUT THE DIFFERENCE MATTERS AND IS NOT MINE TO RESOLVE. A recovery key is a SUFFIX on the
-  // key it recovers, so the resource type is physically there — `tenant:t1:sync:SIGN_INS`
-  // sits inside `tenant:t1:sync:SIGN_INS:recovered:1`. `parseDedupeKey` does not reach into
-  // it, deliberately: checking recovery first is what stops every recovery being classified
-  // as whatever it recovered.
-  const parsed = parseDedupeKey('tenant:t1:sync:SIGN_INS:recovered:1')
-  assert.equal(parsed.resourceType, null, 'not extracted')
-  assert.equal(parsed.recoveryOf, 'tenant:t1:sync:SIGN_INS', 'but present, one field away')
-  assert.equal(parseDedupeKey(parsed.recoveryOf ?? '').resourceType, 'SIGN_INS',
-    'and recoverable by parsing what it recovers')
-
-  // So initial-sync can never be keyed by anyone, and recovery cannot be keyed BY THIS CODE.
-  // Whether a recovery belongs to the incident it recovers is a product question, and until
-  // it is answered both report the same way, which is accurate about today.
-})
-
 test('THE THREE EXCLUSION REASONS ARE DECIDED BY THE CODE, not by a list of shapes', () => {
   // The failure this guards is a hand-maintained set of "shapes that never work", which goes
   // stale the moment a key shape is added. Every answer below comes from the catalogue and
   // the grammar table.
-  assert.equal(exclusionKindFor(null, 'DIRECTORY_AUDIT'), 'TYPE_UNDETERMINED')
-  assert.equal(exclusionKindFor(null, 'UNRECOGNISED'), 'TYPE_UNDETERMINED')
-  assert.equal(exclusionKindFor('monitoring.tenant_disconnected', 'TENANT_CONNECTION'), 'SUBJECT_UNRESOLVED')
-  assert.equal(exclusionKindFor('monitoring.collector_failing', 'TENANT_INITIAL_SYNC'), 'SHAPE_CANNOT_NAME_SUBJECT')
+  assert.equal(exclusionKindFor(null, 'security:directory-audit:Directory_a'), 'TYPE_UNDETERMINED')
+  assert.equal(exclusionKindFor(null, 'nothing:like:a:known:key'), 'TYPE_UNDETERMINED')
+  assert.equal(exclusionKindFor('monitoring.tenant_disconnected', 'tenant:t1:connection'), 'SUBJECT_UNRESOLVED')
+  assert.equal(exclusionKindFor('monitoring.collector_failing', 'tenant:t1:initial-sync'), 'SHAPE_CANNOT_NAME_SUBJECT')
 
   // A TENANT-SUBJECT TYPE IS NEVER PERMANENT, because the subject comes from a column rather
   // than from the key — the row is missing data, not incapable of carrying it.
-  assert.equal(permanentlyUnresolvable('TENANT_INITIAL_SYNC', 'TENANT'), false)
-  assert.equal(permanentlyUnresolvable('DIRECTORY_AUDIT', 'ACTOR'), false)
+  assert.equal(permanentlyUnresolvable('tenant:t1:initial-sync', 'TENANT'), false)
+  assert.equal(permanentlyUnresolvable('security:directory-audit:Directory_a', 'ACTOR'), false)
   // AN ACCOUNT SUBJECT ALWAYS IS, for a migration row: the old system had no assessed account
   // and `subjectFor` returns unresolved for every input.
-  assert.equal(permanentlyUnresolvable('DIRECTORY_AUDIT', 'ACCOUNT'), true)
+  assert.equal(permanentlyUnresolvable('security:directory-audit:Directory_a', 'ACCOUNT'), true)
 })

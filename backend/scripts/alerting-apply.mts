@@ -184,7 +184,7 @@ async function computeMapping(): Promise<{ decisions: MappingDecision[]; figures
         // THREE OUTCOMES, AND ONLY ONE OF THEM IS WAITING FOR THE CLASSIFIER. The third is
         // decided by the key GRAMMAR rather than by this row: a shape with no segment for
         // what its subject reads can never group, whatever arrives later.
-        because: exclusionKindFor(entry.alertTypeId, entry.shape),
+        because: exclusionKindFor(entry.alertTypeId, entry.dedupeKey),
       })
       continue
     }

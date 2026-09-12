@@ -51,34 +51,42 @@ Measured against production on **2026-09-12**:
 
 ```
 366 rows total
- 44 writable now
-319 waiting on the classifier
-  3 NEVER writable - see below
+319 awaiting the classifier
+  3 initial-sync    NEVER writable - no segment could carry a resource type
+ 17 recovery        writable under the ruling below, where what they recover names one
+ 44 writable today
   5 tenants touched
 ```
 
-**44, not 47.** Three `TENANT_INITIAL_SYNC` rows are unkeyable by construction and are not
-waiting for anything. The chain is entirely in the code: the shape types to
-`monitoring.collector_failing`, whose subject is `COLLECTOR`, which reads a resource type out
-of the key — and `tenant:<id>:initial-sync` is anchored with no segment that could hold one.
-**No classifier and no future data changes it.**
+**Three exclusion facts, and they stay three.** Awaiting-classification, permanently-unwritable-
+by-shape and refused-because-moved are different things: the first clears when the classifier
+reaches historical audit rows, the second never clears, and the third is not an exclusion at all
+but an abort. One "left alone" number tells an operator to wait for something that is not coming.
 
-They are listed apart from the 319 because **those are different facts**. One clears when the
-classifier reaches historical audit rows; the other never clears. A single "left alone" number
-tells an operator to wait for something that is not coming.
+### The recovery ruling — subject from what it recovers, type stays its own
 
-> **A second shape is in the same position and has not been counted.** `RECOVERY` types to
-> `monitoring.recovered`, whose subject is **also** `COLLECTOR`, and a recovery key yields no
-> resource type either — so recovery rows are unkeyable today for exactly the same reason.
-> **How many are in production is not known here.** If there are any, they are currently inside
-> the 44 or the 3 and neither figure is right.
+**A recovery row takes its subject from the key it recovers, and keeps `monitoring.recovered` as
+its type.** The distinction is the whole ruling: **the recovery-first rule is about the TYPE, and
+this is about the SUBJECT.**
+
+`parseDedupeKey` still classifies `tenant:t1:sync:SIGN_INS:recovered:8` as a RECOVERY, and must —
+checking recovery first is what stops every recovery being classified as whatever it recovered,
+and the count of recoveries is exactly what this step needs to see. Reading `SIGN_INS` out of the
+recovered key **for the subject** reclassifies nothing.
+
+**It does not merge a recovery into what it recovered.** An incident key carries the type id and
+the two types differ, so a recovery becomes **its own record-tier incident** — which is what the
+tiering already says it is: a searchable record of the recovery, not a second alert. The
+alternative was 17 rows sitting outside the scheme permanently.
+
+> **THE RULING DOES NOT REACH EVERY RECOVERY, AND NOBODY HAS COUNTED WHICH.** A recovery of a
+> CONNECTION or a DIRECTORY_AUDIT alert still names no resource type, because **what it recovers
+> does not have one either.** Only recoveries of sync alerts resolve.
 >
-> **It is also the one case that is a decision rather than an impossibility.** A recovery key is
-> a suffix on the key it recovers, so the resource type is physically present one field away, in
-> `recoveryOf`. `parseDedupeKey` deliberately does not reach into it — checking recovery first
-> is what stops every recovery being classified as whatever it recovered. **Whether a recovery
-> belongs to the incident it recovers is a product question**, and until it is answered these
-> rows report as permanently unwritable, which is accurate about today.
+> So "17 become writable" is a claim about which alerts those 17 recover, not about the ruling.
+> **If any of them recover a connection or an audit row, they stay permanently unwritable and 44
+> is too high.** The runner reports them under `NEVER writable` when that happens, so step 1
+> measures it — but the figure above should be treated as an upper bound until it does.
 
 **366, not the 364 quoted everywhere else in this document — two rows arrived during the
 conversation in which the figure was being discussed.** That is the photograph problem, not as
@@ -303,7 +311,7 @@ Read 366 notification rows.
 
   HOW MANY IT WOULD LEAVE ALONE, AND WHY - decisions, not refusals
     319 waiting on the classifier (the key shape does not type)
-    3 NEVER writable - the key shape cannot name what its subject reads
+    3 NEVER writable - the key cannot name what its subject reads
     0 typed, but this row’s subject did not resolve
 
   HOW MANY INCIDENTS ARE IN THE DATA - a different question, under the nominated type
@@ -321,10 +329,12 @@ mistake that put 71 into every status report as though it were a write count.
 
 1. **Rows this run would key.** About 44 on 2026-09-12. **If it comes back near the total,
    something changed in `TYPE_FOR_SHAPE`** and that is a bigger conversation than this runbook.
-2. **Rows left alone.** About 319 waiting, 3 never. **The middle line is the one to read** — it
-   counts rows no classifier will ever reach, and if it is larger than 3 a shape has moved into
-   that category, which is a finding. A non-zero third line is also a finding: those are rows
-   whose subject is resolvable in principle and absent in fact.
+2. **Rows left alone.** About 319 waiting, 3 never. **The middle line is the one to read.** It
+   counts rows no classifier will ever reach, and **if it is larger than 3, recoveries have
+   landed in it** — meaning some of the 17 recover something that names no resource type, and
+   the writable count is correspondingly lower than 44. That is the measurement the ruling
+   above is waiting on. A non-zero third line is a different finding: rows whose subject is
+   resolvable in principle and absent in fact.
 3. **Incidents in the data.** This is where 71 / 62 / 9 / 47 belong. A change here is not a
    reason to stop by itself — rows keep arriving — but a change **larger than the row count
    moved** is, because then something other than new data has changed.
