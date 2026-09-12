@@ -24,10 +24,12 @@
 > headings, each labelled by the question it answers. If any one of them is read as the
 > answer to another, that is this same mistake happening again.
 >
-> **And the commands have still never been run.** The script exists and typechecks; no `psql`,
-> no Docker and no `DATABASE_URL` exist in the worktree it was written in. What is tested is
-> the pure logic it calls and the SQL it emits, which QA executed against a disposable
-> Postgres at 364 rows. Details under *Before you trust this*.
+> **What has been run, and by whom.** QA has run all five commands end to end against a
+> disposable Postgres — once before the migration existed, and again on the migrated schema,
+> including the concurrent-writer rollback. The migration itself has been applied to a
+> throwaway PostgreSQL 15 from four starting states (see step 0). **Nothing has been run
+> against production, and nothing has been run from an engineering worktree with real data.**
+> Details under *Before you trust this*.
 
 ## What this run is for — a rehearsal, not the fix
 
@@ -87,6 +89,38 @@ alternative was 17 rows sitting outside the scheme permanently.
 > **If any of them recover a connection or an audit row, they stay permanently unwritable and 44
 > is too high.** The runner reports them under `NEVER writable` when that happens, so step 1
 > measures it — but the figure above should be treated as an upper bound until it does.
+>
+> **The line is a working instrument, demonstrated:** rewriting five recoveries to recover a
+> connection alert gave 38 writable and 9 never, so a shortfall lands exactly where the runner
+> says it will. What that cannot establish is what production’s 17 actually recover.
+
+### Where the recovery finding came from, and who has checked it
+
+**This is recorded precisely because 44 depends on it.** The recovery shape was found by the
+engineer, while writing the migration; it was then counted against production by the PM, which
+is where 17 comes from; and the ruling that a recovery takes its subject from what it recovers
+is the PM’s.
+
+**Nobody has independently verified it.** It was briefly attributed to QA, which would have
+meant an independent check existed — QA corrected that rather than accepting the credit, and
+their reason is the one worth keeping: **a finding recorded against the party who would have
+checked it is a finding nobody checked.**
+
+So the chain behind 44 is: one party found it, one party measured it, and the reasoning has had
+no second pair of eyes. The tests pin the behaviour; they cannot supply the review.
+
+### The hop limit reports UNKNOWN, not NEVER
+
+`resourceTypeFor` follows a recovery to what it recovers for at most eight parses. Exhausting
+them is reported as **`RECOVERY_CHAIN_TOO_DEEP` — unknown** — and not as "never writable",
+because for a deeper chain that label would be wrong in a specific way: **the key may well name
+a subject; the walker stopped before reaching it.**
+
+**It cannot happen today.** Recovery keys are built in one place and every caller passes a
+freshly-built non-recovery key, so the maximum depth in production is 1 against a limit of 8.
+The limit exists so that a future change to how recovery keys are composed cannot turn a key
+parser into a hang — a failure nobody would attribute to a key parser. The walk cannot loop
+either way: each hop strips a suffix, so the key strictly shortens.
 
 **366, not the 364 quoted everywhere else in this document — two rows arrived during the
 conversation in which the figure was being discussed.** That is the photograph problem, not as
@@ -258,6 +292,28 @@ npx prisma migrate deploy
 no row, writes no row and deletes nothing** — every existing row gets NULL in both, which is
 exactly the state the apply expects to find and exactly the state a revert returns them to.
 
+**Running it twice is safe from any starting state, and this was measured rather than argued.**
+Against a throwaway PostgreSQL 15:
+
+| starting state | result |
+|---|---|
+| clean | applies; both columns and the index present |
+| already fully applied | exit 0, three `NOTICE ... skipping` lines, nothing changed |
+| **columns created by hand, migration never recorded** | exit 0, converges, index created |
+| `incident_key` created by hand as `text` | **refused**, named, and **nothing added** |
+
+**The third row is the one that mattered.** With bare `ADD COLUMN` it raised `42701`, and Prisma
+then records a FAILED migration that blocks every later migration with `P3009` until somebody
+runs `prisma migrate resolve` by hand. **That is a wedged database produced by running a
+migration twice** — and it was reachable, because the workaround DDL in the first-run record
+creates exactly those columns by hand.
+
+**The fourth row is what `IF NOT EXISTS` costs and why it is not the whole fix.** It matches on
+NAME alone, so a hand-made column of the wrong type would be silently adopted and the database
+would disagree with `schema.prisma` with nothing saying so — the apply would then write incident
+keys into a column that truncates them. The migration checks the type first and stops before any
+DDL runs, which is why the failing case leaves nothing behind.
+
 **Confirm it landed before going on:**
 
 ```sql
@@ -353,13 +409,20 @@ node --import tsx scripts/alerting-apply.mts preflight --mapping ..\artefacts\ma
 ```
 No differences. The mapping still describes the data.
 44 rows would be written. 0 already carry it and would not be written again.
-322 left alone by decision, not by refusal.
+3 NEVER writable - the key cannot name what its subject reads
+319 waiting on the classifier - the key shape does not type
 PREFLIGHT PASSED - safe to apply.
 ```
 
-**The third line is the one to read twice.** A large number there is the design working; the
-same number appearing as differences above it would be the run aborting. See *Unwritable is
+**Those middle lines are the ones to read twice.** A large number there is the design working;
+the same number appearing as differences above it would be the run aborting. See *Unwritable is
 not refused*.
+
+**They are printed broken down rather than summed, and that is a fix rather than a flourish.**
+Step 1 prints three headings and this step used to print their total — so the distinction it
+preserved was decision-versus-refusal, and the one it lost was **waiting-versus-never**, at the
+step an operator reads immediately before authorising a write. The consequence is delayed and
+specific: **when the classifier lands, somebody who remembers 322 will expect 0 and get 3.**
 
 The write count must equal the writable count from step 1. A second number here means the
 mapping file and the database have diverged, which is what the preflight exists to catch.
@@ -395,7 +458,9 @@ node --import tsx scripts/alerting-apply.mts apply --mapping ..\artefacts\mappin
 ```
 Preflight re-run inside the transaction: no differences.
 Applied 44 rows in one statement, in one transaction.
-Left alone by decision: 322. These were never candidates.
+Left alone by decision, not by refusal - these were never candidates:
+  3 NEVER writable - the key cannot name what its subject reads
+  319 waiting on the classifier - the key shape does not type
 Watched fields disturbed: none
 Wrote ..\artefacts\receipt.json - 44 changes, 0 untouched. THE REVERT NEEDS THIS FILE.
 APPLY COMPLETE.
@@ -686,13 +751,19 @@ QA identified in A2, demonstrated rather than asserted.
 
 **What is not tested, and this is the gap that matters:**
 
-- **The commands in this document have never been run.** No `psql`, no Docker, no
-  `DATABASE_URL` in the engineering worktree.
-- **The runner exists and typechecks; that is all.** Typechecking is not execution, and the
-  two are easy to conflate at the moment a file stops being missing.
-- **The migration has never been applied anywhere.** It is written and the schema validates;
-  no database has run it. QA reproduced the missing-columns failure by dropping the columns,
-  which means they had columns to drop — that was their fixture, not this migration.
+- **Nothing here has touched production.** No `DATABASE_URL` for it exists in any engineering
+  worktree, and no connection to it has been made from one.
+- **The five commands HAVE been run, by QA, against a disposable Postgres** — twice, the second
+  time on the migrated schema, including the concurrent-writer rollback. This line previously
+  said they never had; that was wrong, and it was wrong in the flattering direction for a
+  document whose job is to under-claim.
+- **The migration HAS been applied, to a throwaway PostgreSQL 15**, from four starting states,
+  by the engineer. See the table in step 0. It has not been applied to any database holding
+  real data.
+- **The runner has never been run by the engineer who wrote it.** Everything the engineer knows
+  about its behaviour comes from QA running it or from the pure functions it calls.
+- **44 has one source.** The recovery finding behind it has not been independently reviewed by
+  anyone — see *Where the recovery finding came from*.
 - **The number of rows the apply would write is unmeasured.** See the open decision at the top.
   Every "364" in this document below that point is a row count, not a write count.
 - **Neither script had ever been typechecked** until `tsconfig.scripts.json` existed, and the

@@ -33,7 +33,40 @@
 -- this is a catalogue change and takes no meaningful lock time. At 366 rows that would not
 -- matter either way; it is stated because it stops being true if somebody adds a default in
 -- a later edit to this file.
-ALTER TABLE "public"."notifications" ADD COLUMN "incident_key" VARCHAR(300);
+-- `IF NOT EXISTS`, BECAUSE A HALF-RUN DATABASE MUST BE ABLE TO CONVERGE RATHER THAN ONLY
+-- FAIL. Bare `ADD COLUMN` against a database where the columns exist but the migration was
+-- never recorded raises 42701, and Prisma then writes a FAILED migration row that blocks every
+-- later migration with P3009 until somebody runs `prisma migrate resolve` by hand. That is a
+-- wedged database produced by running a migration twice.
+--
+-- AND THAT STATE IS REACHABLE BECAUSE WE MADE IT REACHABLE. The workaround DDL published in
+-- QA's first-run record creates exactly these columns by hand. Anyone who followed it is in the
+-- half-run state right now and would hit P3009 on their next migrate.
+--
+-- WHAT `IF NOT EXISTS` COSTS, AND WHY THE CHECK BELOW IS HERE. It matches on NAME ALONE, so a
+-- hand-made `incident_key` of the wrong type -- `text`, or `varchar(100)` -- would be silently
+-- adopted and the database would disagree with `schema.prisma` with nothing saying so. The
+-- apply would then write incident keys into a column that truncates them, which is the same
+-- class of silent wrong-data failure this whole migration exists to avoid. So the type is
+-- verified first and a mismatch stops the run loudly, before anything is added.
+DO $$
+DECLARE
+  found_type text;
+  found_length integer;
+BEGIN
+  SELECT data_type, character_maximum_length INTO found_type, found_length
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'notifications' AND column_name = 'incident_key';
+
+  IF found_type IS NOT NULL AND (found_type <> 'character varying' OR found_length <> 300) THEN
+    RAISE EXCEPTION
+      'notifications.incident_key already exists as %, expected character varying(300). '
+      'A column created by hand does not match the schema; drop it and re-run this migration.',
+      found_type || coalesce('(' || found_length || ')', '');
+  END IF;
+END $$;
+
+ALTER TABLE "public"."notifications" ADD COLUMN IF NOT EXISTS "incident_key" VARCHAR(300);
 
 -- MATCHES `dedupe_key`'s width on purpose. An incident key is built from the same parts as
 -- a dedupe key -- organisation, tenant, type, subject -- through `alert-incident-key.ts`'s
@@ -45,7 +78,24 @@ ALTER TABLE "public"."notifications" ADD COLUMN "incident_key" VARCHAR(300);
 -- holds a row whose event time is gone, so the number of separate bursts is unknowable".
 -- It is distinguishable from episode 1, and that distinction is the point. `integer`
 -- matches the `::int` cast the apply statement already emits.
-ALTER TABLE "public"."notifications" ADD COLUMN "episode" INTEGER;
+-- Same treatment, same reason. `integer` here rather than `bigint` or `smallint`: an episode
+-- ordinal counts bursts within one incident, and the cast the apply already emits is `::int`.
+DO $$
+DECLARE
+  found_type text;
+BEGIN
+  SELECT data_type INTO found_type
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'notifications' AND column_name = 'episode';
+
+  IF found_type IS NOT NULL AND found_type <> 'integer' THEN
+    RAISE EXCEPTION
+      'notifications.episode already exists as %, expected integer. A column created by hand '
+      'does not match the schema; drop it and re-run this migration.', found_type;
+  END IF;
+END $$;
+
+ALTER TABLE "public"."notifications" ADD COLUMN IF NOT EXISTS "episode" INTEGER;
 
 -- ORGANISATION FIRST, DELIBERATELY.
 --
@@ -66,8 +116,16 @@ ALTER TABLE "public"."notifications" ADD COLUMN "episode" INTEGER;
 -- CONCURRENTLY` cannot run in one. At this size the plain form is immediate. If this is
 -- ever applied to a table where that is untrue, take the index out of this migration rather
 -- than making the whole migration non-transactional.
-CREATE INDEX "notifications_organization_id_incident_key_idx"
+-- `IF NOT EXISTS` for the same convergence reason. An index matching on name alone is a much
+-- smaller risk than a column: a differently-shaped index of this name would make queries
+-- slower and nothing wrong, whereas a differently-typed column corrupts what is stored.
+CREATE INDEX IF NOT EXISTS "notifications_organization_id_incident_key_idx"
   ON "public"."notifications" ("organization_id", "incident_key");
+
+-- RUNNING THIS TWICE IS NOW SAFE FROM ANY STARTING STATE: clean, fully applied, or half-applied
+-- by hand. The only thing it refuses is a column of the wrong type, which it refuses loudly
+-- and without leaving a failed-migration row behind, because the exception is raised before
+-- any DDL in this file has run.
 
 -- No GRANT or RLS statement is needed. Privileges and row-level security are table-level
 -- here (see 20260909120000_lock_down_public_schema_grants_and_rls), so new columns inherit

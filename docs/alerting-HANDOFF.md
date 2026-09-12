@@ -316,8 +316,19 @@ by and every read here is org-scoped. **Both are in `schema.prisma` too**, which
 column absent from the schema is invisible to every consumer except a raw query, so routing
 could not see the key at all.
 
-The runbook has a **step 0** that applies it and a query to confirm it landed. **The migration
-has never been run anywhere.**
+The runbook has a **step 0** that applies it and a query to confirm it landed.
+
+**It is idempotent, and that was measured.** Against a throwaway PostgreSQL 15 from four starting
+states: clean applies; already-applied is a no-op; **columns created by hand with the migration
+unrecorded converges** — that state raised 42701 with bare ADD COLUMN, and Prisma then records a
+failed migration that blocks every later one with P3009, which is a wedged database produced by
+running a migration twice. It was reachable because the workaround DDL in the first-run record
+creates exactly those columns.
+
+**IF NOT EXISTS alone would not have been enough.** It matches on name, so a hand-made column of
+the wrong type would be silently adopted and the apply would write incident keys into something
+that truncates them. The migration checks the type first and stops before any DDL runs; the
+fourth starting state confirms nothing is left behind when it refuses.
 
 A partial index `WHERE incident_key IS NOT NULL` would be much smaller — 44 of 366 rows are
 keyed — and was rejected because Prisma cannot express one, so it would exist only in the SQL
@@ -335,6 +346,13 @@ row that clears when the classifier lands with one that never clears — the sam
 feature has refused five times elsewhere. The vocabulary is owned by `reconciliation.ts`, which
 has both the catalogue and the key grammar; `apply-mapping.ts` aliases it rather than restating
 the literals.
+
+**ATTRIBUTION, BECAUSE 44 DEPENDS ON IT.** The recovery shape was found by the engineer while
+writing the migration; counted against production by the PM, which is where 17 comes from; and
+the ruling below is the PM’s. **Nobody has independently verified any of it.** It was briefly
+recorded as a QA finding, which would have implied an independent check existed — QA corrected
+that rather than accepting the credit, and the reason is the one to keep: **a finding recorded
+against the party who would have checked it is a finding nobody checked.**
 
 **A SECOND SHAPE WAS IN THE SAME POSITION AND HAS BEEN RULED ON.** Production holds 17
 RECOVERY rows. The ruling: **a recovery takes its subject from the key it recovers and keeps its

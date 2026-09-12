@@ -3,6 +3,7 @@ import test from 'node:test'
 import { ALERT_CATALOG } from './alert-catalog.js'
 import {
   adds, exclusionKindFor, parseDedupeKey, permanentlyUnresolvable, reconcile, resourceTypeFor,
+  resourceTypeLookup,
   TYPE_FOR_SHAPE, type ExistingAlertRow, type KeyShape,
 } from './reconciliation.js'
 import { incidentGrouping, wouldGroupTogether } from './alert-incident-key.js'
@@ -1158,4 +1159,44 @@ test('THE THREE EXCLUSION REASONS ARE DECIDED BY THE CODE, not by a list of shap
   // AN ACCOUNT SUBJECT ALWAYS IS, for a migration row: the old system had no assessed account
   // and `subjectFor` returns unresolved for every input.
   assert.equal(permanentlyUnresolvable('security:directory-audit:Directory_a', 'ACCOUNT'), true)
+})
+
+test('EXHAUSTING THE HOP LIMIT IS UNKNOWN, NOT NEVER', () => {
+  // The label matters more than the case does. Returning null for an exhausted walk would file
+  // the row under "NEVER writable - the key cannot name what its subject reads", and that is
+  // wrong in a specific way: the key may well name one, the walker stopped before reaching it.
+  // Never and unknown are different answers.
+  const deep = (n: number) =>
+    `tenant:t1:sync:SIGN_INS${':recovered:1'.repeat(n)}`
+
+  assert.deepEqual(resourceTypeLookup(deep(0)), { kind: 'NAMED', resourceType: 'SIGN_INS' })
+  assert.deepEqual(resourceTypeLookup(deep(7)), { kind: 'NAMED', resourceType: 'SIGN_INS' },
+    'seven suffixes is the deepest chain that still resolves')
+  assert.deepEqual(resourceTypeLookup(deep(8)), { kind: 'EXHAUSTED', hops: 8 })
+
+  // THE BOUNDARY IS PINNED so nobody "fixes" it by one in either direction without noticing:
+  // the walk gets eight parses, and the eighth must land on a non-recovery key to answer.
+  assert.equal(exclusionKindFor('monitoring.recovered', deep(7)), 'SUBJECT_UNRESOLVED')
+  assert.equal(exclusionKindFor('monitoring.recovered', deep(8)), 'RECOVERY_CHAIN_TOO_DEEP')
+  assert.notEqual(exclusionKindFor('monitoring.recovered', deep(8)), 'SHAPE_CANNOT_NAME_SUBJECT')
+
+  // AND AN EXHAUSTED WALK IS NOT "PERMANENTLY UNRESOLVABLE", because nobody established that.
+  assert.equal(permanentlyUnresolvable(deep(8), 'COLLECTOR'), false)
+  assert.equal(permanentlyUnresolvable('tenant:t1:initial-sync', 'COLLECTOR'), true)
+
+  // UNREACHABLE TODAY, and that is the reason it is a label rather than a fix: recovery keys are
+  // built in one place and every caller passes a freshly-built non-recovery key, so the maximum
+  // depth in production is 1. The limit exists so a future change to how recovery keys are
+  // composed cannot turn a key parser into a hang.
+  assert.deepEqual(resourceTypeLookup('tenant:t1:sync:SIGN_INS:recovered:8'),
+    { kind: 'NAMED', resourceType: 'SIGN_INS' }, 'depth 1, which is what production has')
+})
+
+test('A KEY THAT NAMES NOTHING IS NONE, AND THE THREE ANSWERS DO NOT OVERLAP', () => {
+  // Or EXHAUSTED could be satisfied by returning it whenever the answer is not NAMED.
+  assert.deepEqual(resourceTypeLookup('tenant:t1:initial-sync'), { kind: 'NONE' })
+  assert.deepEqual(resourceTypeLookup('tenant:t1:connection:recovered:1'), { kind: 'NONE' })
+  assert.deepEqual(resourceTypeLookup('security:directory-audit:Directory_a'), { kind: 'NONE' })
+  assert.deepEqual(resourceTypeLookup('tenant:t1:sync:SIGN_INS'),
+    { kind: 'NAMED', resourceType: 'SIGN_INS' })
 })

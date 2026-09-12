@@ -141,15 +141,52 @@ export function parseDedupeKey(dedupeKey: string): ParsedKey {
  * still names no resource type, because what it recovers does not have one either. So the
  * ruling does not make every recovery writable, and how many of the 17 it reaches is a
  * measurement rather than a claim. */
-export function resourceTypeFor(dedupeKey: string): string | null {
+/** What the walk found, and it has THREE answers rather than two.
+ *
+ * `EXHAUSTED` is the one that matters. Returning null for it would file the row under
+ * "NEVER writable - the key cannot name what its subject reads", and that label would be
+ * WRONG IN A SPECIFIC WAY: the key may well name one; the walker stopped before reaching it.
+ * Never and unknown are different answers, and this feature has spent its whole length
+ * refusing to collapse that pair. */
+export type ResourceTypeLookup =
+  | Readonly<{ kind: 'NAMED'; resourceType: string }>
+  | Readonly<{ kind: 'NONE' }>
+  | Readonly<{ kind: 'EXHAUSTED'; hops: number }>
+
+/** THE HOP LIMIT IS UNREACHABLE TODAY, and that is worth stating rather than relying on.
+ *
+ * Recovery keys are built in one place and every caller passes a freshly-built non-recovery
+ * key, so the maximum depth in production is 1 and the limit is eight. It exists so that a
+ * future change to how recovery keys are composed cannot turn a key parser into a hang —
+ * which is a failure nobody would attribute to a key parser.
+ *
+ * It cannot loop even without the limit: each hop strips a `:recovered:<n>` suffix, so the key
+ * strictly shortens and the walk terminates on every input. The bound is against depth, not
+ * against cycles. */
+const MAX_RECOVERY_HOPS = 8
+
+export function resourceTypeLookup(dedupeKey: string): ResourceTypeLookup {
   let key = dedupeKey
-  for (let hop = 0; hop < 8; hop += 1) {
+  for (let hop = 0; hop < MAX_RECOVERY_HOPS; hop += 1) {
     const parsed = parseDedupeKey(key)
-    if (parsed.shape !== 'RECOVERY') return parsed.resourceType
-    if (parsed.recoveryOf === null) return null
+    if (parsed.shape !== 'RECOVERY') {
+      return parsed.resourceType === null
+        ? { kind: 'NONE' }
+        : { kind: 'NAMED', resourceType: parsed.resourceType }
+    }
+    if (parsed.recoveryOf === null) return { kind: 'NONE' }
     key = parsed.recoveryOf
   }
-  return null
+  return { kind: 'EXHAUSTED', hops: MAX_RECOVERY_HOPS }
+}
+
+/** The resource type, or null when there is not one AND when we could not tell. Callers that
+ * need to distinguish those use `resourceTypeLookup`; `subjectFor` does not, because an
+ * unresolved subject is unresolved either way — what differs is only what an operator should
+ * be told about why. */
+export function resourceTypeFor(dedupeKey: string): string | null {
+  const found = resourceTypeLookup(dedupeKey)
+  return found.kind === 'NAMED' ? found.resourceType : null
 }
 
 /** Whether NO row carrying this key could ever resolve this subject role.
@@ -174,13 +211,22 @@ export function resourceTypeFor(dedupeKey: string): string | null {
  * row is genuinely waiting on data and this returns false. */
 export function permanentlyUnresolvable(dedupeKey: string, role: SubjectRole): boolean {
   if (role === 'ACCOUNT') return true
-  if (role === 'COLLECTOR') return resourceTypeFor(dedupeKey) === null
+  if (role === 'COLLECTOR') return resourceTypeLookup(dedupeKey).kind === 'NONE'
+  // An exhausted walk is NOT permanent — it is unknown, and saying "never" would be a claim
+  // nobody checked. See `exclusionKindFor`, which reports it as its own thing.
   return false
 }
 /** Why a row is not being keyed by the migration. ONE OWNER FOR THE VOCABULARY, here rather
  * than in `apply-mapping.ts`, because deciding it needs the catalogue and the key grammar and
  * this module has both. The apply imports the type; nothing restates the literals. */
-export type ExclusionKind = 'TYPE_UNDETERMINED' | 'SUBJECT_UNRESOLVED' | 'SHAPE_CANNOT_NAME_SUBJECT'
+export type ExclusionKind =
+  | 'TYPE_UNDETERMINED'
+  | 'SUBJECT_UNRESOLVED'
+  | 'SHAPE_CANNOT_NAME_SUBJECT'
+  /** The recovery chain ran past the hop limit, so whether the key names a subject is
+   * UNKNOWN rather than no. Unreachable today — see `MAX_RECOVERY_HOPS` — and named so that
+   * if it ever fires it does not arrive wearing the label "never". */
+  | 'RECOVERY_CHAIN_TOO_DEEP'
 
 /** Classify an unkeyable row.
  *
@@ -192,7 +238,12 @@ export type ExclusionKind = 'TYPE_UNDETERMINED' | 'SUBJECT_UNRESOLVED' | 'SHAPE_
 export function exclusionKindFor(alertTypeId: string | null, dedupeKey: string): ExclusionKind {
   if (alertTypeId === null) return 'TYPE_UNDETERMINED'
   const declaration = declarationFor(alertTypeId)
-  if (declaration !== null && permanentlyUnresolvable(dedupeKey, declaration.subject)) {
+  if (declaration === null) return 'SUBJECT_UNRESOLVED'
+  if (declaration.subject === 'COLLECTOR'
+    && resourceTypeLookup(dedupeKey).kind === 'EXHAUSTED') {
+    return 'RECOVERY_CHAIN_TOO_DEEP'
+  }
+  if (permanentlyUnresolvable(dedupeKey, declaration.subject)) {
     return 'SHAPE_CANNOT_NAME_SUBJECT'
   }
   return 'SUBJECT_UNRESOLVED'

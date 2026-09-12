@@ -29,7 +29,8 @@ import { randomUUID } from 'node:crypto'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../src/generated/prisma/client.js'
 import {
-  exclusionKindFor, parseDedupeKey, reconcile, type ExistingAlertRow,
+  exclusionKindFor, parseDedupeKey, reconcile,
+  type ExclusionKind, type ExistingAlertRow,
 } from '../src/alerts/reconciliation.js'
 import {
   applyStatement, applyValidated, digestOf, explain, revertStatement, validateApply,
@@ -129,8 +130,37 @@ const STORE_QUERY = `
 type Reader = Readonly<{ $queryRawUnsafe: <T>(sql: string) => Promise<T> }>
 const readStore = (on: Reader): Promise<StoredSnapshot> => on.$queryRawUnsafe<StoredRow[]>(STORE_QUERY)
 
+/** The exclusions, BROKEN DOWN BY REASON rather than summed.
+ *
+ * A single "left alone" total keeps decision-versus-refusal apart and loses
+ * waiting-versus-never — at the step an operator reads immediately before authorising a
+ * write. The consequence is delayed and specific: when the classifier lands, somebody who
+ * remembers one number expects it to go to zero, and three rows stay behind forever.
+ *
+ * Ordered most-actionable first, and a reason with no rows is omitted rather than printed as
+ * zero — a list of zeroes trains the eye to skip the block. */
+const leftAloneLines = (excluded: readonly Excluded[]): readonly string[] => {
+  const say: Readonly<Record<ExclusionKind, string>> = {
+    SHAPE_CANNOT_NAME_SUBJECT: 'NEVER writable - the key cannot name what its subject reads',
+    TYPE_UNDETERMINED: 'waiting on the classifier - the key shape does not type',
+    SUBJECT_UNRESOLVED: 'typed, but this row\u2019s subject did not resolve',
+    RECOVERY_CHAIN_TOO_DEEP: 'UNKNOWN - the recovery chain ran past the hop limit',
+  }
+  const order: readonly ExclusionKind[] = [
+    'SHAPE_CANNOT_NAME_SUBJECT', 'RECOVERY_CHAIN_TOO_DEEP', 'TYPE_UNDETERMINED', 'SUBJECT_UNRESOLVED',
+  ]
+  return order
+    .map((kind) => ({ kind, count: excluded.filter((entry) => entry.because === kind).length }))
+    .filter(({ count }) => count > 0)
+    .map(({ kind, count }) => `${count} ${say[kind]}`)
+}
+
 /** The mapping, computed the way the dry run computes it - same `reconcile`, same inputs. */
-async function computeMapping(): Promise<{ decisions: MappingDecision[]; figures: Record<string, number> }> {
+async function computeMapping(): Promise<{
+  decisions: MappingDecision[]
+  excluded: Excluded[]
+  figures: Record<string, number>
+}> {
   const notifications = await prisma().notification.findMany({
     select: {
       id: true, organizationId: true, customerTenantId: true,
@@ -210,6 +240,7 @@ async function computeMapping(): Promise<{ decisions: MappingDecision[]; figures
 
   return {
     decisions,
+    excluded,
     figures: {
       rows: notifications.length,
       writable: writes.length,
@@ -235,7 +266,7 @@ async function main(): Promise<void> {
   const command = process.argv[2]
 
   if (command === 'save-mapping') {
-    const { decisions, figures } = await computeMapping()
+    const { decisions, excluded, figures } = await computeMapping()
 
     // THE SPLIT IS THE HEADLINE, and each number is labelled by the question it answers.
     // Two questions were read as one for long enough to reach a status report: "how many
@@ -249,9 +280,7 @@ async function main(): Promise<void> {
     console.log(`    ${figures.unnumbered} of those carry no episode number (unrecoverable)`)
     console.log('')
     console.log('  HOW MANY IT WOULD LEAVE ALONE, AND WHY - decisions, not refusals')
-    console.log(`    ${figures.typeUndetermined} waiting on the classifier (the key shape does not type)`)
-    console.log(`    ${figures.shapeCannotName} NEVER writable - the key shape cannot name what its subject reads`)
-    console.log(`    ${figures.subjectUnresolved} typed, but this row\u2019s subject did not resolve`)
+    for (const line of leftAloneLines(excluded)) console.log(`    ${line}`)
     console.log('')
     console.log('  HOW MANY INCIDENTS ARE IN THE DATA - a different question, under the nominated type')
     console.log(`    ${figures.incidentsInAllData} incidents, ${figures.episodes} episodes `
@@ -277,7 +306,12 @@ async function main(): Promise<void> {
          // apart. Under ruling (b) most rows are left alone on purpose; if that read as a
          // refusal the preflight would abort every time by design and the apply could never
          // run. This line is why a large number here is not alarming.
-         `${decision.run.excluded.length} left alone by decision, not by refusal.`,
+         //
+         // AND IT IS BROKEN DOWN, because one total collapses waiting-versus-never at the step
+         // an operator reads immediately before authorising a write. Step 1 prints three
+         // headings and this used to print their sum: when the classifier lands, somebody who
+         // remembers the sum expects zero and gets three.
+         ...leftAloneLines(decision.run.excluded),
          'PREFLIGHT PASSED - safe to apply.'].join('\n')
       : `${explain(decision.differences)}\n`
         + 'PREFLIGHT FAILED - do not apply. Re-run save-mapping and have the new figures approved.'
@@ -298,12 +332,12 @@ async function main(): Promise<void> {
       const before = await readStore(tx as unknown as Reader)
       const decision = validateApply(before, mapping)
       if (!decision.proceed) {
-        return { aborted: explain(decision.differences), written: 0, receipt: null, before, excluded: 0 }
+        return { aborted: explain(decision.differences), written: 0, receipt: null, before, excluded: [] }
       }
 
       const statement = applyStatement(decision.run)
       if (statement.expectedRowCount === 0) {
-        return { aborted: null, written: 0, receipt: null, before, excluded: decision.run.excluded.length }
+        return { aborted: null, written: 0, receipt: null, before, excluded: decision.run.excluded }
       }
 
       const written = await tx.$executeRawUnsafe(statement.sql, ...statement.params)
@@ -315,7 +349,7 @@ async function main(): Promise<void> {
           + 'A row changed between the check and the write. Rolled back; nothing was written.')
       }
       const { receipt } = applyValidated(before, decision.run, randomUUID(), new Date().toISOString())
-      return { aborted: null, written, receipt, before, excluded: decision.run.excluded.length }
+      return { aborted: null, written, receipt, before, excluded: decision.run.excluded }
     })
 
     if (result.aborted !== null) {
@@ -327,7 +361,8 @@ async function main(): Promise<void> {
     const disturbed = watchedFieldsDisturbedBetween(result.before, await readStore(prisma()))
     console.log('Preflight re-run inside the transaction: no differences.')
     console.log(`Applied ${result.written} rows in one statement, in one transaction.`)
-    console.log(`Left alone by decision: ${result.excluded}. These were never candidates.`)
+    console.log('Left alone by decision, not by refusal - these were never candidates:')
+    for (const line of leftAloneLines(result.excluded)) console.log(`  ${line}`)
     console.log(`Watched fields disturbed: ${disturbed.length === 0 ? 'none' : disturbed.join('; ')}`)
     if (result.receipt !== null) {
       writeFile(receiptPath, JSON.stringify(result.receipt, null, 2))
