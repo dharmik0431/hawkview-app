@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { ALERT_CATALOG } from './alert-catalog.js'
 import {
   causeKeyOf,
   contradictions,
@@ -221,9 +222,9 @@ const incident = (over: Partial<RoutableIncident> = {}): RoutableIncident => ({
   incidentKey: 'k-1',
   organizationId: 'org-1',
   customerTenantId: 'tenant-1',
-  ruleId: 'security.privileged_role_granted',
+  alertTypeId: 'security.privileged_directory_change',
+  ruleId: 'directory.privileged_role_assigned',
   severity: 'ACT_NOW',
-  category: 'SECURITY',
   subjectId: 'admin-1',
   ...over,
 })
@@ -345,16 +346,18 @@ test('ONLY MONITORING COALESCES — a security finding never merges across tenan
   // to share a rule, and coalescing them HIDES ONE BEHIND THE OTHER — the 301 defect wearing a
   // rate-limit costume.
   const collectorIn = (tenant: string) => incident({
-    incidentKey: `k-${tenant}`, customerTenantId: tenant, category: 'OPERATIONAL',
-    ruleId: 'monitoring.collector_failing', subjectId: 'SIGN_INS', severity: 'ACT_TODAY',
+    incidentKey: `k-${tenant}`, customerTenantId: tenant,
+    alertTypeId: 'monitoring.collector_failing', ruleId: 'monitoring.collector_failing',
+    subjectId: 'SIGN_INS', severity: 'ACT_TODAY',
   })
   const fleet = ['tenant-1', 'tenant-2', 'tenant-3'].map(collectorIn)
   assert.equal(new Set(fleet.map(causeKeyOf)).size, 1,
     'three tenants, one broken collector, one cause')
 
   const grantIn = (tenant: string) => incident({
-    incidentKey: `g-${tenant}`, customerTenantId: tenant, category: 'SECURITY',
-    ruleId: 'security.privileged_role_granted', subjectId: 'admin-1',
+    incidentKey: `g-${tenant}`, customerTenantId: tenant,
+    alertTypeId: 'security.privileged_directory_change',
+    ruleId: 'directory.privileged_role_assigned', subjectId: 'admin-1',
   })
   const grants = ['tenant-1', 'tenant-2', 'tenant-3'].map(grantIn)
   assert.equal(new Set(grants.map(causeKeyOf)).size, 3,
@@ -467,4 +470,87 @@ test('AN UNROUTABLE INCIDENT IS NOT A DELIVERED ONE', () => {
   // have nobody to tell. Conflating a choice with a gap is the error this feature keeps
   // finding, one layer down each time.
   assert.equal(gap.suppressed.length, 0)
+})
+
+test('THE SWEEP — every declared rule, not the two somebody thought to check', () => {
+  // The instruction was to go through all the subject/category pairs rather than the obvious
+  // candidate. Driven off ALERT_CATALOG so a rule added later is covered without anybody
+  // remembering to come back — a hand-written list of cases is a list of what was thought of.
+  //
+  // THE GENERAL SHAPE BEING SWEPT FOR: any rule whose declared subject reintroduces a
+  // dimension its category branch removes. The operational branch removes the tenant; a
+  // subject that IS the tenant puts it straight back.
+  const pairs = new Set<string>()
+  let tenantSubjected = 0
+
+  for (const declaration of ALERT_CATALOG) {
+    pairs.add(`${declaration.category}/${declaration.subject}`)
+    const inTenant = (tenant: string): RoutableIncident => ({
+      incidentKey: `k-${declaration.id}-${tenant}`,
+      organizationId: 'org-1',
+      customerTenantId: tenant,
+      alertTypeId: declaration.id,
+      ruleId: declaration.id,
+      severity: declaration.severity,
+      // When the declared subject IS the tenant, the subject id is the tenant id. That is the
+      // whole defect, so the fixture has to reproduce it rather than passing a constant.
+      subjectId: declaration.subject === 'TENANT' ? tenant : 'shared-subject',
+    })
+    const one = causeKeyOf(inTenant('tenant-1'))
+    const two = causeKeyOf(inTenant('tenant-2'))
+
+    if (declaration.category === 'SECURITY') {
+      assert.notEqual(one, two,
+        `${declaration.id} is SECURITY and must never coalesce across tenants`)
+      assert.ok(one.includes('tenant-1'), `${declaration.id} must carry its tenant`)
+      continue
+    }
+
+    assert.equal(one, two,
+      `${declaration.id} is OPERATIONAL and two tenants must be one cause`)
+    assert.ok(!one.includes('tenant-1') && !one.includes('tenant-2'),
+      `${declaration.id} leaks a tenant into an operational cause key`)
+    if (declaration.subject === 'TENANT') tenantSubjected += 1
+  }
+
+  // THE SWEEP FOUND MORE THAN THE ONE THAT WAS LOOKED AT. `monitoring.tenant_disconnected` was
+  // the obvious candidate; `monitoring.consent_expiring` has the identical shape and was not
+  // checked. Asserted as a count so that adding a third without handling it fails here.
+  assert.equal(tenantSubjected, 2,
+    'two OPERATIONAL rules declare the tenant as their subject, not one')
+
+  // And the fixture must actually span the interesting pairs, or the loop proves little.
+  assert.deepEqual([...pairs].sort(),
+    ['OPERATIONAL/COLLECTOR', 'OPERATIONAL/TENANT', 'SECURITY/ACTOR', 'SECURITY/TARGET'])
+})
+
+test('THE CATEGORY COMES FROM THE DECLARATION, so a caller cannot put a tenant in or out', () => {
+  // Direction 2: the tenant entered a security cause key only because a caller-supplied field
+  // said SECURITY. The catalogue owns that fact and declares it beside the subject — the same
+  // rule step 02 settled for the subject, one step later, because a second place for one fact
+  // is free to drift.
+  //
+  // THE CASE THAT BITES: one subject present in several tenants — an MSP's own admin account,
+  // or a vendor service principal, which is precisely the identity a fleet-wide privileged
+  // change involves. Same subject, two tenants, mislabelled OPERATIONAL: one message covering a
+  // privileged change in two customers, naming one of them.
+  const sharedAdmin = (tenant: string): RoutableIncident => ({
+    incidentKey: `k-${tenant}`,
+    organizationId: 'org-1',
+    customerTenantId: tenant,
+    alertTypeId: 'security.privileged_directory_change',
+    ruleId: 'directory.privileged_role_assigned',
+    severity: 'ACT_NOW',
+    subjectId: 'msp-admin@example-msp.test',
+  })
+  assert.notEqual(causeKeyOf(sharedAdmin('tenant-1')), causeKeyOf(sharedAdmin('tenant-2')),
+    'the same admin in two tenants is two privileged changes, not one')
+
+  // @ts-expect-error there is no `category` on an incident for a caller to assert
+  const asserted: RoutableIncident = { ...sharedAdmin('tenant-1'), category: 'OPERATIONAL' }
+  assert.ok(asserted)
+
+  // @ts-expect-error nor an alert type the catalogue does not declare
+  const undeclared: RoutableIncident = { ...sharedAdmin('tenant-1'), alertTypeId: 'security.invented' }
+  assert.ok(undeclared)
 })

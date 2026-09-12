@@ -20,6 +20,7 @@
  */
 
 import { joinUnambiguously } from './alert-key-encoding.js'
+import { alertType, type AlertTypeId } from './alert-catalog.js'
 import type { AlertCategory } from './alert-lifecycle.js'
 import type { RoutingTier, Severity } from './alert-type.js'
 
@@ -147,6 +148,9 @@ export interface RoutedRecord {
   /** SECURITY and MONITORING route independently and reach different people inside an MSP.
    * Kept on the record too, so a reader can see which channel it belonged to without
    * re-deriving it from the rule. */
+  /** From the declaration when this record was built, kept so a reader sees which channel
+   * it belonged to without re-deriving it. NOT an input to the cause key — see
+   * `causeKeyOf`, which reads the catalogue. */
   readonly category: AlertCategory
   /** What actually happened to this, IN WORDS, including when nothing was sent.
    *
@@ -225,9 +229,23 @@ export interface RoutableIncident {
   readonly incidentKey: string
   readonly organizationId: string
   readonly customerTenantId: string
+  /** THE DECLARED ALERT TYPE, and the authoritative source of category and subject role.
+   *
+   * `category` used to sit here as a caller-supplied field, and that was the whole of
+   * direction 2: the tenant entered a security cause key only because somebody passed the
+   * string SECURITY. The catalogue owns that fact and declares it beside the subject, so a
+   * second copy is free to drift — exactly the rule step 02 settled for the subject, one
+   * step later.
+   *
+   * Typed as `AlertTypeId`, so an id the catalogue does not declare does not compile. */
+  readonly alertTypeId: AlertTypeId
+  /** The FINER rule, for preferences. NOT the source of category.
+   *
+   * Two namespaces, deliberately separate: 7 catalogue types carry category and subject,
+   * 28 change rules are the configurable grain. "Page me for a role grant but not for an
+   * authentication method" needs the second; deriving a category needs the first. */
   readonly ruleId: string
   readonly severity: Severity
-  readonly category: AlertCategory
   /** The resolved subject from step 02 — for a collector failure the resource type, for a
    * directory change the actor. THE NON-TENANT PART OF THE CAUSE, and the field whose
    * absence meant `causeKeyOf` could not be written: without it, what makes two incidents
@@ -340,17 +358,39 @@ export interface RoutingOutcome {
  * Built with step 01's `joinUnambiguously` rather than a second encoding, so a subject id
  * containing a separator cannot collide two causes into one. */
 export function causeKeyOf(incident: RoutableIncident): string {
-  return incident.category === 'SECURITY'
-    ? joinUnambiguously([
-        'hawkview-cause/v1', 'SECURITY', incident.organizationId, incident.ruleId,
-        // The tenant IS the point here: two tenants are two causes.
-        incident.customerTenantId, incident.subjectId,
-      ])
-    : joinUnambiguously([
-        'hawkview-cause/v1', 'OPERATIONAL', incident.organizationId, incident.ruleId,
-        // No tenant. Fifteen tenants failing on one collector are one cause.
-        incident.subjectId,
-      ])
+  // FROM THE DECLARATION, NOT FROM THE CALLER. Both halves — the category that chooses the
+  // branch, and the subject role that decides whether the subject re-introduces the tenant.
+  const declaration = alertType(incident.alertTypeId)
+
+  if (declaration.category === 'SECURITY') {
+    return joinUnambiguously([
+      'hawkview-cause/v1', 'SECURITY', incident.organizationId, incident.alertTypeId,
+      // The tenant IS the point here: two tenants are two causes, always.
+      incident.customerTenantId, incident.subjectId,
+    ])
+  }
+
+  // WHEN THE DECLARED SUBJECT IS THE TENANT, THE SUBJECT GOES TOO.
+  //
+  // `monitoring.tenant_disconnected` and `monitoring.consent_expiring` both declare
+  // `subject: 'TENANT'`, so their subjectId IS the tenant id. Dropping `customerTenantId`
+  // while keeping `subjectId` let the tenant back in through the subject, and fifteen
+  // disconnected tenants became fifteen causes — one Microsoft outage, fifteen messages per
+  // MSP. That is the 1,500-message case arriving through the very rules the operational
+  // branch exists to coalesce.
+  //
+  // Dropping one copy of the tenant while keeping the other is incoherent: if the subject
+  // IS the tenant, the branch removes it in both places or in neither.
+  //
+  // Safe because coalescing is PER TICK — `fanOutProblems` allows the same fifteen across
+  // different ticks, so two outages a week apart stay two causes. Without that control this
+  // ruling would forbid legitimate recurrence. And the message names the tenants it covers:
+  // `affectedTenants` exists for exactly this case.
+  const subjectIsTheTenant = declaration.subject === 'TENANT'
+  return joinUnambiguously([
+    'hawkview-cause/v1', 'OPERATIONAL', incident.organizationId, incident.alertTypeId,
+    ...(subjectIsTheTenant ? [] : [incident.subjectId]),
+  ])
 }
 
 /** THE FAN-OUT INVARIANT, WHICH THE MISSING FIELD DOES NOT PROVIDE.

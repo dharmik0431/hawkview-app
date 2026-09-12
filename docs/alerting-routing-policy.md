@@ -256,3 +256,86 @@ assuming, and it is cheap enough to repeat.
 Six collapses, six caught: the tenant put back into a monitoring cause, the tenant dropped from
 a security one, the subject dropped entirely, `fanOutProblems` ignoring the tick, keyed per
 tenant, and `contradictions` always reporting none.
+
+## Both directions of `causeKeyOf`, and the sweep that found more than the fix
+
+### Direction 2: the category came from the caller
+
+`causeKeyOf` read `incident.category` and **never consulted `ALERT_CATALOG`**, which is the
+authoritative owner of every rule's category and declares it right beside the subject. So the
+tenant was in a security cause key only because a caller-supplied field said `SECURITY`.
+
+That is exactly the rule step 02 settled for the subject — **it comes from the declaration, not
+from the caller** — because a second place for one fact is free to drift. Same shape, one step
+later. `RoutableIncident` now carries `alertTypeId` (typed, so an undeclared id does not
+compile) and no `category` at all; the declaration supplies it.
+
+**The case that bites:** one subject present in several tenants — an MSP's own admin account,
+or a vendor service principal, which is precisely the identity a fleet-wide privileged change
+involves. Same subject across two tenants, mislabelled `OPERATIONAL`, merges into one cause:
+**one message covering a privileged change in two customers, naming one of them.**
+
+### Direction 1: the tenant re-entered through the subject
+
+`monitoring.tenant_disconnected` declares `subject: 'TENANT'`, so its subject id **is** the
+tenant id. The operational branch dropped `customerTenantId` and **kept** `subjectId` — so
+fifteen disconnected tenants produced fifteen causes. One Microsoft outage, fifteen messages
+per MSP: the 1,500-message case arriving through the very rule the branch exists to coalesce.
+
+**Dropping one copy of the tenant while keeping the other is incoherent.** If the subject is
+the tenant, the branch removes it in both places or in neither.
+
+Safe because coalescing is **per tick** — `fanOutProblems` allows the same fifteen across
+different ticks, so two outages a week apart stay two causes. Without that control this ruling
+would forbid legitimate recurrence. And `affectedTenants` names the tenants the one message
+covers; this is the case it exists for.
+
+### The sweep, and it found a second instance
+
+Driven off `ALERT_CATALOG` rather than written as a list of cases, so a rule added later is
+covered without anybody remembering to come back.
+
+| pair | rules | operational branch removes the tenant? |
+|---|---|---|
+| `OPERATIONAL / COLLECTOR` | `collector_failing`, `recovered` | yes — subject is a resource type, tenant-independent |
+| `OPERATIONAL / TENANT` | `tenant_disconnected`, **`consent_expiring`** | yes, and the subject too — both were affected |
+| `SECURITY / ACTOR` | `privileged_directory_change`, `routine_directory_change` | n/a — security never coalesces |
+| `SECURITY / TARGET` | `suspected_credential_attack` | n/a |
+
+**`monitoring.consent_expiring` has the identical shape and was not among the rules checked.**
+One instance found by looking at the obvious candidate is not evidence there is only one — the
+sweep asserts the count, so adding a third rule with a tenant subject fails here rather than
+shipping.
+
+### And a namespace confusion the sweep surfaced
+
+The instruction described *twenty rules with subject/category pairs*. There are **two separate
+namespaces**, and my own step-01 comment states it: *"the configurable grain is this list, not
+the seven catalogue ids."*
+
+| list | count | carries |
+|---|---|---|
+| `ALERT_CATALOG` | 7 | category, subject, severity — the authority for routing |
+| `CHANGE_RULES` | 28 | nothing but the identifier — the configurable grain for preferences |
+
+Only the seven have categories and subjects at all, so only the seven can be swept for this
+defect. The twenty-eight are what an MSP sets preferences on.
+
+**And there is a third.** Step 04's `intake` puts `IdentityRiskFinding.ruleId` — the Risky
+Users engine's own rule — into `QueuedIncident.ruleId`, and that id is in neither list. So a
+`RoutableIncident` built from step 04's queue has no declared alert type, and **routing cannot
+derive its category at all.**
+
+**That is a gap, not a bug I should fill in.** The Risky Users rules need declared alert types
+before their findings can be routed — category, subject and severity, from the catalogue like
+everything else. Inventing a mapping here is exactly the shortcut that put a caller-supplied
+category in the cause key in the first place. `RoutableIncident.ruleId` is kept alongside
+`alertTypeId` for the preference grain, but the type for those findings has to be declared.
+
+### One follow-on, flagged rather than decided
+
+The cause key now uses `alertTypeId`, the coarse declared type. Preferences are per **fine**
+rule. If two fine rules under one type carry different preferences — one silenced, one not —
+coalescing them into a single cause makes one message span both, and `contradictions` would be
+right to complain. Whether the cause key should therefore use the fine rule, or whether
+preferences should be constrained not to differ within a type, is a product decision.
