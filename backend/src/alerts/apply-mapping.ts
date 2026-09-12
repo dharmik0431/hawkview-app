@@ -93,6 +93,11 @@ export interface ValidatedRun {
     previous: Readonly<{ incidentKey: string | null; episode: number | null }>
     next: Readonly<{ incidentKey: string; episode: number | null }>
     observed: string
+    /** The version predicate, as COLUMNS rather than a digest, because the check has to be
+     * expressible in SQL. A digest would force a read into the application to compute it --
+     * which is the naive shape that lost every round of QA concurrency test. */
+    expectedDedupeKey: string
+    expectedOccurrenceCount: number
   }>[]
   /** Rows already carrying exactly this mapping. Not written again; counted so the operator
    * can tell a re-run from a first run. */
@@ -143,6 +148,8 @@ export function validateApply(store: StoredSnapshot, mapping: readonly MappingEn
       previous: { incidentKey: row.incidentKey, episode: row.episode },
       next: { incidentKey: entry.incidentKey, episode: entry.episode },
       observed: entry.observed,
+      expectedDedupeKey: row.dedupeKey,
+      expectedOccurrenceCount: row.occurrenceCount,
     })
   }
 
@@ -386,4 +393,102 @@ export function explain(differences: readonly Difference[]): string {
     lines.push('')
   }
   return lines.join('\n')
+}
+
+/** THE WRITE, AS ONE STATEMENT. Emitted here so the runner cannot quietly become a loop.
+ *
+ * MEASURED, at 364 rows: a per-row UPDATE is 395 ms on loopback and 5,623 ms with a 14.5 ms
+ * round trip; one statement is 12 ms either way, because it is one round trip. THE DRIVER IS
+ * ROUND TRIPS MULTIPLIED BY LATENCY, NOT ROW COUNT — per row, 364 to 5,000 rows is only 395 ms
+ * to 1,034 ms, under 3x for 14x the rows.
+ *
+ * That matters more than usual here because production is not loopback: Supabase in
+ * ca-central-1 with the backend on Render is a real network hop, and nobody has measured it.
+ * **The shape that does not depend on the number is the one to ship.**
+ *
+ * AND IT KEEPS EVERY GUARANTEE. Still all-or-nothing — the runner compares the returned row
+ * count against `expectedRowCount` and rolls back if they differ. Still version-checked per
+ * row: THE CHECK MOVES INTO THE JOIN CONDITION rather than a loop, so the check and the write
+ * remain one statement, which was always the property. A bulk statement satisfies it more
+ * obviously than a loop does.
+ *
+ * The alternative was a runbook telling the operator to pick a quiet moment. YOU DO NOT NEED A
+ * MAINTENANCE WINDOW IF THE WINDOW IS TWELVE MILLISECONDS — a structural mitigation rather than
+ * an operational one. */
+export interface BulkStatement {
+  /** One statement. Not a template to run per row. */
+  readonly sql: string
+  readonly params: readonly unknown[]
+  /** The runner MUST compare the driver's reported row count against this and roll back on any
+   * difference. That comparison is the all-or-nothing guarantee; the statement alone only
+   * declines the rows whose version moved. */
+  readonly expectedRowCount: number
+}
+
+/** The apply, as one conditional UPDATE.
+ *
+ * The version predicate is `dedupe_key` and `occurrence_count` — apply's scope, every mapping
+ * input — plus `incident_key IS NULL` so a row somebody else keyed is declined by the database
+ * rather than by application logic. */
+export function applyStatement(run: ValidatedRun): BulkStatement {
+  const params: unknown[] = []
+  const rows = run.writes.map((write) => {
+    const at = params.length
+    params.push(write.notificationId, write.next.incidentKey, write.next.episode,
+      write.expectedDedupeKey, write.expectedOccurrenceCount)
+    return `($${at + 1}::uuid, $${at + 2}::varchar, $${at + 3}::int, $${at + 4}::varchar, $${at + 5}::int)`
+  })
+
+  return {
+    sql: [
+      'UPDATE notifications AS n',
+      'SET incident_key = v.incident_key, episode = v.episode',
+      `FROM (VALUES ${rows.join(', ')})`,
+      'AS v(id, incident_key, episode, expected_dedupe_key, expected_occurrence_count)',
+      'WHERE n.id = v.id',
+      '  AND n.incident_key IS NULL',
+      '  AND n.dedupe_key = v.expected_dedupe_key',
+      '  AND n.occurrence_count = v.expected_occurrence_count',
+    ].join('\n'),
+    params,
+    expectedRowCount: run.writes.length,
+  }
+}
+
+/** The revert, as one conditional UPDATE.
+ *
+ * DELIBERATELY A NARROWER PREDICATE THAN THE APPLY'S, and this is B8 expressed in SQL: there is
+ * no `occurrence_count` here. Occurrences arriving between apply and revert are the system
+ * working, and a revert that checked them would refuse every row within five minutes of any new
+ * event — un-runnable at the moment somebody needs it.
+ *
+ * `expectedRowCount` is the rows the decision approved, and the runner reports rather than
+ * rolls back on a shortfall: the revert refuses per row and says which. */
+export function revertStatement(
+  receipt: ApplyReceipt,
+  decision: RevertDecision,
+): BulkStatement {
+  const approved = new Set(decision.rows)
+  const params: unknown[] = []
+  const rows = receipt.changed
+    .filter((entry) => approved.has(entry.notificationId))
+    .map((entry) => {
+      const at = params.length
+      params.push(entry.notificationId, entry.written.incidentKey, entry.written.episode)
+      return `($${at + 1}::uuid, $${at + 2}::varchar, $${at + 3}::int)`
+    })
+
+  return {
+    sql: [
+      'UPDATE notifications AS n',
+      'SET incident_key = NULL, episode = NULL',
+      `FROM (VALUES ${rows.join(', ')})`,
+      'AS v(id, written_incident_key, written_episode)',
+      'WHERE n.id = v.id',
+      '  AND n.incident_key = v.written_incident_key',
+      '  AND n.episode IS NOT DISTINCT FROM v.written_episode',
+    ].join('\n'),
+    params,
+    expectedRowCount: rows.length,
+  }
 }

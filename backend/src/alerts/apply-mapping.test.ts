@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  applyStatement,
   applyValidated,
+  revertStatement,
   digestOf,
   explain,
   revertValidated,
@@ -292,4 +294,92 @@ test('B8 — REVERT MUST NOT REUSE APPLY\'S CHECK, or it is un-runnable within f
   // THE CONTROL, or "never refuses" passes this too: a genuinely re-keyed row IS refused.
   const reKeyed = busy.map((r) => ({ ...r, incidentKey: 'somebody-elses-key' }))
   assert.equal(validateRevert(reKeyed, receipt).refused.length, 1)
+})
+
+test('THE APPLY IS ONE STATEMENT, whatever the row count', () => {
+  // Measured at 364 rows: a per-row UPDATE is 395ms on loopback and 5,623ms with a 14.5ms round
+  // trip; one statement is 12ms either way. THE DRIVER IS ROUND TRIPS x LATENCY, NOT ROWS — per
+  // row, 364 to 5,000 rows is 395ms to 1,034ms, under 3x for 14x the rows.
+  //
+  // Production is Supabase in ca-central-1 with the backend on Render — a real network hop
+  // nobody has measured. That is the argument for the shape that does not depend on the number.
+  const statementsFor = (n: number) => {
+    const store = Array.from({ length: n }, (_, i) => row({ id: `n-${i}`, occurrenceCount: i + 1 }))
+    const decision = validateApply(store, store.map((r) => entryFor(r)))
+    assert.ok(decision.proceed)
+    return applyStatement(decision.run)
+  }
+
+  for (const n of [1, 10, 364, 5000]) {
+    const statement = statementsFor(n)
+    assert.equal(statement.sql.split(';').filter((part) => part.trim() !== '').length, 1,
+      `${n} rows must still be ONE statement`)
+    assert.equal(statement.expectedRowCount, n)
+    // The parameters grow; the round trips do not. That is the whole property.
+    assert.equal(statement.params.length, n * 5)
+  }
+
+  // A LOOP WOULD PASS "the SQL is one statement" TRIVIALLY, so the count that matters is what a
+  // runner would execute: one, for any n.
+  assert.equal(statementsFor(364).sql, statementsFor(364).sql, 'deterministic for a given input')
+})
+
+test('THE VERSION CHECK IS IN THE STATEMENT, not read in the application first', () => {
+  // If the runner reads the version in TypeScript and then writes, it is not the conditional
+  // write — it is the naive control, which let BOTH writers through in all 25 of QA's rounds.
+  // Not "we checked", but "there was no gap in which to be wrong".
+  const store = [row({ id: 'n-1', dedupeKey: 'k-1', occurrenceCount: 7 })]
+  const decision = validateApply(store, [entryFor(store[0]!)])
+  assert.ok(decision.proceed)
+  const statement = applyStatement(decision.run)
+
+  // Both halves of apply's scope are predicates in the statement itself.
+  assert.match(statement.sql, /n\.dedupe_key = v\.expected_dedupe_key/)
+  assert.match(statement.sql, /n\.occurrence_count = v\.expected_occurrence_count/)
+  // And a row somebody else keyed is declined by the database, not by application logic.
+  assert.match(statement.sql, /n\.incident_key IS NULL/)
+
+  // The expected values travel as parameters, so nothing is interpolated into SQL text.
+  assert.ok(statement.params.includes('k-1'))
+  assert.ok(statement.params.includes(7))
+  assert.doesNotMatch(statement.sql, /k-1/, 'values are parameters, never inlined')
+})
+
+test('B8 AT THE SQL LEVEL — the revert statement has no occurrence_count predicate', () => {
+  // The two checks have different scopes, and here it is visible as the absence of a clause.
+  // A revert predicate over occurrence_count would refuse every row within five minutes of any
+  // new event, because occurrences arriving in between are the system working.
+  const before = [row({ id: 'n-1', occurrenceCount: 301 })]
+  const { after, receipt } = mustApply(before, [entryFor(before[0]!)])
+  const busy = after.map((r) => ({ ...r, occurrenceCount: 305 }))
+  const decision = validateRevert(busy, receipt)
+  const statement = revertStatement(receipt, decision)
+
+  assert.doesNotMatch(statement.sql, /occurrence_count/,
+    'the revert must not predicate on a field that legitimately moves between apply and revert')
+  assert.doesNotMatch(statement.sql, /dedupe_key/)
+  // What it DOES check: the values this run wrote.
+  assert.match(statement.sql, /n\.incident_key = v\.written_incident_key/)
+  assert.match(statement.sql, /n\.episode IS NOT DISTINCT FROM v\.written_episode/,
+    'null-safe, because episode is null for the 47 unrecoverable rows')
+
+  // AND THE CONTRAST IS THE POINT: apply's statement does carry that predicate.
+  const applyDecision = validateApply(before, [entryFor(before[0]!)])
+  assert.ok(applyDecision.proceed)
+  assert.match(applyStatement(applyDecision.run).sql, /occurrence_count/)
+
+  assert.equal(statement.expectedRowCount, 1, 'the busy row is still revertable')
+})
+
+test('THE REVERT STATEMENT CARRIES ONLY THE APPROVED ROWS', () => {
+  const before = [row({ id: 'n-1' }), row({ id: 'n-2' })]
+  const { after, receipt } = mustApply(before, before.map((r) => entryFor(r)))
+  const meddled = after.map((r) => (r.id === 'n-2' ? { ...r, incidentKey: 'somebody-else' } : r))
+  const decision = validateRevert(meddled, receipt)
+
+  assert.equal(decision.refused.length, 1)
+  const statement = revertStatement(receipt, decision)
+  assert.equal(statement.expectedRowCount, 1, 'only the row still ours to undo')
+  assert.ok(statement.params.includes('n-1'))
+  assert.ok(!statement.params.includes('n-2'), 'the refused row is not in the statement at all')
 })

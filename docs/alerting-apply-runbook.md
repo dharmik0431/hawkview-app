@@ -269,14 +269,63 @@ runner must still express each write as one conditional statement** whose WHERE 
 the expected version. Say so at the call site — the difference between correct and worthless
 is invisible at a glance and catastrophic in production.
 
+## One statement, not a loop — and you do not need a maintenance window
+
+**Measured at 364 rows:**
+
+| | loopback | + 14.5 ms per round trip |
+|---|---|---|
+| per-row `UPDATE` | 395 ms | **5,623 ms** |
+| one statement | 12 ms | **12 ms** |
+
+**The driver is round trips multiplied by latency, not row count.** Per row, going from 364
+to 5,000 rows is 395 ms to 1,034 ms — under 3× for 14× the rows. The shape matters more than
+the size.
+
+**Production is not loopback.** The database is Supabase in `ca-central-1` and the backend
+runs on Render, so there is a real network hop and **nobody has measured it.** That is not a
+gap to close before shipping — it is the argument for the shape that does not depend on the
+number.
+
+> **You do not need a maintenance window if the window is twelve milliseconds.**
+
+That is a structural mitigation rather than an operational one. The alternative was a runbook
+telling you to pick a quiet moment, which is a worse answer that also has to be remembered.
+
+**Everything Dharmik required survives the change.** Still all-or-nothing — the runner
+compares the returned row count against the expected count and rolls back on any difference.
+Still version-checked per row: **the check moves into the join condition** rather than a loop,
+so check and write remain one statement. Still refusing moved rows, still abort-before-write.
+
+**How to tell the runner is right:** `applyStatement()` emits the SQL, and a test asserts it
+is one statement for 1, 10, 364 and 5,000 rows, that the version predicate is in the WHERE
+clause, and that values travel as parameters. **If somebody replaces it with a loop, that test
+fails** — the constraint is checkable rather than advisory.
+
+### The measurement, with its bounds
+
+Loopback, one machine, Postgres 15, medians of 3–5 samples, and **a sleep rather than a real
+network** — so it models per-round-trip cost and not jitter, packet loss or connection setup.
+
+**And the latency figure itself was nearly wrong in the flattering direction.** The delay was
+requested as 1 ms; Node's timer floor on that machine is ~14 ms, so it was never 1 ms.
+Reporting it as 1 ms would have **understated the effect by an order of magnitude**. It was
+caught by arithmetic: 364 × 1 ms should be 364 ms and the figure was 5,377 ms — **the numbers
+did not close.** The latency is now derived from the measurements twice independently and the
+two derivations agree.
+
+The rule from it is worth keeping: **a simulated parameter must be measured, not assumed,
+because the simulation is part of the instrument.**
+
 ## One transaction means locks are held for the whole run
 
 All-or-nothing means row locks are held until commit, so **every concurrent writer touching an
 already-written row stalls behind the migration for its full duration.** The engine's own
 writes queue behind it.
 
-Measured by QA at 117–199 ms against a ten-row run with a deliberate delay. **At 364 rows this
-is short and entirely acceptable** — it is stated because it is a property of the design
+Measured at 117–199 ms against a ten-row run with a deliberate delay. **With the
+single-statement apply the whole transaction is about twelve milliseconds**, so the stall is
+shorter than the delay used to measure it. Stated because it is a property of the design
 rather than a defect.
 
 **The number that matters is the transaction's wall-clock length, not its row count.** More
@@ -285,9 +334,9 @@ the migration failing** — which would present as the collector being slow rath
 migration doing anything. That is the quiet failure mode to watch for if this is ever run at a
 larger size.
 
-*(A measured figure for 364 rows with no artificial delay is pending from QA; when it lands,
-the sentence to add is: at this size the stall is X, and what makes it stop being short is a
-longer transaction, not more rows.)*
+**The quiet failure mode, in one line:** if the apply ever grows, **the engine backs up rather
+than the migration failing — and that looks like the collector being slow rather than like the
+migration doing anything.** Nobody would attribute it to this.
 
 ## One decision to overrule here rather than in code
 
