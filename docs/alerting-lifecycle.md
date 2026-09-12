@@ -750,13 +750,18 @@ Recorded because this section is where someone goes to judge how urgent the gap
 was, and because overstating exposure spends attention a real gap elsewhere needed.
 The honest claim is: the defect existed in code that is not yet reachable.
 
-### The `unmodelledFingerprint` producer: still a decision, not a gap to fill
+### The `unmodelledFingerprint` producer: the decision, and how it was resolved
 
-`unmodelledFingerprint` is declared, read by the classifier, and **produced by
-nothing**. Every reference outside `privileged-change.ts` is a fixture supplying
-`'same'`, `'before'` or `'after'`. So the coupling the field's doc comment describes
-— digest the unmodelled part, never the whole policy — is currently unverifiable and
-rests on that comment.
+**Resolved — the producer exists, in `conditional-access-model.ts`.** See *The mapper
+and the fingerprint, sharing one declaration* below for what was built. This section is
+kept because the reasoning that got there is the part worth re-reading, and because one
+of its findings still stands.
+
+At the time of writing, `unmodelledFingerprint` was declared, read by the classifier,
+and **produced by nothing** — every reference outside `privileged-change.ts` was a
+fixture supplying `'same'`, `'before'` or `'after'`. So the coupling the field's doc
+comment describes — digest the unmodelled part, never the whole policy — was
+unverifiable and rested on that comment.
 
 QA delivered `auditProducer()` as the contract, proven against a whole-policy digest
 and a constant one. Both are real failure directions and the audit catches both.
@@ -921,3 +926,106 @@ bug.
 - **A rule id in the database that no longer exists in the code.** That is the
   migration this section exists to prevent. The pinned-list test is the thing that
   should have failed first.
+
+## The mapper and the fingerprint, sharing one declaration
+
+`backend/src/alerts/conditional-access-model.ts`. `unmodelledFingerprint` was declared,
+read by the classifier, and produced by nothing — every reference outside the
+classifier was a fixture supplying `'same'`. It now has a producer, and the mapper that
+builds a `ConditionalAccessState` from a collected policy lives beside it.
+
+**One declaration of what is modelled, two consumers.** The mapper reads the state from
+the declared paths; the fingerprint digests what is left. Two lists would be the
+coupling that produced three defects in a week, and putting the mapper and the producer
+on opposite sides of a module boundary would split that list from one of its consumers
+— the same defect with more distance in it.
+
+**It lives in the alerts folder, and the deciding argument is not ownership.** A mapper
+in the collection layer would absorb each new Graph shape and hand alerts a stable type
+— which sounds clean and would silently defeat `unmodelledFingerprint`, whose entire
+purpose is that a new Graph dimension cannot pass unnoticed. A collector that
+normalises Graph changes away is the safety net removing its own reason to exist. The
+cost is that a Graph shape change now touches this folder, which is right: whether we
+model a new policy dimension is an alerts decision and should cost a deliberate edit.
+
+**The collected field list comes from the other side of the boundary.**
+`COLLECTED_POLICY_FIELDS` is taken from `CONDITIONAL_ACCESS` in
+`tenant-sync.service.ts`, not written from memory — a list derived from my reading of
+the collector would agree with my reading and nothing else. A test asserts every
+modelled path sits under a field the collector actually stores.
+
+### Fidelity: which paths may be excluded from the digest
+
+This is the part where a silent gap would live, and it is the operator defect one level
+down.
+
+A path may only be excluded from the digest if the state captures it **losslessly**.
+Otherwise the part the projection discarded is invisible to *both* layers at once: the
+classifier never mapped it, and the fingerprint excluded it as "modelled". So a lossy
+projection keeps its path **in** the digest. The cost is noise — a change there can
+report unclassified when a modelled verdict already covers it — and noise is the safe
+direction.
+
+| path | fidelity | what the projection loses |
+|---|---|---|
+| `grantControls.operator` | **lossless** | nothing; OR/AND/null covers it |
+| `grantControls.builtInControls` | **lossless** | nothing; carried as-is |
+| `state` | lossy | three values onto a boolean: report-only and disabled both read false |
+| `conditions.users.excludeUsers` | lossy | merged with groups and roles into one array |
+| `conditions.users.excludeGroups` | lossy | the *kind*, and with it the blast radius — one group edit removes a policy from everybody in it |
+| `conditions.users.excludeRoles` | lossy | a role exclusion's membership changes without the policy being edited at all |
+| `sessionControls` | lossy | the **values**; only the names are modelled |
+
+**`sessionControls` is the one that matters most.** The state models only which controls
+are present, deliberately, because their direction depends on values it does not
+capture — `persistentBrowser: always` weakens a policy and `never` strengthens it.
+Excluding that subtree as "modelled" would make an always-to-never change invisible to
+the presence check (the key set is unchanged) *and* to the fingerprint (excluded). A
+test asserts the presence check genuinely cannot tell those two apart, and that the
+fingerprint therefore does.
+
+**Five of seven paths are lossy, and that is a finding rather than a design.** Only the
+two grant-control paths are lossless. Making the others lossless would let them be
+excluded and remove the noise — and it is cheap for `state`, because
+`effective-mfa-enforcement.ts` already maps that field to `ON` / `REPORT_ONLY` / `OFF`,
+so the three-value vocabulary exists in the product. Each lossy entry states what it
+discards, and a test requires that reasoning to be there, because this table is what
+somebody reads when deciding whether to fix one.
+
+### The canonicaliser is injected, and that moves a risk rather than removing it
+
+The collection layer already canonicalises conditional access policies, including
+order-insensitivity for the arrays Microsoft returns in arbitrary order. That function
+is module-private and its file is being edited, so this module states what it needs —
+`(value: unknown) => unknown` — and the wiring supplies it. Same shape as `quietMs` and
+the seen-set: the layer declares its dependency instead of reaching across a boundary.
+
+**A compile-time import is at least the right function. An injected one can be wired to
+an identity function**, and the fingerprint then degrades *silently* toward everything
+reading routine — the unsafe direction. A test demonstrates exactly that: with the real
+canonicaliser, a reordered `includeUsers` array does not move the digest; with identity,
+it does.
+
+**Obligation on whoever does the wiring, for step 05:** the producer audit must run
+against the **production-wired** function, not only against what a test supplies. If it
+only ever audits a test double, the coupling has moved from an import somebody can see
+to a wiring nobody checks, and the audit becomes a check sharing an origin with what it
+checks. The loose end — exporting `canonicalize` from `change-evidence.service.ts` — is
+named and deliberately not chased: that directory holds pre-existing unowned work.
+
+### What to check first when this breaks
+
+- **Everything suddenly reads routine.** Check the wired canonicaliser first, before the
+  paths. An identity or wrong canonicaliser degrades the digest quietly and in the
+  unsafe direction; nothing else here fails that way.
+- **A policy change that should have been reported as unmodelled, wasn't.** Check
+  whether its path is marked lossless. A path excluded as "modelled" whose projection
+  actually discards something is the one silent failure this design can still have, and
+  the fidelity table is the list to audit.
+- **Every grant change comes back unclassified.** A lossless path has stopped being
+  excluded, so the digest moves on a dimension the classifier already reads and the
+  routine branch is unreachable. That is the whole-policy-digest mistake returning.
+- **A session control appears on every policy.** Microsoft sends unconfigured controls
+  as keys with `null` values rather than omitting them; the null filter is what makes
+  the presence set mean anything. Without it the set is identical for every policy and
+  the comparison can never fire.
