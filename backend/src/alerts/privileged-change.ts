@@ -47,7 +47,20 @@ export const CHANGE_RULES = [
   // Conditional access
   'conditional_access.state_unavailable',
   'conditional_access.policy_disabled',
-  'conditional_access.principal_excluded',
+  // ADDED rather than folded into policy_disabled. That id now means exactly
+  // enforcing-to-off; a policy that stops ENFORCING while still evaluating is a
+  // different event and an MSP may reasonably want to hear about one and not the
+  // other. Renaming an existing id is forbidden; adding is a line.
+  'conditional_access.policy_stopped_enforcing',
+  'conditional_access.policy_stopped_reporting',
+  'conditional_access.policy_state_unrecognised',
+  // REPLACES 'conditional_access.principal_excluded', which became unreachable when
+  // the exclude lists stopped being merged. A deletion rather than a rename, and
+  // permitted only because nothing is wired and no preference row exists yet — after
+  // wiring this would be a migration and a conversation about saved settings.
+  'conditional_access.user_excluded',
+  'conditional_access.group_excluded',
+  'conditional_access.role_excluded',
   'conditional_access.grant_weakened',
   'conditional_access.grant_operator_unknown',
   'conditional_access.grant_controls_absent',
@@ -158,12 +171,48 @@ export type DirectoryChange =
 
 /** Enough of a conditional access policy to compare two of them. */
 export interface ConditionalAccessState {
-  readonly enabled: boolean
+  /** Enforcing, evaluating-but-not-enforcing, or off.
+   *
+   * THREE VALUES, NOT A BOOLEAN, and the boolean it replaces produced a WRONG
+   * SENTENCE rather than merely a lossy one. Microsoft's `state` is
+   * `enabled | enabledForReportingButNotEnforced | disabled`; projecting it onto
+   * `enabled: boolean` made enabled-to-report-only read as "the policy was
+   * disabled". It was not — it still evaluates and still logs, it just stops
+   * enforcing. Saying more than the evidence shows is the thing this file refuses
+   * everywhere else.
+   *
+   * And report-only to disabled read as false-to-false, no change at all, while
+   * being a real loss: the policy stops even logging. Both transitions now have a
+   * verdict of their own.
+   *
+   * The vocabulary is the product's already — `tenant-sync.service.ts` maps this
+   * field to exactly these three words.
+   *
+   * UNRECOGNISED is the fourth member and it is what keeps the exclusion honest. This
+   * field is modelled losslessly and therefore excluded from
+   * `unmodelledFingerprint`, so if a state Microsoft has not sent before were mapped
+   * to OFF, that guess would be the ONLY thing said about it — an assertion of "not
+   * enforcing" about something we do not understand, with the safety net switched off
+   * for exactly that case. */
+  readonly state: 'ON' | 'REPORT_ONLY' | 'OFF' | 'UNRECOGNISED'
   /** How the grant controls combine. Microsoft's model: OR means any one control
    * satisfies the policy, AND means all of them must. */
   readonly grantOperator: 'OR' | 'AND' | null
   readonly grantControls: readonly string[]
-  readonly excludedPrincipals: readonly string[]
+  /** Excluded principals, kept apart BY KIND rather than merged.
+   *
+   * Merging them lost the blast radius, not a label. Excluding one named account
+   * and excluding a group are different sizes of event, and this is the tier that
+   * rings a phone: "a group was excluded from this policy" tells an MSP the scope
+   * is potentially large and unknown, and "a principal was excluded" does not.
+   *
+   * A ROLE exclusion is worse still and HawkView cannot fully see it — see the
+   * blind spot recorded in `docs/alerting-lifecycle.md`: role membership changes
+   * alter who the exclusion covers with no policy edit at all, so there is no
+   * change for us to collect. */
+  readonly excludedUsers: readonly string[]
+  readonly excludedGroups: readonly string[]
+  readonly excludedRoles: readonly string[]
   /** Session controls PRESENT, by name. Modelled far enough to notice they moved
    * and deliberately no further: their direction depends on values this does not
    * capture — `persistentBrowser: always` weakens a policy and `never` strengthens
@@ -530,18 +579,62 @@ export function classifyConditionalAccessChange(
       'conditional-access-state-missing')
   }
 
-  if (before.enabled && !after.enabled) {
-    return urgent('conditional_access.policy_disabled',
-      'A conditional access policy was disabled. Its protection stops applying immediately.')
+  // A STATE WE DO NOT RECOGNISE IS NOT A STATE WE CAN COMPARE, and it comes first so
+  // no rule below gets to treat it as one of the three it understands.
+  if (before.state !== after.state && (before.state === 'UNRECOGNISED' || after.state === 'UNRECOGNISED')) {
+    return unclassified(
+      'conditional_access.policy_state_unrecognised',
+      'A conditional access policy moved into or out of a state this comparison does not recognise, so ' +
+      'whether it is enforcing cannot be determined. Change detected; impact unknown.',
+      'policy-state')
   }
 
-  const addedExclusions = after.excludedPrincipals.filter(
-    (principal) => !before.excludedPrincipals.includes(principal))
-  if (addedExclusions.length > 0) {
-    return urgent(
-      'conditional_access.principal_excluded',
-      `A principal was excluded from a conditional access policy (${addedExclusions.length}), ` +
-      'so the policy no longer applies to them.')
+  // ENFORCING TO ANYTHING ELSE is the weakening, and the two destinations are not
+  // the same event. Reported separately so the record says what actually happened.
+  if (before.state === 'ON' && after.state === 'OFF') {
+    return urgent('conditional_access.policy_disabled',
+      'A conditional access policy was disabled. Its protection stops applying immediately, and it no ' +
+      'longer evaluates or logs.')
+  }
+  if (before.state === 'ON' && after.state === 'REPORT_ONLY') {
+    return urgent('conditional_access.policy_stopped_enforcing',
+      'A conditional access policy was switched to report-only. It still evaluates and still logs, and it ' +
+      'no longer enforces — so access it previously blocked is now allowed.')
+  }
+  if (before.state === 'REPORT_ONLY' && after.state === 'OFF') {
+    // NOT A WEAKENING UNDER THE POLICY SEMANTICS, and saying otherwise would be the
+    // overreach this file refuses: a report-only policy already allowed every session
+    // and a disabled one allows the same set, so nobody's access changed. What is lost
+    // is OUR visibility — the evaluation log that tells an MSP what the policy would
+    // have done. Routine by default, and now configurable on its own rule if an MSP
+    // decides losing that signal matters more to them than it does to us.
+    return routine('conditional_access.policy_stopped_reporting',
+      'A report-only conditional access policy was disabled. No session\'s access changes — report-only ' +
+      'was not enforcing either — but the policy stops evaluating, so the log of what it would have done ' +
+      'ends here.')
+  }
+
+  // BY KIND, because the kinds are different sizes of event on the tier that pages.
+  // A role exclusion first: its reach is the largest and the least knowable.
+  const addedRoles = after.excludedRoles.filter((role) => !before.excludedRoles.includes(role))
+  if (addedRoles.length > 0) {
+    return urgent('conditional_access.role_excluded',
+      `A directory role was excluded from a conditional access policy (${addedRoles.length}), so the ` +
+      'policy no longer applies to anybody holding that role. Who that covers changes as role ' +
+      'assignments change, with no further edit to the policy.')
+  }
+  const addedGroups = after.excludedGroups.filter((group) => !before.excludedGroups.includes(group))
+  if (addedGroups.length > 0) {
+    return urgent('conditional_access.group_excluded',
+      `A group was excluded from a conditional access policy (${addedGroups.length}), so the policy no ` +
+      'longer applies to its members. The number of accounts that covers is not visible from the policy ' +
+      'itself.')
+  }
+  const addedUsers = after.excludedUsers.filter((user) => !before.excludedUsers.includes(user))
+  if (addedUsers.length > 0) {
+    return urgent('conditional_access.user_excluded',
+      `An account was excluded from a conditional access policy (${addedUsers.length}), so the policy no ` +
+      'longer applies to it.')
   }
 
   const grant = grantChangeVerdict(before, after)

@@ -42,10 +42,12 @@ const policy = (over: Record<string, unknown> = {}): Record<string, unknown> => 
 
 test('the mapper reads every modelled field from the collected policy', () => {
   const state = mapCollectedPolicy(policy(), canonicalise)
-  assert.equal(state.enabled, true)
+  assert.equal(state.state, 'ON')
   assert.equal(state.grantOperator, 'AND')
   assert.deepEqual(state.grantControls, ['mfa', 'compliantDevice'])
-  assert.deepEqual(state.excludedPrincipals, [])
+  assert.deepEqual(state.excludedUsers, [])
+  assert.deepEqual(state.excludedGroups, [])
+  assert.deepEqual(state.excludedRoles, [])
   assert.deepEqual(state.sessionControls, [])
   assert.equal(typeof state.unmodelledFingerprint, 'string')
 
@@ -53,7 +55,10 @@ test('the mapper reads every modelled field from the collected policy', () => {
   const excluded = mapCollectedPolicy(policy({
     conditions: { users: { excludeUsers: ['u1'], excludeGroups: ['g1'], excludeRoles: ['r1'] } },
   }), canonicalise)
-  assert.deepEqual(excluded.excludedPrincipals, ['u1', 'g1', 'r1'])
+  // KEPT APART, which is the point: merging them lost which kind was excluded.
+  assert.deepEqual(excluded.excludedUsers, ['u1'])
+  assert.deepEqual(excluded.excludedGroups, ['g1'])
+  assert.deepEqual(excluded.excludedRoles, ['r1'])
 
   // An absent or unrecognised operator is null rather than guessed.
   assert.equal(mapCollectedPolicy(policy({ grantControls: {} }), canonicalise).grantOperator, null)
@@ -150,13 +155,21 @@ test('A LOSSY PATH STAYS IN THE DIGEST, because the part the projection drops is
   assert.equal(verdict.classification, 'UNCLASSIFIED')
   assert.equal(verdict.rule, 'conditional_access.unmodelled_dimension')
 
-  // STATE. Three values projected onto a boolean, so report-only and disabled are the
-  // same to the classifier. Neither is enforcing, so it is not a weakening — but it is
-  // a change, and the digest is the only thing that can say so.
+  // STATE IS NO LONGER IN THIS LIST. It was lossy — three values onto a boolean — and
+  // is now carried as three plus UNRECOGNISED, so it is excluded from the digest and
+  // the classifier sees the transition directly. Kept here as the case that moved:
+  // report-only and disabled were indistinguishable and are not any more.
   const reportOnly = mapCollectedPolicy(policy({ state: 'enabledForReportingButNotEnforced' }), canonicalise)
   const disabled = mapCollectedPolicy(policy({ state: 'disabled' }), canonicalise)
-  assert.equal(reportOnly.enabled, disabled.enabled, 'the boolean cannot tell them apart')
-  assert.notEqual(reportOnly.unmodelledFingerprint, disabled.unmodelledFingerprint)
+  assert.equal(reportOnly.state, 'REPORT_ONLY')
+  assert.equal(disabled.state, 'OFF')
+  assert.notEqual(reportOnly.state, disabled.state, 'the projection no longer loses this')
+  assert.equal(reportOnly.unmodelledFingerprint, disabled.unmodelledFingerprint,
+    'and because it is lossless it is excluded from the digest, so the state is the only reporter')
+
+  // A state Microsoft has not sent before is UNRECOGNISED rather than guessed as OFF,
+  // which is what keeps excluding this path honest.
+  assert.equal(mapCollectedPolicy(policy({ state: 'somethingNew' }), canonicalise).state, 'UNRECOGNISED')
 })
 
 test('EVERY LOSSY PATH SAYS WHAT ITS PROJECTION DISCARDS', () => {
@@ -164,7 +177,7 @@ test('EVERY LOSSY PATH SAYS WHAT ITS PROJECTION DISCARDS', () => {
   // list somebody needs in order to decide whether to make a projection lossless, so
   // it has to be readable rather than a flag.
   const lossy = MODELLED_PATHS.filter((modelled) => modelled.fidelity === 'LOSSY')
-  assert.equal(lossy.length, 5, 'state, the three exclude lists, and sessionControls')
+  assert.equal(lossy.length, 1, 'only sessionControls, whose values we refuse to infer a direction from')
   for (const modelled of lossy) {
     assert.ok(modelled.because.length > 60, `${modelled.path.join('.')}: reasoning too thin`)
   }
@@ -249,4 +262,48 @@ test('A SESSION CONTROL PRESENT BUT NULL IS NOT CONFIGURED', () => {
   const verdict = classifyConditionalAccessChange(state, two)
   assert.equal(verdict.classification, 'UNCLASSIFIED')
   assert.equal(verdict.rule, 'conditional_access.session_control_changed')
+})
+
+
+test('EVERY FIDELITY CLAIM IS WITNESSED, so a lossy path cannot be excluded by accident', () => {
+  // THE ENFORCEMENT, rather than a label somebody wrote. Each path carries two policies
+  // differing only at it, and the two fidelities make opposite predictions:
+  //
+  //   LOSSLESS  the state MUST differ across the pair (nothing was lost)
+  //             and the digest must NOT move (it is excluded, so a modelled verdict
+  //             stays reachable)
+  //   LOSSY     the state must NOT differ (the loss is real)
+  //             and the digest MUST move (the lost part is still visible somewhere)
+  //
+  // A lossy path marked lossless fails the first pair; a lossless one marked lossy
+  // fails the second. The configuration that produced the grant-operator defect — a
+  // dimension inside the modelled set with no backstop — cannot be written again
+  // without a test going red.
+  const base = policy({ sessionControls: { persistentBrowser: { isEnabled: true, mode: 'always' } } })
+
+  for (const modelled of MODELLED_PATHS) {
+    const { before, after } = modelled.witness(base)
+    const mappedBefore = mapCollectedPolicy(before, canonicalise)
+    const mappedAfter = mapCollectedPolicy(after, canonicalise)
+    const where = `${modelled.path.join('.')} (${modelled.fidelity})`
+
+    if (modelled.fidelity === 'LOSSLESS') {
+      assert.notDeepEqual(mappedAfter[modelled.reads], mappedBefore[modelled.reads],
+        `${where}: the state does NOT reflect a change here, so excluding it from the digest hides it`)
+      assert.equal(mappedAfter.unmodelledFingerprint, mappedBefore.unmodelledFingerprint,
+        `${where}: a lossless path must be excluded, or every modelled verdict is unreachable`)
+    } else {
+      assert.deepEqual(mappedAfter[modelled.reads], mappedBefore[modelled.reads],
+        `${where}: declared lossy, but the state DOES capture this — it may be lossless`)
+      assert.notEqual(mappedAfter.unmodelledFingerprint, mappedBefore.unmodelledFingerprint,
+        `${where}: lossy and the digest does not move — invisible to both layers at once`)
+    }
+  }
+
+  // The witnesses must actually perturb something, or every assertion above is vacuous.
+  for (const modelled of MODELLED_PATHS) {
+    const { before, after } = modelled.witness(base)
+    assert.notEqual(JSON.stringify(before), JSON.stringify(after),
+      `${modelled.path.join('.')}: the witness changes nothing`)
+  }
 })

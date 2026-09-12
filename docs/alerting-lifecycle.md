@@ -783,8 +783,10 @@ called. A real producer must digest **the collected Graph policy.**
 
 That is what makes this a decision rather than a task. The producer needs the
 correspondence between each modelled field and its Graph path — `grantOperator` ←
-`grantControls.operator`, `excludedPrincipals` ← `conditions.users.excludeUsers` and
-its siblings — and that is a second list which must agree with the first, with
+`grantControls.operator`, and what was then a single `excludedPrincipals` field ←
+`conditions.users.excludeUsers` and its siblings (that field has since been split into
+three, for reasons recorded below) — and that is a second list which must agree with the
+first, with
 nothing forcing it to. Exactly the coupling class that produced three defects in a
 week.
 
@@ -966,31 +968,90 @@ projection keeps its path **in** the digest. The cost is noise — a change ther
 report unclassified when a modelled verdict already covers it — and noise is the safe
 direction.
 
-| path | fidelity | what the projection loses |
+| path | fidelity | note |
 |---|---|---|
-| `grantControls.operator` | **lossless** | nothing; OR/AND/null covers it |
-| `grantControls.builtInControls` | **lossless** | nothing; carried as-is |
-| `state` | lossy | three values onto a boolean: report-only and disabled both read false |
-| `conditions.users.excludeUsers` | lossy | merged with groups and roles into one array |
-| `conditions.users.excludeGroups` | lossy | the *kind*, and with it the blast radius — one group edit removes a policy from everybody in it |
-| `conditions.users.excludeRoles` | lossy | a role exclusion's membership changes without the policy being edited at all |
-| `sessionControls` | lossy | the **values**; only the names are modelled |
+| `state` | **lossless** | three values plus UNRECOGNISED; was a boolean |
+| `grantControls.operator` | **lossless** | OR/AND/null covers it |
+| `grantControls.builtInControls` | **lossless** | carried as-is |
+| `conditions.users.excludeUsers` | **lossless** | its own array |
+| `conditions.users.excludeGroups` | **lossless** | its own array |
+| `conditions.users.excludeRoles` | **lossless** | its own array |
+| `sessionControls` | lossy | only the **names** are modelled; the values stay in the digest |
 
-**`sessionControls` is the one that matters most.** The state models only which controls
-are present, deliberately, because their direction depends on values it does not
-capture — `persistentBrowser: always` weakens a policy and `never` strengthens it.
-Excluding that subtree as "modelled" would make an always-to-never change invisible to
-the presence check (the key set is unchanged) *and* to the fingerprint (excluded). A
-test asserts the presence check genuinely cannot tell those two apart, and that the
-fingerprint therefore does.
+Five of these were lossy in the first version and were made lossless, because a lossy
+projection forces a choice between noise and a silent gap and neither is acceptable
+where the fix is cheap.
 
-**Five of seven paths are lossy, and that is a finding rather than a design.** Only the
-two grant-control paths are lossless. Making the others lossless would let them be
-excluded and remove the noise — and it is cheap for `state`, because
-`effective-mfa-enforcement.ts` already maps that field to `ON` / `REPORT_ONLY` / `OFF`,
-so the three-value vocabulary exists in the product. Each lossy entry states what it
-discards, and a test requires that reasoning to be there, because this table is what
-somebody reads when deciding whether to fix one.
+**`state` was not merely lossy — the boolean produced a wrong sentence.**
+Enabled-to-report-only read as *"the policy was disabled"*. It was not: it still
+evaluates and still logs, it just stops enforcing. Saying more than the evidence shows is
+what this file refuses everywhere else. And report-only-to-disabled read as
+false-to-false, no change at all, while being a real loss — the policy stops even
+logging. Both transitions now have a verdict:
+
+| transition | verdict | why |
+|---|---|---|
+| ON → OFF | urgent, `policy_disabled` | protection stops applying and it stops evaluating |
+| ON → REPORT_ONLY | urgent, `policy_stopped_enforcing` | access it previously blocked is now allowed |
+| REPORT_ONLY → OFF | routine, `policy_stopped_reporting` | nobody's access changes; **our** visibility is what is lost |
+| any ↔ UNRECOGNISED | unclassified, `policy_state_unrecognised` | cannot be read, so it is not read |
+| the strengthening directions | routine | turning a policy on must not look like turning one off |
+
+`REPORT_ONLY → OFF` is **not** a weakening under the policy semantics, and calling it one
+would be the same overreach: a report-only policy already allowed every session and a
+disabled one allows the same set. What ends is the evaluation log. Routine by default and
+configurable on its own rule, which is what the rule identifiers are for.
+
+**UNRECOGNISED is the fourth member and it is what keeps the exclusion honest.** This
+path is lossless and therefore excluded from the digest, so mapping an unknown state to
+`OFF` would assert "not enforcing" about something we do not understand — with the safety
+net switched off for exactly that case.
+
+**The exclude lists are three arrays because merging them lost the blast radius, not a
+label.** Excluding one named account and excluding a group are different sizes of event
+on the tier that rings a phone. Three rules, so an MSP can hear about group and role
+exclusions without hearing about every individual account. `role_excluded` is checked
+first, then `group_excluded`, then `user_excluded` — widest reach first, so a policy edit
+that adds several kinds at once reports the largest.
+
+**One rule identifier was deleted**, which the wire-contract discipline otherwise
+forbids. `conditional_access.principal_excluded` became unreachable the moment the
+exclude lists stopped being merged, and a deletion is permitted here only because nothing
+is wired and no preference row exists. After wiring, the same change would be a migration
+and a conversation about somebody's saved settings — which is the whole reason the
+identifiers were named before the settings screen was built.
+
+**One of seven paths is lossy now, and that is the end state rather than an accident.**
+Five were made lossless once the first version surfaced the choice. `sessionControls`
+stays lossy deliberately: making it lossless would mean modelling values whose direction
+we agreed not to infer — `persistentBrowser: always` weakening and `never` strengthening
+is the OR/AND error waiting one dimension across — so the fingerprint firing there is
+designed behaviour, not noise.
+
+**The fidelity claim is witnessed rather than declared.** Each path carries two policies
+differing only at it, and the two fidelities make opposite predictions: a lossless path
+must change the state and must NOT move the digest; a lossy path must leave the state
+identical and MUST move the digest. Mislabelling in either direction fails a test, so a
+lossy-and-excluded path — the configuration that produced the grant-operator defect —
+cannot be written again by accident. That is the obligation enforced by something rather
+than followed by somebody.
+
+### What HawkView cannot see: role-based exclusions
+
+Recorded because it is larger than the decision that surfaced it, and because nothing in
+this feature can fix it.
+
+**A role exclusion's effect changes when role membership changes, with no policy edit at
+all.** "Exclude Global Readers from this policy" covers whoever holds that role today;
+grant the role to somebody tomorrow and the policy silently stops applying to them. The
+policy document is byte-identical, so there is no change for the collector to collect and
+no event for any of this machinery to classify.
+
+The exclusion itself is caught — `role_excluded` is urgent, and its sentence says the
+covered set moves without further edits. What is **not** caught is the later membership
+change. That is a real gap in what the product can observe rather than a defect in this
+comparison, and it belongs in an honest statement of coverage rather than in a fix nobody
+can write here.
 
 ### The canonicaliser is injected, and that moves a risk rather than removing it
 

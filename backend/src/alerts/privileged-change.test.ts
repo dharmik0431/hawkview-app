@@ -216,10 +216,12 @@ test('nothing is asserted benign, and no coverage is claimed for another compone
 })
 
 const policy = (over: Partial<ConditionalAccessState> = {}): ConditionalAccessState => ({
-  enabled: true,
+  state: 'ON',
   grantOperator: 'AND',
   grantControls: ['mfa', 'compliantDevice'],
-  excludedPrincipals: [],
+  excludedUsers: [],
+  excludedGroups: [],
+  excludedRoles: [],
   sessionControls: [],
   unmodelledFingerprint: 'same',
   ...over,
@@ -264,15 +266,15 @@ test('conditional access needs before and after, and says so when it lacks them'
 
 test('disabling a policy and excluding a principal are both weakening', () => {
   assert.equal(
-    classifyConditionalAccessChange(policy(), policy({ enabled: false })).classification,
+    classifyConditionalAccessChange(policy(), policy({ state: 'OFF' })).classification,
     'URGENT')
   assert.equal(
-    classifyConditionalAccessChange(policy(), policy({ excludedPrincipals: ['user-1'] })).classification,
+    classifyConditionalAccessChange(policy(), policy({ excludedUsers: ['user-1'] })).classification,
     'URGENT')
 
   // POSITIVE CONTROL: removing an exclusion is not weakening.
   assert.equal(
-    classifyConditionalAccessChange(policy({ excludedPrincipals: ['user-1'] }), policy()).classification,
+    classifyConditionalAccessChange(policy({ excludedUsers: ['user-1'] }), policy()).classification,
     'ROUTINE')
 })
 
@@ -334,7 +336,7 @@ test('routine requires the modelled dimensions to be the ones that moved', () =>
   assert.equal(
     classifyConditionalAccessChange(
       policy({ unmodelledFingerprint: 'before' }),
-      policy({ enabled: false, unmodelledFingerprint: 'after' })).classification,
+      policy({ state: 'OFF', unmodelledFingerprint: 'after' })).classification,
     'URGENT')
 })
 
@@ -675,9 +677,21 @@ const REACHES: ReadonlyArray<readonly [ChangeRule, () => { rule: ChangeRule }]> 
   ['conditional_access.state_unavailable',
     () => classifyConditionalAccessChange(null, policy())],
   ['conditional_access.policy_disabled',
-    () => classifyConditionalAccessChange(policy(), policy({ enabled: false }))],
-  ['conditional_access.principal_excluded',
-    () => classifyConditionalAccessChange(policy(), policy({ excludedPrincipals: ['someone'] }))],
+    () => classifyConditionalAccessChange(policy(), policy({ state: 'OFF' }))],
+  ['conditional_access.policy_stopped_enforcing',
+    () => classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'REPORT_ONLY' }))],
+  ['conditional_access.policy_stopped_reporting',
+    () => classifyConditionalAccessChange(policy({ state: 'REPORT_ONLY' }), policy({ state: 'OFF' }))],
+  ['conditional_access.policy_state_unrecognised',
+    () => classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'UNRECOGNISED' }))],
+  // Ordered role, group, user in the classifier, so each of these adds only its own
+  // kind — otherwise the earlier rule fires and the later entry is untested.
+  ['conditional_access.role_excluded',
+    () => classifyConditionalAccessChange(policy(), policy({ excludedRoles: ['role-1'] }))],
+  ['conditional_access.group_excluded',
+    () => classifyConditionalAccessChange(policy(), policy({ excludedGroups: ['group-1'] }))],
+  ['conditional_access.user_excluded',
+    () => classifyConditionalAccessChange(policy(), policy({ excludedUsers: ['user-1'] }))],
   ['conditional_access.grant_weakened',
     () => classifyConditionalAccessChange(
       policy({ grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'] }),
@@ -740,7 +754,12 @@ test('THE RULE IDENTIFIERS ARE A WIRE CONTRACT, pinned so a rename cannot be cas
     'directory.admin_password_reset',
     'conditional_access.state_unavailable',
     'conditional_access.policy_disabled',
-    'conditional_access.principal_excluded',
+    'conditional_access.policy_stopped_enforcing',
+    'conditional_access.policy_stopped_reporting',
+    'conditional_access.policy_state_unrecognised',
+    'conditional_access.user_excluded',
+    'conditional_access.group_excluded',
+    'conditional_access.role_excluded',
     'conditional_access.grant_weakened',
     'conditional_access.grant_operator_unknown',
     'conditional_access.grant_controls_absent',
@@ -792,4 +811,120 @@ test('the rule is independent of the classification, which is the point of havin
     assert.ok(rules.size > 1,
       `${classification} maps to only ${rules.size} rule — an MSP could not configure below the tier`)
   }
+})
+
+
+test('THE THREE POLICY-STATE TRANSITIONS SAY DIFFERENT THINGS, because they are different', () => {
+  // The boolean this replaces produced a WRONG sentence, not just a lossy one.
+  // Enabled-to-report-only read as "the policy was disabled" — it was not; it still
+  // evaluates and still logs, it just stops enforcing.
+  const toReportOnly = classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'REPORT_ONLY' }))
+  assert.equal(toReportOnly.classification, 'URGENT')
+  assert.match(toReportOnly.because, /report-only/i)
+  assert.match(toReportOnly.because, /still (evaluates|logs)/i, 'it must not claim the policy was disabled')
+  assert.doesNotMatch(toReportOnly.because, /was disabled/i)
+
+  // Enabled to disabled is the other one, and it may say the stronger thing.
+  const toOff = classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'OFF' }))
+  assert.equal(toOff.classification, 'URGENT')
+  assert.match(toOff.because, /disabled/i)
+  assert.notEqual(toOff.rule, toReportOnly.rule, 'two different events need two different rules')
+
+  // Report-only to disabled read as false-to-false before: no change at all. It now has
+  // a verdict, and the verdict is ROUTINE for a stated reason rather than by falling off
+  // the end — no session's access changes, because report-only was not enforcing either.
+  // What is lost is our own visibility.
+  const reportingOff = classifyConditionalAccessChange(policy({ state: 'REPORT_ONLY' }), policy({ state: 'OFF' }))
+  assert.equal(reportingOff.classification, 'ROUTINE')
+  assert.match(reportingOff.because, /log/i, 'the record must say what was actually lost')
+  assert.doesNotMatch(reportingOff.because, /weaken/i, 'nobody\'s access changed, so it must not claim one did')
+
+  // STRENGTHENING DIRECTIONS ARE NOT REPORTED AS CHANGES OF STATE. Turning a policy on
+  // must not look like turning one off.
+  for (const [before, after] of [['OFF', 'ON'], ['OFF', 'REPORT_ONLY'], ['REPORT_ONLY', 'ON']] as const) {
+    const verdict = classifyConditionalAccessChange(policy({ state: before }), policy({ state: after }))
+    assert.equal(verdict.classification, 'ROUTINE', `${before} -> ${after}`)
+    assert.notEqual(verdict.rule, 'conditional_access.policy_disabled', `${before} -> ${after}`)
+  }
+})
+
+test('AN UNRECOGNISED POLICY STATE IS NEVER TREATED AS ONE OF THE THREE', () => {
+  // This field is modelled losslessly and therefore excluded from the fingerprint, so a
+  // state Microsoft has not sent before would have no backstop if it were guessed.
+  for (const known of ['ON', 'REPORT_ONLY', 'OFF'] as const) {
+    const intoUnknown = classifyConditionalAccessChange(policy({ state: known }), policy({ state: 'UNRECOGNISED' }))
+    assert.equal(intoUnknown.classification, 'UNCLASSIFIED', `${known} -> UNRECOGNISED`)
+    assert.equal(intoUnknown.rule, 'conditional_access.policy_state_unrecognised')
+    assert.match(intoUnknown.because, /impact unknown/i)
+
+    const outOfUnknown = classifyConditionalAccessChange(policy({ state: 'UNRECOGNISED' }), policy({ state: known }))
+    assert.equal(outOfUnknown.classification, 'UNCLASSIFIED', `UNRECOGNISED -> ${known}`)
+  }
+
+  // POSITIVE CONTROL: unrecognised on BOTH sides is not a state change, so it must fall
+  // through to the other comparisons rather than reporting every time it is seen.
+  const unchanged = classifyConditionalAccessChange(
+    policy({ state: 'UNRECOGNISED' }), policy({ state: 'UNRECOGNISED' }))
+  assert.equal(unchanged.classification, 'ROUTINE')
+})
+
+test('AN EXCLUSION NAMES THE KIND, because the kinds are different sizes of event', () => {
+  // Merging them lost the blast radius rather than a label, and this is the tier that
+  // rings a phone.
+  const role = classifyConditionalAccessChange(policy(), policy({ excludedRoles: ['role-1'] }))
+  const group = classifyConditionalAccessChange(policy(), policy({ excludedGroups: ['group-1'] }))
+  const user = classifyConditionalAccessChange(policy(), policy({ excludedUsers: ['user-1'] }))
+
+  for (const verdict of [role, group, user]) assert.equal(verdict.classification, 'URGENT')
+  assert.equal(new Set([role.rule, group.rule, user.rule]).size, 3,
+    'three kinds, three rules, so an MSP can hear about groups and not individuals')
+
+  // The sentence has to carry the scope, which is the reason for the split.
+  assert.match(role.because, /role/i)
+  assert.match(role.because, /changes as role assignments change|holding that role/i,
+    'a role exclusion covers a set that moves without the policy being edited')
+  assert.match(group.because, /group/i)
+  assert.match(group.because, /not visible from the policy/i,
+    'the member count is the part an MSP cannot see')
+  assert.doesNotMatch(user.because, /group|role/i, 'an account exclusion must not overstate its scope')
+})
+
+test('A WEAKENING OUTRANKS EVERY UNKNOWN FIRING ALONGSIDE IT', () => {
+  // The precedence question worth checking rather than assuming: now that the
+  // fingerprint has a real producer, a genuine weakening happens in the same comparison
+  // as an unmodelled change far more often — a policy edit moves several things at once.
+  // If the fingerprint were checked first, a weakening would be relabelled "impact
+  // unknown" and dropped off the tier that pages. The verdict would still look
+  // defensible, which is what makes it the dangerous ordering.
+  const weakenedAndMore = classifyConditionalAccessChange(
+    policy({
+      grantOperator: 'AND', grantControls: ['mfa', 'compliantDevice'],
+      sessionControls: [], unmodelledFingerprint: 'before',
+    }),
+    policy({
+      grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'],
+      sessionControls: ['signInFrequency'], unmodelledFingerprint: 'after',
+    }))
+  assert.equal(weakenedAndMore.classification, 'URGENT',
+    'a grant weakening must not be downgraded by an unknown firing beside it')
+  assert.equal(weakenedAndMore.rule, 'conditional_access.grant_weakened')
+
+  // Each of the three weakening kinds, against every unknown at once.
+  const noisy = { sessionControls: ['signInFrequency'], unmodelledFingerprint: 'after' } as const
+  for (const [label, after] of [
+    ['disabled', { state: 'OFF', ...noisy }],
+    ['role excluded', { excludedRoles: ['role-1'], ...noisy }],
+    ['stopped enforcing', { state: 'REPORT_ONLY', ...noisy }],
+  ] as const) {
+    const verdict = classifyConditionalAccessChange(
+      policy({ unmodelledFingerprint: 'before' }), policy(after))
+    assert.equal(verdict.classification, 'URGENT', label)
+  }
+
+  // POSITIVE CONTROL: with no weakening present, those same unknowns DO decide the
+  // verdict — so the ordering is a precedence rather than the unknowns being inert.
+  const unknownsOnly = classifyConditionalAccessChange(
+    policy({ unmodelledFingerprint: 'before' }), policy({ ...noisy }))
+  assert.equal(unknownsOnly.classification, 'UNCLASSIFIED')
+  assert.equal(unknownsOnly.rule, 'conditional_access.session_control_changed')
 })

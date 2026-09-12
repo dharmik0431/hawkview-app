@@ -57,76 +57,113 @@ export interface ModelledPath {
   readonly fidelity: Fidelity
   /** Which field of `ConditionalAccessState` reads it. */
   readonly reads: keyof ConditionalAccessState
-  /** For a LOSSY path, what the projection discards. Required reading for anyone
-   * deciding whether to make it lossless. */
+  /** Why this fidelity — and for a LOSSY path, what the projection discards.
+   * Required reading for anyone deciding whether to make it lossless. */
   readonly because: string
+  /** TWO POLICIES DIFFERING ONLY AT THIS PATH, which turns the fidelity claim into
+   * something checkable instead of a label somebody wrote.
+   *
+   * This is the enforcement. A LOSSLESS path must produce a state that DIFFERS across
+   * the pair — if it does not, the projection lost something and excluding the path
+   * from the digest hides it. A LOSSY path must produce a state that is IDENTICAL
+   * across the pair (proving the loss is real) while the digest MOVES (proving the
+   * lost part is still visible somewhere). Mislabelling in either direction fails a
+   * test, so a lossy-and-excluded path — the configuration that produced the
+   * grant-operator defect — cannot be written again by accident.
+   *
+   * Self-contained rather than a perturbation of whatever base a caller supplies: a
+   * witness that only sets the "after" side depends on what the base happened to
+   * contain, and for a lossy path that is the difference between demonstrating the
+   * loss and accidentally demonstrating a change. */
+  readonly witness: (base: Collected) => Readonly<{ before: Collected; after: Collected }>
 }
+
+type Collected = Readonly<Record<string, unknown>>
+
+/** Replaces one path in a copy of the base. Only used to build witnesses. */
+const withPath = (base: Collected, target: readonly string[], value: unknown): Collected => {
+  if (target.length === 0) return base
+  const [head, ...rest] = target
+  if (head === undefined) return base
+  const current = (base as Record<string, unknown>)[head]
+  const nested = typeof current === 'object' && current !== null && !Array.isArray(current)
+    ? current as Collected
+    : {}
+  return { ...base, [head]: rest.length === 0 ? value : withPath(nested, rest, value) }
+}
+
+const pairAt = (target: readonly string[], before: unknown, after: unknown) =>
+  (base: Collected) => ({ before: withPath(base, target, before), after: withPath(base, target, after) })
 
 export const MODELLED_PATHS: readonly ModelledPath[] = [
   {
     path: ['state'],
-    fidelity: 'LOSSY',
-    reads: 'enabled',
+    fidelity: 'LOSSLESS',
+    reads: 'state',
     because:
-      'Microsoft\'s state is three-valued — enabled, enabledForReportingButNotEnforced, disabled — ' +
-      'and `enabled` is a boolean, so report-only and disabled both map to false. A policy moving ' +
-      'between those two is invisible to the comparison. Neither is enforcing, so it is not a ' +
-      'weakening, but the projection is lossy and the path therefore stays in the digest. Making it ' +
-      'lossless is cheap: effective-mfa-enforcement.ts already maps this field to ON / REPORT_ONLY / ' +
-      'OFF, so the vocabulary exists in the product.',
+      'Microsoft sends enabled | enabledForReportingButNotEnforced | disabled, and the state carries all ' +
+      'three as ON / REPORT_ONLY / OFF plus UNRECOGNISED for anything else. It was a boolean, which was ' +
+      'not merely lossy: enabled-to-report-only read as "the policy was disabled" when it still evaluates ' +
+      'and still logs, and report-only-to-disabled read as no change at all. The one residue is that two ' +
+      'different unrecognised values both map to UNRECOGNISED, and since every transition touching ' +
+      'UNRECOGNISED returns "impact unknown", no verdict can depend on telling them apart.',
+    witness: pairAt(['state'], 'enabled', 'disabled'),
   },
   {
     path: ['grantControls', 'operator'],
     fidelity: 'LOSSLESS',
     reads: 'grantOperator',
-    because: 'Microsoft\'s operator is OR or AND, and `grantOperator` carries both plus null for absent.',
+    because: 'Microsoft sends OR or AND, and grantOperator carries both plus null for absent or unreadable.',
+    witness: pairAt(['grantControls', 'operator'], 'AND', 'OR'),
   },
   {
     path: ['grantControls', 'builtInControls'],
     fidelity: 'LOSSLESS',
     reads: 'grantControls',
     because: 'The array is carried across as-is.',
+    witness: pairAt(['grantControls', 'builtInControls'], ['mfa', 'compliantDevice'], ['mfa']),
   },
   {
     path: ['conditions', 'users', 'excludeUsers'],
-    fidelity: 'LOSSY',
-    reads: 'excludedPrincipals',
-    because:
-      'Three exclude lists — users, groups and roles — are merged into one array, so which KIND of ' +
-      'principal was excluded is discarded. An identifier moving between the lists reads as no change. ' +
-      'Unlikely to matter and still a loss, so the paths stay in the digest.',
+    fidelity: 'LOSSLESS',
+    reads: 'excludedUsers',
+    because: 'Carried as its own array rather than merged, so the kind of principal survives.',
+    witness: pairAt(['conditions', 'users', 'excludeUsers'], [], ['user-1']),
   },
   {
     path: ['conditions', 'users', 'excludeGroups'],
-    fidelity: 'LOSSY',
-    reads: 'excludedPrincipals',
+    fidelity: 'LOSSLESS',
+    reads: 'excludedGroups',
     because:
-      'Flattened into the same array as excluded users and roles, so "this GROUP no longer has the ' +
-      'policy applied to it" becomes indistinguishable from a user exclusion. Group exclusions are the ' +
-      'broader of the two — one edit can remove a policy from everybody in it — so losing the kind ' +
-      'loses the blast radius, not just a label.',
+      'Its own array. Merging it with excluded users lost the blast radius rather than a label: one group ' +
+      'exclusion can remove a policy from everybody in it, and the count is not visible from the policy.',
+    witness: pairAt(['conditions', 'users', 'excludeGroups'], [], ['group-1']),
   },
   {
     path: ['conditions', 'users', 'excludeRoles'],
-    fidelity: 'LOSSY',
-    reads: 'excludedPrincipals',
+    fidelity: 'LOSSLESS',
+    reads: 'excludedRoles',
     because:
-      'Flattened into the same array as excluded users and groups. A ROLE exclusion removes the policy ' +
-      'from whoever currently holds that role, so the set it covers changes without the policy being ' +
-      'edited at all — which is a materially different fact from excluding one named account, and the ' +
-      'merged array cannot express it.',
+      'Its own array. A role exclusion covers whoever currently holds the role, so the set it applies to ' +
+      'changes with no policy edit at all — which HawkView cannot see, and which is recorded as a product ' +
+      'blind spot rather than something this mapping can fix.',
+    witness: pairAt(['conditions', 'users', 'excludeRoles'], [], ['role-1']),
   },
   {
     path: ['sessionControls'],
     fidelity: 'LOSSY',
     reads: 'sessionControls',
     because:
-      'Only the NAMES of present session controls are modelled, deliberately — their direction ' +
-      'depends on values the state does not capture, since persistentBrowser `always` weakens a policy ' +
-      'and `never` strengthens it. So the values are unmodelled and must stay in the digest. Excluding ' +
-      'this subtree would make an always-to-never change invisible to the presence check (the key set ' +
-      'is unchanged) AND to the fingerprint (excluded as modelled), which is the silent gap this ' +
-      'distinction exists to prevent.',
+      'Only the NAMES of configured session controls are modelled, deliberately — direction depends on ' +
+      'values the state does not capture, since persistentBrowser set to always weakens a policy and set ' +
+      'to never strengthens it, and inferring a direction from presence would be the OR/AND error one ' +
+      'dimension across. So the values stay in the digest. Excluding this subtree would make an ' +
+      'always-to-never change invisible to the presence check, whose key set is unchanged, AND to the ' +
+      'fingerprint, which excluded it as modelled — the silent gap this distinction exists to prevent.',
+    witness: pairAt(
+      ['sessionControls'],
+      { persistentBrowser: { isEnabled: true, mode: 'always' } },
+      { persistentBrowser: { isEnabled: true, mode: 'never' } }),
   },
 ]
 
@@ -147,8 +184,6 @@ export const MODELLED_PATHS: readonly ModelledPath[] = [
  * checks. */
 export type Canonicaliser = (value: unknown) => unknown
 
-type Collected = Readonly<Record<string, unknown>>
-
 const isRecord = (value: unknown): value is Collected =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
@@ -160,6 +195,19 @@ const at = (policy: Collected, path: readonly string[]): unknown => {
   }
   return cursor
 }
+
+/** UNRECOGNISED rather than OFF for a state Microsoft has not sent before.
+ *
+ * Mapping an unknown state to OFF would assert "not enforcing" about something we do
+ * not understand — and because this path is LOSSLESS and therefore excluded from the
+ * digest, that guess would be the only thing said about it, with the safety net
+ * switched off for exactly that case. The fourth member is what keeps the exclusion
+ * honest. */
+const policyState = (raw: unknown): ConditionalAccessState['state'] =>
+  raw === 'enabled' ? 'ON'
+    : raw === 'enabledForReportingButNotEnforced' ? 'REPORT_ONLY'
+      : raw === 'disabled' ? 'OFF'
+        : 'UNRECOGNISED'
 
 const strings = (value: unknown): readonly string[] =>
   Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
@@ -179,14 +227,12 @@ export function mapCollectedPolicy(
   const sessionControls = at(collected, ['sessionControls'])
 
   return {
-    enabled: at(collected, ['state']) === 'enabled',
+    state: policyState(at(collected, ['state'])),
     grantOperator: normalisedOperator === 'OR' || normalisedOperator === 'AND' ? normalisedOperator : null,
     grantControls: strings(at(collected, ['grantControls', 'builtInControls'])),
-    excludedPrincipals: [
-      ...strings(at(collected, ['conditions', 'users', 'excludeUsers'])),
-      ...strings(at(collected, ['conditions', 'users', 'excludeGroups'])),
-      ...strings(at(collected, ['conditions', 'users', 'excludeRoles'])),
-    ],
+    excludedUsers: strings(at(collected, ['conditions', 'users', 'excludeUsers'])),
+    excludedGroups: strings(at(collected, ['conditions', 'users', 'excludeGroups'])),
+    excludedRoles: strings(at(collected, ['conditions', 'users', 'excludeRoles'])),
     // NAMES ONLY, which is why this path is LOSSY and stays in the digest. A control
     // present with a different value is a change the state cannot express.
     sessionControls: isRecord(sessionControls)
