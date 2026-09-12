@@ -247,3 +247,55 @@ Renamed to P9, with P8 asserted where the failure record is actually read.
 It also shows the checks are not one-to-one — the P1 variant trips five tests, because a defect
 in incident identity moves everything downstream. That is expected and is why each check
 declares which variants it expects rather than being forced to fire alone.
+
+## Two markers, two meanings of "latest"
+
+`lastRunAttemptedAt` took a max, `freshnessOf` took a max, and `lastCompletedRun` took
+whatever came last in the array. **Three places in one module, two meanings.** For
+`[completed@t9, completed@t1]` the state reported `t1` while `freshnessOf` reported `t9`, so a
+reader deriving freshness from the state got STALE and one reading the runs got CURRENT.
+
+The direction was safe — it over-reports staleness, never under-reports — but the disagreement
+is not, and the realistic trigger is mundane: **a query returning runs without an `ORDER BY`.**
+Fixed to take the max, and pinned by a test that feeds the runs out of order.
+
+**And it means the runs-versus-state separation was briefly true for the wrong reason.** With
+the markers disagreeing, freshness genuinely could not be derived from the state — but that was
+a bug, not an argument. Fixed, the two now always agree for any state `intake` produces, and
+the separation has to stand on something else. It does, and the reasoning is worth stating
+precisely because it is easy to state loosely:
+
+> A `QueueState` reporting a dead engine as current is **internally consistent**. A check
+> reading only the state cannot distinguish a state `intake` produced from one it did not — a
+> fabricated marker, or one from a future version whose derivation has drifted off the runs the
+> way `rowsWithoutEventTime` drifted off the rows in step 03. Reading the run sequence is not a
+> stronger version of the same check; it is a check against a **different source**.
+
+## The producer dependency nothing recorded
+
+An unattributable finding does not group, so it stands alone keyed on the row id — and that
+means **the consumer depends on the engine keeping the id stable across runs.** If the id
+moved, the same finding would become a new incident and a new notification every five minutes:
+three runs, three notifications, measured.
+
+It is stable today because the engine upserts rather than re-creating, so this is **latent, not
+live.** It becomes live the day findings are re-created instead, and nothing on either side
+would catch it: the producer would be doing something reasonable, and the consumer would be
+doing what it says. Now recorded on `EmittedFinding.id`, and pinned by a test that asserts the
+churn as **current behaviour rather than desired behaviour** — if that assertion starts failing
+because the key changed, that is an improvement and the test should be rewritten, not restored.
+
+**Raised and not acted on:** `dedupeKey` is stable by construction — being stable is what it is
+for — so keying the ungrouped path on it would remove the dependency rather than document it.
+Not changed, because the instruction was to document, and because it alters which findings
+count as the same one when an account cannot be named, which is a product question.
+
+## A pre-registered property is only as wide as its inputs
+
+QA's P2 fixture used an **attributed** finding, so the check named "re-emission does not notify
+again" never exercised the path where a finding stands alone. Not a wrong fixture — an
+**unrepresentative** one, and only the real wiring revealed the difference. That gap is now
+covered from this side too: re-emission on the ungrouped path is one incident and one
+notification, same as when attributed.
+
+Fourteen variants injected, fourteen caught, including both orderings of the marker fix.

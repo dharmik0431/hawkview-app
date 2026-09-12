@@ -549,3 +549,69 @@ test('the identities the state reports about itself hold on real output', () => 
   assert.equal(state.lastRunAttemptedAt?.getTime(), ARRIVED.getTime() + 2 * MINUTE)
   assert.equal(state.incidents.length, 2, 'f-3 re-emits f-1, so two accounts means two incidents')
 })
+
+test('RE-EMISSION ON THE UNGROUPED PATH, which the attributed fixture never reached', () => {
+  // QA found their own P2 fixture used an ATTRIBUTED finding, so the check named "re-emission
+  // does not notify again" never exercised the path where a finding stands alone. Not a wrong
+  // fixture — an unrepresentative one, and only the real wiring showed the difference. A
+  // pre-registered property is only as wide as the inputs it was written against.
+  const nameless = (id: string) => finding({ id, subjectId: '' })
+  const state = intake([
+    run(ARRIVED, nameless('f-1')),
+    run(new Date(ARRIVED.getTime() + 5 * MINUTE), nameless('f-1')),
+    run(new Date(ARRIVED.getTime() + 10 * MINUTE), nameless('f-1')),
+  ])
+
+  assert.equal(state.incidents.length, 1, 'the same unattributable finding is one incident')
+  assert.equal(state.incidents[0]?.notifications.length, 1, 'and one notification, as when attributed')
+  assert.equal(state.incidents[0]?.subject.resolved, false)
+})
+
+test('AND THE PRODUCER DEPENDENCY THAT MAKES THAT TRUE, pinned so it cannot go quiet', () => {
+  // The ungrouped path keys on the row id, so it depends on the ENGINE keeping that id stable
+  // across runs. It does — it upserts — which makes this latent rather than live. Pinned here
+  // because it is a property of the producer that the consumer relies on, and nothing else
+  // records it: if findings are ever re-created instead of upserted, this test is the only
+  // thing that would say so.
+  const movingId = [1, 2, 3].map((n) =>
+    run(new Date(ARRIVED.getTime() + n * MINUTE), finding({ id: `f-${n}`, subjectId: '' })))
+  const churned = intake(movingId)
+
+  // ASSERTED AS CURRENT BEHAVIOUR, NOT AS DESIRED BEHAVIOUR. Three runs, three incidents,
+  // three notifications — somebody told about the same unnameable finding every five minutes.
+  // If this assertion starts failing because the key changed, that is an improvement and this
+  // test should be rewritten, not restored.
+  assert.equal(churned.incidents.length, 3,
+    'a moving row id makes each run a new incident — the dependency, demonstrated')
+  assert.equal(churned.incidents.flatMap((i) => i.notifications).length, 3)
+
+  // The contrast is the point: identical input except for the id being stable.
+  const stable = intake([1, 2, 3].map((n) =>
+    run(new Date(ARRIVED.getTime() + n * MINUTE), finding({ id: 'f-same', subjectId: '' }))))
+  assert.equal(stable.incidents.length, 1)
+  assert.equal(stable.incidents.flatMap((i) => i.notifications).length, 1)
+})
+
+test('LATEST MEANS BY TIME EVERYWHERE, even when the runs arrive out of order', () => {
+  // Two adjacent lines disagreed: `lastRunAttemptedAt` took a max, `lastCompletedRun` took
+  // whatever came last in the list, and `freshnessOf` took a max. Three places, two meanings.
+  // The realistic trigger is mundane — a query returning runs without an ORDER BY.
+  const early = new Date(ARRIVED.getTime())
+  const late = new Date(ARRIVED.getTime() + 60 * MINUTE)
+  const outOfOrder = intake([run(late, finding({ id: 'f-1' })), run(early, finding({ id: 'f-2' }))])
+
+  assert.equal(outOfOrder.lastCompletedRun?.completedAt.getTime(), late.getTime(),
+    'the marker is the latest completed run by TIME, not the last one in the array')
+  assert.equal(outOfOrder.lastRunAttemptedAt?.getTime(), late.getTime())
+
+  // AND THE STATE NOW AGREES WITH THE RUNS. It disagreed before this fix, which made the
+  // runs-versus-state separation look necessary for a reason that was really a bug — the
+  // separation stands on states `intake` did NOT produce, not on this.
+  const runs = [run(late, finding({ id: 'f-1' })), run(early, finding({ id: 'f-2' }))]
+  const now = new Date(late.getTime() + MINUTE)
+  const fresh = freshnessOf(runs, now)
+  assert.equal(fresh.kind, 'CURRENT')
+  assert.equal(fresh.kind === 'CURRENT' ? fresh.lastCompletedAt.getTime() : 0,
+    intake(runs).lastCompletedRun?.completedAt.getTime(),
+    'the two derivations agree for any state intake produces')
+})

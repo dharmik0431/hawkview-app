@@ -33,6 +33,26 @@ export type FindingCoverage = 'FULL' | 'PARTIAL' | 'UNAVAILABLE'
  * producer has; it becomes an `EventInstant` at the boundary below, which is the one place
  * the conversion can be reviewed. */
 export interface EmittedFinding {
+  /** The row id — AND THE CONSUMER DEPENDS ON IT BEING STABLE ACROSS RUNS.
+   *
+   * A PROPERTY OF THE PRODUCER THAT NOTHING RECORDED, which is why it is recorded here. A
+   * finding whose account cannot be named does not group, so it stands alone keyed on this
+   * id. If the id moved between runs, the same unattributable finding would become a NEW
+   * incident and a NEW notification every five minutes — measured at three runs, three
+   * notifications.
+   *
+   * It is stable today because the engine upserts rather than re-creating
+   * (`identity-risk-evaluator.service.ts`), so this is LATENT, not live. It becomes live the
+   * day findings are re-created instead, and nothing on either side of the seam would catch
+   * that: the producer would be doing something reasonable and the consumer would be doing
+   * what it says here.
+   *
+   * NOTE FOR PM, NOT ACTED ON: `dedupeKey` is stable by construction — being stable is what
+   * it is for — so keying the ungrouped path on it would remove the dependency rather than
+   * document it. I have not made that change, because the instruction was to document, and
+   * because it alters which findings count as the same one when an account cannot be named,
+   * which is a product question rather than a mechanical one. Raising it rather than leaving
+   * it out. */
   readonly id: string
   readonly organizationId: string
   readonly customerTenantId: string
@@ -305,7 +325,17 @@ export function intake(runs: readonly IntakeRun[]): QueueState {
     }
 
     completedRuns += 1
-    lastCompletedRun = { completedAt: run.completedAt, emitted: run.emitted.length }
+    // BY TIME, NOT BY POSITION, and the line above it already knew that.
+    //
+    // This was assigned unconditionally while `lastRunAttemptedAt` two lines up took a max
+    // and `freshnessOf` took a max — three places in one module, two meanings of "latest".
+    // For `[completed@t9, completed@t1]` the marker read t1 while `freshnessOf` read t9, so a
+    // reader deriving freshness from the state got STALE and one reading the runs got CURRENT.
+    // The direction was safe — it over-reports staleness — but the disagreement is not, and
+    // the realistic trigger is mundane: a query returning runs without an ORDER BY.
+    if (lastCompletedRun === null || run.completedAt > lastCompletedRun.completedAt) {
+      lastCompletedRun = { completedAt: run.completedAt, emitted: run.emitted.length }
+    }
 
     for (const finding of run.emitted) {
       const account = accountOf(finding)
@@ -374,10 +404,22 @@ export function intake(runs: readonly IntakeRun[]): QueueState {
 
 /** Whether the queue is current, COMPUTED FROM THE RUNS rather than from the state.
  *
- * Deliberately not a field, and deliberately not a function of `QueueState`. A state
- * reporting a dead engine as current is internally consistent — nothing else in it disagrees
- * — so a freshness check reading only the state is testing self-consistency and calling it
- * freshness. This reads the run sequence, which is the only thing that knows. */
+ * THE ARGUMENT, STATED CAREFULLY, BECAUSE IT WAS BRIEFLY TRUE FOR THE WRONG REASON. While
+ * `lastCompletedRun` was assigned by list position rather than by time, the state and the
+ * runs could disagree — and that disagreement made the separation look necessary. It was a
+ * bug, it is fixed, and for any state `intake` produces the two now always agree. The
+ * separation has to stand on something else, and it does:
+ *
+ * A `QueueState` REPORTING A DEAD ENGINE AS CURRENT IS INTERNALLY CONSISTENT. Nothing else in
+ * it disagrees, because every other field can be consistent with the wrong marker. So a
+ * freshness check reading only the state cannot distinguish a state `intake` produced from
+ * one it did not — a fabricated marker, or one from a future version whose derivation has
+ * drifted off the runs the way `rowsWithoutEventTime` drifted off the rows in step 03. Such a
+ * check tests self-consistency and calls it freshness.
+ *
+ * Reading the run sequence is not a stronger version of the same check; it is a check against
+ * a DIFFERENT source. That is the whole distinction between self-reconciliation and an
+ * independently derived reference, and it is why this takes runs and not a state. */
 export type Freshness =
   | Readonly<{ kind: 'CURRENT'; lastCompletedAt: Date; sinceMs: number }>
   | Readonly<{ kind: 'STALE'; lastCompletedAt: Date; sinceMs: number }>
