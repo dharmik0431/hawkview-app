@@ -1219,11 +1219,25 @@ the sentence was. Same discipline as report-only versus disabled.
 
 ### Severity of the unclassified conditional-access rules
 
-**Left at `ACT_TODAY`**, having argued against raising them to `ACT_NOW`, and not overruled.
+**`ACT_TODAY`. The proposal to raise them to `ACT_NOW` was put, argued against, and
+WITHDRAWN** — recorded that way rather than as "not overruled", because a decision
+reconsidered on its merits and a decision nobody returned to are different facts about how
+much weight this record carries.
 
-The case for raising them was the analogy to `directory.role_unidentified`, which is urgent
-because the activity *is* the consequential thing — a privilege was definitely granted and
-only its magnitude is unknown. That does not transfer: "a conditional access policy
+**The test for when an unknown earns a phone call**, which came out of working out why the
+analogy failed and is the transferable part:
+
+> An unknown earns a page when **every resolution of it is consequential** — not when it
+> attaches to an activity whose class is usually urgent.
+
+`directory.role_unidentified` passes: a privilege was definitely granted and only the
+magnitude is open, so every resolution is bad or neutral. An unclassified conditional-access
+change fails it: **half the resolutions are a tightening.** The original reasoning was "an
+unknown on an urgent-class activity", which is a different property and the weaker one.
+
+The case for raising them was that analogy — `directory.role_unidentified` is urgent
+because the activity *is* the consequential thing. That does not transfer: "a conditional
+access policy
 changed" is mostly routine administration, and for these rules the direction is unknown in
 both senses. Tightenings and weakenings arrive through the same door.
 
@@ -1242,6 +1256,27 @@ The three collection-degradation rules — `policy_state_unavailable`,
 channel rather than a security one, which the separate rule identifiers now make possible.
 They are facts about our own sight, not findings about the tenant.
 
+**Two obligations that come with that, for step 05 rather than now.**
+
+**Routing them to monitoring is only correct if a fleet-wide degradation produces one
+message per MSP, not one per tenant.** This is the plan's own rate-limit correctness
+requirement, and it is the case where getting it wrong is roughly 1,500 messages — because
+the conditions that make collection degrade are precisely the conditions that make it
+degrade everywhere at once. A per-tenant fan-out here would turn a single outage into the
+301-alert problem at fleet scale, on the channel we just decided was the calm one.
+
+**An MSP may reasonably want UNAVAILABLE and UNRECOGNISED on different channels.** One is
+our collection degrading and is theirs to chase with us; the other is Microsoft changing
+vocabulary and is ours to fix. The separate rule identifiers permit that split, and nothing
+downstream should collapse them back into "unclassified".
+
+**And a note against failing noisy for undetermined findings.** "If it is noisy, the noise
+means collection is degrading" sounds principled and is the reasoning that produced 353
+unresolved alerts nobody ever acted on. Fail-noisy is right for a **determined** finding and
+wrong for an undetermined one: the weakenings are already urgent, so raising the unknowns
+buys no additional coverage of anything determined — pure noise cost against zero security
+gain.
+
 
 ### Standing trap for step 03: `windowReadableThroughout`
 
@@ -1254,6 +1289,15 @@ QA's warning is exact: when step 03 comes to wire it, **the cheapest way to make
 clear will be to pass `true`, and every test will still pass, because the tests inject it
 too.** The instrument sits below the level where the value is chosen, which is the oldest
 rule here and it is sitting in the file waiting.
+
+**The most persuasive argument for this obligation is that I committed the same defect
+while writing it down.** Every test for the state split set `state: 'UNAVAILABLE'` on the
+mapped object, so none exercised the mapper's own distinction, and a mutation putting an
+absent field back onto `UNRECOGNISED` survived all of them — asserting the classifier's
+behaviour while injecting the value the mapper was supposed to choose. That is this exact
+trap, one field over, found in the same hour as documenting it. If it can be written by
+someone actively warning about it, a default of `true` will not be noticed by someone who
+is not.
 
 **Hard requirement for step 03:** derive it from sync state — successful-collection
 coverage across the window, gaps included — and test the **producer**, above the level
