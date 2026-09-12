@@ -49,7 +49,7 @@ four questions in order) before trusting a green suite.
 | 04 finding intake | closed |
 | 05 routing and policy | closed |
 | 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function landed in `42622d1`** — L1, L2 and L4 now bound. The NUMBER is still a labelled guess. See below |
-| 06 email | not started. Resend is verified on `hawkviewapp.com` (PM's claim, not verified here) |
+| 06 email | **the seam and the ledger exist and are pure; nothing talks to Resend.** No HTTP call, no signature verification, no webhook route, no key read anywhere. See `alerting-email-delivery.md`, which separates the two. Resend is verified on `hawkviewapp.com` (PM's claim, not verified here) |
 | 07 SMS | **shelved by Dharmik until further notice.** The tier survives; the channel does not |
 
 **Correction to the brief this was written from: `EXHAUSTED` is done**, in `e056fc9` — it is
@@ -285,6 +285,25 @@ entitled to it while 317 are not.
 from the same `episodesOf` spans. Deriving it anywhere else — even from this report's own
 `mapping` — would partition the rows a second time and agree with the printed total only by
 luck. The runner throws rather than defaulting when a row has no decision.
+
+### Step 06 exists as a shape, not as a channel
+
+**ACCEPTED is not an outcome.** The provider answers synchronously; whether the message
+arrived is a different fact arriving later by webhook, about a send that already returned. So
+`send(message): Promise<Outcome>` cannot express most of what needs checking, and **an
+unaskable property reads exactly like a passing one.** `Acceptance` and `Outcome` are two
+unions that share no member.
+
+Bound: acceptance is not delivery; an accepted job nobody mentions again is reported rather
+than resting in ACCEPTED; an event for a job we do not hold is named in `unmatched`; a second
+outcome does not overwrite the first; an unsigned event has no path to becoming an outcome;
+the body has no slot for a person, a tenant, a link containing either, or free text.
+
+**What is NOT written, and the doc leads with it:** the Resend HTTP call, the signature
+verification itself, the webhook route, durability for the ledger, and the subject line —
+which is not modelled here and is the obvious next leak. Also unverifiable from this side:
+that an idempotency key is honoured, that "accepted" means the provider has taken
+responsibility, and any real bounce rate.
 
 ### The two migration scripts had never been typechecked
 
