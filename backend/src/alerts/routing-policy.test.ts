@@ -1,0 +1,205 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import {
+  defaultPreference,
+  type CoverageStatement,
+  type Delivery,
+  type DeliveryPreference,
+  type PreferenceChange,
+  type Recipient,
+  type Routing,
+} from './routing-policy.js'
+
+/** THE STEP-05 GATE, run before the routing logic exists.
+ *
+ * Two of the three guardrails are meant to be UNEXPRESSIBLE defects rather than forbidden
+ * ones, and the difference matters: a forbidden thing is caught by a check somebody can
+ * delete, an unexpressible one has no value to write down. So these tests come in two kinds
+ * and they are labelled, because they prove different things:
+ *
+ *   - UNEXPRESSIBLE: asserted with `@ts-expect-error`. The proof is that it does not compile;
+ *     if it ever does, the expect-error itself becomes the failure.
+ *   - EXPRESSIBLE: two states the property must separate, shown distinguishable, as in step 04.
+ *
+ * Nothing here tests routing. There is no routing.
+ */
+
+const VERIFIED: Recipient = {
+  kind: 'MSP_SECURITY_INBOX',
+  address: 'soc@example-msp.test',
+  verifiedAt: new Date('2026-09-01T00:00:00Z'),
+}
+
+test('GUARDRAIL 1 — there is no preference value that silences the record', () => {
+  // Any rule can be turned down to record-only; no rule can be made not-recorded. Expressed
+  // as a MISSING ENUM MEMBER rather than as a validation, because a validation is a thing a
+  // later code path can skip and an absent value is not a thing anyone can select.
+  const quietest: DeliveryPreference = 'RECORD_ONLY'
+  assert.equal(quietest, 'RECORD_ONLY')
+
+  // @ts-expect-error there is no 'OFF', and that absence is the guarantee
+  const off: DeliveryPreference = 'OFF'
+  assert.ok(off, 'referenced so the expectation is checked rather than optimised away')
+
+  // @ts-expect-error nor any other spelling of it
+  const none: DeliveryPreference = 'NONE'
+  assert.ok(none)
+
+  // Every preference is reachable, so the floor is a real setting rather than the only one.
+  const all: readonly DeliveryPreference[] = ['RING', 'EMAIL', 'DIGEST', 'RECORD_ONLY']
+  assert.equal(new Set(all).size, 4)
+})
+
+test('GUARDRAIL 1 — the record is not an output a preference can address', () => {
+  // The stronger half. Even with no `OFF`, a routing result whose record were OPTIONAL would
+  // let a quiet preference produce nothing at all. `Routing.record` is required, so there is
+  // no branch in which a preference suppressed it.
+  const routing: Routing = {
+    record: {
+      incidentKey: 'k-1',
+      organizationId: 'org-1',
+      customerTenantId: 'tenant-1',
+      ruleId: 'security.privileged_role_granted',
+      severity: 'ACT_NOW',
+      category: 'SECURITY',
+      deliveryOutcome: 'Recorded only, at your setting for this rule.',
+      heldDeliveries: [],
+    },
+    // The quietest possible outcome: nothing delivered. The record is still there.
+    deliveries: [],
+  }
+  assert.equal(routing.deliveries.length, 0)
+  assert.ok(routing.record, 'the record survives the quietest setting there is')
+
+  // @ts-expect-error a routing result without a record does not typecheck
+  const recordless: Routing = { deliveries: [] }
+  assert.ok(recordless)
+})
+
+test('GUARDRAIL 2 — a per-tenant fan-out has no field to vary', () => {
+  // A fleet-wide collector failure is ONE cause. At 100 MSPs by 15 tenants, one message per
+  // tenant is 1,500 messages from a single incident — the failure that would destroy the
+  // channel on its first bad day. So a delivery names an ORGANISATION and lists the tenants.
+  const oneMessage: Delivery = {
+    organizationId: 'org-1',
+    causeKey: 'monitoring.collector_failing/SIGN_INS',
+    tier: 'EMAIL',
+    timing: { kind: 'IMMEDIATE' },
+    recipient: VERIFIED,
+    affectedTenants: Array.from({ length: 15 }, (_, n) => `tenant-${n}`),
+    incidentKeys: Array.from({ length: 15 }, (_, n) => `k-${n}`),
+  }
+  assert.equal(oneMessage.affectedTenants.length, 15, 'fifteen tenants')
+  assert.equal([oneMessage].length, 1, 'one message')
+
+  // @ts-expect-error there is no customerTenantId on a Delivery to vary per message
+  const perTenant: Delivery = { ...oneMessage, customerTenantId: 'tenant-1' }
+  assert.ok(perTenant)
+
+  // Coalescing cannot be FORGOTTEN, because un-coalesced is not a thing you can write. That is
+  // the difference between this and a rate limit applied afterwards, which is a thing that can
+  // be bypassed by a caller that does not know it exists.
+})
+
+test('QUIET HOURS DEFER AND NEVER DROP, and the deferral is visible immediately', () => {
+  const until = new Date('2026-09-02T07:00:00Z')
+  const held: Delivery = {
+    organizationId: 'org-1',
+    causeKey: 'security.privileged_role_granted/admin-1',
+    tier: 'PHONE',
+    timing: { kind: 'HELD', until, because: 'quiet hours until 07:00' },
+    recipient: VERIFIED,
+    affectedTenants: ['tenant-1'],
+    incidentKeys: ['k-1'],
+  }
+  assert.equal(held.timing.kind, 'HELD')
+
+  // @ts-expect-error there is no variant meaning "discarded because it was inconvenient"
+  const dropped: Delivery = { ...held, timing: { kind: 'DROPPED' } }
+  assert.ok(dropped)
+
+  // AND THE RECORD SHOWS IT AT ONCE. An in-app view marks the alert as held from the moment
+  // the deferral is decided — "you will hear about this at 07:00" rather than silence until
+  // 07:00, which is indistinguishable from having been forgotten.
+  const record: Routing['record'] = {
+    incidentKey: 'k-1',
+    organizationId: 'org-1',
+    customerTenantId: 'tenant-1',
+    ruleId: 'security.privileged_role_granted',
+    severity: 'ACT_NOW',
+    category: 'SECURITY',
+    deliveryOutcome: 'Held until 07:00 — quiet hours. It will ring then.',
+    heldDeliveries: [{ until, because: 'quiet hours until 07:00' }],
+  }
+  assert.equal(record.heldDeliveries.length, 1)
+  assert.match(record.deliveryOutcome, /07:00/, 'and the sentence names when, not just that')
+})
+
+test('THE DEFAULT IS DERIVED FROM THE DECLARED SEVERITY, so it cannot drift from the tiering', () => {
+  assert.equal(defaultPreference('ACT_NOW'), 'RING')
+  assert.equal(defaultPreference('ACT_TODAY'), 'EMAIL')
+  assert.equal(defaultPreference('RECORD_ONLY'), 'RECORD_ONLY')
+
+  // AND IT DISCRIMINATES. Three severities, three answers — a default function returning one
+  // value everywhere would satisfy "there is a default" and mean nothing.
+  const answers = (['ACT_NOW', 'ACT_TODAY', 'RECORD_ONLY'] as const).map(defaultPreference)
+  assert.equal(new Set(answers).size, 3)
+
+  // The MSP overriding this is expressing a preference; HawkView disagreeing with its own
+  // catalogue would be a bug, which is why the default is derived rather than listed again.
+})
+
+test('A RECIPIENT IS VERIFIED OR IT IS NAMED AS ABSENT — never a bare address', () => {
+  // Never a customer end user: they have no relationship with HawkView and did not ask to
+  // hear from it. A type accepting any string invites one to be typed in.
+  assert.equal(VERIFIED.kind, 'MSP_SECURITY_INBOX')
+
+  // @ts-expect-error an address with no verification is not a recipient
+  const unverified: Recipient = { kind: 'MSP_SECURITY_INBOX', address: 'someone@customer.test' }
+  assert.ok(unverified)
+
+  // "Nobody is listening" is a VARIANT, not an empty list, so a settings screen can say which
+  // tenants have no recipient instead of rendering a blank where a name should be.
+  const nobody: Recipient = { kind: 'NONE_VERIFIED', because: 'no inbox has been verified yet' }
+  assert.equal(nobody.kind, 'NONE_VERIFIED')
+  assert.match(nobody.kind === 'NONE_VERIFIED' ? nobody.because : '', /verified/)
+})
+
+test('COVERAGE GAPS ARE SENTENCES, because a count is not something a reader can act on', () => {
+  // The plan's coverage-gaps requirement, and what stops "make it configurable" becoming
+  // "everybody turns it off and blames HawkView". Under-alerting by default is not a virtue;
+  // it is the same failure as a screen quietly showing stale data.
+  const gaps: readonly CoverageStatement[] = [
+    {
+      ruleId: 'security.privileged_role_granted',
+      preference: 'RECORD_ONLY',
+      sentence: 'You will not be contacted about privileged role grants. They are still recorded.',
+    },
+  ]
+  assert.match(gaps[0]?.sentence ?? '', /not be contacted/)
+  // AND IT SAYS THE RECORD SURVIVES, in the same breath. A gap statement that only said what
+  // is lost would read as "HawkView stops watching", which is not what record-only means.
+  assert.match(gaps[0]?.sentence ?? '', /still recorded/i)
+
+  // "8 rules are set to record-only" tells a reader nothing they can act on.
+  assert.notEqual(String(gaps.length), gaps[0]?.sentence)
+})
+
+test('A PREFERENCE CHANGE CARRIES WHO, WHEN, AND WHAT IT WAS BEFORE', () => {
+  // An MSP asking why they were not told gets an answer with a date on it. The PREVIOUS value
+  // is what explains the gap: "who set this" and "what did they change it from" are different
+  // questions, and only the second says why the period before the change looked different.
+  const change: PreferenceChange = {
+    organizationId: 'org-1',
+    ruleId: 'security.privileged_role_granted',
+    from: 'RING',
+    to: 'RECORD_ONLY',
+    changedByUserId: 'user-7',
+    changedAt: new Date('2026-08-14T09:12:00Z'),
+  }
+  assert.notEqual(change.from, change.to, 'a recorded change must actually be a change')
+
+  // @ts-expect-error a change with no author is not an answer to "who turned this off"
+  const anonymous: PreferenceChange = { ...change, changedByUserId: undefined }
+  assert.ok(anonymous)
+})
