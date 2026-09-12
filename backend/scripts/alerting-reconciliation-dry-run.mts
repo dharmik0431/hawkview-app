@@ -22,6 +22,7 @@
  * notification id.
  */
 import { readFileSync } from 'node:fs'
+import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../src/generated/prisma/client.js'
 import { reconcile, parseDedupeKey, type ExistingAlertRow } from '../src/alerts/reconciliation.js'
 
@@ -69,14 +70,31 @@ function rowsFromFile(path: string): { rows: ExistingAlertRow[]; rejected: reado
   return { rows, rejected }
 }
 
-/** Constructed LAZILY, and that is load-bearing rather than tidy.
+/** Constructed LAZILY, and with an adapter, which are two separate requirements.
  *
- * `new PrismaClient()` reads the database URL at construction. Building it at module scope
- * would throw in a worktree with no `.env` — which is the exact situation the file path was
- * added for, so the escape hatch would have been unreachable in the only case that needed
- * it. The file path must never touch the client. */
+ * LAZILY, because building the client at module scope would throw in a worktree with no
+ * `.env` — and for the dry run that is the exact situation the file-input path exists for, so
+ * the escape hatch would have been unreachable in the only case that needed it.
+ *
+ * WITH AN ADAPTER, because Prisma 7 requires one: `new PrismaClient()` with no argument does
+ * not construct. It was written that way here and NOBODY NOTICED, because `tsconfig.json`
+ * includes only `src/**` — `npx tsc --noEmit` walked past both scripts and exited 0. So the
+ * database path of the dry run had never been executed, and any figure attributed to it came
+ * from somewhere else. `tsconfig.scripts.json` is the fix for the class; this is the instance. */
 let client: PrismaClient | null = null
-const prisma = () => (client ??= new PrismaClient())
+const prisma = () => (client ??= new PrismaClient({
+  adapter: new PrismaPg({ connectionString: databaseUrl(), max: 1 }),
+}))
+
+/** Named rather than defaulted. An empty connection string produces a connection error from
+ * deep inside the driver; this says which variable is missing, at the top. */
+const databaseUrl = (): string => {
+  const url = process.env.DATABASE_URL
+  if (url === undefined || url === '') {
+    throw new Error('DATABASE_URL is not set. This command reads the database; there is no offline mode.')
+  }
+  return url
+}
 
 async function main() {
   const inputFile = process.argv[2]
@@ -163,7 +181,15 @@ function printReport(
   context: {
     source: string
     rejected: readonly string[]
-    auditJoin: { keysNamingAnAuditRecord: number; auditRecordsFound: number; notJoined: number } | null
+    auditJoin: {
+      keysNamingAnAuditRecord: number
+      /** Reported and printed, and MISSING FROM THIS TYPE until the scripts were first
+       * typechecked. `notJoined` is derived from it, so the figure a reader needs in order to
+       * check the subtraction was the one the shape did not admit. */
+      distinctAuditIds: number
+      auditRecordsFound: number
+      notJoined: number
+    } | null
   },
 ) {
   console.log(JSON.stringify({

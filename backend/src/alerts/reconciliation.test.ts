@@ -928,3 +928,127 @@ test('atMost NAMES BOTH SIDES when a bound is violated', () => {
   assert.deepEqual(report.invariants.cardinalityOrderingHolds, [],
     'a healthy report reports no violation')
 })
+
+/** The per-row episode, and what the apply may actually write.
+ *
+ * Added because the apply writes TWO columns and only one had an owner: it had an incident key
+ * from the mapping and no episode at all. The convenient answer — null everywhere — is not a
+ * gap but a WRONG VALUE, because null already means "the count could not be recovered". */
+
+const auditNoTime = (id: string, actor: string) =>
+  row({
+    dedupeKey: `security:directory-audit:Directory_${id}`,
+    audit: { initiatedBy: actor, targetResources: [`t-${id}`], privileged: null },
+  })
+
+const syncAt = (tenant: string, at: number) =>
+  row({ dedupeKey: `tenant:${tenant}:sync:SIGN_INS`, customerTenantId: tenant, occurredAt: new Date(at) })
+
+test('THE EPISODE NUMBER IS PER INCIDENT, NOT A RUNNING COUNTER', () => {
+  // Two tenants, two bursts each, thirty days apart. Numbered within the incident this is
+  // 1,2 and 1,2; numbered globally it is 1,2,3,4 — and the second reads exactly as plausibly
+  // on a row. Nothing about "episode 3" looks wrong until you ask three of what.
+  const rows = ['t1', 't2'].flatMap((tenant) => [0, 30].map((day) => syncAt(tenant, T0 + day * DAY)))
+  const report = reconcile(rows)
+
+  assert.deepEqual(rows.map((r) => report.episodeByRow.get(r.id)), [1, 2, 1, 2])
+  assert.equal(report.episodes.counted, 4, 'four episodes across two incidents')
+
+  // AND THE TWO NUMBERS COME FROM DIFFERENT STRUCTURES AND STILL AGREE. Distinct ordinals per
+  // incident, summed, against the reported total. Unlike the four identities beside it in
+  // `invariants`, AN INPUT CAN SEPARATE THESE: a numbering computed over a second partition
+  // gives the same total with different ordinals, which is the failure worth catching.
+  const byIncident = new Map<string, Set<number>>()
+  for (const entry of report.mapping) {
+    if (entry.incidentKey === null) continue
+    const ordinal = report.episodeByRow.get(entry.notificationId)
+    if (ordinal === null || ordinal === undefined) continue
+    byIncident.set(entry.incidentKey, (byIncident.get(entry.incidentKey) ?? new Set()).add(ordinal))
+  }
+  assert.equal([...byIncident.values()].reduce((total, set) => total + set.size, 0),
+    report.episodes.counted)
+  assert.deepEqual(report.invariants.episodeOrdinalsAgreeWithCounts, [])
+})
+
+test('EVENTS INSIDE ONE BURST SHARE AN EPISODE NUMBER', () => {
+  // Or "per incident" would be satisfied by numbering every row 1 and never splitting — the
+  // degenerate reading of the test above.
+  const together = [0, 3_600_000].map((within) => syncAt('t1', T0 + within))
+  const apart = syncAt('t1', T0 + 30 * DAY)
+  const report = reconcile([...together, apart])
+
+  assert.deepEqual(together.map((r) => report.episodeByRow.get(r.id)), [1, 1])
+  assert.equal(report.episodeByRow.get(apart.id), 2)
+})
+
+test('AN UNRECOVERABLE INCIDENT NUMBERS NONE OF ITS ROWS - not even the ones with a time', () => {
+  // THE TRAP IS THE ROW THAT KEPT ITS TIME. It is numberable in isolation, and numbering it
+  // would place it in a sequence nobody can see: the count that cannot be recovered is the
+  // INCIDENT'S, so a "1" on that row claims a position in a series of unknown length.
+  const timed = auditAt('has-time', 'actor-1', T0)
+  const timeless = auditNoTime('no-time', 'actor-1')
+  const report = reconcile([timed, timeless])
+
+  assert.equal(report.episodes.incidentsWithUnrecoverableEpisodes, 1)
+  assert.equal(report.episodeByRow.get(timeless.id), null)
+  assert.equal(report.episodeByRow.get(timed.id), null, 'the timed row too, because the incident is')
+
+  // POSITIVE CONTROL: the same two rows under different actors are two incidents of one event
+  // each, and a single event is one episode whether or not its time survived.
+  const split = reconcile([auditAt('has-time', 'actor-1', T0), auditNoTime('no-time', 'actor-2')])
+  assert.equal(split.episodes.incidentsWithUnrecoverableEpisodes, 0)
+  for (const [, ordinal] of split.episodeByRow) assert.equal(ordinal, 1)
+})
+
+test('EVERY ROW THE APPLY WOULD WRITE HAS AN EPISODE DECISION', () => {
+  // The coupling the runner depends on. `alerting-apply.mts` throws rather than defaulting when
+  // a decision is missing, so the failure would be loud — but a mapping entry with no decision
+  // means the apply cannot run at all, which is worth catching here and not on production data.
+  const report = reconcile([
+    syncAt('t1', T0),
+    syncAt('t1', T0 + 30 * DAY),
+    auditAt('a', 'actor-1', T0),
+    auditNoTime('c', 'actor-2'),
+    row({ dedupeKey: 'nothing:like:a:known:key' }),
+  ])
+
+  const writable = report.mapping.filter((entry) => entry.incidentKey !== null)
+  assert.ok(writable.length > 0, 'the fixture must produce writable rows or this proves nothing')
+  for (const entry of writable) {
+    assert.ok(report.episodeByRow.has(entry.notificationId),
+      `${entry.notificationId} would be written with no episode decision`)
+  }
+})
+
+test('THE APPLY WOULD NOT KEY A SINGLE DIRECTORY-AUDIT ROW, and that is the open decision', () => {
+  // FOUND WHILE WIRING THE RUNNER, AND IT CHANGES THE EXPECTED OUTPUT. `TYPE_FOR_SHAPE`
+  // maps DIRECTORY_AUDIT to null on purpose — the key shape does not determine the type, and
+  // defaulting it would file real privileged changes as routine. So those rows reach the
+  // mapping with `incidentKey: null` and the apply, which writes only non-null keys, skips
+  // every one of them.
+  //
+  // On production that is 317 of the 364. The runbook's expected figures (364 written, 71
+  // incidents) come from `incidents.assumingSingleType`, which is the count UNDER THE
+  // NOMINATED TYPE — a different question from what the mapping authorises. Whether the apply
+  // should key those rows under the nominated type, or wait for step 05 to classify them, is
+  // not a decision this file can make; it is pinned here so it cannot be lost in a diff.
+  const rows = [
+    auditAt('a', 'actor-1', T0),
+    auditAt('b', 'actor-1', T0 + 30 * DAY),
+    syncAt('t1', T0),
+  ]
+  const report = reconcile(rows)
+
+  const audits = report.mapping.filter((entry) => entry.notificationId !== rows[2]!.id)
+  assert.equal(audits.length, 2)
+  for (const entry of audits) {
+    assert.equal(entry.incidentKey, null, 'no incident key, therefore never written')
+    assert.equal(entry.alertTypeId, null)
+  }
+
+  // AND YET THEY ARE COUNTED. The audit rows contribute two of the three episodes and an
+  // incident of their own, so the headline figures describe rows the apply would not touch.
+  assert.equal(report.episodes.counted, 3)
+  assert.equal(report.mapping.filter((entry) => entry.incidentKey !== null).length, 1,
+    'one writable row out of three — the same shape as 47 out of 364')
+})

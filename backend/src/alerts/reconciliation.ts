@@ -376,6 +376,25 @@ export interface ReconciliationReport {
     /** The interval the count used, from the nominated type's declaration. */
     quietIntervalHours: number
   }>
+  /** THE EPISODE EACH ROW BELONGS TO, or null where the number cannot be recovered.
+   *
+   * WHY THIS IS ON THE REPORT RATHER THAN COMPUTED BY THE APPLY. The migration writes two
+   * columns, `incident_key` and `episode`, and until this existed only the first had an owner:
+   * the apply had an incident key from the mapping and no episode at all. The convenient answer
+   * - null for every row - is not a gap, it is a WRONG VALUE that reads like a gap, because null
+   * already means "unrecoverable" and 47 rows are entitled to it while 317 are not.
+   *
+   * THE ORDINAL COMES FROM THE SAME SPANS THAT PRODUCE THE COUNT, assigned inside the loop that
+   * computes `gained`. Deriving it anywhere else - even from this report’s own `mapping` -
+   * would partition the rows a second time and produce a number that agrees with the printed
+   * episode total only by luck. See `invariants.episodeOrdinalsAgreeWithCounts`.
+   *
+   * AND THE TWO COLUMNS SHARE A PARTITION ON EXACTLY THE ROWS THE APPLY WRITES. Episodes bucket
+   * on `boundGrouping`, which uses the nominated type where a row has no determined type;
+   * `incidentKey` uses `declaredGrouping`. For a row WITH a determined type the two are the same
+   * call with the same arguments, and a row without one has `incidentKey: null` and is never
+   * written. So on the written subset the episode bucket key IS the incident key. */
+  readonly episodeByRow: ReadonlyMap<string, number | null>
   readonly mapping: readonly MappingEntry[]
   /** The generator's checks on its own output — as LISTS, not booleans.
    *
@@ -468,6 +487,15 @@ export interface ReconciliationReport {
     /** `episodes.counted` against its two halves, so the identity that validated the
      * headline figure is printed rather than performed once in a message. */
     episodeCountsAddUp: readonly string[]
+    /** Every row numbered into as many episodes as its incident was counted to have.
+     *
+     * A TRIPWIRE, NOT AN INPUT-FALSIFIABLE CHECK, and labelled the way the four above are. The
+     * ordinals and the count come from ONE `episodesOf` call per bucket, so no input separates
+     * them; a mutation hardcoding this empty survives the suite. What it defends against is the
+     * ordinal later being derived somewhere else - from the mapping, from a second grouping, from
+     * a SQL window function - which is the drift that would put a plausible episode number on a
+     * row belonging to a different sequence. Empty means they agree. */
+    episodeOrdinalsAgreeWithCounts: readonly string[]
     /** `total` against typed + needing-classification, and typed against its own two
      * halves. Three figures that used to stand alone now have to agree with each other. */
     rowCountsAddUp: readonly string[]
@@ -590,6 +618,9 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   let rowsWithoutTimeByRow = 0
   const rowsByIncident = new Map<string, {
     times: Date[]; missing: number; events: number; auditOnly: boolean
+    /** The rows themselves, so an episode ordinal can be handed back per row rather than only
+     * counted. Carrying the id here is what keeps the ordinal and the count on one partition. */
+    entries: { id: string; at: Date | null }[]
     /** Whether this bucket is a single standing-alone row rather than a resolved stream.
      * Carried so the episode total can be SPLIT and the split printed: the identity
      * `counted = attributed + standingAlone` was reconciled by hand once, in a message,
@@ -651,8 +682,10 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       }
       {
         const bucket = rowsByIncident.get(episodeKey)
-          ?? { times: [], missing: 0, events: 0, auditOnly: true, standingAlone: !boundGrouping.groups }
+          ?? { times: [], missing: 0, events: 0, auditOnly: true, entries: [],
+               standingAlone: !boundGrouping.groups }
         bucket.events += row.occurrenceCount
+        bucket.entries.push({ id: row.id, at: row.occurredAt instanceof Date ? row.occurredAt : null })
         if (row.occurredAt instanceof Date) bucket.times.push(row.occurredAt)
         else bucket.missing += 1
         if (parsed.shape !== 'DIRECTORY_AUDIT') bucket.auditOnly = false
@@ -713,6 +746,8 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   let unrecoverable = 0
   let unrecoverableAttributed = 0
   let unrecoverableStandingAlone = 0
+  const episodeByRow = new Map<string, number | null>()
+  const ordinalDisagreements: string[] = []
   for (const bucket of rowsByIncident.values()) {
 
     // ONE EVENT IS ONE EPISODE, AND THAT IS KNOWABLE WITHOUT ITS TIME. The time is only
@@ -728,8 +763,14 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     // others rather than derived with them.
     let gained: number
     if (bucket.events === 1) {
+      // One event is one episode whether or not its time survived, so the row gets ordinal 1.
       gained = 1
+      for (const entry of bucket.entries) episodeByRow.set(entry.id, 1)
     } else if (bucket.missing > 0) {
+      // NULL FOR EVERY ROW IN THE BUCKET, not only the timeless one. The count that cannot be
+      // recovered is the INCIDENT’S, and a row here has no ordinal to be given - numbering the
+      // rows that did keep a time would be numbering them within a sequence nobody can see.
+      for (const entry of bucket.entries) episodeByRow.set(entry.id, null)
       // UNKNOWN, NOT ONE. An incident holding a row whose event time is gone has an episode
       // count nobody can recover, and counting it as a single episode would understate the
       // migration by exactly the thing episodes were built to catch.
@@ -738,8 +779,26 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       else unrecoverableAttributed += 1
       continue
     } else {
-      gained = episodesOf(
-        bucket.times.map((at) => eventInstant({ occurredAt: at, receivedAt: at })), quietMs).length
+      // THE SPANS ARE THE EPISODES, and they are disjoint and in order: `episodesOf` sorts, then
+      // only ever grows the last span or opens a new one beyond it. So the span containing a
+      // row’s time is unique, every input time lies in exactly one, and assigning by containment
+      // reproduces the fold rather than re-implementing it.
+      const spans = episodesOf(
+        bucket.times.map((at) => eventInstant({ occurredAt: at, receivedAt: at })), quietMs)
+      gained = spans.length
+      for (const entry of bucket.entries) {
+        const at = entry.at?.getTime() ?? null
+        const index = at === null ? -1 : spans.findIndex((span) =>
+          span.firstEventAt.getTime() <= at && at <= span.lastEventAt.getTime())
+        episodeByRow.set(entry.id, index === -1 ? null : index + 1)
+      }
+      const distinct = new Set(bucket.entries
+        .map((entry) => episodeByRow.get(entry.id))
+        .filter((ordinal) => ordinal !== null && ordinal !== undefined)).size
+      if (distinct !== gained) {
+        ordinalDisagreements.push(
+          `an incident counted ${gained} episodes but numbered its rows into ${distinct}`)
+      }
     }
 
     episodesCounted += gained
@@ -796,6 +855,7 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       standingAloneByShape,
       quietIntervalHours: quietMs / (60 * 60 * 1000),
     },
+    episodeByRow,
     mapping,
     invariants: {
       rowsMissingFromMapping: rows.map((row) => row.id).filter((id) => !mapped.has(id)).sort(),
@@ -841,6 +901,7 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
           ['standing-alone', unrecoverableStandingAlone],
         ], unrecoverable, 'incidentsWithUnrecoverableEpisodes'),
       ],
+      episodeOrdinalsAgreeWithCounts: ordinalDisagreements,
       cardinalityOrderingHolds: [
         ...atMost(auditBoundKeys.size, boundKeys.size,
           'assumingSingleTypeDirectoryAuditOnly', 'assumingSingleType'),

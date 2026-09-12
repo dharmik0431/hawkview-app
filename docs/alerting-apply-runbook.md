@@ -2,10 +2,41 @@
 
 **Operator: Dharmik. Nothing here runs automatically and nothing runs from an agent session.**
 
-> **THESE COMMANDS HAVE NOT BEEN RUN AGAINST A DATABASE.** This worktree has no `psql`, no
-> Docker and no `DATABASE_URL`, so the pure functions are tested exhaustively against fixtures
-> and **the commands themselves are untested**. What that means concretely is at the bottom
-> under *Before you trust this*. Read that first if you are about to run it on production.
+> **THE EXPECTED FIGURES BELOW ARE WRONG, AND THAT IS THE FIRST THING TO READ.**
+>
+> The runner now exists and typechecks. Writing it surfaced something the design did not
+> account for: **the mapping authorises an incident key for almost none of the 364 rows.**
+> `TYPE_FOR_SHAPE` maps `DIRECTORY_AUDIT` to `null` on purpose — the key shape does not
+> determine the alert type, and defaulting it would file real privileged changes as routine —
+> so those rows reach the mapping with `incidentKey: null`, and the apply writes only non-null
+> keys. **On production that is 317 of the 364 rows skipped.**
+>
+> The 364 / 71 / 62 / 9 / 47 below come from `incidents.assumingSingleType` and the episode
+> counts, which are computed **under the nominated type** — a different question from what the
+> mapping authorises. Two figures that were never the same number have been read as one.
+> See *The open decision* immediately below. **Do not run step 3 until it is resolved.**
+>
+> **And the commands have still never been run.** The script exists; no `psql`, no Docker and
+> no `DATABASE_URL` exist in the worktree it was written in. What is tested is the pure logic
+> it calls and the SQL it emits, which QA executed against a disposable Postgres at 364 rows.
+> Details under *Before you trust this*.
+
+## The open decision — what the apply is allowed to key
+
+Two readings, and this is not a decision the code can make:
+
+**(a) Key everything under the nominated type.** 364 rows, 71 incidents — the figures already
+approved. It assumes a single type for rows whose type is undetermined, which is exactly what
+`reconcile` refuses to do in the mapping, in a comment that says defaulting would file real
+privileged changes as routine.
+
+**(b) Key only the rows whose shape determines a type, and let step 05 classify the rest.**
+Roughly 47 rows now, 317 later. Nothing is mis-typed, the migration lands in two parts, and
+the second part cannot be scheduled until classification exists.
+
+The runner implements neither preference: it writes what the mapping says, which today is (b).
+`save-mapping` prints the writable count and the incident count separately so the split is
+visible before anything is written rather than inferred from a row count afterwards.
 
 ## The two schema findings that determine the shape
 
@@ -46,21 +77,44 @@ Keep all four together. The receipt is the only thing that makes the revert safe
 
 ## Step 1 — save the approved mapping
 
+**Start by confirming where you are.** This step used to open with an absolute path into one
+agent’s worktree — `...\hawkview-api-rate-limiting\backend` — which is not necessarily the
+checkout you want to migrate from, and a wrong one here is silent: the script would read the
+same production database from the wrong branch’s code.
+
 ```powershell
-cd C:\Users\Dharmik\.codex\.chatgpt-projects\g-p-6847a104091c8191870e79dfbb556813\hawkview-api-rate-limiting\backend
+git rev-parse --show-toplevel   # which checkout
+git branch --show-current       # which branch
+git log --oneline -1            # which commit
+cd backend
+npx tsc --noEmit -p tsconfig.scripts.json   # the scripts typecheck; see the note below
 node --import tsx scripts/alerting-apply.mts save-mapping --out ..\artefacts\mapping.json
 ```
+
+The typecheck line is there because **`tsconfig.json` covers the `src` tree only, so
+`npx tsc --noEmit` never read either script and exited 0.** That false green hid a real one:
+the dry-run
+script called `new PrismaClient()` with no arguments, which **Prisma 7 cannot construct** — so
+its database path had never executed, and any figure attributed to it came from somewhere else.
+`tsconfig.scripts.json` closes the class; both scripts now take a `PrismaPg` adapter.
 
 **Expected output — success:**
 
 ```
 Read 364 notification rows.
-Mapping: 364 entries, 71 episodes (62 attributed, 9 standing alone), 47 unrecoverable.
+Mapping: N entries across M incidents; U carry no episode number.
+Episodes: 71 counted (62 attributed, 9 standing alone), 47 incidents unrecoverable.
 Wrote ..\artefacts\mapping.json
 ```
 
-**If the figures differ from 364 / 71 / 62 / 9 / 47, stop.** The approval was for a mapping,
-not a procedure. Send the new figures to be re-approved before going further.
+**`N` is the number that matters and nobody has measured it.** It is the count of rows the
+mapping authorises, not the count of rows read, and the two were conflated — see the open
+decision above. Expect it to be far below 364; if it comes back AT 364, something has changed
+in `TYPE_FOR_SHAPE` and that is a bigger conversation than this runbook.
+
+**`Read 364 notification rows` is the one figure to check against the approval here.** If the
+row count, the 71, the 62 / 9 split or the 47 differ, stop: the approval was for a mapping, not
+a procedure. Send the new figures to be re-approved before going further.
 
 ## Step 2 — preflight (writes nothing, ever)
 
@@ -72,9 +126,12 @@ node --import tsx scripts/alerting-apply.mts preflight --mapping ..\artefacts\ma
 
 ```
 No differences. The mapping still describes the data.
-364 rows would be written. 0 already applied.
+N rows would be written. 0 already carry it and would not be written again.
 PREFLIGHT PASSED - safe to apply.
 ```
+
+`N` must equal the `N` from step 1. A second number appearing here means the mapping file and
+the database have diverged, which is what the preflight exists to catch.
 
 **Expected output — aborting:**
 
@@ -106,9 +163,9 @@ node --import tsx scripts/alerting-apply.mts apply --mapping ..\artefacts\mappin
 
 ```
 Preflight re-run inside the transaction: no differences.
-Applied 364 rows in one transaction.
-Watched fields disturbed: none.
-Wrote ..\artefacts\receipt.json (364 changes, 0 untouched)
+Applied N rows in one statement, in one transaction.
+Watched fields disturbed: none
+Wrote ..\artefacts\receipt.json - N changes, 0 untouched. THE REVERT NEEDS THIS FILE.
 APPLY COMPLETE.
 ```
 
@@ -129,17 +186,32 @@ node --import tsx scripts/alerting-apply.mts verify --receipt ..\artefacts\recei
 **The checklist, and what each line means:**
 
 ```
-[ok] 364 of 364 receipt rows carry the incident key the receipt records
-[ok] 71 distinct incident keys across the migrated rows
-[ok] 47 rows have episode NULL (unrecoverable), 317 have a number
-[ok] no incident key is shared across two organisations
-[ok] occurrenceCount, resolvedAt and lastOccurredAt unchanged for every receipt row
-[ok] 0 rows carry an incident key that is not in the receipt
+[ok] N of N receipt rows carry the key the receipt records
+[ok] M distinct incident keys across N keyed rows
+[  ] X keyed rows carry an episode number, Y carry null - compare both against the
+     save-mapping figures rather than reading either as a pass
+[ok] no incident key is shared across two organisations (0 are)
+[  ] Z receipt rows now have a different dedupeKey or occurrenceCount than when they were
+     written - expected to be non-zero on a live system, and not a failure
+[ok] 0 rows carry an incident key this run did not write
 VERIFY PASSED.
 ```
 
-Any `[--]` line is a failure. **The last two matter most:** the fifth is the delivery
-guarantee, and the sixth catches a second migration having run.
+Any `[--]` line is a failure. **`[  ]` is not a check and does not become one by being read**
+— those two lines report figures that have no correct value the runner can know, and dressing
+either as a pass is the mistake the whole document is built against. The episode split has to
+be compared by a person against step 1; `Z` is expected to be non-zero, because occurrences
+keep arriving after an apply, and it is printed only to explain why the revert does not check
+that field.
+
+**Of the real checks, the last matters most:** it catches a second migration having run.
+
+Note what is NOT in this list: a line asserting `occurrenceCount`, `resolvedAt` and
+`lastOccurredAt` are unchanged. An earlier draft of this runbook printed one, and it could
+not have been true — occurrences move on a live system between apply and verify. The delivery
+guarantee is not that those fields never move; it is that **this migration never writes them**,
+which is established by there being no assignment to them anywhere in `apply-mapping.ts`, and
+by `Watched fields disturbed` in step 3 measuring the window when the apply itself ran.
 
 ## Revert
 
@@ -153,26 +225,36 @@ exactly what it wrote.** Never a blanket update, and it writes its own receipt.
 **Expected output — complete revert:**
 
 ```
-Checked 364 rows from receipt run-2026-09-12T10:00:00Z.
-Reverted 364 rows in one transaction. Refused 0.
-Watched fields disturbed: none.
+Checked N rows from receipt 4f1c8e2a-....
+Reverted N. Refused 0.
+Watched fields disturbed: none
 Wrote ..\artefacts\revert-receipt.json
-REVERT COMPLETE - all 364 rows put back.
+REVERT COMPLETE - N put back, 0 left alone, N of N accounted for.
 ```
 
 **Expected output — partial revert. THIS IS A SUCCESS, NOT A FAILURE:**
 
 ```
-Checked 364 rows from receipt run-2026-09-12T10:00:00Z.
-Reverted 363 rows in one transaction. Refused 1.
+Checked N rows from receipt 4f1c8e2a-....
+Reverted N-1. Refused 1.
 
-1 refused - no longer this run's to undo:
-  9f2c...  holds somebody-elses-later-key/1  this run wrote hawkview.../1
+ABORTED - 1 difference(s). Nothing was written.
 
-Watched fields disturbed: none.
+1 already carries a different incident key:
+  9f2c...  holds somebody-elses-later-key/1  mapping says hawkview.../1
+
+A refused row is not half-done work: somebody changed it after the apply, so it is no
+longer this run's to undo. Leaving it alone is the answer, not a partial one.
+Watched fields disturbed: none
 Wrote ..\artefacts\revert-receipt.json
-REVERT COMPLETE - 363 put back, 1 left alone. 364 of 364 accounted for.
+REVERT COMPLETE - N-1 put back, 1 left alone, N of N accounted for.
 ```
+
+**The `ABORTED - ... Nothing was written` line inside a successful revert is a wart.** The
+refusal report is shared with the preflight, where nothing IS written, and it says so in its
+first line. Here it is describing the rows the revert declined while the others were put back.
+Left as-is rather than papered over with a second formatter, and named here so nobody reads it
+as the revert having failed.
 
 **Read the last line.** Reverted plus refused must equal the receipt's row count; that is what
 says the state is fully described rather than partly unknown. A refused row is one somebody
@@ -347,6 +429,13 @@ A row resolved since the mapping was saved still maps to the same incident, so r
 would abort a correct migration on ordinary churn. Under all-or-nothing that is not one refused
 row; **it is the whole migration never completing** while alerts keep resolving underneath it.
 
+**Stated positively, because it is a decision and not an omission: a row that was resolved
+between the mapping and the apply is NOT refused.** It is keyed, with the incident key it was
+mapped to. That is narrower than "the row is the row that was mapped", and deliberately so —
+the mapping does not depend on whether a row is resolved, so a change there does not make the
+mapping untrue. If you want resolution to block a row, that is a different requirement from
+staleness and it needs its own predicate.
+
 QA's contract says the digest covers *the mutable fields*, which would include `resolvedAt`.
 **I have implemented the narrower version and am flagging it rather than quietly choosing.**
 The two concerns are separate: the delivery guarantee is about what the migration *writes*; the
@@ -367,7 +456,13 @@ QA identified in A2, demonstrated rather than asserted.
 
 - **The commands in this document have never been run.** No `psql`, no Docker, no
   `DATABASE_URL` in the engineering worktree.
-- **The runner script does not exist yet.** The pure logic it will call does.
+- **The runner exists and typechecks; that is all.** Typechecking is not execution, and the
+  two are easy to conflate at the moment a file stops being missing.
+- **The number of rows the apply would write is unmeasured.** See the open decision at the top.
+  Every "364" in this document below that point is a row count, not a write count.
+- **Neither script had ever been typechecked** until `tsconfig.scripts.json` existed, and the
+  first run of it found that the dry run could not construct its database client at all. Assume
+  the same class of defect anywhere else a script is only exercised by being read.
 - **Atomicity, a crash mid-write, and concurrent writers between the check and the write are
   unpinnable in memory.** A single-threaded fixture demonstrates the *shape* of optimistic
   concurrency, not that Postgres enforces it.

@@ -1,0 +1,21 @@
+{
+  // THE SCRIPTS WERE NOT BEING TYPECHECKED AT ALL.
+  //
+  // `tsconfig.json` has `"include": ["src/**/*.ts"]`, so `npx tsc --noEmit` passes over
+  // `scripts/` without reading a line of it — and it exits 0, which reads as a green. Both
+  // `alerting-reconciliation-dry-run.mts` and `alerting-apply.mts` import from `src/` and are
+  // the only two files a person points at production, so they are precisely the wrong pair to
+  // leave unchecked.
+  //
+  //     npx tsc --noEmit -p tsconfig.scripts.json
+  //
+  // Separate from the main config rather than folded into it because `rootDir: src` and the
+  // Nest build's `outDir` both belong to the application; the scripts are run by tsx and never
+  // emitted. This config only typechecks.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.mts", "scripts/**/*.ts"]
+}

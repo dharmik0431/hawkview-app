@@ -45,10 +45,10 @@ four questions in order) before trusting a green suite.
 | step | state |
 |---|---|
 | 01 declarations, 02 keys and episodes | closed |
-| 03 dry run | closed; **apply and revert built to spec, runner script not written, nothing run against a database.** Note: it is an ANNOTATION, not a re-keying -- the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
+| 03 dry run | closed. Apply, revert and the runner script are written and typecheck; **nothing has been run against a database**, and **the apply would key far fewer rows than the approved figures suggest** — see *What the apply is allowed to key* below. Note: it is an ANNOTATION, not a re-keying -- the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
 | 04 finding intake | closed |
 | 05 routing and policy | closed |
-| 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function does not exist** — L1, L2, L4 unbound. See below |
+| 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function landed in `42622d1`** — L1, L2 and L4 now bound. The NUMBER is still a labelled guess. See below |
 | 06 email | not started. Resend is verified on `hawkviewapp.com` (PM's claim, not verified here) |
 | 07 SMS | **shelved by Dharmik until further notice.** The tier survives; the channel does not |
 
@@ -241,17 +241,63 @@ unwriteability was wrong. **Every one of those was written by somebody who knew 
 **The honest gaps, which are what a cold reader most needs.** Each of these is a decision or a
 known hole, not an oversight — and none of them is blocked on something nobody remembers.
 
-### The limit function does not exist
+### The limit function exists; its number does not
 
-05b has the types and none of the behaviour. **QA's L1, L2 and L4 are unbound** because there
-is nothing to bind them to. "05b closed" would imply eight properties checked; five are.
+`applyLimit` landed in `42622d1` and **L1, L2 and L4 are bound**: every delivery is accounted
+for exactly once, withheld ones carry a release CONDITION rather than an invented `until`, the
+backlog drains as one aggregate that names every incident inside it, and the count is per MSP
+per tick — the same window as `fanOutProblems`, so the limit and the invariant measure one
+thing rather than two that nearly agree.
 
-The shape is decided: aggregate for a fleet-wide cause, defer for a per-tenant burst, counted
-over MSP × tick to match `fanOutProblems`, and **never drop** — there is no bucket for a
-dropped message. **The number is not decided**, and should be measured rather than picked: the
-honest input is observed causes per MSP per tick on production data, which no worktree here
-has. Until then it is a constant labelled *not yet measured*, unlike the 30-minute staleness
-threshold which has 5,166 runs behind it.
+**The number is still a guess and says so.** `UNMEASURED_LIMIT` is twenty per MSP per tick,
+carrying the sentence *NOT YET MEASURED*; the honest input is observed causes per MSP per tick
+on production data, which no worktree here has. Contrast `STALE_AFTER_MS`, which carries 5,166
+runs behind it. **A placeholder that reads as authoritative is worse than one that reads as a
+guess,** because nobody goes back for the second kind.
+
+### What the apply is allowed to key — and it is not 364 rows
+
+**Found while writing the runner, and it changes the expected output of step 03.**
+
+`TYPE_FOR_SHAPE` maps `DIRECTORY_AUDIT` to `null` deliberately: the key shape does not determine
+the alert type, and defaulting it would file real privileged changes as routine. So those rows
+reach `report.mapping` with `incidentKey: null` — and the apply writes only non-null keys.
+**On production that is 317 of the 364 rows skipped.**
+
+The approved figures — 364 / 71 / 62 / 9 / 47 — come from `incidents.assumingSingleType` and the
+episode counts, which are computed under the NOMINATED type. That is a different question from
+what the mapping authorises, and the two were read as one number. Pinned by a test
+(`THE APPLY WOULD NOT KEY A SINGLE DIRECTORY-AUDIT ROW`) so it cannot be lost in a diff.
+
+Two readings, and neither is the code's to choose: key everything under the nominated type
+(364 rows, and an assumption the mapping refuses to make), or key only determined-type rows now
+and let step 05 classify the other 317. **The runner implements neither preference** — it writes
+what the mapping says, which today is the second.
+
+### The per-row episode had no owner until now
+
+The migration writes two columns and only one of them was decided. The mapping carried an
+incident key; nothing carried an episode number, and the convenient answer — null for every row
+— is not a gap but a WRONG VALUE, because null already means *unrecoverable* and 47 rows are
+entitled to it while 317 are not.
+
+`reconcile` now returns `episodeByRow`, assigned **inside the loop that counts the episodes**,
+from the same `episodesOf` spans. Deriving it anywhere else — even from this report's own
+`mapping` — would partition the rows a second time and agree with the printed total only by
+luck. The runner throws rather than defaulting when a row has no decision.
+
+### The two migration scripts had never been typechecked
+
+`backend/tsconfig.json` includes `src` only, so `npx tsc --noEmit` walked past `scripts/` and
+exited 0. The first run of the new `tsconfig.scripts.json` found that
+`alerting-reconciliation-dry-run.mts` called `new PrismaClient()` with no arguments — which
+**Prisma 7 cannot construct**, since a driver adapter is required. Its database path had
+therefore never executed, and any figure attributed to it came from somewhere else. Both scripts
+now take a `PrismaPg` adapter and name a missing `DATABASE_URL` at the top rather than failing
+deep inside the driver.
+
+**The generalisable part:** a green from a tool that never read the file is the most convincing
+kind of false green, because the exit code is genuine.
 
 ### `windowReadableThroughout` has no evidence to work from
 
