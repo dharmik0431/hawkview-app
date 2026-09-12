@@ -347,3 +347,97 @@ test('THE DIRECTORY-AUDIT BOUND IS A LIKE-FOR-LIKE SUBSET, so two instruments ca
   // restriction is doing something rather than the two being equal by coincidence.
   assert.ok(report.incidents.assumingSingleType > report.incidents.assumingSingleTypeDirectoryAuditOnly)
 })
+
+const DAY = 86_400_000
+const T0 = Date.parse('2026-07-01T09:00:00.000Z')
+const auditAt = (id: string, actor: string, at: number) =>
+  row({
+    dedupeKey: `security:directory-audit:Directory_${id}`,
+    occurredAt: new Date(at),
+    audit: { initiatedBy: actor, targetResources: [`t-${id}`], privileged: null },
+  })
+
+test('EPISODES SPLIT AN INCIDENT, AND THE INCIDENT KEY CARRIES NO EPISODE', () => {
+  // The gap this closes: the key identifies a STREAM — type, organization, tenant, subject —
+  // so an incident count answers "how many subjects" and not "how many separate bursts".
+  // Across a two-month window those differ by roughly a factor of two, and reporting the
+  // first as the second would create exactly the incidents episodes exist to prevent: an
+  // attack next month joining last month's closed incident with nobody told.
+  const oneActorThreeBursts = [0, 30, 60].flatMap((burst) =>
+    [0, 3_600_000].map((within, index) =>
+      auditAt(`b${burst}-${index}`, 'actor-1', T0 + burst * DAY + within)))
+  const report = reconcile([...oneActorThreeBursts, auditAt('other', 'actor-2', T0)])
+
+  assert.equal(report.incidents.assumingSingleTypeDirectoryAuditOnly, 2, 'two actors, two streams')
+  assert.equal(report.episodes.countedDirectoryAuditOnly, 4, 'three bursts plus one = four episodes')
+  assert.ok(report.episodes.counted > report.incidents.assumingSingleType,
+    'episodes must exceed incidents when activity is spread, or nothing was split')
+})
+
+test('AN INCIDENT WHOSE EPISODES CANNOT BE RECOVERED IS UNKNOWN, NEVER ONE', () => {
+  // A sync alert with occurrenceCount 42 represents 42 events at unknown individual times —
+  // first_occurred_at and last_occurred_at give the span and nothing inside it. Inventing
+  // times would be fabrication, and counting the incident as ONE episode would understate
+  // the migration by exactly the thing episodes were built to catch.
+  const report = reconcile([
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1', occurrenceCount: 42 }),
+    auditAt('a', 'actor-1', T0),
+  ])
+
+  assert.equal(report.episodes.incidentsWithUnrecoverableEpisodes, 1)
+  assert.equal(report.episodes.rowsWithoutEventTime, 1)
+  assert.equal(report.episodes.counted, 1, 'only the audit incident is counted')
+  // NOT folded into the count. Unknown is not one, which is the same refusal this product
+  // makes with EXACT 0 versus NOT_AVAILABLE.
+  assert.notEqual(report.episodes.counted, 2)
+
+  // POSITIVE CONTROL: give the aggregate row a time and it becomes countable, so the
+  // exclusion is about the missing time rather than about the shape.
+  const withTime = reconcile([
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1', occurredAt: new Date(T0) }),
+    auditAt('a', 'actor-1', T0),
+  ])
+  assert.equal(withTime.episodes.incidentsWithUnrecoverableEpisodes, 0)
+  assert.equal(withTime.episodes.counted, 2)
+})
+
+test('THE EPISODE INTERVAL COMES FROM THE DECLARATION, and the report says which', () => {
+  // Two events 30 hours apart: one episode at a 48-hour interval, two at 24. The report
+  // states the interval it used so the number is auditable rather than asserted — and the
+  // declared value is what step 02 ruled, not a constant chosen here.
+  const report = reconcile([
+    auditAt('a', 'actor-1', T0),
+    auditAt('b', 'actor-1', T0 + 30 * 3_600_000),
+  ])
+  assert.equal(report.episodes.quietIntervalHours, 24)
+  assert.equal(report.episodes.countedDirectoryAuditOnly, 2, '30 hours apart exceeds a 24-hour interval')
+
+  // Inside the interval, the same two events are one episode — so the interval is being
+  // applied rather than every event counting as its own episode.
+  const together = reconcile([
+    auditAt('a', 'actor-1', T0),
+    auditAt('b', 'actor-1', T0 + 3 * 3_600_000),
+  ])
+  assert.equal(together.episodes.countedDirectoryAuditOnly, 1)
+  // AND THE ALL-ROWS COUNT TOO. A mutation replacing spans.length with times.length
+  // survived until this line: every assertion above used the directory-audit-only
+  // figure, which is accumulated on a separate statement, so the wider counter was
+  // unpinned. Two sibling counters and only one asserted is the fixture-cannot
+  // -discriminate shape wearing different clothes.
+  assert.equal(together.episodes.counted, 1,
+    'two events inside the interval are one episode, not two')
+})
+
+test('TWO ACTORS BURSTING TOGETHER ARE TWO INCIDENTS, not one episode', () => {
+  // Episodes are counted WITHIN a stream. Counting them across all rows would merge two
+  // actors active on the same day into one burst, which is the actor-keying decision undone
+  // one layer down.
+  const sameDay = [
+    auditAt('a', 'actor-1', T0),
+    auditAt('b', 'actor-2', T0 + 60_000),
+  ]
+  const report = reconcile(sameDay)
+  assert.equal(report.incidents.assumingSingleTypeDirectoryAuditOnly, 2)
+  assert.equal(report.episodes.countedDirectoryAuditOnly, 2,
+    'one episode each, not one episode shared')
+})

@@ -35,7 +35,10 @@ import { reconcile, parseDedupeKey, type ExistingAlertRow } from '../src/alerts/
  * file, the rows come from wherever you can get them and the counts come from the tested
  * `reconcile()`.
  *
- * The file is an array of `ExistingAlertRow`, with `resolvedAt` as an ISO string or null.
+ * The file is an array of `ExistingAlertRow`, with `resolvedAt` and `occurredAt` as ISO
+ * strings or null. `occurredAt` is the EVENT's own time — `event_date_time` on the joined
+ * audit record — and without it an incident's episodes cannot be recovered, so the report
+ * counts that incident as an unknown number of episodes rather than as one.
  * A row that does not parse is REPORTED, not skipped: a reconciliation that silently
  * ignores malformed input gives a smaller answer and looks identical to a correct one. */
 function rowsFromFile(path: string): { rows: ExistingAlertRow[]; rejected: readonly string[] } {
@@ -45,7 +48,8 @@ function rowsFromFile(path: string): { rows: ExistingAlertRow[]; rejected: reado
   const rows: ExistingAlertRow[] = []
   const rejected: string[] = []
   parsed.forEach((entry, index) => {
-    const row = entry as Partial<ExistingAlertRow> & { resolvedAt?: string | null }
+    const row = entry as Partial<ExistingAlertRow>
+      & { resolvedAt?: string | null; occurredAt?: string | null }
     if (typeof row.id !== 'string' || typeof row.organizationId !== 'string'
       || typeof row.dedupeKey !== 'string' || typeof row.occurrenceCount !== 'number') {
       rejected.push(`index ${index}: missing id, organizationId, dedupeKey or occurrenceCount`)
@@ -58,6 +62,7 @@ function rowsFromFile(path: string): { rows: ExistingAlertRow[]; rejected: reado
       dedupeKey: row.dedupeKey,
       occurrenceCount: row.occurrenceCount,
       resolvedAt: typeof row.resolvedAt === 'string' ? new Date(row.resolvedAt) : null,
+      occurredAt: typeof row.occurredAt === 'string' ? new Date(row.occurredAt) : null,
       audit: row.audit ?? null,
     })
   })
@@ -101,7 +106,7 @@ async function main() {
 
   const audits = auditIds.length === 0 ? [] : await prisma().directoryAuditLog.findMany({
     where: { microsoftAuditId: { in: auditIds } },
-    select: { microsoftAuditId: true, initiatedBy: true, targetResources: true },
+    select: { microsoftAuditId: true, initiatedBy: true, targetResources: true, eventDateTime: true },
   })
   const auditById = new Map(audits.map((audit) => [audit.microsoftAuditId, audit]))
 
@@ -115,6 +120,10 @@ async function main() {
       dedupeKey: row.dedupeKey,
       occurrenceCount: row.occurrenceCount,
       resolvedAt: row.resolvedAt,
+      // The event's OWN time, from the audit record rather than from the notification.
+      // `first_occurred_at` is when HawkView raised the alert, which is arrival time — the
+      // thing every episode rule in this feature refuses to decide on.
+      occurredAt: audit?.eventDateTime ?? null,
       audit: audit === null ? null : {
         // `initiatedBy` and `targetResources` are JSON on the audit row; reduced to the two
         // strings the reconciliation needs, and left null rather than coerced when the shape
@@ -179,6 +188,17 @@ function printReport(
       + 'events across types, never merge them. The DirectoryAuditOnly pair is the '
       + 'like-for-like comparison against a SQL figure filtered on that key prefix.',
     incidents: report.incidents,
+    // EPISODES ARE NOT INCIDENTS, and the incident key carries no episode component: it
+    // identifies a stream, so a count of incidents answers "how many subjects" rather than
+    // "how many separate bursts". Over a two-month window those differ by roughly a factor
+    // of two, and only the second is the question the plan asks.
+    episodesNote:
+      'counted with step 02 placeEvent at the interval the nominated type declares. '
+      + 'incidentsWithUnrecoverableEpisodes are NOT one episode each — an aggregate row '
+      + 'carries no per-event time, so its episode count is unknown and is reported as '
+      + 'unknown. countedDirectoryAuditOnly is the like-for-like figure against a '
+      + 'key-prefix-filtered SQL count.',
+    episodes: report.episodes,
     invariants: report.invariants,
     ...(context.auditJoin === null ? {} : { auditJoin: context.auditJoin }),
   }, null, 2))

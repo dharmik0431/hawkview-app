@@ -465,3 +465,55 @@ organizations. The second fact was never measured.
 forms. `Directory_`, `SSPR_`, `PIM_` and `Authentication Methods_` are audit *categories*
 inside one shape, which the parser extracts separately — two levels conflated in the earlier
 count.
+
+## Episodes: the incident key carries none, and the reconciliation had none
+
+Found by running the generator against real rows and comparing it with a SQL count: **34
+against 68**, and the whole gap is episodes.
+
+**The incident key identifies a STREAM** — type, organization, tenant, subject — and
+deliberately contains no episode component. So an incident count answers *"how many distinct
+subjects are involved"*, not *"how many separate bursts of activity happened"*. Across a
+two-month window those are very different numbers, and reporting the first as the second
+would produce exactly what episodes exist to prevent: every change by one actor over two
+months collapsed into one incident, so an attack next month joins last month's closed
+incident and nobody is told.
+
+Neither instrument was wrong. They answered different questions, and only one is the question
+the plan asks.
+
+### Episode what can be episoded, and say so for the rest
+
+The constraint is real for some rows and not others, and that split is the ruling:
+
+| rows | event time | episodes |
+|---|---|---|
+| directory-audit (317 of 364) | `event_date_time` on the joined audit record, one-to-one | **exactly reconstructable** |
+| the aggregate shapes | `occurrenceCount: 42` at unknown individual times — first/last give the span and nothing inside it | **unrecoverable** |
+
+So `ExistingAlertRow` gained an optional `occurredAt`, counted with step 02's `episodesOf`
+rather than a second implementation, at the interval the nominated type declares — reported
+alongside the count so the number is auditable rather than asserted.
+
+**An incident whose episodes cannot be recovered is reported as unknown, never as one.**
+Counting it as a single episode would understate the migration by precisely the thing
+episodes were built to catch, and inventing a time would be fabrication. Same refusal to
+collapse `NOT_AVAILABLE` into a value that this product makes everywhere else.
+
+**The event's own time comes from the audit record, not the notification.**
+`first_occurred_at` is when HawkView raised the alert — arrival time, which every episode
+rule in this feature refuses to decide on.
+
+### What the numbers now mean
+
+- `incidents.*` — how many streams. Answers "how many subjects".
+- `episodes.counted` — how many bursts, where every row in the stream has its own time.
+- `episodes.incidentsWithUnrecoverableEpisodes` — streams whose burst count is unknown. **Not
+  one each.**
+- `episodes.countedDirectoryAuditOnly` — the like-for-like figure against a key-prefix-filtered
+  SQL count.
+
+Two counters were being accumulated on separate statements and only one was asserted, so a
+mutation replacing `spans.length` with `times.length` — every event its own episode — survived
+until the wider counter was pinned too. The fixture-cannot-discriminate shape wearing different
+clothes: two siblings, one tested.

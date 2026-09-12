@@ -1,4 +1,7 @@
 import { ALERT_CATALOG } from './alert-catalog.js'
+import { episodesOf } from './alert-episode.js'
+import { quietIntervalMsOf } from './alert-episode-interval.js'
+import { eventInstant } from './alert-event-time.js'
 import { incidentGrouping, type Grouping, type ResolvedSubject } from './alert-incident-key.js'
 import type { AlertTypeDeclaration, SubjectRole } from './alert-type.js'
 
@@ -142,6 +145,19 @@ export interface ExistingAlertRow {
   readonly dedupeKey: string
   readonly occurrenceCount: number
   readonly resolvedAt: Date | null
+  /** The event's OWN time, where it is recoverable.
+   *
+   * Present for directory-audit rows, which are one-to-one with an audit record carrying
+   * `event_date_time`. Absent for the aggregate shapes: a sync alert with
+   * `occurrenceCount: 42` represents forty-two events at unknown individual times —
+   * `first_occurred_at` and `last_occurred_at` give the span and nothing inside it.
+   *
+   * OPTIONAL, AND ITS ABSENCE IS REPORTED RATHER THAN DEFAULTED. Episodes are genuinely
+   * unreconstructable without it, and inventing a time would be fabrication. An incident
+   * whose episodes cannot be recovered is reported as an unknown number of episodes, never
+   * as one — the same refusal to collapse NOT_AVAILABLE into a value that this product
+   * makes everywhere else. */
+  readonly occurredAt?: Date | null
   readonly audit: Readonly<{
     initiatedBy: string | null
     targetResources: readonly string[]
@@ -217,6 +233,32 @@ export interface ReconciliationReport {
     unattributed: number
     /** Rows whose alert type the shape alone does not determine. */
     needingClassification: number
+  }>
+  /** EPISODES, WHICH THE INCIDENT KEY DOES NOT CARRY.
+   *
+   * The key identifies a stream — type, organization, tenant, subject — and deliberately
+   * contains no episode component. So an incident count answers "how many distinct subjects
+   * are involved", not "how many separate bursts of activity happened", and across a
+   * two-month window those are very different numbers. Reporting the first as though it
+   * were the second would produce exactly the incidents episodes exist to prevent: every
+   * change by one actor over two months collapsed into one, so an attack next month joins
+   * last month's closed incident and nobody is told.
+   *
+   * Counted with step 02's `episodesOf` rather than a second implementation, at the quiet
+   * interval the nominated type declares, which is reported alongside so the number is
+   * auditable. */
+  readonly episodes: Readonly<{
+    /** Episodes across incidents where EVERY row carries its own event time. */
+    counted: number
+    /** Same, restricted to directory-audit rows — the like-for-like comparison. */
+    countedDirectoryAuditOnly: number
+    /** Incidents whose episode count cannot be recovered because at least one row carries
+     * no event time. NOT counted as one episode each: unknown is not one. */
+    incidentsWithUnrecoverableEpisodes: number
+    /** Rows carrying no event time at all. */
+    rowsWithoutEventTime: number
+    /** The interval the count used, from the nominated type's declaration. */
+    quietIntervalHours: number
   }>
   readonly mapping: readonly MappingEntry[]
   /** The generator's checks on its own output — as LISTS, not booleans.
@@ -337,6 +379,9 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   const boundTargetKeys = new Set<string>()
   const auditBoundKeys = new Set<string>()
   const auditBoundTargetKeys = new Set<string>()
+  // Rows per incident, so episodes can be counted within each stream rather than across
+  // all of them — two actors' bursts on the same day are two incidents, not one episode.
+  const rowsByIncident = new Map<string, { times: Date[]; missing: number; auditOnly: boolean }>()
   const nominated = declarationFor('security.routine_directory_change')
   const mapping: MappingEntry[] = []
   let unattributed = 0
@@ -366,6 +411,14 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       if (parsed.shape === 'DIRECTORY_AUDIT') {
         if (boundGrouping.groups) auditBoundKeys.add(boundGrouping.key)
         if (boundTarget.groups) auditBoundTargetKeys.add(boundTarget.key)
+      }
+      if (boundGrouping.groups) {
+        const bucket = rowsByIncident.get(boundGrouping.key)
+          ?? { times: [], missing: 0, auditOnly: true }
+        if (row.occurredAt instanceof Date) bucket.times.push(row.occurredAt)
+        else bucket.missing += 1
+        if (parsed.shape !== 'DIRECTORY_AUDIT') bucket.auditOnly = false
+        rowsByIncident.set(boundGrouping.key, bucket)
       }
     }
 
@@ -409,6 +462,27 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     })
   }
 
+  // Episodes, at the interval the nominated type declares.
+  const quietMs = nominated === null ? 24 * 60 * 60 * 1000 : quietIntervalMsOf(nominated)
+  let episodesCounted = 0
+  let episodesCountedAudit = 0
+  let unrecoverable = 0
+  let rowsWithoutTime = 0
+  for (const bucket of rowsByIncident.values()) {
+    rowsWithoutTime += bucket.missing
+    if (bucket.missing > 0) {
+      // UNKNOWN, NOT ONE. An incident holding a row whose event time is gone has an episode
+      // count nobody can recover, and counting it as a single episode would understate the
+      // migration by exactly the thing episodes were built to catch.
+      unrecoverable += 1
+      continue
+    }
+    const spans = episodesOf(
+      bucket.times.map((at) => eventInstant({ occurredAt: at, receivedAt: at })), quietMs)
+    episodesCounted += spans.length
+    if (bucket.auditOnly) episodesCountedAudit += spans.length
+  }
+
   const mapped = new Set(mapping.map((entry) => entry.notificationId))
   const seen = new Set<string>()
   const duplicated = new Set<string>()
@@ -431,6 +505,13 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget: auditBoundTargetKeys.size,
       unattributed,
       needingClassification,
+    },
+    episodes: {
+      counted: episodesCounted,
+      countedDirectoryAuditOnly: episodesCountedAudit,
+      incidentsWithUnrecoverableEpisodes: unrecoverable,
+      rowsWithoutEventTime: rowsWithoutTime,
+      quietIntervalHours: quietMs / (60 * 60 * 1000),
     },
     mapping,
     invariants: {
