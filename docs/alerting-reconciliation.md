@@ -517,3 +517,55 @@ Two counters were being accumulated on separate statements and only one was asse
 mutation replacing `spans.length` with `times.length` — every event its own episode — survived
 until the wider counter was pinned too. The fixture-cannot-discriminate shape wearing different
 clothes: two siblings, one tested.
+
+### The residual six, and they were mine
+
+After the episode component landed, the counts were **62 against 68** — the bulk of the gap
+explained, six episodes still not. Three candidates were checked, in the order PM proposed:
+
+| candidate | verdict |
+|---|---|
+| `placeEvent` splits on `>= quietMs` where the SQL used `> 24h` | **ruled out** — it splits on `at > span.lastEventAt + quietMs`, strictly greater, the same boundary |
+| the nominated type's declared interval is not actually 24h | **ruled out** — `security.routine_directory_change` declares `hours: 24` and the report prints `quietIntervalHours: 24`, which is why it prints it |
+| unattributable rows excluded rather than counted as singletons | **the cause** |
+
+The episode accumulator sat behind `if (boundGrouping.groups)`. A row whose actor cannot be
+determined does not group, so it was bucketed **nowhere** and contributed **zero** episodes —
+while the SQL coalesced those same rows onto one literal `'UNATTRIBUTED'` actor and got
+several. The reasoning that nearly closed this off was that coalescing makes the *other*
+count lower and therefore cannot open a gap in that direction. True, and it missed the larger
+term in the same expression: one side merged, the other **discarded**, and discarding is the
+stronger effect. **When two instruments disagree, account for what each one drops, not only
+for what each one merges.**
+
+Two rulings came out of the fix:
+
+**An ungrouped row is still an incident.** Each one keys on its own notification id, so two
+unattributable events are two incidents of one event each — exactly what `wouldGroupTogether`
+already refuses to merge, now honoured in the episode count instead of reintroduced a layer
+down. Note that `incidents.unattributed` could not have caught this: that counter runs only
+for rows whose alert type the key shape determines, and a directory-audit shape determines
+none, so those rows `continue` before reaching it. Every counter that might have noticed sat
+downstream of a verdict these rows never get.
+
+**One event is one episode, and that is knowable without its time.** The time is only needed
+to *split* several events; a single event forms exactly one burst whenever it happened.
+Reporting it as unrecoverable was over-refusing — the mirror image of counting a genuinely
+unknowable incident as one, and both are the same failure to distinguish *cannot be computed*
+from *computed*. Many events at unknown times stays unknown, because forty-two events could
+be one burst or forty-two.
+
+Six mutations, no survivors: the original defect restored; all ungrouped rows merged onto one
+bucket (the SQL's behaviour); the single-event rule removed, widened to `>= 1`, and keyed on
+`times.length` instead of `events` (the right count in the wrong dimension — a timeless single
+event has zero times); and the interval ignored.
+
+**The arithmetic this predicts, which needs one query to confirm.** With ungrouped rows
+counted, the same input yields 62 + *n* where *n* is the number of unattributable rows, each
+now worth one episode. If the SQL's coalesced `'UNATTRIBUTED'` stream produced exactly six
+bursts, that closes 62 → 68 precisely and the residual was never anything else. The two
+numbers then *diverge again by design*: the SQL merges those rows and splits by time, this
+count refuses to merge events whose subject is unknown. **Both figures are defensible and they
+answer different questions — but they must not be compared without saying which.** The check
+is one query: episodes among rows whose actor is null. It has not been run here; this worktree
+has no production access and the release hold stands.

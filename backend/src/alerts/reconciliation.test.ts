@@ -441,3 +441,67 @@ test('TWO ACTORS BURSTING TOGETHER ARE TWO INCIDENTS, not one episode', () => {
   assert.equal(report.episodes.countedDirectoryAuditOnly, 2,
     'one episode each, not one episode shared')
 })
+
+test('AN UNGROUPED ROW IS STILL AN INCIDENT AND STILL AN EPISODE', () => {
+  // The cause of a six-episode disagreement with a SQL count over the same rows. The bucket
+  // guard was `if (boundGrouping.groups)`, so every unattributable row was dropped from the
+  // episode accounting entirely and contributed ZERO. The rival instrument coalesced them
+  // onto one literal actor and got at least one. Their reasoning was that merging should make
+  // THEIR count lower and so could not explain the gap — what it could not see is that mine
+  // was discarding the rows outright, which is the stronger effect and points the other way.
+  const unattributable = [1, 2, 3].map((index) =>
+    row({
+      dedupeKey: `security:directory-audit:Directory_u${index}`,
+      occurredAt: new Date(T0 + index * 1000),
+      audit: { initiatedBy: null, targetResources: [], privileged: null },
+    }))
+  const report = reconcile(unattributable)
+
+  // NOT `unattributed`: that counter only runs for rows whose alert type the key shape
+  // determines, and a directory-audit shape does not determine one — those rows are reported
+  // as needing classification and `continue` before reaching it. So "how many rows failed to
+  // group" is not answerable from `unattributed`, which is part of how these rows went
+  // missing: every counter that could have noticed them sits downstream of a verdict they
+  // never get.
+  assert.equal(report.incidents.needingClassification, 3, 'the shape determines no type')
+  assert.equal(report.incidents.unattributed, 0, 'so none of them reaches that counter')
+  assert.equal(report.episodes.counted, 3,
+    'three incidents of one event each — three episodes, not zero and not one merged')
+  assert.equal(report.episodes.countedDirectoryAuditOnly, 3)
+
+  // AND THEY ARE NOT MERGED, even though all three are within seconds of each other. The
+  // unknown-subject merge that `wouldGroupTogether` refuses is now refused in the episode
+  // count as well, rather than being reintroduced one layer down.
+  assert.notEqual(report.episodes.counted, 1)
+})
+
+test('ONE EVENT IS ONE EPISODE, KNOWABLE WITHOUT ITS TIME', () => {
+  // The time is only needed to SPLIT several events. A single event forms exactly one burst
+  // whenever it happened, so refusing to count it was over-refusing — the mirror of counting
+  // a genuinely unknowable incident as one, and both fail to distinguish "cannot be computed"
+  // from "computed".
+  const single = reconcile([
+    row({ dedupeKey: 'tenant:t1:connection', customerTenantId: 't1', occurrenceCount: 1 }),
+  ])
+  assert.equal(single.episodes.counted, 1)
+  assert.equal(single.episodes.incidentsWithUnrecoverableEpisodes, 0,
+    'one event with no time is still one episode')
+  assert.equal(single.episodes.rowsWithoutEventTime, 1, 'and the missing time is still reported')
+
+  // MANY events with no times stays unknown, which is the case that genuinely cannot be
+  // computed: forty-two events at unknown individual times could be one burst or forty-two.
+  const many = reconcile([
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1', occurrenceCount: 42 }),
+  ])
+  assert.equal(many.episodes.counted, 0)
+  assert.equal(many.episodes.incidentsWithUnrecoverableEpisodes, 1)
+
+  // And an incident mixing a timed event with a timeless MULTI-event row is unknown too: the
+  // timeless events could fall inside the known episode or outside it.
+  const mixed = reconcile([
+    auditAt('a', 'actor-1', T0),
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1', occurrenceCount: 9 }),
+  ])
+  assert.equal(mixed.episodes.incidentsWithUnrecoverableEpisodes, 1)
+  assert.equal(mixed.episodes.counted, 1, 'the audit incident counts; the aggregate one does not')
+})

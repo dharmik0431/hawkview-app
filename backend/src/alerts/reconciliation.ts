@@ -381,7 +381,8 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   const auditBoundTargetKeys = new Set<string>()
   // Rows per incident, so episodes can be counted within each stream rather than across
   // all of them — two actors' bursts on the same day are two incidents, not one episode.
-  const rowsByIncident = new Map<string, { times: Date[]; missing: number; auditOnly: boolean }>()
+  const rowsByIncident =
+    new Map<string, { times: Date[]; missing: number; events: number; auditOnly: boolean }>()
   const nominated = declarationFor('security.routine_directory_change')
   const mapping: MappingEntry[] = []
   let unattributed = 0
@@ -412,13 +413,28 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
         if (boundGrouping.groups) auditBoundKeys.add(boundGrouping.key)
         if (boundTarget.groups) auditBoundTargetKeys.add(boundTarget.key)
       }
-      if (boundGrouping.groups) {
-        const bucket = rowsByIncident.get(boundGrouping.key)
-          ?? { times: [], missing: 0, auditOnly: true }
+      // AN UNGROUPED ROW IS STILL AN INCIDENT, and it was contributing ZERO episodes.
+      //
+      // This was the cause of a six-episode disagreement with a SQL count over the same
+      // rows. The guard was `if (boundGrouping.groups)`, so every unattributable row was
+      // dropped from the episode accounting entirely — while the rival instrument coalesced
+      // them onto one literal actor and got at least one episode from them. The other side
+      // reasoned that their merging should make THEIR count lower and therefore could not
+      // explain the gap; what they could not see is that mine was discarding the rows
+      // outright, which is the stronger effect and points the other way.
+      //
+      // Each ungrouped row is its own incident of one event, so it keys on the notification
+      // id. Two unattributed events are two incidents of one event each — exactly what
+      // `wouldGroupTogether` already refuses to merge, now honoured in the episode count too.
+      const episodeKey = boundGrouping.groups ? boundGrouping.key : `ungrouped:${row.id}`
+      {
+        const bucket = rowsByIncident.get(episodeKey)
+          ?? { times: [], missing: 0, events: 0, auditOnly: true }
+        bucket.events += row.occurrenceCount
         if (row.occurredAt instanceof Date) bucket.times.push(row.occurredAt)
         else bucket.missing += 1
         if (parsed.shape !== 'DIRECTORY_AUDIT') bucket.auditOnly = false
-        rowsByIncident.set(boundGrouping.key, bucket)
+        rowsByIncident.set(episodeKey, bucket)
       }
     }
 
@@ -470,6 +486,18 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   let rowsWithoutTime = 0
   for (const bucket of rowsByIncident.values()) {
     rowsWithoutTime += bucket.missing
+
+    // ONE EVENT IS ONE EPISODE, AND THAT IS KNOWABLE WITHOUT ITS TIME. The time is only
+    // needed to SPLIT several events; a single event forms exactly one burst whenever it
+    // happened. Treating a timeless single-event incident as unknown was over-refusing —
+    // the opposite error to counting a genuinely unknowable one as one, and both are failures
+    // to distinguish "cannot be computed" from "computed".
+    if (bucket.events === 1) {
+      episodesCounted += 1
+      if (bucket.auditOnly) episodesCountedAudit += 1
+      continue
+    }
+
     if (bucket.missing > 0) {
       // UNKNOWN, NOT ONE. An incident holding a row whose event time is gone has an episode
       // count nobody can recover, and counting it as a single episode would understate the
