@@ -381,3 +381,52 @@ test('THE LOSSLESS LABEL IS CONSTRAINED BY THE TARGET TYPE, not by the witness',
       .includes(modelled.reads), modelled.reads)
   }
 })
+
+test('A TRUNCATED SNAPSHOT DOES NOT SILENCE A REAL FINDING', () => {
+  // THE REACHABILITY PATH, end to end through the mapper rather than by setting the
+  // mapped state directly. Every other test for this set `state: 'UNAVAILABLE'` on the
+  // state object, so none of them exercised the mapper's own distinction — and a mutation
+  // putting an absent field back onto UNRECOGNISED survived all of them. Asserting the
+  // classifier's behaviour while injecting the value the mapper was supposed to choose
+  // is the instrument sitting below the level where the value is decided.
+  //
+  // This is the case QA described: no Microsoft vocabulary change, just a field missing
+  // from the payload. Before the ordering fix it turned an unambiguous role exclusion
+  // into impact-unknown, which is "the worse collection gets, the quieter alerting gets".
+  const complete = policy({
+    conditions: { users: { excludeUsers: [], excludeGroups: [], excludeRoles: [] } },
+  })
+  const truncated: Record<string, unknown> = {
+    ...policy({ conditions: { users: { excludeUsers: [], excludeGroups: [], excludeRoles: ['role-1'] } } }),
+  }
+  delete truncated.state
+
+  const before = mapCollectedPolicy(complete, canonicalise)
+  const after = mapCollectedPolicy(truncated, canonicalise)
+
+  // The mapper distinguishes absent from unrecognised — which a test that sets the
+  // mapped value itself can never check.
+  assert.equal(after.state, 'UNAVAILABLE')
+  assert.notEqual(after.state, 'UNRECOGNISED')
+
+  // And the real finding survives the truncation.
+  const verdict = classifyConditionalAccessChange(before, after)
+  assert.equal(verdict.classification, 'URGENT')
+  assert.equal(verdict.rule, 'conditional_access.role_excluded')
+
+  // With no finding present, the truncation IS the report — and it says the field was
+  // not read rather than not understood.
+  const quiet = mapCollectedPolicy((() => {
+    const copy: Record<string, unknown> = { ...complete }
+    delete copy.state
+    return copy
+  })(), canonicalise)
+  const onlyTruncation = classifyConditionalAccessChange(before, quiet)
+  assert.equal(onlyTruncation.rule, 'conditional_access.policy_state_unavailable')
+  assert.match(onlyTruncation.because, /collected/i)
+
+  // A null state field is the same fact as an absent one: Microsoft sends both.
+  assert.equal(mapCollectedPolicy(policy({ state: null }), canonicalise).state, 'UNAVAILABLE')
+  // POSITIVE CONTROL: an unknown WORD is still unrecognised, so the split discriminates.
+  assert.equal(mapCollectedPolicy(policy({ state: 'somethingNew' }), canonicalise).state, 'UNRECOGNISED')
+})

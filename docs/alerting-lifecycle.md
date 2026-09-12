@@ -994,7 +994,8 @@ logging. Both transitions now have a verdict:
 | ON → OFF | urgent, `policy_disabled` | protection stops applying and it stops evaluating |
 | ON → REPORT_ONLY | urgent, `policy_stopped_enforcing` | access it previously blocked is now allowed |
 | REPORT_ONLY → OFF | routine, `policy_stopped_reporting` | nobody's access changes; **our** visibility is what is lost |
-| any ↔ UNRECOGNISED | unclassified, `policy_state_unrecognised` | cannot be read, so it is not read |
+| any ↔ UNRECOGNISED | unclassified, `policy_state_unrecognised` | a word we do not know — Microsoft changed |
+| any ↔ UNAVAILABLE | unclassified, `policy_state_unavailable` | the field was not there — our collection degraded |
 | the strengthening directions | routine | turning a policy on must not look like turning one off |
 
 `REPORT_ONLY → OFF` is **not** a weakening under the policy semantics, and calling it one
@@ -1122,6 +1123,79 @@ not understand). The rule is not applied to it, because today that would report
 impact-unknown for every policy with no grant controls. Splitting those two is the
 remaining piece of this repair, and it is the same shape as everything above: a
 distinguished value that means two different things cannot carry the rule.
+
+
+### Precedence: an unknown in another dimension never silences a finding
+
+The headline is QA's and it is the right way to say it: **the worse collection gets, the
+quieter alerting gets.**
+
+The state-readability check ran first. The reasoning was sound about the rules that *do*
+read state — none of them should treat an unreadable value as one of the three it
+understands — and I applied it to the whole function, which preempted the three exclusion
+rules and the grant verdict. **None of those reads state at all.** A role exclusion that
+is urgent on its own came back impact-unknown the moment anything else was unreadable.
+
+And it was reachable without Microsoft changing anything. An **absent** `state` field
+mapped to the same value as an unknown one, so a merely truncated snapshot downgraded a
+real, unambiguous role exclusion. Absence of evidence quietly becoming evidence of
+absence — the defect this entire feature exists to remove, pointing at itself.
+
+**The rule, and it is sharper than "a weakening outranks an unknown":**
+
+> **An unknown in the SAME dimension as a verdict invalidates that verdict. An unknown in
+> a DIFFERENT dimension does not.**
+
+That resolves both directions of the ordering, which a precedence list alone does not:
+
+| unknown | sits | because |
+|---|---|---|
+| an unreadable grant or exclusion list | **above** the grant and exclusion rules | those rules read it; a weakening computed over an incomplete list is a guess with a confident sentence attached |
+| an unreadable policy state | **below** them | they never touch it, and the exclusion they found is as real as it was before the state went missing |
+
+A table binds every weakening against every other-dimension unknown, individually and
+all at once, with a control showing those unknowns still decide the verdict when no
+finding is present — so it is a precedence rather than the unknowns having been made
+inert.
+
+### UNAVAILABLE is not UNRECOGNISED
+
+Two different facts, and collapsing them produced a false sentence: *"a state we do not
+recognise"* when the truth was *"we did not get the state"*. The same class as reporting
+report-only as disabled, and **the product already refuses this conflation everywhere
+else** — `EXACT 0` versus `NOT_AVAILABLE` is the same distinction and one of the oldest
+rules here.
+
+They differ in consequence, which is why they are separate rules rather than one with a
+longer sentence. An unrecognised vocabulary is **Microsoft changing** — an engineering
+signal. An absent field is **our own collection degrading** — a monitoring fact somebody
+should hear about in its own right, not as a modifier on a security verdict. An MSP may
+reasonably want those on different channels, and now they can be.
+
+**One test defect worth recording, because it is the shape not the instance.** Every test
+for this set `state: 'UNAVAILABLE'` on the mapped object, so none exercised the *mapper's*
+distinction — and a mutation putting an absent field back onto `UNRECOGNISED` survived all
+of them. Asserting the classifier's behaviour while injecting the value the mapper was
+supposed to choose is the instrument sitting below the level where the value is decided.
+The test that catches it goes end to end from a truncated payload.
+
+### Standing trap for step 03: `windowReadableThroughout`
+
+**Not a bug today, and it will be the moment step 03 wires it.**
+`alert-clearing.ts` declares it, `conditionSatisfied` reads it, and **nothing produces
+it** — every reference outside the module is a fixture, defaulting to `false`, which is
+the right default.
+
+QA's warning is exact: when step 03 comes to wire it, **the cheapest way to make an alert
+clear will be to pass `true`, and every test will still pass, because the tests inject it
+too.** The instrument sits below the level where the value is chosen, which is the oldest
+rule here and it is sitting in the file waiting.
+
+**Hard requirement for step 03:** derive it from sync state — successful-collection
+coverage across the window, gaps included — and test the **producer**, above the level
+that picks the value. Otherwise a correct rule becomes a flag that is always true, the
+alert clears because the collector died, and that is precisely what the two-halves check
+was built to stop.
 
 
 ### What HawkView cannot see: role-based exclusions

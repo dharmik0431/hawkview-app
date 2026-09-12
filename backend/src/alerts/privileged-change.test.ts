@@ -705,6 +705,8 @@ const REACHES: ReadonlyArray<readonly [ChangeRule, () => { rule: ChangeRule }]> 
     () => classifyConditionalAccessChange(policy({ state: 'REPORT_ONLY' }), policy({ state: 'OFF' }))],
   ['conditional_access.policy_state_unrecognised',
     () => classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'UNRECOGNISED' }))],
+  ['conditional_access.policy_state_unavailable',
+    () => classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'UNAVAILABLE' }))],
   ['conditional_access.list_partially_unreadable',
     () => classifyConditionalAccessChange(
       policy(), policy({ grantControls: { values: ['mfa'], unreadable: 1 } }))],
@@ -781,6 +783,7 @@ test('THE RULE IDENTIFIERS ARE A WIRE CONTRACT, pinned so a rename cannot be cas
     'conditional_access.policy_stopped_enforcing',
     'conditional_access.policy_stopped_reporting',
     'conditional_access.policy_state_unrecognised',
+    'conditional_access.policy_state_unavailable',
     'conditional_access.list_partially_unreadable',
     'conditional_access.user_excluded',
     'conditional_access.group_excluded',
@@ -1017,4 +1020,97 @@ test('AN UNREADABLE LIST ENTRY STOPS A VERDICT, on every one of the four lists',
     policy({ grantOperator: 'OR', grantControls: { values: ['mfa', 'compliantDevice'], unreadable: 2 } }))
   assert.equal(bothWrong.rule, 'conditional_access.list_partially_unreadable',
     'a verdict computed over an incomplete list must not be reported as a finding')
+})
+
+
+test('AN UNKNOWN IN ANOTHER DIMENSION NEVER SILENCES A FINDING', () => {
+  // QA's headline, as a property: THE WORSE COLLECTION GETS, THE QUIETER ALERTING GETS.
+  // The state-readability check used to run first and preempted the exclusion rules and
+  // the grant verdict — none of which read state. A role exclusion that is urgent on its
+  // own came back impact-unknown the moment anything else was unreadable, and because an
+  // ABSENT field produced the same value as an unknown vocabulary word, a truncated
+  // snapshot was enough. Absence of evidence becoming evidence of absence.
+  //
+  // THE RULE, sharper than "a weakening outranks an unknown": an unknown in the SAME
+  // dimension as a verdict invalidates it; an unknown in a DIFFERENT dimension does not.
+  const findings = [
+    ['role excluded', { excludedRoles: ['role-1'] }, 'conditional_access.role_excluded'],
+    ['group excluded', { excludedGroups: ['group-1'] }, 'conditional_access.group_excluded'],
+    ['user excluded', { excludedUsers: ['user-1'] }, 'conditional_access.user_excluded'],
+    ['grant weakened', { grantOperator: 'OR' as const }, 'conditional_access.grant_weakened'],
+  ] as const
+
+  // Unknowns in OTHER dimensions. Each must leave every finding above untouched.
+  const elsewhere = [
+    ['state unreadable word', { state: 'UNRECOGNISED' as const }],
+    ['state field absent', { state: 'UNAVAILABLE' as const }],
+    ['session control moved', { sessionControls: ['signInFrequency'] }],
+    ['unmodelled dimension moved', { unmodelledFingerprint: 'after' }],
+  ] as const
+
+  for (const [findingName, finding, expected] of findings) {
+    // The finding alone, as the baseline this must not drift from.
+    const alone = classifyConditionalAccessChange(policy({ unmodelledFingerprint: 'before' }), policy(finding))
+    assert.equal(alone.rule, expected, `${findingName} alone`)
+    assert.equal(alone.classification, 'URGENT', `${findingName} alone`)
+
+    for (const [unknownName, unknown] of elsewhere) {
+      const together = classifyConditionalAccessChange(
+        policy({ unmodelledFingerprint: 'before' }), policy({ ...finding, ...unknown }))
+      assert.equal(together.classification, 'URGENT', `${findingName} + ${unknownName}`)
+      assert.equal(together.rule, expected, `${findingName} + ${unknownName}`)
+    }
+
+    // And all four unknowns at once still does not silence it.
+    const everything = classifyConditionalAccessChange(
+      policy({ unmodelledFingerprint: 'before' }),
+      policy({ ...finding, state: 'UNAVAILABLE', sessionControls: ['signInFrequency'], unmodelledFingerprint: 'after' }))
+    assert.equal(everything.rule, expected, `${findingName} + everything unreadable`)
+  }
+
+  // POSITIVE CONTROL: with no finding present, those unknowns DO decide the verdict, so
+  // this is a precedence rather than the unknowns having been made inert.
+  for (const [unknownName, unknown] of elsewhere) {
+    const verdict = classifyConditionalAccessChange(
+      policy({ unmodelledFingerprint: 'before' }), policy(unknown))
+    assert.equal(verdict.classification, 'UNCLASSIFIED', unknownName)
+  }
+})
+
+test('AN UNKNOWN IN THE SAME DIMENSION DOES INVALIDATE THE VERDICT', () => {
+  // The other half of the rule, and the reason it is about dimensions rather than about
+  // weakenings always winning. An unreadable grant LIST sits above the grant rules
+  // because those rules read it — a weakening computed over an incomplete list is not a
+  // finding, it is a guess with a confident sentence attached.
+  const sameDimension = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND', grantControls: { values: ['mfa', 'compliantDevice'], unreadable: 1 } }),
+    policy({ grantOperator: 'OR', grantControls: { values: ['mfa', 'compliantDevice'], unreadable: 1 } }))
+  assert.equal(sameDimension.rule, 'conditional_access.list_partially_unreadable')
+
+  // Whereas the SAME weakening with the unreadable list in a dimension it does not read
+  // — the exclusion lists — reports the weakening.
+  const otherDimension = classifyConditionalAccessChange(
+    policy({ grantOperator: 'AND' }),
+    policy({ grantOperator: 'OR', excludedGroups: { values: [], unreadable: 0 } }))
+  assert.equal(otherDimension.rule, 'conditional_access.grant_weakened')
+})
+
+test('AN ABSENT STATE FIELD IS NOT AN UNRECOGNISED ONE', () => {
+  // Two different facts, and conflating them produced a false sentence: "a state we do
+  // not recognise" when the truth was "we did not get the state". Same class as reporting
+  // report-only as disabled. The product already refuses this conflation — EXACT 0 versus
+  // NOT_AVAILABLE is the same distinction.
+  const absent = classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'UNAVAILABLE' }))
+  const unknownWord = classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'UNRECOGNISED' }))
+
+  assert.notEqual(absent.rule, unknownWord.rule, 'two facts, two rules')
+  assert.match(absent.because, /not read rather than not understood|was not read/i)
+  assert.match(absent.because, /collected/i, 'an absent field is a collection gap and should say so')
+  assert.doesNotMatch(absent.because, /do not recognise|does not recognise/i,
+    'it must not claim we failed to understand something we never received')
+  assert.match(unknownWord.because, /does not recognise/i)
+
+  // They differ in consequence, which is why they differ in rule: an unknown vocabulary
+  // is Microsoft changing, an absent field is our collection degrading, and an MSP may
+  // reasonably want to hear about those through different channels.
 })

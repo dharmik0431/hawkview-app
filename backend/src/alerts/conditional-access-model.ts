@@ -150,7 +150,8 @@ export const MODELLED_PATHS: readonly ModelledPath[] = [
     reads: 'state',
     because:
       'Microsoft sends enabled | enabledForReportingButNotEnforced | disabled, and the state carries all ' +
-      'three as ON / REPORT_ONLY / OFF plus UNRECOGNISED for anything else. It was a boolean, which was ' +
+      'three as ON / REPORT_ONLY / OFF, plus UNRECOGNISED for a word we do not know and UNAVAILABLE for ' +
+      'a field that was not there at all. It was a boolean, which was ' +
       'not merely lossy: enabled-to-report-only read as "the policy was disabled" when it still evaluates ' +
       'and still logs, and report-only-to-disabled read as no change at all. The one residue is that two ' +
       'different unrecognised values both map to UNRECOGNISED, and since every transition touching ' +
@@ -249,13 +250,21 @@ const at = (policy: Collected, path: readonly string[]): unknown => {
  * Mapping an unknown state to OFF would assert "not enforcing" about something we do
  * not understand — and because this path is LOSSLESS and therefore excluded from the
  * digest, that guess would be the only thing said about it, with the safety net
- * switched off for exactly that case. The fourth member is what keeps the exclusion
- * honest. */
+ * switched off for exactly that case.
+ *
+ * AND ABSENT IS NOT UNRECOGNISED. Collapsing them said "a state we do not recognise"
+ * when the truth was "we did not get the state", which is a false sentence and the same
+ * class as reporting report-only as disabled. It also mattered more than the wording: a
+ * merely truncated snapshot produced the same value as a genuine vocabulary change, and
+ * at the time that value preempted every other rule — so a truncated payload silenced
+ * real findings. An unrecognised state is Microsoft changing; an absent one is our own
+ * collection degrading. */
 const policyState = (raw: unknown): ConditionalAccessState['state'] =>
-  raw === 'enabled' ? 'ON'
-    : raw === 'enabledForReportingButNotEnforced' ? 'REPORT_ONLY'
-      : raw === 'disabled' ? 'OFF'
-        : 'UNRECOGNISED'
+  raw === undefined || raw === null ? 'UNAVAILABLE'
+    : raw === 'enabled' ? 'ON'
+      : raw === 'enabledForReportingButNotEnforced' ? 'REPORT_ONLY'
+        : raw === 'disabled' ? 'OFF'
+          : 'UNRECOGNISED'
 
 /** Reads a list of identifiers and SAYS WHAT IT COULD NOT READ.
  *

@@ -36,6 +36,13 @@ test('ONE ADMIN TOUCHING TWELVE ACCOUNTS IS ONE INCIDENT', () => {
   // Twelve events, twelve different targets, one actor.
   const groupings = Array.from({ length: 12 }, () =>
     incidentGrouping(PRIVILEGED_CHANGE, scope, resolved('compromised-admin')))
+  // The 'ungrouped' string NARROWS THE TYPE HERE AND IS NOT A BUCKET. Every grouping in
+  // this test resolves, so it is never produced — but it is the idiom anybody wiring this
+  // will copy, and as a real key it would put every unattributable event in a tenant into
+  // one incident, which is the merge the resolved/unresolved split exists to prevent.
+  // `wouldGroupTogether` returns false for two non-grouping events precisely so that
+  // collapse cannot happen through a comparison; a sentinel would reintroduce it through
+  // a map key instead.
   const distinct = new Set(groupings.map((g) => (g.groups ? g.key : 'ungrouped')))
   assert.equal(distinct.size, 1, 'twelve changes by one actor must be one incident')
 })

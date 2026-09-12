@@ -54,6 +54,7 @@ export const CHANGE_RULES = [
   'conditional_access.policy_stopped_enforcing',
   'conditional_access.policy_stopped_reporting',
   'conditional_access.policy_state_unrecognised',
+  'conditional_access.policy_state_unavailable',
   'conditional_access.list_partially_unreadable',
   // REPLACES 'conditional_access.principal_excluded', which became unreachable when
   // the exclude lists stopped being merged. A deletion rather than a rename, and
@@ -210,13 +211,25 @@ export interface ConditionalAccessState {
    * The vocabulary is the product's already — `tenant-sync.service.ts` maps this
    * field to exactly these three words.
    *
-   * UNRECOGNISED is the fourth member and it is what keeps the exclusion honest. This
+   * UNRECOGNISED AND UNAVAILABLE ARE DIFFERENT FACTS AND THEY WERE ONE VALUE, which
+   * produced a false sentence: an absent field reported as "a state we do not
+   * recognise" when the truth is "we did not get the state". Same class as reporting
+   * report-only as disabled. The product already refuses this conflation everywhere
+   * else — EXACT 0 versus NOT_AVAILABLE is the same distinction and one of the oldest
+   * rules here.
+   *
+   * They also differ in consequence. An unrecognised vocabulary is MICROSOFT changing
+   * and is an engineering signal. An absent field is OUR COLLECTION degrading, which is
+   * a monitoring fact somebody should hear about in its own right rather than as a
+   * modifier on a security verdict.
+   *
+   * UNRECOGNISED is what keeps the exclusion honest. This
    * field is modelled losslessly and therefore excluded from
    * `unmodelledFingerprint`, so if a state Microsoft has not sent before were mapped
    * to OFF, that guess would be the ONLY thing said about it — an assertion of "not
    * enforcing" about something we do not understand, with the safety net switched off
    * for exactly that case. */
-  readonly state: 'ON' | 'REPORT_ONLY' | 'OFF' | 'UNRECOGNISED'
+  readonly state: 'ON' | 'REPORT_ONLY' | 'OFF' | 'UNRECOGNISED' | 'UNAVAILABLE'
   /** How the grant controls combine. Microsoft's model: OR means any one control
    * satisfies the policy, AND means all of them must. */
   readonly grantOperator: 'OR' | 'AND' | null
@@ -603,35 +616,6 @@ export function classifyConditionalAccessChange(
       'conditional-access-state-missing')
   }
 
-  // A DISTINGUISHED VALUE MEANS THE FIELD CANNOT BE READ, AND THAT IS TRUE WHETHER OR
-  // NOT THE TWO SIDES DIFFER. This is a rule about distinguished values rather than a
-  // special case for `state`, and it is what makes excluding a lossless path from the
-  // fingerprint safe: the exclusion is only honest while every value the projection
-  // cannot express lands on a member that says so and is never resolved to a verdict.
-  //
-  // THE EARLIER VERSION REQUIRED THE SIDES TO DIFFER, and that was a live defect QA
-  // found. Two different unrecognised raw states both map to UNRECOGNISED, so
-  // UNRECOGNISED-to-UNRECOGNISED looked like "no change" — and because this path is
-  // lossless and therefore excluded from the digest, the fingerprint could not report
-  // it either. A real change between two states we cannot read came back ROUTINE with
-  // nothing to contradict it. The reflexive case is precisely the one the projection
-  // collapses, which makes it the one that needed covering.
-  //
-  // `grantOperator === null` is NOT covered by this rule yet, deliberately: that value
-  // conflates ABSENT (no grant controls configured — knowable, and common for a
-  // session-controls-only policy) with UNRECOGNISED (Microsoft sent an operator we do
-  // not understand). Applying the rule to it today would report impact-unknown for
-  // every policy that simply has no grant controls. Splitting those two is the same
-  // repair as the fidelity constraint and belongs with it.
-  if (before.state === 'UNRECOGNISED' || after.state === 'UNRECOGNISED') {
-    return unclassified(
-      'conditional_access.policy_state_unrecognised',
-      'A conditional access policy is in a state this comparison does not recognise, so whether it is ' +
-      'enforcing cannot be determined — and two states we cannot read are not thereby the same state. ' +
-      'Change detected; impact unknown.',
-      'policy-state')
-  }
-
   // THE SAME RULE, APPLIED TO THE LISTS. An entry the mapper could not read is a
   // distinguished value exactly as UNRECOGNISED is, and these four paths are excluded
   // from the fingerprint — so if an unread entry did not stop a verdict here, nothing
@@ -716,6 +700,44 @@ export function classifyConditionalAccessChange(
   }
   if (grant !== null && grant.kind === 'UNDETERMINED') {
     return unclassified(grant.rule, grant.because, grant.unknown)
+  }
+
+  // STATE READABILITY IS CHECKED HERE, BELOW EVERY RULE THAT DOES NOT READ STATE.
+  //
+  // IT USED TO RUN FIRST AND THAT WAS A SAFETY PROPERTY POINTING THE WRONG WAY. The
+  // reasoning for putting it first was sound about the rules that DO read state — no
+  // state rule should treat an unreadable value as one of the three it understands — and
+  // I applied it to the whole function, which preempted the exclusion rules and the
+  // grant verdict. Neither of those looks at state at all.
+  //
+  // QA's headline is the right way to say it: THE WORSE COLLECTION GETS, THE QUIETER
+  // ALERTING GETS. A role exclusion that is urgent on its own came back impact-unknown
+  // the moment it co-occurred with an unreadable state — and because an ABSENT field
+  // mapped to the same value, a merely truncated snapshot was enough to do it. No
+  // Microsoft vocabulary change required. That is absence of evidence quietly becoming
+  // evidence of absence, which is the defect this entire feature exists to remove.
+  //
+  // THE RULE THAT SETTLES ORDERING, and it is sharper than "a weakening outranks an
+  // unknown": AN UNKNOWN IN THE SAME DIMENSION AS A VERDICT INVALIDATES THAT VERDICT;
+  // AN UNKNOWN IN A DIFFERENT DIMENSION DOES NOT. An unreadable grant list sits above
+  // the grant rules because those rules read it and their conclusion would be computed
+  // over incomplete data. An unreadable STATE sits below them because they never touch
+  // it, and the exclusion they found is as real as it was before the state went missing.
+  if (before.state === 'UNAVAILABLE' || after.state === 'UNAVAILABLE') {
+    return unclassified(
+      'conditional_access.policy_state_unavailable',
+      'A conditional access policy was compared without its state field, so whether it is enforcing was ' +
+      'not read rather than not understood. This is a gap in what was collected, not a finding about the ' +
+      'policy. Change detected; impact unknown.',
+      'policy-state-absent')
+  }
+  if (before.state === 'UNRECOGNISED' || after.state === 'UNRECOGNISED') {
+    return unclassified(
+      'conditional_access.policy_state_unrecognised',
+      'A conditional access policy reported a state this comparison does not recognise, so whether it is ' +
+      'enforcing cannot be determined — and two states we cannot read are not thereby the same state. ' +
+      'Change detected; impact unknown.',
+      'policy-state')
   }
 
   // NOTHING MODELLED WEAKENED. That is not the same as nothing weakened, and this
