@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  causeKeyOf,
+  contradictions,
   defaultPreference,
+  fanOutProblems,
   type CoverageStatement,
   type Delivery,
   type DeliveryPreference,
@@ -26,6 +29,9 @@ import {
  *
  * Nothing here tests routing. There is no routing.
  */
+
+const HELD_AT = new Date('2026-09-01T23:40:00Z')
+const DUE_AT = new Date('2026-09-02T07:00:00Z')
 
 const VERIFIED: Recipient = {
   kind: 'MSP_SECURITY_INBOX',
@@ -89,6 +95,7 @@ test('GUARDRAIL 2 — a per-tenant fan-out has no field to vary', () => {
     tier: 'EMAIL',
     timing: { kind: 'IMMEDIATE' },
     recipient: VERIFIED,
+    tickAt: HELD_AT,
     affectedTenants: Array.from({ length: 15 }, (_, n) => `tenant-${n}`),
     incidentKeys: Array.from({ length: 15 }, (_, n) => `k-${n}`),
   }
@@ -112,6 +119,7 @@ test('QUIET HOURS DEFER AND NEVER DROP, and the deferral is visible immediately'
     tier: 'PHONE',
     timing: { kind: 'HELD', until, because: 'quiet hours until 07:00' },
     recipient: VERIFIED,
+    tickAt: HELD_AT,
     affectedTenants: ['tenant-1'],
     incidentKeys: ['k-1'],
   }
@@ -216,11 +224,9 @@ const incident = (over: Partial<RoutableIncident> = {}): RoutableIncident => ({
   ruleId: 'security.privileged_role_granted',
   severity: 'ACT_NOW',
   category: 'SECURITY',
+  subjectId: 'admin-1',
   ...over,
 })
-
-const HELD_AT = new Date('2026-09-01T23:40:00Z')
-const DUE_AT = new Date('2026-09-02T07:00:00Z')
 
 const delivery = (over: Partial<Delivery> = {}): Delivery => ({
   organizationId: 'org-1',
@@ -228,6 +234,7 @@ const delivery = (over: Partial<Delivery> = {}): Delivery => ({
   tier: 'PHONE',
   timing: { kind: 'HELD', until: DUE_AT, because: 'quiet hours until 07:00' },
   recipient: VERIFIED,
+  tickAt: HELD_AT,
   affectedTenants: ['tenant-1'],
   incidentKeys: ['k-1'],
   ...over,
@@ -238,6 +245,7 @@ const outcome = (over: Partial<RoutingOutcome> = {}): RoutingOutcome => ({
   delivered: [],
   stillHeld: [],
   suppressed: [],
+  unroutable: [],
   silencedRules: [],
   accountingProblems: [],
   ...over,
@@ -329,4 +337,134 @@ test('EVERY INCIDENT LANDS IN EXACTLY ONE BUCKET, and there is no bucket for dro
   assert.ok(!keys.some((k) => /drop/i.test(k)), 'no dropped bucket exists')
   assert.deepEqual(keys.filter((k) => ['delivered', 'stillHeld', 'suppressed'].includes(k)).sort(),
     ['delivered', 'stillHeld', 'suppressed'])
+})
+
+test('ONLY MONITORING COALESCES — a security finding never merges across tenants', () => {
+  // A collector failing across fifteen tenants is ONE REASON: our collection broke, or
+  // Microsoft's API did. Two privileged role grants in two tenants are TWO REASONS that happen
+  // to share a rule, and coalescing them HIDES ONE BEHIND THE OTHER — the 301 defect wearing a
+  // rate-limit costume.
+  const collectorIn = (tenant: string) => incident({
+    incidentKey: `k-${tenant}`, customerTenantId: tenant, category: 'OPERATIONAL',
+    ruleId: 'monitoring.collector_failing', subjectId: 'SIGN_INS', severity: 'ACT_TODAY',
+  })
+  const fleet = ['tenant-1', 'tenant-2', 'tenant-3'].map(collectorIn)
+  assert.equal(new Set(fleet.map(causeKeyOf)).size, 1,
+    'three tenants, one broken collector, one cause')
+
+  const grantIn = (tenant: string) => incident({
+    incidentKey: `g-${tenant}`, customerTenantId: tenant, category: 'SECURITY',
+    ruleId: 'security.privileged_role_granted', subjectId: 'admin-1',
+  })
+  const grants = ['tenant-1', 'tenant-2', 'tenant-3'].map(grantIn)
+  assert.equal(new Set(grants.map(causeKeyOf)).size, 3,
+    'three tenants, three grants, three causes — even with the same actor and rule')
+
+  // THE ASYMMETRY IS THE RULING, so assert it directly rather than leaving it to two counts
+  // that happen to differ: the tenant is absent from one key and present in the other.
+  assert.ok(!causeKeyOf(fleet[0]!).includes('tenant-1'), 'no tenant in a monitoring cause')
+  assert.ok(causeKeyOf(grants[0]!).includes('tenant-1'), 'the tenant IS the point in a security one')
+
+  // Different collectors are still different causes, or "one message per MSP" would collapse
+  // every monitoring problem into a single message.
+  assert.notEqual(
+    causeKeyOf(collectorIn('tenant-1')),
+    causeKeyOf({ ...collectorIn('tenant-1'), subjectId: 'AUDIT_LOGS' }))
+})
+
+test('THE MISSING FIELD STOPS THE ADDRESS, NOT THE FAN-OUT', () => {
+  // A Delivery cannot be ADDRESSED to a tenant — no customerTenantId to vary, verified as a
+  // compile error above. But FIFTEEN DELIVERIES EACH NAMING ONE TENANT compile fine and share
+  // a cause key, and that is the 1,500 messages. So the guarantee needs an accounting rule as
+  // well as a missing field.
+  const cause = 'hawkview-cause/v1-monitoring-SIGN_INS'
+  const fannedOut = ['tenant-1', 'tenant-2', 'tenant-3'].map((tenant) =>
+    delivery({ causeKey: cause, affectedTenants: [tenant], incidentKeys: [`k-${tenant}`] }))
+
+  const problems = fanOutProblems(fannedOut)
+  assert.equal(problems.length, 1, 'one cause fanned across three messages is one problem')
+  assert.match(problems[0] ?? '', /3 deliveries for one cause/)
+
+  // The correct shape: one delivery, three tenants named inside it.
+  assert.deepEqual(fanOutProblems([delivery({
+    causeKey: cause, affectedTenants: ['tenant-1', 'tenant-2', 'tenant-3'],
+    incidentKeys: ['k-1', 'k-2', 'k-3'],
+  })]), [])
+
+  // AND IT MUST NOT FIRE ACROSS TICKS. The same cause recurring next tick is a new message,
+  // not a duplicate — a check that flagged it would make recurrence unreportable.
+  assert.deepEqual(fanOutProblems([
+    delivery({ causeKey: cause, tickAt: HELD_AT }),
+    delivery({ causeKey: cause, tickAt: DUE_AT }),
+  ]), [], 'one per cause per MSP per TICK, not once ever')
+
+  // Nor across MSPs: two organisations with the same cause are two messages by definition.
+  assert.deepEqual(fanOutProblems([
+    delivery({ causeKey: cause, organizationId: 'org-1' }),
+    delivery({ causeKey: cause, organizationId: 'org-2' }),
+  ]), [])
+})
+
+test('HELD THEN SILENCED IS SUPPRESSED — the outcome may not assert both at once', () => {
+  // An alert held under EMAIL, silenced to RECORD_ONLY while the hold is pending, then
+  // maturing: delivering it makes the outcome say the message went out AND that the MSP will
+  // not hear about that rule. The preference at delivery time wins.
+  const contradictory = outcome({
+    records: [{
+      incidentKey: 'k-1', organizationId: 'org-1', customerTenantId: 'tenant-1',
+      ruleId: 'security.privileged_role_granted', severity: 'ACT_NOW', category: 'SECURITY',
+      deliveryOutcome: 'Delivered.', heldDeliveries: [],
+    }],
+    delivered: [delivery({ timing: { kind: 'IMMEDIATE' }, incidentKeys: ['k-1'] })],
+    silencedRules: [{
+      ruleId: 'security.privileged_role_granted',
+      preference: 'RECORD_ONLY',
+      sentence: 'You will not be contacted about privileged role grants. They are still recorded.',
+    }],
+  })
+  const found = contradictions(contradictory)
+  assert.equal(found.length, 1)
+  assert.match(found[0] ?? '', /delivered while the standing statement says it is silenced/)
+
+  // THE REVERSE IS ALREADY RIGHT AND STAYS: silenced on arrival then un-silenced leaves a
+  // suppression in HISTORY and nothing in the standing statement. One is what happened, the
+  // other is what is configured — the same distinction as coverage not being derivable from
+  // events, and conflating them here would undo it.
+  const unsilencedLater = outcome({
+    suppressed: [{
+      incidentKey: 'k-9', organizationId: 'org-1',
+      ruleId: 'security.privileged_role_granted',
+      recordedAs: 'Recorded only, at your setting at the time.',
+    }],
+    silencedRules: [],
+  })
+  assert.deepEqual(contradictions(unsilencedLater), [],
+    'a past suppression is not a contradiction with a present setting')
+})
+
+test('AN UNROUTABLE INCIDENT IS NOT A DELIVERED ONE', () => {
+  // A Delivery once took the full Recipient union, so an organisation with no verified inbox
+  // produced an entry in `delivered` that satisfied the accounting identity and READ AS SERVED.
+  // The bucket was honest and silence got in through a field inside it.
+  const nobody = { kind: 'NONE_VERIFIED', because: 'no inbox has been verified yet' } as const
+
+  // @ts-expect-error a delivery cannot be addressed to nobody
+  const toNobody: Delivery = { ...delivery(), recipient: nobody }
+  assert.ok(toNobody)
+
+  const gap = outcome({
+    unroutable: [{
+      incidentKey: 'k-1', organizationId: 'org-1',
+      ruleId: 'security.privileged_role_granted', recipient: nobody,
+    }],
+  })
+  assert.equal(gap.delivered.length, 0, 'nothing was delivered')
+  assert.equal(gap.unroutable.length, 1, 'and the accounting can see why')
+  assert.notEqual(JSON.stringify(gap), JSON.stringify(outcome()),
+    'an organisation nobody is listening to is distinguishable from one fully reached')
+
+  // AND IT IS NOT SUPPRESSED EITHER. Suppressed means the MSP chose this; unroutable means we
+  // have nobody to tell. Conflating a choice with a gap is the error this feature keeps
+  // finding, one layer down each time.
+  assert.equal(gap.suppressed.length, 0)
 })

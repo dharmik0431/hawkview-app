@@ -19,6 +19,7 @@
  * helpful example contaminates exactly as thoroughly as a bug.
  */
 
+import { joinUnambiguously } from './alert-key-encoding.js'
 import type { AlertCategory } from './alert-lifecycle.js'
 import type { RoutingTier, Severity } from './alert-type.js'
 
@@ -60,7 +61,8 @@ export function defaultPreference(severity: Severity): DeliveryPreference {
  * NEVER A CUSTOMER END USER, and that is why this carries a verification state rather than an
  * address. A customer end user has no relationship with HawkView and did not ask to hear from
  * it; a type that accepts any string invites one to be typed in. */
-export type Recipient =
+/** A recipient we can actually reach. */
+export type VerifiedRecipient =
   | Readonly<{
       kind: 'MSP_SECURITY_INBOX'
       /** Verified, and the verification is the point — an unverified inbox is a guess about
@@ -74,9 +76,14 @@ export type Recipient =
       address: string
       verifiedAt: Date
     }>
-  /** No verified recipient exists yet. Carried as a variant rather than an empty list so the
-   * settings screen can say WHICH tenants have nobody listening, instead of showing a blank
-   * where a name should be. */
+
+/** A recipient, INCLUDING the honest refusal.
+ *
+ * `NONE_VERIFIED` is right to have — it is what a settings screen renders when nobody is
+ * listening — and it is deliberately NOT assignable to a `Delivery`. It is a fact about
+ * configuration, not a destination. */
+export type Recipient =
+  | VerifiedRecipient
   | Readonly<{ kind: 'NONE_VERIFIED'; because: string }>
 
 /** When a delivery may go out.
@@ -110,7 +117,15 @@ export interface Delivery {
   readonly causeKey: string
   readonly tier: RoutingTier
   readonly timing: DeliveryTiming
-  readonly recipient: Recipient
+  /** VERIFIED ONLY. A delivery to nobody is not a delivery, and while this took the full
+   * `Recipient` union it could carry `NONE_VERIFIED` — so an organisation with no inbox
+   * produced an entry in `delivered` that satisfied the accounting identity and read as
+   * served. The bucket was honest and silence got in through a field inside it, which is
+   * the same shape as every other finding in this feature. See `RoutingOutcome.unroutable`. */
+  readonly recipient: VerifiedRecipient
+  /** Which tick produced this, so "one delivery per cause per MSP per TICK" is checkable.
+   * Without it the fan-out invariant has no window to be true over. */
+  readonly tickAt: Date
   /** Every tenant this one cause affected. One entry or two hundred; still one message. */
   readonly affectedTenants: readonly string[]
   /** Incidents folded into this message, so the record and the message can be reconciled. */
@@ -213,6 +228,12 @@ export interface RoutableIncident {
   readonly ruleId: string
   readonly severity: Severity
   readonly category: AlertCategory
+  /** The resolved subject from step 02 — for a collector failure the resource type, for a
+   * directory change the actor. THE NON-TENANT PART OF THE CAUSE, and the field whose
+   * absence meant `causeKeyOf` could not be written: without it, what makes two incidents
+   * one cause was not in the seam at all, so any grouping was somebody's guess rather than
+   * the product's rule. */
+  readonly subjectId: string
 }
 
 /** An incident that produced no delivery BECAUSE THE MSP CHOSE THAT.
@@ -239,8 +260,8 @@ export interface HeldDelivery {
 /** Everything routing produced across the whole sequence.
  *
  * THE TWO INVARIANTS ARE THE ACCOUNTING IDENTITY FROM STEP 03, ARRIVING HERE. Every incident
- * appears exactly once in `records`, and lands in exactly one of `delivered`, `stillHeld` and
- * `suppressed`. An incident in none of those buckets is silence nobody can find, which is
+ * appears exactly once in `records`, and lands in exactly one of `delivered`, `stillHeld`,
+ * `suppressed` and `unroutable`. An incident in none of those buckets is silence nobody can find, which is
  * this step's whole failure mode — and an incident in two of them is a message somebody will
  * receive twice while the record says once.
  *
@@ -250,12 +271,35 @@ export interface HeldDelivery {
  * whose purpose is timing — the same failure, and the limit is the more tempting one because
  * dropping is the simplest implementation and looks like working as designed. With no bucket
  * to put a dropped message in, it cannot be written and then explained. */
+/** An incident nobody can be told about, with the refusal a settings screen would show. */
+export interface Unroutable {
+  readonly incidentKey: string
+  readonly organizationId: string
+  readonly ruleId: string
+  /** The refusal itself, carried rather than flattened to a boolean. */
+  readonly recipient: Extract<Recipient, { kind: 'NONE_VERIFIED' }>
+}
+
 export interface RoutingOutcome {
   /** Every incident, exactly once, whatever happened to it. */
   readonly records: readonly RoutedRecord[]
   readonly delivered: readonly Delivery[]
   readonly stillHeld: readonly HeldDelivery[]
   readonly suppressed: readonly SuppressedIncident[]
+  /** Incidents with nobody verified to tell.
+   *
+   * A FOURTH BUCKET, DELIBERATELY, AND SAY SO IF THAT IS THE WRONG READING. The instruction
+   * was that NONE_VERIFIED belongs somewhere the accounting can see rather than inside the
+   * bucket meaning "told"; I have taken that to mean its own place in the identity. Folding
+   * it into `suppressed` was the alternative and it would be wrong: SUPPRESSED MEANS THE MSP
+   * CHOSE THIS, UNROUTABLE MEANS WE HAVE NOBODY TO TELL. Conflating a choice with a gap is
+   * the error this feature keeps finding, one layer down each time.
+   *
+   * The defect it closes: a Delivery once took the full `Recipient` union, so an
+   * organisation with no inbox produced an entry in `delivered` that satisfied the
+   * accounting identity and read as served. The bucket was honest and silence got in
+   * through a field inside it. */
+  readonly unroutable: readonly Unroutable[]
   /** WHAT THE MSP WILL NOT HEAR ABOUT, DERIVED FROM THE PREFERENCE SET RATHER THAN FROM WHAT
    * HAPPENED.
    *
@@ -275,4 +319,91 @@ export interface RoutingOutcome {
   /** The invariants, checked on the output rather than asserted about it. Empty is healthy;
    * each entry names the incident and which rule it broke. */
   readonly accountingProblems: readonly string[]
+}
+
+/** WHAT MAKES TWO INCIDENTS ONE CAUSE. The function `Delivery.causeKey` referred to and that
+ * did not exist — the reference was dangling, and any grouping written against it would have
+ * been somebody's guess about the product's rule rather than the rule.
+ *
+ * ONLY MONITORING COALESCES. SECURITY FINDINGS NEVER COALESCE ACROSS TENANTS.
+ *
+ * A collector failing across fifteen tenants is ONE REASON — our collection broke, or
+ * Microsoft's API did — and fifteen messages about it is the failure the plan names. Two
+ * privileged role grants in two tenants are TWO REASONS that happen to share a rule, and
+ * coalescing them HIDES ONE BEHIND THE OTHER: the 301 defect wearing a rate-limit costume.
+ *
+ * So the tenant is deliberately absent from a monitoring cause and deliberately present in a
+ * security one. THE DIRECTION OF ERROR IS CHOSEN: over-send security, under-send monitoring
+ * noise. Wrong about a fleet-wide security cause and an MSP gets duplicates; wrong the other
+ * way and an attack in one tenant is hidden inside a message about another.
+ *
+ * Built with step 01's `joinUnambiguously` rather than a second encoding, so a subject id
+ * containing a separator cannot collide two causes into one. */
+export function causeKeyOf(incident: RoutableIncident): string {
+  return incident.category === 'SECURITY'
+    ? joinUnambiguously([
+        'hawkview-cause/v1', 'SECURITY', incident.organizationId, incident.ruleId,
+        // The tenant IS the point here: two tenants are two causes.
+        incident.customerTenantId, incident.subjectId,
+      ])
+    : joinUnambiguously([
+        'hawkview-cause/v1', 'OPERATIONAL', incident.organizationId, incident.ruleId,
+        // No tenant. Fifteen tenants failing on one collector are one cause.
+        incident.subjectId,
+      ])
+}
+
+/** THE FAN-OUT INVARIANT, WHICH THE MISSING FIELD DOES NOT PROVIDE.
+ *
+ * A `Delivery` genuinely cannot be ADDRESSED to a tenant — there is no `customerTenantId` to
+ * vary, and that is a compile error. But FIFTEEN DELIVERIES EACH NAMING ONE TENANT IN
+ * `affectedTenants` COMPILE FINE AND SHARE A CAUSE KEY. The absent field stops the address; it
+ * does not stop the fan-out, and the fan-out is the 1,500 messages.
+ *
+ * So the guarantee needs an accounting rule as well as a missing field: ONE DELIVERY PER CAUSE
+ * KEY PER MSP PER TICK. Reported by name rather than as a count, so a reader knows which cause
+ * to go and look at. */
+export function fanOutProblems(deliveries: readonly Delivery[]): readonly string[] {
+  const seen = new Map<string, number>()
+  for (const delivery of deliveries) {
+    const window = joinUnambiguously([
+      delivery.organizationId, delivery.causeKey, delivery.tickAt.toISOString(),
+    ])
+    seen.set(window, (seen.get(window) ?? 0) + 1)
+  }
+  return [...seen.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([window, count]) =>
+      `${count} deliveries for one cause in one tick — ${window}. One cause is one message per MSP.`)
+    .sort()
+}
+
+/** THE HELD-THEN-SILENCED CONTRADICTION, and the ruling that settles it.
+ *
+ * An alert held under EMAIL, whose rule is silenced to RECORD_ONLY while the hold is pending,
+ * and which then matures: delivering it makes the outcome assert two things at once — the
+ * message went out, and `silencedRules` says the MSP will not hear about that rule.
+ *
+ * THE PREFERENCE AT DELIVERY TIME WINS, so it becomes suppressed rather than delivered. The
+ * MSP's most recent expressed intent is the one to honour; delivering something they have just
+ * silenced is exactly what makes people stop trusting a settings screen; and A HELD ALERT IS BY
+ * DEFINITION NOT THE ALWAYS-RING KIND, since anything that bypasses quiet hours was never held.
+ * The record survives regardless.
+ *
+ * THE REVERSE IS ALREADY RIGHT AND STAYS: silenced on arrival then un-silenced leaves a
+ * suppression in history and nothing in the standing statement. One is what happened, the other
+ * is what is configured — and conflating them is the same error as deriving coverage from
+ * events. */
+export function contradictions(outcome: RoutingOutcome): readonly string[] {
+  const silenced = new Set(outcome.silencedRules.map((statement) => statement.ruleId))
+  const deliveredRules = new Set(
+    outcome.records
+      .filter((record) => outcome.delivered.some((d) => d.incidentKeys.includes(record.incidentKey)))
+      .map((record) => record.ruleId))
+  return [...deliveredRules]
+    .filter((ruleId) => silenced.has(ruleId))
+    .map((ruleId) =>
+      `${ruleId} was delivered while the standing statement says it is silenced. `
+      + 'The preference at delivery time wins: this should be suppressed.')
+    .sort()
 }

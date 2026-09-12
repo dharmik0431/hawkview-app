@@ -168,3 +168,91 @@ reason step 03 settled: a reader needs to know which figure to go and look at.
 **The gate discriminates**: collapsing the tick sequence to a single moment, removing
 `stillHeld`, removing `silencedRules`, or adding a `dropped` bucket are each caught at compile
 time — four collapses, four caught.
+
+## `causeKeyOf` did not exist, and the seam could not say what one cause is
+
+`Delivery.causeKey` said *"see `causeKeyOf`"* and **there was no such function anywhere** — a
+dangling reference I wrote. `RoutableIncident` carried no fleet-wide cause either, so what
+makes two incidents one cause was not in the seam at all, and any grouping written against it
+would have measured a guess rather than the product's rule. Step 04's P7 shape again.
+
+### The ruling: only monitoring coalesces
+
+**Security findings never coalesce across tenants.**
+
+A collector failing across fifteen tenants is **one reason** — our collection broke, or
+Microsoft's API did — and fifteen messages about it is the failure the plan names. Two
+privileged role grants in two tenants are **two reasons that happen to share a rule**, and
+coalescing them **hides one behind the other**: the 301 defect wearing a rate-limit costume.
+
+| category | cause key |
+|---|---|
+| `OPERATIONAL` | organisation + rule + subject. **No tenant** — that is the whole point. |
+| `SECURITY` | organisation + rule + **tenant** + subject. Nothing coalesces. |
+
+**The direction of error is chosen**: over-send security, under-send monitoring noise. Wrong
+about a fleet-wide security cause and an MSP gets duplicates; wrong the other way and an attack
+in one tenant is hidden inside a message about another.
+
+Built on step 01's `joinUnambiguously`, so a subject id containing a separator cannot collide
+two causes into one. `RoutableIncident` gained the `subjectId` the key reads — the field whose
+absence was the actual problem.
+
+### The missing field stops the address, not the fan-out
+
+A `Delivery` genuinely cannot be *addressed* to a tenant — no `customerTenantId` to vary, and
+that is a compile error. But **fifteen Deliveries each naming one tenant in `affectedTenants`
+compile fine and share a cause key.** The absent field stops the address; it does not stop the
+fan-out, and the fan-out is the 1,500 messages.
+
+So the guarantee needs an accounting rule as well: **one delivery per cause key per MSP per
+tick**, in `fanOutProblems`. The two negative controls matter as much as the positive one — it
+must not fire across ticks (recurrence is a new message, not a duplicate) and must not fire
+across MSPs (two organisations with one cause are two messages by definition).
+
+## Held then silenced is suppressed
+
+An alert held under EMAIL, silenced to RECORD_ONLY while the hold is pending, then maturing,
+would come out **delivered** while `silencedRules` simultaneously says the MSP will not hear
+about that rule. **The outcome asserts both at once.**
+
+**The preference at delivery time wins.** The MSP's most recent expressed intent is the one to
+honour; delivering something they have just silenced is exactly what makes people stop trusting
+a settings screen; and **a held alert is by definition not the always-ring kind**, since
+anything that bypasses quiet hours was never held. The record survives regardless.
+
+The reverse stays as it was: silenced on arrival then un-silenced leaves a suppression in
+**history** and nothing in the **standing statement**. One is what happened, the other is what
+is configured — the same distinction as coverage not being derivable from events.
+
+## A delivery to nobody was sitting in `delivered`
+
+`Recipient` has a third member, `NONE_VERIFIED`, and every `Delivery` carried a full
+`Recipient`. So an organisation with **no verified inbox** produced an entry in `delivered`,
+satisfied the accounting identity, and **read as served** — indistinguishable in the outcome
+from one that was fully reached. The bucket was honest and silence got in through a field
+inside it, which is this feature's recurring shape one layer down each time.
+
+`Delivery.recipient` is now `VerifiedRecipient`; a delivery to nobody does not compile.
+
+**I read "it is not a fourth bucket" as *do not leave it hidden in delivered* and gave it its
+own place in the identity — say if that is the wrong call.** Folding it into `suppressed` was
+the alternative and I think it would be wrong: **suppressed means the MSP chose this;
+unroutable means we have nobody to tell.** Conflating a choice with a gap is the error this
+feature keeps finding.
+
+## Casts, checked on my own files
+
+QA's fixtures carried two invented enum values masked by `as` casts added to make the file
+compile — six checks reporting READY over a vocabulary that is not the product's. Their naming
+is the useful part: **a cast written to fix one complaint is a blanket over all of them.**
+
+Grepped mine. No casts in `routing-policy.test.ts` or `finding-intake.test.ts`. The handful
+elsewhere are unknown-object traversal (`as Record<string, unknown>` while walking a value of
+unknown shape) and one deliberate `as never` to pass an undeclared id to a function that must
+reject it. None masking an invented value — but the check was worth running rather than
+assuming, and it is cheap enough to repeat.
+
+Six collapses, six caught: the tenant put back into a monitoring cause, the tenant dropped from
+a security one, the subject dropped entirely, `fanOutProblems` ignoring the tick, keyed per
+tenant, and `contradictions` always reporting none.
