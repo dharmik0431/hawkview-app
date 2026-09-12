@@ -162,7 +162,12 @@ export const MODELLED_PATHS: readonly ModelledPath[] = [
     path: ['grantControls', 'operator'],
     fidelity: 'LOSSLESS',
     reads: 'grantOperator',
-    because: 'Microsoft sends OR or AND, and grantOperator carries both plus null for absent or unreadable.',
+    because:
+      'Microsoft sends OR or AND, and grantOperator carries both plus ABSENT for no operator and ' +
+      'UNRECOGNISED for one we cannot read. Those last two were a single null, which is why the ' +
+      'distinguished-value rule could not be applied to this field: absent is the normal state of a ' +
+      'session-controls-only policy, and forcing impact-unknown on the conflated value would have fired ' +
+      'on every one of them.',
     witness: pairAt(['grantControls', 'operator'], 'AND', 'OR'),
   },
   {
@@ -277,6 +282,19 @@ const policyState = (raw: unknown): ConditionalAccessState['state'] =>
  * empty list with nothing unread; a value that is not a list at all is zero entries
  * read and ONE unread, never "nothing was there"; and a list is its strings plus a
  * count of everything else. */
+/** ABSENT when there is no operator, UNRECOGNISED when there is one we cannot read.
+ *
+ * The two used to be one `null`, which is why the distinguished-value rule could not be
+ * applied to this field: absent is the normal state of a session-controls-only policy, so
+ * forcing impact-unknown on the conflated value would have fired on every one of them.
+ * Case is normalised, matching `effective-mfa-enforcement`. */
+const grantOperatorOf = (raw: unknown): ConditionalAccessState['grantOperator'] => {
+  if (raw === undefined || raw === null) return 'ABSENT'
+  if (typeof raw !== 'string') return 'UNRECOGNISED'
+  const upper = raw.toUpperCase()
+  return upper === 'OR' ? 'OR' : upper === 'AND' ? 'AND' : 'UNRECOGNISED'
+}
+
 const readList = (value: unknown): ReadList => {
   if (value === undefined || value === null) return { values: [], unreadable: 0 }
   if (!Array.isArray(value)) return { values: [], unreadable: 1 }
@@ -295,12 +313,11 @@ export function mapCollectedPolicy(
   canonicalise: Canonicaliser,
 ): ConditionalAccessState {
   const operator = at(collected, ['grantControls', 'operator'])
-  const normalisedOperator = typeof operator === 'string' ? operator.toUpperCase() : null
   const sessionControls = at(collected, ['sessionControls'])
 
   return {
     state: policyState(at(collected, ['state'])),
-    grantOperator: normalisedOperator === 'OR' || normalisedOperator === 'AND' ? normalisedOperator : null,
+    grantOperator: grantOperatorOf(operator),
     grantControls: readList(at(collected, ['grantControls', 'builtInControls'])),
     excludedUsers: readList(at(collected, ['conditions', 'users', 'excludeUsers'])),
     excludedGroups: readList(at(collected, ['conditions', 'users', 'excludeGroups'])),

@@ -265,8 +265,8 @@ test('REMOVING A GRANT CONTROL DOES NOT ALWAYS WEAKEN THE POLICY', () => {
 
   // Operator unknown: we cannot tell which happened, so we say so.
   const unknownOperator = classifyConditionalAccessChange(
-    policy({ grantOperator: null }),
-    policy({ grantOperator: null, grantControls: ['mfa'] }))
+    policy({ grantOperator: 'ABSENT' }),
+    policy({ grantOperator: 'ABSENT', grantControls: ['mfa'] }))
   assert.equal(unknownOperator.classification, 'UNCLASSIFIED')
   assert.match(unknownOperator.because, /impact unknown/i)
 })
@@ -305,8 +305,8 @@ test('A SESSION-CONTROL-ONLY CHANGE MUST NOT COME BACK ROUTINE', () => {
   // fell off the end, and was called routine. Sign-in frequency and persistent
   // browser are where a session is extended from an hour to weeks.
   const changed = classifyConditionalAccessChange(
-    policy({ grantControls: [], grantOperator: null, sessionControls: ['signInFrequency'] }),
-    policy({ grantControls: [], grantOperator: null, sessionControls: [] }))
+    policy({ grantControls: [], grantOperator: 'ABSENT', sessionControls: ['signInFrequency'] }),
+    policy({ grantControls: [], grantOperator: 'ABSENT', sessionControls: [] }))
   assert.equal(changed.classification, 'UNCLASSIFIED')
   assert.equal(changed.unknown, 'session-controls')
   assert.match(changed.because, /impact unknown/i)
@@ -381,7 +381,7 @@ test('URGENT AND UNCLASSIFIED SAY HOW SOON TO LOOK, NOT THAT SOMETHING IS WRONG'
     classifyDirectoryChange({ kind: 'ROLE_ASSIGNMENT', roleTemplateId: null, roleIsPrivileged: null }, context),
     classifyDirectoryChange({ kind: 'ROLE_ASSIGNMENT', roleTemplateId: 'custom', roleIsPrivileged: null }, context),
     classifyConditionalAccessChange(null, policy()),
-    classifyConditionalAccessChange(policy({ grantOperator: null }), policy({ grantOperator: null, grantControls: ['mfa'] })),
+    classifyConditionalAccessChange(policy({ grantOperator: 'ABSENT' }), policy({ grantOperator: 'ABSENT', grantControls: ['mfa'] })),
     classifyConditionalAccessChange(policy({ sessionControls: ['signInFrequency'] }), policy({ sessionControls: [] })),
     classifyConditionalAccessChange(policy({ unmodelledFingerprint: 'a' }), policy({ unmodelledFingerprint: 'b' })),
     // The two paths the operator fix added. A sweep that says "every unclassified
@@ -607,8 +607,8 @@ test('AND AND OR INVERT AT THE EMPTY SET, so an empty side is undetermined', () 
   // fall through to the session-control comparison — the production event that made
   // the old fallback wrong had exactly this shape.
   const sessionOnly = classifyConditionalAccessChange(
-    policy({ grantControls: [], grantOperator: null, sessionControls: ['signInFrequency'] }),
-    policy({ grantControls: [], grantOperator: null, sessionControls: [] }))
+    policy({ grantControls: [], grantOperator: 'ABSENT', sessionControls: ['signInFrequency'] }),
+    policy({ grantControls: [], grantOperator: 'ABSENT', sessionControls: [] }))
   assert.equal(sessionOnly.unknown, 'session-controls')
 })
 
@@ -724,7 +724,10 @@ const REACHES: ReadonlyArray<readonly [ChangeRule, () => { rule: ChangeRule }]> 
       policy({ grantOperator: 'OR', grantControls: ['mfa', 'compliantDevice'] }))],
   ['conditional_access.grant_operator_unknown',
     () => classifyConditionalAccessChange(
-      policy({ grantOperator: null }), policy({ grantOperator: null, grantControls: ['mfa'] }))],
+      policy({ grantOperator: 'UNRECOGNISED' }), policy({ grantOperator: 'UNRECOGNISED', grantControls: ['mfa'] }))],
+  ['conditional_access.grant_operator_absent',
+    () => classifyConditionalAccessChange(
+      policy({ grantOperator: 'ABSENT' }), policy({ grantOperator: 'ABSENT', grantControls: ['mfa'] }))],
   ['conditional_access.grant_controls_absent',
     () => classifyConditionalAccessChange(
       policy({ grantOperator: 'OR', grantControls: [] }),
@@ -790,6 +793,7 @@ test('THE RULE IDENTIFIERS ARE A WIRE CONTRACT, pinned so a rename cannot be cas
     'conditional_access.role_excluded',
     'conditional_access.grant_weakened',
     'conditional_access.grant_operator_unknown',
+    'conditional_access.grant_operator_absent',
     'conditional_access.grant_controls_absent',
     'conditional_access.grant_denial_control',
     'conditional_access.session_control_changed',
@@ -813,7 +817,7 @@ test('THE THREE UNDETERMINED GRANT REASONS STAY SEPARATE RULES', () => {
   // coarser than what the function already knows.
   const rules = [
     classifyConditionalAccessChange(
-      policy({ grantOperator: null }), policy({ grantOperator: null, grantControls: ['mfa'] })).rule,
+      policy({ grantOperator: 'ABSENT' }), policy({ grantOperator: 'ABSENT', grantControls: ['mfa'] })).rule,
     classifyConditionalAccessChange(
       policy({ grantOperator: 'OR', grantControls: [] }),
       policy({ grantOperator: 'OR', grantControls: ['mfa'] })).rule,
