@@ -28,6 +28,18 @@ fresh clone and the file map does not match what you see, that is the first thin
 **Scope has never left** `backend/src/alerts/`, `backend/src/identity-risk/`,
 `backend/scripts/` and `docs/` — verified with `git diff --name-only 5488ad6..HEAD`.
 
+## Read this with `docs/alerting-QA-METHOD.md`
+
+That document is the QA side of the same work — **the practice, written by the session that
+did the attacking**, and it is the half with no other home. This document says what was
+built and what is left; that one says how anything here was ever believed.
+
+It lived only on `qa/verify-e056fc9`, so a checkout of the alerts branch got the handoff and
+not the method. **Copied here byte-identical** — a document is neither instrument nor
+implementation, so the branch separation that keeps QA from reading the code does not apply
+to it. Read section 2 (the seam attack) before designing anything and section 3 (mutation,
+four questions in order) before trusting a green suite.
+
 ## Status
 
 | step | state |
@@ -36,7 +48,7 @@ fresh clone and the file map does not match what you see, that is the first thin
 | 03 dry run | closed; **apply phase approved by Dharmik, shape written, not built** |
 | 04 finding intake | closed |
 | 05 routing and policy | closed |
-| 05b escalation + limits | **EXHAUSTED ruling implemented** (`e056fc9`); **the limit function does not exist** — QA's L1, L2, L4 are unbound. See *what is deliberately not covered* |
+| 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function does not exist** — L1, L2, L4 unbound. See below |
 | 06 email | not started. Resend is verified on `hawkviewapp.com` (PM's claim, not verified here) |
 | 07 SMS | **shelved by Dharmik until further notice.** The tier survives; the channel does not |
 
@@ -44,6 +56,22 @@ fresh clone and the file map does not match what you see, that is the first thin
 distinguishable from every other terminal state, carries `notifiedAt` so it cannot be written
 without one, is surfaced through `statements()`, and zero rungs is unconstructible. It is
 listed here rather than in "next" because the brief still had it pending.
+
+**The three EXHAUSTED rulings are impossibilities rather than checks**, which is why they
+need no test to keep them true:
+
+- `EXHAUSTED` requires `notifiedAt`, so **a ladder that exhausted while nobody was told**
+  **cannot be written.** Notification is what starts the climb.
+- `LadderRungs` is a non-empty tuple, so **a zero-rung ladder does not typecheck** — it would
+  otherwise be EXHAUSTED at birth, reporting *we tried everything* about an incident that
+  never escalated.
+- `STOPPED_BY_PREFERENCE` is its own terminal state, so a ladder halted because the MSP
+  silenced the rule is **not** confused with one that ran out. Same silence, opposite
+  meanings, different remedies.
+
+And `unanswered` carries a sentence that `statements()` surfaces beside the silenced rules,
+because **an explanation reaches somebody already looking; a statement reaches somebody who
+is not** — and the worst outcome the product can produce must not be the quietest.
 
 ## The file map
 
@@ -144,6 +172,27 @@ a no-op mutation survives.
 
 **Two instruments.** PM measures production with SQL; the engineer builds generators PM runs.
 When they disagree, that is the finding — twice the reference instrument was the broken one.
+
+## Why these are mechanised rather than remembered
+
+The obvious objection to a list of rules is that a list is enough. It is not, and the
+evidence is the best single argument for everything above.
+
+**QA wrote the rule about casts, had it adopted as a standing rule, and then broke it within
+two rounds** — a fixture guessed a field name (`to` where the type says `recipient`) and hid
+the guess behind an `as` cast. Their own account, from `alerting-QA-METHOD.md` §5:
+
+> *Knowing the rule is not the same as applying it; the compiler is what applies it.*
+
+**The value of every rule below is that a tool enforces it, not that somebody remembers it.**
+The person who wrote a rule broke it two rounds later, in the document that recommends it.
+So when you read the list, the useful question is not "do I agree" but **"what would catch me
+if I got this wrong"** — and where the answer is "nothing", that rule is decoration.
+
+This is not hypothetical elsewhere either. In this feature the compiler caught: a phantom
+brand emitted as a runtime key, an `@ts-expect-error` on the wrong line, a statically-true
+assertion after a narrowing `find`, and an unused expectation that proved a claim about
+unwriteability was wrong. **Every one of those was written by somebody who knew the rule.**
 
 ## The standing rules, in rough order of how often they paid
 
