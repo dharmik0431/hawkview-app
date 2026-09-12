@@ -541,7 +541,11 @@ Nothing here publishes, groups, migrates or delivers anything.
 - **Reconciling the existing 364** — step 03, dry run and reversible mapping first,
   and no historical alert delivered during migration.
 - **Connecting Risky Users findings** — step 04.
-- **Routing, recipients, email, SMS** — 05 through 07.
+- **Routing, recipients, email** — 05 and 06. ~~SMS — 07~~ **SHELVED until further notice**:
+  the sequence ends at 06, and ACT_NOW delivers by email and in-app carrying its urgent
+  classification. The tier is not weakened by this — urgency is a property of the finding,
+  the channel is a property of how we can reach somebody today. See
+  `alerting-routing-policy.md`.
 
 The existing `notifications` table is untouched. Mapping these three axes onto
 storage is part of 02, and it will need a migration: `resolvedAt` alone cannot

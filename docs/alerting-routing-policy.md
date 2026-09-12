@@ -10,6 +10,40 @@ separate names rather than one category.
 the wiring found two things that would have been expensive later. QA is pre-registering step 05
 now, and their reference has not been read.
 
+## Step 07 is shelved: SMS is delayed until further notice
+
+**The sequence ends at step 06.** Email is the last delivery channel, and **ACT_NOW delivers
+by email and in-app carrying its urgent classification** rather than ringing anything. That
+was already the arrangement while SMS was pending; it is now the arrangement full stop.
+
+### The tier is not weakened by this, and that is the part worth being careful about
+
+**An ACT_NOW incident is still ACT_NOW.** It still carries its rule identifier, still routes
+through preferences and quiet hours, still escalates. **Nothing in steps 01 to 05 was built
+for SMS specifically** — the tier is a statement about *urgency*, and the channel is a
+separate decision. When SMS returns it is a delivery adapter and a routing target, not a
+re-think.
+
+**The risk of a shelved step is that somebody later reads the tier as meaningless.** "Act now"
+arriving in an inbox looks like "worth knowing" unless the record says why they differ. They
+differ because urgency is a property of the finding and the channel is a property of how we
+can reach you today. One of those changed; the other did not.
+
+### The reasons, for the record rather than as caution
+
+- **US carrier registration for A2P messaging takes one to three weeks and is a queue rather
+  than work** — it has to start before it can finish, and building the code first does not
+  shorten it.
+- **Phone numbers carry consent and retention obligations** of their own.
+- **International delivery is a separate problem** if any MSP sits outside North America.
+
+### The option that remains available, recorded as an option and not a plan
+
+A **webhook into an MSP's existing on-call tooling** would give phone alerts through rotas and
+escalation policies they already trust, with no carrier registration and no consent
+obligations taken on by us. **Dharmik has not asked for it.** It is written here so it is not
+rediscovered as a new idea, not because it is queued.
+
 ## Two guardrails built as types, not as rules
 
 A rule is something a later code path routes around. These two are not rules.

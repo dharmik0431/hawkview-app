@@ -242,6 +242,18 @@ export type AlertTypeDeclaration =
  * statement of where it belongs. */
 export type RoutingTier = 'PHONE' | 'EMAIL' | 'IN_APP'
 
+/** SMS IS SHELVED, AND THE TIER STILL MEANS WHAT IT SAYS.
+ *
+ * Step 07 is off the sequence until further notice, so PHONE has no SMS behind it today:
+ * ACT_NOW delivers by email and in-app CARRYING ITS URGENT CLASSIFICATION. The reasons are
+ * carrier registration lead time, consent and retention obligations on phone numbers, and
+ * international delivery — none of which building the code first would shorten.
+ *
+ * DO NOT READ THIS AS THE TIER BEING DECORATIVE. Urgency is a property of the finding; the
+ * channel is a property of how we can reach somebody today. One of those changed. An
+ * ACT_NOW incident still routes through preferences, quiet hours and escalation exactly as
+ * before, and when SMS returns it is a delivery adapter and a routing target rather than a
+ * re-think. See `docs/alerting-routing-policy.md`. */
 export function routingTier(severity: Severity): RoutingTier {
   switch (severity) {
     case 'ACT_NOW': return 'PHONE'

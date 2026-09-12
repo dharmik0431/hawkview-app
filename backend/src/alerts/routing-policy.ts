@@ -392,6 +392,17 @@ export interface Unroutable {
   readonly recipient: Extract<Recipient, { kind: 'NONE_VERIFIED' }>
 }
 
+/** A ladder that ran out with nobody responding. */
+export interface UnansweredEscalation {
+  readonly incidentKey: string
+  readonly organizationId: string
+  readonly ruleId: string
+  readonly notifiedAt: Date
+  readonly rungsClimbed: number
+  /** Plain words for the statement surface. */
+  readonly sentence: string
+}
+
 export interface RoutingOutcome {
   /** Every incident, exactly once, whatever happened to it. */
   readonly records: readonly RoutedRecord[]
@@ -428,6 +439,18 @@ export interface RoutingOutcome {
    * Derived from the preferences, so an MSP who silenced nothing lists nothing — the control
    * that stops this passing by listing everything always. */
   readonly silencedRules: readonly CoverageStatement[]
+  /** INCIDENTS THAT CLIMBED THE WHOLE LADDER AND NOBODY ANSWERED.
+   *
+   * Surfaced beside the coverage statements rather than buried in a state machine, because
+   * this is the worst thing the product can report and a `because` string only reaches
+   * somebody already reading that incident. The statement surface exists for the reader who
+   * is not.
+   *
+   * DERIVED FROM OUTCOMES, NOT FROM CONFIGURATION, and kept in its own field for exactly the
+   * reason `silencedRules` is: one list answers "what did you choose" and the other answers
+   * "what happened", and a reader needs to know which they are looking at. They share the
+   * surface, not the derivation. */
+  readonly unanswered: readonly UnansweredEscalation[]
   /** The invariants, checked on the output rather than asserted about it. Empty is healthy;
    * each entry names the incident and which rule it broke. */
   readonly accountingProblems: readonly string[]
@@ -662,14 +685,57 @@ export type Acknowledgement =
   | Readonly<{ kind: 'ACKNOWLEDGED'; by: string; at: Date }>
   | Readonly<{ kind: 'NOT_ACKNOWLEDGED' }>
 
-/** Where an incident stands on the ladder. */
+/** A ladder has AT LEAST ONE RUNG, and zero is unconstructible.
+ *
+ * A zero-rung ladder is EXHAUSTED the moment it starts, so an incident that never escalated
+ * at all would read as *we tried everything and nobody came* — the worst sentence the product
+ * can produce, attached to the case where it did nothing. A false sentence in the wrong
+ * company, and the third time in this feature.
+ *
+ * A non-empty tuple rather than a length check, because a check is a thing a later caller
+ * can route around and an empty array simply does not typecheck here. */
+export type LadderRungs = readonly [EscalationRung, ...EscalationRung[]]
+
+/** One step of the ladder: how long to wait, and who to tell when it fires. */
+export interface EscalationRung {
+  readonly afterMs: number
+  readonly recipient: VerifiedRecipient
+}
+
+/** Where an incident stands on the ladder.
+ *
+ * FOUR TERMINAL STATES, DISTINCT, because a ladder can stop for reasons that mean opposite
+ * things and only one of them is "we did everything". Collapsing them is how the worst
+ * outcome the product can produce ends up indistinguishable from an ordinary one. */
 export type EscalationState =
   | Readonly<{ kind: 'WAITING'; notifiedAt: Date; rungsClimbed: number; nextRungAt: Date }>
+  /** A person took it. The ladder stops, permanently. */
   | Readonly<{ kind: 'ACKNOWLEDGED'; by: string; at: Date }>
-  /** Every rung climbed and still nobody. NOT A FAILURE STATE: it means we told everybody we
-   * were told to tell. Whether it also raises something to HawkView's own operators is a
-   * product question, deliberately unanswered here rather than defaulted. */
-  | Readonly<{ kind: 'EXHAUSTED'; rungsClimbed: number; lastRungAt: Date; because: string }>
+  /** The rule was silenced while the ladder was climbing. STOPPED, NOT EXHAUSTED: nobody was
+   * reached and we did not try everything — the MSP asked us to stop. Distinct because the
+   * remedy is different and so is whose decision it was. */
+  | Readonly<{
+      kind: 'STOPPED_BY_PREFERENCE'
+      rungsClimbed: number
+      at: Date
+    }>
+  /** EVERY RUNG CLIMBED AND NOBODY CAME. The worst outcome this product can produce.
+   *
+   * NOT A FAILURE STATE — it means we told everybody we were told to tell — and not a quiet
+   * one either. It carries `notifiedAt` so it CANNOT BE WRITTEN WITHOUT THE MOMENT SOMEBODY
+   * WAS TOLD: a ladder that exhausted while nobody had been notified is not reachable,
+   * because notification is what starts the climb.
+   *
+   * And it does not live only in a `because`. A `because` is an explanation for somebody
+   * already looking at it; this reaches the statement surface, whose whole point is the
+   * reader who is not looking. See `unanswered` on `RoutingOutcome`. */
+  | Readonly<{
+      kind: 'EXHAUSTED'
+      notifiedAt: Date
+      rungsClimbed: number
+      lastRungAt: Date
+      because: string
+    }>
 
 /** THE LADDER'S INPUT IS ITS OWN, NOT A PROJECTION OF WHAT WAS SENT.
  *
@@ -684,4 +750,18 @@ export interface EscalationTick {
   readonly at: Date
   readonly notified: readonly Notified[]
   readonly acknowledgements: readonly Readonly<{ incidentKey: string; ack: Acknowledgement }>[]
+}
+
+/** EVERYTHING A READER WHO IS NOT LOOKING SHOULD BE TOLD, in one place.
+ *
+ * Two derivations, one surface. `silencedRules` comes from the preference set and answers
+ * "what did you choose not to hear"; `unanswered` comes from outcomes and answers "what did
+ * we tell you that nobody answered". Neither is derivable from the other and neither is
+ * more important, which is why they are separate lists joined here rather than one list
+ * that would have to lie about where its entries came from. */
+export function statements(outcome: RoutingOutcome): readonly string[] {
+  return [
+    ...outcome.silencedRules.map((statement) => statement.sentence),
+    ...outcome.unanswered.map((entry) => entry.sentence),
+  ]
 }

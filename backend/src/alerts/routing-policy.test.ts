@@ -5,6 +5,7 @@ import {
   alertTypeForChange,
   causeKeyOf,
   fold,
+  statements,
   incidentsCoveredBy,
   routableIncident,
   type IncidentOrigin,
@@ -16,6 +17,7 @@ import {
   type CoverageStatement,
   type EscalationState,
   type EscalationTick,
+  type LadderRungs,
   type Delivery,
   type DeliveryPreference,
   type PreferenceChange,
@@ -277,6 +279,7 @@ const outcome = (over: Partial<RoutingOutcome> = {}): RoutingOutcome => ({
   suppressed: [],
   unroutable: [],
   silencedRules: [],
+  unanswered: [],
   accountingProblems: [],
   ...over,
 })
@@ -767,12 +770,23 @@ test('EXHAUSTED IS NOT A FAILURE, and the ladder needs more than one moment', ()
   // Exhausted means we told everybody we were told to tell. Whether it also raises something
   // to HawkView's own operators is a product question, deliberately unanswered rather than
   // defaulted into a state that reads like an error.
-  const exhausted: EscalationState = {
-    kind: 'EXHAUSTED', rungsClimbed: 3, lastRungAt: DUE_AT,
+  const exhausted = {
+    kind: 'EXHAUSTED', notifiedAt: HELD_AT, rungsClimbed: 3, lastRungAt: DUE_AT,
     because: 'Every named recipient was contacted and none acknowledged.',
-  }
+  } as const satisfies EscalationState
   assert.doesNotMatch(exhausted.because, /fail|error|lost/i,
     'the sentence must not read as a malfunction — it is a completed ladder')
+
+  // AND IT CANNOT BE WRITTEN WITHOUT THE MOMENT SOMEBODY WAS TOLD. Notification is what
+  // starts the climb, so a ladder that exhausted while nobody had been notified is not a
+  // state to be asserted against — it is unreachable, because the field has to be filled.
+  // @ts-expect-error EXHAUSTED with nobody notified does not typecheck
+  const neverTold: EscalationState = { kind: 'EXHAUSTED', rungsClimbed: 3, lastRungAt: DUE_AT,
+    because: 'x' }
+  assert.ok(neverTold)
+  assert.equal(exhausted.notifiedAt.getTime(), HELD_AT.getTime())
+  assert.ok(exhausted.lastRungAt.getTime() > exhausted.notifiedAt.getTime(),
+    'the climb happens after the telling, which is the ordering the field makes checkable')
 
   // A LADDER ADVANCES OVER TIME, so one `now` cannot express two advances. Same
   // sequence-not-snapshot repair as quiet hours, arriving a third time in this feature.
@@ -789,4 +803,87 @@ test('EXHAUSTED IS NOT A FAILURE, and the ladder needs more than one moment', ()
   // decision it is, rather than assumed here.
   const stopped: EscalationState = { kind: 'ACKNOWLEDGED', by: 'user-7', at: DUE_AT }
   assert.equal(stopped.kind, 'ACKNOWLEDGED')
+})
+
+test('EXHAUSTED IS DISTINCT FROM EVERY OTHER WAY A LADDER STOPS', () => {
+  // A ladder can stop for reasons that mean opposite things, and only one of them is "we did
+  // everything". Collapsing them is how the worst outcome the product can produce ends up
+  // indistinguishable from an ordinary one.
+  const terminal: readonly EscalationState[] = [
+    { kind: 'ACKNOWLEDGED', by: 'user-7', at: DUE_AT },
+    { kind: 'STOPPED_BY_PREFERENCE', rungsClimbed: 1, at: DUE_AT },
+    { kind: 'EXHAUSTED', notifiedAt: HELD_AT, rungsClimbed: 3, lastRungAt: DUE_AT,
+      because: 'Every named recipient was contacted and none acknowledged.' },
+  ]
+  assert.equal(new Set(terminal.map((state) => state.kind)).size, 3,
+    'three ways to stop, three states')
+
+  // STOPPED_BY_PREFERENCE IS NOT EXHAUSTED, and the difference is whose decision it was:
+  // nobody was reached and we did not try everything — the MSP asked us to stop. Same
+  // observable silence, opposite meanings, different remedies.
+  // Written as a comparison of the two VALUES rather than of one kind against a literal: the
+  // compiler rejected `stopped.kind !== 'EXHAUSTED'` as having no overlap, which is it saying
+  // the assertion could not fail. A statically true assertion tests nothing, and the compiler
+  // says so for free if you leave it able to.
+  const stopped = terminal.filter((s) => s.kind === 'STOPPED_BY_PREFERENCE')
+  const spent = terminal.filter((s) => s.kind === 'EXHAUSTED')
+  assert.equal(stopped.length, 1)
+  assert.equal(spent.length, 1)
+  assert.notDeepEqual(stopped[0], spent[0],
+    'same observable silence, opposite meanings, different remedies')
+})
+
+test('A ZERO-RUNG LADDER HAS NO CONSTRUCTOR', () => {
+  // A zero-rung ladder is EXHAUSTED the moment it starts, so an incident that never escalated
+  // at all would read as "we tried everything and nobody came" — the worst sentence the
+  // product can produce, attached to the case where it did nothing. Third false-sentence-in-
+  // the-wrong-company in this feature.
+  const oneRung: LadderRungs = [{ afterMs: 15 * 60 * 1000, recipient: VERIFIED }]
+  assert.equal(oneRung.length, 1)
+
+  // @ts-expect-error a ladder with no rungs does not typecheck
+  const none: LadderRungs = []
+  assert.ok(none)
+
+  // A non-empty tuple rather than a length check, because a check is a thing a later caller
+  // can route around and an empty array simply is not this type.
+  const three: LadderRungs = [
+    { afterMs: 15 * 60 * 1000, recipient: VERIFIED },
+    { afterMs: 60 * 60 * 1000, recipient: VERIFIED },
+    { afterMs: 4 * 60 * 60 * 1000, recipient: VERIFIED },
+  ]
+  assert.equal(three.length, 3)
+})
+
+test('AN UNANSWERED LADDER REACHES THE READER WHO IS NOT LOOKING', () => {
+  // A `because` is an explanation for somebody already reading that incident. The statement
+  // surface exists for the reader who is not, and this is the worst thing the product can
+  // report — so it goes there rather than living only inside a state machine.
+  const withBoth = outcome({
+    silencedRules: [{
+      ruleId: 'security.privileged_role_granted', preference: 'RECORD_ONLY',
+      sentence: 'You will not be contacted about privileged role grants. They are still recorded.',
+    }],
+    unanswered: [{
+      incidentKey: 'k-1', organizationId: 'org-1',
+      ruleId: 'security.privileged_directory_change',
+      notifiedAt: HELD_AT, rungsClimbed: 3,
+      sentence: 'Nobody answered a privileged directory change after three attempts.',
+    }],
+  })
+
+  const said = statements(withBoth)
+  assert.equal(said.length, 2, 'both derivations reach the one surface')
+  assert.ok(said.some((s) => /Nobody answered/.test(s)))
+  assert.ok(said.some((s) => /not be contacted/.test(s)))
+
+  // TWO DERIVATIONS, ONE SURFACE, AND THEY STAY SEPARATE LISTS. One answers "what did you
+  // choose not to hear" and the other "what did we tell you that nobody answered"; neither is
+  // derivable from the other, and a single list would have to lie about where its entries
+  // came from — the same reason coverage could not come from events.
+  assert.equal(withBoth.silencedRules.length, 1)
+  assert.equal(withBoth.unanswered.length, 1)
+
+  // A quiet week with nothing unanswered says nothing, or the surface means nothing.
+  assert.deepEqual(statements(outcome()), [])
 })
