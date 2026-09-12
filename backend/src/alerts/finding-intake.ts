@@ -45,7 +45,7 @@ export interface EmittedFinding {
   readonly severity: string
   readonly confidence: string
   readonly coverage: FindingCoverage
-  /** The event's OWN time. Becomes the queue's `EventInstant`; see `IntakeRun.at`. */
+  /** The event's OWN time. Becomes the queue's `EventInstant`; see `IntakeRun.completedAt`. */
   readonly observedAt: Date
   readonly expiresAt: Date
 }
@@ -66,18 +66,39 @@ export interface EmittedFinding {
  * queue, quietly, and the only trace would be a gap nobody was counting.
  *
  * So the variants are separate and a consumer must handle both to compile. */
+/** A DISCRIMINATED UNION ONLY FORCES A BRANCH WHERE THE FIELD DIFFERS BETWEEN ARMS.
+ *
+ * Both arms first carried `at`, which left the hole one field over from the one the union
+ * closed: the freshness marker — the exact value the staleness property is about — could be
+ * computed across every run with no branch, no discriminant and no error, counting a failed
+ * run as evidence the engine is healthy. The defect made unwriteable and its sibling one
+ * field over were reachable through the same type.
+ *
+ * So the times are named per arm. A consumer reaching for a time has to say which kind it
+ * meant, which is the forcing function the union already applied to `emitted`, moved onto
+ * the field a hurried consumer actually touches.
+ *
+ * THERE IS ONE LEGITIMATE CONSUMER OF "when did a run arrive, whatever its outcome", and it
+ * is not freshness — it is LIVENESS: "the scheduler is firing but every run fails" and "the
+ * scheduler is dead" are different conditions with different remedies, and only the second
+ * is fixed by restarting a schedule. That consumer gets `QueueState.lastRunAttemptedAt`,
+ * named for what it answers. Giving it a name is what stops it coming back as an argument
+ * for a common `at`: the question is real, and reaching for the nearest Date is still the
+ * wrong way to answer it. */
 export type IntakeRun =
   | Readonly<{
       kind: 'COMPLETED'
-      /** When the run finished — ARRIVAL TIME, and named so it cannot be mistaken for an
-       * event time. It is the `receivedAt` half of every instant this run produces, and it
-       * is never the half a decision is made on. */
-      at: Date
+      /** When the run FINISHED — arrival time, never an event time, and never the half a
+       * decision is made on. It is the `receivedAt` of every instant this run produces. */
+      completedAt: Date
       emitted: readonly EmittedFinding[]
     }>
   | Readonly<{
       kind: 'FAILED'
-      at: Date
+      /** When the run GAVE UP. Deliberately not the same name: a failed run says nothing
+       * about whether the queue is current, and a consumer that wants the completed time
+       * must now go and get it. */
+      failedAt: Date
       /** Why. Carried so the unanswerable set can be measured and shrunk rather than
        * quietly accumulating — the same discipline as every other refusal in this feature. */
       because: string
@@ -150,17 +171,74 @@ export interface QueueState {
    * happened and emitted nothing" — the input distinction, preserved into the output where
    * a property can reach it. */
   readonly completedRuns: number
-  /** The last completed run's ARRIVAL time, or null if there has never been one.
+  /** Runs seen in total, both arms.
    *
-   * Arrival is the right clock here and it is the only place in this file where it is: the
-   * question "is the engine still running" is about the engine, not about the events. Named
-   * to say so. Freshness of the engine's runs is not a pinned property yet — this is the
-   * field that would make it expressible. */
-  readonly lastCompletedRunArrivedAt: Date | null
+   * FOR THE VARIANT THAT COUNTS RUNS AS `input.length`. Without a total to reconcile
+   * against, a wiring reporting every run as completed is internally consistent: the
+   * failures are still recorded in `failedRuns`, so the record-the-failure property is
+   * satisfied while the count quietly says the engine has never missed. The identity
+   * `runsSeen === completedRuns + failedRuns.length` is what makes that expressible. */
+  readonly runsSeen: number
+  /** THE LAST COMPLETED RUN ITSELF, not a timestamp claiming to describe one.
+   *
+   * The bare `lastCompletedRunArrivedAt: Date` this replaced was a conclusion a wiring
+   * asserted, and a state reporting a dead engine as current is INTERNALLY CONSISTENT —
+   * nothing else in the state contradicts it. Carrying the run means the marker is a projection of something that had
+   * to come from the input, and a fabricated one has to be consistent with the incidents it
+   * claims to have produced.
+   *
+   * That raises the cost of the defect without eliminating it. It cannot be eliminated at
+   * this layer: see the note on staleness in the docs — the property has to read the run
+   * sequence as well as the state. */
+  readonly lastCompletedRun: Readonly<{ completedAt: Date; emitted: number }> | null
+  /** When a run last ARRIVED AT ALL, whatever its outcome. LIVENESS, NOT FRESHNESS.
+   *
+   * The one legitimate consumer of an outcome-blind time, given its own name so that it
+   * cannot be reached by accident and does not become the argument for putting `at` back on
+   * both arms. A scheduler firing into failures and a scheduler that has stopped are
+   * different conditions; this separates them and answers nothing else. Never an input to
+   * whether the queue is current. */
+  readonly lastRunAttemptedAt: Date | null
   /** Runs that failed, with their reasons.
    *
-   * NOT PINNED BY ANY OF THE SEVEN PROPERTIES, and present anyway, because the seam had to
-   * decide whether a failure was expressible at all and the answer determines whether the
-   * absence rule is safe. Failure handling can now be specified against something. */
-  readonly failedRuns: readonly Readonly<{ at: Date; because: string }>[]
+   * ZERO OF THESE HAVE EVER HAPPENED: 5,166 production runs, 5,166 completed, none failed.
+   * The arm this records has never fired, which is an argument FOR enforcing it in the type
+   * rather than against — nothing in the observed history would ever have taught anyone that
+   * failures exist, so the defect was invisible to experience rather than merely unnoticed.
+   * When the first one comes it arrives on a path no production data has ever traversed. */
+  readonly failedRuns: readonly Readonly<{ failedAt: Date; because: string }>[]
 }
+
+/** WHEN A QUEUE STOPS BEING CURRENT. Thirty minutes since the last COMPLETED run.
+ *
+ * MEASURED, NOT BORROWED, and the distribution is carried rather than the conclusion — the
+ * same rule the episode intervals are held to, because a threshold whose provenance is lost
+ * becomes a number nobody may change.
+ *
+ * | across 5,166 production runs | |
+ * |---|---|
+ * | completed | 5,166 |
+ * | failed | 0 |
+ * | gap p50 | 0.1 min |
+ * | gap p95 | 9.1 min |
+ * | **worst gap ever observed** | **14.9 min** |
+ *
+ * Thirty minutes is twice the worst gap ever seen. The p50 of 0.1 min is runs clustering
+ * inside a cycle rather than the cycle cadence, so it is 14.9 that the threshold is set
+ * against; quoting the median here would make the margin look far larger than it is.
+ *
+ * IT IS A CEILING ON SILENCE, NOT A PREDICTION. If the gap distribution shifts, this number
+ * is wrong in the direction that matters — reporting a queue as current when the engine has
+ * stopped — so it is checked against the measurement rather than tuned against complaints. */
+export const STALE_AFTER_MS = 30 * 60 * 1000
+
+/** Observed gaps, kept beside the threshold so the next person can see what it was set
+ * against instead of re-deriving it or trusting it. Milliseconds. */
+export const OBSERVED_RUN_GAPS = {
+  runs: 5166,
+  completed: 5166,
+  failed: 0,
+  p50Ms: 6_000,
+  p95Ms: 546_000,
+  worstMs: 894_000,
+} as const

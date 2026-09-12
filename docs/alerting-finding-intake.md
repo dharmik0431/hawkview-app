@@ -34,8 +34,9 @@ test happens to name.
 **And the gate was checked against itself.** Collapsing each property in the seam — removing
 notifications, removing the event times, reducing coverage to one value, removing the
 finding-to-notification trace, making a failed run an empty one, flattening the subject to a
-string — was caught every time, **all six at compile time.** A wiring built on a collapsed
-seam would not build.
+string, sharing one time across both run arms, dropping the run total, reducing the freshness
+marker to a timestamp — was caught every time. **Ten collapses, all at compile time.** A
+wiring built on a collapsed seam would not build.
 
 | property | what the seam must carry for it to be expressible |
 |---|---|
@@ -63,8 +64,8 @@ express failure, and the second costs more than the first.
 So `IntakeRun` is a union of `COMPLETED` and `FAILED`, and a consumer must handle both to
 compile. **Failure handling was listed as not covered because the semantics did not determine
 an error surface; it is now expressible, which is the flag PM asked for.** So is freshness of
-the engine's own runs: `lastCompletedRunArrivedAt` is the field a freshness property would
-read.
+the engine's own runs: `lastCompletedRun` is what a freshness property reads, and
+`STALE_AFTER_MS` is the threshold it reads against.
 
 ## Two decisions taken in the open rather than buried
 
@@ -75,10 +76,12 @@ every earlier gap. The alternative — carry every value and let the reader deci
 defensible and noisier. Per-notification coverage is kept either way, so the choice is
 reversible without losing information.
 
-**Arrival time appears exactly once, and it is about the engine.** `IntakeRun.at` and
-`lastCompletedRunArrivedAt` are arrival, named so they cannot be mistaken for event time;
-"is the engine still running" is a question about the engine, not about the events. Every time
-a decision could be made on is an `EventInstant`.
+**Every arrival time is about the ENGINE, and each is named for the question it answers.**
+`IntakeRun.completedAt`, `IntakeRun.failedAt`, `QueueState.lastCompletedRun.completedAt` and
+`QueueState.lastRunAttemptedAt` are all arrival, and none of them is reachable by a consumer
+that has not said which it meant — see Ruling 1. "Is the engine still running" is a question
+about the engine, not about the events. Every time a DECISION could be made on is an
+`EventInstant`.
 
 **What the type catches and what it does not.** `EventInstant` is constructible only through
 `eventInstant`, which reads `occurredAt` — so a wiring cannot reach the queue's time fields by
@@ -102,7 +105,85 @@ the pre-registration and none are assumed here.
    incidents close in a batch. A cluster of clearings with a failed run in the same window is
    the signature.
 2. **Is the queue's time the event's or the run's?** Compare an incident's `latestEventAt`
-   against `lastCompletedRunArrivedAt`. If they move together across a backfill, something is
-   stamping on arrival.
+   against `lastCompletedRun.completedAt`. If they move together across a backfill, something
+   is stamping on arrival.
+4. **Is the engine dead, or just failing?** `lastCompletedRun` answers the first and
+   `lastRunAttemptedAt` the second. A stale `lastCompletedRun` with a fresh
+   `lastRunAttemptedAt` is a scheduler running into failures — restarting it fixes nothing.
 3. **Did coverage arrive as FULL for everything?** That is the signature of coverage being
    dropped at the seam rather than of a genuinely clean tenant.
+
+## Ruling 1: `completedAt` and `failedAt`, accepted — and the consumer that does exist
+
+QA is right, and the reasoning generalises: **a discriminated union forces a branch only where
+the field DIFFERS between arms.** A shared `at` left the hole one field over from the one the
+union closed — the freshness marker, the exact value the staleness property is about, could be
+computed across every run with no branch, no discriminant and no error, counting a failed run
+as evidence the engine is healthy.
+
+**There IS a legitimate consumer of an outcome-blind time, and it is not freshness — it is
+LIVENESS.** "The scheduler is firing but every run fails" and "the scheduler has stopped" are
+different conditions with different remedies, and only the second is fixed by restarting a
+schedule. Fold them together and an operator gets sent to restart a scheduler that is running
+perfectly well.
+
+So the answer is not to take the noise back. That consumer gets `QueueState.lastRunAttemptedAt`
+— **named for what it answers**, which is what stops the question returning as an argument for
+a common `at`. The question is real; reaching for the nearest `Date` is still the wrong way to
+answer it.
+
+## C and D, and they are not the same kind of problem
+
+**C — counting runs as `input.length` — was NOT caught.** A wiring reporting every run as
+completed is internally consistent: the failures are still in `failedRuns`, so the
+record-the-failure property is satisfied, while the count quietly says the engine has never
+missed a cycle. Nothing contradicted it because there was **no total to contradict**.
+`runsSeen` is now carried, and the identity `runsSeen === completedRuns + failedRuns.length`
+makes it expressible. Same repair as step 03's arithmetic identities, arriving for the same
+reason.
+
+**D — a dead engine reported as current — is only partly catchable here, and the limit is the
+answer.** The crude form is now hard to write: `lastCompletedRun` carries **the run**, not a
+timestamp claiming to describe one, so the marker is a projection of something that had to come
+from the input and a fabricated one must be consistent with the incidents it claims to have
+produced.
+
+But a marker that is merely **wrong** — a plausible recent time, every other field agreeing —
+is internally consistent, and **no property over the state alone can catch it.** The staleness
+check has to be **relational**: it must read the run sequence the state was built from. A
+property that takes only the state is testing self-consistency and calling it freshness. That
+is a constraint on how P9 is written, not a gap in the seam, and it is better known now.
+
+## Expressibility and writeability are different sweeps
+
+The gate proves the seven properties **can be represented**. It says nothing about which
+**defects can be written**. Those are different questions and this run separated them.
+
+Collapsing the seam so a property becomes inexpressible was caught every time — ten collapses,
+all at compile time. But restoring the shared `at` as an **optional** field was **not** caught,
+and correctly so: a common time makes no property inexpressible; it makes a defect writeable.
+A first attempt at that mutation added `at` as *required* and was "caught" only because the
+fixtures did not supply it — an unfaithful mutation flattering the gate.
+
+**A seam needs both sweeps.** Expressibility asks *can the check see the difference*;
+writeability asks *can the wrong thing be written down*. QA's `at` finding came from the second
+and no amount of the first would have produced it.
+
+## Ruling 2: stale after 30 minutes, and the fact worth more than the threshold
+
+Twice the worst gap ever observed. The distribution travels with it in `OBSERVED_RUN_GAPS`
+rather than the conclusion alone, on the rule set for episode intervals — a threshold whose
+provenance is lost becomes a number nobody may change. The p50 of 0.1 min is runs clustering
+inside a cycle rather than the cadence, so 14.9 min is what the margin is measured against;
+quoting the median would make it look far larger than it is.
+
+**Zero failures in 5,166 runs.** The `FAILED` arm — the one the union now forces every consumer
+to handle — **has never fired in production.** Nothing in the observed history would ever have
+taught anyone that failures exist, which makes this an argument *for* type-level enforcement
+rather than against it: **the defect was invisible to experience, not merely unnoticed.** No
+amount of care, review or familiarity with the data would have surfaced it, because the data
+has never contained an instance.
+
+It also means the first failure arrives on a path no production data has ever traversed. That
+is the case for requiring the failure to be **recorded** rather than merely not-misread: the
+one time it matters, nobody will have seen it work.

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { eventInstant } from './alert-event-time.js'
+import { OBSERVED_RUN_GAPS, STALE_AFTER_MS } from './finding-intake.js'
 import type {
   EmittedFinding,
   IntakeRun,
@@ -74,7 +75,9 @@ const incident = (over: Partial<QueuedIncident> = {}): QueuedIncident => ({
 const state = (over: Partial<QueueState> = {}): QueueState => ({
   incidents: [incident()],
   completedRuns: 1,
-  lastCompletedRunArrivedAt: ARRIVED,
+  runsSeen: 1,
+  lastCompletedRun: { completedAt: ARRIVED, emitted: 1 },
+  lastRunAttemptedAt: ARRIVED,
   failedRuns: [],
   ...over,
 })
@@ -128,12 +131,12 @@ test('P3 absence does not clear IS EXPRESSIBLE, and so is the input it needs', (
   // "Emitted then stopped" and "never emitted" must be different INPUTS before any rule
   // about them can be tested.
   const emittedThenStopped: readonly IntakeRun[] = [
-    { kind: 'COMPLETED', at: ARRIVED, emitted: [finding()] },
-    { kind: 'COMPLETED', at: new Date(ARRIVED.getTime() + 300_000), emitted: [] },
+    { kind: 'COMPLETED', completedAt: ARRIVED, emitted: [finding()] },
+    { kind: 'COMPLETED', completedAt: new Date(ARRIVED.getTime() + 300_000), emitted: [] },
   ]
   const neverEmitted: readonly IntakeRun[] = [
-    { kind: 'COMPLETED', at: ARRIVED, emitted: [] },
-    { kind: 'COMPLETED', at: new Date(ARRIVED.getTime() + 300_000), emitted: [] },
+    { kind: 'COMPLETED', completedAt: ARRIVED, emitted: [] },
+    { kind: 'COMPLETED', completedAt: new Date(ARRIVED.getTime() + 300_000), emitted: [] },
   ]
   assert.notEqual(JSON.stringify(emittedThenStopped), JSON.stringify(neverEmitted))
 
@@ -147,13 +150,13 @@ test('P3 absence does not clear IS EXPRESSIBLE, and so is the input it needs', (
   // to read it is the one deciding whether absence clears. A crashed engine would close every
   // open incident, quietly. Not one of the seven; expressible anyway, and deliberately.
   const crashed: readonly IntakeRun[] = [
-    { kind: 'COMPLETED', at: ARRIVED, emitted: [finding()] },
-    { kind: 'FAILED', at: new Date(ARRIVED.getTime() + 300_000), because: 'Graph returned 503.' },
+    { kind: 'COMPLETED', completedAt: ARRIVED, emitted: [finding()] },
+    { kind: 'FAILED', failedAt: new Date(ARRIVED.getTime() + 300_000), because: 'Graph returned 503.' },
   ]
   assert.notEqual(JSON.stringify(crashed), JSON.stringify(emittedThenStopped),
     'a failed run must not look like a run that emitted nothing')
   assert.ok(distinguishable(state({ failedRuns: [] }),
-    state({ failedRuns: [{ at: ARRIVED, because: 'Graph returned 503.' }] })))
+    state({ failedRuns: [{ failedAt: ARRIVED, because: 'Graph returned 503.' }] })))
 })
 
 test('P4 the subject is the account, and no merge IS EXPRESSIBLE', () => {
@@ -239,7 +242,7 @@ test('P7 the time used is observedAt IS EXPRESSIBLE — the one that was not', (
   assert.ok(rejected, 'referenced so the expectation is checked rather than optimised away')
 
   // The seam keeps arrival where it belongs: on the run, about the engine, not on the event.
-  assert.equal(state().lastCompletedRunArrivedAt?.getTime(), ARRIVED.getTime())
+  assert.equal(state().lastCompletedRun?.completedAt.getTime(), ARRIVED.getTime())
 })
 
 test('every one of the seven was checked, and the count is asserted', () => {
@@ -249,4 +252,103 @@ test('every one of the seven was checked, and the count is asserted', () => {
   // rather than a smaller file.
   const checked = ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7']
   assert.equal(new Set(checked).size, 7)
+})
+
+test('C counting runs as input.length IS EXPRESSIBLE — it was not before', () => {
+  // QA did not claim this one was caught, and it was not. A wiring reporting every run as
+  // completed is INTERNALLY CONSISTENT: the failures are still recorded in `failedRuns`, so
+  // the record-the-failure property is satisfied, while the count quietly says the engine has
+  // never missed a cycle. Nothing contradicted it because there was no total to contradict.
+  const failure = { failedAt: ARRIVED, because: 'Graph returned 503.' }
+  const honest = state({ runsSeen: 2, completedRuns: 1, failedRuns: [failure] })
+  const variant = state({ runsSeen: 2, completedRuns: 2, failedRuns: [failure] })
+  assert.ok(distinguishable(honest, variant))
+
+  // The identity that catches it needs the TOTAL, which the state did not carry.
+  assert.equal(honest.completedRuns + honest.failedRuns.length, honest.runsSeen)
+  assert.notEqual(variant.completedRuns + variant.failedRuns.length, variant.runsSeen)
+})
+
+test('D a dead engine reported as current IS ONLY PARTLY EXPRESSIBLE, and the limit is the answer', () => {
+  // The crude form is now hard to write: a state claiming no completed runs cannot also name
+  // one, and carrying the RUN rather than a timestamp makes the marker a projection of
+  // something that had to come from the input.
+  const noRuns = state({
+    runsSeen: 0, completedRuns: 0, failedRuns: [], incidents: [],
+    lastCompletedRun: null, lastRunAttemptedAt: null,
+  })
+  const claimsOne = state({
+    runsSeen: 0, completedRuns: 0, failedRuns: [], incidents: [],
+    lastCompletedRun: { completedAt: ARRIVED, emitted: 1 },
+  })
+  assert.ok(distinguishable(noRuns, claimsOne))
+  assert.equal(noRuns.lastCompletedRun, null)
+
+  // AND THE LIMIT, WHICH IS THE USEFUL HALF OF THE ANSWER. A marker that is merely WRONG — a
+  // plausible recent time, every other field agreeing — is internally consistent, and no
+  // property over the state alone can catch it. The staleness check must be RELATIONAL: it has
+  // to read the run sequence the state was built from. A property taking only the state is
+  // testing self-consistency and calling it freshness.
+  const actualRuns = [
+    { kind: 'COMPLETED' as const, completedAt: new Date(T0 - 10 * 60 * 60 * 1000), emitted: [] },
+  ]
+  const fabricated = state({
+    runsSeen: 1, completedRuns: 1,
+    lastCompletedRun: { completedAt: ARRIVED, emitted: 0 },
+  })
+  assert.notEqual(
+    fabricated.lastCompletedRun?.completedAt.getTime(),
+    actualRuns[0]?.completedAt.getTime(),
+    'visible only with the input in hand, which is what makes the property relational')
+})
+
+test('LIVENESS AND FRESHNESS ARE DIFFERENT QUESTIONS, and only one of them is about the queue', () => {
+  // The consumer of an outcome-blind time that legitimately exists. A scheduler firing into
+  // failures and a scheduler that has stopped are different conditions with different
+  // remedies, and only the second is fixed by restarting a schedule. That question is real,
+  // which is exactly why it gets a NAME rather than a shared `at` a freshness consumer can
+  // reach into by accident.
+  const firingIntoFailures = state({
+    runsSeen: 2,
+    completedRuns: 1,
+    failedRuns: [{ failedAt: new Date(ARRIVED.getTime() + 300_000), because: 'Graph 503.' }],
+    lastCompletedRun: { completedAt: ARRIVED, emitted: 1 },
+    lastRunAttemptedAt: new Date(ARRIVED.getTime() + 300_000),
+  })
+  const stopped = state({
+    runsSeen: 1, completedRuns: 1, failedRuns: [],
+    lastCompletedRun: { completedAt: ARRIVED, emitted: 1 },
+    lastRunAttemptedAt: ARRIVED,
+  })
+
+  // Identical freshness, different liveness. As one field these would be the same state, and
+  // an operator would be told to restart a scheduler that is running perfectly well.
+  assert.equal(
+    firingIntoFailures.lastCompletedRun?.completedAt.getTime(),
+    stopped.lastCompletedRun?.completedAt.getTime())
+  assert.notEqual(
+    firingIntoFailures.lastRunAttemptedAt?.getTime(),
+    stopped.lastRunAttemptedAt?.getTime())
+  assert.ok(distinguishable(firingIntoFailures, stopped))
+})
+
+test('the staleness threshold carries its distribution, not only its conclusion', () => {
+  // Thirty minutes is twice the worst gap ever observed across 5,166 runs. Same rule the
+  // episode intervals are held to: a threshold whose provenance is lost becomes a number
+  // nobody may change.
+  assert.equal(STALE_AFTER_MS, 30 * 60 * 1000)
+  assert.ok(STALE_AFTER_MS >= 2 * OBSERVED_RUN_GAPS.worstMs,
+    'the threshold must clear the worst observed gap with margin or it fires on healthy runs')
+  assert.equal(OBSERVED_RUN_GAPS.completed + OBSERVED_RUN_GAPS.failed, OBSERVED_RUN_GAPS.runs)
+
+  // THE MEDIAN IS NOT WHAT THIS IS SET AGAINST, and quoting it would make the margin look far
+  // larger than it is: 0.1 min is runs clustering inside a cycle, not the cycle cadence.
+  assert.ok(OBSERVED_RUN_GAPS.p50Ms * 100 < OBSERVED_RUN_GAPS.worstMs,
+    'p50 and the worst gap are different phenomena; the threshold answers to the worst')
+
+  // ZERO FAILURES IN 5,166 RUNS. The arm the union forces every consumer to handle has never
+  // fired in production — so nothing in the observed history would have taught anyone that
+  // failures exist. That is the argument FOR enforcing it in the type, not against it: the
+  // defect was invisible to experience rather than merely unnoticed.
+  assert.equal(OBSERVED_RUN_GAPS.failed, 0)
 })
