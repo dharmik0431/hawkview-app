@@ -864,10 +864,44 @@ Not built here. Recorded because a deferral that drops its constraints rebuilds 
 bug.
 
 - **Silencing a notification must never silence the record.** An MSP may turn any rule
-  down to record-only; they may never make an event not be recorded. The evidence
-  stays searchable whatever they choose. This should be enforced by the type rather
-  than by the settings UI — if silencing *can* reach the record, someone eventually
-  wires it there.
+  down to record-only; they may never make an event not be recorded. The evidence stays
+  searchable whatever they choose. This protects them and it protects us.
+
+  **This is a type-level obligation, not a UI rule, and the distinction is the whole
+  point.** A settings screen that only offers choices down to record-only is a rule
+  enforced by the absence of a control, and the control reappears the first time
+  somebody adds a bulk-edit endpoint, an import, a migration backfill, or an
+  admin-only override — each for a plausible local reason, none of them looking like
+  the decision being reversed. A type where the record is not a thing a preference can
+  address cannot be reversed that way, because there is no code path to add. Same
+  technique as `EventInstant` and the required `subject`: make it unexpressible
+  rather than forbidden.
+
+  Concretely, what step 05 must not be able to write is a preference that ranges over
+  delivery *and* recording. So a preference addresses only the channel:
+
+  ```ts
+  /** What an MSP may change about a rule. Recording is absent BY CONSTRUCTION —
+   * there is no value of this type that suppresses it. */
+  type RulePreference = Readonly<{
+    rule: ChangeRule
+    /** The loudest channel this rule may use for this MSP. `NONE` still records. */
+    notifyAtMost: RoutingTier | 'NONE'
+  }>
+  ```
+
+  The load-bearing part is what is **missing**: no `record: boolean`, no `suppress`,
+  no `enabled`. `'NONE'` is the floor and it means "tell nobody", never "store
+  nothing". A reviewer cannot be relied on to notice a fourth field arriving later, so
+  the obligation for 05 is a test that the recording path takes no preference argument
+  at all — a function that cannot see a preference cannot be changed by one.
+
+  **And the reasoning has to travel with the rule**, because the rule on its own reads
+  like an arbitrary restriction. Somebody will eventually propose `suppress: true` for
+  a good-sounding reason — storage cost, noisy tenant, a customer who asked. The answer
+  is that an MSP who silenced something and later needs to know what happened has only
+  the record to find it in, and the moment recording is optional the product cannot
+  answer that question for the cases where it matters most.
 - **The settings screen states plainly what they will NOT hear about.** The plan's own
   "coverage gaps shown rather than silent", and the reason "make it configurable" does
   not become "everybody turns it off and blames HawkView". If tenant-disconnected has
