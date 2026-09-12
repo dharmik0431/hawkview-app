@@ -56,10 +56,24 @@ export interface ParsedKey {
   readonly recoveryOf: string | null
   /** For TENANT_SYNC, the resource type. */
   readonly resourceType: string | null
+  /** For DIRECTORY_AUDIT, the category Microsoft prefixes onto the audit id.
+   *
+   * FOUND IN PRODUCTION, NOT IN THE CODE. The key is built as
+   * `security:directory-audit:${record.microsoftAuditId}`, and the audit ids Microsoft
+   * issues carry a category prefix: Directory_, SSPR_, PIM_, "Authentication Methods_".
+   * Measured across the 364: 268 Directory, 45 SSPR, 3 PIM, 1 Authentication Methods.
+   *
+   * Worth extracting because it is the only signal in the key about WHAT the change was,
+   * and the type a directory-audit row becomes is exactly the question the key shape could
+   * not answer. PIM is Privileged Identity Management, which is a strong candidate for the
+   * privileged type. It is reported rather than mapped: a category is a hint about the
+   * subject area, not a classification, and guessing from it here would be the same
+   * shortcut as defaulting the type. */
+  readonly auditCategory: string | null
 }
 
 const unparsed = (shape: KeyShape): ParsedKey =>
-  ({ shape, tenantIdInKey: null, eventIdInKey: null, recoveryOf: null, resourceType: null })
+  ({ shape, tenantIdInKey: null, eventIdInKey: null, recoveryOf: null, resourceType: null, auditCategory: null })
 
 /** Parses a dedupe key into its shape, without guessing.
  *
@@ -74,7 +88,14 @@ export function parseDedupeKey(dedupeKey: string): ParsedKey {
   }
 
   const audit = /^security:directory-audit:(.+)$/.exec(dedupeKey)
-  if (audit) return { ...unparsed('DIRECTORY_AUDIT'), eventIdInKey: audit[1] ?? null }
+  if (audit) {
+    const eventId = audit[1] ?? null
+    // The WHOLE remainder stays the event id, because that is what joins to
+    // microsoftAuditId — all 317 production rows joined, so the parse is right. The
+    // category is additionally extracted, not substituted.
+    const category = /^([A-Za-z][A-Za-z ]*)_/.exec(eventId ?? '')
+    return { ...unparsed('DIRECTORY_AUDIT'), eventIdInKey: eventId, auditCategory: category?.[1] ?? null }
+  }
 
   const sync = /^tenant:([^:]+):sync:(.+)$/.exec(dedupeKey)
   if (sync) {
@@ -146,14 +167,33 @@ export interface ReconciliationReport {
   /** Distinct unrecognised keys, with one example each. Reported rather than counted
    * alone, because the shape is the finding. */
   readonly unrecognisedExamples: readonly string[]
+  /** Audit categories found in the directory-audit keys, with counts. The only signal in
+   * the key about what the change was, and therefore the first place to look when deciding
+   * the types those rows should become. Reported, never mapped. */
+  readonly auditCategories: Readonly<Record<string, number>>
   /** Occurrences behind the rows — the events the 301 and the 334 actually represent.
    * Consolidating must preserve these, so the report states them. */
   readonly occurrencesRepresented: number
   readonly incidents: Readonly<{
-    /** Under the subject role each type declares. */
+    /** Under the subject role each type declares, counting only rows whose type the key
+     * shape determines. Rows needing classification are NOT grouped here. */
     declared: number
     /** The same rows keyed on the target instead, for comparison only. */
     ifKeyedOnTarget: number
+    /** THE NUMBER TO PUT IN FRONT OF A PERSON, and it is a FLOOR rather than an answer.
+     *
+     * The 317 directory-audit rows cannot be grouped without knowing which type each
+     * became, because the incident key contains the type id — one actor's privileged change
+     * and their routine change are correctly different incidents. So `declared` above
+     * excludes them entirely, which is honest and unhelpful.
+     *
+     * These two count the same rows with every undetermined row treated as ONE nominated
+     * type. That makes them computable, and it makes them a LOWER BOUND: classification can
+     * only split an actor's events across two types, never merge them. The real number is
+     * this or higher, never lower, and saying "68 incidents" without that is an
+     * understatement presented as a measurement. */
+    assumingSingleType: number
+    assumingSingleTypeKeyedOnTarget: number
     /** Rows that cannot be grouped because the declared subject did not resolve. */
     unattributed: number
     /** Rows whose alert type the shape alone does not determine. */
@@ -242,8 +282,15 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     TENANT_ONBOARDING: 0, RECOVERY: 0, UNRECOGNISED: 0,
   }
   const unrecognised = new Set<string>()
+  const auditCategories: Record<string, number> = {}
   const declaredKeys = new Set<string>()
   const targetKeys = new Set<string>()
+  // The bound: every row grouped under one nominated declaration, including the ones whose
+  // real type is undetermined. Nominated rather than guessed — it is used only to count,
+  // never to assign, and the mapping still records no type for those rows.
+  const boundKeys = new Set<string>()
+  const boundTargetKeys = new Set<string>()
+  const nominated = declarationFor('security.routine_directory_change')
   const mapping: MappingEntry[] = []
   let unattributed = 0
   let needingClassification = 0
@@ -254,9 +301,22 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     byShape[parsed.shape] += 1
     occurrences += row.occurrenceCount
     if (parsed.shape === 'UNRECOGNISED') unrecognised.add(row.dedupeKey)
+    if (parsed.auditCategory !== null) {
+      auditCategories[parsed.auditCategory] = (auditCategories[parsed.auditCategory] ?? 0) + 1
+    }
 
     const alertTypeId = TYPE_FOR_SHAPE[parsed.shape]
     const declaration = alertTypeId === null ? null : declarationFor(alertTypeId)
+
+    // Counted for the bound whatever happens below, so the bound covers every row rather
+    // than only the ones that reached a verdict.
+    const forBound = declaration ?? nominated
+    if (forBound !== null) {
+      const boundGrouping = groupingFor(row, forBound, forBound.subject)
+      if (boundGrouping.groups) boundKeys.add(boundGrouping.key)
+      const boundTarget = groupingFor(row, forBound, 'TARGET')
+      if (boundTarget.groups) boundTargetKeys.add(boundTarget.key)
+    }
 
     if (declaration === null) {
       needingClassification += 1
@@ -307,10 +367,13 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     total: rows.length,
     byShape,
     unrecognisedExamples: [...unrecognised].sort(),
+    auditCategories,
     occurrencesRepresented: occurrences,
     incidents: {
       declared: declaredKeys.size,
       ifKeyedOnTarget: targetKeys.size,
+      assumingSingleType: boundKeys.size,
+      assumingSingleTypeKeyedOnTarget: boundTargetKeys.size,
       unattributed,
       needingClassification,
     },

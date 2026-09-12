@@ -219,3 +219,72 @@ test('A DUPLICATED ROW IS NAMED, which is what makes the invariant testable at a
   ])
   assert.deepEqual(clean.invariants.duplicatedNotificationIds, [])
 })
+
+test('THE AUDIT CATEGORY IS EXTRACTED BUT NOT MAPPED', () => {
+  // Found in production, not in the code: the audit ids Microsoft issues carry a category
+  // prefix, and the dedupe key is built from the id verbatim. Measured across the 364 —
+  // 268 Directory, 45 SSPR, 3 PIM, 1 Authentication Methods.
+  const cases = [
+    ['Directory_abc-123', 'Directory'],
+    ['SSPR_def-456', 'SSPR'],
+    ['PIM_ghi-789', 'PIM'],
+    ['Authentication Methods_jkl-012', 'Authentication Methods'],
+  ] as const
+  for (const [eventId, category] of cases) {
+    const parsed = parseDedupeKey(`security:directory-audit:${eventId}`)
+    assert.equal(parsed.auditCategory, category, eventId)
+    // THE WHOLE REMAINDER STAYS THE EVENT ID, because that is what joins to
+    // microsoftAuditId. All 317 production rows joined, so substituting the category for
+    // the id would have broken a parse that demonstrably works.
+    assert.equal(parsed.eventIdInKey, eventId, 'the join key must survive the extraction')
+  }
+
+  // An id with no category prefix still parses, with the category absent rather than guessed.
+  const bare = parseDedupeKey('security:directory-audit:00000000-1111-2222-3333-444444444444')
+  assert.equal(bare.auditCategory, null)
+  assert.equal(bare.eventIdInKey, '00000000-1111-2222-3333-444444444444')
+
+  // And the category does NOT become a type. It is a hint about subject area, and PIM being
+  // Privileged Identity Management is the strongest candidate for the privileged type —
+  // which is a classification decision, not a parse.
+  const report = reconcile([
+    auditRow('PIM_a-1', 'admin-1', ['v-1']),
+    auditRow('Directory_a-2', 'admin-1', ['v-2']),
+    auditRow('Directory_a-3', 'admin-2', ['v-3']),
+  ])
+  assert.deepEqual(report.auditCategories, { PIM: 1, Directory: 2 })
+  assert.equal(report.incidents.needingClassification, 3,
+    'the category is reported; it does not classify anything')
+  for (const entry of report.mapping) assert.equal(entry.alertTypeId, null)
+})
+
+test('THE HEADLINE NUMBER IS A FLOOR, and the report says which number is which', () => {
+  // The count to put in front of a person is "how many incidents do these become", and it
+  // cannot be answered exactly for the directory-audit rows: the incident key contains the
+  // type id, and one actor's privileged change is correctly a different incident from their
+  // routine one. So `declared` excludes them — honest and unhelpful — and the bound counts
+  // them under one nominated type.
+  //
+  // THE BOUND IS A LOWER BOUND. Classification can only split an actor's events across two
+  // types, never merge them, so the real number is this or higher. Reporting it without that
+  // qualification would be an understatement presented as a measurement.
+  const actors = ['a-1', 'a-1', 'a-1', 'a-2']
+  const rows = actors.map((actor, index) => auditRow(`Directory_e-${index}`, actor, [`t-${index}`]))
+  const report = reconcile(rows)
+
+  assert.equal(report.incidents.declared, 0, 'undetermined types are not grouped in the declared count')
+  assert.equal(report.incidents.assumingSingleType, 2, 'two actors, two incidents under one type')
+  assert.equal(report.incidents.assumingSingleTypeKeyedOnTarget, 4, 'four distinct targets')
+
+  // THE DIRECTION IS THE POINT: keying on the actor collapses, keying on the target does not.
+  assert.ok(report.incidents.assumingSingleType < report.incidents.assumingSingleTypeKeyedOnTarget,
+    'the actor-keyed count must be the smaller one for these rows, which is D1 on the data')
+
+  // The bound covers rows whose type IS determined too, so it is a bound over everything
+  // rather than over a subset.
+  const mixed = reconcile([...rows, row({ dedupeKey: 'tenant:t1:connection', customerTenantId: 't1' })])
+  assert.equal(mixed.incidents.assumingSingleType, 3, 'two actors plus one tenant incident')
+
+  // And nominating a type for the count does NOT assign one in the mapping.
+  for (const entry of report.mapping) assert.equal(entry.alertTypeId, null)
+})

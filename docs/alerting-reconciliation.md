@@ -208,6 +208,99 @@ reading consolidation as deletion. The 301 and the 334 are real events; they are
 301 and 334 problems.
 
 
+## Measured, on production, across five tenants and two months
+
+Run by PM, who has read-only access. Nine shapes, 364 alerts.
+
+```
+security:directory-audit:Directory_{id}              268    268 occ    268 unresolved
+security:directory-audit:SSPR_{id}                    45     45 occ     45 unresolved
+tenant:{id}:sync:{RESOURCE}                           20    346 occ     10 unresolved
+tenant:{id}:sync:{RESOURCE}:recovered:{count}         17     17 occ     17 unresolved
+tenant:{id}:onboarding-authorized                      5     12 occ
+security:directory-audit:PIM_{id}                      3
+tenant:{id}:initial-sync                               3
+tenant:{id}:connection                                 2
+security:directory-audit:Authentication Methods_{id}   1
+                                                     364
+```
+
+**Both defects appear in the same table, two rows apart.** The recovery shape is 17 alerts
+holding 17 occurrences — exactly one-to-one, because the counter is inside the identity, so
+every recovery is its own alert and always will be. Directly above it, 20 sync alerts hold
+**346** occurrences. A key that cannot deduplicate and a key that cannot group, side by side.
+That is the clearest available argument for two layers rather than one.
+
+**Every one of the 317 directory-audit rows joined to an audit record. Zero unjoined**,
+which says the key parses cleanly — and is a better result than expected, since a
+notification outliving the evidence it was raised from is a plausible failure.
+
+### D1 is vindicated on the data
+
+```
+                        incidents
+BY ACTOR (declared)         68
+BY TARGET (comparison)     116
+```
+
+Keying on the actor nearly halves it. The ruling was made on reasoning — a compromised admin
+touching twelve accounts is one incident, not twelve pages — and the measurement agrees.
+35 distinct actors; 9 unattributed events, so the unresolvable-subject path is reachable and
+rare, which is the shape it should have.
+
+### 68 IS A FLOOR, NOT THE ANSWER
+
+Worth stating because the number will be quoted. The incident key contains the **type id**,
+and one actor's privileged change is correctly a different incident from their routine one.
+So a count over the 317 cannot be exact until each is classified, and the generator reports
+two numbers accordingly:
+
+- `declared` — groups only rows whose type the key shape determines. Excludes all 317. Honest
+  and unhelpful.
+- `assumingSingleType` — every undetermined row counted under one nominated type. Computable,
+  and a **lower bound**: classification can only split an actor's events across two types,
+  never merge them.
+
+So the real figure is 68 **or higher**. Quoting it without that is an understatement
+presented as a measurement.
+
+### The audit category is in the key, and was not in the code
+
+The ids Microsoft issues carry a category prefix, which the key inherits verbatim:
+`Directory_`, `SSPR_`, `PIM_`, `Authentication Methods_`. Found in the data rather than the
+source, so the parser now extracts and reports it.
+
+It is the **only signal in the key about what the change was** — which is precisely the
+question the shape could not answer. `PIM` is Privileged Identity Management and is the
+strongest candidate for the privileged type. It is reported, never mapped: a category is a
+hint about subject area, not a classification, and mapping from it here would be the same
+shortcut as defaulting the type.
+
+The whole remainder still serves as the event id, because that is what joins to
+`microsoftAuditId` — and all 317 joining confirms substituting the category would have broken
+a parse that demonstrably works.
+
+## An unsettled ruling: what tier does an incident take?
+
+**Not stated anywhere.** `routingTier` maps one severity to one channel, and nothing derives a
+severity for a *group* — but the group is what gets routed. An incident holding one urgent
+event and nine routine ones has no defined tier.
+
+**The recommendation, and the reasoning is the part that matters:** an incident takes the tier
+of its **most urgent member**. Anything else lets volume dilute urgency — an average or a
+majority would let nine routine events outvote one weakening, and step 01 deliberately has
+**no `OCCURRENCE_COUNT` escalation signal** precisely so volume could not drive severity.
+Averaging would reintroduce volume as a signal, inverted: instead of noise promoting itself,
+noise would demote a real finding.
+
+The cost is accepted rather than hidden: a phone call can arrive carrying 299 routine events
+alongside the one that earned it. That is the correct direction — the alternative is not
+hearing about the one.
+
+PM's note that the tier rows sum past the incident count is the same observation from the
+other side, and it is what surfaced the gap.
+
+
 ## What to check first when this breaks
 
 - **An alert cleared and should not have.** Check which of the five observation fields the
