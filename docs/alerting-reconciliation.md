@@ -835,3 +835,45 @@ quantity accumulated twice in one pass. Killed: the reported figure perturbed (t
 the old boolean missed), the episode split collapsed into one half, the two halves swapped,
 `standingAlone` tagged from the wrong side, `withDeterminedType` counting every row, the
 complement never incrementing, and three on the helper itself.
+
+### Adjacency is where a fix goes wrong
+
+The audit named `countedDirectoryAuditOnly`. The fix decomposed **`counted`** — the
+all-shapes figure sitting next to it — and left the named one still standing alone, with two
+new unconstrained figures beside it. The identity was real (`93 = 63 + 30` holds); it
+constrained the wrong number.
+
+**The two differ only in scope, which is exactly why the fix landed on the neighbour.** When
+a finding names a figure, the figure to constrain is the one named, and the danger is highest
+when an adjacent one looks interchangeable — because the fix then feels complete and even
+verifies clean against an identity nobody asked for.
+
+The directory-only split is now printed, so **`71 = 62 + 9` is reproducible from the output**
+rather than from a message. The root cause was in the loop: how many episodes a bucket
+contributes was decided in **two** places, each repeating the tagging, so the audit-only line
+was written *beside* the halves instead of *derived with* them. It is now decided once, as
+`gained`, and every total derives from it.
+
+### 34 rows, 30 episodes, and why the obvious guess is wrong
+
+The gap was not derivable from the output, and the natural reading — *rows without an event
+time cannot be placed* — **is wrong**. A single timeless event still counts as one episode; a
+standing-alone bucket holds exactly one row, so it contributes one episode or none, and none
+happens only when that row carries **several** events at unknown times. Many events with no
+times is the case that genuinely cannot be computed; one event with no time is not.
+
+So the dividing line is not "has a time" but "has more than one event and no times", which no
+combination of the other figures reveals. `standingAloneRowsWithUnrecoverableEpisodes` is now
+printed, with the identity **every standing-alone row is either an episode or named as
+unplaceable**, and `incidentsWithUnrecoverableEpisodes` is split the same way.
+
+Nine mutations, no unexpected outcomes. Killed: the directory halves fed from the all-shapes
+totals (the original miss), each half ignoring the audit-only tag, the two swapped, unplaceable
+standing-alone rows counted as attributed, the standing-alone side never recorded, a timeless
+single event no longer counting as one, and every bucket gaining exactly one episode.
+
+**Two predicted survivors, declared before the run: removing either new identity from the
+invariant list survives, and must.** No input can make an identity fire, so the list is a
+tripwire and the kills above rest on the component figures being asserted directly. Predicting
+that in advance is what keeps it a property of the design rather than an excuse found
+afterwards.

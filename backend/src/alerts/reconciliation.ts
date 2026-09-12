@@ -277,6 +277,30 @@ export interface ReconciliationReport {
      * See `invariants.episodeCountsAddUp`. */
     fromAttributedRows: number
     fromStandingAloneRows: number
+    /** THE SAME SPLIT ON THE DIRECTORY-ONLY FIGURE, which is the one a person quotes.
+     *
+     * The first attempt at this decomposed `counted` (all shapes) and left
+     * `countedDirectoryAuditOnly` — the figure the audit named — still standing alone. The
+     * two sit adjacent and differ only in scope, which is exactly why the fix landed on the
+     * wrong one: ADJACENCY IS WHERE A FIX GOES WRONG, because the neighbour looks
+     * interchangeable with the thing that was asked for.
+     *
+     * With these, `71 = 62 + 9` is reproducible from the output. See
+     * `invariants.episodeCountsAddUp`. */
+    fromAttributedRowsDirectoryAuditOnly: number
+    fromStandingAloneRowsDirectoryAuditOnly: number
+    /** Standing-alone rows whose single episode could NOT be placed, and its attributed
+     * counterpart.
+     *
+     * Why 34 standing-alone rows yield 30 episodes rather than 34: a standing-alone bucket
+     * holds exactly one row, so it contributes exactly one episode or none, and none
+     * happens when the row carries several events at unknown times — many events with no
+     * times is the case that genuinely cannot be computed. A SINGLE timeless event still
+     * counts as one, so "no event time" is NOT the dividing line; "several events, no
+     * times" is. That distinction is not guessable from the other figures, which is why
+     * this one is printed rather than left to be inferred. */
+    standingAloneRowsWithUnrecoverableEpisodes: number
+    attributedIncidentsWithUnrecoverableEpisodes: number
     /** Same, restricted to directory-audit rows — the like-for-like comparison. */
     countedDirectoryAuditOnly: number
     /** Incidents whose episode count cannot be recovered because at least one row carries
@@ -633,7 +657,11 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   let episodesCountedAudit = 0
   let episodesAttributed = 0
   let episodesStandingAlone = 0
+  let episodesAttributedAudit = 0
+  let episodesStandingAloneAudit = 0
   let unrecoverable = 0
+  let unrecoverableAttributed = 0
+  let unrecoverableStandingAlone = 0
   for (const bucket of rowsByIncident.values()) {
 
     // ONE EVENT IS ONE EPISODE, AND THAT IS KNOWABLE WITHOUT ITS TIME. The time is only
@@ -641,27 +669,37 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     // happened. Treating a timeless single-event incident as unknown was over-refusing —
     // the opposite error to counting a genuinely unknowable one as one, and both are failures
     // to distinguish "cannot be computed" from "computed".
+    // HOW MANY EPISODES THIS BUCKET CONTRIBUTES IS DECIDED ONCE, and every total below
+    // derives from that one number. It was decided in two places and each place repeated
+    // the tagging, which is how a split ended up on the wrong axis: `counted` gained its
+    // attributed/standing-alone halves and `countedDirectoryAuditOnly` — the figure a
+    // person actually quotes — did not, because the audit-only line was written beside the
+    // others rather than derived with them.
+    let gained: number
     if (bucket.events === 1) {
-      episodesCounted += 1
-      if (bucket.auditOnly) episodesCountedAudit += 1
-      if (bucket.standingAlone) episodesStandingAlone += 1
-      else episodesAttributed += 1
-      continue
-    }
-
-    if (bucket.missing > 0) {
+      gained = 1
+    } else if (bucket.missing > 0) {
       // UNKNOWN, NOT ONE. An incident holding a row whose event time is gone has an episode
       // count nobody can recover, and counting it as a single episode would understate the
       // migration by exactly the thing episodes were built to catch.
       unrecoverable += 1
+      if (bucket.standingAlone) unrecoverableStandingAlone += 1
+      else unrecoverableAttributed += 1
       continue
+    } else {
+      gained = episodesOf(
+        bucket.times.map((at) => eventInstant({ occurredAt: at, receivedAt: at })), quietMs).length
     }
-    const spans = episodesOf(
-      bucket.times.map((at) => eventInstant({ occurredAt: at, receivedAt: at })), quietMs)
-    episodesCounted += spans.length
-    if (bucket.auditOnly) episodesCountedAudit += spans.length
-    if (bucket.standingAlone) episodesStandingAlone += spans.length
-    else episodesAttributed += spans.length
+
+    episodesCounted += gained
+    if (bucket.auditOnly) episodesCountedAudit += gained
+    if (bucket.standingAlone) {
+      episodesStandingAlone += gained
+      if (bucket.auditOnly) episodesStandingAloneAudit += gained
+    } else {
+      episodesAttributed += gained
+      if (bucket.auditOnly) episodesAttributedAudit += gained
+    }
   }
 
   const mappingOccurrences = mapping.reduce((sum, entry) => sum + entry.occurrenceCount, 0)
@@ -695,6 +733,10 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       counted: episodesCounted,
       fromAttributedRows: episodesAttributed,
       fromStandingAloneRows: episodesStandingAlone,
+      fromAttributedRowsDirectoryAuditOnly: episodesAttributedAudit,
+      fromStandingAloneRowsDirectoryAuditOnly: episodesStandingAloneAudit,
+      standingAloneRowsWithUnrecoverableEpisodes: unrecoverableStandingAlone,
+      attributedIncidentsWithUnrecoverableEpisodes: unrecoverableAttributed,
       countedDirectoryAuditOnly: episodesCountedAudit,
       incidentsWithUnrecoverableEpisodes: unrecoverable,
       rowsWithoutEventTime: rowsWithoutTimeByRow,
@@ -728,10 +770,26 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       eventTimeCountsAddUp: adds([
         ['with a time', rowsWithTime], ['without', rowsWithoutTimeByRow],
       ], rows.length, 'rows read'),
-      episodeCountsAddUp: adds([
-        ['from attributed rows', episodesAttributed],
-        ['from standing-alone rows', episodesStandingAlone],
-      ], episodesCounted, 'episodes.counted'),
+      episodeCountsAddUp: [
+        ...adds([
+          ['from attributed rows', episodesAttributed],
+          ['from standing-alone rows', episodesStandingAlone],
+        ], episodesCounted, 'episodes.counted'),
+        // THE ONE THE HEADLINE NEEDS: directory-only, decomposed on the same axis.
+        ...adds([
+          ['from attributed directory rows', episodesAttributedAudit],
+          ['from standing-alone directory rows', episodesStandingAloneAudit],
+        ], episodesCountedAudit, 'episodes.countedDirectoryAuditOnly'),
+        // Every standing-alone ROW accounted for as either an episode or an unplaceable one.
+        ...adds([
+          ['standing-alone rows counted as an episode', episodesStandingAlone],
+          ['unplaceable', unrecoverableStandingAlone],
+        ], standingAlone, 'rowsStandingAloneBecauseSubjectUnresolved'),
+        ...adds([
+          ['attributed', unrecoverableAttributed],
+          ['standing-alone', unrecoverableStandingAlone],
+        ], unrecoverable, 'incidentsWithUnrecoverableEpisodes'),
+      ],
       rowCountsAddUp: [
         ...adds([
           ['with a determined type', withDeterminedType],

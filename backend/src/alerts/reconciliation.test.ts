@@ -802,3 +802,82 @@ test('THE IDENTITY HELPER IS TESTED DIRECTLY, because no input can exercise it i
   // Over-count as well as under-count: a report can inflate as easily as it can drop.
   assert.match(adds([['counted', 9]], 5, 'the total')[0] ?? '', /= 9, but the total is 5/)
 })
+
+test('THE DIRECTORY-ONLY HEADLINE DECOMPOSES, which is the figure a person quotes', () => {
+  // The first attempt decomposed `counted` (all shapes) and left `countedDirectoryAuditOnly`
+  // — the figure the audit named — still standing alone. The two sit adjacent and differ only
+  // in scope, which is exactly why the fix landed on the wrong one. ADJACENCY IS WHERE A FIX
+  // GOES WRONG: the neighbour looks interchangeable with the thing that was asked for.
+  const DAY = 24 * 60 * 60 * 1000
+  const rows = [
+    // Directory, attributed: one actor with two bursts, one actor with one. Three episodes.
+    auditAt('a1', 'admin-1', T0),
+    auditAt('a2', 'admin-1', T0 + 3 * DAY),
+    auditAt('b1', 'admin-2', T0),
+    // Directory, standing alone: two rows, one episode each.
+    ...[1, 2].map((index) =>
+      row({
+        dedupeKey: `security:directory-audit:Directory_u${index}`,
+        occurredAt: new Date(T0 + index * 1000),
+        audit: { initiatedBy: null, targetResources: [], privileged: null },
+      })),
+    // NON-directory, attributed: must land in the all-shapes halves and NOT in the
+    // directory-only ones. Without this row the two identities cannot be told apart.
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1' }),
+    // NON-directory, standing alone.
+    row({ dedupeKey: 'tenant:t1:initial-sync', customerTenantId: 't1' }),
+  ]
+  const report = reconcile(rows)
+
+  // The headline, reproducible from the output: 5 = 3 + 2.
+  assert.equal(report.episodes.countedDirectoryAuditOnly, 5)
+  assert.equal(report.episodes.fromAttributedRowsDirectoryAuditOnly, 3)
+  assert.equal(report.episodes.fromStandingAloneRowsDirectoryAuditOnly, 2)
+
+  // The all-shapes figures are LARGER, or the two identities are the same identity and the
+  // directory-only one proves nothing.
+  assert.equal(report.episodes.counted, 7)
+  assert.equal(report.episodes.fromAttributedRows, 4)
+  assert.equal(report.episodes.fromStandingAloneRows, 3)
+  assert.ok(report.episodes.counted > report.episodes.countedDirectoryAuditOnly,
+    'the fixture must contain non-directory rows or the two scopes are indistinguishable')
+
+  assert.deepEqual(report.invariants.episodeCountsAddUp, [])
+})
+
+test('EVERY STANDING-ALONE ROW IS EITHER AN EPISODE OR NAMED AS UNPLACEABLE', () => {
+  // 34 rows yielding 30 episodes was not derivable from the output, and the natural guess —
+  // "rows without an event time cannot be placed" — is WRONG: a single timeless event still
+  // counts as one episode. The dividing line is SEVERAL events at unknown times, which is the
+  // case that genuinely cannot be computed. Not guessable from the other figures, so printed.
+  const rows = [
+    // Stands alone, one event, no time: still one episode.
+    row({ dedupeKey: 'tenant:t1:initial-sync', customerTenantId: 't1', occurrenceCount: 1 }),
+    // Stands alone, MANY events, no times: unplaceable, and named as such.
+    row({ dedupeKey: 'tenant:t2:initial-sync', customerTenantId: 't2', occurrenceCount: 9 }),
+    // Stands alone, directory, with a time: one episode.
+    row({
+      dedupeKey: 'security:directory-audit:Directory_u1',
+      occurredAt: new Date(T0),
+      audit: { initiatedBy: null, targetResources: [], privileged: null },
+    }),
+  ]
+  const report = reconcile(rows)
+
+  assert.equal(report.episodes.rowsStandingAloneBecauseSubjectUnresolved, 3)
+  assert.equal(report.episodes.fromStandingAloneRows, 2)
+  assert.equal(report.episodes.standingAloneRowsWithUnrecoverableEpisodes, 1)
+  assert.equal(
+    report.episodes.fromStandingAloneRows
+    + report.episodes.standingAloneRowsWithUnrecoverableEpisodes,
+    report.episodes.rowsStandingAloneBecauseSubjectUnresolved,
+    'every standing-alone row is accounted for exactly once')
+
+  // NO EVENT TIME IS NOT THE DIVIDING LINE. Two of these three carry no time, and one of
+  // those two is still an episode — asserting this pins the rule rather than the arithmetic.
+  assert.equal(report.episodes.rowsWithoutEventTime, 2)
+  assert.notEqual(report.episodes.standingAloneRowsWithUnrecoverableEpisodes,
+    report.episodes.rowsWithoutEventTime)
+
+  assert.deepEqual(report.invariants.episodeCountsAddUp, [])
+})
