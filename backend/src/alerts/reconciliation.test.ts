@@ -288,3 +288,62 @@ test('THE HEADLINE NUMBER IS A FLOOR, and the report says which number is which'
   // And nominating a type for the count does NOT assign one in the mapping.
   for (const entry of report.mapping) assert.equal(entry.alertTypeId, null)
 })
+
+test('THE OCCURRENCE CHECK COMPARES TWO INDEPENDENT SIDES', () => {
+  // It was vacuous: a loop accumulator against a reduce over the same array with the same
+  // addition, both sides equally wrong and therefore always agreeing. Searched for a
+  // falsifying input — ordinary, zero, negative, MAX_SAFE_INTEGER, fractional values where
+  // addition is not associative, 200,000 random sets. Nothing, bar Infinity + -Infinity
+  // giving NaN, which is an artefact rather than a guard.
+  //
+  // Its comment was the worse half: it said the events are preserved "so applying the
+  // mapping can be checked against it", which reads as a check on consolidation when the
+  // mapping was not in the computation at all. Its sibling one line up honestly calls itself
+  // a tripwire, so a reader comparing them would take the unlabelled one for the stronger.
+  //
+  // Now the mapping carries its own counts and the two sides come from different places.
+  const rows = [
+    row({ dedupeKey: 'tenant:t1:connection', customerTenantId: 't1', occurrenceCount: 334 }),
+    row({ dedupeKey: 'tenant:t2:connection', customerTenantId: 't2', occurrenceCount: 7 }),
+    auditRow('Directory_a-1', 'admin-1', ['v-1']),
+  ]
+  const report = reconcile(rows)
+
+  assert.equal(report.invariants.occurrencesPreserved, true)
+  assert.equal(report.occurrencesRepresented, 342)
+  // The counts reached the mapping, which is what makes the check non-tautological — and
+  // the apply phase needs them anyway, since consolidating must preserve the events.
+  assert.deepEqual(report.mapping.map((entry) => entry.occurrenceCount).sort((a, b) => a - b), [1, 7, 334])
+  assert.equal(
+    report.mapping.reduce((sum, entry) => sum + entry.occurrenceCount, 0),
+    rows.reduce((sum, input) => sum + input.occurrenceCount, 0))
+})
+
+test('THE DIRECTORY-AUDIT BOUND IS A LIKE-FOR-LIKE SUBSET, so two instruments can disagree', () => {
+  // The production figures were computed with SQL filtered on the directory-audit key
+  // prefix, while the all-rows bound covers every shape. Comparing those two would be
+  // comparing different subsets and finding a disagreement that was never there — so the
+  // report carries the restricted pair as well, and that is the one to compare.
+  const rows = [
+    auditRow('Directory_a-1', 'admin-1', ['v-1']),
+    auditRow('Directory_a-2', 'admin-1', ['v-2']),
+    auditRow('SSPR_a-3', 'admin-2', ['v-3']),
+    row({ dedupeKey: 'tenant:t1:connection', customerTenantId: 't1' }),
+    row({ dedupeKey: 'tenant:t2:sync:SIGN_INS', customerTenantId: 't2' }),
+  ]
+  const report = reconcile(rows)
+
+  // Two actors across the audit rows.
+  assert.equal(report.incidents.assumingSingleTypeDirectoryAuditOnly, 2)
+  assert.equal(report.incidents.assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget, 3)
+
+  // AND IT IS A SUBSET: the restricted count can never exceed the all-rows count, which is
+  // the property that makes the two comparable rather than merely adjacent.
+  assert.ok(report.incidents.assumingSingleTypeDirectoryAuditOnly <= report.incidents.assumingSingleType)
+  assert.ok(report.incidents.assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget
+    <= report.incidents.assumingSingleTypeKeyedOnTarget)
+
+  // The non-audit rows are in the wider count and not in the restricted one, so the
+  // restriction is doing something rather than the two being equal by coincidence.
+  assert.ok(report.incidents.assumingSingleType > report.incidents.assumingSingleTypeDirectoryAuditOnly)
+})

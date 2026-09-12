@@ -152,6 +152,13 @@ export interface ExistingAlertRow {
 export interface MappingEntry {
   readonly notificationId: string
   readonly dedupeKey: string
+  /** The occurrences this row represents, carried into the mapping.
+   *
+   * Needed by the apply phase — consolidating must preserve the events, and an entry that
+   * does not say how many it carries cannot be applied without going back to the source.
+   * It is also what makes `occurrencesPreserved` a real check rather than a tautology:
+   * with it, the two sides of that comparison are built by different code paths. */
+  readonly occurrenceCount: number
   readonly shape: KeyShape
   readonly alertTypeId: string | null
   /** The incident this row joins, or null when it cannot be grouped. */
@@ -194,6 +201,18 @@ export interface ReconciliationReport {
      * understatement presented as a measurement. */
     assumingSingleType: number
     assumingSingleTypeKeyedOnTarget: number
+    /** THE SAME BOUND, RESTRICTED TO DIRECTORY-AUDIT ROWS.
+     *
+     * Exists so two instruments can be compared. The production figures were computed with
+     * SQL directly, filtering on `dedupe_key like 'security:directory-audit:%'` before
+     * grouping — so they cover only that shape, while `assumingSingleType` above covers
+     * EVERY row. Comparing those two would be comparing different subsets and finding a
+     * disagreement that was never there.
+     *
+     * These two are the like-for-like pair. If they disagree with the SQL, one instrument is
+     * wrong and that is worth finding before either number reaches a decision. */
+    assumingSingleTypeDirectoryAuditOnly: number
+    assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget: number
     /** Rows that cannot be grouped because the declared subject did not resolve. */
     unattributed: number
     /** Rows whose alert type the shape alone does not determine. */
@@ -232,6 +251,32 @@ export interface ReconciliationReport {
     /** Ids appearing more than once across the input. A duplicate means the report's counts
      * are inflated and the mapping is not a function of the notification. */
     duplicatedNotificationIds: readonly string[]
+    /** Occurrences counted in the MAPPING against occurrences counted in the INPUT.
+     *
+     * IT WAS VACUOUS. It compared a loop accumulator against a reduce over the same array
+     * with the same addition — both sides equally wrong and therefore always agreeing.
+     * Searched for a falsifying input: ordinary, zero, negative, MAX_SAFE_INTEGER,
+     * fractional values where addition is not associative, 200,000 random sets. Nothing,
+     * except `Infinity + -Infinity` giving NaN, which is an artefact rather than a guard.
+     *
+     * And its comment was worse than the code — it said the events are preserved "so that
+     * applying the mapping can be checked against it", which reads as a check on
+     * consolidation when the mapping was not involved in the computation at all. Its
+     * sibling honestly calls itself a tripwire; this one did not, so a reader comparing
+     * them would take the unlabelled one for the stronger and it was the weaker.
+     *
+     * Now the two sides come from different places: the mapping's own entries against the
+     * input rows. A future change that drops an entry, duplicates one, or loses a count in
+     * transit makes them disagree — verified by corrupting a mapping entry's count, which
+     * fails a test where the old form could not have.
+     *
+     * WHAT IS STILL TRUE OF IT, stated so it is not read as more than it is: no INPUT can
+     * make it false, so hardcoding the field true still passes. That is the same
+     * reporting-surface weakness rowsMissingFromMapping carries, and the same honest label
+     * applies. The difference from before is not cosmetic though — the old version was
+     * tautological as a COMPUTATION and would have reported true over a broken generator;
+     * this one catches exactly that. A real check whose reported value is a tripwire,
+     * rather than a tripwire wearing the words of a real check. */
     occurrencesPreserved: boolean
   }>
 }
@@ -290,6 +335,8 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   // never to assign, and the mapping still records no type for those rows.
   const boundKeys = new Set<string>()
   const boundTargetKeys = new Set<string>()
+  const auditBoundKeys = new Set<string>()
+  const auditBoundTargetKeys = new Set<string>()
   const nominated = declarationFor('security.routine_directory_change')
   const mapping: MappingEntry[] = []
   let unattributed = 0
@@ -316,6 +363,10 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       if (boundGrouping.groups) boundKeys.add(boundGrouping.key)
       const boundTarget = groupingFor(row, forBound, 'TARGET')
       if (boundTarget.groups) boundTargetKeys.add(boundTarget.key)
+      if (parsed.shape === 'DIRECTORY_AUDIT') {
+        if (boundGrouping.groups) auditBoundKeys.add(boundGrouping.key)
+        if (boundTarget.groups) auditBoundTargetKeys.add(boundTarget.key)
+      }
     }
 
     if (declaration === null) {
@@ -323,6 +374,7 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       mapping.push({
         notificationId: row.id,
         dedupeKey: row.dedupeKey,
+        occurrenceCount: row.occurrenceCount,
         shape: parsed.shape,
         alertTypeId,
         incidentKey: null,
@@ -347,6 +399,7 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     mapping.push({
       notificationId: row.id,
       dedupeKey: row.dedupeKey,
+      occurrenceCount: row.occurrenceCount,
       shape: parsed.shape,
       alertTypeId: declaration.id,
       incidentKey: declaredGrouping.groups ? declaredGrouping.key : null,
@@ -374,6 +427,8 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       ifKeyedOnTarget: targetKeys.size,
       assumingSingleType: boundKeys.size,
       assumingSingleTypeKeyedOnTarget: boundTargetKeys.size,
+      assumingSingleTypeDirectoryAuditOnly: auditBoundKeys.size,
+      assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget: auditBoundTargetKeys.size,
       unattributed,
       needingClassification,
     },
@@ -381,10 +436,9 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     invariants: {
       rowsMissingFromMapping: rows.map((row) => row.id).filter((id) => !mapped.has(id)).sort(),
       duplicatedNotificationIds: [...duplicated].sort(),
-      // The events behind the rows are preserved by construction — nothing here discards
-      // an occurrence count — and the report states the total so that applying the mapping
-      // can be checked against it rather than trusted.
-      occurrencesPreserved: occurrences === rows.reduce((sum, row) => sum + row.occurrenceCount, 0),
+      occurrencesPreserved:
+        mapping.reduce((sum, entry) => sum + entry.occurrenceCount, 0)
+        === rows.reduce((sum, row) => sum + row.occurrenceCount, 0),
     },
   }
 }

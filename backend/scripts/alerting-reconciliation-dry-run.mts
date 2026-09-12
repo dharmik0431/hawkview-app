@@ -133,11 +133,18 @@ async function main() {
     rejected: [],
     auditJoin: {
       keysNamingAnAuditRecord: auditIds.length,
+      distinctAuditIds: new Set(auditIds).size,
       auditRecordsFound: audits.length,
-      // A shortfall here is a real finding rather than noise: it means the notification
-      // outlived the evidence it was raised from. Measured as zero across all 317, which
-      // says the key parses cleanly.
-      notJoined: auditIds.length - audits.length,
+      // AGAINST THE DISTINCT COUNT, because findMany returns one row per distinct id while
+      // auditIds is not deduplicated — and `dedupeKey` is unique PER ORGANIZATION rather
+      // than globally, so two organizations holding the same audit id produced a phantom
+      // shortfall. The error could only ever over-report, never under-report.
+      //
+      // Which makes the measured zero a stronger result than it looked: an over-reporting
+      // metric reading zero establishes BOTH that every id joined AND that no audit id is
+      // shared across organizations. That second fact was not measured; it follows from the
+      // direction of the error.
+      notJoined: new Set(auditIds).size - audits.length,
     },
   })
 }
@@ -162,6 +169,15 @@ function printReport(
     byShape: report.byShape,
     auditCategories: report.auditCategories,
     unrecognisedExamples: report.unrecognisedExamples,
+    // THE NUMBERS CARRY THEIR CAVEAT IN THE OUTPUT, not only in the source. A figure
+    // printed as "incidents" that is really "a floor computed over all rows" is exactly the
+    // kind of thing that gets quoted into a decision and then relied on.
+    incidentsNote:
+      'declared counts ONLY rows whose type the key shape determines, which excludes every '
+      + 'directory-audit row. assumingSingleType* are LOWER BOUNDS: undetermined rows are '
+      + 'counted under one nominated type, and classification can only split an actor\'s '
+      + 'events across types, never merge them. The DirectoryAuditOnly pair is the '
+      + 'like-for-like comparison against a SQL figure filtered on that key prefix.',
     incidents: report.incidents,
     invariants: report.invariants,
     ...(context.auditJoin === null ? {} : { auditJoin: context.auditJoin }),

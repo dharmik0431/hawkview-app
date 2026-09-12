@@ -416,3 +416,52 @@ recorded with the other handoff obligations for exactly that reason.
 - **A window reads as covered when a collector was down.** Check the tolerance before the
   walk. A tolerance far above the collection cadence lets a real outage pass, and the
   tolerance is a parameter precisely so that it is visible rather than buried.
+
+## Three corrections from QA, and one from PM
+
+**`occurrencesPreserved` was vacuous, and its label was the worse half.** It compared a loop
+accumulator against a reduce over the same array with the same addition — both sides equally
+wrong and therefore always agreeing. Searched for a falsifying input: ordinary, zero,
+negative, `MAX_SAFE_INTEGER`, fractional values where addition is not associative, 200,000
+random sets. Nothing, bar `Infinity + -Infinity` giving `NaN`, which is an artefact.
+
+The comment claimed the events are preserved *"so that applying the mapping can be checked
+against it rather than trusted"* — which reads as a check on consolidation, when **the
+mapping was not in the computation at all**. Its sibling one line up honestly calls itself a
+tripwire; this one did not, so a reader comparing them would take the unlabelled one for the
+stronger and it was the weaker.
+
+Fixed by making it real rather than by relabelling: the mapping now carries each row's
+occurrence count — which the apply phase needs anyway — so the two sides come from different
+places. Verified by corrupting a mapping entry, which fails a test the old form could not
+have. The reported boolean is still hardcodable, because no input falsifies it, and that is
+now said in the file.
+
+**The floor label travels with the number.** `declared` excludes every directory-audit row,
+so the only populated counts are the bounds — and a figure printed as "incidents" that is
+really "a floor over all rows" is what gets quoted into a decision and relied on. The output
+now carries an `incidentsNote` stating which rows each number covers and that the bounds are
+floors.
+
+**And a like-for-like pair was missing.** The production figures were computed with SQL
+filtered on the directory-audit key prefix; `assumingSingleType` covers *every* row.
+Comparing those two would find a disagreement that was never there. The report now also
+gives the bound restricted to directory-audit rows, which is the number to compare — and a
+test asserts the restricted count never exceeds the wider one, so they are comparable rather
+than merely adjacent. **Treat the SQL figures as a rival instrument: if they disagree, one of
+us is wrong and it is worth finding before either number is used.**
+
+**`notJoined` could only over-report, and that makes the measured zero stronger.**
+`auditIds` was not deduplicated while `findMany` returns one row per distinct id — and
+`dedupeKey` is unique **per organization**, not globally, so two organizations holding the
+same audit id produced a phantom shortfall. Now compared against the distinct count.
+
+The consequence is the better half, and it came from reasoning about the direction of the
+error rather than from measuring again: because the metric can only over-report, a measured
+**zero** establishes both that every id joined **and** that no audit id is shared across
+organizations. The second fact was never measured.
+
+**Accounting correction, from PM:** there are **six** key shapes covering nine production
+forms. `Directory_`, `SSPR_`, `PIM_` and `Authentication Methods_` are audit *categories*
+inside one shape, which the parser extracts separately — two levels conflated in the earlier
+count.
