@@ -332,6 +332,21 @@ everything else. Inventing a mapping here is exactly the shortcut that put a cal
 category in the cause key in the first place. `RoutableIncident.ruleId` is kept alongside
 `alertTypeId` for the preference grain, but the type for those findings has to be declared.
 
+### The preference grain for the five non-directory types is the type itself
+
+The `DECLARED_TYPE` origin sets `ruleId = alertTypeId`, because for those five the type IS
+the grain — `monitoring.collector_failing` is both. **Coherent today, and a trap for whoever
+adds the first finer rule under one of them.**
+
+If a finer rule ever appears there, an MSP could not silence it separately — and **the
+collapse would be invisible, because the field would still be populated.** `ruleId` would
+read as a rule and mean a type, which is this feature's recurring shape: a value present and
+correct-looking while meaning something coarser than the reader assumes.
+
+Not a defect now. Recorded here rather than in a commit message so that whoever adds that
+rule meets it while looking at the grain, instead of learning it from a support ticket about
+an MSP who turned off more than they meant to.
+
 ### One follow-on, flagged rather than decided
 
 The cause key now uses `alertTypeId`, the coarse declared type. Preferences are per **fine**
@@ -359,7 +374,15 @@ it is a valid value of a real type, and only the pair is nonsense.
 This applies to the remaining steps as a design rule, not as a thing to check afterwards. A
 review can catch a wrong value; only the shape can stop the pair existing.
 
-### The residual, closed by derivation
+### ~~The residual, closed by derivation~~ — SUPERSEDED, and it was not closed
+
+> **This section was wrong when written.** The derivation existed but the fields were still
+> supplied independently, so the pair it claims to prevent was still writeable and still
+> merged two tenants. See **"Correction: the previous commit claimed a closure that was
+> open"** below for what was actually wrong and what closed it.
+>
+> Kept rather than deleted, because the reasoning about *where the mapping already lives*
+> is sound and is what the real fix was built on. What was wrong is the word **closed**.
 
 `alertTypeId` and `ruleId` were independent fields with nothing tying them, so a
 security-natured rule paired with an operational type merged two tenants again. Not live —
@@ -515,3 +538,94 @@ incident set from the deliveries, so an incident nobody had been told about did 
 have a ladder — and the property passed vacuously against both the reference and the defect.
 Incidents are an input of their own. **Fourth instance of the same rule: a property about
 something that did not happen cannot be carried by a list of things that did.**
+
+# 05b: delivery limits and escalation
+
+Types first again. The three QA said they would check in order are each made **structural**
+rather than checked, so the defect has no shape to take.
+
+## A limit-induced hold has no `until` to invent
+
+Quiet hours release at a time — 07:00, a `Date`, and a person can be told it. **A limit
+releases when volume falls, which is not a time.**
+
+Reuse `HELD` and something must go in `until`, and whatever goes there is a guess. The failure
+is the worst kind this feature produces: **the hold sits forever while the incident is in
+exactly one bucket and every accounting identity passes.** Silence that satisfies the books.
+
+So `DeliveryTiming` gains a third variant carrying a **`ReleaseCondition`**, and there is
+nowhere to put a timestamp:
+
+| condition | releases when |
+|---|---|
+| `WHEN_VOLUME_FALLS` | this MSP's volume for the tick is back under the limit — the numbers are carried, so the sentence a person reads is checkable rather than "temporarily deferred" |
+| `WITH_THE_CAUSE_AHEAD_OF_IT` | the cause it was folded behind is delivered |
+
+And the two waits stay **distinguishable**, so a reader can be told which kind this is and
+therefore what ends it. *"Held until 07:00"* and *"held until volume falls"* are different
+sentences and only one of them can be waited out.
+
+## Folding flattens; an aggregate of aggregates cannot be constructed
+
+`Delivery.incidentKeys` resists nesting only one level deep, so an aggregate holding aggregates
+loses what is inside it — **silence produced by a feature whose purpose is clarity.**
+
+`fold` takes an aggregate and a **delivery**, and appends. There is no fold-two-aggregates, so
+nesting is not an operation that exists; an `Aggregate`'s members are `Delivery[]` and a
+delivery is not an aggregate. `incidentsCoveredBy` derives the covered set rather than carrying
+a count, so it cannot fall out of step with the members it counts.
+
+**Constructed rather than reasoned about**, as QA asked: three folds, three names, fold a
+fourth and the first three are still there and still in order.
+
+## The escalation input has incidents of its own
+
+Derive the set from deliveries and **an incident nobody was told about does not exist to have a
+ladder** — so the property passes vacuously against a correct implementation and a broken one
+alike. That is the fourth instance, and the general form is now worth stating plainly:
+
+> **A property about something that did not happen cannot be carried by a list of things that
+> did.**
+
+Coverage could not come from what was sent. Silenced rules could not come from what fired.
+Absence could not come from a flat list of emissions. Now the ladder cannot come from
+deliveries. Same sentence, four features apart.
+
+### And it measures from the notification, not the incident
+
+`rungFor(incident, now)` is the shape that looks natural and cannot express the property. An
+incident raised at 02:00 and first delivered at 07:00 after quiet hours is **five hours old and
+zero minutes notified** — a ladder measuring the first climbs a rung before the first message
+has landed. The input is `Notified`, and there is no incident time on it to reach for.
+
+### An assumed acknowledgement has no constructor
+
+`Acknowledgement` is `ACKNOWLEDGED` (with who and when) or `NOT_ACKNOWLEDGED`. There is no
+`ASSUMED`. *"Somebody probably saw it"* is not a state: if it were representable, **a ladder
+could be stopped by an inference nobody made.** Same shape as the recipient union — the honest
+refusal is a variant, and the thing that must not exist is given no way to be written.
+
+### `EXHAUSTED` is not a failure
+
+It means we told everybody we were told to tell. The sentence is asserted not to read as a
+malfunction. Whether it also raises something to HawkView's own operators is a product question
+left unanswered rather than defaulted into a state that looks like an error.
+
+### And the ladder needs a sequence
+
+One `now` cannot express two advances — the same snapshot-to-sequence repair as quiet hours,
+**arriving a third time in this feature.**
+
+## Still for PM, not assumed
+
+**Acknowledgement is per incident**, so acknowledging a coalesced message about fifteen tenants
+acknowledges the cause. If an MSP must acknowledge each tenant, coalescing and escalation are
+in tension and the resolution is a product call.
+
+**A rung is a delivery**, so `RECORD_ONLY` silences the ladder too. I think that is right — an
+MSP who silenced a rule has by the same act silenced its escalation — but it should be
+deliberate.
+
+**The limit number is not measured.** The honest input is causes per MSP per tick on production
+data, which this worktree does not have. Until then it is a constant labelled *not yet
+measured* — unlike the staleness threshold, which has 5,166 runs behind it.

@@ -96,6 +96,10 @@ export type Recipient =
  * the choice is made rather than inherited. */
 export type DeliveryTiming =
   | Readonly<{ kind: 'IMMEDIATE' }>
+  /** Held by a LIMIT rather than by the clock. Carries a condition, never an `until` — see
+   * `ReleaseCondition`. A limit releases when volume falls, which is not a time, and inventing
+   * a timestamp for it produces a hold that sits forever while the books still balance. */
+  | Readonly<{ kind: 'LIMITED'; releaseWhen: ReleaseCondition; because: string }>
   | Readonly<{
       kind: 'HELD'
       until: Date
@@ -576,4 +580,108 @@ export function alertTypeForChange(classification: ChangeClassification): TypeFo
           + 'record or page somebody about a read scope.',
       }
   }
+}
+
+// ---------------------------------------------------------------------------------------
+// 05b: DELIVERY LIMITS AND ESCALATION. Types first, and the three sharp edges are structural.
+// ---------------------------------------------------------------------------------------
+
+/** WHY A LIMIT CANNOT REUSE `HELD`.
+ *
+ * A quiet-hours hold has a natural release: the hour they end. A `Date`, checkable, and a
+ * person can be told "07:00". A LIMIT RELEASES WHEN VOLUME FALLS, WHICH IS NOT A TIME. There
+ * is no hour to name, because the answer depends on what happens next.
+ *
+ * Invent an `until` for it and the failure is the worst kind this feature produces: the hold
+ * sits forever while every accounting identity still passes. The incident is in `stillHeld`,
+ * it is in exactly one bucket, the books balance, and nobody is ever told. SILENCE THAT
+ * SATISFIES THE BOOKS.
+ *
+ * So a limited delivery carries a release CONDITION. There is no timestamp to invent because
+ * the variant has nowhere to put one. */
+export type ReleaseCondition =
+  /** Goes as soon as this MSP's volume for the tick is back under the limit. */
+  | Readonly<{ kind: 'WHEN_VOLUME_FALLS'; limit: number; observed: number }>
+  /** Goes when the cause it was folded behind is delivered. */
+  | Readonly<{ kind: 'WITH_THE_CAUSE_AHEAD_OF_IT'; causeKey: string }>
+
+/** ONE AGGREGATE, FLAT, WITH EVERY INCIDENT STILL NAMED.
+ *
+ * `Delivery.incidentKeys` resists nesting only one level deep, so an aggregate of aggregates
+ * loses what is inside it — silence produced by a feature whose purpose is clarity.
+ *
+ * FOLDING FLATTENS. `fold` concatenates the members of both sides rather than nesting one
+ * inside the other, so the count of named incidents is preserved however many times a
+ * delivery is folded. There is no nested-aggregate shape to construct: an `Aggregate` holds
+ * deliveries, and a delivery is not an aggregate. */
+export interface Aggregate {
+  readonly organizationId: string
+  readonly causeKey: string
+  readonly tickAt: Date
+  /** Every delivery folded in, flat. Never an aggregate — the type says so. */
+  readonly members: readonly Delivery[]
+}
+
+/** Fold a delivery into an aggregate, flattening.
+ *
+ * Deliberately takes and returns the same shape so folding repeatedly is the same operation,
+ * and there is no second "fold two aggregates" that could nest by accident. */
+export function fold(into: Aggregate, delivery: Delivery): Aggregate {
+  return { ...into, members: [...into.members, delivery] }
+}
+
+/** Every incident an aggregate speaks for, however deep the folding went.
+ *
+ * A count rather than a boolean, and derived rather than carried, so it cannot fall out of
+ * step with the members it counts. */
+export function incidentsCoveredBy(aggregate: Aggregate): readonly string[] {
+  return aggregate.members.flatMap((member) => member.incidentKeys)
+}
+
+/** ESCALATION MEASURES FROM THE NOTIFICATION, NOT FROM THE INCIDENT.
+ *
+ * `rungFor(incident, now)` is the shape that looks natural and cannot express the property:
+ * time since the incident is not time since anybody was told. An incident raised at 02:00 and
+ * first delivered at 07:00 after quiet hours is five hours old and zero minutes notified, and
+ * a ladder measuring the first will climb a rung before the first message has landed.
+ *
+ * So the ladder's input is the NOTIFICATION. */
+export interface Notified {
+  readonly incidentKey: string
+  readonly organizationId: string
+  /** When somebody was actually told. Not when it happened. */
+  readonly notifiedAt: Date
+}
+
+/** WHO ACKNOWLEDGED AND WHEN — and an assumed acknowledgement has no constructor.
+ *
+ * Same shape as the recipient union: the honest refusal is a variant, and the thing that must
+ * not exist is given no way to be written. "Somebody probably saw it" is not a state; if it
+ * were representable, a ladder could be stopped by an inference nobody made. */
+export type Acknowledgement =
+  | Readonly<{ kind: 'ACKNOWLEDGED'; by: string; at: Date }>
+  | Readonly<{ kind: 'NOT_ACKNOWLEDGED' }>
+
+/** Where an incident stands on the ladder. */
+export type EscalationState =
+  | Readonly<{ kind: 'WAITING'; notifiedAt: Date; rungsClimbed: number; nextRungAt: Date }>
+  | Readonly<{ kind: 'ACKNOWLEDGED'; by: string; at: Date }>
+  /** Every rung climbed and still nobody. NOT A FAILURE STATE: it means we told everybody we
+   * were told to tell. Whether it also raises something to HawkView's own operators is a
+   * product question, deliberately unanswered here rather than defaulted. */
+  | Readonly<{ kind: 'EXHAUSTED'; rungsClimbed: number; lastRungAt: Date; because: string }>
+
+/** THE LADDER'S INPUT IS ITS OWN, NOT A PROJECTION OF WHAT WAS SENT.
+ *
+ * Deriving the set from deliveries means an incident nobody was told about does not exist to
+ * have a ladder — and the property about it passes vacuously against both a correct
+ * implementation and a broken one. Fourth instance of the rule: A PROPERTY ABOUT SOMETHING
+ * THAT DID NOT HAPPEN CANNOT BE CARRIED BY A LIST OF THINGS THAT DID.
+ *
+ * `notified` is where the clock starts and `acknowledgements` is what stops it; an incident
+ * appearing in neither is precisely the case worth being able to see. */
+export interface EscalationTick {
+  readonly at: Date
+  readonly notified: readonly Notified[]
+  readonly acknowledgements: readonly Readonly<{ incidentKey: string; ack: Acknowledgement }>[]
 }

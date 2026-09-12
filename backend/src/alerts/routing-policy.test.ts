@@ -4,12 +4,18 @@ import { alertType, ALERT_CATALOG } from './alert-catalog.js'
 import {
   alertTypeForChange,
   causeKeyOf,
+  fold,
+  incidentsCoveredBy,
   routableIncident,
   type IncidentOrigin,
   contradictions,
   defaultPreference,
   fanOutProblems,
+  type Acknowledgement,
+  type Aggregate,
   type CoverageStatement,
+  type EscalationState,
+  type EscalationTick,
   type Delivery,
   type DeliveryPreference,
   type PreferenceChange,
@@ -653,4 +659,134 @@ test('EVERY DERIVED TYPE IS ONE THE CATALOGUE DECLARES, and carries the category
     assert.notEqual(causeKeyOf(inTenant('tenant-1')), causeKeyOf(inTenant('tenant-2')),
       `${classification} must not coalesce the same admin across two tenants`)
   }
+})
+
+/** 05b: the three QA will check first, each made structural rather than checked. */
+
+test('A LIMIT-INDUCED HOLD HAS NO `until` TO INVENT', () => {
+  // Quiet hours release at a time — 07:00, a Date, and a person can be told it. A LIMIT
+  // RELEASES WHEN VOLUME FALLS, WHICH IS NOT A TIME. Invent an `until` and the hold sits
+  // forever while the incident is in exactly one bucket and every accounting identity passes:
+  // SILENCE THAT SATISFIES THE BOOKS.
+  const limited: Delivery = delivery({
+    timing: {
+      kind: 'LIMITED',
+      releaseWhen: { kind: 'WHEN_VOLUME_FALLS', limit: 20, observed: 47 },
+      because: '47 causes this tick, over the limit of 20.',
+    },
+  })
+  assert.equal(limited.timing.kind, 'LIMITED')
+
+  const invented: Delivery = delivery({
+    // @ts-expect-error a limited hold has nowhere to put a timestamp
+    timing: { kind: 'LIMITED', releaseWhen: { kind: 'WHEN_VOLUME_FALLS', limit: 20, observed: 47 }, because: 'x', until: DUE_AT },
+  })
+  assert.ok(invented)
+
+  // AND IT IS NOT THE QUIET-HOURS SHAPE WEARING A DIFFERENT LABEL: the two timings are
+  // distinguishable, so a reader can be told which kind of wait this is and therefore what
+  // ends it. "Held until 07:00" and "held until volume falls" are different sentences.
+  const byClock = delivery({ timing: { kind: 'HELD', until: DUE_AT, because: 'quiet hours' } })
+  assert.notEqual(JSON.stringify(limited.timing), JSON.stringify(byClock.timing))
+  assert.equal(byClock.timing.kind === 'HELD' ? byClock.timing.until.getTime() : 0, DUE_AT.getTime())
+
+  // The condition names the numbers, so the sentence a person reads is checkable rather than
+  // "temporarily deferred".
+  const release = limited.timing.kind === 'LIMITED' ? limited.timing.releaseWhen : null
+  assert.equal(release?.kind === 'WHEN_VOLUME_FALLS' ? release.observed : 0, 47)
+})
+
+test('FOLDING FLATTENS — an aggregate of aggregates cannot be constructed', () => {
+  // `incidentKeys` resists nesting only one level deep, so an aggregate holding aggregates
+  // loses what is inside it: silence produced by a feature whose purpose is clarity.
+  const base: Aggregate = {
+    organizationId: 'org-1',
+    causeKey: 'monitoring.collector_failing/SIGN_INS',
+    tickAt: HELD_AT,
+    members: [],
+  }
+  const three = ['tenant-1', 'tenant-2', 'tenant-3'].reduce(
+    (acc, tenant) => fold(acc, delivery({ incidentKeys: [`k-${tenant}`] })), base)
+
+  assert.equal(three.members.length, 3)
+  assert.deepEqual(incidentsCoveredBy(three), ['k-tenant-1', 'k-tenant-2', 'k-tenant-3'])
+
+  // FOLD AGAIN AND NOTHING IS LOST — the property that a nested shape would break. Constructed
+  // rather than reasoned about: the count of named incidents survives repeated folding.
+  const four = fold(three, delivery({ incidentKeys: ['k-tenant-4'] }))
+  assert.equal(incidentsCoveredBy(four).length, 4)
+  assert.deepEqual(incidentsCoveredBy(four).slice(0, 3), incidentsCoveredBy(three),
+    'folding appends; it never replaces or buries what was already named')
+
+  // @ts-expect-error an aggregate is not a delivery, so it cannot be folded into another one
+  const nested: Aggregate = fold(base, three)
+  assert.ok(nested)
+
+  // @ts-expect-error nor can members hold aggregates directly
+  const nestedMembers: Aggregate = { ...base, members: [three] }
+  assert.ok(nestedMembers)
+})
+
+test('THE ESCALATION INPUT HAS INCIDENTS OF ITS OWN, not a projection of what was sent', () => {
+  // Derive the set from deliveries and an incident nobody was told about does not exist to
+  // have a ladder — so the property passes VACUOUSLY against a correct implementation and a
+  // broken one alike. Fourth instance: a property about something that did not happen cannot
+  // be carried by a list of things that did.
+  const tick: EscalationTick = {
+    at: DUE_AT,
+    notified: [{ incidentKey: 'k-1', organizationId: 'org-1', notifiedAt: HELD_AT }],
+    acknowledgements: [],
+  }
+  assert.equal(tick.notified.length, 1)
+  assert.equal(tick.acknowledgements.length, 0,
+    'notified but unacknowledged is the case the ladder exists for, and it is representable')
+
+  // THE CLOCK STARTS AT THE NOTIFICATION, NOT AT THE INCIDENT. An incident raised at 02:00 and
+  // first delivered at 07:00 after quiet hours is five hours old and zero minutes notified; a
+  // ladder measuring the first climbs a rung before the first message has landed.
+  const raisedAt = new Date(HELD_AT.getTime() - 5 * 60 * 60 * 1000)
+  assert.notEqual(tick.notified[0]?.notifiedAt.getTime(), raisedAt.getTime())
+  assert.ok(tick.notified[0]?.notifiedAt !== undefined,
+    'the ladder reads a notification time, and there is no incident time on this input to reach for')
+
+  // AN ASSUMED ACKNOWLEDGEMENT HAS NO CONSTRUCTOR. "Somebody probably saw it" is not a state:
+  // if it were representable, a ladder could be stopped by an inference nobody made.
+  const real: Acknowledgement = { kind: 'ACKNOWLEDGED', by: 'user-7', at: DUE_AT }
+  assert.equal(real.kind, 'ACKNOWLEDGED')
+
+  // @ts-expect-error there is no ASSUMED variant
+  const assumed: Acknowledgement = { kind: 'ASSUMED', because: 'the inbox was open' }
+  assert.ok(assumed)
+
+  // @ts-expect-error nor an acknowledgement without an author
+  const anonymous: Acknowledgement = { kind: 'ACKNOWLEDGED', at: DUE_AT }
+  assert.ok(anonymous)
+})
+
+test('EXHAUSTED IS NOT A FAILURE, and the ladder needs more than one moment', () => {
+  // Exhausted means we told everybody we were told to tell. Whether it also raises something
+  // to HawkView's own operators is a product question, deliberately unanswered rather than
+  // defaulted into a state that reads like an error.
+  const exhausted: EscalationState = {
+    kind: 'EXHAUSTED', rungsClimbed: 3, lastRungAt: DUE_AT,
+    because: 'Every named recipient was contacted and none acknowledged.',
+  }
+  assert.doesNotMatch(exhausted.because, /fail|error|lost/i,
+    'the sentence must not read as a malfunction — it is a completed ladder')
+
+  // A LADDER ADVANCES OVER TIME, so one `now` cannot express two advances. Same
+  // sequence-not-snapshot repair as quiet hours, arriving a third time in this feature.
+  const ticks: readonly EscalationTick[] = [
+    { at: HELD_AT, notified: [{ incidentKey: 'k-1', organizationId: 'org-1', notifiedAt: HELD_AT }],
+      acknowledgements: [] },
+    { at: new Date(HELD_AT.getTime() + 30 * 60 * 1000), notified: [], acknowledgements: [] },
+    { at: new Date(HELD_AT.getTime() + 60 * 60 * 1000), notified: [], acknowledgements: [] },
+  ]
+  assert.equal(ticks.length, 3, 'two advances need three moments, and one call has one')
+
+  // Acknowledgement stops it, permanently — and it is per INCIDENT, so acknowledging a
+  // coalesced message about fifteen tenants acknowledges the cause. Flagged to PM as the
+  // decision it is, rather than assumed here.
+  const stopped: EscalationState = { kind: 'ACKNOWLEDGED', by: 'user-7', at: DUE_AT }
+  assert.equal(stopped.kind, 'ACKNOWLEDGED')
 })
