@@ -116,8 +116,8 @@ overclaimed while the code was right.
 
 ## What is not done, and why
 
-**I cannot run the dry run.** It requires reading the 364 live alerts, and this work has no
-production access — the same constraint that meant the episode-interval measurement came
+**The generator is built and runnable; I cannot run it.** Reading the 364 live alerts needs
+production access this work does not have — the same constraint that meant the episode-interval measurement came
 from PM rather than from me. What can be built here is the report *generator* and its
 producers, tested against fixtures; producing the actual numbers needs someone with access.
 
@@ -128,6 +128,85 @@ counts from the same events, and the shape of that answer is the thing to react 
 counts should appear in the dry run; `incidentGrouping` takes the declaration, so producing
 the target-keyed count as a comparison means constructing a second declaration with
 `subject: 'TARGET'` rather than changing anything — cheap, and worth having.
+
+## The dry run: what exists, and how to run it
+
+`backend/src/alerts/reconciliation.ts` is the generator — a **pure function from rows to a
+report**, with no client, clock or environment. `backend/scripts/alerting-reconciliation-dry-run.mts`
+is the runner: two `findMany` calls and a print.
+
+```bash
+npx tsx scripts/alerting-reconciliation-dry-run.mts
+```
+
+**It writes nothing.** No `create`, `update`, `upsert`, `delete` or raw execute appears on
+any code line — verified by grep over non-comment lines, after a first attempt matched only
+the comment that *claimed* the property. The mapping it prints is a proposal; applying it is
+a separate step and reversible, because every entry carries its original notification id.
+
+### The six key shapes, taken from the code rather than the data
+
+| shape | key | what it does today |
+|---|---|---|
+| `DIRECTORY_AUDIT` | `security:directory-audit:{auditId}` | the 301 — carries an event id, so it deduplicates perfectly and groups not at all |
+| `TENANT_SYNC` | `tenant:{id}:sync:{resourceType}` | the 334 collapsed into 15 — no event id, so it groups everything and deduplicates nothing |
+| `TENANT_CONNECTION` | `tenant:{id}:connection` | |
+| `TENANT_INITIAL_SYNC` | `tenant:{id}:initial-sync` | |
+| `TENANT_ONBOARDING` | `tenant:{id}:onboarding-authorized` | |
+| `RECOVERY` | `{anyKey}:recovered:{occurrenceCount}` | **the counter is in the key** |
+
+The list comes from the `dedupeKey:` literals in the codebase, not from the keys present in
+production — a list derived from the data would describe what happens to be there and
+silently omit any shape that has not fired yet, then call that coverage.
+
+**`RECOVERY` is the new finding.** The occurrence count is part of the key, so the same
+logical recovery produces a **different key every time the count moves**. That is the 301
+defect one layer over: a counter embedded in an identity makes the identity non-repeating,
+so recoveries cannot deduplicate against each other at all. It is parsed before the shapes
+it wraps — a recovery of a sync alert matches the sync pattern too, and checking in the other
+order would classify every recovery as whatever it recovered, losing exactly the count this
+step needs.
+
+### An audit row is not given a default type
+
+The shape says *a directory change happened*; whether it was **privileged** is a property of
+the change, not of the key. So those rows are reported as needing classification rather than
+assigned a type. Defaulting to the routine type would file real privileged changes as
+records — the 301 problem arriving from the migration instead of from the collector.
+
+### Both counts, from the same rows
+
+The declared count groups on the subject each type declares — **actor** for directory
+changes. The comparison count keys the same rows on the **target** instead, by constructing a
+declaration with `subject: 'TARGET'` rather than changing anything. The two numbers differ
+only in the subject, which is what makes them comparable.
+
+### The report checks its own output
+
+| invariant | status |
+|---|---|
+| `duplicatedNotificationIds` | **tested** — a bad join returning the same row twice is reachable and caught |
+| `rowsMissingFromMapping` | a **tripwire**, not a tested property |
+| `occurrencesPreserved` | tested |
+
+`rowsMissingFromMapping` is labelled honestly because no input can make this generator drop
+a row — both branches push — so a hardcoded empty array passes every test, and a mutation
+doing that survives. It guards a *future* change that adds a skipping branch, which is a real
+risk in a migration that will grow cases. An empty list there is the alarm not having gone
+off, not evidence the mapping is complete.
+
+These were booleans first, and the mutation that hardcoded the most important one —
+"every row mapped exactly once" — survived everything. Naming the offending ids is what made
+the duplicate case testable, and the arithmetic it shares is what gives the other list any
+assurance at all. Same move as removing the coverage boolean: a list cannot be asserted into
+existence as cheaply as a `true`.
+
+### Occurrences are stated, because consolidating must preserve them
+
+A report saying "51 incidents" without saying how many occurrences they represent invites
+reading consolidation as deletion. The 301 and the 334 are real events; they are simply not
+301 and 334 problems.
+
 
 ## What to check first when this breaks
 
