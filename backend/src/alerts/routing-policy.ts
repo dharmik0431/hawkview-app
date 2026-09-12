@@ -765,3 +765,128 @@ export function statements(outcome: RoutingOutcome): readonly string[] {
     ...outcome.unanswered.map((entry) => entry.sentence),
   ]
 }
+
+// ---------------------------------------------------------------------------------------
+// THE LIMIT. Withholds, never drops; releases what it withheld; counted over a declared scope.
+// ---------------------------------------------------------------------------------------
+
+/** How much one MSP may be told in one tick.
+ *
+ * THE SCOPE IS DECLARED RATHER THAN IMPLIED, which is L4. A limit counted over the wrong thing
+ * is not a smaller limit, it is a different one: per tenant would let a hundred tenants send a
+ * hundred times the volume, and "per hour" would let a burst through and then throttle a quiet
+ * period. Per MSP per tick matches `fanOutProblems`, so the limit and the fan-out invariant
+ * measure the same window rather than two that nearly agree.
+ *
+ * THE NUMBER IS NOT MEASURED. The honest input is observed causes per MSP per tick on
+ * production data, which no worktree here has, so this carries its provenance the way
+ * `STALE_AFTER_MS` carries its 5,166 runs — except that here the provenance is *not yet
+ * measured*, and saying so is the point. */
+export interface LimitPolicy {
+  readonly perOrganizationPerTick: number
+  /** Why this number. Currently: nobody has measured it. */
+  readonly because: string
+}
+
+export const UNMEASURED_LIMIT: LimitPolicy = {
+  perOrganizationPerTick: 20,
+  because:
+    'NOT YET MEASURED. A placeholder pending observed causes per MSP per tick on production '
+    + 'data. Twenty is a guess chosen to be visibly a guess rather than to look authoritative.',
+}
+
+/** What the limit did with one tick's deliveries.
+ *
+ * EVERY INPUT APPEARS IN EXACTLY ONE OF THESE, which is L1 stated as an accounting identity
+ * rather than as a promise. There is no fourth list and no `dropped` — a limit that drops is
+ * silence produced by a feature whose purpose is volume, and the shape has nowhere to put it. */
+export interface LimitOutcome {
+  readonly sent: readonly Delivery[]
+  /** Carrying `LIMITED` timing with a release CONDITION, never an `until`. A limit releases
+   * when volume falls, which is not a time; inventing a timestamp produces the hold that sits
+   * forever while every accounting identity still passes. */
+  readonly withheld: readonly Delivery[]
+  /** Withheld deliveries coming due together, folded so they do not immediately re-trip the
+   * limit — and folded FLAT, so every incident inside is still named. */
+  readonly released: readonly Aggregate[]
+  /** Empty when every input is accounted for exactly once. */
+  readonly accountingProblems: readonly string[]
+}
+
+/** Most urgent first, so a phone-tier delivery is never withheld behind a digest. */
+const URGENCY: Record<RoutingTier, number> = { PHONE: 0, EMAIL: 1, IN_APP: 2 }
+
+/** Apply the limit to one tick, carrying forward anything withheld earlier.
+ *
+ * L2 IS WHY `carriedOver` IS A PARAMETER. A withheld delivery that is never looked at again is
+ * indistinguishable from a dropped one, and "we withheld it" is not a defence if nothing ever
+ * releases it. So release is part of the same function rather than a separate path somebody
+ * has to remember to call.
+ *
+ * WHAT COMES DUE GOES AS ONE AGGREGATE. Releasing forty withheld deliveries as forty messages
+ * would re-trip the limit immediately and withhold most of them again — a queue that never
+ * drains. Folding them flattens, so the aggregate names every incident it speaks for and
+ * nothing is lost inside it. */
+export function applyLimit(
+  carriedOver: readonly Delivery[],
+  arriving: readonly Delivery[],
+  policy: LimitPolicy,
+  tickAt: Date,
+): LimitOutcome {
+  const byOrg = new Map<string, Delivery[]>()
+  for (const delivery of [...carriedOver, ...arriving]) {
+    byOrg.set(delivery.organizationId, [...(byOrg.get(delivery.organizationId) ?? []), delivery])
+  }
+
+  const sent: Delivery[] = []
+  const withheld: Delivery[] = []
+  const released: Aggregate[] = []
+
+  for (const [organizationId, all] of byOrg) {
+    // Most urgent first. Within a tier, what was carried over goes before what just arrived —
+    // otherwise a busy MSP starves its own backlog and the oldest alert is the last one told.
+    const carriedIds = new Set(carriedOver.map((delivery) => delivery.causeKey))
+    const ordered = [...all].sort((left, right) =>
+      URGENCY[left.tier] - URGENCY[right.tier]
+      || Number(carriedIds.has(right.causeKey)) - Number(carriedIds.has(left.causeKey)))
+
+    const room = Math.max(0, policy.perOrganizationPerTick)
+    const goingNow = ordered.slice(0, room)
+    const over = ordered.slice(room)
+
+    // Anything carried over that fits goes as ONE aggregate rather than as separate messages,
+    // so draining the backlog does not immediately re-trip the limit.
+    const drained = goingNow.filter((delivery) => carriedIds.has(delivery.causeKey))
+    const fresh = goingNow.filter((delivery) => !carriedIds.has(delivery.causeKey))
+    sent.push(...fresh)
+    if (drained.length > 0) {
+      released.push(drained.reduce<Aggregate>(
+        (into, delivery) => fold(into, delivery),
+        { organizationId, causeKey: `released-backlog/${tickAt.toISOString()}`, tickAt, members: [] }))
+    }
+
+    for (const delivery of over) {
+      withheld.push({
+        ...delivery,
+        timing: {
+          kind: 'LIMITED',
+          releaseWhen: { kind: 'WHEN_VOLUME_FALLS', limit: room, observed: ordered.length },
+          because: `${ordered.length} causes this tick for this organisation, over the limit of ${room}.`,
+        },
+      })
+    }
+  }
+
+  const input = [...carriedOver, ...arriving].length
+  const accountedFor = sent.length + withheld.length
+    + released.reduce((total, aggregate) => total + aggregate.members.length, 0)
+  return {
+    sent,
+    withheld,
+    released,
+    accountingProblems: accountedFor === input
+      ? []
+      : [`${input} deliveries in, ${accountedFor} accounted for — a limit may withhold or `
+        + 'aggregate, never drop, so these must be equal.'],
+  }
+}

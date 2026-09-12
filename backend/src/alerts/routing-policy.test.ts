@@ -3,10 +3,12 @@ import test from 'node:test'
 import { alertType, ALERT_CATALOG } from './alert-catalog.js'
 import {
   alertTypeForChange,
+  applyLimit,
   causeKeyOf,
   fold,
   statements,
   incidentsCoveredBy,
+  UNMEASURED_LIMIT,
   routableIncident,
   type IncidentOrigin,
   contradictions,
@@ -18,6 +20,7 @@ import {
   type EscalationState,
   type EscalationTick,
   type LadderRungs,
+  type LimitPolicy,
   type Delivery,
   type DeliveryPreference,
   type PreferenceChange,
@@ -886,4 +889,111 @@ test('AN UNANSWERED LADDER REACHES THE READER WHO IS NOT LOOKING', () => {
 
   // A quiet week with nothing unanswered says nothing, or the surface means nothing.
   assert.deepEqual(statements(outcome()), [])
+})
+
+/** L1, L2 and L4 — unbound since 05b landed because the function did not exist. */
+
+const TICK = new Date('2026-09-02T09:00:00Z')
+const NEXT = new Date('2026-09-02T09:05:00Z')
+const cap = (n: number): LimitPolicy => ({ perOrganizationPerTick: n, because: 'test' })
+
+const arriving = (n: number, over: Partial<Delivery> = {}): readonly Delivery[] =>
+  Array.from({ length: n }, (_, i) =>
+    delivery({ causeKey: `cause-${i}`, tier: 'EMAIL', tickAt: TICK, incidentKeys: [`k-${i}`], ...over }))
+
+test('L1 — a limit WITHHOLDS, and every delivery is accounted for exactly once', () => {
+  // A limit that drops is silence produced by a feature whose purpose is volume. There is no
+  // bucket for it, and this is that stated as arithmetic rather than as a promise.
+  const outcome = applyLimit([], arriving(30), cap(20), TICK)
+
+  assert.equal(outcome.sent.length, 20)
+  assert.equal(outcome.withheld.length, 10)
+  assert.deepEqual(outcome.accountingProblems, [], 'in equals out')
+  assert.equal(outcome.sent.length + outcome.withheld.length, 30)
+
+  // WITHHELD CARRIES A CONDITION, NEVER AN `until`. A limit releases when volume falls, which
+  // is not a time; an invented timestamp produces the hold that sits forever while every
+  // accounting identity still passes.
+  for (const held of outcome.withheld) {
+    assert.equal(held.timing.kind, 'LIMITED')
+    const release = held.timing.kind === 'LIMITED' ? held.timing.releaseWhen : null
+    assert.equal(release?.kind, 'WHEN_VOLUME_FALLS')
+    assert.equal(release?.kind === 'WHEN_VOLUME_FALLS' ? release.observed : 0, 30,
+      'and the numbers are carried, so the sentence a person reads is checkable')
+  }
+
+  // UNDER THE LIMIT, NOTHING IS WITHHELD — or "withholds everything" satisfies the above.
+  assert.equal(applyLimit([], arriving(5), cap(20), TICK).withheld.length, 0)
+})
+
+test('L1 — the most urgent go first, so a phone alert is never withheld behind a digest', () => {
+  const outcome = applyLimit([], [
+    ...arriving(3, { tier: 'IN_APP' }),
+    ...arriving(2, { tier: 'PHONE' }).map((d, i) => ({ ...d, causeKey: `urgent-${i}` })),
+  ], cap(2), TICK)
+
+  assert.equal(outcome.sent.length, 2)
+  assert.deepEqual(outcome.sent.map((d) => d.tier), ['PHONE', 'PHONE'])
+  assert.deepEqual([...new Set(outcome.withheld.map((d) => d.tier))], ['IN_APP'])
+})
+
+test('L2 — what was withheld is RELEASED, and does not immediately re-trip the limit', () => {
+  // A withheld delivery nobody looks at again is indistinguishable from a dropped one. "We
+  // withheld it" is not a defence if nothing releases it, so release is part of the same
+  // function rather than a path somebody must remember to call.
+  const first = applyLimit([], arriving(30), cap(20), TICK)
+  assert.equal(first.withheld.length, 10)
+
+  const second = applyLimit(first.withheld, [], cap(20), NEXT)
+  assert.equal(second.withheld.length, 0, 'the backlog drains when there is room')
+  assert.equal(second.released.length, 1, 'and goes as ONE aggregate, not ten messages')
+  assert.equal(second.released[0]?.members.length, 10)
+  assert.deepEqual(second.accountingProblems, [])
+
+  // NOTHING IS LOST INSIDE THE AGGREGATE — the second suspicion. Folding flattens, so every
+  // incident it speaks for is still named.
+  assert.deepEqual(
+    [...incidentsCoveredBy(second.released[0]!)].sort(),
+    first.withheld.flatMap((d) => d.incidentKeys).sort())
+
+  // AND THE BACKLOG GOES BEFORE NEW ARRIVALS at the same tier, or a busy MSP starves its own
+  // queue and the oldest alert is the last one told.
+  const third = applyLimit(first.withheld, arriving(15, { causeKey: 'fresh' }), cap(12), NEXT)
+  assert.equal(third.released[0]?.members.length, 10, 'all ten carried-over go first')
+  assert.equal(third.sent.length, 2, 'and only the remaining room goes to new arrivals')
+})
+
+test('L4 — the limit is counted PER ORGANISATION, not across the fleet', () => {
+  // Counted over the wrong scope is not a smaller limit, it is a different one. Per tenant
+  // would let a hundred tenants send a hundred times the volume; across the fleet, one noisy
+  // MSP would silence everybody else.
+  const twoOrgs = [
+    ...arriving(15).map((d) => ({ ...d, organizationId: 'org-1' })),
+    ...arriving(15).map((d) => ({ ...d, organizationId: 'org-2' })),
+  ]
+  const outcome = applyLimit([], twoOrgs, cap(20), TICK)
+
+  assert.equal(outcome.withheld.length, 0, 'fifteen each is under the limit for each')
+  assert.equal(outcome.sent.length, 30, 'even though thirty is over it across the fleet')
+
+  // AND ONE ORGANISATION OVER THE LIMIT DOES NOT WITHHOLD THE OTHER'S.
+  const lopsided = applyLimit([], [
+    ...arriving(25).map((d) => ({ ...d, organizationId: 'org-1' })),
+    ...arriving(3).map((d) => ({ ...d, organizationId: 'org-2' })),
+  ], cap(20), TICK)
+  assert.equal(lopsided.withheld.filter((d) => d.organizationId === 'org-2').length, 0)
+  assert.equal(lopsided.withheld.filter((d) => d.organizationId === 'org-1').length, 5)
+
+  // It matches the fan-out window, so the limit and the invariant measure the same thing
+  // rather than two windows that nearly agree.
+  assert.deepEqual(fanOutProblems(lopsided.sent), [])
+})
+
+test('THE LIMIT NUMBER IS NOT MEASURED, and says so', () => {
+  // The staleness threshold carries 5,166 runs. This carries an admission, which is the honest
+  // difference — a placeholder that reads as authoritative is worse than one that reads as a
+  // guess, because nobody goes back for the second kind.
+  assert.match(UNMEASURED_LIMIT.because, /NOT YET MEASURED/)
+  assert.match(UNMEASURED_LIMIT.because, /guess/)
+  assert.ok(UNMEASURED_LIMIT.perOrganizationPerTick > 0)
 })

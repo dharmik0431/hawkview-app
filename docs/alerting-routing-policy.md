@@ -443,6 +443,43 @@ today's catalogue, not about the key. An `OPERATIONAL` rule with an `ACTOR`, `TA
 pairs assertion is what stands between us and that, and it discriminates: mutating
 `collector_failing` to `ACTOR` fails three tests by name.
 
+## The limit function — L1, L2 and L4
+
+**L1 — it withholds, and the accounting says so.** Every delivery in appears in exactly one of
+`sent`, `withheld` or a released aggregate, and `accountingProblems` names any shortfall. There
+is no `dropped` list, so the shape has nowhere to put one.
+
+Withheld deliveries carry `LIMITED` timing with a **release condition and no `until`** — a
+limit releases when volume falls, which is not a time, and an invented timestamp is the hold
+that sits forever while every identity still passes. The condition carries the numbers, so the
+sentence a person reads is checkable rather than *temporarily deferred*.
+
+**Most urgent first**, so a phone-tier alert is never withheld behind a digest.
+
+**L2 — release is part of the same function.** A withheld delivery nobody looks at again is
+indistinguishable from a dropped one; *we withheld it* is not a defence if nothing releases it.
+So `applyLimit` takes what was carried over, and the backlog goes **before** new arrivals at the
+same tier — otherwise a busy MSP starves its own queue and the oldest alert is told last.
+
+**And what comes due goes as ONE aggregate**, because releasing forty withheld deliveries as
+forty messages re-trips the limit immediately and withholds most of them again: a queue that
+never drains. Folding flattens, so the aggregate names every incident inside it. That is the
+second suspicion — a limit that aggregates losing what is inside the aggregate — and it is
+pinned by asserting the released incident keys equal the withheld ones exactly.
+
+**L4 — counted per organisation per tick.** Counted over the wrong scope is not a smaller limit,
+it is a different one: per tenant lets a hundred tenants send a hundred times the volume, and
+fleet-wide lets one noisy MSP silence everybody else. It matches `fanOutProblems`, so the limit
+and the invariant measure the same window rather than two that nearly agree.
+
+**The number is not measured, and says so.** `UNMEASURED_LIMIT` carries an admission where
+`STALE_AFTER_MS` carries 5,166 runs. A placeholder that reads as authoritative is worse than one
+that reads as a guess, because nobody goes back for the second kind. The honest input is
+observed causes per MSP per tick on production data, which no worktree here has.
+
+Five mutations, five caught: dropping the excess, never releasing, counting fleet-wide,
+ignoring urgency, and releasing without folding.
+
 ## Two shapes, for approval before any code
 
 ### Escalation
