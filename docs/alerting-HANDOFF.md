@@ -312,6 +312,39 @@ exactly the work where they would matter most.
   `canonicalize` export is needed there; **I could not find that symbol and have not verified
   the claim.**
 
+## Where the work actually stands, and how to tell
+
+**The commit stream on the remote is not the work.** At the time of writing, five commits
+exist locally that the remote does not have — the apply shape, the EXHAUSTED ruling, the
+step-07 shelving, this document and the QA method document. Anybody watching
+`origin/agent/alerts-step-01` sees the last of them as `3529ea1` and reads twenty-three
+minutes of work as a stall.
+
+**If you are trying to work out whether something is in progress, compare the two:**
+
+```bash
+git log --oneline origin/agent/alerts-step-01..HEAD    # done, not visible to anyone else
+git status --porcelain                                  # in progress, not committed
+```
+
+An empty first list and an empty second means the branch is genuinely where it appears to be.
+A non-empty first list means the work exists and the *distribution* is what is behind — which
+has been the state for most of this feature and is the single thing most likely to mislead a
+reader about progress.
+
+## A warning for whoever pre-registers the apply
+
+`docs/alerting-apply-shape.md` is a design document written by the engineering side. **Do not
+derive the apply's pre-registered properties from it.** A pre-registration that reads the
+design agrees with the design by construction, and it agrees just as thoroughly as one that
+read the code — the whole value is that the expectations were formed independently.
+
+Pre-register from the **semantics and the constraints**: reversible, no historical alert
+delivered, underlying events preserved, idempotent, and what a changed row or a partial
+failure must do. Then read the shape document afterwards and see whether it can express them.
+**That order is the seam attack**, and on this step an unpinnable property is a production
+incident rather than a rework.
+
 ## Immediately next
 
 1. **The apply phase.** Shape is in `docs/alerting-apply-shape.md`; the code is not written.
