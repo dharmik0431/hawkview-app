@@ -179,3 +179,100 @@ export interface PreferenceChange {
   readonly changedByUserId: string
   readonly changedAt: Date
 }
+
+// ---------------------------------------------------------------------------------------
+// THE SHAPE, AFTER QA'S SEAM ATTACK. Two properties the first cut could not express.
+// ---------------------------------------------------------------------------------------
+
+/** ROUTING HAPPENS OVER A SEQUENCE OF MOMENTS, NOT AT ONE.
+ *
+ * `route(incidents, preferences, now) -> Delivery[]` cannot express quiet hours deferring,
+ * and the reason is exact: one call carries one `now` and has no later, so **held-and-
+ * delivered and held-and-lost are the same output.** A held delivery that matures and goes
+ * out, and one that is held and then quietly forgotten, both look like "held" at the only
+ * moment the function can see.
+ *
+ * This is step 04's flat-list problem one feature over — there, "emitted then stopped" and
+ * "never emitted" were the same input; here, "held then sent" and "held then lost" are the
+ * same output. Both are fixed the same way: carry the sequence, not the snapshot.
+ *
+ * A tick with no incidents is not a wasted entry. It is the thing that lets a hold MATURE,
+ * and without it the passage of time is not expressible at all. */
+export type RoutingTick = Readonly<{
+  at: Date
+  /** May be empty — an empty tick is time passing, which is when holds come due. */
+  incidents: readonly RoutableIncident[]
+}>
+
+/** What routing needs to know about an incident. Taken from step 04's queue rather than
+ * re-derived, so the two cannot disagree about which incident this is. */
+export interface RoutableIncident {
+  readonly incidentKey: string
+  readonly organizationId: string
+  readonly customerTenantId: string
+  readonly ruleId: string
+  readonly severity: Severity
+  readonly category: AlertCategory
+}
+
+/** An incident that produced no delivery BECAUSE THE MSP CHOSE THAT.
+ *
+ * EVENT-DRIVEN, AND THAT IS ITS LIMIT. An entry exists only when an incident actually arrives
+ * on a silenced rule — so this alone cannot say what an MSP will not hear about. See
+ * `silencedRules`, which is the half this cannot cover. */
+export interface SuppressedIncident {
+  readonly incidentKey: string
+  readonly organizationId: string
+  readonly ruleId: string
+  /** Recorded regardless. The suppression is of delivery, never of the record. */
+  readonly recordedAs: string
+}
+
+/** A delivery that has not gone out yet, carried across ticks so its fate is observable. */
+export interface HeldDelivery {
+  readonly delivery: Delivery
+  readonly heldSince: Date
+  readonly until: Date
+  readonly because: string
+}
+
+/** Everything routing produced across the whole sequence.
+ *
+ * THE TWO INVARIANTS ARE THE ACCOUNTING IDENTITY FROM STEP 03, ARRIVING HERE. Every incident
+ * appears exactly once in `records`, and lands in exactly one of `delivered`, `stillHeld` and
+ * `suppressed`. An incident in none of those buckets is silence nobody can find, which is
+ * this step's whole failure mode — and an incident in two of them is a message somebody will
+ * receive twice while the record says once.
+ *
+ * THERE IS NO DROPPED BUCKET, and that is a ruling made structural. A delivery limit may
+ * AGGREGATE or DEFER; it may never drop. A limit that drops is silence produced by a feature
+ * whose purpose is volume, exactly as a hold that expires is silence produced by a feature
+ * whose purpose is timing — the same failure, and the limit is the more tempting one because
+ * dropping is the simplest implementation and looks like working as designed. With no bucket
+ * to put a dropped message in, it cannot be written and then explained. */
+export interface RoutingOutcome {
+  /** Every incident, exactly once, whatever happened to it. */
+  readonly records: readonly RoutedRecord[]
+  readonly delivered: readonly Delivery[]
+  readonly stillHeld: readonly HeldDelivery[]
+  readonly suppressed: readonly SuppressedIncident[]
+  /** WHAT THE MSP WILL NOT HEAR ABOUT, DERIVED FROM THE PREFERENCE SET RATHER THAN FROM WHAT
+   * HAPPENED.
+   *
+   * QA'S SIXTH FINDING, AND IT IS THE ONE I WOULD HAVE MISSED. `suppressed` is event-driven,
+   * so an entry exists only when an incident arrives on a silenced rule. An MSP who silences
+   * a rule that then never fires produces output BYTE-IDENTICAL to an MSP who silenced
+   * nothing and had a quiet week — and silenced-and-therefore-silent is exactly the state
+   * this property exists to make visible.
+   *
+   * The generalisation is worth more than the instance: A PROPERTY ABOUT A CONFIGURATION
+   * CANNOT BE CARRIED BY A LIST OF EVENTS. If the answer changes when nothing happens, it is
+   * not derivable from what happened.
+   *
+   * Derived from the preferences, so an MSP who silenced nothing lists nothing — the control
+   * that stops this passing by listing everything always. */
+  readonly silencedRules: readonly CoverageStatement[]
+  /** The invariants, checked on the output rather than asserted about it. Empty is healthy;
+   * each entry names the incident and which rule it broke. */
+  readonly accountingProblems: readonly string[]
+}

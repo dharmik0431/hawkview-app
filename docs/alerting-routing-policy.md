@@ -111,3 +111,60 @@ inside quiet hours is either held or is the exception that makes holding pointle
 The `windowReadableThroughout` producer obligation: derived from sync state with gaps included,
 and its producer tested **above** the level that picks it. Step 05 does not touch it yet. If
 routing ever reads coverage to decide whether to alert, that constraint comes with it.
+
+## QA's seam attack: two properties the first shape could not express
+
+Four of their six were already covered by the shape above. Two were not, and both are real.
+
+### Quiet hours need more than one moment
+
+`route(incidents, preferences, now) -> Delivery[]` carries **one `now` and has no later**, so
+**held-and-delivered and held-and-lost are the same output.** A hold that matures and goes out
+and one that is quietly forgotten look identical at the only moment the function can see.
+
+**This is step 04's flat list, one feature over.** There, "emitted then stopped" and "never
+emitted" were the same *input*; here, "held then sent" and "held then lost" are the same
+*output*. Same repair: carry the sequence, not the snapshot. Routing takes `RoutingTick[]`, and
+**a tick with no incidents is not a wasted entry** — it is the thing that lets a hold come due.
+Without it the passage of time is not expressible at all.
+
+### A property about a configuration cannot be carried by a list of events
+
+Their sixth, found by attacking their own repaired seam, and **the one I would have missed.**
+`suppressed` is event-driven: an entry exists only when an incident arrives on a silenced rule.
+So an MSP who silences a rule that then **never fires** produces output byte-identical to an
+MSP who silenced nothing and had a quiet week — and *silenced-and-therefore-silent* is exactly
+the state the property exists to make visible.
+
+`silencedRules` is derived from the **preference set**, not from what happened. The control
+matters as much as the field: an MSP who silenced nothing lists nothing, or the section passes
+by listing everything always.
+
+The generalisation is worth more than the instance: **if the answer changes when nothing
+happens, it is not derivable from what happened.**
+
+## Two rulings, made structural
+
+**A delivery limit may aggregate or defer. It may never drop.** There is no `dropped` bucket in
+`RoutingOutcome`, so a dropped message cannot be written and then explained. A limit that drops
+is silence produced by a feature whose purpose is volume, exactly as a hold that expires is
+silence produced by a feature whose purpose is timing — the same failure, and **the limit is
+the more tempting one, because dropping is the simplest implementation and looks like working
+as designed.**
+
+**Escalation builds on the ownership axis that already exists.** A ladder needs acknowledgement,
+which is a person's act — that is `acknowledge` from step 01, touching ownership only. No second
+notion of "somebody has this". The ladder is a function of time-since-notified and ownership
+state, not a new axis. Not built yet, and the shape comes to PM before it is.
+
+## The accounting identity, arriving here
+
+Every incident appears exactly once in `records`, and lands in **exactly one** of `delivered`,
+`stillHeld`, `suppressed`. An incident in **none** is silence nobody can find — this step's
+whole failure mode. An incident in **two** is a message somebody receives twice while the record
+says once. `accountingProblems` reports violations by name rather than as a boolean, for the
+reason step 03 settled: a reader needs to know which figure to go and look at.
+
+**The gate discriminates**: collapsing the tick sequence to a single moment, removing
+`stillHeld`, removing `silencedRules`, or adding a `dropped` bucket are each caught at compile
+time — four collapses, four caught.

@@ -7,7 +7,10 @@ import {
   type DeliveryPreference,
   type PreferenceChange,
   type Recipient,
+  type RoutableIncident,
   type Routing,
+  type RoutingOutcome,
+  type RoutingTick,
 } from './routing-policy.js'
 
 /** THE STEP-05 GATE, run before the routing logic exists.
@@ -202,4 +205,128 @@ test('A PREFERENCE CHANGE CARRIES WHO, WHEN, AND WHAT IT WAS BEFORE', () => {
   // @ts-expect-error a change with no author is not an answer to "who turned this off"
   const anonymous: PreferenceChange = { ...change, changedByUserId: undefined }
   assert.ok(anonymous)
+})
+
+/** The two properties QA's seam attack showed the first shape could not express. */
+
+const incident = (over: Partial<RoutableIncident> = {}): RoutableIncident => ({
+  incidentKey: 'k-1',
+  organizationId: 'org-1',
+  customerTenantId: 'tenant-1',
+  ruleId: 'security.privileged_role_granted',
+  severity: 'ACT_NOW',
+  category: 'SECURITY',
+  ...over,
+})
+
+const HELD_AT = new Date('2026-09-01T23:40:00Z')
+const DUE_AT = new Date('2026-09-02T07:00:00Z')
+
+const delivery = (over: Partial<Delivery> = {}): Delivery => ({
+  organizationId: 'org-1',
+  causeKey: 'security.privileged_role_granted/admin-1',
+  tier: 'PHONE',
+  timing: { kind: 'HELD', until: DUE_AT, because: 'quiet hours until 07:00' },
+  recipient: VERIFIED,
+  affectedTenants: ['tenant-1'],
+  incidentKeys: ['k-1'],
+  ...over,
+})
+
+const outcome = (over: Partial<RoutingOutcome> = {}): RoutingOutcome => ({
+  records: [],
+  delivered: [],
+  stillHeld: [],
+  suppressed: [],
+  silencedRules: [],
+  accountingProblems: [],
+  ...over,
+})
+
+test('QUIET HOURS NEED MORE THAN ONE MOMENT — held-then-sent differs from held-then-lost', () => {
+  // `route(incidents, preferences, now)` carries one `now` and has no later, so a hold that
+  // matures and one that is quietly forgotten are the SAME OUTPUT. Step 04's flat list one
+  // feature over: there "emitted then stopped" and "never emitted" were the same input.
+  const ticks: readonly RoutingTick[] = [
+    { at: HELD_AT, incidents: [incident()] },
+    // A TICK WITH NO INCIDENTS IS NOT A WASTED ENTRY. It is the thing that lets a hold come
+    // due; without it the passage of time is not expressible at all.
+    { at: DUE_AT, incidents: [] },
+  ]
+  assert.equal(ticks.length, 2)
+  assert.equal(ticks[1]?.incidents.length, 0, 'time passing, with nothing new')
+
+  const heldThenSent = outcome({ delivered: [delivery({ timing: { kind: 'IMMEDIATE' } })] })
+  const heldThenLost = outcome({
+    stillHeld: [{ delivery: delivery(), heldSince: HELD_AT, until: DUE_AT, because: 'quiet hours' }],
+  })
+  assert.notEqual(JSON.stringify(heldThenSent), JSON.stringify(heldThenLost),
+    'the two fates must be different outputs, or a lost hold is indistinguishable from a sent one')
+
+  // And a hold still waiting is visible as waiting, with its due time — not absent.
+  assert.equal(heldThenLost.stillHeld[0]?.until.getTime(), DUE_AT.getTime())
+})
+
+test('A PROPERTY ABOUT A CONFIGURATION CANNOT BE CARRIED BY A LIST OF EVENTS', () => {
+  // QA's sixth finding, and the one I would have missed. `suppressed` is EVENT-DRIVEN: an
+  // entry exists only when an incident arrives on a silenced rule. So an MSP who silences a
+  // rule that then never fires produces output identical to an MSP who silenced nothing and
+  // had a quiet week — and silenced-and-therefore-silent is exactly the state the property
+  // exists to make visible.
+  const silencedButQuiet = outcome({
+    silencedRules: [{
+      ruleId: 'security.privileged_role_granted',
+      preference: 'RECORD_ONLY',
+      sentence: 'You will not be contacted about privileged role grants. They are still recorded.',
+    }],
+  })
+  const nothingSilencedAndQuiet = outcome()
+
+  // Both had a quiet week. Only one of them chose to.
+  assert.equal(silencedButQuiet.suppressed.length, 0, 'nothing fired, so nothing was suppressed')
+  assert.equal(nothingSilencedAndQuiet.suppressed.length, 0, 'nothing fired here either')
+  assert.notEqual(JSON.stringify(silencedButQuiet), JSON.stringify(nothingSilencedAndQuiet),
+    'the configuration is visible even when no event exercised it')
+
+  // THE CONTROL, WITHOUT WHICH THIS PASSES BY LISTING EVERYTHING ALWAYS. An MSP who silenced
+  // nothing must list nothing — a coverage section that always has entries says as little as
+  // one that never does.
+  assert.deepEqual(nothingSilencedAndQuiet.silencedRules, [])
+
+  // If the answer changes when nothing happens, it is not derivable from what happened.
+})
+
+test('EVERY INCIDENT LANDS IN EXACTLY ONE BUCKET, and there is no bucket for dropped', () => {
+  // The accounting identity from step 03, arriving here. An incident in NO bucket is silence
+  // nobody can find; an incident in TWO is a message somebody gets twice while the record
+  // says once.
+  const buckets = outcome({
+    delivered: [delivery({ timing: { kind: 'IMMEDIATE' }, incidentKeys: ['k-1'] })],
+    stillHeld: [{
+      delivery: delivery({ incidentKeys: ['k-2'] }),
+      heldSince: HELD_AT, until: DUE_AT, because: 'quiet hours',
+    }],
+    suppressed: [{
+      incidentKey: 'k-3', organizationId: 'org-1',
+      ruleId: 'security.application_permission_granted',
+      recordedAs: 'Recorded only, at your setting for this rule.',
+    }],
+  })
+  const landed = [
+    ...buckets.delivered.flatMap((d) => d.incidentKeys),
+    ...buckets.stillHeld.flatMap((h) => h.delivery.incidentKeys),
+    ...buckets.suppressed.map((s) => s.incidentKey),
+  ]
+  assert.equal(new Set(landed).size, landed.length, 'no incident in two buckets')
+  assert.deepEqual([...landed].sort(), ['k-1', 'k-2', 'k-3'])
+
+  // A DELIVERY LIMIT MAY AGGREGATE OR DEFER. IT MAY NEVER DROP. There is no fourth bucket to
+  // put a dropped message in, so dropping cannot be written and then explained. A limit that
+  // drops is silence produced by a feature whose purpose is volume — the same failure as a
+  // hold that expires, and the more tempting one, because dropping is the simplest
+  // implementation and looks like working as designed.
+  const keys = Object.keys(outcome())
+  assert.ok(!keys.some((k) => /drop/i.test(k)), 'no dropped bucket exists')
+  assert.deepEqual(keys.filter((k) => ['delivered', 'stillHeld', 'suppressed'].includes(k)).sort(),
+    ['delivered', 'stillHeld', 'suppressed'])
 })
