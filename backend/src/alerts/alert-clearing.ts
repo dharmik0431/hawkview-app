@@ -1,6 +1,7 @@
 import type { CollectorSyncStatus } from '../tenants/service-sync-freshness.js'
 import { evidenceFromSync } from '../risky-users-wiring/evidence-availability.js'
 import type { ConditionClearedWhen } from './alert-type.js'
+import { windowWentQuiet, type QuietWindow } from './window-coverage.js'
 
 /** Whether a declared resolving condition is SATISFIED by a concrete state.
  *
@@ -116,12 +117,21 @@ export interface ClearingObservation {
   readonly sources: readonly SourceState[]
   readonly connectionVerified: boolean
   readonly configurationRestored: boolean
-  /** Events seen inside the declared window. */
-  readonly eventsInWindow: number
-  /** Whether the window was readable THROUGHOUT. A quiet window HawkView could
-   * not see is not quiet, it is unobserved — so this is separate from the count
-   * rather than folded into it. */
-  readonly windowReadableThroughout: boolean
+  /** The quiet-window question, as EVIDENCE rather than as an answer.
+   *
+   * This was two fields — `eventsInWindow: number` and `windowReadableThroughout:
+   * boolean` — and both were assertions a caller simply made. Two problems, and the
+   * second is the one no test of either field could have found:
+   *
+   * 1. THE CHEAPEST WAY TO CLEAR AN ALERT WAS TO PASS `0` AND `true`, which is also
+   *    exactly what a caller who never ran either query would pass. Zero events found
+   *    and zero events looked for were the same value.
+   * 2. NOTHING TIED THE TWO HALVES TO THE SAME WINDOW. Count over the last hour,
+   *    establish coverage over the last month, and the condition reads as satisfied
+   *    while the event it was raised for sits invisible to both halves.
+   *
+   * `QuietWindow` carries the window once and derives both halves from it. */
+  readonly quietWindow: QuietWindow
 }
 
 export function conditionSatisfied(
@@ -145,8 +155,9 @@ export function conditionSatisfied(
       return observation.configurationRestored
 
     case 'NO_FURTHER_EVENTS_IN_READABLE_WINDOW':
-      // Both halves, and the second is the one that matters: silence across a
-      // window nobody could see is not evidence the condition stopped.
-      return observation.eventsInWindow === 0 && observation.windowReadableThroughout
+      // Both halves, over one window, derived rather than asserted. The second half is
+      // the one that matters: silence across a window nobody could see is not evidence
+      // the condition stopped.
+      return windowWentQuiet(observation.quietWindow)
   }
 }

@@ -8,6 +8,7 @@ import {
   type ClearingObservation,
   type SourceState,
 } from './alert-clearing.js'
+import type { WindowCoverage } from './window-coverage.js'
 
 /** EVERY DECLARED RESOLVING CONDITION IS SATISFIABLE.
  *
@@ -28,12 +29,30 @@ import {
  * would make this file pass by restoring the defect it was ruled out to fix.
  */
 
+const WINDOW = { from: new Date('2026-07-01T00:00:00Z'), to: new Date('2026-07-01T06:00:00Z') }
+const TOLERANCE = 10 * 60 * 1000
+
+/** Attempts every five minutes across the window, so coverage is ESTABLISHED rather than
+ * asserted — there is no longer a boolean a fixture could assert it with, which is the
+ * point of the change and the reason this helper has to exist. */
+const watched = (): WindowCoverage => {
+  const attempts: { at: Date; succeeded: boolean }[] = []
+  for (let at = WINDOW.from.getTime() - TOLERANCE; at <= WINDOW.to.getTime(); at += 5 * 60 * 1000) {
+    attempts.push({ at: new Date(at), succeeded: true })
+  }
+  return { kind: 'ATTEMPT_HISTORY', attempts }
+}
+
 const base: ClearingObservation = {
   sources: [],
   connectionVerified: false,
   configurationRestored: false,
-  eventsInWindow: 1,
-  windowReadableThroughout: false,
+  quietWindow: {
+    window: WINDOW,
+    events: { kind: 'COUNTED', at: [new Date('2026-07-01T03:00:00Z')] },
+    coverage: { kind: 'NO_HISTORY_AVAILABLE', because: 'the base state establishes nothing.' },
+    maxGapMs: TOLERANCE,
+  },
 }
 
 /** One state per declared kind that SATISFIES it, and one that does not.
@@ -77,9 +96,21 @@ const WITNESS: Record<string, { satisfying: ClearingObservation; falsifying: Cle
     falsifying: { ...base, configurationRestored: false },
   },
   NO_FURTHER_EVENTS_IN_READABLE_WINDOW: {
-    satisfying: { ...base, eventsInWindow: 0, windowReadableThroughout: true },
-    // Quiet, but across a window nobody could see. Not evidence of anything.
-    falsifying: { ...base, eventsInWindow: 0, windowReadableThroughout: false },
+    satisfying: {
+      ...base,
+      quietWindow: {
+        ...base.quietWindow,
+        events: { kind: 'COUNTED', at: [] },
+        coverage: watched(),
+      },
+    },
+    // Quiet, but across a window nobody could see. Not evidence of anything — and the
+    // fixture can no longer paper over that, because the only way to reach `true` is to
+    // supply an attempt history that actually spans the window.
+    falsifying: {
+      ...base,
+      quietWindow: { ...base.quietWindow, events: { kind: 'COUNTED', at: [] } },
+    },
   },
 }
 

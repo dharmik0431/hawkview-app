@@ -1280,6 +1280,14 @@ gain.
 
 ### Standing trap for step 03: `windowReadableThroughout`
 
+> **CLOSED in step 03.** There is no boolean to pass and no number either: `ClearingObservation`
+> now carries a `QuietWindow` — one window, an `EventTally` that is `COUNTED` or `NOT_COUNTED`,
+> and a `WindowCoverage` — and `windowWentQuiet` derives the answer. The warning below is kept
+> as written because the reasoning is what generalises, and because it was right: wiring it
+> also turned up a second defect the warning did not anticipate, where the count and the
+> coverage could describe different windows. See *One window, not two* in
+> `alerting-reconciliation.md`.
+
 **Not a bug today, and it will be the moment step 03 wires it.**
 `alert-clearing.ts` declares it, `conditionSatisfied` reads it, and **nothing produces
 it** — every reference outside the module is a fixture, defaulting to `false`, which is

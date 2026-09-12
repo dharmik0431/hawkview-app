@@ -2,8 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   describeCoverage,
+  describeQuietWindow,
   windowReadableThroughout,
+  windowWentQuiet,
   type CollectionAttempt,
+  type QuietWindow,
   type WindowCoverage,
 } from './window-coverage.js'
 
@@ -162,4 +165,96 @@ test('THE TOLERANCE IS READ FROM THE ARGUMENT, not a constant that happens to ma
   const every15 = steady(15 * MINUTE)
   assert.equal(windowReadableThroughout(history(every15), window, 10 * MINUTE), false)
   assert.equal(windowReadableThroughout(history(every15), window, 20 * MINUTE), true)
+})
+
+/** The two halves, and the failure mode that lived in the gap between them. */
+
+const quiet = (over: Partial<QuietWindow> = {}): QuietWindow => ({
+  window,
+  events: { kind: 'COUNTED', at: [] },
+  coverage: history(steady(MINUTE)),
+  maxGapMs: TOLERANCE,
+  ...over,
+})
+
+test('THERE IS NO NUMBER TO PASS EITHER, and zero was the dangerous one', () => {
+  // `eventsInWindow` was a bare number, so the cheapest way to clear an alert was to pass
+  // 0 — which is also exactly what a caller who never ran the query would pass. Zero found
+  // and zero looked for are the same value and opposite facts, so the count had to stop
+  // being a number a caller supplies.
+  assert.equal(windowWentQuiet(quiet()), true, 'counted none, across a watched window')
+
+  const notCounted = quiet({
+    events: { kind: 'NOT_COUNTED', because: 'no event query was run for this alert.' },
+  })
+  assert.equal(windowWentQuiet(notCounted), false,
+    'perfect coverage does not make an uncounted window a quiet one')
+
+  // And the refusal survives being the ONLY thing wrong. This is the mutation that would
+  // otherwise pass: check coverage first, and a NOT_COUNTED tally with good history reads
+  // as quiet because nothing ever looks at the tally's kind.
+  assert.match(describeQuietWindow(notCounted), /not established/)
+})
+
+test('AN EVENT INSIDE THE WINDOW KEEPS IT OPEN, boundaries included', () => {
+  const inside = new Date(from.getTime() + 30 * MINUTE)
+  assert.equal(windowWentQuiet(quiet({ events: { kind: 'COUNTED', at: [inside] } })), false)
+
+  // Both edges count as inside. The conservative direction on purpose: a boundary event
+  // treated as outside means an alert closing on the very event it was raised for, and a
+  // boundary event treated as inside costs one more cycle before it clears.
+  for (const edge of [from, to]) {
+    assert.equal(windowWentQuiet(quiet({ events: { kind: 'COUNTED', at: [edge] } })), false,
+      `an event exactly on ${edge === from ? 'from' : 'to'} is inside the window`)
+  }
+
+  // Outside it, on either side, is genuinely outside — otherwise nothing could ever clear.
+  const before = new Date(from.getTime() - MINUTE)
+  const after = new Date(to.getTime() + MINUTE)
+  assert.equal(windowWentQuiet(quiet({ events: { kind: 'COUNTED', at: [before, after] } })), true)
+})
+
+test('ONE WINDOW, NOT TWO, and no test of either half could have found this', () => {
+  // The defect in the old shape: `eventsInWindow` and `windowReadableThroughout` were
+  // independent fields, so nothing required them to describe the same period. Count over
+  // the last hour, establish coverage over the last month, and the condition reads as
+  // satisfied while the event it was raised for is invisible to both halves — each field
+  // correct about its own window, the pair meaningless.
+  //
+  // It is now unexpressible: `QuietWindow` holds ONE window and both halves read it. What
+  // a test can still show is the behavioural consequence — moving the window moves both
+  // halves together, and it cannot be moved for one and not the other.
+  const eventAt = new Date(from.getTime() + 30 * MINUTE)
+  const evidence = quiet({ events: { kind: 'COUNTED', at: [eventAt] } })
+  assert.equal(windowWentQuiet(evidence), false, 'the event is inside')
+
+  // Slide the window past the event. The SAME move that puts the event outside also moves
+  // the period coverage must span — and this history does not reach there, so it does not
+  // silently become quiet. The two halves cannot be aimed independently.
+  const slid = {
+    ...evidence,
+    window: { from: new Date(to.getTime()), to: new Date(to.getTime() + 60 * MINUTE) },
+  }
+  assert.equal(windowWentQuiet(slid), false,
+    'the event left the window and coverage left with it')
+
+  // POSITIVE CONTROL: with history that does span the later period, it clears — so the
+  // assertion above is discriminating, not just failing for a second reason forever.
+  const laterHistory: CollectionAttempt[] = []
+  for (let t = to.getTime() - TOLERANCE; t <= to.getTime() + 60 * MINUTE; t += MINUTE) {
+    laterHistory.push({ at: new Date(t), succeeded: true })
+  }
+  assert.equal(windowWentQuiet({ ...slid, coverage: history(laterHistory) }), true)
+})
+
+test('the sentence names which half failed, because they fail for opposite reasons', () => {
+  const noisy = quiet({ events: { kind: 'COUNTED', at: [new Date(from.getTime() + MINUTE)] } })
+  assert.match(describeQuietWindow(noisy), /1 further event/)
+
+  const unwatched = quiet({
+    coverage: { kind: 'NO_HISTORY_AVAILABLE', because: 'SyncState keeps no attempt history.' },
+  })
+  const sentence = describeQuietWindow(unwatched)
+  assert.match(sentence, /No further events/, 'the quiet half is true and is said so')
+  assert.match(sentence, /SyncState keeps no attempt history/, 'and the reason it is not enough')
 })

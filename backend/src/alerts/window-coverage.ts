@@ -143,3 +143,81 @@ export function describeCoverage(
     : `Collection did not cover the whole window${failures > 0 ? ` (${failures} failed attempt(s))` : ''}, ` +
       'so silence across it is not evidence the condition stopped.'
 }
+
+/** What a caller can actually offer about the EVENTS in a window.
+ *
+ * THERE IS NO NUMBER TO PASS, for the same reason there was no boolean. `eventsInWindow`
+ * was a bare `number` on the observation, and the cheapest way to clear an alert was to
+ * pass `0` — which is exactly what a caller who never ran the query would pass. Zero
+ * events found and zero events looked for are the same value and opposite facts.
+ *
+ * `NOT_COUNTED` carries a reason rather than a count, so "we did not look" is a statement
+ * about evidence and cannot be arithmetic on. */
+export type EventTally =
+  | Readonly<{
+      kind: 'COUNTED'
+      /** When each event happened, for the sources this alert covers. Times rather than a
+       * total, so whether an event falls inside the window is decided HERE against the
+       * window the coverage is also measured over — not by the caller against some other
+       * window. */
+      at: readonly Date[]
+    }>
+  | Readonly<{
+      kind: 'NOT_COUNTED'
+      because: string
+    }>
+
+/** The two halves of `NO_FURTHER_EVENTS_IN_READABLE_WINDOW`, over ONE window.
+ *
+ * THE WINDOW IS CARRIED ONCE, AND THAT IS THE POINT. They were two independent fields on
+ * the observation — a count and a boolean — so nothing tied them to the same period. A
+ * caller could count events over the last hour and establish coverage over the last month
+ * and the condition would read as satisfied: quiet recently, watched for ages, and the
+ * event three weeks ago that the alert is about invisible to both halves. Neither field
+ * was wrong on its own, which is why no test of either one could catch it. */
+export interface QuietWindow {
+  readonly window: Window
+  readonly events: EventTally
+  readonly coverage: WindowCoverage
+  /** How long an uncovered stretch may be. See `windowReadableThroughout`. */
+  readonly maxGapMs: number
+}
+
+/** Whether the window was quiet AND watched. Both, over the same window, or false.
+ *
+ * The boundary is INCLUSIVE at both ends: an event landing exactly on `from` or `to` is
+ * inside the window and keeps the alert open. Deliberately the conservative direction —
+ * the cost of counting a boundary event as inside is that an alert clears one cycle later,
+ * and the cost of the other choice is an alert closing on the event it was raised for. */
+export function windowWentQuiet(evidence: QuietWindow): boolean {
+  // "We did not count" is not "we counted none". Checked before coverage so that a caller
+  // holding perfect attempt history and no event query still cannot clear anything.
+  if (evidence.events.kind === 'NOT_COUNTED') return false
+  if (!windowReadableThroughout(evidence.coverage, evidence.window, evidence.maxGapMs)) {
+    return false
+  }
+  const from = evidence.window.from.getTime()
+  const to = evidence.window.to.getTime()
+  return !evidence.events.at.some((at) => at.getTime() >= from && at.getTime() <= to)
+}
+
+/** The same answer with the reason named, for a person rather than a branch. */
+export function describeQuietWindow(evidence: QuietWindow): string {
+  if (evidence.events.kind === 'NOT_COUNTED') {
+    return `Whether further events occurred is not established: ${evidence.events.because} ` +
+      'An uncounted window is not a quiet one.'
+  }
+  const from = evidence.window.from.getTime()
+  const to = evidence.window.to.getTime()
+  const inside = evidence.events.at
+    .filter((at) => at.getTime() >= from && at.getTime() <= to).length
+  if (inside > 0) {
+    return `${inside} further event(s) occurred inside the window, so the condition has not stopped.`
+  }
+  // No events inside, so the whole answer now rests on whether anyone was watching — which
+  // is the half that gets forgotten, so it is the half this sentence leads with.
+  return `No further events, and ` +
+    describeCoverage(evidence.coverage, evidence.window, evidence.maxGapMs)
+      .replace(/^Collection/, 'collection')
+      .replace(/^Coverage/, 'coverage')
+}

@@ -32,8 +32,10 @@ already settled in commits:
   03's *apply* phase, and only if the mapping is approved. Nothing about producing the report
   requires a schema change.
 
-**Remaining work in this step, in order:** the three unwired clearing producers —
-`eventsInWindow`, `connectionVerified`, `configurationRestored`. That is the rest of the audit
+**Remaining work in this step, in order:** the unwired clearing producers.
+`eventsInWindow` is now done, together with `windowReadableThroughout` — see *One window, not
+two* below for why it could not be done separately. Left: `connectionVerified` and
+`configurationRestored`. That is the rest of the audit
 finding: all five inputs were supplied only from tests, and four fail open on their cheapest
 wrong value. Each gets the treatment `sources` already has — decide what the degenerate input
 means *before* writing the producer, and make it the refusing answer.
@@ -55,11 +57,13 @@ production, and is anything supplied only from a test?* — was pointed at
 
 | field | produced by | cheapest wrong value | fails |
 |---|---|---|---|
-| `windowReadableThroughout` | nothing | `true` | **open** — clears on unobserved silence |
-| `eventsInWindow` | nothing | `0` | **open** — a mis-scoped query returns 0 and the alert clears |
+| `windowReadableThroughout` | ~~nothing~~ `windowWentQuiet`, from `QuietWindow` | ~~`true`~~ none: no boolean to pass | **closed** |
+| `eventsInWindow` | ~~nothing~~ `windowWentQuiet`, from `QuietWindow` | ~~`0`~~ none: no number to pass | **closed** — and the mis-scoped query it warns about was a second, separate defect: see *One window, not two* |
 | `connectionVerified` | nothing | `true` | **open** |
 | `configurationRestored` | nothing | `true` | **open** |
 | `sources` | nothing | `[]` | **closed** — see below |
+
+*(Table as first written; the two struck cells were closed later in this step.)*
 
 So the clearing rule is not "wired except for one flag". **It is entirely unwired**, and
 producing all five is part of this step. `windowReadableThroughout` is the one worth naming
@@ -569,3 +573,48 @@ count refuses to merge events whose subject is unknown. **Both figures are defen
 answer different questions — but they must not be compared without saying which.** The check
 is one query: episodes among rows whose actor is null. It has not been run here; this worktree
 has no production access and the release hold stands.
+
+## One window, not two: `eventsInWindow`, and why it could not be fixed alone
+
+The audit table above lists `eventsInWindow` and `windowReadableThroughout` as two separate
+unproduced inputs. They are two halves of one condition, and treating them as two problems
+was itself the larger defect.
+
+**The cheap wrong value first, since that is what the table predicted.** `eventsInWindow` was
+a bare `number`. The cheapest way to clear an alert was to pass `0` — which is also exactly
+what a caller who never ran the query would pass. **Zero events found and zero events looked
+for are the same value and opposite facts.** So the count stopped being something a caller
+supplies: `EventTally` is `COUNTED` with the event times, or `NOT_COUNTED` with a reason.
+There is no number to pass, on the same rule that left no boolean to pass.
+
+**And then the one the table could not see.** Auditing field by field asks *is this field
+produced?* of each field alone, and both halves can be individually beyond reproach while the
+pair is meaningless:
+
+> Count the events over the last hour. Establish coverage over the last month. The condition
+> reads as satisfied — quiet recently, watched for ages — and the event three weeks ago that
+> the alert was raised for is invisible to both halves.
+
+Nothing in the old shape required the two fields to describe the same period, and **no test of
+either field could have found it**, because neither field is wrong. `QuietWindow` carries the
+window **once**, with the tally, the coverage and the tolerance, and `windowWentQuiet` derives
+both halves from it. The mis-aimed pair is now unexpressible rather than merely discouraged.
+
+**A per-field audit finds fields that are wrong. It cannot find pairs that disagree.** When a
+rule reads two inputs, ask what relationship between them the rule assumes, and put that
+relationship in the type — here, the shared window.
+
+Two smaller rulings that came with it:
+
+- **Uncounted is checked before coverage.** A caller holding perfect attempt history and no
+  event query still clears nothing. Checking coverage first would let a `NOT_COUNTED` tally
+  through on the strength of the other half.
+- **The window boundary is inclusive at both ends.** An event landing exactly on `from` or
+  `to` is inside and keeps the alert open. The conservative direction on purpose: reading a
+  boundary event as outside means an alert closing on the very event it was raised for, while
+  reading it as inside costs one more cycle before it clears.
+
+Eight mutations, no survivors: the uncounted refusal removed; the coverage half dropped; each
+boundary made exclusive; the trailing bound dropped entirely; `some` swapped for `every` (an
+empty tally stops being quiet); the explanatory sentence stopped naming the uncounted case;
+and the condition wired to a constant instead of to the evidence.
