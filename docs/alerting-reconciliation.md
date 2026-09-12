@@ -42,10 +42,29 @@ means *before* writing the producer, and make it the refusing answer.
 
 ### Push status
 
-`origin/agent/alerts-step-01` is at `57ea2e8`, verified identical to the local tip;
-`origin/main` untouched at `5488ad6`. Verified by `git ls-remote` rather than taken from the
-message that reported it, on the same rule as everything else here: a ruling is a decision,
-the file is the fact.
+**This section was stale, and it was stale about the one thing it exists to record.** It
+read "`origin/agent/alerts-step-01` is at `57ea2e8`, verified identical to the local tip".
+The remote has since moved to `d1830e5` and the local tip has moved much further, so both
+halves of that sentence were false while the sentence still carried the words "verified
+identical". A status line that is only true on the day it is written is a trap for whoever
+reads it next, and the rule it invoked — the file is the fact — is what makes it worse: the
+sentence borrowed the authority of a check it was no longer the result of.
+
+**Verified by `git ls-remote` at the time of writing:**
+
+```
+refs/heads/agent/alerts-step-01   d1830e5
+refs/heads/main                   5488ad6   (untouched)
+```
+
+**Six local commits are not on the remote:** `865630a`, `84281a3`, `0f86b02`, `2a9694e`,
+`6560e57`, `fbd06df`. PM listed four; the last two landed after their fetch.
+
+**Nothing here will be pushed.** The release hold is active, one unauthorised push has
+already happened (`d1830e5`, docs-only) and has not been resolved, and a request to push on
+another session’s behalf because its own push was blocked is not something a peer can
+authorise. It needs Dharmik. **Check this section against `git ls-remote` rather than
+believing it.**
 
 
 ## The input audit, and it found more than one trap
@@ -618,3 +637,47 @@ Eight mutations, no survivors: the uncounted refusal removed; the coverage half 
 boundary made exclusive; the trailing bound dropped entirely; `some` swapped for `every` (an
 empty tally stops being quiet); the explanatory sentence stopped naming the uncounted case;
 and the condition wired to a constant instead of to the evidence.
+
+### Confirmed on production, and the count now has a name
+
+PM measured it: **62 attributed episodes, identical to `countedDirectoryAuditOnly`.** Nine
+unattributable rows, six episodes under their coalescing, 68 total. The two instruments agree
+to the row once the difference is accounted for — and **zero gaps land exactly on 24h in the
+data**, so the boundary convention could not have mattered even if the two had differed.
+
+Both original answers were wrong, in opposite directions, against a step-02 ruling that
+already said what to do:
+
+> An event whose declared subject cannot be resolved does not group. It stands alone,
+> labelled unattributed. Merging on "unknown" asserts a relationship we have no evidence for;
+> standing alone asserts nothing.
+
+Nine singletons — not zero, and not six. `incidentGrouping` implemented that ruling correctly
+all along; only the reconciliation diverged. **One module right, one module wrong, and nothing
+tying them together.** So the fix carries a coupling test that partitions the rows using step
+02's own `wouldGroupTogether` and requires the reconciliation to produce exactly that many
+episodes. The expected number is derived from the other side of the boundary rather than
+written down, because a literal agrees with whichever side you copied it from.
+
+**`rowsStandingAloneBecauseSubjectUnresolved` is now reported beside the episode counts.**
+QA's point holds independently of what the count turned out to be: such a row is counted in
+`total`, in `byShape` and in `needingClassification`, and then vanished from the episode
+accounting with no number saying how many or why. `incidents.unattributed` **cannot** cover
+it — that counter sits after the `declaration === null` branch returns, and every
+directory-audit row takes that branch, so it reads 0 for them **by construction rather than
+by measurement**. Absence resolving to silence, in the report whose entire purpose is making
+absences countable. It is also the figure two instruments will most often disagree about, so
+the runner's note now says to compare it *before* comparing totals.
+
+The counter is taken at the point of the grouping decision, not derived from the bucket map,
+so a bucketing bug cannot make it quietly agree — verified by restoring the original defect
+and confirming the count still dissents.
+
+**A fixture whose two populations are the same size cannot tell a count from its complement.**
+The first version of the coupling test used three grouping rows and three unattributable ones,
+and a mutation inverting the counter — count the rows that *did* group — survived every
+assertion, because three and three read alike. The fixture is now asymmetric and asserts its
+own asymmetry, so the next person to edit it cannot silently restore the blind spot.
+
+Five mutations, no survivors: the count never incrementing, counting every row, inverted,
+the buckets dropping ungrouped rows again, and all ungrouped rows merged onto one bucket.

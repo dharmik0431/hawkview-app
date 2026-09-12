@@ -197,7 +197,10 @@ function printReport(
       + 'incidentsWithUnrecoverableEpisodes are NOT one episode each — an aggregate row '
       + 'carries no per-event time, so its episode count is unknown and is reported as '
       + 'unknown. countedDirectoryAuditOnly is the like-for-like figure against a '
-      + 'key-prefix-filtered SQL count.',
+      + 'key-prefix-filtered SQL count. rowsStandingAloneBecauseSubjectUnresolved is the '
+      + 'number a SQL count will most often disagree about: coalescing those rows onto one '
+      + 'literal UNATTRIBUTED actor is the obvious thing to do in SQL and asserts a '
+      + 'relationship nothing evidences, so compare this figure before comparing totals.',
     episodes: report.episodes,
     invariants: report.invariants,
     ...(context.auditJoin === null ? {} : { auditJoin: context.auditJoin }),

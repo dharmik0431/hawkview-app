@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ALERT_CATALOG } from './alert-catalog.js'
 import { parseDedupeKey, reconcile, TYPE_FOR_SHAPE, type ExistingAlertRow } from './reconciliation.js'
+import { incidentGrouping, wouldGroupTogether } from './alert-incident-key.js'
 
 /** The dry run, against fixtures. It writes nothing and it checks its own output. */
 
@@ -504,4 +505,101 @@ test('ONE EVENT IS ONE EPISODE, KNOWABLE WITHOUT ITS TIME', () => {
   ])
   assert.equal(mixed.episodes.incidentsWithUnrecoverableEpisodes, 1)
   assert.equal(mixed.episodes.counted, 1, 'the audit incident counts; the aggregate one does not')
+})
+
+test('STEP 02 DECIDES WHAT GROUPS, AND THE RECONCILIATION MUST NOT DIVERGE', () => {
+  // The coupling test. Step 02 ruled that an unresolvable subject does not group — it
+  // stands alone, labelled unattributed, because merging on "unknown" asserts a
+  // relationship nothing evidences. `incidentGrouping` implemented that ruling correctly
+  // and the reconciliation quietly did something else: it dropped those rows from the
+  // episode accounting entirely. One module right, one module wrong, and nothing tying
+  // them together — so this asserts the tie rather than the number.
+  //
+  // THE EXPECTED COUNT IS DERIVED FROM `wouldGroupTogether`, not written down here. A
+  // literal would agree with whichever side I copied it from; step 02's own predicate is
+  // the other side of the boundary, so it can disagree with the reconciliation and that is
+  // the entire point of the check.
+  const declaration = ALERT_CATALOG.find((d) => d.id === 'security.routine_directory_change')
+  assert.ok(declaration, 'the nominated type must exist for this comparison to mean anything')
+
+  // THREE THAT GROUP AND TWO THAT DO NOT, and the asymmetry is load-bearing. My first
+  // fixture had three of each, and a mutation INVERTING the standing-alone counter — count
+  // the rows that did group — survived every assertion, because three and three read the
+  // same. A fixture whose two populations are the same size cannot tell a count from its
+  // complement. Asserted below rather than left to whoever edits this next.
+  const actors: readonly (string | null)[] = ['admin-1', 'admin-1', 'admin-2', null, null]
+  const rows = actors.map((actor, index) =>
+    row({
+      dedupeKey: `security:directory-audit:Directory_c${index}`,
+      // Seconds apart, so the interval never splits anything and the only thing that can
+      // move the episode count is the grouping decision under test.
+      occurredAt: new Date(T0 + index * 1000),
+      audit: { initiatedBy: actor, targetResources: ['t'], privileged: null },
+    }))
+
+  const groupings = actors.map((actor) =>
+    incidentGrouping(
+      declaration,
+      { organizationId: 'org-1', customerTenantId: 'tenant-1' },
+      actor === null
+        ? { resolved: false, why: 'the audit record names no initiator' }
+        : { resolved: true, id: actor }))
+
+  // Partition by step 02's predicate alone. A non-grouping element joins nothing — not even
+  // another non-grouping one, and not itself — so each forms its own class.
+  const classes: (typeof groupings[number])[][] = []
+  for (const grouping of groupings) {
+    const existing = classes.find((members) => wouldGroupTogether(members[0]!, grouping))
+    if (existing) existing.push(grouping)
+    else classes.push([grouping])
+  }
+
+  const standingAlone = groupings.filter((grouping) => !grouping.groups).length
+  const grouped = groupings.length - standingAlone
+  assert.notEqual(standingAlone, grouped,
+    'the two populations must differ in size, or a counter and its complement read alike')
+
+  const report = reconcile(rows)
+  assert.equal(report.episodes.counted, classes.length,
+    'the reconciliation must produce exactly as many episodes as step 02 has incidents')
+  assert.equal(report.episodes.rowsStandingAloneBecauseSubjectUnresolved, standingAlone)
+
+  // AND THE PARTITION MUST DISCRIMINATE. Without this the assertion above passes whenever
+  // both sides are broken the same way — five classes and five episodes would satisfy it
+  // just as happily if nothing ever grouped at all.
+  assert.equal(classes.length, 4,
+    'two admin-1 rows are one incident, admin-2 is a second, and two unattributable stand alone')
+  assert.ok(classes.length < actors.length, 'something grouped')
+  assert.ok(classes.length > 1, 'and not everything did')
+})
+
+test('THE STANDING-ALONE COUNT IS NAMED, not left to subtraction', () => {
+  // QA's point, and it holds whatever the count turns out to be: a row appears in `total`,
+  // in `byShape` and in `needingClassification`, and then had no number at all in the
+  // episode accounting. `incidents.unattributed` cannot cover it — that counter sits after
+  // the `declaration === null` branch returns, and every directory-audit row takes that
+  // branch, so it reads 0 for them by construction rather than by measurement.
+  // Two that group onto one actor and one that does not — asymmetric on purpose, for the
+  // same reason as the test above: equal populations cannot distinguish a count from its
+  // complement.
+  const rows = [
+    auditAt('a', 'actor-1', T0),
+    auditAt('b', 'actor-1', T0 + 1000),
+    row({
+      dedupeKey: 'security:directory-audit:Directory_u1',
+      occurredAt: new Date(T0 + 2000),
+      audit: { initiatedBy: null, targetResources: [], privileged: null },
+    }),
+  ]
+  const report = reconcile(rows)
+
+  assert.equal(report.episodes.rowsStandingAloneBecauseSubjectUnresolved, 1)
+  assert.equal(report.incidents.unattributed, 0,
+    'and the counter that looks like it should say this cannot')
+  assert.equal(report.incidents.needingClassification, 3, 'though all three rows are counted here')
+
+  // The number is not derivable from the others, which is why it has to be reported: three
+  // rows, two episodes, and nothing in the remaining figures distinguishes "two grouped and
+  // one stood alone" from any other split that lands on two.
+  assert.equal(report.episodes.counted, 2)
 })

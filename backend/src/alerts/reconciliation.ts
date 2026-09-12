@@ -257,6 +257,21 @@ export interface ReconciliationReport {
     incidentsWithUnrecoverableEpisodes: number
     /** Rows carrying no event time at all. */
     rowsWithoutEventTime: number
+    /** Rows whose declared subject did not resolve, so each STANDS ALONE as its own
+     * single-event incident rather than merging with the other unresolved ones.
+     *
+     * NAMED BECAUSE IT WAS INFERABLE ONLY BY SUBTRACTION. These rows are counted in
+     * `total`, in `byShape` and in `needingClassification`, and until this field existed
+     * they then vanished from the episode accounting with no number saying how many or
+     * why — absence resolving to silence, in the report whose whole purpose is to make
+     * absences countable. They were in fact being DROPPED, and the missing count is what
+     * let that sit unnoticed through two readings.
+     *
+     * It is also the number two instruments will most often disagree about, because
+     * coalescing them onto one literal 'UNATTRIBUTED' actor is the obvious thing to do in
+     * SQL and it asserts a relationship nothing evidences. Reported separately so the
+     * disagreement is visible in the output rather than recoverable only by arithmetic. */
+    rowsStandingAloneBecauseSubjectUnresolved: number
     /** The interval the count used, from the nominated type's declaration. */
     quietIntervalHours: number
   }>
@@ -381,6 +396,10 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   const auditBoundTargetKeys = new Set<string>()
   // Rows per incident, so episodes can be counted within each stream rather than across
   // all of them — two actors' bursts on the same day are two incidents, not one episode.
+  // Counted at the point of the decision rather than derived from the bucket map, so it
+  // cannot silently agree with a bucketing bug: if these rows were dropped again this number
+  // would still report them. See the coupling test.
+  let standingAlone = 0
   const rowsByIncident =
     new Map<string, { times: Date[]; missing: number; events: number; auditOnly: boolean }>()
   const nominated = declarationFor('security.routine_directory_change')
@@ -427,6 +446,7 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       // id. Two unattributed events are two incidents of one event each — exactly what
       // `wouldGroupTogether` already refuses to merge, now honoured in the episode count too.
       const episodeKey = boundGrouping.groups ? boundGrouping.key : `ungrouped:${row.id}`
+      if (!boundGrouping.groups) standingAlone += 1
       {
         const bucket = rowsByIncident.get(episodeKey)
           ?? { times: [], missing: 0, events: 0, auditOnly: true }
@@ -539,6 +559,7 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       countedDirectoryAuditOnly: episodesCountedAudit,
       incidentsWithUnrecoverableEpisodes: unrecoverable,
       rowsWithoutEventTime: rowsWithoutTime,
+      rowsStandingAloneBecauseSubjectUnresolved: standingAlone,
       quietIntervalHours: quietMs / (60 * 60 * 1000),
     },
     mapping,
