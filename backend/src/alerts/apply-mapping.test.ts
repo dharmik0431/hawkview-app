@@ -131,10 +131,10 @@ test('NEITHER APPLY NOR REVERT TOUCHES A FIELD A NOTIFIER WATCHES', () => {
   // REVERT TOO, and it is free rather than argued: a revert cannot restore occurrenceCount
   // because the apply never changed it.
   const decision = validateRevert(after, receipt)
-  assert.ok(decision.proceed)
-  const reverted = revertValidated(after, receipt, decision.rows)
-  assert.deepEqual(watchedFieldsDisturbedBetween(after, reverted), [])
-  assert.deepEqual(reverted, before, 'and it lands exactly back on the before-state')
+  assert.deepEqual(decision.refused, [])
+  const undone = revertValidated(after, receipt, decision, '2026-09-12T11:00:00.000Z')
+  assert.deepEqual(watchedFieldsDisturbedBetween(after, undone.after), [])
+  assert.deepEqual(undone.after, before, 'and it lands exactly back on the before-state')
 })
 
 test('REVERT IS NEVER A BLANKET UPDATE, and refuses to overwrite later work', () => {
@@ -144,21 +144,31 @@ test('REVERT IS NEVER A BLANKET UPDATE, and refuses to overwrite later work', ()
 
   // A row somebody re-keyed after this run is not this run's to undo.
   const meddled = after.map((r) => (r.id === 'n-2' ? { ...r, incidentKey: 'somebody-elses-later-key' } : r))
-  const refused = validateRevert(meddled, receipt)
-  assert.equal(refused.proceed, false)
-  assert.equal(refused.proceed === false ? refused.differences[0]?.notificationId : '', 'n-2')
+  const decision = validateRevert(meddled, receipt)
+  assert.equal(decision.refused.length, 1)
+  assert.equal(decision.refused[0]?.notificationId, 'n-2')
 
-  // WHOLESALE, matching apply: the untouched rows are not reverted either. Recommended rather
-  // than assumed — see the runbook for the counter-argument that revert is the emergency path.
-  assert.equal(meddled.find((r) => r.id === 'n-1')?.incidentKey, 'hawkview-alert-incident/v1|admin-1')
+  // PER ROW, NOT WHOLESALE — the opposite of apply, and the asymmetry is the reason. A partial
+  // apply is dangerous for being SILENT; a partial revert is described by the receipt and this
+  // report. And a refused row is not half-done work: somebody else owns it now, so leaving it
+  // is correct rather than incomplete. Refusing the rest would block a recovery action during
+  // an incident, which is when reverts happen.
+  const undone = revertValidated(meddled, receipt, decision, 't')
+  assert.equal(undone.after.find((r) => r.id === 'n-1')?.incidentKey, null, 'the others go back')
+  assert.equal(undone.after.find((r) => r.id === 'n-2')?.incidentKey, 'somebody-elses-later-key',
+    'and the row somebody else changed is left exactly as they left it')
+
+  // THE REPORT IS WHAT MAKES PER-ROW SAFE: reverted plus refused accounts for the whole
+  // receipt, so the mixed state is described rather than inferred.
+  assert.equal(undone.receipt.reverted.length + undone.receipt.refused.length, receipt.changed.length)
+  assert.deepEqual(undone.receipt.refused, decision.refused)
 
   // A ROW OUTSIDE THE RECEIPT IS NEVER TOUCHED, which is what "never a blanket update" means.
   const other = { ...after.find((r) => r.id === 'n-other')!, incidentKey: 'set-by-another-run' }
   const partialReceipt: ApplyReceipt = { ...receipt, changed: receipt.changed.filter((c) => c.notificationId !== 'n-other') }
   const store = after.map((r) => (r.id === 'n-other' ? other : r))
-  const decision = validateRevert(store, partialReceipt)
-  assert.ok(decision.proceed)
-  const reverted = revertValidated(store, partialReceipt, decision.rows)
+  const otherDecision = validateRevert(store, partialReceipt)
+  const reverted = revertValidated(store, partialReceipt, otherDecision, 't').after
   assert.equal(reverted.find((r) => r.id === 'n-other')?.incidentKey, 'set-by-another-run',
     'a row this run did not change keeps its value')
 })
@@ -240,11 +250,46 @@ test('REVERT TOUCHES ONLY THE ROWS IT WAS TOLD TO, even within one receipt', () 
   const { after, receipt } = mustApply(before, before.map((r) => entryFor(r)))
   assert.equal(receipt.changed.length, 2)
 
-  const onlyFirst = revertValidated(after, receipt, ['n-1'])
+  const onlyFirst = revertValidated(after, receipt, { rows: ['n-1'], refused: [] }, 't').after
   assert.equal(onlyFirst.find((r) => r.id === 'n-1')?.incidentKey, null, 'the named row is reverted')
   assert.equal(onlyFirst.find((r) => r.id === 'n-2')?.incidentKey, 'hawkview-alert-incident/v1|admin-1',
     'and the one not named keeps what the run wrote')
 
   // The empty list reverts nothing, rather than meaning "all".
-  assert.deepEqual(revertValidated(after, receipt, []), after)
+  assert.deepEqual(revertValidated(after, receipt, { rows: [], refused: [] }, 't').after, after)
+})
+
+test('B8 — REVERT MUST NOT REUSE APPLY\'S CHECK, or it is un-runnable within five minutes', () => {
+  // The trap, and I had fallen into it before this test existed: `validateRevert` called
+  // `digestOf`, which is apply's check. Apply checks every mapping input; REVERT CHECKS
+  // `incidentKey` AND `episode` ONLY.
+  //
+  // Occurrences arrive between apply and revert — that is the system working. A row reading
+  // 301 at apply time reads 305 an hour later, and apply's digest covers `occurrenceCount`, so
+  // reusing it refuses every row the moment any new event arrives. REUSING THE CHECK LOOKS
+  // LIKE CONSISTENCY, which is why it is a trap rather than an oversight.
+  const before = [row({ id: 'n-1', occurrenceCount: 301 })]
+  const { after, receipt } = mustApply(before, [entryFor(before[0]!)])
+
+  // Four real events arrive after the apply. Nothing about the incident key has changed.
+  const busy = after.map((r) => ({ ...r, occurrenceCount: 305 }))
+  const decision = validateRevert(busy, receipt)
+
+  assert.deepEqual(decision.refused, [],
+    'new occurrences are normal and must not make the revert refuse')
+  assert.deepEqual(decision.rows, ['n-1'])
+
+  // AND THE REVERT MUST NOT ROLL THE COUNT BACK. Restoring the row as the receipt found it
+  // would write 301 over 305 — four real events gone — and `occurrenceCount` is a watched
+  // field, so the same write can deliver. "Restore the prior state" is not "restore the prior
+  // row", and the receipt makes that easier to get wrong because the old values sit in it
+  // looking authoritative.
+  const undone = revertValidated(busy, receipt, decision, 't')
+  assert.equal(undone.after[0]?.occurrenceCount, 305, 'the four events survive the revert')
+  assert.equal(undone.after[0]?.incidentKey, null, 'and the annotation is undone')
+  assert.deepEqual(watchedFieldsDisturbedBetween(busy, undone.after), [])
+
+  // THE CONTROL, or "never refuses" passes this too: a genuinely re-keyed row IS refused.
+  const reKeyed = busy.map((r) => ({ ...r, incidentKey: 'somebody-elses-key' }))
+  assert.equal(validateRevert(reKeyed, receipt).refused.length, 1)
 })

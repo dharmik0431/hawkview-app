@@ -45,7 +45,7 @@ four questions in order) before trusting a green suite.
 | step | state |
 |---|---|
 | 01 declarations, 02 keys and episodes | closed |
-| 03 dry run | closed; **apply phase approved by Dharmik, shape written, not built** |
+| 03 dry run | closed; **apply and revert built to spec, runner script not written, nothing run against a database.** Note: it is an ANNOTATION, not a re-keying -- the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
 | 04 finding intake | closed |
 | 05 routing and policy | closed |
 | 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function does not exist** — L1, L2, L4 unbound. See below |

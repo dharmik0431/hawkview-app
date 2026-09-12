@@ -218,19 +218,40 @@ export function applyValidated(
   }
 }
 
-export type RevertDecision =
-  | Readonly<{ proceed: true; rows: readonly string[] }>
-  | Readonly<{ proceed: false; differences: readonly Difference[] }>
-
-/** Check a revert may proceed. NEVER A BLANKET UPDATE — it reads the receipt and touches only
- * the rows that run changed, and only where they are still exactly as it left them.
+/** What a revert did and declined to do.
  *
- * ABORTS WHOLESALE, matching apply. Recommended rather than assumed, with the counter-argument
- * in the runbook: a partial revert leaves the same mixed state the apply's abort rule exists to
- * prevent, and the operator is a person who reads the report and decides. The counter-argument
- * — that revert is the emergency path and one anomalous row should not block a rollback — is
- * real, and the answer is that the escape hatch should be a separate deliberate command rather
- * than a flag that quietly weakens this one. */
+ * PER ROW, NOT WHOLESALE — the opposite of apply, and the asymmetry is the reason rather
+ * than an inconsistency.
+ *
+ * The apply aborts wholesale because a partial migration is DANGEROUS FOR BEING SILENT:
+ * the table holds two keying schemes and nothing records which rows are which, so it reads
+ * as finished. A partial revert has no such silence — the receipt names every row this run
+ * changed, and this report names which of them were put back and which were declined. The
+ * state is described rather than inferred.
+ *
+ * And a declined row is not half-done work. It means somebody changed that row after this
+ * run, so it is no longer ours to undo; leaving it alone is the correct answer, not a
+ * partial one. Refusing the other 363 as well would block a recovery action over a row the
+ * revert was right to skip — during an incident, which is when reverts happen. */
+export interface RevertReceipt {
+  readonly runId: string
+  readonly revertedAt: string
+  /** Rows put back to null. */
+  readonly reverted: readonly string[]
+  /** Rows this run changed but no longer owns, with why. Empty is a complete revert. */
+  readonly refused: readonly Difference[]
+}
+
+export type RevertDecision = Readonly<{
+  rows: readonly string[]
+  refused: readonly Difference[]
+}>
+
+/** Which rows a revert may put back, and which it must decline.
+ *
+ * NEVER A BLANKET UPDATE — it reads the receipt and touches only the rows that run changed,
+ * and only where they are still exactly as it left them. Declining is per row; see
+ * `RevertReceipt` for why this differs from the apply. */
 export function validateRevert(store: StoredSnapshot, receipt: ApplyReceipt): RevertDecision {
   const byId = new Map(store.map((row) => [row.id, row]))
   const differences: Difference[] = []
@@ -242,13 +263,20 @@ export function validateRevert(store: StoredSnapshot, receipt: ApplyReceipt): Re
       differences.push({ kind: 'ROW_MISSING', notificationId: entry.notificationId })
       continue
     }
-    // STILL AS THIS RUN LEFT IT? Both halves: the mapping inputs, and the values it wrote. A
-    // row somebody has re-keyed since is not this run's to undo.
-    const now = digestOf(row)
-    if (now !== entry.observed) {
-      differences.push({ kind: 'ROW_CHANGED', notificationId: row.id, observed: entry.observed, now })
-      continue
-    }
+    // THE TWO VERSION CHECKS HAVE DIFFERENT SCOPES, AND THIS IS THE TRAP.
+    //
+    // Apply checks every mapping input: if anything moved, the mapping describes a situation
+    // that no longer exists. REVERT CHECKS `incidentKey` AND `episode` ONLY.
+    //
+    // I had `digestOf(row) !== entry.observed` here — apply's check, reused — and reusing it
+    // LOOKS LIKE CONSISTENCY, which is exactly why it is the trap. Occurrences arrive between
+    // apply and revert; that is the system working. A row reading 301 at apply time may read
+    // 305 an hour later, and apply's digest covers `occurrenceCount`, so the revert would
+    // have refused every row within five minutes of any new event — un-runnable by design, at
+    // precisely the moment somebody needs it.
+    //
+    // With the narrow scope a refusal means somebody re-keyed this incident since the receipt,
+    // which is genuinely exceptional rather than routine.
     if (row.incidentKey !== entry.written.incidentKey || row.episode !== entry.written.episode) {
       differences.push({
         kind: 'ALREADY_KEYED_DIFFERENTLY', notificationId: row.id,
@@ -260,24 +288,49 @@ export function validateRevert(store: StoredSnapshot, receipt: ApplyReceipt): Re
     rows.push(row.id)
   }
 
-  return differences.length > 0
-    ? { proceed: false, differences: sorted(differences) }
-    : { proceed: true, rows }
+  return { rows, refused: sorted(differences) }
 }
 
-/** Undo one run's changes, restoring the values the receipt recorded. */
+/** Undo one run's changes — RESTORING ONLY THE FIELDS THE APPLY CHANGED — and say what
+ * happened.
+ *
+ * A REVERT THAT RESTORES THE ROW AS THE RECEIPT FOUND IT DESTROYS REAL EVENTS. Occurrences
+ * arrive between apply and revert; a row reading 301 at apply time may read 305 by the time
+ * anyone reverts, and writing the snapshot back rolls it to 301 — four real events gone. And
+ * `occurrenceCount` is a watched field, so the same write can deliver. Both failures are one
+ * mistake: reading "restore the prior state" as "restore the prior row".
+ *
+ * THE RECEIPT MAKES THAT EASIER TO GET WRONG, NOT HARDER, because the old values sit in it
+ * looking authoritative. It exists to make revert safe and it is the thing that would tempt
+ * somebody into the unsafe version. So this writes two columns and nothing else — which is
+ * also how the no-delivery guarantee stays true for revert.
+ *
+ * THE REPORT IS WHAT MAKES PER-ROW SAFE. A partial revert is acceptable because it is
+ * described: every row put back is listed, every row declined is listed with why, and the
+ * pair accounts for the whole receipt. Without that this would be the apply's silent
+ * mixed state wearing a different name. */
 export function revertValidated(
   store: StoredSnapshot,
   receipt: ApplyReceipt,
-  rows: readonly string[],
-): StoredSnapshot {
+  decision: RevertDecision,
+  revertedAt: string,
+): Readonly<{ after: StoredSnapshot; receipt: RevertReceipt }> {
   const restore = new Map(receipt.changed.map((entry) => [entry.notificationId, entry.previous]))
-  const touching = new Set(rows)
-  return store.map((row) => {
+  const touching = new Set(decision.rows)
+  const after = store.map((row) => {
     if (!touching.has(row.id)) return row
     const previous = restore.get(row.id)
     return previous === undefined ? row : { ...row, incidentKey: previous.incidentKey, episode: previous.episode }
   })
+  return {
+    after,
+    receipt: {
+      runId: receipt.runId,
+      revertedAt,
+      reverted: [...decision.rows].sort(),
+      refused: decision.refused,
+    },
+  }
 }
 
 /** Which rows had a watched field modified between two snapshots. Empty is healthy.

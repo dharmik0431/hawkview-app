@@ -40,6 +40,7 @@ called — is not avoided by discipline; there is nothing to avoid. **A revert c
 | `preflight.txt` | before apply | the abort report, or confirmation there are no differences |
 | `receipt.json` | written **by** apply | enough to undo the run **without consulting the database** |
 | `verify.txt` | after apply | the checklist output |
+| `revert-receipt.json` | written **by** revert | which rows went back and which were left alone -- what makes a partial revert legible rather than silent |
 
 Keep all four together. The receipt is the only thing that makes the revert safe.
 
@@ -147,25 +148,88 @@ node --import tsx scripts/alerting-apply.mts revert --receipt ..\artefacts\recei
 ```
 
 **It reads the receipt and touches only the rows that run changed, only where they still hold
-exactly what it wrote.** Never a blanket update.
+exactly what it wrote.** Never a blanket update, and it writes its own receipt.
+
+**Expected output — complete revert:**
 
 ```
-Checked 364 rows against the receipt: no differences.
-Reverted 364 rows in one transaction.
+Checked 364 rows from receipt run-2026-09-12T10:00:00Z.
+Reverted 364 rows in one transaction. Refused 0.
 Watched fields disturbed: none.
-REVERT COMPLETE.
+Wrote ..\artefacts\revert-receipt.json
+REVERT COMPLETE - all 364 rows put back.
 ```
 
-**If a row has moved since:**
+**Expected output — partial revert. THIS IS A SUCCESS, NOT A FAILURE:**
 
 ```
-ABORTED - 1 difference(s). Nothing was written.
-1 already carries a different incident key:
-  9f2c...  holds somebody-elses-later-key/1  mapping says hawkview.../1
-REVERT ABORTED - nothing was written.
+Checked 364 rows from receipt run-2026-09-12T10:00:00Z.
+Reverted 363 rows in one transaction. Refused 1.
+
+1 refused - no longer this run's to undo:
+  9f2c...  holds somebody-elses-later-key/1  this run wrote hawkview.../1
+
+Watched fields disturbed: none.
+Wrote ..\artefacts\revert-receipt.json
+REVERT COMPLETE - 363 put back, 1 left alone. 364 of 364 accounted for.
 ```
 
-### The design question, and my recommendation
+**Read the last line.** Reverted plus refused must equal the receipt's row count; that is what
+says the state is fully described rather than partly unknown. A refused row is one somebody
+else changed after the migration — **leaving it is correct**, and overwriting it would destroy
+their work.
+
+New occurrences arriving since the apply do **not** cause a refusal. That is the system
+working, and a revert that refused on them would be un-runnable — see the two scopes below.
+
+### Revert refuses PER ROW — ruled, and I argued the other way first
+
+I built wholesale and recommended it. **The argument against it is better and I have changed
+the implementation.**
+
+What I missed is the asymmetry. **The apply aborts wholesale because a partial migration is
+dangerous FOR BEING SILENT** — the table holds two keying schemes and nothing records which
+rows are which, so it reads as finished. **A partial revert has no such silence:** the
+receipt names every row the run changed, and the revert receipt names which of those were put
+back and which were declined. The two lists account for the whole receipt. The state is
+described rather than inferred, and that is what makes per-row safe rather than merely
+convenient.
+
+And a declined row is not half-done work. **It means somebody changed that row after the run,
+so it is no longer ours to undo** — leaving it alone is the correct answer. Refusing the other
+363 as well would block a recovery action over a row the revert was right to skip, during an
+incident, which is when reverts happen.
+
+**With the narrow version check below, a refusal is genuinely exceptional** rather than
+routine — which is what makes per-row tolerable in the first place.
+
+### THE TWO VERSION CHECKS HAVE DIFFERENT SCOPES, and this is the trap
+
+| | scope | why |
+|---|---|---|
+| **apply** | every mapping input — `dedupeKey`, `occurrenceCount` | if anything moved, the mapping describes a situation that no longer exists |
+| **revert** | `incidentKey` and `episode` **only** | occurrences arriving in between are normal and expected |
+
+**Reusing apply's check for revert makes the revert un-runnable by design.** A row reading
+301 at apply time reads 305 an hour later; apply's digest covers `occurrenceCount`, so the
+revert would refuse every row within five minutes of any new event — **precisely when somebody
+needs it.**
+
+I had exactly that bug. `validateRevert` called `digestOf`, which is apply's check, and
+**reusing it looks like consistency** — which is why it is a trap rather than an oversight. It
+is now pinned by a test that fails if the check is widened again.
+
+### A revert restores only the FIELDS the apply changed
+
+**Not the row as the receipt found it.** Occurrences arrive between apply and revert — that is
+the system working. Writing the snapshot back rolls `occurrenceCount` from 305 to 301 and
+**four real events are gone**; and because `occurrenceCount` is watched, the same write can
+deliver. Both failures are one mistake: reading *restore the prior state* as *restore the prior
+row*.
+
+**The receipt makes this easier to get wrong, not harder**, because the old values sit in it
+looking authoritative. It exists to make revert safe and it is the thing that would tempt
+somebody into the unsafe version. Pinned by a test asserting the four events survive.
 
 **Revert aborts wholesale, matching apply — and I recommend keeping it that way, with the
 counter-argument stated because it is real.**
@@ -182,6 +246,48 @@ wrong, one unrelated row that somebody touched should arguably not block rolling
 (revert only the rows still exactly as the receipt left them), not a flag that quietly weakens
 this one. A flag gets used by reflex; a differently-named command is a decision. **That command
 does not exist yet — say the word and it is small.**
+
+## The version check must be ONE SQL STATEMENT, not a read then a write
+
+**Measured against a real Postgres by QA, and it is a constraint on the runner rather than a
+reassurance:**
+
+- Version computed **in SQL**, so check and write are a single statement: two connections
+  racing, 25 rounds, **exactly one winner every time.**
+- The naive read-in-the-application-then-write: **both writers through in all 25 rounds.**
+
+The second is the control, and it is what makes the first mean anything — the harness
+genuinely produces a race, so the single winner is the conditional write rather than lucky
+timing.
+
+> **If the runner reads the version in TypeScript and then writes, it is not the conditional
+> write — it is the naive control, which lost every round.**
+
+Same shape as the delivery guarantee: not *we checked*, but **there was no gap in which to be
+wrong**. The pure functions in `apply-mapping.ts` compute the decision for testing; **the
+runner must still express each write as one conditional statement** whose WHERE clause carries
+the expected version. Say so at the call site — the difference between correct and worthless
+is invisible at a glance and catastrophic in production.
+
+## One transaction means locks are held for the whole run
+
+All-or-nothing means row locks are held until commit, so **every concurrent writer touching an
+already-written row stalls behind the migration for its full duration.** The engine's own
+writes queue behind it.
+
+Measured by QA at 117–199 ms against a ten-row run with a deliberate delay. **At 364 rows this
+is short and entirely acceptable** — it is stated because it is a property of the design
+rather than a defect.
+
+**The number that matters is the transaction's wall-clock length, not its row count.** More
+rows, a slower link, or a retry inside the transaction, and **the engine backs up rather than
+the migration failing** — which would present as the collector being slow rather than as the
+migration doing anything. That is the quiet failure mode to watch for if this is ever run at a
+larger size.
+
+*(A measured figure for 364 rows with no artificial delay is pending from QA; when it lands,
+the sentence to add is: at this size the stall is X, and what makes it stop being short is a
+longer transaction, not more rows.)*
 
 ## One decision to overrule here rather than in code
 
