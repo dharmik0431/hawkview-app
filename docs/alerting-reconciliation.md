@@ -8,6 +8,44 @@ consolidating must preserve the underlying events — the 301 are real, they are
 **Status: the input audit is done and it changes the shape of this step.** The dry-run
 report itself is not written, and the boundary on that is at the bottom.
 
+## Status, and a standing hazard about how this work reports
+
+**If there is a gap between commits and no message, check the branch before assuming a
+stall.** Cross-session messaging pauses after roughly ten sends until the user types in the
+engineer's session, and the pause is invisible from the other side. Three reports have been
+refused so far. From outside, a delivery failure and a stalled build look identical.
+
+**The commits are the reliable channel; the messages are not.** Everything reported in a
+message has also been written here, in the same commit as the work it describes. That is
+deliberate and it is the reason this document is long.
+
+### Answers to the open questions, as of `57ea2e8`
+
+**Nothing is blocked on a ruling.** The two items outstanding from the last exchange are both
+already settled in commits:
+
+- **The incident-tier report shape** — settled above. Tier-by-most-urgent and tier-by-majority
+  are the same number for every grouping the generator produces, so the dry run reports one
+  and says why rather than printing two identical columns.
+- **Whether the reconciliation needs a migration for the episode column** — **no.** Step 02
+  ruled pure functions, and the dry run writes nothing. The episode column belongs to step
+  03's *apply* phase, and only if the mapping is approved. Nothing about producing the report
+  requires a schema change.
+
+**Remaining work in this step, in order:** the three unwired clearing producers —
+`eventsInWindow`, `connectionVerified`, `configurationRestored`. That is the rest of the audit
+finding: all five inputs were supplied only from tests, and four fail open on their cheapest
+wrong value. Each gets the treatment `sources` already has — decide what the degenerate input
+means *before* writing the producer, and make it the refusing answer.
+
+### Push status
+
+`origin/agent/alerts-step-01` is at `57ea2e8`, verified identical to the local tip;
+`origin/main` untouched at `5488ad6`. Verified by `git ls-remote` rather than taken from the
+message that reported it, on the same rule as everything else here: a ruling is a decision,
+the file is the fact.
+
+
 ## The input audit, and it found more than one trap
 
 The standing question — *for every input the dry run reads, what computes it in
