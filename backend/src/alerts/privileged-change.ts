@@ -521,7 +521,42 @@ function grantChangeVerdict(
   const added = afterControls.filter((control) => !beforeSet.has(control.toLowerCase()))
   const operatorChanged = before.grantOperator !== after.grantOperator
 
-  if (!operatorChanged && removed.length === 0 && added.length === 0) return null
+  // "DID ANYTHING CHANGE" IS THE WRONG QUESTION WHEN SOMETHING IS UNREADABLE, and asking it
+  // in projection space is how the second instance of this defect happened.
+  //
+  // `operatorChanged` compares the MAPPED operator, and two different unreadable operators
+  // both map to UNRECOGNISED — so this guard answered "nothing changed" and the
+  // grant_operator_unknown branch below, written for exactly that input, was unreachable.
+  // A correct branch that nothing could reach.
+  //
+  // The honest predicate is "did anything change, OR is anything unreadable". Those are
+  // different questions: an unreadable value means the first cannot be answered, not that
+  // it is answered no. The same distinction as absent versus unavailable, one level up in
+  // the control flow.
+  //
+  // THE RULE THIS HAS NOW COST TWICE, and the thing to grep for rather than the instance to
+  // patch: A DISTINGUISHED-VALUE CHECK MUST NOT SIT BEHIND A CHANGE PREDICATE. I swept the
+  // rest of this file — the two state checks and the unreadable-list check are
+  // unconditional and were never affected; this was the only gated one. Wherever a mapping
+  // collapses distinct sources onto one member, a change predicate over that mapping cannot
+  // see the collapse.
+  // ONLY WHERE THE UNREADABLE VALUE COULD BE HIDING SOMETHING, which is narrower than
+  // "unreadable" and the narrowing is not tidiness. My first version of this let every
+  // unreadable operator through, including on a policy with no grant controls at all — and
+  // that reached the empty-set branch, which says "grant controls changed and one side has
+  // none". Both sides were empty and nothing had changed, so the sentence was false. The
+  // fix for a comparison that hid a change would have produced a verdict that misdescribed
+  // one. My own test caught it.
+  //
+  // ABSENT is deliberately excluded. Absent is absent — there is no hidden variation behind
+  // it, so "nothing changed" is knowable and true. UNRECOGNISED is the value that cannot
+  // support that claim, which is the entire reason the two were split.
+  const unreadableOperatorCouldHideAChange =
+    (before.grantOperator === 'UNRECOGNISED' || after.grantOperator === 'UNRECOGNISED')
+    && (beforeControls.length > 0 || afterControls.length > 0)
+
+  if (!operatorChanged && !unreadableOperatorCouldHideAChange
+    && removed.length === 0 && added.length === 0) return null
 
   // AN OPERATOR IS ONLY NEEDED WHERE THERE ARE CONTROLS TO COMBINE, and that is what
   // makes the split safe. My first version of it checked UNRECOGNISED alone and let every

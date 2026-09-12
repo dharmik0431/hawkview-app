@@ -1360,3 +1360,57 @@ named and deliberately not chased: that directory holds pre-existing unowned wor
   as keys with `null` values rather than omitting them; the null filter is what makes
   the presence set mean anything. Without it the set is identical for every policy and
   the comparison can never fire.
+
+## The reflexive operator case, and the sweep that came with it
+
+The second instance of one root, so the sweep mattered more than the patch.
+
+**The defect.** `operatorChanged` compares the **mapped** operator, and two different
+unreadable operators both map to `UNRECOGNISED` — so the "nothing changed" guard returned
+before reaching the `grant_operator_unknown` branch written for exactly that input. **A
+correct branch that nothing could reach.**
+
+**The root, and it is the same as the state defect: a comparison in projection space.**
+Wherever a mapping collapses distinct sources onto one member, a change predicate over that
+mapping cannot see the collapse.
+
+### The sweep, which found the rule rather than a third instance
+
+Every distinguished-value check in the classifier:
+
+| check | gated on a change predicate? |
+|---|---|
+| `state === 'UNAVAILABLE'` | no — unconditional |
+| `state === 'UNRECOGNISED'` | no — unconditional |
+| unreadable `ReadList` entries | no — unconditional |
+| grant operator `UNRECOGNISED` | **yes** — behind the guard |
+
+So the exclude lists were never exposed: the `unreadable > 0` check asks *"is anything
+unreadable"* directly rather than *"did anything change"*, and that is the entire difference.
+`sessionControls` compares a presence set in projection space, but it is LOSSY and stays in
+the digest, so the fingerprint reports what the set cannot — which is why that path was made
+lossy in the first place.
+
+> **A distinguished-value check must not sit behind a change predicate.**
+
+That is the rule to grep for. The honest question is not *"did anything change"* but *"did
+anything change, or is anything unreadable"* — an unreadable value means the first cannot be
+answered, rather than answered no.
+
+### The fix was too coarse first, and my own test caught it
+
+Letting *every* unreadable operator through reached the empty-set branch on a policy with no
+grant controls, which says *"grant controls changed and one side has none"*. Both sides were
+empty and nothing had changed, so **the sentence was false**. A fix for a comparison that hid
+a change would have produced a verdict that misdescribed one.
+
+Narrowed to where an unreadable value could actually hide something — unreadable **and**
+controls present on either side. **`ABSENT` is deliberately excluded**: absent is absent,
+there is no hidden variation behind it, so "nothing changed" is knowable and true. Treating
+the two alike would report impact-unknown on every comparison of an unchanged operator-less
+policy.
+
+Written test-first, as required: it failed against the code as it stood, because 35 passing
+tests over a behaviour nothing covered was the absence of a test rather than evidence. Three
+mutations, and the one that survived — including `ABSENT` in the unreadable set — exposed
+that nothing pinned the knowably-unchanged case either.
