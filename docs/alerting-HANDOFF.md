@@ -7,10 +7,18 @@ here was verified at the time of writing; where it could not be, it says so.**
 
 Branch `agent/alerts-step-01`, **56 commits over `5488ad6`**. Nothing merged to main.
 
-**Two commits are NOT on the remote.** `origin/agent/alerts-step-01` is at `3529ea1`; local is
-at `e056fc9`. Check before assuming, with `git ls-remote origin refs/heads/agent/alerts-step-01`
-— the gap between local and remote has been the single most repeated source of confusion in
-this work, and a figure quoted from unpushed code has caused it three times.
+**COMMITS ARE NOT ON THE REMOTE, AND THE COUNT IN THIS SENTENCE WILL AGE.** At the time of
+writing `origin/agent/alerts-step-01` was at `3529ea1` with four local commits ahead of it,
+including this document. **Do not trust that figure — run the check:**
+
+```bash
+git ls-remote origin refs/heads/agent/alerts-step-01; git rev-parse HEAD
+```
+
+The gap between local and remote is the single most repeated source of confusion in this work.
+Three separate times a figure was quoted to somebody from code that was not on the remote, and
+each time it was believed because the number looked right. **If you are reading this from a
+fresh clone and the file map does not match what you see, that is the first thing to check.**
 
 | worktree | who |
 |---|---|
@@ -28,7 +36,7 @@ this work, and a figure quoted from unpushed code has caused it three times.
 | 03 dry run | closed; **apply phase approved by Dharmik, shape written, not built** |
 | 04 finding intake | closed |
 | 05 routing and policy | closed |
-| 05b escalation + limits | **types only; the limit function does not exist** — QA's L1, L2, L4 are unbound |
+| 05b escalation + limits | **EXHAUSTED ruling implemented** (`e056fc9`); **the limit function does not exist** — QA's L1, L2, L4 are unbound. See *what is deliberately not covered* |
 | 06 email | not started. Resend is verified on `hawkviewapp.com` (PM's claim, not verified here) |
 | 07 SMS | **shelved by Dharmik until further notice.** The tier survives; the channel does not |
 
@@ -178,6 +186,71 @@ When they disagree, that is the finding — twice the reference instrument was t
   fails toward silence.
 - **Episode interval 24h; staleness 30 min** — both measured, with the distribution recorded
   beside the constant rather than the conclusion alone.
+
+## What is deliberately not covered
+
+**The honest gaps, which are what a cold reader most needs.** Each of these is a decision or a
+known hole, not an oversight — and none of them is blocked on something nobody remembers.
+
+### The limit function does not exist
+
+05b has the types and none of the behaviour. **QA's L1, L2 and L4 are unbound** because there
+is nothing to bind them to. "05b closed" would imply eight properties checked; five are.
+
+The shape is decided: aggregate for a fleet-wide cause, defer for a per-tenant burst, counted
+over MSP × tick to match `fanOutProblems`, and **never drop** — there is no bucket for a
+dropped message. **The number is not decided**, and should be measured rather than picked: the
+honest input is observed causes per MSP per tick on production data, which no worktree here
+has. Until then it is a constant labelled *not yet measured*, unlike the 30-minute staleness
+threshold which has 5,166 runs behind it.
+
+### `windowReadableThroughout` has no evidence to work from
+
+It needs a **collection-attempt history**, and the database does not keep one. `SyncState` is
+current state, not history — a failure inside a window followed by a recovery leaves no trace
+at all. `TenantHealthSnapshot` does keep rows and is *worse* for this: its density is a
+function of **who opened the tenants page**, so an unvisited tenant would read as healthy.
+
+**Consequence, and it is narrower than it sounds.** Only `ATTEMPT_HISTORY` can yield true, and
+nothing constructs one, so a `NO_FURTHER_EVENTS_IN_READABLE_WINDOW` condition never
+auto-clears. **Exactly one declared type resolves that way** — `security.suspected_credential_attack`
+— and its investigation is `ONLY_BY_A_PERSON` regardless, so what is lost is the condition axis
+moving to cleared, not an incident stuck in somebody's queue. **Verified against the catalogue
+rather than remembered: 1 of 7.**
+
+The real repair is a collection-attempt history, which is a schema decision. **This was a
+deliberate deferral, not an oversight** — the alternative was deriving coverage from
+"no failure rows in the window", which fails in the unsafe direction.
+
+### The preference grain for five of the seven types is the type itself
+
+The `DECLARED_TYPE` origin sets `ruleId = alertTypeId`, because for the non-directory types the
+type **is** the grain. Coherent today. **The first finer rule added under one of them would
+collapse invisibly** — an MSP could not silence it separately, and the field would still be
+populated, reading as a rule and meaning a type.
+
+Recorded at the grain in `alerting-routing-policy.md` so whoever adds that rule meets it there
+rather than in a support ticket about an MSP who turned off more than they meant to.
+
+### The Risky Users rules have no declared alert type
+
+Step 04's `intake` puts `IdentityRiskFinding.ruleId` into the queue, and that id is in neither
+the catalogue nor `CHANGE_RULES`. **So routing cannot derive a category for those findings at
+all.** They need declared types — category, subject, severity — before they can route.
+Inventing a mapping is the shortcut that put a caller-supplied category in the cause key in the
+first place.
+
+### `canonicalize` in `backend/src/changes/`
+
+Reported as needing an export, blocked on uncommitted work in the **other** worktree that
+nobody owns. **I could not find that symbol and have not verified the claim** — see the
+constraints section.
+
+### Database-integration tests have never been run against any of this
+
+They need a real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`. **96 tests, zero
+runs.** The 1588 passing figure must not be read as covering them, and the apply phase is
+exactly the work where they would matter most.
 
 ## Constraints that must not be broken
 
