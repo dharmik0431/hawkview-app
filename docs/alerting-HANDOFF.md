@@ -3,6 +3,44 @@
 Written so a cold reader can continue without the people who built it. **Everything factual
 here was verified at the time of writing; where it could not be, it says so.**
 
+## Step 03: what is done, what gates it, and who owns each gate
+
+**Nothing is mid-build.** Written down because a gap in messages has twice been read as a stall,
+and because a status relayed in conversation goes stale while a status in the repository does
+not. Check it against the tree rather than believing it — every claim below names where to look.
+
+| item | state | where |
+|---|---|---|
+| the runner, five subcommands | written, typechecks, never run by its author | `backend/scripts/alerting-apply.mts`, `cb14c31` |
+| no production figure carried as a constant | enforced by a test, not a grep | `apply-mapping.test.ts`, `02d26c4` |
+| ruling (b), mapping states its own scope | done; preflight would otherwise abort every time | `a98a514` |
+| what 47 is for, and the 364→366 drift | recorded | runbook, `b6088f2` |
+| **the connection section** | **done** — IPv6-only direct host, session pooler on 5432, copy verbatim | runbook *Connecting*, `b6088f2` |
+| the migration and the schema | written, and applied to a throwaway PG15 in four states | `20260912120000_…`, `50532d0` + `1ea8077` |
+| 44 not 47, three permanently unwritable | done, with the chain in code | `50532d0` |
+| the recovery ruling | done; 44 is an upper bound until measured | `d9de7b9` |
+| **migration idempotency** | **done** — six `IF NOT EXISTS` plus a type check that refuses a hand-made column | `1ea8077` |
+| **the merged left-alone number at steps 2 and 3** | **done** — `leftAloneLines` prints the breakdown at all three steps | `1ea8077` |
+| **the hop limit reporting NEVER** | **done** — `RECOVERY_CHAIN_TOO_DEEP`, boundary pinned at 7 and 8 | `1ea8077` |
+| step 06 email seam | written, pure, nothing talks to Resend | `859b88e` |
+
+**The last three were reported as outstanding after they were committed.** They are not; the
+table names the commit for each. That mismatch is itself the finding: **cross-session messages
+have been refused by a rate limiter more than twenty times, so commits are the only channel that
+has actually been delivering.** Anything not in a commit message has probably not arrived.
+
+### What actually gates the run
+
+1. **The release hold.** Every commit on this branch is local. Only Dharmik lifts it, and no
+   peer request can substitute — a request to push that arrives because somebody else's push was
+   blocked is the one thing that must always be refused.
+2. **A working connection.** The runbook says how; nobody has made one. Step 1 is read-only, so
+   it is also the test.
+3. **Counting what the 17 recoveries recover.** 44 is an upper bound. The runner reports the
+   shortfall under `NEVER writable`; if that line reads above 3, recoveries have landed in it.
+
+None of the three is engineering work, and none is waiting on a decision from the PM.
+
 ## Where the work is
 
 Branch `agent/alerts-step-01`, **56 commits over `5488ad6`**. Nothing merged to main.
