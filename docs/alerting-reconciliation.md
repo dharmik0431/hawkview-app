@@ -280,7 +280,7 @@ The whole remainder still serves as the event id, because that is what joins to
 `microsoftAuditId` — and all 317 joining confirms substituting the category would have broken
 a parse that demonstrably works.
 
-## An unsettled ruling: what tier does an incident take?
+## The tier question, as first raised (settled below)
 
 **Not stated anywhere.** `routingTier` maps one severity to one channel, and nothing derives a
 severity for a *group* — but the group is what gets routed. An incident holding one urgent
@@ -299,6 +299,72 @@ hearing about the one.
 
 PM's note that the tier rows sum past the incident count is the same observation from the
 other side, and it is what surfaced the gap.
+
+
+## The tier ruling: checked before building, and it is already structural
+
+**The ruling** (Dharmik, via PM): an urgent event is pageable. Nine routine events and a
+tenth that is urgent — you page. So an incident takes the tier of its **most urgent
+member**, and it **never goes back down**.
+
+Checked rather than implemented, and for **declared** severity it is not a mechanism at
+all — it is impossible to violate:
+
+> Severity is declared **per type**. The incident key contains the **type id**. So every
+> event in an incident shares a type and therefore shares a severity. **There is no
+> mixed-tier incident to take the maximum of.**
+
+A test sweeps every pair of catalogue types with different severities and asserts their keys
+differ for the same subject and scope, with a positive control that two events of the same
+type do share an incident.
+
+### The one real tier change, and it was already one-directional
+
+A `RECORD_ONLY` type can be **promoted** into an investigation — that is a genuine tier
+change inside one incident, and it is the case the ruling bites on. All three properties were
+already guaranteed by step 01 rather than needing anything new:
+
+| property | already guaranteed by |
+|---|---|
+| pages **once**, not per subsequent event | `ESCALATE_INTO_INVESTIGATION` sits behind `investigation === 'NONE'`, so after it fires the branch is unreachable for that episode; `alreadyEscalated` covers the plain `ESCALATE` case |
+| **never downgrades** | `openInvestigation` is the only way `NONE` is left, and nothing returns to it — `resolveInvestigation` goes `OPEN` → `RESOLVED`, never to `NONE` |
+| the reason travels | the outcome carries its `signal` |
+
+Verified by mutation: forcing `resolveInvestigation` to produce `NONE` fails three tests,
+including the one that exists for this ruling. And every combination of `applyObservation`
+input is swept against a promoted lifecycle — none can return it to `NONE`.
+
+So the ruling is **a test and a sentence**, which is the outcome PM hoped for and the reason
+for checking first. Implementing it again in a second place would have created two mechanisms
+that can disagree.
+
+### A correction to the measurement that raised it
+
+PM's tier rows summed past the incident count, which is what surfaced the question. **That is
+an artefact of the approximation, not a reachable state.** Their hand-classification grouped
+events without the type in the key, so one group could hold several tiers. Under the real key
+it cannot.
+
+Which answers the worry directly: **the act-now count cannot rise because of this ruling.**
+Tier-by-most-urgent-member and tier-by-majority are *the same number* for every grouping the
+generator produces — the declared path and the `assumingSingleType` bound both put one type in
+each group. Reporting two identical columns would imply the comparison was meaningful, so the
+dry run reports one and says why.
+
+The act-now count may still move once the real classifier replaces the approximation — 3 was
+measured against a hand-written policy reading, and `PIM` alone is 3 rows that are strong
+candidates for the privileged type. It will not move because of tier aggregation.
+
+### The part that is not a mechanism
+
+**The reason must travel with the tier, in the interface.** An MSP opening a paged incident
+that holds one urgent event and nine routine ones must see the urgent one first, and the
+reason must name it. A correctly-tiered incident that opens on a list of password resets has
+technically done its job and practically failed.
+
+That is a presentation obligation for step 06/07 and cannot be enforced here — the outcome
+carries the signal, and whether anything renders it is the part this layer cannot see. It is
+recorded with the other handoff obligations for exactly that reason.
 
 
 ## What to check first when this breaks

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ALERT_CATALOG } from './alert-catalog.js'
+import { acknowledge, applyObservation, openInvestigation, resolveInvestigation } from './alert-lifecycle.js'
+import { evidenceFromSync } from '../risky-users-wiring/evidence-availability.js'
 import { incidentGrouping, wouldGroupTogether, type ResolvedSubject } from './alert-incident-key.js'
 import { quietIntervalIsDerived, quietIntervalMsOf } from './alert-episode-interval.js'
 import type { AlertTypeDeclaration } from './alert-type.js'
@@ -357,4 +359,76 @@ test('THE COMPILER DECIDES WHICH PATH A TYPE TAKES, not a reviewer', () => {
 
   // Both directives are guarantees rather than comments: if either combination stops
   // being an error, the directive goes unused and the build fails saying so.
+})
+
+test('AN INCIDENT CANNOT SPAN DECLARED TIERS, which settles the tier ruling structurally', () => {
+  // The ruling: an incident takes the tier of its most urgent member and never goes back
+  // down. Checked before building anything, and for DECLARED severity it is not a mechanism
+  // at all — it is already impossible to violate.
+  //
+  // Severity is declared per TYPE, and the incident key contains the type id. So every event
+  // in an incident shares a type and therefore shares a severity. There is no mixed-tier
+  // incident to take the maximum of.
+  const bySeverity = new Map<string, typeof ALERT_CATALOG[number][]>()
+  for (const declaration of ALERT_CATALOG) {
+    bySeverity.set(declaration.severity, [...(bySeverity.get(declaration.severity) ?? []), declaration])
+  }
+  assert.ok(bySeverity.size > 1, 'the catalogue must span severities or this proves nothing')
+
+  // Any two types of DIFFERENT severity produce different keys for the same subject and
+  // scope, so their events cannot land in one incident.
+  const subject = resolved('same-subject')
+  for (const left of ALERT_CATALOG) {
+    for (const right of ALERT_CATALOG) {
+      if (left.severity === right.severity) continue
+      assert.equal(
+        wouldGroupTogether(
+          incidentGrouping(left, scope, subject),
+          incidentGrouping(right, scope, subject)),
+        false,
+        `${left.id} (${left.severity}) and ${right.id} (${right.severity}) must not share an incident`)
+    }
+  }
+
+  // POSITIVE CONTROL: two events of the SAME type and subject do share one, so the
+  // separation above is about the type rather than keys never matching.
+  const sameType = ALERT_CATALOG[0]
+  assert.ok(sameType)
+  assert.equal(
+    wouldGroupTogether(incidentGrouping(sameType, scope, subject), incidentGrouping(sameType, scope, subject)),
+    true)
+})
+
+test('THE ONLY TIER CHANGE IS ESCALATION, and it is already one-directional', () => {
+  // The part of the ruling that is a real property rather than a vacuity: a RECORD_ONLY type
+  // can be promoted into an investigation, which is a tier change within one incident. The
+  // ruling says it must never reverse.
+  //
+  // `openInvestigation` is documented as the only way NONE is left, and nothing in the
+  // lifecycle returns to it — `resolveInvestigation` goes OPEN to RESOLVED, never to NONE.
+  // So "never downgrades" is a property of the three axes rather than a rule somebody
+  // enforces, and the check is that no function can produce NONE from a non-NONE state.
+  const promoted = openInvestigation({ ownership: 'UNACKNOWLEDGED', condition: 'ACTIVE', investigation: 'NONE' })
+  assert.equal(promoted.investigation, 'OPEN')
+
+  // Every transition available, applied to a promoted lifecycle: none returns it to NONE.
+  assert.notEqual(acknowledge(promoted).investigation, 'NONE')
+  assert.notEqual(resolveInvestigation(promoted).investigation, 'NONE')
+  assert.notEqual(openInvestigation(promoted).investigation, 'NONE')
+  for (const evidence of [evidenceFromSync('SUCCESS'), evidenceFromSync('PERMISSION_REQUIRED')]) {
+    for (const conditionCleared of [true, false]) {
+      for (const mayAutoCloseInvestigation of [true, false]) {
+        assert.notEqual(
+          applyObservation(promoted, { evidence, conditionCleared, mayAutoCloseInvestigation }).investigation,
+          'NONE',
+          JSON.stringify({ evidence, conditionCleared, mayAutoCloseInvestigation }))
+      }
+    }
+  }
+
+  // And routine evidence arriving after the promotion cannot pull it back: a resolved
+  // investigation stays RESOLVED rather than reverting to a record.
+  const resolvedAgain = resolveInvestigation(promoted)
+  assert.equal(openInvestigation(resolvedAgain).investigation, 'RESOLVED',
+    'openInvestigation is a no-op on a non-NONE investigation, so it cannot be used to churn the axis')
 })
