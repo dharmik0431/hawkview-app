@@ -255,8 +255,23 @@ export interface ReconciliationReport {
     /** Incidents whose episode count cannot be recovered because at least one row carries
      * no event time. NOT counted as one episode each: unknown is not one. */
     incidentsWithUnrecoverableEpisodes: number
-    /** Rows carrying no event time at all. */
+    /** Rows carrying no event time at all.
+     *
+     * THIS FIELD ONCE LIED, AND THE NAME WAS NEVER THE PROBLEM. It was summed as
+     * `rowsWithoutTime += bucket.missing` over the incident buckets, and ungrouped rows were
+     * never bucketed — so the figure silently excluded exactly the rows the bucketing bug had
+     * dropped. It read 22 where the answer was 47, on an input where 364 - 317 = 47 is
+     * checkable by hand, and nothing announced the correction when the bucketing was fixed:
+     * the number simply got better, which is the worst way for a number to change.
+     *
+     * It is now counted PER ROW, where the fact is known, with `rowsWithEventTime` beside it
+     * so the two must add to `total` — see `invariants.eventTimeCountsAddUp`. A COUNTER
+     * DERIVED FROM A STRUCTURE INHERITS THAT STRUCTURE’S OMISSIONS, and the cheapest defence
+     * is an arithmetic identity the report checks on itself. */
     rowsWithoutEventTime: number
+    /** Rows carrying one. Reported only so the pair has something to disagree with: a lone
+     * count cannot be wrong, while a pair that must sum to a known total can. */
+    rowsWithEventTime: number
     /** Rows whose declared subject did not resolve, so each STANDS ALONE as its own
      * single-event incident rather than merging with the other unresolved ones.
      *
@@ -272,6 +287,17 @@ export interface ReconciliationReport {
      * SQL and it asserts a relationship nothing evidences. Reported separately so the
      * disagreement is visible in the output rather than recoverable only by arithmetic. */
     rowsStandingAloneBecauseSubjectUnresolved: number
+    /** The same rows broken down by key shape, so the total is DERIVABLE FROM THE OTHER SIDE.
+     *
+     * A bare 34 is a number nobody can check. The breakdown says which shapes contribute and
+     * therefore why, and each reason is a property of the key rather than of the data: a
+     * directory row stands alone when the audit record names no initiator; initial-sync and
+     * recovery keys name no resource type, so the COLLECTOR subject cannot resolve; onboarding
+     * and unrecognised shapes determine no alert type, so they reach the nominated type’s
+     * ACTOR subject with no audit record to resolve it. Anyone can count those shapes in SQL
+     * and compare, which is the whole point — an unverifiable figure in a reconciliation
+     * report is not evidence, it is a claim. */
+    standingAloneByShape: Partial<Record<KeyShape, number>>
     /** The interval the count used, from the nominated type's declaration. */
     quietIntervalHours: number
   }>
@@ -335,6 +361,26 @@ export interface ReconciliationReport {
      * this one catches exactly that. A real check whose reported value is a tripwire,
      * rather than a tripwire wearing the words of a real check. */
     occurrencesPreserved: boolean
+    /** Whether the event-time counts add up: withTime + withoutTime === total.
+     *
+     * ADDED BECAUSE A METRIC CORRECTED ITSELF IN SILENCE. `rowsWithoutEventTime` was
+     * derived by summing over the incident buckets, which excluded ungrouped rows, so it
+     * read 22 against a true 47 — and the only reason anyone noticed is that a reader
+     * happened to have the arithmetic to check it against. That reader should not have to
+     * be the check.
+     *
+     * A LIST, NOT A BARE BOOLEAN, so it names the discrepancy rather than only its
+     * existence. Empty means it adds up.
+     *
+     * AND IT IS A TRIPWIRE, NOT AN INPUT-FALSIFIABLE CHECK — the same honest label
+     * `occurrencesPreserved` carries, and I first wrote the opposite here. NO INPUT can make
+     * this fail: both counters are incremented in one pass over the same rows, exactly once
+     * each, so the identity holds by construction. A mutation hardcoding it empty survived
+     * every test, which is the proof. What it defends against is a FUTURE derivation moving
+     * off the row — which is exactly what went wrong before, when the count was summed over
+     * the incident buckets and inherited their exclusions. That is worth having, and it is
+     * not the same thing as a check, so it does not get to be described as one. */
+    eventTimeCountsAddUp: readonly string[]
   }>
 }
 
@@ -400,6 +446,14 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   // cannot silently agree with a bucketing bug: if these rows were dropped again this number
   // would still report them. See the coupling test.
   let standingAlone = 0
+  const standingAloneByShape: Partial<Record<KeyShape, number>> = {}
+  // COUNTED PER ROW, NOT SUMMED OVER THE BUCKET MAP. It was `rowsWithoutTime +=
+  // bucket.missing` over `rowsByIncident`, and ungrouped rows were never in that map — so
+  // the field inherited the bucketing exclusion and read 22 where the answer was 47, on an
+  // input where 364 - 317 = 47 is checkable by hand. A COUNTER DERIVED FROM A STRUCTURE
+  // INHERITS THAT STRUCTURE’S OMISSIONS. This one is taken where the fact is known.
+  let rowsWithTime = 0
+  let rowsWithoutTimeByRow = 0
   const rowsByIncident =
     new Map<string, { times: Date[]; missing: number; events: number; auditOnly: boolean }>()
   const nominated = declarationFor('security.routine_directory_change')
@@ -412,6 +466,8 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
     const parsed = parseDedupeKey(row.dedupeKey)
     byShape[parsed.shape] += 1
     occurrences += row.occurrenceCount
+    if (row.occurredAt instanceof Date) rowsWithTime += 1
+    else rowsWithoutTimeByRow += 1
     if (parsed.shape === 'UNRECOGNISED') unrecognised.add(row.dedupeKey)
     if (parsed.auditCategory !== null) {
       auditCategories[parsed.auditCategory] = (auditCategories[parsed.auditCategory] ?? 0) + 1
@@ -446,7 +502,10 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       // id. Two unattributed events are two incidents of one event each — exactly what
       // `wouldGroupTogether` already refuses to merge, now honoured in the episode count too.
       const episodeKey = boundGrouping.groups ? boundGrouping.key : `ungrouped:${row.id}`
-      if (!boundGrouping.groups) standingAlone += 1
+      if (!boundGrouping.groups) {
+        standingAlone += 1
+        standingAloneByShape[parsed.shape] = (standingAloneByShape[parsed.shape] ?? 0) + 1
+      }
       {
         const bucket = rowsByIncident.get(episodeKey)
           ?? { times: [], missing: 0, events: 0, auditOnly: true }
@@ -503,9 +562,7 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
   let episodesCounted = 0
   let episodesCountedAudit = 0
   let unrecoverable = 0
-  let rowsWithoutTime = 0
   for (const bucket of rowsByIncident.values()) {
-    rowsWithoutTime += bucket.missing
 
     // ONE EVENT IS ONE EPISODE, AND THAT IS KNOWABLE WITHOUT ITS TIME. The time is only
     // needed to SPLIT several events; a single event forms exactly one burst whenever it
@@ -558,8 +615,10 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       counted: episodesCounted,
       countedDirectoryAuditOnly: episodesCountedAudit,
       incidentsWithUnrecoverableEpisodes: unrecoverable,
-      rowsWithoutEventTime: rowsWithoutTime,
+      rowsWithoutEventTime: rowsWithoutTimeByRow,
+      rowsWithEventTime: rowsWithTime,
       rowsStandingAloneBecauseSubjectUnresolved: standingAlone,
+      standingAloneByShape,
       quietIntervalHours: quietMs / (60 * 60 * 1000),
     },
     mapping,
@@ -569,6 +628,10 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
       occurrencesPreserved:
         mapping.reduce((sum, entry) => sum + entry.occurrenceCount, 0)
         === rows.reduce((sum, row) => sum + row.occurrenceCount, 0),
+      eventTimeCountsAddUp: rowsWithTime + rowsWithoutTimeByRow === rows.length
+        ? []
+        : [`${rowsWithTime} with a time + ${rowsWithoutTimeByRow} without = ${
+            rowsWithTime + rowsWithoutTimeByRow}, but ${rows.length} rows were read`],
     },
   }
 }

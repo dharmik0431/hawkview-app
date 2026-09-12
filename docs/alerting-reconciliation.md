@@ -681,3 +681,90 @@ own asymmetry, so the next person to edit it cannot silently restore the blind s
 
 Five mutations, no survivors: the count never incrementing, counting every row, inverted,
 the buckets dropping ungrouped rows again, and all ungrouped rows merged onto one bucket.
+
+## 71, and the reference instrument was the wrong one
+
+The final production figures: **`countedDirectoryAuditOnly` 62 → 71**, and **71 = 62 + 9** —
+the nine unattributable rows now standing alone at one episode each, which is the step-02
+ruling. The SQL that read 68 coalesced those nine onto a single literal `'UNATTRIBUTED'`
+actor and got 6 from them: **inventing a relationship between nine strangers, which is
+precisely what the ruling forbids.**
+
+Recorded this way round deliberately. The interesting case for a reader is not *two
+measurements agreed* — that is the case where nobody learns anything — but **they disagreed
+and the reference was wrong.** A second instrument is only worth building if you are willing
+to find out it is the faulty one.
+
+### A metric that corrects itself in silence
+
+`rowsWithoutEventTime` read **22** at `2a9694e` and **47** at `601ba53` on the identical
+input, and 47 is the arithmetically correct answer: 364 − 317 = 47. **22 was lying.** Caught
+only because a reader happened to have the arithmetic to check it against, which is not a
+control.
+
+**The cause, reproduced rather than argued.** Both versions were run over one fixture built
+from the production shape — 364 rows, 317 with `occurredAt`, 9 directory rows with no
+resolvable actor — and the old code reproduced every observed figure:
+
+| | `2a9694e` | `601ba53` | |
+|---|---|---|---|
+| `rowsWithoutEventTime` | 22 | 47 | +25 |
+| `incidentsWithUnrecoverableEpisodes` | 2 | 5 | +3, the observed delta |
+| `countedDirectoryAuditOnly` | 12 | 21 | +9, the nine standing alone |
+| `rowsStandingAlone…` | absent | 34 | the observed figure |
+
+The field was computed as `rowsWithoutTime += bucket.missing` over the incident buckets — and
+ungrouped rows were never in that map. **So the field silently excluded exactly the rows the
+bucketing bug had dropped.** 47 − 25 = 22, where 25 is the standing-alone rows carrying no
+time (34 standing alone, minus the 9 directory ones that do carry times from the audit join).
+`incidentsWithUnrecoverableEpisodes` moved +3 for the same reason, one rule further on: of
+those 25 newly-bucketed rows, the single-event ones now count as one episode each and only the
+three aggregates remain genuinely unknown.
+
+**The name was never the problem, so nothing is renamed.** `rowsWithoutEventTime` always meant
+"rows carrying no event time"; the code computed something else and called it that. This is
+not a field whose subject changed — it is a field that was wrong, and got quietly less wrong.
+That distinction matters for the fix: a rename would have preserved the bad derivation under a
+more careful name.
+
+**A COUNTER DERIVED FROM A STRUCTURE INHERITS THAT STRUCTURE'S OMISSIONS.** The repair is to
+count a row-level fact at the row, where it is known, not by summing something that can decide
+a row does not belong to it. `rowsWithEventTime` is now reported beside it so the two must add
+to `total`, and `invariants.eventTimeCountsAddUp` says so in the output — the reader should
+not have to be the check.
+
+**That invariant is a tripwire, not an input-falsifiable check, and the first version of this
+section claimed otherwise.** Both counters are incremented in one pass over the same rows,
+exactly once each, so no input can make the identity fail; a mutation hardcoding it empty
+survived every test. It defends against a future derivation moving off the row — which is
+exactly what went wrong — and that is worth having, but it is not a check and does not get
+described as one. Same honest label `occurrencesPreserved` already carries.
+
+### The pair of edits a one-at-a-time harness cannot see
+
+Mutating the derivation alone **survives**, and that survival is correct: since every row is
+now bucketed, summing the buckets and counting the rows give the same answer. The defect needed
+**two** things at once — the bucket map excluding ungrouped rows *and* the count deriving from
+that map. Either alone is harmless.
+
+So the harness now applies **paired edits** and declares its expected survivors up front, which
+turns a survival into a prediction confirmed rather than a result explained afterwards. Seven
+mutations, no unexpected outcomes: the real two-edit defect (killed), the exclusion alone
+(killed, and the row-level count does not move with it), the derivation alone (survives, as
+predicted), the row counter never incrementing, the two counters swapped, the breakdown keyed
+on a constant, and the breakdown counting every row.
+
+### The 34, made derivable
+
+A bare 34 is a claim, not evidence. `standingAloneByShape` breaks it down, and every reason is
+a property of the **key** rather than of the data, so it can be counted independently in SQL:
+
+| shape | why it stands alone |
+|---|---|
+| `DIRECTORY_AUDIT` | the audit record names no initiator, so the ACTOR subject cannot resolve |
+| `TENANT_INITIAL_SYNC` | the key names no resource type, so the COLLECTOR subject cannot resolve |
+| `RECOVERY` | likewise — the recovery key carries no resource type |
+| `TENANT_ONBOARDING`, `UNRECOGNISED` | the shape determines no alert type, so they reach the nominated type's ACTOR subject with no audit record |
+
+Shapes that do resolve a subject are **absent** from the breakdown rather than present as
+zero, so it cannot be misread as a list of shapes that all failed.

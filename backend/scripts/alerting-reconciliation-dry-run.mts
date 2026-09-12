@@ -200,7 +200,13 @@ function printReport(
       + 'key-prefix-filtered SQL count. rowsStandingAloneBecauseSubjectUnresolved is the '
       + 'number a SQL count will most often disagree about: coalescing those rows onto one '
       + 'literal UNATTRIBUTED actor is the obvious thing to do in SQL and asserts a '
-      + 'relationship nothing evidences, so compare this figure before comparing totals.',
+      + 'relationship nothing evidences, so compare this figure before comparing totals. '
+      + 'standingAloneByShape breaks that figure down by key shape so it can be derived from '
+      + 'the other side rather than taken on trust. WARNING ON rowsWithoutEventTime: before '
+      + 'this commit it was summed over the incident buckets, which excluded ungrouped rows, '
+      + 'so it UNDER-REPORTED -- 22 was quoted where the answer was 47. It is now counted per '
+      + 'row, invariants.eventTimeCountsAddUp must be empty, and it must NOT be compared with '
+      + 'any figure recorded from an earlier run.',
     episodes: report.episodes,
     invariants: report.invariants,
     ...(context.auditJoin === null ? {} : { auditJoin: context.auditJoin }),

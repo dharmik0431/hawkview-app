@@ -603,3 +603,82 @@ test('THE STANDING-ALONE COUNT IS NAMED, not left to subtraction', () => {
   // one stood alone" from any other split that lands on two.
   assert.equal(report.episodes.counted, 2)
 })
+
+test('A ROW-LEVEL FACT IS COUNTED AT THE ROW, not summed over a structure that can drop it', () => {
+  // The defect, reproduced. `rowsWithoutEventTime` was `rowsWithoutTime += bucket.missing`
+  // over the incident buckets, and ungrouped rows were never bucketed — so the field silently
+  // excluded exactly the rows the bucketing bug had dropped. On the production set it read 22
+  // against a true 47, where 364 − 317 = 47 is checkable by hand, and when the bucketing was
+  // fixed the number simply got better with nothing announcing a correction.
+  //
+  // THE EXPECTATION COMES FROM THE INPUT, not from a literal and not from another field of
+  // the report. A literal would have agreed with whichever run wrote it down.
+  const rows = [
+    // Grouping rows with times — these were always counted correctly, which is how the bug
+    // stayed plausible: every number was right for the rows it could see.
+    auditAt('g1', 'admin-1', T0),
+    auditAt('g2', 'admin-1', T0 + 1000),
+    // A grouping row with NO time.
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1' }),
+    // Rows that do not group AND have no time — invisible to the old derivation entirely.
+    row({ dedupeKey: 'tenant:t1:initial-sync', customerTenantId: 't1' }),
+    row({ dedupeKey: 'tenant:t1:onboarding-authorized', customerTenantId: 't1' }),
+    row({ dedupeKey: 'nobody:wrote:this', customerTenantId: 't1' }),
+  ]
+  const report = reconcile(rows)
+
+  const withoutTime = rows.filter((input) => !(input.occurredAt instanceof Date)).length
+  const withTime = rows.length - withoutTime
+  assert.equal(report.episodes.rowsWithoutEventTime, withoutTime)
+  assert.equal(report.episodes.rowsWithEventTime, withTime)
+
+  // AND THE FIXTURE MUST CONTAIN THE CASE THE OLD DERIVATION MISSED, or this test passes over
+  // a version with the bug still in it. Three timeless rows that do not group: the old code
+  // would have reported 1 here, counting only the grouping one.
+  assert.equal(report.episodes.rowsStandingAloneBecauseSubjectUnresolved, 3)
+  assert.ok(withoutTime > 1, 'more than one timeless row, and not all of them group')
+
+  // The report checks its own arithmetic, so a reader does not have to be the check.
+  assert.deepEqual(report.invariants.eventTimeCountsAddUp, [])
+})
+
+test('THE STANDING-ALONE TOTAL IS DERIVABLE FROM THE OTHER SIDE, by shape', () => {
+  // A bare 34 is a number nobody can verify. Each shape stands alone for a reason that is a
+  // property of the KEY, so anyone can count those shapes in SQL and compare — which is what
+  // makes the figure evidence rather than a claim.
+  const rows = [
+    auditAt('a', 'admin-1', T0),                                          // groups on its actor
+    row({                                                                  // no initiator
+      dedupeKey: 'security:directory-audit:Directory_u1',
+      occurredAt: new Date(T0 + 1000),
+      audit: { initiatedBy: null, targetResources: [], privileged: null },
+    }),
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1' }), // COLLECTOR resolves
+    row({ dedupeKey: 'tenant:t1:initial-sync', customerTenantId: 't1' }),  // no resource type
+    row({ dedupeKey: 'tenant:t1:connection:recovered:2', customerTenantId: 't1' }), // likewise
+    row({ dedupeKey: 'nobody:wrote:this' }),                               // no type, no audit
+  ]
+  const report = reconcile(rows)
+
+  // The shapes that DO resolve a subject are absent rather than present as zero, so the
+  // breakdown cannot be misread as a list of shapes that all failed. Asserted BEFORE the
+  // deepEqual below, because `assert.deepEqual` narrows its first argument to the expected
+  // literal type — after it, this lookup does not compile, which is the compiler pointing
+  // out that the two assertions are about different things.
+  assert.equal(report.episodes.standingAloneByShape.TENANT_SYNC, undefined)
+  assert.equal(report.episodes.standingAloneByShape.TENANT_CONNECTION, undefined)
+
+  // The breakdown must sum to the headline figure, or one of the two is wrong and a reader
+  // has no way to tell which.
+  const summed = Object.values(report.episodes.standingAloneByShape)
+    .reduce((total, count) => total + count, 0)
+  assert.equal(summed, report.episodes.rowsStandingAloneBecauseSubjectUnresolved)
+
+  assert.deepEqual(report.episodes.standingAloneByShape, {
+    DIRECTORY_AUDIT: 1,
+    TENANT_INITIAL_SYNC: 1,
+    RECOVERY: 1,
+    UNRECOGNISED: 1,
+  })
+
+})
