@@ -861,11 +861,36 @@ test('AN UNRECOGNISED POLICY STATE IS NEVER TREATED AS ONE OF THE THREE', () => 
     assert.equal(outOfUnknown.classification, 'UNCLASSIFIED', `UNRECOGNISED -> ${known}`)
   }
 
-  // POSITIVE CONTROL: unrecognised on BOTH sides is not a state change, so it must fall
-  // through to the other comparisons rather than reporting every time it is seen.
-  const unchanged = classifyConditionalAccessChange(
+  // THE REFLEXIVE CASE, WHICH THIS TEST ORIGINALLY ASSERTED BACKWARDS. It said
+  // unrecognised-on-both-sides "is not a state change, so it must fall through", and
+  // expected ROUTINE. That was the defect written down as a control, and QA found it.
+  //
+  // Two different unrecognised raw states both map to UNRECOGNISED, so the projection
+  // collapses exactly this pair — and because the path is lossless and therefore
+  // excluded from the fingerprint, nothing else could report it. A real change between
+  // two states we cannot read came back as a record. The reflexive case is the one the
+  // projection loses, which makes it the one that most needed covering, and calling it
+  // a positive control is what stopped me seeing that.
+  const bothUnreadable = classifyConditionalAccessChange(
     policy({ state: 'UNRECOGNISED' }), policy({ state: 'UNRECOGNISED' }))
-  assert.equal(unchanged.classification, 'ROUTINE')
+  assert.equal(bothUnreadable.classification, 'UNCLASSIFIED',
+    'two states we cannot read are not thereby the same state')
+  assert.equal(bothUnreadable.rule, 'conditional_access.policy_state_unrecognised')
+
+  // THE REAL POSITIVE CONTROL has to be a READABLE pair: two policies in the same known
+  // state still reach routine, so the rule above is about the distinguished value rather
+  // than a gate that fires on every comparison.
+  assert.equal(
+    classifyConditionalAccessChange(policy({ state: 'ON' }), policy({ state: 'ON' })).classification,
+    'ROUTINE')
+
+  // And an unreadable state outranks the other unknowns, the same way a weakening does —
+  // otherwise a policy we cannot read would be reported as whichever lesser thing also
+  // moved, which is a verdict about the wrong dimension.
+  const alsoNoisy = classifyConditionalAccessChange(
+    policy({ state: 'UNRECOGNISED', unmodelledFingerprint: 'before' }),
+    policy({ state: 'UNRECOGNISED', sessionControls: ['signInFrequency'], unmodelledFingerprint: 'after' }))
+  assert.equal(alsoNoisy.rule, 'conditional_access.policy_state_unrecognised')
 })
 
 test('AN EXCLUSION NAMES THE KIND, because the kinds are different sizes of event', () => {

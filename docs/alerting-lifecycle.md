@@ -1031,10 +1031,35 @@ designed behaviour, not noise.
 **The fidelity claim is witnessed rather than declared.** Each path carries two policies
 differing only at it, and the two fidelities make opposite predictions: a lossless path
 must change the state and must NOT move the digest; a lossy path must leave the state
-identical and MUST move the digest. Mislabelling in either direction fails a test, so a
-lossy-and-excluded path — the configuration that produced the grant-operator defect —
-cannot be written again by accident. That is the obligation enforced by something rather
-than followed by somebody.
+identical and MUST move the digest. Mislabelling an **existing** path in either direction
+fails a test.
+
+**What the witness does not do, corrected.** This section previously said a
+lossy-and-excluded path "cannot be written again by accident". **That was false**, and it
+is corrected rather than softened, because this is the paragraph somebody reads when
+deciding whether excluding a path is safe — and an overstated guarantee is worse than
+none, since it stops the next person looking.
+
+A witness is **one pair, chosen by the same hand and on the same row as the label it
+checks.** LOSSLESS is a claim about **every** pair, and an existential cannot establish a
+universal. QA defeated it directly: add a path, project a structured subtree onto a
+boolean, label it LOSSLESS, and choose absent-versus-present as the witness. The boolean
+moves, so the pair passes and the path leaves the digest — then a later change *inside*
+that subtree moves neither the state nor the digest and reads routine, with a `because`
+true as written and false in effect. Nothing went red. That is the grant-operator defect
+one dimension across.
+
+No stronger witness fixes this, because the defect is in the quantifier rather than in
+the example. What a witness is worth is narrower and still real: it forces an author to
+exhibit a concrete pair instead of asserting a label, and it kills a careless relabel of
+a path that was already correctly witnessed.
+
+**The constraint that does close it is on the target type, not on the example:** a
+projection may be LOSSLESS only if the state field it feeds can represent *"there was
+more here than I captured"*. `state` has `UNRECOGNISED`; `grantOperator` has `null`; a
+boolean over a structured subtree has no such member, so QA's path could not have been
+labelled LOSSLESS at all. That is checkable at authoring time and an author cannot
+satisfy it by choosing a convenient example.
 
 ### What HawkView cannot see: role-based exclusions
 

@@ -579,13 +579,32 @@ export function classifyConditionalAccessChange(
       'conditional-access-state-missing')
   }
 
-  // A STATE WE DO NOT RECOGNISE IS NOT A STATE WE CAN COMPARE, and it comes first so
-  // no rule below gets to treat it as one of the three it understands.
-  if (before.state !== after.state && (before.state === 'UNRECOGNISED' || after.state === 'UNRECOGNISED')) {
+  // A DISTINGUISHED VALUE MEANS THE FIELD CANNOT BE READ, AND THAT IS TRUE WHETHER OR
+  // NOT THE TWO SIDES DIFFER. This is a rule about distinguished values rather than a
+  // special case for `state`, and it is what makes excluding a lossless path from the
+  // fingerprint safe: the exclusion is only honest while every value the projection
+  // cannot express lands on a member that says so and is never resolved to a verdict.
+  //
+  // THE EARLIER VERSION REQUIRED THE SIDES TO DIFFER, and that was a live defect QA
+  // found. Two different unrecognised raw states both map to UNRECOGNISED, so
+  // UNRECOGNISED-to-UNRECOGNISED looked like "no change" — and because this path is
+  // lossless and therefore excluded from the digest, the fingerprint could not report
+  // it either. A real change between two states we cannot read came back ROUTINE with
+  // nothing to contradict it. The reflexive case is precisely the one the projection
+  // collapses, which makes it the one that needed covering.
+  //
+  // `grantOperator === null` is NOT covered by this rule yet, deliberately: that value
+  // conflates ABSENT (no grant controls configured — knowable, and common for a
+  // session-controls-only policy) with UNRECOGNISED (Microsoft sent an operator we do
+  // not understand). Applying the rule to it today would report impact-unknown for
+  // every policy that simply has no grant controls. Splitting those two is the same
+  // repair as the fidelity constraint and belongs with it.
+  if (before.state === 'UNRECOGNISED' || after.state === 'UNRECOGNISED') {
     return unclassified(
       'conditional_access.policy_state_unrecognised',
-      'A conditional access policy moved into or out of a state this comparison does not recognise, so ' +
-      'whether it is enforcing cannot be determined. Change detected; impact unknown.',
+      'A conditional access policy is in a state this comparison does not recognise, so whether it is ' +
+      'enforcing cannot be determined — and two states we cannot read are not thereby the same state. ' +
+      'Change detected; impact unknown.',
       'policy-state')
   }
 

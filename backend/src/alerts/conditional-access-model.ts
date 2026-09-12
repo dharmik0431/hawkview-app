@@ -63,13 +63,34 @@ export interface ModelledPath {
   /** TWO POLICIES DIFFERING ONLY AT THIS PATH, which turns the fidelity claim into
    * something checkable instead of a label somebody wrote.
    *
-   * This is the enforcement. A LOSSLESS path must produce a state that DIFFERS across
-   * the pair — if it does not, the projection lost something and excluding the path
-   * from the digest hides it. A LOSSY path must produce a state that is IDENTICAL
-   * across the pair (proving the loss is real) while the digest MOVES (proving the
-   * lost part is still visible somewhere). Mislabelling in either direction fails a
-   * test, so a lossy-and-excluded path — the configuration that produced the
-   * grant-operator defect — cannot be written again by accident.
+   * A LOSSLESS path must produce a state that DIFFERS across the pair — if it does
+   * not, the projection lost something and excluding the path from the digest hides
+   * it. A LOSSY path must produce a state that is IDENTICAL across the pair (proving
+   * the loss is real) while the digest MOVES (proving the lost part is still visible
+   * somewhere). Mislabelling an EXISTING path in either direction fails a test.
+   *
+   * WHAT THIS DOES NOT DO. An earlier version of this comment said a lossy-and-excluded
+   * path "cannot be written again by accident". THAT WAS FALSE, and it is corrected here
+   * rather than softened because a reader deciding whether excluding a path is safe will
+   * rely on exactly these words.
+   *
+   * A witness is ONE PAIR, chosen by the same hand and on the same row as the label it
+   * checks. LOSSLESS is a claim about EVERY pair. An existential cannot establish a
+   * universal, so an author who picks the pair can satisfy both predictions while the
+   * label is wrong. QA demonstrated it: add a path, project a structured subtree onto a
+   * boolean, label it LOSSLESS, and choose absent-versus-present as the witness. The
+   * boolean moves, so the pair passes and the path is excluded from the digest — and a
+   * later change INSIDE that subtree then moves neither the state nor the digest and
+   * reads routine, with a `because` true as written and false in effect. The suite
+   * stayed green throughout. That is the grant-operator defect one dimension across,
+   * reached with nothing red.
+   *
+   * So what a witness is actually worth: it forces an author to exhibit a concrete pair
+   * instead of asserting a label, and it kills a careless relabel of a path that was
+   * already correctly witnessed. Both are real. Neither is the universal, and no
+   * stronger witness can be — the defect is in the quantifier, not the example. What
+   * closes QA's escape is the constraint on `reads`, which an author cannot satisfy by
+   * choosing a convenient example.
    *
    * Self-contained rather than a perturbation of whatever base a caller supplies: a
    * witness that only sets the "after" side depends on what the base happened to
