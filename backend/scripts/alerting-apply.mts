@@ -52,11 +52,40 @@ const prisma = () => (client ??= new PrismaClient({
 }))
 
 /** Named rather than defaulted. An empty connection string produces a connection error from
- * deep inside the driver; this says which variable is missing, at the top. */
+ * deep inside the driver; this says which variable is missing, at the top.
+ *
+ * AND IT SAYS SOMETHING ABOUT THE SHAPE, because the first attempt to run this against
+ * production failed twice on the connection string and a credential was pasted into a chat
+ * message in the process. The two known traps produce errors that read like network problems:
+ * the direct host is IPv6-only and does not resolve on most connections, and 6543 is the
+ * transaction-mode pooler where a one-shot migration has no business being.
+ *
+ * A WARNING RATHER THAN A REFUSAL. Neither rule has been tested from anywhere, and refusing on
+ * an unverified heuristic would block a run that might be perfectly fine. It also NEVER PRINTS
+ * THE STRING — only which of the two shapes it matched. */
 const databaseUrl = (): string => {
   const url = process.env.DATABASE_URL
   if (url === undefined || url === '') {
-    throw new Error('DATABASE_URL is not set. This command reads the database; there is no offline mode.')
+    throw new Error(
+      'DATABASE_URL is not set. This command reads the database; there is no offline mode.\n'
+      + 'Copy the string from the Supabase dashboard verbatim - do not assemble it - and use the\n'
+      + 'session-mode pooler on 5432. See "Connecting" in docs/alerting-apply-runbook.md.')
+  }
+
+  // Parsed for its shape only. A malformed URL is left to the driver, which reports it better
+  // than a guess here would.
+  try {
+    const parsed = new URL(url)
+    if (/^db\..*\.supabase\.co$/.test(parsed.hostname)) {
+      console.warn('WARNING: DATABASE_URL points at the direct Supabase host, which is IPv6-only '
+        + 'and does not resolve on most connections. Use the session-mode pooler on 5432.')
+    }
+    if (parsed.port === '6543') {
+      console.warn('WARNING: port 6543 is the transaction-mode pooler. Session mode on 5432 is '
+        + 'the one to use for a one-shot migration - see "Connecting" in the runbook.')
+    }
+  } catch {
+    // Not a URL this parser understands. The driver will say so.
   }
   return url
 }

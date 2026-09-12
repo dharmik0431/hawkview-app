@@ -45,7 +45,7 @@ four questions in order) before trusting a green suite.
 | step | state |
 |---|---|
 | 01 declarations, 02 keys and episodes | closed |
-| 03 dry run | closed. Apply, revert and the runner script are written and typecheck; **nothing has been run against a database**, and **the apply would key far fewer rows than the approved figures suggest** — see *What the apply is allowed to key* below. Note: it is an ANNOTATION, not a re-keying -- the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
+| 03 dry run | closed. **Approved by Dharmik at the corrected scope: 47 rows now, 319 for the classifier — a rehearsal, not the fix.** Apply, revert and the runner are written and typecheck; **nothing has been run against a database by anyone**, and **nobody has yet connected to production from an engineering machine.** Note: it is an ANNOTATION, not a re-keying -- the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
 | 04 finding intake | closed |
 | 05 routing and policy | closed |
 | 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function landed in `42622d1`** — L1, L2 and L4 now bound. The NUMBER is still a labelled guess. See below |
@@ -269,6 +269,18 @@ episode counts, which are computed under the NOMINATED type. That is a different
 what the mapping authorises, and the two were read as one number. Pinned by a test
 (`THE APPLY WOULD NOT KEY A SINGLE DIRECTORY-AUDIT ROW`) so it cannot be lost in a diff.
 
+**APPROVED BY DHARMIK AT THIS SCOPE, AS A REHEARSAL.** He asked what the number was for before
+approving it, and the honest answer is that **the 47 are monitoring rows and the 301 unclosable
+alerts are all in the other 319** — keying 47 changes almost nothing an MSP would notice. It is
+the apply, the receipt, the revert and the verification exercised against real data at low
+stakes before the same machinery touches rows that include real privileged changes. **If
+somebody later reports this migration as having fixed the alerting problem, it did not.**
+
+**Live figures, 2026-09-12: 366 rows, 47 writable, 319 left, 5 tenants touched.** 366 rather
+than 364 because two rows arrived during the conversation in which the figure was being
+discussed — the photograph problem as an observation rather than a hypothetical, and the best
+argument there is for validating the mapping against current data immediately before a write.
+
 **Ruled: key only the rows whose shape determines a type.** 47 now, 317 when the classifier
 reaches historical audit rows — scoped work, not an open question. Keying everything under the
 nominated type was rejected not for being riskier but for contradicting a decision already made:
@@ -289,6 +301,36 @@ mapping never saw still aborts, unchanged. Two new abort kinds fall out: `EXCLUD
 exclusion is a decision about what WE write, never a promise about what the row holds) and
 `MAPPED_TWICE`. The two exclusion reasons are carried separately because they clear at different
 times — one on the classifier, one on the row's own subject, which may never resolve.
+
+### Nobody can connect to production from an engineering machine
+
+**A defect in the runbook rather than an omission, and it cost a rotated credential.** Two
+connection strings were reconstructed by hand, one was wrong, and a credential reached a chat
+message during the attempt.
+
+Two traps, both of which fail as something that reads like a network problem: the direct host
+`db.<ref>.supabase.co` is **IPv6-only** and does not resolve on most connections, and 6543 is
+the transaction-mode pooler. **Session mode on 5432, copied verbatim from the dashboard.**
+
+The runner now warns on both shapes without ever printing the string, and the runbook has a
+*Connecting* section. **Neither rule has been tested from anywhere** — they are the
+recommendation with the fewest unknowns, not a verified configuration.
+
+One correction worth keeping: transaction mode would **not** "break the single transaction" —
+it pools *by* transaction, and one statement in one transaction is the most pooler-friendly
+shape there is. The real hazards there are session-level, and the usual Prisma one (named
+prepared statements) is reduced by the `pg` driver adapter, which sends unnamed statements.
+Session mode is still right, because a one-shot script gains nothing from pooling and loses the
+guarantee that it ends on the connection it began on. **The rule was right and the reason was
+wrong**, which is worth fixing: a rule with the wrong justification gets applied where it does
+not hold and dropped where it does.
+
+### The next real piece: the classifier on historical audit rows
+
+**This is what turns the rehearsal into the thing he wanted.** The 319 excluded rows are
+excluded because `TYPE_FOR_SHAPE` cannot type a `DIRECTORY_AUDIT` key, and the classifier that
+can already exists — it is simply not pointed at historical rows. Step 05 territory, scoped
+work, and the 301 unclosable alerts are on the other side of it.
 
 ### The per-row episode had no owner until now
 

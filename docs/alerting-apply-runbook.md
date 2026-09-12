@@ -24,6 +24,43 @@
 > the pure logic it calls and the SQL it emits, which QA executed against a disposable
 > Postgres at 364 rows. Details under *Before you trust this*.
 
+## What this run is for — a rehearsal, not the fix
+
+**Approved by Dharmik at this scope, on this basis, and the basis is the part to keep.**
+
+**The 47 rows are monitoring rows. The 301 unclosable alerts — the thing that prompted all of
+this — are all in the other 319.** Keying 47 rows changes almost nothing an MSP would notice.
+
+So this is a **proving run**: the apply, the receipt, the revert and the verification exercised
+against real production data at low stakes, before the same machinery touches rows that include
+real privileged changes. He asked *what is this number for* before approving it, and chose it
+as a rehearsal rather than as a result.
+
+**Do not let 47 be read as the benefit.** If somebody later reports this migration as having
+fixed the alerting problem, it did not: it proved the mechanism that will. The fix is the 319,
+and it needs the classifier pointed at historical audit rows first.
+
+## The figures, and when they were true
+
+Measured against production on **2026-09-12**:
+
+```
+366 rows total
+ 47 writable now
+319 left for the classifier
+  5 tenants touched
+```
+
+**366, not the 364 quoted everywhere else in this document — two rows arrived during the
+conversation in which the figure was being discussed.** That is the photograph problem, not as
+a hypothetical but as an observation: a mapping is a picture of a table that is still moving,
+and the gap between measuring and writing is where a correct migration goes wrong.
+
+**So do not treat any number here as an expected value.** Two of them changed while a sentence
+was being written. What holds regardless is the identity: **writable + left-alone = rows read**,
+and `save-mapping` prints all three so it can be checked at the moment it matters. The only
+reason to compare against the figures above is to notice a change big enough to ask about.
+
 ## What the apply is allowed to key — ruled: (b), the typed rows only
 
 **47 rows now, 317 when the classifier reaches historical audit rows.** The migration lands in
@@ -75,9 +112,10 @@ the two-keying-schemes state arriving through the rows nobody was watching.
 on the row’s own subject becoming resolvable, which may never happen. One count would make the
 second look like it is coming soon.
 
-> **A NOTE ON EVERY 364 BELOW THIS LINE.** They are ROW counts — rows in the table, rows QA
-> ran the emitted SQL against, rows the timing was measured at. **None of them is a write
-> count.** The write count is about 47 and appears only where it is labelled as one.
+> **A NOTE ON EVERY 364 BELOW THIS LINE.** They are ROW counts — rows in the table when the
+> figure was taken, rows QA ran the emitted SQL against, rows the timing was measured at.
+> **None of them is a write count**, and the live row count is now 366. The write count is
+> about 47 and appears only where it is labelled as one.
 
 ## The two schema findings that determine the shape
 
@@ -116,6 +154,53 @@ called — is not avoided by discipline; there is nothing to avoid. **A revert c
 
 Keep all four together. The receipt is the only thing that makes the revert safe.
 
+## Connecting — and this has its own section because it is a defect, not an omission
+
+**Nobody has connected to production from an engineering machine.** Two connection strings were
+reconstructed by hand during the attempt and one of them was wrong. **A credential was pasted
+into a chat message in the process and is being rotated.**
+
+**Copy the connection string from the Supabase dashboard, verbatim.** Do not assemble it from a
+host, a password and a port — it was assembled twice and was wrong once, and a wrong one fails
+as a DNS or auth error that reads like a network problem rather than like a typo.
+
+**Put it in the environment, never in a message.** No connection string belongs in this
+document, in a commit, or in a chat window — including a redacted-looking one.
+
+**Use the session-mode pooler on port 5432** — `aws-0-<region>.pooler.supabase.com`.
+
+**The direct host will not resolve for you.** `db.<ref>.supabase.co` is **IPv6-only**, and most
+home and office connections have no IPv6 route to it. That is the failure Dharmik hit. The
+pooler is reachable over IPv4.
+
+### Why session mode — and the usual reason given for it is wrong
+
+**Transaction mode on 6543 would not "break the single transaction".** It pools *by*
+transaction: a `BEGIN … COMMIT` is exactly the unit it keeps on one server connection, and this
+apply is one statement inside one transaction, which is the most pooler-friendly shape there is.
+
+The reason is worth correcting rather than letting stand, because a rule with the wrong
+justification attached gets applied where it does not hold and dropped where it does.
+
+**The real hazards in transaction mode are session-level:** named prepared statements, `SET`,
+advisory locks, `LISTEN`. The familiar Prisma symptom — *prepared statement "s0" already exists*
+— comes from the first. **This runner is less exposed to that than a Prisma application usually
+is**, because it goes through the `@prisma/adapter-pg` driver adapter and `pg` sends unnamed
+statements unless you name them. That is a reason transaction mode would probably work; it is
+not a reason to choose it.
+
+**Session mode is right for a reason that does not depend on any of the above.** This is a
+one-shot script. It gains nothing from pooling and it loses the guarantee that the connection it
+begins on is the connection it ends on. For a process that writes to production once, fewer
+moving parts between it and the database is the entire argument.
+
+**None of this has been tested from anywhere.** No connection has been made. Treat the port and
+the mode as the recommendation with the fewest unknowns, not as a verified configuration — and
+if it fails, that is a finding for this section rather than a mystery.
+
+**The first real test of the connection is step 1, and step 1 is read-only.** There is no need
+to prove the connection some other way first.
+
 ## Step 1 — save the approved mapping
 
 **Start by confirming where you are.** This step used to open with an absolute path into one
@@ -141,15 +226,18 @@ its database path had never executed, and any figure attributed to it came from 
 
 **Expected output — success:**
 
+*Figures below are the 2026-09-12 measurement, shown so the shape of the output is readable.
+They will have drifted — see* The figures, and when they were true.
+
 ```
-Read 364 notification rows.
+Read 366 notification rows.
 
   HOW MANY ROWS THIS RUN WOULD KEY
     47 writable, across M incidents
     U of those carry no episode number (unrecoverable)
 
   HOW MANY IT WOULD LEAVE ALONE, AND WHY - decisions, not refusals
-    317 the key shape does not type (waiting on the classifier)
+    319 the key shape does not type (waiting on the classifier)
     0 typed, but the declared subject does not resolve
 
   HOW MANY INCIDENTS ARE IN THE DATA - a different question, under the nominated type
@@ -165,18 +253,17 @@ mistake that put 71 into every status report as though it were a write count.
 
 **What to check, per group.**
 
-1. **Rows this run would key.** Nobody has measured this. Expect it far below 364; **if it
-   comes back AT 364 something changed in `TYPE_FOR_SHAPE`**, and that is a bigger
-   conversation than this runbook.
-2. **Rows left alone.** Should be roughly 317, and the first line should hold nearly all of
-   them. A large `subject does not resolve` count is a finding — those do not clear on the
-   classifier and may never clear.
-3. **Incidents in the data.** This is where 364 / 71 / 62 / 9 / 47 belong. **If any of those
-   five differ, stop** — the approval was for a mapping, not a procedure, and the new figures
-   need re-approving before anything is written.
+1. **Rows this run would key.** About 47 on 2026-09-12. **If it comes back near the total,
+   something changed in `TYPE_FOR_SHAPE`** and that is a bigger conversation than this runbook.
+2. **Rows left alone.** About 319, and the first line should hold nearly all of them. **A large
+   `subject does not resolve` count is a finding** — those do not clear when the classifier
+   lands, and may never clear.
+3. **Incidents in the data.** This is where 71 / 62 / 9 / 47 belong. A change here is not a
+   reason to stop by itself — rows keep arriving — but a change **larger than the row count
+   moved** is, because then something other than new data has changed.
 
-Groups 1 and 2 must sum to the rows read. Group 3 does not participate in that sum and is not
-supposed to.
+**Groups 1 and 2 must sum to the rows read.** That identity is the check; the individual
+figures are a photograph. Group 3 does not participate in the sum and is not supposed to.
 
 ## Step 2 — preflight (writes nothing, ever)
 
@@ -189,7 +276,7 @@ node --import tsx scripts/alerting-apply.mts preflight --mapping ..\artefacts\ma
 ```
 No differences. The mapping still describes the data.
 47 rows would be written. 0 already carry it and would not be written again.
-317 left alone by decision, not by refusal.
+319 left alone by decision, not by refusal.
 PREFLIGHT PASSED - safe to apply.
 ```
 
@@ -231,7 +318,7 @@ node --import tsx scripts/alerting-apply.mts apply --mapping ..\artefacts\mappin
 ```
 Preflight re-run inside the transaction: no differences.
 Applied 47 rows in one statement, in one transaction.
-Left alone by decision: 317. These were never candidates.
+Left alone by decision: 319. These were never candidates.
 Watched fields disturbed: none
 Wrote ..\artefacts\receipt.json - 47 changes, 0 untouched. THE REVERT NEEDS THIS FILE.
 APPLY COMPLETE.
