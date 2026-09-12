@@ -782,9 +782,25 @@ that it will not be found until it does. That is the argument for doing the rest
 than after the next one moves — the alternative is not "no bug", it is "the bug is still
 ahead of us".
 
-**The principle, stated so it can be applied without waiting for an incident: every reported
-figure should reconcile against another reported figure.** `317 + 47 = 364`, `62 + 9 = 71`,
-`9 + 17 + 3 + 5 = 34`. Anything standing alone is where the next silent correction will live.
+**The principle, and it needs its bound or it does damage: every reported figure that CAN
+decompose should reconcile against another reported figure.** `317 + 47 = 364`,
+`62 + 9 = 71`, `9 + 17 + 3 + 5 = 34`. A decomposable figure standing alone is where the next
+silent correction will live.
+
+**A figure that cannot decompose gets LABELLED as a cardinality, not given a manufactured
+check.** The six incident figures — `declared`, `ifKeyedOnTarget` and the four
+`assumingSingleType*` — are set cardinalities over different groupings of the same rows.
+They are not partitions of anything, so no two add to a third. Applying the unbounded rule
+to them would produce six fabricated identities that READ exactly like the real ones
+elsewhere in this output, and **a fabricated check is worse than an honest gap**: a figure
+standing alone is visibly unverified, while one standing beside a sum that never meant
+anything is miscredited by something shaped like evidence. That is the `occurrencesPreserved`
+mistake again, committed deliberately and six times over.
+
+The only relation they support is ordering — each directory-only figure is bounded by its
+all-rows sibling, because the narrower set is drawn from the wider one — and that is
+reported through `atMost` rather than `adds`, deliberately in a different shape, so a bound
+is not mistaken for an accounting.
 
 Three figures fixed under it:
 
@@ -877,3 +893,35 @@ invariant list survives, and must.** No input can make an identity fire, so the 
 tripwire and the kills above rest on the component figures being asserted directly. Predicting
 that in advance is what keeps it a property of the design rather than an excuse found
 afterwards.
+
+### The instrument is in scope, and a regression is the first place to look for it
+
+The raw perturbation said **14 of 36 figures unconstrained**, up from 13 of 32 — the fix
+apparently making things worse. It had not. The instrument perturbs the report **object**, and
+the four in-report identity lists are computed **inside** `reconcile`, so flipping a field
+afterwards cannot make them fire. They were invisible to it. Corrected count: **9 of 36, down
+from 13 of 32** — hardening one figure constrained six and added three already covered.
+
+Twice now the measurement has been the broken thing: the SQL that read 68, and this. **When a
+result looks like a regression, check the instrument before checking the code** — and when the
+instrument sits outside the computation it is measuring, ask what the computation does that the
+instrument cannot see. QA got there by correcting the instrument rather than re-running it,
+which is the distinction worth keeping: re-running a broken instrument produces the same wrong
+answer with more confidence.
+
+### 34 versus 30, exactly
+
+`bucket.events` accumulates **`occurrenceCount`, not a row count**. A standing-alone bucket is
+keyed per row so it holds exactly one row — but the one-event-is-one-episode shortcut fires
+only when that row's `occurrenceCount` is 1. Of the four combinations, exactly one produces
+the gap:
+
+| occurrences | event time | contributes |
+|---|---|---|
+| 1 | present | 1 episode |
+| 1 | absent | 1 episode — a single event is one burst whenever it happened |
+| many | present | 1 episode |
+| **many** | **absent** | **0 — unplaceable, and now named** |
+
+So "timeless rows cannot be placed" was half right and missed the occurrence count, which is
+why the non-directory figure of 25 did not predict the 4.

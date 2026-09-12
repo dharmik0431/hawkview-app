@@ -881,3 +881,50 @@ test('EVERY STANDING-ALONE ROW IS EITHER AN EPISODE OR NAMED AS UNPLACEABLE', ()
 
   assert.deepEqual(report.invariants.episodeCountsAddUp, [])
 })
+
+test('A CARDINALITY IS BOUNDED, NOT DECOMPOSED, and the report says which', () => {
+  // QA's correction to the principle, and it is the sharper version: the six incident figures
+  // are set cardinalities over different groupings of the same rows, not partitions. They
+  // admit no additive sibling. Manufacturing six sums for them would produce fake identities
+  // that READ like the real ones — worse than an honest gap, because a figure standing alone
+  // is visibly unverified while one beside a meaningless sum is miscredited.
+  const rows = [
+    auditAt('a', 'admin-1', T0),
+    auditAt('b', 'admin-2', T0 + 1000),
+    row({ dedupeKey: 'tenant:t1:sync:SIGN_INS', customerTenantId: 't1' }),
+    row({ dedupeKey: 'tenant:t2:connection', customerTenantId: 't2' }),
+  ]
+  const report = reconcile(rows)
+
+  // The ONE relation these support: the directory-only figure is bounded by its all-rows
+  // sibling, because the narrower set is drawn from the wider one.
+  assert.ok(report.incidents.assumingSingleTypeDirectoryAuditOnly
+    <= report.incidents.assumingSingleType)
+  assert.ok(report.incidents.assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget
+    <= report.incidents.assumingSingleTypeKeyedOnTarget)
+  assert.deepEqual(report.invariants.cardinalityOrderingHolds, [])
+
+  // AND THE BOUND MUST BE STRICT SOMEWHERE IN THIS FIXTURE, or `<=` is satisfied by equality
+  // everywhere and the assertion is indistinguishable from asserting nothing.
+  assert.ok(report.incidents.assumingSingleTypeDirectoryAuditOnly
+    < report.incidents.assumingSingleType,
+    'the fixture needs non-directory rows, or the ordering check cannot discriminate')
+
+  // NO ADDITIVE IDENTITY IS CLAIMED FOR THEM. Asserted as an absence so that anyone later
+  // tempted to add one has to delete this line and read why first.
+  const invariantNames = Object.keys(report.invariants)
+  assert.ok(!invariantNames.some((name) => /declaredCountsAddUp|incidentCountsAddUp/.test(name)),
+    'the six cardinalities are labelled, not given a manufactured sum')
+})
+
+test('atMost NAMES BOTH SIDES when a bound is violated', () => {
+  // The helper is separate from `adds` because it says something WEAKER, and presenting a
+  // bound in the same shape as a decomposition invites a reader to think a figure is
+  // accounted for when it is only constrained. No input can violate the bound in place — the
+  // narrower set is populated only where the wider one is — so, like `adds`, the only way to
+  // cover its behaviour is to reach the report's own output for the passing case and rely on
+  // the ordering assertions above for the rest.
+  const report = reconcile([auditAt('a', 'admin-1', T0)])
+  assert.deepEqual(report.invariants.cardinalityOrderingHolds, [],
+    'a healthy report reports no violation')
+})

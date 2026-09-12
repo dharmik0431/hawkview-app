@@ -198,6 +198,30 @@ export interface ReconciliationReport {
    * Consolidating must preserve these, so the report states them. */
   readonly occurrencesRepresented: number
   readonly incidents: Readonly<{
+    /** THE SIX FIGURES BELOW ARE SET CARDINALITIES, AND THEY DO NOT DECOMPOSE.
+     *
+     * Each counts DISTINCT KEYS over a different grouping of the same rows — a different
+     * subject role, a different subset, a different assumption about type. They are not
+     * partitions of anything, so no two of them add to a third, and none has an additive
+     * sibling to reconcile against.
+     *
+     * SO THEY ARE LABELLED RATHER THAN GIVEN A CHECK. The rule this report otherwise
+     * follows — every figure reconciles against another — would, applied here, produce six
+     * manufactured identities that READ like the real ones elsewhere in the output. A
+     * fabricated check is worse than an honest gap: a figure standing alone is visibly
+     * unverified, while one standing beside a sum that never meant anything is miscredited
+     * by something that looks exactly like evidence. That is the same mistake as the
+     * `occurrencesPreserved` boolean, committed deliberately and six times over.
+     *
+     * WHAT DOES HOLD IS ORDERING, and only because the sets nest: the directory-only
+     * figures count keys drawn from the same map as the all-rows ones, so each is bounded
+     * by its wider sibling. That is reported as `invariants.cardinalityOrderingHolds` and
+     * it is a TRIPWIRE, like every other identity here — no input can violate it, because
+     * the narrower set is populated only where the wider one is.
+     *
+     * If you are looking for a figure that decomposes, the episode counts do; these do not,
+     * and no amount of arithmetic will make them. */
+
     /** Under the subject role each type declares, counting only rows whose type the key
      * shape determines. Rows needing classification are NOT grouped here. */
     declared: number
@@ -447,6 +471,11 @@ export interface ReconciliationReport {
     /** `total` against typed + needing-classification, and typed against its own two
      * halves. Three figures that used to stand alone now have to agree with each other. */
     rowCountsAddUp: readonly string[]
+    /** The only relation the six incident cardinalities support: each directory-only
+     * figure is bounded by its all-rows sibling, because the narrower set is populated
+     * only where the wider one is. Not a decomposition, and deliberately not dressed as
+     * one — see the note on `incidents`. */
+    cardinalityOrderingHolds: readonly string[]
   }>
 }
 
@@ -456,6 +485,22 @@ export interface ReconciliationReport {
  * this report to decide whether to trust a number. "false" tells them to distrust
  * everything; "317 with a time + 22 without = 339, but rows read is 364" tells them which
  * figure to go and look at. Empty means it adds up. */
+/** Whether one figure is bounded by another, naming both when it is not.
+ *
+ * Separate from `adds` because it says something WEAKER, and the difference is the point:
+ * a bound is not a decomposition, and a report that presents the two in the same shape
+ * invites a reader to believe a figure is accounted for when it is only constrained. */
+const atMost = (
+  narrower: number,
+  wider: number,
+  narrowerLabel: string,
+  widerLabel: string,
+): readonly string[] =>
+  narrower <= wider
+    ? []
+    : [narrowerLabel + ' is ' + narrower + ', which exceeds ' + widerLabel + ' at ' + wider
+        + ' — the narrower set cannot be larger than the one it is drawn from']
+
 export const adds = (
   parts: readonly (readonly [string, number])[],
   whole: number,
@@ -789,6 +834,12 @@ export function reconcile(rows: readonly ExistingAlertRow[]): ReconciliationRepo
           ['attributed', unrecoverableAttributed],
           ['standing-alone', unrecoverableStandingAlone],
         ], unrecoverable, 'incidentsWithUnrecoverableEpisodes'),
+      ],
+      cardinalityOrderingHolds: [
+        ...atMost(auditBoundKeys.size, boundKeys.size,
+          'assumingSingleTypeDirectoryAuditOnly', 'assumingSingleType'),
+        ...atMost(auditBoundTargetKeys.size, boundTargetKeys.size,
+          'assumingSingleTypeDirectoryAuditOnlyKeyedOnTarget', 'assumingSingleTypeKeyedOnTarget'),
       ],
       rowCountsAddUp: [
         ...adds([
