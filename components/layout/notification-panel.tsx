@@ -12,11 +12,13 @@ import {
   Trash2,
   ExternalLink,
   Sparkles,
+  Clock3,
   X,
 } from 'lucide-react'
 import {
   useNotifications,
   NotificationCategory,
+  type NotificationFeedState,
 } from '@/components/providers/notification-provider'
 import { cn } from '@/lib/utils'
 import {
@@ -26,9 +28,109 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 
+
+/**
+ * What an empty inbox means, which depends on whether anyone managed to look.
+ *
+ * One sentence used to cover every case: "You're all caught up" appeared
+ * whether the tenant was quiet or the request had never succeeded. The provider
+ * keeps its previous list when a read fails, and on a first load that list is
+ * empty -- so a broken endpoint reassured the reader.
+ *
+ * Four states, four sentences, and only one of them is reassuring. The bell is
+ * where an MSP checks whether anything needs them, so a false "nothing" here
+ * costs more than a false "something".
+ */
+function EmptyInbox({
+  state,
+  filter,
+}: {
+  state: NotificationFeedState
+  filter: 'all' | 'unread'
+}) {
+  const unreadOnly = filter === 'unread'
+
+  if (state === 'LOADING') {
+    return (
+      <div className="flex flex-col items-center justify-center p-8 text-center text-muted-foreground">
+        <div className="w-10 h-10 rounded-full bg-muted/50 flex items-center justify-center mb-2">
+          <Clock3 className="h-5 w-5 text-muted-foreground/70" aria-hidden="true" />
+        </div>
+        <p className="text-sm font-medium text-foreground">Checking</p>
+        <p className="text-xs text-muted-foreground mt-0.5">
+          Nothing has been read yet, so this is not an answer either way.
+        </p>
+      </div>
+    )
+  }
+
+  if (state === 'UNAVAILABLE') {
+    return (
+      <div className="flex flex-col items-center justify-center p-8 text-center">
+        <div className="w-10 h-10 rounded-full bg-amber-100 dark:bg-amber-950 flex items-center justify-center mb-2">
+          <AlertTriangle
+            className="h-5 w-5 text-amber-600 dark:text-amber-400"
+            aria-hidden="true"
+          />
+        </div>
+        <p className="text-sm font-medium text-foreground">
+          Notifications could not be loaded
+        </p>
+        <p className="text-xs text-muted-foreground mt-0.5 max-w-[15rem]">
+          No request has succeeded, so HawkView cannot say whether anything
+          needs you. This is not an empty inbox.
+        </p>
+      </div>
+    )
+  }
+
+  if (state === 'STALE') {
+    return (
+      <div className="flex flex-col items-center justify-center p-8 text-center">
+        <div className="w-10 h-10 rounded-full bg-amber-100 dark:bg-amber-950 flex items-center justify-center mb-2">
+          <AlertTriangle
+            className="h-5 w-5 text-amber-600 dark:text-amber-400"
+            aria-hidden="true"
+          />
+        </div>
+        <p className="text-sm font-medium text-foreground">
+          Nothing {unreadOnly ? 'unread ' : ''}as of the last successful check
+        </p>
+        <p className="text-xs text-muted-foreground mt-0.5 max-w-[15rem]">
+          The most recent refresh failed, so anything raised since then is not
+          shown here.
+        </p>
+      </div>
+    )
+  }
+
+  // LOADED. The only state in which an empty inbox is a statement about the
+  // tenant rather than about us.
+  return (
+    <div className="flex flex-col items-center justify-center p-8 text-center text-muted-foreground">
+      <div className="w-10 h-10 rounded-full bg-muted/50 flex items-center justify-center mb-2">
+        <Sparkles className="h-5 w-5 text-muted-foreground/70" aria-hidden="true" />
+      </div>
+      <p className="text-sm font-medium text-foreground">
+        You&rsquo;re all caught up
+      </p>
+      <p className="text-xs text-muted-foreground mt-0.5">
+        No {unreadOnly ? 'unread ' : ''}notifications at this time.
+      </p>
+    </div>
+  )
+}
+
 export function NotificationPanel() {
-  const { notifications, unreadCount, markAsRead, dismiss, markAllAsRead, clearRead } =
-    useNotifications()
+  const {
+    notifications,
+    feedState,
+    unreadCount,
+    markAsRead,
+    dismiss,
+    markAllAsRead,
+    clearRead,
+  } = useNotifications()
 
   const [isOpen, setIsOpen] = useState(false)
   const [filter, setFilter] = useState<'all' | 'unread'>('all')
@@ -231,21 +333,7 @@ export function NotificationPanel() {
             {/* Notification List (Internal Scrolling) */}
             <div className="flex-1 overflow-y-auto divide-y divide-border/50 max-h-[340px]">
               {filteredNotifications.length === 0 ? (
-                <div className="flex flex-col items-center justify-center p-8 text-center text-muted-foreground">
-                  <div className="w-10 h-10 rounded-full bg-muted/50 flex items-center justify-center mb-2">
-                    <Sparkles
-                      className="h-5 w-5 text-muted-foreground/70"
-                      aria-hidden="true"
-                    />
-                  </div>
-                  <p className="text-sm font-medium text-foreground">
-                    You’re all caught up
-                  </p>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    No {filter === 'unread' ? 'unread ' : ''}notifications at
-                    this time.
-                  </p>
-                </div>
+                <EmptyInbox state={feedState} filter={filter} />
               ) : (
                 filteredNotifications.map((notif) => (
                   <div
