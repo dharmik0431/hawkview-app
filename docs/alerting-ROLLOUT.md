@@ -277,3 +277,69 @@ pick.**
 *(Separately, and not what was being asked: an MSP security inbox that is a distribution list or a
 forwarding address would send alerts to people nobody enumerated. That is a different concern from
 the one above, it is unexamined, and I raise it only so it is not lost.)*
+
+---
+
+# The second gate, and it is not a date
+
+**A judgement, not a measurement.** Everything above is something that was run. This section is
+an argument about what happens later, and it is labelled that way because it should be argued
+with rather than trusted.
+
+**The first real run is not the first tick after the switch. It is the first tick after findings
+exist.**
+
+Today the source is empty, so switching alerting on is uneventful: the forecast is trivially
+safe, nothing sends, and every check passes. **The day the risk engine starts matching, a set of
+decisions made months earlier all become load-bearing at the same instant — and nobody will be
+watching, precisely because switching it on was uneventful.**
+
+These are not gated by a date, a deploy or a release. **They are gated by the first finding.**
+
+## What changes meaning on that day
+
+| | harmless while the source is empty | load-bearing from the first finding |
+|---|---|---|
+| **the watermark instant** | nothing is older than it, because nothing exists | decides which history is silently never mentioned |
+| **the 24-hour read window** | no findings fall outside it | findings older than a day never receive an incident at all, and no backfill job exists |
+| **the `LIMIT 5000`** | unreachable | a burst above it is silently deferred, and no test can reach the boundary |
+| **the six unmapped rules** | they match nothing | six detectors fire and produce no email, two of them for concealment and weakened identity protection |
+| **the suppression list** | empty | a hard bounce starts deciding who is never written to again |
+| **`maxAttempts` of 3** | no job spends it | decides when a message stops being retried and becomes `EXHAUSTED` |
+
+## And the part that is mine to say
+
+**Several of the passing results in this document are passes over an empty input.** They are true
+and they are worth having, but they have never had the chance to discriminate:
+
+- `accountingProblems: []` balances a set of zero findings. **An invariant that has never seen a
+  non-trivial input has never had the opportunity to fail.** It was mutation-tested on fixtures,
+  which is why I trust it — but the trust comes from the mutation, not from the production zero.
+- `neverSent()` enumerates jobs, and there are none.
+- The unresolved-send report has never had a send to be unresolved about.
+
+**A green check on an empty input is not evidence about a full one.** Every one of these was
+exercised against seeded fixtures, and that is the reason to believe them — **not** the fact that
+production is quiet.
+
+## One thing worth anticipating rather than discovering
+
+The first findings may not arrive one at a time. The engine has run **7,365 times without
+matching**; if what is currently empty is a collection gap rather than a genuinely quiet fleet,
+then fixing it produces findings for **many tenants at once**. That is the case in which the
+watermark, the read window and the `LIMIT` all bite in the same tick — and it is the least likely
+day for anyone to be watching, because it will look like a routine collector fix rather than an
+alerting change.
+
+**This is speculation about a cause nobody has established**, and it is stated as such. It is
+here because the cost of anticipating it is a paragraph, and the cost of discovering it is an
+MSP's first impression of the feature.
+
+## So the ask
+
+**Somebody must be told what to re-check on the day the source stops being empty.** If alerting
+ships while there is nothing to carry, that is defensible — but the knowledge of what becomes
+load-bearing that day currently exists only in one night's working notes.
+
+**A checklist organised solely around switching things on will pass every item in the table above
+and still be wrong later.**
