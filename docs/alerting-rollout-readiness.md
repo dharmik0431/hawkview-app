@@ -391,6 +391,23 @@ the same dead mailbox is not attempted either.
 
 > Performed by ____________________ on ____________  Second message attempted? ______
 
+### What an MSP can and cannot control in this release
+
+**Two of the seven alert types have a setting that changes what the product does.** The other five
+have no producer, so a setting for them cannot bite either way — and **every settings row says
+which it is**, derived from the wiring rather than asserted, so the number moves on its own when
+that changes.
+
+**Nobody is told a switch works when it does not.** That was the property worth having; the
+missing half is reach, not truth.
+
+**The publish path — which would take the count from two to five — is specified and deliberately
+not built.** It requires deciding whether `RECORD_ONLY` hides an alert inside the product or only
+stops the email, and those two readings have both been ruled. Under one, building it changes
+nothing; under the other, it silences something the pipeline currently shows. That is a product
+decision, and it is recorded in the handoff with the full seam ruling so it can be built in a day
+once taken.
+
 ## What is deliberately not in this release
 
 - **SMS.** Deferred.

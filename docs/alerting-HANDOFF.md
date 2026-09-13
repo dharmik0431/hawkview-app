@@ -1250,6 +1250,59 @@ an in-app notification and never an email, so under the second reading, making i
 disposition **changes nothing at all** — the settings row would still be decorative for exactly
 the types it was meant to fix.
 
+### The publish path: specified, not built, and why
+
+**This is a deliberate cut, not an unfinished item.** The seam is fully ruled and the code is a
+day's work at most. It is not built because building it would ship two contradictory meanings of
+*off*, and choosing between them is a product decision nobody has taken.
+
+**What it would do.** `tenant-sync.service.ts` and `tenants.service.ts` publish seven notification
+kinds and an MSP receives them. The publish path would resolve a kind to a catalogue alert type —
+now possible, because the catalogue owns that mapping since `6017f23` — read the organisation's
+disposition, and withhold on `RECORD_ONLY`. That is what would make the settings page reach five
+of seven types instead of two.
+
+**THE CONTRADICTION, stated plainly because it is the whole reason this is cut.**
+
+| path | what `RECORD_ONLY` does today |
+|---|---|
+| the intake pipeline | writes the incident AND the notification; withholds only the send job. **Off means not emailed; still visible in-app.** |
+| the publish path, as ruled | withholds the publish. That path produces an in-app notification and never an email, so **off would mean not visible in-app.** |
+
+Both readings have been ruled, in different messages. They are not reconcilable by care: under the
+first, making the publish path consult the disposition **changes nothing at all**, because there is
+no email to withhold — the settings row stays inert for exactly the types it was meant to fix.
+Under the second, an MSP who silences a type stops seeing it in the product, and the pipeline's
+behaviour becomes inconsistent with it.
+
+**It fails the freeze test.** *Does it silence something that should be sent?* Under one reading,
+yes — and which reading is right is not something the code can settle.
+
+**THE SEAM, RULED AND RECORDED, so whoever builds it does not re-derive it.**
+
+- **A value with a reason, never a boolean.** Under a boolean, *published because the lookup
+  failed* and *published because the setting allowed it* are the same answer, and fail-open
+  becomes unverifiable — nobody can check it was what HAPPENED rather than what was intended.
+- **Pure and synchronous, over a snapshot loaded separately.** No I/O on the collector's path,
+  nothing to await, no transaction held open. *Must not fail a collection* is not a property a
+  `try`/`catch` establishes — the next person removes the catch and nothing notices until a sync
+  fails. Make the failure **unreachable** from that path rather than caught on it. Loading is its
+  own step and its failure is a value.
+- **A withhold has exactly one constructor, demanding a resolved alert type and `RECORD_ONLY`.**
+  *Withheld because something went wrong* must have nothing to return. It follows that an unmapped
+  kind cannot be silenced, which closes the easy-to-get-backwards case by construction.
+- **Resolution is per organisation.** One failed read must not govern another organisation's.
+- **Staleness qualifies a publish** rather than being a fourth outcome. Publishing on old evidence
+  is correct; an operator asking why this sent needs the answer to say so.
+- **The decision carries the type it resolved**, so the publish path's answer can be compared
+  against the catalogue's for every kind rather than a sample. The settings page walks the
+  catalogue; if the publish path resolves kinds any other way, an MSP silences something and keeps
+  receiving it.
+
+**What ships instead is honest.** Two of seven types are controllable, `mapped` is derived rather
+than asserted, and every settings row states its own answer — so an MSP is not told a switch works
+when it does not. That is the property that mattered; the missing half is reach, not truth.
+
 ### Still missing before anything can send
 
 - **NOTHING DRAINS THE QUEUE.** There is no sender worker: `attemptSend` has no production
