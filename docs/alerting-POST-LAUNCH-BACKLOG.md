@@ -84,3 +84,40 @@ a UTC server and `SECRET_ENCRYPTION_KEY`, the remaining prerequisites behind
 
 **What would fix it:** one runnable setup, written down, that takes an empty database to a green
 run — and if some of those tests fail on purpose, that list belongs beside it.
+
+## 9. The lock-ordering failures: classified as environment; ordering unproven
+
+**Label, verbatim, for the release artefact: "classified as environment; ordering unproven".**
+Not "lock ordering verified". The distinction is the whole point — these failures do not
+demonstrate the ordering wrong, which is not the same as demonstrating it right. Nothing
+exercised the ordering successfully, because the transactions did not survive long enough to try.
+
+**Not a blocker**, and that was checked rather than assumed: the alerting pipeline reads
+`identity_risk_findings` directly and never touches the key store, so the unproven ordering sits
+in a path this release does not change.
+
+**The chain**, established conclusively for `wrapped-risk-key` and supported but not individually
+traced for the other two:
+
+```
+timeout expired
+  -> mailbox-read-transaction site 12 (bare catch)  -> IDENTITY_RISK_SOURCE_UNAVAILABLE
+  -> wrapped-risk-key-store line 124 (bare catch)   -> IDENTITY_RISK_KEY_UNAVAILABLE
+  -> one of four concurrent callers rejects
+  -> "Every concurrent caller must reload the winner" fails
+```
+
+**FOUR bare catch-alls, not three.** `wrapped-risk-key-store.ts` lines **124, 138, 143 and 174**
+are each `catch { throw keyUnavailable() }` with no condition and no cause. I reported three and
+was wrong: my own diagnostic patch matched on `} catch {` and line 143 begins `catch {` on its own
+line, so I instrumented three and counted three. **The count came from my instrument rather than
+from the file**, which is the same mistake in miniature as the thing being reported.
+
+The other twelve `keyUnavailable()` occurrences are guarded throws with a condition in front of
+them — deliberate refusals, a different shape, and they should not be changed. **They look
+identical to a grep and are not**, which is worth stating because that resemblance is what makes
+the four hard to find.
+
+**The fix is one parameter each**, the same as `2e4cc54` applied to site 12: `catch (cause) {
+throw new Error(..., { cause }) }`. The first catch-all cost a day of diagnosis across two
+sessions; these four sit directly behind it.
