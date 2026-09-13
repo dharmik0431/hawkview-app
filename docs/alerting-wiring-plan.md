@@ -70,18 +70,20 @@ invocation of `due-tenants` is one tick.**
 
 ## What is actually left
 
-1. `alert_incidents` written by intake — the table exists (`20260912190000`), nothing writes it.
+1. ~~`alert_incidents` written by intake~~ — **DONE**, `finding-pipeline.ts`. A persisted finding reaches a send job, proven end to end against a real database.
 2. Routing reading both preference stores for real.
 3. **The Resend client and the webhook handler. Neither exists anywhere.**
 4. Intake called inside `due-tenants`, in its own admission window.
-5. `alert_send_jobs` — the retry layer's table. `send-queue.ts` emits SQL against it and **the
-   migration is not written**; that is the same gap step 03 had, caught this time before the
-   runner rather than after.
+5. ~~`alert_send_jobs` has no migration~~ — **DONE**, `20260912223000`. Verified on a throwaway
+   PostgreSQL 15: deploys clean, no drift, every constraint rejects its own case.
 6. B3, the integration prerequisites, which is the only item nobody has sized. The configuration
    half is documented and verified; the data half is unknown.
 7. The four rollout artefacts.
 
-**Item 5 is worth noticing.** `claimStatement` names `alert_send_jobs`, its columns and its states,
-and no migration creates it. That is exactly the shape of the step-03 failure — code referring to
-columns nothing had made — found here by writing the list rather than by an operator hitting it at
-step 2.
+**Items 1 and 5 are done.** What remains: routing reading both stores in production code, the
+Resend client, the signature verifier, the webhook route, the scheduler hook, B3, and the four
+artefacts.
+
+**The note that used to stand here — that `alert_send_jobs` was named by code and created by
+nothing — was true when written and is not now.** Corrected rather than deleted, because a
+document that quietly stops mentioning a gap reads the same as one that never had it.

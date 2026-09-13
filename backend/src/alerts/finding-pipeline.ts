@@ -1,0 +1,351 @@
+import { ALERT_CATALOG, type AlertTypeId } from './alert-catalog.js'
+import { OPENED } from './alert-lifecycle.js'
+import { incidentGrouping } from './alert-incident-key.js'
+import { defaultPreference } from './routing-policy.js'
+
+/**
+ * THE WIRING. A persisted finding becomes an incident, and an incident becomes a send job.
+ *
+ * Everything before this was a library nobody called: three migrations, twenty modules, all
+ * pure, and nothing joining them. This is the join.
+ *
+ * PURE CORE, THIN EDGE. `decide` takes rows and returns writes; `runIntake` does the I/O. The
+ * end-to-end test drives the second against a real database, so the hops are proven together
+ * rather than each one being proven alone — which is what a shelf of green unit tests already
+ * was.
+ */
+
+// ---------------------------------------------------------------------------------------
+// NO HISTORICAL SENDS. The record is backfilled; the sending is not.
+// ---------------------------------------------------------------------------------------
+
+/** Findings observed before this produce an INCIDENT but never a SEND JOB.
+ *
+ * THE SAME RULE THE MIGRATION FOLLOWS, for the same reason. Step 03 annotates rows rather than
+ * re-delivering them, because proving a pipeline must not page somebody about something that
+ * happened last month. Turning this on against a table with history in it and no watermark
+ * would send the entire backlog at once — to a real MSP, about real incidents, all of them
+ * stale, and there is no recalling an email.
+ *
+ * IT IS A REQUIRED PARAMETER WITH NO DEFAULT. A default here is the difference between a quiet
+ * first run and an inbox with three hundred messages in it, and no value is safe enough to pick
+ * on somebody's behalf. */
+export interface Watermark {
+  readonly sendNothingObservedBeforeIso: string
+  /** Why this instant. Recorded because a watermark somebody cannot explain is one nobody dares
+   * move. */
+  readonly because: string
+}
+
+// ---------------------------------------------------------------------------------------
+// WHAT COMES IN
+// ---------------------------------------------------------------------------------------
+
+/** A finding as stored, reduced to what the pipeline reads. */
+export interface FindingRow {
+  readonly id: string
+  readonly organizationId: string
+  readonly customerTenantId: string
+  readonly ruleId: string
+  readonly subjectType: string
+  readonly subjectId: string
+  readonly severity: string
+  readonly state: string
+  readonly observedAtIso: string
+}
+
+/** An incident row that already exists, so a second run does not re-open it. */
+export interface ExistingIncident {
+  readonly organizationId: string
+  readonly incidentKey: string
+}
+
+/** What an MSP has said about a rule, and what a person has said about being emailed. Two
+ * grains, two stores, two different facts — see the migration. */
+export interface Dispositions {
+  /** `organizationId|ruleId` → disposition. Absent means the catalogue default. */
+  readonly byOrganizationAndRule: ReadonlyMap<string, string>
+  /** `organizationId` → whether ANY user there can receive email. */
+  readonly anyRecipientByOrganization: ReadonlyMap<string, boolean>
+}
+
+// ---------------------------------------------------------------------------------------
+// THE RULE MAP, AND ITS HOLE, WHICH IS REPORTED RATHER THAN DEFAULTED
+// ---------------------------------------------------------------------------------------
+
+/** Which catalogue type a risk rule becomes.
+ *
+ * **THIS IS THE THIRD RULE NAMESPACE AND IT HAS NO DECLARED MAPPING.** Seven catalogue ids,
+ * twenty-eight change rules, and `IdentityRiskFinding.ruleId`, which maps to nothing. It was on
+ * the backlog with the note *"the moment routing is driven by findings, a finding whose rule id
+ * maps to no alert type has no route, and the failure will be silence."*
+ *
+ * That moment is now, so the hole is a reported count rather than a default. A finding this
+ * cannot type produces **no incident and no job**, and appears in `unmappedRules` — the same
+ * answer step 03 gave a migration row it could not type, for the same reason: defaulting would
+ * file a real credential attack as whatever the default happened to be.
+ *
+ * THE REAL NAMESPACE, TAKEN FROM THE DATABASE RATHER THAN INVENTED. The first version matched
+ * prefixes like `identity.credential`, which NO ROW CAN EVER HAVE:
+ * `identity_risk_matched_rule_check` constrains rule ids to HV-ID- followed by one of EXP, CHG,
+ * APP, MBX or AUTH, three digits and a version. Every production finding would
+ * have been reported as unmappable, the pipeline would have produced zero jobs, and the only
+ * clue would have been an `unmappedRules` list nobody had a reason to read.
+ *
+ * It was found by the integration test refusing to seed — the constraint is the authority and
+ * the test is real enough to meet it. A fixture that mocked the row would have agreed with the
+ * invented namespace and passed.
+ *
+ * APP AND MBX ARE DELIBERATELY ABSENT. Application and mailbox findings have no obvious
+ * catalogue type, and picking one would be the defaulting this refuses everywhere else. They
+ * report as unmapped until somebody decides. */
+const RULE_PREFIX_TO_TYPE: readonly (readonly [string, AlertTypeId])[] = [
+  ['HV-ID-AUTH-', 'security.suspected_credential_attack'],
+  ['HV-ID-CHG-', 'security.privileged_directory_change'],
+  ['HV-ID-EXP-', 'monitoring.consent_expiring'],
+]
+
+export function alertTypeForRule(ruleId: string): AlertTypeId | null {
+  const matched = RULE_PREFIX_TO_TYPE.find(([prefix]) => ruleId.startsWith(prefix))
+  return matched?.[1] ?? null
+}
+
+// ---------------------------------------------------------------------------------------
+// WHAT GOES OUT
+// ---------------------------------------------------------------------------------------
+
+export interface IncidentWrite {
+  readonly organizationId: string
+  readonly incidentKey: string
+  readonly alertTypeId: AlertTypeId
+  readonly ownership: string
+  readonly condition: string
+  readonly investigation: string
+  readonly atIso: string
+}
+
+export interface SendJobWrite {
+  readonly messageId: string
+  readonly idempotencyKey: string
+  readonly organizationId: string
+  readonly incidentKey: string
+  readonly maxAttempts: number
+  readonly notBeforeIso: string
+}
+
+/** Why a finding produced no send job. **EVERY FINDING APPEARS EXACTLY ONCE** across the writes
+ * and these — a finding that simply vanished is the silence this whole feature is about. */
+export type Skipped = Readonly<{
+  findingId: string
+  because:
+    | 'NOT_OPEN'
+    | 'NO_ALERT_TYPE'
+    | 'BEFORE_WATERMARK'
+    | 'INCIDENT_ALREADY_OPEN'
+    | 'NO_ELIGIBLE_RECIPIENT'
+    | 'RECORD_ONLY'
+}>
+
+export interface PipelineDecision {
+  readonly incidents: readonly IncidentWrite[]
+  readonly jobs: readonly SendJobWrite[]
+  readonly skipped: readonly Skipped[]
+  /** Distinct rule ids nothing could type. A count of findings is not enough — the rule id is
+   * what somebody has to go and add. */
+  readonly unmappedRules: readonly string[]
+  /** Empty when every finding is accounted for exactly once. */
+  readonly accountingProblems: readonly string[]
+}
+
+/** The default disposition for a type, when an MSP has expressed no preference.
+ *
+ * THROUGH `defaultPreference`, WHICH ALREADY OWNS THIS. The first version of this invented its
+ * own severity vocabulary - CRITICAL and HIGH, which the catalogue does not have - and the
+ * compiler refused it, because `Severity` is ACT_NOW | ACT_TODAY | RECORD_ONLY. Reading the
+ * field at its declared type made the wrong constant impossible, and it caught a second
+ * implementation of a mapping routing already states.
+ *
+ * Nothing is stored for a default: absence of a row means this, so the default cannot drift
+ * from the tiering the catalogue declares. */
+const defaultDispositionFor = (alertTypeId: AlertTypeId): string => {
+  const declared = ALERT_CATALOG.find((type) => type.id === alertTypeId)
+  return declared === undefined ? 'RECORD_ONLY' : defaultPreference(declared.severity)
+}
+
+/** The whole decision, pure. */
+export function decide(
+  findings: readonly FindingRow[],
+  existing: readonly ExistingIncident[],
+  dispositions: Dispositions,
+  watermark: Watermark,
+  tickAtIso: string,
+): PipelineDecision {
+  const open = new Set(existing.map((each) => `${each.organizationId}|${each.incidentKey}`))
+  const incidents: IncidentWrite[] = []
+  const jobs: SendJobWrite[] = []
+  const skipped: Skipped[] = []
+  const unmapped = new Set<string>()
+  const watermarkAt = Date.parse(watermark.sendNothingObservedBeforeIso)
+
+  for (const finding of findings) {
+    if (finding.state !== 'OPEN') {
+      skipped.push({ findingId: finding.id, because: 'NOT_OPEN' })
+      continue
+    }
+    const alertTypeId = alertTypeForRule(finding.ruleId)
+    if (alertTypeId === null) {
+      unmapped.add(finding.ruleId)
+      skipped.push({ findingId: finding.id, because: 'NO_ALERT_TYPE' })
+      continue
+    }
+
+    const grouping = incidentGrouping(
+      { id: alertTypeId, subject: 'ACCOUNT' } as never,
+      { organizationId: finding.organizationId, customerTenantId: finding.customerTenantId },
+      { resolved: true, id: finding.subjectId })
+    const incidentKey = grouping.groups ? grouping.key : `ungrouped:${finding.id}`
+    const scoped = `${finding.organizationId}|${incidentKey}`
+
+    // THE INCIDENT IS WRITTEN EVEN FOR HISTORY. The record is what makes the backlog visible in
+    // the product; only the SENDING is withheld.
+    if (!open.has(scoped)) {
+      incidents.push({
+        organizationId: finding.organizationId,
+        incidentKey,
+        alertTypeId,
+        ownership: OPENED.ownership,
+        condition: OPENED.condition,
+        investigation: OPENED.investigation,
+        atIso: finding.observedAtIso,
+      })
+      open.add(scoped)
+    } else {
+      skipped.push({ findingId: finding.id, because: 'INCIDENT_ALREADY_OPEN' })
+      continue
+    }
+
+    if (Date.parse(finding.observedAtIso) < watermarkAt) {
+      skipped.push({ findingId: finding.id, because: 'BEFORE_WATERMARK' })
+      continue
+    }
+    const disposition = dispositions.byOrganizationAndRule.get(`${finding.organizationId}|${alertTypeId}`)
+      ?? defaultDispositionFor(alertTypeId)
+    if (disposition === 'RECORD_ONLY') {
+      skipped.push({ findingId: finding.id, because: 'RECORD_ONLY' })
+      continue
+    }
+    // COVERAGE GAP SHOWN RATHER THAN SILENT. An organisational urgency with nobody able to
+    // receive it is not "no email needed" — it is an incident nobody will be told about, and it
+    // has to be visible where the two grains meet.
+    if (dispositions.anyRecipientByOrganization.get(finding.organizationId) !== true) {
+      skipped.push({ findingId: finding.id, because: 'NO_ELIGIBLE_RECIPIENT' })
+      continue
+    }
+
+    jobs.push({
+      // ONE MESSAGE PER INCIDENT, and the id is derived from the incident rather than from the
+      // finding — so a second finding on the same incident cannot produce a second email.
+      messageId: `incident/${scoped}`,
+      idempotencyKey: `incident/${scoped}`,
+      organizationId: finding.organizationId,
+      incidentKey,
+      maxAttempts: 3,
+      notBeforeIso: tickAtIso,
+    })
+  }
+
+  const accountedFor = jobs.length + skipped.length
+  return {
+    incidents,
+    jobs,
+    skipped,
+    unmappedRules: [...unmapped].sort(),
+    accountingProblems: accountedFor === findings.length ? [] : [
+      `${findings.length} findings in, ${accountedFor} accounted for (${jobs.length} produced a `
+      + `job, ${skipped.length} named as skipped) — a finding must appear exactly once, or one `
+      + 'vanished without anybody being able to say why.',
+    ],
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// THE EDGE. Real reads, real writes, and a bounded window.
+// ---------------------------------------------------------------------------------------
+
+/** The narrow slice of Prisma this needs. An interface rather than the client, so the pipeline
+ * can be driven by a transaction, by the client, or by a fake, and so nothing here can reach for
+ * a model it was not given. */
+export interface PipelineStore {
+  findOpenFindings(sinceIso: string): Promise<readonly FindingRow[]>
+  findExistingIncidents(organizationIds: readonly string[]): Promise<readonly ExistingIncident[]>
+  loadDispositions(organizationIds: readonly string[]): Promise<Dispositions>
+  writeIncidents(writes: readonly IncidentWrite[]): Promise<number>
+  writeJobs(writes: readonly SendJobWrite[]): Promise<number>
+}
+
+export interface IntakeReport {
+  readonly findingsRead: number
+  readonly incidentsWritten: number
+  readonly jobsWritten: number
+  readonly skipped: readonly Skipped[]
+  readonly unmappedRules: readonly string[]
+  readonly accountingProblems: readonly string[]
+  /** True when the window ran out before the work finished. **THE CASCADE RULE:** intake yields
+   * rather than borrowing from what comes after it, because collection outranks alerting always
+   * — and a slow intake that ate the collectors' admission budget would show up as tenants
+   * quietly not being collected, which reads as the tenants being quiet. */
+  readonly yieldedOnBudget: boolean
+}
+
+/** Run one tick.
+ *
+ * `deadlineAt` IS THIS STAGE'S OWN WINDOW, not the request's. It is checked between phases and
+ * never inside a write, so yielding leaves the database consistent rather than half-written. */
+export async function runIntake(
+  store: PipelineStore,
+  watermark: Watermark,
+  tickAtIso: string,
+  deadlineAt: number,
+  readSinceIso: string,
+  now: () => number = Date.now,
+): Promise<IntakeReport> {
+  const empty = (yielded: boolean, findingsRead = 0): IntakeReport => ({
+    findingsRead, incidentsWritten: 0, jobsWritten: 0, skipped: [], unmappedRules: [],
+    accountingProblems: [], yieldedOnBudget: yielded,
+  })
+  if (now() >= deadlineAt) return empty(true)
+
+  const findings = await store.findOpenFindings(readSinceIso)
+  if (findings.length === 0) return empty(false)
+  if (now() >= deadlineAt) return empty(true, findings.length)
+
+  const organizationIds = [...new Set(findings.map((each) => each.organizationId))]
+  const [existing, dispositions] = await Promise.all([
+    store.findExistingIncidents(organizationIds),
+    store.loadDispositions(organizationIds),
+  ])
+  if (now() >= deadlineAt) return empty(true, findings.length)
+
+  const decision = decide(findings, existing, dispositions, watermark, tickAtIso)
+  const incidentsWritten = await store.writeIncidents(decision.incidents)
+  // CHECKED BETWEEN THE TWO WRITES, so a yield here leaves incidents recorded and no job — the
+  // safe direction. The opposite order would leave a job for an incident nobody can look up.
+  if (now() >= deadlineAt) {
+    return {
+      findingsRead: findings.length, incidentsWritten, jobsWritten: 0,
+      skipped: decision.skipped, unmappedRules: decision.unmappedRules,
+      accountingProblems: decision.accountingProblems, yieldedOnBudget: true,
+    }
+  }
+  const jobsWritten = await store.writeJobs(decision.jobs)
+
+  return {
+    findingsRead: findings.length,
+    incidentsWritten,
+    jobsWritten,
+    skipped: decision.skipped,
+    unmappedRules: decision.unmappedRules,
+    accountingProblems: decision.accountingProblems,
+    yieldedOnBudget: false,
+  }
+}

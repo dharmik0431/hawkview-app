@@ -304,8 +304,8 @@ model AlertRuleDisposition {
 /// discouraged, because there is no field to partition on.
 model AlertSendJob {
   id             String    @id @default(uuid()) @db.Uuid
-  messageId      String    @unique @map("message_id") @db.VarChar(200)
-  idempotencyKey String    @map("idempotency_key") @db.VarChar(200)
+  messageId      String    @unique @map("message_id") @db.VarChar(400)
+  idempotencyKey String    @map("idempotency_key") @db.VarChar(400)
   /// READY | CLAIMED | SENT | EXHAUSTED | GAVE_UP — constrained in SQL, see the migration.
   state          String    @db.VarChar(20)
   attemptsMade   Int       @map("attempts_made")
@@ -330,7 +330,7 @@ model AlertSendJob {
 /// No foreign key to the job: an attempt is evidence and must survive the job being removed.
 model AlertSendAttempt {
   id          String    @id @default(uuid()) @db.Uuid
-  messageId   String    @map("message_id") @db.VarChar(200)
+  messageId   String    @map("message_id") @db.VarChar(400)
   attemptNo   Int       @map("attempt_no")
   startedAt   DateTime  @map("started_at") @db.Timestamptz(6)
   /// ACCEPTED | REFUSED_RETRYABLE | REFUSED_PERMANENT, or null while in flight.
