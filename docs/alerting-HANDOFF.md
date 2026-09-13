@@ -41,6 +41,17 @@ has actually been delivering.** Anything not in a commit message has probably no
 
 None of the three is engineering work, and none is waiting on a decision from the PM.
 
+## This document moves with the code, not with the milestone
+
+**Dharmik’s rule, and it is the reason this file was stale twice:** *if a commit moves what is
+true about the product, it moves this document in the same commit.* Not at the end of a step,
+not when somebody notices.
+
+**It lives on the release branch and the engineer owns it.** QA proposes text; the engineer
+applies it here. **No replacement files on other branches** — a status living somewhere else is a
+second home for the status, which is the identical shape to the defects this feature has fixed
+three times in code. This section itself arrived that way and is the last one that will.
+
 ## Where the work is
 
 Branch `agent/alerts-step-01`, **56 commits over `5488ad6`**. Nothing merged to main.
@@ -83,11 +94,13 @@ four questions in order) before trusting a green suite.
 | step | state |
 |---|---|
 | 01 declarations, 02 keys and episodes | closed |
-| 03 dry run | closed. **Approved by Dharmik as a rehearsal: 44 rows now, 319 for the classifier, 3 never writable.** The migration adding the two columns now exists (it did not, and step 2 was the step that found out). Apply, revert and the runner are written and typecheck; **nothing has been run against a database by anyone**, and **nobody has yet connected to production from an engineering machine.** Note: it is an ANNOTATION, not a re-keying -- the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
+| 03 dry run | closed. **Approved by Dharmik as a rehearsal: 44 rows now, 319 for the classifier, 3 never writable.** **All five runbook commands have been run end to end against a disposable PostgreSQL 15 by QA** — both preflight outcomes, the apply, verify, a revert with occurrences arriving, and a concurrent writer proving the in-transaction re-check rolls the run back rather than writing 46 of 47. **Nobody has connected to production from an engineering machine**, so every figure remains a synthetic-fixture figure. It is an ANNOTATION, not a re-keying — the unique constraint forbids re-keying. See `alerting-apply-runbook.md` |
 | 04 finding intake | closed |
 | 05 routing and policy | closed |
 | 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function landed in `42622d1`** — L1, L2 and L4 now bound. The NUMBER is still a labelled guess. See below |
-| 06 email | **the seam and the ledger exist and are pure; nothing talks to Resend.** No HTTP call, no signature verification, no webhook route, no key read anywhere. See `alerting-email-delivery.md`, which separates the two. Resend is verified on `hawkviewapp.com` (PM's claim, not verified here) |
+| 06 email | **the seam, the ledger and the send queue exist and are pure; nothing talks to Resend.** No HTTP call, no signature verification, no webhook route, no key read anywhere. QA’s nine properties are bound against the seam — six hold, one partial, and **M1 and M2 are unaskable of it by design**, which is what the send queue was built to own. Ten retry properties bound against the queue, including one proven against a real database. Resend is verified on `hawkviewapp.com` (PM’s claim, not verified here) |
+| **the flow, finding → send job** | **proven, in the test’s hands.** A persisted `identity_risk_findings` row reaches an `alert_send_jobs` row through real foreign keys on a real database, and all five integration tests pass on a genuinely clean database. **But `runIntake` is called by nothing in `src/`, nothing schedules it, and `PipelineStore` has no implementation outside the test file.** The chain is joined by the test rather than by the product |
+| **deploy is migrate** | `backend/Dockerfile` line 44 runs `npm run db:migrate:deploy` on every container start, so **there is no migration gate and no operator step**. Whether a committed migration is live depends on whether a commit containing it has been DEPLOYED — not on whether anybody ran the runbook’s step 0, which does manually what the container does anyway. **Rollback is therefore code-only:** redeploying an earlier image re-runs `migrate deploy`, which does not undo anything |
 | 07 SMS | **shelved by Dharmik until further notice.** The tier survives; the channel does not |
 
 **Correction to the brief this was written from: `EXHAUSTED` is done**, in `e056fc9` — it is
@@ -526,11 +539,91 @@ Reported as needing an export, blocked on uncommitted work in the **other** work
 nobody owns. **I could not find that symbol and have not verified the claim** — see the
 constraints section.
 
-### Database-integration tests have never been run against any of this
+### The blocker in the flow is fixed, and the fix was checked against the thing that would have made it worse
 
-They need a real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`. **96 tests, zero
-runs.** The 1588 passing figure must not be read as covering them, and the apply phase is
-exactly the work where they would matter most.
+Text from QA, applied here rather than left on their branch: **a replacement status living
+somewhere else is a second home for the status**, which is the shape this feature has hit three
+times in the code.
+
+`runIntake` wrote incidents, checked its budget, then wrote jobs. A yield between them left an
+incident with no job, which every later run skipped as `INCIDENT_ALREADY_OPEN` — the alert never
+sent and nothing reporting it, because `neverSent` reports jobs that stopped and this one never
+had a job. Fixed in `5b0883b` by one `commit(incidents, jobs)` with the budget check before the
+write phase.
+
+**The acceptance test was not “did the stranding stop”.** Four shapes produce
+incident-with-no-job — `BEFORE_WATERMARK`, `RECORD_ONLY`, `NO_ELIGIBLE_RECIPIENT` and the
+yield — and three must stay silent forever, so a fix that could not tell them apart would have
+delivered the entire backfill. QA seeded all four at once across two organisations: exactly one
+job came out, with the three silences each named, and killing the backend mid-transaction left
+neither row.
+
+**And the engineer’s first test for that fix did not test it.** It passed a deadline already in
+the past, so the run exited at its first budget check and never reached the write phase — green
+against the reinstated bug. Found by mutation, not by reading, and fixed with an injected clock
+plus an assertion that the run reached the path at all. **That is the second time in two commits
+that a test asserted the right thing about a path it never executed.**
+
+### Six catalogue rules produce nothing, by decision
+
+Since `1ffc88e` the rule mapping derives from `investigationGuidanceCode` rather than a rule-id
+prefix. `REVIEW_CONFIGURATION` and `REVIEW_MAILBOX_RULE` map to no alert type, so those findings
+produce **no incident and no job**, each named individually with its reason and their rule ids
+surfaced in `unmappedRules` — which is what somebody has to go and add.
+
+**Two earlier versions of that mapping were wrong in two different ways and both would have
+shipped.** The first matched a namespace no row can have. The second matched the real families
+and guessed their meaning from the letters: `HV-ID-EXP-001.v1` is an MFA enforcement gap, so EXP
+is EXPOSURE, not expiring, and a whole family would have routed as `monitoring.consent_expiring`.
+That version was consistent, total over the real vocabulary, and wrong.
+
+### The ten lock-ordering failures are environment; the ordering is unproven
+
+**Not “lock ordering verified”.** These failures do not demonstrate the ordering wrong, which is
+not the same as demonstrating it right — nothing exercised it successfully, because the
+transactions did not survive long enough to try. Not a blocker: the alerting pipeline reads
+`identity_risk_findings` directly and never touches the key store. **QA’s classification,
+relayed; the engineer has not investigated it.**
+
+### The accounting invariant is a tripwire, not evidence the routing is right
+
+`accountingProblems: []` means every finding appears exactly once across the jobs and the skips.
+It is a self-reconciliation over one pass: **it proves nothing vanished, and it cannot prove
+anything was classified correctly.** A finding wrongly skipped as `RECORD_ONLY` counts exactly
+once and the books still balance.
+
+It catches a future edit that adds a `continue` without a skip, which is worth having. **It must
+not be cited as a second line of evidence that delivery decisions are right, because it is not
+evidence of that at all.**
+
+### Database-integration tests HAVE now been run — and the count is not reproducible
+
+This section used to say **"96 tests, zero runs"**. Replaced rather than deleted, because the
+warning it carried still stands: **the 1588 passing figure does not cover this suite**, and the
+apply phase is exactly the work where it would matter most.
+
+They have been run, by QA and independently by the engineer, against disposable PostgreSQL 15.
+**The failures are environment, not product defects, and none has been shown to be a defect —
+none should be quoted as one.**
+
+**But do not quote a pass count either.** QA measured 45 passing with every prerequisite set.
+The engineer measured 27, then 22, then 29 — *same machine, same cluster, same commit, same
+environment*. **A spread of seven on one machine, and 45 on another, is one speed-sensitive
+suite sampled four times rather than four environments finding four gaps.** So the honest
+statement is that the suite runs and that no number from it is reproducible, which is a worse
+problem than a missing document because writing the environment down does not fix it.
+
+**The wall is a timeout that a catch-all was hiding.** `IDENTITY_RISK_SOURCE_UNAVAILABLE` is
+thrown from twelve places; every failure came from the twelfth, a bare catch that discarded its
+cause. Since `2e4cc54` it carries the cause, which reads *timeout expired*. QA reports
+`wrapped-risk-key-store.ts` has four more bare catches — lines 124, 138, 143 and 174 — while
+the twelve other `keyUnavailable()` calls there are guarded throws that must not be touched.
+**That is QA’s reading, relayed; the engineer has not opened that file.**
+
+**The other prerequisite is not configuration at all.** `IDENTITY_RISK_KEY_UNAVAILABLE` wants an
+AWS KMS key ARN and a live `KMSClient`. No document makes that green on a laptop; it needs
+real KMS or a substituted `ManagedMacTransport`, and which of those the suite may use is a
+decision nobody has taken.
 
 ## Constraints that must not be broken
 
@@ -579,9 +672,16 @@ incident rather than a rework.
 ## Immediately next
 
 1. **The apply phase.** Shape is in `docs/alerting-apply-shape.md`; the code is not written.
-   **Re-run the dry run first and confirm the figures still match what was approved** — 364
-   rows, 71 episodes, 62 attributed, 9 standing alone, 47 unrecoverable. The apply is designed
-   to take those as an argument and refuse to write if they have drifted.
+   **Re-run the dry run first and confirm the figures still match what was approved** — as of
+   2026-09-12: **366 rows, 319 awaiting the classifier, 3 permanently unwritable, 44 writable.**
+   The apply refuses to write if they have drifted.
+
+   **The figure that used to stand here was "364 rows, 71 episodes".** That was a conflation:
+   71 is the count of INCIDENTS IN THE DATA under the nominated type, which is a different
+   question from how many rows the mapping authorises. It reached a status report as though it
+   were a write count. It matters more than an ordinary stale number because **the apply refuses
+   on drift** — so a reader who meets that refusal while holding the wrong expected figure will
+   doubt the data rather than the document.
 2. **The limit function**, which unbinds L1, L2 and L4.
 3. **Step 06, email.**
 
