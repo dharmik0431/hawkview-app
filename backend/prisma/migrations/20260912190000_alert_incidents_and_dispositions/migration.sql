@@ -123,9 +123,27 @@ END $$;
 CREATE TABLE IF NOT EXISTS "public"."alert_rule_dispositions" (
   "id" UUID NOT NULL,
   "organization_id" UUID NOT NULL,
-  -- Wider than the catalogue's 80 because three rule namespaces exist and are not yet unified:
-  -- 7 catalogue ids, 28 CHANGE_RULES, and identity_risk_findings.rule_id. See the backlog.
-  "rule_id" VARCHAR(120) NOT NULL,
+  -- **`alert_type_id`, BECAUSE THAT IS WHAT THE PIPELINE LOOKS IT UP BY.** This column was called
+  -- `rule_id` and the name lied: `finding-pipeline.ts` keys the lookup on the ALERT TYPE id, so a
+  -- disposition stored as `HV-ID-AUTH-010.v1` — which is what any author reading the old name
+  -- would store — was **silently ignored and the email went anyway**. The row existed, the write
+  -- succeeded, the MSP saw their choice saved, and nothing changed. A correct writer and a
+  -- correct reader disagreeing about the key, with no error anywhere.
+  --
+  -- Renamed while this table has never been deployed. One edit today against a production
+  -- migration plus a live settings bug later — the same asymmetry as the incident_key widening,
+  -- and the same answer.
+  --
+  -- ⚠ THE RENAME DOES NOT SOLVE THE THING THE VAGUE NAME WAS HIDING, and must not look as
+  -- though it has. The reason the name was loose is a real future: a grain FINER than the alert
+  -- type. Five of the seven types currently use the type as their own grain, and the routing
+  -- document warns that the first finer rule added under one of them collapses invisibly. If
+  -- that day comes it needs **its own column and a discriminator** — not this one overloaded
+  -- with two kinds of id, which is the two-homes defect this feature has now fixed three times.
+  --
+  -- 120 rather than the catalogue's 80 is kept: it costs nothing and leaves room for the id
+  -- namespace to grow without a second migration on a table an MSP's settings live in.
+  "alert_type_id" VARCHAR(120) NOT NULL,
   "disposition" VARCHAR(20) NOT NULL,
   "set_by_user_id" UUID,
   "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -149,8 +167,8 @@ BEGIN
   END IF;
 END $$;
 
-CREATE UNIQUE INDEX IF NOT EXISTS "alert_rule_dispositions_organization_id_rule_id_key"
-  ON "public"."alert_rule_dispositions" ("organization_id", "rule_id");
+CREATE UNIQUE INDEX IF NOT EXISTS "alert_rule_dispositions_organization_id_alert_type_id_key"
+  ON "public"."alert_rule_dispositions" ("organization_id", "alert_type_id");
 
 -- ---------------------------------------------------------------------------------------
 -- Row-level security, matching what every other table in this schema has.

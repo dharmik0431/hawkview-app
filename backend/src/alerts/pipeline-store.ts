@@ -1,6 +1,7 @@
 import {
-  type Dispositions, type ExistingIncident, type FindingRow, type IncidentWrite,
-  type NotificationWrite, type PipelineStore, type SendJobWrite,
+  asAlertTypeId, dispositionKey,
+  type DispositionKey, type Dispositions, type ExistingIncident, type FindingRow,
+  type IncidentWrite, type NotificationWrite, type PipelineStore, type SendJobWrite,
 } from './finding-pipeline.js'
 
 /**
@@ -83,17 +84,29 @@ export function pipelineStore(runner: SqlRunner): PipelineStore {
     },
 
     async loadDispositions(organizationIds) {
-      const byOrganizationAndRule = new Map<string, string>()
+      const byOrganizationAndAlertType = new Map<DispositionKey, string>()
       const anyRecipientByOrganization = new Map<string, boolean>()
-      if (organizationIds.length === 0) return { byOrganizationAndRule, anyRecipientByOrganization }
+      const unreadable: string[] = []
+      if (organizationIds.length === 0) {
+        return { byOrganizationAndAlertType, anyRecipientByOrganization, unreadable }
+      }
 
       const dispositions = await runner.query<{
-        organization_id: string; rule_id: string; disposition: string
+        organization_id: string; alert_type_id: string; disposition: string
       }>(
-        'SELECT organization_id, rule_id, disposition FROM alert_rule_dispositions WHERE organization_id = ANY($1::uuid[])',
+        `SELECT organization_id, alert_type_id, disposition
+           FROM alert_rule_dispositions
+          WHERE organization_id = ANY($1::uuid[])`,
         [organizationIds])
       for (const row of dispositions) {
-        byOrganizationAndRule.set(`${row.organization_id}|${row.rule_id}`, row.disposition)
+        // THE ONLY DOOR FROM A STORED STRING TO A KEY. A value the catalogue does not declare is
+        // collected rather than keyed: it is a preference the MSP set that the product cannot act
+        // on, and defaulting it would read as though they had never chosen. Historically this is
+        // exactly what a rule id stored in this column did, silently.
+        const alertTypeId = asAlertTypeId(row.alert_type_id)
+        if (alertTypeId === null) { unreadable.push(row.alert_type_id); continue }
+        byOrganizationAndAlertType.set(
+          dispositionKey(row.organization_id, alertTypeId), row.disposition)
       }
 
       // EMAIL IS OFF UNLESS SOMEBODY TURNED IT ON, AND ABSENCE IS OFF TOO. `bool_or` over no rows
@@ -113,7 +126,7 @@ export function pipelineStore(runner: SqlRunner): PipelineStore {
       for (const row of recipients) {
         anyRecipientByOrganization.set(row.organization_id, row.any_recipient === true)
       }
-      return { byOrganizationAndRule, anyRecipientByOrganization } satisfies Dispositions
+      return { byOrganizationAndAlertType, anyRecipientByOrganization, unreadable } satisfies Dispositions
     },
 
     /** ALL THREE WRITES OR NONE. Incidents and jobs were two calls once, and a budget yield

@@ -287,10 +287,15 @@ model AlertIncident {
 model AlertRuleDisposition {
   id             String   @id @default(uuid()) @db.Uuid
   organizationId String   @map("organization_id") @db.Uuid
-  /// A rule id, at the grain the MSP chooses on. Wider than the catalogue’s 80 because the
-  /// three rule namespaces (catalogue ids, CHANGE_RULES, IdentityRiskFinding.ruleId) are not
-  /// yet unified — see the backlog.
-  ruleId         String   @map("rule_id") @db.VarChar(120)
+  /// **AN ALERT TYPE ID, because that is what the pipeline looks it up by.** This was called
+  /// `ruleId` and the name lied: a disposition stored as a rule id was silently ignored and the
+  /// email went anyway — the row existed, the write succeeded, the MSP saw their choice saved.
+  /// The key is now built by `dispositionKey()`, which only accepts an `AlertTypeId`, so the
+  /// confusion is a compile error rather than a naming convention.
+  ///
+  /// A FINER GRAIN THAN THE ALERT TYPE WOULD NEED ITS OWN COLUMN AND A DISCRIMINATOR, not this
+  /// one holding two kinds of id. Five of the seven types use the type as their own grain today.
+  alertTypeId    String   @map("alert_type_id") @db.VarChar(120)
   /// RING | EMAIL | DIGEST | RECORD_ONLY. There is no OFF: an MSP may choose not to be
   /// DELIVERED to, never to have the thing not recorded.
   disposition    String   @db.VarChar(20)
@@ -300,7 +305,7 @@ model AlertRuleDisposition {
   updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
-  @@unique([organizationId, ruleId])
+  @@unique([organizationId, alertTypeId])
   @@map("alert_rule_dispositions")
 }
 

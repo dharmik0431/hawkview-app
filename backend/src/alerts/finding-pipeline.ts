@@ -74,9 +74,46 @@ export interface ExistingIncident {
 
 /** What an MSP has said about a rule, and what a person has said about being emailed. Two
  * grains, two stores, two different facts — see the migration. */
+/** THE KEY A DISPOSITION IS LOOKED UP BY, AND IT IS A TYPE RATHER THAN A CONVENTION.
+ *
+ * **The measured bug this closes:** the column was called `rule_id`, the pipeline looked it up by
+ * ALERT TYPE id, and a disposition stored as `HV-ID-AUTH-010.v1` was silently ignored — the row
+ * existed, the write succeeded, the MSP saw their choice saved, and the email went anyway.
+ *
+ * Renaming the column fixes today's reader. It does not fix next month's, because `alertTypeForRule`
+ * lives in this same file: **both vocabularies genuinely exist here and both were `string`**, so
+ * nothing made the confusion a compile error. Now the only way to build a key is this function,
+ * and it takes an `AlertTypeId`. A rule id does not typecheck.
+ *
+ * Same move as the claim's row count and the over-long alert type id, and for the same reason:
+ * those two are closed rather than watched. */
+export type DispositionKey = string & { readonly __dispositionKey: unique symbol }
+
+export const dispositionKey = (organizationId: string, alertTypeId: AlertTypeId): DispositionKey =>
+  `${organizationId}|${alertTypeId}` as DispositionKey
+
+/** An alert type id if the catalogue declares one, otherwise null.
+ *
+ * THE ONLY DOOR FROM A DATABASE STRING TO AN `AlertTypeId`. A stored value the catalogue does not
+ * contain is **reported, never defaulted** — see `Dispositions.unreadable`. An unreadable policy
+ * must not silently become the catalogue default, because that is a setting the MSP made, ignored
+ * without anybody being told. */
+export function asAlertTypeId(value: string): AlertTypeId | null {
+  return ALERT_CATALOG.some((type) => type.id === value) ? value as AlertTypeId : null
+}
+
 export interface Dispositions {
-  /** `organizationId|ruleId` → disposition. Absent means the catalogue default. */
-  readonly byOrganizationAndRule: ReadonlyMap<string, string>
+  /** Keyed by `dispositionKey(organizationId, alertTypeId)`, which is the only way to build one.
+   * Absent means the catalogue default — nothing is seeded, so a stored row exists only where an
+   * MSP has overridden it. */
+  readonly byOrganizationAndAlertType: ReadonlyMap<DispositionKey, string>
+  /** Stored values that name no alert type in the catalogue, verbatim.
+   *
+   * **REPORTED, NOT DEFAULTED, AND NOT DROPPED SILENTLY.** A row here is a preference an MSP set
+   * that the product cannot act on — historically because it was written at the wrong grain. It
+   * surfaces in the intake report so somebody can go and look, rather than becoming the
+   * catalogue default and reading as if the MSP had never chosen. */
+  readonly unreadable: readonly string[]
   /** `organizationId` → whether ANY user there can receive email. */
   readonly anyRecipientByOrganization: ReadonlyMap<string, boolean>
 }
@@ -385,8 +422,8 @@ export function decide(
       skipped.push({ findingId: finding.id, because: 'BEFORE_WATERMARK' })
       continue
     }
-    const disposition = dispositions.byOrganizationAndRule.get(`${finding.organizationId}|${alertTypeId}`)
-      ?? defaultDispositionFor(alertTypeId)
+    const disposition = dispositions.byOrganizationAndAlertType.get(
+      dispositionKey(finding.organizationId, alertTypeId)) ?? defaultDispositionFor(alertTypeId)
     if (disposition === 'RECORD_ONLY') {
       skipped.push({ findingId: finding.id, because: 'RECORD_ONLY' })
       continue

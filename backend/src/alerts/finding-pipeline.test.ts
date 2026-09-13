@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   alertTierFor,
+  asAlertTypeId, dispositionKey,
   alertTypeForRule, decide,
   type Dispositions, type ExistingIncident, type FindingRow, type Watermark,
 } from './finding-pipeline.js'
@@ -35,11 +36,13 @@ const finding = (over: Partial<FindingRow> = {}): FindingRow => ({
 })
 
 const canEmail: Dispositions = {
-  byOrganizationAndRule: new Map(),
+  byOrganizationAndAlertType: new Map(),
+  unreadable: [],
   anyRecipientByOrganization: new Map([[ORG, true]]),
 }
 const noRecipients: Dispositions = {
-  byOrganizationAndRule: new Map(),
+  byOrganizationAndAlertType: new Map(),
+  unreadable: [],
   anyRecipientByOrganization: new Map([[ORG, false]]),
 }
 const none: readonly ExistingIncident[] = []
@@ -111,7 +114,9 @@ test('AN ORGANISATION WITH NO ELIGIBLE RECIPIENT IS A REPORTED GAP, not a quiet 
 test('AN MSP PREFERENCE OVERRIDES THE CATALOGUE DEFAULT, and RECORD_ONLY sends nothing', () => {
   const recordOnly: Dispositions = {
     ...canEmail,
-    byOrganizationAndRule: new Map([[`${ORG}|security.suspected_credential_attack`, 'RECORD_ONLY']]),
+    byOrganizationAndAlertType: new Map([
+      [dispositionKey(ORG, 'security.suspected_credential_attack'), 'RECORD_ONLY'],
+    ]),
   }
   const out = decide([finding()], none, recordOnly, WATERMARK, T0)
 
@@ -258,4 +263,39 @@ test('THE NOTIFICATION CARRIES THE ALERT TYPE, and its severity is derived from 
   assert.equal(tier.kind === 'TIER' ? tier.tier : null, 'ACT_NOW')
   assert.equal(written.severity, 'critical', 'ACT_NOW renders critical, which is always shown')
   assert.equal(written.eventType, written.alertTypeId, 'and the family filter matches on it')
+})
+
+test('A DISPOSITION KEY CANNOT BE BUILT FROM A RULE ID', () => {
+  // THE MEASURED BUG, MADE UNWRITEABLE. A disposition stored as `HV-ID-AUTH-010.v1` was silently
+  // ignored and the email went anyway: the row existed, the write succeeded, and the MSP saw
+  // their choice saved. Renaming the column fixed the reader; this fixes the next author,
+  // because `alertTypeForRule` lives in this same file and both vocabularies are strings.
+  const key = dispositionKey(ORG, 'security.suspected_credential_attack')
+  assert.equal(key, `${ORG}|security.suspected_credential_attack`)
+
+  // @ts-expect-error - a rule id is not an alert type id, and now the compiler says so
+  const wrong = dispositionKey(ORG, 'HV-ID-AUTH-010.v1')
+  assert.ok(wrong !== null)
+})
+
+test('A STORED VALUE THE CATALOGUE DOES NOT DECLARE IS REPORTED, NOT DEFAULTED', () => {
+  // An unreadable policy must not silently become the catalogue default — that is a setting the
+  // MSP made, ignored without anybody being told. `asAlertTypeId` is the only door.
+  assert.equal(asAlertTypeId('security.suspected_credential_attack'),
+    'security.suspected_credential_attack')
+  assert.equal(asAlertTypeId('HV-ID-AUTH-010.v1'), null, 'a rule id names no alert type')
+  assert.equal(asAlertTypeId(''), null)
+
+  // NOT VACUOUS: every declared type passes, so the check is not refusing everything.
+  for (const type of ALERT_CATALOG) assert.equal(asAlertTypeId(type.id), type.id)
+})
+
+test('AN UNREADABLE DISPOSITION LEAVES THE CATALOGUE DEFAULT IN FORCE, and is still reported', () => {
+  // The two halves together: the send is decided by the default (so a broken row cannot silence
+  // an alert by accident), AND the broken row is visible (so nobody thinks the MSP never chose).
+  const withJunk: Dispositions = { ...canEmail, unreadable: ['HV-ID-AUTH-010.v1'] }
+  const out = decide([finding()], none, withJunk, WATERMARK, T0)
+
+  assert.equal(out.jobs.length, 1, 'the catalogue default still applies — ACT_NOW sends')
+  assert.deepEqual(withJunk.unreadable, ['HV-ID-AUTH-010.v1'], 'and the value survives to be read')
 })

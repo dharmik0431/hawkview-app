@@ -651,3 +651,64 @@ test('AND A CANCELLED JOB CANNOT THEN BE CLAIMED, which is the other order', { s
     await client.end()
   }
 })
+
+test('A DISPOSITION STORED AT THE WRONG GRAIN IS REPORTED, not silently ignored', { skip: !RUN || !URL }, async () => {
+  // THE MEASURED BUG. The column was called `rule_id` and the pipeline looked it up by ALERT TYPE
+  // id, so a disposition written as `HV-ID-AUTH-010.v1` — which is what any author reading the
+  // old column name would write — was silently ignored and the email went anyway. The row
+  // existed, the write succeeded, the MSP saw their choice saved, and nothing changed.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents, alert_rule_dispositions CASCADE')
+    await client.query('DELETE FROM identity_risk_findings')
+    const operator = '77777777-7777-7777-7777-777777777777'
+    await client.query(
+      `INSERT INTO users (id, email, updated_at) VALUES ($1, 'operator@an-msp.example', now())
+       ON CONFLICT DO NOTHING`, [operator])
+    await client.query(
+      `INSERT INTO notification_preferences (id, user_id, organization_id, email_enabled, updated_at)
+       VALUES (gen_random_uuid(), $2, $1, true, now()) ON CONFLICT DO NOTHING`, [ORG, operator])
+
+    // A preference written at the WRONG grain — a rule id where an alert type id belongs.
+    await client.query(
+      `INSERT INTO alert_rule_dispositions
+         (id, organization_id, alert_type_id, disposition, updated_at)
+       VALUES (gen_random_uuid(), $1, 'HV-ID-AUTH-010.v1', 'RECORD_ONLY', now())`, [ORG])
+    await seed(client)
+
+    const report = await runIntake(
+      storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+
+    // IT STILL DOES NOT SILENCE — it names no alert type, so it cannot. That part is unchanged
+    // and is correct: a broken row must not silence an alert by accident either.
+    assert.equal(report.jobsWritten, 1, 'the catalogue default still applies')
+
+    // BUT IT IS NO LONGER SILENT. The value is carried out verbatim so somebody can go and look,
+    // rather than the MSP believing a choice took effect that the product never saw.
+    const dispositions = await storeFor(client).loadDispositions([ORG])
+    assert.deepEqual(dispositions.unreadable, ['HV-ID-AUTH-010.v1'])
+    assert.equal(dispositions.byOrganizationAndAlertType.size, 0, 'and it is not keyed')
+
+    // AND THE SAME PREFERENCE AT THE RIGHT GRAIN DOES SILENCE — the control, without which the
+    // assertions above are satisfied by a lookup that never matches anything.
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents, alert_rule_dispositions CASCADE')
+    await client.query('DELETE FROM identity_risk_findings')
+    await client.query(
+      `INSERT INTO alert_rule_dispositions
+         (id, organization_id, alert_type_id, disposition, updated_at)
+       VALUES (gen_random_uuid(), $1, 'security.suspected_credential_attack', 'RECORD_ONLY', now())`,
+      [ORG])
+    await seed(client, { id: '66666666-6666-6666-6666-666666666666' })
+
+    const silenced = await runIntake(
+      storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    assert.equal(silenced.jobsWritten, 0, 'stored at the right grain, it silences')
+    assert.equal(silenced.skipped[0]?.because, 'RECORD_ONLY')
+    assert.equal(silenced.incidentsWritten, 1, 'and the incident is still recorded — there is no OFF')
+    assert.deepEqual((await storeFor(client).loadDispositions([ORG])).unreadable, [])
+  } finally {
+    await client.end()
+  }
+})

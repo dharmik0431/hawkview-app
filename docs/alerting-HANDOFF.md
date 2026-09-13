@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1816 tests, 1703 pass, 0 fail.** The remaining 113 are database-integration tests requiring a
+**1820 tests, 1706 pass, 0 fail.** The remaining 114 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -772,6 +772,45 @@ them.
 nowhere**, so a cleared incident sits in the inbox looking identical to one still waiting.
 Reported by the engineer building the surface; not fixed here, and not this feature's to fix
 without a ruling — recorded so it is not rediscovered.
+
+### The disposition column named the wrong thing, and now the key is a type
+
+**`alert_rule_dispositions.rule_id` was looked up by ALERT TYPE id.** So a disposition stored as
+`HV-ID-AUTH-010.v1` — which is what any author reading the column name would store — was
+**silently ignored and the email went anyway**: the row existed, the write succeeded, the MSP saw
+their choice saved, and nothing changed. A correct writer and a correct reader disagreeing about
+the key, with no error anywhere.
+
+Renamed to `alert_type_id`, in the unapplied migration, with the unique index. Free today; a
+production migration plus a live settings bug later.
+
+**THE RENAME ALONE WOULD HAVE FIXED TODAY'S READER AND NOT NEXT MONTH'S**, because
+`alertTypeForRule` lives in the same file — both vocabularies genuinely exist there and both were
+`string`. The key is now built by `dispositionKey(organizationId, alertTypeId)`, which takes an
+`AlertTypeId`; a rule id **does not compile**, and there is a test asserting exactly that. Same
+move as the claim's row count and the over-long alert type id, and the reason those are closed
+rather than watched.
+
+**`asAlertTypeId` is the only door from a stored string to a key**, and a value the catalogue does
+not declare goes to `Dispositions.unreadable` verbatim rather than being keyed or dropped. It does
+not silence — a broken row must not silence an alert by accident either — but it is no longer
+silent, so an MSP cannot believe a choice took effect that the product never saw. Proven against a
+real database in both directions: at the wrong grain it is reported and does not silence; at the
+right grain it silences and the incident is still recorded.
+
+⚠ **THE RENAME DOES NOT SOLVE WHAT THE VAGUE NAME WAS HIDING.** A grain finer than the alert type
+is a real future — five of the seven types use the type as their own grain, and the first finer
+rule under one of them collapses invisibly. That needs **its own column and a discriminator**, not
+this one holding two kinds of id. Stated at the column and in the migration.
+
+⚠ **THE STORED VOCABULARY IS NOT THE TIER VOCABULARY, AND A CONTRACT ASSUMES IT IS.** `disposition`
+is CHECK-constrained to `RING | EMAIL | DIGEST | RECORD_ONLY` — a `DeliveryPreference`, the
+CHANNEL — derived from the catalogue's `Severity` (`ACT_NOW | ACT_TODAY | RECORD_ONLY`) by
+`defaultPreference`. A dispositions API contract specifying the three TIERS would need the CHECK
+changed and `defaultDispositionFor` rewritten; writing to it as-is violates the constraint.
+**`RECORD_ONLY` is in both vocabularies**, which is why the confusion reads plausibly and why a
+half-done change would appear to work for the one case everybody tests. Not changed here —
+flagged, because which vocabulary the MSP should choose in is a product decision, not a rename.
 
 ### The integration tests drive the production store now, and it is gated by a lock
 
