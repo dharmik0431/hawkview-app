@@ -5,9 +5,12 @@ suite.** This document exists because *"we ran the integration tests"* is a sent
 checklist wants and nobody could honestly say.
 
 **Status: the configuration prerequisites below are complete and verified. They are not
-sufficient.** With all nine set correctly against a fresh database, **27 of 94 pass**. The rest
-fail on *data* prerequisites that are not yet documented — see the last section. Nobody can take
-this suite green by following a document, including this one.
+sufficient, and the remaining failures are NOT missing data — see *Root cause* at the end. One
+needs AWS KMS; the other is a stopwatch. The pass count is not reproducible.**
+
+With all nine set correctly against a fresh database, somewhere between 22 and 29 of 94 pass on
+the same machine. **Nobody can take this suite green by following a document, including this one**
+— and documenting harder would not fix it.
 
 ## The nine environment variables
 
@@ -81,22 +84,80 @@ Grouped by cause:
 ones QA reported, reproduced here independently on a different machine and a different database —
 which is what makes them environment rather than product.
 
-**They are prerequisites about DATA, not configuration.** `IDENTITY_RISK_KEY_UNAVAILABLE` wants
-pseudonym key material to exist for the scope; `IDENTITY_RISK_SOURCE_UNAVAILABLE` wants collected
-source rows. A migrated but empty database satisfies neither, and nothing in the repository says
-how to produce them.
+**They are NOT prerequisites about data.** That was the first reading here and it was wrong; the
+root cause is in the last section of this document. One failure wants AWS KMS and the other is a
+timeout. **Do not quote any single pass count** — see *the pass count is not reproducible* below.
 
-**A note on the count: QA got 42 passing and this run got 27.** Same failures, different totals,
-which means one of the two environments has something the other lacks — most likely seeded data.
-**Do not average them or quote either as the number.** Until the data prerequisites are written
-down, the honest statement is the one at the top of this document.
+*(An earlier version of this document proposed documenting how to seed key material and source
+rows. That would not have worked, for the reasons in the last section. The real list is there.)*
 
-## What would close it
+## Root cause, found in the source — and neither one is seeded data
 
-1. **Document how to produce the key material and source rows**, or provide a fixture that does.
-   That is the whole gap; everything else here is settled.
-2. Then re-run and record the number, with the machine and the database it was measured on.
-3. Only then can the release checklist say the suite passes.
+**This supersedes the "data prerequisites" reading above.** It was directionally wrong: nothing is
+missing from the database.
 
-**Until step 1 exists, "we ran the integration tests" remains unsayable**, and the release
-checklist should say 27 of 94 with this document beside it rather than a figure with no context.
+### `IDENTITY_RISK_KEY_UNAVAILABLE` — it wants AWS KMS
+
+`identity-risk-pseudonym.ts:37` requires the key id to match:
+
+```
+/^arn:aws(?:-us-gov|-cn)?:kms:[a-z0-9-]+:\d{12}:key\/[a-f0-9-]{36}$/
+```
+
+That is an **AWS KMS key ARN**, and `aws-kms-mac.transport.ts` drives a real `KMSClient` —
+`DescribeKeyCommand`, `GenerateMacCommand`, and a refusal if `maxAttempts !== 1`.
+
+**So this is not key material somebody forgot to seed. It is an external cloud dependency.** No
+document can make it green on a laptop; it needs either real KMS credentials with a real key, or a
+substituted `ManagedMacTransport` in the test setup. The interface is already there —
+`AwsKmsMacTransport implements ManagedMacTransport` — so a fake is possible, and whether the suite
+should use one is a decision rather than a lookup.
+
+### `IDENTITY_RISK_SOURCE_UNAVAILABLE` — it is a stopwatch, not a fixture
+
+`mailbox-read-transaction.ts:7`:
+
+```ts
+if (!Number.isSafeInteger(remaining) || remaining < 100) throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE')
+```
+
+and the retention path caps its whole budget at **one second** (`Math.min(deadlineAt - wallStart, 1000)`).
+
+**So the error means the machine was too slow, not that anything was absent.** A connection that
+takes longer than the remaining budget produces exactly this, and a cold Postgres easily does.
+
+## Therefore: the pass count is not reproducible, and no checklist should quote one
+
+Measured on **one machine, one cluster, one set of environment variables, the same commit**:
+
+| run | pass | fail |
+|---|---|---|
+| earlier | 27 | 67 |
+| 1 | 22 | 72 |
+| 2 | 29 | 65 |
+
+*(A third run was started and is void — the cluster was stopped under it.)*
+
+**A spread of seven on the same machine, and QA independently reported 42 on theirs.** Those are
+not four different environments discovering four different gaps. They are one speed-sensitive
+suite sampled four times.
+
+**This is the finding, and it is worse than a missing document:** *"we ran the integration tests
+and N passed"* is not a reproducible statement, so it cannot support a release decision no matter
+how carefully the environment is written down. Documenting prerequisites would not have fixed it,
+because the prerequisites are already met — the clock is what varies.
+
+## What would actually close it
+
+1. **Decide whether the suite may substitute the KMS transport.** Until then the key-dependent
+   tests cannot pass anywhere without AWS, and that is a fact about the suite rather than about
+   any machine.
+2. **Give the time-budgeted paths a budget that comes from configuration rather than a literal**,
+   or accept that those tests measure the host and not the product. A one-second cap with a
+   100 ms floor is a reasonable production guard and a poor test oracle; it is the same number
+   doing two jobs.
+3. **Only then quote a number**, with the machine it was measured on.
+
+Until 1 and 2, the release checklist should say what is true: **the suite is not currently
+reproducible, the configuration prerequisites are fully documented above, and the failures are
+environment and timing rather than product defects.**

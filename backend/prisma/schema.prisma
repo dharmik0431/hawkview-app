@@ -294,6 +294,56 @@ model AlertRuleDisposition {
   @@map("alert_rule_dispositions")
 }
 
+/// One send, with its own budget. See `send-queue.ts`.
+///
+/// THE BUDGET IS A FACT ON THE ROW. `attemptsMade`/`maxAttempts` are columns because a
+/// runner-scoped counter restarts at zero on a redeploy or a second worker, and the job then
+/// retries forever while every test of the runner shows it stopping.
+///
+/// NO TENANT AND NO ORGANISATION COLUMN: a per-tenant queue is unwriteable rather than
+/// discouraged, because there is no field to partition on.
+model AlertSendJob {
+  id             String    @id @default(uuid()) @db.Uuid
+  messageId      String    @unique @map("message_id") @db.VarChar(200)
+  idempotencyKey String    @map("idempotency_key") @db.VarChar(200)
+  /// READY | CLAIMED | SENT | EXHAUSTED | GAVE_UP — constrained in SQL, see the migration.
+  state          String    @db.VarChar(20)
+  attemptsMade   Int       @map("attempts_made")
+  maxAttempts    Int       @map("max_attempts")
+  /// The backoff, as a fact rather than a sleeping worker.
+  notBeforeAt    DateTime  @map("not_before_at") @db.Timestamptz(6)
+  claimedBy      String?   @map("claimed_by") @db.VarChar(100)
+  claimedAt      DateTime? @map("claimed_at") @db.Timestamptz(6)
+  claimExpiresAt DateTime? @map("claim_expires_at") @db.Timestamptz(6)
+  providerId     String?   @map("provider_id") @db.VarChar(200)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([state, notBeforeAt])
+  @@map("alert_send_jobs")
+}
+
+/// One attempt. WRITTEN BEFORE THE SEND, which is why the settlement is nullable: an attempt
+/// recorded on return leaves no trace when a process dies mid-send, and the retry then sends a
+/// second email believing it is the first.
+///
+/// No foreign key to the job: an attempt is evidence and must survive the job being removed.
+model AlertSendAttempt {
+  id          String    @id @default(uuid()) @db.Uuid
+  messageId   String    @map("message_id") @db.VarChar(200)
+  attemptNo   Int       @map("attempt_no")
+  startedAt   DateTime  @map("started_at") @db.Timestamptz(6)
+  /// ACCEPTED | REFUSED_RETRYABLE | REFUSED_PERMANENT, or null while in flight.
+  settledKind String?   @map("settled_kind") @db.VarChar(30)
+  settledAt   DateTime? @map("settled_at") @db.Timestamptz(6)
+  providerId  String?   @map("provider_id") @db.VarChar(200)
+  because     String?   @db.VarChar(500)
+
+  @@unique([messageId, attemptNo])
+  @@index([settledKind, startedAt])
+  @@map("alert_send_attempts")
+}
+
 model Organization {
   id                 String                     @id @default(uuid()) @db.Uuid
   name               String                     @db.VarChar(200)
