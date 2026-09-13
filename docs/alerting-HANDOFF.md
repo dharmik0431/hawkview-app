@@ -539,6 +539,38 @@ Reported as needing an export, blocked on uncommitted work in the **other** work
 nobody owns. **I could not find that symbol and have not verified the claim** — see the
 constraints section.
 
+### The sender exists and nothing in this build can reach a provider
+
+**There is no Resend client in the repository.** The provider is a `SendTransport` the caller
+supplies, and the only one that exists — `NO_TRANSPORT_CONFIGURED` — sends nothing and says so.
+**Switching sending on requires somebody to WRITE a transport, not to set a variable**, which is
+a stronger property than a flag defaulting to off.
+
+It refuses RETRYABLY rather than permanently, deliberately: a permanent refusal would burn each
+job’s budget and mark it GAVE_UP, so a system left running against it would conclude every
+address was dead and whoever later wired a real provider would inherit a queue that had already
+given up.
+
+**A hard bounce suppresses the ADDRESS, not the job.** The fact is about the mailbox, so a
+different message to the same dead address is not attempted either; continuing to try is what
+earns a sending domain a reputation problem, and that damage lands on every other message rather
+than on the one that bounced. A soft failure suppresses nothing and retries inside the bound the
+job already carries.
+
+**Nothing reaches a transport without a permit** — the sender takes one, and the only thing that
+produces one is a claim whose row count was exactly one.
+
+### Still missing before anything can send
+
+- **A real transport.** Deliberately absent; see above.
+- **The webhook verifier**, which turns a signed request into the `Authentication` verdict
+  `authenticate()` already takes. Until it exists no delivery outcome can be recorded at all.
+- **A suppression store.** `Suppressions` is an interface with an in-memory implementation; no
+  table holds suppressed addresses, so suppression does not survive a restart.
+- **A cancel for unsent jobs.** Ruled and not yet built: an operator switching this on has no
+  stop button, and that must exist before the sender is switched on rather than before it is
+  written.
+
 ### Intake will not run until somebody chooses the watermark
 
 **`HAWKVIEW_ALERT_WATERMARK_ISO` is unset, so alert intake is a no-op on every tick.** That is
