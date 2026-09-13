@@ -38,6 +38,55 @@ same product.
   actually looked at.
 - **Ten migrations**, all additive or widening; none drops a column or rewrites a row.
 
+## Why there are zero findings — the best answer anyone has, with its limits
+
+**Over the history HawkView collected in Graph shape, across all five tenants, neither sign-in
+detector has ever had qualifying evidence.** *(Measured in production by PM, read-only. I have no
+production access; what I verified is the thresholds the query had to be checked against, and I
+corrected it once.)*
+
+- `HV-ID-AUTH-010.v1` needs **ten** failed sign-ins for one subject and application inside fifteen
+  minutes. The most ever recorded is **five**.
+- `HV-ID-AUTH-005.v2` needs **five** at one client address followed by a success. Across **2,366
+  successes examined**, the most preceding failures at the same address is **one**.
+
+**The second line exists because the first query answered only one rule.** It reported a maximum of
+five and concluded neither rule could fire — but five is precisely the second rule's threshold, which
+I established by running it: five failures then a success **matches**; four does not. Re-run with the
+address constraint the rule actually requires, the maximum falls from five to one.
+
+**The deviations I can find all run the safe way.** The re-run used a fifteen-minute lookback where
+the second rule uses ten, counted successes more broadly than the engine admits them, and did not
+exclude non-interactive sign-ins — each of which makes the query *more* likely to find a trigger than
+the rule is, not less. **One runs the other way:** grouping by the raw address string would split two
+spellings of one IPv6 address that the engine treats as identical, which could undercount. Narrow,
+and worth knowing.
+
+**What is not covered.** Audit-shaped rows are invisible to this extraction, and those are the recent
+rows on the tenants that fell back — one tenant shows 1,115 successes in history and nothing
+classifiable in the last 24 hours. Reading them properly means **running the normaliser over them**,
+not rewriting its rules in SQL: the code gathers up to three error-code fields that must all agree,
+plus four more conditions, and a second home for that logic is the defect this project has fixed four
+times already.
+
+**So this is not a cause. It is the removal of the last reason to think there is one.** Two named
+causes were proposed today and both were true facts about the wrong subject. What this says is that
+the question may be malformed: **nothing matched because nothing matching happened** — and the
+defects are in what the product could *say* about that, not in what it saw.
+
+**Three of those are measured and real:**
+
+1. **An unrecognised sign-in error code prevents a tenant being reported as assessed-and-clear.** It
+   does not suppress a finding — I measured that — but it turns *"evaluated, nothing matched"* into
+   *"could not evaluate"*. **(QA)**
+2. **Two of five tenants stopped collecting sign-in evidence and still report a current collection
+   time**, because the code stamps the window it requested rather than what came back. **(Engineer 2,
+   in production)**
+3. **One tenant's source never becomes `READY` at all**, and nobody knows why. **(unexplained)**
+
+**The product may have been correct and unable to say so.** That is a different sentence from *"the
+engine is broken"*, and it changes what should be fixed.
+
 ## The one thing that outranks everything else
 
 **Production holds zero identity-risk findings.** The risk engine has run thousands of times and
