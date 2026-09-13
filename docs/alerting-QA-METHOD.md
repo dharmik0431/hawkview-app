@@ -276,3 +276,24 @@ applied to your own instruments.
 database refused my test input. My input used an invented namespace the constraint forbids. The
 database was telling me the namespace and I read it as telling me the path did not exist. **A
 search over invented values proves something about the values you invented.**
+
+### One defect per variant, or the register means nothing
+
+A pre-registration is a set of checks and a set of variants, where each check must pass the
+reference, catch the variant it declares, and stay quiet on the rest. **Two ways that silently
+fails, both found by running it and neither visible to review:**
+
+**An inert variant.** I declared `withheld-not-reported` and never implemented it. The check that
+declared it still failed on *another* variant, so it looked like it was working — **it was
+catching somebody else's defect and none of its own.** A variant that changes no behaviour is a
+check with nothing behind it.
+
+**A variant carrying two defects.** My `verifier-rejects-everything` both never authenticated
+*and* collapsed missing with invalid. Two different checks caught it, and neither of them
+discriminated — each was firing for the wrong half. Splitting it into one defect per variant is
+what made both checks mean something.
+
+**The rule:** every variant must change exactly one behaviour, and every check must catch exactly
+one variant. When a check catches two, either the check is too broad or the variant is two
+defects wearing one name. **Print which variants each check caught**, not just whether it passed
+— a check that catches everything is indistinguishable from a check that works, until you look.
