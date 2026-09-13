@@ -282,3 +282,62 @@ test('the page actually uses this, and no longer hardcodes the shield', () => {
     'no reassuring shield remains, so the gate asserted nothing'
   )
 })
+test('the KPI tile is gated on the same coverage as the list', () => {
+  // I DIAGNOSED THIS TILE AND LEFT IT. The commit that fixed the badge and the
+  // empty states said, in as many words, that "100% tenants synced" was derived
+  // from failedTenants -- which counts only assessmentError -- and so claimed a
+  // fully synced fleet over tenants nobody assessed. Then it changed the badge
+  // and not the tile: the visible half fixed and the reassuring half left, which
+  // is the exact shape the sweep was looking for.
+  const page = readFileSync(
+    new URL('../../app/(protected)/risky-users/page.tsx', import.meta.url),
+    'utf8'
+  ).split(String.fromCharCode(13)).join('')
+
+  assert.ok(
+    page.includes('Users requiring review'),
+    'did not find the page where this test expects it'
+  )
+
+  const code = page
+    .split(String.fromCharCode(10))
+    .filter((line) => {
+      const t = line.trim()
+      return !(
+        t.startsWith('//') ||
+        t.startsWith('{/*') ||
+        t.startsWith('/*') ||
+        t.startsWith('*') ||
+        t.endsWith('*/}') ||
+        t.endsWith('*/')
+      )
+    })
+    .join(String.fromCharCode(10))
+
+  assert.ok(
+    !code.includes("'100% tenants synced'"),
+    'the tile still claims a fully synced fleet from failedTenants'
+  )
+  // EVERY coverage claim, not just the tile. There were eight sites reading
+  // failedTenants -- the tile, the heading, two 'N of M' lines, the styling,
+  // and the partial-coverage banner, which renders only when that count is
+  // above zero and so did not appear AT ALL for a fleet whose tenants came
+  // back UNAVAILABLE rather than errored. Fixing one and leaving seven is the
+  // shape that put this test here in the first place.
+  assert.ok(
+    !code.includes('metrics.failedTenants'),
+    'a coverage claim still reads a count that ignores UNAVAILABLE'
+  )
+  assert.ok(
+    code.includes('fleetWide.assessed === fleetWide.inScope'),
+    'the tile is not gated on assessment coverage'
+  )
+
+  // The tile is a fleet KPI and must NOT be scoped to the tenant filter: the
+  // counts beside it are unfiltered, and a tile that narrowed while they did
+  // not would disagree with the numbers it sits under.
+  assert.ok(
+    code.includes("fleetCoverage(tenantStatuses, 'ALL')"),
+    'the fleet tile is scoped to the tenant filter'
+  )
+})

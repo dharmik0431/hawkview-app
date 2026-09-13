@@ -166,6 +166,22 @@ export default function FleetRiskyUsersPage() {
   // discarded. It distinguishes LOADING, FAILED, UNAVAILABLE and SUCCESS;
   // `metrics.failedTenants` counts only assessmentError, so a tenant that came
   // back with no assessment was counted as fine.
+  // THE KPI ROW IS ABOUT THE WHOLE FLEET, not the filtered view -- the counts
+  // beside it (totalRiskyUsers and the rest) are unfiltered, so its coverage
+  // has to be too or the tile would disagree with the numbers it sits under.
+  const fleetWide = useMemo(
+    () => fleetCoverage(tenantStatuses, 'ALL'),
+    [tenantStatuses]
+  )
+
+  // EVERY COVERAGE CLAIM ON THIS PAGE CAME OFF `metrics.failedTenants`, which
+  // counts only assessmentError. Eight sites: the tile, the heading, the
+  // "N of M evaluated" lines, the styling, and the partial-coverage banner --
+  // which, because it renders only when failedTenants > 0, did not appear AT
+  // ALL for a fleet whose tenants came back UNAVAILABLE rather than errored.
+  // One derived number now, so the page cannot tell two coverage stories.
+  const notAssessed = fleetWide.inScope - fleetWide.assessed
+
   const coverage = useMemo(
     () => fleetCoverage(tenantStatuses, selectedTenant),
     [tenantStatuses, selectedTenant]
@@ -261,7 +277,7 @@ export default function FleetRiskyUsersPage() {
               Review users requiring investigation across the Microsoft 365 tenants you manage.
             </p>
             <div className="flex items-center gap-2 mt-1.5 text-xs text-slate-500 dark:text-slate-400 font-medium">
-              <span>{metrics.totalTenants - metrics.failedTenants} of {metrics.totalTenants} tenants evaluated</span>
+              <span>{fleetWide.assessed} of {fleetWide.inScope} tenants assessed</span>
               <span className="text-slate-300 dark:text-slate-700">•</span>
               <span>Updated continuously</span>
             </div>
@@ -291,7 +307,7 @@ export default function FleetRiskyUsersPage() {
           <div>
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                {metrics.failedTenants > 0 ? 'Users Shown (Partial Fleet)' : 'Users Requiring Review'}
+                {notAssessed > 0 ? 'Users Shown (Partial Fleet)' : 'Users Requiring Review'}
               </span>
               <Users className="h-4 w-4 text-slate-400" />
             </div>
@@ -404,9 +420,9 @@ export default function FleetRiskyUsersPage() {
           <div
             className={cn(
               'p-4 rounded-xl border shadow-2xs flex flex-col justify-between space-y-3',
-              metrics.failedTenants === 0
+              notAssessed === 0
                 ? 'border-emerald-200/70 dark:border-emerald-900/40 bg-emerald-50/30 dark:bg-emerald-950/20'
-                : metrics.failedTenants < metrics.totalTenants
+                : notAssessed < fleetWide.inScope
                 ? 'border-amber-200/70 dark:border-amber-900/40 bg-amber-50/30 dark:bg-amber-950/20'
                 : 'border-rose-200/70 dark:border-rose-900/40 bg-rose-50/30 dark:bg-rose-950/20'
             )}
@@ -415,7 +431,7 @@ export default function FleetRiskyUsersPage() {
               <span
                 className={cn(
                   'text-xs font-semibold',
-                  metrics.failedTenants === 0
+                  notAssessed === 0
                     ? 'text-emerald-900 dark:text-emerald-300'
                     : 'text-amber-900 dark:text-amber-300'
                 )}
@@ -425,7 +441,7 @@ export default function FleetRiskyUsersPage() {
               <div
                 className={cn(
                   'p-1.5 rounded-lg border',
-                  metrics.failedTenants === 0
+                  notAssessed === 0
                     ? 'bg-emerald-100/80 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 border-emerald-200/80 dark:border-emerald-800/60'
                     : 'bg-amber-100/80 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300 border-amber-200/80 dark:border-amber-800/60'
                 )}
@@ -435,7 +451,7 @@ export default function FleetRiskyUsersPage() {
             </div>
             <div>
               <div className="text-2xl font-bold text-slate-900 dark:text-slate-100">
-                {isLoading ? '...' : `${metrics.totalTenants - metrics.failedTenants} of ${metrics.totalTenants}`}
+                {isLoading ? '...' : `${fleetWide.assessed} of ${fleetWide.inScope}`}
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 evaluated tenants
@@ -444,27 +460,35 @@ export default function FleetRiskyUsersPage() {
             <div
               className={cn(
                 'text-2xs font-medium pt-1 border-t',
-                metrics.failedTenants === 0
+                fleetWide.assessed === fleetWide.inScope
                   ? 'text-emerald-700 dark:text-emerald-300 border-emerald-100 dark:border-emerald-900/40'
                   : 'text-amber-700 dark:text-amber-300 border-amber-100 dark:border-amber-900/40'
               )}
             >
-              {metrics.failedTenants === 0
-                ? '100% tenants synced'
-                : `${metrics.failedTenants} tenant${metrics.failedTenants === 1 ? '' : 's'} unavailable`}
+              {/* '100% tenants synced' WAS DERIVED FROM failedTenants, WHICH
+                  COUNTS ONLY assessmentError. A tenant whose assessment came
+                  back null is UNAVAILABLE -- not an error, and it contributed
+                  no rows -- so this tile claimed a fully synced fleet over
+                  tenants nobody assessed. I named that in the commit that fixed
+                  the badge and the empty states and then left the tile itself
+                  alone: the visible half fixed and the reassuring half not,
+                  which is the shape this whole sweep is about. */}
+              {fleetWide.assessed === fleetWide.inScope
+                ? `All ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} assessed`
+                : `${fleetWide.inScope - fleetWide.assessed} of ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} not assessed`}
             </div>
           </div>
         </div>
       </div>
 
       {/* Coverage Status Ribbon */}
-      {metrics.failedTenants > 0 && (
+      {notAssessed > 0 && (
         <div className="rounded-xl border border-amber-200/80 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/30 p-3.5 px-4 text-xs text-amber-900 dark:text-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
           <div className="flex items-center gap-2.5">
             <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
             <div>
               <span className="font-semibold">
-                Partial fleet coverage: {metrics.failedTenants} of {metrics.totalTenants} tenant{metrics.totalTenants === 1 ? '' : 's'} could not be fully evaluated.
+                Partial fleet coverage: {notAssessed} of {fleetWide.inScope} tenant{fleetWide.inScope === 1 ? '' : 's'} could not be fully assessed.
               </span>
               <span className="block sm:inline text-2xs text-amber-800 dark:text-amber-300/80 sm:ml-2">
                 Available tenant findings remain displayed below without interruption.
