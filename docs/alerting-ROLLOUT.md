@@ -182,6 +182,9 @@ never by reading a default.
 
 ### The four a person must do
 
+**Each of these is written out as a procedure in `alerting-ACCEPTANCE-HOW.md`** — what to run,
+what to look at, what counts as a pass, and what to write on the line.
+
 **No test can close these. While these lines are blank, this feature is not verified.**
 
 **1. Send twice, one arrives.** Two sends carrying one idempotency key. Our side can only show
@@ -213,6 +216,11 @@ attempted either.
 > Performed by ____________________ on ____________  Address suppressed afterwards: ______
 
 ### Forecast the first real run before it runs
+
+**There is now a command for this — see `alerting-ACCEPTANCE-HOW.md`.**
+`npx tsx scripts/alerting-forecast.mts` reads and nothing else, refuses to run without a chosen
+watermark (and refuses an unparseable one rather than falling back), and prints the four gates it
+is operating under so nobody has to remember they exist.
 
 **How many messages, to which organisations, computed from the chosen watermark, nothing sent.**
 If that number is more than a handful the watermark is wrong — **and that is a tuning question
