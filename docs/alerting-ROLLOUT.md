@@ -133,9 +133,15 @@ Nothing in reading the migrations distinguishes those two outcomes.
 
 ### Two limits on that result, which must not be rounded up
 
-- **Not every route, not under load, not with production configuration.** Six routes were
-  exercised on a synthetic database. **"The old application serves" is a stronger claim than what
-  was tested.**
+- **What was established: three public and three guarded routes answered.** `/health`,
+  `/health/database` and the application starting; `/api/notifications`, `/api/tenants` and
+  `/api/changes` returning 401 rather than 500. On a synthetic database, with synthetic
+  configuration, under no load.
+
+  **"The old application serves" is a stronger claim than that, and it should not be written.**
+  The gap between six routes answering and an application serving is exactly where a rollback
+  goes wrong — and it goes wrong at the worst possible moment, because a rollback is something
+  you do when something is already broken and you are already out of time.
 - **A rollback does not undo the apply.** Keys written by the apply survive a code rollback,
   untouched and unread by the old code. Undoing the apply is the revert subcommand's job, and it
   needs its receipt file — without `receipt.json` there is no revert.
@@ -200,7 +206,7 @@ was classified correctly** — a finding wrongly skipped as `RECORD_ONLY` counts
 the books still balance. A tripwire against a future edit, **not evidence that the delivery
 decisions are right.**
 
-### Two decisions that are yours, not ours
+### Three decisions that are yours, not ours
 
 **1. The watermark instant.** Nobody has chosen it. The service refuses to run without one and
 treats an unparseable value as a refusal rather than a fallback, which is correct — but it means
@@ -211,3 +217,22 @@ ticks read a bounded window, so older findings **never receive an incident row**
 job exists. That is the difference between *"we will not email you about last month"* and *"last
 month is not in the system"*. Both are defensible; they are different products, and the choice is
 yours.
+
+**3. Mailbox forwarding at launch — FLAGGED, AND I COULD NOT FRAME IT.** This was raised as a
+launch decision and I have not been able to establish what it refers to. Searching the alerting
+code, the alerting documents, the handoff and the acceptance notes returns nothing: every match
+for *forward* is unrelated — a watermark's forward edge, carrying an acknowledgement forward. The
+only mailbox-forwarding material in the repository is frontend mock data about Exchange
+auto-forwarding **rules**, which is a control HawkView reports on rather than anything about how
+HawkView's own mail is delivered.
+
+**It is listed here unframed on purpose.** It is a real decision somebody is holding, and writing
+a plausible-sounding version of it would be worse than leaving the gap visible — a decision put
+to you in words nobody checked is how a caller-supplied category ends up in a key. **Whoever
+raised it should supply the sentence.**
+
+If it means what I would guess — that the MSP security inbox may be a distribution list or a
+forwarding address, so HawkView's alerts reach people nobody enumerated — then that is worth
+deciding, and it interacts with the body carrying no identity: **a closed vocabulary limits what
+we say, and says nothing about who ends up reading it.** But that is my guess and it is labelled
+as one.
