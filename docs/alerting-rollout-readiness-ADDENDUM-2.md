@@ -129,11 +129,37 @@ The last two were one screen under a green shield until today.
 
 ## D. Goes into §*What is deliberately not in this release*
 
-**A setting can silence, and cannot escalate.** The tick reads the disposition to decide whether to
-send at all. Moving a type between the two non-silencing tiers changes the notification's severity
-and what the inbox shows, but it does not change routing or channel — SMS is deferred and both
-tiers deliver the same way. An MSP who raises urgency sees the change in the product and should not
-expect a different delivery.
+**A setting changes what the product SHOWS. It does not change how the product REACHES you.**
+
+Re-measured at `ac6318f` with the same end-to-end probe that found the earlier gap — an HTTP write
+through the settings endpoint, then a tick, then the rows it wrote:
+
+| what the organisation stored | the notification's severity | send jobs |
+|---|---|---|
+| nothing (the catalogue says `ACT_NOW`) | `critical` | 1 |
+| `ACT_NOW` | `critical` | 1 |
+| `ACT_TODAY` | **`high`** | 1 |
+| `RECORD_ONLY` | **`info`** | **0** |
+
+So a choice is visible in the product, not only in the settings page. An earlier draft of this
+addendum said a setting *cannot escalate*; that was measured before `73222f6` and **it is wrong** —
+the effective tier owns the notification's tone.
+
+**What is still deliberately absent is routing.** Both non-silencing tiers queue the same job
+through the same channel. SMS is deferred, so `ACT_NOW` and `ACT_TODAY` differ in what a person
+sees and not in how they are reached.
+
+**Raising a tier above the catalogue's own judgement is unreachable today**, and for a reason worth
+knowing rather than a defect: both alert types a setting currently reaches are already `ACT_NOW`,
+so there is nothing below to raise. The mapping is a total table over the three tiers applied to
+the *effective* tier, so it is direction-free and will apply the moment a reachable type sits lower.
+
+**And one consequence an operator should know before an MSP lowers something.** `critical` rows are
+shown in-app whatever an individual's notification switch says — an existing product rule, not a
+new one. Lowering a type from `ACT_NOW` to `ACT_TODAY` therefore takes its rows out of that
+always-shown set, so a person who has muted in-app notifications stops seeing them. That is the
+organisation's setting interacting with an individual's, it is the intended reading, and it is a
+real effect of lowering rather than a change of colour.
 
 ---
 

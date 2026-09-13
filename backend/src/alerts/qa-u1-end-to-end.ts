@@ -199,7 +199,13 @@ async function main() {
       const stored = (await client.query(
         'SELECT disposition FROM alert_rule_dispositions WHERE organization_id=$1 AND alert_type_id=$2',
         [ORG, TYPE])).rows[0]?.disposition ?? null
-      const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+      // `runIntake` returns an outcome union since 28b6ddd. Unwrapped rather than cast, and the
+      // probe FAILS rather than reports zeros if a tick did not run — the typecheck caught the
+      // change when I re-pointed this file at a newer tip, which is the reason for typechecking
+      // a probe at all.
+      const outcome = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+      if (outcome.kind !== 'RAN') throw new Error('the tick did not run: ' + JSON.stringify(outcome))
+      const report = outcome.report
       return { writeStatus: write?.status ?? null, stored, report, written: await whatWasWritten(client) }
     }
 
@@ -270,7 +276,9 @@ async function main() {
     await resetAndSeedOneFinding(client)
     await client.query(`INSERT INTO alert_rule_dispositions (id, organization_id, alert_type_id, disposition, updated_at)
       VALUES (gen_random_uuid(),$1,'HV-ID-AUTH-010.v1','RECORD_ONLY',now())`, [ORG])
-    const tickWithUnreadable = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const unreadableOutcome = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    if (unreadableOutcome.kind !== 'RAN') throw new Error('the tick did not run: ' + JSON.stringify(unreadableOutcome))
+    const tickWithUnreadable = unreadableOutcome.report
 
     const list = listWithUnreadable.body as { dispositions?: { alertTypeId: string; storedValueIgnored?: string }[] }
 
