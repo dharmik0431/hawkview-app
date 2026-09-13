@@ -231,11 +231,13 @@ Said plainly, because a method document implying completeness is the same failur
 about:
 
 - **L1, L2 and L4** (a limit withholds rather than drops; a withheld delivery is released;
-  a limit is counted over its declared scope) are **unbound** — the limit function does not
-  exist yet. The types are designed for them; nothing has been run.
-- **No database, no production data, no integration tests.** Everything here is synthetic
-  fixtures and type-level checks. Database-integration tests need a real Postgres and
-  `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1` and were not run.
+  a limit is counted over its declared scope) are **bound**, at 42622d1: 135 enumerated cases,
+  0 breaches, plus four attacks on the limit itself.
+- **No production data.** Everything here is synthetic fixtures, type-level checks, and work
+  against a disposable local Postgres. A disposable cluster now exists and the apply runbook has
+  been run end to end against it; see `alerting-apply-FIRST-RUN.md` and `-SECOND-RUN.md`.
+  The gated database-integration suite has been run once and does not reach a meaningful result
+  without prerequisites nobody has written down — see `alerting-LAUNCH-BLOCKERS.md` B3.
 - **The rendered screen** is not covered by any of this. The recurring defect in this product
   is a true sentence in the wrong company, and tests cannot see the company — only rendering
   can.
