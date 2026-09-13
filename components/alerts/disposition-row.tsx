@@ -102,6 +102,21 @@ export function DispositionRow({
           })}
         </div>
 
+        {row.storedValueIgnored && (
+          <p className="flex items-start gap-1.5 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+            {/* A SETTING SOMEBODY MADE THAT IS BEING IGNORED. The control above
+                shows what will actually happen, which is true -- and on its own
+                it makes the row look like nobody had chosen. The endpoint
+                reports the unreadable value for exactly this reason, so it is
+                shown on the row where the choice was made. */}
+            <span>
+              A saved value of “{row.storedValueIgnored}” is not one this
+              version of HawkView can read, so it is being ignored. The setting
+              shown above is what will happen until it is changed.
+            </span>
+          </p>
+        )}
         <div className="space-y-1 text-xs text-muted-foreground">
           <p>{delivery.today}</p>
           {delivery.deferred.map((sentence) => (

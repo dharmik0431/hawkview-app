@@ -38,6 +38,14 @@ export type AlertDispositionRow = {
    * to see that they have configured something that will never fire.
    */
   mapped: boolean
+  /**
+   * A stored value outside the vocabulary, verbatim, when there is one.
+   *
+   * Reported rather than defaulted away. `disposition` says what the product
+   * will actually do and that is true; without this the row would look like
+   * nobody had chosen, when in fact somebody chose and is being ignored.
+   */
+  storedValueIgnored?: string
 }
 
 /* -------------------------------------------------------------------------- */

@@ -87,6 +87,13 @@ export function readDispositionRow(value: unknown): AlertDispositionRow | null {
   if (!isDisposition(row.catalogueSeverity)) return null
   if (typeof row.mapped !== 'boolean') return null
 
+  // A STORED VALUE THE BACKEND COULD NOT READ, CARRIED RATHER THAN DROPPED.
+  // The endpoint reports it deliberately: `disposition` already says what the
+  // product will do, and that is true, but without this the row would look like
+  // nobody had chosen. It is a setting somebody made that is being ignored, and
+  // it belongs on the row where they made it.
+  const storedValueIgnored = text(row.storedValueIgnored)
+
   return {
     alertTypeId,
     title,
@@ -94,6 +101,7 @@ export function readDispositionRow(value: unknown): AlertDispositionRow | null {
     catalogueSeverity: row.catalogueSeverity,
     disposition: row.disposition,
     mapped: row.mapped,
+    ...(storedValueIgnored ? { storedValueIgnored } : {}),
   }
 }
 
@@ -104,12 +112,22 @@ export function readDispositionRow(value: unknown): AlertDispositionRow | null {
  * body that is not that shape is UNREADABLE, not an empty organisation.
  */
 export function readDispositions(body: unknown): DispositionsRead {
-  const container =
-    Array.isArray(body) ? body
-    : typeof body === 'object' && body !== null &&
-      Array.isArray((body as Record<string, unknown>).items)
-      ? ((body as Record<string, unknown>).items as unknown[])
-      : null
+  // THE KEY IS `dispositions`, WHICH I LEARNED BY READING THE ENDPOINT RATHER
+  // THAN BY ASSUMING. This accepted a bare array or `{ items }` -- both guesses,
+  // written before the endpoint existed. The real response is
+  // `{ organizationId, dispositions }`, so the page would have reported the
+  // live API as UNREADABLE and shown "no request has succeeded" over a perfectly
+  // good response. `items` is kept because nothing costs less and a reader that
+  // accepts more shapes is not the risk here; a reader that accepts FEWER than
+  // the producer sends is.
+  const fromKey = (key: string): unknown[] | null => {
+    if (typeof body !== 'object' || body === null) return null
+    const value = (body as Record<string, unknown>)[key]
+    return Array.isArray(value) ? (value as unknown[]) : null
+  }
+  const container = Array.isArray(body)
+    ? body
+    : fromKey('dispositions') ?? fromKey('items')
 
   if (container === null) {
     return {

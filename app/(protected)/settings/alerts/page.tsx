@@ -102,9 +102,22 @@ export default function AlertSettingsPage() {
         )
       )
       try {
-        await apiClient.put('/api/alerts/dispositions/' + row.alertTypeId, {
-          disposition,
-        })
+        // PATCH, NOT PUT. This was `put` -- a guess made before the endpoint
+        // existed, and the controller declares @Patch, so every save would have
+        // failed on a method the route does not have.
+        //
+        // The endpoint returns the whole refreshed list, so the row is replaced
+        // with what the server now holds rather than kept as what this page
+        // optimistically set. The rollback below is still needed for a failed
+        // write, but a successful one no longer has to be trusted.
+        const after = await apiClient.patch<unknown>(
+          '/api/alerts/dispositions/' + row.alertTypeId,
+          { disposition }
+        )
+        const confirmed = readDispositions(after)
+        if (confirmed.outcome === 'LOADED' && confirmed.rows.length > 0) {
+          setRows(confirmed.rows)
+        }
         setSaves((current) => ({
           ...current,
           [row.alertTypeId]: { kind: 'SAVED' },

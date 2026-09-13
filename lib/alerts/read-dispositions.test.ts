@@ -138,3 +138,51 @@ test('a bare array is read, and a null body is not', () => {
   // An empty bare array is a real empty result, same as { items: [] }.
   assert.deepEqual(emptinessOf(readDispositions([])), { kind: 'NOTHING_MATCHED' })
 })
+
+test('the shape the real endpoint actually sends is read', () => {
+  // THE GUESS THAT WAS WRONG. This reader accepted a bare array or `{ items }`,
+  // both invented before the endpoint existed. AlertsController returns
+  // `{ organizationId, dispositions }`, so every live response would have been
+  // UNREADABLE and the page would have said "no request has succeeded" over a
+  // perfectly good answer -- the failure mode this module exists to prevent,
+  // arriving from the reader's own assumption about the envelope.
+  const real = {
+    organizationId: 'org-1',
+    dispositions: [row(), row({ alertTypeId: 'monitoring.recovered', mapped: false })],
+  }
+  const read = readDispositions(real)
+  assert.equal(read.outcome, 'LOADED')
+  assert.equal(read.outcome === 'LOADED' && read.rows.length, 2)
+  assert.deepEqual(emptinessOf(read), { kind: 'HAS_ITEMS' })
+
+  // An organisation with no catalogue types is still an empty RESULT, not a
+  // failed read -- the envelope arrived and it said nothing is configured.
+  assert.deepEqual(
+    emptinessOf(readDispositions({ organizationId: 'org-1', dispositions: [] })),
+    { kind: 'NOTHING_MATCHED' }
+  )
+
+  // And the envelope without the array is still unreadable, or the fix above
+  // would have been "accept anything with an organizationId".
+  assert.equal(readDispositions({ organizationId: 'org-1' }).outcome, 'UNREADABLE')
+})
+
+test('a stored value the backend could not read reaches the row', () => {
+  // The endpoint reports it deliberately: `disposition` says what will actually
+  // happen and that is true, but on its own the row looks like nobody chose.
+  // Somebody chose, and is being ignored. Dropping the field here would have
+  // re-hidden exactly what the endpoint went out of its way to surface.
+  const ignored = readDispositionRow(row({ storedValueIgnored: 'RING' }))
+  assert.equal(ignored?.storedValueIgnored, 'RING')
+
+  // Absent when there is none -- an absent key rather than a key holding
+  // undefined, so a reader cannot mistake "no stored value" for "empty string".
+  assert.equal('storedValueIgnored' in (readDispositionRow(row()) as object), false)
+
+  // A non-string is not carried: the field exists to quote what was stored, and
+  // quoting `[object Object]` at somebody is worse than saying nothing.
+  assert.equal(
+    'storedValueIgnored' in (readDispositionRow(row({ storedValueIgnored: 42 })) as object),
+    false
+  )
+})
