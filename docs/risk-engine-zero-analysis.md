@@ -316,3 +316,136 @@ rather than from the database.
 surface is defensible until that distinction exists, because today it makes a
 reassuring claim it cannot support. Once it exists the screen tells the truth and
 can stay, whether or not the engine ever matches anything.
+
+---
+
+# SECOND INTERIM — the data does not yet say cause (2)
+
+I was handed Q0/Q1/Q2 with the conclusion "it is cause (2): the evidence is
+there and the loader is not seeing it." **I do not think that follows yet**, and
+the step that does not hold is one measurement being generalised to four other
+tenants. Saying so before building on it.
+
+## What the code forces, and it is decisive
+
+Every row the readiness loop rejects increments `gaps`
+(`authentication-source-readiness.ts:95-116` — six separate `gaps++; continue`
+branches). Then:
+
+    const partial = gaps > 0 || !window.paginationComplete
+    const reasonCode = partial ? 'INCOMPLETE_WINDOW' : 'READY'
+
+**So a tenant whose rows were fetched and then dropped cannot report READY.** It
+reports PARTIAL / INCOMPLETE_WINDOW. The measured tenant reported
+`READY / reasonCode READY` with `latestEventAt: null`.
+
+The only way to reach READY with no events is for the loop to iterate **zero
+times** — the bounded SQL returned nothing. Not "returned rows that were
+filtered out". Nothing.
+
+## Which tenant that was, and why it changes the reading
+
+The FULL aggregate came from one tenant. Match it against Q1 and Q2:
+
+| | rows in 24h | newest event | Q2 window source |
+| --- | --- | --- | --- |
+| 83f23fe5 | 11 | 2026-09-13 14:34 | GRAPH_SIGN_INS |
+| dcb2a091 | 27 | 2026-09-13 14:16 | M365_AUDIT_STS |
+| 27e8b142 | 43 | 2026-09-13 13:15 | M365_AUDIT_STS |
+| **6facb85e** | **0** | **2026-09-10 13:56** | **GRAPH_SIGN_INS** |
+| 66735f04 | 0 | 2026-08-30 04:24 | M365_AUDIT_STS |
+
+The measured tenant reported `GRAPH_SIGN_INS READY` and
+`M365_AUDIT_STS WAITING_FOR_COLLECTION`. Only two tenants snapshot under
+GRAPH_SIGN_INS: 83f23fe5 and 6facb85e. Of those, only **6facb85e** can produce
+READY-with-no-events, because its window is
+`2026-09-12T14:46 → 2026-09-13T14:46` and its newest row is **2026-09-10** —
+every one of its 119 rows is older than `window.start`, so the SQL returns zero
+and the loop never runs.
+
+83f23fe5 cannot produce it. It has 11 rows inside its own window, so either they
+are returned (loop runs, `latestEventAt` non-null) or they are dropped
+(`gaps > 0`, status PARTIAL). Neither is READY-with-null.
+
+**So the FULL tenant is 6facb85e, and its READY over no events is correct
+behaviour over a collector that stopped three days ago.** It is not the loader
+being blind.
+
+## What that means for the three live tenants
+
+**Their evaluation aggregates have not been measured.** The reasoning that
+reached cause (2) took 6facb85e's aggregate and applied it to 83f23fe5,
+dcb2a091 and 27e8b142. That is the step I do not think holds — and those three
+are most likely the `COMPLETED / PARTIAL` population (4,461 runs, 5 tenants),
+not the FULL one.
+
+If they are PARTIAL, that is consistent with rows being fetched **and dropped**
+— `gaps > 0` — which is a completely different fault from the loader not seeing
+them, and it has a different fix.
+
+## The real finding available right now
+
+Whatever the three live tenants turn out to say, Q1 already establishes
+something that needs no further query:
+
+**Sign-in collection has stopped for two of five tenants.**
+6facb85e last ingested 2026-09-10; 66735f04 last ingested 2026-08-30, with nine
+rows total. Both still report a current `lastSuccessfulCollectionAt` and a
+window ending *now* — `persistCompletedAuthenticationWindow` stamps the window
+from the requested range, not from what came back. So a stalled collector and a
+quiet tenant are indistinguishable in the product, which is the same defect
+again.
+
+That is real, it is independent of the loader question, and it is worth fixing
+whatever else is true.
+
+## What I need to finish this
+
+**Q6 — the deciding query now.** What do the live tenants actually report?
+
+```sql
+-- Most recent evaluation aggregate per tenant, for the three with fresh rows.
+SELECT customer_tenant_id, status, reason_code, created_at
+FROM identity_risk_evaluation_runs
+WHERE customer_tenant_id IN (
+  '83f23fe5-bfdf-4e21-84fb-12f9627a3d06'::uuid,
+  'dcb2a091-ecf5-4bda-8780-a33bfb1b4d63'::uuid,
+  '27e8b142-7456-4cba-bdf3-8897f9f801bd'::uuid)
+ORDER BY customer_tenant_id, created_at DESC
+LIMIT 30;
+```
+
+Plus, if the aggregate payload is stored, the per-source block for 83f23fe5 —
+specifically `status`, `reasonCode`, `latestEventAt` and `gapCount`.
+
+- **PARTIAL / INCOMPLETE_WINDOW** → rows are being fetched and dropped. The
+  fault is in the row filter, and the six `gaps++` branches at
+  `authentication-source-readiness.ts:95-116` are the whole search space.
+  Hours to localise, once I know which branch.
+- **READY with latestEventAt non-null** → the engine is working on those tenants
+  and the zero-match question is genuinely "three narrow detectors found
+  nothing", i.e. shape C.
+- **READY with latestEventAt null on 83f23fe5** → that would contradict the code
+  above and I would want to see the row, because it should be impossible.
+
+**Q3 is still worth running** exactly as specified, because it isolates the SQL
+predicate from everything downstream. If 83f23fe5's 11 rows come back
+`in_window = 11`, the query is fine and the loss is in the loop; if `0`, it is
+`expires_at` or the organisation scoping.
+
+## Revised shape
+
+Still **A**, but a different A than I named this morning, and possibly two
+faults rather than one:
+
+1. **Collection stalled** on 6facb85e (3 days) and 66735f04 (2 weeks), reported
+   as current. Days. Real regardless of anything below.
+2. **Rows dropped in the readiness loop** on the live tenants — *if* Q6 returns
+   PARTIAL. Hours once localised, and the search space is six branches.
+
+Shape C is not dead: it survives if Q6 shows the live tenants READY with events.
+
+I would not tell Dharmik "the engine has been blind over evidence that was there
+the whole time" until Q6 comes back. On the evidence in hand the one tenant we
+measured was behaving correctly over a stalled feed, and the tenants with
+evidence have not been looked at.
