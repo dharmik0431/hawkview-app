@@ -49,6 +49,18 @@
 -- apply would then write incident keys into a column that truncates them, which is the same
 -- class of silent wrong-data failure this whole migration exists to avoid. So the type is
 -- verified first and a mismatch stops the run loudly, before anything is added.
+--
+-- 400 IS ACCEPTED AS WELL AS 300, AND THAT IS A CORRECTION RATHER THAN A LOOSENING. When this
+-- was written 300 was the only right answer. `20260913000000_widen_incident_key` later widened
+-- the column to 400, so on any database migrated past that point this guard fired — and the
+-- message it fired with said *a column created by hand does not match the schema; drop it and
+-- re-run*. That advice would have destroyed a column holding real incident keys, on a database
+-- that was in the correct state. **A guard written before a later change had turned into an
+-- instruction to break a healthy database.** Found by re-running every alerting migration
+-- against an already-migrated cluster rather than by reading them.
+--
+-- The narrow forms are still refused, which is the property that mattered: a `text` or a
+-- `varchar(100)` column still stops the run.
 DO $$
 DECLARE
   found_type text;
@@ -58,10 +70,12 @@ BEGIN
   FROM information_schema.columns
   WHERE table_schema = 'public' AND table_name = 'notifications' AND column_name = 'incident_key';
 
-  IF found_type IS NOT NULL AND (found_type <> 'character varying' OR found_length <> 300) THEN
+  IF found_type IS NOT NULL AND (found_type <> 'character varying' OR found_length NOT IN (300, 400)) THEN
     RAISE EXCEPTION
-      'notifications.incident_key already exists as %, expected character varying(300). '
-      'A column created by hand does not match the schema; drop it and re-run this migration.',
+      'notifications.incident_key already exists as %, expected character varying(300) or (400). '
+      'DO NOT DROP THIS COLUMN IF IT HOLDS DATA. 300 is what this migration creates and 400 is '
+      'what 20260913000000_widen_incident_key produces; any other type means a column was made '
+      'by hand. Reconcile it with schema.prisma before re-running.',
       found_type || coalesce('(' || found_length || ')', '');
   END IF;
 END $$;

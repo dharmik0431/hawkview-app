@@ -2,10 +2,20 @@
 
 **Written for the MSP, not for us.** What you should see, and how you know it worked.
 
-> **INCOMPLETE.** The flow this checks is not built yet — see `alerting-launch-shape.md`. This
-> exists now because criteria have been decided that would otherwise be remembered rather than
-> recorded, and because writing the checklist early is what exposes what the flow does not do.
-> **Do not run it as a sign-off until the wiring lands.**
+> **INCOMPLETE, AND THE REASON IS STRUCTURAL.** Steps 2 onward all need a message to actually
+> leave, and nothing in this build can send one: there is no sender worker, no transport, no
+> webhook route and no persisted ledger. `docs/alerting-rollout-readiness.md` carries the full
+> blocker list in the order it must be cleared, and the measured test position.
+>
+> It exists now because criteria have been decided that would otherwise be remembered rather
+> than recorded, and because writing the checklist early is what exposes what the flow does not
+> do. **Do not run it as a sign-off until the wiring lands** — and marking it complete before a
+> message has left would be exactly the failure it exists to prevent.
+>
+> **Four things CAN be checked today** against a disposable database, and are worth checking
+> first: a real finding produces an incident row and a queued job; an organisation with no
+> preference row produces no job; the stop button empties the queue; a hard bounce survives a
+> restart. All four are covered by the integration tests.
 
 ---
 

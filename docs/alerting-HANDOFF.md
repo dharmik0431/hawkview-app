@@ -148,6 +148,9 @@ All under `backend/src/alerts/`. Line counts and test counts are from the workin
 | `finding-intake.ts` | step 04: `intake`, `freshnessOf`, `STALE_AFTER_MS` | 24 |
 | `routing-policy.ts` | step 05/05b: `causeKeyOf`, `routableIncident`, `fanOutProblems`, `fold`, `statements` | 26 |
 
+Rollout position — the release commit, the measured test results, the migration and rollback
+facts, and the acceptance checklist status: **`docs/alerting-rollout-readiness.md`**.
+
 Runner: `backend/scripts/alerting-reconciliation-dry-run.mts` — **read-only**, takes a JSON
 file or a live read, prints the reconciliation report.
 
@@ -166,7 +169,7 @@ establish. Do not read the two results as one number.
 **One intermittent failure was seen once and has not recurred.** `risk-owned Prisma transport
 drains startup, BEGIN, query and rollback stalls without abandoned callbacks/sockets`
 (`src/identity-risk/risk-bounded-prisma-transaction.test.ts`) failed on one full-suite run at
-2149ms, then passed on three isolated runs and one further full suite. **Recorded as a flake on
+2149ms, then passed on three isolated runs and three further full suites. **Recorded as a flake on
 evidence, not on hope**: it asserts `Date.now() - start < 2_000` around a 650ms deadline, so it
 is a wall-clock bound competing with every other test on one machine; and it imports only
 `node:net` and its own subject, so **no import path reaches anything this branch changed** —
@@ -657,6 +660,28 @@ end to end against a real database, but the worker that would call it is not wri
 bounce does not heal on a timer, so a TTL would resume sending to a dead mailbox on a schedule —
 but an operator who needs to undo a wrong suppression has no button, and that is a real gap
 rather than a closed decision.
+
+### A migration guard had become an instruction to break a healthy database
+
+`20260912120000`'s type check asserted `notifications.incident_key` was `varchar(300)`. Correct
+when written — and then `20260913000000` widened it to 400. From that point, re-running the
+earlier migration against a current database raised, with a message reading *"A column created by
+hand does not match the schema; drop it and re-run this migration."*
+
+**A reader following the runbook's own advice that re-running is safe would have been told to
+drop a column holding real incident keys, on a database that was in the correct state.**
+
+Fixed: it accepts 300 or 400, and the message now says not to drop the column and names the
+migration that produces each width. The guard still discriminates — measured, `text` and
+`varchar(100)` are refused while both correct widths pass, so the fix is not a loosening.
+
+**Found by re-running every alerting migration against an already-migrated cluster rather than by
+reading them.** Reading would not have found it: each file is individually correct, and the
+defect only exists in the relationship between two of them. The rule this instance yields is the
+one the per-field audit already taught — *an audit of each part cannot find a disagreeing pair.*
+
+All six alerting migrations now re-run clean against an already-migrated database, three passes
+deep, with existing rows intact. The full position is in `docs/alerting-rollout-readiness.md`.
 
 ### Still missing before anything can send
 
