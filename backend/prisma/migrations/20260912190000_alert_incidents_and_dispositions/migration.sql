@@ -153,12 +153,32 @@ CREATE TABLE IF NOT EXISTS "public"."alert_rule_dispositions" (
 
 DO $$
 BEGIN
-  -- THERE IS NO 'OFF'. An MSP may choose not to be DELIVERED to; it may not choose for the
-  -- thing not to be recorded. RECORD_ONLY is the quietest value that exists, and the absence of
-  -- an off switch is the same decision `DeliveryPreference` makes in TypeScript.
+  -- **THE DISPOSITION IS THE TIER, NOT THE CHANNEL.** It held
+  -- `RING | EMAIL | DIGEST | RECORD_ONLY` — a `DeliveryPreference`, which is HOW somebody is
+  -- reached. It now holds `ACT_NOW | ACT_TODAY | RECORD_ONLY`, the catalogue's `Severity`, which
+  -- is HOW URGENT this is here.
+  --
+  -- The reasoning: the organisation answers *what counts as urgent for us*, and the product
+  -- answers *how we reach you about something that urgent* — `defaultPreference` already maps
+  -- tier to channel, so storing the channel put the second answer in the MSP's hands and left
+  -- the first unsayable. It also meant the catalogue's declared severity and the stored
+  -- disposition were two vocabularies for one judgement, with a mapping between them.
+  --
+  -- ⚠ `RECORD_ONLY` IS IN BOTH VOCABULARIES, WHICH IS WHY THIS CHANGE IS DANGEROUS TO DO HALF.
+  -- Every test that exercises "off" passes under either spelling, so a half-migrated system looks
+  -- healthy on exactly the case everybody checks and is wrong on RING, EMAIL and DIGEST. Changed
+  -- in one place, in this migration, while the table has never been deployed anywhere.
+  --
+  -- DIGEST HAS NO TIER, AND THAT IS A LOSS. An MSP can no longer say "batch these for me"; it
+  -- can say how urgent they are and the product decides the channel. Recorded rather than
+  -- discovered: if digesting returns it is a delivery preference belonging beside quiet hours,
+  -- not a fourth urgency.
+  --
+  -- THERE IS STILL NO 'OFF'. An MSP may choose not to be DELIVERED to; it may not choose for the
+  -- thing not to be recorded. RECORD_ONLY remains the quietest value that exists.
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'alert_rule_dispositions_disposition_check') THEN
     ALTER TABLE "public"."alert_rule_dispositions" ADD CONSTRAINT "alert_rule_dispositions_disposition_check"
-      CHECK ("disposition" IN ('RING', 'EMAIL', 'DIGEST', 'RECORD_ONLY'));
+      CHECK ("disposition" IN ('ACT_NOW', 'ACT_TODAY', 'RECORD_ONLY'));
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'alert_rule_dispositions_organization_id_fkey') THEN
     ALTER TABLE "public"."alert_rule_dispositions" ADD CONSTRAINT "alert_rule_dispositions_organization_id_fkey"

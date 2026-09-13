@@ -4,7 +4,6 @@ import { type NotificationCategory, type NotificationSeverity }
   from '../notifications/notifications.service.js'
 import { OPENED } from './alert-lifecycle.js'
 import { incidentGrouping } from './alert-incident-key.js'
-import { defaultPreference } from './routing-policy.js'
 import { IDENTITY_RISK_RULE_CATALOG, type IdentityRiskRulePresentation, type IdentityRiskRuleId }
   from '../identity-risk/identity-risk.catalog.js'
 
@@ -351,17 +350,23 @@ export interface PipelineDecision {
 
 /** The default disposition for a type, when an MSP has expressed no preference.
  *
- * THROUGH `defaultPreference`, WHICH ALREADY OWNS THIS. The first version of this invented its
- * own severity vocabulary - CRITICAL and HIGH, which the catalogue does not have - and the
- * compiler refused it, because `Severity` is ACT_NOW | ACT_TODAY | RECORD_ONLY. Reading the
- * field at its declared type made the wrong constant impossible, and it caught a second
- * implementation of a mapping routing already states.
+ * **IT IS THE CATALOGUE'S DECLARED SEVERITY, UNCHANGED.** The disposition column now holds a
+ * tier rather than a channel, so the default is the tier the catalogue already states — not a
+ * mapping of it. That removes a second home for the same judgement: previously this ran the
+ * severity through `defaultPreference` to get RING or EMAIL, so the stored default and the
+ * declared severity were two spellings of one fact with a function between them.
  *
- * Nothing is stored for a default: absence of a row means this, so the default cannot drift
- * from the tiering the catalogue declares. */
+ * `defaultPreference` still exists and is still right — it answers a DIFFERENT question, which
+ * is how to reach somebody about a given tier. That is the product's decision; this one is the
+ * MSP's.
+ *
+ * Nothing is stored for a default: absence of a row means this, so the default cannot drift from
+ * the tiering the catalogue declares. An id the catalogue does not declare is the quietest
+ * answer rather than a guess — but it cannot arise through `decide`, which only reaches here
+ * with an id `alertTypeForRule` produced. */
 const defaultDispositionFor = (alertTypeId: AlertTypeId): string => {
   const declared = ALERT_CATALOG.find((type) => type.id === alertTypeId)
-  return declared === undefined ? 'RECORD_ONLY' : defaultPreference(declared.severity)
+  return declared === undefined ? 'RECORD_ONLY' : declared.severity
 }
 
 /** The whole decision, pure. */

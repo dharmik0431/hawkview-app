@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1826 tests, 1711 pass, 0 fail.** The remaining 115 are database-integration tests requiring a
+**1831 tests, 1711 pass, 0 fail.** The remaining 120 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -966,9 +966,44 @@ answered — see the two open questions above. Under the reading that is current
 `publishIncident` would change nothing at all, because that path produces an in-app notification
 and never an email.
 
-### ⚠ TWO OPEN QUESTIONS BLOCK THE DISPOSITIONS ENDPOINTS
+### The dispositions endpoints, and the disposition is now the tier
 
-Both are product decisions. Neither has been decided, and both have had work built on top of them.
+`GET /api/alerts/dispositions` and `PATCH /api/alerts/dispositions/:alertTypeId`.
+
+**THE COLUMN'S VOCABULARY CHANGED, and this is the part to know.** `disposition` held
+`RING | EMAIL | DIGEST | RECORD_ONLY` — a `DeliveryPreference`, which is *how* somebody is
+reached. It now holds `ACT_NOW | ACT_TODAY | RECORD_ONLY`, the catalogue's `Severity`: the
+organisation answers *what counts as urgent here* and the product answers *how we reach you about
+something that urgent*. `defaultDispositionFor` is now the declared severity itself rather than
+`defaultPreference(severity)`, which removes a second spelling of one judgement.
+
+⚠ **`RECORD_ONLY` IS IN BOTH VOCABULARIES, so a half-done change looks healthy.** Every test that
+exercises *off* passes under either spelling; only RING, EMAIL and DIGEST would be wrong. Changed
+in one place while the table has never been deployed. **DIGEST has no tier and that is a loss** —
+an MSP can no longer ask to be batched. If digesting returns it belongs beside quiet hours as a
+delivery preference, not as a fourth urgency.
+
+**`mapped` is derived, not listed.** It comes from `alert-type-reach.ts`, so when the publish path
+lands the number moves without anybody editing a table. Two of seven today.
+
+**An unreadable stored value is reported, never defaulted away.** `disposition` states what will
+actually happen — the catalogue default, because an unreadable value never reaches the lookup, and
+that is true — and `storedValueIgnored` carries the stored string verbatim so the row cannot look
+as though nobody had chosen. Tested by dropping the CHECK, inserting the old vocabulary, and
+restoring it, which is the only honest way to reproduce a state the database now prevents.
+
+**The write refuses a value outside the vocabulary and an id the catalogue does not declare**, and
+writes nothing in either case — including `HV-ID-AUTH-010.v1`, the rule id that used to be
+accepted and silently ignored. Membership is checked the same way `NotificationsService` checks
+it, against a real second organisation rather than an id that does not exist.
+
+⚠ **THE SETTING STILL ONLY BITES FOR TWO OF SEVEN TYPES.** The endpoint is honest about that
+through `mapped`; it does not fix it. The publish path is the other half and is still blocked —
+see the open question below.
+
+### ⚠ ONE OPEN QUESTION REMAINS, and it blocks the publish path
+
+**Question 1 is now ruled and built: the disposition is the TIER.** It was restated three times and two sessions were blocked on it, so it is taken as decided; the column, the default and the endpoints all follow it. Question 2 is still open and now gates the publish path alone.
 
 **1. Is the disposition a channel or a tier?** The column is CHECK-constrained to
 `RING | EMAIL | DIGEST | RECORD_ONLY` — a `DeliveryPreference`, derived from the catalogue's

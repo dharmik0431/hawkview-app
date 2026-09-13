@@ -296,8 +296,10 @@ model AlertRuleDisposition {
   /// A FINER GRAIN THAN THE ALERT TYPE WOULD NEED ITS OWN COLUMN AND A DISCRIMINATOR, not this
   /// one holding two kinds of id. Five of the seven types use the type as their own grain today.
   alertTypeId    String   @map("alert_type_id") @db.VarChar(120)
-  /// RING | EMAIL | DIGEST | RECORD_ONLY. There is no OFF: an MSP may choose not to be
-  /// DELIVERED to, never to have the thing not recorded.
+  /// ACT_NOW | ACT_TODAY | RECORD_ONLY — the catalogue's `Severity`, constrained in SQL.
+  /// **THE TIER, NOT THE CHANNEL**: the organisation answers what counts as urgent here, and the
+  /// product decides how to reach them about something that urgent. There is still no OFF — an
+  /// MSP may choose not to be DELIVERED to, never to have the thing not recorded.
   disposition    String   @db.VarChar(20)
   /// Who set it and when, because a preference nobody can attribute is one nobody will change.
   setByUserId    String?  @map("set_by_user_id") @db.Uuid
