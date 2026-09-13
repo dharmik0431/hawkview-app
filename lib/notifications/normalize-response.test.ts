@@ -93,3 +93,97 @@ test('does not replace state when the notification API fails', async () => {
   )
   assert.deepEqual(result, { items: [], shouldReplace: false })
 })
+
+test('an alert row carries its urgency, and a row without one does not gain a default', () => {
+  // Without severity on the row, an ACT_NOW incident and a routine info message
+  // render identically, so the tier the whole alerting design is built around
+  // is unsayable in the place alerts land.
+  const withSeverity = normalizeNotificationResponse({
+    items: [
+      {
+        id: 'n1',
+        category: 'warning',
+        title: 'Repeated credential failures',
+        description: 'gary@greentech-services.net',
+        timestamp: '2026-09-13T01:00:00.000Z',
+        read: false,
+        severity: 'ACT_NOW',
+        alertTypeId: 'security.suspected_credential_attack',
+        resolved: false,
+      },
+    ],
+  })
+  assert.equal(withSeverity.items[0].severity, 'ACT_NOW')
+  assert.equal(
+    withSeverity.items[0].alertTypeId,
+    'security.suspected_credential_attack'
+  )
+
+  // Absent is "this row did not say", which is NOT RECORD_ONLY. Defaulting to
+  // the mildest tier would be the reassuring direction of the same error the
+  // empty inbox already made.
+  const plain = normalizeNotificationResponse({
+    items: [
+      {
+        id: 'n2',
+        category: 'info',
+        title: 'Sync finished',
+        description: 'Nothing to report',
+        timestamp: '2026-09-13T01:00:00.000Z',
+        read: false,
+      },
+    ],
+  })
+  assert.equal('severity' in plain.items[0], false)
+  assert.notEqual(plain.items[0].severity, 'RECORD_ONLY')
+
+  // A tier this build does not recognise is dropped rather than guessed.
+  const unknown = normalizeNotificationResponse({
+    items: [
+      {
+        id: 'n3',
+        category: 'info',
+        title: 'From a newer backend',
+        description: 'x',
+        timestamp: '2026-09-13T01:00:00.000Z',
+        read: false,
+        severity: 'PAGE_THE_CEO',
+      },
+    ],
+  })
+  assert.equal('severity' in unknown.items[0], false)
+  // And the row survives -- an unreadable tier must not discard the alert.
+  assert.equal(unknown.items.length, 1)
+})
+
+test('every tier the catalogue can declare survives the read', () => {
+  // Swept rather than sampled. The first version of this file tested ACT_NOW,
+  // absence and an unknown value, and a mutation removing RECORD_ONLY from the
+  // accepted set killed nothing -- so a legitimately recorded alert could have
+  // lost its tier silently and rendered as "this row did not say".
+  //
+  // RECORD_ONLY is the off state: recorded, visible, not delivered. Dropping it
+  // would make "off" indistinguishable from "unspecified", which is the same
+  // merge this inbox already made once with its empty state.
+  for (const severity of ['ACT_NOW', 'ACT_TODAY', 'RECORD_ONLY'] as const) {
+    const result = normalizeNotificationResponse({
+      items: [
+        {
+          id: 'n-' + severity,
+          category: 'info',
+          title: 'x',
+          description: 'y',
+          timestamp: '2026-09-13T01:00:00.000Z',
+          read: false,
+          severity,
+        },
+      ],
+    })
+    assert.equal(result.items.length, 1, severity + ' was discarded')
+    assert.equal(
+      result.items[0].severity,
+      severity,
+      severity + ' did not survive the read'
+    )
+  }
+})

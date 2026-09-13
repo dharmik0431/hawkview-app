@@ -1,5 +1,16 @@
 export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
 
+/**
+ * How urgently an alert-backed notification needs somebody, in the vocabulary
+ * the alerting catalogue already uses.
+ *
+ * Optional because most notifications are not alerts, and because the backend
+ * write that carries it is not landed. Absent means "this row did not say",
+ * which is not the same as RECORD_ONLY -- a row with no severity is not a
+ * declaration that nothing is urgent.
+ */
+export type NotificationSeverity = 'ACT_NOW' | 'ACT_TODAY' | 'RECORD_ONLY'
+
 export interface NotificationItem {
   id: string
   category: NotificationCategory
@@ -11,6 +22,10 @@ export interface NotificationItem {
   actionLabel?: string
   occurrenceCount?: number
   resolved?: boolean
+  /** Present only on alert-backed rows. Absent is "not said", not "not urgent". */
+  severity?: NotificationSeverity
+  /** Which alert type raised this, when one did. */
+  alertTypeId?: string
 }
 
 export interface NotificationRefreshResult {
@@ -64,6 +79,16 @@ function parseNotificationItem(value: unknown): NotificationItem | null {
       : undefined
   const resolved =
     typeof value.resolved === 'boolean' ? value.resolved : undefined
+  // A severity this build does not recognise is dropped rather than guessed.
+  // Rendering an unknown tier as the mildest one would be the reassuring
+  // direction of the same error the inbox already made.
+  const alertTypeId = optionalString(value.alertTypeId)
+  const severity =
+    value.severity === 'ACT_NOW' ||
+    value.severity === 'ACT_TODAY' ||
+    value.severity === 'RECORD_ONLY'
+      ? (value.severity as NotificationSeverity)
+      : undefined
 
   return {
     id,
@@ -76,6 +101,12 @@ function parseNotificationItem(value: unknown): NotificationItem | null {
     actionLabel: optionalString(value.actionLabel),
     occurrenceCount,
     resolved,
+    // Spread conditionally so an absent severity is an ABSENT KEY rather than a
+    // key holding undefined. The two are equal to a reader and not to a deep
+    // comparison, and "this row said nothing about urgency" is better carried
+    // by the field not being there.
+    ...(severity ? { severity } : {}),
+    ...(alertTypeId ? { alertTypeId } : {}),
   }
 }
 

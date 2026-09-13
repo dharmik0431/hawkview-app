@@ -18,6 +18,7 @@ import {
 import {
   useNotifications,
   NotificationCategory,
+  type NotificationItem,
   type NotificationFeedState,
 } from '@/components/providers/notification-provider'
 import { cn } from '@/lib/utils'
@@ -41,6 +42,89 @@ import {
  * where an MSP checks whether anything needs them, so a false "nothing" here
  * costs more than a false "something".
  */
+
+/** What an MSP actually gets today for each tier.
+ *
+ * ACT_NOW routes to PHONE in the catalogue and SMS is shelved, so an ACT_NOW
+ * incident delivers by email and in-app carrying its urgent classification.
+ * Saying "we will call you" would be a promise the product cannot keep, and a
+ * help page nobody opens is not where that belongs -- it belongs beside the
+ * badge that made the claim.
+ */
+const SEVERITY_COPY: Record<
+  NonNullable<NotificationItem['severity']>,
+  { label: string; delivery: string; className: string }
+> = {
+  ACT_NOW: {
+    label: 'Act now',
+    delivery: 'Email and in-app, marked urgent. Phone delivery is deferred.',
+    className:
+      'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-900',
+  },
+  ACT_TODAY: {
+    label: 'Act today',
+    delivery: 'Email and in-app.',
+    className:
+      'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-900',
+  },
+  RECORD_ONLY: {
+    label: 'Recorded',
+    delivery: 'Kept here and not delivered.',
+    className:
+      'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
+  },
+}
+
+/**
+ * The urgency of an alert-backed row, and whether it has already cleared.
+ *
+ * Without this every alert reads like every other notification: an ACT_NOW
+ * incident and a routine info message render identically, so the tier the whole
+ * alerting design is built around is unsayable in the place alerts land.
+ *
+ * A row with NO severity gets no badge rather than a default one. Absent means
+ * the row did not say, which is not the same as RECORD_ONLY -- defaulting to
+ * the mildest tier would be the reassuring direction of the error.
+ *
+ * `resolved` was parsed by the normaliser and rendered nowhere, so a cleared
+ * incident sat in the inbox looking exactly like one still waiting.
+ */
+function AlertBadges({
+  severity,
+  resolved,
+}: {
+  severity?: NotificationItem['severity']
+  resolved?: boolean
+}) {
+  if (!severity && !resolved) return null
+  const copy = severity ? SEVERITY_COPY[severity] : null
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+      {copy && (
+        <span
+          className={cn(
+            'inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-semibold',
+            copy.className
+          )}
+          title={copy.delivery}
+        >
+          {copy.label}
+        </span>
+      )}
+      {resolved && (
+        <span className="inline-flex items-center rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
+          Resolved
+        </span>
+      )}
+      {copy && (
+        <span className="text-[10px] text-muted-foreground">
+          {copy.delivery}
+        </span>
+      )}
+    </div>
+  )
+}
+
 function EmptyInbox({
   state,
   filter,
@@ -373,6 +457,11 @@ export function NotificationPanel() {
                       <p className="text-xs text-muted-foreground line-clamp-2 mt-0.5 leading-relaxed">
                         {notif.description}
                       </p>
+
+                      <AlertBadges
+                        severity={notif.severity}
+                        resolved={notif.resolved}
+                      />
 
                       {(notif.occurrenceCount ?? 1) > 1 && (
                         <p className="mt-1 text-[10px] font-medium text-muted-foreground">
