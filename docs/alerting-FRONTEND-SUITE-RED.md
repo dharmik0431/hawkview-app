@@ -57,3 +57,47 @@ front of an MSP by itself. It belongs in the backlog with this evidence attached
 
 **The one thing that must not happen is the release statement saying "the frontend tests pass."**
 They do not, they did not before, and the reason is worth a line rather than a footnote.
+
+---
+
+## Correction: the mapping to today's work does not hold
+
+I was asked to add a precision saying several of these properties *were* re-established today by
+different instruments. **I checked it, and it is not true — for a reason that makes the finding
+sharper rather than softer.**
+
+**The 51 tests render a different component.** The file compiles and renders
+`components/identity-risk/risky-users-section.tsx` and
+`components/identity-risk/risky-users-count-card.tsx` — the **per-tenant Risky Users section and
+its overview card**. Today's fleet work, and my R1–R9, are on
+`app/(protected)/risky-users/page.tsx` and `lib/identity-risk/fleet-coverage.ts` — the
+**fleet screen**.
+
+Reading the four tests confirms it from the other side. They drive
+`render(assessmentFixture(…))`, `value.summary.currentUsers`, `value.rules[…]`, and
+`microsoftPanel(document)`:
+
+| the guard | what it actually asserts |
+|---|---|
+| *a zero is never rendered alone* | the tenant section's zero carries *"does not establish that an identity is safe"* and *"Not covered by this number … requires Entra ID P2"* |
+| *an unconfirmed empty Microsoft result never becomes an authoritative zero* | an empty Microsoft page **while `pageInfo.hasMore` is true** must not borrow a clean tenant's wording |
+| *a withheld count reads as a decision* | `summary.currentUsers` with `value: null, accuracy: 'UNKNOWN'` |
+| *a zero never renders as a clean tenant while findings sit below it* | `summary.currentUsers.value = 0` with three matched identities in `rules` |
+
+**None of that is the fleet screen's empty states.** The property *family* is the same — a zero that
+means two things, a count without its coverage — which is exactly why the mapping looked right. The
+surface is not.
+
+**And today touched neither component.** `git log` over the last twenty hours on
+`risky-users-section.tsx` and `risky-users-count-card.tsx` is empty. Both last changed at `41d60e5`,
+the same GAS rework that last changed the test file — the component moved and its tests did not.
+
+### So the honest line is simpler than either version
+
+Not *"some were re-established and one was not."* **All 51 guard a component this release does not
+change and today's instruments never rendered.** The property family was re-established today on the
+fleet screen, by rendering and by register; the per-tenant section's own guards have not run since
+the rework, and nothing has looked at it since.
+
+That is a smaller claim about today's work and a larger one about the gap, and it is the version I
+will put in the release statement.
