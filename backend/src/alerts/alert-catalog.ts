@@ -144,6 +144,10 @@ export const ALERT_CATALOG = [
   // ── Tenant disconnected ────────────────────────────────────────────────────
   {
     id: 'monitoring.tenant_disconnected',
+    // `tenant:{id}:connection`. The same event the collectors publish as
+    // `tenant.connection_lost` — one fact, two names, which is why the settings page could not
+    // reach it.
+    covers: ['TENANT_CONNECTION'],
     episodeInterval: {
       hours: 24,
       because:
@@ -202,6 +206,9 @@ export const ALERT_CATALOG = [
   // ── Collector failing ──────────────────────────────────────────────────────
   {
     id: 'monitoring.collector_failing',
+    // BOTH SYNC SHAPES, and they are one type on purpose: a collector that has never succeeded
+    // and one that has stopped succeeding are the same thing to the person who has to fix it.
+    covers: ['TENANT_SYNC', 'TENANT_INITIAL_SYNC'],
     episodeInterval: {
       hours: 24,
       because:
@@ -272,6 +279,9 @@ export const ALERT_CATALOG = [
   // ── Monitoring recovered ───────────────────────────────────────────────────
   {
     id: 'monitoring.recovered',
+    // `{anyKey}:recovered:{n}` — derived from whatever it recovers, so it covers the recovery
+    // shape rather than any particular parent.
+    covers: ['RECOVERY'],
     episodeInterval: {
       hours: 24,
       because:
@@ -421,3 +431,32 @@ type OverLongAlertTypeIds = { [K in AlertTypeId]: AlertTypeIdWithinKeyBudget<K> 
 // into. Shorten the id — do not widen the column again.
 const _everyAlertTypeIdFitsTheIncidentKey: [OverLongAlertTypeIds] extends [never] ? true : OverLongAlertTypeIds = true
 void _everyAlertTypeIdFitsTheIncidentKey
+
+// ---------------------------------------------------------------------------------------
+// NO PUBLICATION KIND MAY BE COVERED BY TWO TYPES — a compile error, not a review comment.
+// ---------------------------------------------------------------------------------------
+//
+// Two types claiming one kind means a published notification has two answers to "what is this",
+// and whichever the lookup happens to find first wins. That is unresolvable at runtime and
+// silent, so it is made unwriteable here instead — the same move as the id-length bound above.
+
+/** Every declared `covers` list, concatenated into ONE TUPLE. A union would collapse the
+ * duplicate and hide exactly what this exists to find, so the tuple is built recursively and the
+ * order is preserved. */
+type CoveredKinds<T extends readonly unknown[]> =
+  T extends readonly [infer H, ...infer R extends readonly unknown[]]
+    ? [...(H extends { readonly covers: readonly unknown[] } ? H['covers'] : []), ...CoveredKinds<R>]
+    : []
+
+/** The first kind that appears twice in that tuple, or `never`. */
+type FirstDuplicate<T extends readonly unknown[]> =
+  T extends readonly [infer H, ...infer R extends readonly unknown[]]
+    ? (H extends R[number] ? H : FirstDuplicate<R>)
+    : never
+
+type DuplicateKinds = FirstDuplicate<CoveredKinds<typeof ALERT_CATALOG>>
+
+// If this line ever fails, two alert types declare the same publication kind and the error text
+// names it. Decide which type owns it; do not resolve it at the lookup.
+const _noKindIsCoveredTwice: [DuplicateKinds] extends [never] ? true : DuplicateKinds = true
+void _noKindIsCoveredTwice

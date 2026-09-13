@@ -1200,3 +1200,38 @@ test('A KEY THAT NAMES NOTHING IS NONE, AND THE THREE ANSWERS DO NOT OVERLAP', (
   assert.deepEqual(resourceTypeLookup('tenant:t1:sync:SIGN_INS'),
     { kind: 'NAMED', resourceType: 'SIGN_INS' })
 })
+
+test('MOVING THE MAPPING INTO THE CATALOGUE CHANGED NOTHING', () => {
+  // THE PROOF THAT THIS MOVE IS BEHAVIOUR-PRESERVING, and it is written against the literal that
+  // was deleted rather than against the thing that replaced it — a derived table compared with
+  // itself agrees by construction. Reconciliation is already verified against production figures;
+  // if moving its table changed any result, it has to be visible here rather than discovered
+  // later tangled up with a new lookup somewhere else.
+  const asItWasBeforeTheMove: Readonly<Record<string, string | null>> = {
+    DIRECTORY_AUDIT: null,
+    TENANT_SYNC: 'monitoring.collector_failing',
+    TENANT_CONNECTION: 'monitoring.tenant_disconnected',
+    TENANT_INITIAL_SYNC: 'monitoring.collector_failing',
+    TENANT_ONBOARDING: null,
+    RECOVERY: 'monitoring.recovered',
+    UNRECOGNISED: null,
+  }
+  assert.deepEqual({ ...TYPE_FOR_SHAPE }, asItWasBeforeTheMove)
+
+  // AND IT IS TOTAL. Every shape has an answer, including the three that are deliberately covered
+  // by nothing — "no type covers this" is one of the answers rather than a gap.
+  assert.equal(Object.keys(TYPE_FOR_SHAPE).length, 7)
+})
+
+test('EVERY COVERED KIND NAMES A TYPE THE CATALOGUE ACTUALLY DECLARES', () => {
+  // A `covers` entry pointing at nothing would be a mapping to an id no lookup can resolve, and
+  // the derived table would carry it silently.
+  const declared = new Set<string>(ALERT_CATALOG.map((type) => type.id))
+  for (const [shape, alertTypeId] of Object.entries(TYPE_FOR_SHAPE)) {
+    if (alertTypeId === null) continue
+    assert.ok(declared.has(alertTypeId), `${shape} maps to ${alertTypeId}, which is not declared`)
+  }
+
+  // NOT VACUOUS: some shape does map, so the loop above is not passing over an empty set.
+  assert.ok(Object.values(TYPE_FOR_SHAPE).some((id) => id !== null))
+})

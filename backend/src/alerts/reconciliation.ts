@@ -1,4 +1,5 @@
 import { ALERT_CATALOG } from './alert-catalog.js'
+import { type PublicationKind } from './alert-type.js'
 import { episodesOf } from './alert-episode.js'
 import { quietIntervalMsOf } from './alert-episode-interval.js'
 import { eventInstant } from './alert-event-time.js'
@@ -29,25 +30,17 @@ import type { AlertTypeDeclaration, SubjectRole } from './alert-type.js'
  * Taken from the `dedupeKey:` literals in the codebase rather than from the keys found in
  * data — a list derived from production rows would describe what happens to be there and
  * would silently omit any shape that has not fired yet. */
-export type KeyShape =
-  /** `security:directory-audit:{microsoftAuditId}` — the 301. Carries an event id, so it
-   * deduplicates perfectly and groups not at all. */
-  | 'DIRECTORY_AUDIT'
-  /** `tenant:{id}:sync:{resourceType}` — the 334 occurrences collapsed into 15. No event
-   * id, so it groups everything and deduplicates nothing. */
-  | 'TENANT_SYNC'
-  | 'TENANT_CONNECTION'
-  | 'TENANT_INITIAL_SYNC'
-  | 'TENANT_ONBOARDING'
-  /** `{anyKey}:recovered:{occurrenceCount}` — a recovery derived from another key.
-   *
-   * THE OCCURRENCE COUNT IS IN THE KEY, which means the same logical recovery produces a
-   * different key every time the count moves. That is the 301 defect one layer over: a
-   * counter embedded in an identity makes the identity non-repeating. Worth reporting
-   * separately rather than folding into its parent, because the count is how many of these
-   * exist for one underlying incident. */
-  | 'RECOVERY'
-  | 'UNRECOGNISED'
+/** The shapes a notification dedupe key can take.
+ *
+ * **AN ALIAS OF `PublicationKind`, WHICH THE CATALOGUE OWNS.** The members and their meanings are
+ * unchanged; what moved is where they are declared, so that an alert type can say which kinds it
+ * covers beside its own id rather than the knowledge living in a table over here. The parsing in
+ * this file still decides which shape a key IS — that is genuinely this module's job. What it no
+ * longer decides is which alert type a shape BECOMES.
+ *
+ * See `PublicationKind` for what each member is and why `UNRECOGNISED`, `DIRECTORY_AUDIT` and
+ * `TENANT_ONBOARDING` are covered by no type. */
+export type KeyShape = PublicationKind
 
 export interface ParsedKey {
   readonly shape: KeyShape
@@ -251,20 +244,38 @@ export function exclusionKindFor(alertTypeId: string | null, dedupeKey: string):
 
 /** Which declared alert type a shape becomes.
  *
- * `null` where the shape alone does not determine it. A directory-audit row becomes the
- * privileged or the routine type depending on what the change WAS, which needs the audit
- * record — so it is reported as needing classification rather than assigned a default.
- * Defaulting would put real privileged changes into the routine type, which is the
- * 301-alerts problem arriving from the migration instead of from the collector. */
-export const TYPE_FOR_SHAPE: Readonly<Record<KeyShape, string | null>> = {
-  DIRECTORY_AUDIT: null,
-  TENANT_SYNC: 'monitoring.collector_failing',
-  TENANT_CONNECTION: 'monitoring.tenant_disconnected',
-  TENANT_INITIAL_SYNC: 'monitoring.collector_failing',
-  TENANT_ONBOARDING: null,
-  RECOVERY: 'monitoring.recovered',
-  UNRECOGNISED: null,
-}
+ * **DERIVED FROM THE CATALOGUE, NOT DECLARED HERE.** This was a literal table, which meant the
+ * answer to *what does this alert type cover* lived in a module that consumes types rather than
+ * in the one that declares them — so a type could be added without anybody being asked, and the
+ * answer sat where its author would never look. The catalogue now declares `covers`, this reads
+ * it, and the two cannot disagree because there is only one of them.
+ *
+ * `null` where no type covers the shape, which is three of the seven and each for its own
+ * reason. A directory-audit row becomes the privileged or the routine type depending on what the
+ * change WAS, which needs the audit record — so it is reported as needing classification rather
+ * than assigned a default. Defaulting would put real privileged changes into the routine type,
+ * which is the 301-alerts problem arriving from the migration instead of from the collector.
+ *
+ * The behaviour is unchanged by the move, and `reconciliation.test.ts` asserts this against the
+ * literal it replaced rather than against itself. */
+export const TYPE_FOR_SHAPE: Readonly<Record<KeyShape, string | null>> = (() => {
+  const table: Record<string, string | null> = {
+    DIRECTORY_AUDIT: null,
+    TENANT_SYNC: null,
+    TENANT_CONNECTION: null,
+    TENANT_INITIAL_SYNC: null,
+    TENANT_ONBOARDING: null,
+    RECOVERY: null,
+    UNRECOGNISED: null,
+  }
+  for (const type of ALERT_CATALOG) {
+    // `in` rather than `?.`, because the catalogue is `as const` and most declarations simply
+    // have no such property to be optional.
+    const covers: readonly string[] = 'covers' in type ? type.covers : []
+    for (const kind of covers) table[kind] = type.id
+  }
+  return table as Readonly<Record<KeyShape, string | null>>
+})()
 
 /** One existing notification, plus what a read-only join can add.
  *

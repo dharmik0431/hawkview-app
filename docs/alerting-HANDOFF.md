@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1824 tests, 1709 pass, 0 fail.** The remaining 115 are database-integration tests requiring a
+**1826 tests, 1711 pass, 0 fail.** The remaining 115 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -929,6 +929,42 @@ does not have. `reconciliation.ts` does classify those dedupe keys into catalogu
 mapping is not unknowable — **but it lives in the step-03 apply phase, and copying it to the
 publish site is the two-homes defect this feature has fixed three times.** This needs a ruling on
 the mapping, not a lookup somebody can add.
+
+### The catalogue owns which publication kinds each type covers
+
+**One event was wearing two names.** `tenant.connection_lost` and `monitoring.tenant_disconnected`
+are the same thing; so are `tenant.sync_recovered` and `monitoring.recovered`. The bridge between
+them existed — `reconciliation.ts` held a `TYPE_FOR_SHAPE` table — but it was keyed the wrong way
+round and in the wrong module: the answer to *what does this alert type cover* lived where types
+are consumed rather than where they are declared, so a type could be added without anybody being
+asked, and the answer sat where its author would never look. **The two-homes shape, moved for the
+fourth time in this feature.**
+
+`AlertTypeDeclaration` now has `covers?: readonly PublicationKind[]`, beside the id and the
+severity where category and subject already live. `TYPE_FOR_SHAPE` reads the catalogue.
+`KeyShape` is an alias of `PublicationKind` — the members and meanings are unchanged; only the
+declaration site moved. Parsing which shape a key *is* remains this module's job; deciding which
+type a shape *becomes* is not.
+
+**A kind covered by two types does not compile.** `FirstDuplicate<CoveredKinds<…>>` over the
+`as const` catalogue, the same move as the alert-type-id length bound. **Verified by mutation:**
+giving a second type `TENANT_CONNECTION` fails with *Type 'true' is not assignable to type
+'"TENANT_CONNECTION"'* — the error names the offending kind. Two types claiming one kind means a
+published notification has two answers to *what is this* and whichever the lookup finds first
+wins, which is unresolvable at runtime and silent.
+
+**Committed alone, and proven behaviour-preserving.** The test asserts the derived table against
+**the literal it replaced**, written out in full, rather than against itself — a derived table
+compared with itself agrees by construction. Reconciliation is already verified against production
+figures, so if moving its table changed a result it had to be visible in that commit rather than
+found later tangled with a new lookup in the collector.
+
+⚠ **THIS DOES NOT YET MAKE ANY SETTING REACH A TENANT-SYNC ALERT.** The mapping now exists in one
+place; the publish path still does not consult it, and doing so depends on a question nobody has
+answered — see the two open questions above. Under the reading that is currently built
+(`RECORD_ONLY` leaves the notification visible in-app), consulting the disposition in
+`publishIncident` would change nothing at all, because that path produces an in-app notification
+and never an email.
 
 ### ⚠ TWO OPEN QUESTIONS BLOCK THE DISPOSITIONS ENDPOINTS
 

@@ -183,8 +183,42 @@ export type EpisodeGrouping =
       episodeInterval: EpisodeInterval
     }>
 
+/** THE KINDS OF THING THE PRODUCT PUBLISHES, named by the shape of the dedupe key each one
+ * writes. This is the vocabulary an alert type maps ONTO — the bridge between what the
+ * collectors publish and what the catalogue declares.
+ *
+ * **IT LIVES HERE BECAUSE THE CATALOGUE OWNS THE MAPPING.** It was a table inside
+ * `reconciliation.ts` keyed the other way round — shape to type — which put knowledge about
+ * what a type covers in a module that consumes types rather than in the one that declares them.
+ * A type could be added without anyone being asked what it covers, and the answer lived
+ * somewhere the author of the type would never open. Same shape as the two-homes defect this
+ * feature has now moved three times.
+ *
+ * `UNRECOGNISED` is a parse outcome rather than a kind anything publishes, and `DIRECTORY_AUDIT`
+ * and `TENANT_ONBOARDING` are published and deliberately covered by no type. All three are in
+ * the union so the mapping is total: every shape has an answer, and "no type covers this" is one
+ * of the answers rather than a gap. */
+export type PublicationKind =
+  | 'DIRECTORY_AUDIT'
+  | 'TENANT_SYNC'
+  | 'TENANT_CONNECTION'
+  | 'TENANT_INITIAL_SYNC'
+  | 'TENANT_ONBOARDING'
+  | 'RECOVERY'
+  | 'UNRECOGNISED'
+
 interface AlertTypeBase {
   readonly id: string
+  /** Which publication kinds this type covers, if any.
+   *
+   * **DECLARED BESIDE THE ID AND THE SEVERITY, so adding a type asks the question.** Absent means
+   * this type covers no published kind — which is true of most of them and is not a defect: the
+   * two the intake pipeline produces are reached through the guidance mapping, not through a
+   * dedupe key.
+   *
+   * A kind may be covered by at most one type, and that is enforced at compile time in
+   * `alert-catalog.ts` rather than by review. */
+  readonly covers?: readonly PublicationKind[]
   readonly severity: Severity
   /** Whose incident this is. See `SubjectRole` — required so that adding a type
    * forces the question rather than inheriting a default. */
