@@ -80,7 +80,7 @@ test('controller emits exactly one diagnostic per authenticated cycle; throwing 
           if(outcome==='ATTEMPT_FAILED')throw new Error('password=SECRET')
           observe(outcome)
         },syncDueTenants:async()=>({status:'unchanged'}),
-      }as any,{runAuthorizedScheduledMaintenance:async()=>({hasMore:false})}as any)
+      }as any,{runAuthorizedScheduledMaintenance:async()=>({hasMore:false})}as any, { runOnce: async () => null } as any)
       ;(controller as any).logger={log(){},warn(){}}
       assert.deepEqual(await controller.syncDueTenants({headers:{}}as any),{status:'unchanged'})
       assert.deepEqual(lines.map(l=>JSON.parse(l)),[{version:1,eventName:'risk_cycle_diagnostic',reason:outcome}])
@@ -123,7 +123,7 @@ test('actual controller distinguishes config, maintenance and elapsed admission 
       }as any,{runAuthorizedScheduledMaintenance:async()=>{
         if(expected==='ADMISSION_BUDGET_EXHAUSTED')now+=50_000
         return{hasMore:expected==='MAINTENANCE_DEFERRED'}
-      }}as any)
+      }}as any, { runOnce: async () => null } as any)
       ;(c as any).logger={log(){},warn(){}}
       assert.deepEqual(await c.syncDueTenants({headers:{}}as any),{status:'unchanged'})
       assert.equal(riskCalls,0);assert.equal(lines.length,1);assert.equal(JSON.parse(lines[0]!).reason,expected)

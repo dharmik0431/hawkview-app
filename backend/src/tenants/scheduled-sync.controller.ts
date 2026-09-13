@@ -9,6 +9,7 @@ import { logProcessMemoryPhase } from './runtime-telemetry.js'
 import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-runtime-config.js'
 import { riskHistoryRetentionConfig } from '../identity-risk/risk-history-retention.js'
 import { RiskCycleDiagnostic } from '../identity-risk/risk-operational-diagnostics.js'
+import { AlertIntakeService } from '../alerts/alert-intake.service.js'
 
 @Controller('api/internal/sync')
 export class ScheduledSyncController {
@@ -20,6 +21,8 @@ export class ScheduledSyncController {
     private readonly tenantSyncService: TenantSyncService,
     @Inject(IdentityRiskMaintenanceService)
     private readonly identityRiskMaintenance: IdentityRiskMaintenanceService,
+    @Inject(AlertIntakeService)
+    private readonly alertIntake: AlertIntakeService,
   ) {}
 
   @Public()
@@ -71,6 +74,27 @@ export class ScheduledSyncController {
       } else riskDiagnostic.record(!isGlobalRiskConfig(riskRuntimeConfig()) ? 'CONFIG_UNAVAILABLE' :
         !riskMaintenanceReady ? 'MAINTENANCE_DEFERRED' : 'ADMISSION_BUDGET_EXHAUSTED')
       riskDiagnostic.finish()
+
+      // ALERT INTAKE, IN ITS OWN WINDOW, AFTER RISK AND BEFORE THE COLLECTORS.
+      //
+      // COLLECTION OUTRANKS ALERTING, ALWAYS. This stage gets from wherever the risk cycle
+      // left off until +60s and not one millisecond of the collectors’ admission budget. If
+      // it cannot finish in that window it YIELDS — leaving the findings untouched and still
+      // OPEN for the next tick — rather than borrowing time from what comes after it.
+      //
+      // The failure it would otherwise cause is the worst one this product has: a slow intake
+      // eats the collectors’ budget, tenants quietly stop being collected, and that reads as
+      // the tenants being quiet. Nobody would trace it to alerting.
+      //
+      // It never throws — see `runOnce`, which logs and returns null — so a settled intake
+      // failure cannot abort the collection that follows. Same rule the maintenance stage
+      // above states in its own words.
+      if (Date.now() < startedAt + 60_000) {
+        await this.alertIntake.runOnce(startedAt + 60_000)
+      } else {
+        this.logger.log(JSON.stringify({ event: 'alert_intake', status: 'WINDOW_MISSED' }))
+      }
+
       const result = await this.tenantSyncService.syncDueTenants(admissionDeadlineAt)
       logProcessMemoryPhase(this.logger, 'scheduled_sync', 'COMPLETED', startedAt)
       return result

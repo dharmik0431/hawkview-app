@@ -99,7 +99,7 @@ four questions in order) before trusting a green suite.
 | 05 routing and policy | closed |
 | 05b escalation + limits | **EXHAUSTED ruling implemented as three type-level impossibilities** (`e056fc9`, verified by QA); **the limit function landed in `42622d1`** — L1, L2 and L4 now bound. The NUMBER is still a labelled guess. See below |
 | 06 email | **the seam, the ledger and the send queue exist and are pure; nothing talks to Resend.** No HTTP call, no signature verification, no webhook route, no key read anywhere. QA’s nine properties are bound against the seam — six hold, one partial, and **M1 and M2 are unaskable of it by design**, which is what the send queue was built to own. Ten retry properties bound against the queue, including one proven against a real database. Resend is verified on `hawkviewapp.com` (PM’s claim, not verified here) |
-| **the flow, finding → send job** | **proven, in the test’s hands.** A persisted `identity_risk_findings` row reaches an `alert_send_jobs` row through real foreign keys on a real database, and all five integration tests pass on a genuinely clean database. **But `runIntake` is called by nothing in `src/`, nothing schedules it, and `PipelineStore` has no implementation outside the test file.** The chain is joined by the test rather than by the product |
+| **the flow, finding → send job** | **wired into the product.** A persisted `identity_risk_findings` row reaches an `alert_send_jobs` row through real foreign keys, and `AlertIntakeService` is the real `PipelineStore` — raw SQL through `PrismaService`, both writes in one transaction. **Called from `api/internal/sync/due-tenants`**, after the risk cycle and before the collectors, in its own window to +60s. It yields rather than borrowing, and never throws into the cascade. **It will not run at all until a watermark is chosen** — see below |
 | **deploy is migrate** | `backend/Dockerfile` line 44 runs `npm run db:migrate:deploy` on every container start, so **there is no migration gate and no operator step**. Whether a committed migration is live depends on whether a commit containing it has been DEPLOYED — not on whether anybody ran the runbook’s step 0, which does manually what the container does anyway. **Rollback is therefore code-only:** redeploying an earlier image re-runs `migrate deploy`, which does not undo anything |
 | 07 SMS | **shelved by Dharmik until further notice.** The tier survives; the channel does not |
 
@@ -538,6 +538,27 @@ first place.
 Reported as needing an export, blocked on uncommitted work in the **other** worktree that
 nobody owns. **I could not find that symbol and have not verified the claim** — see the
 constraints section.
+
+### Intake will not run until somebody chooses the watermark
+
+**`HAWKVIEW_ALERT_WATERMARK_ISO` is unset, so alert intake is a no-op on every tick.** That is
+deliberate and pre-authorised: nobody has chosen the instant before which nothing is sent, the
+only guess available is *now*, and taking it silently would mean the first tick after a deploy
+decides for ever which historical findings were never worth telling anybody about.
+
+**A refusal is recoverable; a guess is not.** An unparseable or empty value is also a refusal —
+a typo must not become a decision, and that direction fails open: `Date.parse` of nonsense is
+NaN, and every comparison against NaN is false, so every historical finding would have been sent.
+
+The log line says `NOT_CONFIGURED` and names the variable. **Setting it is the switch that turns
+the pipeline on**, and it is the one remaining decision between here and alerts being produced.
+
+### Reading is bounded to 24 hours, so history is not backfilled
+
+`HAWKVIEW_ALERT_READ_WINDOW_HOURS` defaults to 24 and is capped at 168, because a tick has an
+admission budget and reading the whole table every five minutes would spend it. **The consequence
+is that findings older than the window never receive an incident row from ordinary ticks.**
+Backfilling them is a separate one-off job that does not exist.
 
 ### The blocker in the flow is fixed, and the fix was checked against the thing that would have made it worse
 
