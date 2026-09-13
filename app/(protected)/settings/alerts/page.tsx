@@ -26,16 +26,15 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import {
-  emptinessCopy,
   type AlertDisposition,
   type AlertDispositionRow,
 } from '@/lib/alerts/dispositions'
+import { settingsView, type SettingsPhase } from '@/lib/alerts/settings-view'
 import {
   DispositionRow,
   type SaveState,
 } from '@/components/alerts/disposition-row'
 import {
-  emptinessOf,
   readDispositions,
   type DispositionsRead,
 } from '@/lib/alerts/read-dispositions'
@@ -48,11 +47,13 @@ import {
  * list is not a result. LOADING here means "no answer yet" and must never
  * render as "nothing is configured".
  */
-type PageState = { phase: 'LOADING' } | { phase: 'READ'; read: DispositionsRead }
+// The state union lives with settingsView, which is declared against it. Two
+// copies of it here and there could drift, and the page would then be holding a
+// shape the decision function does not accept.
 
 
 export default function AlertSettingsPage() {
-  const [state, setState] = useState<PageState>({ phase: 'LOADING' })
+  const [state, setState] = useState<SettingsPhase>({ phase: 'LOADING' })
   const [rows, setRows] = useState<AlertDispositionRow[]>([])
   const [saves, setSaves] = useState<Record<string, SaveState>>({})
 
@@ -135,21 +136,15 @@ export default function AlertSettingsPage() {
     []
   )
 
-  const emptiness =
-    state.phase === 'READ'
-      ? emptinessOf(
-          state.read.outcome === 'LOADED' ? { ...state.read, rows } : state.read
-        )
-      : null
-  const empty = emptiness ? emptinessCopy(emptiness) : null
-  const discarded =
-    state.phase === 'READ' && state.read.outcome === 'LOADED'
-      ? state.read.discarded
-      : 0
-  const because =
-    state.phase === 'READ' && state.read.outcome !== 'LOADED'
-      ? state.read.because
-      : null
+  // ONE DECISION, NOT FOUR. These were four inline ternaries, and the property
+  // that matters is not a property of any one of them: the empty-state card and
+  // the list must never both be on screen. Spread across four expressions that
+  // held only because emptinessCopy happens to return null for HAS_ITEMS --
+  // emergent, unstated, and nothing could fail if an edit broke it.
+  const { loading, empty, because, discarded, rows: visibleRows } = settingsView(
+    state,
+    rows
+  )
 
   return (
     <div className="mx-auto w-full max-w-4xl space-y-6 p-6">
@@ -165,7 +160,7 @@ export default function AlertSettingsPage() {
         </p>
       </div>
 
-      {state.phase === 'LOADING' && (
+      {loading && (
         <Card>
           <CardContent className="flex items-center gap-2 py-10 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -204,9 +199,9 @@ export default function AlertSettingsPage() {
         </p>
       )}
 
-      {rows.length > 0 && (
+      {visibleRows.length > 0 && (
         <div className="space-y-3">
-          {rows.map((row) => (
+          {visibleRows.map((row) => (
             <DispositionRow
               key={row.alertTypeId}
               row={row}
