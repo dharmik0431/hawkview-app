@@ -59,7 +59,7 @@ find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 
 | What | Result |
 | --- | --- |
-| Unit suite | **1832 tests, 1712 pass, 0 fail, 120 skipped** |
+| Unit suite | **1836 tests, 1716 pass, 0 fail, 120 skipped** |
 | `tsc --noEmit -p tsconfig.json` | clean |
 | `tsc --noEmit -p tsconfig.scripts.json` | clean |
 | Alerting integration, real PostgreSQL 15 | **24/24** — 12 pipeline, 4 in-app, 3 suppression, 5 dispositions |

@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1832 tests, 1712 pass, 0 fail.** The remaining 120 are database-integration tests requiring a
+**1836 tests, 1716 pass, 0 fail.** The remaining 120 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -877,6 +877,48 @@ REFUSED_PERMANENT, per message, per attempt. What is genuinely absent is the pro
 verdict — delivered, bounced, complained — and that is now worded as **delivery outcomes are not
 persisted** rather than as an absent ledger, because a blocker a reader can disprove on sight
 teaches them to skim the rest of the list.
+
+### A yield and a failure are now different words
+
+**They were already distinguishable in the log** — a yield logged `YIELDED` and returned a report;
+a failure logged `FAILED` and returned null. The claim that both returned null and logged FAILED
+was checked and is not what the code did. **The real gap was narrower and worse:** a failure said
+*nothing about what it lost*, and the return value collapsed a refusal with a failure.
+
+`runOnce` now returns four arms — `COMPLETED`, `YIELDED`, `NOT_CONFIGURED`, `FAILED` — and a
+failure carries **the phase and how much was in flight**:
+
+| phase | what it means |
+|---|---|
+| `READING` | nothing decided, nothing written, nothing known |
+| `LOADING` | findings read; still nothing written |
+| `WRITING` | **a decision existed and none of it landed** — all three tables or none, so no partial state, but the whole tick's work is gone |
+
+The difference this makes is between *intake failed* and *intake lost five thousand findings
+mid-write*. Both leave every finding OPEN and reprocessable, which is exactly why they must not
+read alike: **an intermittent failure that looks like a routine yield gets explained away once and
+never looked at again.**
+
+⚠ **THE CALLER STILL DOES NOTHING WITH THE VALUE AND MUST NOT START.** The richer return is for
+the log, the record and the tests. The moment a collector branches on an alerting outcome, an
+alerting failure changes what collection does — the thing the never-throw rule exists to prevent,
+arriving through the return value instead of an exception. The corollary stands: **check the
+database, not the report.**
+
+The backstop `catch` in `runOnce` should now be unreachable, and is kept: a safety net that
+excludes what you handled leaves the handled cases with no backstop.
+
+### Verifying a commit in a fresh worktree
+
+*QA hit this checking this branch and nearly filed it as a defect in the code.*
+
+**The generated Prisma client under `src/generated/prisma` is untracked**, so a new worktree
+carries whatever was last generated and typechecks with errors saying fields do not exist that the
+schema in the same tree plainly declares. Run `npx prisma generate` first. **It refuses to start
+without `DATABASE_URL` set, even though it reads no database** — any placeholder will do.
+
+Confirmed here: adding `alert_type_id` to the schema left `row.alertTypeId` unresolvable until the
+client was regenerated, with an error that reads as if the column were imaginary.
 
 ### A fix can be real and its binding unguarded — the fifth instance, in the commit that closed the fourth
 

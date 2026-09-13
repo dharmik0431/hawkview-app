@@ -1,6 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { PrismaService } from '../prisma/prisma.service.js'
-import { runIntake, type IntakeReport, type PipelineStore, type Watermark } from './finding-pipeline.js'
+import {
+  runIntake,
+  type AttemptedWork, type IntakePhase, type IntakeOutcome as PipelineOutcome,
+  type IntakeReport, type PipelineStore, type Watermark,
+} from './finding-pipeline.js'
 import { pipelineStore, type SqlRunner } from './pipeline-store.js'
 
 /**
@@ -13,6 +17,14 @@ import { pipelineStore, type SqlRunner } from './pipeline-store.js'
  * prove the ORM can spell them. It goes through `PrismaService` so there is one connection pool
  * and one place that reads `DATABASE_URL`.
  */
+/** What one tick did. Four arms, and the two that matter are `YIELDED` and `FAILED` — see
+ * `runOnce`. `NOT_CONFIGURED` is a refusal: nothing is broken and nothing has been decided. */
+export type IntakeOutcome =
+  | Readonly<{ kind: 'COMPLETED'; report: IntakeReport }>
+  | Readonly<{ kind: 'YIELDED'; report: IntakeReport }>
+  | Readonly<{ kind: 'NOT_CONFIGURED'; because: string }>
+  | Readonly<{ kind: 'FAILED'; phase: IntakePhase; because: string; attempted: AttemptedWork }>
+
 @Injectable()
 export class AlertIntakeService {
   private readonly logger = new Logger(AlertIntakeService.name)
@@ -21,61 +33,90 @@ export class AlertIntakeService {
 
   /** Run one tick, inside the window the caller gives it.
    *
-   * NEVER THROWS INTO THE CASCADE. Every failure is logged and reported, because this stage sits
+   * NEVER THROWS INTO THE CASCADE. Every failure is caught and reported, because this stage sits
    * in a handler where a throw would abort the collectors that run after it — and collection
    * outranks alerting, always.
    *
-   * ⚠ **A NULL RETURN IS AMBIGUOUS ON PURPOSE, AND THAT IS WHY YOU MUST NOT VERIFY THIS FROM ITS
-   * RETURN VALUE.** A rolled-back transaction comes back as null with a logged FAILED, and a
-   * deliberate refusal — no watermark chosen — comes back as null too. From the return value
-   * alone they are indistinguishable. Collapsing them would be a defect anywhere else; here it
-   * is correct, because the caller's only sane response to either is to carry on and let the
-   * collectors run, and giving it a choice it must not make is worse than giving it none.
+   * **IT RETURNS WHAT HAPPENED, IN FOUR WORDS THAT ARE NOT INTERCHANGEABLE.** It used to return
+   * a report or null, and null meant either *nobody has chosen a watermark* or *the tick failed*.
+   * The log distinguished them; the value did not. That is now four arms, because the two facts
+   * a reader most needs kept apart are the two that look most alike from the outside:
    *
-   * The consequence is where the ambiguity has to be paid for: **check the database, not the
-   * report.** Every test of this path asserts over `alert_incidents`, `notifications` and
-   * `alert_send_jobs` rather than over what `runOnce` handed back, and the log line carries
-   * the status a person needs. Anyone tempted to "improve" this by returning a richer result
-   * should notice they are proposing to let an alerting failure change what collection does. */
-  async runOnce(deadlineAt: number, tickAt: Date = new Date()): Promise<IntakeReport | null> {
+   * - `YIELDED` — the system DECLINED work it could not fit in the window. Routine.
+   * - `FAILED` — the system ATTEMPTED work and lost it, with the phase and how much.
+   *
+   * Both leave every finding OPEN and reprocessable, so the next tick redoes them either way —
+   * and that similarity is exactly why they must not read alike. An intermittent failure that
+   * looks like a yield gets explained away once and never looked at again.
+   *
+   * ⚠ **THE CALLER STILL DOES NOTHING WITH THIS, AND MUST NOT START.** Enriching the value is for
+   * the record, the log and the tests. The moment a collector branches on an alerting outcome,
+   * an alerting failure changes what collection does — which is the thing the never-throw rule
+   * exists to prevent, arriving through the return value instead of through an exception.
+   *
+   * And the corollary is unchanged: **check the database, not the report.** */
+  async runOnce(deadlineAt: number, tickAt: Date = new Date()): Promise<IntakeOutcome> {
     const watermark = configuredWatermark()
     if (watermark === null) {
-      // A REFUSAL, NOT A DEFAULT. See `configuredWatermark`. Logged once per tick so it is
-      // visible without being alarming: nothing is broken, nothing has been decided.
+      // A REFUSAL, NOT A DEFAULT, AND NOT A FAILURE. Nothing is broken; nothing has been decided.
       this.logger.warn(JSON.stringify({
         event: 'alert_intake', status: 'NOT_CONFIGURED',
         detail: 'HAWKVIEW_ALERT_WATERMARK_ISO is unset; intake will not run until it is chosen.',
       }))
-      return null
+      return { kind: 'NOT_CONFIGURED', because: 'HAWKVIEW_ALERT_WATERMARK_ISO is unset.' }
     }
 
+    let outcome: PipelineOutcome
     try {
-      const report = await runIntake(
+      outcome = await runIntake(
         this.store(), watermark, tickAt.toISOString(), deadlineAt, readSinceIso(tickAt))
-
-      this.logger.log(JSON.stringify({
-        event: 'alert_intake',
-        status: report.yieldedOnBudget ? 'YIELDED' : 'COMPLETED',
-        findingsRead: report.findingsRead,
-        incidentsWritten: report.incidentsWritten,
-        notificationsWritten: report.notificationsWritten,
-        jobsWritten: report.jobsWritten,
-        // COUNTS BY REASON, NOT A TOTAL. "17 skipped" collapses waiting-on-the-classifier with
-        // never-writable, which is the collapse this feature has now fixed three times.
-        skipped: countByReason(report.skipped),
-        unmappedRules: report.unmappedRules,
-        accountingProblems: report.accountingProblems,
+    } catch (cause) {
+      // THE BACKSTOP, and it should be unreachable: `runIntake` catches each phase and returns a
+      // FAILED outcome. Kept because a safety net that excludes what you handled leaves the
+      // handled cases with no backstop — and `UNKNOWN` is honest about the phase rather than
+      // guessing one.
+      this.logger.warn(JSON.stringify({
+        event: 'alert_intake', status: 'FAILED', phase: 'UNKNOWN',
+        detail: cause instanceof Error ? cause.message : 'unknown',
       }))
-      return report
-    } catch (error) {
-      // A settled intake failure does not suppress ordinary collectors. Same rule the maintenance
-      // stage states in its own comment, and the same reason.
+      return {
+        kind: 'FAILED',
+        phase: 'READING',
+        because: cause instanceof Error ? cause.message : 'unknown',
+        attempted: { findingsRead: 0, incidents: 0, notifications: 0, jobs: 0 },
+      }
+    }
+
+    if (outcome.kind === 'FAILED') {
+      // WORK ATTEMPTED AND LOST, with the phase and the size of it. "intake failed" and "intake
+      // lost five thousand findings mid-write" are the same line without these fields.
       this.logger.warn(JSON.stringify({
         event: 'alert_intake', status: 'FAILED',
-        detail: error instanceof Error ? error.message : 'unknown',
+        phase: outcome.phase,
+        attempted: outcome.attempted,
+        detail: outcome.because,
       }))
-      return null
+      return outcome
     }
+
+    const report = outcome.report
+    this.logger.log(JSON.stringify({
+      event: 'alert_intake',
+      // TWO WORDS, NOT A BOOLEAN ON ONE. A reader scanning for trouble reads statuses.
+      status: report.yieldedOnBudget ? 'YIELDED' : 'COMPLETED',
+      findingsRead: report.findingsRead,
+      incidentsWritten: report.incidentsWritten,
+      notificationsWritten: report.notificationsWritten,
+      jobsWritten: report.jobsWritten,
+      // COUNTS BY REASON, NOT A TOTAL. "17 skipped" collapses waiting-on-the-classifier with
+      // never-writable, which is the collapse this feature has now fixed three times.
+      skipped: countByReason(report.skipped),
+      unmappedRules: report.unmappedRules,
+      accountingProblems: report.accountingProblems,
+    }))
+    return report.yieldedOnBudget
+      ? { kind: 'YIELDED', report }
+      : { kind: 'COMPLETED', report }
   }
 
   /** The store that ships, adapted onto Prisma.

@@ -520,6 +520,53 @@ export interface IntakeReport {
  *
  * `deadlineAt` IS THIS STAGE'S OWN WINDOW, not the request's. It is checked between phases and
  * never inside a write, so yielding leaves the database consistent rather than half-written. */
+/** Where a tick was when it failed.
+ *
+ * **WORK DECLINED AND WORK LOST ARE DIFFERENT FACTS, and a failure that cannot say which phase it
+ * was in cannot say how much it lost.** A tick that failed reading has written nothing and knows
+ * nothing; a tick that failed WRITING had a decision in hand and lost all of it. Those need
+ * different responses and they used to produce the same line. */
+export type IntakePhase =
+  /** Reading the findings. Nothing has been decided and nothing written. */
+  | 'READING'
+  /** Loading existing incidents and dispositions. Still nothing written. */
+  | 'LOADING'
+  /** The commit. **A decision existed and none of it landed** — all three tables or none, so
+   * there is no partial state, but the whole tick's work is gone and the findings stay OPEN. */
+  | 'WRITING'
+
+/** What the tick was carrying when it failed. Zero before a decision exists. */
+export interface AttemptedWork {
+  readonly findingsRead: number
+  readonly incidents: number
+  readonly notifications: number
+  readonly jobs: number
+}
+
+/** What a tick did, as a value rather than as a report-or-null.
+ *
+ * **A YIELD AND A FAILURE ARE NOT THE SAME EVENT.** A yield is the system declining work it could
+ * not fit inside the window — routine, expected, and it leaves everything reprocessable. A
+ * failure is work it attempted and lost. Both leave the findings OPEN, so the next tick redoes
+ * them either way, and that similarity is exactly why they must not read alike: an intermittent
+ * failure that looks like a yield gets explained away once and never looked at again. */
+export type IntakeOutcome =
+  | Readonly<{ kind: 'RAN'; report: IntakeReport }>
+  | Readonly<{ kind: 'FAILED'; phase: IntakePhase; because: string; attempted: AttemptedWork }>
+
+const NOTHING_ATTEMPTED: AttemptedWork = {
+  findingsRead: 0, incidents: 0, notifications: 0, jobs: 0,
+}
+
+const failure = (
+  phase: IntakePhase, cause: unknown, attempted: AttemptedWork = NOTHING_ATTEMPTED,
+): IntakeOutcome => ({
+  kind: 'FAILED',
+  phase,
+  because: cause instanceof Error ? cause.message : String(cause),
+  attempted,
+})
+
 export async function runIntake(
   store: PipelineStore,
   watermark: Watermark,
@@ -527,23 +574,35 @@ export async function runIntake(
   deadlineAt: number,
   readSinceIso: string,
   now: () => number = Date.now,
-): Promise<IntakeReport> {
+): Promise<IntakeOutcome> {
   const empty = (yielded: boolean, findingsRead = 0): IntakeReport => ({
     findingsRead, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0, skipped: [], unmappedRules: [],
     accountingProblems: [], yieldedOnBudget: yielded,
   })
-  if (now() >= deadlineAt) return empty(true)
+  const ran = (report: IntakeReport): IntakeOutcome => ({ kind: 'RAN', report })
+  if (now() >= deadlineAt) return ran(empty(true))
 
-  const findings = await store.findOpenFindings(readSinceIso)
-  if (findings.length === 0) return empty(false)
-  if (now() >= deadlineAt) return empty(true, findings.length)
+  let findings: readonly FindingRow[]
+  try {
+    findings = await store.findOpenFindings(readSinceIso)
+  } catch (cause) {
+    return failure('READING', cause)
+  }
+  if (findings.length === 0) return ran(empty(false))
+  if (now() >= deadlineAt) return ran(empty(true, findings.length))
 
   const organizationIds = [...new Set(findings.map((each) => each.organizationId))]
-  const [existing, dispositions] = await Promise.all([
-    store.findExistingIncidents(organizationIds),
-    store.loadDispositions(organizationIds),
-  ])
-  if (now() >= deadlineAt) return empty(true, findings.length)
+  let existing: readonly ExistingIncident[]
+  let dispositions: Dispositions
+  try {
+    [existing, dispositions] = await Promise.all([
+      store.findExistingIncidents(organizationIds),
+      store.loadDispositions(organizationIds),
+    ])
+  } catch (cause) {
+    return failure('LOADING', cause, { ...NOTHING_ATTEMPTED, findingsRead: findings.length })
+  }
+  if (now() >= deadlineAt) return ran(empty(true, findings.length))
 
   const decision = decide(findings, existing, dispositions, watermark, tickAtIso)
   // THE BUDGET IS CHECKED HERE, BEFORE THE WRITE PHASE, AND NOT AGAIN INSIDE IT.
@@ -566,17 +625,32 @@ export async function runIntake(
   // them withhold the job ON PURPOSE. A recovery that could not tell them apart would deliver
   // every incident the watermark silenced.
   if (now() >= deadlineAt) {
-    return {
+    return ran({
       findingsRead: findings.length, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0,
       skipped: decision.skipped, unmappedRules: decision.unmappedRules,
       accountingProblems: decision.accountingProblems, yieldedOnBudget: true,
-    }
+    })
   }
 
-  const { incidentsWritten, notificationsWritten, jobsWritten } =
-    await store.commit(decision.incidents, decision.notifications, decision.jobs)
+  // THE WHOLE DECISION IS IN FLIGHT HERE, and a failure loses all of it — all three tables or
+  // none, so there is no partial state, but the tick's work is gone. Reporting how much was lost
+  // is the difference between an operator seeing "intake failed" and seeing that five thousand
+  // findings were being written when it did.
+  const attempted: AttemptedWork = {
+    findingsRead: findings.length,
+    incidents: decision.incidents.length,
+    notifications: decision.notifications.length,
+    jobs: decision.jobs.length,
+  }
+  let written: { incidentsWritten: number; notificationsWritten: number; jobsWritten: number }
+  try {
+    written = await store.commit(decision.incidents, decision.notifications, decision.jobs)
+  } catch (cause) {
+    return failure('WRITING', cause, attempted)
+  }
+  const { incidentsWritten, notificationsWritten, jobsWritten } = written
 
-  return {
+  return ran({
     findingsRead: findings.length,
     incidentsWritten,
     notificationsWritten,
@@ -585,5 +659,5 @@ export async function runIntake(
     unmappedRules: decision.unmappedRules,
     accountingProblems: decision.accountingProblems,
     yieldedOnBudget: false,
-  }
+  })
 }

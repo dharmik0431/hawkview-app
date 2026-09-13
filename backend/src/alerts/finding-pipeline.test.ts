@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  runIntake, type PipelineStore,
   alertTierFor,
   asAlertTypeId, dispositionKey,
   alertTypeForRule, decide,
@@ -298,4 +299,60 @@ test('AN UNREADABLE DISPOSITION LEAVES THE CATALOGUE DEFAULT IN FORCE, and is st
 
   assert.equal(out.jobs.length, 1, 'the catalogue default still applies — ACT_NOW sends')
   assert.deepEqual(withJunk.unreadable, ['HV-ID-AUTH-010.v1'], 'and the value survives to be read')
+})
+
+test('A COMMIT THAT FAILS REPORTS THE PHASE AND EVERYTHING IT LOST', async () => {
+  // THE FAILURE QA MEASURED. The transaction budget is exhausted well below the per-tick cap, and
+  // the tick writes nothing, comes back without throwing, and works on the retry. Both a yield
+  // and this leave every finding OPEN, so they are indistinguishable by their effect — the
+  // report is the only place they can differ.
+  const store: PipelineStore = {
+    findOpenFindings: async () => [finding()],
+    findExistingIncidents: async () => [],
+    loadDispositions: async () => canEmail,
+    commit: async () => { throw new Error('the timeout was 5000 ms, however 5002 ms passed') },
+  }
+  const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+
+  assert.equal(outcome.kind, 'FAILED')
+  if (outcome.kind !== 'FAILED') return
+  assert.equal(outcome.phase, 'WRITING', 'a decision existed and none of it landed')
+  assert.match(outcome.because, /5002 ms/, 'the provider’s own words, so it can be recognised')
+
+  // HOW MUCH WAS LOST, which is the difference between "intake failed" and a number somebody can
+  // act on. All three tables or none, so there is no partial state — but the whole tick is gone.
+  assert.deepEqual(outcome.attempted,
+    { findingsRead: 1, incidents: 1, notifications: 1, jobs: 1 })
+})
+
+test('A READ THAT FAILS IS A DIFFERENT PHASE, and reports nothing attempted', async () => {
+  // The control for the test above: without it, a FAILED outcome that always said WRITING with
+  // the same counts would pass, and the phase would be decoration.
+  const store: PipelineStore = {
+    findOpenFindings: async () => { throw new Error('connection terminated') },
+    findExistingIncidents: async () => [],
+    loadDispositions: async () => canEmail,
+    commit: async () => ({ incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0 }),
+  }
+  const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+
+  assert.equal(outcome.kind, 'FAILED')
+  if (outcome.kind !== 'FAILED') return
+  assert.equal(outcome.phase, 'READING', 'nothing was decided, so nothing could be lost')
+  assert.deepEqual(outcome.attempted, { findingsRead: 0, incidents: 0, notifications: 0, jobs: 0 })
+})
+
+test('AND A HEALTHY TICK IS NEITHER, or the two above are satisfied by always failing', async () => {
+  const store: PipelineStore = {
+    findOpenFindings: async () => [finding()],
+    findExistingIncidents: async () => [],
+    loadDispositions: async () => canEmail,
+    commit: async () => ({ incidentsWritten: 1, notificationsWritten: 1, jobsWritten: 1 }),
+  }
+  const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+
+  assert.equal(outcome.kind, 'RAN')
+  assert.equal(outcome.kind === 'RAN' ? outcome.report.jobsWritten : null, 1)
+  assert.equal(outcome.kind === 'RAN' ? outcome.report.yieldedOnBudget : null, false,
+    'and a completed tick is not a yield either')
 })

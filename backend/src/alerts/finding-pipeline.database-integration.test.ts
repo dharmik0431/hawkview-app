@@ -108,6 +108,17 @@ const insideTransaction = (client: pg.Client): SqlRunner => ({
   transaction: (run) => run(insideTransaction(client)),
 })
 
+/** Run a tick and insist it ran. **A test that silently accepted a FAILED outcome would assert
+ * over zeroes and pass**, which is precisely the confusion the outcome type was added to remove —
+ * so the unwrapping asserts rather than defaults. */
+const ranIntake = async (...args: Parameters<typeof runIntake>) => {
+  const outcome = await runIntake(...args)
+  if (outcome.kind !== 'RAN') {
+    throw new Error(`the tick FAILED in ${outcome.phase}: ${outcome.because}`)
+  }
+  return outcome.report
+}
+
 const storeFor = (client: pg.Client): PipelineStore => pipelineStore(runnerFor(client))
 
 /** The finding's real foreign-key chain. Inserted rather than mocked, because the point of this
@@ -171,7 +182,7 @@ test('A PERSISTED FINDING REACHES A SEND JOB', { skip: !RUN || !URL }, async () 
        ON CONFLICT DO NOTHING`, [ORG, operator])
     await seed(client)
 
-    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const report = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.findingsRead, 1, 'the finding was read from the table')
     assert.equal(report.incidentsWritten, 1, 'an incident row was written')
@@ -190,7 +201,7 @@ test('A PERSISTED FINDING REACHES A SEND JOB', { skip: !RUN || !URL }, async () 
     assert.equal(incidents.rows[0].ownership, 'UNACKNOWLEDGED')
 
     // A SECOND TICK SENDS NOTHING MORE, or every five minutes emails about the same incident.
-    const again = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const again = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
     assert.equal(again.jobsWritten, 0)
     assert.equal((await client.query('SELECT count(*) FROM alert_send_jobs')).rows[0].count, '1')
   } finally {
@@ -207,7 +218,7 @@ test('NO HISTORICAL SENDS, against the real table', { skip: !RUN || !URL }, asyn
     await client.query('DELETE FROM identity_risk_findings')
     await seed(client, { observedAt: OLD, id: '66666666-6666-6666-6666-666666666666' })
 
-    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const report = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.incidentsWritten, 1, 'the record is backfilled')
     assert.equal(report.jobsWritten, 0, 'and NOTHING is sent about last month')
@@ -227,7 +238,7 @@ test('INTAKE YIELDS RATHER THAN BORROWING FROM THE COLLECTORS', { skip: !RUN || 
   try {
     await scaffold(client)
     await client.query('TRUNCATE alert_send_jobs, alert_incidents CASCADE')
-    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() - 1, '2026-01-01T00:00:00.000Z')
+    const report = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() - 1, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.yieldedOnBudget, true)
     assert.equal(report.findingsRead, 0, 'it did not even read')
@@ -268,7 +279,7 @@ test('A BUDGET YIELD LEAVES NO HALF-DONE WORK, and the next run completes it', {
     // Healthy for the reads and the decision; expired by the pre-write check, which is the
     // fourth call. Anything later and the writes have already happened.
     const runningOut = () => (++ticks >= 4 ? deadlineAt + 1 : Date.now())
-    const yielded = await runIntake(
+    const yielded = await ranIntake(
       storeFor(client), WATERMARK, T0, deadlineAt, '2026-01-01T00:00:00.000Z', runningOut)
     assert.ok(ticks >= 4, 'the run must have reached the pre-write check, or this tests nothing')
     assert.equal(yielded.yieldedOnBudget, true)
@@ -279,7 +290,7 @@ test('A BUDGET YIELD LEAVES NO HALF-DONE WORK, and the next run completes it', {
       'no incident, so nothing for the next run to skip over')
 
     // AND THE NEXT RUN COMPLETES IT, along the ordinary path rather than a recovery path.
-    const healthy = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const healthy = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
     assert.equal(healthy.incidentsWritten, 1)
     assert.equal(healthy.jobsWritten, 1, 'the alert is sent, which is what the strand prevented')
     assert.equal((await client.query('SELECT count(*) FROM alert_send_jobs')).rows[0].count, '1')
@@ -303,7 +314,7 @@ test('AN UNMAPPED RULE PRODUCES NOTHING AND IS STILL ACCOUNTED FOR', { skip: !RU
     await client.query('DELETE FROM identity_risk_findings')
     await seed(client, { ruleId: 'HV-ID-MBX-001.v1', id: '99999999-9999-9999-9999-999999999999' })
 
-    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const report = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.findingsRead, 1)
     assert.equal(report.incidentsWritten, 0, 'no incident, because it cannot be typed')
@@ -332,7 +343,7 @@ test('AN ORGANISATION WITH NO PREFERENCE ROW SENDS NOTHING', { skip: !RUN || !UR
     await client.query('DELETE FROM notification_preferences WHERE organization_id = $1', [ORG])
     await seed(client, { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' })
 
-    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const report = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.incidentsWritten, 1, 'the incident is still recorded and visible in the product')
     assert.equal(report.jobsWritten, 0, 'and nothing is sent to nobody')
@@ -351,7 +362,7 @@ test('AN ORGANISATION WITH NO PREFERENCE ROW SENDS NOTHING', { skip: !RUN || !UR
       `INSERT INTO notification_preferences (id, user_id, organization_id, email_enabled, updated_at)
        VALUES (gen_random_uuid(), $2, $1, true, now())`, [ORG, operator])
 
-    const second = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const second = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
     assert.equal(second.jobsWritten, 1)
   } finally {
     await client.end()
@@ -379,7 +390,7 @@ test('AN OPERATOR WITH EMAIL OFF IS STILL NO ELIGIBLE RECIPIENT', { skip: !RUN |
        VALUES (gen_random_uuid(), $2, $1, now())`, [ORG, operator])
     await seed(client, { id: 'dddddddd-dddd-dddd-dddd-dddddddddddd' })
 
-    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    const report = await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
     assert.equal(report.jobsWritten, 0)
     assert.equal(report.skipped[0]?.because, 'NO_ELIGIBLE_RECIPIENT')
   } finally {
@@ -678,7 +689,7 @@ test('A DISPOSITION STORED AT THE WRONG GRAIN IS REPORTED, not silently ignored'
        VALUES (gen_random_uuid(), $1, 'HV-ID-AUTH-010.v1', 'RECORD_ONLY', now())`, [ORG])
     await seed(client)
 
-    const report = await runIntake(
+    const report = await ranIntake(
       storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     // IT STILL DOES NOT SILENCE — it names no alert type, so it cannot. That part is unchanged
@@ -702,7 +713,7 @@ test('A DISPOSITION STORED AT THE WRONG GRAIN IS REPORTED, not silently ignored'
       [ORG])
     await seed(client, { id: '66666666-6666-6666-6666-666666666666' })
 
-    const silenced = await runIntake(
+    const silenced = await ranIntake(
       storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
     assert.equal(silenced.jobsWritten, 0, 'stored at the right grain, it silences')
     assert.equal(silenced.skipped[0]?.because, 'RECORD_ONLY')

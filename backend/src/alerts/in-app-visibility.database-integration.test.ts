@@ -94,6 +94,17 @@ const runnerFor = (client: pg.Client): SqlRunner => ({
     }
   },
 })
+/** Run a tick and insist it ran. **A test that silently accepted a FAILED outcome would assert
+ * over zeroes and pass**, which is precisely the confusion the outcome type was added to remove —
+ * so the unwrapping asserts rather than defaults. */
+const ranIntake = async (...args: Parameters<typeof runIntake>) => {
+  const outcome = await runIntake(...args)
+  if (outcome.kind !== 'RAN') {
+    throw new Error(`the tick FAILED in ${outcome.phase}: ${outcome.because}`)
+  }
+  return outcome.report
+}
+
 const storeFor = (client: pg.Client): PipelineStore => pipelineStore(runnerFor(client))
 
 /** Everything the reader needs to exist: an active organisation, an active membership, and a
@@ -174,7 +185,7 @@ test('AN INCIDENT IS VISIBLE IN THE PRODUCT, asked of the reader rather than the
     assert.equal(before.total, 0, 'the panel starts empty')
 
     await seedFinding(client, '55555555-5555-5555-5555-555555555555')
-    const report = await runIntake(
+    const report = await ranIntake(
       storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.incidentsWritten, 1)
@@ -247,7 +258,7 @@ test('A SECOND FINDING ON ONE INCIDENT IS A SECOND ROW, not nothing', { skip: !R
 
     await seedFinding(client, '55555555-5555-5555-5555-555555555555')
     await seedFinding(client, '66666666-6666-6666-6666-666666666666')
-    const report = await runIntake(
+    const report = await ranIntake(
       storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.findingsRead, 2)
@@ -285,7 +296,7 @@ test('A FINDING HELD BACK FROM SENDING IS STILL VISIBLE IN-APP', { skip: !RUN ||
     // The preference row is left at its defaults, so email_enabled is false.
     await seedFinding(client, '55555555-5555-5555-5555-555555555555')
 
-    const report = await runIntake(
+    const report = await ranIntake(
       storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.jobsWritten, 0, 'nothing is queued to send')
@@ -315,7 +326,7 @@ test('THE TIER REACHES THE WIRE, and a collector row carries none', { skip: !RUN
     await client.query('DELETE FROM notifications')
     await client.query('DELETE FROM identity_risk_findings')
     await seedFinding(client, '55555555-5555-5555-5555-555555555555')
-    await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    await ranIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
 
     // A COLLECTOR ROW AT THE SAME SEVERITY. `critical` is not exclusive to alerts —
     // `tenant-sync.service.ts` publishes a lost Microsoft connection at critical through the same
