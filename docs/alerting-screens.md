@@ -66,9 +66,24 @@ and `06` is the corrected capture.
   `severity` rather than the tier. At 320–384px it will wrap heavily. A density
   question, not an honesty one.
 
-## If HTML is wanted instead
+## HTML as well as PNGs
 
-Self-contained HTML of the same states (rendered DOM with the stylesheet
-inlined, openable with no server) can be produced on request. Screenshots were
-achievable, so they were taken; HTML was the stated fallback for when they were
-not.
+Both formats are in that directory now. The `.html` files are the rendered DOM
+with the stylesheet inlined and the hydration scripts removed, so each one
+**opens offline with no server**. Verified by rendering one back through Chrome
+from a `file://` URL: indistinguishable from the served page.
+
+The only thing that degrades offline is the webfont. The `@font-face` rules
+still point at `/_next/static/media/*.woff2`, which 404s and falls back to the
+next family in the stack. Layout, colour and copy are unaffected. Inlining the
+fonts would add roughly 200KB per file for a slightly different typeface, which
+is not a trade worth making for something being looked at rather than measured.
+
+| state | files |
+| --- | --- |
+| settings, rows | `01-alert-settings-rows.{html,png}` |
+| settings, saved | `02-alert-settings-saved.{html,png}` |
+| settings, could not load | `03-alert-settings-could-not-load.{html,png}` |
+| notification rows + bell | `04-notification-rows-and-bell-states.html`, `04-notification-rows-and-05-bell-states.png` |
+| fleet, partial coverage | `06-risky-users-partial-coverage.{html,png}` |
+| fleet, earned shield | `07-risky-users-earned-shield.{html,png}` |
