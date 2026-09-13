@@ -162,7 +162,13 @@ test('EVERY EVENT IS IN EXACTLY ONE PLACE, and the books say when they are not',
   assert.match(problems[0] ?? '', /4 events received, 3 accounted for/)
 
   // AND A PROVIDER ID ON TWO OPEN JOBS IS A PROBLEM, because an event could resolve either.
-  const doubled = accept(ledger, attempt('m-3'), ACCEPTED('p-2'))
+  //
+  // BUILT BY HAND, BECAUSE `accept` CAN NO LONGER PRODUCE IT. A second accept on a held
+  // provider id is now recorded as a retry rather than a second job — see the retry tests. This
+  // stays as a TRIPWIRE against some future writer that adds a job by another route, which is
+  // the only way left to reach the state. It is not reachable through the public path today,
+  // and that is the improvement rather than a reason to delete the check.
+  const doubled: Ledger = { ...ledger, jobs: [...ledger.jobs, ledger.jobs[1]!] }
   assert.equal(accounting(doubled, 3).filter((line) => line.includes('share provider id')).length, 1)
 })
 
@@ -292,4 +298,78 @@ test('A FORGED AuthenticEvent DOES NOT COMPILE - and the first version of this c
   const genuine = authenticate(webhook(), 'AUTHENTIC')
   assert.ok(genuine.authentic)
   assert.equal(record(sent(), genuine).jobs[0]?.state, 'RESOLVED')
+})
+
+test('A RETRIED SEND DOES NOT MAKE A SECOND JOB - the trap the obvious caller fell into', () => {
+  // MEASURED BEFORE IT WAS FIXED, and the symptom is the point rather than the duplicate:
+  // Resend honouring an idempotency key returns the SAME provider id, so send-then-accept twice
+  // produced two UNRESOLVED jobs sharing one id. The single DELIVERED event resolved only the
+  // first, and the second stayed UNRESOLVED forever — reporting that a message nobody failed to
+  // deliver was never confirmed. Two jobs, one event, [RESOLVED, UNRESOLVED], still unconfirmed
+  // at two hours.
+  const once = accept(EMPTY_LEDGER, attempt('m-1'), ACCEPTED('p-1'))
+  const retried = accept(once, attempt('m-1'), ACCEPTED('p-1', '2026-09-12T09:00:05.000Z'))
+
+  assert.equal(retried.jobs.length, 1, 'one message, one job')
+  assert.equal(retried.retries.length, 1, 'and the retry is recorded rather than invisible')
+  assert.equal(retried.retries[0]?.atIso, '2026-09-12T09:00:05.000Z')
+
+  // THE SYMPTOM IS GONE, which is what actually mattered.
+  const delivered = record(retried, authenticate(webhook(), 'AUTHENTIC'))
+  assert.deepEqual(delivered.jobs.map((job) => job.state), ['RESOLVED'])
+  assert.deepEqual(unconfirmed(delivered, '2026-09-12T11:00:00.000Z', 3_600_000), [],
+    'nothing is permanently unconfirmed')
+  assert.deepEqual(accounting(delivered, 1), [])
+})
+
+test('A RETRY AND A COLLISION ARE DIFFERENT FACTS, and only one of them is fine', () => {
+  // Same provider id, same message: the idempotency key did its job, and there is nothing to
+  // report beyond the retry itself.
+  const retry = accept(accept(EMPTY_LEDGER, attempt('m-1'), ACCEPTED('p-1')),
+    attempt('m-1'), ACCEPTED('p-1'))
+  assert.deepEqual(accounting(retry, 0), [], 'a genuine retry is not a problem')
+
+  // Same provider id, DIFFERENT message: two messages share an identifier, so one message's
+  // outcome would resolve the other's job. That is not a retry and it is named.
+  const collision = accept(accept(EMPTY_LEDGER, attempt('m-1'), ACCEPTED('p-1')),
+    attempt('m-2'), ACCEPTED('p-1'))
+  const problems = accounting(collision, 0)
+  assert.equal(problems.length, 1)
+  assert.match(problems[0] ?? '', /two messages share an identifier/)
+  assert.match(problems[0] ?? '', /m-2/)
+  assert.match(problems[0] ?? '', /m-1/)
+
+  // AND IT STILL ONLY MAKES ONE JOB, because a second would reintroduce the permanent
+  // unconfirmed. The collision is reported, not repaired — repairing it here would mean
+  // guessing which message the provider actually took.
+  assert.equal(collision.jobs.length, 1)
+})
+
+test('A REFUSED SEND IS NOT A RETRY TARGET, because it never got a provider id', () => {
+  // Or "already held" would match on undefined and a second refusal would silently vanish.
+  const refused = accept(EMPTY_LEDGER, attempt('m-1'),
+    { kind: 'REFUSED', code: 'RATE_LIMITED', atIso: '2026-09-12T09:00:00.000Z' })
+  const twice = accept(refused, attempt('m-2'),
+    { kind: 'REFUSED', code: 'RATE_LIMITED', atIso: '2026-09-12T09:00:01.000Z' })
+
+  assert.equal(twice.jobs.length, 2, 'two refusals are two facts')
+  assert.deepEqual(twice.retries, [])
+
+  // And a later successful accept still creates its job rather than matching the refusal.
+  const then = accept(twice, attempt('m-3'), ACCEPTED('p-1'))
+  assert.equal(then.jobs.length, 3)
+  assert.equal(then.jobs[2]?.state, 'UNRESOLVED')
+})
+
+test('A RETRY AFTER THE OUTCOME ARRIVED IS STILL A RETRY, not a new job', () => {
+  // The send layer may retry after the webhook has already landed — nothing orders those two.
+  // A resolved job must absorb it the same way an open one does, or the late retry opens a job
+  // that will never be resolved because its event has already been used.
+  const delivered = record(accept(EMPTY_LEDGER, attempt('m-1'), ACCEPTED('p-1')),
+    authenticate(webhook(), 'AUTHENTIC'))
+  const late = accept(delivered, attempt('m-1'), ACCEPTED('p-1', '2026-09-12T09:05:00.000Z'))
+
+  assert.deepEqual(late.jobs.map((job) => job.state), ['RESOLVED'])
+  assert.equal(late.retries.length, 1)
+  assert.deepEqual(unconfirmed(late, '2026-09-12T11:00:00.000Z', 3_600_000), [])
 })

@@ -247,17 +247,68 @@ export type Job =
     }>
   | Readonly<{ state: 'REFUSED'; messageId: MessageId; refusedAtIso: string; code: RefusalCode }>
 
+/** A send that came back with a provider id we already hold a job for.
+ *
+ * NOT AN ERROR. It is what an honoured idempotency key looks like from this side: the caller
+ * retried a send that had already been accepted, and Resend returned the same provider id
+ * because it is the same message. Recorded so the retry is visible rather than invisible. */
+export type Retry = Readonly<{
+  providerId: ProviderMessageId
+  /** The message the RETRY claimed to be. Compared against the job’s: if they differ, two
+   * different messages share a provider id, which is a much worse thing than a retry. */
+  messageId: MessageId
+  atIso: string
+}>
+
 export interface Ledger {
   readonly jobs: readonly Job[]
   /** Every event that did not resolve a job, with its reason. Empty is a claim; non-empty is
    * a finding. Either way it is stated. */
   readonly unmatched: readonly UnmatchedEvent[]
+  /** Accepts that landed on a provider id already held. See `accept`. */
+  readonly retries: readonly Retry[]
 }
 
-export const EMPTY_LEDGER: Ledger = { jobs: [], unmatched: [] }
+export const EMPTY_LEDGER: Ledger = { jobs: [], unmatched: [], retries: [] }
 
-/** Record what the provider said about a send. Produces a job in exactly one state. */
+/** Record what the provider said about a send. Produces a job in exactly one state.
+ *
+ * A SECOND ACCEPT FOR A PROVIDER ID WE ALREADY HOLD DOES NOT MAKE A SECOND JOB, and this was
+ * a trap that the obvious implementation walked straight into. Resend honouring an idempotency
+ * key returns THE SAME PROVIDER ID for a retry, so a caller doing the natural thing — send,
+ * then accept — produced two UNRESOLVED jobs sharing one id. The single DELIVERED event
+ * resolved the first, and the second stayed UNRESOLVED forever, appearing in `unconfirmed`
+ * permanently: **reporting that a message nobody failed to deliver was never confirmed.**
+ *
+ * Measured before it was fixed: two jobs, one event, `[RESOLVED, UNRESOLVED]`, still
+ * unconfirmed at two hours.
+ *
+ * IT RETURNS THE EXISTING JOB RATHER THAN REFUSING, because that is the truthful answer. If
+ * the provider returned the same id it IS the same message, so keeping one job states a fact
+ * rather than masking a duplicate. Refusing would be louder and would push the work onto a
+ * caller who then has to write the right handler; this way THE OBVIOUS CODE IS CORRECT, which
+ * is the shape that has worked everywhere else in this feature.
+ *
+ * A RETRY AND A COLLISION ARE DIFFERENT FACTS, and only one of them is fine. Same provider id
+ * with the same message id is a retry. Same provider id with a DIFFERENT message id means two
+ * messages share an identifier — so one message’s outcome would resolve the other’s job. That
+ * is not a retry and `accounting` names it separately. */
 export function accept(ledger: Ledger, attempt: SendAttempt, acceptance: Acceptance): Ledger {
+  if (acceptance.kind === 'ACCEPTED') {
+    const held = ledger.jobs.find(
+      (each) => each.state !== 'REFUSED' && each.providerId === acceptance.providerId)
+    if (held !== undefined) {
+      return {
+        ...ledger,
+        retries: [...ledger.retries, {
+          providerId: acceptance.providerId,
+          messageId: attempt.messageId,
+          atIso: acceptance.atIso,
+        }],
+      }
+    }
+  }
+
   const job: Job = acceptance.kind === 'ACCEPTED'
     ? {
         state: 'UNRESOLVED',
@@ -354,6 +405,22 @@ export function accounting(
   eventsReceived: number,
 ): readonly string[] {
   const problems: string[] = []
+
+  // A RETRY IS FINE; A COLLISION IS NOT. Same provider id, same message: the idempotency key
+  // did its job. Same provider id, different message: two messages share an identifier, and
+  // one’s outcome will resolve the other’s job.
+  const messageFor = new Map(ledger.jobs
+    .filter((job) => job.state !== 'REFUSED')
+    .map((job) => [job.providerId as string, job.messageId as string]))
+  for (const retry of ledger.retries) {
+    const held = messageFor.get(retry.providerId)
+    if (held !== undefined && held !== retry.messageId) {
+      problems.push(
+        `provider id ${retry.providerId} was returned for message ${retry.messageId} and is `
+        + `already held by ${held} — two messages share an identifier, so one’s outcome will `
+        + 'resolve the other’s job.')
+    }
+  }
   const resolved = ledger.jobs.filter((job) => job.state === 'RESOLVED').length
   const accountedFor = resolved + ledger.unmatched.length
   if (accountedFor !== eventsReceived) {

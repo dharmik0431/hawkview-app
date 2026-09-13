@@ -91,10 +91,64 @@ way to get one is `operatorAddressOf(recipient: VerifiedRecipient)`, and every a
 is an MSP-side inbox somebody verified. "Never a customer end user as a recipient" is a value
 this code cannot construct rather than a rule it follows.
 
-**Nine negatives are written as `@ts-expect-error` in the test file, so the file type-checking
-is the evidence.** An unused `@ts-expect-error` is itself a compile error, which is what makes
+**Twelve negatives are written as `@ts-expect-error` in the test file, so the file
+type-checking is the evidence** — nine on the body and recipient, three on the authenticity brand
+after it turned out not to be one. An unused `@ts-expect-error` is itself a compile error, which is what makes
 them assertions rather than comments. Verified by mutation: giving `TYPE_COUNT` an optional
 `tenantName` makes `tsc` fail with *Unused '@ts-expect-error' directive* at that line.
+
+## What this module does not carry, and why that is the risk
+
+> **The properties are homeless rather than lost, and the module does not pretend otherwise.
+> The risk is not a false claim — it is that a seam this good makes a gap easy to miss, because
+> homeless reads exactly like handled when everything visible is this careful.**
+
+That is the inverse of every other finding in this feature. The usual danger is a claim stronger
+than the code. Here it is code careful enough that nobody checks whether the thing they need is
+actually in it.
+
+**Idempotence and bounded retries live above a send, not inside one**, and always were going to:
+idempotence needs the job store, bounded retries need the attempt history. Neither is a defect in
+this file and neither is a note for later — **whatever owns retries must own the bound and the
+idempotence, and must be checkable.** That is wiring scope.
+
+**One property is partly askable.** Every attempt that reaches `accept` lands in exactly one
+state, and that is pinned. An attempt that never reached `accept` leaves no trace at all, because
+there is no attempt list to compare against. That closes when the job store exists, and not
+before.
+
+**Two are not askable here at all**, which is honest rather than wrong: nothing in a pure module
+can establish that Resend honours an idempotency key or that its "accepted" means what we take it
+to mean.
+
+## The retry trap, and why `accept` absorbs rather than refuses
+
+**Resend honouring an idempotency key returns the SAME provider id.** So a caller doing the
+obvious thing — send, then accept — called `accept` twice with one provider id, and the ledger
+held two `UNRESOLVED` jobs. The single `DELIVERED` event resolved the first. **The second stayed
+`UNRESOLVED` forever and appeared in `unconfirmed` permanently: reporting that a message nobody
+failed to deliver was never confirmed.**
+
+Measured before it was fixed: two jobs, one event, `[RESOLVED, UNRESOLVED]`, still unconfirmed at
+two hours. `accounting` did catch it — *"2 jobs share provider id p-1"* — but the seam gave the
+caller no way to avoid it, because the provider id is not known until the send returns.
+
+**`accept` now returns the existing job rather than refusing, because that is the truthful
+answer.** If the provider returned the same id it *is* the same message. Refusing would be louder
+and would push the work onto a caller who then has to write the right handler; absorbing makes
+**the obvious code correct**, which is the shape that has worked everywhere else here. The retry
+is recorded so it stays visible.
+
+**And a retry is not a collision.** Same provider id with the same message is an honoured
+idempotency key. Same provider id with a *different* message means two messages share an
+identifier, so one message's outcome would resolve the other's job — `accounting` names that
+separately, and `accept` still creates only one job, because a second would reintroduce the
+permanent unconfirmed. **It is reported, not repaired:** repairing it would mean guessing which
+message the provider actually took.
+
+A consequence worth knowing: the older *"N jobs share provider id"* check is no longer reachable
+through `accept`. It stays as a tripwire against a future writer that adds a job by another
+route, and its test now builds that state by hand.
 
 ## What rests on Resend behaving as documented
 
