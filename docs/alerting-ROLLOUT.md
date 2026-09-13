@@ -19,6 +19,34 @@ nothing has been sent to anybody.**
 - The migration applies itself on deploy, and a rollback of the deploy is a rollback of **code
   only**. This has been rehearsed.
 
+**AND THE THING THAT MATTERS MOST ON THIS PAGE: the pipeline works and there is nothing for it to
+carry.** Measured in production, read-only, by PM — **I have no production access and have not
+confirmed these myself:**
+
+| table | rows |
+|---|---|
+| `identity_risk_evaluation_runs` | **7,365** |
+| `identity_risk_matched_results` | **0** |
+| `identity_risk_findings` | **0** |
+| `notifications` | 366, across 7 tenants and 4 organisations |
+
+**The risk engine has run 7,365 times and matched nothing, ever.** So switching alerting on today
+— with a perfect watermark, a working sender and every check on this page signed — delivers
+**zero emails to Green Technology.** Not because alerting is broken, but because there are no
+findings for it to act on.
+
+**Do not read a correct alerting chain as meaning MSPs will be notified.** Everything this
+document establishes is about a pipeline that currently has an empty source.
+
+**And the zero is uncharacterised.** It has not been established whether it is a true zero —
+three narrow detectors across a small fleet genuinely matching nothing, which is a legitimate
+outcome — or an absence being read as evidence. PM's narrower observation, which I am relaying
+rather than confirming: a source reports READY and CURRENT on the strength of a successful
+collection while carrying no observed events, and the rules built on it assess zero identities
+and also report READY. **That is the difference between "nothing is happening" and "we cannot
+see", and nobody has resolved which.** It is outside the alerting scope and is being handled
+separately.
+
 **What is NOT done, and none of it is optional:**
 
 | | |
@@ -218,21 +246,34 @@ job exists. That is the difference between *"we will not email you about last mo
 month is not in the system"*. Both are defensible; they are different products, and the choice is
 yours.
 
-**3. Mailbox forwarding at launch — FLAGGED, AND I COULD NOT FRAME IT.** This was raised as a
-launch decision and I have not been able to establish what it refers to. Searching the alerting
-code, the alerting documents, the handoff and the acceptance notes returns nothing: every match
-for *forward* is unrelated — a watermark's forward edge, carrying an acknowledgement forward. The
-only mailbox-forwarding material in the repository is frontend mock data about Exchange
-auto-forwarding **rules**, which is a control HawkView reports on rather than anything about how
-HawkView's own mail is delivered.
+**3. Six detectors produce no email, and two of the six are not minor.** This was put to me as
+"mailbox forwarding at launch". I could not frame it from the alerting code, because it is not
+there — and having now been shown where it lives, **the decision is wider than the phrase.**
 
-**It is listed here unframed on purpose.** It is a real decision somebody is holding, and writing
-a plausible-sounding version of it would be worse than leaving the gap visible — a decision put
-to you in words nobody checked is how a caller-supplied category ends up in a key. **Whoever
-raised it should supply the sentence.**
+A risk rule becomes an alert type through the `investigationGuidanceCode` the catalogue declares.
+Two of the four codes map to no alert type, **deliberately** — so a finding under them produces
+no incident, no job and no email, and is reported as unmapped rather than defaulted. Verified by
+running the mapping rather than reading it:
 
-If it means what I would guess — that the MSP security inbox may be a distribution list or a
-forwarding address, so HawkView's alerts reach people nobody enumerated — then that is worth
-deciding, and it interacts with the body carrying no identity: **a closed vocabulary limits what
-we say, and says nothing about who ends up reading it.** But that is my guess and it is labelled
-as one.
+| rule | what it detects | why no email |
+|---|---|---|
+| `HV-ID-MBX-001.v1` | Mailbox forwarding outside verified domains requires review | `REVIEW_MAILBOX_RULE` |
+| `HV-ID-MBX-002.v1` | **Mailbox concealment rule requires investigation** | `REVIEW_MAILBOX_RULE` |
+| `HV-ID-MBX-003.v1` | Mailbox rule changed after suspicious authentication | `REVIEW_MAILBOX_RULE` |
+| `HV-ID-CHG-005.v1` | **Identity protection configuration was weakened** | `REVIEW_CONFIGURATION` |
+| `HV-ID-APP-001.v1` | New application declares high-impact permissions | `REVIEW_CONFIGURATION` |
+| `HV-ID-APP-002.v1` | Application credential metadata changed | `REVIEW_CONFIGURATION` |
+
+Eighteen rules do map. **The refusal is the correct engineering** — inventing a type for these is
+the shortcut that put a caller-supplied category into a key once already. **But "we detect it and
+we will not email you about it" is a product decision, not an engineering one**, and the two rows
+in bold are the reason it is yours: a concealment rule and a weakened identity-protection
+configuration are not routine findings to leave silent.
+
+The options are to add catalogue types for these codes, to ship deliberately silent and say so, or
+to ship with them surfaced somewhere other than email. **All three are defensible; only you can
+pick.**
+
+*(Separately, and not what was being asked: an MSP security inbox that is a distribution list or a
+forwarding address would send alerts to people nobody enumerated. That is a different concern from
+the one above, it is unexamined, and I raise it only so it is not lost.)*
