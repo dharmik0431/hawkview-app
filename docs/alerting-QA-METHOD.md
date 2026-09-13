@@ -335,3 +335,31 @@ wrong. When the implementer's argument is better, the register loses.
 **What to keep from it:** the concession has to be on the argument, not on authority. The test is
 whether you can state the implementer's reason better than they did. If you cannot, you have not
 understood it well enough to give way yet.
+
+### Registered, checked, found not to apply — which is different from not checked
+
+A register that quietly drops a check it could not run is indistinguishable from one that never
+had it. When a registered property turns out not to apply to the implementation that landed, say
+so **in those words**, with the reason.
+
+The instance: I registered three placements for a three-table atomicity test — a failure on the
+job insert, on the notification insert, and **in the reverse write order**. The third does not
+apply, because all three writes are one statement sequence inside one transaction, so there is no
+second order to test. **Registered, checked, found not to apply.** Written down, because six
+months from now "why is there no reverse-order test" has an answer, and the absence is a
+conclusion rather than an omission.
+
+### A finding's end state is a guard, not a document
+
+The best outcome for a QA result is not a paragraph describing the defect. It is **a test that
+rejects the shape**, living in the suite, run by everybody.
+
+My 25-round measurement — that a read-then-write cancel reports an already-taken job as stopped —
+became a test named *"THE READ-THEN-WRITE CANCEL REPORTS A TAKEN JOB AS STOPPED — the shape being
+rejected."* The measurement was evidence once; the test is evidence every time it runs.
+
+**And the same rule applies to your own hand-checks.** I established four store parities by hand
+and left them as findings. A hand-check done once is not a property that stays true — which was
+my own line about the store, and it applied to its own fix. Two of the four had no test until I
+wrote them, and the next refactor of that store would have been unguarded in exactly the way the
+last one was.
