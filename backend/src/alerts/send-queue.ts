@@ -147,10 +147,61 @@ export function backoffMs(attemptsMade: number, baseMs = 30_000, capMs = 900_000
 export interface ClaimStatement {
   readonly sql: string
   readonly params: readonly unknown[]
-  /** One if the claim succeeded, zero if another worker got there first. THE CALLER MUST READ
-   * THIS — a claim that returns zero rows is not an error, it is the other worker winning, and
-   * proceeding to send anyway is the duplicate this whole layer exists to prevent. */
+  /** One if the claim succeeded, zero if another worker got there first. */
   readonly expectedRowCount: 1
+}
+
+declare const CLAIMED: unique symbol
+
+/** PERMISSION TO SEND ONE MESSAGE ONCE. The only thing `beginAttempt` accepts.
+ *
+ * THIS REPLACES A COMMENT THAT SAID "THE CALLER MUST READ THE ROW COUNT". It must, and a
+ * comment is advice to somebody who has not written the caller yet — which is exactly the
+ * situation the `accept` trap was in when the obvious implementation walked into it.
+ *
+ * A claim returning zero rows is not an error. It is the other worker winning, and sending
+ * anyway is the duplicate this entire layer exists to prevent. So the row count is not
+ * something a caller may forget to check: **there is no way to reach a send without having
+ * produced one of these, and the only thing that produces one is a row count of exactly one.**
+ *
+ * Same move as the branded `ValidatedRun` in the apply, and for the same reason: abort-before-
+ * write becomes a property of the shape rather than a rule somebody has to remember in the
+ * right order. */
+export interface SendPermit {
+  readonly messageId: MessageId
+  readonly idempotencyKey: IdempotencyKey
+  /** Which attempt this is. Derived from the job rather than counted by the worker, because a
+   * worker-counted attempt number restarts with the worker — the same failure as the bound. */
+  readonly attemptNo: number
+  readonly [CLAIMED]: true
+}
+
+export type ClaimOutcome =
+  | Readonly<{ won: true; permit: SendPermit }>
+  /** NOT AN ERROR. Another worker holds it, and the correct response is to move on to the next
+   * job — which is why this carries no permit rather than carrying one with a flag. */
+  | Readonly<{ won: false; because: 'ANOTHER_WORKER_WON' }>
+
+/** Turn a row count into permission, or into a refusal.
+ *
+ * TAKES THE STATEMENT AS WELL AS THE COUNT so the comparison is against what the statement
+ * expected rather than against a literal 1 written at the call site. */
+export function claimOutcome(
+  statement: ClaimStatement,
+  rowsUpdated: number,
+  job: SendJob,
+): ClaimOutcome {
+  if (rowsUpdated !== statement.expectedRowCount) {
+    return { won: false, because: 'ANOTHER_WORKER_WON' }
+  }
+  return {
+    won: true,
+    permit: {
+      messageId: job.messageId,
+      idempotencyKey: job.idempotencyKey,
+      attemptNo: job.attemptsMade + 1,
+    } as unknown as SendPermit,
+  }
 }
 
 /** Claim a job for one worker, as ONE conditional UPDATE.
@@ -202,6 +253,24 @@ export interface Attempt {
   readonly attemptNo: number
   readonly startedAtIso: string
   readonly settled: Settled | null
+}
+
+/** Open an attempt. TAKES A PERMIT, WHICH IS THE WHOLE POINT.
+ *
+ * This is the row that must be written BEFORE the side effect, so it is also the narrowest
+ * place to stand between a caller and a send. A worker that ignored the claim’s row count has
+ * no permit, and therefore nothing to open an attempt with — the mistake is not discouraged,
+ * it is unavailable.
+ *
+ * The attempt number comes from the permit rather than from the caller, so two workers cannot
+ * both write attempt 1 and disagree with the job’s own count. */
+export function beginAttempt(permit: SendPermit, startedAtIso: string): Attempt {
+  return {
+    messageId: permit.messageId,
+    attemptNo: permit.attemptNo,
+    startedAtIso,
+    settled: null,
+  }
 }
 
 export type Settled =

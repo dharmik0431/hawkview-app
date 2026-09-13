@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  TERMINAL, accounting, afterAttempt, backoffMs, claimStatement, eligibility, inFlight,
+  TERMINAL, accounting, afterAttempt, backoffMs, beginAttempt, claimOutcome, claimStatement,
+  eligibility, inFlight,
   neverSent, sentMoreThanOnce, workerId,
-  type Attempt, type SendJob, type SendState, type Settled,
+  type Attempt, type SendJob, type SendPermit, type SendState, type Settled,
 } from './send-queue.js'
 import { idempotencyKey, messageId, providerMessageId } from './email-delivery.js'
 
@@ -236,4 +237,39 @@ test('THE STATE SET IS CLOSED, and every state is reachable or terminal', () => 
   assert.deepEqual([...TERMINAL].sort(), ['EXHAUSTED', 'GAVE_UP', 'SENT'])
   // Two of five are non-terminal, so a job always has somewhere to be while it is working.
   assert.equal(all.filter((state) => !TERMINAL.includes(state)).length, 2)
+})
+
+test('A SEND NEEDS A PERMIT, AND ONLY A ROW COUNT OF ONE MAKES ONE', () => {
+  // THIS REPLACED A COMMENT SAYING "THE CALLER MUST READ THE ROW COUNT". It must — a claim
+  // returning zero rows is the other worker winning, and sending anyway is the duplicate this
+  // whole layer exists to prevent — and a comment is advice to somebody who has not written the
+  // caller yet. That is exactly where the `accept` trap was when the obvious implementation
+  // walked into it.
+  const statement = claimStatement(messageId('m-1'), workerId('w-1'), T0, 60_000)
+
+  const lost = claimOutcome(statement, 0, job())
+  assert.equal(lost.won, false)
+  assert.equal(lost.won === false ? lost.because : null, 'ANOTHER_WORKER_WON')
+
+  const won = claimOutcome(statement, 1, job({ attemptsMade: 1 }))
+  assert.ok(won.won)
+  assert.equal(won.permit.messageId, 'm-1')
+  assert.equal(won.permit.attemptNo, 2, 'from the job, not counted by the worker')
+
+  // THE ATTEMPT COMES FROM THE PERMIT, so a worker that ignored the row count has nothing to
+  // open an attempt with.
+  const attempt = beginAttempt(won.permit, T0)
+  assert.equal(attempt.attemptNo, 2)
+  assert.equal(attempt.settled, null, 'open, because it is written before the send')
+
+  // AND A HAND-MADE PERMIT DOES NOT COMPILE. The mistake is unavailable rather than discouraged.
+  // @ts-expect-error - the brand cannot be written
+  const forged: SendPermit = { messageId: messageId('m-1'), idempotencyKey: idempotencyKey('k'), attemptNo: 1 }
+  // @ts-expect-error - and beginAttempt takes nothing else
+  const bypass = beginAttempt({ messageId: messageId('m-1'), idempotencyKey: idempotencyKey('k'), attemptNo: 1 }, T0)
+  assert.equal([forged, bypass].length, 2)
+
+  // NOT VACUOUS: a real permit does reach beginAttempt, so the two errors above are about the
+  // brand rather than about a type nobody can satisfy.
+  assert.equal(beginAttempt(won.permit, T0).messageId, 'm-1')
 })

@@ -95,6 +95,13 @@ async function withRiskTransaction<T>(deadlineAt: number, maximumMs: number, rea
     await client.query('COMMIT')
     if (retentionDeadline !== undefined && remaining() <= 0) throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE')
     return result
-  } catch { throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE') }
+    // THE CATCH-ALL CARRIES ITS CAUSE. Eleven guards above each say exactly what is wrong; this
+    // twelfth answered for every other cause with the same word, and diagnosing the integration
+    // suite therefore began by instrumenting all twelve sites to learn one thing the error
+    // already knew. Every failure was here, and the discarded cause said 'timeout expired'.
+    //
+    // The closed code is unchanged, so nothing that reads `error.message` sees anything new and
+    // no call site logs the cause today. It is attached for whoever is holding the debugger.
+  } catch (cause) { throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE', { cause }) }
   finally { try { await close() } finally { clearTimeout(deadline) } }
 }

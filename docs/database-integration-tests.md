@@ -37,6 +37,22 @@ set up risk at all.
 **`HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE` must be absent, not empty.** It is checked with
 `!== undefined`, so exporting it as `""` disables the global config.
 
+## GENERATE the pilot scope expiry, never copy it
+
+The pilot scope carries an `expiresAt` that must be **in the future and at most 7 days ahead**.
+
+**So a documented example value is wrong a week after it is written** — and wrong in a way that
+reads as a code fault rather than as a stale document, because what you get is a scope that will
+not activate rather than a message saying the date has passed.
+
+**Generate it. Do not copy one from anywhere, including from here:**
+
+```bash
+node -e "console.log(new Date(Date.now() + 6*864e5).toISOString())"
+```
+
+Six days rather than seven, so a slow afternoon does not cross the boundary.
+
 ## `TZ=UTC` is the documented trap, and it is real
 
 A non-UTC server fails eleven tests that have nothing to say about timezones. Set it in the
