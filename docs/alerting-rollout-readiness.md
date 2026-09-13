@@ -10,6 +10,37 @@ Intake reads findings, writes incidents, and queues send jobs. Nothing drains th
 provider client exists, and no email can leave. That is not a caveat on a sending feature — it is
 what the release *is*, and the acceptance checklist below cannot be completed until it changes.
 
+---
+
+## THE ONE DECISION THIS RELEASE NEEDS FROM YOU
+
+**Does `RECORD_ONLY` hide an alert inside HawkView, or only stop the email?**
+
+Everything else here is measured. This is not, and it cannot be settled by the code.
+
+**It has been ruled both ways, in good faith, and the two are not reconcilable by care:**
+
+| | what `RECORD_ONLY` does |
+|---|---|
+| **the intake pipeline**, as built | writes the incident **and** the in-app notification; withholds only the send job. *Off means not emailed, still visible in the product.* |
+| **the publish path**, as ruled | withholds the publish entirely. That path produces an in-app notification and **never an email**. *Off would mean not visible in the product.* |
+
+**Why it cannot be deferred by building it anyway.** Under the first reading, wiring the publish
+path to the setting **changes nothing at all** — there is no email to withhold, so the switch stays
+inert for exactly the five types it was meant to fix. Under the second, an MSP who silences a type
+**stops seeing it in HawkView entirely**, and the two halves of the product then disagree about
+what *off* means.
+
+**So the publish path is specified and deliberately not built.** It is a day's work once the
+question is answered; the full seam ruling is written down in `alerting-HANDOFF.md` so nobody
+re-derives it. What ships is two of seven types controllable, with **every settings row stating
+which it is** — derived from the wiring rather than asserted, so nobody is told a switch works
+when it does not.
+
+The missing half is reach, not truth.
+
+---
+
 **THE RELEASE IS NO LONGER BACKEND-ONLY. Four screens now carry this feature**, and everything
 below was written before that scope existed:
 
@@ -47,9 +78,15 @@ see*, and it is outside alerting scope.
 
 ## 1. The release commit
 
-**Branch `agent/alerts-step-01`.** The exact commit is the tip at the time of reading; the three
-that carry this work are named in `alerting-HANDOFF.md`'s status section, which moves with every
-commit that changes what is true about the product.
+**Branch `agent/alerts-step-01`, and the nominated commit is the tip of the LOCAL branch.**
+
+⚠ **IT IS NOT WHAT IS ON THE REMOTE.** `origin/agent/alerts-step-01` is three commits behind: the
+merge was pushed, and the three commits after it — the addenda, the unknown-type count, and this
+cut — exist only locally. **Anybody reading the remote is reading a document without the screens
+section and without the decision above.** Nothing has been pushed by me; the release hold stands.
+
+The commits that carry this work are named in `alerting-HANDOFF.md`'s status section, which moves
+with every commit that changes what is true about the product.
 
 **Nothing is pushed, merged or deployed.** The release hold is active and this document does not
 ask for it to be lifted. `git log origin/main..HEAD` is the honest description of what would
