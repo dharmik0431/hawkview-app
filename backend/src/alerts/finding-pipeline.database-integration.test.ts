@@ -84,38 +84,61 @@ const storeFor = (client: pg.Client): PipelineStore => ({
     }
     return { byOrganizationAndRule, anyRecipientByOrganization }
   },
-  async writeIncidents(writes: readonly IncidentWrite[]) {
-    let written = 0
-    for (const each of writes) {
-      const { rowCount } = await client.query(
-        `INSERT INTO alert_incidents
-           (id, organization_id, incident_key, alert_type_id, ownership, "condition", investigation,
-            ownership_at, condition_at, investigation_at, updated_at)
-         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7::timestamptz, $7::timestamptz, $7::timestamptz, now())
-         ON CONFLICT (organization_id, incident_key) DO NOTHING`,
-        [each.organizationId, each.incidentKey, each.alertTypeId, each.ownership, each.condition,
-          each.investigation, each.atIso])
-      written += rowCount ?? 0
+  // ONE TRANSACTION, BOTH WRITES. Two calls with a budget check between them left an incident
+  // with no job, which the next run skips as INCIDENT_ALREADY_OPEN — permanently silent. A
+  // crash between them does the same, and no logic inside runIntake could catch that one.
+  async commit(incidents: readonly IncidentWrite[], jobs: readonly SendJobWrite[]) {
+    let incidentsWritten = 0
+    let jobsWritten = 0
+    await client.query('BEGIN')
+    try {
+      for (const each of incidents) {
+        const { rowCount } = await client.query(
+          `INSERT INTO alert_incidents
+             (id, organization_id, incident_key, alert_type_id, ownership, "condition", investigation,
+              ownership_at, condition_at, investigation_at, updated_at)
+           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7::timestamptz, $7::timestamptz, $7::timestamptz, now())
+           ON CONFLICT (organization_id, incident_key) DO NOTHING`,
+          [each.organizationId, each.incidentKey, each.alertTypeId, each.ownership, each.condition,
+            each.investigation, each.atIso])
+        incidentsWritten += rowCount ?? 0
+      }
+      for (const each of jobs) {
+        const { rowCount } = await client.query(
+          `INSERT INTO alert_send_jobs
+             (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at, updated_at)
+           VALUES (gen_random_uuid(), $1, $2, 'READY', 0, $3, $4::timestamptz, now())
+           ON CONFLICT (message_id) DO NOTHING`,
+          [each.messageId, each.idempotencyKey, each.maxAttempts, each.notBeforeIso])
+        jobsWritten += rowCount ?? 0
+      }
+      await client.query('COMMIT')
+    } catch (cause) {
+      await client.query('ROLLBACK')
+      throw cause
     }
-    return written
-  },
-  async writeJobs(writes: readonly SendJobWrite[]) {
-    let written = 0
-    for (const each of writes) {
-      const { rowCount } = await client.query(
-        `INSERT INTO alert_send_jobs
-           (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at, updated_at)
-         VALUES (gen_random_uuid(), $1, $2, 'READY', 0, $3, $4::timestamptz, now())
-         ON CONFLICT (message_id) DO NOTHING`,
-        [each.messageId, each.idempotencyKey, each.maxAttempts, each.notBeforeIso])
-      written += rowCount ?? 0
-    }
-    return written
+    return { incidentsWritten, jobsWritten }
   },
 })
 
 /** The finding's real foreign-key chain. Inserted rather than mocked, because the point of this
  * test is that a row which the production evaluator could have written flows through. */
+/** EVERYTHING THIS TEST NEEDS, CREATED BY THIS TEST.
+ *
+ * It previously depended on an organisation and a customer tenant that happened to be in the
+ * database because somebody had inserted them by hand. On a freshly migrated one it failed on a
+ * foreign key — so "proven against a real database" meant proven against a database that already
+ * had the right rows. A test that depends on ambient state is testing the machine it ran on. */
+async function scaffold(client: pg.Client) {
+  await client.query(
+    `INSERT INTO organizations (id, name, slug, created_at, updated_at)
+     VALUES ($1, 'Probe', 'probe', now(), now()) ON CONFLICT (id) DO NOTHING`, [ORG])
+  await client.query(
+    `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, display_name, created_at, updated_at)
+     VALUES ($1, $2, '99999999-9999-9999-9999-999999999999', 'Probe Tenant', now(), now())
+     ON CONFLICT (id) DO NOTHING`, [TENANT, ORG])
+}
+
 async function seed(client: pg.Client, over: Partial<{ ruleId: string; observedAt: string; id: string; subject: string }> = {}) {
   const runId = '33333333-3333-3333-3333-333333333333'
   const matchedId = '44444444-4444-4444-4444-444444444444'
@@ -144,6 +167,7 @@ test('A PERSISTED FINDING REACHES A SEND JOB', { skip: !RUN || !URL }, async () 
   const client = new pg.Client({ connectionString: URL })
   await client.connect()
   try {
+    await scaffold(client)
     await client.query('TRUNCATE alert_send_jobs, alert_incidents, alert_rule_dispositions CASCADE')
     await client.query('DELETE FROM identity_risk_findings')
     // One operator who has email on. The two grains meeting: the organisation will decide the
@@ -189,6 +213,7 @@ test('NO HISTORICAL SENDS, against the real table', { skip: !RUN || !URL }, asyn
   const client = new pg.Client({ connectionString: URL })
   await client.connect()
   try {
+    await scaffold(client)
     await client.query('TRUNCATE alert_send_jobs, alert_incidents CASCADE')
     await client.query('DELETE FROM identity_risk_findings')
     await seed(client, { observedAt: OLD, id: '66666666-6666-6666-6666-666666666666' })
@@ -211,12 +236,94 @@ test('INTAKE YIELDS RATHER THAN BORROWING FROM THE COLLECTORS', { skip: !RUN || 
   const client = new pg.Client({ connectionString: URL })
   await client.connect()
   try {
+    await scaffold(client)
     await client.query('TRUNCATE alert_send_jobs, alert_incidents CASCADE')
     const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() - 1, '2026-01-01T00:00:00.000Z')
 
     assert.equal(report.yieldedOnBudget, true)
     assert.equal(report.findingsRead, 0, 'it did not even read')
     assert.equal((await client.query('SELECT count(*) FROM alert_incidents')).rows[0].count, '0')
+  } finally {
+    await client.end()
+  }
+})
+
+test('A BUDGET YIELD LEAVES NO HALF-DONE WORK, and the next run completes it', { skip: !RUN || !URL }, async () => {
+  // THE LAUNCH BLOCKER. Two writes with a budget check between them left an incident with no
+  // job; the next run skipped the finding as INCIDENT_ALREADY_OPEN and the email was never sent
+  // — silently, because `neverSent` reports jobs that stopped and this alert never had one.
+  //
+  // Measured before the fix: yield gave 1 incident / 0 jobs, and a healthy run after it added
+  // nothing. The database sat there forever.
+  //
+  // Not a rare crash path: the designed cascade behaviour, firing when the system is busiest.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents CASCADE')
+    await client.query('DELETE FROM identity_risk_findings')
+    await seed(client, { id: '88888888-8888-8888-8888-888888888888' })
+
+    // THE CLOCK RUNS OUT DURING THE RUN, WHICH IS THE ONLY WAY TO REACH THIS PATH.
+    //
+    // The first version of this test passed a deadline already in the past — and it PASSED
+    // against the reinstated bug, because `runIntake` exits at its very first budget check and
+    // never reaches the write phase at all. It asserted the right thing about a path it never
+    // executed: a test that had never disagreed with anybody.
+    //
+    // Found by mutation: putting the strand back left it green. The injected clock is the
+    // reason the `now` parameter exists, and not using it made the parameter decorative.
+    const deadlineAt = Date.now() + 30_000
+    let ticks = 0
+    // Healthy for the reads and the decision; expired by the pre-write check, which is the
+    // fourth call. Anything later and the writes have already happened.
+    const runningOut = () => (++ticks >= 4 ? deadlineAt + 1 : Date.now())
+    const yielded = await runIntake(
+      storeFor(client), WATERMARK, T0, deadlineAt, '2026-01-01T00:00:00.000Z', runningOut)
+    assert.ok(ticks >= 4, 'the run must have reached the pre-write check, or this tests nothing')
+    assert.equal(yielded.yieldedOnBudget, true)
+    assert.equal(yielded.incidentsWritten, 0, 'NOT 1 — a yield gives up work, it does not half-do it')
+    assert.equal(yielded.jobsWritten, 0)
+    assert.equal(yielded.findingsRead, 1, 'and it did read, so the yield is at the write phase')
+    assert.equal((await client.query('SELECT count(*) FROM alert_incidents')).rows[0].count, '0',
+      'no incident, so nothing for the next run to skip over')
+
+    // AND THE NEXT RUN COMPLETES IT, along the ordinary path rather than a recovery path.
+    const healthy = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    assert.equal(healthy.incidentsWritten, 1)
+    assert.equal(healthy.jobsWritten, 1, 'the alert is sent, which is what the strand prevented')
+    assert.equal((await client.query('SELECT count(*) FROM alert_send_jobs')).rows[0].count, '1')
+  } finally {
+    await client.end()
+  }
+})
+
+test('AN UNMAPPED RULE PRODUCES NOTHING AND IS STILL ACCOUNTED FOR', { skip: !RUN || !URL }, async () => {
+  // The negative control the earlier search could not reach: an invented rule id is refused by
+  // the database, but HV-ID-MBX-001.v1 is a REAL rule the constraint permits and whose kind
+  // (REVIEW_MAILBOX_RULE) has no catalogue type on purpose.
+  //
+  // This is the every-finding-appears-exactly-once invariant meeting the case it was written
+  // for: the finding must be named as skipped rather than simply vanishing.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents CASCADE')
+    await client.query('DELETE FROM identity_risk_findings')
+    await seed(client, { ruleId: 'HV-ID-MBX-001.v1', id: '99999999-9999-9999-9999-999999999999' })
+
+    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+
+    assert.equal(report.findingsRead, 1)
+    assert.equal(report.incidentsWritten, 0, 'no incident, because it cannot be typed')
+    assert.equal(report.jobsWritten, 0)
+    assert.deepEqual(report.unmappedRules, ['HV-ID-MBX-001.v1'],
+      'named, so somebody can decide — a count of skipped findings would not say which rule')
+    assert.equal(report.skipped.length, 1)
+    assert.equal(report.skipped[0]?.because, 'NO_ALERT_TYPE')
+    assert.deepEqual(report.accountingProblems, [], 'and it did not vanish')
   } finally {
     await client.end()
   }

@@ -290,8 +290,16 @@ export interface PipelineStore {
   findOpenFindings(sinceIso: string): Promise<readonly FindingRow[]>
   findExistingIncidents(organizationIds: readonly string[]): Promise<readonly ExistingIncident[]>
   loadDispositions(organizationIds: readonly string[]): Promise<Dispositions>
-  writeIncidents(writes: readonly IncidentWrite[]): Promise<number>
-  writeJobs(writes: readonly SendJobWrite[]): Promise<number>
+  /** BOTH WRITES OR NEITHER, IN ONE TRANSACTION. They were two calls, and a budget yield
+   * between them left an incident with no job — which the next run skips as
+   * `INCIDENT_ALREADY_OPEN`, so the alert is never sent and nothing reports it. `neverSent`
+   * covers jobs that exist, and this incident has none.
+   *
+   * A crash between the two writes strands an alert identically, and no logic inside
+   * `runIntake` can catch that one. The seam had to change; a recovery path could not have
+   * fixed it. */
+  commit(incidents: readonly IncidentWrite[], jobs: readonly SendJobWrite[]):
+    Promise<Readonly<{ incidentsWritten: number; jobsWritten: number }>>
 }
 
 export interface IntakeReport {
@@ -338,17 +346,34 @@ export async function runIntake(
   if (now() >= deadlineAt) return empty(true, findings.length)
 
   const decision = decide(findings, existing, dispositions, watermark, tickAtIso)
-  const incidentsWritten = await store.writeIncidents(decision.incidents)
-  // CHECKED BETWEEN THE TWO WRITES, so a yield here leaves incidents recorded and no job — the
-  // safe direction. The opposite order would leave a job for an incident nobody can look up.
+  // THE BUDGET IS CHECKED HERE, BEFORE THE WRITE PHASE, AND NOT AGAIN INSIDE IT.
+  //
+  // WHAT THIS LINE USED TO SAY, AND WHY IT WAS WRONG. There were two writes with a check
+  // between them, and the comment called yielding there "the safe direction" because it left
+  // incidents recorded and no job. **It was the permanently silent direction.** An incident
+  // with no job is skipped by the next run as `INCIDENT_ALREADY_OPEN`, so the email is never
+  // sent — and nothing reports it, because `neverSent` reports jobs that stopped and this
+  // alert never had one. Measured: yield gives 1 incident / 0 jobs, the next healthy run adds
+  // nothing, and the database sits there forever.
+  //
+  // It is not a rare crash path. It is the designed cascade behaviour firing exactly when the
+  // system is busiest, which is when an alert matters most.
+  //
+  // A YIELD MAY GIVE UP WORK; IT MAY NEVER LEAVE WORK HALF DONE. Yielding here leaves the
+  // finding untouched and still OPEN, so the next run redoes it from the top along a path that
+  // is already proven — rather than a recovery path that would have to reconstruct intent it
+  // never recorded. And it could not: FOUR paths produce "incident open, no job", and three of
+  // them withhold the job ON PURPOSE. A recovery that could not tell them apart would deliver
+  // every incident the watermark silenced.
   if (now() >= deadlineAt) {
     return {
-      findingsRead: findings.length, incidentsWritten, jobsWritten: 0,
+      findingsRead: findings.length, incidentsWritten: 0, jobsWritten: 0,
       skipped: decision.skipped, unmappedRules: decision.unmappedRules,
       accountingProblems: decision.accountingProblems, yieldedOnBudget: true,
     }
   }
-  const jobsWritten = await store.writeJobs(decision.jobs)
+
+  const { incidentsWritten, jobsWritten } = await store.commit(decision.incidents, decision.jobs)
 
   return {
     findingsRead: findings.length,
