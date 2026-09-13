@@ -203,14 +203,29 @@ export type NotificationTier =
   | Readonly<{ kind: 'NOT_AN_ALERT' }>
   | Readonly<{ kind: 'UNKNOWN_ALERT_TYPE'; alertTypeId: string }>
 
-export function alertTierFor(alertTypeId: string | null | undefined): NotificationTier {
+export function alertTierFor(
+  alertTypeId: string | null | undefined,
+  storedSeverity: string,
+): NotificationTier {
   if (alertTypeId === null || alertTypeId === undefined || alertTypeId === '') {
     return { kind: 'NOT_AN_ALERT' }
   }
-  const declared = ALERT_CATALOG.find((type) => type.id === alertTypeId)
-  return declared === undefined
+  if (!ALERT_CATALOG.some((type) => type.id === alertTypeId)) {
+    return { kind: 'UNKNOWN_ALERT_TYPE', alertTypeId }
+  }
+  // **FROM THE ROW, NOT FROM THE CATALOGUE, AND THAT IS THE WHOLE CORRECTION.** This read the
+  // catalogue's declared severity — so once the EFFECTIVE tier began owning the row's severity,
+  // the DTO carried two fields disagreeing about one fact: an MSP who set ACT_TODAY got
+  // `severity: 'high'` beside `tier: ACT_NOW`. The derivation was correct and something
+  // downstream re-answered the question.
+  //
+  // The row's severity and its tier are written from ONE value in ONE write, so reading the tier
+  // back out of the severity cannot disagree with it. Lossless because the tone map gives the
+  // three tiers three distinct severities, which is asserted below rather than assumed.
+  const tier = TIER_BY_SEVERITY.get(storedSeverity)
+  return tier === undefined
     ? { kind: 'UNKNOWN_ALERT_TYPE', alertTypeId }
-    : { kind: 'TIER', tier: declared.severity }
+    : { kind: 'TIER', tier }
 }
 
 /** A notification row — the thing that makes an incident visible IN THE PRODUCT.
@@ -279,6 +294,19 @@ const NOTIFICATION_TONE: Readonly<Record<Severity, {
   ACT_NOW: { category: 'error', severity: 'critical' },
   ACT_TODAY: { category: 'warning', severity: 'high' },
   RECORD_ONLY: { category: 'info', severity: 'info' },
+}
+
+/** The tone table, inverted. Built from it rather than restated, so the two cannot drift. */
+const TIER_BY_SEVERITY: ReadonlyMap<string, Severity> = new Map(
+  (Object.keys(NOTIFICATION_TONE) as Severity[]).map(
+    (tier) => [NOTIFICATION_TONE[tier].severity, tier]))
+
+// IF TWO TIERS EVER RENDER AS ONE SEVERITY, THE INVERSION ABOVE SILENTLY LOSES ONE OF THEM — the
+// map would hold whichever came last and a real tier would read back as another. A runtime check
+// at module load rather than a comment, because the failure is invisible at the call site.
+if (TIER_BY_SEVERITY.size !== Object.keys(NOTIFICATION_TONE).length) {
+  throw new Error(
+    'NOTIFICATION_TONE maps two tiers to one severity, so a tier cannot be recovered from a row.')
 }
 
 /** The notification for one finding, or null when the type is not in the catalogue.

@@ -5,6 +5,7 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import type { PrismaService } from '../prisma/prisma.service.js'
+import { ALERT_CATALOG } from './alert-catalog.js'
 import { alertTierFor, runIntake, type PipelineStore, type Watermark } from './finding-pipeline.js'
 import { pipelineStore, type SqlRunner } from './pipeline-store.js'
 
@@ -216,7 +217,7 @@ test('AN INCIDENT IS VISIBLE IN THE PRODUCT, asked of the reader rather than the
     // anybody edits one. `severity` is set as well because the reader's filter matches on it,
     // and this asserts the RELATIONSHIP between them rather than two remembered constants.
     assert.equal(keyed.rows[0].alert_type_id, 'security.suspected_credential_attack')
-    const tier = alertTierFor(keyed.rows[0].alert_type_id)
+    const tier = alertTierFor(keyed.rows[0].alert_type_id, keyed.rows[0].severity)
     assert.equal(tier.kind === 'TIER' ? tier.tier : null, 'ACT_NOW')
     assert.equal(keyed.rows[0].severity, 'critical', 'the rendering agrees with the fact')
 
@@ -232,7 +233,7 @@ test('AN INCIDENT IS VISIBLE IN THE PRODUCT, asked of the reader rather than the
     const collector = await client.query(
       "SELECT alert_type_id FROM notifications WHERE dedupe_key = 'tenant:probe:sync:mailbox'")
     assert.equal(collector.rows[0].alert_type_id, null)
-    assert.deepEqual(alertTierFor(collector.rows[0].alert_type_id), { kind: 'NOT_AN_ALERT' })
+    assert.deepEqual(alertTierFor(collector.rows[0].alert_type_id, 'critical'), { kind: 'NOT_AN_ALERT' })
     const incidents = await client.query('SELECT incident_key FROM alert_incidents')
     assert.equal(keyed.rows[0].incident_key, incidents.rows[0].incident_key,
       'the notification and the incident share a key — the projection is not empty')
@@ -368,6 +369,48 @@ test('THE TIER REACHES THE WIRE, and a collector row carries none', { skip: !RUN
     const unreadable = again.items.find((item) => item.eventType === 'tenant.connection.lost')
     assert.deepEqual(unreadable?.tier,
       { kind: 'UNKNOWN_ALERT_TYPE', alertTypeId: 'security.invented' })
+  } finally {
+    await prisma.$disconnect()
+    await client.end()
+  }
+})
+
+test('THE DTO CANNOT DISAGREE WITH ITSELF ABOUT THE TIER', { skip: !RUN || !URL }, async () => {
+  // **THE DEFECT THIS CLOSES WAS MINE, AND IT ARRIVED IN THE COMMIT THAT MADE THE SETTING WORK.**
+  // The row's severity began coming from the EFFECTIVE tier while the DTO's `tier` was still
+  // derived from the CATALOGUE — so an MSP who set ACT_TODAY got `severity: 'high'` beside
+  // `tier: ACT_NOW`. Two fields, one fact, disagreeing. The derivation was right and something
+  // downstream re-answered the question.
+  const client = new pg.Client({ connectionString: URL })
+  const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: URL }) })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents, alert_rule_dispositions CASCADE')
+    await client.query('DELETE FROM notifications')
+    await client.query('DELETE FROM identity_risk_findings')
+
+    // The MSP departs from the catalogue: this type is ACT_NOW there, ACT_TODAY here.
+    await client.query(
+      `INSERT INTO alert_rule_dispositions (id, organization_id, alert_type_id, disposition, updated_at)
+       VALUES (gen_random_uuid(), $1, 'security.suspected_credential_attack', 'ACT_TODAY', now())`,
+      [ORG])
+    await seedFinding(client, '55555555-5555-5555-5555-555555555555')
+    await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+
+    const list = await readerFor(prisma).list(
+      { subject: SUBJECT, email: 'in-app-probe@an-msp.example' })
+    const item = list.items.find((each) => each.eventType === 'security.suspected_credential_attack')
+    assert.ok(item !== undefined)
+
+    // THE SETTING TOOK EFFECT, in both fields, and they agree.
+    assert.equal(item.severity, 'high', 'not critical — the MSP lowered it')
+    assert.deepEqual(item.tier, { kind: 'TIER', tier: 'ACT_TODAY' },
+      'and the badge says the same thing the severity does')
+
+    // AND THE CATALOGUE STILL SAYS ACT_NOW, so this is not the two happening to coincide.
+    const declared = ALERT_CATALOG.find((type) => type.id === 'security.suspected_credential_attack')
+    assert.equal(declared?.severity, 'ACT_NOW')
   } finally {
     await prisma.$disconnect()
     await client.end()

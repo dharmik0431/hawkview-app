@@ -221,7 +221,7 @@ export class NotificationsService {
        * THREE ARMS, AND THE OBJECT SHAPE IS DELIBERATE. A bare nullable string would collapse
        * `NOT_AN_ALERT` — a collector row that genuinely has no tier — into
        * `UNKNOWN_ALERT_TYPE`, which is a fact about the data somebody should look at. */
-      tier: alertTierFor(row.alertTypeId),
+      tier: alertTierFor(row.alertTypeId, row.severity),
       title: row.title,
       description: row.description,
       timestamp: row.lastOccurredAt.toISOString(),

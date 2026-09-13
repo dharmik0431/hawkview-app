@@ -22,6 +22,11 @@ const WATERMARK: Watermark = {
   because: 'the instant the pipeline was first switched on',
 }
 
+/** The severity a row carries for a given tier, so these tests read the row the way the DTO
+ * does rather than restating the tone table. */
+const severityOf = (tier: string) =>
+  tier === 'ACT_NOW' ? 'critical' : tier === 'ACT_TODAY' ? 'high' : 'info'
+
 const finding = (over: Partial<FindingRow> = {}): FindingRow => ({
   id: 'f-1',
   organizationId: ORG,
@@ -211,9 +216,10 @@ test('THE TIER IS DERIVED FROM THE ALERT TYPE, and absence is not RECORD_ONLY', 
   // ALL THREE TIERS, not one plus two edge cases. A mutation sweep elsewhere deleted RECORD_ONLY
   // from an accepted set and killed nothing, because the tests had covered one tier and two
   // edges — so the tier that means "off" was the one nobody checked.
-  assert.deepEqual(alertTierFor('security.suspected_credential_attack'), { kind: 'TIER', tier: 'ACT_NOW' })
+  assert.deepEqual(alertTierFor('security.suspected_credential_attack', 'critical'),
+    { kind: 'TIER', tier: 'ACT_NOW' })
 
-  const tiers = new Set(ALERT_CATALOG.map((type) => alertTierFor(type.id))
+  const tiers = new Set(ALERT_CATALOG.map((type) => alertTierFor(type.id, severityOf(type.severity)))
     .flatMap((answer) => (answer.kind === 'TIER' ? [answer.tier] : [])))
   assert.ok(tiers.has('ACT_NOW'), 'ACT_NOW is reachable from the catalogue')
   assert.ok(tiers.has('ACT_TODAY'), 'and so is ACT_TODAY')
@@ -221,7 +227,8 @@ test('THE TIER IS DERIVED FROM THE ALERT TYPE, and absence is not RECORD_ONLY', 
 
   // EVERY DECLARED TYPE RESOLVES, so the derivation is not covered by an author-chosen example.
   for (const type of ALERT_CATALOG) {
-    assert.equal(alertTierFor(type.id).kind, 'TIER', `${type.id} has no tier`)
+    assert.equal(alertTierFor(type.id, severityOf(type.severity)).kind, 'TIER',
+      `${type.id} has no tier`)
   }
 })
 
@@ -230,22 +237,22 @@ test('A ROW THAT DID NOT SAY IS NOT A ROW THAT SAID RECORD_ONLY', () => {
   // alert type, and rendering them as RECORD_ONLY would make a silenced alert type and an
   // unconfigured one look identical. RECORD_ONLY is a decision somebody made; null is the
   // absence of one, and the two have different remedies.
-  assert.deepEqual(alertTierFor(null), { kind: 'NOT_AN_ALERT' })
-  assert.deepEqual(alertTierFor(undefined), { kind: 'NOT_AN_ALERT' })
-  assert.deepEqual(alertTierFor(''), { kind: 'NOT_AN_ALERT' })
+  assert.deepEqual(alertTierFor(null, 'high'), { kind: 'NOT_AN_ALERT' })
+  assert.deepEqual(alertTierFor(undefined, 'high'), { kind: 'NOT_AN_ALERT' })
+  assert.deepEqual(alertTierFor('', 'high'), { kind: 'NOT_AN_ALERT' })
 
   // AND THEY ARE DISTINGUISHABLE IN THE TYPE, not merely by convention — there is no value of
   // `NotificationTier` that is both.
   const recordOnly = ALERT_CATALOG.find((type) => type.severity === 'RECORD_ONLY')
   assert.ok(recordOnly !== undefined, 'the catalogue has a RECORD_ONLY type to compare against')
-  assert.notDeepEqual(alertTierFor(recordOnly.id), alertTierFor(null))
+  assert.notDeepEqual(alertTierFor(recordOnly.id, 'info'), alertTierFor(null, 'info'))
 })
 
 test('AN UNRECOGNISED ALERT TYPE IS REPORTED, NEVER DEFAULTED', () => {
   // A stored id the catalogue does not contain is a fact about the data. Defaulting it to a tier
   // is how a setting somebody made gets silently ignored — the same failure the disposition
   // column has, where a value outside the vocabulary must be reported rather than replaced.
-  const answer = alertTierFor('security.invented_by_a_typo')
+  const answer = alertTierFor('security.invented_by_a_typo', 'critical')
   assert.equal(answer.kind, 'UNKNOWN_ALERT_TYPE')
   assert.equal(answer.kind === 'UNKNOWN_ALERT_TYPE' ? answer.alertTypeId : null,
     'security.invented_by_a_typo', 'and it names the value, so somebody can go and look')
@@ -259,7 +266,7 @@ test('THE NOTIFICATION CARRIES THE ALERT TYPE, and its severity is derived from 
 
   // THE RENDERINGS AGREE WITH IT BY CONSTRUCTION, because they are computed from it rather than
   // chosen alongside it. This asserts the relationship, not two remembered constants.
-  const tier = alertTierFor(written.alertTypeId)
+  const tier = alertTierFor(written.alertTypeId, written.severity)
   assert.equal(tier.kind, 'TIER')
   assert.equal(tier.kind === 'TIER' ? tier.tier : null, 'ACT_NOW')
   assert.equal(written.severity, 'critical', 'ACT_NOW renders critical, which is always shown')
