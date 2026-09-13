@@ -1,15 +1,42 @@
 export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
 
 /**
- * How urgently an alert-backed notification needs somebody, in the vocabulary
- * the alerting catalogue already uses.
+ * The severity a notification row actually arrives with.
  *
- * Optional because most notifications are not alerts, and because the backend
- * write that carries it is not landed. Absent means "this row did not say",
- * which is not the same as RECORD_ONLY -- a row with no severity is not a
- * declaration that nothing is urgent.
+ * THIS IS THE WIRE'S VOCABULARY, NOT THE CATALOGUE'S. An earlier version of this
+ * type was `ACT_NOW | ACT_TODAY | RECORD_ONLY` -- the alerting catalogue's
+ * tiers -- written while the backend notification write was assumed not to be
+ * landed. It was landed. `finding-pipeline.ts` translates the tier into this
+ * vocabulary on the way in (`ACT_NOW -> critical`, `ACT_TODAY -> high`,
+ * `RECORD_ONLY -> info`) and `notifications.service.ts` passes
+ * `row.severity` straight through. So every alert-backed row arrived as
+ * `critical`, `high` or `info`, matched none of the three tiers, and was
+ * dropped here -- visible in no badge, which is indistinguishable from alerting
+ * not working. The backend's own comment warns against exactly this, about a
+ * second producer; it arrived from the reader instead.
+ *
+ * THE TIER IS NOT ON THE WIRE AND IS NOT REBUILT HERE. `severity` cannot be
+ * inverted back into a tier: `tenant-sync.service.ts` publishes collector rows
+ * at `critical` too (a lost Microsoft connection), so `critical -> ACT_NOW`
+ * would label a disconnected tenant an ACT_NOW alert. The only honest
+ * discriminator is the alert type id, and the list response does not send one --
+ * `eventType` holds it for alert rows, but reading the tier out of it needs a
+ * copy of the catalogue on the client, which is the same derivation twice with a
+ * network hop in between. Until the API sends the tier, this renders what it
+ * sends.
+ *
+ * Optional because most notifications say nothing about urgency, and absent
+ * means "this row did not say" rather than "nothing is urgent".
  */
-export type NotificationSeverity = 'ACT_NOW' | 'ACT_TODAY' | 'RECORD_ONLY'
+export const NOTIFICATION_SEVERITIES = [
+  'info',
+  'low',
+  'medium',
+  'high',
+  'critical',
+] as const
+
+export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number]
 
 export interface NotificationItem {
   id: string
@@ -80,15 +107,16 @@ function parseNotificationItem(value: unknown): NotificationItem | null {
   const resolved =
     typeof value.resolved === 'boolean' ? value.resolved : undefined
   // A severity this build does not recognise is dropped rather than guessed.
-  // Rendering an unknown tier as the mildest one would be the reassuring
-  // direction of the same error the inbox already made.
+  // Rendering an unknown severity as the mildest one would be the reassuring
+  // direction of the same error the inbox already made. Checked against the list
+  // the backend declares, so a value added there fails a test here rather than
+  // disappearing from the screen.
   const alertTypeId = optionalString(value.alertTypeId)
-  const severity =
-    value.severity === 'ACT_NOW' ||
-    value.severity === 'ACT_TODAY' ||
-    value.severity === 'RECORD_ONLY'
-      ? (value.severity as NotificationSeverity)
-      : undefined
+  const severity = (NOTIFICATION_SEVERITIES as readonly string[]).includes(
+    value.severity as string
+  )
+    ? (value.severity as NotificationSeverity)
+    : undefined
 
   return {
     id,
