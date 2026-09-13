@@ -157,13 +157,31 @@ export type Authentication = 'AUTHENTIC' | 'SIGNATURE_MISSING' | 'SIGNATURE_INVA
  * AN UNAUTHENTICATED WEBHOOK ENDPOINT THAT UPDATES DELIVERY STATE IS AN ENDPOINT ANYBODY CAN
  * USE TO MARK OUR MESSAGES DELIVERED. QA flagged authenticity as unpinnable — they cannot tell
  * a forged event from a real one — so it is pinned from the other side: `record` accepts only
- * this type, and a forged event has no path to producing one. */
+ * this type, and a forged event has no path to producing one.
+ *
+ * THE BRAND IS A `unique symbol`, AND THE FIRST VERSION OF THIS WAS A LIE. It was
+ * `readonly __authentic: true` — an ordinary structural field — while five other types in this
+ * same file used `unique symbol`. So the ONE type whose entire purpose is authenticity was the
+ * one anybody could hand-write, and the comment above claiming otherwise was false. A forged
+ * event literal compiled clean.
+ *
+ * Nothing was exploitable, because no webhook handler exists yet — WHICH IS EXACTLY WHY IT
+ * MATTERED. The handler would have been written against a comment promising the compiler
+ * enforced something it did not, and the result is an endpoint that marks our own messages
+ * DELIVERED on anybody’s say-so: a false record, of the silent kind, because a forged
+ * "delivered" looks like success.
+ *
+ * A FALSE CLAIM OF A SAFETY GUARANTEE IS A BLOCKER WHEN THE CLAIM IS LOAD-BEARING AND THE THING
+ * IT GUARDS HAS NOT BEEN BUILT YET — not because the code is wrong today, but because the next
+ * person builds on the claim instead of checking it. */
+declare const AUTHENTIC: unique symbol
+
 export interface AuthenticEvent {
   readonly providerId: ProviderMessageId
   readonly kind: Outcome['kind']
   readonly atIso: string
   readonly bounce: BounceClass | null
-  readonly __authentic: true
+  readonly [AUTHENTIC]: true
 }
 
 /** An event that did not become an outcome, and why. NEVER DROPPED SILENTLY.
@@ -186,12 +204,14 @@ export function authenticate(raw: RawWebhook, verdict: Authentication): Received
   if (verdict !== 'AUTHENTIC') {
     return { authentic: false, rejected: { providerId: raw.providerId, atIso: raw.atIso, because: verdict } }
   }
+  // The cast is the only place the brand is applied, which is what makes this the only door.
+  // Written as `as unknown as` rather than a computed key, because a `declare const` symbol has
+  // no runtime value — building the object with `[AUTHENTIC]: true` throws at run time.
   return {
     authentic: true,
     event: {
       providerId: raw.providerId, kind: raw.kind, atIso: raw.atIso, bounce: raw.bounce,
-      __authentic: true,
-    },
+    } as unknown as AuthenticEvent,
   }
 }
 

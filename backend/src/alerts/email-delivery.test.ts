@@ -3,7 +3,8 @@ import test from 'node:test'
 import {
   EMPTY_LEDGER, accept, accounting, authenticate, digestId, idempotencyKey, messageId,
   operatorAddressOf, providerMessageId, record, unconfirmed,
-  type Acceptance, type Body, type Job, type Ledger, type OperatorAddress, type RawWebhook,
+  type Acceptance, type AuthenticEvent, type Body, type Job, type Ledger,
+  type OperatorAddress, type RawWebhook,
   type SendAttempt,
 } from './email-delivery.js'
 import { type VerifiedRecipient } from './routing-policy.js'
@@ -249,4 +250,46 @@ test('A JOB IS IN EXACTLY ONE STATE, and the union has no fourth reading', () =>
   assert.ok(job !== undefined && job.state === 'UNRESOLVED')
   assert.equal(job.unresolvedSinceIso, job.acceptedAtIso,
     'equal today, and separate fields because a re-opened job waits from then, not from the send')
+})
+
+test('A FORGED AuthenticEvent DOES NOT COMPILE - and the first version of this claim was false', () => {
+  // THE COMMENT SAID THE COMPILER ENFORCED THIS AND IT DID NOT. `AuthenticEvent` carried
+  // `readonly __authentic: true` — an ordinary structural field — while five other types in the
+  // same file used `unique symbol`. So the one type whose entire purpose is authenticity was
+  // the one anybody could hand-write, and a forged literal compiled clean.
+  //
+  // Nothing was exploitable, because no webhook handler exists yet, WHICH IS EXACTLY WHY IT
+  // MATTERED: the handler gets written against the comment rather than against the type, and
+  // what that produces is an endpoint marking our own messages DELIVERED on anybody's say-so.
+  //
+  // These negatives are the claim, made checkable. An unused `@ts-expect-error` is itself a
+  // compile error, so if the brand is ever weakened this file stops building.
+
+  const shape = {
+    providerId: providerMessageId('p-1'),
+    kind: 'DELIVERED' as const,
+    atIso: '2026-09-12T00:00:00.000Z',
+    bounce: null,
+  }
+
+  // 1. The old field name is no longer the brand — this is what used to compile.
+  // @ts-expect-error - '__authentic' is not the brand and cannot be written
+  const withOldField: AuthenticEvent = { ...shape, __authentic: true }
+
+  // 2. And omitting the brand does not work either, which is the stronger half: the first fix
+  //    for a bad brand is often a rename, and a rename alone would leave the type satisfiable.
+  // @ts-expect-error - the branded property is missing
+  const withoutBrand: AuthenticEvent = shape
+
+  // 3. `record` therefore cannot be reached with a hand-made event.
+  // @ts-expect-error - no forged event can be built to pass here
+  const forced = record(EMPTY_LEDGER, { authentic: true, event: { ...shape, __authentic: true } })
+
+  assert.equal([withOldField, withoutBrand, forced].length, 3)
+
+  // POSITIVE CONTROL, because three compile errors are also what you get from a type nobody can
+  // construct at all. `authenticate` still produces one, and it still resolves a job.
+  const genuine = authenticate(webhook(), 'AUTHENTIC')
+  assert.ok(genuine.authentic)
+  assert.equal(record(sent(), genuine).jobs[0]?.state, 'RESOLVED')
 })

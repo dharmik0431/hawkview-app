@@ -7,6 +7,18 @@ blocker, and written down so the judgement is reviewable and the item is not los
 is a blocker and it is in `alerting-launch-shape.md` instead. Everything below fails that test
 for a stated reason.
 
+**AND A SECOND TEST, added after it caught something the first one missed:**
+
+> **A false claim of a safety guarantee is a blocker when the claim is load-bearing and the
+> thing it guards has not been built yet** — not because the code is wrong today, but because
+> **the next person builds on the claim instead of checking it.**
+
+That rule exists because of `AuthenticEvent`. Its comment said the compiler made a forged
+webhook event unconstructible; the brand was an ordinary structural field and a forgery compiled
+clean. By the first test alone it was backlog — no handler existed, so nothing was exploitable.
+By this one it was a blocker, because the handler would have been written against the comment.
+Fixed, with the forgery pinned as three `@ts-expect-error` negatives.
+
 ---
 
 ## 1. The 319 rows awaiting the classifier
