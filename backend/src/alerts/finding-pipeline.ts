@@ -2,6 +2,12 @@ import { ALERT_CATALOG, type AlertTypeId } from './alert-catalog.js'
 import { OPENED } from './alert-lifecycle.js'
 import { incidentGrouping } from './alert-incident-key.js'
 import { defaultPreference } from './routing-policy.js'
+import { IDENTITY_RISK_RULE_CATALOG, type IdentityRiskRulePresentation, type IdentityRiskRuleId }
+  from '../identity-risk/identity-risk.catalog.js'
+
+/** The catalogue's own closed set of investigation kinds. Imported as a type rather than
+ * restated, so a fifth kind is a compile error here rather than a silent fall-through. */
+type GuidanceCode = IdentityRiskRulePresentation['investigationGuidanceCode']
 
 /**
  * THE WIRING. A persisted finding becomes an incident, and an incident becomes a send job.
@@ -70,44 +76,49 @@ export interface Dispositions {
 }
 
 // ---------------------------------------------------------------------------------------
-// THE RULE MAP, AND ITS HOLE, WHICH IS REPORTED RATHER THAN DEFAULTED
+// THE RULE MAP, DERIVED FROM WHAT THE CATALOGUE DECLARES
 // ---------------------------------------------------------------------------------------
 
-/** Which catalogue type a risk rule becomes.
+/** Which catalogue alert type a risk rule becomes.
  *
- * **THIS IS THE THIRD RULE NAMESPACE AND IT HAS NO DECLARED MAPPING.** Seven catalogue ids,
- * twenty-eight change rules, and `IdentityRiskFinding.ruleId`, which maps to nothing. It was on
- * the backlog with the note *"the moment routing is driven by findings, a finding whose rule id
- * maps to no alert type has no route, and the failure will be silence."*
+ * **DERIVED FROM `investigationGuidanceCode`, NOT FROM THE RULE ID.** Two earlier versions of
+ * this were wrong in two different ways, and both would have shipped:
  *
- * That moment is now, so the hole is a reported count rather than a default. A finding this
- * cannot type produces **no incident and no job**, and appears in `unmappedRules` — the same
- * answer step 03 gave a migration row it could not type, for the same reason: defaulting would
- * file a real credential attack as whatever the default happened to be.
+ * 1. It matched prefixes like `identity.credential`, a namespace no row can have — the real ids
+ *    are constrained to `HV-ID-{EXP,CHG,APP,MBX,AUTH}-NNN`. Every production finding would have
+ *    reported as unmappable. Found by the integration test refusing to seed.
+ * 2. It then matched the real three-letter families, and **guessed their meaning from the
+ *    letters**. `HV-ID-EXP-001.v1` is *"Privileged identity has an MFA enforcement gap"* — EXP
+ *    is EXPOSURE, not expiring — so an entire family would have routed as
+ *    `monitoring.consent_expiring`, which is a different thing entirely.
  *
- * THE REAL NAMESPACE, TAKEN FROM THE DATABASE RATHER THAN INVENTED. The first version matched
- * prefixes like `identity.credential`, which NO ROW CAN EVER HAVE:
- * `identity_risk_matched_rule_check` constrains rule ids to HV-ID- followed by one of EXP, CHG,
- * APP, MBX or AUTH, three digits and a version. Every production finding would
- * have been reported as unmappable, the pipeline would have produced zero jobs, and the only
- * clue would have been an `unmappedRules` list nobody had a reason to read.
+ * The second is the more instructive: it was consistent, total over the real vocabulary, and
+ * wrong. A three-letter abbreviation is not a specification.
  *
- * It was found by the integration test refusing to seed — the constraint is the authority and
- * the test is real enough to meet it. A fixture that mocked the row would have agreed with the
- * invented namespace and passed.
+ * SO IT READS THE FIELD THE CATALOGUE ACTUALLY DECLARES. Every rule carries exactly one
+ * `investigationGuidanceCode`, and the mapping is total over those FOUR values rather than over
+ * twenty-four rule ids — so **a twenty-fifth rule inherits its kind rather than falling through
+ * a gap nobody notices**, and the compiler demands a decision if a fifth code is ever added.
  *
- * APP AND MBX ARE DELIBERATELY ABSENT. Application and mailbox findings have no obvious
- * catalogue type, and picking one would be the defaulting this refuses everywhere else. They
- * report as unmapped until somebody decides. */
-const RULE_PREFIX_TO_TYPE: readonly (readonly [string, AlertTypeId])[] = [
-  ['HV-ID-AUTH-', 'security.suspected_credential_attack'],
-  ['HV-ID-CHG-', 'security.privileged_directory_change'],
-  ['HV-ID-EXP-', 'monitoring.consent_expiring'],
-]
+ * TWO OF THE FOUR ARE DELIBERATE REFUSALS. A configuration change is exactly the privileged-or-
+ * routine question the classifier exists to answer, and defaulting it here would file a real
+ * privileged change as whatever this file guessed — the same refusal step 03 makes. A mailbox
+ * rule has no catalogue type at all. Both report as unmapped. */
+const TYPE_FOR_GUIDANCE: Readonly<Record<GuidanceCode, AlertTypeId | null>> = {
+  REVIEW_ACTIVITY: 'security.suspected_credential_attack',
+  REVIEW_ACCESS: 'security.privileged_directory_change',
+  REVIEW_CONFIGURATION: null,
+  REVIEW_MAILBOX_RULE: null,
+}
 
+/** Null for a rule the catalogue does not declare, and for a declared rule whose kind has no
+ * alert type. Both are reported rather than defaulted; they differ only in what somebody has to
+ * do about it. */
 export function alertTypeForRule(ruleId: string): AlertTypeId | null {
-  const matched = RULE_PREFIX_TO_TYPE.find(([prefix]) => ruleId.startsWith(prefix))
-  return matched?.[1] ?? null
+  const declared = IDENTITY_RISK_RULE_CATALOG[ruleId as IdentityRiskRuleId] as
+    | { investigationGuidanceCode: GuidanceCode }
+    | undefined
+  return declared === undefined ? null : TYPE_FOR_GUIDANCE[declared.investigationGuidanceCode]
 }
 
 // ---------------------------------------------------------------------------------------

@@ -4,6 +4,8 @@ import {
   alertTypeForRule, decide,
   type Dispositions, type ExistingIncident, type FindingRow, type Watermark,
 } from './finding-pipeline.js'
+import { ALERT_CATALOG } from './alert-catalog.js'
+import { IDENTITY_RISK_RULE_CATALOG } from '../identity-risk/identity-risk.catalog.js'
 
 /** The join. Everything before this was a library nobody called. */
 
@@ -124,18 +126,20 @@ test('A RULE NOTHING CAN TYPE PRODUCES NOTHING, AND IS NAMED', () => {
   // The third rule namespace. `IdentityRiskFinding.ruleId` maps to no alert type, and it was on
   // the backlog with the note that the failure would be silence the moment routing was driven by
   // findings. This is that moment, so the hole is a reported count.
-  const out = decide([finding({ ruleId: 'HV-ID-MBX-004.v1' })], none, canEmail, WATERMARK, T0)
+  const out = decide([finding({ ruleId: 'HV-ID-MBX-001.v1' })], none, canEmail, WATERMARK, T0)
 
   assert.equal(out.incidents.length, 0, 'no incident, because it cannot be typed')
   assert.equal(out.jobs.length, 0)
   assert.equal(out.skipped[0]?.because, 'NO_ALERT_TYPE')
-  assert.deepEqual(out.unmappedRules, ['HV-ID-MBX-004.v1'],
+  assert.deepEqual(out.unmappedRules, ['HV-ID-MBX-001.v1'],
     'the rule id is what somebody has to go and add, so a count is not enough')
 
   // NOT A BLANKET REFUSAL: the mapped prefixes do work.
   assert.equal(alertTypeForRule('HV-ID-CHG-002.v1'), 'security.privileged_directory_change')
-  assert.equal(alertTypeForRule('HV-ID-EXP-003.v1'), 'monitoring.consent_expiring')
-  assert.equal(alertTypeForRule('HV-ID-APP-001.v1'), null)
+  assert.equal(alertTypeForRule('HV-ID-EXP-003.v1'), 'security.privileged_directory_change',
+    'EXP is EXPOSURE, not expiring - an access rule, which the guidance code says and the letters do not')
+  assert.equal(alertTypeForRule('HV-ID-APP-001.v1'), null, 'a declared rule whose kind has no type')
+  assert.equal(alertTypeForRule('HV-ID-NOPE-999.v1'), null, 'and a rule the catalogue never declared')
 })
 
 test('A CLOSED FINDING IS NOT AN ALERT', () => {
@@ -151,7 +155,7 @@ test('EVERY FINDING IS ACCOUNTED FOR EXACTLY ONCE', () => {
     finding({ id: 'a' }),
     finding({ id: 'b', subjectId: 'user-2' }),
     finding({ id: 'c', state: 'EXPIRED' }),
-    finding({ id: 'd', ruleId: 'HV-ID-APP-009.v1' }),
+    finding({ id: 'd', ruleId: 'HV-ID-APP-001.v1' }),
     finding({ id: 'e', subjectId: 'user-3', observedAtIso: OLD }),
   ], none, canEmail, WATERMARK, T0)
 
@@ -159,4 +163,38 @@ test('EVERY FINDING IS ACCOUNTED FOR EXACTLY ONCE', () => {
   assert.equal(out.jobs.length + out.skipped.length, 5)
   assert.deepEqual(
     [...out.skipped.map((each) => each.findingId), ...out.jobs.map(() => 'a-or-b')].length, 5)
+})
+
+test('THE MAPPING IS DERIVED FROM THE CATALOGUE, so a new rule cannot fall through a gap', () => {
+  // Two earlier versions matched on the rule id: the first on a namespace no row can have, the
+  // second on three-letter families whose meaning it guessed. EXP is EXPOSURE, not expiring, and
+  // that version was consistent, total over the real vocabulary, and wrong.
+  //
+  // This reads `investigationGuidanceCode`, which every rule declares exactly one of. The test
+  // is that EVERY declared rule resolves through it — so adding a rule inherits its kind rather
+  // than silently producing nothing.
+  const declared = Object.keys(IDENTITY_RISK_RULE_CATALOG)
+  assert.ok(declared.length >= 20, `expected the full catalogue, saw ${declared.length}`)
+
+  const byKind = new Map<string, number>()
+  for (const ruleId of declared) {
+    const type = alertTypeForRule(ruleId)
+    const kind = (IDENTITY_RISK_RULE_CATALOG as Record<string, { investigationGuidanceCode: string }>)
+      [ruleId]!.investigationGuidanceCode
+    byKind.set(kind, (byKind.get(kind) ?? 0) + 1)
+    // Every rule gets an answer, and the answer is a catalogue id or an honest null. What must
+    // not happen is a rule the function has no opinion about at all.
+    assert.ok(type === null || ALERT_CATALOG.some((each) => each.id === type),
+      `${ruleId} mapped to ${type}, which is not a catalogue type`)
+  }
+
+  // ALL FOUR KINDS ARE PRESENT IN THE DATA, so the two refusals are refusing something real
+  // rather than describing an empty case.
+  assert.deepEqual([...byKind.keys()].sort(),
+    ['REVIEW_ACCESS', 'REVIEW_ACTIVITY', 'REVIEW_CONFIGURATION', 'REVIEW_MAILBOX_RULE'])
+
+  // AND THE TWO REFUSALS ARE REFUSALS, not an empty map: some rules do get a type.
+  const typed = declared.filter((ruleId) => alertTypeForRule(ruleId) !== null)
+  assert.ok(typed.length > 0, 'nothing maps, so the mapping is not doing anything')
+  assert.ok(typed.length < declared.length, 'everything maps, so the refusals are not refusing')
 })
