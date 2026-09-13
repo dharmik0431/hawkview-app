@@ -259,7 +259,17 @@ export function exclusionKindFor(alertTypeId: string | null, dedupeKey: string):
  * The behaviour is unchanged by the move, and `reconciliation.test.ts` asserts this against the
  * literal it replaced rather than against itself. */
 export const TYPE_FOR_SHAPE: Readonly<Record<KeyShape, string | null>> = (() => {
-  const table: Record<string, string | null> = {
+  // **THE LITERAL IS TYPED, AND THERE IS NO CAST AT THE END.** It was
+  // `Record<string, string | null>` closed by `as Readonly<Record<KeyShape, …>>`, which meant an
+  // eighth `PublicationKind` would not have been required here and the lookup would have
+  // returned `undefined` where every consumer's type says `string | null`.
+  //
+  // Adding a member did fail the build even then — but the error named `byShape`'s object
+  // literal further down this file, an unrelated construct that happens to be exhaustive. **The
+  // protection was real and lived in a bystander**, so the natural refactor of building
+  // `byShape` in a loop would have removed it silently and left the cast as the only thing
+  // standing. Typing the literal puts the error where the omission is.
+  const table: Record<PublicationKind, string | null> = {
     DIRECTORY_AUDIT: null,
     TENANT_SYNC: null,
     TENANT_CONNECTION: null,
@@ -270,11 +280,12 @@ export const TYPE_FOR_SHAPE: Readonly<Record<KeyShape, string | null>> = (() => 
   }
   for (const type of ALERT_CATALOG) {
     // `in` rather than `?.`, because the catalogue is `as const` and most declarations simply
-    // have no such property to be optional.
-    const covers: readonly string[] = 'covers' in type ? type.covers : []
+    // have no such property to be optional. Kept at `PublicationKind` rather than widened to
+    // `string`, so writing an undeclared kind into the table does not typecheck either.
+    const covers: readonly PublicationKind[] = 'covers' in type ? type.covers : []
     for (const kind of covers) table[kind] = type.id
   }
-  return table as Readonly<Record<KeyShape, string | null>>
+  return table
 })()
 
 /** One existing notification, plus what a read-only join can add.

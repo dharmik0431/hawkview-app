@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1831 tests, 1711 pass, 0 fail.** The remaining 120 are database-integration tests requiring a
+**1832 tests, 1712 pass, 0 fail.** The remaining 120 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -878,6 +878,35 @@ verdict — delivered, bounced, complained — and that is now worded as **deliv
 persisted** rather than as an absent ledger, because a blocker a reader can disprove on sight
 teaches them to skim the rest of the list.
 
+### A fix can be real and its binding unguarded — the fifth instance, in the commit that closed the fourth
+
+**`rawBody` was correct and nothing tied it to the application.** The options lived in a shared
+constant and `main.ts` passed it, so the tests guarded *removing `rawBody` from the constant* and
+guarded nothing about `main.ts` continuing to pass it. **Measured by QA and reproduced here:**
+reverting `main.ts` to the bare `NestFactory.create(AppModule)` typechecked clean — the import
+simply became unused — and all three bootstrap tests stayed green.
+
+Closed by removing the class rather than the instance: `createHawkviewApp()` in `bootstrap.ts` is
+**the only `NestFactory.create` call in the codebase**, `main.ts` is an entry point that chooses
+nothing, and the tests boot through the same function. Both halves are now mutation-checked —
+dropping the options at the create call and removing `rawBody` from the constant each fail three
+of four tests.
+
+**The one test that still calls `NestFactory` directly does so deliberately**, because it exists
+to show what the *other* path does; going through `createHawkviewApp` would make it prove nothing.
+
+### A guard that lives in a bystander is not a guard
+
+`TYPE_FOR_SHAPE` ended in `as Readonly<Record<KeyShape, …>>` over a `Record<string, …>` literal,
+so an eighth `PublicationKind` would not have been required in it and the lookup would have
+returned `undefined` where every consumer's type says `string | null`.
+
+Adding a member *did* fail the build — but the error named `byShape`'s literal 476 lines away, an
+unrelated construct that happens to be exhaustive. **The protection was real and it was
+accidental**, and the natural refactor of building `byShape` in a loop would have removed it
+silently, leaving the cast as the only thing standing. The literal is now typed and the cast is
+gone; measured, the error names the table itself first and the bystander second.
+
 ### Four functions have been written correct, tested, and unreachable
 
 Worth naming because it is now four, and the fourth asserted its own caller in prose.
@@ -1039,7 +1068,15 @@ the types it was meant to fix.
   that establishes it: `grep -rn "attemptSend" src --include=*.ts | grep -v test` returns only
   the definition.
 - **A real transport.** Deliberately absent; see above. Second on this list, not first.
-- **A ROUTE FOR THE WEBHOOK VERIFIER.** The verifier is built and tested; *nothing calls it.*
+- **A ROUTE FOR THE WEBHOOK VERIFIER — AND IT MUST CARRY `@Public()`.** `auth.module.ts`
+  registers a global `APP_GUARD`, so a controller without the decorator answers **401 before the
+  handler runs**, and Resend sends no bearer token. A webhook route written without it would fail
+  every genuine delivery, permanently, and read like a provider problem — the rawBody defect one
+  level up, and equally invisible to any test that calls the verifier directly. Written down now,
+  while the route is unbuilt, because the moment to remember it is before it is written.
+  **The opposite holds for the dispositions endpoints**: those are correctly NOT public, and an
+  organisation-scoped write that skipped the guard would be worse than a webhook that 401s.
+  The verifier is built and tested; *nothing calls it.*
   There is no `@Public() @Post('resend')` controller, so the verdict has a producer and no
   caller. Whoever writes it must hand the verifier the RAW body — `req.rawBody`, which is now
   available (see below); a parsed-and-restringified one changes bytes and every genuine request
