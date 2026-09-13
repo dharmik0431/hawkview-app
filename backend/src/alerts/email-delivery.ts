@@ -159,11 +159,16 @@ export type Authentication = 'AUTHENTIC' | 'SIGNATURE_MISSING' | 'SIGNATURE_INVA
  * a forged event from a real one — so it is pinned from the other side: `record` accepts only
  * this type, and a forged event has no path to producing one.
  *
- * THE BRAND IS A `unique symbol`, AND THE FIRST VERSION OF THIS WAS A LIE. It was
- * `readonly __authentic: true` — an ordinary structural field — while five other types in this
- * same file used `unique symbol`. So the ONE type whose entire purpose is authenticity was the
- * one anybody could hand-write, and the comment above claiming otherwise was false. A forged
- * event literal compiled clean.
+ * THE BRAND IS A `unique symbol`, AND THE FIRST VERSION OF THIS WAS A LIE. It used a plain
+ * structural boolean field instead — an ordinary property, not a brand — while five other types
+ * in this same file used `unique symbol`. So the ONE type whose entire purpose is authenticity
+ * was the one anybody could hand-write, and the comment above claiming otherwise was false. A
+ * forged event literal compiled clean.
+ *
+ * The dead field name is deliberately NOT written out here. It was, and a reviewer grepping for
+ * it hit this comment and reported the defect as still open — prose describing a fixed bug reads
+ * exactly like the bug to a search. The negatives in the test file are where the old spelling
+ * lives now, which is the one place it should: there it is an assertion, not a description.
  *
  * Nothing was exploitable, because no webhook handler exists yet — WHICH IS EXACTLY WHY IT
  * MATTERED. The handler would have been written against a comment promising the compiler
