@@ -316,3 +316,22 @@ shape nobody has verified**, whether it is a product script or a QA probe.
 **Standing practice: typecheck the probe before trusting the probe.** It costs one command, and
 it is the same argument as an unused `@ts-expect-error` failing the build — the negatives in a
 type-level register are only evidence *because* the compiler is the thing checking them.
+
+### A check can be correct about its subject and wrong about the product
+
+I pre-registered that a claimed send job must never be cancelled, because it may already be at
+the provider and calling it cancelled would be a lie. **The reasoning is sound and the register
+was wrong.**
+
+A job attempted once and refused retryably is still `READY` with its budget unspent. Leaving it
+alone means the operator presses stop and an email goes out afterwards anyway — **a stop button
+that does not stop.** My check protected the accuracy of the record at the cost of the feature
+the record is about.
+
+**A register is a hypothesis, not a law.** It is written before the code precisely so it cannot be
+bent to fit the implementation — and that same property means it can be confidently, carefully
+wrong. When the implementer's argument is better, the register loses.
+
+**What to keep from it:** the concession has to be on the argument, not on authority. The test is
+whether you can state the implementer's reason better than they did. If you cannot, you have not
+understood it well enough to give way yet.
