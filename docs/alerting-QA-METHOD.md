@@ -297,3 +297,22 @@ what made both checks mean something.
 one variant. When a check catches two, either the check is too broad or the variant is two
 defects wearing one name. **Print which variants each check caught**, not just whether it passed
 — a check that catches everything is indistinguishable from a check that works, until you look.
+
+### Typecheck the probe, because failing loudly was luck
+
+A binding probe of mine ran with its arguments in the wrong order — `attemptSend(outbound,
+transport…)` against a signature of `(transport, outbound…)`. **It ran, because `tsx` executes
+without typechecking.** It happened to throw, so I noticed. Had the two parameters been
+structurally compatible it would have produced a clean, wrong result, and I would have reported
+a property as bound that had never been exercised.
+
+**Failing loudly was luck, and luck is not a control.**
+
+This is the same lesson as the scripts tsconfig: `tsconfig.json` covered `src` only, so
+`npx tsc --noEmit` walked past both scripts and exited 0 — and the false green hid a Prisma
+client that could never have constructed. **A check that is never compiled is a check whose
+shape nobody has verified**, whether it is a product script or a QA probe.
+
+**Standing practice: typecheck the probe before trusting the probe.** It costs one command, and
+it is the same argument as an unused `@ts-expect-error` failing the build — the negatives in a
+type-level register are only evidence *because* the compiler is the thing checking them.
