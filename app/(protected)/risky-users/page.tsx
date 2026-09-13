@@ -10,12 +10,17 @@ import {
   Filter,
   Globe,
   RefreshCw,
+  AlertTriangle,
   Search,
   ShieldAlert,
   ShieldCheck,
   ShieldOff,
   Users,
 } from 'lucide-react'
+import {
+  fleetCoverage,
+  riskyUsersSummary,
+} from '@/lib/identity-risk/fleet-coverage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -138,6 +143,7 @@ export default function FleetRiskyUsersPage() {
   const {
     tenants,
     fleetRows,
+    tenantStatuses,
     metrics,
     isLoading,
     retryAll,
@@ -150,6 +156,28 @@ export default function FleetRiskyUsersPage() {
 
   const [drawerRow, setDrawerRow] = useState<FleetRiskyUserRow | null>(null)
   const [isDrawerOpen, setIsDrawerOpen] = useState(false)
+
+  // ONE FACT, ONE RENDERING. The badge showed `{filteredRows.length} users`
+  // and a KPI tile several inches away showed "N tenants unavailable", and
+  // neither knew about the other -- so a reader asking "is my fleet clean"
+  // read a number over a subset with nothing saying so.
+  //
+  // Derived from tenantStatuses, which the hook already computed and this page
+  // discarded. It distinguishes LOADING, FAILED, UNAVAILABLE and SUCCESS;
+  // `metrics.failedTenants` counts only assessmentError, so a tenant that came
+  // back with no assessment was counted as fine.
+  const coverage = useMemo(
+    () => fleetCoverage(tenantStatuses, selectedTenant),
+    [tenantStatuses, selectedTenant]
+  )
+
+  // Only a filter that is narrowing something may be blamed for an empty list.
+  // The same four controls the "Clear filters" button resets.
+  const filtersActive =
+    searchQuery.trim() !== '' ||
+    selectedTenant !== 'ALL' ||
+    sourceFilter !== 'ALL' ||
+    priorityFilter !== 'ALL'
 
   const filteredRows = useMemo(() => {
     return fleetRows.filter((row) => {
@@ -187,6 +215,14 @@ export default function FleetRiskyUsersPage() {
       return true
     })
   }, [fleetRows, searchQuery, selectedTenant, sourceFilter, priorityFilter])
+
+  // The badge and all three empty states come from here, so the count and the
+  // coverage cannot drift apart again.
+  const summary = riskyUsersSummary(
+    filteredRows.length,
+    coverage,
+    filtersActive
+  )
 
   const openDrawer = (row: FleetRiskyUserRow) => {
     setDrawerRow(row)
@@ -459,7 +495,7 @@ export default function FleetRiskyUsersPage() {
                 variant="secondary"
                 className="bg-slate-200/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-semibold text-xs px-2 py-0.5"
               >
-                {filteredRows.length} user{filteredRows.length === 1 ? '' : 's'}
+                {summary.headline}
               </Badge>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
@@ -594,35 +630,45 @@ export default function FleetRiskyUsersPage() {
                     </div>
                   </TableCell>
                 </TableRow>
-              ) : fleetRows.length === 0 ? (
+              ) : summary.empty ? (
                 <TableRow>
                   <TableCell colSpan={7} className="h-48 text-center p-6">
+                    {/* TWO EMPTY STATES COLLAPSED INTO ONE. They were separate
+                        branches -- "no rows at all" and "nothing matched the
+                        filters" -- and BOTH drew their own conclusion about a
+                        fleet neither had asked about coverage. The first showed a
+                        green ShieldCheck in an emerald circle and said "Evaluated
+                        N authorized tenants" using totalTenants - failedTenants,
+                        which counts a tenant that returned no assessment as
+                        evaluated. */}
                     <div className="flex flex-col items-center justify-center gap-2.5 max-w-md mx-auto">
-                      <div className="p-3 rounded-full bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
-                        <ShieldCheck className="h-6 w-6" />
-                      </div>
+                      {/* THE ICON IS THE STRONGEST CLAIM ON THE SCREEN: read
+                          before the prose, believed faster, and impossible to
+                          qualify with a clause. Exactly one tone earns the
+                          shield, and the tone is derived rather than chosen
+                          here. */}
+                      {summary.empty.tone === 'QUIET' ? (
+                        <div className="p-3 rounded-full bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+                          <ShieldCheck className="h-6 w-6" />
+                        </div>
+                      ) : summary.empty.tone === 'UNKNOWN' ? (
+                        <div className="p-3 rounded-full bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800">
+                          <AlertTriangle className="h-6 w-6" />
+                        </div>
+                      ) : (
+                        <Search className="h-6 w-6 text-slate-400" />
+                      )}
                       <div className="space-y-1">
                         <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                          No risky users were reported in the completed assessments
+                          {summary.empty.title}
                         </h3>
                         <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                          Evaluated {metrics.totalTenants - metrics.failedTenants} authorized Microsoft 365 tenants across all HawkView detectors and Microsoft Entra ID Protection. Note: Zero findings indicate clean current rule checks, not proof that every identity is uncompromised.
+                          {summary.empty.detail}
+                          {summary.empty.tone === 'QUIET' &&
+                            ' Zero findings indicate clean current rule checks, not proof that every identity is uncompromised.'}
                         </p>
                       </div>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ) : filteredRows.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={7} className="h-40 text-center p-6">
-                    <div className="flex flex-col items-center justify-center gap-2 max-w-sm mx-auto">
-                      <Search className="h-6 w-6 text-slate-400" />
-                      <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                        No users match the selected filters
-                      </h3>
-                      <p className="text-xs text-slate-500 dark:text-slate-400">
-                        Try adjusting your search terms, tenant selection, or detection source criteria.
-                      </p>
+                      {summary.empty.tone === 'FILTERED' && (
                       <Button
                         variant="outline"
                         size="sm"
@@ -636,6 +682,7 @@ export default function FleetRiskyUsersPage() {
                       >
                         Clear filters
                       </Button>
+                      )}
                     </div>
                   </TableCell>
                 </TableRow>
@@ -811,10 +858,20 @@ export default function FleetRiskyUsersPage() {
               <RefreshCw className="h-6 w-6 animate-spin text-blue-600 mx-auto" />
               <p className="text-xs font-medium">Evaluating fleet-wide identity risk...</p>
             </div>
-          ) : filteredRows.length === 0 ? (
+          ) : summary.empty ? (
             <div className="p-6 text-center text-slate-500 space-y-2">
-              <ShieldCheck className="h-6 w-6 text-emerald-500 mx-auto" />
-              <p className="text-xs font-bold text-slate-800 dark:text-slate-200">No matching users found</p>
+              {/* Same rule as the desktop table. A green shield here said "you
+                  are fine" about tenants nobody assessed, on the narrow screen
+                  where it is the only thing visible. */}
+              {summary.empty.tone === 'QUIET' ? (
+                <ShieldCheck className="h-6 w-6 text-emerald-500 mx-auto" />
+              ) : summary.empty.tone === 'UNKNOWN' ? (
+                <AlertTriangle className="h-6 w-6 text-amber-500 mx-auto" />
+              ) : (
+                <Search className="h-6 w-6 text-slate-400 mx-auto" />
+              )}
+              <p className="text-xs font-bold text-slate-800 dark:text-slate-200">{summary.empty.title}</p>
+              <p className="text-2xs text-slate-500 dark:text-slate-400 leading-relaxed">{summary.empty.detail}</p>
             </div>
           ) : (
             filteredRows.map((row, idx) => {
