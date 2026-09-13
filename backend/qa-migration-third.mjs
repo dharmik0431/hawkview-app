@@ -12,7 +12,8 @@ import pg from 'pg'
 
 const HOST = 'postgresql://postgres:postgres@127.0.0.1:55432/'
 const url = (db) => HOST + db + '?schema=public'
-const OLD3 = 'C:/hv-pre3/backend'
+const OLD3 = 'C:/hv-pre3/backend'   // 0a62f8d^ — the file as it was ACTUALLY applied, VARCHAR(200)
+const MID3 = 'C:/hv-par/backend'    // ac6318f — the file edited in place to 400, before the restore
 const TIP = 'C:/hv-run/backend'
 
 // A REAL message_id, taken verbatim from the U1 end-to-end run earlier today. Not invented to be
@@ -34,7 +35,13 @@ function migrate(cwd, db) {
       { cwd, encoding: 'utf8', shell: true, env: { ...process.env, DATABASE_URL: url(db) } })
     return { ok: true, tail: out.trim().split('\n').pop() }
   } catch (e) {
-    return { ok: false, tail: String(e.stdout ?? '').trim().split('\n').slice(-4).join(' | ') }
+    // FULL OUTPUT ON FAILURE. My first version kept the last four lines of stdout, and a run that
+    // failed produced only the datasource banner — a failure with no reason in it, which says
+    // nothing and reads like a finding about the subject rather than about the harness.
+    return {
+      ok: false, status: e.status,
+      stdout: String(e.stdout ?? '').trim(), stderr: String(e.stderr ?? '').trim(),
+    }
   }
 }
 
@@ -47,8 +54,8 @@ const widths = async (c) => (await c.query(
 async function tryInsert(c) {
   try {
     await c.query(
-      `INSERT INTO alert_send_jobs (id, message_id, idempotency_key, state, max_attempts, not_before_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $1, 'READY', 3, now(), now())`, [REAL_MESSAGE_ID])
+      `INSERT INTO alert_send_jobs (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $1, 'READY', 0, 3, now(), now())`, [REAL_MESSAGE_ID])
     return 'accepted'
   } catch (e) { return 'REFUSED ' + e.code + ' ' + String(e.message).slice(0, 70) }
 }
@@ -74,6 +81,25 @@ async function main() {
     `SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NULL`)).rows
   await d.end()
 
+  // THE OTHER DIRECTION, which a fix can easily break: a database migrated while the file said
+  // VARCHAR(400) in place, so its columns are ALREADY wide. The forward migration must be a clean
+  // no-op there rather than an error or a narrowing.
+  await admin('DROP DATABASE IF EXISTS hvmigmid3')
+  await admin('CREATE DATABASE hvmigmid3')
+  const applyMid = migrate(MID3, 'hvmigmid3')
+  const m1 = new pg.Client({ connectionString: HOST + 'hvmigmid3' })
+  await m1.connect()
+  const midBefore = await widths(m1)
+  await m1.end()
+  const midForward = migrate(TIP, 'hvmigmid3')
+  const m2 = new pg.Client({ connectionString: HOST + 'hvmigmid3' })
+  await m2.connect()
+  const midAfter = await widths(m2)
+  const midInsert = await tryInsert(m2)
+  const midFailed = (await m2.query(
+    `SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NULL`)).rows
+  await m2.end()
+
   // And what a FRESH database at the tip has, as the reference.
   await admin('DROP DATABASE IF EXISTS hvmigref')
   await admin('CREATE DATABASE hvmigref')
@@ -84,6 +110,7 @@ async function main() {
   await e.end()
 
   const same = JSON.stringify(after) === JSON.stringify(reference)
+  const midSame = JSON.stringify(midAfter) === JSON.stringify(reference)
   console.log(JSON.stringify({
     QA_MIGRATION_THIRD: {
       realMessageIdLength: REAL_MESSAGE_ID.length,
@@ -97,6 +124,15 @@ async function main() {
       DEPLOY_REPORTED_SUCCESS: forward.ok,
       DEPLOY_ACTUALLY_WIDENED_IT: insertAfter === 'accepted',
       OLD_REACHES_THE_SAME_WIDTHS_AS_FRESH: same,
+
+      theAlreadyWideDatabase: {
+        applyMid, midForward, failedMigrations: midFailed,
+        widths: { before: midBefore, after: midAfter },
+        FORWARD_WAS_A_CLEAN_NO_OP: midForward.ok && midFailed.length === 0
+          && JSON.stringify(midBefore) === JSON.stringify(midAfter),
+        MID_REACHES_THE_SAME_WIDTHS_AS_FRESH: midSame,
+        REAL_MESSAGE_ID_FITS: midInsert === 'accepted',
+      },
     },
   }, null, 2))
 }
