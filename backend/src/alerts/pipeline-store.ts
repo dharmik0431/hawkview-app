@@ -155,19 +155,22 @@ export function pipelineStore(runner: SqlRunner): PipelineStore {
           notificationsWritten += await tx.execute(
             `INSERT INTO notifications
                (id, organization_id, customer_tenant_id, event_type, category, severity,
-                title, description, dedupe_key, source, incident_key,
+                title, description, dedupe_key, source, incident_key, alert_type_id,
                 occurrence_count, first_occurred_at, last_occurred_at, created_at, updated_at)
-             VALUES (gen_random_uuid(), $1, $2::uuid, $3, $4, $5, $6, $7, $8, 'identity-risk', $9,
+             VALUES (gen_random_uuid(), $1, $2::uuid, $3, $4, $5, $6, $7, $8, 'identity-risk', $9, $11,
                      1, $10::timestamptz, $10::timestamptz, now(), now())
              ON CONFLICT (organization_id, dedupe_key) DO UPDATE
                 SET last_occurred_at = EXCLUDED.last_occurred_at,
                     occurrence_count = notifications.occurrence_count + 1,
                     incident_key = EXCLUDED.incident_key,
+                    alert_type_id = EXCLUDED.alert_type_id,
+                    severity = EXCLUDED.severity,
+                    category = EXCLUDED.category,
                     resolved_at = NULL,
                     updated_at = now()`,
             [each.organizationId, each.customerTenantId, each.eventType, each.category,
               each.severity, each.title, each.description, each.dedupeKey, each.incidentKey,
-              each.atIso])
+              each.atIso, each.alertTypeId])
         }
 
         for (const each of jobs) {

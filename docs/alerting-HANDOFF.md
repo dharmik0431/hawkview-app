@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1812 tests, 1699 pass, 0 fail.** The remaining 113 are database-integration tests requiring a
+**1816 tests, 1703 pass, 0 fail.** The remaining 113 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -743,6 +743,35 @@ kills exactly the second-row test and nothing else).
 restated, so an invented value is a compile error rather than a row the reader's filter silently
 never matches. `ACT_NOW` maps to `critical`, which the filter shows regardless of the in-app
 switch — the existing product rule, and deliberate for the tier that would otherwise ring a phone.
+
+### The notification carries the alert type, and the tier is derived from it
+
+**An ACT_NOW incident and a routine informational message rendered identically in the panel**, so
+the tier the whole design turns on was unsayable in the one place alerts land. `notifications`
+now has `alert_type_id` (migration `20260913080000`).
+
+**That column is the fact; the tier is derived through `ALERT_CATALOG`.** Third time in this
+feature the right answer has been *derive it from the catalogue rather than store it again*. There
+is no second severity column: two columns describing how urgent something is disagree the first
+time anybody edits one. The legacy `severity` is still written — the reader's visibility filter
+matches on it — **derived from the alert type at write time, a rendering rather than the fact**,
+and `alert_type_id` wins if they ever disagree.
+
+**`alertTierFor` has three answers, and the third is not the first.** A tier; `NOT_AN_ALERT` for a
+row with no alert type; `UNKNOWN_ALERT_TYPE` for a stored id the catalogue does not contain,
+reported rather than defaulted. **A row that did not say is not RECORD_ONLY** — that is a decision
+somebody made to stop being told, and collapsing the two makes a silenced alert type and an
+unconfigured one render the same. Tested at all three tiers rather than one plus two edges,
+because a mutation sweep elsewhere deleted RECORD_ONLY from an accepted set and killed nothing.
+
+**The API derives the tier and returns it.** Whoever builds the surface renders what the API
+sends; deriving it again on the client is the same fact in two places with a network hop between
+them.
+
+⚠ **`resolved` has been parsed by the notification normaliser since before this work and rendered
+nowhere**, so a cleared incident sits in the inbox looking identical to one still waiting.
+Reported by the engineer building the surface; not fixed here, and not this feature's to fix
+without a ruling — recorded so it is not rediscovered.
 
 ### The integration tests drive the production store now, and it is gated by a lock
 

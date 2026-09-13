@@ -131,6 +131,36 @@ export function alertTypeForRule(ruleId: string): AlertTypeId | null {
 // WHAT GOES OUT
 // ---------------------------------------------------------------------------------------
 
+/** The urgency tier for a notification, derived from its alert type.
+ *
+ * **THREE ANSWERS, AND THE THIRD IS NOT THE FIRST.** A tier, or `null` for a row that is not an
+ * alert at all. `null` is *did not say* — a sync failure, a connection problem, anything with no
+ * alert type — and it must never render as `RECORD_ONLY`, which is a decision somebody made to
+ * stop being told about a type they had. A silenced alert type and an unconfigured one looking
+ * the same is the defect a mutation sweep found by deleting `RECORD_ONLY` and killing nothing.
+ *
+ * **AN UNRECOGNISED ID IS REPORTED, NOT DEFAULTED.** A stored id the catalogue does not contain
+ * comes back as `UNKNOWN_ALERT_TYPE` rather than quietly becoming a tier — an unreadable value is
+ * a fact about the data and defaulting it is how a setting somebody made gets silently ignored.
+ * That is the same rule the disposition column follows.
+ *
+ * DERIVED HERE AND RETURNED BY THE API, so the client renders what it is sent. Deriving it again
+ * on the client is the same fact in two places with a network hop between them. */
+export type NotificationTier =
+  | Readonly<{ kind: 'TIER'; tier: Severity }>
+  | Readonly<{ kind: 'NOT_AN_ALERT' }>
+  | Readonly<{ kind: 'UNKNOWN_ALERT_TYPE'; alertTypeId: string }>
+
+export function alertTierFor(alertTypeId: string | null | undefined): NotificationTier {
+  if (alertTypeId === null || alertTypeId === undefined || alertTypeId === '') {
+    return { kind: 'NOT_AN_ALERT' }
+  }
+  const declared = ALERT_CATALOG.find((type) => type.id === alertTypeId)
+  return declared === undefined
+    ? { kind: 'UNKNOWN_ALERT_TYPE', alertTypeId }
+    : { kind: 'TIER', tier: declared.severity }
+}
+
 /** A notification row — the thing that makes an incident visible IN THE PRODUCT.
  *
  * **WITHOUT THIS THE BELL SHOWS NOTHING.** `alert_incidents`' own migration header says an
@@ -152,6 +182,9 @@ export interface NotificationWrite {
   readonly organizationId: string
   readonly customerTenantId: string
   readonly dedupeKey: string
+  /** **THE FACT.** Which alert type this row is. The urgency tier is derived from it through
+   * `ALERT_CATALOG` — see `alertTierFor` — and never stored beside it. */
+  readonly alertTypeId: AlertTypeId
   /** **THE FAMILY, AND THE READER'S SWITCH KEYS ON IT.** `notifications.service.ts` decides which
    * rows a person sees by matching `eventType` against four prefixes — `security.`, anything
    * containing `connection`, anything containing `sync`, `account.` — and gating each on the
@@ -160,6 +193,9 @@ export interface NotificationWrite {
    * those four falls into the *no known family* arm and is always shown. Neither is a guess:
    * both were read out of the filter. */
   readonly eventType: string
+  /** RENDERINGS OF `alertTypeId`, not independent facts. Both are derived at write time because
+   * the reader's visibility filter matches on them; if either ever disagrees with the alert
+   * type, the alert type is right. */
   readonly category: NotificationCategory
   readonly severity: NotificationSeverity
   readonly title: string
@@ -208,6 +244,9 @@ export function notificationFor(
     organizationId: finding.organizationId,
     customerTenantId: finding.customerTenantId,
     dedupeKey: `identity-risk:${finding.dedupeKey}`,
+    alertTypeId,
+    // DERIVED FROM THE ALERT TYPE, not chosen here. `event_type` is what the reader's family
+    // filter matches against, so for an alert it must BE the alert type id.
     eventType: alertTypeId,
     category: tone.category,
     severity: tone.severity,

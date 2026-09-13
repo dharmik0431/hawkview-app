@@ -391,6 +391,16 @@ export const PRIVILEGED_DIRECTORY_CHANGES: readonly PrivilegedChangeRule[] = [
 // SIXTY-FOUR, and the number has a derivation rather than a feel: at 400 the key has roughly 147
 // characters of room for the id, so 64 is far inside the column while being nearly twice the
 // longest name anybody has needed. It is a naming discipline, not a technical limit.
+//
+// ⚠ THE DERIVATION ASSUMES A 400-WIDE `incident_key`, AND THE TWO GUARDS DISAGREE BY SEVENTEEN
+// CHARACTERS ON A DATABASE THAT STOPPED MID-CHAIN. `incident_key` is created at 300 by
+// 20260912120000 and widened to 400 by 20260913000000; at 300 the room for an id is about 47,
+// not 147, so this compile-time bound would pass an id the column then truncates.
+//
+// Latent rather than live: it needs a half-migrated database AND an id over 47 characters, and
+// the longest declared today is 36. Written down because the number above silently depends on a
+// migration having run, and the next person to raise this limit will not otherwise know that
+// raising it is only safe once every database is past 20260913000000.
 
 type Ones<N extends number, A extends 1[] = []> = A['length'] extends N ? A : Ones<N, [...A, 1]>
 type Chars<S extends string, A extends 1[] = []> =

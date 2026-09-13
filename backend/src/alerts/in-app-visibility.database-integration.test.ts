@@ -5,7 +5,7 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import type { PrismaService } from '../prisma/prisma.service.js'
-import { runIntake, type PipelineStore, type Watermark } from './finding-pipeline.js'
+import { alertTierFor, runIntake, type PipelineStore, type Watermark } from './finding-pipeline.js'
 import { pipelineStore, type SqlRunner } from './pipeline-store.js'
 
 /**
@@ -188,9 +188,32 @@ test('AN INCIDENT IS VISIBLE IN THE PRODUCT, asked of the reader rather than the
     // THE INCIDENT KEY TRAVELS WITH IT, which is what makes the row part of a projection rather
     // than a loose notification that happens to look similar.
     const keyed = await client.query(
-      'SELECT incident_key FROM notifications WHERE dedupe_key = $1',
+      'SELECT incident_key, alert_type_id, severity FROM notifications WHERE dedupe_key = $1',
       ['identity-risk:dedupe-55555555-5555-5555-5555-555555555555'])
     assert.equal(keyed.rowCount, 1)
+
+    // THE ALERT TYPE IS ON THE ROW, AND IT IS THE FACT. The tier is derived from it rather than
+    // stored beside it — two columns describing how urgent something is disagree the first time
+    // anybody edits one. `severity` is set as well because the reader's filter matches on it,
+    // and this asserts the RELATIONSHIP between them rather than two remembered constants.
+    assert.equal(keyed.rows[0].alert_type_id, 'security.suspected_credential_attack')
+    const tier = alertTierFor(keyed.rows[0].alert_type_id)
+    assert.equal(tier.kind === 'TIER' ? tier.tier : null, 'ACT_NOW')
+    assert.equal(keyed.rows[0].severity, 'critical', 'the rendering agrees with the fact')
+
+    // AND A NOTIFICATION THAT IS NOT AN ALERT CARRIES NO TIER — absence stays absence, rather
+    // than collapsing into RECORD_ONLY, which is a decision somebody made.
+    await client.query(
+      `INSERT INTO notifications (id, organization_id, event_type, category, severity, title,
+          description, dedupe_key, source, occurrence_count, first_occurred_at, last_occurred_at,
+          created_at, updated_at)
+        VALUES (gen_random_uuid(), $1, 'tenant.sync.failed', 'warning', 'high', 'Sync failed',
+                'A collector could not finish.', 'tenant:probe:sync:mailbox', 'system', 1,
+                now(), now(), now(), now())`, [ORG])
+    const collector = await client.query(
+      "SELECT alert_type_id FROM notifications WHERE dedupe_key = 'tenant:probe:sync:mailbox'")
+    assert.equal(collector.rows[0].alert_type_id, null)
+    assert.deepEqual(alertTierFor(collector.rows[0].alert_type_id), { kind: 'NOT_AN_ALERT' })
     const incidents = await client.query('SELECT incident_key FROM alert_incidents')
     assert.equal(keyed.rows[0].incident_key, incidents.rows[0].incident_key,
       'the notification and the incident share a key — the projection is not empty')

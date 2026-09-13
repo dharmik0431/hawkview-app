@@ -151,6 +151,15 @@ model Notification {
   /// from the schema is invisible to every consumer except a raw query — so routing, and
   /// anything that reads incidents, could not see the key at all, and the point of the
   /// migration is that many rows share one.
+  /// WHICH ALERT TYPE THIS IS, AND IT IS THE FACT. The urgency tier is DERIVED from it through
+  /// `ALERT_CATALOG`, never stored a second time — two columns describing how urgent something
+  /// is disagree the first time anybody edits one. `severity` below is still set, derived from
+  /// this at write time, because the reader's visibility filter matches on it: it is a
+  /// RENDERING, and this column wins if they ever disagree.
+  ///
+  /// NULL FOR EVERY NOTIFICATION THAT IS NOT AN ALERT, and absence is not a tier. A row that did
+  /// not say is not RECORD_ONLY — that is a decision somebody made to stop being told.
+  alertTypeId       String?                 @map("alert_type_id") @db.VarChar(64)
   incidentKey       String?                 @map("incident_key") @db.VarChar(400)
   /// Which burst within the incident. NULL where the count could not be recovered, which is
   /// a VALUE and not an absence: it means the incident holds a row whose event time is gone.
@@ -167,6 +176,7 @@ model Notification {
   /// and an incident key never spans two organisations. See the migration for why this is
   /// not a partial index.
   @@index([organizationId, incidentKey])
+  @@index([organizationId, alertTypeId])
   @@map("notifications")
 }
 
