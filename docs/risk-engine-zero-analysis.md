@@ -766,3 +766,145 @@ Three tenants, three faults, and **none of them is the detectors being wrong**:
 
 **Zero matches is not correct behaviour and it is not narrow rules.** The engine
 has never been given a run it could complete.
+
+---
+
+# The audit field names, and what your two zeros probably mean
+
+## Confirmed
+
+50053 is smart lockout. The chain holds end to end: `classify()` maps it to
+`UNKNOWN`, `validEvent` accepts `UNKNOWN` so `gaps` stays 0 and the source
+reports READY with a true `latestEventAt`, `evaluate.ts:93` adds
+`UNKNOWN_OUTCOMES`, `readiness()` has no named branch for it, and the catch-all
+produces `PARTIAL / INCOMPLETE_WINDOW` with nobody assessed.
+
+**The rule is silenced by the evidence it exists to detect.** Five lockout rows
+and three invalid-credential rows in one window: the detector had its signal and
+the gate closed on it.
+
+## Your query was looking in the right place — which makes the zeros interesting
+
+You assumed `raw.managementActivityRecord` and you were right that it exists
+(`tenant-sync.service.ts:4617`, `managementActivityRecord: record`). But the
+limited projection **also writes a Graph-shaped status block at the top level**
+(`:4601`):
+
+    status: { errorCode: reportedErrorCode, failureReason: ... }
+
+So `raw->'status'->>'errorCode'` is a valid path for audit rows too, and your
+`COALESCE` should have found it. **It returned nothing for both tenants.**
+
+That is not a shape mismatch. It most likely means `reportedErrorCode` is
+**null** on those rows — and if so it is a second finding, not a measurement
+failure:
+
+`normalize.ts:77` requires `codes.length > 0` and every code to be a numeric
+string and all codes to agree. If no code can be extracted, `errorCode` stays
+null and `outcome` stays at its initial value — **`UNKNOWN`** (`:54`). So audit
+rows with no extractable code are *all* UNKNOWN, and those tenants are silenced
+by the same `some()` at `:93`, via a different route: not an unrecognised code,
+but **no code at all**.
+
+I have not confirmed that. It is a prediction, and the query below tests it.
+
+## The field names you asked for
+
+For `M365_AUDIT_STS` rows the normaliser reads the **audit record's own**
+fields, not the Graph projection:
+
+| what | path |
+| --- | --- |
+| error code, primary | `raw->'managementActivityRecord'->>'ErrorCode'` |
+| error code, alternates | `ExtendedProperties[]` entries named `ErrorCode` **or** `ErrorNumber` |
+| logon error | `raw->'managementActivityRecord'->>'LogonError'`, plus `ExtendedProperties` named `LogonError` |
+| login status | `raw->'managementActivityRecord'->>'LoginStatus'` |
+| operation | `raw->'managementActivityRecord'->>'Operation'` |
+| result status | `raw->'managementActivityRecord'->>'ResultStatus'` |
+| graph-shaped mirror | `raw->'status'->>'errorCode'` |
+
+```sql
+-- Q13  Re-run of Q11 for the audit tenants, both paths, plus the null case.
+SELECT customer_tenant_id,
+       count(*) AS rows_24h,
+       count(*) FILTER (WHERE raw->'status'->>'errorCode' IS NOT NULL)      AS has_graph_code,
+       count(*) FILTER (WHERE raw->'managementActivityRecord'->>'ErrorCode' IS NOT NULL)
+                                                                            AS has_audit_code,
+       count(*) FILTER (WHERE raw->'status'->>'errorCode' IS NULL
+                          AND raw->'managementActivityRecord'->>'ErrorCode' IS NULL)
+                                                                            AS no_code_anywhere,
+       count(*) FILTER (WHERE coalesce(raw->'managementActivityRecord'->>'ErrorCode',
+                                       raw->'status'->>'errorCode') NOT IN ('0','50126','50076'))
+                                                                            AS unknown_code
+FROM sign_in_logs
+WHERE event_date_time > now() - interval '24 hours'
+  AND customer_tenant_id IN (
+    'dcb2a091-ecf5-4bda-8780-a33bfb1b4d63'::uuid,
+    '27e8b142-7456-4cba-bdf3-8897f9f801bd'::uuid)
+GROUP BY 1;
+```
+
+- `no_code_anywhere` > 0 → the prediction above. Same silencing, second route.
+- `unknown_code` > 0 → the same cause as 83f23fe5, confirmed fleet-wide.
+- both 0 → those tenants are silenced by something else and I would want the
+  `ExtendedProperties` contents before guessing again.
+
+One more column worth a glance, and it is cheap: the limited projection sets
+`isInteractive: null` (`:4600`). In the **Graph** branch of the normaliser,
+`isInteractive` that is present but not exactly `true`/`false` sets `UNKNOWN`
+(`normalize.ts:62`). That only bites if a limited row is ever normalised under
+`GRAPH_SIGN_INS` — which is precisely dcb2a091's shape, where the window is
+stamped `M365_AUDIT_STS` while the rule waits on `GRAPH_SIGN_INS`. Worth keeping
+in view; not a claim.
+
+## Fleet statement as it honestly stands
+
+- **83f23fe5** — confirmed. 50053, smart lockout, 6 of 13 rows.
+- **dcb2a091, 27e8b142** — unmeasured, not zero. Q13 measures them.
+- **6facb85e, 66735f04** — no recent evidence at all; separately written up.
+
+Your framing of the limit is the right one and I would keep it: a count of zero
+produced by looking in the wrong place is the same defect in a measurement that
+the product has in its screens.
+
+# INTERIM, FINAL FORM
+
+**Zero matches is not correct behaviour and it is not narrow rules. The engine
+has never been given a run it could complete.**
+
+Three tenants, three distinct faults, none of them the detectors:
+
+| tenant | fault | evidence | size |
+| --- | --- | --- | --- |
+| 83f23fe5 | one unrecognised error code silences the whole rule | 50053 × 5, and `classify()` knows only 0, 50126, 50076 | hours to name, days to fix properly |
+| dcb2a091 | entitlement fallback collects under `M365_AUDIT_STS` while the rule waits on `GRAPH_SIGN_INS` | window stamped `M365_AUDIT_STS`; source `WAITING` over 27 fresh rows | days; licensing as much as code |
+| 6facb85e | no recent evidence, reported as current | newest event 2026-09-10; window stamped from the requested range | hours for the distinction |
+
+## The three fixes
+
+1. **Name the reason.** Hours. `readiness()` receives the reason set and
+   discards it on its last line. Until that changes, every future instance of
+   this costs another day of exactly what today cost.
+2. **Classify the error codes.** Days. Three constants are not the Entra failure
+   vocabulary. At minimum: credential failure, lockout, MFA/CA interruption,
+   non-qualifying, genuinely unknown — and 50053 belongs in the first group,
+   since lockout *is* repeated credential failure, which is what the rule
+   detects.
+3. **Stop one event silencing a tenant.** Days, and a product decision rather
+   than a repair. `some()` at `evaluate.ts:93` is a fleet-wide switch operated by
+   a single row. Even after (2) there will be unmapped codes, so this is what
+   prevents the recurrence rather than what fixes today.
+
+I would do (1) today, (2) next, and hold (3) for a decision — it is the same
+"missing is a state" question this codebase has answered four times on screens,
+now arriving in the evaluator.
+
+## On hiding the feature
+
+Given the latitude to remove or hide: **I would not hide it, and I would not
+ship it claiming to work either.** The honest middle is (1) plus the readiness
+distinction from the collector writeup — after those, the screen says "HawkView
+could not complete an assessment for this tenant, and here is why", which is
+true, useful, and costs hours rather than weeks. Hiding buys nothing that
+sentence does not, and it removes the only surface that would show the fix
+working.
