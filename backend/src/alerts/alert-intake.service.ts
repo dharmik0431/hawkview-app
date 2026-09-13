@@ -112,6 +112,9 @@ export class AlertIntakeService {
       // never-writable, which is the collapse this feature has now fixed three times.
       skipped: countByReason(report.skipped),
       unmappedRules: report.unmappedRules,
+      // A SETTING THE PRODUCT CANNOT ACT ON, where operators look. It silences nothing — the
+      // catalogue default applies — so the harm is entirely that the MSP believes otherwise.
+      unreadableDispositions: report.unreadableDispositions,
       accountingProblems: report.accountingProblems,
     }))
     return report.yieldedOnBudget

@@ -21,9 +21,11 @@
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../src/generated/prisma/client.js'
 import {
-  alertTypeForRule, asAlertTypeId, decide, dispositionKey,
+  alertTypeForRule, asAlertTypeId, asDisposition, decide, dispositionKey,
   type DispositionKey, type Dispositions, type ExistingIncident, type FindingRow,
+  type UnreadableDisposition,
 } from '../src/alerts/finding-pipeline.js'
+import { type Severity } from '../src/alerts/alert-type.js'
 import { MAX_FINDINGS_PER_TICK } from '../src/alerts/pipeline-store.js'
 
 // IMPORTED, NOT MIRRORED. This was a local 5000 with a comment saying it mirrored the store's
@@ -81,9 +83,9 @@ const existing: ExistingIncident[] = organizationIds.length === 0 ? [] :
     'SELECT organization_id, incident_key FROM alert_incidents WHERE organization_id = ANY($1::uuid[])',
     organizationIds)).map((r) => ({ organizationId: r.organization_id, incidentKey: r.incident_key }))
 
-const byOrganizationAndAlertType = new Map<DispositionKey, string>()
+const byOrganizationAndAlertType = new Map<DispositionKey, Severity>()
 const anyRecipientByOrganization = new Map<string, boolean>()
-const unreadable: string[] = []
+const unreadable: UnreadableDisposition[] = []
 if (organizationIds.length > 0) {
   // `alert_type_id`, RENAMED FROM `rule_id`, and the key is built by the one function that only
   // accepts an AlertTypeId. A stored value the catalogue does not declare is collected rather
@@ -93,8 +95,18 @@ if (organizationIds.length > 0) {
     'SELECT organization_id, alert_type_id, disposition FROM alert_rule_dispositions WHERE organization_id = ANY($1::uuid[])',
     organizationIds)) {
     const alertTypeId = asAlertTypeId(r.alert_type_id)
-    if (alertTypeId === null) { unreadable.push(r.alert_type_id); continue }
-    byOrganizationAndAlertType.set(dispositionKey(r.organization_id, alertTypeId), r.disposition)
+    if (alertTypeId === null) {
+      unreadable.push({ alertTypeId: r.alert_type_id, disposition: r.disposition, because: 'UNKNOWN_ALERT_TYPE' })
+      continue
+    }
+    // AND THE VALUE. A database migrated before the vocabulary changed holds the old spelling,
+    // which is exactly the fleet this forecast is most likely to be run against.
+    const disposition = asDisposition(r.disposition)
+    if (disposition === null) {
+      unreadable.push({ alertTypeId: r.alert_type_id, disposition: r.disposition, because: 'UNKNOWN_DISPOSITION' })
+      continue
+    }
+    byOrganizationAndAlertType.set(dispositionKey(r.organization_id, alertTypeId), disposition)
   }
   for (const r of await prisma.$queryRawUnsafe<{ organization_id: string; any_recipient: boolean }[]>(
     `SELECT organization_id, bool_or(email_enabled) AS any_recipient FROM notification_preferences
@@ -146,7 +158,9 @@ if (unreadable.length > 0) {
   console.log('  *** PREFERENCES THIS PRODUCT CANNOT ACT ON')
   console.log('      Stored against an id the catalogue does not declare — most likely written at')
   console.log('      the wrong grain. They are NOT silencing anything, and the MSP believes they are:')
-  for (const value of [...new Set(unreadable)].sort()) console.log(`        ${value}`)
+  for (const each of unreadable) {
+    console.log(`        ${each.alertTypeId} = ${each.disposition}   (${each.because})`)
+  }
 }
 console.log('')
 console.log('  THE SAME FIGURE COUNTED TWICE, so a disagreement is visible')

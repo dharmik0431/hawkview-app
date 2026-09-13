@@ -1,8 +1,10 @@
 import {
-  asAlertTypeId, dispositionKey,
+  asAlertTypeId, asDisposition, dispositionKey,
   type DispositionKey, type Dispositions, type ExistingIncident, type FindingRow,
   type IncidentWrite, type NotificationWrite, type PipelineStore, type SendJobWrite,
+  type UnreadableDisposition,
 } from './finding-pipeline.js'
+import { type Severity } from './alert-type.js'
 
 /**
  * THE STORE THAT SHIPS, extracted so a test can drive it.
@@ -84,9 +86,9 @@ export function pipelineStore(runner: SqlRunner): PipelineStore {
     },
 
     async loadDispositions(organizationIds) {
-      const byOrganizationAndAlertType = new Map<DispositionKey, string>()
+      const byOrganizationAndAlertType = new Map<DispositionKey, Severity>()
       const anyRecipientByOrganization = new Map<string, boolean>()
-      const unreadable: string[] = []
+      const unreadable: UnreadableDisposition[] = []
       if (organizationIds.length === 0) {
         return { byOrganizationAndAlertType, anyRecipientByOrganization, unreadable }
       }
@@ -104,9 +106,28 @@ export function pipelineStore(runner: SqlRunner): PipelineStore {
         // on, and defaulting it would read as though they had never chosen. Historically this is
         // exactly what a rule id stored in this column did, silently.
         const alertTypeId = asAlertTypeId(row.alert_type_id)
-        if (alertTypeId === null) { unreadable.push(row.alert_type_id); continue }
+        if (alertTypeId === null) {
+          unreadable.push({
+            alertTypeId: row.alert_type_id,
+            disposition: row.disposition,
+            because: 'UNKNOWN_ALERT_TYPE',
+          })
+          continue
+        }
+        // AND THE VALUE, for the same reason. The CHECK constraint refuses one today, but a
+        // database migrated before the vocabulary changed holds the old spelling — and that is
+        // precisely the state the forward migration exists for, so it is reachable.
+        const disposition = asDisposition(row.disposition)
+        if (disposition === null) {
+          unreadable.push({
+            alertTypeId: row.alert_type_id,
+            disposition: row.disposition,
+            because: 'UNKNOWN_DISPOSITION',
+          })
+          continue
+        }
         byOrganizationAndAlertType.set(
-          dispositionKey(row.organization_id, alertTypeId), row.disposition)
+          dispositionKey(row.organization_id, alertTypeId), disposition)
       }
 
       // EMAIL IS OFF UNLESS SOMEBODY TURNED IT ON, AND ABSENCE IS OFF TOO. `bool_or` over no rows

@@ -73,7 +73,22 @@ export class AlertDispositionsService {
         ...(raw !== undefined && !readable ? { storedValueIgnored: raw } : {}),
       }
     })
-    return { organizationId: organisation, dispositions }
+    // **KEYS THE CATALOGUE DOES NOT DECLARE, NAMED RATHER THAN SKIPPED.** This method walks the
+    // catalogue, so a stored row whose `alert_type_id` is not a declared id is invisible to it —
+    // seven rows come back and none mentions it. That is exactly what this column held before it
+    // was renamed, so the rows most likely to be here are real settings real people made.
+    //
+    // The distinction the endpoint now makes at both ends: an unreadable VALUE appears on its
+    // row as `storedValueIgnored`; an unreadable KEY has no row to appear on, so it is listed
+    // here. Neither silences anything — the catalogue default applies either way — and the harm
+    // in both is that somebody believes their choice took effect.
+    const declared = new Set<string>(ALERT_CATALOG.map((type) => type.id))
+    const unrecognisedKeys = stored
+      .map((row) => row.alertTypeId)
+      .filter((id) => !declared.has(id))
+      .sort()
+
+    return { organizationId: organisation, dispositions, unrecognisedKeys }
   }
 
   /** Set one type's disposition for this organisation.

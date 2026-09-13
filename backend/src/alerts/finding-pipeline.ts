@@ -101,18 +101,27 @@ export function asAlertTypeId(value: string): AlertTypeId | null {
   return ALERT_CATALOG.some((type) => type.id === value) ? value as AlertTypeId : null
 }
 
+export type UnreadableDisposition = Readonly<{
+  alertTypeId: string
+  disposition: string
+  because: 'UNKNOWN_ALERT_TYPE' | 'UNKNOWN_DISPOSITION'
+}>
+
 export interface Dispositions {
   /** Keyed by `dispositionKey(organizationId, alertTypeId)`, which is the only way to build one.
    * Absent means the catalogue default — nothing is seeded, so a stored row exists only where an
    * MSP has overridden it. */
-  readonly byOrganizationAndAlertType: ReadonlyMap<DispositionKey, string>
-  /** Stored values that name no alert type in the catalogue, verbatim.
+  readonly byOrganizationAndAlertType: ReadonlyMap<DispositionKey, Severity>
+  /** Stored rows the product cannot act on, verbatim and with the reason.
    *
-   * **REPORTED, NOT DEFAULTED, AND NOT DROPPED SILENTLY.** A row here is a preference an MSP set
-   * that the product cannot act on — historically because it was written at the wrong grain. It
-   * surfaces in the intake report so somebody can go and look, rather than becoming the
-   * catalogue default and reading as if the MSP had never chosen. */
-  readonly unreadable: readonly string[]
+   * **REPORTED, NOT DEFAULTED, AND NOT DROPPED SILENTLY.** Each is a preference an MSP set that
+   * has no effect — the catalogue default applies instead — so the harm is entirely that they
+   * believe otherwise. It surfaces in the intake report and on the settings endpoint rather than
+   * being computed and thrown away.
+   *
+   * TWO REASONS, KEPT APART. An unknown KEY is what this column held before the rename; an
+   * unknown VALUE is what it held before the vocabulary changed. They have different remedies. */
+  readonly unreadable: readonly UnreadableDisposition[]
   /** `organizationId` → whether ANY user there can receive email. */
   readonly anyRecipientByOrganization: ReadonlyMap<string, boolean>
 }
@@ -253,6 +262,11 @@ export interface NotificationWrite {
  * here rather than a row that quietly takes a default. The last time this feature invented a
  * severity vocabulary the compiler caught it; this is the same protection, kept.
  *
+ * **IT IS APPLIED TO THE EFFECTIVE TIER**, which is the organisation's disposition where one is
+ * set and readable and the catalogue's severity otherwise. One derivation, one owner — so
+ * ACT_TODAY on a catalogue-ACT_NOW type renders as `high` rather than `critical`, and an MSP can
+ * see their choice took effect.
+ *
  * ⚠ `critical` IS ALWAYS SHOWN, WHATEVER THE USER'S IN-APP SWITCH SAYS — that is the existing
  * product rule in `visibilityFilter`, not a new one, and mapping ACT_NOW onto it is deliberate:
  * ACT_NOW is the tier that routes to a phone, so a person who muted in-app notifications should
@@ -279,10 +293,15 @@ export function notificationFor(
   finding: FindingRow,
   alertTypeId: AlertTypeId,
   incidentKey: string,
+  effectiveTier: Severity,
 ): NotificationWrite | null {
   const declared = ALERT_CATALOG.find((type) => type.id === alertTypeId)
   if (declared === undefined) return null
-  const tone = NOTIFICATION_TONE[declared.severity]
+  // **THE EFFECTIVE TIER, NOT THE CATALOGUE'S.** Written from the catalogue in every case, an
+  // MSP who raised urgency had made a choice the product recorded, displayed and never acted on
+  // — and one who lowered it still got the row marked critical. Two of the three settings were
+  // inert and the third only worked because RECORD_ONLY is also the thing that stops the job.
+  const tone = NOTIFICATION_TONE[effectiveTier]
   return {
     organizationId: finding.organizationId,
     customerTenantId: finding.customerTenantId,
@@ -364,10 +383,20 @@ export interface PipelineDecision {
  * the tiering the catalogue declares. An id the catalogue does not declare is the quietest
  * answer rather than a guess — but it cannot arise through `decide`, which only reaches here
  * with an id `alertTypeForRule` produced. */
-const defaultDispositionFor = (alertTypeId: AlertTypeId): string => {
+const defaultDispositionFor = (alertTypeId: AlertTypeId): Severity => {
   const declared = ALERT_CATALOG.find((type) => type.id === alertTypeId)
   return declared === undefined ? 'RECORD_ONLY' : declared.severity
 }
+
+/** The only door from a stored string to a tier.
+ *
+ * **THE MAP HOLDS `Severity`, NOT `string`, SO `decide` NEEDS NO GUARD AT ALL.** It had one, and
+ * a mutation that removed it killed no test — because the store never puts an unreadable value in
+ * the map, so both versions fell back identically and the test was describing the fallback rather
+ * than the guard. Narrowing the map's value type removed the guard instead of testing it: an
+ * unreadable value is now unwriteable there, and the store reports it. */
+export const asDisposition = (value: string): Severity | null =>
+  value === 'ACT_NOW' || value === 'ACT_TODAY' || value === 'RECORD_ONLY' ? value : null
 
 /** The whole decision, pure. */
 export function decide(
@@ -404,12 +433,25 @@ export function decide(
     const incidentKey = grouping.groups ? grouping.key : `ungrouped:${finding.id}`
     const scoped = `${finding.organizationId}|${incidentKey}`
 
+    // **THE EFFECTIVE TIER, DERIVED ONCE AND USED FOR BOTH DECISIONS.** The notification's
+    // severity and whether a job is produced are the same judgement — what this organisation
+    // considers this type to be — so they read one value. Computing it twice, or reading the
+    // catalogue for one and the disposition for the other, is how two of the three settings
+    // ended up inert.
+    //
+    // An unreadable stored value is not in this map at all — the store collects those into
+    // `unreadable` — so the catalogue default applies and the fact is reported rather than
+    // silently becoming a tier.
+    const effectiveTier: Severity =
+      dispositions.byOrganizationAndAlertType.get(
+        dispositionKey(finding.organizationId, alertTypeId)) ?? defaultDispositionFor(alertTypeId)
+
     // THE NOTIFICATION IS WRITTEN FIRST AND FOR EVERY FINDING THAT GETS THIS FAR, including one
     // whose incident is already open. An incident is the SET of rows sharing its key, so a second
     // finding on the same incident is a second row rather than nothing — and the `continue` below
     // would otherwise drop it. This is the in-app channel; it is not gated by the watermark, by
     // the disposition or by there being an email recipient, all of which govern SENDING only.
-    const notification = notificationFor(finding, alertTypeId, incidentKey)
+    const notification = notificationFor(finding, alertTypeId, incidentKey, effectiveTier)
     if (notification !== null) notifications.push(notification)
 
     // THE INCIDENT IS WRITTEN EVEN FOR HISTORY. The record is what makes the backlog visible in
@@ -434,9 +476,7 @@ export function decide(
       skipped.push({ findingId: finding.id, because: 'BEFORE_WATERMARK' })
       continue
     }
-    const disposition = dispositions.byOrganizationAndAlertType.get(
-      dispositionKey(finding.organizationId, alertTypeId)) ?? defaultDispositionFor(alertTypeId)
-    if (disposition === 'RECORD_ONLY') {
+    if (effectiveTier === 'RECORD_ONLY') {
       skipped.push({ findingId: finding.id, because: 'RECORD_ONLY' })
       continue
     }
@@ -508,6 +548,17 @@ export interface IntakeReport {
   readonly jobsWritten: number
   readonly skipped: readonly Skipped[]
   readonly unmappedRules: readonly string[]
+  /** Stored dispositions whose `alert_type_id` names no declared alert type, verbatim.
+   *
+   * **A SETTING SOMEBODY MADE THAT THE PRODUCT CANNOT ACT ON.** The store already computes this —
+   * see `Dispositions.unreadable` — and until now the list was built and thrown away, so
+   * "reported, never defaulted" was true where the disposition VALUE was unreadable and false
+   * where its KEY was. One field over from the defect the column rename closed.
+   *
+   * It does not silence anything: an unreadable key never reaches the lookup, so the catalogue
+   * default applies and the alert still goes. The harm is entirely that the MSP believes
+   * otherwise. */
+  readonly unreadableDispositions: readonly UnreadableDisposition[]
   readonly accountingProblems: readonly string[]
   /** True when the window ran out before the work finished. **THE CASCADE RULE:** intake yields
    * rather than borrowing from what comes after it, because collection outranks alerting always
@@ -576,8 +627,8 @@ export async function runIntake(
   now: () => number = Date.now,
 ): Promise<IntakeOutcome> {
   const empty = (yielded: boolean, findingsRead = 0): IntakeReport => ({
-    findingsRead, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0, skipped: [], unmappedRules: [],
-    accountingProblems: [], yieldedOnBudget: yielded,
+    findingsRead, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0, skipped: [],
+    unmappedRules: [], unreadableDispositions: [], accountingProblems: [], yieldedOnBudget: yielded,
   })
   const ran = (report: IntakeReport): IntakeOutcome => ({ kind: 'RAN', report })
   if (now() >= deadlineAt) return ran(empty(true))
@@ -628,6 +679,7 @@ export async function runIntake(
     return ran({
       findingsRead: findings.length, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0,
       skipped: decision.skipped, unmappedRules: decision.unmappedRules,
+      unreadableDispositions: dispositions.unreadable,
       accountingProblems: decision.accountingProblems, yieldedOnBudget: true,
     })
   }
@@ -657,6 +709,7 @@ export async function runIntake(
     jobsWritten,
     skipped: decision.skipped,
     unmappedRules: decision.unmappedRules,
+    unreadableDispositions: dispositions.unreadable,
     accountingProblems: decision.accountingProblems,
     yieldedOnBudget: false,
   })

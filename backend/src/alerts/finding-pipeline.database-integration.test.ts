@@ -699,7 +699,9 @@ test('A DISPOSITION STORED AT THE WRONG GRAIN IS REPORTED, not silently ignored'
     // BUT IT IS NO LONGER SILENT. The value is carried out verbatim so somebody can go and look,
     // rather than the MSP believing a choice took effect that the product never saw.
     const dispositions = await storeFor(client).loadDispositions([ORG])
-    assert.deepEqual(dispositions.unreadable, ['HV-ID-AUTH-010.v1'])
+    assert.deepEqual(dispositions.unreadable, [
+      { alertTypeId: 'HV-ID-AUTH-010.v1', disposition: 'RECORD_ONLY', because: 'UNKNOWN_ALERT_TYPE' },
+    ])
     assert.equal(dispositions.byOrganizationAndAlertType.size, 0, 'and it is not keyed')
 
     // AND THE SAME PREFERENCE AT THE RIGHT GRAIN DOES SILENCE — the control, without which the
@@ -720,6 +722,56 @@ test('A DISPOSITION STORED AT THE WRONG GRAIN IS REPORTED, not silently ignored'
     assert.equal(silenced.incidentsWritten, 1, 'and the incident is still recorded — there is no OFF')
     assert.deepEqual((await storeFor(client).loadDispositions([ORG])).unreadable, [])
   } finally {
+    await client.end()
+  }
+})
+
+test('BOTH KINDS OF UNREADABLE DISPOSITION ARE REPORTED, and neither silences anything', { skip: !RUN || !URL }, async () => {
+  // TWO SETTINGS AN MSP MADE THAT THE PRODUCT CANNOT ACT ON, and they used to be reported
+  // unevenly: an unreadable VALUE appeared on its row, an unreadable KEY appeared nowhere at all
+  // — the tick collected it and threw the list away. One field over from the defect the column
+  // rename closed.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents, alert_rule_dispositions CASCADE')
+    await client.query('DELETE FROM identity_risk_findings')
+
+    // An unknown KEY — what this column held before the rename.
+    await client.query(
+      `INSERT INTO alert_rule_dispositions (id, organization_id, alert_type_id, disposition, updated_at)
+       VALUES (gen_random_uuid(), $1, 'HV-ID-AUTH-010.v1', 'RECORD_ONLY', now())`, [ORG])
+    // An unknown VALUE — what it held before the vocabulary changed. The CHECK refuses it now, so
+    // it goes in with the constraint briefly dropped: this is the state a database migrated
+    // before 20260913100000 is actually in, which is why that migration exists.
+    await client.query('ALTER TABLE alert_rule_dispositions DROP CONSTRAINT alert_rule_dispositions_disposition_check')
+    await client.query(
+      `INSERT INTO alert_rule_dispositions (id, organization_id, alert_type_id, disposition, updated_at)
+       VALUES (gen_random_uuid(), $1, 'security.suspected_credential_attack', 'EMAIL', now())`, [ORG])
+
+    const loaded = await storeFor(client).loadDispositions([ORG])
+
+    assert.equal(loaded.byOrganizationAndAlertType.size, 0, 'neither is keyed, so neither bites')
+    assert.deepEqual([...loaded.unreadable].sort((a, b) => a.because.localeCompare(b.because)), [
+      { alertTypeId: 'HV-ID-AUTH-010.v1', disposition: 'RECORD_ONLY', because: 'UNKNOWN_ALERT_TYPE' },
+      { alertTypeId: 'security.suspected_credential_attack', disposition: 'EMAIL', because: 'UNKNOWN_DISPOSITION' },
+    ])
+
+    // AND THE TICK CARRIES THEM OUT. The list was computed and discarded before; an operator
+    // reading the intake log now sees the settings that are being ignored.
+    await seed(client)
+    const report = await ranIntake(
+      storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    assert.equal(report.unreadableDispositions.length, 2)
+
+    // NEITHER SILENCED ANYTHING — the catalogue default applied, so the alert still went. The
+    // harm was only ever that the MSP believed otherwise.
+    assert.equal(report.jobsWritten, 1)
+  } finally {
+    await client.query(
+      `ALTER TABLE alert_rule_dispositions ADD CONSTRAINT alert_rule_dispositions_disposition_check
+       CHECK (disposition IN ('ACT_NOW', 'ACT_TODAY', 'RECORD_ONLY')) NOT VALID`).catch(() => undefined)
     await client.end()
   }
 })

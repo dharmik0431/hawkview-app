@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1836 tests, 1716 pass, 0 fail.** The remaining 120 are database-integration tests requiring a
+**1840 tests, 1719 pass, 0 fail.** The remaining 121 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -877,6 +877,37 @@ REFUSED_PERMANENT, per message, per attempt. What is genuinely absent is the pro
 verdict — delivered, bounced, complained — and that is now worded as **delivery outcomes are not
 persisted** rather than as an absent ledger, because a blocker a reader can disprove on sight
 teaches them to skim the rest of the list.
+
+### The setting now changes something, and an ignored setting is visible at both ends
+
+**Two of the three choices were inert.** `ACT_NOW` and `ACT_TODAY` produced byte-identical output
+and both matched having no row at all, because the notification's severity was written from the
+CATALOGUE in every case and the only use of the disposition was `=== 'RECORD_ONLY'`. An MSP who
+raised urgency had made a choice the product recorded, displayed and never acted on; one who
+lowered it still got the row marked `critical`.
+
+**The effective tier now owns it** — the organisation's disposition where set and readable, the
+catalogue's severity otherwise — derived once and used for *both* the notification's severity and
+whether a job is produced, because they are the same judgement. `ACT_TODAY` on a
+catalogue-`ACT_NOW` type renders `high` rather than `critical`. No routing or channel change: SMS
+is deferred and both tiers deliver identically, which is already stated at the control.
+
+**An ignored setting is now reported at both ends, in both its forms.**
+
+| | before | now |
+|---|---|---|
+| unreadable **value** | on its row as `storedValueIgnored` | unchanged, plus `UNKNOWN_DISPOSITION` in the tick |
+| unreadable **key** | **nowhere** — the endpoint walks the catalogue so never sees the row, and the tick computed the list and threw it away | `unrecognisedKeys` on the endpoint, `unreadableDispositions` in `IntakeReport` |
+
+Neither silences anything — the catalogue default applies either way — so the harm was always
+that somebody believed otherwise.
+
+⚠ **A GUARD I WROTE WAS UNTESTABLE, SO IT WAS REMOVED RATHER THAN TESTED.** `decide` checked the
+stored tier with an `isSeverity` guard; a mutation deleting that guard killed nothing, because the
+store never puts an unreadable value in the map and both versions fell back identically — the test
+was describing the fallback. `byOrganizationAndAlertType` is now `ReadonlyMap<…, Severity>`, so an
+unreadable value is **unwriteable there** and the store reports it instead. The guard is gone
+because the wrong thing became impossible, not because it was proven right.
 
 ### Forward migrations only — a rule now, not a judgement
 

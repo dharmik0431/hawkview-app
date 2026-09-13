@@ -294,11 +294,12 @@ test('A STORED VALUE THE CATALOGUE DOES NOT DECLARE IS REPORTED, NOT DEFAULTED',
 test('AN UNREADABLE DISPOSITION LEAVES THE CATALOGUE DEFAULT IN FORCE, and is still reported', () => {
   // The two halves together: the send is decided by the default (so a broken row cannot silence
   // an alert by accident), AND the broken row is visible (so nobody thinks the MSP never chose).
-  const withJunk: Dispositions = { ...canEmail, unreadable: ['HV-ID-AUTH-010.v1'] }
+  const withJunk: Dispositions = { ...canEmail, unreadable: [{ alertTypeId: 'HV-ID-AUTH-010.v1', disposition: 'RECORD_ONLY', because: 'UNKNOWN_ALERT_TYPE' as const }] }
   const out = decide([finding()], none, withJunk, WATERMARK, T0)
 
   assert.equal(out.jobs.length, 1, 'the catalogue default still applies — ACT_NOW sends')
-  assert.deepEqual(withJunk.unreadable, ['HV-ID-AUTH-010.v1'], 'and the value survives to be read')
+  assert.equal(withJunk.unreadable[0]?.alertTypeId, 'HV-ID-AUTH-010.v1',
+    'and the value survives to be read')
 })
 
 test('A COMMIT THAT FAILS REPORTS THE PHASE AND EVERYTHING IT LOST', async () => {
@@ -355,4 +356,66 @@ test('AND A HEALTHY TICK IS NEITHER, or the two above are satisfied by always fa
   assert.equal(outcome.kind === 'RAN' ? outcome.report.jobsWritten : null, 1)
   assert.equal(outcome.kind === 'RAN' ? outcome.report.yieldedOnBudget : null, false,
     'and a completed tick is not a yield either')
+})
+
+test('LOWERING URGENCY CHANGES THE NOTIFICATION, and raising it does too', () => {
+  // **TWO OF THE THREE SETTINGS WERE INERT.** ACT_NOW and ACT_TODAY produced byte-identical
+  // output and both matched no row at all, because the severity was written from the CATALOGUE
+  // in every case. An MSP who lowered urgency still got the row marked critical; one who raised
+  // it had made a choice the product recorded, displayed and never acted on.
+  const lowered: Dispositions = {
+    ...canEmail,
+    byOrganizationAndAlertType: new Map([
+      [dispositionKey(ORG, 'security.suspected_credential_attack'), 'ACT_TODAY'],
+    ]),
+  }
+  const out = decide([finding()], none, lowered, WATERMARK, T0)
+
+  assert.equal(out.notifications[0]?.severity, 'high', 'NOT critical, which is the catalogue value')
+  assert.equal(out.notifications[0]?.category, 'warning')
+  assert.equal(out.jobs.length, 1, 'and it still sends — ACT_TODAY is not off')
+
+  // THE CONTROL: with no setting the catalogue's own judgement applies, so the assertion above
+  // is about the disposition rather than about a severity that is always high.
+  const untouched = decide([finding()], none, canEmail, WATERMARK, T0)
+  assert.equal(untouched.notifications[0]?.severity, 'critical')
+  assert.equal(untouched.notifications[0]?.category, 'error')
+})
+
+test('RAISING URGENCY ON A QUIET TYPE IS VISIBLE TOO', () => {
+  // The other direction, on a type the catalogue calls RECORD_ONLY — so this cannot pass by the
+  // catalogue happening to agree.
+  const quiet = ALERT_CATALOG.find((type) => type.severity === 'RECORD_ONLY')
+  assert.ok(quiet !== undefined)
+  const mapped = ALERT_CATALOG.find((type) => type.id === 'security.suspected_credential_attack')
+  assert.ok(mapped !== undefined)
+
+  const raised: Dispositions = {
+    ...canEmail,
+    byOrganizationAndAlertType: new Map([
+      [dispositionKey(ORG, mapped.id), 'RECORD_ONLY'],
+    ]),
+  }
+  const out = decide([finding()], none, raised, WATERMARK, T0)
+
+  // RECORD_ONLY renders as info AND withholds the job — one value deciding both, which is the
+  // point: they are the same judgement.
+  assert.equal(out.notifications[0]?.severity, 'info')
+  assert.equal(out.jobs.length, 0)
+  assert.equal(out.skipped[0]?.because, 'RECORD_ONLY')
+
+  // AND THE INCIDENT AND THE NOTIFICATION STILL EXIST. Off means recorded, not absent.
+  assert.equal(out.incidents.length, 1)
+  assert.equal(out.notifications.length, 1)
+})
+
+test('AN UNREADABLE STORED TIER LEAVES THE CATALOGUE IN CHARGE, and is reported', () => {
+  // A value outside the vocabulary never reaches the map — the store collects it into
+  // `unreadable` — so the catalogue default applies and the fact travels in the report rather
+  // than becoming a tier nobody chose.
+  const withJunk: Dispositions = { ...canEmail, unreadable: [{ alertTypeId: 'HV-ID-AUTH-010.v1', disposition: 'RECORD_ONLY', because: 'UNKNOWN_ALERT_TYPE' as const }] }
+  const out = decide([finding()], none, withJunk, WATERMARK, T0)
+
+  assert.equal(out.notifications[0]?.severity, 'critical', 'the catalogue judgement, unchanged')
+  assert.equal(out.jobs.length, 1)
 })

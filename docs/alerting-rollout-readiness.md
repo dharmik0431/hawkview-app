@@ -59,10 +59,10 @@ find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 
 | What | Result |
 | --- | --- |
-| Unit suite | **1836 tests, 1716 pass, 0 fail, 120 skipped** |
+| Unit suite | **1840 tests, 1719 pass, 0 fail, 121 skipped** |
 | `tsc --noEmit -p tsconfig.json` | clean |
 | `tsc --noEmit -p tsconfig.scripts.json` | clean |
-| Alerting integration, real PostgreSQL 15 | **24/24** — 12 pipeline, 4 in-app, 3 suppression, 5 dispositions |
+| Alerting integration, real PostgreSQL 15 | **25/25** — 13 pipeline, 4 in-app, 3 suppression, 5 dispositions |
 | Schema drift vs `schema.prisma` | 254 lines, **none naming an `alert_` table** |
 
 **The 113 skipped are the database-integration tests**, gated behind
