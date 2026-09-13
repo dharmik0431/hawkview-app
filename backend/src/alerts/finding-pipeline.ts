@@ -181,8 +181,15 @@ export function alertTypeForRule(ruleId: string): AlertTypeId | null {
  * a fact about the data and defaulting it is how a setting somebody made gets silently ignored.
  * That is the same rule the disposition column follows.
  *
- * DERIVED HERE AND RETURNED BY THE API, so the client renders what it is sent. Deriving it again
- * on the client is the same fact in two places with a network hop between them. */
+ * DERIVED HERE AND RETURNED BY THE API on every notification list item, so the client renders
+ * what it is sent. Deriving it again on the client is the same fact in two places with a network
+ * hop between them.
+ *
+ * THIS SENTENCE WAS WRITTEN BEFORE THE CALLER EXISTED. For one commit it asserted a call that was
+ * not there, the DTO sent only the legacy five-value severity, and the inbox rendered no badge at
+ * all for every alert-backed row. **A comment is a claim: grep for the caller before writing that
+ * something is returned by the API.** The fourth zero-caller instance in this feature and the
+ * first to assert its own caller in prose. */
 export type NotificationTier =
   | Readonly<{ kind: 'TIER'; tier: Severity }>
   | Readonly<{ kind: 'NOT_AN_ALERT' }>

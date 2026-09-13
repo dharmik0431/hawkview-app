@@ -116,9 +116,17 @@ async function scaffold(client: pg.Client) {
     `INSERT INTO memberships (id, user_id, organization_id, role, status, created_at, updated_at)
      VALUES (gen_random_uuid(), $1, $2, 'MSP_OWNER', 'ACTIVE', now(), now())
      ON CONFLICT (user_id, organization_id) DO NOTHING`, [USER, ORG])
+  // **THIS FILE OWNS THIS ORGANISATION'S PREFERENCE STATE, so it clears it first.**
+  // `bool_or(email_enabled)` is evaluated per ORGANISATION across every user in it, so a
+  // preference row another test file left behind — for a different user, in the same org, with
+  // email on — makes "nobody here can be reached" false for tests that never touched it. Measured:
+  // the held-back-from-sending test below queued a job it should not have, and only because the
+  // advisory gate happened to run the other file first that time. A test that depends on which
+  // test ran before it is testing the machine it ran on.
+  await client.query('DELETE FROM notification_preferences WHERE organization_id = $1', [ORG])
   await client.query(
     `INSERT INTO notification_preferences (id, user_id, organization_id, updated_at)
-     VALUES (gen_random_uuid(), $1, $2, now()) ON CONFLICT DO NOTHING`, [USER, ORG])
+     VALUES (gen_random_uuid(), $1, $2, now())`, [USER, ORG])
 }
 
 async function seedFinding(client: pg.Client, id: string, ruleId = 'HV-ID-AUTH-001.v1') {
@@ -287,6 +295,68 @@ test('A FINDING HELD BACK FROM SENDING IS STILL VISIBLE IN-APP', { skip: !RUN ||
     const reader = readerFor(prisma)
     const list = await reader.list({ subject: SUBJECT, email: 'in-app-probe@an-msp.example' })
     assert.equal(list.total, 1, 'the panel shows an alert nobody will be emailed about')
+  } finally {
+    await prisma.$disconnect()
+    await client.end()
+  }
+})
+
+test('THE TIER REACHES THE WIRE, and a collector row carries none', { skip: !RUN || !URL }, async () => {
+  // THE GAP THIS CLOSES. `alertTierFor` was correct, tested, and had NO CALLER — while its own
+  // comment said the API returned it. The DTO sent the legacy five-value severity and no tier, so
+  // the inbox rendered no badge for every alert-backed row, always. Nothing failed, because no
+  // test asked the wire what it carried.
+  const client = new pg.Client({ connectionString: URL })
+  const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: URL }) })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents, alert_rule_dispositions CASCADE')
+    await client.query('DELETE FROM notifications')
+    await client.query('DELETE FROM identity_risk_findings')
+    await seedFinding(client, '55555555-5555-5555-5555-555555555555')
+    await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+
+    // A COLLECTOR ROW AT THE SAME SEVERITY. `critical` is not exclusive to alerts —
+    // `tenant-sync.service.ts` publishes a lost Microsoft connection at critical through the same
+    // publishIncident. This row is why the tier cannot be recovered by inverting severity at
+    // either end, and it exists here so the assertion below is not a coincidence of the fixture.
+    await client.query(
+      `INSERT INTO notifications (id, organization_id, event_type, category, severity, title,
+          description, dedupe_key, source, occurrence_count, first_occurred_at, last_occurred_at,
+          created_at, updated_at)
+        VALUES (gen_random_uuid(), $1, 'tenant.connection.lost', 'error', 'critical',
+                'Tenant is no longer connected', 'Reconnect the tenant.',
+                'tenant:probe:connection', 'system', 1, now(), now(), now(), now())`, [ORG])
+
+    const list = await readerFor(prisma).list(
+      { subject: SUBJECT, email: 'in-app-probe@an-msp.example' })
+    assert.equal(list.total, 2, 'both rows are visible')
+
+    const alert = list.items.find((item) => item.eventType === 'security.suspected_credential_attack')
+    const collector = list.items.find((item) => item.eventType === 'tenant.connection.lost')
+    assert.ok(alert !== undefined && collector !== undefined)
+
+    // THE ALERT CARRIES ITS TIER.
+    assert.deepEqual(alert.tier, { kind: 'TIER', tier: 'ACT_NOW' })
+    assert.equal(alert.alertTypeId, 'security.suspected_credential_attack')
+
+    // THE COLLECTOR ROW CARRIES NONE, AT THE SAME SEVERITY. Both are `critical`; only one is an
+    // alert. Anything inverting severity into a tier would badge the disconnected tenant ACT_NOW.
+    assert.equal(collector.severity, 'critical')
+    assert.equal(alert.severity, 'critical')
+    assert.deepEqual(collector.tier, { kind: 'NOT_AN_ALERT' })
+    assert.equal(collector.alertTypeId, undefined)
+
+    // AND AN UNREADABLE ONE IS ITS OWN ANSWER, not silently a missing tier. A stored id the
+    // catalogue does not declare is a fact about the data somebody should look at.
+    await client.query(
+      "UPDATE notifications SET alert_type_id = 'security.invented' WHERE event_type = 'tenant.connection.lost'")
+    const again = await readerFor(prisma).list(
+      { subject: SUBJECT, email: 'in-app-probe@an-msp.example' })
+    const unreadable = again.items.find((item) => item.eventType === 'tenant.connection.lost')
+    assert.deepEqual(unreadable?.tier,
+      { kind: 'UNKNOWN_ALERT_TYPE', alertTypeId: 'security.invented' })
   } finally {
     await prisma.$disconnect()
     await client.end()

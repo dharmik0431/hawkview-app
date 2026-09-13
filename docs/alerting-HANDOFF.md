@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1820 tests, 1706 pass, 0 fail.** The remaining 114 are database-integration tests requiring a
+**1821 tests, 1706 pass, 0 fail.** The remaining 115 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -877,6 +877,34 @@ REFUSED_PERMANENT, per message, per attempt. What is genuinely absent is the pro
 verdict — delivered, bounced, complained — and that is now worded as **delivery outcomes are not
 persisted** rather than as an absent ledger, because a blocker a reader can disprove on sight
 teaches them to skim the rest of the list.
+
+### Four functions have been written correct, tested, and unreachable
+
+Worth naming because it is now four, and the fourth asserted its own caller in prose.
+
+| | state |
+|---|---|
+| `cancelStatement` | had no caller — a release precondition that could not be pressed. **Closed**: `scripts/alerting-cancel.mts` |
+| `alertTierFor` | had no caller **while its own comment said the API returned it**. **Closed**: wired into the notification list DTO |
+| the suppression store | had no caller. Still has none — nothing drains the queue |
+| the send queue | `claimStatement`, `attemptSend`, `beginAttempt`, `afterAttempt` all at zero callers. **Open**, and first on the missing list |
+
+Each time the function was correct and tested; each time the commit message described the
+capability rather than the wiring. **Before writing a comment that says something is returned by
+the API, grep for the caller.** A comment is a claim, and this one was false for a commit — the
+DTO sent the legacy five-value severity and no tier, so the inbox rendered no badge for every
+alert-backed row, always, and nothing failed because no test asked the wire what it carried.
+
+**The tier could not have been recovered at either end.** `critical` is not exclusive to alerts:
+`tenant-sync.service.ts` publishes a lost Microsoft connection at `critical` through the same
+`publishIncident`, on rows that exist in production today. Any scheme inverting severity into a
+tier badges a disconnected tenant as ACT_NOW. That is why it travels as its own field, and there
+is a test with a real collector row at `critical` beside a real alert at `critical` — a mutation
+that derives the tier from severity fails it.
+
+⚠ **`resolved` is already in the DTO** (`resolved: Boolean(row.resolvedAt)`), so a cleared
+incident looking identical to a waiting one is a rendering gap on the client, not a missing field
+on the wire. Reported as backend-side; measured otherwise.
 
 ### Still missing before anything can send
 
