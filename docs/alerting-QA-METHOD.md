@@ -363,3 +363,40 @@ and left them as findings. A hand-check done once is not a property that stays t
 my own line about the store, and it applied to its own fix. Two of the four had no test until I
 wrote them, and the next refactor of that store would have been unguarded in exactly the way the
 last one was.
+
+### Check what your probe received before you believe what it concluded
+
+Three times in two days a check reported a pass **because it had found nothing**, each time through
+a different mechanism.
+
+1. A regex that extracted zero CSS classes reported *"0 classes not emitted"*.
+2. A `sed` escaping step that errored on every class left the pattern empty, so `grep -F ""`
+   matched everything and again reported zero.
+3. A route probe computed its booleans over the body of a **401** — the route had never run, and
+   two of the three read `true`.
+
+The first two look like regex bugs. The third has nothing to do with regexes, which is what makes
+the pattern visible: **the conclusion was computed over something other than the thing being
+measured, and nothing in the output said so.** A zero and a green are the same shape whether they
+come from a subject that passed or from an instrument that missed.
+
+So every probe now carries a line that proves it measured what it meant to. A status code, a byte
+count, a digest of the body, a count of the rows examined — anything whose wrong value is obviously
+wrong. In the route probe every claim is now gated on the response status, and the gate is written
+so that an unexpected status makes the claims read `false`, never `true`.
+
+**A related sub-case, and it is the good one.** That gate's first version said `status === 200`, and
+a Nest `POST` answers `201` — so every claim read `false` over a response that was completely
+correct. A gate that is wrong makes work; a gate that is wrong in the *reassuring* direction makes
+a false report. When you cannot get a gate exactly right, get it wrong towards the alarm.
+
+### The toolchain can hand you somebody else's bug
+
+A fresh worktree at the commit under test failed to typecheck with two errors saying a field did not
+exist on a Prisma model — a field that commit had added. The generated Prisma client is **untracked**,
+so a clean worktree carries whatever happened to be generated last, and `npx prisma generate`
+refuses to run without `DATABASE_URL` set even though it reads no database.
+
+Reported as found, that would have been my worktree's staleness filed as the author's defect. The
+tell was the same one as always: the error contradicted something I had already read — the field was
+right there in `schema.prisma` in the same tree that said it did not exist.
