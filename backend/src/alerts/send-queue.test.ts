@@ -2,9 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   TERMINAL, accounting, afterAttempt, backoffMs, beginAttempt, claimOutcome, claimStatement,
-  cancelStatement, eligibility, inFlight, wouldCancel,
+  cancelReason, cancelStatement, classifyCancellation, eligibility, inFlight, wouldCancel,
   neverSent, sentMoreThanOnce, workerId,
-  type Attempt, type CancelScope, type SendJob, type SendPermit, type SendState, type Settled,
+  type Attempt, type CancelOrder, type CancelScope, type SendJob, type SendPermit,
+  type SendState, type Settled,
 } from './send-queue.js'
 import { idempotencyKey, messageId, providerMessageId } from './email-delivery.js'
 
@@ -13,6 +14,9 @@ import { idempotencyKey, messageId, providerMessageId } from './email-delivery.j
 
 const T0 = '2026-09-12T09:00:00.000Z'
 const at = (ms: number) => new Date(Date.parse(T0) + ms).toISOString()
+/** Created before and after the instant the operator pressed stop. */
+const BEFORE = at(-60_000)
+const AFTER = at(60_000)
 
 const job = (over: Partial<SendJob> = {}): SendJob => ({
   messageId: messageId('m-1'),
@@ -282,25 +286,25 @@ test('CANCEL STOPS INTENT, INCLUDING INTENT THAT HAS ALREADY BEEN ATTEMPTED', ()
   const attempted = job({ messageId: messageId('incident/org-1|k2'), attemptsMade: 1 })
   const claimed = job({
     messageId: messageId('incident/org-1|k4'), state: 'CLAIMED', attemptsMade: 2,
-    claim: { by: workerId('w-1'), atIso: T0, expiresIso: '2026-09-13T09:01:00.000Z' },
+    claim: { by: workerId('w-1'), atIso: T0, expiresIso: at(60_000) },
   })
 
-  const everything: CancelScope = { kind: 'EVERYTHING' }
-  assert.equal(wouldCancel(unattempted, everything), true)
-  assert.equal(wouldCancel(attempted, everything), true, 'or stop does not stop')
-  assert.equal(wouldCancel(claimed, everything), true, 'a dead worker holding a job must not win')
+  const everything: CancelScope = { kind: 'EVERYTHING', createdBeforeIso: T0 }
+  assert.equal(wouldCancel(unattempted, everything, BEFORE), true)
+  assert.equal(wouldCancel(attempted, everything, BEFORE), true, 'or stop does not stop')
+  assert.equal(wouldCancel(claimed, everything, BEFORE), true, 'a dead worker holding a job must not win')
 
   // BUT HISTORY IS NEVER RELABELLED, or the cancel is satisfied by cancelling everything. This is
   // the control: a settled send stays settled, and `CANCELLED` never overwrites what happened.
   const sent = job({ messageId: messageId('incident/org-1|k3'), state: 'SENT', providerId: providerMessageId('p') })
-  assert.equal(wouldCancel(sent, everything), false)
-  assert.equal(wouldCancel(job({ state: 'GAVE_UP' }), everything), false)
-  assert.equal(wouldCancel(job({ state: 'EXHAUSTED' }), everything), false)
+  assert.equal(wouldCancel(sent, everything, BEFORE), false)
+  assert.equal(wouldCancel(job({ state: 'GAVE_UP' }), everything, BEFORE), false)
+  assert.equal(wouldCancel(job({ state: 'EXHAUSTED' }), everything, BEFORE), false)
 
   // AND THE SQL CARRIES THE RULE, so it is the database's rather than the caller's — a worker
   // that never calls `wouldCancel` is still stopped.
-  const sql = cancelStatement(everything, T0).sql
-  assert.doesNotMatch(sql, /attempts_made/, 'an attempted job is stopped too')
+  const sql = cancelStatement({ scope: everything, by: 'ops', because: cancelReason('spam') }, T0).sql
+  assert.doesNotMatch(sql, /attempts_made = 0/, 'an attempted job is stopped too')
   assert.ok(sql.includes("state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED')"),
     'history is excluded by the database, not by the caller')
   assert.equal(sql.split(';').filter((part) => part.trim() !== '').length, 1, 'one statement')
@@ -308,16 +312,102 @@ test('CANCEL STOPS INTENT, INCLUDING INTENT THAT HAS ALREADY BEEN ATTEMPTED', ()
   assert.doesNotMatch(sql, /alert_send_attempts/, 'nor what actually reached a provider')
 })
 
+test('THE RESULT DISTINGUISHES STOPPED FROM MAY-HAVE-GONE, PER JOB', () => {
+  // A COUNT OF ROWS UPDATED IS NOT AN ANSWER. Told "3 stopped", an operator stops watching the
+  // inbox and tells the customer it was caught — and two of those three may be at the provider.
+  const jobs = classifyCancellation([
+    { message_id: 'incident/org-1|k1', state_before: 'READY', attempts_made: 0, was_claimed: false },
+    { message_id: 'incident/org-1|k2', state_before: 'READY', attempts_made: 1, was_claimed: false },
+    { message_id: 'incident/org-1|k4', state_before: 'CLAIMED', attempts_made: 0, was_claimed: true },
+  ])
+
+  assert.equal(jobs[0]?.outcome, 'STOPPED_BEFORE_ANY_ATTEMPT')
+  // AN OPEN ATTEMPT MEANS A SEND MAY HAVE LEFT: the attempt row is written BEFORE the side effect.
+  assert.equal(jobs[1]?.outcome, 'MAY_HAVE_REACHED_PROVIDER')
+  // AND SO DOES A LIVE CLAIM AT ZERO ATTEMPTS — the worker can be inside `attemptSend` right now.
+  // This is the case a rule keyed only on `attempts_made` would report as safely stopped.
+  assert.equal(jobs[2]?.outcome, 'MAY_HAVE_REACHED_PROVIDER')
+
+  // THE PRE-IMAGE TRAVELS WITH IT, so the report can be argued with rather than trusted.
+  assert.equal(jobs[2]?.stateBefore, 'CLAIMED')
+  assert.equal(jobs[2]?.wasClaimed, true)
+  assert.deepEqual(jobs.map((each) => each.messageId),
+    ['incident/org-1|k1', 'incident/org-1|k2', 'incident/org-1|k4'])
+
+  // NOT VACUOUS: cancelling nothing returns nothing, rather than one reassuring row.
+  assert.deepEqual(classifyCancellation([]), [])
+})
+
+test('THE STATEMENT CAPTURES THE PRE-IMAGE INSIDE ITSELF, or the race returns', () => {
+  // The read-then-write form cancels a job a worker has already claimed — measured 25 out of 25
+  // against a real database. The columns that classify a job are the ones the cancel overwrites,
+  // so capturing them in a separate SELECT would reintroduce exactly that race.
+  const sql = cancelStatement({
+    scope: { kind: 'EVERYTHING', createdBeforeIso: T0 }, by: 'ops', because: cancelReason('spam'),
+  }, T0).sql
+
+  assert.match(sql, /FOR UPDATE/, 'the targets are locked as they are read')
+  assert.match(sql, /^WITH targets AS \(/, 'and the read is inside the same statement')
+  assert.match(sql, /RETURNING[\s\S]*t\.state_before/, 'the report reads the pre-image, not the new row')
+  assert.match(sql, /RETURNING[\s\S]*claimed_by IS NOT NULL/)
+  assert.equal(sql.split(';').filter((part) => part.trim() !== '').length, 1, 'STILL ONE STATEMENT')
+})
+
+test('WHO, WHEN AND WHY GO ON THE ROW, and the reason cannot be blank', () => {
+  // Six months from now "why was this MSP never told" has to be answerable from the record. The
+  // state alone says somebody stopped it and nothing says who or on what grounds.
+  const statement = cancelStatement({
+    scope: { kind: 'EVERYTHING', createdBeforeIso: T0 },
+    by: 'dharmik@hawkview.example',
+    because: cancelReason('  duplicate storm from the 09:00 tick  '),
+  }, T0)
+
+  assert.match(statement.sql, /cancelled_at = \$1::timestamptz/)
+  assert.match(statement.sql, /cancelled_by = \$2/)
+  assert.match(statement.sql, /cancelled_because = \$3/)
+  assert.equal(statement.params[1], 'dharmik@hawkview.example')
+  assert.equal(statement.params[2], 'duplicate storm from the 09:00 tick', 'trimmed')
+
+  // AN UNEXPLAINED STOP IS UNAVAILABLE, not discouraged. Empty and whitespace both satisfy a NOT
+  // NULL column and neither answers the question the column exists for.
+  assert.throws(() => cancelReason(''), /must carry a reason/)
+  assert.throws(() => cancelReason('   '), /must carry a reason/)
+
+  // @ts-expect-error - and a bare string is not a reason
+  const forged: CancelOrder = { scope: { kind: 'EVERYTHING', createdBeforeIso: T0 }, by: 'ops', because: 'spam' }
+  assert.ok(forged !== null)
+})
+
+test('createdBeforeIso IS REQUIRED, because the next tick is a real category', () => {
+  // Intake runs every five minutes. Whether "stop" means the jobs that exist now or also the ones
+  // the next tick writes is a decision the operator must make, not one they inherit from a WHERE
+  // clause they never read.
+  const scope: CancelScope = { kind: 'EVERYTHING', createdBeforeIso: T0 }
+  const statement = cancelStatement({ scope, by: 'ops', because: cancelReason('spam') }, T0)
+  assert.match(statement.sql, /created_at < \$4::timestamptz/)
+  assert.equal(statement.params[3], T0)
+
+  // A JOB CREATED AFTER THE PRESS IS NOT STOPPED, which is the whole reason the bound exists.
+  assert.equal(wouldCancel(job(), scope, BEFORE), true)
+  assert.equal(wouldCancel(job(), scope, AFTER), false, 'formed after the operator pressed stop')
+  assert.equal(wouldCancel(job(), scope, T0), false, 'strictly before, so the boundary is not both')
+
+  // @ts-expect-error - a scope without it does not typecheck
+  const forged: CancelScope = { kind: 'EVERYTHING' }
+  assert.ok(forged !== null)
+})
+
 test('CANCEL IS SCOPABLE, and the scope cannot catch a neighbouring organisation', () => {
   // A stop button that can only stop everything is one nobody dares press.
-  const scope: CancelScope = { kind: 'ORGANISATION', organizationId: 'org-1' }
-  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-1|k') }), scope), true)
-  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-2|k') }), scope), false)
+  const scope: CancelScope = { kind: 'ORGANISATION', organizationId: 'org-1', createdBeforeIso: T0 }
+  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-1|k') }), scope, BEFORE), true)
+  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-2|k') }), scope, BEFORE), false)
 
   // THE SEPARATOR IS INSIDE THE PREFIX, or `org-1` would also stop `org-12`.
-  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-12|k') }), scope), false)
-  assert.match(cancelStatement(scope, T0).sql, /message_id LIKE \$2 \|\| '%'/)
-  assert.deepEqual(cancelStatement(scope, T0).params, [T0, 'incident/org-1|'])
+  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-12|k') }), scope, BEFORE), false)
+  const statement = cancelStatement({ scope, by: 'ops', because: cancelReason('spam') }, T0)
+  assert.match(statement.sql, /message_id LIKE \$5 \|\| '%'/)
+  assert.deepEqual(statement.params, [T0, 'ops', 'spam', T0, 'incident/org-1|'])
 })
 
 test('A CANCELLED JOB CANNOT BE CLAIMED AGAIN, or the stop button is decorative', () => {
@@ -327,6 +417,7 @@ test('A CANCELLED JOB CANNOT BE CLAIMED AGAIN, or the stop button is decorative'
   assert.equal(verdict.mayAttempt, false)
   assert.equal(verdict.mayAttempt === false ? verdict.because.kind : null, 'TERMINAL')
   assert.ok(TERMINAL.includes('CANCELLED'))
-  assert.ok(cancelStatement({ kind: 'EVERYTHING' }, T0).sql.includes("'CANCELLED'"),
-    'and a second cancel does not re-cancel')
+  assert.ok(cancelStatement({
+    scope: { kind: 'EVERYTHING', createdBeforeIso: T0 }, by: 'ops', because: cancelReason('spam'),
+  }, T0).sql.includes("'CANCELLED'"), 'and a second cancel does not re-cancel')
 })

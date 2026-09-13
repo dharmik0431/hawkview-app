@@ -417,6 +417,13 @@ const countBy = (values: readonly string[]): ReadonlyMap<string, number> => {
  * others, and if the only control is global they will hesitate — which is the worst moment to
  * hesitate.
  *
+ * `createdBeforeIso` IS REQUIRED ON BOTH SCOPES, NOT OPTIONAL, and the requirement is the point.
+ * Intake runs every five minutes, so jobs created AFTER the operator pressed stop are a real
+ * category rather than a theoretical one. Whether "stop" means the jobs that exist now or also
+ * the ones the next tick writes is a **decision the operator has to make**, and an optional field
+ * would let them inherit it from a WHERE clause they never read. Making it required costs one
+ * argument and converts a silent default into an answered question.
+ *
  * ⚠ THE ORGANISATION SCOPE MATCHES A MESSAGE-ID PREFIX, and that is a consequence of R8 rather
  * than a design choice. `alert_send_jobs` deliberately carries no organisation column so a
  * per-tenant queue is unwriteable — which leaves the message id, built as
@@ -424,8 +431,36 @@ const countBy = (values: readonly string[]): ReadonlyMap<string, number> => {
  * the stop button to that format.** The alternative is an organisation column, which would
  * reopen exactly what R8 closed. Flagged rather than decided. */
 export type CancelScope =
-  | Readonly<{ kind: 'EVERYTHING' }>
-  | Readonly<{ kind: 'ORGANISATION'; organizationId: string }>
+  | Readonly<{ kind: 'EVERYTHING'; createdBeforeIso: string }>
+  | Readonly<{ kind: 'ORGANISATION'; organizationId: string; createdBeforeIso: string }>
+
+/** Who is stopping it and why, carried into the row.
+ *
+ * SIX MONTHS FROM NOW, "why was this MSP never told" HAS TO BE ANSWERABLE FROM THE RECORD. The
+ * state alone says somebody stopped it; it does not say who or on what grounds, and by the time
+ * the question is asked every log that might have settled it has rotated away.
+ *
+ * THE REASON IS A BRANDED TYPE WITH NO DEFAULT, so an unexplained stop is unavailable rather than
+ * discouraged. A default would be written by the code rather than by the person, and a field that
+ * always says the same thing answers nothing. */
+export type CancelReason = string & { readonly __cancelReason: unique symbol }
+
+/** The only producer. Refuses empty and whitespace, because both satisfy a NOT NULL column and
+ * neither answers the question the column exists for. */
+export function cancelReason(value: string): CancelReason {
+  const trimmed = value.trim()
+  if (trimmed.length === 0) {
+    throw new Error('A cancellation must carry a reason. An unexplained stop is what turns into an argument with a customer.')
+  }
+  return trimmed.slice(0, 500) as CancelReason
+}
+
+export interface CancelOrder {
+  readonly scope: CancelScope
+  /** The operator, as an identifier a person can be found from later. */
+  readonly by: string
+  readonly because: CancelReason
+}
 
 export interface CancelStatement {
   readonly sql: string
@@ -435,6 +470,40 @@ export interface CancelStatement {
   readonly expectedRowCount: null
 }
 
+/** What happened to ONE job, and the distinction is the reason this returns rows at all.
+ *
+ * **A COUNT OF ROWS UPDATED IS NOT AN ANSWER.** Told "3 stopped", an operator stops apologising,
+ * stops watching the inbox and tells the customer it was caught — and if two of those three had
+ * an attempt already open, the message may be at the provider. Somebody told a message was
+ * stopped behaves completely differently from somebody told it might not have been, so the two
+ * facts must not arrive in the same word.
+ *
+ * `STOPPED_BEFORE_ANY_ATTEMPT` is safe to report as stopped: the job was `READY`, unclaimed, and
+ * no attempt row was ever opened for it.
+ *
+ * `MAY_HAVE_REACHED_PROVIDER` covers both of the uncertain shapes, deliberately in one word
+ * because the operator's action is the same for both — keep watching. Either an attempt was
+ * already open (the row is written BEFORE the side effect, so its existence means a send may have
+ * left) or a worker held the claim and could be inside `attemptSend` at this instant. */
+export type CancelOutcome = 'STOPPED_BEFORE_ANY_ATTEMPT' | 'MAY_HAVE_REACHED_PROVIDER'
+
+export interface CancelledJob {
+  readonly messageId: MessageId
+  readonly outcome: CancelOutcome
+  /** The state it was in before the cancel, so the report can be argued with rather than trusted. */
+  readonly stateBefore: SendState
+  readonly attemptsMade: number
+  readonly wasClaimed: boolean
+}
+
+/** One row of the statement's `RETURNING`, before it is classified. */
+export interface CancelledRow {
+  readonly message_id: string
+  readonly state_before: string
+  readonly attempts_made: number
+  readonly was_claimed: boolean
+}
+
 /** Cancel every job that is not already finished.
  *
  * STOP MEANS STOP, INCLUDING JOBS THAT HAVE BEEN ATTEMPTED. This bound was `attempts_made = 0`
@@ -442,51 +511,98 @@ export interface CancelStatement {
  * cancelled would be a lie. **That reasoning protected the record and broke the button.** A job
  * attempted once and refused RETRYABLY is still `READY` with its budget unspent, so leaving it
  * alone means the operator presses stop and an email goes out afterwards anyway — a decorative
- * stop button, which is the R2 defect wearing a different hat.
- *
- * THE RECORD IS NOT ACTUALLY AT RISK, which is why both properties survive. `CANCELLED` is a
- * statement about the JOB — *we stopped pursuing this* — and never a claim that nothing reached
- * a provider. What reached a provider is in `alert_send_attempts`, which this does not touch.
- * The genuinely uncertain case is narrow: a job that crashed after the provider accepted it, and
- * that one carries the same idempotency key, so the send it loses is one the provider would have
- * deduplicated anyway.
+ * stop button, which is the R2 defect wearing a different hat. QA had pre-registered the opposite
+ * and withdrew it; the record is not at risk, because `CANCELLED` is a statement about the JOB
+ * and never a claim that nothing reached a provider. What did reach one is in
+ * `alert_send_attempts`, which this does not touch.
  *
  * A SETTLED SEND IS STILL SAFE, because `SENT` is terminal and excluded by the state list. This
  * cancels intent, never history.
  *
- * ONE STATEMENT, so it is safe to run while intake is running. Intake inserts inside a
- * transaction; this updates inside one; neither sees the other half-done. A job inserted a
- * millisecond after this runs is simply not cancelled, which is correct — it is a new intent
- * formed after the operator pressed stop, and stopping the future is what the watermark and the
- * disposition are for.
+ * **ONE STATEMENT, AND THE CTE IS WHAT KEEPS IT ONE.** The read-then-write form — the shape
+ * anybody would script by hand at 3am — cancels a job a worker has already claimed, measured 25
+ * times out of 25 against a real database. The pre-image has to be captured to label each job,
+ * and capturing it in a separate `SELECT` would reintroduce exactly that race. So the `SELECT
+ * ... FOR UPDATE` lives inside the same statement: it locks each target, the `UPDATE` joins to
+ * it, and a claim arriving concurrently either blocks and then finds `CANCELLED`, or wins first
+ * and is reported back as `MAY_HAVE_REACHED_PROVIDER`. Both are correct answers; neither is a
+ * lost update.
+ *
+ * `RETURNING` READS THE CTE, NOT THE UPDATED ROW. PostgreSQL 15 has no `OLD` in `RETURNING`, and
+ * the columns that classify a job — its state, whether it was claimed — are the ones the cancel
+ * overwrites. Taking them from the locked pre-image is the only way to report what was true when
+ * the decision was made.
  *
  * IT NEVER TOUCHES `alert_incidents`. The incident is the record that something happened. */
-export function cancelStatement(scope: CancelScope, nowIso: string): CancelStatement {
-  const common = [
-    'UPDATE alert_send_jobs',
-    "SET state = 'CANCELLED', claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL,",
-    '    updated_at = $1::timestamptz',
+export function cancelStatement(order: CancelOrder, nowIso: string): CancelStatement {
+  const { scope } = order
+  const scoped = scope.kind === 'ORGANISATION'
+  const targetWhere = [
     // Not already finished — and nothing else. A CLAIMED job whose worker died must stop, and so
     // must one that was attempted and refused retryably, or stop does not stop. A SENT, EXHAUSTED,
     // GAVE_UP or CANCELLED job is not relabelled: those are history, and this cancels intent.
-    "WHERE state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED')",
+    "   WHERE state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED')",
+    '     AND created_at < $4::timestamptz',
   ]
-  if (scope.kind === 'EVERYTHING') {
-    return { sql: common.join('\n'), params: [nowIso], expectedRowCount: null }
-  }
-  return {
-    // `LIKE` with the separator included, so `incident/org-1|` cannot also match `incident/org-12|`.
-    sql: [...common, "  AND message_id LIKE $2 || '%'"].join('\n'),
-    params: [nowIso, `incident/${scope.organizationId}|`],
-    expectedRowCount: null,
-  }
+  // `LIKE` with the separator included, so `incident/org-1|` cannot also match `incident/org-12|`.
+  if (scoped) targetWhere.push("     AND message_id LIKE $5 || '%'")
+
+  const sql = [
+    'WITH targets AS (',
+    '  SELECT message_id, state AS state_before, attempts_made, claimed_by',
+    '    FROM alert_send_jobs',
+    ...targetWhere,
+    '     FOR UPDATE',
+    ')',
+    'UPDATE alert_send_jobs AS j',
+    "   SET state = 'CANCELLED',",
+    '       claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL,',
+    '       cancelled_at = $1::timestamptz,',
+    '       cancelled_by = $2,',
+    '       cancelled_because = $3,',
+    '       updated_at = $1::timestamptz',
+    '  FROM targets t',
+    ' WHERE j.message_id = t.message_id',
+    'RETURNING j.message_id, t.state_before, t.attempts_made,',
+    '          (t.claimed_by IS NOT NULL) AS was_claimed',
+  ].join('\n')
+
+  const params: unknown[] = [nowIso, order.by, order.because, scope.createdBeforeIso]
+  if (scoped) params.push(`incident/${scope.organizationId}|`)
+  return { sql, params, expectedRowCount: null }
 }
 
-/** Whether a job would be cancelled by a stop, without running one. For an operator to see the
- * blast radius before pressing it — D9's forecast-before-you-run, applied to the stop button
- * rather than to the first send. */
-export function wouldCancel(job: SendJob, scope: CancelScope): boolean {
+/** Label the rows the statement returned.
+ *
+ * SEPARATE FROM THE SQL SO IT CAN BE TESTED WITHOUT A DATABASE, and so the rule that decides
+ * "may have reached the provider" lives in one readable place rather than inside a CASE
+ * expression nobody reviews. */
+export function classifyCancellation(rows: Iterable<CancelledRow>): readonly CancelledJob[] {
+  const out: CancelledJob[] = []
+  for (const row of rows) {
+    // AN OPEN ATTEMPT OR A LIVE CLAIM, EITHER ONE. The attempt row is written before the side
+    // effect, so its existence means a send may have left; and a worker holding the claim can be
+    // inside `attemptSend` at this instant. Reporting either as "stopped" is the lie that makes
+    // an operator stop watching.
+    const uncertain = row.attempts_made > 0 || row.was_claimed
+    out.push({
+      messageId: row.message_id as MessageId,
+      outcome: uncertain ? 'MAY_HAVE_REACHED_PROVIDER' : 'STOPPED_BEFORE_ANY_ATTEMPT',
+      stateBefore: row.state_before as SendState,
+      attemptsMade: row.attempts_made,
+      wasClaimed: row.was_claimed,
+    })
+  }
+  return out
+}
+
+/** Whether a job would be cancelled by a stop, without running one.
+ *
+ * THE PREVIEW ANSWERS A DIFFERENT QUESTION FROM THE RESULT, and both are needed: before, which
+ * jobs would stop; after, which of those may already have gone. */
+export function wouldCancel(job: SendJob, scope: CancelScope, createdAtIso: string): boolean {
   if (TERMINAL.includes(job.state)) return false
+  if (!(Date.parse(createdAtIso) < Date.parse(scope.createdBeforeIso))) return false
   return scope.kind === 'EVERYTHING'
     || job.messageId.startsWith(`incident/${scope.organizationId}|`)
 }

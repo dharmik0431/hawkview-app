@@ -38,14 +38,14 @@ find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 
 | What | Result |
 | --- | --- |
-| Unit suite | **1799 tests, 1692 pass, 0 fail, 107 skipped** |
+| Unit suite | **1806 tests, 1696 pass, 0 fail, 110 skipped** |
 | `tsc --noEmit -p tsconfig.json` | clean |
 | `tsc --noEmit -p tsconfig.scripts.json` | clean |
-| Alerting integration, real PostgreSQL 15 | **11/11** — 8 pipeline, 3 suppression |
+| Alerting integration, real PostgreSQL 15 | **14/14** — 11 pipeline, 3 suppression |
 | Schema drift vs `schema.prisma` | 254 lines, **none naming an `alert_` table** |
 
-**The 107 skipped are the database-integration tests**, gated behind
-`HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which that command does not set. **The 1692 figure
+**The 110 skipped are the database-integration tests**, gated behind
+`HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which that command does not set. **The 1696 figure
 does not cover them.** They were run separately, and the two results must not be added together
 or quoted as one.
 
@@ -75,7 +75,7 @@ does not make a timing assertion sound.
 
 ## 3. Migrations and rollback
 
-Six migrations carry this feature. **All six are additive or widening — none drops a column,
+Seven migrations carry this feature. **All seven are additive or widening — none drops a column,
 narrows a type, or rewrites a row.**
 
 | Migration | What it does |
@@ -86,6 +86,7 @@ narrows a type, or rewrites a row.**
 | `20260913000000_widen_incident_key` | `VARCHAR(300)` → `(400)` on two columns |
 | `20260913020000_send_job_cancelled` | replaces one CHECK with a wider one |
 | `20260913040000_alert_suppressed_addresses` | one new table |
+| `20260913060000_send_job_cancellation_provenance` | three **nullable** columns on `alert_send_jobs`, two CHECKs, one index |
 
 ### Measured, not assumed
 
@@ -94,7 +95,7 @@ migrated with `prisma migrate deploy`, used, and destroyed inside the session. 5
 applied, no failures.
 
 **Re-running every alerting migration by hand is safe, and this was measured three passes deep.**
-All six re-run clean against an already-migrated database, repeatedly, with existing rows intact.
+All of them re-run clean against an already-migrated database, repeatedly, with existing rows intact.
 
 **That measurement found a real defect, which is now fixed.**
 `20260912120000`'s type guard asserted the column was `varchar(300)`. After `20260913000000`
@@ -152,6 +153,9 @@ What blocks it, in the order it must be cleared — this is the launch-blocker l
    today.
 4. **No persisted ledger.** Outcomes are in-memory values with no table, which is why the route
    is unwritten rather than written and left half-connected.
+
+   *(The stop button is no longer on this list:  is its
+   press, run end to end against a real cluster. So is the suppression store.)*
 5. **The watermark is unchosen.** `HAWKVIEW_ALERT_WATERMARK_ISO` is unset, and intake refuses to
    run rather than defaulting — deliberately, because the default available is "now" and taking
    it silently decides for ever which history was never worth telling anybody about.

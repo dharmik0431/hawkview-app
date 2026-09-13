@@ -160,9 +160,9 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1799 tests, 1692 pass, 0 fail.** The remaining 107 are database-integration tests requiring a
+**1806 tests, 1696 pass, 0 fail.** The remaining 110 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
-so **the 1692 figure does not cover them.** They have been run, separately and against a real
+so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
 establish. Do not read the two results as one number.
 
@@ -597,31 +597,57 @@ reached*, or a brand-new MSP is emailed before anybody chose to be. Proven again
 database in both shapes — no row, and a row left at the column default — each beside a positive
 control.
 
-**The stop button exists, and it stops attempted jobs too.** `cancelStatement` cancels every job
-that is not already finished, in one statement so it is safe while intake runs, scopable to one
-organisation or everything, and it never touches `alert_incidents` or `alert_send_attempts`.
-`CANCELLED` is its own terminal state — deleting the row would lose the ability to explain what
-the product did, and reusing `GAVE_UP` would confuse *the address refused us* with *a person
-stopped it*, which have different remedies.
+**The stop button exists, it stops attempted jobs too, and it has a press.** `cancelStatement`
+cancels every job that is not already finished, in one statement, scopable to one organisation or
+everything, and it never touches `alert_incidents` or `alert_send_attempts`. `CANCELLED` is its
+own terminal state — deleting the row would lose the ability to explain what the product did, and
+reusing `GAVE_UP` would confuse *the address refused us* with *a person stopped it*.
 
-**The bound was `attempts_made = 0` first, and that was wrong in the direction that sends.** The
-reasoning was that an attempted job has already reached a provider and calling it cancelled would
-be a lie. But a job attempted once and refused RETRYABLY is still `READY` with budget left — so
-excluding it meant the operator pressed stop and an email went out afterwards. The record was
-never actually at risk: `CANCELLED` is a statement about the job, not a claim that nothing
-reached a provider, and what did reach one is in `alert_send_attempts`, untouched. The one
-genuinely uncertain case — a crash after the provider accepted — carries the same idempotency
-key, so the send it loses is one the provider would have deduplicated.
+**The bound was `attempts_made = 0` first, and that was wrong in the direction that sends.** A job
+attempted once and refused RETRYABLY is still `READY` with budget left, so excluding it meant the
+operator pressed stop and an email went out afterwards. Measured: of three stoppable jobs the old
+bound stopped one. QA had pre-registered that a CLAIMED job must never be cancelled and has
+withdrawn it.
 
-⚠ **OPEN, NOT DECIDED: a stopped job that may already have reached the provider is not
-distinguishable from one that never did**, because both end as `CANCELLED` and only the attempt
-rows tell them apart. If an operator ever needs that distinction at a glance it wants its own
-disposition rather than a join. Taken in the sends-less direction on the standing rule, because
-nobody has ruled on it.
+**THE RESULT IS PER JOB, NEVER A COUNT.** Each cancelled job comes back labelled
+`STOPPED_BEFORE_ANY_ATTEMPT` or `MAY_HAVE_REACHED_PROVIDER`. Told *"3 stopped"*, an operator stops
+watching the inbox and tells the customer it was caught — and QA measured a real press reporting
+3 where two had attempts already made. Somebody told a message was stopped behaves completely
+differently from somebody told it might not have been, so the two facts never arrive in one word,
+and the script never adds the two numbers together.
+
+**A live claim at zero attempts counts as uncertain**, not just a non-zero attempt count. The
+worker can be inside `attemptSend` at that instant, and a rule keyed only on `attempts_made`
+would report it as safely stopped.
+
+**Who, when and why are on the row** (`cancelled_by`, `cancelled_at`, `cancelled_because`), with a
+CHECK making cancelled-without-provenance and provenance-without-cancelled both unwriteable, and
+the reason a branded type with no default. Six months from now *why was this MSP never told* has
+to be answerable from the record rather than from a log somebody still happens to have.
+
+**`createdBeforeIso` is required on both scopes.** Intake runs every five minutes, so jobs created
+after the press are a real category, and whether stop means those too is a decision the operator
+makes rather than one they inherit from a WHERE clause.
+
+**THE PRESS IS `backend/scripts/alerting-cancel.mts`**, because a release precondition that cannot
+be pressed is not met by the function existing. A script rather than an endpoint: no new public
+surface, no authorisation question, no deploy, and reachable by anyone with the database URL —
+which is the situation a stop button is for. It previews by default and needs `--apply` to write.
+Run end to end against a real cluster: the refusals, the preview changing nothing, the apply
+writing provenance, the neighbouring organisation untouched, a second press stopping nothing.
 
 ⚠ **The organisation scope matches a message-id prefix**, because R8 deliberately left the queue
 with no organisation column. That couples the stop button to the message-id format. The
 alternative reopens what R8 closed. Flagged, not decided.
+
+⚠ **WHAT THE RACE TESTS DO AND DO NOT ESTABLISH.** The read-then-write cancel — the shape anybody
+would script by hand — is demonstrated failing: it reports a job as stopped after a worker has
+claimed it. The one-statement form is then shown leaving no gap for that claim. But the first
+version of that test **passed with `FOR UPDATE` deleted**, and the corrected comment says so: the
+UPDATE's own row lock is what excludes the claim in that interleaving. `FOR UPDATE` closes a
+narrower window — a claim committing between the statement's snapshot and the UPDATE's lock,
+leaving the CTE's pre-image stale — which is sub-millisecond and is **argued from the shape of the
+statement, not measured**. Whoever revisits this should know which half has evidence behind it.
 
 ### Suppression now survives a restart, and the table is keyed by the address
 
@@ -789,7 +815,7 @@ evidence of that at all.**
 ### Database-integration tests HAVE now been run — and the count is not reproducible
 
 This section used to say **"96 tests, zero runs"**. Replaced rather than deleted, because the
-warning it carried still stands: **the 1692 passing figure does not cover this suite**, and the
+warning it carried still stands: **the 1696 passing figure does not cover this suite**, and the
 apply phase is exactly the work where it would matter most.
 
 They have been run, by QA and independently by the engineer, against disposable PostgreSQL 15.
@@ -802,8 +828,8 @@ inputs. **The suite has no reproducible number.** Writing the environment down d
 that, which is why it is worse than a missing document.
 
 **THE ALERTING INTEGRATION FILES ARE NOT PART OF THAT, and must not be discounted with them.**
-`finding-pipeline.database-integration.test.ts` (8 tests) and
-`suppression-store.database-integration.test.ts` (3) pass **11/11** against a freshly
+`finding-pipeline.database-integration.test.ts` (11 tests) and
+`suppression-store.database-integration.test.ts` (3) pass **14/14** against a freshly
 `migrate deploy`-ed PostgreSQL 15, created and destroyed inside the session. They share the
 harness but not the wall: they touch no KMS and no risk key store, and they have been green on
 every run. The unreproducible numbers above are the identity-risk suite. **Two different suites,

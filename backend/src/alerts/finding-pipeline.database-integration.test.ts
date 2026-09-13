@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import pg from 'pg'
-import { cancelStatement } from './send-queue.js'
+import {
+  cancelReason, cancelStatement, classifyCancellation, claimStatement, workerId,
+} from './send-queue.js'
+import { messageId } from './email-delivery.js'
 import { runIntake, type Dispositions, type ExistingIncident, type FindingRow,
   type IncidentWrite, type PipelineStore, type SendJobWrite, type Watermark } from './finding-pipeline.js'
 
@@ -399,7 +402,7 @@ test('AN OPERATOR WITH EMAIL OFF IS STILL NO ELIGIBLE RECIPIENT', { skip: !RUN |
   }
 })
 
-test('THE STOP BUTTON STOPS ATTEMPTED JOBS TOO, against the real table', { skip: !RUN || !URL }, async () => {
+test('THE STOP BUTTON STOPS ATTEMPTED JOBS TOO, and says which may already have gone', { skip: !RUN || !URL }, async () => {
   // THE CLAIM THIS TEST EXISTS FOR. An earlier bound was `attempts_made = 0`, on the reasoning
   // that an attempted job had already reached a provider. But a job attempted once and refused
   // RETRYABLY is still READY with budget left — so the operator pressed stop and an email went
@@ -412,59 +415,253 @@ test('THE STOP BUTTON STOPS ATTEMPTED JOBS TOO, against the real table', { skip:
     await client.query('TRUNCATE alert_send_jobs CASCADE')
 
     const OTHER = '88888888-8888-8888-8888-888888888888'
-    const put = (key: string, state: string, attempts: number, org = ORG) => client.query(
+    // `created_at` IS SET EXPLICITLY rather than left to its default, because the press instant is
+    // what this test is partly about — a job created after it must survive.
+    const put = (key: string, state: string, attempts: number, createdAt: string, org = ORG) => client.query(
       `INSERT INTO alert_send_jobs
          (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at,
-          claimed_by, claimed_at, claim_expires_at, provider_id, updated_at)
-       VALUES (gen_random_uuid(), $1, $1, $2::text, $3, 3, now(),
+          claimed_by, claimed_at, claim_expires_at, provider_id, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $1, $2::text, $3, 3, $4::timestamptz,
                CASE WHEN $2::text = 'CLAIMED' THEN 'w-1' END,
-               CASE WHEN $2::text = 'CLAIMED' THEN now() END,
-               CASE WHEN $2::text = 'CLAIMED' THEN now() + interval '1 minute' END,
+               CASE WHEN $2::text = 'CLAIMED' THEN $4::timestamptz END,
+               CASE WHEN $2::text = 'CLAIMED' THEN $4::timestamptz + interval '1 minute' END,
                CASE WHEN $2::text = 'SENT' THEN 'p-1' END,
-               now())`,
-      [`incident/${org}|${key}`, state, attempts])
+               $4::timestamptz, $4::timestamptz)`,
+      [`incident/${org}|${key}`, state, attempts, createdAt])
 
-    await put('k1', 'READY', 0)
-    await put('k2', 'READY', 1)   // attempted and refused retryably — the one that used to escape
-    await put('k3', 'SENT', 1)
-    await put('k4', 'CLAIMED', 2) // a worker that died holding it
-    await put('k5', 'GAVE_UP', 3)
-    await put('k6', 'READY', 0, OTHER)
+    const OLD = '2026-09-12T08:00:00.000Z'
+    const PRESS = '2026-09-12T09:00:00.000Z'
+    const NEW = '2026-09-12T10:00:00.000Z'
 
-    const scoped = cancelStatement({ kind: 'ORGANISATION', organizationId: ORG }, T0)
+    await put('k1', 'READY', 0, OLD)
+    await put('k2', 'READY', 1, OLD)   // attempted and refused retryably — the one that used to escape
+    await put('k3', 'SENT', 1, OLD)
+    await put('k4', 'CLAIMED', 0, OLD) // a live claim at zero attempts: the subtle uncertain case
+    await put('k5', 'GAVE_UP', 3, OLD)
+    await put('k6', 'READY', 0, OLD, OTHER)
+    await put('k7', 'READY', 0, NEW)   // written by the tick AFTER the operator pressed stop
+
+    const order = {
+      scope: { kind: 'ORGANISATION', organizationId: ORG, createdBeforeIso: PRESS } as const,
+      by: 'ops@hawkview.example',
+      because: cancelReason('duplicate storm from the 09:00 tick'),
+    }
+    const scoped = cancelStatement(order, PRESS)
     const stopped = await client.query(scoped.sql, [...scoped.params])
-    assert.equal(stopped.rowCount, 3, 'k1, k2 and k4 — including the attempted one')
+    const jobs = classifyCancellation(stopped.rows)
+    assert.equal(jobs.length, 3, 'k1, k2 and k4 — including the attempted one')
 
-    const state = async (key: string, org = ORG) => (await client.query(
-      'SELECT state, claimed_by, claim_expires_at FROM alert_send_jobs WHERE message_id = $1',
-      [`incident/${org}|${key}`])).rows[0]
+    // PER JOB, NOT A COUNT. Told "3 stopped", an operator stops watching the inbox and tells the
+    // customer it was caught — and two of these three may be at the provider.
+    const outcome = (key: string) =>
+      jobs.find((each) => each.messageId === `incident/${ORG}|${key}`)?.outcome
+    assert.equal(outcome('k1'), 'STOPPED_BEFORE_ANY_ATTEMPT')
+    assert.equal(outcome('k2'), 'MAY_HAVE_REACHED_PROVIDER', 'an attempt was already open')
+    assert.equal(outcome('k4'), 'MAY_HAVE_REACHED_PROVIDER', 'a worker held the claim')
 
-    assert.equal((await state('k1')).state, 'CANCELLED')
-    assert.equal((await state('k2')).state, 'CANCELLED', 'STOP MEANS STOP')
-    assert.equal((await state('k4')).state, 'CANCELLED')
+    const row = async (key: string, org = ORG) => (await client.query(
+      `SELECT state, claimed_by, claim_expires_at, cancelled_at, cancelled_by, cancelled_because
+         FROM alert_send_jobs WHERE message_id = $1`, [`incident/${org}|${key}`])).rows[0]
+
+    assert.equal((await row('k1')).state, 'CANCELLED')
+    assert.equal((await row('k2')).state, 'CANCELLED', 'STOP MEANS STOP')
+    assert.equal((await row('k4')).state, 'CANCELLED')
+
+    // WHO, WHEN AND WHY ARE ON THE ROW. Six months from now "why was this MSP never told" has to
+    // be answerable from the record rather than from a log somebody still happens to have.
+    assert.equal((await row('k2')).cancelled_by, 'ops@hawkview.example')
+    assert.equal((await row('k2')).cancelled_because, 'duplicate storm from the 09:00 tick')
+    assert.equal(new Date((await row('k2')).cancelled_at).toISOString(), PRESS)
 
     // AND THE CLAIM IS RELEASED WITH IT, or a cancelled job still looks held to `inFlight`.
-    assert.equal((await state('k4')).claimed_by, null)
-    assert.equal((await state('k4')).claim_expires_at, null)
+    assert.equal((await row('k4')).claimed_by, null)
+    assert.equal((await row('k4')).claim_expires_at, null)
 
     // HISTORY IS UNTOUCHED — the control. Without these the widened cancel is satisfied by
     // cancelling the whole table, which is a worse bug than the one it fixed.
-    assert.equal((await state('k3')).state, 'SENT', 'a settled send is never relabelled')
-    assert.equal((await state('k5')).state, 'GAVE_UP')
+    assert.equal((await row('k3')).state, 'SENT', 'a settled send is never relabelled')
+    assert.equal((await row('k5')).state, 'GAVE_UP')
+    assert.equal((await row('k3')).cancelled_at, null, 'and carries no cancellation')
 
-    // AND SO IS THE NEIGHBOUR, which is the property the message-id prefix has to carry.
-    assert.equal((await state('k6', OTHER)).state, 'READY')
+    // THE NEIGHBOUR SURVIVES, which is the property the message-id prefix has to carry.
+    assert.equal((await row('k6', OTHER)).state, 'READY')
+
+    // AND SO DOES THE JOB THE NEXT TICK WROTE. That is a new intent formed after the press, and
+    // whether to stop it is a second decision the operator makes by moving createdBeforeIso.
+    assert.equal((await row('k7')).state, 'READY', 'created after the press')
 
     // A SECOND PRESS CHANGES NOTHING, because CANCELLED is excluded by its own state list.
     assert.equal((await client.query(scoped.sql, [...scoped.params])).rowCount, 0)
 
-    // EVERYTHING NOW CATCHES THE NEIGHBOUR, or the scope was doing nothing above.
-    const all = cancelStatement({ kind: 'EVERYTHING' }, T0)
+    // A LATER PRESS DOES CATCH IT, so the bound above is the reason k7 survived rather than a
+    // scope that never matched it.
+    const later = cancelStatement({ ...order, scope: { ...order.scope, createdBeforeIso: '2026-09-12T11:00:00.000Z' } }, NEW)
+    assert.equal((await client.query(later.sql, [...later.params])).rowCount, 1)
+    assert.equal((await row('k7')).state, 'CANCELLED')
+
+    // EVERYTHING CATCHES THE NEIGHBOUR, or the organisation scope was doing nothing above.
+    const all = cancelStatement({
+      scope: { kind: 'EVERYTHING', createdBeforeIso: '2026-09-12T11:00:00.000Z' },
+      by: 'ops@hawkview.example', because: cancelReason('stopping all sends'),
+    }, NEW)
     assert.equal((await client.query(all.sql, [...all.params])).rowCount, 1)
-    assert.equal((await state('k6', OTHER)).state, 'CANCELLED')
+    assert.equal((await row('k6', OTHER)).state, 'CANCELLED')
 
     // AND THE INCIDENTS SURVIVE. The incident is the record that something happened.
     assert.doesNotMatch(all.sql, /alert_incidents/)
+  } finally {
+    await client.end()
+  }
+})
+
+test('THE READ-THEN-WRITE CANCEL REPORTS A TAKEN JOB AS STOPPED — the shape being rejected', { skip: !RUN || !URL }, async () => {
+  // THE CONTROL FOR THE TEST BELOW, and it exists because a safety test that has never seen the
+  // defect is not evidence. This is the cancel anybody would script by hand at 3am: read which
+  // jobs look stoppable, then update them. The gap between the two is where a worker claims one.
+  //
+  // It is written HERE, in the test, and is not reachable from the product — the point is to show
+  // the failure mode is real and that this instrument can detect it, so that the one-statement
+  // form passing the next test means something.
+  const a = new pg.Client({ connectionString: URL })
+  const b = new pg.Client({ connectionString: URL })
+  await a.connect(); await b.connect()
+  try {
+    await scaffold(a)
+    await a.query('TRUNCATE alert_send_jobs CASCADE')
+    const PRESS = '2026-09-12T09:00:00.000Z'
+    const key = `incident/${ORG}|naive`
+    await a.query(
+      `INSERT INTO alert_send_jobs
+         (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at,
+          created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $1, 'READY', 0, 3, '2026-09-12T08:00:00.000Z'::timestamptz,
+               '2026-09-12T08:00:00.000Z'::timestamptz, now())`, [key])
+
+    // STEP 1 of the naive cancel: read what looks stoppable. The row is READY and unclaimed, so
+    // the operator is about to be told it was stopped before any attempt.
+    const seen = (await b.query(
+      `SELECT message_id, state AS state_before, attempts_made, (claimed_by IS NOT NULL) AS was_claimed
+         FROM alert_send_jobs
+        WHERE state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED')
+          AND created_at < $1::timestamptz`, [PRESS])).rows
+    const wouldReport = classifyCancellation(seen)
+    assert.equal(wouldReport[0]?.outcome, 'STOPPED_BEFORE_ANY_ATTEMPT')
+
+    // THE GAP. A worker claims the job here — which in production is a five-minute-wide window,
+    // not a contrived one.
+    const claim = claimStatement(messageId(key), workerId('w-1'), PRESS, 60_000)
+    assert.equal((await a.query(claim.sql, [...claim.params])).rowCount, 1, 'the worker took it')
+
+    // STEP 2: write, keyed on what step 1 saw.
+    await b.query(
+      `UPDATE alert_send_jobs SET state = 'CANCELLED', claimed_by = NULL, claimed_at = NULL,
+              claim_expires_at = NULL, cancelled_at = $1::timestamptz, cancelled_by = 'ops',
+              cancelled_because = 'naive', updated_at = $1::timestamptz
+        WHERE message_id = ANY($2::varchar[])`,
+      [PRESS, seen.map((row) => row.message_id)])
+
+    // THE DEFECT, MEASURED. The operator has been told the job was stopped before any attempt,
+    // and a worker holds a permit for it and may be inside `attemptSend` right now. Somebody told
+    // a message was stopped stops watching the inbox and tells the customer it was caught.
+    const after = (await a.query('SELECT state FROM alert_send_jobs WHERE message_id = $1', [key])).rows[0]
+    assert.equal(after.state, 'CANCELLED', 'the naive cancel overwrote the claim')
+    assert.equal(wouldReport[0]?.outcome, 'STOPPED_BEFORE_ANY_ATTEMPT',
+      'and reported it as safely stopped — this is the report the one-statement form exists to prevent')
+  } finally {
+    await a.end(); await b.end()
+  }
+})
+
+test('THE ONE-STATEMENT CANCEL LEAVES NO GAP FOR A CLAIM', { skip: !RUN || !URL }, async () => {
+  // THE SAME SCENARIO AS THE CONTROL ABOVE, against the real `cancelStatement`. The cancel is held
+  // open in a transaction after it has run, and the claim is issued into that window.
+  //
+  // ⚠ WHAT THIS DOES AND DOES NOT ESTABLISH, because the first version of this test overstated it.
+  // It proves the operator-visible property: a job reported STOPPED_BEFORE_ANY_ATTEMPT is not
+  // claimable afterwards. It does NOT isolate `FOR UPDATE` — measured, deleting `FOR UPDATE` from
+  // the CTE leaves this test green, because the UPDATE's own row lock already excludes the claim
+  // in this interleaving. `FOR UPDATE` closes a narrower window — a claim committing between the
+  // statement's snapshot and the UPDATE's lock, which would leave the CTE's pre-image stale and
+  // reproduce the control's report. That window is sub-millisecond and is not forced by any test
+  // here; it is closed by construction and argued, not measured. Said plainly rather than left
+  // for somebody to assume the mutation was checked.
+  const a = new pg.Client({ connectionString: URL })
+  const b = new pg.Client({ connectionString: URL })
+  await a.connect(); await b.connect()
+  try {
+    await scaffold(a)
+    await a.query('TRUNCATE alert_send_jobs CASCADE')
+    const PRESS = '2026-09-12T09:00:00.000Z'
+    const key = `incident/${ORG}|forced`
+    await a.query(
+      `INSERT INTO alert_send_jobs
+         (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at,
+          created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $1, 'READY', 0, 3, '2026-09-12T08:00:00.000Z'::timestamptz,
+               '2026-09-12T08:00:00.000Z'::timestamptz, now())`, [key])
+
+    const cancel = cancelStatement({
+      scope: { kind: 'EVERYTHING', createdBeforeIso: PRESS }, by: 'ops', because: cancelReason('racing'),
+    }, PRESS)
+    const claim = claimStatement(messageId(key), workerId('w-1'), PRESS, 60_000)
+
+    await b.query('BEGIN')
+    const stopped = classifyCancellation((await b.query(cancel.sql, [...cancel.params])).rows)
+    assert.equal(stopped.length, 1)
+    assert.equal(stopped[0]?.outcome, 'STOPPED_BEFORE_ANY_ATTEMPT',
+      'the cancel read a clean READY row — this is the report that must survive being true')
+
+    // Issued into the open window and deliberately not awaited: it is blocked on the row lock now
+    // and will not resolve until the COMMIT below. Long enough that an UNBLOCKED claim finishes
+    // inside it — which is exactly what the control above demonstrates happening.
+    const claiming = a.query(claim.sql, [...claim.params])
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    await b.query('COMMIT')
+
+    assert.equal((await claiming).rowCount, 0,
+      'a worker claimed a job the operator had just been told was stopped before any attempt')
+    const after = (await a.query(
+      'SELECT state, cancelled_by, claimed_by FROM alert_send_jobs WHERE message_id = $1', [key])).rows[0]
+    assert.equal(after.state, 'CANCELLED')
+    assert.equal(after.claimed_by, null, 'and nothing holds it')
+    assert.equal(after.cancelled_by, 'ops')
+  } finally {
+    await a.end(); await b.end()
+  }
+})
+
+test('AND A CANCELLED JOB CANNOT THEN BE CLAIMED, which is the other order', { skip: !RUN || !URL }, async () => {
+  // The forced window above tests a claim arriving DURING a cancel. This is a claim arriving
+  // after one has committed — the ordinary case, and the one that makes CANCELLED terminal
+  // rather than merely recorded.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs CASCADE')
+    const PRESS = '2026-09-12T09:00:00.000Z'
+    const key = `incident/${ORG}|after-cancel`
+    await client.query(
+      `INSERT INTO alert_send_jobs
+         (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at,
+          created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $1, 'READY', 0, 3, '2026-09-12T08:00:00.000Z'::timestamptz,
+               '2026-09-12T08:00:00.000Z'::timestamptz, now())`, [key])
+
+    const cancel = cancelStatement({
+      scope: { kind: 'EVERYTHING', createdBeforeIso: PRESS }, by: 'ops', because: cancelReason('stop'),
+    }, PRESS)
+    const stopped = classifyCancellation((await client.query(cancel.sql, [...cancel.params])).rows)
+    assert.equal(stopped.length, 1)
+    assert.equal(stopped[0]?.outcome, 'STOPPED_BEFORE_ANY_ATTEMPT', 'nothing had touched it')
+
+    // If a cancelled job could still be claimed the operator would press stop and the next worker
+    // would pick it straight back up — the R2 defect, which is why CANCELLED is in the claim's
+    // excluded state list.
+    const claim = claimStatement(messageId(key), workerId('w-1'), PRESS, 60_000)
+    assert.equal((await client.query(claim.sql, [...claim.params])).rowCount, 0)
+    assert.equal((await client.query(
+      'SELECT state FROM alert_send_jobs WHERE message_id = $1', [key])).rows[0].state, 'CANCELLED')
   } finally {
     await client.end()
   }
