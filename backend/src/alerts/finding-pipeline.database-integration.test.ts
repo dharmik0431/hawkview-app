@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import pg from 'pg'
+import { cancelStatement } from './send-queue.js'
 import { runIntake, type Dispositions, type ExistingIncident, type FindingRow,
   type IncidentWrite, type PipelineStore, type SendJobWrite, type Watermark } from './finding-pipeline.js'
 
@@ -324,6 +325,146 @@ test('AN UNMAPPED RULE PRODUCES NOTHING AND IS STILL ACCOUNTED FOR', { skip: !RU
     assert.equal(report.skipped.length, 1)
     assert.equal(report.skipped[0]?.because, 'NO_ALERT_TYPE')
     assert.deepEqual(report.accountingProblems, [], 'and it did not vanish')
+  } finally {
+    await client.end()
+  }
+})
+
+test('AN ORGANISATION WITH NO PREFERENCE ROW SENDS NOTHING', { skip: !RUN || !URL }, async () => {
+  // ABSENCE MUST READ AS OFF, NOT AS UNSET. `bool_or` over no rows is NULL, and an organisation
+  // with no preference row at all returns nothing from the query — so both have to be read as
+  // "nobody here can be reached", or a brand-new MSP is emailed before anybody there has chosen
+  // to be. The store seeds every organisation false before the query for exactly this.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents CASCADE')
+    await client.query('DELETE FROM identity_risk_findings')
+    await client.query('DELETE FROM notification_preferences WHERE organization_id = $1', [ORG])
+    await seed(client, { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' })
+
+    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+
+    assert.equal(report.incidentsWritten, 1, 'the incident is still recorded and visible in the product')
+    assert.equal(report.jobsWritten, 0, 'and nothing is sent to nobody')
+    assert.equal(report.skipped[0]?.because, 'NO_ELIGIBLE_RECIPIENT',
+      'named as a coverage gap rather than passing silently')
+    assert.equal((await client.query('SELECT count(*) FROM alert_send_jobs')).rows[0].count, '0')
+
+    // POSITIVE CONTROL: give that organisation one operator with email on, and the same finding
+    // does produce a job — so the refusal is about the preference, not about the fixture.
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents CASCADE')
+    const operator = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+    await client.query(
+      "INSERT INTO users (id, email, updated_at) VALUES ($1, 'op2@an-msp.example', now()) ON CONFLICT DO NOTHING",
+      [operator])
+    await client.query(
+      `INSERT INTO notification_preferences (id, user_id, organization_id, email_enabled, updated_at)
+       VALUES (gen_random_uuid(), $2, $1, true, now())`, [ORG, operator])
+
+    const second = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    assert.equal(second.jobsWritten, 1)
+  } finally {
+    await client.end()
+  }
+})
+
+test('AN OPERATOR WITH EMAIL OFF IS STILL NO ELIGIBLE RECIPIENT', { skip: !RUN || !URL }, async () => {
+  // The column defaults false, so the ordinary case is a row that exists and says no. That must
+  // behave exactly like no row at all — otherwise the default would be off in the schema and on
+  // in the pipeline.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents CASCADE')
+    await client.query('DELETE FROM identity_risk_findings')
+    await client.query('DELETE FROM notification_preferences WHERE organization_id = $1', [ORG])
+    const operator = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+    await client.query(
+      "INSERT INTO users (id, email, updated_at) VALUES ($1, 'off@an-msp.example', now()) ON CONFLICT DO NOTHING",
+      [operator])
+    // Inserted WITHOUT naming email_enabled, so the column default is what decides.
+    await client.query(
+      `INSERT INTO notification_preferences (id, user_id, organization_id, updated_at)
+       VALUES (gen_random_uuid(), $2, $1, now())`, [ORG, operator])
+    await seed(client, { id: 'dddddddd-dddd-dddd-dddd-dddddddddddd' })
+
+    const report = await runIntake(storeFor(client), WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
+    assert.equal(report.jobsWritten, 0)
+    assert.equal(report.skipped[0]?.because, 'NO_ELIGIBLE_RECIPIENT')
+  } finally {
+    await client.end()
+  }
+})
+
+test('THE STOP BUTTON STOPS ATTEMPTED JOBS TOO, against the real table', { skip: !RUN || !URL }, async () => {
+  // THE CLAIM THIS TEST EXISTS FOR. An earlier bound was `attempts_made = 0`, on the reasoning
+  // that an attempted job had already reached a provider. But a job attempted once and refused
+  // RETRYABLY is still READY with budget left — so the operator pressed stop and an email went
+  // out afterwards. Proven here in SQL rather than in a matcher over a string, because the WHERE
+  // clause is only a real rule if the database agrees with it.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs CASCADE')
+
+    const OTHER = '88888888-8888-8888-8888-888888888888'
+    const put = (key: string, state: string, attempts: number, org = ORG) => client.query(
+      `INSERT INTO alert_send_jobs
+         (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at,
+          claimed_by, claimed_at, claim_expires_at, provider_id, updated_at)
+       VALUES (gen_random_uuid(), $1, $1, $2::text, $3, 3, now(),
+               CASE WHEN $2::text = 'CLAIMED' THEN 'w-1' END,
+               CASE WHEN $2::text = 'CLAIMED' THEN now() END,
+               CASE WHEN $2::text = 'CLAIMED' THEN now() + interval '1 minute' END,
+               CASE WHEN $2::text = 'SENT' THEN 'p-1' END,
+               now())`,
+      [`incident/${org}|${key}`, state, attempts])
+
+    await put('k1', 'READY', 0)
+    await put('k2', 'READY', 1)   // attempted and refused retryably — the one that used to escape
+    await put('k3', 'SENT', 1)
+    await put('k4', 'CLAIMED', 2) // a worker that died holding it
+    await put('k5', 'GAVE_UP', 3)
+    await put('k6', 'READY', 0, OTHER)
+
+    const scoped = cancelStatement({ kind: 'ORGANISATION', organizationId: ORG }, T0)
+    const stopped = await client.query(scoped.sql, [...scoped.params])
+    assert.equal(stopped.rowCount, 3, 'k1, k2 and k4 — including the attempted one')
+
+    const state = async (key: string, org = ORG) => (await client.query(
+      'SELECT state, claimed_by, claim_expires_at FROM alert_send_jobs WHERE message_id = $1',
+      [`incident/${org}|${key}`])).rows[0]
+
+    assert.equal((await state('k1')).state, 'CANCELLED')
+    assert.equal((await state('k2')).state, 'CANCELLED', 'STOP MEANS STOP')
+    assert.equal((await state('k4')).state, 'CANCELLED')
+
+    // AND THE CLAIM IS RELEASED WITH IT, or a cancelled job still looks held to `inFlight`.
+    assert.equal((await state('k4')).claimed_by, null)
+    assert.equal((await state('k4')).claim_expires_at, null)
+
+    // HISTORY IS UNTOUCHED — the control. Without these the widened cancel is satisfied by
+    // cancelling the whole table, which is a worse bug than the one it fixed.
+    assert.equal((await state('k3')).state, 'SENT', 'a settled send is never relabelled')
+    assert.equal((await state('k5')).state, 'GAVE_UP')
+
+    // AND SO IS THE NEIGHBOUR, which is the property the message-id prefix has to carry.
+    assert.equal((await state('k6', OTHER)).state, 'READY')
+
+    // A SECOND PRESS CHANGES NOTHING, because CANCELLED is excluded by its own state list.
+    assert.equal((await client.query(scoped.sql, [...scoped.params])).rowCount, 0)
+
+    // EVERYTHING NOW CATCHES THE NEIGHBOUR, or the scope was doing nothing above.
+    const all = cancelStatement({ kind: 'EVERYTHING' }, T0)
+    assert.equal((await client.query(all.sql, [...all.params])).rowCount, 1)
+    assert.equal((await state('k6', OTHER)).state, 'CANCELLED')
+
+    // AND THE INCIDENTS SURVIVE. The incident is the record that something happened.
+    assert.doesNotMatch(all.sql, /alert_incidents/)
   } finally {
     await client.end()
   }

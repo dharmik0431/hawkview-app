@@ -28,11 +28,25 @@ import { type IdempotencyKey, type MessageId, type ProviderMessageId } from './e
  * hard bounce, an invalid address — and trying again is not merely futile but rude to the
  * recipient's mail server. Collapsing them loses the difference between "we ran out of patience"
  * and "this address does not exist". */
-export type SendState = 'READY' | 'CLAIMED' | 'SENT' | 'EXHAUSTED' | 'GAVE_UP'
+export type SendState = 'READY' | 'CLAIMED' | 'SENT' | 'EXHAUSTED' | 'GAVE_UP' | 'CANCELLED'
+
+/** `CANCELLED` IS ITS OWN TERMINAL STATE, NOT A DELETION AND NOT A REUSE.
+ *
+ * A job is an intent to send; an incident is a fact. Cancelling unattempted intent is the only
+ * undo that matters — and it is the operator’s stop button, which somebody will want within a
+ * minute of switching this on.
+ *
+ * WHY NOT DELETE THE ROW: the same reason the apply annotates rather than re-keys. You do not
+ * unhappen an intent by removing the record of it; you lose the ability to explain what the
+ * product did.
+ *
+ * WHY NOT REUSE `GAVE_UP`: same silence, opposite meanings, different remedies. Gave up means
+ * the address refused us and somebody should check the mailbox. Cancelled means a person
+ * stopped it, and the remedy is to decide whether they were right.
 
 /** The states from which no further attempt may be made. Exported so a caller cannot maintain a
  * second, drifting copy of the list. */
-export const TERMINAL: readonly SendState[] = ['SENT', 'EXHAUSTED', 'GAVE_UP']
+export const TERMINAL: readonly SendState[] = ['SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED']
 
 export type WorkerId = string & { readonly __workerId: unique symbol }
 export const workerId = (value: string): WorkerId => value as WorkerId
@@ -227,7 +241,7 @@ export function claimStatement(
       'WHERE message_id = $1',
       // The terminal states refuse a claim. R2 failed against QA's own reference because an
       // EXHAUSTED job could be claimed again, which makes the bound decorative.
-      "  AND state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP')",
+      "  AND state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED')",
       '  AND attempts_made < max_attempts',
       '  AND not_before_at <= $3::timestamptz',
       '  AND (claim_expires_at IS NULL OR claim_expires_at <= $3::timestamptz)',
@@ -390,4 +404,89 @@ const countBy = (values: readonly string[]): ReadonlyMap<string, number> => {
   const counts = new Map<string, number>()
   for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1)
   return counts
+}
+
+// ---------------------------------------------------------------------------------------
+// THE STOP BUTTON. Cancels intent, never the record.
+// ---------------------------------------------------------------------------------------
+
+/** What to stop.
+ *
+ * SCOPABLE, BECAUSE A STOP BUTTON THAT CAN ONLY STOP EVERYTHING IS ONE NOBODY DARES PRESS. An
+ * operator who sees one MSP being spammed should be able to stop that MSP without silencing the
+ * others, and if the only control is global they will hesitate — which is the worst moment to
+ * hesitate.
+ *
+ * ⚠ THE ORGANISATION SCOPE MATCHES A MESSAGE-ID PREFIX, and that is a consequence of R8 rather
+ * than a design choice. `alert_send_jobs` deliberately carries no organisation column so a
+ * per-tenant queue is unwriteable — which leaves the message id, built as
+ * `incident/<organisation>|<incident key>`, as the only link to who a job is for. **This couples
+ * the stop button to that format.** The alternative is an organisation column, which would
+ * reopen exactly what R8 closed. Flagged rather than decided. */
+export type CancelScope =
+  | Readonly<{ kind: 'EVERYTHING' }>
+  | Readonly<{ kind: 'ORGANISATION'; organizationId: string }>
+
+export interface CancelStatement {
+  readonly sql: string
+  readonly params: readonly unknown[]
+  /** Unknown until it runs — unlike a claim, where one row is the only success. Cancelling
+   * nothing is a legitimate outcome: it means there was nothing waiting. */
+  readonly expectedRowCount: null
+}
+
+/** Cancel every job that is not already finished.
+ *
+ * STOP MEANS STOP, INCLUDING JOBS THAT HAVE BEEN ATTEMPTED. This bound was `attempts_made = 0`
+ * first, on the reasoning that an attempted job has already reached a provider and calling it
+ * cancelled would be a lie. **That reasoning protected the record and broke the button.** A job
+ * attempted once and refused RETRYABLY is still `READY` with its budget unspent, so leaving it
+ * alone means the operator presses stop and an email goes out afterwards anyway — a decorative
+ * stop button, which is the R2 defect wearing a different hat.
+ *
+ * THE RECORD IS NOT ACTUALLY AT RISK, which is why both properties survive. `CANCELLED` is a
+ * statement about the JOB — *we stopped pursuing this* — and never a claim that nothing reached
+ * a provider. What reached a provider is in `alert_send_attempts`, which this does not touch.
+ * The genuinely uncertain case is narrow: a job that crashed after the provider accepted it, and
+ * that one carries the same idempotency key, so the send it loses is one the provider would have
+ * deduplicated anyway.
+ *
+ * A SETTLED SEND IS STILL SAFE, because `SENT` is terminal and excluded by the state list. This
+ * cancels intent, never history.
+ *
+ * ONE STATEMENT, so it is safe to run while intake is running. Intake inserts inside a
+ * transaction; this updates inside one; neither sees the other half-done. A job inserted a
+ * millisecond after this runs is simply not cancelled, which is correct — it is a new intent
+ * formed after the operator pressed stop, and stopping the future is what the watermark and the
+ * disposition are for.
+ *
+ * IT NEVER TOUCHES `alert_incidents`. The incident is the record that something happened. */
+export function cancelStatement(scope: CancelScope, nowIso: string): CancelStatement {
+  const common = [
+    'UPDATE alert_send_jobs',
+    "SET state = 'CANCELLED', claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL,",
+    '    updated_at = $1::timestamptz',
+    // Not already finished — and nothing else. A CLAIMED job whose worker died must stop, and so
+    // must one that was attempted and refused retryably, or stop does not stop. A SENT, EXHAUSTED,
+    // GAVE_UP or CANCELLED job is not relabelled: those are history, and this cancels intent.
+    "WHERE state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED')",
+  ]
+  if (scope.kind === 'EVERYTHING') {
+    return { sql: common.join('\n'), params: [nowIso], expectedRowCount: null }
+  }
+  return {
+    // `LIKE` with the separator included, so `incident/org-1|` cannot also match `incident/org-12|`.
+    sql: [...common, "  AND message_id LIKE $2 || '%'"].join('\n'),
+    params: [nowIso, `incident/${scope.organizationId}|`],
+    expectedRowCount: null,
+  }
+}
+
+/** Whether a job would be cancelled by a stop, without running one. For an operator to see the
+ * blast radius before pressing it — D9's forecast-before-you-run, applied to the stop button
+ * rather than to the first send. */
+export function wouldCancel(job: SendJob, scope: CancelScope): boolean {
+  if (TERMINAL.includes(job.state)) return false
+  return scope.kind === 'EVERYTHING'
+    || job.messageId.startsWith(`incident/${scope.organizationId}|`)
 }

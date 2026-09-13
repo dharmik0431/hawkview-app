@@ -157,9 +157,22 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1684 tests, 1588 pass, 0 fail.** The remaining 96 are database-integration tests requiring a
-real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`; **they were never run here**, and
-the pass count must not be read as covering them.
+**1789 tests, 1685 pass, 0 fail.** The remaining 104 are database-integration tests requiring a
+real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
+so **the 1685 figure does not cover them.** They have been run, separately and against a real
+cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
+establish. Do not read the two results as one number.
+
+**One intermittent failure was seen once and has not recurred.** `risk-owned Prisma transport
+drains startup, BEGIN, query and rollback stalls without abandoned callbacks/sockets`
+(`src/identity-risk/risk-bounded-prisma-transaction.test.ts`) failed on one full-suite run at
+2149ms, then passed on three isolated runs and one further full suite. **Recorded as a flake on
+evidence, not on hope**: it asserts `Date.now() - start < 2_000` around a 650ms deadline, so it
+is a wall-clock bound competing with every other test on one machine; and it imports only
+`node:net` and its own subject, so **no import path reaches anything this branch changed** —
+the only identity-risk file touched here is `mailbox-read-transaction.ts`, which it does not
+load. That is an argument, not a proof: a fifth green run does not make a timing assertion
+sound. Whoever sees it fail again should suspect the bound, not the transport.
 
 **Write full TAP to a file and grep the file, never the stream.** A grep pipeline destroyed the
 one diagnostic that mattered in this work — the assertion message and character offset of an
@@ -560,16 +573,68 @@ job already carries.
 **Nothing reaches a transport without a permit** — the sender takes one, and the only thing that
 produces one is a claim whose row count was exactly one.
 
+### The webhook verifier, the off switch and the stop button
+
+**The verifier is real HMAC over the Svix scheme** — id, timestamp and RAW body, with a
+five-minute replay window each way and constant-time comparison. It is the only place the
+webhook secret is read; `email-delivery.ts` takes the verdict and never learns how it was
+reached. **Unconfigured fails closed** as `SIGNATURE_INVALID`, never AUTHENTIC.
+
+**It returns a verdict and never throws**, unlike `SchedulerTokenVerifier`: a webhook we cannot
+authenticate is not an error, it is an unmatched event that must still be recorded.
+
+**Every negative sits beside a genuine signature that must verify.** A verifier that rejects
+everything passes every forgery test and is indistinguishable from a correct one until real
+traffic arrives — and the mutation confirms it: making the comparison always fail breaks the
+positive control first.
+
+**Absence of a preference row sends nothing.** `bool_or` over no rows is NULL and an
+organisation with no rows returns nothing at all; both must read as *nobody here can be
+reached*, or a brand-new MSP is emailed before anybody chose to be. Proven against a real
+database in both shapes — no row, and a row left at the column default — each beside a positive
+control.
+
+**The stop button exists, and it stops attempted jobs too.** `cancelStatement` cancels every job
+that is not already finished, in one statement so it is safe while intake runs, scopable to one
+organisation or everything, and it never touches `alert_incidents` or `alert_send_attempts`.
+`CANCELLED` is its own terminal state — deleting the row would lose the ability to explain what
+the product did, and reusing `GAVE_UP` would confuse *the address refused us* with *a person
+stopped it*, which have different remedies.
+
+**The bound was `attempts_made = 0` first, and that was wrong in the direction that sends.** The
+reasoning was that an attempted job has already reached a provider and calling it cancelled would
+be a lie. But a job attempted once and refused RETRYABLY is still `READY` with budget left — so
+excluding it meant the operator pressed stop and an email went out afterwards. The record was
+never actually at risk: `CANCELLED` is a statement about the job, not a claim that nothing
+reached a provider, and what did reach one is in `alert_send_attempts`, untouched. The one
+genuinely uncertain case — a crash after the provider accepted — carries the same idempotency
+key, so the send it loses is one the provider would have deduplicated.
+
+⚠ **OPEN, NOT DECIDED: a stopped job that may already have reached the provider is not
+distinguishable from one that never did**, because both end as `CANCELLED` and only the attempt
+rows tell them apart. If an operator ever needs that distinction at a glance it wants its own
+disposition rather than a join. Taken in the sends-less direction on the standing rule, because
+nobody has ruled on it.
+
+⚠ **The organisation scope matches a message-id prefix**, because R8 deliberately left the queue
+with no organisation column. That couples the stop button to the message-id format. The
+alternative reopens what R8 closed. Flagged, not decided.
+
 ### Still missing before anything can send
 
 - **A real transport.** Deliberately absent; see above.
-- **The webhook verifier**, which turns a signed request into the `Authentication` verdict
-  `authenticate()` already takes. Until it exists no delivery outcome can be recorded at all.
+- **A ROUTE FOR THE WEBHOOK VERIFIER.** The verifier is built and tested; *nothing calls it.*
+  There is no `@Public() @Post('resend')` controller, so the verdict has a producer and no
+  caller and **no delivery outcome can be recorded yet.** Whoever writes it must hand the
+  verifier the RAW body — a parsed-and-restringified one changes bytes and every genuine request
+  will read as `SIGNATURE_INVALID`, which looks like a key problem and is not.
 - **A suppression store.** `Suppressions` is an interface with an in-memory implementation; no
-  table holds suppressed addresses, so suppression does not survive a restart.
-- **A cancel for unsent jobs.** Ruled and not yet built: an operator switching this on has no
-  stop button, and that must exist before the sender is switched on rather than before it is
-  written.
+  table holds suppressed addresses, so **suppression does not survive a restart** — a hard-bounced
+  address is retried again after the next deploy, which is the reputation damage the suppression
+  was for.
+
+Built since this list was first written, and no longer on it: the webhook verifier itself, the
+`emailEnabled` switch with absence reading as off, and the stop button.
 
 ### Intake will not run until somebody chooses the watermark
 
@@ -652,19 +717,35 @@ evidence of that at all.**
 ### Database-integration tests HAVE now been run — and the count is not reproducible
 
 This section used to say **"96 tests, zero runs"**. Replaced rather than deleted, because the
-warning it carried still stands: **the 1588 passing figure does not cover this suite**, and the
+warning it carried still stands: **the 1685 passing figure does not cover this suite**, and the
 apply phase is exactly the work where it would matter most.
 
 They have been run, by QA and independently by the engineer, against disposable PostgreSQL 15.
 **The failures are environment, not product defects, and none has been shown to be a defect —
 none should be quoted as one.**
 
-**But do not quote a pass count either.** QA measured 45 passing with every prerequisite set.
-The engineer measured 27, then 22, then 29 — *same machine, same cluster, same commit, same
-environment*. **A spread of seven on one machine, and 45 on another, is one speed-sensitive
-suite sampled four times rather than four environments finding four gaps.** So the honest
-statement is that the suite runs and that no number from it is reproducible, which is a worse
-problem than a missing document because writing the environment down does not fix it.
+**But do not quote a pass count either.** Nine samples across two machines on one commit: 45,
+then 27, 22, 29 by the engineer, then 22, 22, 11, 15, 14 by QA on one cluster with identical
+inputs. **The suite has no reproducible number.** Writing the environment down does not fix
+that, which is why it is worse than a missing document.
+
+**THE ALERTING INTEGRATION FILE IS NOT PART OF THAT, and must not be discounted with it.**
+`src/alerts/finding-pipeline.database-integration.test.ts` — 8 tests — passes 8/8 against a
+freshly `migrate deploy`-ed PostgreSQL 15 created and destroyed inside the session. It shares
+the harness but not the wall: it touches no KMS and no risk key store, and it has been green on
+every run. The unreproducible numbers above are the identity-risk suite. **Two different
+suites, two different states; a reader who takes one figure for the other will either trust the
+alerting evidence too little or the identity-risk evidence far too much.**
+
+**AND THAT IS A DESCRIPTION OF THE VARIANCE, NOT AN ACCOUNT OF THE FAILURES.** An earlier
+version of this section said “one speed-sensitive suite sampled four times” as though that
+explained them. It does not. *Timeout expired* accounts for only 5 to 18 of 133 to 155 failures,
+so **the cause of the large majority is unidentified and nobody has looked.**
+
+The distinction is the one already enforced on the lock ordering — classified as environment,
+ordering unproven. **An account that explains a tenth of the failures is not the account.** That
+suite is not on the release path, so nobody is hunting the rest; what must not happen is a
+reader taking the variance framing as a diagnosis.
 
 **The wall is a timeout that a catch-all was hiding.** `IDENTITY_RISK_SOURCE_UNAVAILABLE` is
 thrown from twelve places; every failure came from the twelfth, a bare catch that discarded its

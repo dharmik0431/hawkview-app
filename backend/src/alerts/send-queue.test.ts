@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   TERMINAL, accounting, afterAttempt, backoffMs, beginAttempt, claimOutcome, claimStatement,
-  eligibility, inFlight,
+  cancelStatement, eligibility, inFlight, wouldCancel,
   neverSent, sentMoreThanOnce, workerId,
-  type Attempt, type SendJob, type SendPermit, type SendState, type Settled,
+  type Attempt, type CancelScope, type SendJob, type SendPermit, type SendState, type Settled,
 } from './send-queue.js'
 import { idempotencyKey, messageId, providerMessageId } from './email-delivery.js'
 
@@ -232,9 +232,9 @@ test('NOTHING HERE IS TENANT-SHAPED, so a per-tenant queue is unwriteable', () =
 })
 
 test('THE STATE SET IS CLOSED, and every state is reachable or terminal', () => {
-  const all: readonly SendState[] = ['READY', 'CLAIMED', 'SENT', 'EXHAUSTED', 'GAVE_UP']
-  assert.equal(new Set(all).size, 5)
-  assert.deepEqual([...TERMINAL].sort(), ['EXHAUSTED', 'GAVE_UP', 'SENT'])
+  const all: readonly SendState[] = ['READY', 'CLAIMED', 'SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED']
+  assert.equal(new Set(all).size, 6)
+  assert.deepEqual([...TERMINAL].sort(), ['CANCELLED', 'EXHAUSTED', 'GAVE_UP', 'SENT'])
   // Two of five are non-terminal, so a job always has somewhere to be while it is working.
   assert.equal(all.filter((state) => !TERMINAL.includes(state)).length, 2)
 })
@@ -272,4 +272,61 @@ test('A SEND NEEDS A PERMIT, AND ONLY A ROW COUNT OF ONE MAKES ONE', () => {
   // NOT VACUOUS: a real permit does reach beginAttempt, so the two errors above are about the
   // brand rather than about a type nobody can satisfy.
   assert.equal(beginAttempt(won.permit, T0).messageId, 'm-1')
+})
+
+test('CANCEL STOPS INTENT, INCLUDING INTENT THAT HAS ALREADY BEEN ATTEMPTED', () => {
+  // THE BOUND THAT WOULD MAKE THE BUTTON DECORATIVE. A job attempted once and refused RETRYABLY
+  // is still READY with budget left, so excluding it from cancel means the operator presses stop
+  // and an email goes out afterwards. That is what an earlier `attempts_made = 0` bound did.
+  const unattempted = job({ messageId: messageId('incident/org-1|k1') })
+  const attempted = job({ messageId: messageId('incident/org-1|k2'), attemptsMade: 1 })
+  const claimed = job({
+    messageId: messageId('incident/org-1|k4'), state: 'CLAIMED', attemptsMade: 2,
+    claim: { by: workerId('w-1'), atIso: T0, expiresIso: '2026-09-13T09:01:00.000Z' },
+  })
+
+  const everything: CancelScope = { kind: 'EVERYTHING' }
+  assert.equal(wouldCancel(unattempted, everything), true)
+  assert.equal(wouldCancel(attempted, everything), true, 'or stop does not stop')
+  assert.equal(wouldCancel(claimed, everything), true, 'a dead worker holding a job must not win')
+
+  // BUT HISTORY IS NEVER RELABELLED, or the cancel is satisfied by cancelling everything. This is
+  // the control: a settled send stays settled, and `CANCELLED` never overwrites what happened.
+  const sent = job({ messageId: messageId('incident/org-1|k3'), state: 'SENT', providerId: providerMessageId('p') })
+  assert.equal(wouldCancel(sent, everything), false)
+  assert.equal(wouldCancel(job({ state: 'GAVE_UP' }), everything), false)
+  assert.equal(wouldCancel(job({ state: 'EXHAUSTED' }), everything), false)
+
+  // AND THE SQL CARRIES THE RULE, so it is the database's rather than the caller's — a worker
+  // that never calls `wouldCancel` is still stopped.
+  const sql = cancelStatement(everything, T0).sql
+  assert.doesNotMatch(sql, /attempts_made/, 'an attempted job is stopped too')
+  assert.ok(sql.includes("state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED')"),
+    'history is excluded by the database, not by the caller')
+  assert.equal(sql.split(';').filter((part) => part.trim() !== '').length, 1, 'one statement')
+  assert.doesNotMatch(sql, /alert_incidents/, 'it never touches the record')
+  assert.doesNotMatch(sql, /alert_send_attempts/, 'nor what actually reached a provider')
+})
+
+test('CANCEL IS SCOPABLE, and the scope cannot catch a neighbouring organisation', () => {
+  // A stop button that can only stop everything is one nobody dares press.
+  const scope: CancelScope = { kind: 'ORGANISATION', organizationId: 'org-1' }
+  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-1|k') }), scope), true)
+  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-2|k') }), scope), false)
+
+  // THE SEPARATOR IS INSIDE THE PREFIX, or `org-1` would also stop `org-12`.
+  assert.equal(wouldCancel(job({ messageId: messageId('incident/org-12|k') }), scope), false)
+  assert.match(cancelStatement(scope, T0).sql, /message_id LIKE \$2 \|\| '%'/)
+  assert.deepEqual(cancelStatement(scope, T0).params, [T0, 'incident/org-1|'])
+})
+
+test('A CANCELLED JOB CANNOT BE CLAIMED AGAIN, or the stop button is decorative', () => {
+  // Exactly the R2 defect, in a new state: if CANCELLED were claimable the operator would press
+  // stop and the next worker would pick the job straight back up.
+  const verdict = eligibility(job({ state: 'CANCELLED' }), T0)
+  assert.equal(verdict.mayAttempt, false)
+  assert.equal(verdict.mayAttempt === false ? verdict.because.kind : null, 'TERMINAL')
+  assert.ok(TERMINAL.includes('CANCELLED'))
+  assert.ok(cancelStatement({ kind: 'EVERYTHING' }, T0).sql.includes("'CANCELLED'"),
+    'and a second cancel does not re-cancel')
 })
