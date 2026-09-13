@@ -5,7 +5,7 @@ import {
   cancelReason, cancelStatement, classifyCancellation, claimStatement, workerId,
 } from './send-queue.js'
 import { messageId } from './email-delivery.js'
-import { runIntake, type PipelineStore, type Watermark } from './finding-pipeline.js'
+import { FINDINGS_PER_CHUNK, runIntake, type PipelineStore, type Watermark } from './finding-pipeline.js'
 import { pipelineStore, type SqlRunner } from './pipeline-store.js'
 
 /**
@@ -772,6 +772,87 @@ test('BOTH KINDS OF UNREADABLE DISPOSITION ARE REPORTED, and neither silences an
     await client.query(
       `ALTER TABLE alert_rule_dispositions ADD CONSTRAINT alert_rule_dispositions_disposition_check
        CHECK (disposition IN ('ACT_NOW', 'ACT_TODAY', 'RECORD_ONLY')) NOT VALID`).catch(() => undefined)
+    await client.end()
+  }
+})
+
+test('A TICK LARGER THAN ONE CHUNK COMMITS IN SEVERAL, against the real tables', { skip: !RUN || !URL }, async () => {
+  // **THE DEFECT THIS CLOSES WAS MEASURED, NOT REASONED.** The transaction budget was exhausted
+  // between two and five times BELOW the per-tick cap — 500 and 1000 fine, 2000 and 3000 failing
+  // with "the timeout was 5000 ms, however 5002 ms passed" — so the limit chosen to make the work
+  // bounded did not bound it. And it was intermittent: three ticks at 2000 gave 0, then 2000,
+  // then 2000.
+  //
+  // This crosses a real chunk boundary against real tables, so the chunking is proven together
+  // with the store rather than only in a fake.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents, alert_rule_dispositions CASCADE')
+    await client.query('DELETE FROM notifications')
+    await client.query('DELETE FROM identity_risk_findings')
+    const operator = '77777777-7777-7777-7777-777777777777'
+    await client.query(
+      `INSERT INTO users (id, email, updated_at) VALUES ($1, 'operator@an-msp.example', now())
+       ON CONFLICT DO NOTHING`, [operator])
+    await client.query(
+      `INSERT INTO notification_preferences (id, user_id, organization_id, email_enabled, updated_at)
+       VALUES (gen_random_uuid(), $2, $1, true, now()) ON CONFLICT DO NOTHING`, [ORG, operator])
+
+    // The FK chain once, then one row per finding — each its own subject, so each is its own
+    // incident and the counts below are exact rather than grouped.
+    const runId = '33333333-3333-3333-3333-333333333333'
+    const matchedId = '44444444-4444-4444-4444-444444444444'
+    await client.query(`INSERT INTO identity_risk_evaluation_runs
+        (id, organization_id, customer_tenant_id, run_key, engine_version, catalog_version, status,
+         window_start, window_end, source_watermark_hash, source_content_hash, expires_at, completed_at, created_at)
+        VALUES ($1,$2,$3,'bulk','test','test','COMPLETED', now() - interval '1 hour', now(),
+                'h','h', now() + interval '30 days', now(), now())
+        ON CONFLICT DO NOTHING`, [runId, ORG, TENANT])
+    await client.query(`INSERT INTO identity_risk_matched_results
+        (id, organization_id, customer_tenant_id, evaluation_run_id, result_key, rule_id, subject_type,
+         subject_id, severity, confidence, coverage, observed_at, expires_at, created_at)
+        VALUES ($1,$2,$3,$4,'bulk-result','HV-ID-AUTH-001.v1','USER','seed','HIGH','HIGH','FULL',
+                now(), now() + interval '30 days', now())
+        ON CONFLICT DO NOTHING`, [matchedId, ORG, TENANT, runId])
+
+    const total = FINDINGS_PER_CHUNK + 50
+    await client.query(`INSERT INTO identity_risk_findings
+        (id, organization_id, customer_tenant_id, matched_result_id, dedupe_key, rule_id, rule_version,
+         subject_type, subject_id, state, severity, confidence, coverage, observed_at, expires_at, updated_at)
+      SELECT gen_random_uuid(), $1, $2, $3, 'bulk-' || i, 'HV-ID-AUTH-001.v1', 'v1',
+             'USER', 'user-' || i, 'OPEN', 'HIGH', 'HIGH', 'FULL',
+             $4::timestamptz, now() + interval '30 days', now()
+        FROM generate_series(1, $5) AS i`, [ORG, TENANT, matchedId, T0, total])
+
+    const report = await ranIntake(
+      storeFor(client), WATERMARK, T0, Date.now() + 300_000, '2026-01-01T00:00:00.000Z')
+
+    assert.equal(report.findingsRead, total)
+    assert.equal(report.chunksCommitted, 2, 'it really crossed a boundary')
+    assert.equal(report.yieldedOnBudget, false)
+    assert.equal(report.truncated, false, 'well under the per-tick cap')
+    assert.equal(report.findingsUnprocessed, 0)
+
+    // EVERY FINDING LANDED, ACROSS BOTH CHUNKS. Counted in SQL rather than trusted from the
+    // report — the report is the thing under test.
+    const counts = await client.query(
+      `SELECT (SELECT count(*)::int FROM alert_incidents) AS incidents,
+              (SELECT count(*)::int FROM notifications WHERE source = 'identity-risk') AS notifications,
+              (SELECT count(*)::int FROM alert_send_jobs) AS jobs`)
+    assert.equal(counts.rows[0].incidents, total)
+    assert.equal(counts.rows[0].notifications, total)
+    assert.equal(counts.rows[0].jobs, total)
+    assert.deepEqual(report.accountingProblems, [])
+
+    // AND A SECOND TICK ADDS NOTHING, so the chunk boundary has not made anything reprocessable.
+    const again = await ranIntake(
+      storeFor(client), WATERMARK, T0, Date.now() + 300_000, '2026-01-01T00:00:00.000Z')
+    assert.equal(again.jobsWritten, 0)
+    assert.equal(again.incidentsWritten, 0)
+    assert.equal((await client.query('SELECT count(*)::int AS n FROM alert_send_jobs')).rows[0].n, total)
+  } finally {
     await client.end()
   }
 })

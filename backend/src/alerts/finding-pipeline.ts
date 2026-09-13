@@ -593,6 +593,15 @@ export interface IntakeReport {
    * — and a slow intake that ate the collectors' admission budget would show up as tenants
    * quietly not being collected, which reads as the tenants being quiet. */
   readonly yieldedOnBudget: boolean
+  /** **MORE FINDINGS EXISTED THAN THE TICK'S CAP.** A tick that read its limit and one that read
+   * everything produced the same report, so *we are behind* was not observable. The store reads
+   * one row past the cap to answer this without a second query. */
+  readonly truncated: boolean
+  /** How many chunks were committed. Each is one transaction across all three tables. */
+  readonly chunksCommitted: number
+  /** Findings this tick did not get to — a yield between chunks, or the cap. Still OPEN, so the
+   * next tick redoes exactly them. */
+  readonly findingsUnprocessed: number
 }
 
 /** Run one tick.
@@ -659,6 +668,58 @@ const failure = (
   attempted,
 })
 
+/** THE FIRST HALF OF THE FIRST-RUN BOUND: how many findings one tick may read at all.
+ *
+ * A tick reads at most 24 hours of findings (`HAWKVIEW_ALERT_READ_WINDOW_HOURS`) AND at most this
+ * many rows. Above this in one window a tick takes the first 5000 by `observed_at` and the rest
+ * wait — which is now SAID rather than silent, because the report carries `truncated`.
+ *
+ * The bound is correct and is not to be removed: an unbounded read inside an admission budget
+ * spends a budget shared with collection, and collection outranks alerting.
+ *
+ * **IT LIVES HERE RATHER THAN IN THE STORE** because the store imports this module and moving it
+ * the other way made the import circular — and a constant read during module initialisation on
+ * the wrong side of a cycle is `undefined` rather than an error. */
+export const MAX_FINDINGS_PER_TICK = 5000
+
+/** How many findings go into ONE transaction.
+ *
+ * **THE DECLARED BOUND AND THE EFFECTIVE BOUND WERE DIFFERENT NUMBERS.** `MAX_FINDINGS_PER_TICK`
+ * is 5000, and the transaction budget was measured exhausting between two and five times below
+ * it — 500 and 1000 fine, 2000, 3000 and 5001 all failing with *the timeout was 5000 ms, however
+ * 5002 ms passed*. The limit chosen to make the work bounded did not bound it.
+ *
+ * **AND IT WAS INTERMITTENT, WHICH IS WORSE THAN STUCK.** Three consecutive ticks at 2000 gave 0,
+ * then 2000, then 2000: timing decides. A tick that writes nothing and then works on the retry is
+ * exactly what gets explained away once and never looked at again.
+ *
+ * NOT A SMALLER `MAX_FINDINGS_PER_TICK`, because any single constant is a guess about an
+ * environment that cannot be measured from here. Those figures come from a loopback socket;
+ * production is a container talking to a managed database across a network, and each finding is
+ * three round trips — an incident, a notification and a job. **Production is worse, not better,
+ * so the direction is the finding and the threshold is not.**
+ *
+ * SIZED FOR THE SLOW ENVIRONMENT ON PURPOSE. 200 findings is 600 statements, an order of
+ * magnitude under the smallest measured failure on the fast one. The cost of it being too small
+ * is more transactions; the cost of it being too large is a tick that writes nothing at all.
+ */
+export const FINDINGS_PER_CHUNK = 200
+
+/** The whole tick, in chunks.
+ *
+ * **EACH CHUNK IS ONE TRANSACTION ACROSS ALL THREE TABLES**, which is the atomicity the stranding
+ * blocker turned on, applied per chunk rather than per tick. The budget is checked BETWEEN
+ * chunks and never inside one — the same rule as the original blocker: *a yield may give up work,
+ * it may never leave work half done.* Yielding between chunks leaves earlier chunks fully written
+ * and later findings entirely untouched and still OPEN, so the next tick resumes along a path
+ * already proven.
+ *
+ * WHAT CARRIES BETWEEN CHUNKS is the set of incident keys already opened. Two findings on one
+ * incident can fall in different chunks, and without carrying them the second chunk would decide
+ * the incident was new — writing a duplicate the unique index would swallow, and a second job the
+ * message id would swallow, while the accounting quietly said two. The database would survive it
+ * and the report would lie.
+ */
 export async function runIntake(
   store: PipelineStore,
   watermark: Watermark,
@@ -670,18 +731,27 @@ export async function runIntake(
   const empty = (yielded: boolean, findingsRead = 0): IntakeReport => ({
     findingsRead, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0, skipped: [],
     unmappedRules: [], unreadableDispositions: [], accountingProblems: [], yieldedOnBudget: yielded,
+    truncated: false, chunksCommitted: 0, findingsUnprocessed: 0,
   })
   const ran = (report: IntakeReport): IntakeOutcome => ({ kind: 'RAN', report })
   if (now() >= deadlineAt) return ran(empty(true))
 
-  let findings: readonly FindingRow[]
+  let read: readonly FindingRow[]
   try {
-    findings = await store.findOpenFindings(readSinceIso)
+    read = await store.findOpenFindings(readSinceIso)
   } catch (cause) {
     return failure('READING', cause)
   }
-  if (findings.length === 0) return ran(empty(false))
-  if (now() >= deadlineAt) return ran(empty(true, findings.length))
+
+  // **TRUNCATION IS A FACT THE TICK CAN STATE**, because the store reads one row past the cap. A
+  // tick that read its limit and a tick that read everything used to produce the same report, so
+  // *we are behind* was not observable at all — and the backlog it hides is exactly the shape of
+  // the first real load, a collection gap being fixed and producing findings for many tenants at
+  // once.
+  const truncated = read.length > MAX_FINDINGS_PER_TICK
+  const findings = truncated ? read.slice(0, MAX_FINDINGS_PER_TICK) : read
+  if (findings.length === 0) return ran({ ...empty(false), truncated })
+  if (now() >= deadlineAt) return ran({ ...empty(true, findings.length), truncated })
 
   const organizationIds = [...new Set(findings.map((each) => each.organizationId))]
   let existing: readonly ExistingIncident[]
@@ -694,64 +764,83 @@ export async function runIntake(
   } catch (cause) {
     return failure('LOADING', cause, { ...NOTHING_ATTEMPTED, findingsRead: findings.length })
   }
-  if (now() >= deadlineAt) return ran(empty(true, findings.length))
-
-  const decision = decide(findings, existing, dispositions, watermark, tickAtIso)
-  // THE BUDGET IS CHECKED HERE, BEFORE THE WRITE PHASE, AND NOT AGAIN INSIDE IT.
-  //
-  // WHAT THIS LINE USED TO SAY, AND WHY IT WAS WRONG. There were two writes with a check
-  // between them, and the comment called yielding there "the safe direction" because it left
-  // incidents recorded and no job. **It was the permanently silent direction.** An incident
-  // with no job is skipped by the next run as `INCIDENT_ALREADY_OPEN`, so the email is never
-  // sent — and nothing reports it, because `neverSent` reports jobs that stopped and this
-  // alert never had one. Measured: yield gives 1 incident / 0 jobs, the next healthy run adds
-  // nothing, and the database sits there forever.
-  //
-  // It is not a rare crash path. It is the designed cascade behaviour firing exactly when the
-  // system is busiest, which is when an alert matters most.
-  //
-  // A YIELD MAY GIVE UP WORK; IT MAY NEVER LEAVE WORK HALF DONE. Yielding here leaves the
-  // finding untouched and still OPEN, so the next run redoes it from the top along a path that
-  // is already proven — rather than a recovery path that would have to reconstruct intent it
-  // never recorded. And it could not: FOUR paths produce "incident open, no job", and three of
-  // them withhold the job ON PURPOSE. A recovery that could not tell them apart would deliver
-  // every incident the watermark silenced.
   if (now() >= deadlineAt) {
-    return ran({
-      findingsRead: findings.length, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0,
-      skipped: decision.skipped, unmappedRules: decision.unmappedRules,
-      unreadableDispositions: dispositions.unreadable,
-      accountingProblems: decision.accountingProblems, yieldedOnBudget: true,
-    })
+    return ran({ ...empty(true, findings.length), truncated, findingsUnprocessed: findings.length })
   }
 
-  // THE WHOLE DECISION IS IN FLIGHT HERE, and a failure loses all of it — all three tables or
-  // none, so there is no partial state, but the tick's work is gone. Reporting how much was lost
-  // is the difference between an operator seeing "intake failed" and seeing that five thousand
-  // findings were being written when it did.
-  const attempted: AttemptedWork = {
-    findingsRead: findings.length,
-    incidents: decision.incidents.length,
-    notifications: decision.notifications.length,
-    jobs: decision.jobs.length,
+  const opened: ExistingIncident[] = [...existing]
+  const skipped: Skipped[] = []
+  const unmapped = new Set<string>()
+  const accountingProblems: string[] = []
+  let incidentsWritten = 0
+  let notificationsWritten = 0
+  let jobsWritten = 0
+  let chunksCommitted = 0
+  let processed = 0
+
+  for (let at = 0; at < findings.length; at += FINDINGS_PER_CHUNK) {
+    // **BETWEEN CHUNKS, NEVER INSIDE ONE.** Checking inside would be the original blocker exactly:
+    // a yield partway through a chunk's three writes leaves an incident with no job, which every
+    // later run skips as already-open and nothing reports.
+    if (now() >= deadlineAt) {
+      return ran({
+        findingsRead: findings.length,
+        incidentsWritten, notificationsWritten, jobsWritten,
+        skipped, unmappedRules: [...unmapped].sort(),
+        unreadableDispositions: dispositions.unreadable,
+        accountingProblems,
+        yieldedOnBudget: true,
+        truncated,
+        chunksCommitted,
+        findingsUnprocessed: findings.length - processed,
+      })
+    }
+
+    const chunk = findings.slice(at, at + FINDINGS_PER_CHUNK)
+    const decision = decide(chunk, opened, dispositions, watermark, tickAtIso)
+
+    const attempted: AttemptedWork = {
+      findingsRead: chunk.length,
+      incidents: decision.incidents.length,
+      notifications: decision.notifications.length,
+      jobs: decision.jobs.length,
+    }
+    let written: { incidentsWritten: number; notificationsWritten: number; jobsWritten: number }
+    try {
+      written = await store.commit(decision.incidents, decision.notifications, decision.jobs)
+    } catch (cause) {
+      // **THE CHUNKS BEFORE THIS ONE ARE COMMITTED AND STAY COMMITTED.** Only this chunk is lost,
+      // and its findings are still OPEN, so the next tick redoes exactly them. That is the whole
+      // point of chunking: a failure costs one chunk rather than the tick.
+      return failure('WRITING', cause, attempted)
+    }
+
+    incidentsWritten += written.incidentsWritten
+    notificationsWritten += written.notificationsWritten
+    jobsWritten += written.jobsWritten
+    skipped.push(...decision.skipped)
+    for (const rule of decision.unmappedRules) unmapped.add(rule)
+    accountingProblems.push(...decision.accountingProblems)
+    // CARRIED FORWARD, so a later chunk knows this incident is already open.
+    opened.push(...decision.incidents.map((each) => ({
+      organizationId: each.organizationId, incidentKey: each.incidentKey,
+    })))
+    chunksCommitted += 1
+    processed += chunk.length
   }
-  let written: { incidentsWritten: number; notificationsWritten: number; jobsWritten: number }
-  try {
-    written = await store.commit(decision.incidents, decision.notifications, decision.jobs)
-  } catch (cause) {
-    return failure('WRITING', cause, attempted)
-  }
-  const { incidentsWritten, notificationsWritten, jobsWritten } = written
 
   return ran({
     findingsRead: findings.length,
     incidentsWritten,
     notificationsWritten,
     jobsWritten,
-    skipped: decision.skipped,
-    unmappedRules: decision.unmappedRules,
+    skipped,
+    unmappedRules: [...unmapped].sort(),
     unreadableDispositions: dispositions.unreadable,
-    accountingProblems: decision.accountingProblems,
+    accountingProblems,
     yieldedOnBudget: false,
+    truncated,
+    chunksCommitted,
+    findingsUnprocessed: findings.length - processed,
   })
 }

@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1842 tests, 1720 pass, 0 fail.** The remaining 122 are database-integration tests requiring a
+**1847 tests, 1724 pass, 0 fail.** The remaining 123 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -969,6 +969,45 @@ last.
 rows seeded) converges with every row translated and the endpoint's write succeeding; a fresh
 database ends in the identical shape. Idempotent across two further hand re-runs. Drift unchanged
 at 254 lines with no alerting table named.
+
+### The tick commits in chunks, and can say it is behind
+
+**The declared bound and the effective bound were different numbers.** `MAX_FINDINGS_PER_TICK` is
+5000; the transaction budget was measured exhausting between two and five times below it — 500 and
+1000 fine, 2000, 3000 and 5001 all failing with *the timeout was 5000 ms, however 5002 ms passed*.
+The limit chosen to make the work bounded did not bound it.
+
+**And it was intermittent, which is worse than stuck.** Three consecutive ticks at 2000 gave 0,
+then 2000, then 2000 — timing decides. A tick that writes nothing and works on the retry is
+exactly what gets explained away once.
+
+Each chunk is now **one transaction across all three tables**, `FINDINGS_PER_CHUNK = 200`. The
+budget is checked BETWEEN chunks and never inside one — the same rule as the original stranding
+blocker: *a yield may give up work, it may never leave work half done.*
+
+**NOT A SMALLER `MAX_FINDINGS_PER_TICK`**, because any single constant is a guess about an
+environment nobody can measure from here. Those figures are from a loopback socket; production is
+a container talking to a managed database across a network, and each finding is three round trips.
+**Production is worse, not better — the direction is the finding and the threshold is not.** 200
+findings is 600 statements, an order of magnitude under the smallest measured failure on the fast
+machine, because the cost of too small is more transactions and the cost of too large is a tick
+that writes nothing.
+
+**What carries between chunks is the set of incident keys already opened.** Two findings on one
+incident can fall either side of a boundary; without carrying them the second chunk decides the
+incident is new, the unique index swallows the duplicate row, the message id swallows the second
+job — **the database survives and the report lies.** Tested directly, and a mutation removing the
+carry-forward fails it.
+
+**`truncated` is now a fact the tick states.** A tick that read its cap and one that read
+everything produced the same report, so *we are behind* was not observable at all. The store reads
+one row past the cap to answer it without a second COUNT on every run; the report also carries
+`chunksCommitted` and `findingsUnprocessed`, so a yield says how far behind it left things.
+
+Proven on a real database across a real boundary: 250 findings, 2 chunks, 250 incidents, 250
+notifications and 250 jobs counted in SQL, `accountingProblems` empty, and a second tick adding
+nothing. Three mutations killed — removing the carry-forward, making the chunk the whole tick, and
+never reporting truncation.
 
 ### A yield and a failure are now different words
 

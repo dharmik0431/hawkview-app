@@ -1,3 +1,4 @@
+import { MAX_FINDINGS_PER_TICK } from './finding-pipeline.js'
 import {
   asAlertTypeId, asDisposition, dispositionKey,
   type DispositionKey, type Dispositions, type ExistingIncident, type FindingRow,
@@ -23,16 +24,7 @@ import { type Severity } from './alert-type.js'
  * prove the columns exist and the constraints hold, not to prove the ORM can spell them.
  */
 
-/** THE SECOND HALF OF THE FIRST-RUN BOUND, and it belongs somewhere findable rather than inside
- * a SQL string.
- *
- * A tick reads at most 24 hours of findings (`HAWKVIEW_ALERT_READ_WINDOW_HOURS`) AND at most this
- * many rows. Above this in one window, a tick silently takes the first 5000 by `observed_at` and
- * the rest wait for the next one. **The bound is correct** — an unbounded read inside an
- * admission budget is the worse option, because the budget is shared with collection and
- * collection outranks alerting. But anybody forecasting a first run needs both numbers, and until
- * this constant existed the second one was only discoverable by reading the query. */
-export const MAX_FINDINGS_PER_TICK = 5000
+export { MAX_FINDINGS_PER_TICK } from './finding-pipeline.js'
 
 /** The narrow slice of a database this needs: two shapes of statement and a transaction.
  *
@@ -59,7 +51,10 @@ export function pipelineStore(runner: SqlRunner): PipelineStore {
            FROM identity_risk_findings
           WHERE state = 'OPEN' AND observed_at >= $1::timestamptz
           ORDER BY observed_at, id
-          LIMIT ${MAX_FINDINGS_PER_TICK}`,
+          -- ONE PAST THE CAP, so the tick can say whether it was TRUNCATED without a second
+          -- COUNT on every run. runIntake slices back to the cap; the extra row exists only
+          -- to answer "was there more".
+          LIMIT ${MAX_FINDINGS_PER_TICK + 1}`,
         [sinceIso])
       return rows.map((row): FindingRow => ({
         id: row.id,

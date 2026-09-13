@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   runIntake, type PipelineStore,
   alertTierFor,
+  FINDINGS_PER_CHUNK, MAX_FINDINGS_PER_TICK,
   asAlertTypeId, dispositionKey,
   alertTypeForRule, decide,
   type Dispositions, type ExistingIncident, type FindingRow, type Watermark,
@@ -425,4 +426,150 @@ test('AN UNREADABLE STORED TIER LEAVES THE CATALOGUE IN CHARGE, and is reported'
 
   assert.equal(out.notifications[0]?.severity, 'critical', 'the catalogue judgement, unchanged')
   assert.equal(out.jobs.length, 1)
+})
+
+/** Many distinct findings, each its own subject so each is its own incident. */
+const manyFindings = (count: number) =>
+  Array.from({ length: count }, (_, i) =>
+    finding({ id: `f-${i}`, subjectId: `user-${i}`, dedupeKey: `d-${i}` }))
+
+test('THE TICK COMMITS IN CHUNKS, one transaction each', async () => {
+  // The transaction budget was measured exhausting between two and five times BELOW the per-tick
+  // cap, so the declared bound and the effective bound were different numbers. Chunking makes the
+  // transaction size a constant sized for the slow environment rather than a consequence of how
+  // many findings happened to arrive.
+  const commits: number[] = []
+  const store: PipelineStore = {
+    findOpenFindings: async () => manyFindings(FINDINGS_PER_CHUNK * 2 + 5),
+    findExistingIncidents: async () => [],
+    loadDispositions: async () => canEmail,
+    commit: async (incidents, notifications, jobs) => {
+      commits.push(incidents.length)
+      return {
+        incidentsWritten: incidents.length,
+        notificationsWritten: notifications.length,
+        jobsWritten: jobs.length,
+      }
+    },
+  }
+  const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 300_000, '2026-01-01T00:00:00.000Z')
+
+  assert.equal(outcome.kind, 'RAN')
+  if (outcome.kind !== 'RAN') return
+  assert.equal(commits.length, 3, 'two full chunks and a remainder')
+  assert.equal(outcome.report.chunksCommitted, 3)
+
+  // NO CHUNK IS LARGER THAN THE CONSTANT. That is the property: the transaction size no longer
+  // depends on how many findings the window held.
+  for (const size of commits) assert.ok(size <= FINDINGS_PER_CHUNK, `a chunk held ${size}`)
+  assert.equal(outcome.report.findingsRead, FINDINGS_PER_CHUNK * 2 + 5)
+  assert.equal(outcome.report.findingsUnprocessed, 0)
+})
+
+test('A YIELD BETWEEN CHUNKS KEEPS THE EARLIER ONES AND LEAVES THE REST UNTOUCHED', async () => {
+  // A yield may give up work; it may never leave work half done. Yielding between chunks leaves
+  // earlier chunks fully written and later findings entirely untouched and still OPEN, so the
+  // next tick resumes along a path already proven.
+  let commits = 0
+  const store: PipelineStore = {
+    findOpenFindings: async () => manyFindings(FINDINGS_PER_CHUNK * 3),
+    findExistingIncidents: async () => [],
+    loadDispositions: async () => canEmail,
+    commit: async (incidents, notifications, jobs) => {
+      commits += 1
+      return {
+        incidentsWritten: incidents.length,
+        notificationsWritten: notifications.length,
+        jobsWritten: jobs.length,
+      }
+    },
+  }
+  // A clock that runs out once the first chunk has committed.
+  const deadline = Date.now() + 300_000
+  let reads = 0
+  const clock = () => (++reads > 4 ? deadline + 1 : Date.now())
+
+  const outcome = await runIntake(
+    store, WATERMARK, T0, deadline, '2026-01-01T00:00:00.000Z', clock)
+
+  assert.equal(outcome.kind, 'RAN')
+  if (outcome.kind !== 'RAN') return
+  assert.equal(outcome.report.yieldedOnBudget, true)
+  assert.ok(commits >= 1, 'it committed what it could before yielding')
+  assert.equal(outcome.report.chunksCommitted, commits)
+
+  // AND IT SAYS HOW FAR BEHIND IT IS, which is what makes a yield actionable rather than a shrug.
+  assert.ok(outcome.report.findingsUnprocessed > 0)
+  assert.equal(
+    outcome.report.findingsUnprocessed,
+    FINDINGS_PER_CHUNK * 3 - commits * FINDINGS_PER_CHUNK)
+})
+
+test('AN INCIDENT OPENED IN ONE CHUNK IS NOT REOPENED BY THE NEXT', async () => {
+  // **THE CHUNK BOUNDARY IS NEW, SO THIS IS PROVEN RATHER THAN ASSUMED.** Two findings on ONE
+  // incident can fall either side of it. Without carrying the opened keys forward, the second
+  // chunk decides the incident is new — the unique index swallows the duplicate row and the
+  // message id swallows the second job, so the database survives and the REPORT lies.
+  const shared = [
+    finding({ id: 'f-1', subjectId: 'user-1', dedupeKey: 'd-1' }),
+    ...Array.from({ length: FINDINGS_PER_CHUNK - 1 }, (_, i) =>
+      finding({ id: `pad-${i}`, subjectId: `pad-${i}`, dedupeKey: `pad-${i}` })),
+    // Same subject as f-1, so the same incident key — but in the second chunk.
+    finding({ id: 'f-2', subjectId: 'user-1', dedupeKey: 'd-2' }),
+  ]
+  const store: PipelineStore = {
+    findOpenFindings: async () => shared,
+    findExistingIncidents: async () => [],
+    loadDispositions: async () => canEmail,
+    commit: async (incidents, notifications, jobs) => ({
+      incidentsWritten: incidents.length,
+      notificationsWritten: notifications.length,
+      jobsWritten: jobs.length,
+    }),
+  }
+  const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 300_000, '2026-01-01T00:00:00.000Z')
+
+  assert.equal(outcome.kind, 'RAN')
+  if (outcome.kind !== 'RAN') return
+  assert.equal(outcome.report.chunksCommitted, 2, 'the two really are in different chunks')
+
+  // ONE INCIDENT AND ONE JOB for the shared subject, and the second finding is NAMED as skipped
+  // rather than vanishing.
+  assert.equal(
+    outcome.report.skipped.filter((each) => each.because === 'INCIDENT_ALREADY_OPEN').length, 1)
+  assert.equal(outcome.report.jobsWritten, FINDINGS_PER_CHUNK,
+    'one job per distinct incident, not one per finding')
+
+  // AND EVERY FINDING IS ACCOUNTED FOR EXACTLY ONCE across the chunks.
+  assert.deepEqual(outcome.report.accountingProblems, [])
+})
+
+test('A TICK THAT READ ITS LIMIT SAYS SO', async () => {
+  // A tick that read its cap and one that read everything produced the same report, so "we are
+  // behind" was not observable at all. The store reads one row past the cap to answer it without
+  // a second COUNT on every run.
+  const store: PipelineStore = {
+    findOpenFindings: async () => manyFindings(MAX_FINDINGS_PER_TICK + 1),
+    findExistingIncidents: async () => [],
+    loadDispositions: async () => canEmail,
+    commit: async (incidents, notifications, jobs) => ({
+      incidentsWritten: incidents.length,
+      notificationsWritten: notifications.length,
+      jobsWritten: jobs.length,
+    }),
+  }
+  const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 300_000, '2026-01-01T00:00:00.000Z')
+
+  assert.equal(outcome.kind, 'RAN')
+  if (outcome.kind !== 'RAN') return
+  assert.equal(outcome.report.truncated, true)
+  assert.equal(outcome.report.findingsRead, MAX_FINDINGS_PER_TICK, 'the extra row is not processed')
+
+  // THE CONTROL: exactly the cap is NOT truncated. Without it, `truncated` could be true whenever
+  // the read is large and would mean nothing.
+  const atCap: PipelineStore = {
+    ...store, findOpenFindings: async () => manyFindings(MAX_FINDINGS_PER_TICK),
+  }
+  const exact = await runIntake(atCap, WATERMARK, T0, Date.now() + 300_000, '2026-01-01T00:00:00.000Z')
+  assert.equal(exact.kind === 'RAN' ? exact.report.truncated : null, false)
 })
