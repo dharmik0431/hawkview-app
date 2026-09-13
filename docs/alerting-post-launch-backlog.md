@@ -116,3 +116,45 @@ launch produces that data**, not before by guessing harder.
 **Why it will become one.** The moment routing is driven by findings rather than by
 notifications, a finding whose rule id maps to no alert type has no route, and the failure will
 be silence. **Check this before wiring intake to findings**, not after.
+
+## 9. The repository has pre-existing schema drift, and it is large
+
+**What.** `prisma migrate diff` between a database freshly built by `migrate deploy` and
+`schema.prisma` emits roughly eighty statements — RenameIndex, RenameForeignKey and
+`ALTER COLUMN … DROP DEFAULT` — across identity-risk, directory and notification tables that
+nobody touched. Found while verifying the launch migration. **None of it is caused by the
+alerting work**, and the alerting tables themselves come back clean.
+
+**Why not a blocker.** It is naming and defaults, not structure. The deployed database and the
+model describe the same tables; Prisma would like the constraints named differently.
+
+**Why it is a trap.** Anyone who runs `prisma migrate dev` gets a vast spurious migration
+containing all of it, and will either commit it or spend an afternoon working out why.
+**Whoever touches the schema next should expect this and not read it as their own mistake.**
+
+## 10. Quiet hours have two possible timezones and no rule
+
+**What.** The two-grain ruling puts quiet hours at the user grain. Both `users.time_zone` and
+`organizations.time_zone` exist and **both are nullable** — so "do not email me at 2am" has no
+defined answer when a user has no timezone, and none at all when neither does.
+
+**Why it is not in the migration.** This is why quiet hours were left out of
+`20260912190000_alert_incidents_and_dispositions`. Building the column before the fallback is
+decided means building the wrong column. Everything that did not depend on the answer was built.
+
+**What needs deciding.** The chain — user, then organisation, then what? — and the both-null
+case. UTC is the obvious last resort and it is also the one that silently emails somebody at 2am.
+
+## 11. `digestMode` and the DIGEST disposition may be the same fact twice
+
+**What.** `notification_preferences.digest_mode` already exists, and `DIGEST` is one of the four
+dispositions an MSP can now set per rule. If both are read at delivery time, two stores answer
+*should this be batched*.
+
+**Why not a blocker today.** Nothing reads either at delivery time, because nothing delivers.
+
+**Why to settle it before wiring.** This is the two-places-one-fact shape, and it is far cheaper
+to resolve before something depends on both. The likely answer is that the disposition decides
+whether a rule batches and `digest_mode` decides the cadence of the batch a person receives —
+two different facts — but that needs stating rather than assuming, which is exactly how the
+first three instances of this got in.

@@ -207,12 +207,101 @@ model NotificationPreference {
   @@map("notification_preferences")
 }
 
+/// THE LIFECYCLE OF AN INCIDENT, once per incident.
+///
+/// A PROJECTION OVER `notifications`, NOT A PARENT OF THEM. An incident is the set of rows
+/// sharing an `incident_key`; this holds the state of that set. There is deliberately no
+/// relation to `Notification`: nothing cascades either way, and an incident row missing for a
+/// keyed notification is a REPORTABLE GAP rather than a broken foreign key.
+///
+/// WHY NOT COLUMNS ON `notifications`: an incident spans many rows, so the state would be
+/// stored once per row with nothing making the copies agree. Acknowledging would be N writes,
+/// and a partial failure leaves an incident half-acknowledged with no way to tell.
+///
+/// WHY NOT ON `IdentityRiskFinding`: half the incidents have no finding. Step 03 migrates rows
+/// produced by tenant sync and directory audit, which never had one.
+model AlertIncident {
+  id              String   @id @default(uuid()) @db.Uuid
+  organizationId  String   @map("organization_id") @db.Uuid
+  /// Matches `notifications.incident_key`. Same width, for the same reason.
+  incidentKey     String   @map("incident_key") @db.VarChar(300)
+  /// Which catalogue type this incident is, so the lifecycle rules that depend on category
+  /// (an OPERATIONAL investigation may be closed by the system; a SECURITY one may not) can be
+  /// applied without re-deriving the type from the key.
+  alertTypeId     String   @map("alert_type_id") @db.VarChar(80)
+  /// UNACKNOWLEDGED | ACKNOWLEDGED
+  ownership       String   @db.VarChar(20)
+  /// ACTIVE | CLEARED | UNKNOWN
+  condition       String   @db.VarChar(20)
+  /// OPEN | RESOLVED | NONE
+  investigation   String   @db.VarChar(20)
+  /// THREE TIMESTAMPS, ONE PER AXIS, and that is the point of three axes.
+  ///
+  /// A single `updatedAt` would collapse "when did the condition last change" and "when was
+  /// this acknowledged" into one fact, and those move independently — a cleared condition on an
+  /// unacknowledged incident is a normal state. Collapsing them is the failure this feature has
+  /// found in four other places.
+  ownershipAt     DateTime @map("ownership_at") @db.Timestamptz(6)
+  conditionAt     DateTime @map("condition_at") @db.Timestamptz(6)
+  investigationAt DateTime @map("investigation_at") @db.Timestamptz(6)
+  /// Who acknowledged it. Constrained in SQL to be present exactly when ownership is
+  /// ACKNOWLEDGED — see the migration. Two fields that can disagree need one owner, and here
+  /// the database is it.
+  acknowledgedBy  String?  @map("acknowledged_by") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, incidentKey])
+  /// The queue read: this MSP’s incidents that still need somebody.
+  @@index([organizationId, ownership, conditionAt(sort: Desc)])
+  @@map("alert_incidents")
+}
+
+/// WHAT AN MSP CONSIDERS URGENT, per rule. ORGANISATION GRAIN, deliberately.
+///
+/// TWO GRAINS, TWO QUESTIONS, AND THEY HOLD DIFFERENT FACTS. This answers *what counts as
+/// urgent here*, which is an MSP policy — two people in one MSP must not disagree about whether
+/// a privileged role grant is urgent. How and when a given person hears about it is a separate
+/// fact and lives on `NotificationPreference`, at the user grain.
+///
+/// Two places holding the SAME fact is the defect this feature has fixed three times. Two
+/// places holding DIFFERENT facts is just a system: the organisation says a role grant is
+/// urgent, a user says do not email me, and both are honoured.
+///
+/// A ROW EXISTS ONLY WHERE AN MSP HAS OVERRIDDEN THE DEFAULT. Nothing is seeded, and that is
+/// forced rather than lazy: `defaultPreferenceFor` derives the default FROM THE DECLARED
+/// SEVERITY, precisely "so the default cannot drift from the tiering the catalogue already
+/// states". Seeding twenty rows per organisation would copy a derived value into storage, and
+/// the copies would disagree with the catalogue the first time a severity changed.
+model AlertRuleDisposition {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  /// A rule id, at the grain the MSP chooses on. Wider than the catalogue’s 80 because the
+  /// three rule namespaces (catalogue ids, CHANGE_RULES, IdentityRiskFinding.ruleId) are not
+  /// yet unified — see the backlog.
+  ruleId         String   @map("rule_id") @db.VarChar(120)
+  /// RING | EMAIL | DIGEST | RECORD_ONLY. There is no OFF: an MSP may choose not to be
+  /// DELIVERED to, never to have the thing not recorded.
+  disposition    String   @db.VarChar(20)
+  /// Who set it and when, because a preference nobody can attribute is one nobody will change.
+  setByUserId    String?  @map("set_by_user_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, ruleId])
+  @@map("alert_rule_dispositions")
+}
+
 model Organization {
   id                 String                     @id @default(uuid()) @db.Uuid
   name               String                     @db.VarChar(200)
   slug               String                     @unique @db.VarChar(100)
   businessDomain     String?                    @map("business_domain") @db.VarChar(253)
   timeZone           String?                    @map("time_zone") @db.VarChar(100)
+  alertIncidents     AlertIncident[]
+  alertRuleDispositions AlertRuleDisposition[]
   onboardingCompletedAt DateTime?               @map("onboarding_completed_at") @db.Timestamptz(6)
   createdByUserId    String?                    @map("created_by_user_id") @db.Uuid
   status             OrganizationStatus         @default(ACTIVE)
