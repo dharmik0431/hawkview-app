@@ -8,13 +8,18 @@ where something was not measured it says so rather than reading as covered.
 
 ## The commit
 
-**`b9187d3`** — *"count types the catalogue no longer declares, and say what a restore buys"* — the
-tip of `agent/alerts-step-01`.
+**`7530528`** — the tip of `agent/alerts-step-01`, **and it is pushed.** The remote branch is at the
+same commit, so what ships is what was checked. Anybody can re-run the check:
 
-⚠ **The last two commits are not pushed.** `git ls-remote` puts the remote branch at `d0bafac`;
-`b9187d3` and `ee8ab98` exist only locally. Everything below was verified against `b9187d3`. **If
-this ships from the remote, it ships `d0bafac` — a different commit from the one that was checked.**
-That is a one-command fix and it should happen before anybody decides.
+```bash
+git ls-remote origin agent/alerts-step-01
+```
+
+Verified at the time of writing. It was *not* true an hour earlier — four commits were local-only —
+so if the tip moves again, run it again rather than trusting this line.
+
+The behaviour below was measured at `b9187d3`; `7530528` and `ee8ab98` on top of it change
+documentation only.
 
 ## What is in it
 
@@ -97,6 +102,42 @@ nothing establishes that it is fine.
 
 ---
 
+## The one open product decision
+
+**The publish path was specified and deliberately not built**, because building it would have
+required choosing between two meanings of *off* that are both already in the product — and because,
+under one of them, it would have done nothing at all while looking like a control.
+
+**Both halves are measured, by me, today:**
+
+- **Intake's `RECORD_ONLY` writes the incident and the in-app notification and withholds only the
+  send job.** Measured: 1 incident, 1 notification, **0 jobs**. So *off* there means **not emailed,
+  still visible in the product**.
+- **The tenant-sync publish path cannot produce an email at all.** `publishIncident` upserts a
+  notification row and nothing else; `notifications.service.ts` references send jobs **zero** times.
+  So withholding a publish would mean **not visible at all** — the opposite meaning.
+
+**And the consequence that matters more than the inconsistency.** Making the publish path consult
+the disposition would have withheld *an email that does not exist*. Reach would have gone from two
+alert types to **two**, not to seven, while the settings page showed a control over five more that
+did nothing. **A control that looks live and is inert is worse than an absent one**, and this
+release does not ship one.
+
+**What the decision is:** when an MSP silences a tenant-connection alert, should that stop an email
+they are not currently receiving, or stop the thing appearing in HawkView at all? It is a product
+question, not an engineering one. Once it is answered the work is about a day.
+
+## A finding this work surfaced, which is not part of it
+
+**Two of five tenants have no sign-in evidence since 2026-09-10 and 2026-08-30, and both report a
+current collection time**, because the code stamps the window it *requested* rather than what came
+back. *(Measured in production by Engineer 2; recorded at `4492d67` in `docs/sign-in-evidence-gap.md`.
+I have not confirmed the production figures and have no production access.)*
+
+It is independent of alerting and true today. It belongs here because it bears on the sentence at
+the top of this page: **a fleet that reports itself current is not necessarily being looked at**,
+and the zero-findings figure sits downstream of exactly this collection.
+
 ## What is deliberately absent
 
 - **Routing and channel.** A setting changes what the product *shows* — `ACT_TODAY` on a type the
@@ -109,6 +150,9 @@ nothing establishes that it is fine.
 - **Six detectors produce no email, by decision** — their findings map to no alert type and are
   reported as unmapped rather than defaulted. Refusing to invent a type is correct; it also means
   *"we detect it"* and *"you will be told"* are different sets.
+- **A setting reaches two of seven alert types**, not seven. That is the open decision above, and
+  the number should be stated rather than left to be inferred from a settings page that lists all of
+  them. The five it does not reach are the tenant-sync family.
 
 ---
 
@@ -141,11 +185,19 @@ approved step-03 figures are provably unchanged; and the two things a reader wou
 misled by — a green shield over an unassessed fleet, and a saved setting the product ignores — are
 both closed and were both verified by instruments that did not share an author with the fix.
 
-**Two things should happen before it ships**, neither of which is a defect in the work: **push the
-branch**, so the commit that was verified is the commit that goes; and decide whether the 51 stale
-guards on the per-tenant surface are acceptable to carry, knowing they cover a component this
-release does not touch.
+**The most encouraging thing on this page is not a passing test.** It is that the last substantial
+piece of work was **cut rather than built** — because building it would have shipped a control that
+looked live and did nothing. A team that stops on a contradiction it found in its own instructions,
+a few hours before a deadline, is the reason the rest of these results are worth reading.
+
+**Two things need a decision, neither of them a defect in the work:**
+
+1. **Which meaning of *off*** the settings page should have for the five alert types it does not yet
+   reach. Until that is answered, the honest statement to anyone using the page is that a setting
+   governs two of seven.
+2. **Whether the 51 stale guards** on the per-tenant surface are acceptable to carry, knowing they
+   cover a component this release does not touch and that nothing has examined it since the rework.
 
 **And the sentence to keep in mind while deciding:** this release makes HawkView able to say things
-correctly. Whether it has anything to say is a question about the risk engine, and that question is
-open.
+correctly. Whether it has anything to say is a question about the risk engine — and the collector
+finding above is a reason to treat that question as open rather than settled.
