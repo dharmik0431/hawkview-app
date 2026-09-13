@@ -175,6 +175,10 @@ async function main() {
           : /No users to review among the tenants HawkView assessed/.test(body)
             ? 'No users to review among the tenants HawkView assessed'
             : /No users match the selected filters/.test(body) ? 'No users match the selected filters' : null,
+      // GENERIC CAPTURE. My title extractor is a fixed list of three strings, so a FOURTH tone
+      // returns null and reads as nothing rendered. Print the text and judge it.
+      emptyStateText: (/(No [^.]{0,120}.[^|]{0,400})/.exec(body) ?? [])[1] ?? null,
+      bodyTail: body.slice(-520),
       saysNotAssessed: /not assessed/.test(body),
       saysAllInScopeWereAssessed: /in scope were assessed/.test(body),
       detail: (/((?:All \d+ tenants? in scope were assessed[^.]*\.)|(?:\d+ of \d+ tenants? (?:was|were) not assessed[^.]*\.))/.exec(body) ?? [])[1] ?? null,
