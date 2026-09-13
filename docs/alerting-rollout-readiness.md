@@ -10,6 +10,18 @@ Intake reads findings, writes incidents, and queues send jobs. Nothing drains th
 provider client exists, and no email can leave. That is not a caveat on a sending feature — it is
 what the release *is*, and the acceptance checklist below cannot be completed until it changes.
 
+**THE RELEASE IS NO LONGER BACKEND-ONLY. Four screens now carry this feature**, and everything
+below was written before that scope existed:
+
+- **the alert settings page** — where an MSP chooses what counts as urgent, and where a setting
+  that cannot take effect is named rather than shown as saved;
+- **the notification inbox and the bell** — which now carry the alert type and the effective tier;
+- **the Risky Users fleet screen** — the count, its coverage, and the icon;
+- **the dashboard's Priority Action Queue** — a count that walked every tenant and let an
+  unreadable one contribute zero.
+
+Two of those were shipping a reassurance they had not earned. Both are fixed.
+
 ### The pipeline has nothing to carry yet
 
 *Measured in production, read-only, by PM. I have no production access and did not confirm these.*
@@ -105,6 +117,36 @@ second line of proof that they are.
 
 ---
 
+## What the screens say, and what they refuse to say
+
+*Every result here comes from rendering the real page and reading what a person would see, icon
+included, over fixtures registered before the code existed. Reported by QA; the backend half is
+verified here.*
+
+**The alert settings page.** A disposition is a tier (`ACT_NOW | ACT_TODAY | RECORD_ONLY`), not a
+delivery channel. A value outside that vocabulary is refused at the write — five ways, all 400 or
+403, none writing a row — and the database refuses one directly too. The endpoint is **not**
+public: no token, a forged token and a valid single-factor token are all refused, and none writes.
+
+**A setting that cannot take effect is named at both ends.** A stored key that is not a catalogue
+id — a risk rule id, which is exactly what that column held before the rename — appears on the
+settings page as an unrecognised key *and* in the intake report, with the reason. A run with no
+such row names nothing.
+
+**The fleet screen.** Five distinct empty states, and the green shield appears on exactly one:
+
+| what happened | what it says | shield |
+|---|---|---|
+| every tenant assessed, nothing found | No users require review · *All 4 tenants in scope were assessed…* | **green** |
+| some tenants unreadable | No users to review among the tenants HawkView assessed · *3 of 4 were not assessed…* | none |
+| still loading | *…4 of 4 not assessed (4 still loading)* | none |
+| no tenants connected | No tenants are in scope · *There is nothing to assess, which is not the same as nothing being wrong* | none |
+| the tenant list failed | **HawkView could not determine which tenants to assess** · *Nothing here is a statement about your tenants* | none |
+
+The last two were one screen under a green shield until today.
+
+---
+
 ## 3. Migrations and rollback
 
 Ten migrations carry this feature. **All but the last are additive or widening — none drops a column,
@@ -181,6 +223,26 @@ there is no incident, no notification and no job — **the alert simply does not
 Prisma reports a healthy, fully-migrated database. `20260913120000` corrects it forward, a no-op
 where the columns are already 400. Verified: converged from the old widths, both inserts then
 fit, second deploy a clean no-op, idempotent across two hand re-runs.
+
+### Three in-place edits were made, and all three are corrected forward
+
+| migration | in-place edits | corrected forward |
+|---|---|---|
+| `20260912190000_alert_incidents_and_dispositions` | 2 | **yes** — `dcca63e` |
+| `20260912223000_alert_send_jobs` | 1 | **yes** — `446ba90` and `09d9c8d` |
+| `20260912120000_notification_incident_key` | 2 | **not needed** — both routes converge, checked |
+
+*Two items were handed over as open and are closed: the widening migration, and the intake
+backstop returning `READING` where it logged `UNKNOWN`. `IntakePhase` gained `UNKNOWN` so the
+return can say what the log says. Recorded because a list of open items that is quietly out of
+date is worse than no list.*
+
+**The premise is settled.** *Read in production by PM, read-only:* none of the alerting migrations
+appears in production's `_prisma_migrations`, so those tables will be created fresh at the correct
+width. **The widening matters for every OTHER database** — staging, developer machines, any QA
+cluster — which is reason enough, because a migration set correct only on one machine is not
+correct. The two older migrations (`20260902090000`, `20260829150000`) are closed: recorded
+checksums match the committed files and the edit timestamps independently predate application.
 
 ### ⚠ THERE IS NO CHECKSUM GUARD. THE RULE IS THE ONLY THING STANDING THERE.
 
@@ -323,6 +385,11 @@ the same dead mailbox is not attempted either.
 ## What is deliberately not in this release
 
 - **SMS.** Deferred.
+- **A setting can silence, and cannot escalate.** The tick reads the disposition to decide whether
+  to send at all. Moving a type between the two non-silencing tiers changes the notification's
+  severity and what the inbox shows, but it does not change routing or channel — SMS is deferred
+  and both tiers deliver the same way. An MSP who raises urgency sees the change in the product
+  and should not expect a different delivery.
 - **Six detectors that produce no email, by decision.** A risk rule becomes an alert type through
   the `investigationGuidanceCode` the catalogue declares, and two of the four codes map to no
   alert type — those findings produce no incident, no job and no email, and are reported as
