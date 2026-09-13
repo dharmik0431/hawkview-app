@@ -186,3 +186,43 @@ test('a stored value the backend could not read reaches the row', () => {
     false
   )
 })
+
+test('a saved setting with no row to appear on is carried, not dropped', () => {
+  // THE SECOND FIELD OF THIS KIND I WOULD HAVE DISCARDED BY READING ONLY WHAT I
+  // EXPECTED. `list()` walks the catalogue, so a stored row keyed to an id the
+  // catalogue no longer declares is invisible in the rows -- seven come back and
+  // none mentions it. The endpoint lists them at the envelope for that reason.
+  // Dropping them here puts the page back where it was before
+  // `storedValueIgnored`: a setting somebody made, doing nothing, with nothing
+  // on screen saying so.
+  const read = readDispositions({
+    organizationId: 'org-1',
+    dispositions: [row()],
+    unrecognisedKeys: ['security.renamed_last_year', 'monitoring.typo'],
+  })
+  assert.equal(read.outcome, 'LOADED')
+  assert.deepEqual(
+    read.outcome === 'LOADED' ? read.unrecognisedKeys : null,
+    ['security.renamed_last_year', 'monitoring.typo']
+  )
+
+  // Absent is an empty list, not undefined -- every caller renders a count.
+  const without = readDispositions({ organizationId: 'org-1', dispositions: [row()] })
+  assert.deepEqual(without.outcome === 'LOADED' ? without.unrecognisedKeys : null, [])
+
+  // NOT FOLDED INTO `discarded`. A discarded row is one this build could not
+  // parse; an unrecognised key is one the CATALOGUE does not have. Different
+  // causes, different remedies, and a reader given one number cannot tell which.
+  assert.equal(read.outcome === 'LOADED' && read.discarded, 0)
+
+  // Junk in the list is dropped rather than rendered as an empty name.
+  const messy = readDispositions({
+    organizationId: 'org-1',
+    dispositions: [row()],
+    unrecognisedKeys: ['real.id', '', '   ', 42, null],
+  })
+  assert.deepEqual(
+    messy.outcome === 'LOADED' ? messy.unrecognisedKeys : null,
+    ['real.id']
+  )
+})

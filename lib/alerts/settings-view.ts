@@ -31,6 +31,15 @@ export type SettingsView = {
   because: string | null
   /** Rows the response carried that this build could not read. */
   discarded: number
+  /**
+   * Saved settings keyed to alert types this build does not declare.
+   *
+   * Carried beside the rows rather than folded into `discarded`: a discarded
+   * row is one this build could not parse, and one of these is a row the
+   * CATALOGUE does not have. Different causes, different remedies, and merging
+   * them would leave a reader unable to tell which.
+   */
+  unrecognisedKeys: string[]
   /** The rows to render. Empty whenever `empty` is set. */
   rows: AlertDispositionRow[]
 }
@@ -46,7 +55,14 @@ export function settingsView(
   rows: AlertDispositionRow[]
 ): SettingsView {
   if (state.phase === 'LOADING') {
-    return { loading: true, empty: null, because: null, discarded: 0, rows: [] }
+    return {
+      loading: true,
+      empty: null,
+      because: null,
+      discarded: 0,
+      unrecognisedKeys: [],
+      rows: [],
+    }
   }
 
   const { read } = state
@@ -60,6 +76,7 @@ export function settingsView(
     empty,
     because: read.outcome === 'LOADED' ? null : read.because,
     discarded: read.outcome === 'LOADED' ? read.discarded : 0,
+    unrecognisedKeys: read.outcome === 'LOADED' ? read.unrecognisedKeys : [],
     // THE INVARIANT, WRITTEN DOWN RATHER THAN ARRIVED AT. An empty-state card
     // claims there is nothing to show; a list beside it says otherwise. Rather
     // than trusting that the two conditions stay complementary, one of them is

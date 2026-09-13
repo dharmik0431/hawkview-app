@@ -154,7 +154,14 @@ export default function AlertSettingsPage() {
   // the list must never both be on screen. Spread across four expressions that
   // held only because emptinessCopy happens to return null for HAS_ITEMS --
   // emergent, unstated, and nothing could fail if an edit broke it.
-  const { loading, empty, because, discarded, rows: visibleRows } = settingsView(
+  const {
+    loading,
+    empty,
+    because,
+    discarded,
+    unrecognisedKeys,
+    rows: visibleRows,
+  } = settingsView(
     state,
     rows
   )
@@ -196,6 +203,27 @@ export default function AlertSettingsPage() {
             </CardContent>
           )}
         </Card>
+      )}
+
+      {unrecognisedKeys.length > 0 && (
+        <p className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          {/* THESE HAVE NO ROW TO APPEAR ON. The list walks the catalogue, so a
+              saved setting keyed to an alert type this build does not declare is
+              invisible in it -- the rows come back and none mentions it. The
+              endpoint lists them separately for exactly that reason, and showing
+              nothing here would leave somebody believing a choice took effect
+              when the catalogue default is what applies. */}
+          <span>
+            {unrecognisedKeys.length} saved{' '}
+            {unrecognisedKeys.length === 1 ? 'setting refers' : 'settings refer'} to
+            alert {unrecognisedKeys.length === 1 ? 'a type' : 'types'} this version
+            of HawkView does not have, so{' '}
+            {unrecognisedKeys.length === 1 ? 'it does' : 'they do'} nothing:{' '}
+            <span className="font-mono">{unrecognisedKeys.join(', ')}</span>. The
+            catalogue default applies to anything they were meant to cover.
+          </span>
+        </p>
       )}
 
       {discarded > 0 && (

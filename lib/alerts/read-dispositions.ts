@@ -41,6 +41,20 @@ export type DispositionsRead =
       outcome: 'LOADED'
       rows: AlertDispositionRow[]
       /**
+       * Stored settings whose alert type id the catalogue does not declare.
+       *
+       * THESE HAVE NO ROW TO APPEAR ON. `list()` walks the catalogue, so a
+       * stored row keyed to an id that is no longer declared is invisible to it
+       * -- seven rows come back and none mentions it. The endpoint lists them at
+       * the envelope instead, and dropping them here would put the page back
+       * where it was before `storedValueIgnored`: a setting somebody made,
+       * doing nothing, with nothing on screen saying so.
+       *
+       * This is the second field of this kind I would have discarded by reading
+       * only what I expected. Both were surfaced deliberately by the producer.
+       */
+      unrecognisedKeys: string[]
+      /**
        * Rows the response carried that this build could not read.
        *
        * Surfaced rather than swallowed. A list quietly one row short is a list
@@ -136,6 +150,18 @@ export function readDispositions(body: unknown): DispositionsRead {
     }
   }
 
+  // Read from the envelope rather than the array, because that is where the
+  // endpoint puts them -- they have no row.
+  const unrecognisedKeys =
+    typeof body === 'object' && body !== null
+      ? ((body as Record<string, unknown>).unrecognisedKeys ?? [])
+      : []
+  const keys = Array.isArray(unrecognisedKeys)
+    ? unrecognisedKeys
+        .map((each) => (typeof each === 'string' && each.trim() ? each : null))
+        .filter((each): each is string => each !== null)
+    : []
+
   const rows: AlertDispositionRow[] = []
   for (const entry of container) {
     const row = readDispositionRow(entry)
@@ -160,7 +186,7 @@ export function readDispositions(body: unknown): DispositionsRead {
     }
   }
 
-  return { outcome: 'LOADED', rows, discarded }
+  return { outcome: 'LOADED', rows, discarded, unrecognisedKeys: keys }
 }
 
 /**

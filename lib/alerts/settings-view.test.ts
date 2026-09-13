@@ -205,3 +205,29 @@ test('the discarded count belongs to a read that succeeded', () => {
   )
   assert.equal(failed.discarded, 0)
 })
+
+test('unrecognised keys survive the view, and are not merged with discarded rows', () => {
+  // THE READER CARRYING THEM IS NOT THE PAGE SEEING THEM. A mutation zeroing
+  // this field in settingsView killed nothing: the reader tests covered the
+  // reader and no test looked at the layer between it and the screen. Same gap
+  // as the wiring checks, one module in.
+  const read = readDispositions({
+    organizationId: 'org-1',
+    dispositions: [wire(), wire({ alertTypeId: 'b', disposition: 'NONSENSE' })],
+    unrecognisedKeys: ['security.renamed_last_year'],
+  })
+  const view = settingsView({ phase: 'READ', read }, [row])
+
+  assert.deepEqual(view.unrecognisedKeys, ['security.renamed_last_year'])
+  // Kept apart from the discarded count on purpose: one is a row this build
+  // could not parse, the other a row the catalogue does not have.
+  assert.equal(view.discarded, 1)
+
+  // A failed read has no envelope to read them from, and must not invent one.
+  const failed = settingsView(
+    { phase: 'READ', read: { outcome: 'FAILED', because: 'gone' } },
+    []
+  )
+  assert.deepEqual(failed.unrecognisedKeys, [])
+  assert.deepEqual(settingsView({ phase: 'LOADING' }, []).unrecognisedKeys, [])
+})
