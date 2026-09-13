@@ -16,7 +16,7 @@ test('no tier promises a channel that cannot carry anything', () => {
   // Deriving the sentence from the tier's NAME would promise a call until
   // somebody remembered to edit a string.
   for (const tier of TIERS) {
-    const shown = deliveryDescription(tier)
+    const shown = deliveryDescription(tier, true)
     const dead = TIER_CHANNELS[tier].filter((entry) => !entry.live)
     for (const channel of dead) {
       assert.ok(
@@ -32,7 +32,7 @@ test('no tier promises a channel that cannot carry anything', () => {
 })
 
 test('ACT_NOW says email and in-app today, and says phone is deferred', () => {
-  const shown = deliveryDescription('ACT_NOW')
+  const shown = deliveryDescription('ACT_NOW', true)
   assert.match(shown.today, /email/)
   assert.match(shown.today, /in-app/)
   assert.ok(!/phone/i.test(shown.today), 'ACT_NOW promised a phone call')
@@ -43,7 +43,7 @@ test('ACT_NOW says email and in-app today, and says phone is deferred', () => {
 test('the sentence follows the channel data, not the tier name', () => {
   // The property that makes this worth more than a hand-written string per
   // tier: flip a channel and the copy changes with no edit to the copy.
-  assert.match(deliveryDescription('ACT_TODAY').today, /email/)
+  assert.match(deliveryDescription('ACT_TODAY', true).today, /email/)
 
   const mailDown = {
     ...TIER_CHANNELS,
@@ -52,7 +52,7 @@ test('the sentence follows the channel data, not the tier name', () => {
       { channel: 'IN_APP', live: true },
     ],
   } as const
-  const after = deliveryDescription('ACT_TODAY', mailDown)
+  const after = deliveryDescription('ACT_TODAY', true, mailDown)
   assert.ok(
     !/email/i.test(after.today),
     'the sentence still promised email after the channel went dark'
@@ -60,7 +60,7 @@ test('the sentence follows the channel data, not the tier name', () => {
   assert.match(after.deferred[0], /Mail relay is down/)
 
   // And the real table is untouched, because nothing mutated it.
-  assert.match(deliveryDescription('ACT_TODAY').today, /email/)
+  assert.match(deliveryDescription('ACT_TODAY', true).today, /email/)
 })
 
 test('a tier with every channel dark says so rather than saying nothing', () => {
@@ -72,7 +72,7 @@ test('a tier with every channel dark says so rather than saying nothing', () => 
       { channel: 'IN_APP', live: false, deferredBecause: 'Down.' },
     ],
   } as const
-  const shown = deliveryDescription('ACT_NOW', allDark)
+  const shown = deliveryDescription('ACT_NOW', true, allDark)
   assert.match(shown.today, /Nothing can be delivered/)
   assert.equal(shown.deferred.length, 3)
 })
@@ -105,4 +105,64 @@ test('saving says when the change takes effect', () => {
   // mid-run and then receives it concludes the setting is broken.
   assert.match(SAVED_APPLIES_FROM, /next evaluation run/)
   assert.match(SAVED_APPLIES_FROM, /already in progress is not affected/)
+})
+
+test('an unmapped type does not claim its alerts are delivered', () => {
+  // FOUND BY LOOKING AT THE RENDERED ROW, NOT BY A TEST. The card carried the
+  // badge "Nothing feeds this yet" and, four lines below it, "Delivered by
+  // email and in-app, marked Act today." Each sentence was true in isolation --
+  // one about whether a detector exists, one about what happens when the type
+  // fires -- and side by side they contradict. The reader's question is "will I
+  // hear about this", and the pair answers both yes and no.
+  //
+  // Swept over all three tiers so a mutation restoring the unconditional voice
+  // in any one of them fails. RECORD_ONLY is included deliberately: its mapped
+  // sentence ("Recorded and visible here") is already the quiet one, which is
+  // exactly why a contradiction there would be easy to leave in.
+  for (const tier of TIERS) {
+    const unmapped = deliveryDescription(tier, false)
+    const mapped = deliveryDescription(tier, true)
+    assert.notEqual(
+      unmapped.today,
+      mapped.today,
+      tier + ' said the same thing whether or not anything feeds it'
+    )
+    assert.match(
+      unmapped.today,
+      /Nothing (raises|feeds) this alert type/,
+      tier + ' did not say that nothing feeds it: ' + unmapped.today
+    )
+  }
+
+  // The control. A mapped type must still speak in the present tense, or the
+  // rule above could be satisfied by hedging every row -- which would make the
+  // page useless in the case that actually matters.
+  const live = deliveryDescription('ACT_TODAY', true)
+  assert.match(live.today, /^Delivered by/)
+  assert.ok(
+    !/Nothing raises/.test(live.today),
+    'a mapped alert type was described as one nothing raises'
+  )
+
+  // What is deferred is a fact about the channel, not about the mapping, so it
+  // is reported either way. An unmapped ACT_NOW still must not imply a call.
+  const unmappedUrgent = deliveryDescription('ACT_NOW', false)
+  assert.equal(unmappedUrgent.deferred.length, 1)
+  assert.ok(
+    !/phone/i.test(unmappedUrgent.today),
+    'an unmapped ACT_NOW promised a phone call'
+  )
+})
+
+test('the tier is named, not lowercased into the sentence', () => {
+  // "marked act now" read as a broken sentence on the assembled screen. The
+  // label is the NAME of the thing the reader just clicked, and names keep
+  // their capital. Only visible by rendering it; no assertion here would have
+  // been written without having seen it.
+  assert.match(deliveryDescription('ACT_NOW', true).today, /marked Act now\./)
+  assert.match(deliveryDescription('ACT_TODAY', true).today, /marked Act today\./)
+  assert.ok(
+    !/marked act now/.test(deliveryDescription('ACT_NOW', true).today),
+    'the tier name was lowercased into the middle of a sentence'
+  )
 })

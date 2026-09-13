@@ -2943,6 +2943,12 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
               )}
             </div>
 
+            {/* THE OTHER GRAIN. These switches are about how THIS PERSON hears; whether an alert type is urgent at all is the organisation's answer and the same for everyone. Two people in one MSP disagreeing about that is the thing the split prevents, and without a pointer here the org page is not reachable from the place people go looking. */}
+            <p className="text-xs text-muted-foreground">
+              These control how you hear about alerts. What counts as urgent is set for the whole organisation on{' '}
+              <Link href="/settings/alerts" className="font-medium text-blue-600 underline-offset-4 hover:underline dark:text-blue-400">alert settings</Link>.
+            </p>
+
             {/* Read-only banner if notification preferences are not persisted */}
             {!notificationPrefs && !loading && (
               <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/60 text-xs text-amber-800 dark:text-amber-300 flex items-center gap-2">

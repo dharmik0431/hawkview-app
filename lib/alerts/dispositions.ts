@@ -119,6 +119,18 @@ export type DeliveryDescription = {
  */
 export function deliveryDescription(
   disposition: AlertDisposition,
+  /**
+   * Whether any detector currently feeds this alert type.
+   *
+   * REQUIRED, NOT DEFAULTED. Rendering the row showed the reason: an unmapped
+   * row carried the badge "Nothing feeds this yet" and the sentence "Delivered
+   * by email and in-app" on the same card. Each was true on its own and the
+   * pair was a contradiction -- the delivery sentence is about what happens
+   * when the type fires, and for an unmapped type nothing does. A default of
+   * true would have let a caller reproduce that by saying nothing; making it
+   * required means the compiler asks every caller which case they are in.
+   */
+  mapped: boolean,
   // Taken as a parameter rather than read from the module so the derivation can
   // be demonstrated against a table where a channel is dark, without mutating
   // shared state to do it. A test that had to reach in and change the real
@@ -137,12 +149,22 @@ export function deliveryDescription(
         ? names[0]
         : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1]
 
+  // The label keeps its capital. "marked act now" read as a broken sentence on
+  // the assembled screen; "marked Act now" reads as what it is, the name of the
+  // tier the reader just chose.
+  const label = DISPOSITION_LABELS[disposition]
   const today =
     joined === null
-      ? 'Nothing can be delivered for this tier today. It is recorded and visible here only.'
+      ? mapped
+        ? 'Nothing can be delivered for this tier today. It is recorded and visible here only.'
+        : 'Nothing feeds this alert type, and nothing can be delivered for this tier today either.'
       : disposition === 'RECORD_ONLY'
-        ? 'Recorded and visible here. Not delivered.'
-        : `Delivered by ${joined}, marked ${DISPOSITION_LABELS[disposition].toLowerCase()}.`
+        ? mapped
+          ? 'Recorded and visible here. Not delivered.'
+          : 'Nothing raises this alert type today. If something did, it would be recorded and visible here, not delivered.'
+        : mapped
+          ? `Delivered by ${joined}, marked ${label}.`
+          : `Nothing raises this alert type today. If something did, it would be delivered by ${joined}, marked ${label}.`
 
   return {
     today,
