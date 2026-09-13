@@ -3,9 +3,13 @@ import 'reflect-metadata'
 import { NestFactory } from '@nestjs/core'
 import helmet from 'helmet'
 import { AppModule } from './app.module.js'
+import { HAWKVIEW_NEST_OPTIONS } from './bootstrap-options.js'
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule)
+  // THE OPTIONS ARE A SHARED CONSTANT, not a literal here — `rawBody` is load-bearing for
+  // webhook signature verification and a test asserts it against the same object. See
+  // `bootstrap-options.ts` for why re-serialising a body breaks every signature, permanently.
+  const app = await NestFactory.create(AppModule, HAWKVIEW_NEST_OPTIONS)
   const port = Number(process.env.PORT ?? 8080)
   const allowedOrigins = (
     process.env.FRONTEND_ORIGINS ??

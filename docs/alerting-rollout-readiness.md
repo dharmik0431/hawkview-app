@@ -38,7 +38,7 @@ find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 
 | What | Result |
 | --- | --- |
-| Unit suite | **1809 tests, 1696 pass, 0 fail, 113 skipped** |
+| Unit suite | **1812 tests, 1699 pass, 0 fail, 113 skipped** |
 | `tsc --noEmit -p tsconfig.json` | clean |
 | `tsc --noEmit -p tsconfig.scripts.json` | clean |
 | Alerting integration, real PostgreSQL 15 | **17/17** — 11 pipeline, 3 in-app, 3 suppression |
@@ -148,11 +148,12 @@ What blocks it, in the order it must be cleared — this is the launch-blocker l
    because nothing would call it.**
 2. **No transport.** Deliberately absent, so switching sending on requires somebody to *write*
    one rather than to set a variable.
-3. **No route for the webhook verifier**, so no delivery outcome can be recorded. `main.ts`
-   passes no `rawBody` option, so the raw bytes a signature is computed over are not available
-   today.
-4. **No persisted ledger.** Outcomes are in-memory values with no table, which is why the route
-   is unwritten rather than written and left half-connected.
+3. **No route for the webhook verifier**, so no delivery outcome can be recorded. The raw bytes
+   a signature is computed over ARE now available (`rawBody: true`, measured against a real Nest
+   pipeline); what is missing is the controller.
+4. **Delivery outcomes are not persisted.** `alert_send_attempts` does persist what reached a
+   provider; what has no table is the provider's later verdict — delivered, bounced,
+   complained — so a route would authenticate an event and discard it.
 
    *(The stop button is no longer on this list:  is its
    press, run end to end against a real cluster. So is the suppression store.)*

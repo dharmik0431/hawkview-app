@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1809 tests, 1696 pass, 0 fail.** The remaining 113 are database-integration tests requiring a
+**1812 tests, 1699 pass, 0 fail.** The remaining 113 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -770,6 +770,46 @@ the caller's only sane response to either is to let the collectors run, and givi
 must not make is worse than giving it none. The consequence is written where it is paid for:
 **check the database, not the report.**
 
+### The raw bytes now reach the handler, and a genuine signature would have failed every time
+
+**The verifier was correct and the pipeline that feeds it was not.** `main.ts` created the Nest
+application with no options, so `req.rawBody` was undefined. A handler could only re-serialise the
+parsed body — and re-serialising does not reproduce what arrived. **Measured here, not relayed:**
+a real Nest app over a real socket, a body with two spaces after each comma, and the genuine
+signature verifies over the raw bytes and is refused over the rebuild. Not intermittently. Every
+time, reading like a wrong key.
+
+`HAWKVIEW_NEST_OPTIONS` in `bootstrap-options.ts` now carries `rawBody: true`, and `main.ts` and
+the test read **the same object** — a test asserting against its own literal would prove nothing
+about the application that ships.
+
+**No test could see this**, verifier tests included, because every one of them handed `verify()`
+the raw bytes directly: the half that already worked. The property lived in the seam. Third time
+in this feature that the untested thing was the join rather than a part.
+
+⚠ **What it costs:** one extra buffer per parsed request body, on every route rather than only
+the webhook. Bounded by the body-parser's size limit, and inbound bodies here are small — the
+memory pressure in HawkView is Graph responses going out. A route-scoped parser would have been
+narrower and does not work: Nest registers its parsers at creation, so anything scoped runs after
+`json()` has consumed the stream and silently sees nothing.
+
+### Two things reported as missing that already exist
+
+Recorded because building them again is the cost of not checking.
+
+**The suppression row already carries its cause.** `alert_suppressed_addresses` has `message_id`
+(which message proved it), `because` (the provider's words, verbatim) and `first_suppressed_at`
+(when), with a CHECK that refuses a machine-made suppression carrying no message. So "after a
+restart you know an address is dead and not which message killed it" is not the current state —
+it was the state before `20260913040000`, and that migration's provenance check is the thing that
+closed it.
+
+**`alert_send_attempts` persists what reached a provider.** ACCEPTED, REFUSED_RETRYABLE and
+REFUSED_PERMANENT, per message, per attempt. What is genuinely absent is the provider's *later*
+verdict — delivered, bounced, complained — and that is now worded as **delivery outcomes are not
+persisted** rather than as an absent ledger, because a blocker a reader can disprove on sight
+teaches them to skim the rest of the list.
+
 ### Still missing before anything can send
 
 - **NOTHING DRAINS THE QUEUE.** There is no sender worker: `attemptSend` has no production
@@ -783,14 +823,17 @@ must not make is worse than giving it none. The consequence is written where it 
 - **A real transport.** Deliberately absent; see above. Second on this list, not first.
 - **A ROUTE FOR THE WEBHOOK VERIFIER.** The verifier is built and tested; *nothing calls it.*
   There is no `@Public() @Post('resend')` controller, so the verdict has a producer and no
-  caller and **no delivery outcome can be recorded yet.** Whoever writes it must hand the
-  verifier the RAW body — a parsed-and-restringified one changes bytes and every genuine request
-  will read as `SIGNATURE_INVALID`, which looks like a key problem and is not. Note that
-  `NestFactory.create(AppModule)` in `main.ts` passes no `rawBody` option, so the raw bytes are
-  **not available today** and enabling them is a bootstrap change affecting every route.
-- **A LEDGER THAT PERSISTS.** `email-delivery.ts` builds `Ledger` values in memory and no table
-  holds them. Until one exists the webhook route would authenticate an event and then discard
-  it, which is why the route is not written yet rather than written and left half-connected.
+  caller. Whoever writes it must hand the verifier the RAW body — `req.rawBody`, which is now
+  available (see below); a parsed-and-restringified one changes bytes and every genuine request
+  reads as `SIGNATURE_INVALID`, permanently, which looks like a key problem and is not.
+  **The route's test must drive the real pipeline**, because a verifier test that supplies its
+  own bytes is testing the half that already works.
+- **DELIVERY OUTCOMES ARE NOT PERSISTED** — *not* "no ledger", which reads as though nothing
+  about sending is recorded and is false. `alert_send_attempts` exists and persists ACCEPTED,
+  REFUSED_RETRYABLE and REFUSED_PERMANENT against a message. What has no table is the provider's
+  later verdict — DELIVERED, BOUNCED, COMPLAINED — plus unmatched events and retries, which
+  `email-delivery.ts` builds as in-memory `Ledger` values. Until those exist a webhook route
+  would authenticate an event and then discard it.
 
 Built since this list was first written, and no longer on it: the webhook verifier itself, the
 `emailEnabled` switch with absence reading as off, the stop button, and the suppression store.
