@@ -449,3 +449,153 @@ I would not tell Dharmik "the engine has been blind over evidence that was there
 the whole time" until Q6 comes back. On the evidence in hand the one tenant we
 measured was behaving correctly over a stalled feed, and the tenants with
 evidence have not been looked at.
+
+---
+
+# ANSWER: what makes a window INCOMPLETE, and can it become complete
+
+Short version: **`INCOMPLETE_WINDOW` is not a statement about the window.** It is
+a fall-through label, and on 83f23fe5 it is being produced by a single unusable
+event among eleven.
+
+## 1. The reason code is a catch-all
+
+`risky-users-auth/to-assessment.ts:30`:
+
+    return reasons.length
+      ? { status: 'PARTIAL', reasonCode: 'INCOMPLETE_WINDOW' }
+      : { status: 'READY',   reasonCode: 'READY' }
+
+Seven specific conditions are named in the branches above it — capacity,
+insufficient fields, conflicting duplicates, stale, unavailable, invalid context,
+invalid readiness. **Everything else lands on `INCOMPLETE_WINDOW`**, including at
+least these seven, all emitted by `evaluate.ts`:
+
+    PAGINATION_INCOMPLETE        SOURCE_GAPS          SOURCE_REPORTED_GAP
+    FUTURE_RECORD_EXCLUDED       INGESTION_PRECEDES_EVENT
+    MALFORMED_NORMALIZED_EVENT   SOURCE_SCOPE_MISMATCH
+
+So the code that has been reported all day means "there was at least one reason
+and it was not one of the seven we modelled". It cannot be diagnosed from, which
+is most of why this took a day. This is the safety-net shape: the catch-all for
+unmodelled cases leaves the modelled ones with no distinct backstop, and the
+better the naming looks, the more silently the gap passes.
+
+## 2. On 83f23fe5, four candidates remain and no more
+
+The source DTO reported `GRAPH_SIGN_INS: READY`. From
+`authentication-source-readiness.ts:121-130`, that requires `gapCount === 0`,
+`paginationComplete === true`, `state === 'READY'`, `capped === false`. Those are
+exactly the inputs to `evaluate.ts:59-66`, so **every source-level reason is
+eliminated**. `LOOKBACK_CAPPED` is eliminated too — it maps to `CAPACITY_LIMIT`,
+and the rule reported `INCOMPLETE_WINDOW`.
+
+That leaves only the per-event branches, `evaluate.ts:74-78`:
+
+| reason | condition |
+| --- | --- |
+| `FUTURE_RECORD_EXCLUDED` | `eventAt > asOf` **or** `ingestedAt > asOf` |
+| `INGESTION_PRECEDES_EVENT` | `ingestedAt < eventAt` |
+| `MALFORMED_NORMALIZED_EVENT` | `validEvent(event)` false |
+| `SOURCE_SCOPE_MISMATCH` | `event.source !== input.source` or scope differs |
+
+One of those four is firing on 83f23fe5. Nothing else can be.
+
+## 3. Can it become complete? Yes — but it is all-or-nothing
+
+`reasons` is a `Set` (`evaluate.ts:57`) that is never cleared, and each of those
+branches does `reasons.add(...)` then `continue`. So:
+
+**One unusable event out of eleven downgrades the entire tenant to PARTIAL and
+sets `assessedIdentities: null`.**
+
+The other ten events are dropped from the evaluation with them. The rule does not
+evaluate what it can and report the rest — it reports nothing, and says nothing
+about how much it discarded. That matches the measurement exactly:
+`assessedIdentities null`, no findings, on a tenant with fresh evidence.
+
+Note the contrast one line earlier: `evaluate.ts:72` skips events older than the
+lower bound with a **silent** `continue` and no reason. So "outside the window"
+is handled cleanly, and "inside the window but unusable" poisons the run. The
+condition is not strictly unsatisfiable — a tenant whose every event normalises
+cleanly reaches READY — but it is fragile in a way that scales badly: the more
+evidence a tenant has, the likelier one bad row silences all of it.
+
+That is the bug. Not entitlement, not a missing read, not the window.
+
+## 4. Which of the four — three cheap queries
+
+```sql
+-- Q7  INGESTION_PRECEDES_EVENT. Should be zero; anything above zero fires it.
+SELECT customer_tenant_id, count(*) AS ingested_before_event
+FROM sign_in_logs
+WHERE ingested_at < event_date_time
+GROUP BY customer_tenant_id ORDER BY 2 DESC;
+```
+
+```sql
+-- Q8  FUTURE_RECORD_EXCLUDED. Events stamped ahead of the evaluator's clock.
+SELECT customer_tenant_id, count(*) AS future_events,
+       max(event_date_time) AS furthest
+FROM sign_in_logs
+WHERE event_date_time > now()
+GROUP BY customer_tenant_id ORDER BY 2 DESC;
+```
+
+```sql
+-- Q9  The eleven rows themselves, for 83f23fe5, to eyeball the last two causes.
+--     MALFORMED / SCOPE_MISMATCH are shape problems and need the raw row.
+SELECT microsoft_sign_in_id,
+       event_date_time, ingested_at,
+       (raw->>'userId')  IS NOT NULL AS has_user_id,
+       (raw->>'appId')   IS NOT NULL AS has_app_id,
+       raw->>'appId'     AS app_id,
+       raw ? 'hawkviewLimited' AS limited_row,
+       raw->>'hawkviewSource'  AS hawkview_source
+FROM sign_in_logs
+WHERE customer_tenant_id = '83f23fe5-bfdf-4e21-84fb-12f9627a3d06'::uuid
+  AND event_date_time > now() - interval '24 hours'
+ORDER BY event_date_time DESC;
+```
+
+Q9 is the one I would run first. If any row shows `limited_row = true` on a
+tenant whose window says `GRAPH_SIGN_INS`, that is `SOURCE_SCOPE_MISMATCH`
+directly: rows collected under the Management Activity fallback sitting in a
+window attested as Graph. Given dcb2a091 and 27e8b142 both snapshot under
+`M365_AUDIT_STS`, a tenant that has switched between paths is likely to hold a
+mix — and a mix is exactly what poisons a run under the all-or-nothing rule.
+
+If `app_id` is non-UUID or null on any row, that is
+`MALFORMED_NORMALIZED_EVENT` — `authentication-source-readiness.ts:100` already
+requires `UUID.test(appId)`, so such a row would also have been counted as a
+readiness gap, which contradicts `gapCount = 0`. So I expect Q9 to point at the
+limited/source mix rather than at field shape.
+
+## 5. Two fixes, and they are different sizes
+
+**(a) Make the reason code say which.** Hours. `readiness()` in
+`to-assessment.ts` already receives the `reasons` set; it discards the
+distinction on the last line. Carrying the specific code — or even the count of
+dropped events — turns a day of investigation into a glance. I would do this
+first regardless of (b), because it is diagnosis infrastructure and everything
+else in this feature is harder to see without it.
+
+**(b) Stop one bad event silencing a tenant.** Days, and it is a product
+decision rather than a repair. The honest options are to evaluate the usable
+events and report how many were dropped — which is the `notYetCited` /
+`uninterpreted` distinction this codebase already uses elsewhere — or to keep
+all-or-nothing and make the dropped count visible so the refusal is legible. The
+current behaviour is the worst of both: it refuses, and it does not say what it
+refused over.
+
+## 6. Revised summary of all three tenants
+
+| tenant | shape | cause | size |
+| --- | --- | --- | --- |
+| 83f23fe5 | evidence seen, rule refuses | one unusable event in the window, reported as `INCOMPLETE_WINDOW` | hours to identify with Q9, then (a) |
+| dcb2a091 | premium path refused | entitlement fallback at `:4087`; window stamped `M365_AUDIT_STS` while the rule waits on `GRAPH_SIGN_INS` | days |
+| 6facb85e | correct | collection stopped 2026-09-10; reports current because the window is stamped from the requested range | days |
+
+**Shape A**, three distinct faults, none of them the detectors being wrong. The
+zero-match figure is not evidence the rules are too narrow — on this data the
+rules have never been given a clean run to be narrow on.
