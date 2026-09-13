@@ -205,3 +205,114 @@ On hiding: the feature currently shows an MSP "0 risky users" over tenants it ha
 no evidence for. That is the reassuring-absence shape. If Q1 confirms there is no
 evidence, hiding the surface is defensible **until the readiness distinction
 above exists** — after which the screen tells the truth and can stay.
+
+---
+
+# INTERIM FINDING
+
+**Shape: most likely A (a wiring or entitlement fault), not C.** One query
+settles it, and I can state now why "the tenants are genuinely quiet" has become
+the *less* likely reading rather than the safe default.
+
+## The fact that changes the odds
+
+`INITIAL_LOG_LOOKBACK_DAYS = 30` (`tenant-sync.service.ts:1485`).
+
+The collector's window is `latest stored event - 10 minutes`, or, **when nothing
+is stored yet, `now - 30 days`**. It then asks Graph for
+`createdDateTime ge <start> and le <end>` with no other filter.
+
+So for a tenant with an empty `sign_in_logs`, every collection asks for **thirty
+days of interactive user sign-ins**. If `GRAPH_SIGN_INS` reports READY with a
+current `lastSuccessfulCollectionAt` and the table is still empty, Graph returned
+**zero sign-ins across thirty days** for a tenant with live users. That is not a
+quiet tenant; that is a collection that is not returning what it appears to.
+
+This is what moves me off "correct behaviour". Over a 24-hour evaluation window a
+small tenant plausibly has nothing. Over a rolling 30-day collection window, an
+empty table is very hard to explain benignly.
+
+## Three leads followed and killed, so nobody re-walks them
+
+1. **Collector writes where the evaluator does not read.** False. One production
+   writer (`tenant-sync.service.ts:4169`), one reader
+   (`authentication-risk-loader.ts:53`), same table.
+2. **A `$select` shrinking `raw` so failures are invisible.** False. There is no
+   `$select` on the sign-in request, so Graph's default projection - including
+   `status.errorCode`, which the credential-failure detectors need - is stored
+   whole. The field list I first mistook for a projection is the fingerprint key
+   list in `authentication-ingestion-integrity.ts:31`.
+3. **The servicePrincipal / managedIdentity exclusion dropping every row.**
+   False, and worth stating because it is one `Array.isArray` away from being
+   true. `authentication-source-readiness.ts:101` guards on
+   `Array.isArray(raw.signInEventTypes)`, and that field is `undefined` on every
+   row today, so the predicate never fires. It becomes live the moment anybody
+   adds a `$select` - a hazard for that change, not a cause of this one.
+
+## The leading hypothesis
+
+**Entra ID Premium entitlement.** `auditLogs/signIns` requires P1/P2. The
+collector handles refusal explicitly (`tenant-sync.service.ts:4087`), matching
+
+    Authentication_RequestFromNonPremiumTenantOrB2CTenant
+    "doesn't have premium license"
+
+and on either it falls back to `fetchLimitedLoginActivity` with `limited = true`,
+stamping the window as **`M365_AUDIT_STS`** rather than `GRAPH_SIGN_INS`
+(`:4181`). Anything else is rethrown (`:4093`).
+
+The measurement says `M365_AUDIT_STS: WAITING, WAITING_FOR_COLLECTION, never
+collected`. So on the FULL tenant the fallback has never run, which means the
+premium path was not refused there - that tenant is entitled, collection
+succeeded, and Graph returned nothing.
+
+For the **six tenants that never reach FULL**, the fallback never having run is
+the more telling fact: they are collecting via neither path. That fits an error
+which is not one of the two handled strings, and is therefore rethrown rather
+than falling back - a permission failure such as a missing `AuditLog.Read.All`
+would look exactly like this.
+
+## The one query that decides it
+
+Q1 above, unchanged. Reading it:
+
+| result | shape | what it means |
+| --- | --- | --- |
+| no rows for any tenant | **A** | collection returns nothing over 30 days. Permission or entitlement. Days, not weeks. |
+| rows, but none in last 24h | **C**, with a caveat | tenants genuinely quiet in the evaluated window. The feature works and has nothing to report - but see below. |
+| rows in last 24h | **A**, narrower | the loader is excluding them; one predicate in `authentication-risk-loader.ts`. Hours. |
+
+Run **Q0 first**. It is the control: if it returns nothing, the connection is
+mis-scoped and every other answer is meaningless.
+
+## Estimates
+
+- **A, entitlement or permission:** days. The handling code exists; what is
+  missing is knowing which tenants are entitled and saying so. Verify
+  `AuditLog.Read.All`, and carry a per-tenant entitlement state.
+- **A, loader window:** hours. One predicate.
+- **B, design gap:** only reachable if Q1 shows rows the detectors cannot use at
+  all. No evidence for it, and two of the three candidate mechanisms are killed
+  above.
+- **C, correct:** no work, and I would say so plainly. It would still leave the
+  reporting defect below.
+
+## The one thing worth doing whatever Q1 says
+
+A source reporting `READY` and `CURRENT` while carrying `latestEventAt: null`
+should not be indistinguishable from one carrying evidence.
+`persistCompletedAuthenticationWindow` is explicit that its metadata "contains no
+events/identities" - READY means *a collection completed*, not *we have
+evidence*. Nothing downstream separates the two, so two rules assessed zero
+identities and reported READY, and an MSP is shown "0 risky users" for tenants
+the product has no evidence about.
+
+That is the same defect fixed on four screens today, at the top of the pipeline
+instead of the bottom. It is a field on the readiness DTO plus a rendering that
+respects it, and it would have made this question answerable from the product
+rather than from the database.
+
+**On hiding:** if Q1 confirms there is no evidence, hiding the Risky Users
+surface is defensible until that distinction exists, because today it makes a
+reassuring claim it cannot support. Once it exists the screen tells the truth and
+can stay, whether or not the engine ever matches anything.
