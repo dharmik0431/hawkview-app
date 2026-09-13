@@ -922,6 +922,12 @@ So this is not a discipline with a net behind it. **A third in-place edit was th
 rather than on a settings write: a realistic message id is 206 characters, refused with 22001, and
 the tick writes no incident, no notification and no job. Corrected forward by `20260913120000`.
 
+**Both edited files are restored to what they actually applied**, so a database that recorded
+their checksums matches them again — 20260912190000 by dcca63e and 20260912223000 here. The
+corrections live only in the forward migrations, which is what makes the history honest as well
+as the schema right. I missed the second restore on the first pass and it is called out rather
+than quietly amended.
+
 Also worth knowing: **one file legitimately carries two recorded checksums**, because Prisma
 hashes the bytes on disk and a Windows checkout records the CRLF digest where Linux records LF.
 

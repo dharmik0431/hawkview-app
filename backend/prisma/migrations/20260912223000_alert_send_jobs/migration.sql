@@ -8,14 +8,6 @@
 --
 -- Idempotent from any starting state, for the reason 20260912120000 learned.
 
--- WIDTHS: 400, NOT 200. A message id derives from the incident it speaks for, and an incident
--- key is up to 300 characters of length-prefixed encoding — so 200 truncated exactly the long
--- subjects that are hardest to notice. Found by the end-to-end test, which built a real key
--- rather than a short fixture; a hand-written 'm-1' would have fitted and passed.
---
--- EDITED IN PLACE RATHER THAN FOLLOWED BY AN ALTER, and that is only defensible because this
--- migration has never been applied anywhere but throwaway clusters created and deleted inside
--- this session. The moment it reaches a database somebody keeps, it becomes immutable.
 -- ---------------------------------------------------------------------------------------
 -- alert_send_jobs
 -- ---------------------------------------------------------------------------------------
@@ -39,8 +31,8 @@ CREATE TABLE IF NOT EXISTS "public"."alert_send_jobs" (
   -- default would be a second writer for the same field. Learned from the drift check on
   -- 20260912190000, which reported exactly those two columns.
   "id" UUID NOT NULL,
-  "message_id" VARCHAR(400) NOT NULL,
-  "idempotency_key" VARCHAR(400) NOT NULL,
+  "message_id" VARCHAR(200) NOT NULL,
+  "idempotency_key" VARCHAR(200) NOT NULL,
   "state" VARCHAR(20) NOT NULL,
   "attempts_made" INTEGER NOT NULL,
   "max_attempts" INTEGER NOT NULL,
@@ -111,7 +103,7 @@ CREATE INDEX IF NOT EXISTS "alert_send_jobs_state_not_before_at_idx"
 -- happened to that send" is expressible at all.
 CREATE TABLE IF NOT EXISTS "public"."alert_send_attempts" (
   "id" UUID NOT NULL,
-  "message_id" VARCHAR(400) NOT NULL,
+  "message_id" VARCHAR(200) NOT NULL,
   "attempt_no" INTEGER NOT NULL,
   "started_at" TIMESTAMPTZ(6) NOT NULL,
   "settled_kind" VARCHAR(30),
