@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ALERT_CATALOG, PRIVILEGED_DIRECTORY_CHANGES, alertType } from './alert-catalog.js'
+import { ALERT_CATALOG, PRIVILEGED_DIRECTORY_CHANGES, alertType, type LongerThan } from './alert-catalog.js'
 import { mayAutoClose, routingTier } from './alert-type.js'
 import { applyObservation, OPENED } from './alert-lifecycle.js'
 import { evidenceFromSync } from '../risky-users-wiring/evidence-availability.js'
@@ -251,4 +251,40 @@ test('an alert must not clear on a weaker claim than it opened on', () => {
   // about the connection rather than about seeing. Consent expiring is retracted by
   // re-consent, which a verification does observe.
   assert.equal(alertType('monitoring.consent_expiring').conditionClears.kind, 'CONNECTION_VERIFIED')
+})
+
+test('AN OVER-LONG ALERT TYPE ID DOES NOT COMPILE', () => {
+  // THE BOUND WHERE THE VALUE IS CHOSEN. A wider column raises the ceiling; it does not stop
+  // anybody walking into it. The id is picked by a person editing this catalogue, so the
+  // compiler tells them at the line where they write it — rather than Postgres refusing an
+  // INSERT in production on a real finding, which kills the intake run rather than degrading
+  // one alert.
+  //
+  // These are the claim, made checkable: an unused `@ts-expect-error` is itself a compile error,
+  // so if the bound is ever weakened this file stops building.
+
+  // LITERAL TYPES, NOT `'a'.repeat(64)`. The first version used repeat(), whose type is plain
+  // `string` — so the check measured nothing and reported the wrong answer immediately. A
+  // type-level length test needs a literal, and that is easy to get wrong in the direction that
+  // silently passes.
+  type A8 = 'aaaaaaaa'
+  type A64 = `${A8}${A8}${A8}${A8}${A8}${A8}${A8}${A8}`
+  type A65 = `${A64}a`
+
+  // Exactly at the bound is allowed — the boundary is pinned at both ends, so nobody can "fix"
+  // it by one in either direction without this failing.
+  const atTheBound: LongerThan<A64, 64> extends false ? true : never = true
+  const oneOver: LongerThan<A65, 64> extends true ? true : never = true
+
+  assert.ok(atTheBound && oneOver)
+
+  // AND A LITERAL TOO-LONG ID IS REJECTED where an id is required to fit.
+  type Fits<S extends string> = LongerThan<S, 64> extends true ? never : S
+  const shortEnough: Fits<'security.suspected_credential_attack'> = 'security.suspected_credential_attack'
+  // @ts-expect-error - 70 characters, which would overflow the incident key it is built into
+  const tooLong: Fits<'security.this_name_is_far_too_long_to_fit_inside_an_incident_key_ever'> =
+    'security.this_name_is_far_too_long_to_fit_inside_an_incident_key_ever'
+
+  assert.equal(shortEnough.length, 36, 'the longest real id today, with room to spare')
+  assert.ok(tooLong === undefined || typeof tooLong === 'string')
 })

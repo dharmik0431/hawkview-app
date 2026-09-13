@@ -373,3 +373,41 @@ export const PRIVILEGED_DIRECTORY_CHANGES: readonly PrivilegedChangeRule[] = [
     urgency: 'The protection is gone from that moment, and its absence is invisible on every screen that shows only what exists.',
   },
 ]
+
+// ---------------------------------------------------------------------------------------
+// AN ALERT TYPE ID THAT WOULD OVERFLOW THE INCIDENT KEY DOES NOT COMPILE
+// ---------------------------------------------------------------------------------------
+//
+// THE BOUND BELONGS WHERE THE VALUE IS CHOSEN. An incident key is built from this id plus an
+// organisation uuid, a tenant uuid, a subject role and a subject id, length-prefixed. The worst
+// case the column widths allow was 289 of 300 and overflowed at a 48-character id; the longest
+// here is 36. Widening the column to 400 buys headroom, but a wider column only raises the
+// ceiling — it does not stop the next person naming a type that walks into it.
+//
+// So the compiler tells the author immediately, at the line where the name is written, instead
+// of Postgres refusing an INSERT in production on a real finding — which in the intake pipeline
+// kills the run rather than degrading one alert.
+//
+// SIXTY-FOUR, and the number has a derivation rather than a feel: at 400 the key has roughly 147
+// characters of room for the id, so 64 is far inside the column while being nearly twice the
+// longest name anybody has needed. It is a naming discipline, not a technical limit.
+
+type Ones<N extends number, A extends 1[] = []> = A['length'] extends N ? A : Ones<N, [...A, 1]>
+type Chars<S extends string, A extends 1[] = []> =
+  S extends `${string}${infer Rest}` ? Chars<Rest, [...A, 1]> : A
+
+/** True when `S` is longer than `N` characters. */
+export type LongerThan<S extends string, N extends number> =
+  Chars<S> extends [...Ones<N>, 1, ...1[]] ? true : false
+
+/** `never` unless the id fits. Used below and in the test's negative. */
+export type AlertTypeIdWithinKeyBudget<S extends string> = LongerThan<S, 64> extends true ? S : never
+
+/** THE ASSERTION, AND IT NAMES THE OFFENDER. Every catalogue id that is too long collects here;
+ * if any does, the declaration below stops compiling and the error text contains the id. */
+type OverLongAlertTypeIds = { [K in AlertTypeId]: AlertTypeIdWithinKeyBudget<K> }[AlertTypeId]
+
+// If this line ever fails, an alert type id is too long for the incident key it will be built
+// into. Shorten the id — do not widen the column again.
+const _everyAlertTypeIdFitsTheIncidentKey: [OverLongAlertTypeIds] extends [never] ? true : OverLongAlertTypeIds = true
+void _everyAlertTypeIdFitsTheIncidentKey

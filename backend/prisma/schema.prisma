@@ -151,7 +151,7 @@ model Notification {
   /// from the schema is invisible to every consumer except a raw query — so routing, and
   /// anything that reads incidents, could not see the key at all, and the point of the
   /// migration is that many rows share one.
-  incidentKey       String?                 @map("incident_key") @db.VarChar(300)
+  incidentKey       String?                 @map("incident_key") @db.VarChar(400)
   /// Which burst within the incident. NULL where the count could not be recovered, which is
   /// a VALUE and not an absence: it means the incident holds a row whose event time is gone.
   /// Distinguishable from episode 1, deliberately.
@@ -224,7 +224,7 @@ model AlertIncident {
   id              String   @id @default(uuid()) @db.Uuid
   organizationId  String   @map("organization_id") @db.Uuid
   /// Matches `notifications.incident_key`. Same width, for the same reason.
-  incidentKey     String   @map("incident_key") @db.VarChar(300)
+  incidentKey     String   @map("incident_key") @db.VarChar(400)
   /// Which catalogue type this incident is, so the lifecycle rules that depend on category
   /// (an OPERATIONAL investigation may be closed by the system; a SECURITY one may not) can be
   /// applied without re-deriving the type from the key.
