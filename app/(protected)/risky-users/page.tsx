@@ -20,6 +20,7 @@ import {
 import {
   fleetCoverage,
   riskyUsersSummary,
+  type FleetSize,
 } from '@/lib/identity-risk/fleet-coverage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -146,6 +147,7 @@ export default function FleetRiskyUsersPage() {
     tenantStatuses,
     metrics,
     isLoading,
+    isError,
     retryAll,
   } = useFleetRiskyUsers()
 
@@ -169,9 +171,29 @@ export default function FleetRiskyUsersPage() {
   // THE KPI ROW IS ABOUT THE WHOLE FLEET, not the filtered view -- the counts
   // beside it (totalRiskyUsers and the rest) are unfiltered, so its coverage
   // has to be too or the tile would disagree with the numbers it sits under.
+  // WHETHER THE FLEET COULD BE ENUMERATED AT ALL, which this page never asked.
+  // `useFleetRiskyUsers` does `tenantsResponse?.tenants ?? []`, so a failed
+  // tenant-list request is an empty array -- indistinguishable from an
+  // organisation with nothing onboarded, and it made every coverage ratio
+  // below it vacuously true. The hook has exposed `isError` all along.
+  // Memoised because it is an OBJECT: a fresh literal each render would change
+  // the identity the two useMemos below depend on, recomputing coverage every
+  // time. Caught by lint rather than by me.
+  const fleetSize: FleetSize = useMemo(
+    () =>
+      isError
+        ? {
+            kind: 'UNKNOWN',
+            because:
+              'The list of tenants could not be loaded, so HawkView does not know which tenants exist.',
+          }
+        : { kind: 'KNOWN' },
+    [isError]
+  )
+
   const fleetWide = useMemo(
-    () => fleetCoverage(tenantStatuses, 'ALL'),
-    [tenantStatuses]
+    () => fleetCoverage(tenantStatuses, 'ALL', fleetSize),
+    [tenantStatuses, fleetSize]
   )
 
   // EVERY COVERAGE CLAIM ON THIS PAGE CAME OFF `metrics.failedTenants`, which
@@ -183,8 +205,8 @@ export default function FleetRiskyUsersPage() {
   const notAssessed = fleetWide.inScope - fleetWide.assessed
 
   const coverage = useMemo(
-    () => fleetCoverage(tenantStatuses, selectedTenant),
-    [tenantStatuses, selectedTenant]
+    () => fleetCoverage(tenantStatuses, selectedTenant, fleetSize),
+    [tenantStatuses, selectedTenant, fleetSize]
   )
 
   // Only a filter that is narrowing something may be blamed for an empty list.
