@@ -400,3 +400,47 @@ refuses to run without `DATABASE_URL` set even though it reads no database.
 Reported as found, that would have been my worktree's staleness filed as the author's defect. The
 tell was the same one as always: the error contradicted something I had already read — the field was
 right there in `schema.prisma` in the same tree that said it did not exist.
+
+### When you compare a digest, hash what the other system hashed
+
+PM checked production's recorded migration checksums against the files and got **two mismatches**,
+on two unrelated migrations edited by different people weeks apart. One message from telling the
+owner that the next deploy might fail to boot.
+
+The digests were computed with `sha256sum` over a **Windows checkout with CRLF line endings**.
+Prisma had computed its over **LF**, in a Linux container. The instrument was measuring line
+endings. Recomputed over the git blob content, both matched.
+
+I confirmed the diagnosis from the other side rather than taking it: running `prisma migrate deploy`
+in a CRLF checkout makes Prisma record the **CRLF** digest — `cc4e9d6c…` for the file whose LF
+digest is `4495006f…`. Prisma hashes the bytes on disk. So the same file legitimately has two
+recorded checksums depending on where it was applied, and neither is wrong.
+
+**The rule:** a digest comparison is only a comparison if both sides normalise the same way. Hash
+the bytes the other system hashed — not the bytes your shell finds convenient.
+
+**And the tell was the shape, not the doubt.** Two unrelated migrations both mismatching is not a
+plausible failure; a common-mode instrument fault is. That is the same signal as the four-for-four
+column widths, and it is worth more than suspicion of any particular step.
+
+### Verify the safety net before recording it as one
+
+Beside that finding sat a reassuring sentence: *Prisma validates recorded checksums, so a genuine
+post-application edit would be caught at deploy.* It was about to go into a rollout document as a
+fact. It is not true of the commands that ship.
+
+Measured at Prisma **7.9.1**, on a database with every migration applied, with one applied
+migration's file then modified on disk so its checksum no longer matches the recorded one:
+
+```
+prisma migrate status →  "Database schema is up to date!"        exit 0
+prisma migrate deploy →  "No pending migrations to apply."       exit 0
+```
+
+**Neither validates the recorded checksum.** `deploy` is what the Dockerfile runs on every container
+start, so an edit to an already-applied migration is silent in exactly the place the safety net was
+supposed to operate. (`migrate dev` is a different command with different behaviour; I did not test
+it, and it is not what ships.)
+
+A believed safety net is worse than a known gap, because it is the reason nobody looks. Check that
+the net exists before writing the sentence that says it does.
