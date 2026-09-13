@@ -147,7 +147,7 @@ export interface Dispositions {
  * routine question the classifier exists to answer, and defaulting it here would file a real
  * privileged change as whatever this file guessed — the same refusal step 03 makes. A mailbox
  * rule has no catalogue type at all. Both report as unmapped. */
-const TYPE_FOR_GUIDANCE: Readonly<Record<GuidanceCode, AlertTypeId | null>> = {
+export const TYPE_FOR_GUIDANCE: Readonly<Record<GuidanceCode, AlertTypeId | null>> = {
   REVIEW_ACTIVITY: 'security.suspected_credential_attack',
   REVIEW_ACCESS: 'security.privileged_directory_change',
   REVIEW_CONFIGURATION: null,

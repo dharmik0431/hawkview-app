@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1821 tests, 1706 pass, 0 fail.** The remaining 115 are database-integration tests requiring a
+**1824 tests, 1709 pass, 0 fail.** The remaining 115 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -905,6 +905,57 @@ that derives the tier from severity fails it.
 ⚠ **`resolved` is already in the DTO** (`resolved: Boolean(row.resolvedAt)`), so a cleared
 incident looking identical to a waiting one is a rendering gap on the client, not a missing field
 on the wire. Reported as backend-side; measured otherwise.
+
+### The settings page: what a disposition reaches, and two rulings that contradict
+
+**Derived, not counted** — `alert-type-reach.ts`, with a test, because this count has already been
+got wrong by hand once and a ruling was then built on top of it.
+
+| | |
+|---|---|
+| **2 of 7** types have a setting that is consulted | `security.suspected_credential_attack`, `security.privileged_directory_change` — the two the guidance mapping reaches |
+| **5 of 7** have **no producer** | nothing writes a notification carrying them, so a setting cannot bite either way |
+
+⚠ **THE "PRODUCED BUT IGNORED" CASE DOES NOT EXIST, and this matters because a ruling assumed it
+did.** `tenant-sync.service.ts` and `tenants.service.ts` publish seven notification kinds and an
+MSP does receive them — but **none carries a catalogue alert type id.** They publish
+`tenant.connection_lost`, `tenant.sync_failed`, `tenant.connection_authorized`,
+`tenant.connection_failed`, `tenant.connection_permissions_missing`, `tenant.sync_recovered` and
+`security.directory_change`, in a different namespace, with `alert_type_id` NULL. Measured: every
+reference to the five unproduced catalogue ids lives inside `src/alerts/`, none in `src/tenants/`.
+
+So *"make the publish path read the disposition for that alert type"* asks it to look up a type it
+does not have. `reconciliation.ts` does classify those dedupe keys into catalogue types, so the
+mapping is not unknowable — **but it lives in the step-03 apply phase, and copying it to the
+publish site is the two-homes defect this feature has fixed three times.** This needs a ruling on
+the mapping, not a lookup somebody can add.
+
+### ⚠ TWO OPEN QUESTIONS BLOCK THE DISPOSITIONS ENDPOINTS
+
+Both are product decisions. Neither has been decided, and both have had work built on top of them.
+
+**1. Is the disposition a channel or a tier?** The column is CHECK-constrained to
+`RING | EMAIL | DIGEST | RECORD_ONLY` — a `DeliveryPreference`, derived from the catalogue's
+`Severity` by `defaultPreference`. A contract specifying `ACT_NOW | ACT_TODAY | RECORD_ONLY` needs
+the CHECK changed and `defaultDispositionFor` rewritten; writing to the column as it stands
+violates the constraint. **`RECORD_ONLY` is in both vocabularies**, which is why the confusion
+reads plausibly and why a half-done change appears to work for the one case everybody tests.
+
+**2. Does `RECORD_ONLY` hide an alert in-app, or only stop the email?** Two rulings disagree:
+
+- *"the incident row still exists so the history is intact, and no notification and no job are
+  produced"* — off means invisible in-app too.
+- *"RECORD_ONLY is off — recorded, **visible in-app**, not delivered"* — off means email only.
+
+**As built, the second holds**: `RECORD_ONLY` writes the notification and no send job. That is
+tested for the adjacent `NO_ELIGIBLE_RECIPIENT` case and **not directly tested for `RECORD_ONLY`
+itself.**
+
+The two readings are not interchangeable now that a further ruling depends on them. *"Silencing
+tenant-disconnected must stop them arriving"* requires the first; `publishIncident` produces only
+an in-app notification and never an email, so under the second reading, making it consult the
+disposition **changes nothing at all** — the settings row would still be decorative for exactly
+the types it was meant to fix.
 
 ### Still missing before anything can send
 
