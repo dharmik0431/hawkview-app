@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1840 tests, 1719 pass, 0 fail.** The remaining 121 are database-integration tests requiring a
+**1842 tests, 1720 pass, 0 fail.** The remaining 122 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -908,6 +908,22 @@ store never puts an unreadable value in the map and both versions fell back iden
 was describing the fallback. `byOrganizationAndAlertType` is now `ReadonlyMap<…, Severity>`, so an
 unreadable value is **unwriteable there** and the store reports it instead. The guard is gone
 because the wrong thing became impossible, not because it was proven right.
+
+### Forward migrations only — and it is the ONLY thing standing there
+
+**Corrected from a belief, not from a mistake in the code.** Prisma was thought to validate
+recorded checksums, so an in-place edit to an applied migration would be caught at deploy. It does
+not: measured at 7.9.1, `migrate status` says *Database schema is up to date!* and `migrate
+deploy` says *No pending migrations to apply*, both exit 0, over a database whose schema disagrees
+with its own migration history. `deploy` is what the Dockerfile runs on every container start.
+
+So this is not a discipline with a net behind it. **A third in-place edit was then found** —
+`0a62f8d` widening three id columns from 200 to 400 — and that one fails on the FIRST REAL ALERT
+rather than on a settings write: a realistic message id is 206 characters, refused with 22001, and
+the tick writes no incident, no notification and no job. Corrected forward by `20260913120000`.
+
+Also worth knowing: **one file legitimately carries two recorded checksums**, because Prisma
+hashes the bytes on disk and a Windows checkout records the CRLF digest where Linux records LF.
 
 ### Forward migrations only — a rule now, not a judgement
 

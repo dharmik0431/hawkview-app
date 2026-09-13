@@ -613,6 +613,19 @@ export type IntakePhase =
   /** The commit. **A decision existed and none of it landed** — all three tables or none, so
    * there is no partial state, but the whole tick's work is gone and the findings stay OPEN. */
   | 'WRITING'
+  /** **WE DO NOT KNOW.** `runIntake` rejected rather than returning, so it died somewhere no
+   * phase guard covers — which today is `decide` and the `findings.length` test, both of which
+   * sit AFTER a decision may exist.
+   *
+   * IT IS HERE BECAUSE THE TYPE COULD NOT SAY IT. The backstop logged `phase: 'UNKNOWN'` and
+   * returned `phase: 'READING'`, so a programmatic consumer was told nothing was decided,
+   * nothing written and nothing lost — **the most reassuring of the four and, for the path that
+   * actually reaches that branch, the least likely to be true.** The comment above it already
+   * said UNKNOWN was the honest answer; the log took that advice and the return value could not.
+   *
+   * A tick reporting this has lost an unknown amount of work. Treat it as WRITING until somebody
+   * establishes otherwise, not as READING. */
+  | 'UNKNOWN'
 
 /** What the tick was carrying when it failed. Zero before a decision exists. */
 export interface AttemptedWork {

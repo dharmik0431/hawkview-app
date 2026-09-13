@@ -120,3 +120,34 @@ test('A FAILURE SAYS WHICH PHASE AND HOW MUCH IT LOST, and is not a yield', asyn
   // that run after it in the cascade.
   assert.ok(outcome.kind === 'FAILED')
 })
+
+test('A REJECTION REPORTS UNKNOWN, not the most reassuring phase available', async () => {
+  // **THE BACKSTOP TOLD THE TRUTH IN THE LOG AND NOT IN THE VALUE.** It logged phase UNKNOWN and
+  // returned phase READING, so a programmatic consumer was told nothing was decided, nothing
+  // written and nothing lost. That is the most reassuring of the four phases and, on the path
+  // that actually reaches the branch, the least likely to be true — a rejection escapes the
+  // per-phase guards, and the only unguarded region sits AFTER a decision may exist.
+  const { instance, logged } = service()
+
+  // A store that RESOLVES to something unusable, so runIntake rejects rather than returning a
+  // FAILED outcome — which is the only way into the backstop.
+  const broken = { findOpenFindings: async () => undefined as never }
+  const patched = instance as unknown as { store: () => unknown }
+  const original = patched.store.bind(instance)
+  patched.store = () => ({ ...(original() as object), ...broken })
+
+  const outcome = await withEnv('2026-09-12T00:00:00.000Z',
+    () => instance.runOnce(Date.now() + 30_000))
+
+  assert.equal(outcome.kind, 'FAILED')
+  assert.equal(outcome.kind === 'FAILED' ? outcome.phase : null, 'UNKNOWN',
+    'the value says what the log says')
+  assert.match(logged.join(' '), /UNKNOWN/)
+
+  // AND IT IS NOT READING, which is the specific wrong answer this replaced — stated separately
+  // so the assertion above cannot be satisfied by the phase becoming any other constant.
+  assert.notEqual(outcome.kind === 'FAILED' ? outcome.phase : null, 'READING')
+
+  // IT STILL DOES NOT THROW. Collection outranks alerting.
+  assert.ok(outcome.kind === 'FAILED')
+})

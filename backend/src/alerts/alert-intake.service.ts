@@ -81,8 +81,14 @@ export class AlertIntakeService {
       }))
       return {
         kind: 'FAILED',
-        phase: 'READING',
+        // **UNKNOWN, NOT READING.** This said READING while the log two lines above said UNKNOWN,
+        // so the value claimed nothing was decided and nothing lost — the most reassuring answer
+        // available and, on the path that reaches here, the least likely to be true.
+        phase: 'UNKNOWN',
         because: cause instanceof Error ? cause.message : 'unknown',
+        // ZEROES BECAUSE NOTHING IS KNOWN, WHICH IS NOT THE SAME AS NOTHING HAPPENING. The phase
+        // above is what says so; these numbers are the absence of a measurement, not a
+        // measurement of absence.
         attempted: { findingsRead: 0, incidents: 0, notifications: 0, jobs: 0 },
       }
     }

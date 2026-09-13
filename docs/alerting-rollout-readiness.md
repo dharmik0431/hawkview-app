@@ -59,7 +59,7 @@ find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 
 | What | Result |
 | --- | --- |
-| Unit suite | **1840 tests, 1719 pass, 0 fail, 121 skipped** |
+| Unit suite | **1842 tests, 1720 pass, 0 fail, 122 skipped** |
 | `tsc --noEmit -p tsconfig.json` | clean |
 | `tsc --noEmit -p tsconfig.scripts.json` | clean |
 | Alerting integration, real PostgreSQL 15 | **25/25** — 13 pipeline, 4 in-app, 3 suppression, 5 dispositions |
@@ -107,7 +107,7 @@ second line of proof that they are.
 
 ## 3. Migrations and rollback
 
-Nine migrations carry this feature. **All but the last are additive or widening — none drops a column,
+Ten migrations carry this feature. **All but the last are additive or widening — none drops a column,
 narrows a type, or rewrites a row.**
 
 | Migration | What it does |
@@ -121,6 +121,7 @@ narrows a type, or rewrites a row.**
 | `20260913060000_send_job_cancellation_provenance` | three **nullable** columns on `alert_send_jobs`, two CHECKs, one index |
 | `20260913080000_notification_alert_type` | one **nullable** column on `notifications`, one index |
 | `20260913100000_disposition_key_and_vocabulary` | renames a column and an index, translates rows, swaps one CHECK |
+| `20260913120000_widen_send_job_ids` | widens three id columns to 400; a no-op where they already are |
 
 ### Measured, not assumed
 
@@ -157,12 +158,53 @@ older code against a migrated database does not roll the schema back and does no
 also means **the schema advances the moment any container starts with these migrations present.**
 Deploying this branch is the schema change; there is no separate migration step to withhold.
 
-⚠ **Editing an already-applied migration is SILENT — and it has now happened here, twice, and been corrected forward. See the handoff.** Measured: after changing
-`20260912120000` in place, `migrate deploy` reported *No pending migrations to apply* and
-`migrate status` reported *Database schema is up to date* against a database holding the
-pre-edit checksum. Neither noticed. **In-place edits are defensible only while these migrations
-have reached nothing but throwaway clusters, which is the case today.** The moment one reaches a
-database somebody keeps, they become immutable and every correction must be a forward migration.
+### A third in-place edit, and it failed on the first real alert
+
+`0a62f8d` widened `alert_send_jobs.message_id`, `.idempotency_key` and
+`alert_send_attempts.message_id` from `VARCHAR(200)` to `(400)` by editing an applied migration.
+Measured on a database built from the pre-edit file:
+
+```
+widths before          200, 200, 200
+prisma migrate deploy  All migrations have been successfully applied.   exit 0
+widths after           STILL 200
+a fresh database       400
+```
+
+**A realistic message id does not fit.** `incident/<organisation>|<incident key>` measured 206
+characters here for one ordinary finding, refused with **22001** — and that is a floor, taken with
+short synthetic subjects. A real subject is a UUID or a UPN and an alert type id may be 64
+characters.
+
+So the first tick that decides to send anything fails on the write. All three tables or none, so
+there is no incident, no notification and no job — **the alert simply does not happen** — while
+Prisma reports a healthy, fully-migrated database. `20260913120000` corrects it forward, a no-op
+where the columns are already 400. Verified: converged from the old widths, both inserts then
+fit, second deploy a clean no-op, idempotent across two hand re-runs.
+
+### ⚠ THERE IS NO CHECKSUM GUARD. THE RULE IS THE ONLY THING STANDING THERE.
+
+**This corrects something believed, not something written.** Prisma was thought to validate
+recorded checksums, so an edit to an applied migration would be caught at deploy. **It does not.**
+Measured at Prisma 7.9.1, with an applied migration's file modified so its recorded checksum no
+longer matches:
+
+```
+prisma migrate status  →  Database schema is up to date!     exit 0
+prisma migrate deploy  →  No pending migrations to apply.    exit 0
+```
+
+Neither validates it, and `deploy` is what `backend/Dockerfile` runs on every container start. The
+result is a database whose schema disagrees with its own migration history, with nothing saying
+so.
+
+**An in-place edit to an already-applied migration is invisible to both `prisma migrate status`
+and `prisma migrate deploy`; the only protection is never doing it.** A believed safety net is
+worse than a known gap, because it is the reason nobody looks.
+
+⚠ **A file legitimately carries two recorded checksums.** Prisma hashes the bytes on disk, so the
+same migration applied from a Windows checkout records the CRLF digest and from Linux the LF
+digest. Comparing one means hashing it the way the machine that recorded it did.
 
 ---
 
