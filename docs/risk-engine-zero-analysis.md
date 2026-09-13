@@ -599,3 +599,170 @@ refused over.
 **Shape A**, three distinct faults, none of them the detectors being wrong. The
 zero-match figure is not evidence the rules are too narrow — on this data the
 rules have never been given a clean run to be narrow on.
+
+---
+
+# THE CAUSE: three error codes are known, everything else silences the tenant
+
+## First, correcting myself
+
+I wrote that exactly four per-event branches remained and "nothing else can be".
+That was a bounded read presented as a complete one — I stopped at line 80 of
+`evaluate.ts`. There are two more `reasons.add` calls below it, and **one of them
+is the cause**. A bounded search proves only its bounds, and I asserted past
+mine.
+
+Also: the rejection is **not** in the `gaps++` loop. The source reported READY,
+which requires `gaps === 0`, and its `latestEventAt` equals the max event time in
+the window — so all eleven rows were accepted by readiness and at least one ran
+the full length of the loop. Nothing was dropped there. The two
+`INCOMPLETE_WINDOW`s come from different files and mean different things.
+
+## The cause
+
+`risky-users-auth/normalize.ts:26`
+
+    const classify = (code) =>
+      code === 50126 ? 'INVALID_CREDENTIAL'
+    : code === 0     ? 'SUCCESS'
+    : code === 50076 ? 'NON_QUALIFYING'
+    :                  'UNKNOWN';
+
+**Three Entra error codes are recognised. Every other code in existence maps to
+`UNKNOWN`.**
+
+`risky-users-auth/evaluate.ts:93`
+
+    if (events.some(event => event.outcome === 'UNKNOWN')) reasons.add('UNKNOWN_OUTCOMES');
+
+`UNKNOWN_OUTCOMES` is not matched by any named branch in `readiness()`
+(`to-assessment.ts:21-30`), so it falls through to the catch-all on the last
+line: `PARTIAL` / `INCOMPLETE_WINDOW`, and the projector nulls
+`assessedIdentities`.
+
+**One sign-in carrying any error code other than 0, 50126 or 50076 silences the
+entire tenant's rule for that run.**
+
+Two further routes to the same place, same line region:
+
+- `normalize.ts:60` — `errorCode === 0` but a non-empty `failureReason` → UNKNOWN
+- `normalize.ts:62` — `isInteractive` present and not exactly `true`/`false` → UNKNOWN
+
+## Why this fits every measurement
+
+| observation | explained |
+| --- | --- |
+| source `READY`, `gaps === 0` | `UNKNOWN` is a **valid** outcome for `validEvent` (`evaluate.ts:17`), so these rows are accepted by readiness, not dropped |
+| `latestEventAt` = 14:34:44Z, the real max | events ran the full loop and reached the `latestEvent` assignment |
+| rule `PARTIAL` / `INCOMPLETE_WINDOW` | `UNKNOWN_OUTCOMES` → unnamed → catch-all |
+| `assessedIdentities: null` | set whenever the rule is not READY |
+| **zero findings across the whole fleet** | every tenant with a realistic sign-in mix trips it |
+
+That last row is the point. Entra routinely emits `50058` (interrupted), `50074`
+(strong auth required), `50079` (MFA enrolment), `53003` (conditional access
+blocked), `50105` (not assigned), `65001` (consent), `50173` (token expired).
+A tenant needs **every single sign-in in the 24-hour window** to be one of three
+codes for the rule ever to report. That is not narrow detectors finding nothing —
+it is a gate that practically cannot open, which is what you suspected when you
+asked whether the condition was satisfiable.
+
+## The query that confirms it — one column
+
+You asked which columns the branches test. For this cause it is one, and the
+eleven rows will settle it:
+
+```sql
+-- Q10  The deciding column. Any code outside {0, 50126, 50076} silences the run.
+SELECT raw->'status'->>'errorCode'   AS error_code,
+       count(*)                      AS rows,
+       bool_or(raw->>'failureReason' IS NOT NULL
+               AND raw->>'failureReason' NOT IN ('', '0', 'None')) AS has_failure_reason,
+       bool_or(raw->>'isInteractive' IS NULL)                      AS missing_is_interactive
+FROM sign_in_logs
+WHERE customer_tenant_id = '83f23fe5-bfdf-4e21-84fb-12f9627a3d06'::uuid
+  AND event_date_time >= '2026-09-12T14:45:54.607Z'::timestamptz
+  AND event_date_time <= '2026-09-13T14:45:54.607Z'::timestamptz
+GROUP BY 1 ORDER BY rows DESC;
+```
+
+**Any row whose `error_code` is not `0`, `50126` or `50076` confirms it.** I
+expect at least one and probably several.
+
+Two secondary columns, if you want the other routes ruled out in the same pass:
+`has_failure_reason` true on an `error_code = 0` row is `normalize.ts:60`;
+`missing_is_interactive` is not itself a trigger (undefined is permitted) but a
+non-boolean value there is `:62`.
+
+## Fleet-wide version, if you want the scale in one number
+
+```sql
+-- Q11  How much of the fleet's recent evidence is unclassifiable.
+SELECT customer_tenant_id,
+       count(*) AS rows_24h,
+       count(*) FILTER (WHERE (raw->'status'->>'errorCode') NOT IN ('0','50126','50076')
+                           OR (raw->'status'->>'errorCode') IS NULL) AS unknown_outcome_rows
+FROM sign_in_logs
+WHERE event_date_time > now() - interval '24 hours'
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
+If `unknown_outcome_rows > 0` for every tenant with recent evidence, that is the
+whole zero-findings figure explained in one column.
+
+## Estimates
+
+**(a) Name the reason.** Hours. `readiness()` has the set and discards it. Until
+this changes, every future instance of this costs another day.
+
+**(b) Classify the error codes.** Days, and it is the real fix. The classifier
+needs the Entra failure vocabulary, not three constants — at minimum a mapping
+that distinguishes *credential failure*, *MFA/CA interruption*, *non-qualifying*
+and *genuinely unknown*, since the detectors care about the first.
+
+**(c) Stop one event silencing a tenant.** Days, product decision. `some()` at
+`:93` is a fleet-wide switch operated by a single row. Even after (b) there will
+be codes nobody has mapped, so (c) is what stops the next unmapped code
+reproducing this exactly.
+
+I would do (a) today, (b) next, and treat (c) as the thing that prevents the
+recurrence rather than the thing that fixes today.
+
+## dcb2a091 — the second, different fault
+
+Its `GRAPH_SIGN_INS` is `WAITING` with `latestEventAt: null` while holding 27
+rows from the last 24 hours, and its latest `SIGN_INS` snapshot is stamped
+`M365_AUDIT_STS`. That is consistent with the entitlement fallback at
+`tenant-sync.service.ts:4087` having fired: rows collected via the Management
+Activity path, the window attested as `M365_AUDIT_STS`, and
+`selectedAuthenticationSource` still choosing `GRAPH_SIGN_INS` from the sync
+proof — so `window.source !== selected` fails at
+`authentication-source-readiness.ts:58` and the Graph source never becomes
+ready.
+
+I have not confirmed it; the confirming query is one column:
+
+```sql
+-- Q12  Were dcb2a091's recent rows collected via the fallback?
+SELECT count(*) FILTER (WHERE microsoft_sign_in_id LIKE 'management:%') AS fallback_rows,
+       count(*) FILTER (WHERE microsoft_sign_in_id NOT LIKE 'management:%') AS graph_rows
+FROM sign_in_logs
+WHERE customer_tenant_id = 'dcb2a091-ecf5-4bda-8780-a33bfb1b4d63'::uuid
+  AND event_date_time > now() - interval '24 hours';
+```
+
+`fallback_rows = 27` confirms it. **Days**, and it is a licensing question as
+much as a code one.
+
+## Where that leaves the original question
+
+Three tenants, three faults, and **none of them is the detectors being wrong**:
+
+- **83f23fe5** — evidence collected and seen; the rule is silenced by one
+  unrecognised error code. Hours to confirm, days to fix properly.
+- **dcb2a091** — premium path refused; the fallback collects but the rule waits
+  on a source that never becomes ready. Days.
+- **6facb85e** — no recent evidence; reports current because the window is
+  stamped from the requested range. Hours for the distinction.
+
+**Zero matches is not correct behaviour and it is not narrow rules.** The engine
+has never been given a run it could complete.
