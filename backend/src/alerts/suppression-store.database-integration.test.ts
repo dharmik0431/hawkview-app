@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { after, before } from 'node:test'
 import pg from 'pg'
 import {
   SUPPRESSION_SELECT_SQL, suppressionFor, suppressionUpsert, suppressionsFrom,
@@ -22,6 +22,40 @@ import { type VerifiedRecipient } from './routing-policy.js'
 
 const RUN = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 const URL = process.env.DATABASE_URL
+
+/**
+ * ONE DATABASE, SO ONE FILE AT A TIME.
+ *
+ * These files truncate shared tables. `node --test` runs test FILES in parallel, so two of them
+ * against one database interleave a truncate with another file's assertions — measured: run
+ * together they failed two or three of seventeen, and which ones varied between runs. Run one at
+ * a time they pass. **That is a property of the suite, not a flake to be re-run.**
+ *
+ * A POSTGRESQL ADVISORY LOCK RATHER THAN `--test-concurrency=1`, because the flag lives in
+ * whoever's command line and CI's is `find … | xargs tsx --test` with no flag at all — so the
+ * constraint would be satisfied by a habit. A session-level advisory lock is held by a
+ * CONNECTION, so it serialises across processes, and it is released when the connection closes
+ * even if a file dies badly.
+ *
+ * Every alerting integration file takes the SAME key. Adding a file means copying this block.
+ */
+const INTEGRATION_GATE = 8_192_026
+
+let gate: pg.Client | null = null
+
+before(async () => {
+  if (!RUN || !URL) return
+  gate = new pg.Client({ connectionString: URL })
+  await gate.connect()
+  await gate.query('SELECT pg_advisory_lock($1)', [INTEGRATION_GATE])
+})
+
+after(async () => {
+  if (gate === null) return
+  await gate.query('SELECT pg_advisory_unlock($1)', [INTEGRATION_GATE])
+  await gate.end()
+  gate = null
+})
 const T0 = '2026-09-13T09:00:00.000Z'
 const LATER = '2026-09-14T09:00:00.000Z'
 const MSG = 'incident/11111111-1111-1111-1111-111111111111|k1'

@@ -24,6 +24,7 @@ const finding = (over: Partial<FindingRow> = {}): FindingRow => ({
   organizationId: ORG,
   customerTenantId: TENANT,
   ruleId: 'HV-ID-AUTH-001.v1',
+  dedupeKey: 'auth-001:user-1',
   subjectType: 'ACCOUNT',
   subjectId: 'user-1',
   severity: 'ACT_NOW',

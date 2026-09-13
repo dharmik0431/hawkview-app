@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1806 tests, 1696 pass, 0 fail.** The remaining 110 are database-integration tests requiring a
+**1809 tests, 1696 pass, 0 fail.** The remaining 113 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -709,6 +709,67 @@ one the per-field audit already taught — *an audit of each part cannot find a 
 All six alerting migrations now re-run clean against an already-migrated database, three passes
 deep, with existing rows intact. The full position is in `docs/alerting-rollout-readiness.md`.
 
+### Alerts are visible in the product, and the tests now drive the store that ships
+
+**Every incident was a projection over the empty set.** `alert_incidents`' own migration header
+says an incident is *a projection over `notifications`, not a parent of them — the set of rows
+sharing an incident_key*. The pipeline wrote the incident and the send job and **no notification
+row at all**, so the bell showed nothing, the unread count counted nothing, and read and dismiss
+had nothing to act on. An incident with no notification is invisible in-app for exactly the
+reason an incident with no job was invisible by email — the third instance of that shape.
+
+**The notification is written in the same transaction as the incident and the job**, not as a
+follow-up. All three or none; a notification that failed separately would leave an incident that
+counts as written and shows nowhere.
+
+**One row per finding, not per incident**, because that is what the projection means and what
+`notifications`' unique constraint on `(organization_id, dedupe_key)` allows. A second finding on
+an open incident writes a second row — it is written *before* the `INCIDENT_ALREADY_OPEN` branch,
+or the product would show the first occurrence of a burst and none of the rest.
+
+**In-app and email are separate channels, and the code shows it.** A finding held back by the
+watermark, by `RECORD_ONLY`, or by there being nobody to email still gets its row. Only SENDING is
+withheld. `emailEnabled` defaults false and `inAppEnabled` defaults true, so a new MSP sees its
+alerts and is emailed about none of them.
+
+**FOURTEEN INTEGRATION TESTS PASSED WHILE THE BELL SHOWED NOTHING**, because every one of them
+asked the database what was written and none asked the reader. The new tests call
+`NotificationsService.list` — the method the panel calls — and assert the alert is *in the panel*,
+with a control that the panel is empty first. Three mutations kill them: removing the write,
+returning null from `notificationFor`, and moving the write after the already-open branch (which
+kills exactly the second-row test and nothing else).
+
+**The severity and category vocabularies are imported from `notifications.service.ts`**, not
+restated, so an invented value is a compile error rather than a row the reader's filter silently
+never matches. `ACT_NOW` maps to `critical`, which the filter shows regardless of the in-app
+switch — the existing product rule, and deliberate for the tier that would otherwise ring a phone.
+
+### The integration tests drive the production store now, and it is gated by a lock
+
+`pipeline-store.ts` holds the store that ships. It used to live inside `AlertIntakeService` where
+**no test could reach it**: the integration tests drove a `storeFor` written in the test file by
+the same hand as the assertions. The two had already drifted — production's `findOpenFindings`
+ended `LIMIT 5000` and the test's had no limit, so no test could reach that boundary. One
+disagreement found by reading means the set of disagreements was not known to be empty.
+
+**`MAX_FINDINGS_PER_TICK = 5000` is now a named constant.** It is the second half of the
+first-run bound: a tick reads at most 24 hours of findings AND at most 5000 rows. Anybody
+forecasting a first run needs both numbers, and the second one used to exist only inside a SQL
+string. The bound is correct and is not to be removed — an unbounded read inside an admission
+budget spends the budget collection shares.
+
+⚠ **THE INTEGRATION FILES SHARE ONE DATABASE AND MUST NOT RUN IN PARALLEL.** Measured: run
+together they failed two or three of seventeen and which ones varied; run one at a time they
+pass. They now take a **PostgreSQL session advisory lock** (`INTEGRATION_GATE`) in a `before`
+hook rather than relying on `--test-concurrency=1`, because CI's command is
+`find … | xargs tsx --test` with no flag — a constraint satisfied by a habit is not satisfied.
+A new integration file in this area must copy that block.
+
+**`runOnce` returns null for a failure and null for a deliberate refusal, and that is correct** —
+the caller's only sane response to either is to let the collectors run, and giving it a choice it
+must not make is worse than giving it none. The consequence is written where it is paid for:
+**check the database, not the report.**
+
 ### Still missing before anything can send
 
 - **NOTHING DRAINS THE QUEUE.** There is no sender worker: `attemptSend` has no production
@@ -828,8 +889,9 @@ inputs. **The suite has no reproducible number.** Writing the environment down d
 that, which is why it is worse than a missing document.
 
 **THE ALERTING INTEGRATION FILES ARE NOT PART OF THAT, and must not be discounted with them.**
-`finding-pipeline.database-integration.test.ts` (11 tests) and
-`suppression-store.database-integration.test.ts` (3) pass **14/14** against a freshly
+`finding-pipeline.database-integration.test.ts` (11 tests),
+`in-app-visibility.database-integration.test.ts` (3) and
+`suppression-store.database-integration.test.ts` (3) pass **17/17** against a freshly
 `migrate deploy`-ed PostgreSQL 15, created and destroyed inside the session. They share the
 harness but not the wall: they touch no KMS and no risk key store, and they have been green on
 every run. The unreproducible numbers above are the identity-risk suite. **Two different suites,

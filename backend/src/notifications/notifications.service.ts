@@ -12,6 +12,13 @@ const preferenceFields = [
   'emailEnabled',
 ] as const
 const severities = ['info', 'low', 'medium', 'high', 'critical'] as const
+
+/** THE TWO VOCABULARIES A NOTIFICATION IS WRITTEN IN, exported so a second producer cannot
+ * invent its own. The alerting pipeline writes notification rows too, and an invented severity
+ * there would be a row the reader's filter silently never matches — visible in no list and
+ * counted in no badge, which is indistinguishable from the feature not working. */
+export type NotificationSeverity = (typeof severities)[number]
+export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
 const digestModes = ['off', 'daily', 'weekly'] as const
 const severityRank = new Map(severities.map((value, index) => [value, index]))
 
@@ -20,8 +27,8 @@ export type NotificationIncident = {
   customerTenantId?: string
   recipientUserId?: string
   eventType: string
-  category: 'success' | 'info' | 'warning' | 'error'
-  severity?: (typeof severities)[number]
+  category: NotificationCategory
+  severity?: NotificationSeverity
   title: string
   description: string
   dedupeKey: string

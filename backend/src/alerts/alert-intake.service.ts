@@ -1,10 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { PrismaService } from '../prisma/prisma.service.js'
-import {
-  runIntake,
-  type Dispositions, type ExistingIncident, type FindingRow, type IncidentWrite,
-  type IntakeReport, type PipelineStore, type SendJobWrite, type Watermark,
-} from './finding-pipeline.js'
+import { runIntake, type IntakeReport, type PipelineStore, type Watermark } from './finding-pipeline.js'
+import { pipelineStore, type SqlRunner } from './pipeline-store.js'
 
 /**
  * THE PRODUCTION CALLER. Until this existed, `runIntake` was called by nothing and the only
@@ -26,7 +23,20 @@ export class AlertIntakeService {
    *
    * NEVER THROWS INTO THE CASCADE. Every failure is logged and reported, because this stage sits
    * in a handler where a throw would abort the collectors that run after it — and collection
-   * outranks alerting, always. */
+   * outranks alerting, always.
+   *
+   * ⚠ **A NULL RETURN IS AMBIGUOUS ON PURPOSE, AND THAT IS WHY YOU MUST NOT VERIFY THIS FROM ITS
+   * RETURN VALUE.** A rolled-back transaction comes back as null with a logged FAILED, and a
+   * deliberate refusal — no watermark chosen — comes back as null too. From the return value
+   * alone they are indistinguishable. Collapsing them would be a defect anywhere else; here it
+   * is correct, because the caller's only sane response to either is to carry on and let the
+   * collectors run, and giving it a choice it must not make is worse than giving it none.
+   *
+   * The consequence is where the ambiguity has to be paid for: **check the database, not the
+   * report.** Every test of this path asserts over `alert_incidents`, `notifications` and
+   * `alert_send_jobs` rather than over what `runOnce` handed back, and the log line carries
+   * the status a person needs. Anyone tempted to "improve" this by returning a richer result
+   * should notice they are proposing to let an alerting failure change what collection does. */
   async runOnce(deadlineAt: number, tickAt: Date = new Date()): Promise<IntakeReport | null> {
     const watermark = configuredWatermark()
     if (watermark === null) {
@@ -48,6 +58,7 @@ export class AlertIntakeService {
         status: report.yieldedOnBudget ? 'YIELDED' : 'COMPLETED',
         findingsRead: report.findingsRead,
         incidentsWritten: report.incidentsWritten,
+        notificationsWritten: report.notificationsWritten,
         jobsWritten: report.jobsWritten,
         // COUNTS BY REASON, NOT A TOTAL. "17 skipped" collapses waiting-on-the-classifier with
         // never-writable, which is the collapse this feature has now fixed three times.
@@ -67,115 +78,17 @@ export class AlertIntakeService {
     }
   }
 
+  /** The store that ships, adapted onto Prisma.
+   *
+   * THE SQL LIVES IN `pipeline-store.ts`, NOT HERE, and that is the point: the integration tests
+   * construct the same `pipelineStore` against a bare `pg.Client`, so the store they prove is
+   * the store that runs. It used to live in this method, where no test could reach it — five
+   * green tests drove a copy written inside the test file, and the two had already drifted.
+   *
+   * This method is now only the adapter: three methods turning `PrismaService` into a
+   * `SqlRunner`. There is no SQL to disagree with anything. */
   private store(): PipelineStore {
-    const prisma = this.prisma
-    return {
-      async findOpenFindings(sinceIso) {
-        const rows = await prisma.$queryRawUnsafe<readonly {
-          id: string; organization_id: string; customer_tenant_id: string; rule_id: string
-          subject_type: string; subject_id: string; severity: string; state: string
-          observed_at: Date
-        }[]>(
-          `SELECT id, organization_id, customer_tenant_id, rule_id, subject_type, subject_id,
-                  severity, state, observed_at
-             FROM identity_risk_findings
-            WHERE state = 'OPEN' AND observed_at >= $1::timestamptz
-            ORDER BY observed_at, id
-            LIMIT 5000`,
-          sinceIso)
-        return rows.map((row): FindingRow => ({
-          id: row.id,
-          organizationId: row.organization_id,
-          customerTenantId: row.customer_tenant_id,
-          ruleId: row.rule_id,
-          subjectType: row.subject_type,
-          subjectId: row.subject_id,
-          severity: row.severity,
-          state: row.state,
-          observedAtIso: row.observed_at.toISOString(),
-        }))
-      },
-
-      async findExistingIncidents(organizationIds) {
-        if (organizationIds.length === 0) return []
-        const rows = await prisma.$queryRawUnsafe<readonly {
-          organization_id: string; incident_key: string
-        }[]>(
-          'SELECT organization_id, incident_key FROM alert_incidents WHERE organization_id = ANY($1::uuid[])',
-          organizationIds)
-        return rows.map((row): ExistingIncident => ({
-          organizationId: row.organization_id, incidentKey: row.incident_key,
-        }))
-      },
-
-      async loadDispositions(organizationIds) {
-        const byOrganizationAndRule = new Map<string, string>()
-        const anyRecipientByOrganization = new Map<string, boolean>()
-        if (organizationIds.length === 0) return { byOrganizationAndRule, anyRecipientByOrganization }
-
-        const dispositions = await prisma.$queryRawUnsafe<readonly {
-          organization_id: string; rule_id: string; disposition: string
-        }[]>(
-          'SELECT organization_id, rule_id, disposition FROM alert_rule_dispositions WHERE organization_id = ANY($1::uuid[])',
-          organizationIds)
-        for (const row of dispositions) {
-          byOrganizationAndRule.set(`${row.organization_id}|${row.rule_id}`, row.disposition)
-        }
-
-        // EMAIL IS OFF UNLESS SOMEBODY TURNED IT ON, AND ABSENCE IS OFF TOO. `bool_or` over no
-        // rows is NULL, and an organisation with no preference row at all returns nothing — both
-        // must read as "nobody can be reached", or a brand-new MSP would be sent to before
-        // anybody there had chosen to be. Every organisation is seeded false first so the
-        // absent case cannot be mistaken for the unset case.
-        for (const id of organizationIds) anyRecipientByOrganization.set(id, false)
-        const recipients = await prisma.$queryRawUnsafe<readonly {
-          organization_id: string; any_recipient: boolean | null
-        }[]>(
-          `SELECT organization_id, bool_or(email_enabled) AS any_recipient
-             FROM notification_preferences
-            WHERE organization_id = ANY($1::uuid[])
-            GROUP BY organization_id`,
-          organizationIds)
-        for (const row of recipients) {
-          anyRecipientByOrganization.set(row.organization_id, row.any_recipient === true)
-        }
-        return { byOrganizationAndRule, anyRecipientByOrganization } satisfies Dispositions
-      },
-
-      /** BOTH WRITES OR NEITHER. A yield or a crash between them would leave an incident with no
-       * job, which every later run skips as already-open — the alert never sent and nothing
-       * reporting it. That was the launch blocker; this is the shape that closed it. */
-      async commit(incidents: readonly IncidentWrite[], jobs: readonly SendJobWrite[]) {
-        if (incidents.length === 0 && jobs.length === 0) {
-          return { incidentsWritten: 0, jobsWritten: 0 }
-        }
-        return prisma.$transaction(async (tx) => {
-          let incidentsWritten = 0
-          let jobsWritten = 0
-          for (const each of incidents) {
-            incidentsWritten += await tx.$executeRawUnsafe(
-              `INSERT INTO alert_incidents
-                 (id, organization_id, incident_key, alert_type_id, ownership, "condition",
-                  investigation, ownership_at, condition_at, investigation_at, updated_at)
-               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6,
-                       $7::timestamptz, $7::timestamptz, $7::timestamptz, now())
-               ON CONFLICT (organization_id, incident_key) DO NOTHING`,
-              each.organizationId, each.incidentKey, each.alertTypeId, each.ownership,
-              each.condition, each.investigation, each.atIso)
-          }
-          for (const each of jobs) {
-            jobsWritten += await tx.$executeRawUnsafe(
-              `INSERT INTO alert_send_jobs
-                 (id, message_id, idempotency_key, state, attempts_made, max_attempts,
-                  not_before_at, updated_at)
-               VALUES (gen_random_uuid(), $1, $2, 'READY', 0, $3, $4::timestamptz, now())
-               ON CONFLICT (message_id) DO NOTHING`,
-              each.messageId, each.idempotencyKey, each.maxAttempts, each.notBeforeIso)
-          }
-          return { incidentsWritten, jobsWritten }
-        })
-      },
-    }
+    return pipelineStore(runnerFor(this.prisma))
   }
 }
 
@@ -216,4 +129,41 @@ const countByReason = (skipped: IntakeReport['skipped']): Record<string, number>
   const counts: Record<string, number> = {}
   for (const each of skipped) counts[each.because] = (counts[each.because] ?? 0) + 1
   return counts
+}
+
+/** Raw SQL, without saying which client it came from. `PrismaService` and the client
+ * `$transaction` hands back both satisfy it. */
+type RawCapable = {
+  $queryRawUnsafe<T>(sql: string, ...params: unknown[]): Promise<T>
+  $executeRawUnsafe(sql: string, ...params: unknown[]): Promise<number>
+}
+
+/** `PrismaService` as a `SqlRunner`.
+ *
+ * THE ONLY PLACE THE PRODUCTION CLIENT MEETS THE STORE. `$queryRawUnsafe` and
+ * `$executeRawUnsafe` take their parameters spread rather than as an array, which is very nearly
+ * the whole difference between this and the test's adapter — and keeping that difference this
+ * small is why the store itself can be shared instead of written twice. */
+function runnerFor(prisma: PrismaService): SqlRunner {
+  return {
+    query: (sql, params) => prisma.$queryRawUnsafe(sql, ...params),
+    execute: (sql, params) => prisma.$executeRawUnsafe(sql, ...params),
+    // The callback form, so every write inside `commit` lands in ONE transaction — the property
+    // the stranding blocker turned on.
+    transaction: (run) => prisma.$transaction((tx) => run(insideTransaction(tx))),
+  }
+}
+
+/** The client Prisma hands a transaction callback, as a `SqlRunner`.
+ *
+ * `transaction` HERE IS THE IDENTITY, deliberately. We are already inside one; opening another
+ * would be a savepoint, and `commit` neither needs one nor should quietly get one — a nested
+ * rollback that left the outer transaction alive would be exactly the partial write this seam
+ * exists to make impossible. */
+function insideTransaction(tx: RawCapable): SqlRunner {
+  return {
+    query: (sql, params) => tx.$queryRawUnsafe(sql, ...params),
+    execute: (sql, params) => tx.$executeRawUnsafe(sql, ...params),
+    transaction: (run) => run(insideTransaction(tx)),
+  }
 }

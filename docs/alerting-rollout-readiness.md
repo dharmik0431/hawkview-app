@@ -38,13 +38,13 @@ find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 
 | What | Result |
 | --- | --- |
-| Unit suite | **1806 tests, 1696 pass, 0 fail, 110 skipped** |
+| Unit suite | **1809 tests, 1696 pass, 0 fail, 113 skipped** |
 | `tsc --noEmit -p tsconfig.json` | clean |
 | `tsc --noEmit -p tsconfig.scripts.json` | clean |
-| Alerting integration, real PostgreSQL 15 | **14/14** — 11 pipeline, 3 suppression |
+| Alerting integration, real PostgreSQL 15 | **17/17** — 11 pipeline, 3 in-app, 3 suppression |
 | Schema drift vs `schema.prisma` | 254 lines, **none naming an `alert_` table** |
 
-**The 110 skipped are the database-integration tests**, gated behind
+**The 113 skipped are the database-integration tests**, gated behind
 `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which that command does not set. **The 1696 figure
 does not cover them.** They were run separately, and the two results must not be added together
 or quoted as one.

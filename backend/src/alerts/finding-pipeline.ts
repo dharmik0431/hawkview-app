@@ -1,4 +1,7 @@
 import { ALERT_CATALOG, type AlertTypeId } from './alert-catalog.js'
+import { type Severity } from './alert-type.js'
+import { type NotificationCategory, type NotificationSeverity }
+  from '../notifications/notifications.service.js'
 import { OPENED } from './alert-lifecycle.js'
 import { incidentGrouping } from './alert-incident-key.js'
 import { defaultPreference } from './routing-policy.js'
@@ -53,6 +56,9 @@ export interface FindingRow {
   readonly organizationId: string
   readonly customerTenantId: string
   readonly ruleId: string
+  /** The finding's own identity. Needed because the notification row is unique on it — see
+   * `notificationFor`. It was not selected at all until the in-app surface existed. */
+  readonly dedupeKey: string
   readonly subjectType: string
   readonly subjectId: string
   readonly severity: string
@@ -125,6 +131,95 @@ export function alertTypeForRule(ruleId: string): AlertTypeId | null {
 // WHAT GOES OUT
 // ---------------------------------------------------------------------------------------
 
+/** A notification row — the thing that makes an incident visible IN THE PRODUCT.
+ *
+ * **WITHOUT THIS THE BELL SHOWS NOTHING.** `alert_incidents`' own migration header says an
+ * incident is *a projection over `notifications`, not a parent of them — the set of rows sharing
+ * an incident_key*. The pipeline wrote the incident and the send job and no notification row at
+ * all, so every incident was a projection over the EMPTY SET: nothing in the list, nothing in the
+ * unread count, and read and dismiss with nothing to act on. An incident with no notification is
+ * invisible in-app for exactly the reason an incident with no job was invisible by email.
+ *
+ * ONE ROW PER FINDING, NOT PER INCIDENT, because that is what the projection means and what the
+ * unique constraint allows: `notifications` is unique on `(organization_id, dedupe_key)` and a
+ * dedupe key belongs to a finding. Many rows then share one `incident_key`, which is the shape
+ * the step-03 work already established.
+ *
+ * WRITTEN FOR FINDINGS THAT PRODUCE NO SEND, TOO. In-app and email are separate channels: a
+ * finding held back by the watermark, by RECORD_ONLY, or by there being nobody to email is still
+ * a thing that happened and still belongs in the product. Only the SENDING is withheld. */
+export interface NotificationWrite {
+  readonly organizationId: string
+  readonly customerTenantId: string
+  readonly dedupeKey: string
+  /** **THE FAMILY, AND THE READER'S SWITCH KEYS ON IT.** `notifications.service.ts` decides which
+   * rows a person sees by matching `eventType` against four prefixes — `security.`, anything
+   * containing `connection`, anything containing `sync`, `account.` — and gating each on the
+   * matching preference. An alert type id is already `security.<something>`, so it lands in the
+   * security family and is governed by `securityEnabled`, which defaults true. A value outside
+   * those four falls into the *no known family* arm and is always shown. Neither is a guess:
+   * both were read out of the filter. */
+  readonly eventType: string
+  readonly category: NotificationCategory
+  readonly severity: NotificationSeverity
+  readonly title: string
+  readonly description: string
+  readonly incidentKey: string
+  readonly atIso: string
+}
+
+/** How an alert type's declared urgency reads in the notification list.
+ *
+ * A `Record` OVER THE CLOSED SEVERITY UNION, so adding a tier to the catalogue is a compile error
+ * here rather than a row that quietly takes a default. The last time this feature invented a
+ * severity vocabulary the compiler caught it; this is the same protection, kept.
+ *
+ * ⚠ `critical` IS ALWAYS SHOWN, WHATEVER THE USER'S IN-APP SWITCH SAYS — that is the existing
+ * product rule in `visibilityFilter`, not a new one, and mapping ACT_NOW onto it is deliberate:
+ * ACT_NOW is the tier that routes to a phone, so a person who muted in-app notifications should
+ * still see the one they would have been rung about. Stated because it is a real consequence of
+ * a mapping that otherwise looks like decoration. */
+const NOTIFICATION_TONE: Readonly<Record<Severity, {
+  readonly category: NotificationCategory
+  readonly severity: NotificationSeverity
+}>> = {
+  ACT_NOW: { category: 'error', severity: 'critical' },
+  ACT_TODAY: { category: 'warning', severity: 'high' },
+  RECORD_ONLY: { category: 'info', severity: 'info' },
+}
+
+/** The notification for one finding, or null when the type is not in the catalogue.
+ *
+ * THE DEDUPE KEY IS NAMESPACED. `notifications` is unique on `(organization_id, dedupe_key)` and
+ * that table is shared with the collectors, whose keys look like `tenant:<id>:sync:<resource>`.
+ * A bare finding key could in principle collide with one of theirs and silently overwrite it;
+ * the prefix makes that impossible. `reconciliation.ts`'s `parseDedupeKey` reads the result as
+ * `UNRECOGNISED`, which costs nothing — these rows carry their `incident_key` from birth, so
+ * they are never the rows reconciliation has to key. */
+export function notificationFor(
+  finding: FindingRow,
+  alertTypeId: AlertTypeId,
+  incidentKey: string,
+): NotificationWrite | null {
+  const declared = ALERT_CATALOG.find((type) => type.id === alertTypeId)
+  if (declared === undefined) return null
+  const tone = NOTIFICATION_TONE[declared.severity]
+  return {
+    organizationId: finding.organizationId,
+    customerTenantId: finding.customerTenantId,
+    dedupeKey: `identity-risk:${finding.dedupeKey}`,
+    eventType: alertTypeId,
+    category: tone.category,
+    severity: tone.severity,
+    title: declared.summary,
+    // The rule and the subject, because a title alone tells somebody an alert type fired and not
+    // which account it fired about — and the account is the thing they act on.
+    description: `${declared.summary} — ${finding.subjectType.toLowerCase()} ${finding.subjectId} (${finding.ruleId}).`,
+    incidentKey,
+    atIso: finding.observedAtIso,
+  }
+}
+
 export interface IncidentWrite {
   readonly organizationId: string
   readonly incidentKey: string
@@ -159,6 +254,9 @@ export type Skipped = Readonly<{
 
 export interface PipelineDecision {
   readonly incidents: readonly IncidentWrite[]
+  /** The in-app half. See `NotificationWrite` — without these every incident is a projection
+   * over the empty set and the bell shows nothing. */
+  readonly notifications: readonly NotificationWrite[]
   readonly jobs: readonly SendJobWrite[]
   readonly skipped: readonly Skipped[]
   /** Distinct rule ids nothing could type. A count of findings is not enough — the rule id is
@@ -193,6 +291,7 @@ export function decide(
 ): PipelineDecision {
   const open = new Set(existing.map((each) => `${each.organizationId}|${each.incidentKey}`))
   const incidents: IncidentWrite[] = []
+  const notifications: NotificationWrite[] = []
   const jobs: SendJobWrite[] = []
   const skipped: Skipped[] = []
   const unmapped = new Set<string>()
@@ -216,6 +315,14 @@ export function decide(
       { resolved: true, id: finding.subjectId })
     const incidentKey = grouping.groups ? grouping.key : `ungrouped:${finding.id}`
     const scoped = `${finding.organizationId}|${incidentKey}`
+
+    // THE NOTIFICATION IS WRITTEN FIRST AND FOR EVERY FINDING THAT GETS THIS FAR, including one
+    // whose incident is already open. An incident is the SET of rows sharing its key, so a second
+    // finding on the same incident is a second row rather than nothing — and the `continue` below
+    // would otherwise drop it. This is the in-app channel; it is not gated by the watermark, by
+    // the disposition or by there being an email recipient, all of which govern SENDING only.
+    const notification = notificationFor(finding, alertTypeId, incidentKey)
+    if (notification !== null) notifications.push(notification)
 
     // THE INCIDENT IS WRITTEN EVEN FOR HISTORY. The record is what makes the backlog visible in
     // the product; only the SENDING is withheld.
@@ -268,6 +375,7 @@ export function decide(
   const accountedFor = jobs.length + skipped.length
   return {
     incidents,
+    notifications,
     jobs,
     skipped,
     unmappedRules: [...unmapped].sort(),
@@ -298,13 +406,17 @@ export interface PipelineStore {
    * A crash between the two writes strands an alert identically, and no logic inside
    * `runIntake` can catch that one. The seam had to change; a recovery path could not have
    * fixed it. */
-  commit(incidents: readonly IncidentWrite[], jobs: readonly SendJobWrite[]):
-    Promise<Readonly<{ incidentsWritten: number; jobsWritten: number }>>
+  commit(
+    incidents: readonly IncidentWrite[],
+    notifications: readonly NotificationWrite[],
+    jobs: readonly SendJobWrite[],
+  ): Promise<Readonly<{ incidentsWritten: number; notificationsWritten: number; jobsWritten: number }>>
 }
 
 export interface IntakeReport {
   readonly findingsRead: number
   readonly incidentsWritten: number
+  readonly notificationsWritten: number
   readonly jobsWritten: number
   readonly skipped: readonly Skipped[]
   readonly unmappedRules: readonly string[]
@@ -329,7 +441,7 @@ export async function runIntake(
   now: () => number = Date.now,
 ): Promise<IntakeReport> {
   const empty = (yielded: boolean, findingsRead = 0): IntakeReport => ({
-    findingsRead, incidentsWritten: 0, jobsWritten: 0, skipped: [], unmappedRules: [],
+    findingsRead, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0, skipped: [], unmappedRules: [],
     accountingProblems: [], yieldedOnBudget: yielded,
   })
   if (now() >= deadlineAt) return empty(true)
@@ -367,17 +479,19 @@ export async function runIntake(
   // every incident the watermark silenced.
   if (now() >= deadlineAt) {
     return {
-      findingsRead: findings.length, incidentsWritten: 0, jobsWritten: 0,
+      findingsRead: findings.length, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0,
       skipped: decision.skipped, unmappedRules: decision.unmappedRules,
       accountingProblems: decision.accountingProblems, yieldedOnBudget: true,
     }
   }
 
-  const { incidentsWritten, jobsWritten } = await store.commit(decision.incidents, decision.jobs)
+  const { incidentsWritten, notificationsWritten, jobsWritten } =
+    await store.commit(decision.incidents, decision.notifications, decision.jobs)
 
   return {
     findingsRead: findings.length,
     incidentsWritten,
+    notificationsWritten,
     jobsWritten,
     skipped: decision.skipped,
     unmappedRules: decision.unmappedRules,

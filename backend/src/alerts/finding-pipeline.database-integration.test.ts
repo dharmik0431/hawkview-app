@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { after, before } from 'node:test'
 import pg from 'pg'
 import {
   cancelReason, cancelStatement, classifyCancellation, claimStatement, workerId,
 } from './send-queue.js'
 import { messageId } from './email-delivery.js'
-import { runIntake, type Dispositions, type ExistingIncident, type FindingRow,
-  type IncidentWrite, type PipelineStore, type SendJobWrite, type Watermark } from './finding-pipeline.js'
+import { runIntake, type PipelineStore, type Watermark } from './finding-pipeline.js'
+import { pipelineStore, type SqlRunner } from './pipeline-store.js'
 
 /**
  * ONE TEST THAT STARTS AT A PERSISTED FINDING AND ENDS AT A SEND JOB.
@@ -22,6 +22,40 @@ import { runIntake, type Dispositions, type ExistingIncident, type FindingRow,
 const RUN = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 const URL = process.env.DATABASE_URL
 
+/**
+ * ONE DATABASE, SO ONE FILE AT A TIME.
+ *
+ * These files truncate shared tables. `node --test` runs test FILES in parallel, so two of them
+ * against one database interleave a truncate with another file's assertions — measured: run
+ * together they failed two or three of seventeen, and which ones varied between runs. Run one at
+ * a time they pass. **That is a property of the suite, not a flake to be re-run.**
+ *
+ * A POSTGRESQL ADVISORY LOCK RATHER THAN `--test-concurrency=1`, because the flag lives in
+ * whoever's command line and CI's is `find … | xargs tsx --test` with no flag at all — so the
+ * constraint would be satisfied by a habit. A session-level advisory lock is held by a
+ * CONNECTION, so it serialises across processes, and it is released when the connection closes
+ * even if a file dies badly.
+ *
+ * Every alerting integration file takes the SAME key. Adding a file means copying this block.
+ */
+const INTEGRATION_GATE = 8_192_026
+
+let gate: pg.Client | null = null
+
+before(async () => {
+  if (!RUN || !URL) return
+  gate = new pg.Client({ connectionString: URL })
+  await gate.connect()
+  await gate.query('SELECT pg_advisory_lock($1)', [INTEGRATION_GATE])
+})
+
+after(async () => {
+  if (gate === null) return
+  await gate.query('SELECT pg_advisory_unlock($1)', [INTEGRATION_GATE])
+  await gate.end()
+  gate = null
+})
+
 const ORG = '11111111-1111-1111-1111-111111111111'
 const TENANT = '22222222-2222-2222-2222-222222222222'
 const T0 = '2026-09-12T09:00:00.000Z'
@@ -32,98 +66,49 @@ const WATERMARK: Watermark = {
   because: 'the instant this pipeline was first switched on, so history is recorded not sent',
 }
 
-/** The store, against real SQL. Deliberately raw rather than through Prisma's client: these
- * tables are new and the point is to prove the columns exist and the constraints hold, not to
- * prove the ORM can spell them. */
-const storeFor = (client: pg.Client): PipelineStore => ({
-  async findOpenFindings(sinceIso) {
-    const { rows } = await client.query(
-      `SELECT id, organization_id, customer_tenant_id, rule_id, subject_type, subject_id,
-              severity, state, observed_at
-         FROM identity_risk_findings
-        WHERE state = 'OPEN' AND observed_at >= $1::timestamptz
-        ORDER BY observed_at, id`, [sinceIso])
-    return rows.map((row): FindingRow => ({
-      id: row.id,
-      organizationId: row.organization_id,
-      customerTenantId: row.customer_tenant_id,
-      ruleId: row.rule_id,
-      subjectType: row.subject_type,
-      subjectId: row.subject_id,
-      severity: row.severity,
-      state: row.state,
-      observedAtIso: new Date(row.observed_at).toISOString(),
-    }))
-  },
-  async findExistingIncidents(organizationIds) {
-    if (organizationIds.length === 0) return []
-    const { rows } = await client.query(
-      'SELECT organization_id, incident_key FROM alert_incidents WHERE organization_id = ANY($1::uuid[])',
-      [organizationIds])
-    return rows.map((row): ExistingIncident => ({
-      organizationId: row.organization_id, incidentKey: row.incident_key,
-    }))
-  },
-  async loadDispositions(organizationIds) {
-    const byOrganizationAndRule = new Map<string, string>()
-    const anyRecipientByOrganization = new Map<string, boolean>()
-    if (organizationIds.length === 0) return { byOrganizationAndRule, anyRecipientByOrganization }
-
-    const dispositions = await client.query(
-      'SELECT organization_id, rule_id, disposition FROM alert_rule_dispositions WHERE organization_id = ANY($1::uuid[])',
-      [organizationIds])
-    for (const row of dispositions.rows) {
-      byOrganizationAndRule.set(`${row.organization_id}|${row.rule_id}`, row.disposition)
-    }
-    // THE TWO GRAINS MEETING. The organisation decides what is urgent; a person decides whether
-    // they are emailed. This asks whether ANYBODY there can be.
-    const recipients = await client.query(
-      `SELECT organization_id, bool_or(email_enabled) AS any_recipient
-         FROM notification_preferences
-        WHERE organization_id = ANY($1::uuid[])
-        GROUP BY organization_id`, [organizationIds])
-    for (const id of organizationIds) anyRecipientByOrganization.set(id, false)
-    for (const row of recipients.rows) {
-      anyRecipientByOrganization.set(row.organization_id, row.any_recipient === true)
-    }
-    return { byOrganizationAndRule, anyRecipientByOrganization }
-  },
-  // ONE TRANSACTION, BOTH WRITES. Two calls with a budget check between them left an incident
-  // with no job, which the next run skips as INCIDENT_ALREADY_OPEN — permanently silent. A
-  // crash between them does the same, and no logic inside runIntake could catch that one.
-  async commit(incidents: readonly IncidentWrite[], jobs: readonly SendJobWrite[]) {
-    let incidentsWritten = 0
-    let jobsWritten = 0
+/** A `pg.Client` as a `SqlRunner`.
+ *
+ * **THE TESTS BELOW NOW DRIVE THE STORE THAT SHIPS.** They used to drive a `storeFor` written in
+ * this file by the same hand as the assertions — so the evidence was about a store nobody
+ * deploys, and the one that does deploy was covered by nothing. The two had already drifted:
+ * production's `findOpenFindings` ended `LIMIT 5000` and this file's had no limit at all, so no
+ * test could reach that boundary. One disagreement found by reading means the set of
+ * disagreements was not known to be empty.
+ *
+ * What remains here is only the adapter — three methods turning a `pg.Client` into the interface
+ * `pipelineStore` takes. There is no SQL in this file to disagree with the SQL that ships.
+ */
+const runnerFor = (client: pg.Client): SqlRunner => ({
+  query: async <T>(sql: string, params: readonly unknown[]) =>
+    (await client.query(sql, [...params])).rows as T[],
+  execute: async (sql: string, params: readonly unknown[]) =>
+    (await client.query(sql, [...params])).rowCount ?? 0,
+  transaction: async (run) => {
     await client.query('BEGIN')
     try {
-      for (const each of incidents) {
-        const { rowCount } = await client.query(
-          `INSERT INTO alert_incidents
-             (id, organization_id, incident_key, alert_type_id, ownership, "condition", investigation,
-              ownership_at, condition_at, investigation_at, updated_at)
-           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7::timestamptz, $7::timestamptz, $7::timestamptz, now())
-           ON CONFLICT (organization_id, incident_key) DO NOTHING`,
-          [each.organizationId, each.incidentKey, each.alertTypeId, each.ownership, each.condition,
-            each.investigation, each.atIso])
-        incidentsWritten += rowCount ?? 0
-      }
-      for (const each of jobs) {
-        const { rowCount } = await client.query(
-          `INSERT INTO alert_send_jobs
-             (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at, updated_at)
-           VALUES (gen_random_uuid(), $1, $2, 'READY', 0, $3, $4::timestamptz, now())
-           ON CONFLICT (message_id) DO NOTHING`,
-          [each.messageId, each.idempotencyKey, each.maxAttempts, each.notBeforeIso])
-        jobsWritten += rowCount ?? 0
-      }
+      const result = await run(insideTransaction(client))
       await client.query('COMMIT')
+      return result
     } catch (cause) {
       await client.query('ROLLBACK')
       throw cause
     }
-    return { incidentsWritten, jobsWritten }
   },
 })
+
+/** Inside the transaction, `transaction` is the identity — the same rule the production adapter
+ * follows. A second BEGIN on one connection is not a nested transaction in PostgreSQL, and
+ * silently making it a savepoint would let an inner rollback leave the outer transaction alive:
+ * the partial write this seam exists to make impossible. */
+const insideTransaction = (client: pg.Client): SqlRunner => ({
+  query: async <T>(sql: string, params: readonly unknown[]) =>
+    (await client.query(sql, [...params])).rows as T[],
+  execute: async (sql: string, params: readonly unknown[]) =>
+    (await client.query(sql, [...params])).rowCount ?? 0,
+  transaction: (run) => run(insideTransaction(client)),
+})
+
+const storeFor = (client: pg.Client): PipelineStore => pipelineStore(runnerFor(client))
 
 /** The finding's real foreign-key chain. Inserted rather than mocked, because the point of this
  * test is that a row which the production evaluator could have written flows through. */
