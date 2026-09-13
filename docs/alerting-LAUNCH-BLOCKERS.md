@@ -20,7 +20,7 @@ problems, and the second one scales.
 defect needing a state the launch cannot produce is backlog, and I moved two of my own findings
 there on exactly that ground.
 
-## B1 — Step 0 wedges a half-migrated database. Unrecoverable.
+## B1 — FIXED at 1ea8077, and I verified it rather than relaying it. ~~Blocker~~
 
 `20260912120000_notification_incident_key` uses bare `ADD COLUMN` and `CREATE INDEX` with no
 `IF NOT EXISTS`. Against a database that already has the columns it fails `42701` and leaves a
@@ -30,9 +30,16 @@ failed-migration row that blocks **every subsequent migration** with `P3009` unt
 **Reachable, and partly my doing.** The workaround DDL I published in the first-run record puts
 an operator in exactly that state. So does any earlier partial attempt.
 
-**Why blocker:** it is the one step that changes schema rather than data, Dharmik runs it once
-and alone, and the failure mode is not "try again" — it is a database whose migration channel is
-stuck. Fix is one line per statement.
+**VERIFIED FIXED.** Three cases run against disposable databases at 08133a2: a clean database
+run twice reports no pending migrations; a half-migrated one with the correct column types
+**converges** — index created, migration recorded finished, types right; and a half-migrated one
+whose `incident_key` was hand-made as `text` **fails loudly** with a message naming the found
+type, the expected type and the remedy. I then checked the guard was not asymmetric: a hand-made
+`episode` of type `bigint` is caught too. The fix goes further than I asked — `IF NOT EXISTS`
+matches on name alone, so without the type check a wrong-typed hand-made column would have been
+silently adopted, which is the hole my own published workaround DDL could have opened.
+
+**Two blockers remain, not three.**
 
 ## B2 — `AuthenticEvent` can be forged, and the comment says it cannot. Wrong, and silent.
 
