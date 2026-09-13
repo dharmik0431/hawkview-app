@@ -241,3 +241,38 @@ about:
 - **The rendered screen** is not covered by any of this. The recurring defect in this product
   is a true sentence in the wrong company, and tests cannot see the company — only rendering
   can.
+
+## Two shapes found late, both worth the page
+
+### The test and the comment agree, and neither touched the case that matters
+
+A branch has two instances. A test covers the harmless one. A comment reasons carefully about the
+dangerous one and concludes it is safe. **Both artefacts point at the branch; neither exercises
+the case that breaks.** The agreement between them reads as coverage.
+
+The instance: `runIntake` checked its budget between writing incidents and writing jobs. The
+comment called that "the safe direction". The test named `INTAKE YIELDS RATHER THAN BORROWING`
+asserted `findingsRead: 0` — it exercised the yield *before anything is read*. The yield the
+comment reasoned about was the one that stranded an alert permanently, and nothing went near it.
+
+**What to do with it:** when a comment argues that a case is safe, that is the case to write a
+test for. A comment reasoning hard about a branch is evidence somebody found it worth thinking
+about and stopped there. **Ask which instance of the branch the green test took** — "it took the
+other one" has been the answer twice.
+
+### The count came from my instrument rather than from the file
+
+I reported three bare catch-alls in a file that has four. My diagnostic patch matched `} catch {`;
+the fourth begins `catch {` on its own line. I instrumented three, saw three, and reported three —
+**while reporting a defect about an error path that reports what its instrument produced rather
+than what happened.**
+
+**What to do with it:** a count produced by a tool you wrote is a measurement of your tool. Before
+reporting a number, get it a second way — `grep -c` the file, or count by hand — and if the two
+disagree, the file wins. The same rule as deriving a check from the other side of the boundary,
+applied to your own instruments.
+
+**And its sibling, from the same feature:** I concluded a code path was unreachable because the
+database refused my test input. My input used an invented namespace the constraint forbids. The
+database was telling me the namespace and I read it as telling me the path did not exist. **A
+search over invented values proves something about the values you invented.**
