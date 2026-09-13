@@ -88,3 +88,25 @@ console.log(JSON.stringify({
     IT_NEVER_HAD_ENOUGH_FAILURES_EITHER_WAY: c.findings === 0 && d.findings === 0,
   },
 }, null, 2))
+
+// ── E. THE OTHER RULE'S THRESHOLD IS FIVE, NOT TEN ──────────────────────────────────────────
+// Added after a fleet query reported "most ever in any 15 minutes for one subject and application:
+// FIVE, moments reaching ten: zero" and concluded the rules have never had cause to fire. That is
+// true of the ten-threshold rule. The SECOND rule takes five failures followed by a success, so a
+// maximum of exactly five sits ON its boundary rather than below it.
+const fiveThenSuccess: AuthNormalizedEvent[] = [
+  ...Array.from({ length: 5 }, (_, i) => event(`b-fail-${i}`, -6 + i)),
+  event('b-success', -1, { outcome: 'SUCCESS', errorCode: 0 }),
+]
+const e = look('E — five 50126 failures then one success, same client address', fiveThenSuccess)
+console.log(JSON.stringify({
+  QA_SECOND_RULE_THRESHOLD: {
+    ...e,
+    FIVE_IS_ENOUGH_FOR_THE_SECOND_RULE: e.findings > 0,
+    // And the control: four is not, so five is the boundary rather than an artefact of the fixture.
+    withFour: look('four then a success', [
+      ...Array.from({ length: 4 }, (_, i) => event(`c-fail-${i}`, -6 + i)),
+      event('c-success', -1, { outcome: 'SUCCESS', errorCode: 0 }),
+    ]).findings,
+  },
+}, null, 2))
