@@ -107,7 +107,7 @@ second line of proof that they are.
 
 ## 3. Migrations and rollback
 
-Seven migrations carry this feature. **All seven are additive or widening — none drops a column,
+Nine migrations carry this feature. **All but the last are additive or widening — none drops a column,
 narrows a type, or rewrites a row.**
 
 | Migration | What it does |
@@ -119,6 +119,8 @@ narrows a type, or rewrites a row.**
 | `20260913020000_send_job_cancelled` | replaces one CHECK with a wider one |
 | `20260913040000_alert_suppressed_addresses` | one new table |
 | `20260913060000_send_job_cancellation_provenance` | three **nullable** columns on `alert_send_jobs`, two CHECKs, one index |
+| `20260913080000_notification_alert_type` | one **nullable** column on `notifications`, one index |
+| `20260913100000_disposition_key_and_vocabulary` | renames a column and an index, translates rows, swaps one CHECK |
 
 ### Measured, not assumed
 
@@ -155,7 +157,7 @@ older code against a migrated database does not roll the schema back and does no
 also means **the schema advances the moment any container starts with these migrations present.**
 Deploying this branch is the schema change; there is no separate migration step to withhold.
 
-⚠ **Editing an already-applied migration is SILENT.** Measured: after changing
+⚠ **Editing an already-applied migration is SILENT — and it has now happened here, twice, and been corrected forward. See the handoff.** Measured: after changing
 `20260912120000` in place, `migrate deploy` reported *No pending migrations to apply* and
 `migrate status` reported *Database schema is up to date* against a database holding the
 pre-edit checksum. Neither noticed. **In-place edits are defensible only while these migrations

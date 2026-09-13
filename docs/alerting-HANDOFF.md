@@ -878,6 +878,45 @@ verdict — delivered, bounced, complained — and that is now worded as **deliv
 persisted** rather than as an absent ledger, because a blocker a reader can disprove on sight
 teaches them to skim the rest of the list.
 
+### Forward migrations only — a rule now, not a judgement
+
+**Two changes were made by editing `20260912190000` in place: the `rule_id` → `alert_type_id`
+rename and the disposition vocabulary. Both were wrong, and the failure is silent.** Measured
+against a database migrated before the edits:
+
+```
+prisma migrate deploy  ->  No pending migrations to apply.
+prisma migrate status  ->  Database schema is up to date!
+```
+
+…while the column is still `rule_id`, the CHECK still holds `RING | EMAIL | DIGEST | RECORD_ONLY`,
+and every write from the settings endpoint fails with **23514**. Both Prisma commands report
+health the whole time, and `backend/Dockerfile` runs `db:migrate:deploy` on every container start,
+so deploying *is* migrating — the state reaches production with nothing raising a hand.
+
+`20260912190000` has been restored to what it actually applied. `20260913100000` carries both
+corrections forward. **This is correct whether or not the old file ever reached a database**,
+which is the property that matters: an in-place edit is safe only under a premise nobody can
+verify from here, and being right about it once does not make it a method.
+
+**Existing rows are translated, not dropped.** `RING → ACT_NOW`, `EMAIL → ACT_TODAY`,
+`RECORD_ONLY` unchanged — `defaultPreference` run backwards, the only mapping that ever related
+the two vocabularies. **`DIGEST` had no tier**, so it becomes `ACT_TODAY` rather than being
+discarded; an MSP who asked to be batched loses the batching but not the setting, and that loss is
+stated rather than hidden.
+
+⚠ **THE ORDER OF THAT MIGRATION IS LOAD-BEARING AND A FRESH DATABASE CANNOT TEST IT.** Written
+with the row translation before the constraint swap, it failed on a real seeded database: writing
+`ACT_NOW` under the old CHECK raised 23514, rolled the whole migration back, and left it recorded
+as failed with every later deploy blocked by P3009. A fresh database has no rows to translate, so
+both orderings pass. The constraint now comes off first, the rows move, the new constraint goes on
+last.
+
+**Verified from both starting states**: an old database (with `RING`, `DIGEST` and `RECORD_ONLY`
+rows seeded) converges with every row translated and the endpoint's write succeeding; a fresh
+database ends in the identical shape. Idempotent across two further hand re-runs. Drift unchanged
+at 254 lines with no alerting table named.
+
 ### A yield and a failure are now different words
 
 **They were already distinguishable in the log** — a yield logged `YIELDED` and returned a report;
