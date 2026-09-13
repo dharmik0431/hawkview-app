@@ -39,6 +39,10 @@ const NO_DISPOSITIONS: Dispositions = {
 
 /** A store that works, with one method replaced by a thrower. */
 const storeWith = (over: Partial<PipelineStore> = {}): PipelineStore => ({
+  // Added when b9187d3 gave `PipelineStore` a new method. The typecheck refused the double before
+  // it ran, which is the point of typechecking a probe: the alternative is a double that silently
+  // lacks a method the subject now calls.
+  countUnknownAlertTypes: async () => 0,
   findOpenFindings: async () => [finding(1), finding(2), finding(3)],
   findExistingIncidents: async (): Promise<readonly ExistingIncident[]> => [],
   loadDispositions: async () => NO_DISPOSITIONS,
