@@ -306,7 +306,8 @@ model AlertSendJob {
   id             String    @id @default(uuid()) @db.Uuid
   messageId      String    @unique @map("message_id") @db.VarChar(400)
   idempotencyKey String    @map("idempotency_key") @db.VarChar(400)
-  /// READY | CLAIMED | SENT | EXHAUSTED | GAVE_UP — constrained in SQL, see the migration.
+  /// READY | CLAIMED | SENT | EXHAUSTED | GAVE_UP | CANCELLED — constrained in SQL, see the
+  /// migration. CANCELLED is the operator stop; it is terminal and cannot be claimed again.
   state          String    @db.VarChar(20)
   attemptsMade   Int       @map("attempts_made")
   maxAttempts    Int       @map("max_attempts")
@@ -342,6 +343,37 @@ model AlertSendAttempt {
   @@unique([messageId, attemptNo])
   @@index([settledKind, startedAt])
   @@map("alert_send_attempts")
+}
+
+/// AN ADDRESS THAT MUST NOT BE WRITTEN TO AGAIN. A hard bounce is a fact about an address, not
+/// an error in a log — the mail server has said the mailbox does not exist, and continuing to
+/// attempt it is what earns a sending domain a reputation problem. The damage lands on every
+/// other message HawkView sends, not on the one that bounced.
+///
+/// THE ADDRESS IS THE PRIMARY KEY, not a surrogate id. A uuid key permits two rows disagreeing
+/// about one address, and then "is this suppressed" has two answers and no owner.
+///
+/// NO ORGANISATION COLUMN, deliberately, and it is the uncomfortable direction: a mailbox proven
+/// dead by one MSP's send is dead for all of them, because the fact is about the mailbox. Scoping
+/// it per organisation would let a second organisation re-prove the same dead address and take
+/// the same reputation hit to learn what was already known.
+///
+/// NO EXPIRY, AND NO UNSUPPRESS PATH YET. A hard bounce does not heal on a timer, so a TTL would
+/// be a guess that resumes sending to a dead mailbox on a schedule. Removing one is a deliberate
+/// act; that it currently requires SQL is flagged in the handoff rather than hidden.
+model AlertSuppressedAddress {
+  address           String   @id @db.VarChar(320)
+  /// HARD_BOUNCE | COMPLAINT | MANUAL — constrained in SQL, see the migration.
+  reason            String   @db.VarChar(30)
+  /// What the provider said, kept verbatim so a wrong suppression can be argued with.
+  because           String?  @db.VarChar(500)
+  /// The message that proved it. Null for MANUAL, which has no send behind it.
+  messageId         String?  @map("message_id") @db.VarChar(400)
+  firstSuppressedAt DateTime @map("first_suppressed_at") @db.Timestamptz(6)
+  lastSeenAt        DateTime @map("last_seen_at") @db.Timestamptz(6)
+
+  @@index([reason, firstSuppressedAt])
+  @@map("alert_suppressed_addresses")
 }
 
 model Organization {

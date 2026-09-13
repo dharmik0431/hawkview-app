@@ -157,9 +157,9 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1789 tests, 1685 pass, 0 fail.** The remaining 104 are database-integration tests requiring a
+**1799 tests, 1692 pass, 0 fail.** The remaining 107 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
-so **the 1685 figure does not cover them.** They have been run, separately and against a real
+so **the 1692 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
 establish. Do not read the two results as one number.
 
@@ -620,21 +620,68 @@ nobody has ruled on it.
 with no organisation column. That couples the stop button to the message-id format. The
 alternative reopens what R8 closed. Flagged, not decided.
 
+### Suppression now survives a restart, and the table is keyed by the address
+
+`Suppressions` was an interface with one in-memory implementation. A hard bounce was therefore
+forgotten on the next deploy and the dead mailbox was written to again — **that is not a
+suppression, it is a cache with a very short life**, and a mailbox retried after every release is
+what costs a sending domain its reputation, on every other message rather than on the one that
+bounced. `alert_suppressed_addresses` (migration `20260913040000`) holds them.
+
+**The address is the primary key**, not a uuid with a unique index. Those are the same thing
+until somebody writes the second row; a surrogate key makes two rows disagreeing about one
+address *writeable*, and then "is this suppressed" has two answers and no owner.
+
+**Two timestamps, and the first never moves.** `first_suppressed_at` answers *since when* and a
+repeat bounce moving it would reset the age of every address still bouncing — so the mailboxes
+dead longest would read as the newest, the exact reverse of what anybody opens the table to find
+out. `last_seen_at` moves instead. The reason does not move either: a complaint after a hard
+bounce does not make the mailbox exist again.
+
+**The restart is what the integration test simulates**, by discarding the snapshot and loading a
+fresh one, which is what a new process does. A unit test cannot see this failure, because the
+failure *is* the process ending. Beside it: an empty snapshot still sends to the same address, so
+the refusal is the stored row rather than a sender that has stopped sending.
+
+**`suppressionFor` has three answers, not two.** `NONE`, `SUPPRESS`, and `UNSUPPRESSABLE` — an
+address that should be suppressed and will not fit the column. Collapsing that third case into
+`null` is how a permanent hole acquires the shape of a working guard: the address would be
+retried for ever while the code read as if it had handled the bounce. An address is never
+truncated to fit, because a truncated address is a different address.
+
+⚠ **NOTHING WRITES TO IT IN PRODUCTION YET**, because nothing drains the queue — see the missing
+list. The producer exists (`suppressionFor` over a `REFUSED_PERMANENT` settlement) and is proven
+end to end against a real database, but the worker that would call it is not written.
+
+⚠ **NO UNSUPPRESS PATH.** Removing a suppression currently requires SQL. Deliberate — a hard
+bounce does not heal on a timer, so a TTL would resume sending to a dead mailbox on a schedule —
+but an operator who needs to undo a wrong suppression has no button, and that is a real gap
+rather than a closed decision.
+
 ### Still missing before anything can send
 
-- **A real transport.** Deliberately absent; see above.
+- **NOTHING DRAINS THE QUEUE.** There is no sender worker: `attemptSend` has no production
+  caller, nothing calls `claimStatement`, and `SendPermit` is produced only inside tests. Intake
+  writes `alert_send_jobs` rows on every tick and **no code path ever reads one.** This is the
+  same defect the intake half already had and fixed — *the chain was joined by the test rather
+  than by the product* — surviving in the other half, and it is the single largest gap on this
+  list: a real transport would change nothing on its own, because nothing would call it. Grep
+  that establishes it: `grep -rn "attemptSend" src --include=*.ts | grep -v test` returns only
+  the definition.
+- **A real transport.** Deliberately absent; see above. Second on this list, not first.
 - **A ROUTE FOR THE WEBHOOK VERIFIER.** The verifier is built and tested; *nothing calls it.*
   There is no `@Public() @Post('resend')` controller, so the verdict has a producer and no
   caller and **no delivery outcome can be recorded yet.** Whoever writes it must hand the
   verifier the RAW body — a parsed-and-restringified one changes bytes and every genuine request
-  will read as `SIGNATURE_INVALID`, which looks like a key problem and is not.
-- **A suppression store.** `Suppressions` is an interface with an in-memory implementation; no
-  table holds suppressed addresses, so **suppression does not survive a restart** — a hard-bounced
-  address is retried again after the next deploy, which is the reputation damage the suppression
-  was for.
+  will read as `SIGNATURE_INVALID`, which looks like a key problem and is not. Note that
+  `NestFactory.create(AppModule)` in `main.ts` passes no `rawBody` option, so the raw bytes are
+  **not available today** and enabling them is a bootstrap change affecting every route.
+- **A LEDGER THAT PERSISTS.** `email-delivery.ts` builds `Ledger` values in memory and no table
+  holds them. Until one exists the webhook route would authenticate an event and then discard
+  it, which is why the route is not written yet rather than written and left half-connected.
 
 Built since this list was first written, and no longer on it: the webhook verifier itself, the
-`emailEnabled` switch with absence reading as off, and the stop button.
+`emailEnabled` switch with absence reading as off, the stop button, and the suppression store.
 
 ### Intake will not run until somebody chooses the watermark
 
@@ -717,7 +764,7 @@ evidence of that at all.**
 ### Database-integration tests HAVE now been run — and the count is not reproducible
 
 This section used to say **"96 tests, zero runs"**. Replaced rather than deleted, because the
-warning it carried still stands: **the 1685 passing figure does not cover this suite**, and the
+warning it carried still stands: **the 1692 passing figure does not cover this suite**, and the
 apply phase is exactly the work where it would matter most.
 
 They have been run, by QA and independently by the engineer, against disposable PostgreSQL 15.
@@ -729,13 +776,14 @@ then 27, 22, 29 by the engineer, then 22, 22, 11, 15, 14 by QA on one cluster wi
 inputs. **The suite has no reproducible number.** Writing the environment down does not fix
 that, which is why it is worse than a missing document.
 
-**THE ALERTING INTEGRATION FILE IS NOT PART OF THAT, and must not be discounted with it.**
-`src/alerts/finding-pipeline.database-integration.test.ts` — 8 tests — passes 8/8 against a
-freshly `migrate deploy`-ed PostgreSQL 15 created and destroyed inside the session. It shares
-the harness but not the wall: it touches no KMS and no risk key store, and it has been green on
-every run. The unreproducible numbers above are the identity-risk suite. **Two different
-suites, two different states; a reader who takes one figure for the other will either trust the
-alerting evidence too little or the identity-risk evidence far too much.**
+**THE ALERTING INTEGRATION FILES ARE NOT PART OF THAT, and must not be discounted with them.**
+`finding-pipeline.database-integration.test.ts` (8 tests) and
+`suppression-store.database-integration.test.ts` (3) pass **11/11** against a freshly
+`migrate deploy`-ed PostgreSQL 15, created and destroyed inside the session. They share the
+harness but not the wall: they touch no KMS and no risk key store, and they have been green on
+every run. The unreproducible numbers above are the identity-risk suite. **Two different suites,
+two different states; a reader who takes one figure for the other will either trust the alerting
+evidence too little or the identity-risk evidence far too much.**
 
 **AND THAT IS A DESCRIPTION OF THE VARIANCE, NOT AN ACCOUNT OF THE FAILURES.** An earlier
 version of this section said “one speed-sensitive suite sampled four times” as though that
