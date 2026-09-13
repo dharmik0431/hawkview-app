@@ -1,3 +1,5 @@
+import { readTier, type ReadTier } from './tier.ts'
+
 export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
 
 /**
@@ -15,15 +17,17 @@ export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
  * not working. The backend's own comment warns against exactly this, about a
  * second producer; it arrived from the reader instead.
  *
- * THE TIER IS NOT ON THE WIRE AND IS NOT REBUILT HERE. `severity` cannot be
- * inverted back into a tier: `tenant-sync.service.ts` publishes collector rows
- * at `critical` too (a lost Microsoft connection), so `critical -> ACT_NOW`
- * would label a disconnected tenant an ACT_NOW alert. The only honest
- * discriminator is the alert type id, and the list response does not send one --
- * `eventType` holds it for alert rows, but reading the tier out of it needs a
- * copy of the catalogue on the client, which is the same derivation twice with a
- * network hop in between. Until the API sends the tier, this renders what it
- * sends.
+ * THE TIER NOW TRAVELS AS ITS OWN FIELD, AND IS STILL NOT REBUILT HERE. When
+ * this comment was written the list response sent no tier and no alert type id;
+ * b5e2c79 added both, deriving the tier server-side through the catalogue. It is
+ * read by `./tier.ts` and never reconstructed, because `severity` cannot be
+ * inverted into a tier: `tenant-sync.service.ts` publishes collector rows at
+ * `critical` too (a lost Microsoft connection), so `critical -> ACT_NOW` would
+ * label a disconnected tenant an ACT_NOW alert. That is a correctness argument,
+ * not a preference about deriving twice.
+ *
+ * `severity` is still sent and still read, because a row that is not an alert has
+ * no tier and its severity IS its urgency.
  *
  * Optional because most notifications say nothing about urgency, and absent
  * means "this row did not say" rather than "nothing is urgent".
@@ -53,6 +57,15 @@ export interface NotificationItem {
   severity?: NotificationSeverity
   /** Which alert type raised this, when one did. */
   alertTypeId?: string
+  /**
+   * The urgency tier, as the API sends it.
+   *
+   * ALWAYS PRESENT, unlike `severity`, because its NOT_STATED arm already
+   * carries "the API did not say". A conditional key here would give absence
+   * two spellings -- a missing key and a NOT_STATED value -- and a reader
+   * checking one of them would miss the other.
+   */
+  tier: ReadTier
 }
 
 export interface NotificationRefreshResult {
@@ -112,6 +125,12 @@ function parseNotificationItem(value: unknown): NotificationItem | null {
   // the backend declares, so a value added there fails a test here rather than
   // disappearing from the screen.
   const alertTypeId = optionalString(value.alertTypeId)
+  // NOT DERIVED FROM `severity` OR FROM `alertTypeId`. The API computes the tier
+  // from the row's alert type through the catalogue and sends it; rebuilding it
+  // here would need a copy of the catalogue on the client, and inverting
+  // `severity` is not merely redundant but wrong -- `critical` is also what a
+  // lost Microsoft connection is published at.
+  const tier = readTier(value.tier)
   const severity = (NOTIFICATION_SEVERITIES as readonly string[]).includes(
     value.severity as string
   )
@@ -133,6 +152,7 @@ function parseNotificationItem(value: unknown): NotificationItem | null {
     // key holding undefined. The two are equal to a reader and not to a deep
     // comparison, and "this row said nothing about urgency" is better carried
     // by the field not being there.
+    tier,
     ...(severity ? { severity } : {}),
     ...(alertTypeId ? { alertTypeId } : {}),
   }

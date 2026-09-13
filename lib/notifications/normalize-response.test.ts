@@ -19,6 +19,9 @@ const notification: NotificationItem = {
   actionLabel: 'Review tenant',
   occurrenceCount: 2,
   resolved: false,
+  // Always present: NOT_STATED is how the reader says the API did not say, so
+  // absence never needs a second spelling as a missing key.
+  tier: { kind: 'NOT_STATED' },
 }
 
 const silentDiagnostics = {
