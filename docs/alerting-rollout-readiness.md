@@ -71,10 +71,10 @@ find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 
 | What | Result |
 | --- | --- |
-| Unit suite | **1847 tests, 1724 pass, 0 fail, 123 skipped** |
+| Unit suite | **1848 tests, 1724 pass, 0 fail, 124 skipped** |
 | `tsc --noEmit -p tsconfig.json` | clean |
 | `tsc --noEmit -p tsconfig.scripts.json` | clean |
-| Alerting integration, real PostgreSQL 15 | **27/27** — 14 pipeline, 5 in-app, 3 suppression, 5 dispositions |
+| Alerting integration, real PostgreSQL 15 | **28/28** — 15 pipeline, 5 in-app, 3 suppression, 5 dispositions |
 | Schema drift vs `schema.prisma` | 254 lines, **none naming an `alert_` table** |
 
 **The 113 skipped are the database-integration tests**, gated behind
@@ -263,6 +263,15 @@ so.
 **An in-place edit to an already-applied migration is invisible to both `prisma migrate status`
 and `prisma migrate deploy`; the only protection is never doing it.** A believed safety net is
 worse than a known gap, because it is the reason nobody looks.
+
+**AND WHAT A RESTORE ACTUALLY BUYS, because it is easy to overclaim.** Restoring an edited
+migration makes the file match the CONTENT that was applied. Whether it matches a recorded DIGEST
+depends on the line endings of the checkout that applied it — Prisma hashes the bytes on disk, so
+content is the durable claim and digest is environment-dependent. **A restore does not buy safety
+at deploy time**: both commands still report health over an edited applied migration, before and
+after. What it buys is that the file is an accurate record of what ran, that the correction becomes
+a step every database passes through so the routes converge, and that a tool which *does* validate
+will not fire spuriously.
 
 ⚠ **A file legitimately carries two recorded checksums.** Prisma hashes the bytes on disk, so the
 same migration applied from a Windows checkout records the CRLF digest and from Linux the LF

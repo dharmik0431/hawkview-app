@@ -319,6 +319,7 @@ test('A COMMIT THAT FAILS REPORTS THE PHASE AND EVERYTHING IT LOST', async () =>
     findOpenFindings: async () => [finding()],
     findExistingIncidents: async () => [],
     loadDispositions: async () => canEmail,
+    countUnknownAlertTypes: async () => 0,
     commit: async () => { throw new Error('the timeout was 5000 ms, however 5002 ms passed') },
   }
   const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
@@ -341,6 +342,7 @@ test('A READ THAT FAILS IS A DIFFERENT PHASE, and reports nothing attempted', as
     findOpenFindings: async () => { throw new Error('connection terminated') },
     findExistingIncidents: async () => [],
     loadDispositions: async () => canEmail,
+    countUnknownAlertTypes: async () => 0,
     commit: async () => ({ incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0 }),
   }
   const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
@@ -356,6 +358,7 @@ test('AND A HEALTHY TICK IS NEITHER, or the two above are satisfied by always fa
     findOpenFindings: async () => [finding()],
     findExistingIncidents: async () => [],
     loadDispositions: async () => canEmail,
+    countUnknownAlertTypes: async () => 0,
     commit: async () => ({ incidentsWritten: 1, notificationsWritten: 1, jobsWritten: 1 }),
   }
   const outcome = await runIntake(store, WATERMARK, T0, Date.now() + 30_000, '2026-01-01T00:00:00.000Z')
@@ -443,6 +446,7 @@ test('THE TICK COMMITS IN CHUNKS, one transaction each', async () => {
     findOpenFindings: async () => manyFindings(FINDINGS_PER_CHUNK * 2 + 5),
     findExistingIncidents: async () => [],
     loadDispositions: async () => canEmail,
+    countUnknownAlertTypes: async () => 0,
     commit: async (incidents, notifications, jobs) => {
       commits.push(incidents.length)
       return {
@@ -475,6 +479,7 @@ test('A YIELD BETWEEN CHUNKS KEEPS THE EARLIER ONES AND LEAVES THE REST UNTOUCHE
     findOpenFindings: async () => manyFindings(FINDINGS_PER_CHUNK * 3),
     findExistingIncidents: async () => [],
     loadDispositions: async () => canEmail,
+    countUnknownAlertTypes: async () => 0,
     commit: async (incidents, notifications, jobs) => {
       commits += 1
       return {
@@ -521,6 +526,7 @@ test('AN INCIDENT OPENED IN ONE CHUNK IS NOT REOPENED BY THE NEXT', async () => 
     findOpenFindings: async () => shared,
     findExistingIncidents: async () => [],
     loadDispositions: async () => canEmail,
+    countUnknownAlertTypes: async () => 0,
     commit: async (incidents, notifications, jobs) => ({
       incidentsWritten: incidents.length,
       notificationsWritten: notifications.length,
@@ -552,6 +558,7 @@ test('A TICK THAT READ ITS LIMIT SAYS SO', async () => {
     findOpenFindings: async () => manyFindings(MAX_FINDINGS_PER_TICK + 1),
     findExistingIncidents: async () => [],
     loadDispositions: async () => canEmail,
+    countUnknownAlertTypes: async () => 0,
     commit: async (incidents, notifications, jobs) => ({
       incidentsWritten: incidents.length,
       notificationsWritten: notifications.length,

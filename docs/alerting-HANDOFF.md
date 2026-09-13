@@ -160,7 +160,7 @@ Run everything the way CI does, from `backend/`:
 find src -type f -name '*.test.ts' | sort | xargs ./node_modules/.bin/tsx --test
 ```
 
-**1847 tests, 1724 pass, 0 fail.** The remaining 123 are database-integration tests requiring a
+**1848 tests, 1724 pass, 0 fail.** The remaining 124 are database-integration tests requiring a
 real Postgres and `HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1`, which this command does not set,
 so **the 1696 figure does not cover them.** They have been run, separately and against a real
 cluster — see *Database-integration tests HAVE now been run* below for what that did and did not
@@ -969,6 +969,26 @@ last.
 rows seeded) converges with every row translated and the endpoint's write succeeding; a fresh
 database ends in the identical shape. Idempotent across two further hand re-runs. Drift unchanged
 at 254 lines with no alerting table named.
+
+### A type the catalogue no longer declares is counted where operators look
+
+`alertTierFor` answers `UNKNOWN_ALERT_TYPE` for a notification row naming a type this build does
+not have, and **the inbox deliberately shows no tier for it** — a catalogue id nobody can resolve
+is not something a reader can act on. That is right for the reader, and it means the fact reached
+**nobody at all**.
+
+The tick now counts them, scoped to the organisations it already touched and served by the
+`(organization_id, alert_type_id)` index, and reports
+`notificationsWithUnknownAlertType`. It cannot arise from this build — the tick writes
+`alert_type_id` from a catalogue lookup — so a non-zero means a type was REMOVED and rows written
+by an older build survived, which is a deployment event nobody would otherwise connect to a blank
+badge.
+
+⚠ **A FAILURE TO COUNT IS NOT A FAILURE OF THE TICK, and the zero is therefore ambiguous.** The
+count is wrapped so an operator's diagnostic cannot fail a run that would otherwise deliver
+alerts — but that means zero reads as either *none* or *could not count*. Stated here rather than
+left for somebody to infer, and the trade is deliberate: inverting it would let a diagnostic
+silence a delivery.
 
 ### The tick commits in chunks, and can say it is behind
 

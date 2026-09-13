@@ -554,6 +554,19 @@ export interface PipelineStore {
   findOpenFindings(sinceIso: string): Promise<readonly FindingRow[]>
   findExistingIncidents(organizationIds: readonly string[]): Promise<readonly ExistingIncident[]>
   loadDispositions(organizationIds: readonly string[]): Promise<Dispositions>
+  /** How many notification rows carry an alert type the catalogue no longer declares.
+   *
+   * **IT IS BADGED NOWHERE, SO IT MUST BE COUNTED SOMEWHERE.** `alertTierFor` answers
+   * `UNKNOWN_ALERT_TYPE` for such a row and the inbox deliberately shows no tier for it — a
+   * catalogue id this build does not have is not something a reader can act on. That is right for
+   * the reader and it means the fact reaches nobody at all unless an operator is told, so it goes
+   * in the intake report where they already look.
+   *
+   * It cannot arise from this build: the tick writes `alert_type_id` from a catalogue lookup. It
+   * arises when a type is REMOVED from the catalogue and rows written by an older build survive
+   * — which is a deployment event nobody would otherwise connect to a blank badge. */
+  countUnknownAlertTypes(
+    organizationIds: readonly string[], declared: readonly string[]): Promise<number>
   /** BOTH WRITES OR NEITHER, IN ONE TRANSACTION. They were two calls, and a budget yield
    * between them left an incident with no job — which the next run skips as
    * `INCIDENT_ALREADY_OPEN`, so the alert is never sent and nothing reports it. `neverSent`
@@ -587,6 +600,9 @@ export interface IntakeReport {
    * default applies and the alert still goes. The harm is entirely that the MSP believes
    * otherwise. */
   readonly unreadableDispositions: readonly UnreadableDisposition[]
+  /** Notification rows whose alert type the catalogue no longer declares. Zero on any build that
+   * has not removed a type. See `PipelineStore.countUnknownAlertTypes`. */
+  readonly notificationsWithUnknownAlertType: number
   readonly accountingProblems: readonly string[]
   /** True when the window ran out before the work finished. **THE CASCADE RULE:** intake yields
    * rather than borrowing from what comes after it, because collection outranks alerting always
@@ -732,6 +748,7 @@ export async function runIntake(
     findingsRead, incidentsWritten: 0, notificationsWritten: 0, jobsWritten: 0, skipped: [],
     unmappedRules: [], unreadableDispositions: [], accountingProblems: [], yieldedOnBudget: yielded,
     truncated: false, chunksCommitted: 0, findingsUnprocessed: 0,
+    notificationsWithUnknownAlertType: 0,
   })
   const ran = (report: IntakeReport): IntakeOutcome => ({ kind: 'RAN', report })
   if (now() >= deadlineAt) return ran(empty(true))
@@ -768,6 +785,19 @@ export async function runIntake(
     return ran({ ...empty(true, findings.length), truncated, findingsUnprocessed: findings.length })
   }
 
+  // COUNTED ONCE PER TICK, over the organisations this tick already touched, on the index the
+  // alert-type column carries. A failure to count is NOT a failure of the tick: this is an
+  // operator's diagnostic, and letting it fail a run that would otherwise deliver alerts inverts
+  // what matters. Zero is honest for "we could not count" here only because the field is a
+  // diagnostic — it is stated in the report's own comment so nobody reads a zero as proof.
+  let notificationsWithUnknownAlertType = 0
+  try {
+    notificationsWithUnknownAlertType = await store.countUnknownAlertTypes(
+      organizationIds, ALERT_CATALOG.map((type) => type.id))
+  } catch {
+    notificationsWithUnknownAlertType = 0
+  }
+
   const opened: ExistingIncident[] = [...existing]
   const skipped: Skipped[] = []
   const unmapped = new Set<string>()
@@ -793,6 +823,7 @@ export async function runIntake(
         truncated,
         chunksCommitted,
         findingsUnprocessed: findings.length - processed,
+        notificationsWithUnknownAlertType,
       })
     }
 
@@ -842,5 +873,6 @@ export async function runIntake(
     truncated,
     chunksCommitted,
     findingsUnprocessed: findings.length - processed,
+    notificationsWithUnknownAlertType,
   })
 }

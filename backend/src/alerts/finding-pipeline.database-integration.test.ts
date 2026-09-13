@@ -5,6 +5,7 @@ import {
   cancelReason, cancelStatement, classifyCancellation, claimStatement, workerId,
 } from './send-queue.js'
 import { messageId } from './email-delivery.js'
+import { ALERT_CATALOG } from './alert-catalog.js'
 import { FINDINGS_PER_CHUNK, runIntake, type PipelineStore, type Watermark } from './finding-pipeline.js'
 import { pipelineStore, type SqlRunner } from './pipeline-store.js'
 
@@ -852,6 +853,52 @@ test('A TICK LARGER THAN ONE CHUNK COMMITS IN SEVERAL, against the real tables',
     assert.equal(again.jobsWritten, 0)
     assert.equal(again.incidentsWritten, 0)
     assert.equal((await client.query('SELECT count(*)::int AS n FROM alert_send_jobs')).rows[0].n, total)
+  } finally {
+    await client.end()
+  }
+})
+
+test('A NOTIFICATION NAMING A TYPE THE CATALOGUE NO LONGER HAS IS COUNTED', { skip: !RUN || !URL }, async () => {
+  // **IT IS BADGED NOWHERE ON PURPOSE.** `alertTierFor` answers UNKNOWN_ALERT_TYPE and the inbox
+  // shows no tier — a catalogue id this build does not have is not something a reader can act on.
+  // That is right for the reader and it means the fact reaches NOBODY unless an operator is told,
+  // so it is counted where they already look.
+  const client = new pg.Client({ connectionString: URL })
+  await client.connect()
+  try {
+    await scaffold(client)
+    await client.query('TRUNCATE alert_send_jobs, alert_incidents, alert_rule_dispositions CASCADE')
+    await client.query('DELETE FROM notifications')
+
+    const put = (alertTypeId: string | null, key: string) => client.query(
+      `INSERT INTO notifications (id, organization_id, event_type, category, severity, title,
+          description, dedupe_key, source, alert_type_id, occurrence_count,
+          first_occurred_at, last_occurred_at, created_at, updated_at)
+        VALUES (gen_random_uuid(), $1, 'security.x', 'error', 'critical', 't', 'd', $2,
+                'identity-risk', $3, 1, now(), now(), now(), now())`,
+      [ORG, key, alertTypeId])
+
+    // One the catalogue declares, one it does not, and one that is not an alert at all.
+    await put('security.suspected_credential_attack', 'k-known')
+    await put('security.retired_in_an_older_build', 'k-unknown')
+    await put(null, 'k-collector')
+
+    const declared = ALERT_CATALOG.map((type) => type.id)
+    assert.equal(await storeFor(client).countUnknownAlertTypes([ORG], declared), 1,
+      'only the one the catalogue no longer declares')
+
+    // NOT VACUOUS IN EITHER DIRECTION. A row with no alert type is not an unknown type — absence
+    // is not an unknown — and a declared one is not counted either.
+    await client.query("DELETE FROM notifications WHERE dedupe_key = 'k-unknown'")
+    assert.equal(await storeFor(client).countUnknownAlertTypes([ORG], declared), 0)
+
+    // AND AN ORGANISATION THE TICK DID NOT TOUCH IS NOT COUNTED, or the number would grow with
+    // the fleet rather than with the problem.
+    await put('security.retired_in_an_older_build', 'k-unknown-2')
+    assert.equal(
+      await storeFor(client).countUnknownAlertTypes(['99999999-0000-4000-8000-000000009999'], declared),
+      0)
+    assert.equal(await storeFor(client).countUnknownAlertTypes([ORG], declared), 1)
   } finally {
     await client.end()
   }

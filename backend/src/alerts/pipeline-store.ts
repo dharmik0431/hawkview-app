@@ -145,6 +145,24 @@ export function pipelineStore(runner: SqlRunner): PipelineStore {
       return { byOrganizationAndAlertType, anyRecipientByOrganization, unreadable } satisfies Dispositions
     },
 
+    /** How many notification rows name an alert type the catalogue no longer declares.
+     *
+     * SCOPED TO THE ORGANISATIONS THIS TICK TOUCHED and served by
+     * `notifications(organization_id, alert_type_id)`, so it is one indexed count rather than a
+     * scan. Rows with no alert type at all are not alerts and are excluded — absence is not an
+     * unknown type. */
+    async countUnknownAlertTypes(organizationIds, declared) {
+      if (organizationIds.length === 0) return 0
+      const rows = await runner.query<{ n: number }>(
+        `SELECT count(*)::int AS n
+           FROM notifications
+          WHERE organization_id = ANY($1::uuid[])
+            AND alert_type_id IS NOT NULL
+            AND NOT (alert_type_id = ANY($2::varchar[]))`,
+        [organizationIds, declared])
+      return Number(rows[0]?.n ?? 0)
+    },
+
     /** ALL THREE WRITES OR NONE. Incidents and jobs were two calls once, and a budget yield
      * between them left an incident with no job — which every later run skips as
      * `INCIDENT_ALREADY_OPEN`, so the alert was never sent and nothing reported it. The

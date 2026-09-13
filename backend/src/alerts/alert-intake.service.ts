@@ -121,6 +121,7 @@ export class AlertIntakeService {
       // A SETTING THE PRODUCT CANNOT ACT ON, where operators look. It silences nothing — the
       // catalogue default applies — so the harm is entirely that the MSP believes otherwise.
       unreadableDispositions: report.unreadableDispositions,
+      notificationsWithUnknownAlertType: report.notificationsWithUnknownAlertType,
       accountingProblems: report.accountingProblems,
     }))
     return report.yieldedOnBudget
