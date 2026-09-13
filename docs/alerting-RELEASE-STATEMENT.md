@@ -8,18 +8,26 @@ where something was not measured it says so rather than reading as covered.
 
 ## The commit
 
-**`7530528`** — the tip of `agent/alerts-step-01`, **and it is pushed.** The remote branch is at the
-same commit, so what ships is what was checked. Anybody can re-run the check:
+**`7530528`** — the tip of `agent/alerts-step-01`, **and it is pushed.** Local and remote are the
+same commit, nothing outstanding:
 
 ```bash
-git ls-remote origin agent/alerts-step-01
+git ls-remote origin agent/alerts-step-01     # → 7530528, matching local
 ```
 
-Verified at the time of writing. It was *not* true an hour earlier — four commits were local-only —
-so if the tip moves again, run it again rather than trusting this line.
+This was **not** true an hour before writing — four commits were local-only — so if the tip has
+moved again, run that command rather than trusting this line.
 
-The behaviour below was measured at `b9187d3`; `7530528` and `ee8ab98` on top of it change
-documentation only.
+**The behaviour below was measured at `b9187d3`, and everything since is documentation.** Checked
+rather than assumed, and re-runnable:
+
+```bash
+git diff --name-only b9187d3..7530528 | grep -v '^docs/'    # → empty
+```
+
+Two files changed, `docs/alerting-HANDOFF.md` and `docs/alerting-rollout-readiness.md`. **No source
+file, no migration, no test.** So the commit that ships and the commit that was verified are the
+same product.
 
 ## What is in it
 
