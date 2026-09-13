@@ -602,7 +602,47 @@ rules have never been given a clean run to be narrow on.
 
 ---
 
-# THE CAUSE: three error codes are known, everything else silences the tenant
+# ~~THE CAUSE: three error codes are known, everything else silences the tenant~~
+
+
+> ## SUPERSEDED — THIS CAUSE WAS TESTED AND IT FAILED
+>
+> **Everything below this line is wrong about its conclusion.** The mechanism
+> it traces is real; the consequence I claimed for it is not. Retracted here,
+> at the claim, rather than corrected further down the file.
+>
+> QA drove the real `evaluateAuthenticationRules` with shipped fixtures — the
+> instrument I should have used and did not:
+>
+> - ten 50126 failures → **one finding, MATCHED**
+> - the same ten **plus one 50053** → **still one finding, still MATCHED**
+>
+> So **one unrecognised code does not silence a run.** What it changes is
+> qualification: `UNKNOWN_OUTCOMES` appears as a reason code and a caveat, and
+> the second rule moves to `NOT_EVALUATED`. Findings still flow.
+>
+> They then reconstructed the production window — 5 × 50053, 3 successes,
+> 3 × 50126 — and it produces nothing. **Deleting all five 50053 rows changes
+> nothing.** Three invalid-credential events cannot satisfy a rule that needs
+> ten in fifteen minutes. Removing the entire proposed cause does not move the
+> outcome, which is the control I never ran.
+>
+> And across all Graph-shaped history for five tenants: 2,366 successes
+> examined, and the most failures ever preceding a success at the same subject,
+> application and address is **one**. AUTH-005 needs five. AUTH-010 needs ten
+> in fifteen minutes and the most ever seen for one subject and application is
+> five. **Neither rule has ever had qualifying evidence.**
+>
+> **What actually holds is in the section titled RETRACTION AND WHAT SURVIVES
+> at the end of this file.**
+>
+> How I got it wrong: I traced a chain through the source and asserted its
+> consequence without executing it. `evaluateAuthenticationRules` is a pure
+> function with fixtures already in the tree — the case that would have
+> falsified me was one test away, and I wrote "CAUSE FOUND" instead. It is the
+> same failure I spent the day naming in other people: knowing the shape does
+> not help; only constructing the case does.
+
 
 ## First, correcting myself
 
@@ -867,7 +907,13 @@ Your framing of the limit is the right one and I would keep it: a count of zero
 produced by looking in the wrong place is the same defect in a measurement that
 the product has in its screens.
 
-# INTERIM, FINAL FORM
+# ~~INTERIM, FINAL FORM~~ — superseded, see RETRACTION below
+
+
+> **The 83f23fe5 row in the table below is retracted.** Its stated fault — an
+> unrecognised error code silencing the rule — was tested and failed. The
+> other two rows stand.
+
 
 **Zero matches is not correct behaviour and it is not narrow rules. The engine
 has never been given a run it could complete.**
@@ -908,3 +954,99 @@ could not complete an assessment for this tenant, and here is why", which is
 true, useful, and costs hours rather than weeks. Hiding buys nothing that
 sentence does not, and it removes the only surface that would show the fix
 working.
+
+---
+
+# RETRACTION AND WHAT SURVIVES
+
+This supersedes the `THE CAUSE` and `INTERIM, FINAL FORM` sections above, both
+of which are marked at their heads.
+
+## The retraction
+
+**I claimed a cause that was tested and failed.** I traced a chain through the
+source — `classify()` knows three codes, `UNKNOWN_OUTCOMES` is unnamed in
+`readiness()`, the catch-all yields `PARTIAL / INCOMPLETE_WINDOW` — and asserted
+that one unrecognised code silences a tenant's rule. The chain is real. The
+conclusion is not.
+
+QA drove the real evaluator with shipped fixtures. Ten 50126 failures produce one
+finding, MATCHED. The same ten plus one 50053 produce **the same finding, still
+MATCHED**. Findings flow; what changes is qualification.
+
+I never ran it. `evaluateAuthenticationRules` is a pure function with fixtures
+already in the tree, and the case that would have falsified me was one test away.
+I had spent the day telling other people that knowing a shape does not protect
+you and only constructing the case does, and then published "CAUSE FOUND" off a
+reading.
+
+Worse, I skipped the control I have asked for repeatedly: **remove the proposed
+cause and see whether the outcome moves.** QA ran it — delete all five 50053 rows
+and the window still produces nothing. That single check would have retracted
+this before it was written.
+
+## The likely answer
+
+**Nothing matched because nothing matching happened.**
+
+Across all Graph-shaped history for five tenants: 2,366 successes examined, and
+the most failures ever preceding a success at the same subject, application and
+address is **one**. `HV-ID-AUTH-005` needs five. `HV-ID-AUTH-010` needs ten
+within fifteen minutes, and the most ever recorded for one subject and
+application is five.
+
+Neither rule has ever had qualifying evidence. Zero findings is the detectors
+working and having nothing to report — the undramatic answer, and I dismissed it
+because I had found a mechanism and wanted it to be the cause.
+
+## What survives, and it is not nothing
+
+**1. Two of five tenants have no recent sign-in evidence and report as current.**
+Written up separately at `docs/sign-in-evidence-gap.md`, committed at `4492d67`.
+6facb85e last ingested 2026-09-10; 66735f04 2026-08-30. Both report a current
+`lastSuccessfulCollectionAt` over a window ending now, because
+`persistCompletedAuthenticationWindow` stamps the requested range rather than
+what came back. `latestEventAt` is the only field that differs and nothing reads
+it. Independent of alerting, true today, unaffected by this retraction.
+
+**2. The classifier chain is real as a mechanism, and QA established its actual
+consequence.** An unrecognised code does not suppress findings — it prevents a
+tenant being reported as **assessed and clear**. It reads as *not assessed*
+instead. That is could-not-look standing where nothing-found belongs, one layer
+deeper than any screen, and it is the same distinction this project has fixed
+four times in the UI. Smaller than I claimed and still worth fixing.
+
+The three estimates stand against *that* defect rather than against the
+zero-match question:
+
+- **Name the reason** — hours. `readiness()` receives the reason set and discards
+  it on its last line, which is why "INCOMPLETE_WINDOW" cost a day to interpret.
+- **Classify the codes** — days. 50053 is smart lockout and belongs with
+  credential failure, since lockout *is* repeated credential failure. Getting
+  this right changes whether a tenant can ever be reported as clear.
+- **Stop one event downgrading a tenant's qualification** — days, product
+  decision. Now correctly scoped: it degrades reporting, not detection.
+
+**3. dcb2a091 never reaching READY is still unexplained.** 27 fresh rows, source
+`WAITING`, `latestEventAt` null, window stamped `M365_AUDIT_STS` while the rule
+waits on `GRAPH_SIGN_INS`. My reading is that `window.source !== selected` fails
+at `authentication-source-readiness.ts:58` — but that is a reading, and the
+lesson of this retraction is that a reading is a hypothesis until it is run. Q12
+and Q13 in this file test it. **Do not treat it as established.**
+
+## What I would tell Dharmik
+
+The risk engine is not broken in the way I said this morning. On the evidence,
+the detectors are correct and have never seen a pattern that qualifies. That is
+the cheapest possible outcome and it should not be dressed up.
+
+What *is* broken is quieter and survives independently: the product cannot
+distinguish "assessed and clear" from "could not assess", at three separate
+layers — a tenant that stopped collecting, a source with no events, and a rule
+whose qualification was degraded by an unrecognised code. An MSP reads all three
+as "nothing wrong here".
+
+On hiding: **no.** There is nothing to hide from — the engine is not producing
+false results, it is producing correct empty ones. What it cannot do is say
+which kind of empty, and hiding the surface removes the only place that could
+ever say it.
