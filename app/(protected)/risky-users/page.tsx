@@ -408,6 +408,8 @@ export default function FleetRiskyUsersPage() {
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 distinct users flagged
+                {notAssessed > 0 &&
+                  ` across ${fleetWide.assessed} of ${fleetWide.inScope} tenants`}
               </p>
             </div>
             <div className="text-2xs font-medium text-blue-700 dark:text-blue-300 pt-1 border-t border-blue-100 dark:border-blue-900/40">
@@ -431,6 +433,13 @@ export default function FleetRiskyUsersPage() {
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 reported active in Entra ID
+                {/* THE SCREENSHOT FOUND THESE TWO. Side by side, a fully
+                    assessed fleet and a one-third assessed one rendered these
+                    tiles identically: a bare 0 with no coverage on it. The
+                    sweep missed them because it looked for `.length` counts
+                    and health words, and these are aggregate metrics. */}
+                {notAssessed > 0 &&
+                  ` across ${fleetWide.assessed} of ${fleetWide.inScope} tenants`}
               </p>
             </div>
             <div className="text-2xs font-medium text-purple-700 dark:text-purple-300 pt-1 border-t border-purple-100 dark:border-purple-900/40">

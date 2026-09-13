@@ -8,6 +8,33 @@ import {
   type TenantAssessmentStatus,
 } from './fleet-coverage.ts'
 
+/**
+ * Strip comments before searching source.
+ *
+ * A LINE FILTER IS NOT ENOUGH. The earlier version dropped lines that START
+ * with a comment marker, so the CONTINUATION lines of a multi-line JSX
+ * comment block -- which are plain prose, with no marker of their own --
+ * survived, and were searched as if they were code.
+ * It cost a false failure here, and it is the same error as matching an
+ * import or a category glyph: the check read a mention rather than a use.
+ */
+const stripComments = (source: string): string => {
+  let out = source
+  for (const [open, close] of [['{/*', '*/}'], ['/*', '*/']]) {
+    for (;;) {
+      const from = out.indexOf(open)
+      if (from === -1) break
+      const to = out.indexOf(close, from + open.length)
+      if (to === -1) break
+      out = out.slice(0, from) + out.slice(to + close.length)
+    }
+  }
+  return out
+    .split(String.fromCharCode(10))
+    .filter((line) => !line.trim().startsWith('//'))
+    .join(String.fromCharCode(10))
+}
+
 const statuses = (...pairs: [string, TenantAssessmentStatus][]) =>
   pairs.map(([tenantId, status]) => ({ tenantId, status }))
 
@@ -230,20 +257,7 @@ test('the page actually uses this, and no longer hardcodes the shield', () => {
 
   // Comments stripped: the comments explaining this fix quote the old sentences,
   // and a check that reads prose as behaviour is wrong in both directions.
-  const code = page
-    .split(String.fromCharCode(10))
-    .filter((line) => {
-      const t = line.trim()
-      return !(
-        t.startsWith('//') ||
-        t.startsWith('{/*') ||
-        t.startsWith('/*') ||
-        t.startsWith('*') ||
-        t.endsWith('*/}') ||
-        t.endsWith('*/')
-      )
-    })
-    .join(String.fromCharCode(10))
+  const code = stripComments(page)
 
   assert.ok(
     !code.includes('{filteredRows.length} user{filteredRows.length === 1'),
@@ -316,20 +330,7 @@ test('the KPI tile is gated on the same coverage as the list', () => {
     'did not find the page where this test expects it'
   )
 
-  const code = page
-    .split(String.fromCharCode(10))
-    .filter((line) => {
-      const t = line.trim()
-      return !(
-        t.startsWith('//') ||
-        t.startsWith('{/*') ||
-        t.startsWith('/*') ||
-        t.startsWith('*') ||
-        t.endsWith('*/}') ||
-        t.endsWith('*/')
-      )
-    })
-    .join(String.fromCharCode(10))
+  const code = stripComments(page)
 
   assert.ok(
     !code.includes("'100% tenants synced'"),
@@ -509,4 +510,35 @@ test('fleetCoverage names the missed tenants and carries the fleet size', () => 
   const unknown = fleetCoverage([], 'ALL', { kind: 'UNKNOWN', because: 'x' })
   assert.equal(unknown.fleet.kind, 'UNKNOWN')
   assert.equal(unknown.inScope, 0)
+})
+
+test('no KPI tile renders a bare count over an unassessed fleet', () => {
+  // FOUND BY LOOKING AT TWO SCREENSHOTS SIDE BY SIDE. "HawkView Findings: 0
+  // distinct users flagged" and "Microsoft Detections: 0 reported active in
+  // Entra ID" rendered IDENTICALLY for a fully assessed fleet and a one-third
+  // assessed one. Two of the four tiles could not tell the difference, on the
+  // same screen where the other two could.
+  //
+  // The sweep missed them because it searched for `{x.length}` renderings and
+  // health words; these are aggregate metrics off the hook, which is a third
+  // spelling of the same thing. A person saw it in one glance.
+  const page = readFileSync(
+    new URL('../../app/(protected)/risky-users/page.tsx', import.meta.url),
+    'utf8'
+  ).split(String.fromCharCode(13)).join('')
+
+  assert.ok(page.includes('distinct users flagged'), 'tile copy moved')
+
+  const code = stripComments(page)
+
+  // Each of the two tiles must carry coverage within a few lines of its label.
+  for (const label of ['distinct users flagged', 'reported active in Entra ID']) {
+    const at = code.indexOf(label)
+    assert.ok(at !== -1, label + ' not found in the page')
+    const after = code.slice(at, at + 260)
+    assert.ok(
+      after.includes('notAssessed') && after.includes('fleetWide'),
+      label + ' renders a count with no coverage beside it'
+    )
+  }
 })
