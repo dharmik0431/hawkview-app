@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { summarizeMicrosoftRisk } from '../identity-risk/microsoft-risk-summary.js'
 import test from 'node:test'
-import { deriveCollectionReadiness, M365_ACTIVITY_CONTENT_TYPES } from './collection-readiness.js'
+import { deriveCollectionReadiness, microsoftRiskSourceAllowed, effectiveMicrosoftConnectionStatus, M365_ACTIVITY_CONTENT_TYPES } from './collection-readiness.js'
+import { capabilitiesForWorkload, CONNECTION_REQUIRED_PERMISSIONS } from '../microsoft/microsoft-access-contract.js'
 
 const now = new Date('2026-08-18T12:00:00.000Z')
 const current = new Date('2026-08-18T11:55:00.000Z')
@@ -161,6 +162,24 @@ test('keeps Microsoft Identity Protection risk explicitly P2-only', () => {
     consentedPermissions: permissions.filter((permission) => permission !== 'IdentityRiskyUser.Read.All'),
   }))
   assert.equal(row(entitlementUnknown, 'entra_identity_protection').state, 'UNVERIFIED')
+})
+
+test('shared Microsoft eligibility consumes the same permission manifest and connection normalization', () => {
+  const capability = capabilitiesForWorkload('entra_identity_protection').find((item) => item.key === 'entra_identity_protection_risky_users')!
+  assert.equal(capability.licensePrerequisite, 'ENTRA_ID_P2')
+  const riskPermissions = capability.applicationPermissions.map((permission) => permission.name)
+  assert.deepEqual(riskPermissions, ['IdentityRiskyUser.Read.All'])
+  const eligible = { ...input(), licenseServicePlans: [{ servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }], consentedPermissions: [...CONNECTION_REQUIRED_PERMISSIONS, ...riskPermissions] }
+  assert.equal(microsoftRiskSourceAllowed(eligible), true)
+  for (const permission of riskPermissions) {
+    assert.equal(microsoftRiskSourceAllowed({ ...eligible, consentedPermissions: eligible.consentedPermissions.filter((value) => value !== permission) }), false)
+  }
+  assert.equal(microsoftRiskSourceAllowed({ ...eligible, connectionStatus: 'ERROR', connectionLastErrorCode: 'missing-permissions' }), true)
+  for (const permission of CONNECTION_REQUIRED_PERMISSIONS) {
+    const consentedPermissions = eligible.consentedPermissions.filter((value) => value !== permission)
+    assert.equal(effectiveMicrosoftConnectionStatus('ERROR', 'missing-permissions', [permission]), 'ERROR')
+    assert.equal(microsoftRiskSourceAllowed({ ...eligible, connectionStatus: 'ERROR', connectionLastErrorCode: 'missing-permissions', consentedPermissions }), false)
+  }
 })
 
 test('risk summary is shared across readiness and canonical helper without raw-count or clock drift', () => {

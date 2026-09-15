@@ -3,6 +3,7 @@ import { summarizeMicrosoftRisk, type MicrosoftRiskSummary } from '../identity-r
 import { deriveSignInEntitlement } from './sign-in-entitlement.js'
 import {
   capabilitiesForWorkload,
+  CONNECTION_REQUIRED_PERMISSIONS,
   MICROSOFT_ACCESS_CONTRACT_VERSION,
   type MicrosoftAccessCapability,
 } from '../microsoft/microsoft-access-contract.js'
@@ -180,6 +181,7 @@ export type PilotEvidenceProjection = {
 
 type ReadinessInput = {
   connectionStatus: string | null | undefined
+  connectionLastErrorCode?: string | null
   connectionVerifiedAt?: Date | null
   consentedPermissions: string[]
   syncStates: ReadinessSyncState[]
@@ -218,6 +220,34 @@ function entraP2Applicability(plans: ReadinessInput['licenseServicePlans']) {
   return p2.every((plan) => plan.provisioningStatus.toUpperCase() === 'DISABLED')
     ? 'NOT_LICENSED' as const
     : 'UNVERIFIED' as const
+}
+
+export function effectiveMicrosoftConnectionStatus(status: string | null, lastErrorCode: string | null, missingRequiredPermissions: readonly string[]) {
+  return status === 'ERROR' && lastErrorCode === 'missing-permissions' && missingRequiredPermissions.length === 0 ? 'ACTIVE' : status
+}
+
+/** One projection of durable license facts for both risk-summary read paths. */
+export function collectedLicenseServicePlans(licenses: readonly { servicePlans?: unknown }[]): ReadinessInput['licenseServicePlans'] {
+  const plans: NonNullable<ReadinessInput['licenseServicePlans']> = []
+  for (const license of licenses) {
+    if (!Array.isArray(license.servicePlans)) return null
+    for (const plan of license.servicePlans) {
+      if (!plan || typeof plan !== 'object' || typeof plan.servicePlanName !== 'string' || typeof plan.provisioningStatus !== 'string') return null
+      plans.push({ servicePlanName: plan.servicePlanName, provisioningStatus: plan.provisioningStatus, ...(typeof plan.servicePlanId === 'string' ? { servicePlanId: plan.servicePlanId } : {}) })
+    }
+  }
+  return plans
+}
+
+/** Shared CURRENT eligibility, intentionally independent of the RISKY_USERS age policy. */
+export function microsoftRiskSourceAllowed(input: Pick<ReadinessInput, 'connectionStatus' | 'connectionLastErrorCode' | 'connectionVerifiedAt' | 'consentedPermissions' | 'licenseServicePlans' | 'syncStates' | 'now'>): boolean {
+  const now = input.now ?? new Date()
+  const status = effectiveMicrosoftConnectionStatus(input.connectionStatus ?? null, input.connectionLastErrorCode ?? null, CONNECTION_REQUIRED_PERMISSIONS.filter((permission) => !input.consentedPermissions.includes(permission)))
+  if (['ERROR', 'REVOKED', 'PENDING_CONSENT', 'EXPIRED', 'INVALID'].includes(status?.toUpperCase() ?? '')) return false
+  const capability: MicrosoftAccessCapability | undefined = capabilitiesForWorkload('entra_identity_protection').find((item) => item.key === 'entra_identity_protection_risky_users')
+  if (!capability) return false
+  const grants = permissionStatus(capability.applicationPermissions.map((permission) => permission.name), new Set(input.consentedPermissions.map((permission) => permission.toLowerCase())), Boolean(validDate(input.connectionVerifiedAt)), capability.permissionMatch ?? 'ALL')
+  return grants === 'CONFIRMED' && fromSyncState(input.syncStates.find((state) => state.resourceType === 'LICENSES'), now, 'daily').state === 'READY' && entraP2Applicability(input.licenseServicePlans) === 'APPLICABLE'
 }
 
 const CURRENT_MS = 15 * 60 * 1000
@@ -831,7 +861,9 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     snapshotObservedAt: riskySnapshot?.observedAt,
     collectionSucceededAt: states.get('RISKY_USERS')?.lastSuccessfulAt,
     collectionStatus: states.get('RISKY_USERS')?.status,
-    sourceAllowed: riskyDataset?.state === 'READY',
+    // Current eligibility is shared. Non-successful collection states are rejected
+    // by the summary itself; only successful collections need this surface's age gate.
+    sourceAllowed: microsoftRiskSourceAllowed({ ...input, now }) && (states.get('RISKY_USERS')?.status !== 'SUCCEEDED' || riskyDataset?.state === 'READY'),
     now,
   })
   const conditionalAccessRows = Array.isArray(conditionalAccessSnapshot?.payload) ? conditionalAccessSnapshot.payload : null

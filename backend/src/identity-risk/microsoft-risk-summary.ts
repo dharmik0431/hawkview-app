@@ -69,6 +69,9 @@ export function summarizeMicrosoftRisk(input: {
   if (input.sourceAllowed === false) return unavailable('SOURCE_UNAVAILABLE')
   if (input.collectionStatus !== 'SUCCEEDED') return unavailable('COLLECTION_NOT_SUCCEEDED')
   if (!observation || !collection) return unavailable('INVALID_CLOCK')
+  // Snapshot persistence completes before runSnapshotSync records success.
+  // Millisecond equality is valid; even a 1ms inversion cannot attest this snapshot.
+  if (collection.getTime() < observation.getTime()) return unavailable('INVALID_CLOCK')
   if (input.now.getTime() - observation.getTime() > MAX_AGE_MS || input.now.getTime() - collection.getTime() > MAX_AGE_MS) return unavailable('STALE_EVIDENCE')
   if (!Array.isArray(input.payload) || input.payload.length > MICROSOFT_RISK_MAX_ROWS) return unavailable('INVALID_SNAPSHOT')
   const identities = new Map<string, { active: boolean; signature: string; conflict: boolean }>()

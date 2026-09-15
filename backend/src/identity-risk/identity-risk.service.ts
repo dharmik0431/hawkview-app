@@ -1,5 +1,6 @@
 import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common'
 import { summarizeMicrosoftRisk, parseMicrosoftRiskRecord, MICROSOFT_RISK_MAX_ROWS } from './microsoft-risk-summary.js'
+import { microsoftRiskSourceAllowed, collectedLicenseServicePlans } from '../tenants/collection-readiness.js'
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
 import { RiskAssessmentReader, unavailableAssessment } from './risk-assessment-reader.service.js'
 import { recordRiskReader } from './risk-operational-diagnostics.js'
@@ -905,7 +906,7 @@ export class IdentityRiskService {
       }
     }
     const now = new Date()
-    const [snapshot, syncState] = await Promise.all([
+    const [snapshot, syncState, eligibility] = await Promise.all([
       this.prisma.tenantEntraSnapshot.findFirst({
         where: {
           organizationId: tenant.organizationId,
@@ -923,8 +924,26 @@ export class IdentityRiskService {
         },
         select: { status: true, lastSuccessfulAt: true },
       }),
+      this.prisma.customerTenant.findFirst({
+        where: { id: tenant.id, organizationId: tenant.organizationId },
+        select: {
+          connection: { select: { status: true, lastErrorCode: true, lastVerifiedAt: true, consentedPermissions: true } },
+          tenantLicenses: { select: { servicePlans: true } },
+          syncStates: { where: { resourceType: 'LICENSES' }, select: { resourceType: true, status: true, lastAttemptAt: true, lastSuccessfulAt: true } },
+        },
+      }),
     ])
-    const microsoftRiskSummary = summarizeMicrosoftRisk({ payload: snapshot?.payload, snapshotObservedAt: snapshot?.observedAt, collectionSucceededAt: syncState?.lastSuccessfulAt, collectionStatus: syncState?.status, now })
+    const sourceAllowed = Boolean(eligibility && microsoftRiskSourceAllowed({
+      connectionStatus: eligibility.connection?.status,
+      connectionLastErrorCode: eligibility.connection?.lastErrorCode,
+      connectionVerifiedAt: eligibility.connection?.lastVerifiedAt,
+      consentedPermissions: eligibility.connection?.consentedPermissions ?? [],
+      licenseServicePlans: collectedLicenseServicePlans(eligibility.tenantLicenses),
+      // Eligibility needs success/freshness, not diagnostic provider text.
+      syncStates: eligibility.syncStates.map((state) => ({ ...state, lastErrorCode: null, lastErrorMessage: null })),
+      now,
+    }))
+    const microsoftRiskSummary = summarizeMicrosoftRisk({ payload: snapshot?.payload, snapshotObservedAt: snapshot?.observedAt, collectionSucceededAt: syncState?.lastSuccessfulAt, collectionStatus: syncState?.status, sourceAllowed, now })
     if (
       !snapshot ||
       !syncState?.lastSuccessfulAt ||

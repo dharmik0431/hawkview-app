@@ -68,6 +68,24 @@ test('missing source gates, failed/running collections and stale/future clocks a
   }
 })
 
+test('snapshot success attests observation only at equal or later time, with no inversion tolerance', () => {
+  for (const delta of [0, 1]) {
+    const result = summarizeMicrosoftRisk({ ...input([row('active')]), collectionSucceededAt: new Date(now.getTime() + delta) })
+    assert.equal(result.activeDistinctUserCount, 1)
+  }
+  for (const delta of [-1, -24 * 3600000]) {
+    const result = summarizeMicrosoftRisk({ ...input([row('active')]), collectionSucceededAt: new Date(now.getTime() + delta) })
+    assert.equal(result.reasonCode, 'INVALID_CLOCK')
+    assert.equal(result.availability, 'UNAVAILABLE')
+    assert.equal(result.activeDistinctUserCount, null)
+    assert.equal(result.observedActiveDistinctUserCount, null)
+  }
+  const boundary = new Date(now.getTime() - 36 * 3600000)
+  assert.equal(summarizeMicrosoftRisk({ ...input([row('active')]), snapshotObservedAt: boundary, collectionSucceededAt: boundary }).activeDistinctUserCount, 1)
+  assert.equal(summarizeMicrosoftRisk({ ...input([row('active')]), snapshotObservedAt: boundary, collectionSucceededAt: new Date(boundary.getTime() + 1) }).activeDistinctUserCount, 1)
+  assert.equal(summarizeMicrosoftRisk({ ...input([row('active')]), snapshotObservedAt: new Date(boundary.getTime() - 1), collectionSucceededAt: boundary }).reasonCode, 'STALE_EVIDENCE')
+})
+
 test('bounded whole-snapshot validation and canonical timestamps', () => {
   for (const payload of [{}, null, Array(MICROSOFT_RISK_MAX_ROWS + 1).fill(row('x'))]) {
     assert.equal(summarizeMicrosoftRisk(input(payload)).reasonCode, 'INVALID_SNAPSHOT')
