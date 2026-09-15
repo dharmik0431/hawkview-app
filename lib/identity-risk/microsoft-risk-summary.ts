@@ -10,7 +10,21 @@ export const MICROSOFT_RISK_SUMMARY_REASON_CODES = [
   'CONFLICTING_RECORDS',
 ] as const
 
-const nonnegativeCount = z.number().int().nonnegative()
+const MICROSOFT_RISK_MAX_ROWS = 50_000
+const nonnegativeCount = z.number().finite().int().nonnegative().max(MICROSOFT_RISK_MAX_ROWS)
+const canonicalTimestamp = z.string()
+  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+  .refine((value) => {
+    const parsed = new Date(value)
+    return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value
+  })
+const unavailableReasons = new Set([
+  'SOURCE_UNAVAILABLE',
+  'COLLECTION_NOT_SUCCEEDED',
+  'INVALID_CLOCK',
+  'STALE_EVIDENCE',
+  'INVALID_SNAPSHOT',
+])
 
 export const MicrosoftRiskSummarySchema = z.object({
   source: z.literal('MICROSOFT_IDENTITY_PROTECTION'),
@@ -19,8 +33,8 @@ export const MicrosoftRiskSummarySchema = z.object({
   rawRecordCount: nonnegativeCount.nullable(),
   observedActiveDistinctUserCount: nonnegativeCount.nullable(),
   activeDistinctUserCount: nonnegativeCount.nullable(),
-  snapshotObservedAt: z.string().datetime().nullable(),
-  collectionSucceededAt: z.string().datetime().nullable(),
+  snapshotObservedAt: canonicalTimestamp.nullable(),
+  collectionSucceededAt: canonicalTimestamp.nullable(),
   reasonCode: z.enum(MICROSOFT_RISK_SUMMARY_REASON_CODES).nullable(),
 }).strict().superRefine((summary, context) => {
   if (summary.availability === 'AVAILABLE') {
@@ -30,6 +44,7 @@ export const MicrosoftRiskSummarySchema = z.object({
       summary.observedActiveDistinctUserCount === null ||
       summary.activeDistinctUserCount === null ||
       summary.activeDistinctUserCount !== summary.observedActiveDistinctUserCount ||
+      summary.activeDistinctUserCount > summary.rawRecordCount ||
       summary.snapshotObservedAt === null ||
       summary.collectionSucceededAt === null ||
       summary.reasonCode !== null
@@ -42,11 +57,19 @@ export const MicrosoftRiskSummarySchema = z.object({
   if (summary.availability === 'PARTIAL') {
     if (
       summary.completeness === 'COMPLETE' ||
+      summary.rawRecordCount === null ||
       summary.observedActiveDistinctUserCount === null ||
+      summary.observedActiveDistinctUserCount > summary.rawRecordCount ||
       summary.activeDistinctUserCount !== null ||
       summary.snapshotObservedAt === null ||
       summary.collectionSucceededAt === null ||
-      summary.reasonCode === null
+      !(
+        (summary.completeness === 'PARTIAL' || summary.completeness === 'UNKNOWN') &&
+        summary.reasonCode === 'PARTIAL_RECORDS'
+      ) && !(
+        summary.completeness === 'CONFLICTING' &&
+        summary.reasonCode === 'CONFLICTING_RECORDS'
+      )
     ) {
       context.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid partial Microsoft risk summary' })
     }
@@ -55,9 +78,11 @@ export const MicrosoftRiskSummarySchema = z.object({
 
   if (
     summary.completeness !== 'UNKNOWN' ||
+    summary.rawRecordCount !== null ||
     summary.observedActiveDistinctUserCount !== null ||
     summary.activeDistinctUserCount !== null ||
-    summary.reasonCode === null
+    summary.reasonCode === null ||
+    !unavailableReasons.has(summary.reasonCode)
   ) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid unavailable Microsoft risk summary' })
   }
@@ -71,6 +96,15 @@ export function normalizeMicrosoftRiskSummary(
   value: unknown,
   trustedCurrentTimeMs = Date.now(),
 ): MicrosoftRiskSummary | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== null && prototype !== Object.prototype) return null
+  if (
+    Object.values(Object.getOwnPropertyDescriptors(value)).some(
+      (descriptor) => !('value' in descriptor),
+    )
+  ) return null
+
   const parsed = MicrosoftRiskSummarySchema.safeParse(value)
   if (!parsed.success) return null
 
@@ -89,7 +123,11 @@ export function normalizeMicrosoftRiskSummary(
     parsed.data.snapshotObservedAt !== null &&
     parsed.data.collectionSucceededAt !== null &&
     new Date(parsed.data.collectionSucceededAt).getTime() <
-      new Date(parsed.data.snapshotObservedAt).getTime()
+      new Date(parsed.data.snapshotObservedAt).getTime() &&
+    !(
+      parsed.data.availability === 'UNAVAILABLE' &&
+      parsed.data.reasonCode === 'INVALID_CLOCK'
+    )
   ) {
     return null
   }
@@ -168,6 +206,8 @@ export function presentMicrosoftRiskSummary(
     detail: summary.reasonCode
       ? reasonCopy[summary.reasonCode]
       : 'Microsoft Identity Protection evidence is incomplete.',
-    observedAt: summary.snapshotObservedAt,
+    observedAt: summary.availability === 'PARTIAL'
+      ? summary.snapshotObservedAt
+      : null,
   }
 }

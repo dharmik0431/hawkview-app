@@ -22,7 +22,7 @@ export const TenantSchema = z.object({
   healthScore: z.number().min(0).max(100).nullish(),
   mfaCoverage: z.number().min(0).max(100).nullish(),
   riskyIdentityCount: z.number().int().nonnegative().nullish(),
-  microsoftRiskSummary: MicrosoftRiskSummarySchema.optional().catch(undefined),
+  microsoftRiskSummary: MicrosoftRiskSummarySchema.optional(),
   attention: z.array(z.object({
     key: z.string(),
     label: z.string(),

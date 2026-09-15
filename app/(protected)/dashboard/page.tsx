@@ -309,9 +309,8 @@ function buildTenants(source: any[]): TenantRow[] {
     const riskPresentation = normalizedRiskSummary
       ? presentMicrosoftRiskSummary(normalizedRiskSummary)
       : null
-    const legacyIdentityCount = numericEvidence(t.riskyIdentityCount, 0)
-    const identityDetected = riskPresentation?.count ?? legacyIdentityCount
-    const identityExact = riskPresentation?.exact ?? legacyIdentityCount !== null
+    const identityDetected = riskPresentation?.count ?? null
+    const identityExact = riskPresentation?.exact ?? false
 
     return {
       ...t,
@@ -322,7 +321,6 @@ function buildTenants(source: any[]): TenantRow[] {
       lastCriticalAt,
       healthScore,
       mfaCoverage,
-      riskyIdentityCount: legacyIdentityCount,
       identityDetected,
       identityExact,
     }
@@ -353,21 +351,15 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
 
   if (label.includes('risky') || label.includes('risk')) {
     const normalizedSummary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
-    const presentation = normalizedSummary
-      ? presentMicrosoftRiskSummary(normalizedSummary)
-      : null
+    const presentation = presentMicrosoftRiskSummary(normalizedSummary)
     return {
       metricLabel: 'RISK EVIDENCE',
       metricValue:
-        presentation
-          ? presentation.count === null
-            ? 'Not reported'
-            : presentation.exact
+        presentation.count === null
+          ? 'Not reported'
+          : presentation.exact
             ? `${presentation.count} active ${presentation.count === 1 ? 'identity' : 'identities'}`
-            : `${presentation.count} observed`
-          : tenant.identityDetected === null
-            ? 'Not reported'
-            : `${tenant.identityDetected} active ${tenant.identityDetected === 1 ? 'identity' : 'identities'}`,
+            : `${presentation.count} observed`,
     }
   }
 

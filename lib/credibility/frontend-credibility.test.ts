@@ -31,12 +31,23 @@ test('Microsoft risk consumers use the additive summary and canonical evidence r
 
   assert.match(dashboard, /normalizeMicrosoftRiskSummary/)
   assert.match(dashboard, /identityExact/)
+  assert.doesNotMatch(dashboard, /riskyIdentityCount/)
   assert.doesNotMatch(dashboard, /partial \? `≥\$\{value\}`/)
   assert.match(helpers, /tenantRiskyUsersPath\(tenant\.id\)/)
+  assert.doesNotMatch(helpers, /riskyIdentityCount/)
   assert.doesNotMatch(helpers, /'0 users at risk'|'No risky users'/)
   assert.match(workspace, /if \(key\.includes\('risky'\)\) return 'risky-users'/)
   assert.match(section, /id="microsoft-risk-summary"/)
   assert.match(section, /Microsoft Identity Protection/)
+  assert.doesNotMatch(section, /activeMsCount|microsoftRecordsByPolarity/)
+})
+
+test('alert details navigation is bound to the alert tenant', () => {
+  const modal = source('components/dashboard/alert-details-modal.tsx')
+  assert.match(
+    modal,
+    /investigateDestination\([\s\S]*?item\.item\.actionUrl,[\s\S]*?item\.tenantId,[\s\S]*?\)/,
+  )
 })
 
 test('activity normalization never invents timestamps, identities, outcomes, or random IDs', () => {

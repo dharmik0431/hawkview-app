@@ -32,7 +32,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
-import { hawkViewDetectionSummary, microsoftRiskSummary, riskyUsersEmptyState } from '@/lib/identity-risk/risky-users-view'
+import { hawkViewDetectionSummary, riskyUsersEmptyState } from '@/lib/identity-risk/risky-users-view'
 import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { FleetRiskAssessmentDrawer } from '@/components/identity-risk/fleet-risk-assessment-drawer'
 import type { FleetRiskyUserRow } from '@/lib/api/fleet-risky-users-hooks'
@@ -41,7 +41,6 @@ import {
   getUserEmailOrUpn,
   mapRuleToPresentation,
 } from '@/lib/identity-risk/risk-presentation-mapper'
-import { microsoftRecordsByPolarity } from '@/lib/identity-risk/risky-users-view'
 import type { MicrosoftChannel, RiskyUserCount, RiskyUserRow } from '@/lib/identity-risk/risky-users-view'
 import type { MicrosoftEntraRiskyUsersView } from '@/lib/identity-risk/types'
 import { presentMicrosoftRiskSummary } from '@/lib/identity-risk/microsoft-risk-summary'
@@ -281,21 +280,11 @@ function CompactSummaryStrip({
   const hawkViewText = hawkViewDetectionSummary(count, hawkViewUsers)
 
   // 3. Active Microsoft risk detections
-  const activeMsCount =
-    microsoftView?.users !== null && microsoftView?.users !== undefined
-      ? microsoftRecordsByPolarity(microsoftView).ACTIVE_RISK.length
-      : null
-  // THE CHANNEL SAYS WHETHER A NUMBER IS EARNED, not the length of an array. An empty list from a
-  // channel that could not report is not zero risk. See microsoftRiskSummary.
+  // The server summary is the only tenant-wide Microsoft count. Paginated
+  // records remain visible evidence but never become an aggregate fallback.
   const microsoftSummary = microsoftView.microsoftRiskSummary ?? null
-  const serverMicrosoftSummary = microsoftSummary
-    ? presentMicrosoftRiskSummary(microsoftSummary)
-    : null
-  const microsoftText = serverMicrosoftSummary?.headline ?? microsoftRiskSummary(
-    channel,
-    activeMsCount,
-    microsoftView?.pageInfo?.hasMore === true,
-  )
+  const serverMicrosoftSummary = presentMicrosoftRiskSummary(microsoftSummary)
+  const microsoftText = serverMicrosoftSummary.headline
 
   // 4. Assessment date
   const assessedText = asOf ? `Assessed ${formatTimestamp(asOf)}` : 'Assessment time: Not reported'
@@ -347,14 +336,12 @@ function CompactSummaryStrip({
               <span className="block font-medium text-slate-800 dark:text-slate-200">
                 {microsoftText}
               </span>
-              {serverMicrosoftSummary && (
-                <span className="mt-0.5 block text-2xs text-slate-500 dark:text-slate-400">
-                  Microsoft Identity Protection
-                  {serverMicrosoftSummary.observedAt
-                    ? ` · Evidence observed ${formatTimestamp(serverMicrosoftSummary.observedAt)}`
-                    : ' · Evidence time not reported'}
-                </span>
-              )}
+              <span className="mt-0.5 block text-2xs text-slate-500 dark:text-slate-400">
+                Microsoft Identity Protection
+                {serverMicrosoftSummary.observedAt
+                  ? ` · Evidence observed ${formatTimestamp(serverMicrosoftSummary.observedAt)}`
+                  : ' · Evidence time not reported'}
+              </span>
             </span>
           </div>
 

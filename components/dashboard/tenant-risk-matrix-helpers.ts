@@ -54,9 +54,10 @@ export function getTenantMatrixOverallState(
     ['pending-consent', 'pending'].includes(connectionStatus) ||
     tenantStatus === 'pending'
   const hasExplicitConnection = ['connected', 'error', 'revoked', 'disconnected', 'pending-consent', 'pending'].includes(connectionStatus)
+  const microsoftRiskSummary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
   const hasBaselineEvidence =
     Number.isFinite(tenant.healthScore) &&
-    Number.isFinite(tenant.riskyIdentityCount) &&
+    microsoftRiskSummary?.availability === 'AVAILABLE' &&
     tenant.mfaCoverage != null &&
     Array.isArray(tenant.attention)
 
@@ -225,8 +226,6 @@ export function getTenantActiveIssuesInfo(tenant: Tenant) {
   const riskAttention = attentionItems.find((item) => item.key.toLowerCase().includes('risky'))
   if (riskAttention) {
     summaryParts.push(riskAttention.label)
-  } else if (typeof tenant.riskyIdentityCount === 'number' && tenant.riskyIdentityCount > 0) {
-    summaryParts.push(`${tenant.riskyIdentityCount} active Microsoft risk identities`)
   }
 
   if (summaryParts.length === 0 && attentionItems.length > 0) {
@@ -277,11 +276,7 @@ export function getTenantIdentityInfo(tenant: Tenant) {
   let riskyText = 'Risk data unavailable'
   const summary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
   const riskPresentation = summary ? presentMicrosoftRiskSummary(summary) : null
-  let riskyCount: number | null = riskPresentation?.count ?? (
-    Number.isFinite(tenant.riskyIdentityCount)
-      ? (tenant.riskyIdentityCount as number)
-      : null
-  )
+  const riskyCount = riskPresentation?.count ?? null
 
   if (isDisconnected) {
     riskyText = 'Risk data unavailable'
@@ -291,10 +286,6 @@ export function getTenantIdentityInfo(tenant: Tenant) {
     riskyText = 'Permission required'
   } else if (riskPresentation) {
     riskyText = riskPresentation.headline
-  } else if (riskyCount !== null && riskyCount > 0) {
-    riskyText = `${riskyCount} active Microsoft risk ${riskyCount === 1 ? 'identity' : 'identities'}`
-  } else if (riskyCount === 0) {
-    riskyText = '0 active Microsoft risk identities in current evidence'
   } else {
     riskyText = 'Risk data not reported'
   }
@@ -429,6 +420,7 @@ export function getTenantRecommendedAction(tenant: Tenant) {
 
   const attentionItems = computeTenantAttention(tenant)
   const riskAttention = attentionItems.find((item) => item.key.toLowerCase().includes('risky'))
+  const riskInfo = getTenantRiskyUsersInfo(tenant)
 
   if (isDisconnected) {
     return {
@@ -446,11 +438,11 @@ export function getTenantRecommendedAction(tenant: Tenant) {
     }
   }
 
-  if (riskAttention || (typeof tenant.riskyIdentityCount === 'number' && tenant.riskyIdentityCount > 0)) {
+  if ((riskInfo.count ?? 0) > 0) {
     return {
       label: riskAttention?.actionLabel ?? 'Review Microsoft risk',
       destinationUrl: tenantRiskyUsersPath(tenant.id),
-      description: riskAttention?.why ?? `${tenant.riskyIdentityCount} active Microsoft risk ${tenant.riskyIdentityCount === 1 ? 'identity requires' : 'identities require'} review.`,
+      description: riskAttention?.why ?? riskInfo.breakdownNote,
     }
   }
 
@@ -605,28 +597,12 @@ export function getTenantRiskyUsersInfo(tenant: Tenant) {
     }
   }
 
-  const count = Number.isFinite(tenant.riskyIdentityCount)
-    ? (tenant.riskyIdentityCount as number)
-    : null
-  if (count === null) {
-    return {
-      count: null,
-      isExact: false,
-      label: 'Risk data not reported',
-      statusType: 'unavailable' as const,
-      breakdownNote: 'Microsoft risk evidence unavailable',
-    }
-  }
   return {
-    count,
-    isExact: true,
-    label: count === 0
-      ? '0 active Microsoft risk identities in current evidence'
-      : `${count} active Microsoft risk ${count === 1 ? 'identity' : 'identities'}`,
-    statusType: 'available' as const,
-    breakdownNote: count > 0
-      ? 'Microsoft Identity Protection evidence requires review.'
-      : 'This is not a statement that the tenant is safe.',
+    count: null,
+    isExact: false,
+    label: 'Risk data not reported',
+    statusType: 'unavailable' as const,
+    breakdownNote: 'Microsoft risk evidence unavailable',
   }
 }
 
@@ -781,7 +757,7 @@ export function getPrimaryConcern(tenant: Tenant) {
   if (
     !Array.isArray(tenant.attention) ||
     !Number.isFinite(tenant.healthScore) ||
-    !Number.isFinite(tenant.riskyIdentityCount) ||
+    normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)?.availability !== 'AVAILABLE' ||
     tenant.mfaCoverage == null
   ) {
     return {
