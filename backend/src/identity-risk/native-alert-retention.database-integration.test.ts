@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { assertDisposableNativeAlertDatabase } from '../prisma/native-alert-test-database.js'
 import { RiskHistoryRetention, riskHistoryRetentionConfig } from './risk-history-retention.js'
 import { RUN_STATUS, RUN_ENGINE_VERSION, RUN_CATALOG_VERSION } from '../risky-users-wiring/persist-run.js'
 import { NATIVE_RULE_ID, NOT_ASSESSED } from '../risky-users-wiring/publish-to-intake.js'
@@ -14,14 +15,7 @@ type Fixture = { c: pg.Client; prisma: PrismaService; scopes: Scope[]; worker: R
   config: NonNullable<ReturnType<typeof riskHistoryRetentionConfig>>; lease: { key: string; id: string } }
 
 async function fixture(work: (f: Fixture) => Promise<void>) {
-  assert.equal(process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS, '1', 'Explicit disposable DB test opt-in required')
-  const url = new URL(process.env.DATABASE_URL ?? '')
-  assert.ok(['postgresql:', 'postgres:'].includes(url.protocol), 'PostgreSQL required')
-  assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Loopback only')
-  assert.equal(url.port, '55432', 'Reserved disposable port only; never5432')
-  assert.ok(/^\/hv_qa_native_alert(?:_[a-z0-9]+)*$/.test(url.pathname)
-    || ['/hv_e2_m65_fresh_20260914', '/hv_e2_m65_upgrade_20260914'].includes(url.pathname),
-  'Reserved native-alert QA or exact Engineer 2 disposable database required')
+  const url = assertDisposableNativeAlertDatabase(process.env, { retention: true })
   assert.equal(process.env.TZ, 'UTC', 'UTC Node process required')
   const c = new pg.Client({ connectionString: url.toString() })
   const prisma = new PrismaService()

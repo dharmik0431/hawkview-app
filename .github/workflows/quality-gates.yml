@@ -44,6 +44,9 @@ jobs:
     env:
       DATABASE_URL: postgresql://hawkview_ci:hawkview_ci@127.0.0.1:5432/hawkview_ci
       HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS: '1'
+      # This hosted backend job provisions the exact disposable loopback service.
+      HAWKVIEW_CI_DISPOSABLE_POSTGRES: '1'
+      TZ: UTC
     services:
       postgres:
         image: postgres:16-alpine

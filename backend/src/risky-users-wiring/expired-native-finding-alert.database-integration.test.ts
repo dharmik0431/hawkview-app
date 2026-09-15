@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { AlertIntakeService } from '../alerts/alert-intake.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { assertDisposableNativeAlertDatabase } from '../prisma/native-alert-test-database.js'
 import { NATIVE_RULE_ID, NOT_ASSESSED } from './publish-to-intake.js'
 
 /**
@@ -16,16 +17,7 @@ import { NATIVE_RULE_ID, NOT_ASSESSED } from './publish-to-intake.js'
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 
 function disposable(): void {
-  const url = new URL(process.env.DATABASE_URL ?? '')
-  assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable loopback DB only')
-  assert.equal(url.port, '55432', 'The reserved disposable PostgreSQL port is mandatory')
-  const databaseName = url.pathname.replace(/^\/+/, '')
-  const explicitlyReserved = new Set([
-    'hv_e2_m65_fresh_20260914',
-    'hv_e2_m65_upgrade_20260914',
-  ])
-  assert.ok(/test|qa|^hawkview_ci$/i.test(databaseName) || explicitlyReserved.has(databaseName),
-    'Explicit test/QA database only')
+  assertDisposableNativeAlertDatabase()
 }
 
 async function ingestAtExpiryBoundary(expiryOffsetFromTickMs: number) {
