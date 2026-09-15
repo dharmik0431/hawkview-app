@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
@@ -31,7 +32,7 @@ const newest = (list: ReadonlyArray<{ eventDateTime: Date }>): string | null =>
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 const deadline = () => Date.now()+6000
 async function fixture(work:(f:any)=>Promise<void>, audit=false, complete=true, activity:'POSITIVE'|'ZERO'='POSITIVE') {
-  const url=new URL(process.env.DATABASE_URL??'')
+  const url=assertDisposableTestDatabase()
   assert.ok(['127.0.0.1','localhost','[::1]'].includes(url.hostname),'Disposable loopback DB only')
   assert.match(url.pathname,/test|qa|^\/hawkview_ci$/i,'Explicit test/QA or repository CI database only')
   const prisma=new PrismaService(),client=new pg.Client({connectionString:url.toString()})

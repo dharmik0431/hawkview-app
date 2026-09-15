@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
@@ -44,7 +45,7 @@ function useKeys(configuration: { current: string; version?: string; previous?: 
 }
 
 function disposable() {
-  const url = new URL(process.env.DATABASE_URL ?? '')
+  const url = assertDisposableTestDatabase()
   assert.ok(
     ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname),
     'Disposable local/CI PostgreSQL only')

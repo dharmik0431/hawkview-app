@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
@@ -16,7 +17,7 @@ import { approvedIdentitySignalDetectors } from './identity-risk-approved-evalua
 
 test('wrapped pilot real DB races, constraints, collection-to-finding-to-mailbox, rotation/revocation/deletion/replay',
   { skip:process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS!=='1',timeout:45000 },async()=>{
-    const url=new URL(process.env.DATABASE_URL??'')
+    const url=assertDisposableTestDatabase()
     assert.ok(['127.0.0.1','localhost','[::1]'].includes(url.hostname),'Disposable local database only')
     const client=new pg.Client({connectionString:url.toString()});await client.connect()
     const prisma=new PrismaService();await prisma.$connect()
@@ -93,7 +94,7 @@ test('wrapped pilot real DB races, constraints, collection-to-finding-to-mailbox
 
 test('older BEGIN can reload a later-started committed winner without accepting future activation',
   {skip:process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS!=='1',timeout:30000},async()=>{
-    const url=new URL(process.env.DATABASE_URL??'')
+    const url=assertDisposableTestDatabase()
     assert.ok(['127.0.0.1','localhost','[::1]'].includes(url.hostname),'Disposable local database only')
     const client=new pg.Client({connectionString:url.toString()});await client.connect()
     const prisma=new PrismaService();await prisma.$connect()

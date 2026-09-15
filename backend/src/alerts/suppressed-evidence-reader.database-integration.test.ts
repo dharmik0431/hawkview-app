@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import test, { after, before } from 'node:test'
 import { randomUUID } from 'node:crypto'
 import pg from 'pg'
@@ -24,7 +25,7 @@ import { pipelineStore, type SqlRunner } from './pipeline-store.js'
  */
 
 const RUN = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
-const URL = process.env.DATABASE_URL
+const URL = RUN ? assertDisposableTestDatabase().toString() : undefined
 
 const T0 = '2026-09-12T09:00:00.000Z'
 const WATERMARK: Watermark = {

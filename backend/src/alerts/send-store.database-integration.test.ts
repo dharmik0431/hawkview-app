@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
@@ -27,7 +28,7 @@ const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 
 /** The same guard the other suites use, for the same reason: this writes and deletes. */
 function disposableUrl(): string {
-  const url = new URL(process.env.DATABASE_URL ?? '')
+  const url = assertDisposableTestDatabase()
   // NO QUERY PARAMETERS, AND THIS IS NOT TIDINESS. libpq honours `?host=` and `?hostaddr=` in a
   // connection URI and they OVERRIDE the authority — so a URL whose hostname reads 127.0.0.1 can
   // connect somewhere else entirely, and every check below would pass while doing it. The guard

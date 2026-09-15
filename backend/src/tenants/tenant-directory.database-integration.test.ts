@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { PrismaService } from '../prisma/prisma.service.js'
@@ -11,6 +12,7 @@ test(
   'a migrated PostgreSQL database returns only the authenticated MSP workspace tenants',
   { skip: !databaseIntegrationEnabled },
   async (context) => {
+    assertDisposableTestDatabase()
     const prisma = new PrismaService()
     await prisma.$connect()
 

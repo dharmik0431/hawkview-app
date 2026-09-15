@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import test, { after, before } from 'node:test'
 import pg from 'pg'
 import {
@@ -24,7 +25,7 @@ import { pipelineStore, type SqlRunner } from './pipeline-store.js'
  */
 
 const RUN = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
-const URL = process.env.DATABASE_URL
+const URL = RUN ? assertDisposableTestDatabase().toString() : undefined
 
 /**
  * ONE DATABASE, SO ONE FILE AT A TIME.

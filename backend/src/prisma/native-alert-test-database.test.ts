@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { Socket } from 'node:net'
 import test from 'node:test'
+import pg from 'pg'
 import { inspect } from 'node:util'
-import { assertDisposableNativeAlertDatabase } from './native-alert-test-database.js'
+import { assertDisposableNativeAlertDatabase, assertDisposableTestDatabase, parseDisposablePostgresUrl } from './native-alert-test-database.js'
 
 const local = {
   TZ: 'UTC',
@@ -33,10 +34,13 @@ for (const hostname of ['127.0.0.1', 'localhost', '[::1]']) {
 }
 
 for (const name of ['hv_e2_m65_fresh_20260914', 'hv_e2_m65_upgrade_20260914']) {
-  test(`existing exact reserved migration database remains accepted: ${name}`, () => {
-    assert.equal(assertDisposableNativeAlertDatabase({
+  test(`reserved migration database is never admitted to native retention: ${name}`, () => {
+    const environment = {
       ...local, DATABASE_URL: `postgresql://fixture:fixture@localhost:55432/${name}`,
-    }, { retention: true }).pathname, `/${name}`)
+    }
+    assert.throws(() => assertDisposableNativeAlertDatabase(environment, { retention: true }))
+    assert.equal(assertDisposableNativeAlertDatabase(environment).pathname, `/${name}`)
+    assert.throws(() => assertDisposableTestDatabase(environment))
   })
 }
 
@@ -130,4 +134,78 @@ test('malformed credential-bearing input is rejected without connection attempts
   assert.ok(!surfaces.includes(password), 'Error surfaces must not retain a password')
   assert.ok(!surfaces.includes(malformed), 'Error surfaces must not retain the input URL')
   assert.equal(connectionAttempts, 0)
+})
+
+test('every query or fragment is rejected before any socket attempt, with no input disclosure', (t) => {
+  let attempts = 0
+  t.mock.method(Socket.prototype, 'connect', () => {
+    attempts += 1
+    throw new Error('Unexpected socket')
+  })
+  const password = 'synthetic-hostile-parser-only'
+  const authority = `postgresql://fixture:${password}@127.0.0.1:55432/hv_qa_native_alert_guard`
+  const suffixes = [
+    '?', '#', '?host=database.invalid', '?HOST=database.invalid', '?%68ost=database.invalid',
+    '?host=127.0.0.1&host=database.invalid', '?hostaddr=192.0.2.1', '?options=-csearch_path%3Dother',
+    '?service=other', '?user=other', '?password=other', '?port=5432', '?dbname=production',
+    '?schema=public', '?sslmode=disable', '?connect_timeout=5', '#host=database.invalid',
+  ]
+  for (const suffix of suffixes) {
+    const value = authority + suffix
+    for (const parse of [
+      () => parseDisposablePostgresUrl(value),
+      () => assertDisposableTestDatabase({ ...local, DATABASE_URL: value }),
+      () => assertDisposableNativeAlertDatabase({ ...local, DATABASE_URL: value }, { retention: true }),
+    ]) {
+      let error: unknown
+      try { parse() } catch (caught) { error = caught }
+      assert.ok(error instanceof Error)
+      const surface = [String(error), error.stack, JSON.stringify(error), inspect(error, { showHidden: true })].join('\n')
+      assert.equal('cause' in error, false)
+      assert.equal('input' in error, false)
+      assert.ok(!surface.includes(password))
+      assert.ok(!surface.includes(value))
+    }
+  }
+  assert.equal(attempts, 0)
+})
+
+test('legacy boundary narrows missing guards without relaxing native restrictions', () => {
+  assert.equal(assertDisposableTestDatabase(local).port, '55432')
+  assert.equal(assertDisposableTestDatabase(hosted).pathname, '/hawkview_ci')
+  assert.equal(assertDisposableTestDatabase({ ...local, TZ: 'America/New_York' }).port, '55432')
+  assert.throws(() => assertDisposableTestDatabase({ ...local, TZ: 'America/New_York' }, { requireUtc: true }))
+  for (const port of ['', ':1', ':5433', ':6543']) {
+    assert.throws(() => assertDisposableTestDatabase({
+      ...local, DATABASE_URL: `postgresql://fixture:fixture@127.0.0.1${port}/hawkview_test`,
+    }))
+  }
+  assert.throws(() => assertDisposableTestDatabase({ ...local, HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS: undefined }))
+  assert.throws(() => assertDisposableTestDatabase({ ...local, DATABASE_URL: local.DATABASE_URL.replace('hv_qa_native_alert_guard', 'production') }))
+})
+
+test('fixed timezone driver options reach the actual pg connection parameters without URI queries', (t) => {
+  let attempts = 0
+  t.mock.method(Socket.prototype, 'connect', () => { attempts += 1; throw new Error('Unexpected socket') })
+  const previous = process.env.PGOPTIONS
+  const url = assertDisposableTestDatabase(local)
+  try {
+    for (const zone of ['UTC', 'America/New_York', 'Asia/Kolkata']) {
+      const options = `-c timezone=${zone}`
+      process.env.PGOPTIONS = options
+      const inherited = new pg.Client({ connectionString: url.toString() })
+      const explicit = new pg.Client({ connectionString: url.toString(), options })
+      for (const client of [inherited, explicit]) {
+        const parameters = (client as unknown as { connectionParameters: { options: string; host: string; port: number; database: string } }).connectionParameters
+        assert.equal(parameters.options, options)
+        assert.equal(parameters.host, '127.0.0.1')
+        assert.equal(parameters.port, 55432)
+        assert.equal(parameters.database, 'hv_qa_native_alert_guard')
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.PGOPTIONS
+    else process.env.PGOPTIONS = previous
+  }
+  assert.equal(attempts, 0)
 })

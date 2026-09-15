@@ -13,6 +13,7 @@
 // This test PASSES today and must keep passing. If it starts failing, (b) has
 // bought a reportable count by discarding evidence.
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
@@ -51,7 +52,7 @@ const UNRECOGNIZED = [50053, 53003]
 const NON_QUALIFYING = [50076, 50140]
 
 async function securityEventTenant<T>(codes: readonly number[], work: (context: any) => Promise<T>): Promise<T> {
-  const url = new URL(process.env.DATABASE_URL ?? '')
+  const url = assertDisposableTestDatabase()
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable loopback DB only')
   assert.match(url.pathname, /test|qa|^\/hawkview_ci$/i, 'Explicit test/QA database only')
   const prisma = new PrismaService(), client = new pg.Client({ connectionString: url.toString() })

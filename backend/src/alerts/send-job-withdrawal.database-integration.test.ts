@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
@@ -30,7 +31,7 @@ const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 
 /** The same guard the identity-risk suites use, for the same reason: this writes and deletes. */
 function disposableUrl(): string {
-  const url = new URL(process.env.DATABASE_URL ?? '')
+  const url = assertDisposableTestDatabase()
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable loopback DB only')
   assert.match(url.pathname, /test|qa|^\/hawkview_ci$/i, 'Explicit test/QA or repository CI database only')
   return url.toString()

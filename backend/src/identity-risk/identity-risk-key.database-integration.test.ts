@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
@@ -18,7 +19,7 @@ import { withMailboxReadTransaction } from './mailbox-read-transaction.js'
 
 test('registry deadline cancels the actual blocked PostgreSQL statement, not an abandoned promise',
   { skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1', timeout: 10000 }, async () => {
-    const url = new URL(process.env.DATABASE_URL ?? '')
+    const url = assertDisposableTestDatabase()
     assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable local/CI PostgreSQL only')
     const locker = new pg.Client({ connectionString: url.toString() })
     const prisma = new PrismaService()
@@ -65,7 +66,7 @@ test('registry deadline cancels the actual blocked PostgreSQL statement, not an 
 
 test('real concurrent key revocation serializes with claim/persist and never publishes after a winning revoke',
   { skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1', timeout: 30000 }, async () => {
-    const url = new URL(process.env.DATABASE_URL ?? '')
+    const url = assertDisposableTestDatabase()
     assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable local/CI PostgreSQL only')
     const prisma = new PrismaService()
     const revoker = new pg.Client({ connectionString: url.toString() })
@@ -162,7 +163,7 @@ test('real concurrent key revocation serializes with claim/persist and never pub
 
 test('managed key versions preserve actual finding-result-run lookup, legacy nulls, rotation and tenant isolation',
   { skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1' }, async () => {
-    const url = new URL(process.env.DATABASE_URL ?? '')
+    const url = assertDisposableTestDatabase()
     assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable local/CI PostgreSQL only')
     const client = new pg.Client({ connectionString: url.toString() })
     await client.connect()
@@ -227,7 +228,7 @@ test('managed key versions preserve actual finding-result-run lookup, legacy nul
 
 test('real scoped snapshot reader -> managed test MAC -> approved evaluator -> PostgreSQL -> authorized v1 API',
   { skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1' }, async () => {
-    const url = new URL(process.env.DATABASE_URL ?? '')
+    const url = assertDisposableTestDatabase()
     assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable local/CI PostgreSQL only')
     const prisma = new PrismaService()
     const organizationId = randomUUID(); const customerTenantId = randomUUID(); const userId = randomUUID(); const subject = randomUUID()
@@ -278,13 +279,11 @@ test('real scoped snapshot reader -> managed test MAC -> approved evaluator -> P
       const writer = new pg.Client({ connectionString: url.toString() })
       await writer.connect()
       const previousTZ = process.env.TZ
-      const previousDatabaseUrl = process.env.DATABASE_URL
+      const previousPgOptions = process.env.PGOPTIONS
       try {
         for (const zone of ['UTC', 'America/New_York', 'Asia/Kolkata']) {
           process.env.TZ = zone
-          const startupUrl = new URL(url)
-          startupUrl.searchParams.set('options', `-c timezone=${zone}`)
-          process.env.DATABASE_URL = startupUrl.toString()
+          process.env.PGOPTIONS = `-c timezone=${zone}`
           await writer.query("SELECT set_config('TimeZone', $1, false)", [zone])
           for (const age of [1000, MAILBOX_SOURCE_MAX_AGE_MS, MAILBOX_SOURCE_MAX_AGE_MS + 1, -300000, -300001]) {
             const observation = new Date(now.getTime() - age)
@@ -319,7 +318,7 @@ test('real scoped snapshot reader -> managed test MAC -> approved evaluator -> P
       } finally {
         await writer.query('ROLLBACK'); await writer.end()
         if (previousTZ === undefined) delete process.env.TZ; else process.env.TZ = previousTZ
-        if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = previousDatabaseUrl
+        if (previousPgOptions === undefined) delete process.env.PGOPTIONS; else process.env.PGOPTIONS = previousPgOptions
       }
       await prisma.tenantCollectionFieldState.deleteMany({ where: { ...scope, fieldKey: sourceAttestationKey('EXCHANGE_MAILBOX_RULES') } })
       assert.equal((await projector.load(scope, now)).capability, 'UNAVAILABLE')

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
@@ -16,7 +17,7 @@ test(
   'legacy workspace audit rows are backfilled, bounded, pruned, and organization isolated',
   { skip: !databaseIntegrationEnabled },
   async () => {
-    const client = new pg.Client({ connectionString: process.env.DATABASE_URL })
+    const client = new pg.Client({ connectionString: assertDisposableTestDatabase().toString() })
     await client.connect()
     await client.query("SET TIME ZONE 'UTC'")
     const schema = `workspace_audit_${randomUUID().replaceAll('-', '')}`

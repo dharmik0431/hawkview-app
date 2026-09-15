@@ -92,7 +92,7 @@ async function snapshot(prisma: PrismaService, value: Awaited<ReturnType<typeof 
   ])
 }
 
-test('native retention: expired91d graph is pruned, incident/notification/withheld provenance and other organization remain', async () => fixture(async f => {
+test('native retention: expired91d graph is pruned, incident/notification/withheld provenance and other organization remain', { skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1' }, async () => fixture(async f => {
   const scope = f.scopes[0]!
   const expired = await graph(f.prisma, scope)
   const foreign = await graph(f.prisma, f.scopes[1]!)
@@ -124,7 +124,7 @@ test('native retention: expired91d graph is pruned, incident/notification/withhe
   assert.deepEqual(await prune(f), { findings: 0, matchedResults: 0, coverage: 0, runs: 0 })
 }))
 
-test('native retention: current evidence, independent expiry,90d age floor and live lease stay protected', async () => fixture(async f => {
+test('native retention: current evidence, independent expiry,90d age floor and live lease stay protected', { skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1' }, async () => fixture(async f => {
   const kept = await Promise.all([
     graph(f.prisma, f.scopes[0]!, { liveChild: true }),
     graph(f.prisma, f.scopes[0]!, { liveRun: true }),
@@ -137,7 +137,7 @@ test('native retention: current evidence, independent expiry,90d age floor and l
   await assert.rejects(f.worker.prune(f.scopes[1]!, f.config, f.lease, Date.now() + 3000), /RISK_HISTORY_UNAVAILABLE/)
 }))
 
-test('native retention: failure after finding deletion rolls back the entire graph', async () => fixture(async f => {
+test('native retention: failure after finding deletion rolls back the entire graph', { skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1' }, async () => fixture(async f => {
   const value = await graph(f.prisma, f.scopes[0]!)
   const before = await snapshot(f.prisma, value)
   const original = (f.worker as any).tx.bind(f.worker)
