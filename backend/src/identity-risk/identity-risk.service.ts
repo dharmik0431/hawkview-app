@@ -1,4 +1,5 @@
 import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common'
+import { NATIVE_SUMMARY_TENANT_LIMIT, type NativeSummaryScope } from '../risky-users-wiring/native-risk-summary.js'
 import { summarizeMicrosoftRisk, parseMicrosoftRiskRecord, MICROSOFT_RISK_MAX_ROWS } from './microsoft-risk-summary.js'
 import { microsoftRiskSourceAllowed, collectedLicenseServicePlans } from '../tenants/collection-readiness.js'
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
@@ -73,7 +74,7 @@ type HawkViewControlState = Readonly<{
   alertDeliveryDisabled: boolean
 }>
 
-function pilotReadAllowed(tenant: ScopedTenant) {
+function pilotReadAllowed(tenant: Pick<ScopedTenant, 'id' | 'organizationId'>) {
   const config = riskRuntimeConfig()
   return Boolean(config && riskScopeAllowed({
     organizationId: tenant.organizationId,
@@ -331,11 +332,8 @@ export class IdentityRiskService {
     return { gate: null, tenant } as const
   }
 
-  private async scope(
-    identity: AuthenticatedIdentity,
-    tenantId: string,
-  ): Promise<ScopedTenant> {
-    const user = await this.prisma.user.findUnique({
+  private async activeRiskReader(identity: AuthenticatedIdentity, client: Pick<Prisma.TransactionClient, 'user'> = this.prisma) {
+    const user = await client.user.findUnique({
       where: { authProviderUserId: identity.subject },
       select: {
         id: true,
@@ -350,6 +348,46 @@ export class IdentityRiskService {
       },
     })
     if (!user || user.disabledAt) throw new ForbiddenException('Tenant access denied')
+    return user
+  }
+
+  /** One authorization snapshot and bounded batch reads, never N tenant reads. */
+  async authorizeRiskyUsersFleetRead(identity: AuthenticatedIdentity, client: Prisma.TransactionClient): Promise<NativeSummaryScope> {
+    const user = await this.activeRiskReader(identity, client)
+    const organizationIds = [...new Set(user.memberships.map((membership) => membership.organizationId))]
+    if (organizationIds.length === 0) return { totalTenants: 0, tenants: [] }
+    const where = { organizationId: { in: organizationIds } }
+    const totalTenants = await client.customerTenant.count({ where })
+    const candidates = await client.customerTenant.findMany({
+      where, select: { id: true, organizationId: true },
+      orderBy: [{ organizationId: 'asc' }, { id: 'asc' }], take: NATIVE_SUMMARY_TENANT_LIMIT + 1,
+    })
+    if (candidates.some((tenant) => !organizationIds.includes(tenant.organizationId)) ||
+      candidates.length !== Math.min(totalTenants, NATIVE_SUMMARY_TENANT_LIMIT + 1)) throw new Error('Invalid summary scope')
+    const tenants = candidates.slice(0, NATIVE_SUMMARY_TENANT_LIMIT)
+    if (tenants.length === 0) return { totalTenants, tenants: [] }
+    const controls = await client.identityRiskOperationalControl.findMany({
+      where: { state: 'ACTIVE', controlType: 'EVALUATION_HARD_DISABLED', OR: [
+        { scopeType: 'GLOBAL', scopeKey: 'GLOBAL' },
+        ...tenants.map((tenant) => ({ scopeType: 'TENANT', scopeKey: `${tenant.organizationId}:${tenant.id}`, organizationId: tenant.organizationId, customerTenantId: tenant.id })),
+      ] },
+      select: { scopeType: true, scopeKey: true, organizationId: true, customerTenantId: true },
+      take: NATIVE_SUMMARY_TENANT_LIMIT + 2,
+    })
+    if (controls.length > tenants.length + 1) throw new Error('Invalid summary controls')
+    const halted = controls.some((control) => control.scopeType === 'GLOBAL' && control.scopeKey === 'GLOBAL')
+    return { totalTenants, tenants: tenants.map((tenant) => ({ ...tenant,
+      gate: !pilotReadAllowed(tenant) ? 'NOT_ENABLED_FOR_TENANT' : halted || controls.some((control) =>
+        control.scopeType === 'TENANT' && control.scopeKey === `${tenant.organizationId}:${tenant.id}` &&
+        control.organizationId === tenant.organizationId && control.customerTenantId === tenant.id) ? 'EVALUATION_DISABLED' : null,
+    })) }
+  }
+
+  private async scope(
+    identity: AuthenticatedIdentity,
+    tenantId: string,
+  ): Promise<ScopedTenant> {
+    const user = await this.activeRiskReader(identity)
     const organizationIds = user.memberships.map(
       (membership) => membership.organizationId,
     )
