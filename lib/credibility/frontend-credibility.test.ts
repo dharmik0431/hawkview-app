@@ -26,6 +26,7 @@ test('dashboard renders explicit evidence states and has no healthy or risky fab
 test('Microsoft risk consumers use the additive summary and canonical evidence route', () => {
   const dashboard = source('app/(protected)/dashboard/page.tsx')
   const helpers = source('components/dashboard/tenant-risk-matrix-helpers.ts')
+  const matrix = source('components/dashboard/tenant-risk-matrix.tsx')
   const workspace = source('lib/tenant-workspace-state.ts')
   const section = source('components/identity-risk/risky-users-section.tsx')
 
@@ -35,6 +36,8 @@ test('Microsoft risk consumers use the additive summary and canonical evidence r
   assert.doesNotMatch(dashboard, /partial \? `≥\$\{value\}`/)
   assert.match(helpers, /tenantRiskyUsersPath\(tenant\.id\)/)
   assert.doesNotMatch(helpers, /riskyIdentityCount/)
+  assert.match(matrix, /sortTenantRiskMatrixTenants\(tenants, sortColumn, sortDir\)/)
+  assert.doesNotMatch(matrix, /riskyIdentityCount/)
   assert.doesNotMatch(helpers, /'0 users at risk'|'No risky users'/)
   assert.match(workspace, /if \(key\.includes\('risky'\)\) return 'risky-users'/)
   assert.match(section, /id="microsoft-risk-summary"/)

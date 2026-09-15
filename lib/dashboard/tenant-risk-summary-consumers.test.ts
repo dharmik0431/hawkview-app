@@ -50,7 +50,55 @@ function compileHelpers() {
   }
 }
 
+function compileMatrix(helpers: ReturnType<typeof compileHelpers>) {
+  const exports: Record<string, unknown> = {}
+  const source = readFileSync(
+    new URL('../../components/dashboard/tenant-risk-matrix.tsx', import.meta.url),
+    'utf8',
+  )
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: {
+      jsx: ts.JsxEmit.ReactJSX,
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const icons = new Proxy({}, { get: () => () => null })
+  new Function('require', 'exports', compiled)(
+    (name: string) => ({
+      react: require('react'),
+      'next/navigation': { useRouter: () => ({ push: () => undefined }) },
+      'lucide-react': icons,
+      '@/components/ui/button': { Button: () => null },
+      '@/components/ui/badge': { Badge: () => null },
+      '@/components/ui/tooltip': {
+        Tooltip: () => null,
+        TooltipContent: () => null,
+        TooltipProvider: () => null,
+        TooltipTrigger: () => null,
+      },
+      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+      './tenant-risk-matrix-helpers': helpers,
+      './tenant-risk-matrix-drawer': { TenantRiskMatrixDrawer: () => null },
+    }[name] ?? require(name)),
+    exports,
+  )
+  return exports as {
+    compareTenantRiskSummaries: (
+      a: Record<string, unknown>,
+      b: Record<string, unknown>,
+      direction: 'asc' | 'desc',
+    ) => number
+    sortTenantRiskMatrixTenants: (
+      tenants: Record<string, unknown>[],
+      sortColumn: 'users_at_risk',
+      direction: 'asc' | 'desc',
+    ) => Record<string, unknown>[]
+  }
+}
+
 const helpers = compileHelpers()
+const matrix = compileMatrix(helpers)
 const tenantId = '11111111-1111-4111-8111-111111111111'
 const baseTenant = {
   id: tenantId,
@@ -147,5 +195,75 @@ test('valid summaries win over the legacy scalar without treating partial eviden
   assert.equal(
     helpers.getTenantRecommendedAction(tenant).destinationUrl,
     tenantNavigation.tenantRiskyUsersPath(tenantId),
+  )
+})
+
+test('Users at Risk sorting follows visible summary counts and never the legacy scalar', () => {
+  const exactZero = {
+    ...baseTenant,
+    name: 'Exact zero',
+    microsoftRiskSummary: {
+      source: 'MICROSOFT_IDENTITY_PROTECTION',
+      availability: 'AVAILABLE',
+      completeness: 'COMPLETE',
+      rawRecordCount: 1,
+      observedActiveDistinctUserCount: 0,
+      activeDistinctUserCount: 0,
+      ...clocks,
+      reasonCode: null,
+    },
+  }
+  const observedTwo = {
+    ...baseTenant,
+    name: 'Observed two',
+    microsoftRiskSummary: {
+      source: 'MICROSOFT_IDENTITY_PROTECTION',
+      availability: 'PARTIAL',
+      completeness: 'PARTIAL',
+      rawRecordCount: 2,
+      observedActiveDistinctUserCount: 2,
+      activeDistinctUserCount: null,
+      ...clocks,
+      reasonCode: 'PARTIAL_RECORDS',
+    },
+  }
+  const partialZero = {
+    ...baseTenant,
+    name: 'Partial zero',
+    microsoftRiskSummary: {
+      ...observedTwo.microsoftRiskSummary,
+      observedActiveDistinctUserCount: 0,
+    },
+  }
+  const missing = { ...baseTenant, name: 'Missing summary' }
+  const invalid = {
+    ...baseTenant,
+    name: 'Invalid summary',
+    microsoftRiskSummary: {
+      ...exactZero.microsoftRiskSummary,
+      rawRecordCount: 1,
+      observedActiveDistinctUserCount: 9,
+      activeDistinctUserCount: 9,
+    },
+  }
+
+  const descending = matrix.sortTenantRiskMatrixTenants(
+    [exactZero, missing, invalid, partialZero, observedTwo],
+    'users_at_risk',
+    'desc',
+  )
+  assert.deepEqual(
+    descending.map((tenant) => tenant.name),
+    ['Observed two', 'Exact zero', 'Invalid summary', 'Missing summary', 'Partial zero'],
+  )
+
+  const ascending = matrix.sortTenantRiskMatrixTenants(
+    [observedTwo, partialZero, invalid, missing, exactZero],
+    'users_at_risk',
+    'asc',
+  )
+  assert.deepEqual(
+    ascending.map((tenant) => tenant.name),
+    ['Exact zero', 'Observed two', 'Invalid summary', 'Missing summary', 'Partial zero'],
   )
 })
