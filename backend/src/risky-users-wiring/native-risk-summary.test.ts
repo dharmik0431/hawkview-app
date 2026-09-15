@@ -8,8 +8,8 @@ const scope = (tenants = [tenant()], totalTenants = tenants.length): NativeSumma
 function row(id = 'tenant-a', value = 2) {
   return {
     organizationId: 'org-a', customerTenantId: id, readLimitExceeded: false,
-    completedAt: new Date('2026-09-15T11:00:00Z'), windowStart: new Date('2026-09-01T00:00:00Z'),
-    windowEnd: new Date('2026-09-15T10:00:00Z'), expiresAt: new Date('2026-09-16T00:00:00Z'),
+    completedAt: '2026-09-15T11:00:00.000Z', windowStart: '2026-09-01T00:00:00.000Z',
+    windowEnd: '2026-09-15T10:00:00.000Z', expiresAt: '2026-09-16T00:00:00.000Z',
     evaluationCoverage: { version: 'hawkview-run-coverage/v1', streams: [{ stream: 'GRAPH_SIGN_INS', coverage: {
       version: 'hawkview-coverage/v1', collectionScope: { declared: true, asked: 'GRAPH_INTERACTIVE_ONLY' },
       applies: 10, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {},
@@ -116,9 +116,11 @@ test('foreign organization, unknown tenant, duplicate rows and invalid scopes fa
 
 test('expired, invalid, absent and future clocks never permit a count', async () => {
   for (const change of [
-    { expiresAt: now }, { completedAt: null }, { completedAt: new Date('invalid') },
-    { completedAt: new Date(now.getTime() + 1) }, { windowStart: new Date('2026-09-16') },
-    { windowEnd: now }, { expiresAt: new Date('invalid') },
+    { expiresAt: now.toISOString() }, { completedAt: null }, { completedAt: new Date('invalid') },
+    { completedAt: new Date(now.getTime() + 1).toISOString() }, { windowStart: '2026-09-16T00:00:00.000Z' },
+    { windowEnd: now.toISOString() }, { expiresAt: new Date('invalid') },
+    { completedAt: '2026-09-15 11:00:00' }, { completedAt: '2026-09-15T07:00:00.000-04:00' },
+    { completedAt: '2026-02-30T11:00:00.000Z' },
   ]) {
     const { client, calls } = reader([{ ...row(), ...change }])
     const result = await readNativeRiskSummary(client, scope(), now)
@@ -154,7 +156,6 @@ test('database and defensive payload budgets withhold oversized evidence', async
   assert.match(NATIVE_SUMMARY_SQL, /CASE WHEN[\s\S]*octet_length[\s\S]*THEN r.evaluation_findings ELSE NULL/)
   assert.match(NATIVE_SUMMARY_SQL, /organization_id=s\."organizationId" AND r.customer_tenant_id=s.id/)
   assert.match(NATIVE_SUMMARY_SQL, /completed_at DESC,r.id DESC/)
-  assert.match(NATIVE_SUMMARY_SQL, /AT TIME ZONE 'UTC'/)
 })
 
 test('a missing assessment denominator cannot produce an exact all-clear', async () => {

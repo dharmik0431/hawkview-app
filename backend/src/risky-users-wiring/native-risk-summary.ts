@@ -9,10 +9,17 @@ type Accuracy = 'EXACT' | 'AT_LEAST' | 'NOT_AVAILABLE'
 type Availability = 'AVAILABLE' | 'PARTIAL' | 'UNAVAILABLE'
 export type NativeSummaryScope = { totalTenants: number; tenants: Array<{ id: string; organizationId: string; gate: 'NOT_ENABLED_FOR_TENANT' | 'EVALUATION_DISABLED' | null }> }
 type TenantSummary = { tenantId: string; availability: Availability; accuracy: Accuracy; distinctUserCount: number | null; evaluatedAt: string | null; windowStart: string | null; windowEnd: string | null; complete: boolean; limitations: Reason[] }
-type BatchRow = RunRow & { organizationId: string; customerTenantId: string; expiresAt: Date; readLimitExceeded: boolean }
+type BatchRow = Pick<RunRow, 'evaluationCoverage' | 'evaluationFindings'> & { organizationId: string; customerTenantId: string; completedAt: unknown; windowStart: unknown; windowEnd: unknown; expiresAt: unknown; readLimitExceeded: boolean }
 type Reader = { $queryRawUnsafe: <T>(query: string, ...values: unknown[]) => Promise<T> }
 const unique = (reasons: Reason[]): Reason[] => [...new Set(reasons)].sort()
 const date = (value: unknown): value is Date => value instanceof Date && Number.isFinite(value.getTime())
+// SQL returns text, not a timezone-sensitive driver timestamp type. Refuse any
+// noncanonical/missing clock rather than interpreting it in the host timezone.
+function utcClock(value: unknown): Date | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return null
+  const parsed = new Date(value)
+  return date(parsed) && parsed.toISOString() === value ? parsed : null
+}
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === 'string' && item.trim().length > 0 && item.length <= 200)
 const integer = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000
@@ -54,7 +61,10 @@ export const NATIVE_SUMMARY_SQL = `WITH authorized AS (
   ) selected ON true
 )
 SELECT r.organization_id AS "organizationId",r.customer_tenant_id AS "customerTenantId",
- r.completed_at AT TIME ZONE 'UTC' AS "completedAt",r.window_start AT TIME ZONE 'UTC' AS "windowStart",r.window_end AT TIME ZONE 'UTC' AS "windowEnd",r.expires_at AT TIME ZONE 'UTC' AS "expiresAt",
+ to_char(r.completed_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "completedAt",
+ to_char(r.window_start AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "windowStart",
+ to_char(r.window_end AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "windowEnd",
+ to_char(r.expires_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "expiresAt",
  (coalesce(octet_length(r.evaluation_coverage::text),0)+coalesce(octet_length(r.evaluation_findings::text),0)>$5) AS "readLimitExceeded",
  CASE WHEN coalesce(octet_length(r.evaluation_coverage::text),0)+coalesce(octet_length(r.evaluation_findings::text),0)<=$5 THEN r.evaluation_coverage ELSE NULL END AS "evaluationCoverage",
  CASE WHEN coalesce(octet_length(r.evaluation_coverage::text),0)+coalesce(octet_length(r.evaluation_findings::text),0)<=$5 THEN r.evaluation_findings ELSE NULL END AS "evaluationFindings"
@@ -77,15 +87,17 @@ export async function readNativeRiskSummary(client: Reader, scope: NativeSummary
     const unavailable = (reason: Reason): TenantSummary => ({ tenantId: tenant.id, availability: 'UNAVAILABLE', accuracy: 'NOT_AVAILABLE', distinctUserCount: null, evaluatedAt: null, windowStart: null, windowEnd: null, complete: false, limitations: [reason] })
     if (tenant.gate) return unavailable(tenant.gate)
     const row = byTenant.get(`${tenant.organizationId}:${tenant.id}`)
-    if (!row || (date(row.expiresAt) && row.expiresAt <= now)) return unavailable('NO_CURRENT_RUN')
+    if (!row) return unavailable('NO_CURRENT_RUN')
+    const completedAt = utcClock(row.completedAt), windowStart = utcClock(row.windowStart), windowEnd = utcClock(row.windowEnd), expiresAt = utcClock(row.expiresAt)
+    if (expiresAt && expiresAt <= now) return unavailable('NO_CURRENT_RUN')
     if (row.readLimitExceeded) return unavailable('READ_LIMIT_EXCEEDED')
-    if (!date(row.completedAt) || !date(row.windowStart) || !date(row.windowEnd) || !date(row.expiresAt) || row.windowStart > row.windowEnd || row.windowEnd > row.completedAt || row.completedAt > now) return unavailable('INVALID_RUN')
+    if (!completedAt || !windowStart || !windowEnd || !expiresAt || windowStart > windowEnd || windowEnd > completedAt || completedAt > now) return unavailable('INVALID_RUN')
     // Defense in depth for alternate clients/tests; production SQL has already bounded transfer.
     let size: number
     try { size = Buffer.byteLength(JSON.stringify(row.evaluationCoverage)) + Buffer.byteLength(JSON.stringify(row.evaluationFindings)) } catch { return unavailable('INVALID_RUN') }
     if (size > NATIVE_SUMMARY_RUN_BYTES) return unavailable('READ_LIMIT_EXCEEDED')
     if (!safeDocument(row.evaluationCoverage) || !safeDocument(row.evaluationFindings) || !validVerdict(row.evaluationFindings)) return unavailable('INVALID_RUN')
-    const run = decodeNativeRunRow(row)
+    const run = decodeNativeRunRow({ ...row, completedAt, windowStart, windowEnd })
     if (!run.present) return unavailable('INVALID_RUN')
     const count = run.count
     if (count.accuracy !== 'NOT_AVAILABLE' && (!Number.isSafeInteger(count.value) || count.value < 0 || count.value > 1_000_000)) return unavailable('INVALID_RUN')
