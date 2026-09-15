@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 
 import { useTenants } from '@/lib/api/hooks'
+import { useNativeRiskSummary } from '@/lib/api/native-risk-summary-hooks'
 import { investigateDestination } from '@/lib/tenants/investigate-navigation'
 import { AlertDetailsModal } from '@/components/dashboard/alert-details-modal'
 import { TenantRiskMatrix } from '@/components/dashboard/tenant-risk-matrix'
@@ -28,7 +29,6 @@ import {
   getTenantMatrixOverallState,
   getTenantConnectionDataInfo,
   getTenantIdentityInfo,
-  getTenantRiskyUsersInfo,
   getTenantThreatsInfo,
 } from '@/components/dashboard/tenant-risk-matrix-helpers'
 import type { Tenant } from '@/types/api'
@@ -40,6 +40,10 @@ import {
   normalizeMicrosoftRiskSummary,
   presentMicrosoftRiskSummary,
 } from '@/lib/identity-risk/microsoft-risk-summary'
+import {
+  presentHawkViewTenantRisk,
+  summarizeHawkViewPortfolioRisk,
+} from '@/lib/dashboard/hawkview-risk-summary'
 
 export type Severity = 'critical' | 'high' | 'medium'
 type TabKey = 'queue' | 'matrix'
@@ -373,6 +377,7 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
 export default function DashboardPage() {
   const router = useRouter()
   const tenantQuery = useTenants()
+  const nativeRiskQuery = useNativeRiskSummary()
   const {
     data,
     isLoading,
@@ -403,6 +408,32 @@ export default function DashboardPage() {
   const tenants = React.useMemo(
     () => buildTenants(data?.tenants ?? []),
     [data?.tenants]
+  )
+
+  const nativeRiskByTenant = React.useMemo(
+    () =>
+      new Map(
+        (nativeRiskQuery.data?.tenants ?? []).map((summary) => [
+          summary.tenantId,
+          summary,
+        ]),
+      ),
+    [nativeRiskQuery.data?.tenants],
+  )
+
+  const nativeRiskRequestState = nativeRiskQuery.isLoading
+    ? 'LOADING' as const
+    : nativeRiskQuery.isError
+      ? 'ERROR' as const
+      : 'SUCCESS' as const
+
+  const hawkViewPortfolioRisk = React.useMemo(
+    () =>
+      summarizeHawkViewPortfolioRisk(
+        nativeRiskQuery.data?.fleet,
+        nativeRiskRequestState,
+      ),
+    [nativeRiskQuery.data?.fleet, nativeRiskRequestState],
   )
 
   const filteredTenants = React.useMemo(() => {
@@ -449,11 +480,14 @@ export default function DashboardPage() {
       }
 
       // 2. Has Risky Users
+      const hawkViewRisk = presentHawkViewTenantRisk(
+        nativeRiskByTenant.get(t.id),
+        nativeRiskRequestState,
+      )
       if (matrixHasRiskyUsers === 'yes') {
-        if ((getTenantRiskyUsersInfo(t).count ?? 0) <= 0) return false
+        if ((hawkViewRisk.count ?? 0) <= 0) return false
       } else if (matrixHasRiskyUsers === 'no') {
-        const risk = getTenantRiskyUsersInfo(t)
-        if (!risk.isExact || risk.count !== 0) return false
+        if (!hawkViewRisk.exact || hawkViewRisk.count !== 0) return false
       }
 
       // 3. Has Active Threats
@@ -484,6 +518,8 @@ export default function DashboardPage() {
     matrixHasRiskyUsers,
     matrixHasThreats,
     matrixDataAvailability,
+    nativeRiskByTenant,
+    nativeRiskRequestState,
   ])
 
   const queueItems = React.useMemo(() => {
@@ -714,18 +750,29 @@ export default function DashboardPage() {
       ) : null}
       {/* KPI Cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <Card className="rounded-2xl">
+        <button
+          type="button"
+          onClick={() => router.push('/risky-users')}
+          className="rounded-2xl text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+          aria-label={`Open Risky Users. ${hawkViewPortfolioRisk.accessibleValue} HawkView risky users.`}
+        >
+          <Card className="h-full rounded-2xl transition-colors hover:border-blue-300 dark:hover:border-blue-700">
           <CardContent className="p-5">
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
-                  Risky Identities
+                  HawkView Risky Users
                 </div>
                 <div className="mt-1 text-3xl font-bold">
-                  {evidenceCount(kpis.riskyIdentities, kpis.riskPartial, 'Unavailable')}
+                  {hawkViewPortfolioRisk.display}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
-                  {kpis.riskPartial ? 'Partial Microsoft risk evidence' : 'Microsoft risk evidence'}
+                  {hawkViewPortfolioRisk.totalTenants === null
+                    ? hawkViewPortfolioRisk.detail
+                    : `${hawkViewPortfolioRisk.assessedTenants} of ${hawkViewPortfolioRisk.totalTenants} tenants assessed`}
+                </div>
+                <div className="mt-2 text-[11px] text-slate-400">
+                  Microsoft Entra risk: {evidenceCount(kpis.riskyIdentities, kpis.riskPartial, 'Unavailable')}
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-red-50 border border-red-100 flex items-center justify-center">
@@ -733,7 +780,8 @@ export default function DashboardPage() {
               </div>
             </div>
           </CardContent>
-        </Card>
+          </Card>
+        </button>
 
         <Card className="rounded-2xl">
           <CardContent className="p-5">
@@ -899,15 +947,15 @@ export default function DashboardPage() {
             </div>
 
             <div className="relative">
-              <label className="sr-only">Has Risky Users</label>
+              <label className="sr-only">HawkView risky-user status</label>
               <select
                 value={matrixHasRiskyUsers}
                 onChange={(e) => setMatrixHasRiskyUsers(e.target.value)}
                 className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-xs font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
               >
                 <option value="all">All Risky User States</option>
-                <option value="yes">Has Risky Users (&gt;0)</option>
-                <option value="no">No Risky Users (0)</option>
+                <option value="yes">HawkView findings (&gt;0 users)</option>
+                <option value="no">No HawkView findings (exact 0)</option>
               </select>
             </div>
 
@@ -1244,7 +1292,11 @@ export default function DashboardPage() {
             </span>
           </div>
 
-          <TenantRiskMatrix tenants={filteredMatrixTenants} />
+          <TenantRiskMatrix
+            tenants={filteredMatrixTenants}
+            nativeRiskByTenant={nativeRiskByTenant}
+            nativeRiskRequestState={nativeRiskRequestState}
+          />
         </div>
       )}
 
