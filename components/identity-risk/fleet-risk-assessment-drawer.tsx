@@ -238,6 +238,8 @@ export function FleetRiskAssessmentDrawer({
                       ? 'Active risk reported by Microsoft Entra ID Protection'
                       : row.detection.microsoft === 'UNAVAILABLE'
                       ? 'Microsoft Entra risk data unavailable'
+                      : isUnmatchedOrPartial
+                      ? 'Microsoft risk comparison incomplete'
                       : 'No active Microsoft risk reported'}
                   </span>
                 </div>
@@ -246,6 +248,8 @@ export function FleetRiskAssessmentDrawer({
                     ? 'Microsoft Entra ID Protection has flagged an active risk event for this user.'
                     : row.detection.microsoft === 'UNAVAILABLE'
                     ? 'Microsoft Entra ID Protection risk telemetry could not be retrieved for this tenant.'
+                    : isUnmatchedOrPartial
+                    ? 'No conclusion about active Microsoft risk can be drawn because the available evidence could not be fully compared.'
                     : 'This means Microsoft currently has no active risk record for this identity. It does not confirm that the account is safe.'}
                 </p>
               </div>
@@ -267,7 +271,7 @@ export function FleetRiskAssessmentDrawer({
                   </Badge>
                 </div>
                 <div className="text-xs text-slate-500 dark:text-slate-400 font-normal whitespace-nowrap">
-                  Latest evidence · {formatTimestamp(row.lastSeen)}
+                  Latest evidence · {row.lastSeen ? formatTimestamp(row.lastSeen) : 'No evidence time recorded'}
                 </div>
               </div>
 
@@ -334,8 +338,8 @@ export function FleetRiskAssessmentDrawer({
                             <Clock3 className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                             <span>
                               {isStateObserved
-                                ? `Configuration read · ${formatTimestamp(reason.lastSeen)}`
-                                : `Last observed · ${formatTimestamp(reason.lastSeen)}`}
+                                ? `Configuration read · ${reason.lastSeen ? formatTimestamp(reason.lastSeen) : 'No evidence time recorded'}`
+                                : `Last observed · ${reason.lastSeen ? formatTimestamp(reason.lastSeen) : 'No evidence time recorded'}`}
                             </span>
                           </span>
                           <span className="text-slate-300 dark:text-slate-700">•</span>
@@ -436,7 +440,7 @@ export function FleetRiskAssessmentDrawer({
                       HawkView evidence
                     </span>
                     <span className="text-xs text-slate-500 dark:text-slate-400">
-                      Evaluated · {formatTimestamp(row.lastSeen)}
+                      Evaluated · {row.lastSeen ? formatTimestamp(row.lastSeen) : 'No evidence time recorded'}
                     </span>
                   </div>
                   <Badge

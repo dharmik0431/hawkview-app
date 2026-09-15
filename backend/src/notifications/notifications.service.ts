@@ -2,6 +2,7 @@ import { BadRequestException, ForbiddenException, Inject, Injectable, Logger } f
 import { PrismaService } from '../prisma/prisma.service.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { Prisma } from '../generated/prisma/client.js'
+import { alertTierFor } from '../alerts/finding-pipeline.js'
 
 const preferenceFields = [
   'securityEnabled',
@@ -12,6 +13,13 @@ const preferenceFields = [
   'emailEnabled',
 ] as const
 const severities = ['info', 'low', 'medium', 'high', 'critical'] as const
+
+/** THE TWO VOCABULARIES A NOTIFICATION IS WRITTEN IN, exported so a second producer cannot
+ * invent its own. The alerting pipeline writes notification rows too, and an invented severity
+ * there would be a row the reader's filter silently never matches — visible in no list and
+ * counted in no badge, which is indistinguishable from the feature not working. */
+export type NotificationSeverity = (typeof severities)[number]
+export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
 const digestModes = ['off', 'daily', 'weekly'] as const
 const severityRank = new Map(severities.map((value, index) => [value, index]))
 
@@ -20,8 +28,8 @@ export type NotificationIncident = {
   customerTenantId?: string
   recipientUserId?: string
   eventType: string
-  category: 'success' | 'info' | 'warning' | 'error'
-  severity?: (typeof severities)[number]
+  category: NotificationCategory
+  severity?: NotificationSeverity
   title: string
   description: string
   dedupeKey: string
@@ -198,6 +206,22 @@ export class NotificationsService {
       eventType: row.eventType,
       category: row.category,
       severity: row.severity,
+      /** The alert type, for rows that are alerts. The FACT the tier below is derived from. */
+      alertTypeId: row.alertTypeId ?? undefined,
+      /** **THE URGENCY TIER, DERIVED SERVER-SIDE AND SENT.** The client renders what it is sent
+       * and must not re-derive: deriving twice is one fact in two places with a network hop
+       * between them, and the two ends drift.
+       *
+       * **IT CANNOT BE RECOVERED FROM `severity` AT EITHER END.** `critical` is not exclusive to
+       * alerts — `tenant-sync.service.ts` publishes a lost Microsoft connection at `critical`
+       * through the same `publishIncident`, on rows that exist in production today. Anything
+       * inverting severity back to a tier badges a disconnected tenant as ACT_NOW. That is why
+       * the tier travels as its own field.
+       *
+       * THREE ARMS, AND THE OBJECT SHAPE IS DELIBERATE. A bare nullable string would collapse
+       * `NOT_AN_ALERT` — a collector row that genuinely has no tier — into
+       * `UNKNOWN_ALERT_TYPE`, which is a fact about the data somebody should look at. */
+      tier: alertTierFor(row.alertTypeId, row.severity),
       title: row.title,
       description: row.description,
       timestamp: row.lastOccurredAt.toISOString(),

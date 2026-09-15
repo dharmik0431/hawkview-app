@@ -161,7 +161,7 @@ test('scheduler authorization succeeds before retention maintenance and tenant s
       return { status: 'COMPLETED', deletedCount: 0, hasMore: false }
     },
   } as unknown as IdentityRiskMaintenanceService
-  const controller = new ScheduledSyncController(verifier, sync, maintenance)
+  const controller = new ScheduledSyncController(verifier, sync, maintenance, { runOnce: async () => null } as any)
 
   try {
   assert.deepEqual(
@@ -189,7 +189,7 @@ test('failed scheduler authorization prevents retention and tenant work', async 
   const maintenance = {
     runAuthorizedScheduledMaintenance: async () => { maintenanceCalls += 1 },
   } as unknown as IdentityRiskMaintenanceService
-  const controller = new ScheduledSyncController(verifier, sync, maintenance)
+  const controller = new ScheduledSyncController(verifier, sync, maintenance, { runOnce: async () => null } as any)
   const messages: string[] = []
   ;(controller as any).logger = { log: (message: string) => messages.push(message) }
 
@@ -208,7 +208,7 @@ test('risk maintenance failure cannot prevent normal collection or leak provider
   let collections = 0; const logs: string[] = []
   const controller = new ScheduledSyncController({ verify: async () => undefined } as any,
     { syncDueTenants: async () => { collections++; return { status: 'ok' } } } as any,
-    { runAuthorizedScheduledMaintenance: async () => { throw new Error('password=synthetic-only') } } as any)
+    { runAuthorizedScheduledMaintenance: async () => { throw new Error('password=synthetic-only') } } as any, { runOnce: async () => null } as any)
   ;(controller as any).logger = { log: (message: string) => logs.push(message), warn: (message: string) => logs.push(message) }
   try {
     assert.deepEqual(await controller.syncDueTenants({ headers: {} } as Request), { status: 'ok' })

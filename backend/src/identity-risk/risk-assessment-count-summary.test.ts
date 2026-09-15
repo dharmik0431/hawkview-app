@@ -130,3 +130,61 @@ test('protection context cannot subtract an otherwise qualifying current user', 
   const protection = { ...protectedUser.protection, securityDefaults: { ...protectedUser.protection.securityDefaults, state: 'ENABLED' as const } }
   assert.deepEqual(count(fixture([{ ...protectedUser, protection }])), { value: 1, accuracy: 'EXACT' })
 })
+
+/**
+ * DOCUMENTED GAP: THE WITHHELD COUNT CANNOT YET SAY WHY.
+ *
+ * `RiskAssessmentSummaryDto` has no `reasons` field — not "the producer omits
+ * it", the TYPE forbids it. The frontend nonetheless validates count reasons
+ * against `assessmentCountReasons` and renders per-reason copy, and I added
+ * `NO_EVIDENCE_IN_WINDOW` to that list. That entry is PREPARATION. Nothing on
+ * this side can populate it, and my test for it supplied a handcrafted
+ * `reasons` array, which proves the adapter accepts the shape, not that any
+ * server sends it.
+ *
+ * The allow-list entry looks exactly like a working feature, so this test is
+ * here to stop the next person reading it as one. Raised by the PM.
+ *
+ * WHAT HAPPENS TODAY, and it is honest rather than wrong: an empty-window
+ * tenant is not `complete`, contributes no identities, and falls to the
+ * UNKNOWN return. The screen then renders the unexplained-withheld copy —
+ * "did not report why. It is not zero." True, and vaguer than it could be.
+ *
+ * WHAT TO CHANGE WHEN WIRING IT. The fact is already here: `assessment.rules`
+ * carries `reasonCode: 'NO_EVIDENCE_IN_WINDOW'` at this point. Wiring means
+ * adding `reasons` to RiskAssessmentSummaryDto, populating it at the UNKNOWN
+ * return, and admitting it in the projection validator. It was left undone
+ * deliberately — it is new wire surface, and the only guard that exercises the
+ * producer against the production adapter needs a cluster that is not
+ * available here. This test fails the moment it IS wired, which is the point:
+ * it should send whoever does it to the frontend entry already waiting.
+ */
+test('GAP: an empty-window tenant withholds its count and cannot say why', () => {
+  // REBUILT RATHER THAN MUTATED: `rules` is a readonly property on the DTO, so
+  // assigning to it never compiled. The fixture is the same and so is the intent.
+  const base = fixture()
+  const data = {
+    ...base,
+    rules: base.rules.map((rule) => ({
+      ...rule, status: 'WAITING' as const, reasonCode: 'NO_EVIDENCE_IN_WINDOW' as const,
+      evaluatedAt: null, assessedIdentities: 0, matchedIdentities: 0,
+    })),
+  }
+  const summary = riskAssessmentSummary(data, now)
+
+  assert.deepEqual(summary.currentUsers, unknown,
+    'an empty-window tenant no longer withholds its count')
+  assert.equal(
+    'reasons' in summary.currentUsers, false,
+    'the count now carries a reason — wire it through the projection validator ' +
+    'and drop this test; assessmentCountReasons in the frontend adapter is ' +
+    'already waiting for NO_EVIDENCE_IN_WINDOW')
+})
+
+test('GAP CONTROL: a healthy tenant is unaffected and still counts exactly', () => {
+  // So the assertion above cannot be passing because this fixture withholds
+  // every count regardless of what the rules say.
+  const healthy = riskAssessmentSummary(fixture([user(1)]), now)
+  assert.equal(healthy.currentUsers.accuracy, 'EXACT')
+  assert.equal(healthy.currentUsers.value, 1)
+})

@@ -27,6 +27,13 @@ export type RiskAssessmentReason =
   | 'DIRECTORY_SYNC_MISSING' | 'DIRECTORY_SYNC_NOT_SUCCEEDED' | 'DIRECTORY_SYNC_UNDATED'
   | 'DIRECTORY_SYNC_STALE' | 'DIRECTORY_SYNC_NEWER_ATTEMPT' | 'RULE_ENDPOINT_NOT_FOUND'
   | 'RULE_VALIDATION_UNATTESTABLE' | 'SOURCE_NOT_ATTESTED' | 'ATTESTED_COMPLETE'
+  /** Collection succeeded and the window held nothing to evaluate.
+   *
+   * NOT 'READY' and NOT 'INCOMPLETE_WINDOW'. A rule that saw no events did not
+   * decline them, so it cannot report NOT_MATCHED; and the window was not
+   * incomplete, it was empty. Those are different facts with different
+   * remedies, and before this they were the same sentence. */
+  | 'NO_EVIDENCE_IN_WINDOW'
 export type RiskEvidenceWindow = Readonly<{ start: string | null; end: string | null }>
 export type RiskProtectionEvidence<State extends string> = Readonly<{
   state: State | 'UNKNOWN'

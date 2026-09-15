@@ -10,12 +10,18 @@ import {
   Filter,
   Globe,
   RefreshCw,
+  AlertTriangle,
   Search,
   ShieldAlert,
   ShieldCheck,
   ShieldOff,
   Users,
 } from 'lucide-react'
+import {
+  fleetCoverage,
+  riskyUsersSummary,
+  type FleetSize,
+} from '@/lib/identity-risk/fleet-coverage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -138,8 +144,10 @@ export default function FleetRiskyUsersPage() {
   const {
     tenants,
     fleetRows,
+    tenantStatuses,
     metrics,
     isLoading,
+    isError,
     retryAll,
   } = useFleetRiskyUsers()
 
@@ -150,6 +158,64 @@ export default function FleetRiskyUsersPage() {
 
   const [drawerRow, setDrawerRow] = useState<FleetRiskyUserRow | null>(null)
   const [isDrawerOpen, setIsDrawerOpen] = useState(false)
+
+  // ONE FACT, ONE RENDERING. The badge showed `{filteredRows.length} users`
+  // and a KPI tile several inches away showed "N tenants unavailable", and
+  // neither knew about the other -- so a reader asking "is my fleet clean"
+  // read a number over a subset with nothing saying so.
+  //
+  // Derived from tenantStatuses, which the hook already computed and this page
+  // discarded. It distinguishes LOADING, FAILED, UNAVAILABLE and SUCCESS;
+  // `metrics.failedTenants` counts only assessmentError, so a tenant that came
+  // back with no assessment was counted as fine.
+  // THE KPI ROW IS ABOUT THE WHOLE FLEET, not the filtered view -- the counts
+  // beside it (totalRiskyUsers and the rest) are unfiltered, so its coverage
+  // has to be too or the tile would disagree with the numbers it sits under.
+  // WHETHER THE FLEET COULD BE ENUMERATED AT ALL, which this page never asked.
+  // `useFleetRiskyUsers` does `tenantsResponse?.tenants ?? []`, so a failed
+  // tenant-list request is an empty array -- indistinguishable from an
+  // organisation with nothing onboarded, and it made every coverage ratio
+  // below it vacuously true. The hook has exposed `isError` all along.
+  // Memoised because it is an OBJECT: a fresh literal each render would change
+  // the identity the two useMemos below depend on, recomputing coverage every
+  // time. Caught by lint rather than by me.
+  const fleetSize: FleetSize = useMemo(
+    () =>
+      isError
+        ? {
+            kind: 'UNKNOWN',
+            because:
+              'The list of tenants could not be loaded, so HawkView does not know which tenants exist.',
+          }
+        : { kind: 'KNOWN' },
+    [isError]
+  )
+
+  const fleetWide = useMemo(
+    () => fleetCoverage(tenantStatuses, 'ALL', fleetSize),
+    [tenantStatuses, fleetSize]
+  )
+
+  // EVERY COVERAGE CLAIM ON THIS PAGE CAME OFF `metrics.failedTenants`, which
+  // counts only assessmentError. Eight sites: the tile, the heading, the
+  // "N of M evaluated" lines, the styling, and the partial-coverage banner --
+  // which, because it renders only when failedTenants > 0, did not appear AT
+  // ALL for a fleet whose tenants came back UNAVAILABLE rather than errored.
+  // One derived number now, so the page cannot tell two coverage stories.
+  const notAssessed = fleetWide.inScope - fleetWide.assessed
+
+  const coverage = useMemo(
+    () => fleetCoverage(tenantStatuses, selectedTenant, fleetSize),
+    [tenantStatuses, selectedTenant, fleetSize]
+  )
+
+  // Only a filter that is narrowing something may be blamed for an empty list.
+  // The same four controls the "Clear filters" button resets.
+  const filtersActive =
+    searchQuery.trim() !== '' ||
+    selectedTenant !== 'ALL' ||
+    sourceFilter !== 'ALL' ||
+    priorityFilter !== 'ALL'
 
   const filteredRows = useMemo(() => {
     return fleetRows.filter((row) => {
@@ -188,6 +254,14 @@ export default function FleetRiskyUsersPage() {
     })
   }, [fleetRows, searchQuery, selectedTenant, sourceFilter, priorityFilter])
 
+  // The badge and all three empty states come from here, so the count and the
+  // coverage cannot drift apart again.
+  const summary = riskyUsersSummary(
+    filteredRows.length,
+    coverage,
+    filtersActive
+  )
+
   const openDrawer = (row: FleetRiskyUserRow) => {
     setDrawerRow(row)
     setIsDrawerOpen(true)
@@ -225,7 +299,7 @@ export default function FleetRiskyUsersPage() {
               Review users requiring investigation across the Microsoft 365 tenants you manage.
             </p>
             <div className="flex items-center gap-2 mt-1.5 text-xs text-slate-500 dark:text-slate-400 font-medium">
-              <span>{metrics.totalTenants - metrics.failedTenants} of {metrics.totalTenants} tenants evaluated</span>
+              <span>{fleetWide.assessed} of {fleetWide.inScope} tenants assessed</span>
               <span className="text-slate-300 dark:text-slate-700">•</span>
               <span>Updated continuously</span>
             </div>
@@ -255,7 +329,7 @@ export default function FleetRiskyUsersPage() {
           <div>
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                {metrics.failedTenants > 0 ? 'Users Shown (Partial Fleet)' : 'Users Requiring Review'}
+                {notAssessed > 0 ? 'Users Shown (Partial Fleet)' : 'Users Requiring Review'}
               </span>
               <Users className="h-4 w-4 text-slate-400" />
             </div>
@@ -334,6 +408,8 @@ export default function FleetRiskyUsersPage() {
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 distinct users flagged
+                {notAssessed > 0 &&
+                  ` across ${fleetWide.assessed} of ${fleetWide.inScope} tenants`}
               </p>
             </div>
             <div className="text-2xs font-medium text-blue-700 dark:text-blue-300 pt-1 border-t border-blue-100 dark:border-blue-900/40">
@@ -357,6 +433,13 @@ export default function FleetRiskyUsersPage() {
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 reported active in Entra ID
+                {/* THE SCREENSHOT FOUND THESE TWO. Side by side, a fully
+                    assessed fleet and a one-third assessed one rendered these
+                    tiles identically: a bare 0 with no coverage on it. The
+                    sweep missed them because it looked for `.length` counts
+                    and health words, and these are aggregate metrics. */}
+                {notAssessed > 0 &&
+                  ` across ${fleetWide.assessed} of ${fleetWide.inScope} tenants`}
               </p>
             </div>
             <div className="text-2xs font-medium text-purple-700 dark:text-purple-300 pt-1 border-t border-purple-100 dark:border-purple-900/40">
@@ -368,9 +451,9 @@ export default function FleetRiskyUsersPage() {
           <div
             className={cn(
               'p-4 rounded-xl border shadow-2xs flex flex-col justify-between space-y-3',
-              metrics.failedTenants === 0
+              notAssessed === 0
                 ? 'border-emerald-200/70 dark:border-emerald-900/40 bg-emerald-50/30 dark:bg-emerald-950/20'
-                : metrics.failedTenants < metrics.totalTenants
+                : notAssessed < fleetWide.inScope
                 ? 'border-amber-200/70 dark:border-amber-900/40 bg-amber-50/30 dark:bg-amber-950/20'
                 : 'border-rose-200/70 dark:border-rose-900/40 bg-rose-50/30 dark:bg-rose-950/20'
             )}
@@ -379,7 +462,7 @@ export default function FleetRiskyUsersPage() {
               <span
                 className={cn(
                   'text-xs font-semibold',
-                  metrics.failedTenants === 0
+                  notAssessed === 0
                     ? 'text-emerald-900 dark:text-emerald-300'
                     : 'text-amber-900 dark:text-amber-300'
                 )}
@@ -389,7 +472,7 @@ export default function FleetRiskyUsersPage() {
               <div
                 className={cn(
                   'p-1.5 rounded-lg border',
-                  metrics.failedTenants === 0
+                  notAssessed === 0
                     ? 'bg-emerald-100/80 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 border-emerald-200/80 dark:border-emerald-800/60'
                     : 'bg-amber-100/80 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300 border-amber-200/80 dark:border-amber-800/60'
                 )}
@@ -399,7 +482,7 @@ export default function FleetRiskyUsersPage() {
             </div>
             <div>
               <div className="text-2xl font-bold text-slate-900 dark:text-slate-100">
-                {isLoading ? '...' : `${metrics.totalTenants - metrics.failedTenants} of ${metrics.totalTenants}`}
+                {isLoading ? '...' : `${fleetWide.assessed} of ${fleetWide.inScope}`}
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 evaluated tenants
@@ -408,27 +491,35 @@ export default function FleetRiskyUsersPage() {
             <div
               className={cn(
                 'text-2xs font-medium pt-1 border-t',
-                metrics.failedTenants === 0
+                fleetWide.assessed === fleetWide.inScope
                   ? 'text-emerald-700 dark:text-emerald-300 border-emerald-100 dark:border-emerald-900/40'
                   : 'text-amber-700 dark:text-amber-300 border-amber-100 dark:border-amber-900/40'
               )}
             >
-              {metrics.failedTenants === 0
-                ? '100% tenants synced'
-                : `${metrics.failedTenants} tenant${metrics.failedTenants === 1 ? '' : 's'} unavailable`}
+              {/* '100% tenants synced' WAS DERIVED FROM failedTenants, WHICH
+                  COUNTS ONLY assessmentError. A tenant whose assessment came
+                  back null is UNAVAILABLE -- not an error, and it contributed
+                  no rows -- so this tile claimed a fully synced fleet over
+                  tenants nobody assessed. I named that in the commit that fixed
+                  the badge and the empty states and then left the tile itself
+                  alone: the visible half fixed and the reassuring half not,
+                  which is the shape this whole sweep is about. */}
+              {fleetWide.assessed === fleetWide.inScope
+                ? `All ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} assessed`
+                : `${fleetWide.inScope - fleetWide.assessed} of ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} not assessed`}
             </div>
           </div>
         </div>
       </div>
 
       {/* Coverage Status Ribbon */}
-      {metrics.failedTenants > 0 && (
+      {notAssessed > 0 && (
         <div className="rounded-xl border border-amber-200/80 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/30 p-3.5 px-4 text-xs text-amber-900 dark:text-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
           <div className="flex items-center gap-2.5">
             <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
             <div>
               <span className="font-semibold">
-                Partial fleet coverage: {metrics.failedTenants} of {metrics.totalTenants} tenant{metrics.totalTenants === 1 ? '' : 's'} could not be fully evaluated.
+                Partial fleet coverage: {notAssessed} of {fleetWide.inScope} tenant{fleetWide.inScope === 1 ? '' : 's'} could not be fully assessed.
               </span>
               <span className="block sm:inline text-2xs text-amber-800 dark:text-amber-300/80 sm:ml-2">
                 Available tenant findings remain displayed below without interruption.
@@ -459,7 +550,7 @@ export default function FleetRiskyUsersPage() {
                 variant="secondary"
                 className="bg-slate-200/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-semibold text-xs px-2 py-0.5"
               >
-                {filteredRows.length} user{filteredRows.length === 1 ? '' : 's'}
+                {summary.headline}
               </Badge>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
@@ -594,35 +685,45 @@ export default function FleetRiskyUsersPage() {
                     </div>
                   </TableCell>
                 </TableRow>
-              ) : fleetRows.length === 0 ? (
+              ) : summary.empty ? (
                 <TableRow>
                   <TableCell colSpan={7} className="h-48 text-center p-6">
+                    {/* TWO EMPTY STATES COLLAPSED INTO ONE. They were separate
+                        branches -- "no rows at all" and "nothing matched the
+                        filters" -- and BOTH drew their own conclusion about a
+                        fleet neither had asked about coverage. The first showed a
+                        green ShieldCheck in an emerald circle and said "Evaluated
+                        N authorized tenants" using totalTenants - failedTenants,
+                        which counts a tenant that returned no assessment as
+                        evaluated. */}
                     <div className="flex flex-col items-center justify-center gap-2.5 max-w-md mx-auto">
-                      <div className="p-3 rounded-full bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
-                        <ShieldCheck className="h-6 w-6" />
-                      </div>
+                      {/* THE ICON IS THE STRONGEST CLAIM ON THE SCREEN: read
+                          before the prose, believed faster, and impossible to
+                          qualify with a clause. Exactly one tone earns the
+                          shield, and the tone is derived rather than chosen
+                          here. */}
+                      {summary.empty.tone === 'QUIET' ? (
+                        <div className="p-3 rounded-full bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+                          <ShieldCheck className="h-6 w-6" />
+                        </div>
+                      ) : summary.empty.tone === 'UNKNOWN' ? (
+                        <div className="p-3 rounded-full bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800">
+                          <AlertTriangle className="h-6 w-6" />
+                        </div>
+                      ) : (
+                        <Search className="h-6 w-6 text-slate-400" />
+                      )}
                       <div className="space-y-1">
                         <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                          No risky users were reported in the completed assessments
+                          {summary.empty.title}
                         </h3>
                         <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                          Evaluated {metrics.totalTenants - metrics.failedTenants} authorized Microsoft 365 tenants across all HawkView detectors and Microsoft Entra ID Protection. Note: Zero findings indicate clean current rule checks, not proof that every identity is uncompromised.
+                          {summary.empty.detail}
+                          {summary.empty.tone === 'QUIET' &&
+                            ' Zero findings indicate clean current rule checks, not proof that every identity is uncompromised.'}
                         </p>
                       </div>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ) : filteredRows.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={7} className="h-40 text-center p-6">
-                    <div className="flex flex-col items-center justify-center gap-2 max-w-sm mx-auto">
-                      <Search className="h-6 w-6 text-slate-400" />
-                      <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                        No users match the selected filters
-                      </h3>
-                      <p className="text-xs text-slate-500 dark:text-slate-400">
-                        Try adjusting your search terms, tenant selection, or detection source criteria.
-                      </p>
+                      {summary.empty.tone === 'FILTERED' && (
                       <Button
                         variant="outline"
                         size="sm"
@@ -636,6 +737,7 @@ export default function FleetRiskyUsersPage() {
                       >
                         Clear filters
                       </Button>
+                      )}
                     </div>
                   </TableCell>
                 </TableRow>
@@ -811,10 +913,20 @@ export default function FleetRiskyUsersPage() {
               <RefreshCw className="h-6 w-6 animate-spin text-blue-600 mx-auto" />
               <p className="text-xs font-medium">Evaluating fleet-wide identity risk...</p>
             </div>
-          ) : filteredRows.length === 0 ? (
+          ) : summary.empty ? (
             <div className="p-6 text-center text-slate-500 space-y-2">
-              <ShieldCheck className="h-6 w-6 text-emerald-500 mx-auto" />
-              <p className="text-xs font-bold text-slate-800 dark:text-slate-200">No matching users found</p>
+              {/* Same rule as the desktop table. A green shield here said "you
+                  are fine" about tenants nobody assessed, on the narrow screen
+                  where it is the only thing visible. */}
+              {summary.empty.tone === 'QUIET' ? (
+                <ShieldCheck className="h-6 w-6 text-emerald-500 mx-auto" />
+              ) : summary.empty.tone === 'UNKNOWN' ? (
+                <AlertTriangle className="h-6 w-6 text-amber-500 mx-auto" />
+              ) : (
+                <Search className="h-6 w-6 text-slate-400 mx-auto" />
+              )}
+              <p className="text-xs font-bold text-slate-800 dark:text-slate-200">{summary.empty.title}</p>
+              <p className="text-2xs text-slate-500 dark:text-slate-400 leading-relaxed">{summary.empty.detail}</p>
             </div>
           ) : (
             filteredRows.map((row, idx) => {

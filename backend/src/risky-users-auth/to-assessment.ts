@@ -27,6 +27,11 @@ function readiness(reasons: readonly string[], ruleId: AuthRuleId, capacity: boo
   if (has('SOURCE_STALE')) return { status: 'STALE', reasonCode: 'COLLECTION_STALE' };
   if (has('SOURCE_UNAVAILABLE')) return { status: 'WAITING', reasonCode: 'SOURCE_UNAVAILABLE' };
   if (has('INVALID_EVALUATION_CONTEXT', 'INVALID_READINESS')) return { status: 'FAILED', reasonCode: 'EVALUATION_FAILED' };
+  // NAMED BEFORE THE CATCH-ALL. Everything that reaches the last line is
+  // reported as INCOMPLETE_WINDOW regardless of what it was, which is why that
+  // code cost a day to interpret. An empty window is the commonest of those and
+  // the least like an incomplete one.
+  if (has('NO_EVIDENCE_IN_WINDOW')) return { status: 'WAITING', reasonCode: 'NO_EVIDENCE_IN_WINDOW' };
   return reasons.length ? { status: 'PARTIAL', reasonCode: 'INCOMPLETE_WINDOW' } : { status: 'READY', reasonCode: 'READY' };
 }
 

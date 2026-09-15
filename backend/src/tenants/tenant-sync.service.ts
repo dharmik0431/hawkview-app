@@ -1542,6 +1542,76 @@ export function organizationConfigurationSnapshotForTenant(
   }
 }
 
+/**
+ * ONE DIRECTORY USER, AS THE MAILBOX SNAPSHOT STORES IT.
+ *
+ * EXTRACTED SO IT CAN BE TESTED AGAINST REAL CODE. It was inline in the sync method, which meant
+ * the only way to check its behaviour was to restate the expression in a test — and a test that
+ * restates the thing it checks agrees with itself by construction.
+ *
+ * WHAT IT DOES WITH AN ABSENT PROPERTY, stated plainly because it is not obvious:
+ * `accountEnabled` absent becomes TRUE, and `proxyAddresses` absent becomes `[]`. Absent and
+ * explicitly null are therefore indistinguishable here — both take the default.
+ *
+ * THIS IS A ROBUSTNESS GAP, NOT AN OBSERVED DATA LOSS, and the distinction matters. Graph's
+ * default delta responses RETAIN previously-set selected properties; omission is the opt-in
+ * `Prefer: return=minimal` mode, and nothing in this codebase sends that header. So there is no
+ * evidence of an active erasure and it should not be described as customer data loss. What is
+ * true is that a partial payload arriving for any other reason would be written as fact.
+ *
+ * Whether to harden this is the owner's decision and is not taken here. */
+export function exchangeMailboxRow(user: any) {
+  // PRESENT-ONLY. A property the directory did not mention is OMITTED rather than defaulted,
+  // because "I am not telling you about this" and "this is empty" are different facts and this
+  // mapping is the last place they can be told apart. `accountEnabled` used to become TRUE when
+  // absent -- the opposite of a stored false -- and `proxyAddresses` became `[]`, which is a
+  // claim that there are none rather than a record that none were sent.
+  //
+  // An EXPLICIT null is kept and still clears: the directory said the value is empty, and that
+  // is a fact it is entitled to state. Losing that half would be this defect mirrored.
+  const row: Record<string, unknown> = { id: user.id }
+  const carry = (key: string, value: unknown) => {
+    if (value !== undefined) row[key] = value
+  }
+  carry('displayName', user.displayName)
+  carry('userPrincipalName', user.userPrincipalName)
+  carry('mail', user.mail)
+  carry('proxyAddresses', user.proxyAddresses)
+  // Normalised only when PRESENT. Absent stays absent.
+  carry('accountEnabled', user.accountEnabled === undefined ? undefined : user.accountEnabled !== false)
+  return row
+}
+
+/**
+ * MERGE A NEW SNAPSHOT ONTO THE STORED ONE, PROPERTY BY PROPERTY.
+ *
+ * Absent properties inherit the stored value; present ones win, INCLUDING an explicit null,
+ * which clears. Rows absent from the incoming snapshot are removed, because `saveSnapshot`
+ * only accepts a collection that attests to complete pagination -- a legitimate empty inventory
+ * is allowed to remove objects, and a partial read cannot reach here at all.
+ *
+ * NOT A RESPONSE TO OBSERVED DATA LOSS. Graph's default delta responses retain previously-set
+ * selected properties, and nothing here sends `Prefer: return=minimal`. This is robustness
+ * against a partial payload arriving for any other reason -- a truncated response, an API
+ * change, a replayed fixture -- and it must not be described as confirmed customer data loss.
+ */
+export function mergeExchangeMailboxRows(
+  previous: readonly unknown[], incoming: readonly unknown[],
+): unknown[] {
+  const stored = new Map<unknown, Record<string, unknown>>()
+  for (const row of previous) {
+    if (row && typeof row === 'object' && 'id' in row) {
+      stored.set((row as Record<string, unknown>).id, row as Record<string, unknown>)
+    }
+  }
+  return incoming.map((row) => {
+    if (!row || typeof row !== 'object' || !('id' in row)) return row
+    const current = row as Record<string, unknown>
+    const before = stored.get(current.id)
+    return before === undefined ? current : { ...before, ...current }
+  })
+}
+
 @Injectable()
 export class TenantSyncService {
   private readonly logger = new Logger(TenantSyncService.name)
@@ -4178,8 +4248,18 @@ export class TenantSyncService {
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
       if (records.length !== rows.length) throw new CollectionPartialError('sign-ins-record-validation-partial',
         'Some Microsoft authentication records could not be validated. Authentication evidence coverage remains incomplete.')
+      // WHAT THE COLLECTION OBSERVED, not what it requested. `records` is what
+      // was validated and persisted this pass; the partial check above has
+      // already established records.length === rows.length, so this is the whole
+      // of what Graph returned for the window. A tenant that has gone quiet now
+      // stamps observedEvents 0 while carrying forward the last time anything
+      // was seen, which is the fact that separates a silent tenant from a busy
+      // one and which nothing recorded before.
+      const observedLatest = records.reduce<Date | null>((newest, record) =>
+        newest === null || record.eventDateTime > newest ? record.eventDateTime : newest, null)
       await persistCompletedAuthenticationWindow(this.prisma, { organizationId: tenant.organizationId, customerTenantId: tenant.id },
-        limited ? 'M365_AUDIT_STS' : 'GRAPH_SIGN_INS', start, end, true)
+        limited ? 'M365_AUDIT_STS' : 'GRAPH_SIGN_INS', start, end, true,
+        { events: records.length, latestEventAt: observedLatest === null ? null : observedLatest.toISOString() })
       if (limitedReason) {
         // Primary limited-source ingestion succeeded. Its freshness stamp may
         // advance, but RUNNING + the partial code must never imply complete
@@ -4901,13 +4981,17 @@ export class TenantSyncService {
     persistWithSnapshot?: (transaction: Prisma.TransactionClient) => Promise<void>,
     riskAttestable = false,
     riskFailureReason?: MailboxAttestationFailureReason,
+    /** Merge the incoming rows onto the stored baseline, property by property, INSIDE the
+     *  advisory lock. Only supplied where a partial payload would otherwise overwrite stored
+     *  values with defaults; every other resource keeps replace-wholesale semantics unchanged. */
+    mergeWithPrevious?: (previous: readonly unknown[], incoming: readonly unknown[]) => unknown[],
   ) {
     if (result.completeness !== 'authoritative_complete') {
       throw new Error(
         `Refusing to advance ${resourceType} snapshot baseline from a partial or unverified collection.`
       )
     }
-    const rows = result.rows
+    const incomingRows = result.rows
     const observedAt = new Date()
     // A baseline and its evidence must move together.  The first snapshot has
     // no prior successful collection and intentionally creates no change. A
@@ -4927,6 +5011,9 @@ export class TenantSyncService {
         throw new Error('Snapshot organization mismatch; refusing cross-organization comparison.')
       }
       const previousRows = Array.isArray(existing?.payload) ? existing.payload : []
+      // MERGED BEFORE THE EVIDENCE IS BUILT, not after. Comparing the baseline against a merged
+      // snapshot means an absent property no longer reads as a change -- which it never was.
+      const rows = mergeWithPrevious ? mergeWithPrevious(previousRows, incomingRows) : incomingRows
       // This method only accepts a collector result that explicitly attests
       // to complete pagination. A legitimate empty inventory can therefore
       // remove prior objects, while failed or partial reads cannot advance
@@ -5014,15 +5101,10 @@ export class TenantSyncService {
             (Array.isArray(user?.assignedLicenses) &&
               user.assignedLicenses.length > 0)
         )
-        .map((user: any) => ({
-          id: user.id,
-          displayName: user.displayName,
-          userPrincipalName: user.userPrincipalName,
-          mail: user.mail,
-          proxyAddresses: user.proxyAddresses ?? [],
-          accountEnabled: user.accountEnabled !== false,
-        }))
-      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOXES', authoritativeSnapshot(rows))
+        .map(exchangeMailboxRow)
+      await this.saveSnapshot(
+        tenant, 'EXCHANGE_MAILBOXES', authoritativeSnapshot(rows),
+        undefined, false, undefined, mergeExchangeMailboxRows)
     })
   }
 

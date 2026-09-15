@@ -30,7 +30,7 @@ test('scheduler authenticates then cleanup with risk OFF; no evaluation/key hook
   const order:string[]=[];const messages:string[]=[]
   const controller=new ScheduledSyncController({verify:async()=>{order.push('auth')}} as any,
     {syncDueTenants:async()=>{order.push('collection');return {status:'ok'}},runScheduledGlobalRiskCycle:async()=>{throw new Error('evaluation forbidden')}} as any,
-    {runAuthorizedRiskHistoryMaintenance:async()=>{order.push('history');return {status:'COMPLETED',runs:1}},runAuthorizedScheduledMaintenance:async()=>{throw new Error('keys/operational maintenance forbidden while OFF')}} as any)
+    {runAuthorizedRiskHistoryMaintenance:async()=>{order.push('history');return {status:'COMPLETED',runs:1}},runAuthorizedScheduledMaintenance:async()=>{throw new Error('keys/operational maintenance forbidden while OFF')}} as any, { runOnce: async () => null } as any)
   ;(controller as any).logger={log:(s:string)=>messages.push(s),warn:(s:string)=>messages.push(s)}
   await controller.syncDueTenants({headers:{}} as any)
   assert.deepEqual(order,['auth','history','collection'])
@@ -41,7 +41,7 @@ test('unauthorized requests cannot reach retention; raw failure is closed and do
   let cleanup=0,collections=0
   const controller=new ScheduledSyncController({verify:async()=>{throw new Error('unauthorized')}} as any,
     {syncDueTenants:async()=>{collections++;return {status:'ok'}}} as any,
-    {runAuthorizedRiskHistoryMaintenance:async()=>{cleanup++;throw new Error('password=secret tenant@example.invalid')}} as any)
+    {runAuthorizedRiskHistoryMaintenance:async()=>{cleanup++;throw new Error('password=secret tenant@example.invalid')}} as any, { runOnce: async () => null } as any)
   const messages:string[]=[];(controller as any).logger={log:(s:string)=>messages.push(s),warn:(s:string)=>messages.push(s)}
   await assert.rejects(()=>controller.syncDueTenants({headers:{}} as any),/unauthorized/)
   assert.equal(cleanup,0);assert.equal(collections,0)

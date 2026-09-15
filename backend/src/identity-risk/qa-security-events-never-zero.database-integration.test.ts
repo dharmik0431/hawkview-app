@@ -33,6 +33,11 @@ import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION } fro
 import { mailboxRule } from './mailbox-risk.test-fixtures.js'
 import { IDENTITY_RISK_ENGINE_VERSION, IDENTITY_RISK_CATALOG_VERSION } from './identity-risk.contract.js'
 
+/** The newest event actually seeded, so the window records what the fixture
+ *  observed rather than a number chosen to make it pass. */
+const newest = (list: ReadonlyArray<{ eventDateTime: Date }>): string | null =>
+  list.reduce<Date | null>((max, row) => max === null || row.eventDateTime > max ? row.eventDateTime : max, null)?.toISOString() ?? null
+
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 const deadline = () => Date.now() + 6000
 
@@ -104,7 +109,8 @@ async function securityEventTenant<T>(codes: readonly number[], work: (context: 
         riskLevel: 'high', ingestedAt: base, expiresAt: new Date(base.getTime() + 90 * 86_400_000) }
     })
     await persistAuthenticationRecords(prisma, scope, rows)
-    await persistCompletedAuthenticationWindow(prisma, scope, 'GRAPH_SIGN_INS', new Date(base.getTime() - 86_400_000), base, true)
+    await persistCompletedAuthenticationWindow(prisma, scope, 'GRAPH_SIGN_INS', new Date(base.getTime() - 86_400_000), base, true,
+      { events: rows.length, latestEventAt: newest(rows) })
     await prisma.syncState.create({ data: { organizationId: scope.organizationId, customerTenantId: scope.customerTenantId, resourceType: 'SIGN_INS',
       status: 'SUCCEEDED', lastAttemptAt: base, lastSuccessfulAt: new Date() } })
 

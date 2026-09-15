@@ -224,8 +224,26 @@ const assessmentReasons = [
   'CHECK_NOT_APPLICABLE',
   'UNRESOLVED_SUBJECT_IDENTITY',
   'UNINTERPRETABLE_EVIDENCE',
+  // An unrecognised reasonCode does not degrade one rule -- it nulls the whole
+  // response, because a null entry in `rules` fails the assembly check below.
+  // So this list is not decoration: omitting a reason the backend emits turns
+  // every affected tenant's assessment into an unreadable page.
+  'NO_EVIDENCE_IN_WINDOW',
 ] as const
 const assessmentCountReasons = [
+  // PREPARATORY, NOT ACTIVE. No server sends this yet: the backend's
+  // RiskAssessmentSummaryDto has no `reasons` field at all -- the type forbids
+  // one, so it is not a producer that merely omits it. An empty-window tenant
+  // today falls to accuracy UNKNOWN with no explanation and renders the
+  // unexplained-withheld copy, which is honest and vaguer than it could be.
+  //
+  // The entry is here because the alternative, once a reason IS sent, is
+  // INCOMPLETE_WINDOW -- which claims part of the window was seen, the exact
+  // conflation this work removes, one level up in the sentence the screen leads
+  // on. Kept rather than deferred so the vocabulary lands in one piece; see the
+  // documented gap in backend risk-assessment-count-summary.test.ts, which
+  // fails when the producer is wired and points back here.
+  'NO_EVIDENCE_IN_WINDOW',
   'UNRESOLVED_SUBJECT_IDENTITY',
   'UNINTERPRETABLE_EVIDENCE',
   'CAPACITY_LIMIT',
@@ -233,6 +251,53 @@ const assessmentCountReasons = [
   'COLLECTION_STALE',
   'SOURCE_UNAVAILABLE',
 ] as const
+/**
+ * THE ALLOW-LISTS MUST COVER THEIR UNIONS, AND THE COMPILER NOW SAYS SO.
+ *
+ * These lists are hand-maintained and were untyped, so a list NARROWER than its
+ * union compiled cleanly. That is not a cosmetic gap: `enumValue` returns null
+ * for an unlisted reason, the rule or source then adapts to null, and
+ * `adaptRiskAssessmentResponse` rejects the ENTIRE assessment if any entry is
+ * null. A value present in the union and missing from the list does not produce
+ * a rule with a missing label — it produces a blank Risky Users screen.
+ *
+ * Nothing caught that. `tsc` did not, because the list had no annotation; the
+ * frontend union is also declared separately from the backend contract, so the
+ * backend cannot force either. The only real guard is the connected assessment
+ * suite, which needs a cluster nobody here can run.
+ *
+ * `Exclude<Union, Listed>` is empty only when the list covers the union, so
+ * adding a reason to `types.ts` without adding it here is now a compile error
+ * naming the missing member. It does NOT make the two homes one definition —
+ * the frontend still mirrors the backend contract by hand, and that remains
+ * open. It closes the half that lives inside this repository.
+ */
+/** `true` when the list covers the union; otherwise the MISSING MEMBERS,
+ *  so the compiler error names them. The brackets stop the conditional
+ *  distributing, which would collapse the covered case to `never` and make
+ *  this assertion unsatisfiable rather than automatic.
+ *
+ *  Written as a value assignment on purpose: an empty array annotated with the
+ *  leftover type was the first attempt and it is INERT -- `[]` is assignable
+ *  to every array type, including `never[]`, so removing an entry produced no
+ *  error at all. Verified by removing one. */
+type Covers<Union extends string, Listed extends string> = [
+  Exclude<Union, Listed>,
+] extends [never]
+  ? true
+  : Exclude<Union, Listed>
+
+const assessmentReasonsCoverUnion: Covers<
+  RiskAssessmentReason,
+  (typeof assessmentReasons)[number]
+> = true
+const assessmentCountReasonsCoverUnion: Covers<
+  RiskAssessmentCountReason,
+  (typeof assessmentCountReasons)[number]
+> = true
+void assessmentReasonsCoverUnion
+void assessmentCountReasonsCoverUnion
+
 const recommendationCodes = [
   'CONFIRM_EXPECTED_ACTIVITY',
   'REVIEW_SIGN_INS',

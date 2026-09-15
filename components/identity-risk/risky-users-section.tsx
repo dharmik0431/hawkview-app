@@ -32,6 +32,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
+import { hawkViewDetectionSummary, microsoftRiskSummary, riskyUsersEmptyState } from '@/lib/identity-risk/risky-users-view'
 import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { FleetRiskAssessmentDrawer } from '@/components/identity-risk/fleet-risk-assessment-drawer'
 import type { FleetRiskyUserRow } from '@/lib/api/fleet-risky-users-hooks'
@@ -41,7 +42,7 @@ import {
   mapRuleToPresentation,
 } from '@/lib/identity-risk/risk-presentation-mapper'
 import { microsoftRecordsByPolarity } from '@/lib/identity-risk/risky-users-view'
-import type { RiskyUserRow } from '@/lib/identity-risk/risky-users-view'
+import type { MicrosoftChannel, RiskyUserCount, RiskyUserRow } from '@/lib/identity-risk/risky-users-view'
 
 function formatTimestamp(value: string | null | undefined): string {
   if (!value || !Number.isFinite(Date.parse(value))) return 'Not reported'
@@ -255,10 +256,13 @@ function CompactSummaryStrip({
   channel,
   asOf,
 }: {
-  count: any
+  // TYPED, AND THIS IS THE ROOT ENABLER RATHER THAN A TIDY-UP. As `any` the props accepted a
+  // summary line that did its own arithmetic over the rows and never consulted accuracy or
+  // listCoverage — the compiler had nothing to object to.
+  count: RiskyUserCount
   rows: RiskyUserRow[]
   microsoftView: any
-  channel: any
+  channel: MicrosoftChannel
   asOf: string | null
 }) {
   // 1. Users requiring review
@@ -268,21 +272,24 @@ function CompactSummaryStrip({
       : `Users requiring review: ${count?.display || 'Not available'}`
 
   // 2. HawkView detections
+  // NOT A BARE COUNT OF THE ROWS. The row list and the count go unavailable on the identical
+  // condition, so a zero here was guaranteed to appear beside "Not available" rather than merely
+  // able to. See hawkViewDetectionSummary.
   const hawkViewUsers = rows.filter((r) => r.reasons.length > 0).length
-  const hawkViewText = `${hawkViewUsers} detected by HawkView`
+  const hawkViewText = hawkViewDetectionSummary(count, hawkViewUsers)
 
   // 3. Active Microsoft risk detections
   const activeMsCount =
     microsoftView?.users !== null && microsoftView?.users !== undefined
       ? microsoftRecordsByPolarity(microsoftView).ACTIVE_RISK.length
       : null
-  const microsoftText =
-    activeMsCount !== null
-      ? `${activeMsCount} active Microsoft risk`
-      : 'Microsoft risk: Not available'
+  // THE CHANNEL SAYS WHETHER A NUMBER IS EARNED, not the length of an array. An empty list from a
+  // channel that could not report is not zero risk. See microsoftRiskSummary.
+  const microsoftText = microsoftRiskSummary(channel, activeMsCount, microsoftView?.pageInfo?.hasMore === true)
 
   // 4. Assessment date
   const assessedText = asOf ? `Assessed ${formatTimestamp(asOf)}` : 'Assessment time: Not reported'
+  const additionalReasons = count.reasons.filter((reason) => reason !== count.caption)
 
   const isUnmatchedOrPartial =
     rows.some(
@@ -336,6 +343,31 @@ function CompactSummaryStrip({
         </div>
       </div>
 
+      <div className="space-y-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+        <p>{count.caption}</p>
+        {additionalReasons.length > 0 && (
+          <ul className="list-disc space-y-1 pl-4">
+            {additionalReasons.map((reason) => <li key={reason}>{reason}</li>)}
+          </ul>
+        )}
+        {(count.value === null || count.value === 0) && count.known.length > 0 && (
+          <div>
+            <p className="font-semibold">What HawkView did find</p>
+            <ul className="list-disc space-y-1 pl-4">
+              {count.known.map((finding) => <li key={finding}>{finding}</li>)}
+            </ul>
+          </div>
+        )}
+        {count.gaps.length > 0 && (
+          <div>
+            <p className="font-semibold">Not covered by this number</p>
+            <ul className="list-disc space-y-1 pl-4">
+              {count.gaps.map((gap) => <li key={gap}>{gap}</li>)}
+            </ul>
+          </div>
+        )}
+      </div>
+
       {isUnmatchedOrPartial && (
         <div className="rounded-lg border border-amber-200/80 bg-amber-50/80 p-3 dark:border-amber-900/60 dark:bg-amber-950/40 text-xs text-amber-900 dark:text-amber-200 flex items-center gap-2">
           <ShieldOff className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
@@ -365,22 +397,26 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
 
   const [searchQuery, setSearchQuery] = useState('')
   const [sourceFilter, setSourceFilter] = useState<'ALL' | 'HAWKVIEW' | 'MICROSOFT' | 'BOTH'>('ALL')
-  const [priorityFilter, setPriorityFilter] = useState<'ALL' | 'HIGH' | 'MEDIUM' | 'LOW'>('ALL')
   const [dataStateFilter, setDataStateFilter] = useState<'ALL' | 'CURRENT' | 'STALE' | 'PARTIAL' | 'NOT_AVAILABLE'>('ALL')
 
   const [drawerRow, setDrawerRow] = useState<RiskyUserRow | null>(null)
   const [isDrawerOpen, setIsDrawerOpen] = useState(false)
-
   const isFiltersActive =
     Boolean(searchQuery.trim()) ||
     sourceFilter !== 'ALL' ||
-    priorityFilter !== 'ALL' ||
     dataStateFilter !== 'ALL'
+
+  // ONE DERIVATION FOR BOTH BRANCHES, AND IT READS THE COUNT RATHER THAN THE ROWS. The desktop
+  // table and the mobile cards each chose their own sentence from `filteredRows.length === 0` and
+  // the filters alone — so neither could tell an unread assessment from a confirmed zero, and
+  // "Users requiring review: Not available" rendered directly above "No users requiring review
+  // found." Two copies also meant every honest state had to be added twice, in two places that
+  // could then disagree. See `riskyUsersEmptyState`.
+  const emptyState = riskyUsersEmptyState(count, isFiltersActive)
 
   const resetFilters = useCallback(() => {
     setSearchQuery('')
     setSourceFilter('ALL')
-    setPriorityFilter('ALL')
     setDataStateFilter('ALL')
   }, [])
 
@@ -403,9 +439,6 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
       if (sourceFilter === 'MICROSOFT' && !isMicrosoft) return false
       if (sourceFilter === 'BOTH' && (!isHawkView || !isMicrosoft)) return false
 
-      if (priorityFilter !== 'ALL' && row.priority !== priorityFilter) {
-        return false
-      }
 
       if (dataStateFilter === 'CURRENT' && (row.lastSeenState === 'DATELESS' || row.detection.microsoft === 'UNAVAILABLE')) {
         return false
@@ -422,7 +455,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
 
       return true
     })
-  }, [list?.rows, searchQuery, sourceFilter, priorityFilter, dataStateFilter])
+  }, [list?.rows, searchQuery, sourceFilter, dataStateFilter])
 
   const openDrawer = (row: RiskyUserRow) => {
     setDrawerRow(row)
@@ -462,9 +495,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                   : 'The latest response could not be read'}
               </p>
               <p className="mt-1 text-xs leading-relaxed">
-                {native
-                  ? 'Users below are from an earlier read and remain open. Missing evidence is not a no-findings result.'
-                  : 'No current result can be confirmed.'}
+                No current result can be confirmed. Missing evidence is not a no-findings result.
               </p>
             </div>
           )}
@@ -491,20 +522,33 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                   Users requiring review
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  Ordered by the most important current finding.
+                  Ordered by observed lockout volume, then rejected sign-ins, then latest evidence.
+                  This table lists HawkView findings. Microsoft-only identities may need review in Entra ID Protection.
                 </p>
                 <details className="group mt-1">
                   <summary className="text-2xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer select-none inline-flex items-center gap-1">
                     How this works
                   </summary>
                   <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 leading-relaxed max-w-2xl">
-                    HawkView orders findings by investigation priority. HawkView rules and Microsoft Entra ID Protection operate independently and their results are never combined into a single score.
+                    HawkView orders findings by observed volume, then recency. HawkView rules and Microsoft Entra ID Protection operate independently and their results are never combined into a single score.
                   </p>
                 </details>
               </div>
 
               <div className="text-xs font-medium text-slate-500 dark:text-slate-400 shrink-0 self-start sm:self-auto">
-                Showing {filteredRows.length} of {(list?.rows ?? []).length} users
+                {/* THE THIRD DERIVED ZERO. "Showing 0 of 0 users" is a third voice asserting
+                    emptiness beside a count that says it cannot tell, and it is redundant even
+                    when the zero IS sound — the sentence in the table already says it better.
+                    Rendered only when there is something to count. */}
+                {(list?.rows ?? []).length > 0
+                  ? (isFiltersActive ? 'Filtered in this response: ' : '') + (
+                      count.accuracy === 'EXACT'
+                        ? `Showing ${filteredRows.length} of ${count.display} reported users`
+                        : count.accuracy === 'AT_LEAST'
+                          ? `Showing ${filteredRows.length}; at least ${count.value?.toLocaleString()} reported users`
+                          : `${filteredRows.length} shown; complete total unavailable`
+                    )
+                  : null}
               </div>
             </div>
 
@@ -545,17 +589,6 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                     <option value="BOTH">Both sources</option>
                   </select>
 
-                  {/* Priority filter */}
-                  <select
-                    value={priorityFilter}
-                    onChange={(e) => setPriorityFilter(e.target.value as any)}
-                    className="h-9 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="ALL">All priorities</option>
-                    <option value="HIGH">High priority</option>
-                    <option value="MEDIUM">Medium priority</option>
-                    <option value="LOW">Low priority</option>
-                  </select>
 
                   {/* Data state filter */}
                   <select
@@ -628,9 +661,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
                         colSpan={6}
                         className="text-center py-8 text-xs text-slate-500 dark:text-slate-400"
                       >
-                        {isFiltersActive
-                          ? 'No users match the active search or filters.'
-                          : 'No users requiring review found.'}
+                        {emptyState.sentence}
                       </TableCell>
                     </TableRow>
                   ) : (
@@ -708,9 +739,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
             <div className="md:hidden space-y-3">
               {filteredRows.length === 0 ? (
                 <div className="p-6 text-center text-xs text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-800 rounded-xl">
-                  {isFiltersActive
-                    ? 'No users match the active search or filters.'
-                    : 'No users requiring review found.'}
+                  {emptyState.sentence}
                 </div>
               ) : (
                 filteredRows.map((row) => {

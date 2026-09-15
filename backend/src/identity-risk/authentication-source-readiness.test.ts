@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { test } from 'node:test'
 import { evaluateAuthenticationRules } from '../risky-users-auth/index.js'
 import { SYNTHETIC_SCOPE as scope, SYNTHETIC_NOW, at, auditRecord, graphRecord } from '../risky-users-auth/fixtures.js'
-import { AUTH_WINDOW_SCHEMA, authenticationWindow, mergeAuthenticationWindow, prepareAuthenticationEvaluation,
+import { AUTH_WINDOW_SCHEMA_V1, authenticationWindow, mergeAuthenticationWindow, prepareAuthenticationEvaluation,
   type AuthenticationDirectoryUser, type AuthenticationProof, type AuthenticationReference, type AuthenticationRow, type AuthenticationWindow } from './authentication-source-readiness.js'
 const now = new Date(SYNTHETIC_NOW)
 const user: AuthenticationDirectoryUser = { organizationId: scope.organizationId, customerTenantId: scope.customerTenantId,
@@ -11,7 +11,7 @@ const user: AuthenticationDirectoryUser = { organizationId: scope.organizationId
 const reference: AuthenticationReference = async (kind, identifiers) => `hvr1_${kind}_${createHash('sha256').update(JSON.stringify(identifiers)).digest('hex')}`
 const graphProof: AuthenticationProof = { status:'SUCCEEDED',lastSuccessfulAt:now,lastAttemptAt:new Date(at(-2)),lastErrorCode:null }
 const stsProof: AuthenticationProof = { ...graphProof,status:'RUNNING',lastErrorCode:'sign-ins-non-premium-fallback-active' }
-const window = (sts=false, complete=true): AuthenticationWindow => ({schemaVersion:AUTH_WINDOW_SCHEMA,source:sts?'M365_AUDIT_STS':'GRAPH_SIGN_INS',start:at(-24*60),end:SYNTHETIC_NOW,paginationComplete:complete})
+const window = (sts=false, complete=true): AuthenticationWindow => ({schemaVersion:AUTH_WINDOW_SCHEMA_V1,source:sts?'M365_AUDIT_STS':'GRAPH_SIGN_INS',start:at(-24*60),end:SYNTHETIC_NOW,paginationComplete:complete})
 const row = (raw: unknown): AuthenticationRow => ({organizationId:scope.organizationId,customerTenantId:scope.customerTenantId,raw,ingestedAt:now})
 const run = (rows: AuthenticationRow[], options: {sts?:boolean;complete?:boolean;users?:AuthenticationDirectoryUser[];window?:AuthenticationWindow;proof?:AuthenticationProof}={}) =>
   prepareAuthenticationEvaluation(scope, rows, options.users??[user], options.proof??(options.sts?stsProof:graphProof), options.window??window(options.sts,options.complete),true,now,reference)

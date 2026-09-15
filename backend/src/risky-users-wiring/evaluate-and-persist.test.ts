@@ -2,22 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { evaluateAndPersistTenant } from './evaluate-and-persist.js'
 
-/** A half-written run must be impossible rather than unlikely.
- *
- * The write is the LAST operation in `evaluateAndPersistTenant` — only the
- * return object is built after it, and that cannot fail — and it is a single
- * insert, so the row either exists complete or does not exist. These tests pin
- * that ordering, because the property depends on the write staying last and
- * nothing else enforces it.
- *
- * The read path refuses a row with no `completedAt` as a second line of defence;
- * that is asserted in `read-run.test.ts`.
- */
+/** Source failures precede the transaction; publication completes atomically.
+ * Real database rollback/isolation is exercised by the integration suite. */
 
 const scope = { organizationId: 'org', customerTenantId: 'tenant' }
 
-/** A Prisma double. The columns written here do not exist in production, so a
- * test against a real client could not run at all. */
+/** Unit double for the production orchestration seam. */
 function client(options: Readonly<{ failAt?: 'syncState' | 'tenant' | 'rows' }> = {}) {
   const created: Record<string, unknown>[] = []
   const calls: string[] = []
@@ -26,6 +16,14 @@ function client(options: Readonly<{ failAt?: 'syncState' | 'tenant' | 'rows' }> 
     created,
     calls,
     db: {
+      async $transaction<T>(run: (tx: unknown) => Promise<T>): Promise<T> {
+        calls.push('begin')
+        const result = await run(this)
+        calls.push('commit')
+        return result
+      },
+      $queryRawUnsafe: async () => [{ id: scope.customerTenantId }],
+      identityRiskFinding: { updateMany: async () => ({ count: 0 }) },
       syncState: {
         findMany: async () => {
           calls.push('syncState')
@@ -54,6 +52,9 @@ function client(options: Readonly<{ failAt?: 'syncState' | 'tenant' | 'rows' }> 
       },
       directoryUser: { findMany: async () => { calls.push('directory'); return [] } },
       identityRiskEvaluationRun: {
+        findUnique: async () => null,
+        findFirst: async () => null,
+        update: async () => { calls.push('marker'); return {} },
         create: async ({ data }: { data: Record<string, unknown> }) => {
           calls.push('create')
           created.push(data)
@@ -66,17 +67,14 @@ function client(options: Readonly<{ failAt?: 'syncState' | 'tenant' | 'rows' }> 
 
 const now = new Date('2026-09-10T21:05:00.000Z')
 
-test('a completed assessment writes exactly one run, and the write is the last thing it does', async () => {
+test('a completed assessment commits its run and publication marker before returning', async () => {
   const { db, created, calls } = client()
   const result = await evaluateAndPersistTenant(db as never, scope, { now })
 
   assert.equal(created.length, 1)
   assert.equal(result.runId, 'run-1')
-  // THE ORDERING THAT MAKES A PARTIAL ROW IMPOSSIBLE. If anything is ever added
-  // after the write, `create` stops being last and this fails — which is the
-  // point, because a step after the write could fail and leave a row claiming a
-  // completion that did not happen.
-  assert.equal(calls.at(-1), 'create')
+  assert.equal(result.publication, 'PUBLISHED')
+  assert.deepEqual(calls.slice(-4), ['begin', 'create', 'marker', 'commit'])
   // And one clock: the window end, the completion stamp and the retention
   // horizon are all derived from the same instant.
   assert.equal((created[0]!.windowEnd as Date).getTime(), now.getTime())

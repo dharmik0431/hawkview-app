@@ -41,7 +41,7 @@ export function riskHistoryRetentionConfig(env: NodeJS.ProcessEnv = process.env)
 
 // UTC session (enforced by the owned transaction helper): exact 90*24 hours.
 // expires_at is the INDEPENDENT validity cap, never extended by this worker.
-const eligible = `r.status IN ('COMPLETED','FAILED')
+const eligible = `r.status IN ('COMPLETED','COMPLETED_EVALUATION_CORE','FAILED')
   AND isfinite(r.created_at) AND r.created_at <= CURRENT_TIMESTAMP - INTERVAL '2160 hours'
   AND isfinite(r.expires_at) AND r.expires_at <= CURRENT_TIMESTAMP
   AND ((r.status='FAILED' AND r.completed_at IS NULL) OR (isfinite(r.completed_at) AND r.completed_at >= r.created_at AND r.completed_at <= CURRENT_TIMESTAMP))

@@ -1,7 +1,7 @@
 import { IDENTITY_RISK_RUN_RETENTION_MS } from '../identity-risk/identity-risk.contract.js'
 import { collectorStatus } from '../tenants/service-sync-freshness.js'
 import { credentialFailureDetector } from './detectors/credential-failure.js'
-import { persistRun } from './persist-run.js'
+import { publishNativeAssessment, type NativePublication } from './native-alert-publisher.js'
 import type { SourceCollection } from './run-findings.js'
 import { readTenantAssessment } from './read-tenant.js'
 import type { PrismaClient } from '../generated/prisma/client.js'
@@ -12,9 +12,9 @@ import type { CollectionScope } from '../risky-users-normalization/reasons.js'
 /** Assess one tenant and record the result. The piece that makes everything
  * else reachable.
  *
- * Read-only except for the single run row it writes, and that row is invisible
- * to the live reader by construction — see `persist-run.ts`, where the status
- * value and the test asserting the old reader's own filter live.
+ * Source reads precede one transaction publishing the native run and scoped
+ * alert evidence. The native run remains separate from the legacy run reader;
+ * native findings use explicit NOT_ASSESSED classification, never invented risk.
  */
 
 /** Thirty days of evidence, and the window END is set HERE rather than accepted
@@ -135,6 +135,7 @@ async function syncStatusPerFeed(
 
 export type EvaluateAndPersistResult = Readonly<{
   runId: string
+  publication: NativePublication
   rowsFetched: number
   feed: NormalizationSource
   findings: number
@@ -168,13 +169,8 @@ export async function evaluateAndPersistTenant(
     maxEvents: options.maxEvents ?? 20_000,
   })
 
-  // The writer takes a MINIMAL structural type so its tests can supply a double —
-  // the columns it writes do not exist in production yet, so a test needing a
-  // real client could not run at all. Prisma's generated `create` is generic and
-  // is not nominally assignable to that simpler shape even though the real client
-  // satisfies it at runtime, so the seam is crossed once, here, rather than by
-  // widening the writer's type until the double stops being checked.
-  const { id } = await persistRun(prisma as unknown as Parameters<typeof persistRun>[0], assessment, {
+  // Persist the run and its alert evidence atomically after source evaluation.
+  const { id, publication } = await publishNativeAssessment(prisma, assessment, {
     organizationId: scope.organizationId,
     customerTenantId: scope.customerTenantId,
     windowStart,
@@ -187,5 +183,5 @@ export async function evaluateAndPersistTenant(
     sources: collectors.sources,
   })
 
-  return { runId: id, rowsFetched, feed: feed.feed, findings: assessment.findings.items.length }
+  return { runId: id, publication, rowsFetched, feed: feed.feed, findings: assessment.findings.items.length }
 }

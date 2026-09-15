@@ -4,10 +4,12 @@ import { IDENTITY_RISK_RULE_CATALOG } from './identity-risk.catalog.js'
 
 test('v1 catalog owns all bounded user-facing finding text', () => {
   const entries = Object.entries(IDENTITY_RISK_RULE_CATALOG)
-  assert.equal(entries.length, 24)
+  assert.equal(entries.length, 25)
   assert.match(IDENTITY_RISK_RULE_CATALOG['HV-ID-AUTH-009.v1'].title, /Break-glass/)
   assert.ok(IDENTITY_RISK_RULE_CATALOG['HV-ID-AUTH-010.v1'])
   assert.ok(IDENTITY_RISK_RULE_CATALOG['HV-ID-AUTH-005.v2'])
+  assert.equal(IDENTITY_RISK_RULE_CATALOG['HV-ID-AUTH-011.v1'].investigationGuidanceCode, 'REVIEW_ACTIVITY')
+  assert.match(IDENTITY_RISK_RULE_CATALOG['HV-ID-AUTH-011.v1'].explanation, /does not assert/)
   for (const [ruleId, presentation] of entries) {
     assert.match(ruleId, /^(?:HV-ID-(EXP|CHG|APP|MBX|AUTH)-\d{3}\.v1|HV-ID-AUTH-005\.v2)$/)
     assert.ok(ruleId.length <= 150)

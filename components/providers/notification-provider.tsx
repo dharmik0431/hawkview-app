@@ -12,12 +12,20 @@ import { cn } from '@/lib/utils'
 import { useAuth } from '@/components/providers/auth-provider'
 import { apiClient } from '@/lib/api/client'
 import {
+  emptyMeansQuiet,
+  notificationFeedState,
+  type NotificationFeedState,
+} from '@/lib/notifications/feed-state'
+import {
   requestNotifications,
   type NotificationCategory,
   type NotificationItem,
 } from '@/lib/notifications/normalize-response'
 
 export type { NotificationCategory, NotificationItem }
+export type { NotificationFeedState }
+export { emptyMeansQuiet }
+
 
 export interface ToastItem {
   id: string
@@ -29,6 +37,8 @@ export interface ToastItem {
 
 interface NotificationContextValue {
   notifications: NotificationItem[]
+  /** Whether an empty list means "nothing happened" or "we could not look". */
+  feedState: NotificationFeedState
   unreadCount: number
   toasts: ToastItem[]
   notify: (payload: {
@@ -56,6 +66,10 @@ export function NotificationProvider({
   const { session } = useAuth()
   const userId = session?.user.id
   const [notifications, setNotifications] = useState<NotificationItem[]>([])
+  // Tracked separately from the list because the list cannot carry it: an empty
+  // array is the same value whether it was fetched or never arrived.
+  const [everLoaded, setEverLoaded] = useState(false)
+  const [lastReadFailed, setLastReadFailed] = useState(false)
   const [toasts, setToasts] = useState<ToastItem[]>([])
 
   // Notifications belong to the signed-in HawkView user and are loaded from
@@ -72,9 +86,17 @@ export function NotificationProvider({
       void requestNotifications(() =>
         apiClient.get<unknown>('/api/notifications')
       ).then((result) => {
-        if (!cancelled && result.shouldReplace) {
+        if (cancelled) return
+        if (result.shouldReplace) {
           setNotifications(result.items)
+          setEverLoaded(true)
+          setLastReadFailed(false)
+          return
         }
+        // shouldReplace is false for a throw AND for a response this build
+        // cannot read. Both mean this read told us nothing, and neither may be
+        // allowed to look like an answer.
+        setLastReadFailed(true)
       })
     }
     const handleVisibility = () => {
@@ -92,6 +114,11 @@ export function NotificationProvider({
       document.removeEventListener('visibilitychange', handleVisibility)
     }
   }, [userId])
+
+  // One definition of the rule, shared with its test. A copy here would agree
+  // with the test by construction and neither could fail when the other moved.
+  const feedState = notificationFeedState(everLoaded, lastReadFailed)
+
 
   const unreadCount = notifications.filter((n) => !n.read).length
 
@@ -186,6 +213,7 @@ export function NotificationProvider({
     <NotificationContext.Provider
       value={{
         notifications,
+        feedState,
         unreadCount,
         toasts,
         notify,

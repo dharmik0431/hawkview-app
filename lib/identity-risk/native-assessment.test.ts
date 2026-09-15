@@ -679,7 +679,11 @@ test('the clean zero does not arrive discrediting itself', () => {
   const count = nativeRiskyUserCount(msft)
 
   assert.equal(count.value, 0)
-  assert.deepEqual(count.known, ['Repeated credential failures'])
+  // A covered detector is still recognized, but with no findings it is not
+  // "What HawkView did find". Preserve the evaluated scope independently.
+  assert.ok(msft?.available)
+  assert.deepEqual(msft.count.covered, ['repeated-credential-failure'])
+  assert.deepEqual(count.known, [])
   const everything = [
     count.headline,
     count.caption,
