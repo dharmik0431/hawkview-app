@@ -23,6 +23,36 @@ test('dashboard renders explicit evidence states and has no healthy or risky fab
   assert.match(helpers, /Risk data not reported/)
 })
 
+test('Microsoft risk consumers use the additive summary and canonical evidence route', () => {
+  const dashboard = source('app/(protected)/dashboard/page.tsx')
+  const helpers = source('components/dashboard/tenant-risk-matrix-helpers.ts')
+  const matrix = source('components/dashboard/tenant-risk-matrix.tsx')
+  const workspace = source('lib/tenant-workspace-state.ts')
+  const section = source('components/identity-risk/risky-users-section.tsx')
+
+  assert.match(dashboard, /normalizeMicrosoftRiskSummary/)
+  assert.match(dashboard, /identityExact/)
+  assert.doesNotMatch(dashboard, /riskyIdentityCount/)
+  assert.doesNotMatch(dashboard, /partial \? `≥\$\{value\}`/)
+  assert.match(helpers, /tenantRiskyUsersPath\(tenant\.id\)/)
+  assert.doesNotMatch(helpers, /riskyIdentityCount/)
+  assert.match(matrix, /sortTenantRiskMatrixTenants\(tenants, sortColumn, sortDir\)/)
+  assert.doesNotMatch(matrix, /riskyIdentityCount/)
+  assert.doesNotMatch(helpers, /'0 users at risk'|'No risky users'/)
+  assert.match(workspace, /if \(key\.includes\('risky'\)\) return 'risky-users'/)
+  assert.match(section, /id="microsoft-risk-summary"/)
+  assert.match(section, /Microsoft Identity Protection/)
+  assert.doesNotMatch(section, /activeMsCount|microsoftRecordsByPolarity/)
+})
+
+test('alert details navigation is bound to the alert tenant', () => {
+  const modal = source('components/dashboard/alert-details-modal.tsx')
+  assert.match(
+    modal,
+    /investigateDestination\([\s\S]*?item\.item\.actionUrl,[\s\S]*?item\.tenantId,[\s\S]*?\)/,
+  )
+})
+
 test('activity normalization never invents timestamps, identities, outcomes, or random IDs', () => {
   const activity = source('app/(protected)/activity/page.tsx')
   const normalize = source('app/(protected)/activity/data/normalize.ts')

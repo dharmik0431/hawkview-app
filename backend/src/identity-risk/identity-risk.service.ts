@@ -1,4 +1,6 @@
 import { ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common'
+import { summarizeMicrosoftRisk, parseMicrosoftRiskRecord, MICROSOFT_RISK_MAX_ROWS } from './microsoft-risk-summary.js'
+import { microsoftRiskSourceAllowed, collectedLicenseServicePlans } from '../tenants/collection-readiness.js'
 import { MailboxInvestigationResolver } from './mailbox-investigation-resolver.js'
 import { RiskAssessmentReader, unavailableAssessment } from './risk-assessment-reader.service.js'
 import { recordRiskReader } from './risk-operational-diagnostics.js'
@@ -18,9 +20,6 @@ import {
   type IdentityRiskFindingDto,
   type IdentityRiskPageInfo,
   type MailboxInvestigationDto,
-  type MicrosoftRiskDetail,
-  type MicrosoftRiskLevel,
-  type MicrosoftRiskState,
   type MicrosoftRiskyUserDto,
 } from './identity-risk.contract.js'
 import {
@@ -43,48 +42,12 @@ const HAWKVIEW_SOURCE_LABEL = 'HawkView Identity Signals'
 const MICROSOFT_SOURCE_LABEL = 'Microsoft Entra Risky Users'
 const CURRENT_RUN_MAX_AGE_MS = 36 * 60 * 60 * 1_000
 const MAX_SUMMARY_COUNT = 10_000
-const MAX_MICROSOFT_SNAPSHOT_ROWS = 50_000
 
 const findingStates = new Set(['OPEN', 'UPDATED', 'RESOLVED', 'EXPIRED'])
 const severities = new Set(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'])
 const confidences = new Set(['LOW', 'MEDIUM', 'HIGH'])
 const coverages = new Set(['FULL', 'PARTIAL', 'UNAVAILABLE'])
 const subjectTypes = new Set(['USER', 'MAILBOX', 'APPLICATION', 'UNKNOWN'])
-const microsoftRiskLevels = new Set<MicrosoftRiskLevel>([
-  'none',
-  'low',
-  'medium',
-  'high',
-  'hidden',
-  'unknownFutureValue',
-])
-const microsoftRiskStates = new Set<MicrosoftRiskState>([
-  'none',
-  'atRisk',
-  'remediated',
-  'dismissed',
-  'confirmedSafe',
-  'confirmedCompromised',
-  'unknownFutureValue',
-])
-const microsoftRiskDetails = new Set([
-  'none',
-  'adminGeneratedTemporaryPassword',
-  'userPerformedSecuredPasswordChange',
-  'userPerformedSecuredPasswordReset',
-  'adminConfirmedSigninSafe',
-  'aiConfirmedSigninSafe',
-  'userPassedMFADrivenByRiskBasedPolicy',
-  'adminDismissedAllRiskForUser',
-  'adminConfirmedSigninCompromised',
-  'hidden',
-  'adminConfirmedUserCompromised',
-  'm365DAdminDismissedDetection',
-  'userChangedPasswordOnPremises',
-  'adminDismissedRiskForSignIn',
-  'adminConfirmedAccountSafe',
-  'unknownFutureValue',
-])
 
 type ScopedTenant = Readonly<{
   /** The database id of the operator this tenant was scoped FOR. Carried here
@@ -932,6 +895,7 @@ export class IdentityRiskService {
     const limit = parsePageLimit(query.limit)
     if (!microsoftRiskDisplayEnabled()) {
       return {
+        microsoftRiskSummary: summarizeMicrosoftRisk({ payload: null, snapshotObservedAt: null, collectionSucceededAt: null, collectionStatus: null, sourceAllowed: false, now: new Date() }),
         ...unavailableEnvelope(
           'MICROSOFT_ENTRA_RISKY_USERS',
           'UNAVAILABLE',
@@ -942,7 +906,7 @@ export class IdentityRiskService {
       }
     }
     const now = new Date()
-    const [snapshot, syncState] = await Promise.all([
+    const [snapshot, syncState, eligibility] = await Promise.all([
       this.prisma.tenantEntraSnapshot.findFirst({
         where: {
           organizationId: tenant.organizationId,
@@ -950,6 +914,7 @@ export class IdentityRiskService {
           resourceType: 'RISKY_USERS',
         },
         select: { payload: true, observedAt: true },
+        orderBy: { observedAt: 'desc' },
       }),
       this.prisma.syncState.findFirst({
         where: {
@@ -959,13 +924,33 @@ export class IdentityRiskService {
         },
         select: { status: true, lastSuccessfulAt: true },
       }),
+      this.prisma.customerTenant.findFirst({
+        where: { id: tenant.id, organizationId: tenant.organizationId },
+        select: {
+          connection: { select: { status: true, lastErrorCode: true, lastVerifiedAt: true, consentedPermissions: true } },
+          tenantLicenses: { select: { servicePlans: true } },
+          syncStates: { where: { resourceType: 'LICENSES' }, select: { resourceType: true, status: true, lastAttemptAt: true, lastSuccessfulAt: true } },
+        },
+      }),
     ])
+    const sourceAllowed = Boolean(eligibility && microsoftRiskSourceAllowed({
+      connectionStatus: eligibility.connection?.status,
+      connectionLastErrorCode: eligibility.connection?.lastErrorCode,
+      connectionVerifiedAt: eligibility.connection?.lastVerifiedAt,
+      consentedPermissions: eligibility.connection?.consentedPermissions ?? [],
+      licenseServicePlans: collectedLicenseServicePlans(eligibility.tenantLicenses),
+      // Eligibility needs success/freshness, not diagnostic provider text.
+      syncStates: eligibility.syncStates.map((state) => ({ ...state, lastErrorCode: null, lastErrorMessage: null })),
+      now,
+    }))
+    const microsoftRiskSummary = summarizeMicrosoftRisk({ payload: snapshot?.payload, snapshotObservedAt: snapshot?.observedAt, collectionSucceededAt: syncState?.lastSuccessfulAt, collectionStatus: syncState?.status, sourceAllowed, now })
     if (
       !snapshot ||
       !syncState?.lastSuccessfulAt ||
       !Array.isArray(snapshot.payload)
     ) {
       return {
+        microsoftRiskSummary,
         ...unavailableEnvelope(
           'MICROSOFT_ENTRA_RISKY_USERS',
           'UNAVAILABLE',
@@ -977,6 +962,7 @@ export class IdentityRiskService {
     }
     if (syncState.status !== 'SUCCEEDED') {
       return {
+        microsoftRiskSummary,
         ...unavailableEnvelope(
           'MICROSOFT_ENTRA_RISKY_USERS',
           syncState.status === 'FAILED' ? 'ERROR' : 'UNAVAILABLE',
@@ -991,19 +977,21 @@ export class IdentityRiskService {
       syncState.lastSuccessfulAt,
       now,
     )
-    if (!envelope || snapshot.payload.length > MAX_MICROSOFT_SNAPSHOT_ROWS) {
+    if (!envelope || snapshot.payload.length > MICROSOFT_RISK_MAX_ROWS) {
       return {
+        microsoftRiskSummary,
         ...projectionError('MICROSOFT_ENTRA_RISKY_USERS'),
         users: [] as MicrosoftRiskyUserDto[],
         pageInfo: emptyPage(),
       }
     }
-    if (envelope.freshness !== 'CURRENT') {
+    if (envelope.freshness !== 'CURRENT' || microsoftRiskSummary.availability === 'UNAVAILABLE') {
       return {
+        microsoftRiskSummary,
         ...unavailableEnvelope(
           'MICROSOFT_ENTRA_RISKY_USERS',
           'UNAVAILABLE',
-          'Current Microsoft Identity Protection evidence is stale.',
+          microsoftRiskSummary.reasonCode === 'STALE_EVIDENCE' ? 'Current Microsoft Identity Protection evidence is stale.' : 'Current Microsoft Identity Protection evidence is unavailable.',
         ),
         users: [] as MicrosoftRiskyUserDto[],
         pageInfo: emptyPage(),
@@ -1011,6 +999,7 @@ export class IdentityRiskService {
     }
     if (snapshot.payload.length === 0) {
       return {
+        microsoftRiskSummary,
         ...envelope,
         users: [] as MicrosoftRiskyUserDto[],
         pageInfo: emptyPage(),
@@ -1024,14 +1013,15 @@ export class IdentityRiskService {
         now,
       ),
     )
-    if (users.some((user) => user === null)) {
+    if (users.every((user) => user === null)) {
       return {
+        microsoftRiskSummary,
         ...projectionError('MICROSOFT_ENTRA_RISKY_USERS'),
         users: [] as MicrosoftRiskyUserDto[],
         pageInfo: emptyPage(),
       }
     }
-    const ordered = (users as MicrosoftRiskyUserDto[]).sort((left, right) =>
+    const ordered = users.filter((user): user is MicrosoftRiskyUserDto => user !== null).sort((left, right) =>
       right.observedAt.localeCompare(left.observedAt) || right.id.localeCompare(left.id),
     )
     const cursor = decodeIdentityRiskCursor({
@@ -1053,6 +1043,9 @@ export class IdentityRiskService {
     const last = page.at(-1)
     return {
       ...envelope,
+      microsoftRiskSummary,
+      capability: microsoftRiskSummary.availability === 'PARTIAL' ? 'PARTIAL' as const : envelope.capability,
+      limitation: microsoftRiskSummary.availability === 'PARTIAL' ? 'Microsoft risk evidence is incomplete or conflicting; observed active evidence requires review and the exact active total is unknown.' : envelope.limitation,
       users: page,
       pageInfo: {
         hasMore,
@@ -1132,8 +1125,8 @@ export class IdentityRiskService {
     platformNow: Date,
   ): MicrosoftRiskyUserDto | null {
     if (!isPlainRecord(value)) return null
-    const sourceId = boundedOpaqueId(value.id, 128)
-    if (!sourceId) return null
+    const record = parseMicrosoftRiskRecord(value, snapshotObservedAt, platformNow)
+    if (!record) return null
     const labelCandidate =
       boundedSafeString(value.userDisplayName, 160) ??
       boundedSafeString(value.userPrincipalName, 160) ??
@@ -1141,48 +1134,18 @@ export class IdentityRiskService {
     const identityLabel = /[<>\[\]{}\\]/.test(labelCandidate)
       ? 'Microsoft identity'
       : labelCandidate
-    const riskLevel = typeof value.riskLevel === 'string'
-      ? microsoftRiskLevels.has(value.riskLevel as MicrosoftRiskLevel)
-        ? (value.riskLevel as MicrosoftRiskLevel)
-        : 'unknownFutureValue'
-      : null
-    const riskState = typeof value.riskState === 'string'
-      ? microsoftRiskStates.has(value.riskState as MicrosoftRiskState)
-        ? (value.riskState as MicrosoftRiskState)
-        : 'unknownFutureValue'
-      : null
-    const detail: MicrosoftRiskDetail | null =
-      value.riskDetail === null || value.riskDetail === undefined
-      ? null
-      : typeof value.riskDetail === 'string'
-        ? microsoftRiskDetails.has(value.riskDetail)
-          ? (value.riskDetail as MicrosoftRiskDetail)
-          : 'unknownFutureValue'
-        : null
-    const observedAt = parseTimestamp(
-      value.riskLastUpdatedDateTime ?? snapshotObservedAt,
-      platformNow,
-    )
-    if (
-      !riskLevel ||
-      !riskState ||
-      !observedAt ||
-      (value.riskDetail !== null &&
-        value.riskDetail !== undefined &&
-        typeof value.riskDetail !== 'string')
-    ) return null
     return {
       id: tenantScopedOpaqueId(
         'msru',
         tenant.organizationId,
         tenant.id,
-        sourceId,
+        record.sourceId,
       ),
       identityLabel,
-      riskLevel,
-      riskState,
-      riskDetail: detail,
-      observedAt: observedAt.toISOString(),
+      riskLevel: record.riskLevel,
+      riskState: record.riskState,
+      riskDetail: record.riskDetail,
+      observedAt: record.observedAt.toISOString(),
     }
   }
 }

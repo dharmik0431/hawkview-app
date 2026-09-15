@@ -132,6 +132,48 @@ test('adapts the two channels without merging their records', () => {
   assert.equal(view.microsoft.users?.[0]?.riskState, 'atRisk')
 })
 
+test('adapts the additive Microsoft risk summary independently of page size', () => {
+  const responses = validResponses()
+  responses.microsoftRiskyUsers.microsoftRiskSummary = {
+    source: 'MICROSOFT_IDENTITY_PROTECTION',
+    availability: 'AVAILABLE',
+    completeness: 'COMPLETE',
+    rawRecordCount: 10,
+    observedActiveDistinctUserCount: 3,
+    activeDistinctUserCount: 3,
+    snapshotObservedAt: now,
+    collectionSucceededAt: now,
+    reasonCode: null,
+  }
+  responses.microsoftRiskyUsers.pageInfo = { hasMore: true, nextCursor: 'next.page' }
+  responses.microsoftRiskyUsers.users = [microsoftUser()]
+
+  const microsoft = adaptIdentityRiskResponses(responses).microsoft
+  assert.equal(microsoft.users?.length, 1)
+  assert.equal(microsoft.pageInfo?.hasMore, true)
+  assert.equal(microsoft.microsoftRiskSummary?.activeDistinctUserCount, 3)
+})
+
+test('rejects an impossible Microsoft risk summary instead of deriving a zero', () => {
+  const responses = validResponses()
+  responses.microsoftRiskyUsers.microsoftRiskSummary = {
+    source: 'MICROSOFT_IDENTITY_PROTECTION',
+    availability: 'PARTIAL',
+    completeness: 'CONFLICTING',
+    rawRecordCount: 4,
+    observedActiveDistinctUserCount: 2,
+    activeDistinctUserCount: 0,
+    snapshotObservedAt: now,
+    collectionSucceededAt: now,
+    reasonCode: 'CONFLICTING_RECORDS',
+  }
+
+  const microsoft = adaptIdentityRiskResponses(responses).microsoft
+  assert.equal(microsoft.meta.status, 'ERROR')
+  assert.equal(microsoft.microsoftRiskSummary, null)
+  assert.equal(microsoft.users, null)
+})
+
 test('mailbox provenance and approved forwarding alternative do not alter authoritative Microsoft risk', () => {
   const responses = validResponses()
   responses.hawkViewFindings.findings = [

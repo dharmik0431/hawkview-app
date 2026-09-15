@@ -4,6 +4,10 @@ import test, { beforeEach, afterEach } from 'node:test'
 import { ForbiddenException } from '@nestjs/common'
 import type { PrismaService } from '../prisma/prisma.service.js'
 import { IdentityRiskService } from './identity-risk.service.js'
+import { summarizeMicrosoftRisk } from './microsoft-risk-summary.js'
+import { collectedLicenseServicePlans, deriveCollectionReadiness, effectiveMicrosoftConnectionStatus } from '../tenants/collection-readiness.js'
+import { deriveTenantHealth } from '../tenants/tenant-health.js'
+import { CONNECTION_REQUIRED_PERMISSIONS } from '../microsoft/microsoft-access-contract.js'
 
 const identity = { subject: 'auth-user', email: 'owner@example.com' }
 const organizationId = '11111111-1111-4111-8111-111111111111'
@@ -38,7 +42,12 @@ function scoped(overrides: Record<string, unknown> = {}) {
       }),
     },
     customerTenant: {
-      findFirst: async () => ({ id: tenantId, organizationId }),
+      findFirst: async () => ({
+        id: tenantId, organizationId,
+        connection: { status: 'ACTIVE', lastErrorCode: null, lastVerifiedAt: new Date(), consentedPermissions: [...CONNECTION_REQUIRED_PERMISSIONS, 'IdentityRiskyUser.Read.All'] },
+        tenantLicenses: [{ servicePlans: [{ servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }] }],
+        syncStates: [{ resourceType: 'LICENSES', status: 'SUCCEEDED', lastAttemptAt: new Date(Date.now() - 1000), lastSuccessfulAt: new Date(Date.now() - 1000), lastErrorCode: null, lastErrorMessage: null }],
+      }),
     },
     syncState: {
       findFirst: async () => ({ status: 'SUCCEEDED', lastSuccessfulAt: new Date() }),
@@ -607,6 +616,106 @@ test('a corrupt capped-zero coverage row fails closed instead of rendering at le
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('all Microsoft summary surfaces share current eligibility and clock ordering, with explicit age policies', async () => {
+  const previous = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+  process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = 'true'
+  const clock = new Date(Date.now() - 60000)
+  const payload = [{ id: 'synthetic-risk', riskState: 'atRisk', riskLevel: 'high' }]
+  const cases = [
+    { name: 'READY' }, { name: 'not licensed', p1: true }, { name: 'permission absent', missingPermission: true },
+    { name: 'revoked', connection: 'REVOKED' }, { name: 'pending', connection: 'PENDING_CONSENT' }, { name: 'error', connection: 'ERROR' },
+    { name: 'unverified consent', noVerification: true }, { name: 'failed licensing', licenseStatus: 'FAILED' }, { name: 'stale licensing', licenseAge: 27 },
+    { name: 'collection failed', collectionStatus: 'FAILED' }, { name: 'collection running', collectionStatus: 'RUNNING' },
+    { name: 'equal clock', delta: 0 }, { name: 'later clock', delta: 1 }, { name: '1ms inversion', delta: -1 }, { name: '24h inversion', delta: -86400000 },
+    { name: '27h policy difference', hours: 27 }, { name: '37h expired', hours: 37 },
+    { name: 'recovered current' }, { name: 'legacy optional-permission error', connection: 'ERROR', errorCode: 'missing-permissions' },
+  ]
+  try {
+    for (const scenario of cases) {
+      const observedAt = new Date(clock.getTime() - (scenario.hours ?? 0) * 3600000)
+      const lastSuccessfulAt = new Date(observedAt.getTime() + (scenario.delta ?? 0))
+      const connection = { status: scenario.connection ?? 'ACTIVE', lastErrorCode: scenario.errorCode ?? null, lastVerifiedAt: scenario.noVerification ? null : clock, consentedPermissions: [...CONNECTION_REQUIRED_PERMISSIONS, ...(scenario.missingPermission ? [] : ['IdentityRiskyUser.Read.All'])] }
+      const tenantLicenses = [{ servicePlans: [{ servicePlanName: scenario.p1 ? 'AAD_PREMIUM' : 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }] }]
+      const licenseState = { resourceType: 'LICENSES', status: scenario.licenseStatus ?? 'SUCCEEDED', lastSuccessfulAt: new Date(clock.getTime() - (scenario.licenseAge ?? 0) * 3600000), lastAttemptAt: clock, lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 }
+      const riskState = { ...licenseState, resourceType: 'RISKY_USERS', status: scenario.collectionStatus ?? 'SUCCEEDED', lastSuccessfulAt }
+      const service = new IdentityRiskService(scoped({
+        customerTenant: { findFirst: async (args: { where: { organizationId: unknown }; select: object }) => {
+          if (typeof args.where.organizationId === 'string') {
+            assert.deepEqual(args.where, { id: tenantId, organizationId })
+            assert.deepEqual(Object.keys(args.select).sort(), ['connection', 'syncStates', 'tenantLicenses'])
+          }
+          return { id: tenantId, organizationId, connection, tenantLicenses, syncStates: [licenseState] }
+        } },
+        syncState: { findFirst: async () => riskState },
+        tenantEntraSnapshot: { findFirst: async () => ({ payload, observedAt }) },
+      }))
+      const endpoint = await service.microsoftRiskyUsers(identity, tenantId)
+      const effectiveStatus = effectiveMicrosoftConnectionStatus(connection.status, connection.lastErrorCode, CONNECTION_REQUIRED_PERMISSIONS.filter((permission) => !connection.consentedPermissions.includes(permission)))
+      const readiness = deriveCollectionReadiness({ connectionStatus: effectiveStatus, connectionVerifiedAt: connection.lastVerifiedAt, consentedPermissions: connection.consentedPermissions, licenseServicePlans: collectedLicenseServicePlans(tenantLicenses), syncStates: [licenseState, riskState], evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload, observedAt }], now: new Date() }).evidence.riskyIdentities
+      const health = deriveTenantHealth({ tenantId, effectiveStatus: 'active', connectionStatus: effectiveStatus, missingPermissions: [], syncStates: [licenseState, riskState], authSnapshot: null, riskyIdentityCount: readiness.count, microsoftRiskSummary: readiness.microsoftRiskSummary })
+      assert.strictEqual(health.microsoftRiskSummary, readiness.microsoftRiskSummary)
+      assert.equal(endpoint.microsoftRiskSummary.snapshotObservedAt, readiness.microsoftRiskSummary.snapshotObservedAt, scenario.name)
+      assert.equal(endpoint.microsoftRiskSummary.collectionSucceededAt, readiness.microsoftRiskSummary.collectionSucceededAt, scenario.name)
+      if (scenario.hours === 27) {
+        assert.equal(endpoint.microsoftRiskSummary.activeDistinctUserCount, 1)
+        assert.equal(readiness.microsoftRiskSummary.availability, 'UNAVAILABLE')
+        assert.equal(health.attention.some((item) => item.key === 'risky-identities'), false)
+      } else if (scenario.hours === 37) {
+        assert.equal(endpoint.microsoftRiskSummary.availability, 'UNAVAILABLE')
+        assert.equal(readiness.microsoftRiskSummary.availability, 'UNAVAILABLE')
+      } else {
+        assert.deepEqual(endpoint.microsoftRiskSummary, readiness.microsoftRiskSummary, scenario.name)
+      }
+      const allowed = ['READY', 'equal clock', 'later clock', 'recovered current', 'legacy optional-permission error'].includes(scenario.name)
+      if (allowed) assert.equal(endpoint.microsoftRiskSummary.activeDistinctUserCount, 1, scenario.name)
+      else if (scenario.hours !== 27) {
+        assert.equal(endpoint.microsoftRiskSummary.activeDistinctUserCount, null, scenario.name)
+        assert.equal(endpoint.microsoftRiskSummary.observedActiveDistinctUserCount, null, scenario.name)
+        assert.equal(health.attention.some((item) => item.key === 'risky-identities'), false, scenario.name)
+      }
+      if ((scenario.delta ?? 0) < 0) assert.equal(endpoint.microsoftRiskSummary.reasonCode, 'INVALID_CLOCK', scenario.name)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    else process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previous
+  }
+})
+
+test('Microsoft summary is snapshot-wide before pagination and preserves uncertain active observations', async () => {
+  const previousDisplay = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+  const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+  process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = 'true'
+  process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = 'unit-test-only-cursor-secret-at-least-32-bytes'
+  const now = new Date()
+  try {
+    const payload: unknown[] = Array.from({ length: 55 }, (_, i) => ({ id: `source-${i}`, riskLevel: 'high', riskState: i < 2 ? 'atRisk' : 'dismissed' }))
+    payload.push({ id: 'source-0', riskLevel: 'high', riskState: 'confirmedSafe' }, {})
+    const prisma = scoped({
+      syncState: { findFirst: async (args: { where: unknown }) => { assert.deepEqual(args.where, { organizationId, customerTenantId: tenantId, resourceType: 'RISKY_USERS' }); return { status: 'SUCCEEDED', lastSuccessfulAt: now } } },
+      tenantEntraSnapshot: { findFirst: async (args: { where: unknown; orderBy: unknown }) => { assert.deepEqual(args.where, { organizationId, customerTenantId: tenantId, resourceType: 'RISKY_USERS' }); assert.deepEqual(args.orderBy, { observedAt: 'desc' }); return { payload, observedAt: now } } },
+    })
+    const service = new IdentityRiskService(prisma)
+    const first = await service.microsoftRiskyUsers(identity, tenantId, { limit: '1' })
+    const larger = await service.microsoftRiskyUsers(identity, tenantId, { limit: '100' })
+    assert.equal(first.users.length, 1)
+    assert.equal(larger.users.length, 56)
+    assert.deepEqual(first.microsoftRiskSummary, larger.microsoftRiskSummary)
+    assert.deepEqual(first.microsoftRiskSummary, summarizeMicrosoftRisk({ payload, snapshotObservedAt: now, collectionSucceededAt: now, collectionStatus: 'SUCCEEDED', now }))
+    assert.equal(first.microsoftRiskSummary.observedActiveDistinctUserCount, 2)
+    assert.equal(first.microsoftRiskSummary.activeDistinctUserCount, null)
+    assert.equal(first.capability, 'PARTIAL')
+    assert.equal(first.microsoftRiskSummary.completeness, 'CONFLICTING')
+    assert.doesNotMatch(JSON.stringify(first.microsoftRiskSummary), /source-\d/)
+    assert.equal(first.observedAt, first.microsoftRiskSummary.snapshotObservedAt)
+    assert.equal(first.evaluatedAt, first.microsoftRiskSummary.collectionSucceededAt)
+  } finally {
+    if (previousDisplay === undefined) delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    else process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previousDisplay
+    if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+    else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
   }
 })
 

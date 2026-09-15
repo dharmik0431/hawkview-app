@@ -12,6 +12,11 @@ import {
 } from 'lucide-react'
 import type { Tenant } from '@/types/api'
 import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
+import {
+  normalizeMicrosoftRiskSummary,
+  presentMicrosoftRiskSummary,
+} from '@/lib/identity-risk/microsoft-risk-summary'
+import { tenantRiskyUsersPath } from '@/lib/tenants/navigation'
 
 export type MatrixOverallStateKey =
   | 'critical'
@@ -49,9 +54,10 @@ export function getTenantMatrixOverallState(
     ['pending-consent', 'pending'].includes(connectionStatus) ||
     tenantStatus === 'pending'
   const hasExplicitConnection = ['connected', 'error', 'revoked', 'disconnected', 'pending-consent', 'pending'].includes(connectionStatus)
+  const microsoftRiskSummary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
   const hasBaselineEvidence =
     Number.isFinite(tenant.healthScore) &&
-    Number.isFinite(tenant.riskyIdentityCount) &&
+    microsoftRiskSummary?.availability === 'AVAILABLE' &&
     tenant.mfaCoverage != null &&
     Array.isArray(tenant.attention)
 
@@ -217,8 +223,9 @@ export function getTenantActiveIssuesInfo(tenant: Tenant) {
   ) {
     summaryParts.push(`MFA registration: ${tenant.mfaCoverage}% covered`)
   }
-  if (typeof tenant.riskyIdentityCount === 'number' && tenant.riskyIdentityCount > 0) {
-    summaryParts.push(`${tenant.riskyIdentityCount} risky identities`)
+  const riskAttention = attentionItems.find((item) => item.key.toLowerCase().includes('risky'))
+  if (riskAttention) {
+    summaryParts.push(riskAttention.label)
   }
 
   if (summaryParts.length === 0 && attentionItems.length > 0) {
@@ -267,9 +274,9 @@ export function getTenantIdentityInfo(tenant: Tenant) {
 
   // Risky Identities
   let riskyText = 'Risk data unavailable'
-  let riskyCount: number | null = Number.isFinite(tenant.riskyIdentityCount)
-    ? (tenant.riskyIdentityCount as number)
-    : null
+  const summary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
+  const riskPresentation = summary ? presentMicrosoftRiskSummary(summary) : null
+  const riskyCount = riskPresentation?.count ?? null
 
   if (isDisconnected) {
     riskyText = 'Risk data unavailable'
@@ -277,12 +284,8 @@ export function getTenantIdentityInfo(tenant: Tenant) {
     riskyText = 'Awaiting synchronization'
   } else if (tenant.missingPermissions && tenant.missingPermissions.some(p => p.toLowerCase().includes('identityrisk') || p.toLowerCase().includes('audit'))) {
     riskyText = 'Permission required'
-  } else if (riskyCount !== null && riskyCount > 0) {
-    riskyText = `${tenant.riskyIdentityCount} risky ${
-      tenant.riskyIdentityCount === 1 ? 'identity' : 'identities'
-    }`
-  } else if (riskyCount === 0) {
-    riskyText = 'No risky identities detected'
+  } else if (riskPresentation) {
+    riskyText = riskPresentation.headline
   } else {
     riskyText = 'Risk data not reported'
   }
@@ -416,6 +419,8 @@ export function getTenantRecommendedAction(tenant: Tenant) {
   const missingPerms = tenant.missingPermissions || []
 
   const attentionItems = computeTenantAttention(tenant)
+  const riskAttention = attentionItems.find((item) => item.key.toLowerCase().includes('risky'))
+  const riskInfo = getTenantRiskyUsersInfo(tenant)
 
   if (isDisconnected) {
     return {
@@ -433,11 +438,11 @@ export function getTenantRecommendedAction(tenant: Tenant) {
     }
   }
 
-  if (typeof tenant.riskyIdentityCount === 'number' && tenant.riskyIdentityCount > 0) {
+  if ((riskInfo.count ?? 0) > 0) {
     return {
-      label: 'Review risky users',
-      destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`,
-      description: `${tenant.riskyIdentityCount} risky user account${tenant.riskyIdentityCount === 1 ? '' : 's'} detected in directory.`,
+      label: riskAttention?.actionLabel ?? 'Review Microsoft risk',
+      destinationUrl: tenantRiskyUsersPath(tenant.id),
+      description: riskAttention?.why ?? riskInfo.breakdownNote,
     }
   }
 
@@ -576,22 +581,28 @@ export function getTenantRiskyUsersInfo(tenant: Tenant) {
     }
   }
 
-  const count = Number.isFinite(tenant.riskyIdentityCount)
-    ? (tenant.riskyIdentityCount as number)
-    : null
-  if (count === null) {
+  const summary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
+  if (summary) {
+    const presentation = presentMicrosoftRiskSummary(summary)
     return {
-      count: null,
-      label: 'Risk data not reported',
-      statusType: 'unavailable' as const,
-      breakdownNote: 'Microsoft risk evidence unavailable',
+      count: presentation.count,
+      isExact: presentation.exact,
+      label: presentation.headline,
+      statusType: summary.availability === 'AVAILABLE'
+        ? 'available' as const
+        : summary.availability === 'PARTIAL'
+          ? 'partial' as const
+          : 'unavailable' as const,
+      breakdownNote: presentation.detail,
     }
   }
+
   return {
-    count,
-    label: count === 0 ? '0 users at risk' : `${count} user${count === 1 ? '' : 's'} at risk`,
-    statusType: 'available' as const,
-    breakdownNote: count > 0 ? 'Level breakdown unavailable' : 'No risky users',
+    count: null,
+    isExact: false,
+    label: 'Risk data not reported',
+    statusType: 'unavailable' as const,
+    breakdownNote: 'Microsoft risk evidence unavailable',
   }
 }
 
@@ -746,7 +757,7 @@ export function getPrimaryConcern(tenant: Tenant) {
   if (
     !Array.isArray(tenant.attention) ||
     !Number.isFinite(tenant.healthScore) ||
-    !Number.isFinite(tenant.riskyIdentityCount) ||
+    normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)?.availability !== 'AVAILABLE' ||
     tenant.mfaCoverage == null
   ) {
     return {

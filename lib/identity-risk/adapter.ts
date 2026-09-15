@@ -32,6 +32,7 @@ import type {
   RiskSourceReadiness,
 } from './types'
 import { RISK_ASSESSMENT_RULE_TUPLES } from './types.ts'
+import { normalizeMicrosoftRiskSummary } from './microsoft-risk-summary.ts'
 
 const capabilities = ['FULL', 'PARTIAL', 'UNAVAILABLE'] as const
 const statuses = [
@@ -1014,6 +1015,7 @@ export function unavailableMicrosoftEntraRiskyUsers(
   return {
     channel: 'MICROSOFT_ENTRA_RISKY_USERS',
     meta: fallbackMeta(status, limitation, reasonCode),
+    microsoftRiskSummary: null,
     users: null,
     pageInfo: null,
   }
@@ -1166,8 +1168,15 @@ export function adaptIdentityRiskResponses(input: {
           )
         : null
     const pageInfo = adaptPageInfo(microsoftEnvelope.pageInfo)
+    const microsoftRiskSummary = microsoftEnvelope.microsoftRiskSummary === undefined
+      ? null
+      : normalizeMicrosoftRiskSummary(
+          microsoftEnvelope.microsoftRiskSummary,
+          trustedCurrentTimeMs,
+        )
     if (
       meta &&
+      (microsoftEnvelope.microsoftRiskSummary === undefined || microsoftRiskSummary !== null) &&
       users &&
       users.every((user): user is MicrosoftEntraRiskyUser => user !== null) &&
       new Set(users.map((user) => user.id)).size === users.length &&
@@ -1176,6 +1185,7 @@ export function adaptIdentityRiskResponses(input: {
       microsoft = {
         channel: 'MICROSOFT_ENTRA_RISKY_USERS',
         meta,
+        microsoftRiskSummary,
         users,
         pageInfo,
       }

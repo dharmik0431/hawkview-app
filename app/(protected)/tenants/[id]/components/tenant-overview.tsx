@@ -33,6 +33,7 @@ export function TenantOverview({
   bundle,
   display,
   onOpenModule,
+  onOpenIssue,
   onSync,
   isSyncing = false,
   riskyUsers = null,
@@ -40,6 +41,7 @@ export function TenantOverview({
   bundle: TenantBundle
   display: TenantWorkspaceDisplay
   onOpenModule: (module: string) => void
+  onOpenIssue?: (issue: TenantIssue) => void
   onSync?: () => void
   isSyncing?: boolean
   /**
@@ -49,6 +51,13 @@ export function TenantOverview({
    */
   riskyUsers?: React.ReactNode
 }) {
+  const openIssue = (issue: TenantIssue) => {
+    if (onOpenIssue) {
+      onOpenIssue(issue)
+      return
+    }
+    onOpenModule(issue.targetModule || 'settings')
+  }
   const [selectedIssue, setSelectedIssue] = useState<TenantIssue | null>(null)
   const [isTechDetailsOpen, setIsTechDetailsOpen] = useState(false)
 
@@ -398,7 +407,7 @@ export function TenantOverview({
                         ) : (
                           <button
                             type="button"
-                            onClick={() => onOpenModule(issue.targetModule || 'settings')}
+                            onClick={() => openIssue(issue)}
                             className="inline-flex items-center gap-1.5 rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:bg-slate-800 dark:hover:bg-white px-3.5 py-1.5 text-[14px] font-semibold shadow-2xs transition cursor-pointer"
                           >
                             <span>{issue.action || 'Review permissions'}</span>
@@ -734,7 +743,7 @@ export function TenantOverview({
                 <button
                   type="button"
                   onClick={() => {
-                    onOpenModule(selectedIssue.targetModule || 'settings')
+                    openIssue(selectedIssue)
                     setSelectedIssue(null)
                   }}
                   className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:bg-slate-800 dark:hover:bg-white px-3 py-2 text-xs font-semibold shadow-2xs transition cursor-pointer"
@@ -748,7 +757,7 @@ export function TenantOverview({
                 <button
                   type="button"
                   onClick={() => {
-                    onOpenModule(selectedIssue.targetModule || 'home')
+                    openIssue(selectedIssue)
                     setSelectedIssue(null)
                   }}
                   className="inline-flex items-center justify-center gap-1.5 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition cursor-pointer"

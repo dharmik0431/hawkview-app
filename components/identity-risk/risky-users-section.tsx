@@ -32,7 +32,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
-import { hawkViewDetectionSummary, microsoftRiskSummary, riskyUsersEmptyState } from '@/lib/identity-risk/risky-users-view'
+import { hawkViewDetectionSummary, riskyUsersEmptyState } from '@/lib/identity-risk/risky-users-view'
 import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { FleetRiskAssessmentDrawer } from '@/components/identity-risk/fleet-risk-assessment-drawer'
 import type { FleetRiskyUserRow } from '@/lib/api/fleet-risky-users-hooks'
@@ -41,8 +41,9 @@ import {
   getUserEmailOrUpn,
   mapRuleToPresentation,
 } from '@/lib/identity-risk/risk-presentation-mapper'
-import { microsoftRecordsByPolarity } from '@/lib/identity-risk/risky-users-view'
 import type { MicrosoftChannel, RiskyUserCount, RiskyUserRow } from '@/lib/identity-risk/risky-users-view'
+import type { MicrosoftEntraRiskyUsersView } from '@/lib/identity-risk/types'
+import { presentMicrosoftRiskSummary } from '@/lib/identity-risk/microsoft-risk-summary'
 
 function formatTimestamp(value: string | null | undefined): string {
   if (!value || !Number.isFinite(Date.parse(value))) return 'Not reported'
@@ -261,7 +262,7 @@ function CompactSummaryStrip({
   // listCoverage — the compiler had nothing to object to.
   count: RiskyUserCount
   rows: RiskyUserRow[]
-  microsoftView: any
+  microsoftView: MicrosoftEntraRiskyUsersView
   channel: MicrosoftChannel
   asOf: string | null
 }) {
@@ -279,13 +280,11 @@ function CompactSummaryStrip({
   const hawkViewText = hawkViewDetectionSummary(count, hawkViewUsers)
 
   // 3. Active Microsoft risk detections
-  const activeMsCount =
-    microsoftView?.users !== null && microsoftView?.users !== undefined
-      ? microsoftRecordsByPolarity(microsoftView).ACTIVE_RISK.length
-      : null
-  // THE CHANNEL SAYS WHETHER A NUMBER IS EARNED, not the length of an array. An empty list from a
-  // channel that could not report is not zero risk. See microsoftRiskSummary.
-  const microsoftText = microsoftRiskSummary(channel, activeMsCount, microsoftView?.pageInfo?.hasMore === true)
+  // The server summary is the only tenant-wide Microsoft count. Paginated
+  // records remain visible evidence but never become an aggregate fallback.
+  const microsoftSummary = microsoftView.microsoftRiskSummary ?? null
+  const serverMicrosoftSummary = presentMicrosoftRiskSummary(microsoftSummary)
+  const microsoftText = serverMicrosoftSummary.headline
 
   // 4. Assessment date
   const assessedText = asOf ? `Assessed ${formatTimestamp(asOf)}` : 'Assessment time: Not reported'
@@ -299,6 +298,7 @@ function CompactSummaryStrip({
         r.detection.microsoft === 'NOT_COMPARABLE'
     ) ||
     microsoftView?.meta?.status === 'UNAVAILABLE' ||
+    (microsoftSummary !== null && microsoftSummary.availability !== 'AVAILABLE') ||
     channel?.state === 'CONTRADICTORY'
 
   return (
@@ -326,10 +326,22 @@ function CompactSummaryStrip({
           <div className="hidden sm:block h-4 w-px bg-slate-200 dark:bg-slate-800" />
 
           {/* Fact 3 */}
-          <div className="flex items-center gap-2">
+          <div
+            id="microsoft-risk-summary"
+            className="flex items-start gap-2"
+            tabIndex={-1}
+          >
             <ShieldCheck className="h-4 w-4 text-purple-600 dark:text-purple-400 shrink-0" />
-            <span className="font-medium text-slate-800 dark:text-slate-200">
-              {microsoftText}
+            <span>
+              <span className="block font-medium text-slate-800 dark:text-slate-200">
+                {microsoftText}
+              </span>
+              <span className="mt-0.5 block text-2xs text-slate-500 dark:text-slate-400">
+                Microsoft Identity Protection
+                {serverMicrosoftSummary.observedAt
+                  ? ` · Evidence observed ${formatTimestamp(serverMicrosoftSummary.observedAt)}`
+                  : ' · Evidence time not reported'}
+              </span>
             </span>
           </div>
 

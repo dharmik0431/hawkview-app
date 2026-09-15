@@ -1,7 +1,9 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import { summarizeMicrosoftRisk, type MicrosoftRiskSummary } from '../identity-risk/microsoft-risk-summary.js'
 import { deriveSignInEntitlement } from './sign-in-entitlement.js'
 import {
   capabilitiesForWorkload,
+  CONNECTION_REQUIRED_PERMISSIONS,
   MICROSOFT_ACCESS_CONTRACT_VERSION,
   type MicrosoftAccessCapability,
 } from '../microsoft/microsoft-access-contract.js'
@@ -151,6 +153,7 @@ export type PilotEvidenceProjection = {
     reason: string | null
   }
   riskyIdentities: {
+    microsoftRiskSummary: MicrosoftRiskSummary
     availability: CollectionReadinessState
     count: number | null
     selectedSource: 'MICROSOFT_IDENTITY_PROTECTION'
@@ -178,6 +181,7 @@ export type PilotEvidenceProjection = {
 
 type ReadinessInput = {
   connectionStatus: string | null | undefined
+  connectionLastErrorCode?: string | null
   connectionVerifiedAt?: Date | null
   consentedPermissions: string[]
   syncStates: ReadinessSyncState[]
@@ -216,6 +220,34 @@ function entraP2Applicability(plans: ReadinessInput['licenseServicePlans']) {
   return p2.every((plan) => plan.provisioningStatus.toUpperCase() === 'DISABLED')
     ? 'NOT_LICENSED' as const
     : 'UNVERIFIED' as const
+}
+
+export function effectiveMicrosoftConnectionStatus(status: string | null, lastErrorCode: string | null, missingRequiredPermissions: readonly string[]) {
+  return status === 'ERROR' && lastErrorCode === 'missing-permissions' && missingRequiredPermissions.length === 0 ? 'ACTIVE' : status
+}
+
+/** One projection of durable license facts for both risk-summary read paths. */
+export function collectedLicenseServicePlans(licenses: readonly { servicePlans?: unknown }[]): ReadinessInput['licenseServicePlans'] {
+  const plans: NonNullable<ReadinessInput['licenseServicePlans']> = []
+  for (const license of licenses) {
+    if (!Array.isArray(license.servicePlans)) return null
+    for (const plan of license.servicePlans) {
+      if (!plan || typeof plan !== 'object' || typeof plan.servicePlanName !== 'string' || typeof plan.provisioningStatus !== 'string') return null
+      plans.push({ servicePlanName: plan.servicePlanName, provisioningStatus: plan.provisioningStatus, ...(typeof plan.servicePlanId === 'string' ? { servicePlanId: plan.servicePlanId } : {}) })
+    }
+  }
+  return plans
+}
+
+/** Shared CURRENT eligibility, intentionally independent of the RISKY_USERS age policy. */
+export function microsoftRiskSourceAllowed(input: Pick<ReadinessInput, 'connectionStatus' | 'connectionLastErrorCode' | 'connectionVerifiedAt' | 'consentedPermissions' | 'licenseServicePlans' | 'syncStates' | 'now'>): boolean {
+  const now = input.now ?? new Date()
+  const status = effectiveMicrosoftConnectionStatus(input.connectionStatus ?? null, input.connectionLastErrorCode ?? null, CONNECTION_REQUIRED_PERMISSIONS.filter((permission) => !input.consentedPermissions.includes(permission)))
+  if (['ERROR', 'REVOKED', 'PENDING_CONSENT', 'EXPIRED', 'INVALID'].includes(status?.toUpperCase() ?? '')) return false
+  const capability: MicrosoftAccessCapability | undefined = capabilitiesForWorkload('entra_identity_protection').find((item) => item.key === 'entra_identity_protection_risky_users')
+  if (!capability) return false
+  const grants = permissionStatus(capability.applicationPermissions.map((permission) => permission.name), new Set(input.consentedPermissions.map((permission) => permission.toLowerCase())), Boolean(validDate(input.connectionVerifiedAt)), capability.permissionMatch ?? 'ALL')
+  return grants === 'CONFIRMED' && fromSyncState(input.syncStates.find((state) => state.resourceType === 'LICENSES'), now, 'daily').state === 'READY' && entraP2Applicability(input.licenseServicePlans) === 'APPLICABLE'
 }
 
 const CURRENT_MS = 15 * 60 * 1000
@@ -824,11 +856,20 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   const riskySnapshot = snapshotByResource.get('RISKY_USERS')
   const conditionalAccessSnapshot = snapshotByResource.get('CONDITIONAL_ACCESS')
   const securityDefaultsSnapshot = snapshotByResource.get('SECURITY_DEFAULTS')
-  const riskyRows = Array.isArray(riskySnapshot?.payload) ? riskySnapshot.payload : null
+  const microsoftRiskSummary = summarizeMicrosoftRisk({
+    payload: riskySnapshot?.payload,
+    snapshotObservedAt: riskySnapshot?.observedAt,
+    collectionSucceededAt: states.get('RISKY_USERS')?.lastSuccessfulAt,
+    collectionStatus: states.get('RISKY_USERS')?.status,
+    // Current eligibility is shared. Non-successful collection states are rejected
+    // by the summary itself; only successful collections need this surface's age gate.
+    sourceAllowed: microsoftRiskSourceAllowed({ ...input, now }) && (states.get('RISKY_USERS')?.status !== 'SUCCEEDED' || riskyDataset?.state === 'READY'),
+    now,
+  })
   const conditionalAccessRows = Array.isArray(conditionalAccessSnapshot?.payload) ? conditionalAccessSnapshot.payload : null
   const securityDefaultsRows = Array.isArray(securityDefaultsSnapshot?.payload) ? securityDefaultsSnapshot.payload : null
   const securityDefaultsValue = securityDefaultsRows?.[0]
-  const riskyEvidenceReady = riskyDataset?.state === 'READY' && riskyRows !== null && Boolean(riskySnapshot?.observedAt)
+  const riskyEvidenceReady = microsoftRiskSummary.availability === 'AVAILABLE'
   const conditionalAccessEvidenceReady = conditionalAccessDataset?.state === 'READY' && conditionalAccessRows !== null && Boolean(conditionalAccessSnapshot?.observedAt)
   const securityDefaultsEnabled = securityDefaultsValue && typeof securityDefaultsValue === 'object' && typeof (securityDefaultsValue as { isEnabled?: unknown }).isEnabled === 'boolean'
     ? (securityDefaultsValue as { isEnabled: boolean }).isEnabled
@@ -847,12 +888,13 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
       reason: fallbackCurrent ? safeReason(signInSync?.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' : fallbackRunning ? 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' : signInDataset?.reason ?? null,
     },
     riskyIdentities: {
-      availability: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'UNVERIFIED' : riskyDataset?.state ?? 'UNVERIFIED',
-      count: riskyEvidenceReady ? riskyRows.length : null,
+      microsoftRiskSummary,
+      availability: microsoftRiskSummary.availability === 'PARTIAL' ? 'PARTIAL' : evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'UNVERIFIED' : riskyDataset?.state ?? 'UNVERIFIED',
+      count: microsoftRiskSummary.activeDistinctUserCount,
       selectedSource: 'MICROSOFT_IDENTITY_PROTECTION',
-      observedAt: riskyEvidenceReady ? iso(riskySnapshot?.observedAt) : null,
-      reasonCode: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : riskyDataset?.reasonCode ?? null,
-      reason: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'Current Microsoft Identity Protection evidence is unavailable.' : riskyDataset?.reason ?? null,
+      observedAt: microsoftRiskSummary.snapshotObservedAt,
+      reasonCode: microsoftRiskSummary.availability === 'PARTIAL' ? microsoftRiskSummary.reasonCode : evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : riskyDataset?.reasonCode ?? null,
+      reason: microsoftRiskSummary.availability === 'PARTIAL' ? 'Microsoft Identity Protection evidence is incomplete or conflicting; the exact active total is unknown.' : evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'Current Microsoft Identity Protection evidence is unavailable.' : riskyDataset?.reason ?? null,
     },
     conditionalAccess: {
       availability: evidenceUnavailable(conditionalAccessDataset?.state, conditionalAccessEvidenceReady) ? 'UNVERIFIED' : conditionalAccessDataset?.state ?? 'UNVERIFIED',

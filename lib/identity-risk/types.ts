@@ -1,3 +1,5 @@
+import type { MicrosoftRiskSummary } from './microsoft-risk-summary.ts'
+
 export type IdentityRiskCapability = 'FULL' | 'PARTIAL' | 'UNAVAILABLE'
 
 export type IdentityRiskChannelStatus =
@@ -141,6 +143,7 @@ export type HawkViewIdentitySignalsView = {
 export type MicrosoftEntraRiskyUsersView = {
   channel: 'MICROSOFT_ENTRA_RISKY_USERS'
   meta: IdentityRiskChannelMeta
+  microsoftRiskSummary?: MicrosoftRiskSummary | null
   users: MicrosoftEntraRiskyUser[] | null
   pageInfo: IdentityRiskPageInfo | null
 }

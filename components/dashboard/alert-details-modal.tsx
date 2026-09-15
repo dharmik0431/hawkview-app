@@ -226,6 +226,7 @@ export function AlertDetailsModal({
   const destinationUrl = investigateDestination(
     item.item.actionUrl,
     `/tenants/${encodeURIComponent(item.tenantId)}/settings`,
+    item.tenantId,
   )
 
   let primaryActionText = 'Go fix it'

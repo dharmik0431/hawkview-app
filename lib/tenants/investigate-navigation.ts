@@ -4,7 +4,11 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
  * Canonicalize only the small set of internal investigation routes emitted by
  * the API. Router navigation must never accept a URL-shaped value as a route.
  */
-export function investigateDestination(actionUrl: unknown, fallback: string) {
+export function investigateDestination(
+  actionUrl: unknown,
+  fallback: string,
+  expectedTenantId?: string,
+) {
   if (typeof actionUrl !== 'string' || !actionUrl || actionUrl.trim() !== actionUrl) return fallback
 
   const decoded = boundedDecode(actionUrl)
@@ -27,7 +31,7 @@ export function investigateDestination(actionUrl: unknown, fallback: string) {
   }
   if (parsed.origin !== 'https://hawkview.invalid') return fallback
 
-  const canonicalPath = canonicalInternalPath(parsed.pathname)
+  const canonicalPath = canonicalInternalPath(parsed.pathname, expectedTenantId)
   if (!canonicalPath) return fallback
 
   return `${canonicalPath}${parsed.search}`
@@ -48,9 +52,15 @@ function boundedDecode(value: string) {
   return decoded
 }
 
-function canonicalInternalPath(pathname: string) {
+function canonicalInternalPath(pathname: string, expectedTenantId?: string) {
   if (pathname === '/what-changed') return pathname
-  const match = /^\/tenants\/([^/]+)(\/settings)?$/.exec(pathname)
+  const match = /^\/tenants\/([^/]+)(\/settings|\/risky-users)?$/.exec(pathname)
   if (!match || !UUID.test(match[1])) return null
-  return `/tenants/${match[1].toLowerCase()}${match[2] ?? ''}`
+  const tenantId = match[1].toLowerCase()
+  if (expectedTenantId !== undefined) {
+    if (!UUID.test(expectedTenantId) || tenantId !== expectedTenantId.toLowerCase()) {
+      return null
+    }
+  }
+  return `/tenants/${tenantId}${match[2] ?? ''}`
 }

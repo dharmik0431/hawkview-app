@@ -70,7 +70,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: backend/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+      - name: Install root dependencies for cross-layer tests
+        working-directory: .
+        run: npm ci
       - run: npm ci
       - run: npm run db:generate
       - run: npm run db:validate

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { summarizeMicrosoftRisk } from '../identity-risk/microsoft-risk-summary.js'
 import {
   deriveTenantHealth,
   TENANT_HEALTH_RESOURCE_REGISTRY,
@@ -19,6 +20,31 @@ function baseInput() {
     auditEvents: [] as TenantAuditEvent[],
   }
 }
+
+test('risk attention transports canonical summary and review route, never raw counts or uncertain zero', () => {
+  const now = new Date('2026-09-15T12:00:00Z')
+  const row = (id: string, riskState = 'atRisk') => ({ id, riskState, riskLevel: 'high' })
+  const summary = (payload: unknown, sourceAllowed = true) => summarizeMicrosoftRisk({ payload, sourceAllowed, snapshotObservedAt: now, collectionSucceededAt: now, collectionStatus: 'SUCCEEDED', now })
+  for (const microsoftRiskSummary of [summary(Array.from({ length: 10 }, (_, i) => row(`closed-${i}`, 'dismissed'))), summary([row('x')], false), summary([{}])]) {
+    const result = deriveTenantHealth({ ...baseInput(), riskyIdentityCount: 10, microsoftRiskSummary, now })
+    assert.equal(result.attention.some((item) => item.key === 'risky-identities'), false)
+    assert.equal(result.riskyIdentityCount, microsoftRiskSummary.activeDistinctUserCount)
+    assert.strictEqual(result.microsoftRiskSummary, microsoftRiskSummary)
+  }
+  const partial = summary([row('same'), row('same', 'confirmedSafe'), row('other'), {}])
+  const result = deriveTenantHealth({ ...baseInput(), microsoftRiskSummary: partial, now })
+  const attention = result.attention.find((item) => item.key === 'risky-identities')!
+  assert.equal(result.riskyIdentityCount, null)
+  assert.equal(attention.label, '2 identities have active Microsoft-risk evidence requiring review')
+  assert.equal(attention.actionUrl, '/tenants/tenant-1/risky-users')
+  assert.equal(attention.actionLabel, 'Review Microsoft risk')
+  assert.equal(attention.detectedAt, partial.snapshotObservedAt)
+  assert.doesNotMatch(attention.label, /currently|at least.*active/i)
+  const exact = deriveTenantHealth({ ...baseInput(), microsoftRiskSummary: summary([row('one'), row('one'), row('two')]), now })
+  assert.equal(exact.riskyIdentityCount, 2)
+  assert.equal(exact.attention.find((item) => item.key === 'risky-identities')?.label, '2 active Microsoft risk identities')
+  assert.equal(deriveTenantHealth({ ...baseInput(), riskyIdentityCount: 10 }).riskyIdentityCount, null)
+})
 
 test('disconnected tenants link directly to connection settings', () => {
   const result = deriveTenantHealth({

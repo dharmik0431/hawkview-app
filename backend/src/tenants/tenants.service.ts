@@ -21,7 +21,8 @@ import {
   deriveTenantHealth,
   type TenantAuditEvent,
 } from './tenant-health.js'
-import { deriveCollectionReadiness } from './collection-readiness.js'
+import { deriveCollectionReadiness, collectedLicenseServicePlans, effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
+export { effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
 import {
   deriveTenantSyncFreshness,
   type TenantSyncFreshness,
@@ -67,18 +68,6 @@ const TENANT_ONBOARDING_ROLES = [
 
 const MICROSOFT_TENANT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-
-export function effectiveMicrosoftConnectionStatus(
-  status: string | null,
-  lastErrorCode: string | null,
-  missingRequiredPermissions: readonly string[],
-) {
-  return status === 'ERROR' &&
-    lastErrorCode === 'missing-permissions' &&
-    missingRequiredPermissions.length === 0
-    ? 'ACTIVE'
-    : status
-}
 
 export const preserveOptionalExchangeConsent = (
   graphPermissions: string[],
@@ -380,9 +369,7 @@ export class TenantsService {
       // Existing rows deliberately remain null until a successful authoritative
       // LICENSES collection writes service plans.  Do not turn that absence
       // into a deceptive authoritative empty inventory.
-      licenseServicePlans: tenant.tenantLicenses.some((license) => !Array.isArray(license.servicePlans))
-        ? null
-        : tenant.tenantLicenses.flatMap((license) => license.servicePlans as Array<{ servicePlanId?: string; servicePlanName: string; provisioningStatus: string }>),
+      licenseServicePlans: collectedLicenseServicePlans(tenant.tenantLicenses),
       sharePointUsageProjectionEvidence: usageProjectionEvidence('sharepoint.usage-projection'),
       oneDriveUsageProjectionEvidence: usageProjectionEvidence('onedrive.usage-projection'),
       evidenceSnapshots: tenant.entraSnapshots,
@@ -405,6 +392,7 @@ export class TenantsService {
       syncStates: tenant.syncStates,
       authSnapshot: tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.AUTH_REGISTRATIONS) ?? null,
       riskyIdentityCount: collectionReadiness.evidence.riskyIdentities.count,
+      microsoftRiskSummary: collectionReadiness.evidence.riskyIdentities.microsoftRiskSummary,
       signInEvidence: collectionReadiness.evidence.signIns,
       auditEvents,
       notApplicableResourceTypes,

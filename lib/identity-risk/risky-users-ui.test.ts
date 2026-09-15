@@ -5,6 +5,7 @@ import test from 'node:test'
 import * as adapter from './adapter.ts'
 import * as presentation from './presentation.ts'
 import * as riskyUsersView from './risky-users-view.ts'
+import * as microsoftRiskSummary from './microsoft-risk-summary.ts'
 import type { useNativeRiskyUsersRead } from '../api/risky-users-assessment-hooks.ts'
 import type { NativeAssessment } from './native-assessment.ts'
 import {
@@ -52,6 +53,31 @@ function microsoftWithoutP2() {
     ),
     reasonCode: 'LICENSE_REQUIRED',
     users: [],
+    microsoftRiskSummary: {
+      source: 'MICROSOFT_IDENTITY_PROTECTION',
+      availability: 'UNAVAILABLE',
+      completeness: 'UNKNOWN',
+      rawRecordCount: null,
+      observedActiveDistinctUserCount: null,
+      activeDistinctUserCount: null,
+      snapshotObservedAt: null,
+      collectionSucceededAt: null,
+      reasonCode: 'SOURCE_UNAVAILABLE',
+    },
+  }
+}
+
+function exactMicrosoftSummary(rawRecordCount: number, activeDistinctUserCount: number) {
+  return {
+    source: 'MICROSOFT_IDENTITY_PROTECTION',
+    availability: 'AVAILABLE',
+    completeness: 'COMPLETE',
+    rawRecordCount,
+    observedActiveDistinctUserCount: activeDistinctUserCount,
+    activeDistinctUserCount,
+    snapshotObservedAt: '2026-09-08T22:00:00.000Z',
+    collectionSucceededAt: '2026-09-08T22:01:00.000Z',
+    reasonCode: null,
   }
 }
 
@@ -84,6 +110,7 @@ function microsoftLive(hasMore = false) {
     pageInfo: hasMore
       ? { hasMore: true, nextCursor: 'cursor.abc' }
       : { hasMore: false, nextCursor: null },
+    microsoftRiskSummary: exactMicrosoftSummary(2, 1),
   }
 }
 
@@ -132,6 +159,13 @@ function microsoftMixedVerdicts() {
       },
     ],
     pageInfo: { hasMore: false, nextCursor: null },
+    microsoftRiskSummary: {
+      ...exactMicrosoftSummary(5, 2),
+      availability: 'PARTIAL',
+      completeness: 'PARTIAL',
+      activeDistinctUserCount: null,
+      reasonCode: 'PARTIAL_RECORDS',
+    },
   }
 }
 
@@ -197,6 +231,7 @@ function render(
   const uiMocks = {
     '@/lib/identity-risk/presentation': presentation,
     '@/lib/identity-risk/risky-users-view': riskyUsersView,
+    '@/lib/identity-risk/microsoft-risk-summary': microsoftRiskSummary,
     '@/lib/identity-risk/native-view': nativeViewModule,
     '@/lib/identity-risk/risk-presentation-mapper': riskPresentationMapper,
     '@/lib/api/hooks': {
@@ -543,7 +578,7 @@ test('native contracts P35: the P2 gap is shown once as a first-class state, not
 
   const result = renderNative()
   const summary = compactSummary(result.document).textContent ?? ''
-  assert.equal((summary.match(/requires Entra ID P2/g) ?? []).length, 1)
+  assert.equal((summary.match(/Microsoft risk status unavailable/g) ?? []).length, 1)
   assert.doesNotMatch(summary, /0 active Microsoft risk/)
   assert.match(summary, /1 users requiring review/)
   assert.match(summary, /1 detected by HawkView/)
@@ -601,19 +636,19 @@ test('native contracts R40: rows say Microsoft is not comparable rather than tha
   assertNoMicrosoftConclusion()
   assertNoActiveMicrosoftControl()
 })
-test('native contracts P41: a bounded Microsoft page says so instead of implying a full total', () => {
-  // P41: A bounded Microsoft page must expose a page-local count, not an exact tenant total or an invented zero lower bound.
+test('native contracts P41: pagination never supplies or changes the server tenant total', () => {
+  // P41: A bounded page remains record evidence only; the independent server summary owns the tenant total.
 
   const partial = renderNative(nativeRiskyUsersFixture(), { microsoft: microsoftLive(true) })
-  assert.match(compactSummary(partial.document).textContent ?? '', /1 active Microsoft risk records on this page; more results available/)
+  assert.match(compactSummary(partial.document).textContent ?? '', /1 active Microsoft risk identity/)
   const emptyPage = { ...microsoftLive(true), users: [] }
   const empty = renderNative(nativeRiskyUsersFixture(), { microsoft: emptyPage })
   const summary = compactSummary(empty.document).textContent ?? ''
-  assert.match(summary, /Microsoft active-risk count unavailable.*more results available/)
-  assert.doesNotMatch(summary, /0 active Microsoft|at least 0/i)
+  assert.match(summary, /1 active Microsoft risk identity/)
+  assert.doesNotMatch(summary, /0 active Microsoft|records on this page|at least 0/i)
   const complete = renderNative(nativeRiskyUsersFixture(), { microsoft: microsoftLive() })
   assert.match(compactSummary(complete.document).textContent ?? '', /1 active Microsoft risk/)
-  assert.doesNotMatch(compactSummary(complete.document).textContent ?? '', /more results available/)
+  assert.doesNotMatch(compactSummary(complete.document).textContent ?? '', /records on this page/)
 })
 test('native contracts C42: a withheld count reads as a decision, not as a blank or a breakage', () => {
   // C42: Native supplied withholding explanations replace the legacy reason literal; withholding is a decision, not a failed request.
@@ -780,7 +815,7 @@ test('native contracts P52: an unrecognised verdict renders as unrecognised, not
   assert.equal(riskyUsersView.microsoftPolarityLabel.UNRECOGNISED, 'Verdict not recognised')
   assert.ok(!groups.ACTIVE_RISK.includes(groups.UNRECOGNISED[0]!))
   const result = renderNative(nativeRiskyUsersFixture(), { microsoft })
-  assert.match(compactSummary(result.document).textContent ?? '', /2 active Microsoft risk/)
+  assert.match(compactSummary(result.document).textContent ?? '', /2 identities have active Microsoft-risk evidence requiring review/)
   assertIndependentPair()
 })
 test('native contracts P53: Microsoft automatic remediation is not shown as human negligence', () => {
@@ -804,7 +839,7 @@ test('native contracts P54: a withheld risk level says so instead of reading as 
   assert.ok(hidden)
   assert.match(riskyUsersView.microsoftRiskLevelLabel(hidden.riskLevel), /Detected.*level requires Entra ID P2/)
   assert.equal(riskyUsersView.microsoftLevelsHidden(view), true)
-  assert.match(compactSummary(renderNative(nativeRiskyUsersFixture(), { microsoft }).document).textContent ?? '', /2 active Microsoft risk/)
+  assert.match(compactSummary(renderNative(nativeRiskyUsersFixture(), { microsoft }).document).textContent ?? '', /2 identities have active Microsoft-risk evidence requiring review/)
   const pair = nativeMicrosoftPair()
   pair.microsoft.users[0]!.riskLevel = 'hidden'
   assert.match(renderNative(pair.native, { microsoft: pair.microsoft }).openNativeDrawer().text, /Active risk reported by Microsoft/)
@@ -1016,7 +1051,7 @@ test('native contracts P68: the compact summary names active Microsoft risk with
   // P68: The compact summary answers active Microsoft risk with attribution, not the removed panel heading or a merged score.
 
   const result = assertIndependentPair()
-  assert.match(compactSummary(result.document).textContent ?? '', /active Microsoft risk/)
+  assert.match(compactSummary(result.document).textContent ?? '', /active Microsoft(?:-| )risk/)
   assert.match(result.openNativeDrawer().text, /Microsoft Entra ID Protection/)
   assert.match(result.text, /never combined into a single score/)
 })
@@ -1093,6 +1128,7 @@ test('native contracts P70: a reporting Microsoft channel with no records says s
 
   const pair = nativeMicrosoftPair()
   pair.microsoft.users = []
+  pair.microsoft.microsoftRiskSummary = exactMicrosoftSummary(0, 0)
   const result = renderNative(pair.native, { microsoft: pair.microsoft })
   const summary = compactSummary(result.document).textContent ?? ''
   assert.match(summary, /0 active Microsoft risk/)
@@ -1105,7 +1141,7 @@ test('native contracts P71: an unavailable Microsoft channel adds no empty-count
 
   const result = renderNative(nativeRiskyUsersFixture(), { microsoft: microsoftWithoutP2() })
   const summary = compactSummary(result.document).textContent ?? ''
-  assert.match(summary, /requires Entra ID P2/)
+  assert.match(summary, /Microsoft risk status unavailable/)
   assert.doesNotMatch(summary, /0 active Microsoft risk/)
   assert.equal(actionableRows(result.document).length, 1)
 })
@@ -1116,7 +1152,13 @@ test('native contracts P72: an unconfirmed empty Microsoft result never becomes 
     const result = renderNative(nativeRiskyUsersFixture(), { microsoft })
     assert.doesNotMatch(compactSummary(result.document).textContent ?? '', /0 active Microsoft risk/)
   }
-  const complete = renderNative(nativeRiskyUsersFixture(), { microsoft: { ...microsoftLive(), users: [] } })
+  const complete = renderNative(nativeRiskyUsersFixture(), {
+    microsoft: {
+      ...microsoftLive(),
+      users: [],
+      microsoftRiskSummary: exactMicrosoftSummary(0, 0),
+    },
+  })
   assert.match(compactSummary(complete.document).textContent ?? '', /0 active Microsoft risk/)
 })
 test('native contracts S73: two reasons with different dates never share one', () => {

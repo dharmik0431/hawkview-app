@@ -53,6 +53,56 @@ interface TenantRiskMatrixProps {
   onSortChange?: (column: MatrixSortColumn, direction: 'asc' | 'desc') => void
 }
 
+/** Sort the same server-owned evidence that the cell renders. Unknown stays last. */
+export function compareTenantRiskSummaries(
+  a: Tenant,
+  b: Tenant,
+  direction: 'asc' | 'desc',
+) {
+  const riskA = getTenantRiskyUsersInfo(a)
+  const riskB = getTenantRiskyUsersInfo(b)
+  const countA = riskA.count
+  const countB = riskB.count
+
+  if (countA === null || countB === null) {
+    if (countA === null && countB !== null) return 1
+    if (countA !== null && countB === null) return -1
+  } else if (countA !== countB) {
+    return direction === 'asc' ? countA - countB : countB - countA
+  }
+
+  if (riskA.isExact !== riskB.isExact) return riskA.isExact ? -1 : 1
+  return a.name.localeCompare(b.name)
+}
+
+export function sortTenantRiskMatrixTenants(
+  tenants: Tenant[],
+  sortColumn: MatrixSortColumn,
+  sortDir: 'asc' | 'desc',
+) {
+  const list = [...tenants]
+  list.sort((a, b) => {
+    let cmp = 0
+
+    if (sortColumn === 'tenant') {
+      cmp = a.name.localeCompare(b.name)
+    } else if (sortColumn === 'secure_score') {
+      const scoreA = a.secureScore ?? -1
+      const scoreB = b.secureScore ?? -1
+      cmp = scoreA - scoreB
+    } else if (sortColumn === 'users_at_risk') {
+      return compareTenantRiskSummaries(a, b, sortDir)
+    } else if (sortColumn === 'active_threats') {
+      const threatsA = getTenantThreatsInfo(a).count ?? -1
+      const threatsB = getTenantThreatsInfo(b).count ?? -1
+      cmp = threatsA - threatsB
+    }
+
+    return sortDir === 'asc' ? cmp : -cmp
+  })
+  return list
+}
+
 function ProviderMark({ provider }: { provider: 'microsoft' | 'google' }) {
   if (provider === 'microsoft') {
     return (
@@ -111,33 +161,10 @@ export function TenantRiskMatrix({
     }
   }
 
-  const sortedTenants = React.useMemo(() => {
-    const list = [...tenants]
-
-    list.sort((a, b) => {
-      let cmp = 0
-
-      if (sortColumn === 'tenant') {
-        cmp = a.name.localeCompare(b.name)
-      } else if (sortColumn === 'secure_score') {
-        const scoreA = a.secureScore ?? -1
-        const scoreB = b.secureScore ?? -1
-        cmp = scoreA - scoreB
-      } else if (sortColumn === 'users_at_risk') {
-        const usersA = a.riskyIdentityCount ?? -1
-        const usersB = b.riskyIdentityCount ?? -1
-        cmp = usersA - usersB
-      } else if (sortColumn === 'active_threats') {
-        const threatsA = getTenantThreatsInfo(a).count ?? -1
-        const threatsB = getTenantThreatsInfo(b).count ?? -1
-        cmp = threatsA - threatsB
-      }
-
-      return sortDir === 'asc' ? cmp : -cmp
-    })
-
-    return list
-  }, [tenants, sortColumn, sortDir])
+  const sortedTenants = React.useMemo(
+    () => sortTenantRiskMatrixTenants(tenants, sortColumn, sortDir),
+    [tenants, sortColumn, sortDir],
+  )
 
   if (tenants.length === 0) {
     return (

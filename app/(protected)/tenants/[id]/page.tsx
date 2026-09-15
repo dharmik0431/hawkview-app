@@ -30,6 +30,7 @@ import TenantSettingsPage from './settings/page'
 import { deriveTenantWorkspaceDisplay, formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { normalizeCollectionReadiness } from '@/lib/tenants/collection-readiness'
+import { investigateDestination } from '@/lib/tenants/investigate-navigation'
 import {
   legacyRiskyUsersRedirect,
   parseTenantPath,
@@ -3982,6 +3983,23 @@ export default function TenantDetailsPage() {
             bundle={bundle}
             display={workspaceDisplay}
             onOpenModule={(m) => handleSectionNavigate(m as TenantSection)}
+            onOpenIssue={(issue) => {
+              const fallback = issue.targetModule === 'risky-users'
+                ? tenantRiskyUsersPath(resolvedTenantId)
+                : issue.targetModule === 'entra'
+                  ? tenantEntraPath(resolvedTenantId, 'overview')
+                  : issue.targetModule === 'settings'
+                    ? tenantSectionPath(resolvedTenantId, 'settings')
+                    : tenantOverviewPath(resolvedTenantId)
+              router.push(
+                investigateDestination(
+                  issue.actionUrl,
+                  fallback,
+                  resolvedTenantId,
+                ),
+                { scroll: false },
+              )
+            }}
             onSync={runSync}
             isSyncing={syncState === 'syncing'}
             riskyUsers={
